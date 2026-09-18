@@ -2,6 +2,7 @@ package com.filmkit.app.ui
 
 import android.content.Context
 import android.opengl.GLSurfaceView
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -129,18 +131,31 @@ fun SpikeScreen() {
     Column(
         Modifier
             .fillMaxSize()
+            .background(FilmTheme.Body)
             .padding(12.dp),
     ) {
-        Text("状态：$status", style = MaterialTheme.typography.titleSmall)
+        Text("状态：$status", color = FilmTheme.Cream, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { view?.rerun() }) { Text("重新运行 spike") }
-            Button(onClick = {
-                auditPath = com.filmkit.app.camera.CameraAudit.export(context)
-            }) { Text("导出相机审计") }
+            Button(
+                onClick = { view?.rerun() },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Amber,
+                    contentColor = FilmTheme.OnAccent,
+                ),
+            ) { Text("重新运行 spike") }
+            Button(
+                onClick = {
+                    auditPath = com.filmkit.app.camera.CameraAudit.export(context)
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Amber,
+                    contentColor = FilmTheme.OnAccent,
+                ),
+            ) { Text("导出相机审计") }
         }
         auditPath?.let {
-            Text("审计文件：$it", style = MaterialTheme.typography.labelSmall)
+            Text("审计文件：$it", color = FilmTheme.CreamDim, style = MaterialTheme.typography.labelSmall)
         }
         // GLSurfaceView 只承载 GL 上下文与离屏渲染，显示上占位即可
         AndroidView(
@@ -169,7 +184,7 @@ fun SpikeScreen() {
 
 @Composable
 private fun Section(title: String, lines: List<Pair<String, String>>) {
-    Text(title, style = MaterialTheme.typography.titleMedium)
+    Text(title, color = FilmTheme.Cream, style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(4.dp))
     Column(
         Modifier
@@ -178,8 +193,8 @@ private fun Section(title: String, lines: List<Pair<String, String>>) {
     ) {
         lines.forEach { (k, v) ->
             Row(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
-                Text(k, Modifier.width(170.dp), style = MaterialTheme.typography.bodySmall)
-                Text(v, style = MaterialTheme.typography.bodySmall)
+                Text(k, Modifier.width(170.dp), color = FilmTheme.CreamDim, style = MaterialTheme.typography.bodySmall)
+                Text(v, color = FilmTheme.CreamDim, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

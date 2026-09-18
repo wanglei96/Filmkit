@@ -9,10 +9,15 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +25,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,12 +34,13 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -50,13 +55,22 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -70,9 +84,12 @@ import kotlin.math.pow
 import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 
-/** M 档专业拍摄界面（布局参照 DAZZ / PhotonCamera）。 */
+/**
+ * M 档专业拍摄界面（UI 专项定稿方向 C：PhotonCamera 结构骨架 + DAZZ 胶片质感）。
+ * 结构约定：参数面板全局单实例（叠加取景器底部、状态驱动显隐）；焦段条固定不随面板跳位。
+ */
 @Composable
-fun CameraScreen() {
+fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     val context = LocalContext.current
     var hasPerm by rememberSaveable {
         mutableStateOf(
@@ -92,13 +109,13 @@ fun CameraScreen() {
         Column(
             Modifier
                 .fillMaxSize()
-                .background(Color.Black)
+                .background(FilmTheme.Body)
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("胶片预览需要相机权限", color = Color.White)
+            Text("胶片预览需要相机权限", color = FilmTheme.Cream)
             Spacer(Modifier.height(12.dp))
             Button(onClick = { permLauncher.launch(Manifest.permission.CAMERA) }) {
                 Text("授权")
@@ -113,15 +130,13 @@ fun CameraScreen() {
     var fps by remember { mutableIntStateOf(0) }
     var lensChips by remember { mutableStateOf(emptyList<Int>()) } // 启用镜头等效焦段（焦段条）
     var presetIdx by rememberSaveable { mutableIntStateOf(1) }
-    var fillTest by rememberSaveable { mutableStateOf(false) }
-    var orientation by rememberSaveable { mutableIntStateOf(0) }
     var focalBase by remember { mutableFloatStateOf(24f) } // 当前镜头等效焦距
 
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
     var manualAE by rememberSaveable { mutableStateOf(false) }
     var iso by rememberSaveable { mutableIntStateOf(100) }
     var shutterV by rememberSaveable { mutableFloatStateOf(0.75f) }
-    var ev by rememberSaveable { mutableStateOf(0f) }
+    var ev by remember { mutableStateOf(0f) }
     var manualWb by rememberSaveable { mutableStateOf(false) }
     var wbK by rememberSaveable { mutableIntStateOf(5000) }
     var focusMark by remember { mutableStateOf<Pair<Float, Float>?>(null) }
@@ -130,6 +145,11 @@ fun CameraScreen() {
     var liveK by remember { mutableIntStateOf(0) }
     var boxW by remember { mutableIntStateOf(1) }
     var boxH by remember { mutableIntStateOf(1) }
+
+    // 此前预设只在点按时应用，界面默认选中「负片400」而引擎仍是默认参数——启动即对齐
+    LaunchedEffect(Unit) {
+        controller.setFilmParams(CameraPresets.byIndex(presetIdx))
+    }
 
     DisposableEffect(Unit) {
         onDispose { controller.stop() }
@@ -182,15 +202,52 @@ fun CameraScreen() {
     Column(
         Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(FilmTheme.Body)
             .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
-        // ── 预览区（3:4 居中）──
+        // ── 顶栏：胶片型号条（胶卷仓选择）──
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CameraPresets.names.forEachIndexed { i, name ->
+                FilmChip(
+                    selected = presetIdx == i,
+                    label = name,
+                    serif = true,
+                    fontSize = 13.sp,
+                    onClick = {
+                        presetIdx = i
+                        controller.setFilmParams(CameraPresets.byIndex(i))
+                    },
+                )
+            }
+        }
+
+        // ── 实测参数条（CaptureResult 回填读数，等宽字）──
+        Row(
+            Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            val meter = FilmTheme.CreamDim.copy(alpha = 0.85f)
+            Text("+/- %.1f".format(ev), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+            Text(secText(liveNs), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+            Text("ISO $liveIso", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+            if (liveK > 0) {
+                Text("${liveK}K", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+            }
+        }
+
+        // ── 取景器（3:4 居中，圆角机框）──
         Box(
             Modifier
                 .fillMaxWidth()
                 .weight(1f, fill = false)
-                .align(Alignment.CenterHorizontally)
                 .aspectRatio(3f / 4f)
                 .onSizeChanged { boxW = it.width; boxH = it.height },
         ) {
@@ -231,30 +288,40 @@ fun CameraScreen() {
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // 顶部实时参数条
-            Row(
-                Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 8.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xB3141414))
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Text("+/- %.1f".format(ev), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Text(secText(liveNs), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Text("ISO $liveIso", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                if (liveK > 0) {
-                    Text("${liveK}K", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            // 圆角机框：SurfaceView 不响应 Compose clip，用机身色环带遮出圆角 + 奶油细线勾边
+            Canvas(Modifier.matchParentSize()) {
+                val inset = 5.dp.toPx()
+                val radius = 22.dp.toPx()
+                val frame = Path().apply {
+                    fillType = PathFillType.EvenOdd
+                    addRect(Rect(0f, 0f, size.width, size.height))
+                    addRoundRect(
+                        RoundRect(
+                            Rect(inset, inset, size.width - inset, size.height - inset),
+                            CornerRadius(radius, radius),
+                        ),
+                    )
                 }
+                drawPath(frame, FilmTheme.Body)
+                drawRoundRect(
+                    color = FilmTheme.CreamDim.copy(alpha = 0.35f),
+                    topLeft = Offset(inset, inset),
+                    size = androidx.compose.ui.geometry.Size(
+                        size.width - inset * 2,
+                        size.height - inset * 2,
+                    ),
+                    cornerRadius = CornerRadius(radius, radius),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
+                )
             }
 
-            // fps
+            // fps（调试读数，功能验证期保留）
             Text(
                 "fps $fps",
-                Modifier.align(Alignment.TopStart).padding(6.dp),
-                color = Color(0x88FFFFFF),
-                fontSize = 10.sp,
+                Modifier.align(Alignment.TopStart).padding(start = 14.dp, top = 12.dp),
+                color = FilmTheme.CreamDim.copy(alpha = 0.4f),
+                fontSize = 9.sp,
+                fontFamily = FilmTheme.Mono,
             )
 
             // 对焦指示框（按预览比例定位；半径用 dp→px 换算，硬编码像素会让圆心偏离点击点）
@@ -276,113 +343,138 @@ fun CameraScreen() {
                 )
             }
 
-            // 焦段条（预览内底部）：按发现的启用镜头等效焦段生成，不写死档位
+            // 焦段条：常量 padding 固定于取景器下缘（此前随面板开合 10↔108dp 跳位）
             Row(
                 Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = if (selectedControl != null) 108.dp else 10.dp)
+                    .padding(bottom = 14.dp)
                     .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xB3141414))
+                    .background(FilmTheme.Panel)
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
                 chips.forEach { f ->
-                    FilterChip(
+                    FilmChip(
                         selected = focalBase.roundToInt() == f,
+                        label = "$f",
                         onClick = { controller.setFocal(f) },
-                        label = { Text("$f", fontSize = 12.sp, color = Color.White) },
                     )
                 }
             }
 
-            // 参数滑杆面板（叠加预览底部）
-            selectedControl?.let { ctrl ->
+            // 参数面板：全局单实例（旧版在预览内、按钮下各写一份重复实现），状态驱动显隐
+            androidx.compose.animation.AnimatedVisibility(
+                visible = selectedControl != null,
+                enter = slideInVertically { it / 2 } + fadeIn(),
+                exit = slideOutVertically { it / 2 } + fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(horizontal = 12.dp, vertical = 14.dp),
+            ) {
+                val ctrl = selectedControl
                 Column(
                     Modifier
-                        .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .padding(8.dp)
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0xE6141414))
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                        .background(FilmTheme.Panel)
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
                 ) {
                     when (ctrl) {
                         "AF" -> {
-                            Text(
-                                "AF · 点按画面对焦（连续自动对焦）",
-                                color = Color.White, fontSize = 12.sp,
-                            )
+                            Text("点按画面对焦（连续自动对焦）", color = FilmTheme.Cream, fontSize = 12.sp)
                         }
                         "EXP" -> {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("AE", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(30.dp))
-                                FilterChip(
-                                    selected = !manualAE,
-                                    onClick = {
-                                        manualAE = false
-                                        controller.setManualExposure(false)
-                                    },
-                                    label = { Text("AUTO", fontSize = 10.sp) },
-                                )
-                                FilterChip(
-                                    selected = manualAE,
-                                    onClick = {
-                                        manualAE = true
-                                        controller.setManualExposure(true)
-                                    },
-                                    label = { Text("OFF", fontSize = 10.sp) },
-                                )
+                                PanelLabel("AE")
+                                FilmChip(selected = !manualAE, label = "AUTO", onClick = {
+                                    manualAE = false
+                                    controller.setManualExposure(false)
+                                })
+                                Spacer(Modifier.width(6.dp))
+                                FilmChip(selected = manualAE, label = "OFF", onClick = {
+                                    manualAE = true
+                                    controller.setManualExposure(true)
+                                })
                             }
                             PanelRow("SEC", secText(shutterNs)) {
-                                Slider(value = shutterV, onValueChange = {
-                                    shutterV = it
-                                    controller.setExposureNs(10f.pow(5f + 4f * shutterV).roundToLong())
-                                }, valueRange = 0f..1f)
+                                Slider(
+                                    value = shutterV,
+                                    onValueChange = {
+                                        shutterV = it
+                                        controller.setExposureNs(10f.pow(5f + 4f * shutterV).roundToLong())
+                                    },
+                                    valueRange = 0f..1f,
+                                    colors = SliderDefaults.colors(
+                                        thumbColor = FilmTheme.Cream,
+                                        activeTrackColor = FilmTheme.Amber,
+                                        inactiveTrackColor = FilmTheme.ChipBorder,
+                                    ),
+                                )
                             }
                             PanelRow("ISO", "$iso") {
-                                Slider(value = iso.toFloat(), onValueChange = {
-                                    iso = it.roundToInt()
-                                    controller.setIso(iso)
-                                }, valueRange = 100f..controller.maxAnalogIso.toFloat())
+                                Slider(
+                                    value = iso.toFloat(),
+                                    onValueChange = {
+                                        iso = it.roundToInt()
+                                        controller.setIso(iso)
+                                    },
+                                    valueRange = 100f..controller.maxAnalogIso.toFloat(),
+                                    colors = SliderDefaults.colors(
+                                        thumbColor = FilmTheme.Cream,
+                                        activeTrackColor = FilmTheme.Amber,
+                                        inactiveTrackColor = FilmTheme.ChipBorder,
+                                    ),
+                                )
                             }
                         }
                         "EV" -> {
                             PanelRow("EV", "%.1f".format(ev)) {
-                                Slider(value = ev.coerceIn(-4f, 4f), onValueChange = {
-                                    ev = it
-                                    manualAE = false
-                                    controller.setManualExposure(false)
-                                    controller.setEv(ev)
-                                }, valueRange = -4f..4f)
+                                Slider(
+                                    value = ev.coerceIn(-4f, 4f),
+                                    onValueChange = {
+                                        ev = it
+                                        manualAE = false
+                                        controller.setManualExposure(false)
+                                        controller.setEv(ev)
+                                    },
+                                    valueRange = -4f..4f,
+                                    colors = SliderDefaults.colors(
+                                        thumbColor = FilmTheme.Cream,
+                                        activeTrackColor = FilmTheme.Amber,
+                                        inactiveTrackColor = FilmTheme.ChipBorder,
+                                    ),
+                                )
                             }
                         }
                         "WB" -> {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("WB", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(30.dp))
-                                FilterChip(
-                                    selected = !manualWb,
-                                    onClick = {
-                                        manualWb = false
-                                        controller.setAutoWb()
-                                    },
-                                    label = { Text("AUTO", fontSize = 10.sp) },
-                                )
-                                FilterChip(
-                                    selected = manualWb,
-                                    onClick = {
-                                        manualWb = true
-                                        controller.setWbK(wbK)
-                                    },
-                                    label = { Text("${wbK}K", fontSize = 10.sp) },
-                                )
+                                PanelLabel("WB")
+                                FilmChip(selected = !manualWb, label = "AUTO", onClick = {
+                                    manualWb = false
+                                    controller.setAutoWb()
+                                })
+                                Spacer(Modifier.width(6.dp))
+                                FilmChip(selected = manualWb, label = "${wbK}K", onClick = {
+                                    manualWb = true
+                                    controller.setWbK(wbK)
+                                })
                             }
                             if (manualWb) {
                                 PanelRow("K", "$wbK") {
-                                    Slider(value = wbK.toFloat(), onValueChange = {
-                                        wbK = it.roundToInt()
-                                        controller.setWbK(wbK)
-                                    }, valueRange = 2500f..7500f)
+                                    Slider(
+                                        value = wbK.toFloat(),
+                                        onValueChange = {
+                                            wbK = it.roundToInt()
+                                            controller.setWbK(wbK)
+                                        },
+                                        valueRange = 2500f..7500f,
+                                        colors = SliderDefaults.colors(
+                                            thumbColor = FilmTheme.Cream,
+                                            activeTrackColor = FilmTheme.Amber,
+                                            inactiveTrackColor = FilmTheme.ChipBorder,
+                                        ),
+                                    )
                                 }
                             }
                         }
@@ -391,7 +483,7 @@ fun CameraScreen() {
             }
         }
 
-        // ── 控制按钮行 ──
+        // ── 控制圆钮（选中琥珀底）──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -399,11 +491,17 @@ fun CameraScreen() {
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             listOf("AF", "EXP", "EV", "WB").forEach { c ->
+                val on = selectedControl == c
                 Box(
                     Modifier
                         .size(52.dp)
                         .clip(CircleShape)
-                        .background(if (selectedControl == c) Color.White else Color(0xFF222222))
+                        .background(if (on) FilmTheme.Amber else FilmTheme.ChipBg)
+                        .border(
+                            1.dp,
+                            if (on) FilmTheme.Amber else FilmTheme.ChipBorder,
+                            CircleShape,
+                        )
                         .pointerInput(c) {
                             detectTapGestures {
                                 selectedControl = if (selectedControl == c) null else c
@@ -413,153 +511,113 @@ fun CameraScreen() {
                 ) {
                     Text(
                         c,
-                        color = if (selectedControl == c) Color.Black else Color.White,
+                        color = if (on) FilmTheme.OnAccent else FilmTheme.Cream,
                         fontSize = 13.sp,
+                        fontFamily = FilmTheme.Mono,
                         fontWeight = FontWeight.Medium,
                     )
                 }
             }
         }
 
-        // ── 选中控制项的滑杆面板（按钮下方）──
-        selectedControl?.let { ctrl ->
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF1C1C1C))
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-            ) {
-                when (ctrl) {
-                    "AF" -> Text("AF · 点按画面对焦", color = Color.White, fontSize = 12.sp)
-                    "EXP" -> {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("AE", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(34.dp))
-                            FilterChip(
-                                selected = !manualAE,
-                                onClick = {
-                                    manualAE = false
-                                    controller.setManualExposure(false)
-                                },
-                                label = { Text("AUTO", fontSize = 10.sp) },
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            FilterChip(
-                                selected = manualAE,
-                                onClick = {
-                                    manualAE = true
-                                    controller.setManualExposure(true)
-                                },
-                                label = { Text("OFF", fontSize = 10.sp) },
-                            )
-                        }
-                        PanelRow("SEC", secText(shutterNs)) {
-                            Slider(value = shutterV, onValueChange = {
-                                shutterV = it
-                                controller.setExposureNs(10f.pow(5f + 4f * shutterV).roundToLong())
-                            }, valueRange = 0f..1f)
-                        }
-                        PanelRow("ISO", "$iso") {
-                            Slider(value = iso.toFloat(), onValueChange = {
-                                iso = it.roundToInt()
-                                controller.setIso(iso)
-                            }, valueRange = 100f..controller.maxAnalogIso.toFloat())
-                        }
-                    }
-                    "EV" -> {
-                        PanelRow("EV", "%.1f".format(ev)) {
-                            Slider(value = ev.coerceIn(-4f, 4f), onValueChange = {
-                                ev = it
-                                manualAE = false
-                                controller.setManualExposure(false)
-                                controller.setEv(ev)
-                            }, valueRange = -4f..4f)
-                        }
-                    }
-                    "WB" -> {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("WB", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(30.dp))
-                            FilterChip(
-                                selected = !manualWb,
-                                onClick = {
-                                    manualWb = false
-                                    controller.setAutoWb()
-                                },
-                                label = { Text("AUTO", fontSize = 10.sp) },
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            FilterChip(
-                                selected = manualWb,
-                                onClick = {
-                                    manualWb = true
-                                    controller.setWbK(wbK)
-                                },
-                                label = { Text("${wbK}K", fontSize = 10.sp) },
-                            )
-                        }
-                        if (manualWb) {
-                            PanelRow("K", "$wbK") {
-                                Slider(value = wbK.toFloat(), onValueChange = {
-                                    wbK = it.roundToInt()
-                                    controller.setWbK(wbK)
-                                }, valueRange = 2500f..7500f)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 预设 + 快门 ──
+        // ── 底部三段：胶卷位（相册接入前占位）· 快门 · 设置 ──
         Row(
-            Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
-            Row(
+            Box(
                 Modifier
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF1C1C1C))
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    .size(44.dp)
+                    .alpha(0.35f),
+                contentAlignment = Alignment.Center,
             ) {
-                CameraPresets.names.forEachIndexed { i, name ->
-                    FilterChip(
-                        selected = presetIdx == i,
-                        onClick = {
-                            presetIdx = i
-                            controller.setFilmParams(CameraPresets.byIndex(i))
-                        },
-                        label = { Text(name, fontSize = 11.sp) },
-                    )
-                }
+                Text("▦", color = FilmTheme.Cream, fontSize = 22.sp)
             }
             Box(
                 Modifier
-                    .size(70.dp)
+                    .size(72.dp)
                     .clip(CircleShape)
-                    .border(4.dp, Color.White, CircleShape)
+                    .border(4.dp, FilmTheme.Cream, CircleShape)
                     .pointerInput(Unit) { detectTapGestures { controller.capture() } },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
                     Modifier
-                        .size(54.dp)
+                        .size(56.dp)
                         .clip(CircleShape)
-                        .background(Color.White),
+                        .background(FilmTheme.Cream),
                 )
+            }
+            Box(
+                Modifier
+                    .size(44.dp)
+                    .pointerInput(Unit) { detectTapGestures { onOpenSettings() } },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("⚙", color = FilmTheme.Cream, fontSize = 22.sp)
             }
         }
     }
 }
 
-/** 面板内一行：标签 + 滑杆 + 值 */
+/** 面板行首标签：琥珀等宽小字 */
+@Composable
+private fun PanelLabel(text: String) {
+    Text(
+        text,
+        color = FilmTheme.Amber,
+        fontSize = 11.sp,
+        fontFamily = FilmTheme.Mono,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier.width(38.dp),
+    )
+}
+
+/** 面板内一行：琥珀标签 + 滑杆 + 奶油读数 */
 @Composable
 private fun PanelRow(label: String, value: String, slider: @Composable () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(34.dp))
+        PanelLabel(label)
         Box(Modifier.weight(1f)) { slider() }
-        Text(value, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(44.dp))
+        Text(
+            value,
+            color = FilmTheme.Cream,
+            fontSize = 11.sp,
+            fontFamily = FilmTheme.Mono,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(48.dp),
+        )
     }
+}
+
+/** 胶片风选择片：未选中炭黑奶油字，选中琥珀底深字 */
+@Composable
+private fun FilmChip(
+    selected: Boolean,
+    label: String,
+    onClick: () -> Unit,
+    serif: Boolean = false,
+    fontSize: TextUnit = 12.sp,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Text(
+                label,
+                fontSize = fontSize,
+                fontFamily = if (serif) FilmTheme.Serif else FilmTheme.Mono,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            )
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            containerColor = FilmTheme.ChipBg,
+            labelColor = FilmTheme.Cream,
+            selectedContainerColor = FilmTheme.Amber,
+            selectedLabelColor = FilmTheme.OnAccent,
+        ),
+    )
 }

@@ -45,13 +45,16 @@ private fun M0App() {
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
-        PrimaryTabRow(selectedTabIndex = tab) {
-            tabs.forEachIndexed { i, title ->
-                Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
+        // 相机页沉浸化（UI 专项方向 C）：隐藏调试 Tab 条，经相机页 ⚙ 进入设置页
+        if (tab != 0) {
+            PrimaryTabRow(selectedTabIndex = tab) {
+                tabs.forEachIndexed { i, title ->
+                    Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
+                }
             }
         }
         when (tab) {
-            0 -> CameraScreen()
+            0 -> CameraScreen(onOpenSettings = { tab = 1 })
             1 -> SettingsScreen()
             2 -> SpikeScreen()
             else -> LogScreen()

@@ -2,6 +2,7 @@ package com.filmkit.app.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -60,27 +62,41 @@ fun LogScreen() {
     Column(
         Modifier
             .fillMaxSize()
+            .background(FilmTheme.Body)
             .padding(12.dp),
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { load() }) { Text("刷新") }
+            Button(
+                onClick = { load() },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Amber,
+                    contentColor = FilmTheme.OnAccent,
+                ),
+            ) { Text("刷新") }
             Button(
                 onClick = {
                     val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
                     export.launch("filmkit-logs-$ts.jsonl")
                 },
                 enabled = lines.isNotEmpty(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Amber,
+                    contentColor = FilmTheme.OnAccent,
+                    disabledContainerColor = FilmTheme.ChipBg,
+                    disabledContentColor = FilmTheme.CreamDim,
+                ),
             ) { Text("导出 JSONL") }
         }
         Spacer(Modifier.height(8.dp))
         Text(
             "最近 ${lines.size} 条（环形缓冲，完整文件在应用 logs 目录）",
+            color = FilmTheme.CreamDim,
             style = MaterialTheme.typography.labelSmall,
         )
         Spacer(Modifier.height(4.dp))
         LazyColumn(Modifier.fillMaxSize()) {
             items(lines) { line ->
-                Text(line, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                Text(line, fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = FilmTheme.CreamDim)
             }
         }
     }
