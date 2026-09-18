@@ -20,3 +20,4 @@ status: active
 - [2026-09-18] **焦段条改按发现镜头生成（v0.4.4，更新上一条）** — 写死 15/24/35/50/85 与实际镜头组合不符（X300=15/24/70）；焦段条=启用镜头等效焦段去重升序，点按=原生 1.0x 直切
 - [2026-09-18] **出包单文件覆盖制** — 根目录固定 filmkit.apk 每次构建覆盖，不再按版本号新建（用户要求省磁盘）；版本区分靠 build.gradle versionName + 开发计划记录
 - [2026-09-18] **相机 UI 重设计走专项任务** — 用户对当前 UI 不满意；修 bug 会话不顺手改 UI，新窗口先设计定稿（参照 DAZZ/PhotonCamera）再重构 CameraScreen
+- [2026-09-18] **版本管理：GitHub + 附注标签** — 远端 git@github.com:wanglei96/Filmkit.git（main）；每个 versionName 发版打 `v<versionName>` 标签；apk 不入库（gitignore），构建/发布靠 CI artifact 与 GitHub Releases

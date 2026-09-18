@@ -19,7 +19,8 @@ status: active
 
 ## 路径与位置
 
-- [2026-09-18] APK 产物：app/build/outputs/apk/debug/app-debug.apk；出包覆盖仓库根 filmkit.apk（单文件覆盖制，2026-09-18 起不再按版本号新建副本）
+- [2026-09-18] Git 远端：git@github.com:wanglei96/Filmkit.git，主分支 main；CI（.github/workflows/android.yml）在 push main/PR 时构建+单测并上传 APK artifact
+- [2026-09-18] APK 产物：app/build/outputs/apk/debug/app-debug.apk；出包覆盖仓库根 filmkit.apk（单文件覆盖制，2026-09-18 起不再按版本号新建副本）；filmkit.apk 已 gitignore，发布走 GitHub Releases/CI artifact
 - [2026-09-18] 设备日志导出：/storage/emulated/0/Android/data/com.filmkit.app/files/logs（用户经 vivo办公套件回传）
 - [2026-09-18] 审计导出：同上 files/audit/camera-audit-*.json
 - [2026-09-18] 引擎 so：libfilmengine.so，JNI 入口 com.filmkit.app.EngineBridge
@@ -28,5 +29,6 @@ status: active
 
 - [2026-09-18] 构建+单测：`JAVA_HOME=$HOME/.filmkit-dev/jdk-17.0.20.1+1/Contents/Home ./gradlew assembleDebug testDebugUnitTest`
 - [2026-09-18] 命令行构建替代 JDK：系统默认 Java 8 跑不动 AGP，可用 `JAVA_HOME=/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`（Homebrew JDK23，实测 assembleDebug 通过）
+- [2026-09-18] 版本管理约定：发版时打附注标签 `v<versionName>`（如 v0.4.5-m2）并 push；提交信息用 Conventional Commits（英文）；版本号在 app/build.gradle.kts（versionCode/versionName）+ docs/开发计划.md 记录
 - [2026-09-18] X300 焦段事实：启用镜头等效焦段 15/24/70（超广 id4、主摄 id2/0、长焦 id3）；焦段条由 lensEquivs() 生成
 - [2026-09-18] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`
