@@ -9,7 +9,6 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -18,29 +17,34 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -85,8 +89,9 @@ import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 
 /**
- * M 档专业拍摄界面（UI 专项定稿方向 C：PhotonCamera 结构骨架 + DAZZ 胶片质感）。
- * 结构约定：参数面板全局单实例（叠加取景器底部、状态驱动显隐）；焦段条固定不随面板跳位。
+ * M 档专业拍摄界面（UI 专项方向 C：PhotonCamera 结构骨架 + DAZZ 胶片质感）。
+ * v0.4.7 按真机反馈：顶部胶片条并入取景器内底部「变焦刻度 + 滤镜」透明行；默认标准；
+ * ⚙ 移到右上角，点开半透明快捷设置悬浮窗（DNG/镜头开关 + 更多设置入口）；底部不留白。
  */
 @Composable
 fun CameraScreen(onOpenSettings: () -> Unit = {}) {
@@ -110,7 +115,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             Modifier
                 .fillMaxSize()
                 .background(FilmTheme.Body)
-                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .statusBarsPadding()
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
@@ -128,11 +133,12 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var surface by remember { mutableStateOf<Surface?>(null) }
     var resumed by remember { mutableStateOf(true) }
     var fps by remember { mutableIntStateOf(0) }
-    var lensChips by remember { mutableStateOf(emptyList<Int>()) } // 启用镜头等效焦段（焦段条）
-    var presetIdx by rememberSaveable { mutableIntStateOf(1) }
+    var lensChips by remember { mutableStateOf(emptyList<Int>()) } // 启用镜头等效焦段（变焦刻度）
+    var presetIdx by rememberSaveable { mutableIntStateOf(0) } // 默认标准
     var focalBase by remember { mutableFloatStateOf(24f) } // 当前镜头等效焦距
 
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
+    var quickOpen by rememberSaveable { mutableStateOf(false) } // 快捷设置悬浮窗
     var manualAE by rememberSaveable { mutableStateOf(false) }
     var iso by rememberSaveable { mutableIntStateOf(100) }
     var shutterV by rememberSaveable { mutableFloatStateOf(0.75f) }
@@ -146,7 +152,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var boxW by remember { mutableIntStateOf(1) }
     var boxH by remember { mutableIntStateOf(1) }
 
-    // 此前预设只在点按时应用，界面默认选中「负片400」而引擎仍是默认参数——启动即对齐
+    // 启动即应用选中预设，保证界面选中态与引擎参数一致
     LaunchedEffect(Unit) {
         controller.setFilmParams(CameraPresets.byIndex(presetIdx))
     }
@@ -199,47 +205,40 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
 
+    // 底部不留白：只让出状态栏，内容延伸到手势条之下
     Column(
         Modifier
             .fillMaxSize()
             .background(FilmTheme.Body)
-            .windowInsetsPadding(WindowInsets.safeDrawing),
+            .statusBarsPadding(),
     ) {
-        // ── 顶栏：胶片型号条（胶卷仓选择）──
-        Row(
+        // ── 顶栏：实测参数居中，⚙ 右上角 ──
+        Box(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .padding(vertical = 6.dp),
         ) {
-            CameraPresets.names.forEachIndexed { i, name ->
-                FilmChip(
-                    selected = presetIdx == i,
-                    label = name,
-                    serif = true,
-                    fontSize = 13.sp,
-                    onClick = {
-                        presetIdx = i
-                        controller.setFilmParams(CameraPresets.byIndex(i))
-                    },
-                )
+            Row(
+                Modifier.align(Alignment.Center),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                val meter = FilmTheme.CreamDim.copy(alpha = 0.85f)
+                Text("+/- %.1f".format(ev), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+                Text(secText(liveNs), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+                Text("ISO $liveIso", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+                if (liveK > 0) {
+                    Text("${liveK}K", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+                }
             }
-        }
-
-        // ── 实测参数条（CaptureResult 回填读数，等宽字）──
-        Row(
-            Modifier
-                .align(Alignment.CenterHorizontally)
-                .padding(bottom = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            val meter = FilmTheme.CreamDim.copy(alpha = 0.85f)
-            Text("+/- %.1f".format(ev), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
-            Text(secText(liveNs), color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
-            Text("ISO $liveIso", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
-            if (liveK > 0) {
-                Text("${liveK}K", color = meter, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+            Box(
+                Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 10.dp)
+                    .size(40.dp)
+                    .pointerInput(Unit) { detectTapGestures { quickOpen = !quickOpen } },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("⚙", color = if (quickOpen) FilmTheme.Amber else FilmTheme.Cream, fontSize = 20.sp)
             }
         }
 
@@ -343,34 +342,55 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 )
             }
 
-            // 焦段条：常量 padding 固定于取景器下缘（此前随面板开合 10↔108dp 跳位）
+            // 变焦刻度 + 滤镜：透明底叠预览下缘（变焦左、滤镜右，选中琥珀）
             Row(
                 Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 14.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(FilmTheme.Panel)
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(horizontal = 10.dp, vertical = 12.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
                 chips.forEach { f ->
                     FilmChip(
                         selected = focalBase.roundToInt() == f,
                         label = "$f",
+                        transparent = true,
                         onClick = { controller.setFocal(f) },
+                    )
+                }
+                Box(
+                    Modifier
+                        .padding(horizontal = 6.dp)
+                        .width(1.dp)
+                        .height(16.dp)
+                        .background(FilmTheme.ChipBorder),
+                )
+                CameraPresets.names.forEachIndexed { i, name ->
+                    FilmChip(
+                        selected = presetIdx == i,
+                        label = name,
+                        serif = true,
+                        transparent = true,
+                        fontSize = 13.sp,
+                        onClick = {
+                            presetIdx = i
+                            controller.setFilmParams(CameraPresets.byIndex(i))
+                        },
                     )
                 }
             }
 
-            // 参数面板：全局单实例（旧版在预览内、按钮下各写一份重复实现），状态驱动显隐
+            // 参数面板：全局单实例，状态驱动显隐
             androidx.compose.animation.AnimatedVisibility(
                 visible = selectedControl != null,
                 enter = slideInVertically { it / 2 } + fadeIn(),
                 exit = slideOutVertically { it / 2 } + fadeOut(),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(horizontal = 12.dp, vertical = 14.dp),
+                    .padding(horizontal = 12.dp, vertical = 60.dp),
             ) {
                 val ctrl = selectedControl
                 Column(
@@ -481,13 +501,40 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     }
                 }
             }
+
+            // ── 快捷设置悬浮窗（半透明，点⚙展开；参考 vivo/徕卡快捷面板）──
+            if (quickOpen) {
+                // 悬浮窗外的透明拦截层：点画面任意处收起（打开期间不触发对焦）。
+                // 必须先于面板绘制（Box 后绘者在上），否则会挡住面板自身的点击
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .pointerInput(Unit) { detectTapGestures { quickOpen = false } },
+                )
+            }
+            androidx.compose.animation.AnimatedVisibility(
+                visible = quickOpen,
+                enter = fadeIn() + slideInVertically { -it / 6 },
+                exit = fadeOut() + slideOutVertically { -it / 6 },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+                QuickSettingsPanel(
+                    onDismiss = { quickOpen = false },
+                    onMoreSettings = {
+                        quickOpen = false
+                        onOpenSettings()
+                    },
+                )
+            }
         }
 
         // ── 控制圆钮（选中琥珀底）──
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(vertical = 10.dp),
+                .padding(vertical = 8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             listOf("AF", "EXP", "EV", "WB").forEach { c ->
@@ -520,11 +567,11 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             }
         }
 
-        // ── 底部三段：胶卷位（相册接入前占位）· 快门 · 设置 ──
+        // ── 底部：胶卷位（相册接入前占位）· 快门 · 预留翻转位 ──
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(vertical = 6.dp),
+                .padding(top = 2.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
@@ -551,14 +598,108 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                         .background(FilmTheme.Cream),
                 )
             }
-            Box(
-                Modifier
-                    .size(44.dp)
-                    .pointerInput(Unit) { detectTapGestures { onOpenSettings() } },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("⚙", color = FilmTheme.Cream, fontSize = 22.sp)
+            Spacer(Modifier.size(44.dp))
+        }
+    }
+}
+
+/**
+ * 快捷设置悬浮窗：格式（DNG 开关）+ 镜头启停 + 底部「更多设置」入口。
+ * 与设置页共享 prefs 键（dng_enabled / lens_on_<id>），此处改动设置页即时同步。
+ */
+@Composable
+private fun QuickSettingsPanel(
+    onDismiss: () -> Unit,
+    onMoreSettings: () -> Unit,
+) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+    var dngEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("dng_enabled", false)) }
+    val cm = remember {
+        context.getSystemService(android.content.Context.CAMERA_SERVICE)
+            as android.hardware.camera2.CameraManager
+    }
+    val lenses = remember { CameraController.LensDiscovery.discoverBackLenses(cm, prefs) }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(FilmTheme.Panel)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Text("格式", color = FilmTheme.Amber, fontSize = 11.sp, fontFamily = FilmTheme.Mono, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("DNG 原始格式存储", color = FilmTheme.Cream, fontSize = 13.sp)
+                Text(
+                    "快门同时保存 DNG 底片 + 胶片 JPEG（单张约 10–20MB）",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                )
             }
+            Switch(
+                checked = dngEnabled,
+                onCheckedChange = { on ->
+                    dngEnabled = on
+                    prefs.edit().putBoolean("dng_enabled", on).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.dng",
+                        "{\"enabled\":$on}",
+                    )
+                },
+                colors = SwitchDefaults.colors(checkedTrackColor = FilmTheme.Amber),
+            )
+        }
+
+        Spacer(Modifier.height(10.dp))
+        Text("镜头", color = FilmTheme.Amber, fontSize = 11.sp, fontFamily = FilmTheme.Mono, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(2.dp))
+        Column(Modifier.heightIn(max = 200.dp).verticalScroll(rememberScrollState())) {
+            lenses.forEach { lens ->
+                val key = "lens_on_${lens.id}"
+                var on by rememberSaveable(lens.id) { mutableStateOf(prefs.getBoolean(key, true)) }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "ID ${lens.id} · ${lens.label()}",
+                        color = FilmTheme.Cream,
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = on,
+                        onCheckedChange = { v ->
+                            on = v
+                            prefs.edit().putBoolean(key, v).apply()
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_INFO, "camera", "lens.enabled_set",
+                                com.filmkit.app.kv("id" to lens.id, "enabled" to v),
+                            )
+                        },
+                        colors = SwitchDefaults.colors(checkedTrackColor = FilmTheme.Amber),
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider(color = FilmTheme.ChipBorder)
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .pointerInput(Unit) { detectTapGestures { onMoreSettings() } }
+                .padding(vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("更多设置", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            Text("›", color = FilmTheme.CreamDim, fontSize = 18.sp)
         }
     }
 }
@@ -593,13 +734,17 @@ private fun PanelRow(label: String, value: String, slider: @Composable () -> Uni
     }
 }
 
-/** 胶片风选择片：未选中炭黑奶油字，选中琥珀底深字 */
+/**
+ * 胶片风选择片：选中琥珀底深字；未选中炭黑（transparent 时全透明、仅奶油字），
+ * 透明态用于叠加预览的变焦刻度/滤镜行。
+ */
 @Composable
 private fun FilmChip(
     selected: Boolean,
     label: String,
     onClick: () -> Unit,
     serif: Boolean = false,
+    transparent: Boolean = false,
     fontSize: TextUnit = 12.sp,
 ) {
     FilterChip(
@@ -614,7 +759,7 @@ private fun FilmChip(
             )
         },
         colors = FilterChipDefaults.filterChipColors(
-            containerColor = FilmTheme.ChipBg,
+            containerColor = if (transparent) Color.Transparent else FilmTheme.ChipBg,
             labelColor = FilmTheme.Cream,
             selectedContainerColor = FilmTheme.Amber,
             selectedLabelColor = FilmTheme.OnAccent,

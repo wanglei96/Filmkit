@@ -43,7 +43,15 @@ private fun M0App() {
     Column(
         Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing),
+            // 相机页自己只做 statusBarsPadding（底部延伸到手势条之下，不留白）；
+            // 其他页维持全安全区 padding
+            .then(
+                if (tab != 0) {
+                    Modifier.windowInsetsPadding(WindowInsets.safeDrawing)
+                } else {
+                    Modifier
+                },
+            ),
     ) {
         // 相机页沉浸化（UI 专项方向 C）：隐藏调试 Tab 条，经相机页 ⚙ 进入设置页
         if (tab != 0) {
