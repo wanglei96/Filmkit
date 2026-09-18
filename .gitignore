@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio / IDEA
+.idea/
+*.iml
+captures/
+local.properties
+
+# NDK / CMake 构建产物
+.cxx/
+.kotlin/
+
+# 本地工具状态
+.mimosa/
+
+# 打包产物（CI 构建上传 artifact，发布走 GitHub Releases）
+*.apk
+
+# 系统
+.DS_Store

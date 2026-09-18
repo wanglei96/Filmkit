@@ -1,0 +1,262 @@
+#include <android/native_window_jni.h>
+#include <jni.h>
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "../gl/Capabilities.h"
+#include "../gl/EglCore.h"
+#include "../log/Logger.h"
+#include "../render/FrameRenderer.h"
+#include "../spike/SpikePass.h"
+
+// JNI 桥：
+//  - 日志/能力/spike：任意线程（detect/spike 需持有 GL 上下文，当前在 GLSurfaceView 线程调用）
+//  - engine*：必须全部在 RenderClient 渲染线程调用（EGL 上下文 per-thread current）
+
+using filmkit::Capabilities;
+using filmkit::detectCapabilities;
+using filmkit::EglCore;
+using filmkit::FilmParams;
+using filmkit::FrameRenderer;
+using filmkit::jsonEscape;
+using filmkit::Logger;
+using filmkit::LogLevel;
+using filmkit::runSpikePass;
+
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+namespace {
+
+std::string toStd(JNIEnv* env, jstring s) {
+  if (!s) return {};
+  const char* p = env->GetStringUTFChars(s, nullptr);
+  std::string r = p ? p : "";
+  if (p) env->ReleaseStringUTFChars(s, p);
+  return r;
+}
+
+jstring toJString(JNIEnv* env, const std::string& s) {
+  return env->NewStringUTF(s.c_str());
+}
+
+// 引擎单实例（M1：单相机会话；多实例随多会话需求引入）
+EglCore& engineEgl() {
+  static EglCore egl;
+  return egl;
+}
+FrameRenderer* g_renderer = nullptr;
+EGLSurface g_win_surface = EGL_NO_SURFACE;
+EGLSurface g_pb_surface = EGL_NO_SURFACE;
+ANativeWindow* g_window = nullptr;
+unsigned int g_oes_tex = 0;
+
+FilmParams paramsFromJava(JNIEnv* env, jdoubleArray film) {
+  FilmParams p;
+  if (film) {
+    const jsize n = env->GetArrayLength(film);
+    std::vector<double> v(static_cast<size_t>(n));
+    env->GetDoubleArrayRegion(film, 0, n, v.data());
+    p.fromDoubles(v.data(), n);
+  }
+  return p;
+}
+
+}  // namespace
+
+// ── 日志 / 能力 / spike（M0）──────────────────────────────────────────
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeInitLogger(JNIEnv* env, jobject,
+                                                   jstring dir) {
+  return Logger::instance().init(toStd(env, dir)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeAppendLog(JNIEnv* env, jobject,
+                                                  jint level, jstring module,
+                                                  jstring event,
+                                                  jstring kv_json) {
+  Logger::instance().log(static_cast<LogLevel>(level), toStd(env, module),
+                         toStd(env, event), toStd(env, kv_json));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeRecentLogs(JNIEnv* env, jobject,
+                                                   jint max_lines) {
+  return toJString(env, Logger::instance().recentLines(max_lines));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeFlushLogs(JNIEnv*, jobject) {
+  return Logger::instance().flush() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeDetectCapabilities(JNIEnv* env,
+                                                           jobject) {
+  const Capabilities caps = detectCapabilities();
+  Logger::instance().log(LogLevel::kInfo, "engine", "caps.detected",
+                         caps.toJson());
+  return toJString(env, caps.toJson());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeRunSpike(JNIEnv* env, jobject, jint w,
+                                                 jint h, jint iters,
+                                                 jboolean use_compute) {
+  const filmkit::SpikeResult r =
+      runSpikePass(w, h, iters, use_compute == JNI_TRUE);
+  return toJString(env, r.toJson());
+}
+
+// ── 相机引擎（M1：SurfaceTexture + OES，参照 PhotonCamera 路径）──────
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineStart(JNIEnv* env, jobject,
+                                                    jobject surface) {
+  if (!engineEgl().init()) return JNI_FALSE;
+
+  if (g_renderer == nullptr) {
+    g_renderer = new FrameRenderer();
+  }
+  if (g_window) {
+    ANativeWindow_release(g_window);
+    g_window = nullptr;
+  }
+  g_window = ANativeWindow_fromSurface(env, surface);
+  if (!g_window) return JNI_FALSE;
+
+  if (g_win_surface != EGL_NO_SURFACE) {
+    engineEgl().destroySurface(g_win_surface);
+    g_win_surface = EGL_NO_SURFACE;
+  }
+  g_win_surface = engineEgl().createWindowSurface(g_window);
+  if (g_win_surface == EGL_NO_SURFACE) return JNI_FALSE;
+  if (!engineEgl().makeCurrent(g_win_surface)) return JNI_FALSE;
+
+  // 渲染器随 start 重建（stop 时已 release+delete，program 需重新编译）
+  if (!g_renderer->init()) {
+    Logger::instance().log(LogLevel::kError, "engine", "engine.init_failed",
+                           "{}");
+    return JNI_FALSE;
+  }
+  Logger::instance().log(
+      LogLevel::kInfo, "engine", "engine.start",
+      "{\"w\":" + std::to_string(ANativeWindow_getWidth(g_window)) +
+          ",\"h\":" + std::to_string(ANativeWindow_getHeight(g_window)) + "}");
+  return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineStop(JNIEnv*, jobject) {
+  // 渲染器重建放回 start：release 需 current context，stop 时临时挂 pbuffer
+  if (g_renderer) {
+    if (g_pb_surface == EGL_NO_SURFACE) {
+      g_pb_surface = engineEgl().createPbufferSurface(1, 1);
+    }
+    engineEgl().makeCurrent(g_pb_surface);
+    g_renderer->release();
+    delete g_renderer;
+    g_renderer = nullptr;
+  }
+  if (g_win_surface != EGL_NO_SURFACE) {
+    engineEgl().destroySurface(g_win_surface);
+    g_win_surface = EGL_NO_SURFACE;
+  }
+  engineEgl().makeCurrent(EGL_NO_SURFACE);
+  if (g_window) {
+    ANativeWindow_release(g_window);
+    g_window = nullptr;
+  }
+  Logger::instance().log(LogLevel::kInfo, "engine", "engine.stop", "{}");
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_filmkit_app_EngineBridge_nativeCreateOesTexture(JNIEnv*, jobject) {
+  if (!g_renderer) return 0;
+  glGenTextures(1, &g_oes_tex);
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_oes_tex);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_renderer->setOesTexture(g_oes_tex);
+  Logger::instance().log(LogLevel::kInfo, "engine", "oes.created",
+                         "{\"id\":" + std::to_string(g_oes_tex) + "}");
+  return static_cast<jint>(g_oes_tex);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
+    JNIEnv* env, jobject, jfloatArray st, jint src_w, jint src_h, jint rotation,
+    jdoubleArray film, jboolean fill_test) {
+  if (!g_renderer || !g_window) return JNI_FALSE;
+  (void)src_w;
+  (void)src_h;
+
+  float m[16] = {0};
+  if (st) env->GetFloatArrayRegion(st, 0, 16, m);
+  const FilmParams p = paramsFromJava(env, film);
+
+  // 预览不自行裁剪：STMatrix 已含生产者的裁剪/翻转信息，
+  // 叠加自算 center-crop 会双重裁剪 → 画面横向拉伸（X300 实测）。
+  const float sx = 1.0f, sy = 1.0f;
+  const int dst_w = ANativeWindow_getWidth(g_window);
+  const int dst_h = ANativeWindow_getHeight(g_window);
+
+  const bool ok = g_renderer->submitFrame(m, rotation, sx, sy, dst_w, dst_h, p,
+                                          fill_test == JNI_TRUE);
+  if (!ok) return JNI_FALSE;
+
+  if (!engineEgl().swapBuffers(g_win_surface)) {
+    Logger::instance().log(LogLevel::kError, "engine", "render.swap_failed",
+                           "{\"frames\":" +
+                               std::to_string(g_renderer->frameCount()) + "}");
+    return JNI_FALSE;
+  }
+  static int64_t last_logged = 0;
+  const int64_t f = g_renderer->frameCount();
+  if (f == 1 || f - last_logged >= 120) {
+    last_logged = f;
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "preview.frame",
+        "{\"frames\":" + std::to_string(f) +
+            ",\"dstW\":" + std::to_string(dst_w) +
+            ",\"dstH\":" + std::to_string(dst_h) + "}");
+  }
+  return JNI_TRUE;
+}
+
+// 静拍：全分辨率 YUV → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
+    JNIEnv* env, jobject, jobject y_buf, jobject u_buf, jobject v_buf, jint w,
+    jint h, jint y_stride, jint uv_stride, jint uv_pix, jint rotation,
+    jdoubleArray film) {
+  if (!g_renderer) return nullptr;
+  const FilmParams p = paramsFromJava(env, film);
+  std::vector<uint8_t> rgba;
+  const bool ok = g_renderer->submitStill(
+      env->GetDirectBufferAddress(y_buf), env->GetDirectBufferAddress(u_buf),
+      v_buf ? env->GetDirectBufferAddress(v_buf) : nullptr, w, h, y_stride,
+      uv_stride, uv_pix, rotation, p, &rgba);
+  if (!ok) return nullptr;
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
+  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
+                          reinterpret_cast<const jbyte*>(rgba.data()));
+  return out;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
+  const int64_t frames = g_renderer ? g_renderer->frameCount() : 0;
+  const int w = g_renderer ? g_renderer->sceneW() : 0;
+  const int h = g_renderer ? g_renderer->sceneH() : 0;
+  return toJString(env, "{\"frames\":" + std::to_string(frames) +
+                            ",\"w\":" + std::to_string(w) +
+                            ",\"h\":" + std::to_string(h) + "}");
+}
