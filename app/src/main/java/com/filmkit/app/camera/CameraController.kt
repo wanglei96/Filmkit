@@ -629,14 +629,16 @@ class CameraController(private val context: Context, private val render: RenderC
                     val nearAnchor = Math.abs(wbK - frozenK) <= 25
                     val mulR = if (nearAnchor) 1f else (g[0] / ref[0]).coerceIn(0.25f, 4f)
                     val mulB = if (nearAnchor) 1f else (g[2] / ref[2]).coerceIn(0.25f, 4f)
+                    // HAL 报告的矩阵已含 AWB 增益（T = CCM·diag(w)），手动改白平衡要在 CCM
+                    // 之前调增益 = 缩放矩阵的**列**（v0.5.7 缩了行 = CCM 之后的通道增益 → 发绿）
                     val els = Array(9) { android.util.Rational(0, 1) }
-                    for (row in 0..2) {
-                        val mul = when (row) {
+                    for (col in 0..2) {
+                        val mul = when (col) {
                             0 -> mulR
                             2 -> mulB
                             else -> 1f
                         }
-                        for (col in 0..2) {
+                        for (row in 0..2) {
                             els[row * 3 + col] = r(ft.getElement(col, row).toFloat() * mul)
                         }
                     }

@@ -24,6 +24,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -83,6 +84,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -202,6 +204,15 @@ fun CameraScreen(
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
     var zoomEquiv by remember { mutableFloatStateOf(24f) } // 捏合变焦目标（35mm 等效焦段）
     var pinching by remember { mutableStateOf(false) }
+    var wheelActive by remember { mutableStateOf(false) } // 长按轮盘变焦进行中
+    var wheelFrac by remember { mutableFloatStateOf(0.5f) } // 轮盘对数位置 0..1
+    val wheelOn = remember { prefs.getBoolean("wheel_zoom", true) }
+    val wheelMinE = (lensChips.minOrNull() ?: 15).toFloat()
+    val wheelMaxE = (lensChips.maxOrNull() ?: 70).toFloat() * controller.maxZoom
+    fun wheelFracOf(e: Float): Float =
+        ((ln(e.coerceAtLeast(1f)) - ln(wheelMinE)) / (ln(wheelMaxE) - ln(wheelMinE))).coerceIn(0f, 1f)
+    val density2 = LocalDensity.current
+    val wheelHpx = with(density2) { 210.dp.toPx() }
     var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
@@ -425,6 +436,8 @@ fun CameraScreen(
                                         val maxE = (lensChips.maxOrNull() ?: focalBase.roundToInt()) * controller.maxZoom
                                         zoomEquiv = (zoomEquiv * d.scaleFactor).coerceIn(minE, maxE)
                                         controller.setZoomEquiv(zoomEquiv)
+                                        // 同步当前镜头等效焦距：否则跨镜头瞬间倍率显示 = 新焦段/旧焦段（虚高）
+                                        focalBase = controller.currentLensEquiv()
                                         return true
                                     }
                                 },
@@ -561,12 +574,61 @@ fun CameraScreen(
                     )
                 }
 
-                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘
+                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘；长按弹轮盘变焦（设置可关）
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
                         .padding(start = 10.dp, end = 10.dp, bottom = 12.dp)
                         .clip(RoundedCornerShape(16.dp))
+                        .then(
+                            if (wheelOn) {
+                                Modifier.pointerInput(wheelMinE, wheelMaxE) {
+                                    // 长按（450ms）进入轮盘变焦，纵向拖动连续变焦；松手退出。
+                                    // 指针状态自跟踪，不依赖事件类型常量（跨 Compose 版本稳定）
+                                    awaitPointerEventScope {
+                                        var downId: androidx.compose.ui.input.pointer.PointerId? = null
+                                        var lastY = 0f
+                                        var downAt = 0L
+                                        var inWheel = false
+                                        while (true) {
+                                            val ev = awaitPointerEvent()
+                                            val c = ev.changes.firstOrNull() ?: continue
+                                            if (downId == null) {
+                                                if (c.pressed) {
+                                                    downId = c.id
+                                                    lastY = c.position.y
+                                                    downAt = android.os.SystemClock.uptimeMillis()
+                                                    inWheel = false
+                                                }
+                                            } else if (c.id == downId) {
+                                                if (!c.pressed) {
+                                                    downId = null
+                                                    inWheel = false
+                                                    wheelActive = false
+                                                } else if (inWheel || android.os.SystemClock.uptimeMillis() - downAt > 450L) {
+                                                    if (!inWheel) {
+                                                        inWheel = true
+                                                        wheelActive = true
+                                                        wheelFrac = wheelFracOf(zoomEquiv)
+                                                    }
+                                                    c.consume()
+                                                    val dy = c.position.y - lastY
+                                                    lastY = c.position.y
+                                                    wheelFrac = (wheelFrac - dy / wheelHpx).coerceIn(0f, 1f)
+                                                    zoomEquiv = exp(
+                                                        ln(wheelMinE) + wheelFrac * (ln(wheelMaxE) - ln(wheelMinE)),
+                                                    )
+                                                    controller.setZoomEquiv(zoomEquiv)
+                                                    focalBase = controller.currentLensEquiv()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Modifier
+                            },
+                        )
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -621,7 +683,56 @@ fun CameraScreen(
                     }
                 }
 
-                // 参数面板：全局单实例，状态驱动显隐
+                // 长按轮盘：原生焦段刻度（≤6 个，对数位置）+ 当前等效焦距指示线
+            if (wheelActive) {
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 104.dp)
+                        .size(width = 76.dp, height = 210.dp)
+                        .clip(RoundedCornerShape(38.dp))
+                        .background(FilmTheme.Panel)
+                        .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(38.dp)),
+                ) {
+                    lensChips.take(6).forEach { e ->
+                        val f = wheelFracOf(e.toFloat())
+                        Text(
+                            "$e",
+                            Modifier
+                                .align(Alignment.CenterStart)
+                                .offset {
+                                    IntOffset(0, (wheelHpx * (0.5f - f)).roundToInt() - 8.dp.roundToPx())
+                                }
+                                .padding(start = 12.dp),
+                            color = FilmTheme.CreamDim,
+                            fontSize = 10.sp,
+                            fontFamily = FilmTheme.Mono,
+                        )
+                    }
+                    val cf = wheelFracOf(zoomEquiv)
+                    Box(
+                        Modifier
+                            .align(Alignment.CenterStart)
+                            .offset { IntOffset(0, (wheelHpx * (0.5f - cf)).roundToInt()) }
+                            .fillMaxWidth()
+                            .height(2.dp)
+                            .background(FilmTheme.Accent),
+                    )
+                    Text(
+                        "${zoomEquiv.roundToInt()}",
+                        Modifier
+                            .align(Alignment.CenterEnd)
+                            .offset { IntOffset(0, (wheelHpx * (0.5f - cf)).roundToInt()) }
+                            .padding(end = 10.dp),
+                        color = FilmTheme.Accent,
+                        fontSize = 14.sp,
+                        fontFamily = FilmTheme.Mono,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+
+            // 参数面板：全局单实例，状态驱动显隐
                 androidx.compose.animation.AnimatedVisibility(
                     visible = selectedControl != null,
                     enter = FilmMotion.panelEnter,

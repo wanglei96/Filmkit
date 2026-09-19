@@ -62,6 +62,7 @@ fun SettingsScreen(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
     var dngEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("dng_enabled", false)) }
+    var wheelZoom by rememberSaveable { mutableStateOf(prefs.getBoolean("wheel_zoom", true)) }
     var auditPath by rememberSaveable { mutableStateOf<String?>(null) }
 
     Column(
@@ -94,6 +95,19 @@ fun SettingsScreen(
                 },
             )
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
+            SettingSwitchRow(
+                title = "长按焦段轮盘变焦",
+                subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
+                checked = wheelZoom,
+                onChecked = { v ->
+                    wheelZoom = v
+                    prefs.edit().putBoolean("wheel_zoom", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.wheel_zoom",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)
