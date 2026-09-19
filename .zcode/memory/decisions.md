@@ -21,3 +21,9 @@ status: active
 - [2026-09-18] **出包单文件覆盖制** — 根目录固定 filmkit.apk 每次构建覆盖，不再按版本号新建（用户要求省磁盘）；版本区分靠 build.gradle versionName + 开发计划记录
 - [2026-09-18] **相机 UI 重设计走专项任务** — 用户对当前 UI 不满意；修 bug 会话不顺手改 UI，新窗口先设计定稿（参照 DAZZ/PhotonCamera）再重构 CameraScreen
 - [2026-09-18] **版本管理：GitHub + 附注标签** — 远端 git@github.com:wanglei96/Filmkit.git（main）；每个 versionName 发版打 `v<versionName>` 标签；apk 不入库（gitignore），构建/发布靠 CI artifact 与 GitHub Releases
+- [2026-09-19] **UI 专项定稿方向 C**（更新「走专项任务」条）— PhotonCamera 结构骨架 + DAZZ 胶片质感；v0.4.6–0.5.1 落地为 FilmTheme/FilmMotion token、控制瓦片、LUT 菜单、沉浸化导航
+- [2026-09-19] **主动审计工作约定** — 每次 UI 改动先按设计规范+交互清单自查列项与用户确认（动效/触感/按压反馈默认检查项），不等用户批注
+- [2026-09-19] **手动 WB = HAL 恒 AWB AUTO + 引擎侧补偿** — 补偿=wbGains(目标K)/wbGains(自动估计K) 写 filmParams wb 位；HAL 的 CCT/GAINS/矩阵三路径在 X300 全部证伪，弃用
+- [2026-09-19] **变焦倍率基线 = 主摄等效焦距**（mainEquiv 最接近 24mm）— 70mm≈2.9x、15mm≈0.6x，非当前镜头
+- [2026-09-19] **自定义焦段 ≤3 个** — 设置子页维护（20–120mm），与原生焦段合并去重总显示 ≤6；自定义=setZoomEquiv、原生=setFocal
+- [2026-09-19] **参数 A/手动模型** — EV、AE(Tv+ISO 联动)、WB 三组独立默认 A；拖刻度进手动、点 A 回自动；UI 范围/步进取自 HAL 实际能力（evInfo）

@@ -31,3 +31,10 @@ status: active
 - [2026-09-18] **对焦圆圈中心偏离点击点**：偏移写死像素（-28）与 dp 尺寸（56.dp）不匹配，高密度屏漂 (密度-1)×28px；规避：Dp.roundToPx() 动态换算
 - [2026-09-18] **AF/AE 区域落点与点击位置差 90°**：视图竖屏坐标直填横向 active array（X300 sensorOrientation=90）；规避：按总旋转 k=(sensorOrientation/90+orientationStep)%4 反推，k=1:(ny,1-nx)、k=2:双反、k=3:(1-ny,nx)；focus.set 日志记录 rot/sx/sy 供核对
 - [2026-09-18] **通用教训：跨语言参数数组沉默零值**（wb/contrast/cross）与「设置器必须触发应用」是本项目的两类高危模式，新参数一律走中性基线+防呆
+- [2026-09-19] **X300 HAL 手动 WB 三路径全不可用**：CCT 直填被忽略；GAINS/COLOR_TEMPERATURE 结果键不回填（GAINS 作为结果键 API36 仍在但 X300 不给值）；变换矩阵直发（对角/行/列缩放）观感不可控（行缩放=CCM 后通道增益会发绿）——解法是引擎侧补偿，勿再回头调 HAL
+- [2026-09-19] **预览 center-crop sx/sy 是四象限映射**：分配取决于着色器自转奇偶 ⊕ STMatrix 换轴（|m[4]|>0.5，X300 把 sensor 90° 藏在矩阵里）；只看 rotation 参数必错；4:3 时 a==srcAspect 会掩盖 bug，务必多画幅验证
+- [2026-09-19] **跨镜头变焦倍率虚高**：focalBase 轮询慢半拍，读数处须即时同步 currentLensEquiv()
+- [2026-09-19] **ColorSpaceTransform API**：构造收 Rational[]（行主序），读取 getElement(col,row)；无下标/getColor
+- [2026-09-19] **Box 内 AnimatedVisibility 被 ColumnScope 扩展遮蔽**：全限定 androidx.compose.animation.AnimatedVisibility 调用顶层函数
+- [2026-09-19] **闪退无 Java 栈时先装捕获再复现**：未捕获异常处理器写 crash-latest.txt + JSONL app.crash（v0.5.6 已装）；XPAN 闪退装捕获后未再复现
+- [2026-09-19] **EV 补偿范围因机而异**：UI 滑杆禁写死 ±4，用 evInfo()（characteristics 范围×步进）自适应，session_ready 日志记 evRange/evStep 供核对

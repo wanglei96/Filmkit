@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-18 10:20
+updated: 2026-09-19 22:30
 status: active
 ---
 
@@ -30,5 +30,9 @@ status: active
 - [2026-09-18] 构建+单测：`JAVA_HOME=$HOME/.filmkit-dev/jdk-17.0.20.1+1/Contents/Home ./gradlew assembleDebug testDebugUnitTest`
 - [2026-09-18] 命令行构建替代 JDK：系统默认 Java 8 跑不动 AGP，可用 `JAVA_HOME=/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`（Homebrew JDK23，实测 assembleDebug 通过）
 - [2026-09-18] 版本管理约定：发版时打附注标签 `v<versionName>`（如 v0.4.5-m2）并 push；提交信息用 Conventional Commits（英文）；版本号在 app/build.gradle.kts（versionCode/versionName）+ docs/开发计划.md 记录
-- [2026-09-18] X300 焦段事实：启用镜头等效焦段 15/24/70（超广 id4、主摄 id2/0、长焦 id3）；焦段条由 lensEquivs() 生成
-- [2026-09-18] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`
+- [2026-09-18] X300 焦段事实：启用镜头等效焦段 15/24/70（超广 id4、主摄 id2/0、长焦 id3）；焦段条由 lensEquivs() 生成，倍率基线 mainEquiv()
+- [2026-09-19] 发布现状：最新 v0.5.9-m2（versionCode 40，tag v0.5.9-m2 已推送）；FilmKitApp 启动日志 version 字段需随版本同步改（历次遗漏过）
+- [2026-09-19] UI token：ui/FilmTheme.kt（色板 Body/Panel/Cream/Amber→Accent/OnAccent + Mono/Serif + FilmMotion 浮层动效）；prefs 键 accent_argb / histogram / grid / shutter_sound / wheel_zoom / custom_focals / dng_enabled / lens_on_<id> / ev_auto / ae_auto / wb_auto / wb_k / iso / shutter_v / ev
+- [2026-09-19] 崩溃捕获：未捕获异常写 files/logs/crash-latest.txt + JSONL `app.crash`（含堆栈）；X300 闪退排查先导日志看这两处
+- [2026-09-19] WB 色温估计：优先 CaptureResult.COLOR_CORRECTION_GAINS（X300 不回填），兜底变换矩阵对角线 + 校准系数 WB_CAL_R=0.923/WB_CAL_B=1.238（单点推得，M3 灰卡精校）；kFromGains=50K 步进扫描组合对数距离
+- [2026-09-19] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`
