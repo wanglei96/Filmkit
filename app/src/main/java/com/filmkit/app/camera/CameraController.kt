@@ -243,6 +243,13 @@ class CameraController(private val context: Context, private val render: RenderC
 
     /** 手动白平衡：K 色温直填（API36 走 COLOR_TEMPERATURE 键） */
     fun setWbK(k: Int) {
+        if (!manualWb) {
+            // 进手动瞬间冻结 HAL 估计增益与估计色温（此后 AWB 停更，锚点不漂移）
+            val fallback = wbGains(if (estK > 0) estK else 6500)
+            frozenGainR = if (estGainR > 0.05f) estGainR else fallback[0]
+            frozenGainB = if (estGainB > 0.05f) estGainB else fallback[2]
+            frozenK = if (estK > 0) estK else 6500
+        }
         wbK = k.coerceIn(2000, 8000)
         manualWb = true
         rebuildRepeating()
@@ -472,11 +479,14 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile var liveFocusDiopter = 0f
         private set
 
-    // AWB 实时估计（来自 CaptureResult 变换矩阵对角线）：手动 WB 锚定它保证
-    // 拖到与自动相同色温时预览一致（否则手动脉冲跳变/位置对不上）
+    // AWB 实时估计（仅 AWB AUTO 时更新）：来自结果变换矩阵对角线
     @Volatile private var estGainR = 0f
     @Volatile private var estGainB = 0f
     @Volatile private var estK = 0
+    // 手动锚点：进手动瞬间冻结 HAL 估计增益与估计色温（PhotonCamera ManualWhiteBalanceAnchor 策略）
+    private var frozenGainR = 0f
+    private var frozenGainB = 0f
+    private var frozenK = 0
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -501,24 +511,29 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             if (kEst > 0) {
                 liveK = kEst
-                estK = kEst
+                if (!manualWb) estK = kEst
             } else {
                 result.get(CaptureResult.COLOR_CORRECTION_COLOR_TEMPERATURE)?.let { liveK = it }
             }
         }
     }
 
-    /** 在 wbGains 模型上按 gB 单调性二分：增益比 → 色温（K） */
+    /** 增益比 → 色温：50K 步进扫描 + 组合对数距离（PhotonCamera estimateKelvinFromRggbGains 同款） */
     private fun kFromGains(gR: Float, gB: Float): Int {
-        var lo = 1500
-        var hi = 12000
-        repeat(20) {
-            val mid = (lo + hi) / 2
-            if (wbGains(mid)[2] > gB) lo = mid else hi = mid
+        var bestK = 2000
+        var bestDist = Double.MAX_VALUE
+        var k = 2000
+        while (k <= 8000) {
+            val g = wbGains(k)
+            val d = Math.abs(Math.log((g[0] / gR.coerceAtLeast(1e-3f)).toDouble())) +
+                Math.abs(Math.log((g[2] / gB.coerceAtLeast(1e-3f)).toDouble()))
+            if (d < bestDist) {
+                bestDist = d
+                bestK = k
+            }
+            k += 50
         }
-        val k = (lo + hi) / 2
-        // gR 分量交叉校验：若严重偏离（非黑体光源），仍返回 gB 主导解
-        return k
+        return bestK
     }
 
     // ── 手动对焦（屈光度）──
@@ -571,13 +586,13 @@ class CameraController(private val context: Context, private val render: RenderC
         if (manualWb) {
             b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
             if (transformWbSupported) {
-                // 手动增益 = AWB 实时估计增益 × (目标色温增益 / 估计色温增益)：
-                // 拖到与自动相同色温时增益与 HAL 一致，预览无跳变；无估计数据时用绝对值
+                // PhotonCamera ManualWhiteBalanceAnchor 策略：手动增益 = 冻结的 HAL 估计增益 ×
+                // (目标色温增益 / 锚点色温增益)；±25K 死区内保持冻结增益，预览无跳变
                 val g = wbGains(wbK)
-                val refK = if (estK > 0) estK else 6500
-                val ref = wbGains(refK)
-                val estR = if (estGainR > 0.05f) estGainR else ref[0]
-                val estB = if (estGainB > 0.05f) estGainB else ref[2]
+                val ref = wbGains(frozenK.coerceAtLeast(2000))
+                val nearAnchor = Math.abs(wbK - frozenK) <= 25
+                val mulR = if (nearAnchor) 1f else g[0] / ref[0]
+                val mulB = if (nearAnchor) 1f else g[2] / ref[2]
                 fun r(f: Float) = android.util.Rational((f * 1000).toInt(), 1000)
                 b.set(
                     CaptureRequest.COLOR_CORRECTION_MODE,
@@ -587,9 +602,9 @@ class CameraController(private val context: Context, private val render: RenderC
                     CaptureRequest.COLOR_CORRECTION_TRANSFORM,
                     android.hardware.camera2.params.ColorSpaceTransform(
                         arrayOf(
-                            r((estR * g[0] / ref[0]).coerceIn(0.3f, 3f)), r(0f), r(0f),
+                            r((frozenGainR * mulR).coerceIn(0.25f, 4f)), r(0f), r(0f),
                             r(0f), r(1f), r(0f),
-                            r(0f), r(0f), r((estB * g[2] / ref[2]).coerceIn(0.3f, 3f)),
+                            r(0f), r(0f), r((frozenGainB * mulB).coerceIn(0.25f, 4f)),
                         ),
                     ),
                 )

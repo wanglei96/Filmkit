@@ -1318,7 +1318,7 @@ private fun QuickDropdown(
 ) {
     Column(
         Modifier
-            .width(230.dp)
+            .width(248.dp)
             .clip(RoundedCornerShape(16.dp))
             .background(FilmTheme.Panel)
             .padding(vertical = 6.dp),
@@ -1408,6 +1408,7 @@ private fun FilmChip(
                 fontSize = fontSize,
                 fontFamily = if (serif) FilmTheme.Serif else FilmTheme.Mono,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
             )
         },
         colors = FilterChipDefaults.filterChipColors(

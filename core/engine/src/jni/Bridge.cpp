@@ -211,27 +211,23 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
   // 宽高比关系选取缩轴，保证显示内容比例 = 视口比例。
   float sx = 1.0f, sy = 1.0f;
   if (src_w > 0 && src_h > 0 && dst_h > 0) {
-    // 净旋转奇偶 = STMatrix 换轴（部分 HAL 如 X300 把 sensor 90° 藏在矩阵里，rotation 参数
-    // 只是界面方向）异或顶点着色器自转。换轴时显示宽高比 = sy*H/(sx*W)，否则 = sx*W/(sy*H)，
-    // 按源/目标宽高比选缩轴即得铺满不拉伸的 center-crop。
+    // 四象限组合（v0.5.4 教训：sx/sy 分配依赖着色器自转奇偶，不能只看净旋转）：
+    //   even+无ST换轴: 显示比例 = sx*W/(sy*H)   odd+无ST换轴: 显示比例 = sy*H/(sx*W)
+    //   even+ST换轴:   显示比例 = sx*H/(sy*W)   odd+ST换轴:   显示比例 = sy*W/(sx*H)
+    // srcAspect 取换轴后的源宽高比；sx/sy 谁缩由 shaderSwap 决定，与已知正确的
+    // v0.5.2 状态（even+stSwap → 全 1）自洽。
     const bool stSwap = m[4] > 0.5f || m[4] < -0.5f;
     const bool shaderSwap = (rotation % 2) != 0;
     const bool swapped = stSwap != shaderSwap;
     const float srcAspect =
         swapped ? (float)src_h / (float)src_w : (float)src_w / (float)src_h;
     const float a = (float)dst_w / (float)dst_h;
-    if (swapped) {
-      if (a <= srcAspect) {
-        sy = a / srcAspect;
-      } else {
-        sx = srcAspect / a;
-      }
+    if (!shaderSwap) {
+      sx = (a / srcAspect < 1.0f) ? a / srcAspect : 1.0f;
+      sy = (srcAspect / a < 1.0f) ? srcAspect / a : 1.0f;
     } else {
-      if (a <= srcAspect) {
-        sx = a / srcAspect;
-      } else {
-        sy = srcAspect / a;
-      }
+      sx = (srcAspect / a < 1.0f) ? srcAspect / a : 1.0f;
+      sy = (a / srcAspect < 1.0f) ? a / srcAspect : 1.0f;
     }
   }
 
