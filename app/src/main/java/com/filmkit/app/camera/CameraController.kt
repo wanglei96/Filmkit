@@ -189,6 +189,33 @@ class CameraController(private val context: Context, private val render: RenderC
         rebuildRepeating()
     }
 
+    /** 闪光灯（AE 联动）：0 关 / 1 自动 / 2 常闪；手动 AE（AE OFF）下闪光不生效，回 A 后应用 */
+    @Volatile
+    private var flashMode = 0
+
+    fun setFlash(mode: Int) {
+        flashMode = mode.coerceIn(0, 2)
+        rebuildRepeating()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "flash.set",
+            kv("mode" to flashMode),
+        )
+    }
+
+    /** 快门音：camera2 本身不发声，捕获提交时经 MediaActionSound 播放 */
+    @Volatile
+    private var shutterSound = true
+
+    private val shutterSoundPlayer by lazy {
+        android.media.MediaActionSound().also {
+            it.load(android.media.MediaActionSound.SHUTTER_CLICK)
+        }
+    }
+
+    fun setShutterSound(on: Boolean) {
+        shutterSound = on
+    }
+
     fun setIso(v: Int) {
         iso = v.coerceIn(100, maxAnalogIso)
         if (manualExposure) rebuildRepeating()
@@ -323,7 +350,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 对焦区域要含坐标——否则第二次点击不同位置会被当作未变化而跳过
         val fr = focusRect
         val focusSig = if (fr != null) "${fr.x},${fr.y},${fr.width}" else "null"
-        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${manualWb}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}"
+        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${manualWb}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}|${flashMode}"
         if (sig == lastApplied) return
         lastApplied = sig
         try {
@@ -406,7 +433,15 @@ class CameraController(private val context: Context, private val render: RenderC
             b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
         } else {
-            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            // 自动 AE：闪光灯档位联动（0 关=纯 ON / 1 自动闪光 / 2 常闪）
+            b.set(
+                CaptureRequest.CONTROL_AE_MODE,
+                when (flashMode) {
+                    2 -> CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                    1 -> CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                    else -> CaptureRequest.CONTROL_AE_MODE_ON
+                },
+            )
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
         }
         // WB：手动 K → 色温直填（API36 已移除 RB_GAINS 键）；否则 AWB 场景模式
@@ -499,6 +534,9 @@ class CameraController(private val context: Context, private val render: RenderC
         val s = session ?: return
         if (capturing) return
         capturing = true
+        if (shutterSound) {
+            shutterSoundPlayer.play(android.media.MediaActionSound.SHUTTER_CLICK)
+        }
         try {
             val b = camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)

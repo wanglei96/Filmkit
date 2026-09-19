@@ -9,6 +9,10 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -66,6 +70,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -82,10 +87,18 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.FlashAuto
+import androidx.compose.material.icons.filled.FlashOff
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
+import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
 import kotlinx.coroutines.delay
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.pow
@@ -93,9 +106,10 @@ import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 
 /**
- * M 档专业拍摄界面（方向 C 定稿，v0.4.9）。
- * 参数模型：EV / AE(Tv+ISO) / WB 三组独立 A(自动)/手动；默认 A，拖动刻度条进手动，
- * 点 A 回自动；刻度条随参数切换自适应刻度（Tv 对数快门、ISO 对数、EV/WB 线性）。
+ * M 档专业拍摄界面（方向 C 定稿，v0.5.0）。
+ * 顶部快捷设置区：闪光灯（关/自动/开）、实时直方图开关、快门声音开关、菜单（一级悬浮窗：
+ * 画幅 4:3/16:9/XPAN + 更多设置）。参数模型：EV / AE(Tv+ISO) / WB 三组独立 A/手动；
+ * 拖刻度条进手动，点 A 回自动（线性过渡）；自动挡瓦片显示实时读数。
  * 组件与颜色规范见 docs/开发计划.md「UI 设计规范」。
  */
 @Composable
@@ -134,6 +148,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
         return
     }
 
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
     val controller = remember { CameraController(context, RenderClient()) }
     var surface by remember { mutableStateOf<Surface?>(null) }
     var resumed by remember { mutableStateOf(true) }
@@ -142,8 +157,13 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var focalBase by remember { mutableFloatStateOf(24f) } // 当前镜头等效焦距
 
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
-    var quickOpen by rememberSaveable { mutableStateOf(false) } // 快捷设置下拉
+    var quickOpen by rememberSaveable { mutableStateOf(false) } // 一级悬浮窗（画幅+更多设置）
     var lutOpen by rememberSaveable { mutableStateOf(false) } // LUT 二级菜单
+    // 顶部快捷区状态：闪光灯会话内有效；直方图/快门声持久化
+    var flashMode by rememberSaveable { mutableIntStateOf(0) }
+    var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
+    var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
+    var aspect by rememberSaveable { mutableStateOf("4:3") }
     // A(自动)/手动状态：EV 与 AE(Tv+ISO 联动，Camera2 AE OFF 同时定死两参数)、WB 各自独立
     var evAuto by rememberSaveable { mutableStateOf(true) }
     var aeAuto by rememberSaveable { mutableStateOf(true) }
@@ -162,6 +182,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     // 启动即应用选中预设，保证界面选中态与引擎参数一致
     LaunchedEffect(Unit) {
         controller.setFilmParams(CameraPresets.byIndex(presetIdx))
+        controller.setShutterSound(soundOn)
     }
 
     DisposableEffect(Unit) {
@@ -204,6 +225,11 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     val maxIso = controller.maxAnalogIso
+    val aspectF = when (aspect) {
+        "16:9" -> 9f / 16f
+        "XPAN" -> 65f / 24f
+        else -> 3f / 4f
+    }
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下
     Column(
@@ -212,281 +238,347 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             .background(FilmTheme.Body)
             .statusBarsPadding(),
     ) {
-        // ── 顶栏：仅右上 ⚙（打开变强调色）──
+        // ── 顶部快捷设置区：闪光灯 · 直方图 · 快门声 · 菜单 ──
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TopQuickIcon(
+                icon = when (flashMode) {
+                    2 -> Icons.Filled.FlashOn
+                    1 -> Icons.Filled.FlashAuto
+                    else -> Icons.Filled.FlashOff
+                },
+                tint = if (flashMode != 0) FilmTheme.Accent else FilmTheme.CreamDim,
+                desc = "闪光灯",
+            ) {
+                flashMode = (flashMode + 1) % 3
+                controller.setFlash(flashMode)
+            }
+            TopQuickIcon(
+                icon = Icons.Filled.BarChart,
+                tint = if (histOn) FilmTheme.Accent else FilmTheme.CreamDim,
+                desc = "实时直方图",
+            ) {
+                histOn = !histOn
+                prefs.edit().putBoolean("histogram", histOn).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "quick.histogram",
+                    "{\"on\":$histOn}",
+                )
+            }
+            TopQuickIcon(
+                icon = if (soundOn) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+                tint = if (soundOn) FilmTheme.Accent else FilmTheme.CreamDim,
+                desc = "快门声音",
+            ) {
+                soundOn = !soundOn
+                controller.setShutterSound(soundOn)
+                prefs.edit().putBoolean("shutter_sound", soundOn).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "quick.shutter_sound",
+                    "{\"on\":$soundOn}",
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            TopQuickIcon(
+                icon = Icons.Filled.Menu,
+                tint = if (quickOpen) FilmTheme.Accent else FilmTheme.Cream,
+                desc = "菜单",
+            ) { quickOpen = !quickOpen }
+        }
+
+        // ── 取景器区（任意画幅下底部控制区都贴底，取景器居中）──
         Box(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 6.dp),
+                .weight(1f),
+            contentAlignment = Alignment.Center,
         ) {
             Box(
                 Modifier
-                    .align(Alignment.CenterEnd)
-                    .size(40.dp)
-                    .pointerInput(Unit) { detectTapGestures { quickOpen = !quickOpen } },
-                contentAlignment = Alignment.Center,
+                    .fillMaxWidth()
+                    .aspectRatio(aspectF)
+                    .onSizeChanged { boxW = it.width; boxH = it.height },
             ) {
-                Icon(
-                    Icons.Filled.Settings,
-                    contentDescription = "设置",
-                    tint = if (quickOpen) FilmTheme.Accent else FilmTheme.CreamDim,
-                    modifier = Modifier.size(22.dp),
-                )
-            }
-        }
-
-        // ── 取景器（3:4 居中，圆角机框）──
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .weight(1f, fill = false)
-                .aspectRatio(3f / 4f)
-                .onSizeChanged { boxW = it.width; boxH = it.height },
-        ) {
-            AndroidView(
-                factory = { c ->
-                    SurfaceView(c).apply {
-                        // 触屏对焦：SurfaceView 原生触摸（Compose 手势部分机型不送达）。
-                        // 必须消费事件（true），否则 ACTION_UP 不会送达本视图，对焦永不触发
-                        setOnTouchListener { _, e ->
-                            if (e.action == MotionEvent.ACTION_UP) {
-                                val nx = (e.x / width).coerceIn(0f, 1f)
-                                val ny = (e.y / height).coerceIn(0f, 1f)
-                                controller.focusAt(nx, ny)
-                                focusMark = nx to ny
+                AndroidView(
+                    factory = { c ->
+                        SurfaceView(c).apply {
+                            // 触屏对焦：SurfaceView 原生触摸（Compose 手势部分机型不送达）。
+                            // 必须消费事件（true），否则 ACTION_UP 不会送达本视图，对焦永不触发
+                            setOnTouchListener { _, e ->
+                                if (e.action == MotionEvent.ACTION_UP) {
+                                    val nx = (e.x / width).coerceIn(0f, 1f)
+                                    val ny = (e.y / height).coerceIn(0f, 1f)
+                                    controller.focusAt(nx, ny)
+                                    focusMark = nx to ny
+                                }
+                                true
                             }
-                            true
+                            holder.addCallback(object : SurfaceHolder.Callback {
+                                override fun surfaceCreated(h: SurfaceHolder) {
+                                    surface = h.surface
+                                    if (resumed) controller.start(h.surface)
+                                }
+
+                                override fun surfaceChanged(
+                                    h: SurfaceHolder, format: Int, width: Int, height: Int,
+                                ) {
+                                    surface = h.surface
+                                    if (resumed) controller.start(h.surface)
+                                }
+
+                                override fun surfaceDestroyed(h: SurfaceHolder) {
+                                    controller.stop()
+                                    surface = null
+                                }
+                            })
                         }
-                        holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(h: SurfaceHolder) {
-                                surface = h.surface
-                                if (resumed) controller.start(h.surface)
-                            }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
 
-                            override fun surfaceChanged(
-                                h: SurfaceHolder, format: Int, width: Int, height: Int,
-                            ) {
-                                surface = h.surface
-                                if (resumed) controller.start(h.surface)
-                            }
-
-                            override fun surfaceDestroyed(h: SurfaceHolder) {
-                                controller.stop()
-                                surface = null
-                            }
-                        })
+                // 圆角机框：SurfaceView 不响应 Compose clip，用机身色环带遮出圆角 + 奶油细线勾边
+                Canvas(Modifier.matchParentSize()) {
+                    val inset = 5.dp.toPx()
+                    val radius = 22.dp.toPx()
+                    val frame = Path().apply {
+                        fillType = PathFillType.EvenOdd
+                        addRect(Rect(0f, 0f, size.width, size.height))
+                        addRoundRect(
+                            RoundRect(
+                                Rect(inset, inset, size.width - inset, size.height - inset),
+                                CornerRadius(radius, radius),
+                            ),
+                        )
                     }
-                },
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            // 圆角机框：SurfaceView 不响应 Compose clip，用机身色环带遮出圆角 + 奶油细线勾边
-            Canvas(Modifier.matchParentSize()) {
-                val inset = 5.dp.toPx()
-                val radius = 22.dp.toPx()
-                val frame = Path().apply {
-                    fillType = PathFillType.EvenOdd
-                    addRect(Rect(0f, 0f, size.width, size.height))
-                    addRoundRect(
-                        RoundRect(
-                            Rect(inset, inset, size.width - inset, size.height - inset),
-                            CornerRadius(radius, radius),
-                        ),
+                    drawPath(frame, FilmTheme.Body)
+                    drawRoundRect(
+                        color = FilmTheme.CreamDim.copy(alpha = 0.35f),
+                        topLeft = Offset(inset, inset),
+                        size = Size(size.width - inset * 2, size.height - inset * 2),
+                        cornerRadius = CornerRadius(radius, radius),
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
                 }
-                drawPath(frame, FilmTheme.Body)
-                drawRoundRect(
-                    color = FilmTheme.CreamDim.copy(alpha = 0.35f),
-                    topLeft = Offset(inset, inset),
-                    size = Size(size.width - inset * 2, size.height - inset * 2),
-                    cornerRadius = CornerRadius(radius, radius),
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
-                )
-            }
 
-            // 对焦指示框（按预览比例定位；半径用 dp→px 换算，硬编码像素会让圆心偏离点击点）
-            focusMark?.let { (fx, fy) ->
-                LaunchedEffect(fx, fy) {
-                    delay(700)
-                    focusMark = null
-                }
-                Box(
-                    Modifier
-                        .offset {
-                            IntOffset(
-                                (fx * boxW).roundToInt() - 28.dp.roundToPx(),
-                                (fy * boxH).roundToInt() - 28.dp.roundToPx(),
-                            )
-                        }
-                        .size(56.dp)
-                        .border(1.5.dp, Color.White, CircleShape),
-                )
-            }
-
-            // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘
-            Row(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 10.dp, vertical = 12.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
-                chips.forEach { f ->
-                    FilmChip(
-                        selected = focalBase.roundToInt() == f,
-                        label = "$f",
-                        transparent = true,
-                        onClick = { controller.setFocal(f) },
-                    )
-                }
-                Box(
-                    Modifier
-                        .padding(horizontal = 6.dp)
-                        .width(1.dp)
-                        .height(16.dp)
-                        .background(FilmTheme.ChipBorder),
-                )
-                Column(
-                    Modifier
-                        .padding(horizontal = 4.dp)
-                        .pointerInput(Unit) { detectTapGestures { lutOpen = !lutOpen } },
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        "✦",
-                        color = if (lutOpen) FilmTheme.Accent else FilmTheme.Cream,
-                        fontSize = 17.sp,
-                    )
-                    // 非默认预设激活时的小圆点提示
+                // 实时直方图（开关；渲染链路 M3 接入，当前为占位）
+                if (histOn) {
                     Box(
                         Modifier
-                            .padding(top = 1.dp)
-                            .size(3.dp)
-                            .alpha(if (presetIdx != 0) 1f else 0f)
-                            .background(FilmTheme.Accent, CircleShape),
+                            .align(Alignment.TopStart)
+                            .padding(start = 14.dp, top = 12.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(FilmTheme.Panel)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "直方图 · M3 接入",
+                            color = FilmTheme.CreamDim,
+                            fontSize = 9.sp,
+                            fontFamily = FilmTheme.Mono,
+                        )
+                    }
+                }
+
+                // 对焦指示框（按预览比例定位；半径用 dp→px 换算，硬编码像素会让圆心偏离点击点）
+                focusMark?.let { (fx, fy) ->
+                    LaunchedEffect(fx, fy) {
+                        delay(700)
+                        focusMark = null
+                    }
+                    Box(
+                        Modifier
+                            .offset {
+                                IntOffset(
+                                    (fx * boxW).roundToInt() - 28.dp.roundToPx(),
+                                    (fy * boxH).roundToInt() - 28.dp.roundToPx(),
+                                )
+                            }
+                            .size(56.dp)
+                            .border(1.5.dp, Color.White, CircleShape),
+                    )
+                }
+
+                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘
+                Row(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 10.dp, vertical = 12.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
+                    chips.forEach { f ->
+                        FilmChip(
+                            selected = focalBase.roundToInt() == f,
+                            label = "$f",
+                            transparent = true,
+                            onClick = { controller.setFocal(f) },
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .padding(horizontal = 6.dp)
+                            .width(1.dp)
+                            .height(16.dp)
+                            .background(FilmTheme.ChipBorder),
+                    )
+                    Column(
+                        Modifier
+                            .padding(horizontal = 4.dp)
+                            .pointerInput(Unit) { detectTapGestures { lutOpen = !lutOpen } },
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            "✦",
+                            color = if (lutOpen) FilmTheme.Accent else FilmTheme.Cream,
+                            fontSize = 17.sp,
+                        )
+                        // 非默认预设激活时的小圆点提示
+                        Box(
+                            Modifier
+                                .padding(top = 1.dp)
+                                .size(3.dp)
+                                .alpha(if (presetIdx != 0) 1f else 0f)
+                                .background(FilmTheme.Accent, CircleShape),
+                        )
+                    }
+                }
+
+                // 参数面板：全局单实例，状态驱动显隐
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = selectedControl != null,
+                    enter = slideInVertically { it / 2 } + fadeIn(),
+                    exit = slideOutVertically { it / 2 } + fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 12.dp, vertical = 60.dp),
+                ) {
+                    ControlPanel(
+                        ctrl = selectedControl,
+                        evAuto = evAuto,
+                        aeAuto = aeAuto,
+                        wbAuto = wbAuto,
+                        ev = ev,
+                        shutterV = shutterV,
+                        iso = iso,
+                        wbK = wbK,
+                        liveNs = liveNs,
+                        liveIso = liveIso,
+                        liveK = liveK,
+                        maxIso = maxIso,
+                        onEvDrag = { v ->
+                            evAuto = false
+                            ev = v
+                            controller.setEv(v)
+                        },
+                        onEvAuto = {
+                            evAuto = true
+                            ev = 0f
+                            controller.setEv(0f)
+                        },
+                        onTvDrag = { f ->
+                            // AE OFF 会同时锁快门与 ISO：从 A 进入时把另一参数冻结在当前实测值
+                            if (aeAuto && liveIso > 0) iso = liveIso.coerceIn(100, maxIso)
+                            aeAuto = false
+                            shutterV = f
+                            controller.setManualExposure(true)
+                            controller.setExposureNs(10f.pow(5f + 4f * f).roundToLong())
+                        },
+                        onIsoDrag = { i ->
+                            if (aeAuto && liveNs > 0) {
+                                val nsF = liveNs.coerceIn(100_000L, 1_000_000_000L).toFloat()
+                                shutterV = ((log10(nsF) - 5f) / 4f).coerceIn(0f, 1f)
+                            }
+                            aeAuto = false
+                            iso = i
+                            controller.setManualExposure(true)
+                            controller.setIso(i)
+                        },
+                        onAeAuto = {
+                            aeAuto = true
+                            controller.setManualExposure(false)
+                        },
+                        onWbDrag = { k ->
+                            wbAuto = false
+                            wbK = k
+                            controller.setWbK(k)
+                        },
+                        onWbAuto = {
+                            wbAuto = true
+                            controller.setAutoWb()
+                        },
+                        secText = ::secText,
+                    )
+                }
+
+                // ── LUT 二级菜单（✦ 展开；点画面收起）──
+                if (lutOpen) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
+                    )
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = lutOpen,
+                    enter = fadeIn() + slideInVertically { it / 4 },
+                    exit = fadeOut() + slideOutVertically { it / 4 },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 14.dp, vertical = 64.dp),
+                ) {
+                    LutMenu(
+                        presetIdx = presetIdx,
+                        onPick = { i ->
+                            presetIdx = i
+                            controller.setFilmParams(CameraPresets.byIndex(i))
+                            lutOpen = false
+                        },
+                    )
+                }
+
+                // ── 一级悬浮窗（菜单展开；点画面收起）：画幅 + 更多设置 ──
+                if (quickOpen) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .pointerInput(Unit) { detectTapGestures { quickOpen = false } },
+                    )
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = quickOpen,
+                    enter = fadeIn() + slideInVertically { -it / 6 },
+                    exit = fadeOut() + slideOutVertically { -it / 6 },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(end = 10.dp, top = 8.dp),
+                ) {
+                    QuickDropdown(
+                        aspect = aspect,
+                        onAspect = { a ->
+                            aspect = a
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_INFO, "app", "quick.aspect",
+                                "\"ratio\":\"$a\"",
+                            )
+                            // TODO(M3): 成片裁切跟随画幅（当前仅取景显示比例）
+                        },
+                        onMoreSettings = {
+                            quickOpen = false
+                            onOpenSettings()
+                        },
                     )
                 }
             }
-
-            // 参数面板：全局单实例，状态驱动显隐
-            androidx.compose.animation.AnimatedVisibility(
-                visible = selectedControl != null,
-                enter = slideInVertically { it / 2 } + fadeIn(),
-                exit = slideOutVertically { it / 2 } + fadeOut(),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 12.dp, vertical = 60.dp),
-            ) {
-                ControlPanel(
-                    ctrl = selectedControl,
-                    evAuto = evAuto,
-                    aeAuto = aeAuto,
-                    wbAuto = wbAuto,
-                    ev = ev,
-                    shutterV = shutterV,
-                    iso = iso,
-                    wbK = wbK,
-                    liveNs = liveNs,
-                    liveIso = liveIso,
-                    liveK = liveK,
-                    maxIso = maxIso,
-                    onEvDrag = { v ->
-                        evAuto = false
-                        ev = v
-                        controller.setEv(v)
-                    },
-                    onEvAuto = {
-                        evAuto = true
-                        ev = 0f
-                        controller.setEv(0f)
-                    },
-                    onTvDrag = { f ->
-                        // AE OFF 会同时锁快门与 ISO：从 A 进入时把另一参数冻结在当前实测值
-                        if (aeAuto && liveIso > 0) iso = liveIso.coerceIn(100, maxIso)
-                        aeAuto = false
-                        shutterV = f
-                        controller.setManualExposure(true)
-                        controller.setExposureNs(10f.pow(5f + 4f * f).roundToLong())
-                    },
-                    onIsoDrag = { i ->
-                        if (aeAuto && liveNs > 0) {
-                            val nsF = liveNs.coerceIn(100_000L, 1_000_000_000L).toFloat()
-                            shutterV = ((log10(nsF) - 5f) / 4f).coerceIn(0f, 1f)
-                        }
-                        aeAuto = false
-                        iso = i
-                        controller.setManualExposure(true)
-                        controller.setIso(i)
-                    },
-                    onAeAuto = {
-                        aeAuto = true
-                        controller.setManualExposure(false)
-                    },
-                    onWbDrag = { k ->
-                        wbAuto = false
-                        wbK = k
-                        controller.setWbK(k)
-                    },
-                    onWbAuto = {
-                        wbAuto = true
-                        controller.setAutoWb()
-                    },
-                    secText = ::secText,
-                )
-            }
-
-            // ── LUT 二级菜单（✦ 展开；点画面收起）──
-            if (lutOpen) {
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
-                )
-            }
-            androidx.compose.animation.AnimatedVisibility(
-                visible = lutOpen,
-                enter = fadeIn() + slideInVertically { it / 4 },
-                exit = fadeOut() + slideOutVertically { it / 4 },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 14.dp, vertical = 64.dp),
-            ) {
-                LutMenu(
-                    presetIdx = presetIdx,
-                    onPick = { i ->
-                        presetIdx = i
-                        controller.setFilmParams(CameraPresets.byIndex(i))
-                        lutOpen = false
-                    },
-                )
-            }
-
-            // ── 快捷设置下拉（⚙ 展开；点画面收起；预留画面比例/HDR 等入口）──
-            if (quickOpen) {
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .pointerInput(Unit) { detectTapGestures { quickOpen = false } },
-                )
-            }
-            androidx.compose.animation.AnimatedVisibility(
-                visible = quickOpen,
-                enter = fadeIn() + slideInVertically { -it / 6 },
-                exit = fadeOut() + slideOutVertically { -it / 6 },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(end = 10.dp, top = 8.dp),
-            ) {
-                QuickDropdown(onMoreSettings = {
-                    quickOpen = false
-                    onOpenSettings()
-                })
-            }
         }
 
-        // ── 控制瓦片：A(自动)/手动值实时显示（选中强调色，Tv/ISO 共用 AE 组）──
+        // ── 控制瓦片：自动挡显示实时读数（次级色），手动显示设定值，面板展开强调色 ──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -498,7 +590,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             }
             val expActive = selectedControl == "EXP"
             ControlTile(
-                value = if (evAuto) "A" else (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
+                value = if (evAuto) "+0.0" else (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
                 label = "EV",
                 state = when {
                     selectedControl == "EV" -> TileState.ACTIVE
@@ -507,7 +599,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 },
             ) { toggle("EV") }
             ControlTile(
-                value = if (aeAuto) "A" else secText(shutterNs),
+                value = if (aeAuto) (if (liveNs > 0) secText(liveNs) else "--") else secText(shutterNs),
                 label = "Tv",
                 state = when {
                     expActive -> TileState.ACTIVE
@@ -516,7 +608,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 },
             ) { toggle("EXP") }
             ControlTile(
-                value = if (aeAuto) "A" else "$iso",
+                value = if (aeAuto) (if (liveIso > 0) "$liveIso" else "--") else "$iso",
                 label = "ISO",
                 state = when {
                     expActive -> TileState.ACTIVE
@@ -524,11 +616,13 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     else -> TileState.MANUAL
                 },
             ) { toggle("EXP") }
-            ControlTile("A", "AF", state = if (selectedControl == "AF") TileState.ACTIVE else TileState.AUTO) {
-                toggle("AF")
-            }
             ControlTile(
-                value = if (wbAuto) "A" else "${wbK}K",
+                value = "AUTO",
+                label = "AF",
+                state = if (selectedControl == "AF") TileState.ACTIVE else TileState.AUTO,
+            ) { toggle("AF") }
+            ControlTile(
+                value = if (wbAuto) (if (liveK > 0) "${liveK}K" else "AUTO") else "${wbK}K",
                 label = "WB",
                 state = when {
                     selectedControl == "WB" -> TileState.ACTIVE
@@ -574,9 +668,22 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     }
 }
 
+/** 顶部快捷区图标钮：40dp 点击区，强调色=开启态 */
+@Composable
+private fun TopQuickIcon(icon: ImageVector, tint: Color, desc: String, onTap: () -> Unit) {
+    Box(
+        Modifier
+            .size(40.dp)
+            .pointerInput(desc) { detectTapGestures { onTap() } },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(21.dp))
+    }
+}
+
 private enum class TileState { AUTO, MANUAL, ACTIVE }
 
-/** 底部控制瓦片：上实时读数（A=自动）、下标签；AUTO 次级色 / MANUAL 奶油白 / ACTIVE 强调色+下划线 */
+/** 底部控制瓦片：上实时读数/设定值、下标签；AUTO 次级色 / MANUAL 奶油白 / ACTIVE 强调色+下划线 */
 @Composable
 private fun ControlTile(value: String, label: String, state: TileState, onTap: () -> Unit) {
     val color = when (state) {
@@ -676,7 +783,15 @@ private fun ControlPanel(
                     value = "$curIso",
                     fraction = isoF,
                     ticks = ticksIso(maxIso),
-                    onFraction = { onIsoDrag(it.roundToInt()) },
+                    // 刻度比例 → ISO 值（对数反演），此前误把比例直接取整导致 ISO 无法拖动
+                    onFraction = { f ->
+                        val v = if (lnMax > 0f) {
+                            (100f * exp(f * lnMax)).roundToInt().coerceIn(100, maxIso)
+                        } else {
+                            100
+                        }
+                        onIsoDrag(v)
+                    },
                 )
             }
             "EV" -> {
@@ -701,7 +816,8 @@ private fun ControlPanel(
                     value = "${curK}K",
                     fraction = f,
                     ticks = ticksWb,
-                    onFraction = { onWbDrag(it.roundToInt()) },
+                    // 刻度比例 → K 值（此前误把比例直接取整导致 WB 无法拖动）
+                    onFraction = { f -> onWbDrag((2500f + 5000f * f).roundToInt()) },
                 )
             }
         }
@@ -765,8 +881,8 @@ private fun AChip(active: Boolean, onTap: () -> Unit) {
 }
 
 /**
- * 刻度滑条：活动轨/刻度线用强调色，刻度标签随参数传入（自适应刻度），
- * 拖动/点按更新 fraction；奶油白竖条拇指。
+ * 刻度滑条：活动轨/刻度线用强调色，刻度标签随参数传入（自适应刻度）。
+ * 非拖动变化（点 A 回自动、测光实时移动）经 260ms 线性过渡，拖动即时跟手。
  */
 @Composable
 private fun TickSlider(
@@ -776,6 +892,12 @@ private fun TickSlider(
     modifier: Modifier = Modifier,
 ) {
     val measurer = rememberTextMeasurer()
+    var dragging by remember { mutableStateOf(false) }
+    val animF by animateFloatAsState(
+        targetValue = fraction,
+        animationSpec = if (dragging) snap() else tween(durationMillis = 260, easing = LinearEasing),
+        label = "tickFraction",
+    )
     Canvas(
         modifier
             .height(46.dp)
@@ -785,7 +907,11 @@ private fun TickSlider(
                 }
             }
             .pointerInput(Unit) {
-                detectHorizontalDragGestures { change, _ ->
+                detectHorizontalDragGestures(
+                    onDragStart = { dragging = true },
+                    onDragEnd = { dragging = false },
+                    onDragCancel = { dragging = false },
+                ) { change, _ ->
                     change.consume()
                     onFraction((change.position.x / size.width).coerceIn(0f, 1f))
                 }
@@ -795,11 +921,11 @@ private fun TickSlider(
         val trackY = size.height * 0.32f
         val stroke = 3.dp.toPx()
         drawLine(FilmTheme.ChipBorder, Offset(0f, trackY), Offset(w, trackY), stroke, StrokeCap.Round)
-        if (fraction > 0f) {
+        if (animF > 0f) {
             drawLine(
                 FilmTheme.Accent,
                 Offset(0f, trackY),
-                Offset(fraction * w, trackY),
+                Offset(animF * w, trackY),
                 stroke,
                 StrokeCap.Round,
             )
@@ -820,7 +946,7 @@ private fun TickSlider(
         }
         drawRoundRect(
             FilmTheme.Cream,
-            topLeft = Offset(fraction * w - 3.dp.toPx(), trackY - 10.dp.toPx()),
+            topLeft = Offset(animF * w - 3.dp.toPx(), trackY - 10.dp.toPx()),
             size = Size(6.dp.toPx(), 20.dp.toPx()),
             cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
         )
@@ -911,21 +1037,46 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
     }
 }
 
-/** 快捷设置下拉（⚙）：后续增加画面比例 / HDR 等入口 */
+/** 一级悬浮窗（菜单）：画幅选项（后续在此区继续加拍摄功能入口）+ 更多设置 */
 @Composable
-private fun QuickDropdown(onMoreSettings: () -> Unit) {
+private fun QuickDropdown(
+    aspect: String,
+    onAspect: (String) -> Unit,
+    onMoreSettings: () -> Unit,
+) {
     Column(
         Modifier
-            .width(200.dp)
+            .width(230.dp)
             .clip(RoundedCornerShape(16.dp))
             .background(FilmTheme.Panel)
-            .padding(vertical = 4.dp),
+            .padding(vertical = 6.dp),
     ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text(
+                "画幅",
+                color = FilmTheme.Accent,
+                fontSize = 11.sp,
+                fontFamily = FilmTheme.Mono,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("4:3", "16:9", "XPAN").forEach { a ->
+                    FilmChip(
+                        selected = aspect == a,
+                        label = a,
+                        fontSize = 11.sp,
+                        onClick = { onAspect(a) },
+                    )
+                }
+            }
+        }
+        HorizontalDivider(color = FilmTheme.ChipBorder)
         Row(
             Modifier
                 .fillMaxWidth()
                 .pointerInput(Unit) { detectTapGestures { onMoreSettings() } }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("更多设置", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
