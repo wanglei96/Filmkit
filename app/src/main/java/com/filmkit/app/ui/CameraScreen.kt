@@ -322,13 +322,14 @@ fun CameraScreen(
         controller.setCaptureAspect(guideAspect)
     }
 
-    // 底部不留白：只让出状态栏，内容延伸到手势条之下
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(FilmTheme.Body)
-            .statusBarsPadding(),
-    ) {
+    // 底部不留白：只让出状态栏，内容延伸到手势条之下；悬浮窗浮于整机上层（不受取景框约束）
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(FilmTheme.Body)
+                .statusBarsPadding(),
+        ) {
         // ── 顶部快捷设置区：闪光灯 · 直方图 · 构图线 · 快门声 · 菜单 ──
         Row(
             Modifier
@@ -737,38 +738,7 @@ fun CameraScreen(
                     )
                 }
 
-                // ── 一级悬浮窗（菜单展开；点画面收起）：画幅 + 更多设置 ──
-                if (quickOpen) {
-                    Box(
-                        Modifier
-                            .matchParentSize()
-                            .pointerInput(Unit) { detectTapGestures { quickOpen = false } },
-                    )
-                }
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = quickOpen,
-                    enter = FilmMotion.dropEnter,
-                    exit = FilmMotion.dropExit,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(end = 10.dp, top = 8.dp),
-                ) {
-                    QuickDropdown(
-                        aspect = aspect,
-                        onAspect = { a ->
-                            aspect = a
-                            EngineBridge.nativeAppendLog(
-                                EngineBridge.LEVEL_INFO, "app", "quick.aspect",
-                                "\"ratio\":\"$a\"",
-                            )
-                            // 成片同步居中裁切（setCaptureAspect，与取景窗口一致）
-                        },
-                        onMoreSettings = {
-                            quickOpen = false
-                            onOpenSettings()
-                        },
-                    )
-                }
+                // ── 一级悬浮窗移至整机层（锚定屏幕右上、宽度随屏幕）──
             }
         }
 
@@ -890,6 +860,42 @@ fun CameraScreen(
                 )
             }
             Spacer(Modifier.size(44.dp))
+        }
+        }
+
+        // ── 一级悬浮窗：锚定屏幕右上、宽度随屏幕（浮于整机上层，点任意处收起）──
+        if (quickOpen) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) { detectTapGestures { quickOpen = false } },
+            )
+        }
+        androidx.compose.animation.AnimatedVisibility(
+            visible = quickOpen,
+            enter = FilmMotion.dropEnter,
+            exit = FilmMotion.dropExit,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(start = 16.dp, end = 16.dp, top = 8.dp)
+                .fillMaxWidth(),
+        ) {
+            QuickDropdown(
+                aspect = aspect,
+                onAspect = { a ->
+                    aspect = a
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.aspect",
+                        "\"ratio\":\"$a\"",
+                    )
+                    // 成片同步居中裁切（setCaptureAspect，与取景窗口一致）
+                },
+                onMoreSettings = {
+                    quickOpen = false
+                    onOpenSettings()
+                },
+            )
         }
     }
 }
@@ -1309,7 +1315,7 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
     }
 }
 
-/** 一级悬浮窗（菜单）：画幅选项（后续在此区继续加拍摄功能入口）+ 更多设置 */
+/** 一级悬浮窗（菜单）：宽度随屏幕；画幅选项（后续在此区继续加拍摄功能入口）+ 更多设置 */
 @Composable
 private fun QuickDropdown(
     aspect: String,
@@ -1318,7 +1324,7 @@ private fun QuickDropdown(
 ) {
     Column(
         Modifier
-            .width(248.dp)
+            .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(FilmTheme.Panel)
             .padding(vertical = 6.dp),
@@ -1332,12 +1338,12 @@ private fun QuickDropdown(
                 fontWeight = FontWeight.SemiBold,
             )
             Spacer(Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
                 listOf("4:3", "16:9", "XPAN").forEach { a ->
                     FilmChip(
                         selected = aspect == a,
                         label = a,
-                        fontSize = 11.sp,
+                        fontSize = 12.sp,
                         onClick = { onAspect(a) },
                     )
                 }

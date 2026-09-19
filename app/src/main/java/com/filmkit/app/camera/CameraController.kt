@@ -497,21 +497,40 @@ class CameraController(private val context: Context, private val render: RenderC
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { liveIso = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { liveExposureNs = it }
             result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { if (it > 0f) liveFocusDiopter = it }
-            // X300 HAL 不报 COLOR_TEMPERATURE：从应用的 3x3 变换矩阵对角线反解色温
+            // 色温估计：优先读 COLOR_CORRECTION_GAINS 纯增益结果键（API36 作为结果键仍在，
+            // 无 CCM 混杂、与 PhotonCamera 同源）；无增益时退回变换矩阵对角线（有 CCM 偏差）
             var kEst = 0
-            result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
-                val r = t.getElement(0, 0).toFloat()
-                val g = t.getElement(1, 1).toFloat()
-                val b = t.getElement(2, 2).toFloat()
-                if (g > 0.001f && r > 0.001f && b > 0.001f) {
-                    estGainR = r / g
-                    estGainB = b / g
-                    kEst = kFromGains(estGainR, estGainB)
+            var gR = 0f
+            var gB = 0f
+            result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { gg ->
+                val green = ((gg.greenEven + gg.greenOdd) / 2f).coerceAtLeast(1e-3f)
+                val r = gg.red / green
+                val b = gg.blue / green
+                if (r > 0.001f && b > 0.001f) {
+                    gR = r
+                    gB = b
+                    kEst = kFromGains(gR, gB)
+                }
+            }
+            if (kEst == 0) {
+                result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
+                    val r = t.getElement(0, 0).toFloat()
+                    val g = t.getElement(1, 1).toFloat()
+                    val b = t.getElement(2, 2).toFloat()
+                    if (g > 0.001f && r > 0.001f && b > 0.001f) {
+                        gR = r / g
+                        gB = b / g
+                        kEst = kFromGains(gR, gB)
+                    }
                 }
             }
             if (kEst > 0) {
                 liveK = kEst
-                if (!manualWb) estK = kEst
+                if (!manualWb && gR > 0f) {
+                    estGainR = gR
+                    estGainB = gB
+                    estK = kEst
+                }
             } else {
                 result.get(CaptureResult.COLOR_CORRECTION_COLOR_TEMPERATURE)?.let { liveK = it }
             }
