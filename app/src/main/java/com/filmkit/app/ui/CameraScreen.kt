@@ -108,6 +108,7 @@ import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
+import com.filmkit.app.kv
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -887,7 +888,7 @@ fun CameraScreen(
                     aspect = a
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "quick.aspect",
-                        "\"ratio\":\"$a\"",
+                        kv("ratio" to a),
                     )
                     // 成片同步居中裁切（setCaptureAspect，与取景窗口一致）
                 },

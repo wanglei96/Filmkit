@@ -13,7 +13,7 @@ class FilmKitApp : Application() {
         EngineBridge.nativeInitLogger(dir)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "app.start",
-            kv("version" to "0.5.6-m2", "logDir" to dir),
+            kv("version" to "0.5.7-m2", "logDir" to dir),
         )
         installCrashCapture(dir)
     }
