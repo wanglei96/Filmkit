@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -120,7 +121,7 @@ class SpikeGLView(
 }
 
 @Composable
-fun SpikeScreen() {
+fun SpikeScreen(onBack: () -> Unit = {}) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var capsJson by remember { mutableStateOf("{}") }
     var spikeJson by remember { mutableStateOf("") }
@@ -132,8 +133,11 @@ fun SpikeScreen() {
         Modifier
             .fillMaxSize()
             .background(FilmTheme.Body)
-            .padding(12.dp),
+            .statusBarsPadding()
+            .padding(horizontal = 12.dp),
     ) {
+        SubPageTopBar("能力 / Spike", onBack)
+        Spacer(Modifier.height(4.dp))
         Text("状态：$status", color = FilmTheme.Cream, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -84,8 +84,8 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 28
-        versionName = "0.4.7-m2"
+        versionCode = 29
+        versionName = "0.4.8-m2"
     }
 
     sourceSets {
@@ -122,5 +122,6 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
+    implementation("androidx.compose.material:material-icons-core")
     testImplementation(libs.junit)
 }
