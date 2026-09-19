@@ -73,7 +73,7 @@ fun LogScreen(onBack: () -> Unit = {}) {
             Button(
                 onClick = { load() },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = FilmTheme.Amber,
+                    containerColor = FilmTheme.Accent,
                     contentColor = FilmTheme.OnAccent,
                 ),
             ) { Text("刷新") }
@@ -84,7 +84,7 @@ fun LogScreen(onBack: () -> Unit = {}) {
                 },
                 enabled = lines.isNotEmpty(),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = FilmTheme.Amber,
+                    containerColor = FilmTheme.Accent,
                     contentColor = FilmTheme.OnAccent,
                     disabledContainerColor = FilmTheme.ChipBg,
                     disabledContentColor = FilmTheme.CreamDim,

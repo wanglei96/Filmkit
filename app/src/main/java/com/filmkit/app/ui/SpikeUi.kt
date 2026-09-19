@@ -144,7 +144,7 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
             Button(
                 onClick = { view?.rerun() },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = FilmTheme.Amber,
+                    containerColor = FilmTheme.Accent,
                     contentColor = FilmTheme.OnAccent,
                 ),
             ) { Text("重新运行 spike") }
@@ -153,7 +153,7 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
                     auditPath = com.filmkit.app.camera.CameraAudit.export(context)
                 },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = FilmTheme.Amber,
+                    containerColor = FilmTheme.Accent,
                     contentColor = FilmTheme.OnAccent,
                 ),
             ) { Text("导出相机审计") }

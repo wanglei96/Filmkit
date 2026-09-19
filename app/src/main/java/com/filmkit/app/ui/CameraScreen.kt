@@ -16,6 +16,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -40,8 +41,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -62,13 +61,18 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
@@ -82,14 +86,16 @@ import androidx.compose.material.icons.filled.Settings
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
 import kotlinx.coroutines.delay
+import kotlin.math.ln
+import kotlin.math.log10
 import kotlin.math.pow
 import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 
 /**
- * M 档专业拍摄界面（方向 C 定稿，v0.4.8）。
- * 层级（自下而上）：取景器（圆角机框）→ 预览内浮层（变焦刻度 + ✦ LUT 入口、参数面板单实例、
- * LUT 二级菜单、快捷设置下拉）→ 底部控制瓦片（EV/Tv/ISO/AF/WB，实时读数即按钮）→ 快门三段。
+ * M 档专业拍摄界面（方向 C 定稿，v0.4.9）。
+ * 参数模型：EV / AE(Tv+ISO) / WB 三组独立 A(自动)/手动；默认 A，拖动刻度条进手动，
+ * 点 A 回自动；刻度条随参数切换自适应刻度（Tv 对数快门、ISO 对数、EV/WB 线性）。
  * 组件与颜色规范见 docs/开发计划.md「UI 设计规范」。
  */
 @Composable
@@ -138,11 +144,13 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
     var quickOpen by rememberSaveable { mutableStateOf(false) } // 快捷设置下拉
     var lutOpen by rememberSaveable { mutableStateOf(false) } // LUT 二级菜单
-    var manualAE by rememberSaveable { mutableStateOf(false) }
+    // A(自动)/手动状态：EV 与 AE(Tv+ISO 联动，Camera2 AE OFF 同时定死两参数)、WB 各自独立
+    var evAuto by rememberSaveable { mutableStateOf(true) }
+    var aeAuto by rememberSaveable { mutableStateOf(true) }
+    var wbAuto by rememberSaveable { mutableStateOf(true) }
     var iso by rememberSaveable { mutableIntStateOf(100) }
     var shutterV by rememberSaveable { mutableFloatStateOf(0.75f) }
-    var ev by remember { mutableStateOf(0f) }
-    var manualWb by rememberSaveable { mutableStateOf(false) }
+    var ev by rememberSaveable { mutableStateOf(0f) }
     var wbK by rememberSaveable { mutableIntStateOf(5000) }
     var focusMark by remember { mutableStateOf<Pair<Float, Float>?>(null) }
     var liveIso by remember { mutableIntStateOf(0) }
@@ -195,6 +203,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
         else "%.1fS".format(ns / 1_000_000_000.0)
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
+    val maxIso = controller.maxAnalogIso
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下
     Column(
@@ -203,7 +212,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             .background(FilmTheme.Body)
             .statusBarsPadding(),
     ) {
-        // ── 顶栏：仅右上 ⚙（打开变琥珀）──
+        // ── 顶栏：仅右上 ⚙（打开变强调色）──
         Box(
             Modifier
                 .fillMaxWidth()
@@ -219,7 +228,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 Icon(
                     Icons.Filled.Settings,
                     contentDescription = "设置",
-                    tint = if (quickOpen) FilmTheme.Amber else FilmTheme.CreamDim,
+                    tint = if (quickOpen) FilmTheme.Accent else FilmTheme.CreamDim,
                     modifier = Modifier.size(22.dp),
                 )
             }
@@ -288,10 +297,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 drawRoundRect(
                     color = FilmTheme.CreamDim.copy(alpha = 0.35f),
                     topLeft = Offset(inset, inset),
-                    size = androidx.compose.ui.geometry.Size(
-                        size.width - inset * 2,
-                        size.height - inset * 2,
-                    ),
+                    size = Size(size.width - inset * 2, size.height - inset * 2),
                     cornerRadius = CornerRadius(radius, radius),
                     style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                 )
@@ -350,7 +356,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 ) {
                     Text(
                         "✦",
-                        color = if (lutOpen) FilmTheme.Amber else FilmTheme.Cream,
+                        color = if (lutOpen) FilmTheme.Accent else FilmTheme.Cream,
                         fontSize = 17.sp,
                     )
                     // 非默认预设激活时的小圆点提示
@@ -359,7 +365,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                             .padding(top = 1.dp)
                             .size(3.dp)
                             .alpha(if (presetIdx != 0) 1f else 0f)
-                            .background(FilmTheme.Amber, CircleShape),
+                            .background(FilmTheme.Accent, CircleShape),
                     )
                 }
             }
@@ -375,38 +381,57 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             ) {
                 ControlPanel(
                     ctrl = selectedControl,
-                    manualAE = manualAE,
-                    onManualAE = { v ->
-                        manualAE = v
-                        controller.setManualExposure(v)
-                    },
-                    shutterV = shutterV,
-                    onShutter = { v ->
-                        shutterV = v
-                        controller.setExposureNs(10f.pow(5f + 4f * v).roundToLong())
-                    },
-                    iso = iso,
-                    maxIso = controller.maxAnalogIso,
-                    onIso = {
-                        iso = it
-                        controller.setIso(it)
-                    },
+                    evAuto = evAuto,
+                    aeAuto = aeAuto,
+                    wbAuto = wbAuto,
                     ev = ev,
-                    onEv = {
-                        ev = it
-                        manualAE = false
-                        controller.setManualExposure(false)
-                        controller.setEv(it)
-                    },
-                    manualWb = manualWb,
-                    onManualWb = { v ->
-                        manualWb = v
-                        if (v) controller.setWbK(wbK) else controller.setAutoWb()
-                    },
+                    shutterV = shutterV,
+                    iso = iso,
                     wbK = wbK,
-                    onWbK = {
-                        wbK = it
-                        controller.setWbK(it)
+                    liveNs = liveNs,
+                    liveIso = liveIso,
+                    liveK = liveK,
+                    maxIso = maxIso,
+                    onEvDrag = { v ->
+                        evAuto = false
+                        ev = v
+                        controller.setEv(v)
+                    },
+                    onEvAuto = {
+                        evAuto = true
+                        ev = 0f
+                        controller.setEv(0f)
+                    },
+                    onTvDrag = { f ->
+                        // AE OFF 会同时锁快门与 ISO：从 A 进入时把另一参数冻结在当前实测值
+                        if (aeAuto && liveIso > 0) iso = liveIso.coerceIn(100, maxIso)
+                        aeAuto = false
+                        shutterV = f
+                        controller.setManualExposure(true)
+                        controller.setExposureNs(10f.pow(5f + 4f * f).roundToLong())
+                    },
+                    onIsoDrag = { i ->
+                        if (aeAuto && liveNs > 0) {
+                            val nsF = liveNs.coerceIn(100_000L, 1_000_000_000L).toFloat()
+                            shutterV = ((log10(nsF) - 5f) / 4f).coerceIn(0f, 1f)
+                        }
+                        aeAuto = false
+                        iso = i
+                        controller.setManualExposure(true)
+                        controller.setIso(i)
+                    },
+                    onAeAuto = {
+                        aeAuto = true
+                        controller.setManualExposure(false)
+                    },
+                    onWbDrag = { k ->
+                        wbAuto = false
+                        wbK = k
+                        controller.setWbK(k)
+                    },
+                    onWbAuto = {
+                        wbAuto = true
+                        controller.setAutoWb()
                     },
                     secText = ::secText,
                 )
@@ -461,7 +486,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             }
         }
 
-        // ── 控制瓦片：实时读数即按钮（选中琥珀，Tv/ISO 共用 EXP 面板）──
+        // ── 控制瓦片：A(自动)/手动值实时显示（选中强调色，Tv/ISO 共用 AE 组）──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -473,21 +498,43 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             }
             val expActive = selectedControl == "EXP"
             ControlTile(
-                value = (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
+                value = if (evAuto) "A" else (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
                 label = "EV",
-                active = selectedControl == "EV",
+                state = when {
+                    selectedControl == "EV" -> TileState.ACTIVE
+                    evAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
             ) { toggle("EV") }
-            ControlTile(secText(liveNs), "Tv", active = expActive) { toggle("EXP") }
             ControlTile(
-                if (liveIso > 0) "$liveIso" else "--",
-                "ISO",
-                active = expActive,
+                value = if (aeAuto) "A" else secText(shutterNs),
+                label = "Tv",
+                state = when {
+                    expActive -> TileState.ACTIVE
+                    aeAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
             ) { toggle("EXP") }
-            ControlTile("AUTO", "AF", active = selectedControl == "AF") { toggle("AF") }
             ControlTile(
-                if (liveK > 0) "${liveK}K" else "AUTO",
-                "WB",
-                active = selectedControl == "WB",
+                value = if (aeAuto) "A" else "$iso",
+                label = "ISO",
+                state = when {
+                    expActive -> TileState.ACTIVE
+                    aeAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
+            ) { toggle("EXP") }
+            ControlTile("A", "AF", state = if (selectedControl == "AF") TileState.ACTIVE else TileState.AUTO) {
+                toggle("AF")
+            }
+            ControlTile(
+                value = if (wbAuto) "A" else "${wbK}K",
+                label = "WB",
+                state = when {
+                    selectedControl == "WB" -> TileState.ACTIVE
+                    wbAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
             ) { toggle("WB") }
         }
 
@@ -527,9 +574,16 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     }
 }
 
-/** 底部控制瓦片：上实时读数、下标签，选中琥珀 + 下划线 */
+private enum class TileState { AUTO, MANUAL, ACTIVE }
+
+/** 底部控制瓦片：上实时读数（A=自动）、下标签；AUTO 次级色 / MANUAL 奶油白 / ACTIVE 强调色+下划线 */
 @Composable
-private fun ControlTile(value: String, label: String, active: Boolean, onTap: () -> Unit) {
+private fun ControlTile(value: String, label: String, state: TileState, onTap: () -> Unit) {
+    val color = when (state) {
+        TileState.AUTO -> FilmTheme.CreamDim
+        TileState.MANUAL -> FilmTheme.Cream
+        TileState.ACTIVE -> FilmTheme.Accent
+    }
     Column(
         Modifier
             .width(62.dp)
@@ -538,7 +592,7 @@ private fun ControlTile(value: String, label: String, active: Boolean, onTap: ()
     ) {
         Text(
             value,
-            color = if (active) FilmTheme.Amber else FilmTheme.Cream,
+            color = color,
             fontSize = 14.sp,
             fontFamily = FilmTheme.Mono,
             maxLines = 1,
@@ -546,7 +600,7 @@ private fun ControlTile(value: String, label: String, active: Boolean, onTap: ()
         Spacer(Modifier.height(2.dp))
         Text(
             label,
-            color = if (active) FilmTheme.Amber else FilmTheme.CreamDim,
+            color = color,
             fontSize = 10.sp,
             fontFamily = FilmTheme.Mono,
         )
@@ -554,31 +608,35 @@ private fun ControlTile(value: String, label: String, active: Boolean, onTap: ()
         Box(
             Modifier
                 .size(width = 16.dp, height = 2.dp)
-                .background(if (active) FilmTheme.Amber else Color.Transparent),
+                .background(if (state == TileState.ACTIVE) FilmTheme.Accent else Color.Transparent),
         )
     }
 }
 
-/** 参数面板（单实例）：AF 提示 / EXP（AE 开关+快门+ISO）/ EV / WB */
+/** 参数面板（单实例）：AF 提示 / EXP（SEC+ISO，共用 AE 组）/ EV / WB，统一 ParamRow 风格 */
 @Composable
 private fun ControlPanel(
     ctrl: String?,
-    manualAE: Boolean,
-    onManualAE: (Boolean) -> Unit,
-    shutterV: Float,
-    onShutter: (Float) -> Unit,
-    iso: Int,
-    maxIso: Int,
-    onIso: (Int) -> Unit,
+    evAuto: Boolean,
+    aeAuto: Boolean,
+    wbAuto: Boolean,
     ev: Float,
-    onEv: (Float) -> Unit,
-    manualWb: Boolean,
-    onManualWb: (Boolean) -> Unit,
+    shutterV: Float,
+    iso: Int,
     wbK: Int,
-    onWbK: (Int) -> Unit,
+    liveNs: Long,
+    liveIso: Int,
+    liveK: Int,
+    maxIso: Int,
+    onEvDrag: (Float) -> Unit,
+    onEvAuto: () -> Unit,
+    onTvDrag: (Float) -> Unit,
+    onIsoDrag: (Int) -> Unit,
+    onAeAuto: () -> Unit,
+    onWbDrag: (Int) -> Unit,
+    onWbAuto: () -> Unit,
     secText: (Long) -> String,
 ) {
-    val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     Column(
         Modifier
             .fillMaxWidth()
@@ -591,59 +649,206 @@ private fun ControlPanel(
                 Text("点按画面对焦（连续自动对焦）", color = FilmTheme.Cream, fontSize = 12.sp)
             }
             "EXP" -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    PanelLabel("AE")
-                    FilmChip(selected = !manualAE, label = "AUTO", onClick = { onManualAE(false) })
-                    Spacer(Modifier.width(6.dp))
-                    FilmChip(selected = manualAE, label = "OFF", onClick = { onManualAE(true) })
-                }
-                PanelRow("SEC", secText(shutterNs)) {
-                    Slider(
-                        value = shutterV,
-                        onValueChange = onShutter,
-                        valueRange = 0f..1f,
-                        colors = filmSliderColors(),
-                    )
-                }
-                PanelRow("ISO", "$iso") {
-                    Slider(
-                        value = iso.toFloat(),
-                        onValueChange = { onIso(it.roundToInt()) },
-                        valueRange = 100f..maxIso.toFloat(),
-                        colors = filmSliderColors(),
-                    )
-                }
+                // A 时滑杆停在实测值并跟随测光；拖动即进手动
+                val curNs = if (aeAuto) {
+                    if (liveNs > 0) liveNs else 10_000_000L
+                } else {
+                    10f.pow(5f + 4f * shutterV).roundToLong()
+                }.coerceIn(100_000L, 1_000_000_000L)
+                val tvF = ((log10(curNs.toFloat()) - 5f) / 4f).coerceIn(0f, 1f)
+                ParamRow(
+                    label = "SEC",
+                    auto = aeAuto,
+                    onAuto = onAeAuto,
+                    value = secText(curNs),
+                    fraction = tvF,
+                    ticks = ticksTv,
+                    onFraction = onTvDrag,
+                )
+                Spacer(Modifier.height(2.dp))
+                val curIso = if (aeAuto) liveIso.coerceIn(100, maxIso) else iso
+                val lnMax = ln(maxIso / 100f)
+                val isoF = if (lnMax > 0f && curIso >= 100) (ln(curIso / 100f) / lnMax).coerceIn(0f, 1f) else 0f
+                ParamRow(
+                    label = "ISO",
+                    auto = aeAuto,
+                    onAuto = onAeAuto,
+                    value = "$curIso",
+                    fraction = isoF,
+                    ticks = ticksIso(maxIso),
+                    onFraction = { onIsoDrag(it.roundToInt()) },
+                )
             }
             "EV" -> {
-                PanelRow("EV", "%.1f".format(ev)) {
-                    Slider(
-                        value = ev.coerceIn(-4f, 4f),
-                        onValueChange = onEv,
-                        valueRange = -4f..4f,
-                        colors = filmSliderColors(),
-                    )
-                }
+                val f = ((ev + 4f) / 8f).coerceIn(0f, 1f)
+                ParamRow(
+                    label = "EV",
+                    auto = evAuto,
+                    onAuto = onEvAuto,
+                    value = (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
+                    fraction = f,
+                    ticks = ticksEv,
+                    onFraction = onEvDrag,
+                )
             }
             "WB" -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    PanelLabel("WB")
-                    FilmChip(selected = !manualWb, label = "AUTO", onClick = { onManualWb(false) })
-                    Spacer(Modifier.width(6.dp))
-                    FilmChip(selected = manualWb, label = "${wbK}K", onClick = { onManualWb(true) })
-                }
-                if (manualWb) {
-                    PanelRow("K", "$wbK") {
-                        Slider(
-                            value = wbK.toFloat(),
-                            onValueChange = { onWbK(it.roundToInt()) },
-                            valueRange = 2500f..7500f,
-                            colors = filmSliderColors(),
-                        )
-                    }
-                }
+                val curK = if (wbAuto) (if (liveK > 0) liveK else 5000) else wbK
+                val f = ((curK - 2500f) / 5000f).coerceIn(0f, 1f)
+                ParamRow(
+                    label = "WB",
+                    auto = wbAuto,
+                    onAuto = onWbAuto,
+                    value = "${curK}K",
+                    fraction = f,
+                    ticks = ticksWb,
+                    onFraction = { onWbDrag(it.roundToInt()) },
+                )
             }
         }
     }
+}
+
+/** 一行参数：A 片 + 标签 + 自适应刻度滑条 + 值（统一 EV 行风格） */
+@Composable
+private fun ParamRow(
+    label: String,
+    auto: Boolean,
+    onAuto: () -> Unit,
+    value: String,
+    fraction: Float,
+    ticks: List<Pair<Float, String>>,
+    onFraction: (Float) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        AChip(active = auto, onTap = onAuto)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            label,
+            color = FilmTheme.Accent,
+            fontSize = 11.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.width(32.dp),
+        )
+        TickSlider(fraction, ticks, onFraction, Modifier.weight(1f))
+        Text(
+            value,
+            color = FilmTheme.Cream,
+            fontSize = 11.sp,
+            fontFamily = FilmTheme.Mono,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(52.dp),
+        )
+    }
+}
+
+/** A(自动)片：激活=强调色底深字；手动态描边灰，点按回自动 */
+@Composable
+private fun AChip(active: Boolean, onTap: () -> Unit) {
+    Box(
+        Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(if (active) FilmTheme.Accent else Color.Transparent)
+            .border(1.dp, if (active) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape)
+            .pointerInput(Unit) { detectTapGestures { onTap() } },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            "A",
+            color = if (active) FilmTheme.OnAccent else FilmTheme.CreamDim,
+            fontSize = 13.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+/**
+ * 刻度滑条：活动轨/刻度线用强调色，刻度标签随参数传入（自适应刻度），
+ * 拖动/点按更新 fraction；奶油白竖条拇指。
+ */
+@Composable
+private fun TickSlider(
+    fraction: Float,
+    ticks: List<Pair<Float, String>>,
+    onFraction: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val measurer = rememberTextMeasurer()
+    Canvas(
+        modifier
+            .height(46.dp)
+            .pointerInput(Unit) {
+                detectTapGestures { off ->
+                    onFraction((off.x / size.width).coerceIn(0f, 1f))
+                }
+            }
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures { change, _ ->
+                    change.consume()
+                    onFraction((change.position.x / size.width).coerceIn(0f, 1f))
+                }
+            },
+    ) {
+        val w = size.width
+        val trackY = size.height * 0.32f
+        val stroke = 3.dp.toPx()
+        drawLine(FilmTheme.ChipBorder, Offset(0f, trackY), Offset(w, trackY), stroke, StrokeCap.Round)
+        if (fraction > 0f) {
+            drawLine(
+                FilmTheme.Accent,
+                Offset(0f, trackY),
+                Offset(fraction * w, trackY),
+                stroke,
+                StrokeCap.Round,
+            )
+        }
+        ticks.forEach { (f, label) ->
+            drawLine(
+                FilmTheme.Accent.copy(alpha = 0.7f),
+                Offset(f * w, trackY - 5.dp.toPx()),
+                Offset(f * w, trackY + 5.dp.toPx()),
+                1.5.dp.toPx(),
+            )
+            val tr = measurer.measure(
+                label,
+                TextStyle(fontSize = 9.sp, color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono),
+            )
+            val x = (f * w - tr.size.width / 2f).coerceIn(0f, w - tr.size.width)
+            drawText(tr, topLeft = Offset(x, trackY + 6.dp.toPx()))
+        }
+        drawRoundRect(
+            FilmTheme.Cream,
+            topLeft = Offset(fraction * w - 3.dp.toPx(), trackY - 10.dp.toPx()),
+            size = Size(6.dp.toPx(), 20.dp.toPx()),
+            cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
+        )
+    }
+}
+
+private val ticksEv = listOf(0f to "-4", 0.25f to "-2", 0.5f to "0", 0.75f to "+2", 1f to "+4")
+
+private val ticksTv = listOf(
+    0.25f to "1/1000",
+    0.4f to "1/250",
+    0.555f to "1/60",
+    0.706f to "1/15",
+    0.85f to "1/4",
+    1f to "1S",
+)
+
+private val ticksWb = listOf(0.1f to "3000K", 0.5f to "5000K", 0.9f to "7000K")
+
+/** ISO 刻度：对数（相机 ISO 感光度按档位），端点对齐实际量程 */
+private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
+    val stops = listOf(100, 200, 400, 800, 1600, 3200, 6400, 12800).filter { it <= maxIso }
+        .toMutableList()
+    if (stops.isEmpty()) return listOf(0f to "100", 1f to "$maxIso")
+    if (stops.last() != maxIso) stops.add(maxIso)
+    val lnMax = ln(maxIso / 100f)
+    if (lnMax <= 0f) return listOf(0f to "100", 1f to "$maxIso")
+    return stops.map { v -> (ln(v / 100f) / lnMax).coerceIn(0f, 1f) to "$v" }
 }
 
 /** LUT 二级菜单：内置胶片预设 + LUT（.cube，M4 接入） */
@@ -658,7 +863,7 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
     ) {
         Text(
             "胶片预设",
-            color = FilmTheme.Amber,
+            color = FilmTheme.Accent,
             fontSize = 11.sp,
             fontFamily = FilmTheme.Mono,
             fontWeight = FontWeight.SemiBold,
@@ -675,14 +880,14 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
             ) {
                 Text(
                     name,
-                    color = if (selected) FilmTheme.Amber else FilmTheme.Cream,
+                    color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
                     fontSize = 15.sp,
                     fontFamily = FilmTheme.Serif,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.weight(1f),
                 )
                 if (selected) {
-                    Text("✓", color = FilmTheme.Amber, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+                    Text("✓", color = FilmTheme.Accent, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
                 }
             }
         }
@@ -691,7 +896,7 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
         Spacer(Modifier.height(6.dp))
         Text(
             "LUT",
-            color = FilmTheme.Amber,
+            color = FilmTheme.Accent,
             fontSize = 11.sp,
             fontFamily = FilmTheme.Mono,
             fontWeight = FontWeight.SemiBold,
@@ -729,7 +934,7 @@ private fun QuickDropdown(onMoreSettings: () -> Unit) {
     }
 }
 
-/** 子页顶栏：左上返回 + 标题（设置 / 日志 / 能力 Spike 共用） */
+/** 子页顶栏：左上返回 + 标题（设置 / 日志 / 能力 Spike / 镜头配置 / 系统颜色 共用） */
 @Composable
 fun SubPageTopBar(title: String, onBack: () -> Unit) {
     Row(
@@ -758,45 +963,8 @@ fun SubPageTopBar(title: String, onBack: () -> Unit) {
     }
 }
 
-/** 面板行首标签：琥珀等宽小字 */
-@Composable
-private fun PanelLabel(text: String) {
-    Text(
-        text,
-        color = FilmTheme.Amber,
-        fontSize = 11.sp,
-        fontFamily = FilmTheme.Mono,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier.width(38.dp),
-    )
-}
-
-/** 面板内一行：琥珀标签 + 滑杆 + 奶油读数 */
-@Composable
-private fun PanelRow(label: String, value: String, slider: @Composable () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        PanelLabel(label)
-        Box(Modifier.weight(1f)) { slider() }
-        Text(
-            value,
-            color = FilmTheme.Cream,
-            fontSize = 11.sp,
-            fontFamily = FilmTheme.Mono,
-            textAlign = TextAlign.End,
-            modifier = Modifier.width(48.dp),
-        )
-    }
-}
-
-@Composable
-private fun filmSliderColors() = SliderDefaults.colors(
-    thumbColor = FilmTheme.Cream,
-    activeTrackColor = FilmTheme.Amber,
-    inactiveTrackColor = FilmTheme.ChipBorder,
-)
-
 /**
- * 胶片风选择片：选中琥珀底深字；未选中炭黑（transparent 时全透明、仅奶油字），
+ * 胶片风选择片：选中强调色底深字；未选中炭黑（transparent 时全透明、仅奶油字），
  * 透明态用于叠加预览的变焦刻度行。
  */
 @Composable
@@ -822,7 +990,7 @@ private fun FilmChip(
         colors = FilterChipDefaults.filterChipColors(
             containerColor = if (transparent) Color.Transparent else FilmTheme.ChipBg,
             labelColor = FilmTheme.Cream,
-            selectedContainerColor = FilmTheme.Amber,
+            selectedContainerColor = FilmTheme.Accent,
             selectedLabelColor = FilmTheme.OnAccent,
         ),
     )
