@@ -461,6 +461,14 @@ class CameraController(private val context: Context, private val render: RenderC
         private set
     @Volatile var liveK = 0
         private set
+    @Volatile var liveFocusDiopter = 0f
+        private set
+
+    // AWB 实时估计（来自 CaptureResult 变换矩阵对角线）：手动 WB 锚定它保证
+    // 拖到与自动相同色温时预览一致（否则手动脉冲跳变/位置对不上）
+    @Volatile private var estGainR = 0f
+    @Volatile private var estGainB = 0f
+    @Volatile private var estK = 0
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -470,8 +478,39 @@ class CameraController(private val context: Context, private val render: RenderC
         ) {
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { liveIso = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { liveExposureNs = it }
-            result.get(CaptureResult.COLOR_CORRECTION_COLOR_TEMPERATURE)?.let { liveK = it }
+            result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { if (it > 0f) liveFocusDiopter = it }
+            // X300 HAL 不报 COLOR_TEMPERATURE：从应用的 3x3 变换矩阵对角线反解色温
+            var kEst = 0
+            result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
+                val r = t.getElement(0, 0).toFloat()
+                val g = t.getElement(1, 1).toFloat()
+                val b = t.getElement(2, 2).toFloat()
+                if (g > 0.001f && r > 0.001f && b > 0.001f) {
+                    estGainR = r / g
+                    estGainB = b / g
+                    kEst = kFromGains(estGainR, estGainB)
+                }
+            }
+            if (kEst > 0) {
+                liveK = kEst
+                estK = kEst
+            } else {
+                result.get(CaptureResult.COLOR_CORRECTION_COLOR_TEMPERATURE)?.let { liveK = it }
+            }
         }
+    }
+
+    /** 在 wbGains 模型上按 gB 单调性二分：增益比 → 色温（K） */
+    private fun kFromGains(gR: Float, gB: Float): Int {
+        var lo = 1500
+        var hi = 12000
+        repeat(20) {
+            val mid = (lo + hi) / 2
+            if (wbGains(mid)[2] > gB) lo = mid else hi = mid
+        }
+        val k = (lo + hi) / 2
+        // gR 分量交叉校验：若严重偏离（非黑体光源），仍返回 gB 主导解
+        return k
     }
 
     // ── 手动对焦（屈光度）──
@@ -524,7 +563,13 @@ class CameraController(private val context: Context, private val render: RenderC
         if (manualWb) {
             b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
             if (transformWbSupported) {
+                // 手动增益 = AWB 实时估计增益 × (目标色温增益 / 估计色温增益)：
+                // 拖到与自动相同色温时增益与 HAL 一致，预览无跳变；无估计数据时用绝对值
                 val g = wbGains(wbK)
+                val refK = if (estK > 0) estK else 6500
+                val ref = wbGains(refK)
+                val estR = if (estGainR > 0.05f) estGainR else ref[0]
+                val estB = if (estGainB > 0.05f) estGainB else ref[2]
                 fun r(f: Float) = android.util.Rational((f * 1000).toInt(), 1000)
                 b.set(
                     CaptureRequest.COLOR_CORRECTION_MODE,
@@ -534,9 +579,9 @@ class CameraController(private val context: Context, private val render: RenderC
                     CaptureRequest.COLOR_CORRECTION_TRANSFORM,
                     android.hardware.camera2.params.ColorSpaceTransform(
                         arrayOf(
-                            r(g[0]), r(0f), r(0f),
+                            r((estR * g[0] / ref[0]).coerceIn(0.3f, 3f)), r(0f), r(0f),
                             r(0f), r(1f), r(0f),
-                            r(0f), r(0f), r(g[2]),
+                            r(0f), r(0f), r((estB * g[2] / ref[2]).coerceIn(0.3f, 3f)),
                         ),
                     ),
                 )

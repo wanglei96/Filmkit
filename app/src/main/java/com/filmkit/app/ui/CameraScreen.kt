@@ -81,8 +81,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -195,6 +195,7 @@ fun CameraScreen(
     var liveIso by remember { mutableIntStateOf(0) }
     var liveNs by remember { mutableLongStateOf(0L) }
     var liveK by remember { mutableIntStateOf(0) }
+    var liveFocus by remember { mutableFloatStateOf(0f) }
     var boxW by remember { mutableIntStateOf(1) }
     var boxH by remember { mutableIntStateOf(1) }
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
@@ -257,6 +258,7 @@ fun CameraScreen(
             liveIso = controller.liveIso
             liveNs = controller.liveExposureNs
             liveK = controller.liveK
+            liveFocus = controller.liveFocusDiopter
             val newUri = controller.lastPhotoUri
             if (newUri != photoUri) photoUri = newUri
         }
@@ -297,15 +299,25 @@ fun CameraScreen(
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     val maxIso = controller.maxAnalogIso
-    // 画幅 = 4:3 流内的裁切显示窗（预览流恒 4:3 不拉伸，16:9/XPAN 只显示对应裁切区域）
-    // TODO(M3): 成片裁切跟随画幅（当前仅取景显示比例）
-    val visAspect = when (aspect) {
-        "16:9" -> 16f / 9f
-        "XPAN" -> 65f / 24f
-        else -> 4f / 3f
+    // 画幅 = 成片裁切比例引导框（预览全屏铺满，引擎按视口 center-crop 不拉伸）；
+    // 比例随屏幕方向取向：竖屏时 16:9 → 9:16 竖向铺满、XPAN → 24:65 竖长条。
+    // TODO(M3): 成片裁切跟随画幅（当前仅取景引导）
+    val portrait = LocalConfiguration.current.orientation ==
+        android.content.res.Configuration.ORIENTATION_PORTRAIT
+    val guideAspect = when (aspect) {
+        "16:9" -> if (portrait) 9f / 16f else 16f / 9f
+        "XPAN" -> if (portrait) 24f / 65f else 65f / 24f
+        else -> if (portrait) 3f / 4f else 4f / 3f
     }
-    val density = LocalDensity.current
-    val maskPad = with(density) { ((boxH - boxW / visAspect) / 2f).coerceAtLeast(0f).toDp() }
+    // 对焦区域映射随显示旋转补偿（X300 sensor 90，竖屏 k=1）
+    val winMgr = remember {
+        context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
+    }
+    @Suppress("DEPRECATION")
+    val displayRot = winMgr.defaultDisplay.rotation
+    LaunchedEffect(displayRot) {
+        controller.setOrientationStep(displayRot)
+    }
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下
     Column(
@@ -378,17 +390,15 @@ fun CameraScreen(
             ) { quickOpen = !quickOpen }
         }
 
-        // ── 取景器区（任意画幅下底部控制区都贴底，取景器居中）──
+        // ── 取景器：全屏铺满（引擎按视口 center-crop，不拉伸），随屏幕方向适配 ──
         Box(
             Modifier
                 .fillMaxWidth()
                 .weight(1f),
-            contentAlignment = Alignment.Center,
         ) {
             Box(
                 Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(3f / 4f)
+                    .fillMaxSize()
                     .onSizeChanged { boxW = it.width; boxH = it.height },
             ) {
                 AndroidView(
@@ -461,50 +471,56 @@ fun CameraScreen(
                     Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
                 }
 
-                // 机框遮罩：遮出 4:3 流内所选画幅的可见裁切窗（消除 16:9/XPAN 硬拉伸）+ 圆角勾边
+                // 画幅引导框：所选比例为成片裁切参考，外部压暗 + 奶油圆角框线
                 Canvas(Modifier.matchParentSize()) {
-                    val inset = 5.dp.toPx()
-                    val radius = 22.dp.toPx()
-                    val visH = size.width / visAspect
-                    val top = (size.height - visH) / 2f
-                    val frame = Path().apply {
+                    val regA = size.width / size.height
+                    val gw = if (guideAspect > regA) size.width else size.height * guideAspect
+                    val gh = if (guideAspect > regA) size.width / guideAspect else size.height
+                    val left = (size.width - gw) / 2f
+                    val top = (size.height - gh) / 2f
+                    val inset = 3.dp.toPx()
+                    val radius = 14.dp.toPx()
+                    val dim = Path().apply {
                         fillType = PathFillType.EvenOdd
                         addRect(Rect(0f, 0f, size.width, size.height))
                         addRoundRect(
                             RoundRect(
-                                Rect(inset, top + inset, size.width - inset, top + visH - inset),
+                                Rect(left + inset, top + inset, left + gw - inset, top + gh - inset),
                                 CornerRadius(radius, radius),
                             ),
                         )
                     }
-                    drawPath(frame, FilmTheme.Body)
+                    drawPath(dim, Color.Black.copy(alpha = 0.45f))
                     drawRoundRect(
-                        color = FilmTheme.CreamDim.copy(alpha = 0.35f),
-                        topLeft = Offset(inset, top + inset),
-                        size = Size(size.width - inset * 2, visH - inset * 2),
+                        color = FilmTheme.CreamDim.copy(alpha = 0.5f),
+                        topLeft = Offset(left + inset, top + inset),
+                        size = Size(gw - inset * 2, gh - inset * 2),
                         cornerRadius = CornerRadius(radius, radius),
                         style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
                 }
 
-                // 三分构图线（画在可见裁切窗内）
+                // 三分构图线（画在画幅引导框内）
                 if (gridOn) {
                     Canvas(Modifier.matchParentSize()) {
                         val c = FilmTheme.Cream.copy(alpha = 0.28f)
                         val w = 1.dp.toPx()
-                        val visH = size.width / visAspect
-                        val top = (size.height - visH) / 2f
+                        val regA = size.width / size.height
+                        val gw = if (guideAspect > regA) size.width else size.height * guideAspect
+                        val gh = if (guideAspect > regA) size.width / guideAspect else size.height
+                        val left = (size.width - gw) / 2f
+                        val top = (size.height - gh) / 2f
                         for (i in 1..2) {
                             drawLine(
                                 c,
-                                Offset(size.width * i / 3f, top),
-                                Offset(size.width * i / 3f, top + visH),
+                                Offset(left + gw * i / 3f, top),
+                                Offset(left + gw * i / 3f, top + gh),
                                 w,
                             )
                             drawLine(
                                 c,
-                                Offset(0f, top + visH * i / 3f),
-                                Offset(size.width, top + visH * i / 3f),
+                                Offset(left, top + gh * i / 3f),
+                                Offset(left + gw, top + gh * i / 3f),
                                 w,
                             )
                         }
@@ -516,7 +532,7 @@ fun CameraScreen(
                     Box(
                         Modifier
                             .align(Alignment.TopStart)
-                            .padding(start = 14.dp, top = maskPad + 12.dp)
+                            .padding(start = 14.dp, top = 12.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(FilmTheme.Panel)
                             .padding(horizontal = 10.dp, vertical = 6.dp),
@@ -549,11 +565,11 @@ fun CameraScreen(
                     )
                 }
 
-                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘（锚定裁切窗底边）
+                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 10.dp, end = 10.dp, bottom = maskPad + 12.dp)
+                        .padding(start = 10.dp, end = 10.dp, bottom = 12.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -616,11 +632,12 @@ fun CameraScreen(
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 12.dp, end = 12.dp, bottom = maskPad + 58.dp),
+                        .padding(start = 12.dp, end = 12.dp, bottom = 58.dp),
                 ) {
                     ControlPanel(
                         ctrl = selectedControl,
                         maxDiopter = controller.maxDiopter,
+                        liveFocusD = liveFocus,
                         mfOn = mfOn,
                         mfDiopter = mfDiopter,
                         onMfDrag = { f ->
@@ -714,7 +731,7 @@ fun CameraScreen(
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 14.dp, end = 14.dp, bottom = maskPad + 62.dp),
+                        .padding(start = 14.dp, end = 14.dp, bottom = 62.dp),
                 ) {
                     LutMenu(
                         presetIdx = presetIdx,
@@ -804,7 +821,13 @@ fun CameraScreen(
                 onTap = { toggle("EXP") },
             )
             ControlTile(
-                value = if (mfOn) fmtDist(mfDiopter) else "AUTO",
+                value = if (mfOn) {
+                    fmtDist(mfDiopter)
+                } else if (liveFocus > 0.01f) {
+                    fmtDist(liveFocus)
+                } else {
+                    "AUTO"
+                },
                 label = "AF",
                 state = when {
                     selectedControl == "AF" -> TileState.ACTIVE
@@ -951,6 +974,7 @@ private fun ControlTile(value: String, label: String, state: TileState, onTap: (
 private fun ControlPanel(
     ctrl: String?,
     maxDiopter: Float,
+    liveFocusD: Float,
     mfOn: Boolean,
     mfDiopter: Float,
     onMfDrag: (Float) -> Unit,
@@ -984,14 +1008,15 @@ private fun ControlPanel(
     ) {
         when (ctrl) {
             "AF" -> {
-                // 手动对焦：屈光度滑杆，刻度为对焦距离（HAL 上报 0 时控制器用 10D 试值）；A=连续自动对焦
+                // 手动对焦：屈光度滑杆，刻度为对焦距离（HAL 上报 0 时控制器用 10D 试值）；
+                // A=连续自动对焦，滑杆停在实测对焦距离（此前误显示 ∞ = 屈光度 0）
                 val maxD = maxDiopter
-                val d = if (mfOn) mfDiopter else 0f
+                val d = if (mfOn) mfDiopter else liveFocusD.coerceAtLeast(0f)
                 ParamRow(
                     label = "MF",
                     auto = !mfOn,
                     onAuto = onMfAuto,
-                    value = fmtDist(d),
+                    value = if (mfOn || liveFocusD > 0.01f) fmtDist(d) else "AUTO",
                     fraction = (d / maxD).coerceIn(0f, 1f),
                     ticks = ticksDiopter(maxD),
                     onFraction = onMfDrag,

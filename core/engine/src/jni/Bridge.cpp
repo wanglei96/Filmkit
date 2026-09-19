@@ -202,11 +202,26 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
   if (st) env->GetFloatArrayRegion(st, 0, 16, m);
   const FilmParams p = paramsFromJava(env, film);
 
-  // 预览不自行裁剪：STMatrix 已含生产者的裁剪/翻转信息，
-  // 叠加自算 center-crop 会双重裁剪 → 画面横向拉伸（X300 实测）。
-  const float sx = 1.0f, sy = 1.0f;
   const int dst_w = ANativeWindow_getWidth(g_window);
   const int dst_h = ANativeWindow_getHeight(g_window);
+
+  // 预览 center-crop：按（旋转换轴后的）源宽高比适配目标视口——铺满、不拉伸。
+  // v0.3.5 的旧问题在于用未换轴的名义尺寸算错裁剪方向（横竖轴颠倒 → 双重裁剪）；
+  // uScale 是绕中心采样窗：sx/sy 分别为 u/v 轴采样比例，按 rot 奇偶与源/目标
+  // 宽高比关系选取缩轴，保证显示内容比例 = 视口比例。
+  float sx = 1.0f, sy = 1.0f;
+  if (src_w > 0 && src_h > 0 && dst_h > 0) {
+    const float srcAspect =
+        (rotation % 2 == 1) ? (float)src_h / (float)src_w : (float)src_w / (float)src_h;
+    const float a = (float)dst_w / (float)dst_h;
+    if (rotation % 2 == 1) {
+      sx = (srcAspect / a < 1.0f) ? srcAspect / a : 1.0f;
+      sy = (a / srcAspect < 1.0f) ? a / srcAspect : 1.0f;
+    } else {
+      sx = (a / srcAspect < 1.0f) ? a / srcAspect : 1.0f;
+      sy = (srcAspect / a < 1.0f) ? srcAspect / a : 1.0f;
+    }
+  }
 
   const bool ok = g_renderer->submitFrame(m, rotation, sx, sy, dst_w, dst_h, p,
                                           fill_test == JNI_TRUE);
