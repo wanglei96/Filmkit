@@ -146,6 +146,10 @@ class CameraController(private val context: Context, private val render: RenderC
         else enabledLenses().minByOrNull { kotlin.math.abs(it.equivMm - 24f) }?.equivMm ?: 24f
     }
 
+    /** 变焦倍率基线 = 主摄（等效最接近 24mm）的等效焦距：70mm 显示 2.9x、15mm 显示 0.6x */
+    fun mainEquiv(): Float =
+        enabledLenses().minByOrNull { kotlin.math.abs(it.equivMm - 24f) }?.equivMm ?: 24f
+
     @Volatile
     private var zoomRatio = 1f
 
@@ -175,9 +179,6 @@ class CameraController(private val context: Context, private val render: RenderC
 
     @Volatile
     private var wbK = 5000
-
-    @Volatile
-    private var manualWb = false
 
     var maxAnalogIso = 3200
         private set
@@ -228,9 +229,6 @@ class CameraController(private val context: Context, private val render: RenderC
         captureAspect = a.coerceIn(0.2f, 5f)
     }
 
-    /** HAL 是否支持 COLOR_CORRECTION_MODE_TRANSFORM_MATRIX（不支持则手动 WB 退回 CCT 模式） */
-    private var transformWbSupported = true
-
     fun setIso(v: Int) {
         iso = v.coerceIn(100, maxAnalogIso)
         if (manualExposure) rebuildRepeating()
@@ -241,24 +239,14 @@ class CameraController(private val context: Context, private val render: RenderC
         if (manualExposure) rebuildRepeating()
     }
 
-    /** 手动白平衡：K 色温直填（API36 走 COLOR_TEMPERATURE 键） */
+    /** 手动白平衡只存 UI 目标值：实际生效走引擎侧补偿（updateWbCompensation），不再动 HAL */
     fun setWbK(k: Int) {
-        if (!manualWb) {
-            // 进手动瞬间冻结 HAL 估计增益/估计色温/完整 AWB 矩阵（此后锚点不漂移）
-            val fallback = wbGains(if (estK > 0) estK else 6500)
-            frozenGainR = if (estGainR > 0.05f) estGainR else fallback[0]
-            frozenGainB = if (estGainB > 0.05f) estGainB else fallback[2]
-            frozenK = if (estK > 0) estK else 6500
-            frozenTransform = awbTransform
-        }
         wbK = k.coerceIn(2000, 8000)
-        manualWb = true
-        rebuildRepeating()
     }
 
     fun setAutoWb() {
-        manualWb = false
-        rebuildRepeating()
+        // 自动白平衡：清引擎补偿即可（HAL 恒 AWB AUTO）
+        clearWbCompensation()
     }
 
     private var activeArray = android.graphics.Rect(0, 0, 4096, 3072)
@@ -441,7 +429,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 对焦区域要含坐标——否则第二次点击不同位置会被当作未变化而跳过
         val fr = focusRect
         val focusSig = if (fr != null) "${fr.x},${fr.y},${fr.width}" else "null"
-        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${manualWb}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}|${flashMode}"
+        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}|${flashMode}"
         if (sig == lastApplied) return
         lastApplied = sig
         try {
@@ -455,7 +443,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 kv(
                     "evSteps" to evSteps, "ae" to (if (manualExposure) "OFF" else "AUTO"),
                     "iso" to iso, "sec" to "%.4f".format(exposureNs / 1e9f),
-                    "wb" to (if (manualWb) "${wbK}K" else "AUTO"),
+                    "wb" to "AUTO+eng",
                     "zoom" to "%.2f".format(zoomRatio), "focus" to (focusSig != "null"),
                 ),
             )
@@ -481,15 +469,11 @@ class CameraController(private val context: Context, private val render: RenderC
         private set
 
     // AWB 实时估计（仅 AWB AUTO 时更新）：优先 GAINS 纯增益，兜底矩阵对角线（带设备校准）
+    // AWB 实时估计：仅用于显示与引擎补偿基准（GAINS 结果键优先，X300 实测不回填 →
+    // 矩阵对角线 + 设备校准系数兜底）
     @Volatile private var estGainR = 0f
     @Volatile private var estGainB = 0f
     @Volatile private var estK = 0
-    // 手动锚点：进手动瞬间冻结 HAL 估计增益与估计色温（PhotonCamera ManualWhiteBalanceAnchor 策略）
-    private var frozenGainR = 0f
-    private var frozenGainB = 0f
-    private var frozenK = 0
-    @Volatile private var awbTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
-    private var frozenTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
 
     companion object {
         // 变换矩阵对角线的 CCM 常量偏差校准（X300）：由真机日光数据点推得——
@@ -524,7 +508,6 @@ class CameraController(private val context: Context, private val render: RenderC
                 }
             }
             result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
-                if (!manualWb) awbTransform = t
                 if (kEst == 0 && gR == 0f) {
                     val dr = t.getElement(0, 0).toFloat() / t.getElement(1, 1).toFloat().coerceAtLeast(1e-3f)
                     val db = t.getElement(2, 2).toFloat() / t.getElement(1, 1).toFloat().coerceAtLeast(1e-3f)
@@ -538,7 +521,7 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             if (kEst > 0) {
                 liveK = kEst
-                if (!manualWb && gR > 0f) {
+                if (gR > 0f) {
                     estGainR = gR
                     estGainB = gB
                     estK = kEst
@@ -612,68 +595,9 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
         }
-        // WB：手动 K → AWB OFF + 3x3 变换矩阵做通道增益（API36 已移除 RB_GAINS，
-        // 且 X300 HAL 实测忽略 CCT 直填——故以色温反演增益矩阵；不支持时退回 CCT 模式）
-        if (manualWb) {
-            b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-            if (transformWbSupported) {
-                fun r(f: Float) = android.util.Rational((f * 1000).toInt(), 1000)
-                // PhotonCamera ManualWhiteBalanceAnchor 策略：冻结进手动瞬间的 HAL 完整矩阵，
-                // 拖动时按 wbGains 比例对矩阵行缩放（等价于在 CCM 之前调白增益）——
-                // 锚点 ±25K 内与自动观感像素级一致；无冻结矩阵时退回对角增益
-                b.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                val ft = frozenTransform
-                if (ft != null) {
-                    val g = wbGains(wbK)
-                    val ref = wbGains(frozenK.coerceAtLeast(2000))
-                    val nearAnchor = Math.abs(wbK - frozenK) <= 25
-                    val mulR = if (nearAnchor) 1f else (g[0] / ref[0]).coerceIn(0.25f, 4f)
-                    val mulB = if (nearAnchor) 1f else (g[2] / ref[2]).coerceIn(0.25f, 4f)
-                    // HAL 报告的矩阵已含 AWB 增益（T = CCM·diag(w)），手动改白平衡要在 CCM
-                    // 之前调增益 = 缩放矩阵的**列**（v0.5.7 缩了行 = CCM 之后的通道增益 → 发绿）
-                    val els = Array(9) { android.util.Rational(0, 1) }
-                    for (col in 0..2) {
-                        val mul = when (col) {
-                            0 -> mulR
-                            2 -> mulB
-                            else -> 1f
-                        }
-                        for (row in 0..2) {
-                            els[row * 3 + col] = r(ft.getElement(col, row).toFloat() * mul)
-                        }
-                    }
-                    b.set(
-                        CaptureRequest.COLOR_CORRECTION_TRANSFORM,
-                        android.hardware.camera2.params.ColorSpaceTransform(els),
-                    )
-                } else {
-                    val g = wbGains(wbK)
-                    val ref = wbGains(frozenK.coerceAtLeast(2000))
-                    val nearAnchor = Math.abs(wbK - frozenK) <= 25
-                    val mulR = if (nearAnchor) 1f else g[0] / ref[0]
-                    val mulB = if (nearAnchor) 1f else g[2] / ref[2]
-                    b.set(
-                        CaptureRequest.COLOR_CORRECTION_TRANSFORM,
-                        android.hardware.camera2.params.ColorSpaceTransform(
-                            arrayOf(
-                                r((frozenGainR * mulR).coerceIn(0.25f, 4f)), r(0f), r(0f),
-                                r(0f), r(1f), r(0f),
-                                r(0f), r(0f), r((frozenGainB * mulB).coerceIn(0.25f, 4f)),
-                            ),
-                        ),
-                    )
-                }
-            } else {
-                b.set(
-                    CaptureRequest.COLOR_CORRECTION_MODE,
-                    CaptureRequest.COLOR_CORRECTION_MODE_CCT,
-                )
-                b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TEMPERATURE, wbK)
-                b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TINT, 0)
-            }
-        } else {
-            b.set(CaptureRequest.CONTROL_AWB_MODE, wbMode)
-        }
+        // WB 恒为 AWB AUTO：手动白平衡走引擎侧补偿（updateWbCompensation），
+        // 不再 AWB OFF + 矩阵（X300 实测 CCT 忽略、矩阵路径观感不可控）
+        b.set(CaptureRequest.CONTROL_AWB_MODE, wbMode)
         if (oisSupported) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
@@ -719,6 +643,33 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun setFilmParams(p: DoubleArray) {
         filmParams = p
+        presetWbBase = doubleArrayOf(p[1], p[2], p[3])
+    }
+
+    // 预设自带的白平衡基线（引擎补偿在其上相乘）
+    private var presetWbBase = doubleArrayOf(1.0, 1.0, 1.0)
+
+    /**
+     * 手动白平衡 = 引擎侧补偿（预览/成片同链路，行为与 HAL 解耦）：
+     * 补偿 = wbGains(目标K) / wbGains(当前自动估计K)，目标=估计时恒为 1（与自动一致）。
+     */
+    fun updateWbCompensation(targetK: Int, estK: Int) {
+        if (estK <= 0) return
+        val g = wbGains(targetK.coerceIn(2000, 8000))
+        val r = wbGains(estK.coerceIn(2000, 8000))
+        setWbCompensation(g[0] / r[0], g[2] / r[2])
+    }
+
+    fun setWbCompensation(r: Float, b: Float) {
+        filmParams[1] = (presetWbBase[0] * r.coerceIn(0.25f, 4f))
+        filmParams[2] = presetWbBase[1]
+        filmParams[3] = (presetWbBase[2] * b.coerceIn(0.25f, 4f))
+    }
+
+    fun clearWbCompensation() {
+        filmParams[1] = presetWbBase[0]
+        filmParams[2] = presetWbBase[1]
+        filmParams[3] = presetWbBase[2]
     }
 
     /** 真机二分定位开关：true 时 pass1 用梯度填充替代相机采样。 */
@@ -821,8 +772,6 @@ class CameraController(private val context: Context, private val render: RenderC
             oisSupported = it.contains(1) // 1 = ON
         }
         maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
-        transformWbSupported = ch.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_MODES)
-            ?.contains(CameraCharacteristics.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX) == true
         colorFilterArrangement = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         maxAnalogIso = ch.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY) ?: 3200
         ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()?.let {
@@ -924,6 +873,8 @@ class CameraController(private val context: Context, private val render: RenderC
                         "sensorOrientation" to sensorOrientation,
                         "ois" to oisSupported,
                         "path" to "surfacetexture+still",
+                        "evRange" to "${evRange.lower}..${evRange.upper}",
+                        "evStep" to "%.4f".format(evStep),
                     ),
                 )
             }

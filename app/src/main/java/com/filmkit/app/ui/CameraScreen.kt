@@ -222,7 +222,7 @@ fun CameraScreen(
         controller.capture()
     }
 
-    // 启动即应用选中预设与持久化的手动档（WB 走变换矩阵、AE 走手动曝光）
+    // 启动即应用选中预设与持久化的手动档（WB 走引擎补偿、AE 走手动曝光）
     LaunchedEffect(Unit) {
         controller.setFilmParams(CameraPresets.byIndex(presetIdx))
         controller.setShutterSound(soundOn)
@@ -232,7 +232,7 @@ fun CameraScreen(
             controller.setIso(iso)
             controller.setExposureNs(10f.pow(5f + 4f * shutterV).roundToLong())
         }
-        if (!wbAuto) controller.setWbK(wbK)
+        if (!wbAuto) controller.setWbK(wbK) // 补偿值由轮询按实时估计应用
     }
     DisposableEffect(Unit) {
         onRegisterVolume { doCapture() }
@@ -271,6 +271,8 @@ fun CameraScreen(
             liveNs = controller.liveExposureNs
             liveK = controller.liveK
             liveFocus = controller.liveFocusDiopter
+            // 手动 WB：补偿 = 目标K / 当前自动估计K（跟随估计移动，目标=估计时为 1）
+            if (!wbAuto && liveK > 0) controller.updateWbCompensation(wbK, liveK)
             val newUri = controller.lastPhotoUri
             if (newUri != photoUri) photoUri = newUri
         }
@@ -311,6 +313,8 @@ fun CameraScreen(
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     val maxIso = controller.maxAnalogIso
+    // EV 补偿实际范围/步进来自 characteristics（部分设备不支持负补偿，UI 自适应）
+    val (evLo, evHi, evStp) = controller.evInfo()
     // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）；
     // 比例随屏幕方向取向：竖屏 4:3 = 3:4 铺满宽度、16:9 = 9:16、XPAN = 24:65 竖长条
     val portrait = LocalConfiguration.current.orientation ==
@@ -436,8 +440,6 @@ fun CameraScreen(
                                         val maxE = (lensChips.maxOrNull() ?: focalBase.roundToInt()) * controller.maxZoom
                                         zoomEquiv = (zoomEquiv * d.scaleFactor).coerceIn(minE, maxE)
                                         controller.setZoomEquiv(zoomEquiv)
-                                        // 同步当前镜头等效焦距：否则跨镜头瞬间倍率显示 = 新焦段/旧焦段（虚高）
-                                        focalBase = controller.currentLensEquiv()
                                         return true
                                     }
                                 },
@@ -633,25 +635,36 @@ fun CameraScreen(
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val zoomMul = zoomEquiv / focalBase.coerceAtLeast(1f)
-                    if (zoomMul > 1.02f) {
+                    // 倍率 = 等效焦段 / 主摄等效（主摄=1x；70mm≈2.9x、15mm≈0.6x）
+                    val baseE = remember(lensChips) { controller.mainEquiv() }
+                    val mult = zoomEquiv / baseE.coerceAtLeast(1f)
+                    if (Math.abs(mult - 1f) > 0.03f) {
                         FilmChip(
                             selected = false,
-                            label = "×%.1f".format(zoomMul),
+                            label = "×%.1f".format(mult),
                             transparent = true,
                             onClick = {
-                                zoomEquiv = focalBase
-                                controller.setZoomEquiv(focalBase)
+                                zoomEquiv = baseE
+                                controller.setZoomEquiv(baseE)
                             },
                         )
                     }
-                    val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
+                    // 焦段条 = 启用镜头原生焦段 + 自定义焦段（≤3 个，设置页维护），总计 ≤6
+                    val customFocals = remember {
+                        prefs.getString("custom_focals", "")?.split(",")?.mapNotNull { it.toIntOrNull() }
+                            ?.sorted() ?: emptyList<Int>()
+                    }
+                    val chips = (lensChips + customFocals).distinct().sorted().take(6)
                     chips.forEach { f ->
+                        val isNative = lensChips.contains(f)
                         FilmChip(
-                            selected = focalBase.roundToInt() == f,
+                            selected = Math.abs(zoomEquiv - f) < 2f,
                             label = "$f",
                             transparent = true,
-                            onClick = { controller.setFocal(f) },
+                            onClick = {
+                                zoomEquiv = f.toFloat()
+                                if (isNative) controller.setFocal(f) else controller.setZoomEquiv(f.toFloat())
+                            },
                         )
                     }
                     Box(
@@ -768,6 +781,9 @@ fun CameraScreen(
                         liveIso = liveIso,
                         liveK = liveK,
                         maxIso = maxIso,
+                        evLo = evLo,
+                        evHi = evHi,
+                        evStp = evStp,
                         onEvDrag = { v ->
                             evAuto = false
                             ev = v
@@ -813,11 +829,12 @@ fun CameraScreen(
                             wbAuto = false
                             wbK = k
                             controller.setWbK(k)
+                            if (liveK > 0) controller.updateWbCompensation(k, liveK)
                             prefs.edit().putBoolean("wb_auto", false).putInt("wb_k", k).apply()
                         },
                         onWbAuto = {
                             wbAuto = true
-                            controller.setAutoWb()
+                            controller.setAutoWb() // 清引擎补偿，回到 HAL AWB 原样
                             prefs.edit().putBoolean("wb_auto", true).apply()
                         },
                         secText = ::secText,
@@ -1087,6 +1104,9 @@ private fun ControlPanel(
     ctrl: String?,
     maxDiopter: Float,
     liveFocusD: Float,
+    evLo: Float,
+    evHi: Float,
+    evStp: Float,
     mfOn: Boolean,
     mfDiopter: Float,
     onMfDrag: (Float) -> Unit,
@@ -1174,15 +1194,20 @@ private fun ControlPanel(
                 )
             }
             "EV" -> {
-                val f = ((ev + 4f) / 8f).coerceIn(0f, 1f)
+                // 范围/步进取自 HAL 实际能力（此前写死 ±4，部分设备负补偿无效）
+                val span = (evHi - evLo).coerceAtLeast(0.5f)
+                val f = ((ev - evLo) / span).coerceIn(0f, 1f)
                 ParamRow(
                     label = "EV",
                     auto = evAuto,
                     onAuto = onEvAuto,
                     value = (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
                     fraction = f,
-                    ticks = ticksEv,
-                    onFraction = onEvDrag,
+                    ticks = evTicks(evLo, evHi),
+                    onFraction = { fr ->
+                        val raw = evLo + fr * span
+                        onEvDrag((raw / evStp).roundToInt() * evStp)
+                    },
                 )
             }
             "WB" -> {
@@ -1332,7 +1357,12 @@ private fun TickSlider(
     }
 }
 
-private val ticksEv = listOf(0f to "-4", 0.25f to "-2", 0.5f to "0", 0.75f to "+2", 1f to "+4")
+/** EV 刻度：范围随 HAL 实际能力（5 个等分点） */
+private fun evTicks(lo: Float, hi: Float): List<Pair<Float, String>> =
+    listOf(0f, 0.25f, 0.5f, 0.75f, 1f).map { f ->
+        val v = lo + f * (hi - lo)
+        f to ((if (v >= 0f) "+" else "") + "%.1f".format(v))
+    }
 
 private val ticksTv = listOf(
     0.25f to "1/1000",

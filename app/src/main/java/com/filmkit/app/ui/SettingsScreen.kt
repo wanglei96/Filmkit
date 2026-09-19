@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
+import kotlin.math.roundToInt
 
 /**
  * 设置主页（v0.4.9 二级菜单化）：主页只放导航行与开关，
@@ -58,6 +59,7 @@ fun SettingsScreen(
     onOpenSpike: () -> Unit = {},
     onOpenLenses: () -> Unit = {},
     onOpenAccent: () -> Unit = {},
+    onOpenFocals: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
@@ -95,6 +97,7 @@ fun SettingsScreen(
                 },
             )
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
+            SettingNavRow("自定义焦段", "最多 3 个，与原生焦段同显于变焦条（总 ≤6）") { onOpenFocals() }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
@@ -340,5 +343,121 @@ private fun SettingNavRow(title: String, subtitle: String?, onTap: () -> Unit) {
             }
         }
         Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
+    }
+}
+
+/** 自定义焦段子页：最多 3 个（20–120mm，步进 5），与原生焦段同显于变焦条（总 ≤6） */
+@Composable
+fun FocalScreen(onBack: () -> Unit = {}) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+    // CSV 字符串作为可保存状态（List<Int> 不能进 Bundle）
+    var focalsCsv by rememberSaveable { mutableStateOf(prefs.getString("custom_focals", "") ?: "") }
+    val focals = focalsCsv.split(",").mapNotNull { it.toIntOrNull() }.sorted()
+    var addOpen by remember { mutableStateOf(false) }
+    var sliderV by remember { mutableStateOf(35f) }
+
+    fun save(list: List<Int>) {
+        focalsCsv = list.distinct().sorted().take(3).joinToString(",")
+        prefs.edit().putString("custom_focals", focalsCsv).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.custom_focals",
+            com.filmkit.app.kv("focals" to focalsCsv),
+        )
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(FilmTheme.Body)
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp),
+    ) {
+        SubPageTopBar("自定义焦段", onBack)
+        Text(
+            "在原生镜头焦段之外添加常用焦段（点按 = 无缝变焦到该焦段）；最多 3 个，20–120mm",
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        Spacer(Modifier.height(8.dp))
+        focals.forEach { f ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "${f}mm",
+                    color = FilmTheme.Cream,
+                    fontSize = 16.sp,
+                    fontFamily = FilmTheme.Serif,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "移除",
+                    color = FilmTheme.Accent,
+                    fontSize = 12.sp,
+                    fontFamily = FilmTheme.Mono,
+                    modifier = Modifier.clickable { save(focals - f) },
+                )
+            }
+        }
+        if (focals.size < 3) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { sliderV = 35f; addOpen = true }
+                    .padding(vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("+ 添加焦段", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
+            }
+        }
+
+        if (addOpen) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { addOpen = false },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(
+                        onClick = {
+                            save(focals + sliderV.roundToInt())
+                            addOpen = false
+                        },
+                    ) { Text("添加", color = FilmTheme.Accent) }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { addOpen = false }) {
+                        Text("取消", color = FilmTheme.CreamDim)
+                    }
+                },
+                title = { Text("添加焦段", color = FilmTheme.Cream) },
+                text = {
+                    Column {
+                        Text(
+                            "${sliderV.roundToInt()}mm",
+                            color = FilmTheme.Accent,
+                            fontSize = 24.sp,
+                            fontFamily = FilmTheme.Mono,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                        androidx.compose.material3.Slider(
+                            value = sliderV,
+                            onValueChange = { sliderV = it },
+                            valueRange = 20f..120f,
+                            steps = 19,
+                            colors = androidx.compose.material3.SliderDefaults.colors(
+                                thumbColor = FilmTheme.Cream,
+                                activeTrackColor = FilmTheme.Accent,
+                                inactiveTrackColor = FilmTheme.ChipBorder,
+                            ),
+                        )
+                    }
+                },
+                containerColor = FilmTheme.Panel,
+            )
+        }
     }
 }

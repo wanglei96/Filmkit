@@ -59,7 +59,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     var screen by rememberSaveable { mutableStateOf("camera") }
 
     BackHandler(enabled = screen != "camera") {
-        screen = if (screen == "logs" || screen == "spike" || screen == "lens" || screen == "accent") {
+        screen = if (screen in setOf("logs", "spike", "lens", "accent", "focals")) {
             "settings"
         } else {
             "camera"
@@ -73,9 +73,11 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             onOpenSpike = { screen = "spike" },
             onOpenLenses = { screen = "lens" },
             onOpenAccent = { screen = "accent" },
+            onOpenFocals = { screen = "focals" },
         )
         "lens" -> LensConfigScreen(onBack = { screen = "settings" })
         "accent" -> AccentColorScreen(onBack = { screen = "settings" })
+        "focals" -> com.filmkit.app.ui.FocalScreen(onBack = { screen = "settings" })
         "logs" -> LogScreen(onBack = { screen = "settings" })
         "spike" -> SpikeScreen(onBack = { screen = "settings" })
         else -> CameraScreen(
