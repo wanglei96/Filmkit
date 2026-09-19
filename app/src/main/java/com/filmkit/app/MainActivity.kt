@@ -1,6 +1,7 @@
 package com.filmkit.app
 
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -21,6 +22,20 @@ import com.filmkit.app.ui.SpikeScreen
 
 class MainActivity : ComponentActivity() {
 
+    /** 相机页注册的音量键拍照动作（离开相机页即注销） */
+    private var volumeCapture: (() -> Unit)? = null
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // 音量键拍照：仅在相机页拦截（volumeCapture 非空），其余页面走系统音量
+        if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&
+            volumeCapture != null
+        ) {
+            volumeCapture?.invoke()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         EngineBridge.ensureLoaded()
@@ -29,7 +44,7 @@ class MainActivity : ComponentActivity() {
         FilmTheme.setAccent(Color(prefs.getInt("accent_argb", 0xFFE8842C.toInt())))
         setContent {
             MaterialTheme {
-                FilmKitNav()
+                FilmKitNav(onRegisterVolume = { volumeCapture = it })
             }
         }
     }
@@ -40,7 +55,7 @@ class MainActivity : ComponentActivity() {
  * 左上角返回按钮逐级回退，系统 Back 键同路。子页归属：设置页各分类。
  */
 @Composable
-private fun FilmKitNav() {
+private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     var screen by rememberSaveable { mutableStateOf("camera") }
 
     BackHandler(enabled = screen != "camera") {
@@ -63,6 +78,9 @@ private fun FilmKitNav() {
         "accent" -> AccentColorScreen(onBack = { screen = "settings" })
         "logs" -> LogScreen(onBack = { screen = "settings" })
         "spike" -> SpikeScreen(onBack = { screen = "settings" })
-        else -> CameraScreen(onOpenSettings = { screen = "settings" })
+        else -> CameraScreen(
+            onOpenSettings = { screen = "settings" },
+            onRegisterVolume = onRegisterVolume,
+        )
     }
 }

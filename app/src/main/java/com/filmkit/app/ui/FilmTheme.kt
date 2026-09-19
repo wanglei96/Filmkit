@@ -35,3 +35,22 @@ object FilmTheme {
     val Mono = FontFamily.Monospace // 实测数字（ISO/快门/EV/K）
     val Serif = FontFamily.Serif // 胶片型号名
 }
+
+/**
+ * 统一浮层动效（规范：面板/菜单出入场只用这里定义的转场，禁止各自另配 tween/spring）。
+ * 滑入用 spring（有生命感），滑出用短 tween（干脆），淡入快、淡出更短。
+ */
+object FilmMotion {
+    val panelEnter = androidx.compose.animation.slideInVertically(
+        androidx.compose.animation.core.spring(dampingRatio = 0.9f, stiffness = 380f),
+    ) { it / 2 } + androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(90))
+    val panelExit = androidx.compose.animation.slideOutVertically(
+        androidx.compose.animation.core.tween(150),
+    ) { it / 2 } + androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(110))
+    val dropEnter = androidx.compose.animation.slideInVertically(
+        androidx.compose.animation.core.spring(dampingRatio = 0.9f, stiffness = 380f),
+    ) { -it / 3 } + androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(90))
+    val dropExit = androidx.compose.animation.slideOutVertically(
+        androidx.compose.animation.core.tween(150),
+    ) { -it / 3 } + androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(110))
+}

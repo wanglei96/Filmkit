@@ -242,6 +242,11 @@ class CameraController(private val context: Context, private val render: RenderC
     var maxZoom = 1f
         private set
 
+    /** 最近一张成片的 MediaStore URI（胶卷位缩略图用）；API<29 分支不记录 */
+    @Volatile
+    var lastPhotoUri: android.net.Uri? = null
+        private set
+
     /** 等效 EV 范围与步进（UI 滑杆用） */
     fun evInfo(): Triple<Float, Float, Float> =
         Triple(evRange.lower * evStep, evRange.upper * evStep, evStep)
@@ -757,6 +762,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 context.contentResolver
                     .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                     ?.let { uri ->
+                        lastPhotoUri = uri
                         context.contentResolver.openOutputStream(uri)?.use {
                             bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
                         }

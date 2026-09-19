@@ -3,26 +3,30 @@ package com.filmkit.app.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -46,6 +50,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -70,10 +75,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
@@ -91,13 +100,16 @@ import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.log10
@@ -106,15 +118,19 @@ import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 
 /**
- * M 档专业拍摄界面（方向 C 定稿，v0.5.0）。
- * 顶部快捷设置区：闪光灯（关/自动/开）、实时直方图开关、快门声音开关、菜单（一级悬浮窗：
- * 画幅 4:3/16:9/XPAN + 更多设置）。参数模型：EV / AE(Tv+ISO) / WB 三组独立 A/手动；
- * 拖刻度条进手动，点 A 回自动（线性过渡）；自动挡瓦片显示实时读数。
- * 组件与颜色规范见 docs/开发计划.md「UI 设计规范」。
+ * M 档专业拍摄界面（方向 C 定稿，v0.5.1）。
+ * 顶部快捷设置区：闪光灯 / 实时直方图 / 构图线 / 快门声 / 菜单（画幅 + 更多设置）。
+ * 参数模型：EV / AE(Tv+ISO) / WB 独立 A/手动，拖刻度进手动、点 A 线性回自动。
+ * 交互反馈：快门触感+黑闪+按钮脉冲、全局按压缩放、捏合变焦、音量键拍照。
+ * 规范见 docs/开发计划.md「UI 设计规范」。
  */
 @Composable
-fun CameraScreen(onOpenSettings: () -> Unit = {}) {
+fun CameraScreen(
+    onOpenSettings: () -> Unit = {},
+    onRegisterVolume: ((() -> Unit)?) -> Unit = {},
+) {
     val context = LocalContext.current
+    val androidView = LocalView.current
     var hasPerm by rememberSaveable {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -159,12 +175,11 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
     var quickOpen by rememberSaveable { mutableStateOf(false) } // 一级悬浮窗（画幅+更多设置）
     var lutOpen by rememberSaveable { mutableStateOf(false) } // LUT 二级菜单
-    // 顶部快捷区状态：闪光灯会话内有效；直方图/快门声持久化
     var flashMode by rememberSaveable { mutableIntStateOf(0) }
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
+    var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
     var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
     var aspect by rememberSaveable { mutableStateOf("4:3") }
-    // A(自动)/手动状态：EV 与 AE(Tv+ISO 联动，Camera2 AE OFF 同时定死两参数)、WB 各自独立
     var evAuto by rememberSaveable { mutableStateOf(true) }
     var aeAuto by rememberSaveable { mutableStateOf(true) }
     var wbAuto by rememberSaveable { mutableStateOf(true) }
@@ -178,11 +193,25 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     var liveK by remember { mutableIntStateOf(0) }
     var boxW by remember { mutableIntStateOf(1) }
     var boxH by remember { mutableIntStateOf(1) }
+    var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
+    var currentZoom by remember { mutableFloatStateOf(1f) } // 捏合变焦显示值
+    var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
+    var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
-    // 启动即应用选中预设，保证界面选中态与引擎参数一致
+    fun doCapture() {
+        androidView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        captureTick++
+        controller.capture()
+    }
+
+    // 启动即应用选中预设；注册音量键拍照
     LaunchedEffect(Unit) {
         controller.setFilmParams(CameraPresets.byIndex(presetIdx))
         controller.setShutterSound(soundOn)
+    }
+    DisposableEffect(Unit) {
+        onRegisterVolume { doCapture() }
+        onDispose { onRegisterVolume(null) }
     }
 
     DisposableEffect(Unit) {
@@ -216,7 +245,39 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             liveIso = controller.liveIso
             liveNs = controller.liveExposureNs
             liveK = controller.liveK
+            val newUri = controller.lastPhotoUri
+            if (newUri != photoUri) photoUri = newUri
         }
+    }
+
+    // 换镜头后变焦比例回到 1x（控制器侧同样复位）
+    LaunchedEffect(focalBase) {
+        currentZoom = 1f
+        controller.setZoom(1f)
+    }
+
+    // 快门黑闪 + 快门钮脉冲
+    val shutterAlpha = remember { Animatable(0f) }
+    val shutterPulse = remember { Animatable(1f) }
+    LaunchedEffect(captureTick) {
+        if (captureTick == 0) return@LaunchedEffect
+        shutterAlpha.snapTo(0.85f)
+        shutterAlpha.animateTo(0f, tween(durationMillis = 190, easing = LinearEasing))
+        shutterPulse.snapTo(0.86f)
+        shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f))
+    }
+
+    // 最近成片缩略图（保存完成后 lastPhotoUri 才会更新，此时文件已就绪）
+    LaunchedEffect(photoUri) {
+        val uri = photoUri ?: return@LaunchedEffect
+        val bmp = withContext(Dispatchers.IO) {
+            try {
+                context.contentResolver.loadThumbnail(uri, android.util.Size(128, 128), null)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        thumb = bmp?.asImageBitmap()
     }
 
     fun secText(ns: Long): String =
@@ -238,7 +299,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             .background(FilmTheme.Body)
             .statusBarsPadding(),
     ) {
-        // ── 顶部快捷设置区：闪光灯 · 直方图 · 快门声 · 菜单 ──
+        // ── 顶部快捷设置区：闪光灯 · 直方图 · 构图线 · 快门声 · 菜单 ──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -267,6 +328,18 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "app", "quick.histogram",
                     "{\"on\":$histOn}",
+                )
+            }
+            TopQuickIcon(
+                icon = Icons.Filled.GridOn,
+                tint = if (gridOn) FilmTheme.Accent else FilmTheme.CreamDim,
+                desc = "构图线",
+            ) {
+                gridOn = !gridOn
+                prefs.edit().putBoolean("grid", gridOn).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "quick.grid",
+                    "{\"on\":$gridOn}",
                 )
             }
             TopQuickIcon(
@@ -306,14 +379,40 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 AndroidView(
                     factory = { c ->
                         SurfaceView(c).apply {
-                            // 触屏对焦：SurfaceView 原生触摸（Compose 手势部分机型不送达）。
+                            var pinching = false
+                            val pinch = ScaleGestureDetector(
+                                c,
+                                object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                                    override fun onScaleBegin(d: ScaleGestureDetector): Boolean {
+                                        pinching = true
+                                        return true
+                                    }
+
+                                    override fun onScale(d: ScaleGestureDetector): Boolean {
+                                        currentZoom =
+                                            (currentZoom * d.scaleFactor).coerceIn(1f, controller.maxZoom)
+                                        controller.setZoom(currentZoom)
+                                        return true
+                                    }
+                                },
+                            )
+                            // 触屏对焦 + 捏合变焦：SurfaceView 原生触摸（Compose 手势部分机型不送达）。
                             // 必须消费事件（true），否则 ACTION_UP 不会送达本视图，对焦永不触发
-                            setOnTouchListener { _, e ->
-                                if (e.action == MotionEvent.ACTION_UP) {
-                                    val nx = (e.x / width).coerceIn(0f, 1f)
-                                    val ny = (e.y / height).coerceIn(0f, 1f)
-                                    controller.focusAt(nx, ny)
-                                    focusMark = nx to ny
+                            setOnTouchListener { v, e ->
+                                pinch.onTouchEvent(e)
+                                when (e.actionMasked) {
+                                    MotionEvent.ACTION_POINTER_DOWN -> pinching = true
+                                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                        val wasPinching = pinching
+                                        pinching = false
+                                        if (e.actionMasked == MotionEvent.ACTION_UP && !wasPinching) {
+                                            val nx = (e.x / width).coerceIn(0f, 1f)
+                                            val ny = (e.y / height).coerceIn(0f, 1f)
+                                            controller.focusAt(nx, ny)
+                                            focusMark = nx to ny
+                                            v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                        }
+                                    }
                                 }
                                 true
                             }
@@ -340,6 +439,11 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     modifier = Modifier.fillMaxSize(),
                 )
 
+                // 快门黑闪（模拟机械快门，覆盖画面但保留机框线）
+                if (shutterAlpha.value > 0.01f) {
+                    Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
+                }
+
                 // 圆角机框：SurfaceView 不响应 Compose clip，用机身色环带遮出圆角 + 奶油细线勾边
                 Canvas(Modifier.matchParentSize()) {
                     val inset = 5.dp.toPx()
@@ -362,6 +466,28 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                         cornerRadius = CornerRadius(radius, radius),
                         style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
+                }
+
+                // 三分构图线
+                if (gridOn) {
+                    Canvas(Modifier.matchParentSize()) {
+                        val c = FilmTheme.Cream.copy(alpha = 0.28f)
+                        val w = 1.dp.toPx()
+                        for (i in 1..2) {
+                            drawLine(
+                                c,
+                                Offset(size.width * i / 3f, 0f),
+                                Offset(size.width * i / 3f, size.height),
+                                w,
+                            )
+                            drawLine(
+                                c,
+                                Offset(0f, size.height * i / 3f),
+                                Offset(size.width, size.height * i / 3f),
+                                w,
+                            )
+                        }
+                    }
                 }
 
                 // 实时直方图（开关；渲染链路 M3 接入，当前为占位）
@@ -412,6 +538,17 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    if (currentZoom > 1.02f) {
+                        FilmChip(
+                            selected = false,
+                            label = "×%.1f".format(currentZoom),
+                            transparent = true,
+                            onClick = {
+                                currentZoom = 1f
+                                controller.setZoom(1f)
+                            },
+                        )
+                    }
                     val chips = lensChips.ifEmpty { listOf(focalBase.roundToInt()) }
                     chips.forEach { f ->
                         FilmChip(
@@ -431,7 +568,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     Column(
                         Modifier
                             .padding(horizontal = 4.dp)
-                            .pointerInput(Unit) { detectTapGestures { lutOpen = !lutOpen } },
+                            .pressScale(onTap = { lutOpen = !lutOpen }),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text(
@@ -453,8 +590,8 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 // 参数面板：全局单实例，状态驱动显隐
                 androidx.compose.animation.AnimatedVisibility(
                     visible = selectedControl != null,
-                    enter = slideInVertically { it / 2 } + fadeIn(),
-                    exit = slideOutVertically { it / 2 } + fadeOut(),
+                    enter = FilmMotion.panelEnter,
+                    exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(horizontal = 12.dp, vertical = 60.dp),
@@ -527,8 +664,8 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 }
                 androidx.compose.animation.AnimatedVisibility(
                     visible = lutOpen,
-                    enter = fadeIn() + slideInVertically { it / 4 },
-                    exit = fadeOut() + slideOutVertically { it / 4 },
+                    enter = FilmMotion.panelEnter,
+                    exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(horizontal = 14.dp, vertical = 64.dp),
@@ -553,8 +690,8 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                 }
                 androidx.compose.animation.AnimatedVisibility(
                     visible = quickOpen,
-                    enter = fadeIn() + slideInVertically { -it / 6 },
-                    exit = fadeOut() + slideOutVertically { -it / 6 },
+                    enter = FilmMotion.dropEnter,
+                    exit = FilmMotion.dropExit,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(end = 10.dp, top = 8.dp),
@@ -586,6 +723,7 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             fun toggle(c: String) {
+                androidView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                 selectedControl = if (selectedControl == c) null else c
             }
             val expActive = selectedControl == "EXP"
@@ -597,7 +735,8 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     evAuto -> TileState.AUTO
                     else -> TileState.MANUAL
                 },
-            ) { toggle("EV") }
+                onTap = { toggle("EV") },
+            )
             ControlTile(
                 value = if (aeAuto) (if (liveNs > 0) secText(liveNs) else "--") else secText(shutterNs),
                 label = "Tv",
@@ -606,7 +745,8 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     aeAuto -> TileState.AUTO
                     else -> TileState.MANUAL
                 },
-            ) { toggle("EXP") }
+                onTap = { toggle("EXP") },
+            )
             ControlTile(
                 value = if (aeAuto) (if (liveIso > 0) "$liveIso" else "--") else "$iso",
                 label = "ISO",
@@ -615,12 +755,14 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     aeAuto -> TileState.AUTO
                     else -> TileState.MANUAL
                 },
-            ) { toggle("EXP") }
+                onTap = { toggle("EXP") },
+            )
             ControlTile(
                 value = "AUTO",
                 label = "AF",
                 state = if (selectedControl == "AF") TileState.ACTIVE else TileState.AUTO,
-            ) { toggle("AF") }
+                onTap = { toggle("AF") },
+            )
             ControlTile(
                 value = if (wbAuto) (if (liveK > 0) "${liveK}K" else "AUTO") else "${wbK}K",
                 label = "WB",
@@ -629,10 +771,11 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
                     wbAuto -> TileState.AUTO
                     else -> TileState.MANUAL
                 },
-            ) { toggle("WB") }
+                onTap = { toggle("WB") },
+            )
         }
 
-        // ── 底部：胶卷位（相册接入前占位）· 快门 · 预留翻转位 ──
+        // ── 底部：胶卷位（最近样张）· 快门 · 预留翻转位 ──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -640,20 +783,36 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
+            val t = thumb
             Box(
                 Modifier
                     .size(44.dp)
-                    .alpha(0.35f),
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(FilmTheme.ChipBg)
+                    .alpha(if (t == null) 0.5f else 1f),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("▦", color = FilmTheme.Cream, fontSize = 22.sp)
+                if (t != null) {
+                    Image(
+                        bitmap = t,
+                        contentDescription = "最近样张",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Text("▦", color = FilmTheme.Cream, fontSize = 20.sp)
+                }
             }
             Box(
                 Modifier
                     .size(72.dp)
+                    .graphicsLayer {
+                        scaleX = shutterPulse.value
+                        scaleY = shutterPulse.value
+                    }
+                    .pressScale(onTap = { doCapture() }, pressedScale = 0.94f)
                     .clip(CircleShape)
-                    .border(4.dp, FilmTheme.Cream, CircleShape)
-                    .pointerInput(Unit) { detectTapGestures { controller.capture() } },
+                    .border(4.dp, FilmTheme.Cream, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
@@ -668,13 +827,30 @@ fun CameraScreen(onOpenSettings: () -> Unit = {}) {
     }
 }
 
+/**
+ * 按压缩放 + 波纹点击（规范：自绘可点元素一律用本修饰符，保证「按下有反应」）。
+ * 仅供 @Composable 上下文使用。
+ */
+@Composable
+private fun Modifier.pressScale(pressedScale: Float = 0.92f, onTap: () -> Unit): Modifier {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val s = if (pressed) pressedScale else 1f
+    return this
+        .graphicsLayer {
+            scaleX = s
+            scaleY = s
+        }
+        .clickable(interactionSource = interaction, indication = ripple(bounded = false), onClick = onTap)
+}
+
 /** 顶部快捷区图标钮：40dp 点击区，强调色=开启态 */
 @Composable
 private fun TopQuickIcon(icon: ImageVector, tint: Color, desc: String, onTap: () -> Unit) {
     Box(
         Modifier
             .size(40.dp)
-            .pointerInput(desc) { detectTapGestures { onTap() } },
+            .pressScale(onTap = onTap, pressedScale = 0.85f),
         contentAlignment = Alignment.Center,
     ) {
         Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(21.dp))
@@ -683,7 +859,7 @@ private fun TopQuickIcon(icon: ImageVector, tint: Color, desc: String, onTap: ()
 
 private enum class TileState { AUTO, MANUAL, ACTIVE }
 
-/** 底部控制瓦片：上实时读数/设定值、下标签；AUTO 次级色 / MANUAL 奶油白 / ACTIVE 强调色+下划线 */
+/** 底部控制瓦片：自动挡实时读数（次级色）、手动设定值（奶油白）、ACTIVE 强调色+下划线 */
 @Composable
 private fun ControlTile(value: String, label: String, state: TileState, onTap: () -> Unit) {
     val color = when (state) {
@@ -694,7 +870,7 @@ private fun ControlTile(value: String, label: String, state: TileState, onTap: (
     Column(
         Modifier
             .width(62.dp)
-            .pointerInput(Unit) { detectTapGestures { onTap() } },
+            .pressScale(onTap = onTap, pressedScale = 0.9f),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
@@ -864,10 +1040,10 @@ private fun AChip(active: Boolean, onTap: () -> Unit) {
     Box(
         Modifier
             .size(30.dp)
+            .pressScale(onTap = onTap, pressedScale = 0.85f)
             .clip(CircleShape)
             .background(if (active) FilmTheme.Accent else Color.Transparent)
-            .border(1.dp, if (active) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape)
-            .pointerInput(Unit) { detectTapGestures { onTap() } },
+            .border(1.dp, if (active) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape),
         contentAlignment = Alignment.Center,
     ) {
         Text(
@@ -1000,7 +1176,7 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .pointerInput(i) { detectTapGestures { onPick(i) } }
+                    .clickable { onPick(i) }
                     .padding(vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -1075,7 +1251,7 @@ private fun QuickDropdown(
         Row(
             Modifier
                 .fillMaxWidth()
-                .pointerInput(Unit) { detectTapGestures { onMoreSettings() } }
+                .clickable { onMoreSettings() }
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -1095,7 +1271,7 @@ fun SubPageTopBar(title: String, onBack: () -> Unit) {
         Box(
             Modifier
                 .size(44.dp)
-                .pointerInput(Unit) { detectTapGestures { onBack() } },
+                .clickable { onBack() },
             contentAlignment = Alignment.Center,
         ) {
             Icon(
