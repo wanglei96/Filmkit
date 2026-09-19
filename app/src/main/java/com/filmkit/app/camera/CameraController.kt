@@ -216,6 +216,13 @@ class CameraController(private val context: Context, private val render: RenderC
         shutterSound = on
     }
 
+    /** 手动对焦量程上限（屈光度）：HAL 上报 0 时用 10D 试值 */
+    val maxDiopter: Float
+        get() = minFocusDiopter.coerceAtLeast(1f)
+
+    /** HAL 是否支持 COLOR_CORRECTION_MODE_TRANSFORM_MATRIX（不支持则手动 WB 退回 CCT 模式） */
+    private var transformWbSupported = true
+
     fun setIso(v: Int) {
         iso = v.coerceIn(100, maxAnalogIso)
         if (manualExposure) rebuildRepeating()
@@ -307,9 +314,72 @@ class CameraController(private val context: Context, private val render: RenderC
         rebuildRepeating()
     }
 
+    /**
+     * 无缝变焦：目标 35mm 等效焦段。等效焦段跨过其它镜头的等效焦距时自动切换物理镜头
+     * （选法与 setFocal 一致），zoomRatio 按目标镜头归一（参考 PhotonCamera）。
+     */
+    fun setZoomEquiv(targetEquiv: Float) {
+        if (backLenses.size < 2) {
+            backLenses = LensDiscovery.discoverBackLenses(
+                context.getSystemService(Context.CAMERA_SERVICE) as CameraManager,
+                context.getSharedPreferences("filmkit", 0),
+            )
+        }
+        val pool = enabledLenses().ifEmpty { backLenses }
+        if (pool.isEmpty()) return
+        val lens = pool.filter { it.equivMm <= targetEquiv * 1.05f }.maxByOrNull { it.equivMm }
+            ?: pool.minByOrNull { it.equivMm }
+            ?: return
+        val idx = backLenses.indexOf(lens)
+        val newRatio = (targetEquiv / lens.equivMm).coerceIn(1f, maxZoom)
+        if (idx != activeLensIdx) {
+            zoomRatio = newRatio
+            activeLensIdx = idx
+            started = false
+            stopInternalKeepClient()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "zoom_equiv.lens_switch",
+                kv("equiv" to "%.1f".format(targetEquiv), "lens" to lens.id,
+                    "lensEquiv" to "%.0f".format(lens.equivMm), "zoom" to "%.2f".format(newRatio)),
+            )
+            openCamera(lens.id)
+        } else if (Math.abs(newRatio - zoomRatio) >= 0.01f) {
+            zoomRatio = newRatio
+            rebuildRepeating()
+        }
+    }
+
     fun setEv(ev: Float) {
         evSteps = (ev / evStep).toInt().coerceIn(evRange.lower, evRange.upper)
         rebuildRepeating()
+    }
+
+    /** 色温 → 通道增益（R/G/B，G 归一）：黑体色度取反即白平衡增益，钳制防过冲 */
+    private fun wbGains(kelvin: Int): FloatArray {
+        val t = kelvin.coerceIn(1500, 12000) / 100.0
+        val r: Double
+        val g: Double
+        val b: Double
+        if (t <= 66) {
+            r = 255.0
+            g = 99.4708025861 * Math.log(t) - 161.1195681661
+        } else {
+            r = 329.698727446 * Math.pow(t - 60, -0.1332047592)
+            g = 288.1221695283 * Math.pow(t - 60, -0.0755148492)
+        }
+        b = when {
+            t >= 66 -> 255.0
+            t <= 19 -> 0.0
+            else -> 138.5177312231 * Math.log(t - 10) - 305.0447927307
+        }
+        val rn = r.coerceIn(0.0, 255.0)
+        val gn = g.coerceIn(0.0, 255.0)
+        val bn = b.coerceIn(0.0, 255.0).coerceAtLeast(1.0)
+        return floatArrayOf(
+            (gn / rn).toFloat().coerceIn(0.3f, 3f),
+            1f,
+            (gn / bn).toFloat().coerceIn(0.3f, 3f),
+        )
     }
 
     fun setWb(mode: Int) {
@@ -449,15 +519,35 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
         }
-        // WB：手动 K → 色温直填（API36 已移除 RB_GAINS 键）；否则 AWB 场景模式
+        // WB：手动 K → AWB OFF + 3x3 变换矩阵做通道增益（API36 已移除 RB_GAINS，
+        // 且 X300 HAL 实测忽略 CCT 直填——故以色温反演增益矩阵；不支持时退回 CCT 模式）
         if (manualWb) {
             b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-            b.set(
-                CaptureRequest.COLOR_CORRECTION_MODE,
-                CaptureRequest.COLOR_CORRECTION_MODE_CCT,
-            )
-            b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TEMPERATURE, wbK)
-            b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TINT, 0)
+            if (transformWbSupported) {
+                val g = wbGains(wbK)
+                fun r(f: Float) = android.util.Rational((f * 1000).toInt(), 1000)
+                b.set(
+                    CaptureRequest.COLOR_CORRECTION_MODE,
+                    CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
+                )
+                b.set(
+                    CaptureRequest.COLOR_CORRECTION_TRANSFORM,
+                    android.hardware.camera2.params.ColorSpaceTransform(
+                        arrayOf(
+                            r(g[0]), r(0f), r(0f),
+                            r(0f), r(1f), r(0f),
+                            r(0f), r(0f), r(g[2]),
+                        ),
+                    ),
+                )
+            } else {
+                b.set(
+                    CaptureRequest.COLOR_CORRECTION_MODE,
+                    CaptureRequest.COLOR_CORRECTION_MODE_CCT,
+                )
+                b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TEMPERATURE, wbK)
+                b.set(CaptureRequest.COLOR_CORRECTION_COLOR_TINT, 0)
+            }
         } else {
             b.set(CaptureRequest.CONTROL_AWB_MODE, wbMode)
         }
@@ -608,6 +698,8 @@ class CameraController(private val context: Context, private val render: RenderC
             oisSupported = it.contains(1) // 1 = ON
         }
         maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        transformWbSupported = ch.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_MODES)
+            ?.contains(CameraCharacteristics.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX) == true
         colorFilterArrangement = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         maxAnalogIso = ch.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY) ?: 3200
         ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()?.let {

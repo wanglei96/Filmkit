@@ -82,6 +82,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -180,13 +181,16 @@ fun CameraScreen(
     var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
     var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
     var aspect by rememberSaveable { mutableStateOf("4:3") }
-    var evAuto by rememberSaveable { mutableStateOf(true) }
-    var aeAuto by rememberSaveable { mutableStateOf(true) }
-    var wbAuto by rememberSaveable { mutableStateOf(true) }
-    var iso by rememberSaveable { mutableIntStateOf(100) }
-    var shutterV by rememberSaveable { mutableFloatStateOf(0.75f) }
-    var ev by rememberSaveable { mutableStateOf(0f) }
-    var wbK by rememberSaveable { mutableIntStateOf(5000) }
+    // A/手动状态持久化（重启不丢手动档），初始值读 prefs
+    var evAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("ev_auto", true)) }
+    var aeAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("ae_auto", true)) }
+    var wbAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("wb_auto", true)) }
+    var iso by rememberSaveable { mutableIntStateOf(prefs.getInt("iso", 100)) }
+    var shutterV by rememberSaveable { mutableFloatStateOf(prefs.getFloat("shutter_v", 0.75f)) }
+    var ev by rememberSaveable { mutableStateOf(prefs.getFloat("ev", 0f)) }
+    var wbK by rememberSaveable { mutableIntStateOf(prefs.getInt("wb_k", 5000)) }
+    var mfOn by rememberSaveable { mutableStateOf(false) } // 手动对焦（会话内）
+    var mfDiopter by rememberSaveable { mutableFloatStateOf(0f) }
     var focusMark by remember { mutableStateOf<Pair<Float, Float>?>(null) }
     var liveIso by remember { mutableIntStateOf(0) }
     var liveNs by remember { mutableLongStateOf(0L) }
@@ -194,7 +198,8 @@ fun CameraScreen(
     var boxW by remember { mutableIntStateOf(1) }
     var boxH by remember { mutableIntStateOf(1) }
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
-    var currentZoom by remember { mutableFloatStateOf(1f) } // 捏合变焦显示值
+    var zoomEquiv by remember { mutableFloatStateOf(24f) } // 捏合变焦目标（35mm 等效焦段）
+    var pinching by remember { mutableStateOf(false) }
     var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
@@ -204,10 +209,17 @@ fun CameraScreen(
         controller.capture()
     }
 
-    // 启动即应用选中预设；注册音量键拍照
+    // 启动即应用选中预设与持久化的手动档（WB 走变换矩阵、AE 走手动曝光）
     LaunchedEffect(Unit) {
         controller.setFilmParams(CameraPresets.byIndex(presetIdx))
         controller.setShutterSound(soundOn)
+        if (!evAuto) controller.setEv(ev)
+        if (!aeAuto) {
+            controller.setManualExposure(true)
+            controller.setIso(iso)
+            controller.setExposureNs(10f.pow(5f + 4f * shutterV).roundToLong())
+        }
+        if (!wbAuto) controller.setWbK(wbK)
     }
     DisposableEffect(Unit) {
         onRegisterVolume { doCapture() }
@@ -250,10 +262,9 @@ fun CameraScreen(
         }
     }
 
-    // 换镜头后变焦比例回到 1x（控制器侧同样复位）
+    // 镜头变化（点焦段条/跨镜头变焦）后同步等效变焦基准；捏合进行中不打断
     LaunchedEffect(focalBase) {
-        currentZoom = 1f
-        controller.setZoom(1f)
+        if (!pinching) zoomEquiv = focalBase
     }
 
     // 快门黑闪 + 快门钮脉冲
@@ -286,11 +297,15 @@ fun CameraScreen(
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     val maxIso = controller.maxAnalogIso
-    val aspectF = when (aspect) {
-        "16:9" -> 9f / 16f
+    // 画幅 = 4:3 流内的裁切显示窗（预览流恒 4:3 不拉伸，16:9/XPAN 只显示对应裁切区域）
+    // TODO(M3): 成片裁切跟随画幅（当前仅取景显示比例）
+    val visAspect = when (aspect) {
+        "16:9" -> 16f / 9f
         "XPAN" -> 65f / 24f
-        else -> 3f / 4f
+        else -> 4f / 3f
     }
+    val density = LocalDensity.current
+    val maskPad = with(density) { ((boxH - boxW / visAspect) / 2f).coerceAtLeast(0f).toDp() }
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下
     Column(
@@ -373,7 +388,7 @@ fun CameraScreen(
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .aspectRatio(aspectF)
+                    .aspectRatio(3f / 4f)
                     .onSizeChanged { boxW = it.width; boxH = it.height },
             ) {
                 AndroidView(
@@ -389,9 +404,11 @@ fun CameraScreen(
                                     }
 
                                     override fun onScale(d: ScaleGestureDetector): Boolean {
-                                        currentZoom =
-                                            (currentZoom * d.scaleFactor).coerceIn(1f, controller.maxZoom)
-                                        controller.setZoom(currentZoom)
+                                        // 目标为 35mm 等效焦段：跨过其它镜头等效焦距时自动切换物理镜头
+                                        val minE = (lensChips.minOrNull() ?: focalBase.roundToInt()).toFloat()
+                                        val maxE = (lensChips.maxOrNull() ?: focalBase.roundToInt()) * controller.maxZoom
+                                        zoomEquiv = (zoomEquiv * d.scaleFactor).coerceIn(minE, maxE)
+                                        controller.setZoomEquiv(zoomEquiv)
                                         return true
                                     }
                                 },
@@ -444,16 +461,18 @@ fun CameraScreen(
                     Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
                 }
 
-                // 圆角机框：SurfaceView 不响应 Compose clip，用机身色环带遮出圆角 + 奶油细线勾边
+                // 机框遮罩：遮出 4:3 流内所选画幅的可见裁切窗（消除 16:9/XPAN 硬拉伸）+ 圆角勾边
                 Canvas(Modifier.matchParentSize()) {
                     val inset = 5.dp.toPx()
                     val radius = 22.dp.toPx()
+                    val visH = size.width / visAspect
+                    val top = (size.height - visH) / 2f
                     val frame = Path().apply {
                         fillType = PathFillType.EvenOdd
                         addRect(Rect(0f, 0f, size.width, size.height))
                         addRoundRect(
                             RoundRect(
-                                Rect(inset, inset, size.width - inset, size.height - inset),
+                                Rect(inset, top + inset, size.width - inset, top + visH - inset),
                                 CornerRadius(radius, radius),
                             ),
                         )
@@ -461,29 +480,31 @@ fun CameraScreen(
                     drawPath(frame, FilmTheme.Body)
                     drawRoundRect(
                         color = FilmTheme.CreamDim.copy(alpha = 0.35f),
-                        topLeft = Offset(inset, inset),
-                        size = Size(size.width - inset * 2, size.height - inset * 2),
+                        topLeft = Offset(inset, top + inset),
+                        size = Size(size.width - inset * 2, visH - inset * 2),
                         cornerRadius = CornerRadius(radius, radius),
                         style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
                 }
 
-                // 三分构图线
+                // 三分构图线（画在可见裁切窗内）
                 if (gridOn) {
                     Canvas(Modifier.matchParentSize()) {
                         val c = FilmTheme.Cream.copy(alpha = 0.28f)
                         val w = 1.dp.toPx()
+                        val visH = size.width / visAspect
+                        val top = (size.height - visH) / 2f
                         for (i in 1..2) {
                             drawLine(
                                 c,
-                                Offset(size.width * i / 3f, 0f),
-                                Offset(size.width * i / 3f, size.height),
+                                Offset(size.width * i / 3f, top),
+                                Offset(size.width * i / 3f, top + visH),
                                 w,
                             )
                             drawLine(
                                 c,
-                                Offset(0f, size.height * i / 3f),
-                                Offset(size.width, size.height * i / 3f),
+                                Offset(0f, top + visH * i / 3f),
+                                Offset(size.width, top + visH * i / 3f),
                                 w,
                             )
                         }
@@ -495,7 +516,7 @@ fun CameraScreen(
                     Box(
                         Modifier
                             .align(Alignment.TopStart)
-                            .padding(start = 14.dp, top = 12.dp)
+                            .padding(start = 14.dp, top = maskPad + 12.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(FilmTheme.Panel)
                             .padding(horizontal = 10.dp, vertical = 6.dp),
@@ -528,24 +549,25 @@ fun CameraScreen(
                     )
                 }
 
-                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘
+                // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘（锚定裁切窗底边）
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 10.dp, vertical = 12.dp)
+                        .padding(start = 10.dp, end = 10.dp, bottom = maskPad + 12.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (currentZoom > 1.02f) {
+                    val zoomMul = zoomEquiv / focalBase.coerceAtLeast(1f)
+                    if (zoomMul > 1.02f) {
                         FilmChip(
                             selected = false,
-                            label = "×%.1f".format(currentZoom),
+                            label = "×%.1f".format(zoomMul),
                             transparent = true,
                             onClick = {
-                                currentZoom = 1f
-                                controller.setZoom(1f)
+                                zoomEquiv = focalBase
+                                controller.setZoomEquiv(focalBase)
                             },
                         )
                     }
@@ -594,10 +616,23 @@ fun CameraScreen(
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 12.dp, vertical = 60.dp),
+                        .padding(start = 12.dp, end = 12.dp, bottom = maskPad + 58.dp),
                 ) {
                     ControlPanel(
                         ctrl = selectedControl,
+                        maxDiopter = controller.maxDiopter,
+                        mfOn = mfOn,
+                        mfDiopter = mfDiopter,
+                        onMfDrag = { f ->
+                            mfOn = true
+                            mfDiopter = f * controller.maxDiopter
+                            controller.setManualFocus(true)
+                            controller.setFocusDiopter(mfDiopter)
+                        },
+                        onMfAuto = {
+                            mfOn = false
+                            controller.setManualFocus(false)
+                        },
                         evAuto = evAuto,
                         aeAuto = aeAuto,
                         wbAuto = wbAuto,
@@ -613,42 +648,53 @@ fun CameraScreen(
                             evAuto = false
                             ev = v
                             controller.setEv(v)
+                            prefs.edit().putBoolean("ev_auto", false).putFloat("ev", v).apply()
                         },
                         onEvAuto = {
                             evAuto = true
                             ev = 0f
                             controller.setEv(0f)
+                            prefs.edit().putBoolean("ev_auto", true).putFloat("ev", 0f).apply()
                         },
                         onTvDrag = { f ->
                             // AE OFF 会同时锁快门与 ISO：从 A 进入时把另一参数冻结在当前实测值
-                            if (aeAuto && liveIso > 0) iso = liveIso.coerceIn(100, maxIso)
+                            if (aeAuto && liveIso > 0) {
+                                iso = liveIso.coerceIn(100, maxIso)
+                                prefs.edit().putInt("iso", iso).apply()
+                            }
                             aeAuto = false
                             shutterV = f
                             controller.setManualExposure(true)
                             controller.setExposureNs(10f.pow(5f + 4f * f).roundToLong())
+                            prefs.edit().putBoolean("ae_auto", false).putFloat("shutter_v", f).apply()
                         },
                         onIsoDrag = { i ->
                             if (aeAuto && liveNs > 0) {
                                 val nsF = liveNs.coerceIn(100_000L, 1_000_000_000L).toFloat()
                                 shutterV = ((log10(nsF) - 5f) / 4f).coerceIn(0f, 1f)
+                                prefs.edit().putFloat("shutter_v", shutterV).apply()
                             }
                             aeAuto = false
                             iso = i
                             controller.setManualExposure(true)
                             controller.setIso(i)
+                            prefs.edit().putBoolean("ae_auto", false).putInt("iso", i).apply()
                         },
                         onAeAuto = {
                             aeAuto = true
                             controller.setManualExposure(false)
+                            prefs.edit().putBoolean("ae_auto", true).apply()
                         },
                         onWbDrag = { k ->
                             wbAuto = false
                             wbK = k
                             controller.setWbK(k)
+                            prefs.edit().putBoolean("wb_auto", false).putInt("wb_k", k).apply()
                         },
                         onWbAuto = {
                             wbAuto = true
                             controller.setAutoWb()
+                            prefs.edit().putBoolean("wb_auto", true).apply()
                         },
                         secText = ::secText,
                     )
@@ -668,7 +714,7 @@ fun CameraScreen(
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 14.dp, vertical = 64.dp),
+                        .padding(start = 14.dp, end = 14.dp, bottom = maskPad + 62.dp),
                 ) {
                     LutMenu(
                         presetIdx = presetIdx,
@@ -758,9 +804,13 @@ fun CameraScreen(
                 onTap = { toggle("EXP") },
             )
             ControlTile(
-                value = "AUTO",
+                value = if (mfOn) fmtDist(mfDiopter) else "AUTO",
                 label = "AF",
-                state = if (selectedControl == "AF") TileState.ACTIVE else TileState.AUTO,
+                state = when {
+                    selectedControl == "AF" -> TileState.ACTIVE
+                    mfOn -> TileState.MANUAL
+                    else -> TileState.AUTO
+                },
                 onTap = { toggle("AF") },
             )
             ControlTile(
@@ -896,10 +946,15 @@ private fun ControlTile(value: String, label: String, state: TileState, onTap: (
     }
 }
 
-/** 参数面板（单实例）：AF 提示 / EXP（SEC+ISO，共用 AE 组）/ EV / WB，统一 ParamRow 风格 */
+/** 参数面板（单实例）：AF（MF 屈光度）/ EXP（SEC+ISO，共用 AE 组）/ EV / WB，统一 ParamRow 风格 */
 @Composable
 private fun ControlPanel(
     ctrl: String?,
+    maxDiopter: Float,
+    mfOn: Boolean,
+    mfDiopter: Float,
+    onMfDrag: (Float) -> Unit,
+    onMfAuto: () -> Unit,
     evAuto: Boolean,
     aeAuto: Boolean,
     wbAuto: Boolean,
@@ -929,7 +984,18 @@ private fun ControlPanel(
     ) {
         when (ctrl) {
             "AF" -> {
-                Text("点按画面对焦（连续自动对焦）", color = FilmTheme.Cream, fontSize = 12.sp)
+                // 手动对焦：屈光度滑杆，刻度为对焦距离（HAL 上报 0 时控制器用 10D 试值）；A=连续自动对焦
+                val maxD = maxDiopter
+                val d = if (mfOn) mfDiopter else 0f
+                ParamRow(
+                    label = "MF",
+                    auto = !mfOn,
+                    onAuto = onMfAuto,
+                    value = fmtDist(d),
+                    fraction = (d / maxD).coerceIn(0f, 1f),
+                    ticks = ticksDiopter(maxD),
+                    onFraction = onMfDrag,
+                )
             }
             "EXP" -> {
                 // A 时滑杆停在实测值并跟随测光；拖动即进手动
@@ -1141,6 +1207,17 @@ private val ticksTv = listOf(
 )
 
 private val ticksWb = listOf(0.1f to "3000K", 0.5f to "5000K", 0.9f to "7000K")
+
+/** 屈光度 → 对焦距离显示（∞ / 米 / 厘米） */
+private fun fmtDist(diopter: Float): String =
+    if (diopter <= 0.01f) "∞"
+    else {
+        val cm = 100f / diopter
+        if (cm >= 100f) "%.1fm".format(cm / 100f) else "%.0fcm".format(cm)
+    }
+
+private fun ticksDiopter(maxD: Float): List<Pair<Float, String>> =
+    listOf(0f, 0.25f, 0.5f, 0.75f, 1f).map { f -> f to fmtDist(f * maxD) }
 
 /** ISO 刻度：对数（相机 ISO 感光度按档位），端点对齐实际量程 */
 private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
