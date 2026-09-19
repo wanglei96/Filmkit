@@ -299,9 +299,8 @@ fun CameraScreen(
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
     val maxIso = controller.maxAnalogIso
-    // 画幅 = 成片裁切比例引导框（预览全屏铺满，引擎按视口 center-crop 不拉伸）；
-    // 比例随屏幕方向取向：竖屏时 16:9 → 9:16 竖向铺满、XPAN → 24:65 竖长条。
-    // TODO(M3): 成片裁切跟随画幅（当前仅取景引导）
+    // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）；
+    // 比例随屏幕方向取向：竖屏 4:3 = 3:4 铺满宽度、16:9 = 9:16、XPAN = 24:65 竖长条
     val portrait = LocalConfiguration.current.orientation ==
         android.content.res.Configuration.ORIENTATION_PORTRAIT
     val guideAspect = when (aspect) {
@@ -317,6 +316,10 @@ fun CameraScreen(
     val displayRot = winMgr.defaultDisplay.rotation
     LaunchedEffect(displayRot) {
         controller.setOrientationStep(displayRot)
+    }
+    // 成片按同一比例居中裁切（与取景窗口一致）
+    LaunchedEffect(guideAspect) {
+        controller.setCaptureAspect(guideAspect)
     }
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下
@@ -390,15 +393,16 @@ fun CameraScreen(
             ) { quickOpen = !quickOpen }
         }
 
-        // ── 取景器：全屏铺满（引擎按视口 center-crop，不拉伸），随屏幕方向适配 ──
+        // ── 取景窗口 = 所选画幅（WYSIWYG），窗口外为机身黑，随屏幕方向适配 ──
         Box(
             Modifier
                 .fillMaxWidth()
                 .weight(1f),
+            contentAlignment = Alignment.Center,
         ) {
             Box(
                 Modifier
-                    .fillMaxSize()
+                    .aspectRatio(guideAspect)
                     .onSizeChanged { boxW = it.width; boxH = it.height },
             ) {
                 AndroidView(
@@ -471,56 +475,46 @@ fun CameraScreen(
                     Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
                 }
 
-                // 画幅引导框：所选比例为成片裁切参考，外部压暗 + 奶油圆角框线
+                // 圆角机框：窗口即成片范围，机身色环带遮出圆角 + 奶油细线勾边
                 Canvas(Modifier.matchParentSize()) {
-                    val regA = size.width / size.height
-                    val gw = if (guideAspect > regA) size.width else size.height * guideAspect
-                    val gh = if (guideAspect > regA) size.width / guideAspect else size.height
-                    val left = (size.width - gw) / 2f
-                    val top = (size.height - gh) / 2f
-                    val inset = 3.dp.toPx()
-                    val radius = 14.dp.toPx()
-                    val dim = Path().apply {
+                    val inset = 5.dp.toPx()
+                    val radius = 22.dp.toPx()
+                    val frame = Path().apply {
                         fillType = PathFillType.EvenOdd
                         addRect(Rect(0f, 0f, size.width, size.height))
                         addRoundRect(
                             RoundRect(
-                                Rect(left + inset, top + inset, left + gw - inset, top + gh - inset),
+                                Rect(inset, inset, size.width - inset, size.height - inset),
                                 CornerRadius(radius, radius),
                             ),
                         )
                     }
-                    drawPath(dim, Color.Black.copy(alpha = 0.45f))
+                    drawPath(frame, FilmTheme.Body)
                     drawRoundRect(
-                        color = FilmTheme.CreamDim.copy(alpha = 0.5f),
-                        topLeft = Offset(left + inset, top + inset),
-                        size = Size(gw - inset * 2, gh - inset * 2),
+                        color = FilmTheme.CreamDim.copy(alpha = 0.35f),
+                        topLeft = Offset(inset, inset),
+                        size = Size(size.width - inset * 2, size.height - inset * 2),
                         cornerRadius = CornerRadius(radius, radius),
                         style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
                 }
 
-                // 三分构图线（画在画幅引导框内）
+                // 三分构图线
                 if (gridOn) {
                     Canvas(Modifier.matchParentSize()) {
                         val c = FilmTheme.Cream.copy(alpha = 0.28f)
                         val w = 1.dp.toPx()
-                        val regA = size.width / size.height
-                        val gw = if (guideAspect > regA) size.width else size.height * guideAspect
-                        val gh = if (guideAspect > regA) size.width / guideAspect else size.height
-                        val left = (size.width - gw) / 2f
-                        val top = (size.height - gh) / 2f
                         for (i in 1..2) {
                             drawLine(
                                 c,
-                                Offset(left + gw * i / 3f, top),
-                                Offset(left + gw * i / 3f, top + gh),
+                                Offset(size.width * i / 3f, 0f),
+                                Offset(size.width * i / 3f, size.height),
                                 w,
                             )
                             drawLine(
                                 c,
-                                Offset(left, top + gh * i / 3f),
-                                Offset(left + gw, top + gh * i / 3f),
+                                Offset(0f, size.height * i / 3f),
+                                Offset(size.width, size.height * i / 3f),
                                 w,
                             )
                         }
@@ -767,7 +761,7 @@ fun CameraScreen(
                                 EngineBridge.LEVEL_INFO, "app", "quick.aspect",
                                 "\"ratio\":\"$a\"",
                             )
-                            // TODO(M3): 成片裁切跟随画幅（当前仅取景显示比例）
+                            // 成片同步居中裁切（setCaptureAspect，与取景窗口一致）
                         },
                         onMoreSettings = {
                             quickOpen = false

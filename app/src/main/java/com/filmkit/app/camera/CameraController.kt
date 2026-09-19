@@ -220,6 +220,14 @@ class CameraController(private val context: Context, private val render: RenderC
     val maxDiopter: Float
         get() = minFocusDiopter.coerceAtLeast(1f)
 
+    /** 成片裁切宽高比（与取景画幅引导一致，WYSIWYG；0 = 不裁切） */
+    @Volatile var captureAspect = 0f
+        private set
+
+    fun setCaptureAspect(a: Float) {
+        captureAspect = a.coerceIn(0.2f, 5f)
+    }
+
     /** HAL 是否支持 COLOR_CORRECTION_MODE_TRANSFORM_MATRIX（不支持则手动 WB 退回 CCT 模式） */
     private var transformWbSupported = true
 
@@ -888,6 +896,23 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             yy += step
         }
+        // 成片按画幅居中裁切（与取景窗口一致，WYSIWYG）
+        var outBmp = bmp
+        if (captureAspect > 0f) {
+            val curA = w.toFloat() / h.toFloat()
+            if (Math.abs(curA - captureAspect) > 0.01f) {
+                val cw = if (curA > captureAspect) (h * captureAspect).toInt() else w
+                val ch = if (curA > captureAspect) h else (w / captureAspect).toInt()
+                outBmp = Bitmap.createBitmap(bmp, (w - cw) / 2, (h - ch) / 2, cw, ch)
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "photo.crop",
+                    kv("srcA" to "%.3f".format(curA), "dstA" to "%.3f".format(captureAspect),
+                        "out" to "${outBmp.width}x${outBmp.height}"),
+                )
+            }
+        }
+        val outW = outBmp.width
+        val outH = outBmp.height
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.jpg"
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -901,19 +926,19 @@ class CameraController(private val context: Context, private val render: RenderC
                     ?.let { uri ->
                         lastPhotoUri = uri
                         context.contentResolver.openOutputStream(uri)?.use {
-                            bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                            outBmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
                         }
                     }
             } else {
                 val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
                 dir.mkdirs()
                 File(dir, name).outputStream().use {
-                    bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                    outBmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
                 }
             }
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "photo.saved",
-                kv("name" to name, "w" to w, "h" to h, "avgLuma" to (sum / n.coerceAtLeast(1))),
+                kv("name" to name, "w" to outW, "h" to outH, "avgLuma" to (sum / n.coerceAtLeast(1))),
             )
         } catch (t: Throwable) {
             EngineBridge.nativeAppendLog(
@@ -922,6 +947,7 @@ class CameraController(private val context: Context, private val render: RenderC
             )
         } finally {
             bmp.recycle()
+            if (outBmp !== bmp) outBmp.recycle()
         }
     }
 }
