@@ -329,18 +329,16 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         val pool = enabledLenses().ifEmpty { backLenses }
         if (pool.isEmpty()) return
-        // 覆盖则留（无缝变焦）：当前镜头数码范围（下限含 3% 迟滞）能覆盖目标等效焦段时
-        // 不切镜头——主摄数码撑到上限才切长焦，两个方向的切换点自然错开，
-        // 拖动在切换点附近抖动不会反复重开会话；超广不数码延展（小底裁切画质差）
+        // 画质优先：光学镜头可覆盖即选（选法与 setFocal 一致），不做数码延展；
+        // 仅在切换点 ±3% 迟滞带内保持当前镜头（zoomRatio 顶到边界），
+        // 避免拖动在切换点附近抖动时反复重开会话；出带立即切到光学镜头
         val cur = backLenses.getOrNull(activeLensIdx)?.takeIf { pool.contains(it) }
-        val lens = if (cur != null && cur.equivMm >= mainEquiv() - 0.5f &&
-            targetEquiv >= cur.equivMm * 0.97f && targetEquiv <= cur.equivMm * maxZoom
-        ) {
-            cur
-        } else {
-            pool.filter { it.equivMm <= targetEquiv * 1.05f }.maxByOrNull { it.equivMm }
-                ?: pool.minByOrNull { it.equivMm }
-                ?: return
+        var lens = pool.filter { it.equivMm <= targetEquiv * 1.05f }.maxByOrNull { it.equivMm }
+            ?: pool.minByOrNull { it.equivMm }
+            ?: return
+        if (cur != null && lens.id != cur.id) {
+            val sp = maxOf(cur.equivMm, lens.equivMm) / 1.05f
+            if (targetEquiv >= sp * 0.97f && targetEquiv <= sp * 1.03f) lens = cur
         }
         val idx = backLenses.indexOf(lens)
         val newRatio = (targetEquiv / lens.equivMm).coerceIn(1f, maxZoom)

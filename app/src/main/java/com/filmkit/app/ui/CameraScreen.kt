@@ -755,7 +755,7 @@ fun CameraScreen(
                     natives = lensChips,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 96.dp),
+                        .padding(bottom = 64.dp),
                 )
             }
 

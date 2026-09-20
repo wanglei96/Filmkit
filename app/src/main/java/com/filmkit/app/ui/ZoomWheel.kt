@@ -4,7 +4,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -108,14 +107,13 @@ fun ZoomWheel(
         // 弧顶读数：当前倍率大字 + 等效焦段小字
         Column(
             Modifier
-                .align(Alignment.CenterHorizontally)
-                .padding(top = 2.dp),
+                .align(Alignment.CenterHorizontally),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
                 multLabel(equiv / mainE) + "x",
                 color = FilmTheme.Accent,
-                fontSize = 32.sp,
+                fontSize = 28.sp,
                 fontWeight = FontWeight.SemiBold,
             )
             Text(
@@ -132,12 +130,14 @@ fun ZoomWheel(
         ) {
             val w = size.width
             val h = size.height
-            val r = w * 0.62f
+            val u = 4.dp.toPx()
+            // 半径同时受宽度（弦贴屏）与高度（弧顶不被 Canvas 裁剪）约束：
+            // 弧顶 = h - 0.58R ≥ 8dp，X300 宽屏下高度约束生效
+            val r = minOf(w / 1.638f, (h - u * 2f) / 0.58f)
             val cx = w / 2f
             val cy = h + r * 0.42f
             val arc = 115f // frac 0..1 对应的弧角
             val vis = 55f // 指针两侧可见范围
-            val u = 4.dp.toPx()
 
             // 底部渐暗提高刻度可读性（叠预览）
             drawRect(
