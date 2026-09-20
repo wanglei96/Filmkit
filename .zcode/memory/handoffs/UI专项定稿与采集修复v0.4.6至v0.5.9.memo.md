@@ -1,8 +1,8 @@
 ---
 summary: UI专项定稿与采集修复v0.4.6至v0.5.9
 created: 2026-09-19 22:30
-updated: 2026-09-19 22:30
-status: active
+updated: 2026-09-20 10:50
+status: absorbed
 ---
 
 # UI专项定稿与采集修复v0.4.6至v0.5.9

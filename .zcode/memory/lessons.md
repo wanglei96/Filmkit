@@ -38,3 +38,8 @@ status: active
 - [2026-09-19] **Box 内 AnimatedVisibility 被 ColumnScope 扩展遮蔽**：全限定 androidx.compose.animation.AnimatedVisibility 调用顶层函数
 - [2026-09-19] **闪退无 Java 栈时先装捕获再复现**：未捕获异常处理器写 crash-latest.txt + JSONL app.crash（v0.5.6 已装）；XPAN 闪退装捕获后未再复现
 - [2026-09-19] **EV 补偿范围因机而异**：UI 滑杆禁写死 ±4，用 evInfo()（characteristics 范围×步进）自适应，session_ready 日志记 evRange/evStep 供核对
+- [2026-09-20] **引擎 shader 改动构建/单测全绿仍可能设备端全黑**：shader 是设备运行时编译——GLSL 非法重载 step(vec3,float) 致 prog_film_ 编译失败→init 失败→openCamera 不执行（黑屏+焦段全空，v0.5.13 事故）。铁律：shader 改动必须设备验证后才发版；M3 考虑抽独立 .glsl 用 glslangValidator 构建期校验
+- [2026-09-20] **log 域 ±4EV 硬截断的观感代价巨大**：14.2% 像素钉死同一灰度=直方图单尖峰+暗部色带+文件体积 1/4 的共同主因；域外须分段延展，且 filmCurve 的 toe/shoulder exp 在域外发散，延展段必须绕开该函数
+- [2026-09-20] **Bitmap.compress 不写任何 EXIF**：保存后用 ExifInterface 经可写 FileDescriptor（MediaStore openFileDescriptor "rw"）补写；InputStream 构造不支持 saveAttributes；ORIENTATION 不显式写会落非法 0
+- [2026-09-20] **阈值判定无滞回必闪**：水平仪对齐 ±0.5° 单阈值在手抖下持续切色——进入 0.4°/退出 1.2° 滞回解决；平移气泡式水平仪结构上不可用（指示线滑出刻度区成半截+无旋转语义）
+- [2026-09-20] **docs/开发计划.md 插入新版本节**：old_string 含「旧节标题+空行」会吞掉旧标题（本窗口发生 3 次）——插入新节时把旧标题保留在 new_string 尾部

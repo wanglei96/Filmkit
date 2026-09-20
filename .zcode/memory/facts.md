@@ -36,3 +36,7 @@ status: active
 - [2026-09-19] 崩溃捕获：未捕获异常写 files/logs/crash-latest.txt + JSONL `app.crash`（含堆栈）；X300 闪退排查先导日志看这两处
 - [2026-09-19] WB 色温估计：优先 CaptureResult.COLOR_CORRECTION_GAINS（X300 不回填），兜底变换矩阵对角线 + 校准系数 WB_CAL_R=0.923/WB_CAL_B=1.238（单点推得，M3 灰卡精校）；kFromGains=50K 步进扫描组合对数距离
 - [2026-09-19] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`
+- [2026-09-20] 发布现状：最新 v0.5.19-m2（versionCode 50，tag 已推送）；FilmKitApp 启动/崩溃 version 字段已同步 0.5.19-m2
+- [2026-09-20] prefs 键新增：jpeg_quality（95/100 成像质量）、level（水平仪）、yuv_709（静拍解码矩阵，已定论 601 正确保留备查）；既有 grid（三分线，入口移至菜单面板构图辅助区）
+- [2026-09-20] 手机存储可从 Mac 直读：`~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/`——成片原样张可直接取做像素分析（PIL/numpy 对比有效）
+- [2026-09-20] 成像链结构：静拍 CPU YUV→RGB（FrameRenderer.cpp，矩阵参数化 setYuvMatrix/JNI nativeEngineSetYuvMatrix）→ kFsFilm log 域分段延展（±4EV 有效 + 域外半斜率外推至 ~±9EV）→ JPEG 质量 95/100 + exifinterface 补写 EXIF
