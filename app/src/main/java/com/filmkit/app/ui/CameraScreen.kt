@@ -80,6 +80,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -573,52 +574,40 @@ fun CameraScreen(
                     }
                 }
 
-                // 水平仪：中央固定参考刻度 + 指示线随滚转角平移（气泡式），
-                // |roll| < 0.5° 吸附归中并转强调色；±10° 满量程
+                // 水平仪：中心固定参考刻度 + 长指示线随滚转角旋转（v0.5.17：
+                // 弃平移气泡——线滑出刻度区只剩半截且无旋转语义）。
+                // 对齐（|roll|<0.5° 吸附）= 系统强调色；不对齐 = 白色不透明
                 if (levelOn) {
-                    Box(Modifier.matchParentSize()) {
+                    Canvas(Modifier.matchParentSize()) {
                         val roll = levelRoll.coerceIn(-10f, 10f)
                         val locked = levelRoll == 0f
-                        val lineColor =
-                            if (locked) FilmTheme.Accent else FilmTheme.Cream.copy(alpha = 0.75f)
-                        Box(
-                            Modifier
-                                .align(Alignment.Center)
-                                .fillMaxWidth(0.42f),
-                        ) {
-                            // 固定参考：中心刻度 + 两端止点
-                            Box(
-                                Modifier
-                                    .align(Alignment.Center)
-                                    .width(2.dp)
-                                    .height(18.dp)
-                                    .background(if (locked) FilmTheme.Accent else FilmTheme.CreamDim),
-                            )
-                            Box(
-                                Modifier
-                                    .align(Alignment.CenterStart)
-                                    .width(1.5.dp)
-                                    .height(12.dp)
-                                    .background(FilmTheme.CreamDim),
-                            )
-                            Box(
-                                Modifier
-                                    .align(Alignment.CenterEnd)
-                                    .width(1.5.dp)
-                                    .height(12.dp)
-                                    .background(FilmTheme.CreamDim),
-                            )
-                            // 指示线：随滚转平移
-                            val travel = with(LocalDensity.current) { 56.dp.toPx() }
-                            Box(
-                                Modifier
-                                    .align(Alignment.Center)
-                                    .graphicsLayer {
-                                        translationX = roll / 10f * travel
-                                    }
-                                    .fillMaxWidth(0.34f)
-                                    .height(2.dp)
-                                    .background(lineColor),
+                        val lineColor = if (locked) FilmTheme.Accent else Color.White
+                        val cx = size.width / 2f
+                        val cy = size.height / 2f
+                        val gauge = 14.dp.toPx()
+                        val gaugeH = 16.dp.toPx()
+                        // 固定参考刻度：中心左右两根短竖线（不随倾斜动）
+                        drawLine(
+                            FilmTheme.CreamDim,
+                            Offset(cx - gauge, cy - gaugeH / 2f),
+                            Offset(cx - gauge, cy + gaugeH / 2f),
+                            2.dp.toPx(),
+                        )
+                        drawLine(
+                            FilmTheme.CreamDim,
+                            Offset(cx + gauge, cy - gaugeH / 2f),
+                            Offset(cx + gauge, cy + gaugeH / 2f),
+                            2.dp.toPx(),
+                        )
+                        // 旋转指示线：以画面中心为轴随滚转转动，长 60% 屏宽
+                        val len = size.width * 0.6f
+                        rotate(degrees = roll, pivot = Offset(cx, cy)) {
+                            drawLine(
+                                lineColor,
+                                Offset(cx - len / 2f, cy),
+                                Offset(cx + len / 2f, cy),
+                                3.dp.toPx(),
+                                StrokeCap.Round,
                             )
                         }
                     }
