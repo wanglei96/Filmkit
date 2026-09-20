@@ -532,13 +532,16 @@ float halfToFloat(unsigned short h) {
   return sign != 0u ? -v : v;
 }
 
-// Camera2 CFA 枚举 → 2×2 相位查表（shader 按 ((y&1)<<1)|(x&1) 位移取 2bit 通道）
+// Camera2 CFA 枚举 → 2×2 相位查表（shader 按 ((y&1)<<1)|(x&1) 位移取 2bit 通道）。
+// 位序：k0=(0,0) 在 bits[1:0]，k1=(1,0) 在 bits[3:2]，k2=(0,1) 在 bits[5:4]，
+// k3=(1,1) 在 bits[7:6]——v0.5.29 曾把 k1/k2 写反（GRBG 误编码成 GBRG 的
+// 0x49），R/B 相位对调 + WB 增益错乘 → 成片系统性发红（v0.5.31 修正）。
 int cfaLutOf(int cfa) {
   switch (cfa) {
-    case 0: return (0 << 6) | (1 << 4) | (1 << 2) | 2;  // RGGB: R G / G B
-    case 1: return (1 << 6) | (0 << 4) | (2 << 2) | 1;  // GRBG: G R / B G
-    case 2: return (1 << 6) | (2 << 4) | (0 << 2) | 1;  // GBRG: G B / R G
-    default: return (2 << 6) | (1 << 4) | (1 << 2) | 0;  // BGGR: B G / G R
+    case 0: return (2 << 6) | (1 << 4) | (1 << 2) | 0;  // RGGB: R G / G B
+    case 1: return (1 << 6) | (2 << 4) | (0 << 2) | 1;  // GRBG: G R / B G
+    case 2: return (1 << 6) | (0 << 4) | (2 << 2) | 1;  // GBRG: G B / R G
+    default: return (0 << 6) | (1 << 4) | (1 << 2) | 2;  // BGGR: B G / G R
   }
 }
 
