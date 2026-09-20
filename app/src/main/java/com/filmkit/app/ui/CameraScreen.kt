@@ -691,10 +691,11 @@ fun CameraScreen(
                 }
 
                 // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘；长按弹轮盘变焦（设置可关）
+                // v0.5.25 与控制瓦片互换位置：焦段条在上（bottom 64dp），瓦片贴底
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 10.dp, end = 10.dp, bottom = 12.dp)
+                        .padding(start = 10.dp, end = 10.dp, bottom = 64.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .then(
                             if (wheelOn) {
@@ -957,15 +958,14 @@ fun CameraScreen(
                             .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
                     )
                 }
-                // ── 控制瓦片（v0.5.24 移入预览框、焦段条上方）：半透明底叠画面，
-                //    底部机身区只留快门行，快门/图库整体上移 ──
+                // ── 控制瓦片（贴预览底缘，焦段条上方与之互换 v0.5.25）：紧凑排布 ──
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 12.dp, end = 12.dp, bottom = 64.dp)
-                        .clip(RoundedCornerShape(18.dp))
+                        .padding(start = 8.dp, end = 8.dp, bottom = 12.dp)
+                        .clip(RoundedCornerShape(16.dp))
                         .background(FilmTheme.Body.copy(alpha = 0.66f))
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .padding(horizontal = 6.dp, vertical = 3.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                 ) {
                     fun toggle(c: String) {
@@ -1059,7 +1059,7 @@ fun CameraScreen(
             Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(top = 2.dp, bottom = 18.dp),
+                .padding(top = 2.dp, bottom = 36.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
@@ -1224,25 +1224,25 @@ private fun ControlTile(value: String, label: String, state: TileState, onTap: (
     }
     Column(
         Modifier
-            .width(62.dp)
+            .width(54.dp)
             .pressScale(onTap = onTap, pressedScale = 0.9f),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
             value,
             color = color,
-            fontSize = 14.sp,
+            fontSize = 13.sp,
             fontFamily = FilmTheme.Mono,
             maxLines = 1,
         )
-        Spacer(Modifier.height(2.dp))
+        Spacer(Modifier.height(1.dp))
         Text(
             label,
             color = color,
-            fontSize = 10.sp,
+            fontSize = 9.sp,
             fontFamily = FilmTheme.Mono,
         )
-        Spacer(Modifier.height(3.dp))
+        Spacer(Modifier.height(2.dp))
         Box(
             Modifier
                 .size(width = 16.dp, height = 2.dp)
