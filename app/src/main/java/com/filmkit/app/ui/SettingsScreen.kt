@@ -84,8 +84,8 @@ fun SettingsScreen(
 
             SectionHeader("拍摄")
             SettingSwitchRow(
-                title = "DNG 原始格式存储",
-                subtitle = "快门同时保存 DNG 底片 + 胶片 JPEG（单张约 10–20MB）",
+                title = "DNG 底片保留",
+                subtitle = "M 档（RAW）拍摄时同时保存 DNG 底片（单张约 10–20MB）",
                 checked = dngEnabled,
                 onChecked = { on ->
                     dngEnabled = on

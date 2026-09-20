@@ -666,6 +666,14 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
+    /** 静拍格式切换（M 档 RAW 开关）后重建会话：走切镜头同款串行重开，
+     *  openCamera 会重读 raw_mode prefs 决定新格式 */
+    fun restartSession() {
+        val id = backLenses.getOrNull(activeLensIdx)?.id ?: return
+        started = false
+        stopInternalKeepClient(id)
+    }
+
     fun setFilmParams(p: DoubleArray) {
         filmParams = p
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
@@ -835,15 +843,17 @@ class CameraController(private val context: Context, private val render: RenderC
             ?: sizes.firstOrNull { it.width.toLong() * it.height <= 1920L * 1080 }
             ?: sizes.last()
 
-        // 静拍流：DNG 开关 + 镜头 RAW 能力决定走 RAW_SENSOR（M2-3）或 YUV_420_888；
+        // 静拍流：M 档（raw_mode，快捷开关）+ 镜头 RAW 能力决定走 RAW_SENSOR 或 YUV_420_888；
+        // DNG 开关只控制是否额外保留底片文件（与采集格式解耦）。
         // 尺寸一致且格式未变时复用现有 reader
-        val dngOn = context.getSharedPreferences("filmkit", 0).getBoolean("dng_enabled", false)
+        val wantRaw = context.getSharedPreferences("filmkit", 0)
+            .getBoolean("raw_mode", false) && lens.rawSupported
         val rawSizes = if (lens.rawSupported) {
             map.getOutputSizes(ImageFormat.RAW_SENSOR)
                 .sortedByDescending { it.width.toLong() * it.height }
         } else emptyList()
-        rawMode = dngOn && rawSizes.isNotEmpty()
-        if (dngOn && rawSizes.isEmpty()) {
+        rawMode = wantRaw && rawSizes.isNotEmpty()
+        if (context.getSharedPreferences("filmkit", 0).getBoolean("raw_mode", false) && rawSizes.isEmpty()) {
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_WARN, "camera", "raw.fallback_yuv",
                 kv("lens" to lens.id, "reason" to "raw_unsupported"),
@@ -1030,6 +1040,16 @@ class CameraController(private val context: Context, private val render: RenderC
         val ch = curCharacteristics
         val dngOn = context.getSharedPreferences("filmkit", 0).getBoolean("dng_enabled", false)
         val meta = extractRawMeta(result, ch)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "raw.meta",
+            kv(
+                "cfa" to meta.cfa, "white" to meta.whiteLevel,
+                "black" to meta.blackPhase.joinToString(",") { "%.0f".format(it) },
+                "neutral" to meta.neutral.joinToString(",") { "%.4f".format(it) },
+                "ccm" to meta.ccm.take(6).joinToString(",") { "%.3f".format(it) },
+                "in" to "${img.width}x${img.height}",
+            ),
+        )
         if (dngOn && ch != null) {
             try {
                 saveDng(img, result, ch)
@@ -1134,7 +1154,15 @@ class CameraController(private val context: Context, private val render: RenderC
         ch: CameraCharacteristics,
     ) {
         val creator = android.hardware.camera2.DngCreator(ch, result)
-        creator.setOrientation(sensorOrientation) // 原始传感器方向，第三方 Raw 软件自行转正
+        // setOrientation 只收 EXIF orientation（1..8）：sensor 0/90/180/270 → 1/6/3/8
+        creator.setOrientation(
+            when (sensorOrientation) {
+                90 -> 6
+                180 -> 3
+                270 -> 8
+                else -> 1
+            },
+        )
         val now = Date()
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.dng"
         if (Build.VERSION.SDK_INT >= 29) {

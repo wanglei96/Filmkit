@@ -93,6 +93,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
@@ -192,6 +194,9 @@ fun CameraScreen(
     var levelRoll by remember { mutableFloatStateOf(0f) }
     var levelAligned by remember { mutableStateOf(false) } // 模 90° 任一轴水平即对齐（横竖屏均可）
     var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
+
+    // M 档（RAW 采集）：开 = 静拍走 RAW_SENSOR 引擎胶片链；与 DNG 底片开关解耦（§0-D6 更新）
+    var rawOn by rememberSaveable { mutableStateOf(prefs.getBoolean("raw_mode", false)) }
     var aspect by rememberSaveable { mutableStateOf("4:3") }
     // A/手动状态持久化（重启不丢手动档），初始值读 prefs
     var evAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("ev_auto", true)) }
@@ -428,6 +433,19 @@ fun CameraScreen(
             ) {
                 flashMode = (flashMode + 1) % 3
                 controller.setFlash(flashMode)
+            }
+            TopQuickText(
+                text = "M",
+                tint = if (rawOn) FilmTheme.Accent else FilmTheme.CreamDim,
+                desc = "M 档（RAW 采集）",
+            ) {
+                rawOn = !rawOn
+                prefs.edit().putBoolean("raw_mode", rawOn).apply()
+                controller.restartSession() // 静拍流 YUV↔RAW 切换须重建会话
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "quick.raw_mode",
+                    "{\"on\":$rawOn}",
+                )
             }
             TopQuickIcon(
                 icon = Icons.Filled.BarChart,
@@ -1159,6 +1177,26 @@ private fun TopQuickIcon(icon: ImageVector, tint: Color, desc: String, onTap: ()
         contentAlignment = Alignment.Center,
     ) {
         Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(21.dp))
+    }
+}
+
+/** 顶部快捷区文字钮（M 档）：40dp 点击区，强调色=开启态 */
+@Composable
+private fun TopQuickText(text: String, tint: Color, desc: String, onTap: () -> Unit) {
+    Box(
+        Modifier
+            .size(40.dp)
+            .pressScale(onTap = onTap, pressedScale = 0.85f),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            color = tint,
+            fontFamily = FilmTheme.Mono,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.clearAndSetSemantics { contentDescription = desc },
+        )
     }
 }
 

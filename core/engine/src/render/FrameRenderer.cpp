@@ -662,7 +662,9 @@ void FrameRenderer::passRaw(int dst_w, int dst_h, int rot, int cfa,
               black_phase[3]);
   glUniform1f(u_raw_.white, white_level);
   glUniform3f(u_raw_.gain, gains[0], gains[1], gains[2]);
-  glUniformMatrix3fv(u_raw_.ccm, 1, GL_FALSE, ccm);
+  // ccm 数组是行主序（ColorSpaceTransform 语义），GL 按列主序读取——必须 transpose，
+  // 否则实际作用转置矩阵 → 严重偏色（v0.5.20 样张全局品红的根因）
+  glUniformMatrix3fv(u_raw_.ccm, 1, GL_TRUE, ccm);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
