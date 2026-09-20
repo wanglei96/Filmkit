@@ -25,3 +25,6 @@ local.properties
 # 成片样张（不入库，仅本地留存）
 FILMKIT_*.jpg
 FILMKIT_*.dng
+
+# 本地工具二进制（不入库）
+tools/bin/

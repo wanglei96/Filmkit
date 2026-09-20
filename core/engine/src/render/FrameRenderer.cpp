@@ -1,5 +1,6 @@
 #include "FrameRenderer.h"
 
+#include <chrono>
 #include <cmath>
 #include <string>
 
@@ -678,6 +679,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
+  // 分段计时（M3 §3.3 出口标准的度量基础）：上传 / pass 链 / 读回
+  const auto t0 = std::chrono::steady_clock::now();
 
   if (raw_w_ != w || raw_h_ != h) {
     if (raw_tex_) glDeleteTextures(1, &raw_tex_);
@@ -709,6 +712,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                                ",\"h\":" + std::to_string(h) + "}");
     return false;
   }
+  const auto t1 = std::chrono::steady_clock::now();
 
   // WB 增益 = asShotNeutral 的倒数，G 归一；非法值回中性（防全 0/负数防呆）
   float gains[3] = {1.0f, 1.0f, 1.0f};
@@ -738,6 +742,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   passRaw(dst_w, dst_h, effective_rot, cfa, black_phase,
           static_cast<float>(white_level), gains, ccm, p);
   passFilm(dst_w, dst_h, p);
+  const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
     if (tex_cap_) {
@@ -750,9 +755,21 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     cap_h_ = dst_h;
   }
   passOutput(dst_w, dst_h, p, true);
+  // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
+  glFinish();
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  const auto t3 = std::chrono::steady_clock::now();
+  const auto ms = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  Logger::instance().log(
+      LogLevel::kInfo, "engine", "raw.render",
+      "{\"uploadMs\":" + std::to_string(ms(t0, t1)).substr(0, 6) +
+          ",\"passMs\":" + std::to_string(ms(t1, t2)).substr(0, 6) +
+          ",\"totalMs\":" + std::to_string(ms(t0, t3)).substr(0, 7) +
+          ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
   return true;
 }
 
