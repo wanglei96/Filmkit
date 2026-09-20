@@ -26,6 +26,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -203,7 +204,6 @@ fun CameraScreen(
     var boxH by remember { mutableIntStateOf(1) }
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
     var zoomEquiv by remember { mutableFloatStateOf(24f) } // 捏合变焦目标（35mm 等效焦段）
-    var pinching by remember { mutableStateOf(false) }
     var wheelActive by remember { mutableStateOf(false) } // 长按轮盘变焦进行中
     var wheelFrac by remember { mutableFloatStateOf(0.5f) } // 轮盘对数位置 0..1
     val wheelOn = remember { prefs.getBoolean("wheel_zoom", true) }
@@ -211,8 +211,8 @@ fun CameraScreen(
     val wheelMaxE = (lensChips.maxOrNull() ?: 70).toFloat() * controller.maxZoom
     fun wheelFracOf(e: Float): Float =
         ((ln(e.coerceAtLeast(1f)) - ln(wheelMinE)) / (ln(wheelMaxE) - ln(wheelMinE))).coerceIn(0f, 1f)
-    val density2 = LocalDensity.current
-    val wheelHpx = with(density2) { 210.dp.toPx() }
+    // 半圆轮盘滚动量程：对数全程对应 1.4 屏宽的横向拖动
+    val wheelSpanPx = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() * 1.4f }
     var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
@@ -278,9 +278,11 @@ fun CameraScreen(
         }
     }
 
-    // 镜头变化（点焦段条/跨镜头变焦）后同步等效变焦基准；捏合进行中不打断
-    LaunchedEffect(focalBase) {
-        if (!pinching) zoomEquiv = focalBase
+    // 镜头集合变化（设置页启停）时把当前焦段兜底回有效范围。
+    // 勿在此重置 zoomEquiv = focalBase：跨镜头连续变焦（轮盘/捏合）中 focalBase 会先变为
+    // 新镜头原生焦距，重置会让缩小方向从目标值直接跳回 1x（跳变根因，2026-09-20）
+    LaunchedEffect(lensChips) {
+        zoomEquiv = zoomEquiv.coerceIn(wheelMinE, wheelMaxE)
     }
 
     // 快门黑闪 + 快门钮脉冲
@@ -584,21 +586,23 @@ fun CameraScreen(
                         .clip(RoundedCornerShape(16.dp))
                         .then(
                             if (wheelOn) {
-                                Modifier.pointerInput(wheelMinE, wheelMaxE) {
-                                    // 长按（450ms）进入轮盘变焦，纵向拖动连续变焦；松手退出。
+                                Modifier.pointerInput(wheelMinE, wheelMaxE, wheelSpanPx) {
+                                    // 长按（450ms）进入半圆轮盘变焦，横向拖动沿弧滚动
+                                    // （左滑放大/右滑缩小，刻度跟手）；松手退出。
+                                    // Initial pass 先于内层横滚消费事件，轮盘滚动时压住焦段条横滚；
                                     // 指针状态自跟踪，不依赖事件类型常量（跨 Compose 版本稳定）
                                     awaitPointerEventScope {
                                         var downId: androidx.compose.ui.input.pointer.PointerId? = null
-                                        var lastY = 0f
+                                        var lastX = 0f
                                         var downAt = 0L
                                         var inWheel = false
                                         while (true) {
-                                            val ev = awaitPointerEvent()
+                                            val ev = awaitPointerEvent(PointerEventPass.Initial)
                                             val c = ev.changes.firstOrNull() ?: continue
                                             if (downId == null) {
                                                 if (c.pressed) {
                                                     downId = c.id
-                                                    lastY = c.position.y
+                                                    lastX = c.position.x
                                                     downAt = android.os.SystemClock.uptimeMillis()
                                                     inWheel = false
                                                 }
@@ -614,9 +618,9 @@ fun CameraScreen(
                                                         wheelFrac = wheelFracOf(zoomEquiv)
                                                     }
                                                     c.consume()
-                                                    val dy = c.position.y - lastY
-                                                    lastY = c.position.y
-                                                    wheelFrac = (wheelFrac - dy / wheelHpx).coerceIn(0f, 1f)
+                                                    val dx = c.position.x - lastX
+                                                    lastX = c.position.x
+                                                    wheelFrac = (wheelFrac - dx / wheelSpanPx).coerceIn(0f, 1f)
                                                     zoomEquiv = exp(
                                                         ln(wheelMinE) + wheelFrac * (ln(wheelMaxE) - ln(wheelMinE)),
                                                     )
@@ -631,7 +635,7 @@ fun CameraScreen(
                                 Modifier
                             },
                         )
-                        .horizontalScroll(rememberScrollState()),
+                        .horizontalScroll(rememberScrollState(), enabled = !wheelActive),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -696,53 +700,20 @@ fun CameraScreen(
                     }
                 }
 
-                // 长按轮盘：原生焦段刻度（≤6 个，对数位置）+ 当前等效焦距指示线
+                // 半圆变焦轮盘：长按进入，横向拖动沿弧滚动；指针固定弧顶，
+                // 刻度 = 原生焦段（带 mm 副标签）+ 数码档，对数映射与拖动一致
             if (wheelActive) {
-                Box(
-                    Modifier
+                ZoomWheel(
+                    frac = wheelFrac,
+                    equiv = zoomEquiv,
+                    minE = wheelMinE,
+                    maxE = wheelMaxE,
+                    mainE = controller.mainEquiv(),
+                    natives = lensChips,
+                    modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 104.dp)
-                        .size(width = 76.dp, height = 210.dp)
-                        .clip(RoundedCornerShape(38.dp))
-                        .background(FilmTheme.Panel)
-                        .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(38.dp)),
-                ) {
-                    lensChips.take(6).forEach { e ->
-                        val f = wheelFracOf(e.toFloat())
-                        Text(
-                            "$e",
-                            Modifier
-                                .align(Alignment.CenterStart)
-                                .offset {
-                                    IntOffset(0, (wheelHpx * (0.5f - f)).roundToInt() - 8.dp.roundToPx())
-                                }
-                                .padding(start = 12.dp),
-                            color = FilmTheme.CreamDim,
-                            fontSize = 10.sp,
-                            fontFamily = FilmTheme.Mono,
-                        )
-                    }
-                    val cf = wheelFracOf(zoomEquiv)
-                    Box(
-                        Modifier
-                            .align(Alignment.CenterStart)
-                            .offset { IntOffset(0, (wheelHpx * (0.5f - cf)).roundToInt()) }
-                            .fillMaxWidth()
-                            .height(2.dp)
-                            .background(FilmTheme.Accent),
-                    )
-                    Text(
-                        "${zoomEquiv.roundToInt()}",
-                        Modifier
-                            .align(Alignment.CenterEnd)
-                            .offset { IntOffset(0, (wheelHpx * (0.5f - cf)).roundToInt()) }
-                            .padding(end = 10.dp),
-                        color = FilmTheme.Accent,
-                        fontSize = 14.sp,
-                        fontFamily = FilmTheme.Mono,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
+                        .padding(bottom = 96.dp),
+                )
             }
 
             // 参数面板：全局单实例，状态驱动显隐
