@@ -98,6 +98,40 @@ fun SettingsScreen(
             )
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
             SettingNavRow("自定义焦段", "最多 3 个，与原生焦段同显于变焦条（总 ≤6）") { onOpenFocals() }
+            var rcdOn by rememberSaveable { mutableStateOf(prefs.getBoolean("demosaic_quality", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !rcdOn
+                        rcdOn = v
+                        prefs.edit().putBoolean("demosaic_quality", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.demosaic_quality",
+                            "{\"rcd\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("RAW 去马赛克", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "RCD 质量 = 方向自适应+色比修正，边缘伪彩少；" +
+                            "快速 = bilinear，最快。仅影响 M 档成片",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (rcdOn) "RCD 质量" else "快速",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
@@ -182,7 +216,7 @@ fun SettingsScreen(
             HorizontalDivider(color = FilmTheme.ChipBorder)
             SectionHeader("关于")
             Text(
-                "FilmKit 胶片相机 · M2 开发中 · vivo X300 专项适配",
+                "FilmKit 胶片相机 · M3 开发中 · vivo X300 专项适配",
                 color = FilmTheme.CreamDim,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(bottom = 24.dp),

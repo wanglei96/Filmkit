@@ -1038,7 +1038,10 @@ class CameraController(private val context: Context, private val render: RenderC
      *  submitRaw 内部消费后关闭。 */
     private fun processRaw(img: Image, result: TotalCaptureResult) {
         val ch = curCharacteristics
-        val dngOn = context.getSharedPreferences("filmkit", 0).getBoolean("dng_enabled", false)
+        val prefs = context.getSharedPreferences("filmkit", 0)
+        val dngOn = prefs.getBoolean("dng_enabled", false)
+        // 去马赛克质量档：1 = RCD 三段管线（默认，M3-1）；0 = bilinear 速度档
+        val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
         val meta = extractRawMeta(result, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",
@@ -1060,7 +1063,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
             }
         }
-        render.submitRaw(img, meta, orientationStep, filmParams) { bytes, w, h ->
+        render.submitRaw(img, meta, orientationStep, filmParams, demosaic) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
         }

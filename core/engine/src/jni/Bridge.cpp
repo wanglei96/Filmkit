@@ -282,12 +282,13 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
 }
 
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
+// demosaic：0=bilinear（速度档）1=RCD 三段管线（质量档，M3-1）
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     JNIEnv* env, jobject, jobject raw_buf, jint w, jint h, jint row_stride_px,
     jint cfa, jfloatArray black_phase, jint white_level, jfloat neutral_r,
     jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jint rotation,
-    jdoubleArray film) {
+    jint demosaic, jdoubleArray film) {
   if (!g_renderer || !raw_buf) return nullptr;
   float black4[4] = {0, 0, 0, 0};
   if (black_phase) {
@@ -304,7 +305,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   const bool ok = g_renderer->submitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
-      rotation, p, &rgba);
+      rotation, p, demosaic, &rgba);
   if (!ok) return nullptr;
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
   env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),

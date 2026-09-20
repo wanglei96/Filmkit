@@ -169,8 +169,9 @@ class RenderClient {
     )
 
     /** 静拍 RAW：u16 Bayer → 引擎 demosaic+胶片链 → 读回，回调在渲染线程。
-     *  img 在本函数消费后关闭；DNG 原片须在本调用前写出（依赖 image 与 result）。 */
-    fun submitRaw(img: android.media.Image, meta: RawFrameMeta, rotation: Int, film: DoubleArray, onDone: (ByteArray?, Int, Int) -> Unit) {
+     *  img 在本函数消费后关闭；DNG 原片须在本调用前写出（依赖 image 与 result）。
+     *  demosaic：0 = bilinear（速度档）1 = RCD 三段管线（质量档）。 */
+    fun submitRaw(img: android.media.Image, meta: RawFrameMeta, rotation: Int, film: DoubleArray, demosaic: Int, onDone: (ByteArray?, Int, Int) -> Unit) {
         val h = handler
         if (h == null) {
             img.close()
@@ -189,7 +190,7 @@ class RenderClient {
                     p.buffer, img.width, img.height, p.rowStride / 2,
                     meta.cfa, meta.blackPhase, meta.whiteLevel,
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
-                    meta.ccm, rotation, film,
+                    meta.ccm, rotation, demosaic, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

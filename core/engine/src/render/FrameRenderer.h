@@ -43,16 +43,17 @@ class FrameRenderer {
                    const FilmParams& p, std::vector<uint8_t>* out_rgba);
 
   // RAW 静拍（M2-3）：u16 Bayer（R16UI 整型纹理 + texelFetch）→ 黑阶扣除
-  // → 白阶归一 → WB（asShotNeutral）→ bilinear demosaic（CFA 相位）→ CCM
+  // → 白阶归一 → WB（asShotNeutral）→ demosaic（CFA 相位）→ CCM
   // → 场景线性，汇流 pass2/3 胶片链 → RGBA8 读回。
   //   black_phase —— 按相位 (0,0)(1,0)(0,1)(1,1) 的四通道黑阶
   //   neutral*    —— JPEG_NEUTRAL_COLOR_POINT（asShotNeutral），增益=其倒数 G 归一
   //   ccm9        —— sensor→sRGB 3×3 行主序；nullptr = 单位阵
+  //   demosaic    —— 0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
                  const float black_phase[4], int white_level,
                  float neutral_r, float neutral_g, float neutral_b,
                  const float* ccm9, int rotation, const FilmParams& p,
-                 std::vector<uint8_t>* out_rgba);
+                 int demosaic, std::vector<uint8_t>* out_rgba);
 
   int64_t frameCount() const { return frames_.load(std::memory_order_relaxed); }
   int sceneW() const { return scene_w_; }
@@ -60,12 +61,21 @@ class FrameRenderer {
 
  private:
   bool ensureTargets(int w, int h);
+  bool ensureRcdTargets(int w, int h);
   void passOES(int dst_w, int dst_h, const float* st, int rot, float sx,
                float sy, const FilmParams& p);
   void passStill(int dst_w, int dst_h, int rot, const FilmParams& p);
   void passRaw(int dst_w, int dst_h, int rot, int cfa,
                const float black_phase[4], float white_level,
                const float gains[3], const float* ccm, const FilmParams& p);
+  // RCD 质量档（M3-1）：方向场 → G@RB（比值修正）→ 色度填充（伪彩限幅）
+  void passRcdDir(int w, int h, int cfa, const float black_phase[4],
+                  float white_level, const float gains[3]);
+  void passRcdG(int w, int h, int cfa, const float black_phase[4],
+                float white_level, const float gains[3]);
+  void passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
+                     const float black_phase[4], float white_level,
+                     const float gains[3], const float* ccm);
   void passFilm(int w, int h, const FilmParams& p);
   void passOutput(int w, int h, const FilmParams& p, bool flip_y);
   void passFill(int dst_w, int dst_h);
@@ -74,7 +84,8 @@ class FrameRenderer {
   void logPassDiag(const char* stage, GLuint fbo, bool half_float);
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
-         prog_fill_ = 0, prog_raw_ = 0;
+         prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
+         prog_rcd_chroma_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -83,6 +94,9 @@ class FrameRenderer {
   int still_w_ = 0, still_h_ = 0;
   GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
   int raw_w_ = 0, raw_h_ = 0;
+  GLuint fbo_dir_ = 0, tex_dir_ = 0;  // RGBA16F，RCD 方向场（vh + pq 统计）
+  GLuint fbo_g_ = 0, tex_g_ = 0;      // RGBA16F，RCD 全图 G（g 通道有效）
+  int rcd_w_ = 0, rcd_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
@@ -101,6 +115,17 @@ class FrameRenderer {
     GLint st = -1, rot = -1, scale = -1, tex = -1, size = -1, cfa = -1,
           black = -1, white = -1, gain = -1, ccm = -1;
   } u_raw_;
+  struct {
+    GLint tex = -1, size = -1, cfa = -1, black = -1, white = -1, gain = -1;
+  } u_rcd_dir_;
+  struct {
+    GLint tex = -1, dir = -1, size = -1, cfa = -1, black = -1, white = -1,
+          gain = -1;
+  } u_rcd_g_;
+  struct {
+    GLint st = -1, rot = -1, scale = -1, tex = -1, dir = -1, g = -1, size = -1,
+          cfa = -1, black = -1, white = -1, gain = -1, ccm = -1;
+  } u_rcd_chroma_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1;
