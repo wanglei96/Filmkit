@@ -358,23 +358,22 @@ float chromaDiag(ivec2 p) {
     float hi = max(max(cnw - gAt(nw), cse - gAt(se)), max(cne - gAt(ne), csw - gAt(sw)));
     return clamp(d, lo, hi);
 }
-// 轴向色差填充：G 位置补 B（Bayer 结构保证轴向 ±2 同为 B 实测位）。
-// 垂直/水平两组色差按梯度反比交叉加权，vh 方向混合 + 限幅。
-float chromaAxial(ivec2 p) {
-    float g0 = gAt(p);
-    ivec2 n = p + ivec2(0, -2), st = p + ivec2(0, 2);
-    ivec2 e = p + ivec2(2, 0), w = p + ivec2(-2, 0);
-    float cn = s(n), cs = s(st), ce = s(e), cw = s(w);
-    float gn = abs(cn - cs) + abs(g0 - gAt(p + ivec2(0, -4))) + EPS;
-    float gs = abs(cs - cn) + abs(g0 - gAt(p + ivec2(0, 4))) + EPS;
-    float vEst = (gn * (cs - gAt(st)) + gs * (cn - gAt(n))) / (gn + gs);
-    float gE = abs(ce - cw) + abs(g0 - gAt(p + ivec2(4, 0))) + EPS;
-    float gW = abs(cw - ce) + abs(g0 - gAt(p + ivec2(-4, 0))) + EPS;
-    float hEst = (gE * (cw - gAt(w)) + gW * (ce - gAt(e))) / (gE + gW);
-    float d = mix(vEst, hEst, dir5(p, 0));
-    float lo = min(min(cn - gAt(n), cs - gAt(st)), min(ce - gAt(e), cw - gAt(w)));
-    float hi = max(max(cn - gAt(n), cs - gAt(st)), max(ce - gAt(e), cw - gAt(w)));
-    return clamp(d, lo, hi);
+// 轴向色差填充（G 位置专用）：Bayer 中 G 位的 R/B 都在四正邻（±1），
+// 哪个轴是 R 由 G 的两种相位决定（水平邻 R 或垂直邻 R），按 chanAt 实测
+// 分派；同轴 ±3 为第二对。近对反梯度加权为主、远对弱混合，限幅防过冲。
+float axialFill(ivec2 p, int c) {
+    ivec2 d = chanAt(p + ivec2(1, 0)) == c ? ivec2(1, 0) : ivec2(0, 1);
+    float c1 = s(p + d), c2 = s(p - d);
+    float c3 = s(p + 3 * d), c4 = s(p - 3 * d);
+    float d1 = c1 - gAt(p + d), d2 = c2 - gAt(p - d);
+    float d3 = c3 - gAt(p + 3 * d), d4 = c4 - gAt(p - 3 * d);
+    float g1 = abs(c1 - c2) + EPS;
+    float g2 = abs(c3 - c4) + EPS;
+    float near = (g2 * d1 + g1 * d2) / (g1 + g2);
+    float far = 0.5 * (d3 + d4);
+    float lo = min(min(d1, d2), min(d3, d4));
+    float hi = max(max(d1, d2), max(d3, d4));
+    return clamp(mix(far, near, 0.75), lo, hi);
 }
 void main() {
     // 2D 纹理坐标 (0,0) 在左上，vUV0 翻转对齐 OES 习惯（与 kFsRaw 一致）
@@ -390,8 +389,8 @@ void main() {
         b = s(p);
         r = g + chromaDiag(p);
     } else {
-        r = g + chromaDiag(p);
-        b = g + chromaAxial(p);
+        r = g + axialFill(p, 0);
+        b = g + axialFill(p, 2);
     }
     vec3 rgb = uCcm * vec3(r, g, b);
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
