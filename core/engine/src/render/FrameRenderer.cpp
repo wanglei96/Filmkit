@@ -118,8 +118,9 @@ void main() {
     // 域外 -6.5..-4 / 4..6.5EV 半斜率延展，更暗/更亮继续线性外推到 ~±9EV
     vec3 e = log2(max(lin, vec3(1e-6)) / 0.18);
     vec3 lg = e * 0.125 + 0.5;
-    lg = mix(lg, 1.0 + (e - 4.0) * 0.0625, step(4.0, e));
-    lg = mix(lg, (e + 4.0) * 0.0625, step(e, -4.0));
+    // step 参数必须同维（vec3,vec3）——step(e,-4.0) 无此重载，编译失败=全链路黑屏
+    lg = mix(lg, 1.0 + (e - 4.0) * 0.0625, step(vec3(4.0), e));
+    lg = mix(lg, (e + 4.0) * 0.0625, step(e, vec3(-4.0)));
     lg = uCross * lg;
     vec3 g;
     g.r = filmCurve(lg.r, uToe.r, uShoulder.r);

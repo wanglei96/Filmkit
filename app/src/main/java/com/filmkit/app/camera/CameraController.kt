@@ -699,10 +699,13 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             return
         }
-        // 静拍 YUV 解码矩阵（设置页开关，实拍 A/B 定夺；须在引擎启动后设置）
-        EngineBridge.nativeEngineSetYuvMatrix(
-            if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
-        )
+        // 静拍 YUV 解码矩阵（设置页开关，实拍 A/B 定夺；须在引擎启动后设置）。
+        // 防御性包裹：JNI/任何异常不得阻断相机启动（started=false = 全黑+焦段丢失）
+        runCatching {
+            EngineBridge.nativeEngineSetYuvMatrix(
+                if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
+            )
+        }
         started = true
         openCamera()
     }
