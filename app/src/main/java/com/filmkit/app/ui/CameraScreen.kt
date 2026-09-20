@@ -1,6 +1,7 @@
 package com.filmkit.app.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
@@ -126,7 +127,7 @@ import kotlin.math.roundToInt
 
 /**
  * M 档专业拍摄界面（方向 C 定稿，v0.5.1）。
- * 顶部快捷设置区：闪光灯 / 实时直方图 / 构图线 / 快门声 / 菜单（画幅 + 更多设置）。
+ * 顶部快捷设置区：闪光灯 / 实时直方图 / 快门声 / 菜单（构图线与水平仪移入菜单悬浮面板）。
  * 参数模型：EV / AE(Tv+ISO) / WB 独立 A/手动，拖刻度进手动、点 A 线性回自动。
  * 交互反馈：快门触感+黑闪+按钮脉冲、全局按压缩放、捏合变焦、音量键拍照。
  * 规范见 docs/开发计划.md「UI 设计规范」。
@@ -185,6 +186,8 @@ fun CameraScreen(
     var flashMode by rememberSaveable { mutableIntStateOf(0) }
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
     var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
+    var levelOn by rememberSaveable { mutableStateOf(prefs.getBoolean("level", false)) }
+    var levelRoll by remember { mutableFloatStateOf(0f) } // 设备滚转角（度），水平仪显示用
     var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
     var aspect by rememberSaveable { mutableStateOf("4:3") }
     // A/手动状态持久化（重启不丢手动档），初始值读 prefs
@@ -259,6 +262,30 @@ fun CameraScreen(
 
     DisposableEffect(Unit) {
         onDispose { controller.stop() }
+    }
+
+    // 水平仪：加速度计重力分量求滚转角（竖屏持机 roll = atan2(gx, -gy)），
+    // 水平（±0.5°）时吸附 0 供指示线归中
+    DisposableEffect(levelOn) {
+        if (!levelOn) return@DisposableEffect onDispose { }
+        val sm = context.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                if (e.sensor.type == android.hardware.Sensor.TYPE_ACCELEROMETER) {
+                    val g = e.values
+                    val roll = Math.toDegrees(kotlin.math.atan2(g[0].toDouble(), -g[1].toDouble()))
+                    levelRoll = (if (kotlin.math.abs(roll) < 0.5) 0.0 else roll).toFloat()
+                }
+            }
+
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) = Unit
+        }
+        sm.registerListener(
+            listener,
+            sm.getDefaultSensor(android.hardware.Sensor.TYPE_ACCELEROMETER),
+            android.hardware.SensorManager.SENSOR_DELAY_GAME,
+        )
+        onDispose { sm.unregisterListener(listener) }
     }
 
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
@@ -366,7 +393,7 @@ fun CameraScreen(
                 .background(FilmTheme.Body)
                 .statusBarsPadding(),
         ) {
-        // ── 顶部快捷设置区：闪光灯 · 直方图 · 构图线 · 快门声 · 菜单 ──
+        // ── 顶部快捷设置区：闪光灯 · 直方图 · 快门声 · 菜单 ──
         Row(
             Modifier
                 .fillMaxWidth()
@@ -395,18 +422,6 @@ fun CameraScreen(
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "app", "quick.histogram",
                     "{\"on\":$histOn}",
-                )
-            }
-            TopQuickIcon(
-                icon = Icons.Filled.GridOn,
-                tint = if (gridOn) FilmTheme.Accent else FilmTheme.CreamDim,
-                desc = "构图线",
-            ) {
-                gridOn = !gridOn
-                prefs.edit().putBoolean("grid", gridOn).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "quick.grid",
-                    "{\"on\":$gridOn}",
                 )
             }
             TopQuickIcon(
@@ -553,6 +568,57 @@ fun CameraScreen(
                                 Offset(0f, size.height * i / 3f),
                                 Offset(size.width, size.height * i / 3f),
                                 w,
+                            )
+                        }
+                    }
+                }
+
+                // 水平仪：中央固定参考刻度 + 指示线随滚转角平移（气泡式），
+                // |roll| < 0.5° 吸附归中并转强调色；±10° 满量程
+                if (levelOn) {
+                    Box(Modifier.matchParentSize()) {
+                        val roll = levelRoll.coerceIn(-10f, 10f)
+                        val locked = levelRoll == 0f
+                        val lineColor =
+                            if (locked) FilmTheme.Accent else FilmTheme.Cream.copy(alpha = 0.75f)
+                        Box(
+                            Modifier
+                                .align(Alignment.Center)
+                                .fillMaxWidth(0.42f),
+                        ) {
+                            // 固定参考：中心刻度 + 两端止点
+                            Box(
+                                Modifier
+                                    .align(Alignment.Center)
+                                    .width(2.dp)
+                                    .height(18.dp)
+                                    .background(if (locked) FilmTheme.Accent else FilmTheme.CreamDim),
+                            )
+                            Box(
+                                Modifier
+                                    .align(Alignment.CenterStart)
+                                    .width(1.5.dp)
+                                    .height(12.dp)
+                                    .background(FilmTheme.CreamDim),
+                            )
+                            Box(
+                                Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .width(1.5.dp)
+                                    .height(12.dp)
+                                    .background(FilmTheme.CreamDim),
+                            )
+                            // 指示线：随滚转平移
+                            val travel = with(LocalDensity.current) { 56.dp.toPx() }
+                            Box(
+                                Modifier
+                                    .align(Alignment.Center)
+                                    .graphicsLayer {
+                                        translationX = roll / 10f * travel
+                                    }
+                                    .fillMaxWidth(0.34f)
+                                    .height(2.dp)
+                                    .background(lineColor),
                             )
                         }
                     }
@@ -1034,6 +1100,24 @@ fun CameraScreen(
                     )
                     // 成片同步居中裁切（setCaptureAspect，与取景窗口一致）
                 },
+                gridOn = gridOn,
+                onGrid = {
+                    gridOn = !gridOn
+                    prefs.edit().putBoolean("grid", gridOn).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.grid",
+                        "{\"on\":$gridOn}",
+                    )
+                },
+                levelOn = levelOn,
+                onLevel = {
+                    levelOn = !levelOn
+                    prefs.edit().putBoolean("level", levelOn).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.level",
+                        "{\"on\":$levelOn}",
+                    )
+                },
                 onMoreSettings = {
                     quickOpen = false
                     onOpenSettings()
@@ -1476,6 +1560,10 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
 private fun QuickDropdown(
     aspect: String,
     onAspect: (String) -> Unit,
+    gridOn: Boolean,
+    onGrid: () -> Unit,
+    levelOn: Boolean,
+    onLevel: () -> Unit,
     onMoreSettings: () -> Unit,
 ) {
     Column(
@@ -1503,6 +1591,29 @@ private fun QuickDropdown(
                         onClick = { onAspect(a) },
                     )
                 }
+            }
+        }
+        HorizontalDivider(color = FilmTheme.ChipBorder)
+        // 构图辅助：三分线 / 水平仪（自顶栏快捷区移入，v0.5.16）
+        listOf(
+            Triple("三分构图线", gridOn, onGrid),
+            Triple("水平仪", levelOn, onLevel),
+        ).forEach { (title, on, toggle) ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { toggle() }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(title, color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Text(
+                    if (on) "开" else "关",
+                    color = if (on) FilmTheme.Accent else FilmTheme.CreamDim,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
             }
         }
         HorizontalDivider(color = FilmTheme.ChipBorder)
