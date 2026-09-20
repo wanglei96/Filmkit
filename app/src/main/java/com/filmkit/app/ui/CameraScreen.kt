@@ -290,7 +290,9 @@ fun CameraScreen(
                 // 与最近 90° 轴的偏差（phi≡0/90/180/270 时 d=45）
                 var d = (phi + 45f) % 90f
                 if (d < 0f) d += 90f
-                levelAligned = kotlin.math.abs(d - 45f) < 0.5f
+                val dev = kotlin.math.abs(d - 45f)
+                // 滞回对齐：进入 0.4°、退出 1.2°——阈值附近抖动不会来回闪色
+                levelAligned = if (levelAligned) dev < 1.2f else dev < 0.4f
             }
 
             override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) = Unit
@@ -612,9 +614,10 @@ fun CameraScreen(
                                 style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()),
                             )
                         }
-                        // 旋转指示线：60% 屏宽、2.5dp 圆头，360° 连续
-                        val len = size.width * 0.6f
-                        rotate(degrees = levelRoll, pivot = Offset(cx, cy)) {
+                        // 旋转指示线：44% 屏宽、2.5dp 圆头，360° 连续；
+                        // 取反：设备右倾（顺时针）时水平线相对屏幕为逆时针
+                        val len = size.width * 0.44f
+                        rotate(degrees = -levelRoll, pivot = Offset(cx, cy)) {
                             drawLine(
                                 lineColor,
                                 Offset(cx - len / 2f, cy),
