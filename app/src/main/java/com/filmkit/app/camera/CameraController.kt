@@ -11,6 +11,8 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.BlackLevelPattern
 import android.media.Image
 import android.media.ImageReader
 import android.os.Build
@@ -41,6 +43,25 @@ class CameraController(private val context: Context, private val render: RenderC
     private var surfaceTexture: SurfaceTexture? = null
     private var previewSurface: Surface? = null
     private var stillReader: ImageReader? = null
+
+    /** RAW 静拍模式（M2-3）：DNG 开关开启且当前镜头支持 RAW_SENSOR 时生效，
+     *  openCamera 时决定；false 走 YUV_420_888 原路径 */
+    @Volatile
+    private var rawMode = false
+
+    /** 当前镜头 characteristics（DngCreator 必需；openCamera 时暂存） */
+    private var curCharacteristics: CameraCharacteristics? = null
+
+    /** RAW 静拍汇合：Image（reader listener）与 TotalCaptureResult（capture 回调）
+     *  都就绪才处理；两者回调同绑渲染线程 looper，天然串行无锁 */
+    private var pendingRawImage: Image? = null
+    private var pendingResult: TotalCaptureResult? = null
+
+    @Volatile
+    private var rawResultWarned = false
+
+    /** 当前激活 reader 的格式标记（ImageReader.getFormat 需 API29，用引用比对替代） */
+    private var rawReader: ImageReader? = null
 
     var sensorOrientation = 90
         private set
@@ -722,7 +743,15 @@ class CameraController(private val context: Context, private val render: RenderC
                 addTarget(stillReader!!.surface)
                 applyControls(this) // 静拍继承 M 档控制（WB/EV/OIS/变焦/对焦区域）
             }
-            s.capture(b.build(), null, render.looper?.let { android.os.Handler(it) })
+            if (rawMode) {
+                // RAW 路径需要 TotalCaptureResult（DngCreator/黑阶/WB/CCM 元数据）：
+                // 回调暂存 result，与 reader listener 的 Image 在渲染线程汇合
+                pendingResult = null
+                rawResultWarned = false
+                s.capture(b.build(), rawCaptureCb, render.looper?.let { android.os.Handler(it) })
+            } else {
+                s.capture(b.build(), null, render.looper?.let { android.os.Handler(it) })
+            }
         } catch (t: Throwable) {
             capturing = false
             EngineBridge.nativeAppendLog(
@@ -742,6 +771,9 @@ class CameraController(private val context: Context, private val render: RenderC
             session = null
             stillReader?.close()
             stillReader = null
+            rawReader = null
+            pendingRawImage = null
+            pendingResult = null
             surfaceTexture?.release()
             surfaceTexture = null
             previewSurface?.release()
@@ -771,6 +803,7 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         var targetId: String = lens.id
         val ch = cm.getCameraCharacteristics(targetId)
+        curCharacteristics = ch
         activeLensIdx = backLenses.indexOf(lens).coerceAtLeast(0)
         // 手动对焦：部分 HAL（X300）不上报屈光度上限，给 10D 试值（≈10cm）
         minFocusDiopter = (ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f)
@@ -802,25 +835,52 @@ class CameraController(private val context: Context, private val render: RenderC
             ?: sizes.firstOrNull { it.width.toLong() * it.height <= 1920L * 1080 }
             ?: sizes.last()
 
-        // 静拍流：YUV_420_888 最大分辨率（X300 主摄 4096×3072）；尺寸一致时复用现有 reader
-        val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
-            .sortedByDescending { it.width.toLong() * it.height }
-        stillSize = yuvSizes.first()
+        // 静拍流：DNG 开关 + 镜头 RAW 能力决定走 RAW_SENSOR（M2-3）或 YUV_420_888；
+        // 尺寸一致且格式未变时复用现有 reader
+        val dngOn = context.getSharedPreferences("filmkit", 0).getBoolean("dng_enabled", false)
+        val rawSizes = if (lens.rawSupported) {
+            map.getOutputSizes(ImageFormat.RAW_SENSOR)
+                .sortedByDescending { it.width.toLong() * it.height }
+        } else emptyList()
+        rawMode = dngOn && rawSizes.isNotEmpty()
+        if (dngOn && rawSizes.isEmpty()) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "raw.fallback_yuv",
+                kv("lens" to lens.id, "reason" to "raw_unsupported"),
+            )
+        }
+        val stillFormat = if (rawMode) ImageFormat.RAW_SENSOR else ImageFormat.YUV_420_888
+        stillSize = if (rawMode) rawSizes.first()
+        else map.getOutputSizes(ImageFormat.YUV_420_888)
+            .sortedByDescending { it.width.toLong() * it.height }.first()
         val oldReader = stillReader
         stillReader = if (oldReader != null &&
-            oldReader.width == stillSize.width && oldReader.height == stillSize.height
+            oldReader.width == stillSize.width && oldReader.height == stillSize.height &&
+            rawMode == (oldReader === rawReader)
         ) {
             oldReader
         } else {
             oldReader?.close()
+            rawReader = null
+            pendingRawImage?.close()
+            pendingRawImage = null
+            pendingResult = null
             ImageReader.newInstance(
-                stillSize.width, stillSize.height, ImageFormat.YUV_420_888, 2,
+                stillSize.width, stillSize.height, stillFormat, 2,
             ).apply {
                 setOnImageAvailableListener({ r ->
-                    r.acquireLatestImage()?.let { img -> submitStill(img) }
+                    val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    if (img.format == ImageFormat.RAW_SENSOR) {
+                        pendingRawImage?.close()
+                        pendingRawImage = img
+                        tryProcessRaw()
+                    } else {
+                        submitStill(img)
+                    }
                 }, render.looper?.let { android.os.Handler(it) })
             }
         }
+        if (rawMode) rawReader = stillReader
 
         // OES 纹理与 SurfaceTexture 跨镜头复用（渲染端纹理不变，新首帧一到即恢复画面）
         val st = surfaceTexture ?: run {
@@ -904,6 +964,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     kv(
                         "preview" to "${previewSize.width}x${previewSize.height}",
                         "still" to "${stillSize.width}x${stillSize.height}",
+                        "stillFormat" to (if (rawMode) "RAW_SENSOR" else "YUV"),
                         "sensorOrientation" to sensorOrientation,
                         "ois" to oisSupported,
                         "path" to "surfacetexture+still",
@@ -929,6 +990,186 @@ class CameraController(private val context: Context, private val render: RenderC
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
         }
+    }
+
+    // ── RAW 静拍（M2-3）：Image 与 TotalCaptureResult 汇合后处理 ──
+
+    private val rawCaptureCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: android.hardware.camera2.TotalCaptureResult,
+        ) {
+            pendingResult = result
+            tryProcessRaw()
+        }
+    }
+
+    /** Image/result 双事件汇合（均在渲染线程串行回调，无锁）；缺 result 不处理等回调 */
+    private fun tryProcessRaw() {
+        val img = pendingRawImage ?: return
+        val result = pendingResult
+        if (result == null) {
+            if (!rawResultWarned) {
+                rawResultWarned = true
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "camera", "raw.wait_result", "{}",
+                )
+            }
+            return
+        }
+        pendingRawImage = null
+        pendingResult = null
+        processRaw(img, result)
+    }
+
+    /** RAW 端到端：提取元数据 → DNG 原片（HAL 元数据，不含引擎 WB 补偿——口径 §0-D6）→
+     *  引擎 submitRaw 胶片成片 JPEG。img 生命周期：saveDng 与 submitRaw 都在渲染线程，
+     *  submitRaw 内部消费后关闭。 */
+    private fun processRaw(img: Image, result: TotalCaptureResult) {
+        val ch = curCharacteristics
+        val dngOn = context.getSharedPreferences("filmkit", 0).getBoolean("dng_enabled", false)
+        val meta = extractRawMeta(result, ch)
+        if (dngOn && ch != null) {
+            try {
+                saveDng(img, result, ch)
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "camera", "dng.save_failed",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+            }
+        }
+        render.submitRaw(img, meta, orientationStep, filmParams) { bytes, w, h ->
+            capturing = false
+            if (bytes != null) saveJpeg(bytes, w, h)
+        }
+    }
+
+    /** CFA 相位 → 通道（0=R 1=G 2=B）；与引擎 shader chanAt 同一映射（Camera2: 0=RGGB 1=GRBG 2=GBRG 3=BGGR） */
+    private fun cfaChan(cfa: Int, x: Int, y: Int): Int {
+        val px = x and 1
+        val py = y and 1
+        return when (cfa) {
+            0 -> if (py == 0) (if (px == 0) 0 else 1) else (if (px == 0) 1 else 2)
+            1 -> if (py == 0) (if (px == 0) 1 else 0) else (if (px == 0) 2 else 1)
+            2 -> if (py == 0) (if (px == 0) 1 else 2) else (if (px == 0) 0 else 1)
+            else -> if (py == 0) (if (px == 0) 2 else 1) else (if (px == 0) 1 else 0)
+        }
+    }
+
+    /** CaptureResult → 引擎 RAW 参数。黑阶：dynamic 优先（[R,Ge,Go,B] 顺序）、pattern 兜底，
+     *  统一重排为按相位 (0,0)(1,0)(0,1)(1,1)；白阶：dynamic → characteristics；
+     *  WB：SENSOR_NEUTRAL_COLOR_POINT → 实时增益估计 → 中性 */
+    private fun extractRawMeta(
+        result: TotalCaptureResult,
+        ch: CameraCharacteristics?,
+    ): RenderClient.RawFrameMeta {
+        val black4 = FloatArray(4)
+        val dynBl: FloatArray? = if (Build.VERSION.SDK_INT >= 28) {
+            result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+        } else null
+        if (dynBl != null && dynBl.size >= 4) {
+            // dynamic 顺序 [R, Geven, Godd, B]：G 通道按行奇偶取下标 1/2
+            var i = 0
+            for (y in 0..1) for (x in 0..1) {
+                val c = cfaChan(colorFilterArrangement, x, y)
+                black4[i++] = dynBl[if (c == 0) 0 else if (c == 2) 3 else y]
+            }
+        } else {
+            val blp: BlackLevelPattern? =
+                ch?.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+            if (blp != null) {
+                val vals = IntArray(BlackLevelPattern.COUNT)
+                blp.copyTo(vals, 0)
+                var i = 0
+                for (y in 0..1) for (x in 0..1) {
+                    black4[i++] = vals[blp.getOffsetForIndex(x, y)].toFloat()
+                }
+            }
+        }
+        val whiteLevel = (if (Build.VERSION.SDK_INT >= 28) {
+            result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
+        } else null)
+            ?: ch?.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+            ?: 1023
+
+        var nR = 0f
+        var nG = 0f
+        var nB = 0f
+        val neutral: Array<android.util.Rational>? =
+            result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
+        neutral?.let { n ->
+            val r = n[0].toFloat()
+            val g = n[1].toFloat()
+            val b = n[2].toFloat()
+            if (r > 0f && g > 0f && b > 0f) {
+                nR = r; nG = g; nB = b
+            }
+        }
+        if (nR <= 0f || nG <= 0f || nB <= 0f) {
+            // 兜底：AWB 实时增益估计（neutral = 1/gain，G 归一）；再兜底全中性
+            if (estGainR > 0.001f && estGainB > 0.001f) {
+                nR = 1f / estGainR; nG = 1f; nB = 1f / estGainB
+            } else {
+                nR = 1f; nG = 1f; nB = 1f
+            }
+        }
+        val ccm = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
+            // 构造收行主序、读取 getElement(col,row)——遍历须 (row, col) 双重序防转置
+            for (row in 0..2) for (col in 0..2) ccm[row * 3 + col] = t.getElement(col, row).toFloat()
+        }
+        return RenderClient.RawFrameMeta(
+            colorFilterArrangement, black4, whiteLevel,
+            floatArrayOf(nR, nG, nB), ccm,
+        )
+    }
+
+    /** DNG 原片保存：DngCreator 按 HAL 元数据写（asShotNeutral/黑阶/CCM 全在其中），
+     *  用户手动 WB 的引擎侧补偿不进 DNG（底片口径，v0.5.9 决策）。 */
+    private fun saveDng(
+        img: Image,
+        result: TotalCaptureResult,
+        ch: CameraCharacteristics,
+    ) {
+        val creator = android.hardware.camera2.DngCreator(ch, result)
+        creator.setOrientation(sensorOrientation) // 原始传感器方向，第三方 Raw 软件自行转正
+        val now = Date()
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.dng"
+        if (Build.VERSION.SDK_INT >= 29) {
+            val cv = android.content.ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            context.contentResolver
+                .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                ?.let { uri ->
+                    context.contentResolver.openOutputStream(uri)?.use {
+                        creator.writeImage(it, img)
+                    }
+                    cv.clear()
+                    cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    context.contentResolver.update(uri, cv, null, null)
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "camera", "dng.saved",
+                        kv("name" to name, "out" to "${img.width}x${img.height}"),
+                    )
+                }
+        } else {
+            val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
+            dir.mkdirs()
+            File(dir, name).outputStream().use {
+                creator.writeImage(it, img)
+            }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "dng.saved",
+                kv("name" to name, "out" to "${img.width}x${img.height}"),
+            )
+        }
+        creator.close()
     }
 
     private fun saveJpeg(rgba: ByteArray, w: Int, h: Int) {

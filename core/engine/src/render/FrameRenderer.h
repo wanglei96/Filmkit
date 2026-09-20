@@ -42,6 +42,18 @@ class FrameRenderer {
                    int y_stride, int uv_stride, int uv_pix, int rotation,
                    const FilmParams& p, std::vector<uint8_t>* out_rgba);
 
+  // RAW 静拍（M2-3）：u16 Bayer（R16UI 整型纹理 + texelFetch）→ 黑阶扣除
+  // → 白阶归一 → WB（asShotNeutral）→ bilinear demosaic（CFA 相位）→ CCM
+  // → 场景线性，汇流 pass2/3 胶片链 → RGBA8 读回。
+  //   black_phase —— 按相位 (0,0)(1,0)(0,1)(1,1) 的四通道黑阶
+  //   neutral*    —— JPEG_NEUTRAL_COLOR_POINT（asShotNeutral），增益=其倒数 G 归一
+  //   ccm9        —— sensor→sRGB 3×3 行主序；nullptr = 单位阵
+  bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
+                 const float black_phase[4], int white_level,
+                 float neutral_r, float neutral_g, float neutral_b,
+                 const float* ccm9, int rotation, const FilmParams& p,
+                 std::vector<uint8_t>* out_rgba);
+
   int64_t frameCount() const { return frames_.load(std::memory_order_relaxed); }
   int sceneW() const { return scene_w_; }
   int sceneH() const { return scene_h_; }
@@ -51,6 +63,9 @@ class FrameRenderer {
   void passOES(int dst_w, int dst_h, const float* st, int rot, float sx,
                float sy, const FilmParams& p);
   void passStill(int dst_w, int dst_h, int rot, const FilmParams& p);
+  void passRaw(int dst_w, int dst_h, int rot, int cfa,
+               const float black_phase[4], float white_level,
+               const float gains[3], const float* ccm, const FilmParams& p);
   void passFilm(int w, int h, const FilmParams& p);
   void passOutput(int w, int h, const FilmParams& p, bool flip_y);
   void passFill(int dst_w, int dst_h);
@@ -59,13 +74,15 @@ class FrameRenderer {
   void logPassDiag(const char* stage, GLuint fbo, bool half_float);
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
-         prog_fill_ = 0;
+         prog_fill_ = 0, prog_raw_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
   int yuv_matrix_ = 0;
   GLuint still_tex_ = 0;  // RGB8，静拍 CPU 转换后上传
   int still_w_ = 0, still_h_ = 0;
+  GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
+  int raw_w_ = 0, raw_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
@@ -80,6 +97,10 @@ class FrameRenderer {
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, wb = -1, exposure = -1;
   } u_still_;
+  struct {
+    GLint st = -1, rot = -1, scale = -1, tex = -1, size = -1, cfa = -1,
+          black = -1, white = -1, gain = -1, ccm = -1;
+  } u_raw_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1;

@@ -281,6 +281,37 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
   return out;
 }
 
+// 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
+    JNIEnv* env, jobject, jobject raw_buf, jint w, jint h, jint row_stride_px,
+    jint cfa, jfloatArray black_phase, jint white_level, jfloat neutral_r,
+    jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jint rotation,
+    jdoubleArray film) {
+  if (!g_renderer || !raw_buf) return nullptr;
+  float black4[4] = {0, 0, 0, 0};
+  if (black_phase) {
+    const jsize bn = env->GetArrayLength(black_phase);
+    if (bn >= 4) env->GetFloatArrayRegion(black_phase, 0, 4, black4);
+  }
+  float ccm9[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  if (ccm) {
+    const jsize cn = env->GetArrayLength(ccm);
+    if (cn >= 9) env->GetFloatArrayRegion(ccm, 0, 9, ccm9);
+  }
+  const FilmParams p = paramsFromJava(env, film);
+  std::vector<uint8_t> rgba;
+  const bool ok = g_renderer->submitRaw(
+      env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
+      white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
+      rotation, p, &rgba);
+  if (!ok) return nullptr;
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
+  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
+                          reinterpret_cast<const jbyte*>(rgba.data()));
+  return out;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
   const int64_t frames = g_renderer ? g_renderer->frameCount() : 0;

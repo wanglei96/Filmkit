@@ -159,6 +159,49 @@ class RenderClient {
         }
     }
 
+    /** RAW 静拍元数据（CaptureResult 提取，M2-3）。 */
+    class RawFrameMeta(
+        val cfa: Int,
+        val blackPhase: FloatArray, // 相位 (0,0)(1,0)(0,1)(1,1)
+        val whiteLevel: Int,
+        val neutral: FloatArray,    // asShotNeutral (r,g,b)
+        val ccm: FloatArray,        // sensor→sRGB 行主序 3×3
+    )
+
+    /** 静拍 RAW：u16 Bayer → 引擎 demosaic+胶片链 → 读回，回调在渲染线程。
+     *  img 在本函数消费后关闭；DNG 原片须在本调用前写出（依赖 image 与 result）。 */
+    fun submitRaw(img: android.media.Image, meta: RawFrameMeta, rotation: Int, film: DoubleArray, onDone: (ByteArray?, Int, Int) -> Unit) {
+        val h = handler
+        if (h == null) {
+            img.close()
+            onDone(null, 0, 0)
+            return
+        }
+        h.post {
+            // 与 submitStill 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
+            val effectiveRot = (rotation + 1) % 4
+            val rotatedW = if (effectiveRot % 2 == 1) img.height else img.width
+            val rotatedH = if (effectiveRot % 2 == 1) img.width else img.height
+            var bytes: ByteArray? = null
+            try {
+                val p = img.planes[0]
+                bytes = EngineBridge.nativeEngineSubmitRaw(
+                    p.buffer, img.width, img.height, p.rowStride / 2,
+                    meta.cfa, meta.blackPhase, meta.whiteLevel,
+                    meta.neutral[0], meta.neutral[1], meta.neutral[2],
+                    meta.ccm, rotation, film,
+                )
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.raw_error",
+                    com.filmkit.app.kv("error" to (t.message ?: t.toString())),
+                )
+            }
+            img.close()
+            onDone(bytes, rotatedW, rotatedH)
+        }
+    }
+
     fun stop() {
         synchronized(this) { stopInternal() }
     }

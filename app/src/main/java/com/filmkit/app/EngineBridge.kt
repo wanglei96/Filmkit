@@ -58,6 +58,18 @@ object EngineBridge {
         rotation: Int, film: DoubleArray,
     ): ByteArray?
 
+    /**
+     * 静拍 RAW（M2-3）：u16 Bayer → 黑阶扣除 → 白阶归一 → WB（asShotNeutral 倒数）
+     * → bilinear demosaic → CCM → 胶片链 → 读回 RGBA（旋转后尺寸）。
+     * blackPhase 按相位 (0,0)(1,0)(0,1)(1,1)；ccm 为 sensor→sRGB 行主序 3×3（null=单位阵）。
+     */
+    external fun nativeEngineSubmitRaw(
+        raw: ByteBuffer, width: Int, height: Int, rowStridePx: Int,
+        cfa: Int, blackPhase: FloatArray, whiteLevel: Int,
+        neutralR: Float, neutralG: Float, neutralB: Float,
+        ccm: FloatArray?, rotation: Int, film: DoubleArray,
+    ): ByteArray?
+
     /** 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709（须在引擎启动后设置） */
     external fun nativeEngineSetYuvMatrix(m: Int)
 }
