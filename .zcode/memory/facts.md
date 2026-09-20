@@ -40,3 +40,8 @@ status: active
 - [2026-09-20] prefs 键新增：jpeg_quality（95/100 成像质量）、level（水平仪）、yuv_709（静拍解码矩阵，已定论 601 正确保留备查）；既有 grid（三分线，入口移至菜单面板构图辅助区）
 - [2026-09-20] 手机存储可从 Mac 直读：`~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/`——成片原样张可直接取做像素分析（PIL/numpy 对比有效）
 - [2026-09-20] 成像链结构：静拍 CPU YUV→RGB（FrameRenderer.cpp，矩阵参数化 setYuvMatrix/JNI nativeEngineSetYuvMatrix）→ kFsFilm log 域分段延展（±4EV 有效 + 域外半斜率外推至 ~±9EV）→ JPEG 质量 95/100 + exifinterface 补写 EXIF
+- [2026-09-20] 发布现状：最新 v0.5.27-m2（versionCode 58，tag 已推送）；M2 全部完成，M3 开工（基建：计时+shader 校验）
+- [2026-09-20] M 档 RAW 链：prefs raw_mode 快捷开关（顶栏「M」）→ RAW_SENSOR 4080×3072 → DngCreator（dng_enabled 才存底片，MIME image/x-adobe-dng）→ 引擎 submitRaw：R16UI 整型纹理（texelFetch+UNPACK_ROW_LENGTH）→ shader 黑阶/WB/bilinear/CCM → 汇流 pass2/3；prefs capture_aspect 画幅持久化
+- [2026-09-20] X300 RAW result 键真机确认回填：SENSOR_NEUTRAL_COLOR_POINT（如 0.4895/1.0/0.671）、COLOR_CORRECTION_TRANSFORM（对角 ~1.5/1.14）、SENSOR_DYNAMIC_BLACK_LEVEL（64×4）、白阶 1023；raw.meta 日志可核对
+- [2026-09-20] raw.render 日志：uploadMs/passMs/totalMs（glFinish 后计时，真实端到端）；M3 性能出口=12MP 全链路 ≤900ms（标准档）
+- [2026-09-20] shader 校验：tools/validate-shaders.sh（提取 FrameRenderer.cpp 全部 GLSL 按 vert/frag 交 glslang）；本地二进制 tools/bin/glslang（16.6.0，gitignore）；发版前必跑

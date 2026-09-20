@@ -43,3 +43,9 @@ status: active
 - [2026-09-20] **Bitmap.compress 不写任何 EXIF**：保存后用 ExifInterface 经可写 FileDescriptor（MediaStore openFileDescriptor "rw"）补写；InputStream 构造不支持 saveAttributes；ORIENTATION 不显式写会落非法 0
 - [2026-09-20] **阈值判定无滞回必闪**：水平仪对齐 ±0.5° 单阈值在手抖下持续切色——进入 0.4°/退出 1.2° 滞回解决；平移气泡式水平仪结构上不可用（指示线滑出刻度区成半截+无旋转语义）
 - [2026-09-20] **docs/开发计划.md 插入新版本节**：old_string 含「旧节标题+空行」会吞掉旧标题（本窗口发生 3 次）——插入新节时把旧标题保留在 new_string 尾部
+- [2026-09-20] **行主序 CCM 数组传 glUniformMatrix3fv 必须 transpose=GL_TRUE**：GL 按列主序读取，GL_FALSE=作用转置矩阵→全局严重偏色（v0.5.20 品红根因，真机确认修复）
+- [2026-09-20] **DngCreator.setOrientation 只收 EXIF orientation 1..8**：传 sensor 角度值（90）抛异常→DNG 保存失败；映射 0/90/180/270→1/6/3/8
+- [2026-09-20] **Camera2 RAW 元数据键名/类型凭记忆易错，javap 对 SDK 核实**：WB 键=SENSOR_NEUTRAL_COLOR_POINT（非 JPEG_ 前缀）；SENSOR_DYNAMIC_BLACK_LEVEL 返回 float[4]（[R,Ge,Go,B] 顺序，非 BlackLevelPattern）；pattern 方法=getOffsetForIndex(col,row)
+- [2026-09-20] **rememberSaveable 状态随子页进出销毁丢失**（本项目导航进出设置页销毁重建 CameraScreen）：跨会话 UI 状态（画幅 capture_aspect）必须 prefs 持久化
+- [2026-09-20] **预览框 weight(1f) 弹性占满是"快门调不上移"根因**：剩余空间全被吃掉、底部行永远贴屏底；自适应场景用 weight(1f, fill=false)——4:3 按内容占高、16:9 受可用高度约束
+- [2026-09-20] **shader 静态校验须分 stage**（含 gl_Position=vert），glslang 新版二进制名 glslang；brew 目录 root 属主装不了时用 Khronos release 二进制放 tools/bin（gitignore）
