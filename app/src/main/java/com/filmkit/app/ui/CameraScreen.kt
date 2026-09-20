@@ -486,10 +486,12 @@ fun CameraScreen(
         }
 
         // ── 取景窗口 = 所选画幅（WYSIWYG），窗口外为机身黑，随屏幕方向适配 ──
+        // weight(fill=false)：预览框按画幅内容自适应高度——4:3 不再吃掉多余空间
+        // （快门/瓦片跟随上移、底部留白），16:9 需求高过可用空间时被约束不挤压其他 UI
         Box(
             Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .weight(1f, fill = false),
             contentAlignment = Alignment.Center,
         ) {
             Box(
@@ -691,11 +693,10 @@ fun CameraScreen(
                 }
 
                 // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘；长按弹轮盘变焦（设置可关）
-                // v0.5.25 与控制瓦片互换位置：焦段条在上（bottom 64dp），瓦片贴底
                 Row(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 10.dp, end = 10.dp, bottom = 64.dp)
+                        .padding(start = 10.dp, end = 10.dp, bottom = 12.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .then(
                             if (wheelOn) {
@@ -854,14 +855,14 @@ fun CameraScreen(
                 )
             }
 
-            // 参数面板：全局单实例，状态驱动显隐（v0.5.24 起在控制瓦片上方展开）
+            // 参数面板：全局单实例，状态驱动显隐（焦段条上方展开）
                 androidx.compose.animation.AnimatedVisibility(
                     visible = selectedControl != null,
                     enter = FilmMotion.panelEnter,
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 12.dp, end = 12.dp, bottom = 124.dp),
+                        .padding(start = 12.dp, end = 12.dp, bottom = 58.dp),
                 ) {
                     ControlPanel(
                         ctrl = selectedControl,
@@ -958,85 +959,13 @@ fun CameraScreen(
                             .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
                     )
                 }
-                // ── 控制瓦片（贴预览底缘，焦段条上方与之互换 v0.5.25）：紧凑排布 ──
-                Row(
-                    Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(start = 8.dp, end = 8.dp, bottom = 12.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(FilmTheme.Body.copy(alpha = 0.66f))
-                        .padding(horizontal = 6.dp, vertical = 3.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                ) {
-                    fun toggle(c: String) {
-                        androidView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                        selectedControl = if (selectedControl == c) null else c
-                    }
-                    val expActive = selectedControl == "EXP"
-                    ControlTile(
-                        value = if (evAuto) "+0.0" else (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
-                        label = "EV",
-                        state = when {
-                            selectedControl == "EV" -> TileState.ACTIVE
-                            evAuto -> TileState.AUTO
-                            else -> TileState.MANUAL
-                        },
-                        onTap = { toggle("EV") },
-                    )
-                    ControlTile(
-                        value = if (aeAuto) (if (liveNs > 0) secText(liveNs) else "--") else secText(shutterNs),
-                        label = "Tv",
-                        state = when {
-                            expActive -> TileState.ACTIVE
-                            aeAuto -> TileState.AUTO
-                            else -> TileState.MANUAL
-                        },
-                        onTap = { toggle("EXP") },
-                    )
-                    ControlTile(
-                        value = if (aeAuto) (if (liveIso > 0) "$liveIso" else "--") else "$iso",
-                        label = "ISO",
-                        state = when {
-                            expActive -> TileState.ACTIVE
-                            aeAuto -> TileState.AUTO
-                            else -> TileState.MANUAL
-                        },
-                        onTap = { toggle("EXP") },
-                    )
-                    ControlTile(
-                        value = if (mfOn) {
-                            fmtDist(mfDiopter)
-                        } else if (liveFocus > 0.01f) {
-                            fmtDist(liveFocus)
-                        } else {
-                            "AUTO"
-                        },
-                        label = "AF",
-                        state = when {
-                            selectedControl == "AF" -> TileState.ACTIVE
-                            mfOn -> TileState.MANUAL
-                            else -> TileState.AUTO
-                        },
-                        onTap = { toggle("AF") },
-                    )
-                    ControlTile(
-                        value = if (wbAuto) (if (liveK > 0) "${liveK}K" else "AUTO") else "${wbK}K",
-                        label = "WB",
-                        state = when {
-                            selectedControl == "WB" -> TileState.ACTIVE
-                            wbAuto -> TileState.AUTO
-                            else -> TileState.MANUAL
-                        },
-                        onTap = { toggle("WB") },
-                    )
-                }
                 androidx.compose.animation.AnimatedVisibility(
                     visible = lutOpen,
                     enter = FilmMotion.panelEnter,
                     exit = FilmMotion.panelExit,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 14.dp, end = 14.dp, bottom = 124.dp),
+                        .padding(start = 14.dp, end = 14.dp, bottom = 62.dp),
                 ) {
                     LutMenu(
                         presetIdx = presetIdx,
@@ -1052,6 +981,76 @@ fun CameraScreen(
             }
         }
 
+        // ── 控制瓦片：单行紧凑，预览框下方、快门上方（v0.5.26 移出预览框）──
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+        ) {
+            fun toggle(c: String) {
+                androidView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                selectedControl = if (selectedControl == c) null else c
+            }
+            val expActive = selectedControl == "EXP"
+            ControlTile(
+                value = if (evAuto) "+0.0" else (if (ev >= 0f) "+" else "") + "%.1f".format(ev),
+                label = "EV",
+                state = when {
+                    selectedControl == "EV" -> TileState.ACTIVE
+                    evAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
+                onTap = { toggle("EV") },
+            )
+            ControlTile(
+                value = if (aeAuto) (if (liveNs > 0) secText(liveNs) else "--") else secText(shutterNs),
+                label = "Tv",
+                state = when {
+                    expActive -> TileState.ACTIVE
+                    aeAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
+                onTap = { toggle("EXP") },
+            )
+            ControlTile(
+                value = if (aeAuto) (if (liveIso > 0) "$liveIso" else "--") else "$iso",
+                label = "ISO",
+                state = when {
+                    expActive -> TileState.ACTIVE
+                    aeAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
+                onTap = { toggle("EXP") },
+            )
+            ControlTile(
+                value = if (mfOn) {
+                    fmtDist(mfDiopter)
+                } else if (liveFocus > 0.01f) {
+                    fmtDist(liveFocus)
+                } else {
+                    "AUTO"
+                },
+                label = "AF",
+                state = when {
+                    selectedControl == "AF" -> TileState.ACTIVE
+                    mfOn -> TileState.MANUAL
+                    else -> TileState.AUTO
+                },
+                onTap = { toggle("AF") },
+            )
+            ControlTile(
+                value = if (wbAuto) (if (liveK > 0) "${liveK}K" else "AUTO") else "${wbK}K",
+                label = "WB",
+                state = when {
+                    selectedControl == "WB" -> TileState.ACTIVE
+                    wbAuto -> TileState.AUTO
+                    else -> TileState.MANUAL
+                },
+                onTap = { toggle("WB") },
+            )
+        }
+
         // ── 底部：胶卷位（最近样张）· 快门 · 预留翻转位 ──
         // navigationBarsPadding + 加大底距：控制瓦片移入预览框后快门整体上移，
         // 单手更好按（v0.5.22/24 反馈）
@@ -1059,7 +1058,7 @@ fun CameraScreen(
             Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(top = 2.dp, bottom = 36.dp),
+                .padding(top = 2.dp, bottom = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
@@ -1224,14 +1223,14 @@ private fun ControlTile(value: String, label: String, state: TileState, onTap: (
     }
     Column(
         Modifier
-            .width(54.dp)
+            .width(50.dp)
             .pressScale(onTap = onTap, pressedScale = 0.9f),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
             value,
             color = color,
-            fontSize = 13.sp,
+            fontSize = 12.sp,
             fontFamily = FilmTheme.Mono,
             maxLines = 1,
         )
