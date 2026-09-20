@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -1049,10 +1050,12 @@ fun CameraScreen(
         }
 
         // ── 底部：胶卷位（最近样张）· 快门 · 预留翻转位 ──
+        // navigationBarsPadding：快门抬到系统手势条之上（v0.5.22 反馈：重叠小白条、单手难按）
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(top = 2.dp, bottom = 4.dp),
+                .navigationBarsPadding()
+                .padding(top = 2.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
