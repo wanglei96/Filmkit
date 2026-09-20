@@ -21,3 +21,7 @@ local.properties
 
 # 系统
 .DS_Store
+
+# 成片样张（不入库，仅本地留存）
+FILMKIT_*.jpg
+FILMKIT_*.dng

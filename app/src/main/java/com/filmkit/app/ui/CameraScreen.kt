@@ -197,7 +197,11 @@ fun CameraScreen(
 
     // M 档（RAW 采集）：开 = 静拍走 RAW_SENSOR 引擎胶片链；与 DNG 底片开关解耦（§0-D6 更新）
     var rawOn by rememberSaveable { mutableStateOf(prefs.getBoolean("raw_mode", false)) }
-    var aspect by rememberSaveable { mutableStateOf("4:3") }
+    // 画幅持久化（prefs capture_aspect）：进出设置页会销毁重建 CameraScreen，
+    // 纯内存状态会丢回 4:3（v0.5.21 真机实测）
+    var aspect by rememberSaveable {
+        mutableStateOf(prefs.getString("capture_aspect", null) ?: "4:3")
+    }
     // A/手动状态持久化（重启不丢手动档），初始值读 prefs
     var evAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("ev_auto", true)) }
     var aeAuto by rememberSaveable { mutableStateOf(prefs.getBoolean("ae_auto", true)) }
@@ -1117,6 +1121,7 @@ fun CameraScreen(
                 aspect = aspect,
                 onAspect = { a ->
                     aspect = a
+                    prefs.edit().putString("capture_aspect", a).apply()
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "quick.aspect",
                         kv("ratio" to a),
