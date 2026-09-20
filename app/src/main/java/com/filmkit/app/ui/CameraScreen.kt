@@ -188,7 +188,9 @@ fun CameraScreen(
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
     var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
     var levelOn by rememberSaveable { mutableStateOf(prefs.getBoolean("level", false)) }
-    var levelRoll by remember { mutableFloatStateOf(0f) } // 设备滚转角（度），水平仪显示用
+    // 水平仪显示角（重力方向相对屏幕下方，-180..180 连续，低通平滑后）
+    var levelRoll by remember { mutableFloatStateOf(0f) }
+    var levelAligned by remember { mutableStateOf(false) } // 模 90° 任一轴水平即对齐（横竖屏均可）
     var soundOn by rememberSaveable { mutableStateOf(prefs.getBoolean("shutter_sound", true)) }
     var aspect by rememberSaveable { mutableStateOf("4:3") }
     // A/手动状态持久化（重启不丢手动档），初始值读 prefs
@@ -265,18 +267,30 @@ fun CameraScreen(
         onDispose { controller.stop() }
     }
 
-    // 水平仪：加速度计重力分量求滚转角（竖屏持机 roll = atan2(gx, -gy)），
-    // 水平（±0.5°）时吸附 0 供指示线归中
+    // 水平仪：加速度计重力方向 φ=atan2(gx,-gy)。
+    // 对齐 = φ 距 0/90/180/270 任一轴 <0.5°（竖握/横握/倒握均可对齐，模 90° 判定）；
+    // 显示角连续 360°，按最短角差做低通平滑防跳变
     DisposableEffect(levelOn) {
         if (!levelOn) return@DisposableEffect onDispose { }
         val sm = context.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        var smooth = 0f
+        fun wrap180(a: Float): Float {
+            var x = a
+            while (x > 180f) x -= 360f
+            while (x < -180f) x += 360f
+            return x
+        }
         val listener = object : android.hardware.SensorEventListener {
             override fun onSensorChanged(e: android.hardware.SensorEvent) {
-                if (e.sensor.type == android.hardware.Sensor.TYPE_ACCELEROMETER) {
-                    val g = e.values
-                    val roll = Math.toDegrees(kotlin.math.atan2(g[0].toDouble(), -g[1].toDouble()))
-                    levelRoll = (if (kotlin.math.abs(roll) < 0.5) 0.0 else roll).toFloat()
-                }
+                if (e.sensor.type != android.hardware.Sensor.TYPE_ACCELEROMETER) return
+                val g = e.values
+                val phi = Math.toDegrees(kotlin.math.atan2(g[0].toDouble(), -g[1].toDouble())).toFloat()
+                smooth += wrap180(phi - smooth) * 0.22f // 低通：响应与防抖折中
+                levelRoll = smooth
+                // 与最近 90° 轴的偏差（phi≡0/90/180/270 时 d=45）
+                var d = (phi + 45f) % 90f
+                if (d < 0f) d += 90f
+                levelAligned = kotlin.math.abs(d - 45f) < 0.5f
             }
 
             override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) = Unit
@@ -574,39 +588,38 @@ fun CameraScreen(
                     }
                 }
 
-                // 水平仪：中心固定参考刻度 + 长指示线随滚转角旋转（v0.5.17：
-                // 弃平移气泡——线滑出刻度区只剩半截且无旋转语义）。
-                // 对齐（|roll|<0.5° 吸附）= 系统强调色；不对齐 = 白色不透明
+                // 水平仪：中心圆环 + 两侧短刻度为固定参考；长指示线随重力方向
+                // 连续旋转（360°，竖握/横握均适用）。对齐 = 强调色，不对齐 = 白色
                 if (levelOn) {
                     Canvas(Modifier.matchParentSize()) {
-                        val roll = levelRoll.coerceIn(-10f, 10f)
-                        val locked = levelRoll == 0f
-                        val lineColor = if (locked) FilmTheme.Accent else Color.White
+                        val lineColor = if (levelAligned) FilmTheme.Accent else Color.White
+                        val refColor = if (levelAligned) FilmTheme.Accent else FilmTheme.CreamDim
                         val cx = size.width / 2f
                         val cy = size.height / 2f
-                        val gauge = 14.dp.toPx()
-                        val gaugeH = 16.dp.toPx()
-                        // 固定参考刻度：中心左右两根短竖线（不随倾斜动）
-                        drawLine(
-                            FilmTheme.CreamDim,
-                            Offset(cx - gauge, cy - gaugeH / 2f),
-                            Offset(cx - gauge, cy + gaugeH / 2f),
-                            2.dp.toPx(),
-                        )
-                        drawLine(
-                            FilmTheme.CreamDim,
-                            Offset(cx + gauge, cy - gaugeH / 2f),
-                            Offset(cx + gauge, cy + gaugeH / 2f),
-                            2.dp.toPx(),
-                        )
-                        // 旋转指示线：以画面中心为轴随滚转转动，长 60% 屏宽
+                        val gap = 34.dp.toPx()   // 刻度距中心
+                        val tick = 7.dp.toPx()   // 刻度半长
+                        // 左右固定刻度
+                        drawLine(refColor, Offset(cx - gap, cy - tick), Offset(cx - gap, cy + tick), 2.dp.toPx())
+                        drawLine(refColor, Offset(cx + gap, cy - tick), Offset(cx + gap, cy + tick), 2.dp.toPx())
+                        // 中心圆环（对齐时实心点）
+                        if (levelAligned) {
+                            drawCircle(lineColor, radius = 4.dp.toPx(), center = Offset(cx, cy))
+                        } else {
+                            drawCircle(
+                                refColor,
+                                radius = 5.dp.toPx(),
+                                center = Offset(cx, cy),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()),
+                            )
+                        }
+                        // 旋转指示线：60% 屏宽、2.5dp 圆头，360° 连续
                         val len = size.width * 0.6f
-                        rotate(degrees = roll, pivot = Offset(cx, cy)) {
+                        rotate(degrees = levelRoll, pivot = Offset(cx, cy)) {
                             drawLine(
                                 lineColor,
                                 Offset(cx - len / 2f, cy),
                                 Offset(cx + len / 2f, cy),
-                                3.dp.toPx(),
+                                2.5.dp.toPx(),
                                 StrokeCap.Round,
                             )
                         }
