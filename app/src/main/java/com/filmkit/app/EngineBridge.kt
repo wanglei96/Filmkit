@@ -57,4 +57,7 @@ object EngineBridge {
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
         rotation: Int, film: DoubleArray,
     ): ByteArray?
+
+    /** 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709（须在引擎启动后设置） */
+    external fun nativeEngineSetYuvMatrix(m: Int)
 }

@@ -111,6 +111,21 @@ fun SettingsScreen(
                     )
                 },
             )
+            var yuv709 by rememberSaveable { mutableStateOf(prefs.getBoolean("yuv_709", false)) }
+            SettingSwitchRow(
+                title = "静拍 YUV 解码 BT.709",
+                subtitle = "色彩偏品红时打开（新平台 HAL 多为 709）；同场景 A/B 对比后择一",
+                checked = yuv709,
+                onChecked = { v ->
+                    yuv709 = v
+                    prefs.edit().putBoolean("yuv_709", v).apply()
+                    EngineBridge.nativeEngineSetYuvMatrix(if (v) 1 else 0)
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.yuv709",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)

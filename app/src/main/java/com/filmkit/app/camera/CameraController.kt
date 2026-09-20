@@ -50,7 +50,7 @@ class CameraController(private val context: Context, private val render: RenderC
         private set
 
     @Volatile
-    private var filmParams: DoubleArray = CameraPresets.negative400()
+    private var filmParams: DoubleArray = CameraPresets.standard()
 
     @Volatile
     private var fillTest = false
@@ -184,6 +184,7 @@ class CameraController(private val context: Context, private val render: RenderC
         private set
     var baseFocalMm = 23f
         private set
+    private var apertureF = 1.68f // 最大光圈（EXIF 写入）
 
     fun setManualExposure(on: Boolean) {
         manualExposure = on
@@ -698,6 +699,10 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             return
         }
+        // 静拍 YUV 解码矩阵（设置页开关，实拍 A/B 定夺；须在引擎启动后设置）
+        EngineBridge.nativeEngineSetYuvMatrix(
+            if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
+        )
         started = true
         openCamera()
     }
@@ -780,6 +785,9 @@ class CameraController(private val context: Context, private val render: RenderC
         maxAnalogIso = ch.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY) ?: 3200
         ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()?.let {
             baseFocalMm = it
+        }
+        ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull()?.let {
+            apertureF = it
         }
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         val sizes = map.getOutputSizes(SurfaceTexture::class.java)
@@ -957,32 +965,47 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         val outW = outBmp.width
         val outH = outBmp.height
-        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.jpg"
+        val now = Date()
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.jpg"
         try {
+            var savedUri: android.net.Uri? = null
+            var savedFile: File? = null
             if (Build.VERSION.SDK_INT >= 29) {
                 val cv = android.content.ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, name)
                     put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                     put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
                 context.contentResolver
                     .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                     ?.let { uri ->
                         lastPhotoUri = uri
                         context.contentResolver.openOutputStream(uri)?.use {
-                            outBmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
                         }
+                        cv.clear()
+                        cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                        context.contentResolver.update(uri, cv, null, null)
+                        savedUri = uri
                     }
             } else {
                 val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
                 dir.mkdirs()
                 File(dir, name).outputStream().use {
-                    outBmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                    outBmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
                 }
+                savedFile = File(dir, name)
             }
+            // Bitmap.compress 不写任何元数据——用 ExifInterface 补写拍摄参数
+            writeExif(savedUri, savedFile, now)
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "photo.saved",
-                kv("name" to name, "w" to outW, "h" to outH, "avgLuma" to (sum / n.coerceAtLeast(1))),
+                kv(
+                    "name" to name, "w" to outW, "h" to outH,
+                    "avgLuma" to (sum / n.coerceAtLeast(1)),
+                    "iso" to liveIso, "sec" to "%.4f".format(liveExposureNs / 1e9f),
+                ),
             )
         } catch (t: Throwable) {
             EngineBridge.nativeAppendLog(
@@ -992,6 +1015,56 @@ class CameraController(private val context: Context, private val render: RenderC
         } finally {
             bmp.recycle()
             if (outBmp !== bmp) outBmp.recycle()
+        }
+    }
+
+    /** 补写 EXIF：机型/时间/ISO/快门/光圈/焦距（35mm 等效）/白平衡模式 */
+    private fun writeExif(uri: android.net.Uri?, file: File?, whenShot: Date) {
+        runCatching {
+            // 可写 FileDescriptor 构造的 ExifInterface 才支持 saveAttributes
+            val pfd = uri?.let { context.contentResolver.openFileDescriptor(it, "rw") }
+            val exif = when {
+                pfd != null -> androidx.exifinterface.media.ExifInterface(pfd.fileDescriptor)
+                file != null -> androidx.exifinterface.media.ExifInterface(file.absolutePath)
+                else -> return
+            }
+            val dt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(whenShot)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, dt)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, dt)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MAKE, Build.MANUFACTURER)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MODEL, Build.MODEL)
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+                liveIso.coerceAtLeast(0).toString(),
+            )
+            val sec = liveExposureNs / 1e9
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME,
+                if (sec >= 0.25) "%.1f".format(sec) else "1/${(1 / sec).roundToInt()}",
+            )
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER,
+                "%.1f".format(apertureF.coerceAtLeast(1f)),
+            )
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH,
+                "%.1f/1".format(baseFocalMm * zoomRatio),
+            )
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM,
+                (currentLensEquiv() * zoomRatio).roundToInt().toString(),
+            )
+            exif.setAttribute(
+                androidx.exifinterface.media.ExifInterface.TAG_WHITE_BALANCE,
+                if (wbMode == CaptureRequest.CONTROL_AWB_MODE_AUTO) "0" else "1", // EXIF: 0=Auto 1=Manual
+            )
+            exif.saveAttributes()
+            pfd?.close()
+        }.onFailure {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "photo.exif_failed",
+                kv("error" to (it.message ?: it.toString())),
+            )
         }
     }
 }

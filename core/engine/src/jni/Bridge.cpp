@@ -254,6 +254,13 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
   return JNI_TRUE;
 }
 
+// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSetYuvMatrix(JNIEnv* env, jobject,
+                                                           jint m) {
+  if (g_renderer) g_renderer->setYuvMatrix(m);
+}
+
 // 静拍：全分辨率 YUV → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(

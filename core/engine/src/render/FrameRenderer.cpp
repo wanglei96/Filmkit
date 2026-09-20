@@ -102,7 +102,10 @@ uniform vec3 uSat;    // 阴影/中间/高光 饱和度
 uniform vec2 uSplit;  // 阴影暖 / 高光冷
 uniform float uMono;
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
+// 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）
 float filmCurve(float x, float toe, float shoulder) {
+    if (x < 0.0 || x > 1.0) return x; // 域外延展段：无 toe/shoulder（exp 会发散）
     x = clamp((x - 0.5) * uContrast + 0.5, 0.0, 1.0);
     float y = x;
     y -= toe * exp(-x * 6.0) * x * (1.0 - x);
@@ -111,9 +114,12 @@ float filmCurve(float x, float toe, float shoulder) {
 }
 void main() {
     vec3 lin = texture(uTex, vUV0).rgb;
-    // log 域：以 0.18 中灰为轴，±4EV → [0,1]。
-    // （修复：旧映射仅覆盖 lin∈[0.25,4]，暗部全被夹到 0 再抬回 0.5 中灰）
-    vec3 lg = clamp(log2(max(lin, vec3(1e-6)) / 0.18) * 0.125 + 0.5, 0.0, 1.0);
+    // log 域：以 0.18 中灰为轴。±4EV 有效域斜率 0.125（对比不变），
+    // 域外 -6.5..-4 / 4..6.5EV 半斜率延展，更暗/更亮继续线性外推到 ~±9EV
+    vec3 e = log2(max(lin, vec3(1e-6)) / 0.18);
+    vec3 lg = e * 0.125 + 0.5;
+    lg = mix(lg, 1.0 + (e - 4.0) * 0.0625, step(4.0, e));
+    lg = mix(lg, (e + 4.0) * 0.0625, step(e, -4.0));
     lg = uCross * lg;
     vec3 g;
     g.r = filmCurve(lg.r, uToe.r, uShoulder.r);
@@ -485,11 +491,18 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
     rgb_stage_.resize(static_cast<size_t>(w) * h * 3);
   }
 
-  // CPU YUV→RGB（BT.601 limited，与预览 pass1 同一矩阵）
+  // CPU YUV→RGB（limited range 展开）。矩阵可选 BT.601（默认，旧行为）/
+  // BT.709（新平台 HAL 常用）——错配时高饱和区 G 被低估 → 偏品红，
+  // 设置页开关实拍 A/B 定夺
   const auto* yp = static_cast<const uint8_t*>(y);
   const auto* up = static_cast<const uint8_t*>(u);
   const auto* vp = static_cast<const uint8_t*>(v);
   const int cw = w / 2;
+  // 归一化色度（±0.5）系数：R←Cr、G←Cb/Cr、B←Cb
+  const float kRCr = yuv_matrix_ == 1 ? 1.793f : 1.596f;
+  const float kGCb = yuv_matrix_ == 1 ? 0.213f : 0.391f;
+  const float kGCr = yuv_matrix_ == 1 ? 0.533f : 0.813f;
+  const float kBCb = yuv_matrix_ == 1 ? 2.112f : 2.017f;
   uint8_t* dst = rgb_stage_.data();
   for (int r = 0; r < h; ++r) {
     const uint8_t* yrow = yp + static_cast<size_t>(r) * y_stride;
@@ -504,9 +517,9 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
       const int cc = c >> (uv_pix >= 2 ? 1 : 0);
       const float cb = (uv_pix >= 2 ? urow[cc * uv_pix] : urow[cc]) / 255.0f - 0.5f;
       const float cr = (uv_pix >= 2 ? vrow[cc * uv_pix] : vrow[cc]) / 255.0f - 0.5f;
-      float R = (yv + 1.596f * cr) * 255.0f;
-      float G = (yv - 0.391f * cb - 0.813f * cr) * 255.0f;
-      float B = (yv + 2.017f * cb) * 255.0f;
+      float R = (yv + kRCr * cr) * 255.0f;
+      float G = (yv - kGCb * cb - kGCr * cr) * 255.0f;
+      float B = (yv + kBCb * cb) * 255.0f;
       orow[c * 3] = static_cast<uint8_t>(R < 0 ? 0 : R > 255 ? 255 : R);
       orow[c * 3 + 1] = static_cast<uint8_t>(G < 0 ? 0 : G > 255 ? 255 : G);
       orow[c * 3 + 2] = static_cast<uint8_t>(B < 0 ? 0 : B > 255 ? 255 : B);

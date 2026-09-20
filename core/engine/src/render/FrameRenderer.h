@@ -26,6 +26,9 @@ class FrameRenderer {
 
   void setOesTexture(GLuint tex) { oes_tex_ = tex; }
 
+  /// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
+  void setYuvMatrix(int m) { yuv_matrix_ = m ? 1 : 0; }
+
   // 预览帧：OES 纹理（Kotlin 侧已 updateTexImage）→ 渲染到当前窗口面。
   //   st      —— SurfaceTexture.getTransformMatrix()（列主序 16 float）
   //   rot     —— 传感器旋转 90° 步进（0..3）
@@ -60,6 +63,7 @@ class FrameRenderer {
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
+  int yuv_matrix_ = 0;
   GLuint still_tex_ = 0;  // RGB8，静拍 CPU 转换后上传
   int still_w_ = 0, still_h_ = 0;
   std::vector<uint8_t> rgb_stage_;

@@ -1,21 +1,20 @@
 package com.filmkit.app.ui
 
 /**
- * M1 内置胶片预设（简化模型的参数集，索引见 C++ film/FilmParams.h）。
- * M4 起接入 JSON 预设系统。
+ * 内置预设：只保留「标准」= 无风格化中性基线（基准色彩科学：log 域 + 胶片曲线骨架，
+ * 全部参数中性）。
+ *
+ * 预设机制定位（2026-09-20 拍板）：预设 = 用户自建（LUT + 参数调节保存），内置风格化
+ * 预设（负片/黑白）无意义已删除。
  *
  * 教训（X300 事故）：DoubleArray 默认全 0，而对比度 0 = 灰板、串扰矩阵 0 = 信号清零、
- * 白平衡 0 = 全黑——所有预设必须从 neutral() 基线出发再覆盖。
+ * 白平衡 0 = 全黑——必须从 neutral() 基线出发再覆盖。
  */
 object CameraPresets {
 
-    val names = listOf("标准", "负片 400", "黑白 400")
+    val names = listOf("标准")
 
-    fun byIndex(i: Int): DoubleArray = when (i) {
-        0 -> standard()
-        2 -> mono400()
-        else -> negative400()
-    }
+    fun byIndex(i: Int): DoubleArray = standard()
 
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
         a[i] = v0; a[i + 1] = v1; a[i + 2] = v2
@@ -32,31 +31,6 @@ object CameraPresets {
         put3(this, 20, 1.0, 1.0, 1.0)     // 分区饱和度
     }
 
-    fun standard(): DoubleArray = neutral().apply {
-        this[21] = 1.1                    // 中间调略提饱和
-    }
-
-    fun negative400(): DoubleArray = neutral().apply {
-        this[4] = 1.12                    // contrast
-        put3(this, 5, 0.32, 0.30, 0.26)   // shoulder
-        put3(this, 8, 0.55, 0.48, 0.38)   // toe
-        put3(this, 11, 1.04, 0.02, -0.02) // 串扰矩阵
-        put3(this, 14, -0.01, 1.02, 0.01)
-        put3(this, 17, 0.02, -0.01, 1.03)
-        put3(this, 20, 0.88, 1.08, 0.96)  // 分区饱和度
-        this[23] = 0.45                   // 阴影暖
-        this[24] = 0.15                   // 高光冷
-        this[26] = 0.10                   // grain
-        this[27] = 1.2
-    }
-
-    fun mono400(): DoubleArray = neutral().apply {
-        this[4] = 1.18
-        put3(this, 5, 0.30, 0.30, 0.30)
-        put3(this, 8, 0.45, 0.45, 0.45)
-        this[21] = 0.6
-        this[25] = 1.0                    // 黑白
-        this[26] = 0.16
-        this[27] = 1.4
-    }
+    /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */
+    fun standard(): DoubleArray = neutral()
 }
