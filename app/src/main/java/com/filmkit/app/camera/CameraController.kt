@@ -286,8 +286,7 @@ class CameraController(private val context: Context, private val render: RenderC
         if (idx != activeLensIdx) {
             activeLensIdx = idx
             started = false
-            stopInternalKeepClient()
-            openCamera(lens.id)
+            stopInternalKeepClient(lens.id)
         } else {
             rebuildRepeating()
         }
@@ -304,13 +303,12 @@ class CameraController(private val context: Context, private val render: RenderC
             return
         }
         activeLensIdx = backLenses.indexOf(lens).coerceAtLeast(0)
-        started = false // 复用 start() 重新打开指定镜头
-        stopInternalKeepClient()
+        started = false
+        stopInternalKeepClient(lens.id)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "lens.switch",
             kv("to" to idx, "id" to lens.id, "equiv" to "%.0fMM".format(lens.equivMm)),
         )
-        openCamera(lens.id)
     }
 
     fun setZoom(ratio: Float) {
@@ -331,22 +329,31 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         val pool = enabledLenses().ifEmpty { backLenses }
         if (pool.isEmpty()) return
-        val lens = pool.filter { it.equivMm <= targetEquiv * 1.05f }.maxByOrNull { it.equivMm }
-            ?: pool.minByOrNull { it.equivMm }
-            ?: return
+        // 覆盖则留（无缝变焦）：当前镜头数码范围（下限含 3% 迟滞）能覆盖目标等效焦段时
+        // 不切镜头——主摄数码撑到上限才切长焦，两个方向的切换点自然错开，
+        // 拖动在切换点附近抖动不会反复重开会话；超广不数码延展（小底裁切画质差）
+        val cur = backLenses.getOrNull(activeLensIdx)?.takeIf { pool.contains(it) }
+        val lens = if (cur != null && cur.equivMm >= mainEquiv() - 0.5f &&
+            targetEquiv >= cur.equivMm * 0.97f && targetEquiv <= cur.equivMm * maxZoom
+        ) {
+            cur
+        } else {
+            pool.filter { it.equivMm <= targetEquiv * 1.05f }.maxByOrNull { it.equivMm }
+                ?: pool.minByOrNull { it.equivMm }
+                ?: return
+        }
         val idx = backLenses.indexOf(lens)
         val newRatio = (targetEquiv / lens.equivMm).coerceIn(1f, maxZoom)
         if (idx != activeLensIdx) {
             zoomRatio = newRatio
             activeLensIdx = idx
             started = false
-            stopInternalKeepClient()
+            stopInternalKeepClient(lens.id)
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "zoom_equiv.lens_switch",
                 kv("equiv" to "%.1f".format(targetEquiv), "lens" to lens.id,
                     "lensEquiv" to "%.0f".format(lens.equivMm), "zoom" to "%.2f".format(newRatio)),
             )
-            openCamera(lens.id)
         } else if (Math.abs(newRatio - zoomRatio) >= 0.01f) {
             zoomRatio = newRatio
             rebuildRepeating()
@@ -618,26 +625,24 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
-    private fun stopInternalKeepClient() {
-        // 先在调用线程捕获旧引用并摘下字段：openCamera 紧随其后会赋新值，
-        // 清理必须针对旧实例，否则可能把新 SurfaceTexture/Reader 释放掉
+    /** 切镜头的待重开镜头 ID（onClosed 里消费；跨线程访问，volatile） */
+    @Volatile
+    private var pendingOpenId: String? = null
+
+    /**
+     * 切镜头：关闭当前设备，重开经 onClosed 串行触发（旧 Surface 释放完成后再 open）。
+     * stillReader/surfaceTexture/previewSurface 保留复用：切换期间渲染端持续输出最后一帧
+     * （冻结而非黑屏），尺寸不匹配时在 openCamera 重建
+     */
+    private fun stopInternalKeepClient(pendingLensId: String? = null) {
+        pendingOpenId = pendingLensId
         val cam = camera
         val ses = session
-        val reader = stillReader
-        val st = surfaceTexture
-        val ps = previewSurface
         camera = null
         session = null
-        stillReader = null
-        surfaceTexture = null
-        previewSurface = null
         render.post {
             try { ses?.stopRepeating() } catch (_: Throwable) {}
             cam?.close()
-            reader?.close()
-            // 切镜头只换采集源：旧 SurfaceTexture/Surface 必须释放，否则每次切换泄漏一套
-            st?.release()
-            ps?.release()
         }
     }
 
@@ -723,6 +728,7 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun stop() {
         started = false
+        pendingOpenId = null
         render.post {
             try { session?.stopRepeating() } catch (_: Throwable) {}
             camera?.close()
@@ -787,43 +793,53 @@ class CameraController(private val context: Context, private val render: RenderC
             ?: sizes.firstOrNull { it.width.toLong() * it.height <= 1920L * 1080 }
             ?: sizes.last()
 
-        // 静拍流：YUV_420_888 最大分辨率（X300 主摄 4096×3072）
+        // 静拍流：YUV_420_888 最大分辨率（X300 主摄 4096×3072）；尺寸一致时复用现有 reader
         val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
             .sortedByDescending { it.width.toLong() * it.height }
         stillSize = yuvSizes.first()
-
-        stillReader = ImageReader.newInstance(
-            stillSize.width, stillSize.height, ImageFormat.YUV_420_888, 2,
-        ).apply {
-            setOnImageAvailableListener({ r ->
-                r.acquireLatestImage()?.let { img -> submitStill(img) }
-            }, render.looper?.let { android.os.Handler(it) })
-        }
-
-        // OES 纹理在渲染上下文创建（SurfaceTexture 绑定它）
-        val texId = render.createOesTexture()
-        if (texId == 0) {
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_ERROR, "camera", "oes.create_failed", "{}",
-            )
-            return
-        }
-        val st = SurfaceTexture(texId)
-        st.setDefaultBufferSize(previewSize.width, previewSize.height)
-        st.setOnFrameAvailableListener({ texture ->
-            if (!firstFrameLogged) {
-                firstFrameLogged = true
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
-                )
+        val oldReader = stillReader
+        stillReader = if (oldReader != null &&
+            oldReader.width == stillSize.width && oldReader.height == stillSize.height
+        ) {
+            oldReader
+        } else {
+            oldReader?.close()
+            ImageReader.newInstance(
+                stillSize.width, stillSize.height, ImageFormat.YUV_420_888, 2,
+            ).apply {
+                setOnImageAvailableListener({ r ->
+                    r.acquireLatestImage()?.let { img -> submitStill(img) }
+                }, render.looper?.let { android.os.Handler(it) })
             }
-            render.frameAvailable(
-                texture, previewSize.width, previewSize.height,
-                orientationStep, filmParams, fillTest,
-            )
-        }, render.looper?.let { android.os.Handler(it) })
+        }
+
+        // OES 纹理与 SurfaceTexture 跨镜头复用（渲染端纹理不变，新首帧一到即恢复画面）
+        val st = surfaceTexture ?: run {
+            val texId = render.createOesTexture()
+            if (texId == 0) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "camera", "oes.create_failed", "{}",
+                )
+                return
+            }
+            SurfaceTexture(texId).apply {
+                setOnFrameAvailableListener({ texture ->
+                    if (!firstFrameLogged) {
+                        firstFrameLogged = true
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
+                        )
+                    }
+                    render.frameAvailable(
+                        texture, previewSize.width, previewSize.height,
+                        orientationStep, filmParams, fillTest,
+                    )
+                }, render.looper?.let { android.os.Handler(it) })
+            }
+        }
+        st.setDefaultBufferSize(previewSize.width, previewSize.height)
         surfaceTexture = st
-        previewSurface = Surface(st)
+        previewSurface = previewSurface ?: Surface(st)
 
         // 切镜头路径（setFocal/setLens）把 started 置 false 后进入这里：
         // 必须恢复，否则 onConfigured 的 !started 守卫会放弃建 session → 黑屏
@@ -836,6 +852,15 @@ class CameraController(private val context: Context, private val render: RenderC
                 if (gen != openGen) { d.close(); return } // 已被更新的打开请求取代
                 camera = d
                 createSession(d)
+            }
+
+            // 切镜头链：close 完成（Surface 已释放）后才重开 pending 镜头
+            override fun onClosed(d: CameraDevice) {
+                val p = pendingOpenId
+                if (p != null) {
+                    pendingOpenId = null
+                    openCamera(p)
+                }
             }
 
             override fun onDisconnected(d: CameraDevice) = d.close()

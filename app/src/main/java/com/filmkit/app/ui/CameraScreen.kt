@@ -64,6 +64,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -205,7 +207,6 @@ fun CameraScreen(
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
     var zoomEquiv by remember { mutableFloatStateOf(24f) } // 捏合变焦目标（35mm 等效焦段）
     var wheelActive by remember { mutableStateOf(false) } // 长按轮盘变焦进行中
-    var wheelFrac by remember { mutableFloatStateOf(0.5f) } // 轮盘对数位置 0..1
     val wheelOn = remember { prefs.getBoolean("wheel_zoom", true) }
     val wheelMinE = (lensChips.minOrNull() ?: 15).toFloat()
     val wheelMaxE = (lensChips.maxOrNull() ?: 70).toFloat() * controller.maxZoom
@@ -213,6 +214,23 @@ fun CameraScreen(
         ((ln(e.coerceAtLeast(1f)) - ln(wheelMinE)) / (ln(wheelMaxE) - ln(wheelMinE))).coerceIn(0f, 1f)
     // 半圆轮盘滚动量程：对数全程对应 1.4 屏宽的横向拖动
     val wheelSpanPx = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() * 1.4f }
+    var wheelFrac by remember { mutableFloatStateOf(0.5f) } // 轮盘对数位置 0..1
+    var lastZoomSent by remember { mutableFloatStateOf(0f) }
+    // 拖动与 fling 都只写 wheelFrac（手势 scope 是 restricted suspension，不能调外部 suspend）；
+    // 变焦请求经 snapshotFlow 按帧节拍派生（触摸 120Hz → setZoomEquiv 每帧至多一次，
+    // 微幅量化防 rebuildRepeating 刷屏）
+    LaunchedEffect(wheelMinE, wheelMaxE) {
+        snapshotFlow { wheelFrac }.collect { f ->
+            if (!wheelActive) return@collect
+            val ze = exp(ln(wheelMinE) + f * (ln(wheelMaxE) - ln(wheelMinE)))
+            if (Math.abs(ze - lastZoomSent) > ze * 0.002f) {
+                lastZoomSent = ze
+                zoomEquiv = ze
+                controller.setZoomEquiv(ze)
+                focalBase = controller.currentLensEquiv()
+            }
+        }
+    }
     var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
@@ -587,48 +605,73 @@ fun CameraScreen(
                         .then(
                             if (wheelOn) {
                                 Modifier.pointerInput(wheelMinE, wheelMaxE, wheelSpanPx) {
-                                    // 长按（450ms）进入半圆轮盘变焦，横向拖动沿弧滚动
-                                    // （左滑放大/右滑缩小，刻度跟手）；松手退出。
-                                    // Initial pass 先于内层横滚消费事件，轮盘滚动时压住焦段条横滚；
-                                    // 指针状态自跟踪，不依赖事件类型常量（跨 Compose 版本稳定）
-                                    awaitPointerEventScope {
-                                        var downId: androidx.compose.ui.input.pointer.PointerId? = null
-                                        var lastX = 0f
-                                        var downAt = 0L
-                                        var inWheel = false
-                                        while (true) {
-                                            val ev = awaitPointerEvent(PointerEventPass.Initial)
-                                            val c = ev.changes.firstOrNull() ?: continue
-                                            if (downId == null) {
-                                                if (c.pressed) {
-                                                    downId = c.id
-                                                    lastX = c.position.x
-                                                    downAt = android.os.SystemClock.uptimeMillis()
-                                                    inWheel = false
-                                                }
-                                            } else if (c.id == downId) {
-                                                if (!c.pressed) {
-                                                    downId = null
-                                                    inWheel = false
-                                                    wheelActive = false
-                                                } else if (inWheel || android.os.SystemClock.uptimeMillis() - downAt > 450L) {
-                                                    if (!inWheel) {
-                                                        inWheel = true
-                                                        wheelActive = true
-                                                        wheelFrac = wheelFracOf(zoomEquiv)
+                                    // 长按（450ms）进入半圆轮盘，横向拖动沿弧滚动
+                                    // （左滑放大/右滑缩小，刻度跟手）；松手按惯性衰减，
+                                    // fling 停止后收起轮盘。Initial pass 先于内层横滚消费事件，
+                                    // 轮盘滚动时压住焦段条横滚；指针状态自跟踪（跨 Compose 版本稳定）
+                                    while (true) {
+                                        val flingV = awaitPointerEventScope {
+                                            var downId: androidx.compose.ui.input.pointer.PointerId? = null
+                                            var lastX = 0f
+                                            var lastT = 0L
+                                            var downAt = 0L
+                                            var vel = 0f
+                                            var inWheel = false
+                                            while (true) {
+                                                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                                val c = ev.changes.firstOrNull() ?: continue
+                                                if (downId == null) {
+                                                    if (c.pressed) {
+                                                        downId = c.id
+                                                        lastX = c.position.x
+                                                        lastT = c.uptimeMillis
+                                                        downAt = lastT
+                                                        vel = 0f
+                                                        inWheel = false
                                                     }
-                                                    c.consume()
-                                                    val dx = c.position.x - lastX
-                                                    lastX = c.position.x
-                                                    wheelFrac = (wheelFrac - dx / wheelSpanPx).coerceIn(0f, 1f)
-                                                    zoomEquiv = exp(
-                                                        ln(wheelMinE) + wheelFrac * (ln(wheelMaxE) - ln(wheelMinE)),
-                                                    )
-                                                    controller.setZoomEquiv(zoomEquiv)
-                                                    focalBase = controller.currentLensEquiv()
+                                                } else if (c.id == downId) {
+                                                    if (!c.pressed) {
+                                                        downId = null
+                                                        if (inWheel) {
+                                                            inWheel = false
+                                                            break // 返回惯性速度，fling 在 scope 外跑
+                                                        }
+                                                    } else if (inWheel || c.uptimeMillis - downAt > 450L) {
+                                                        if (!inWheel) {
+                                                            inWheel = true
+                                                            wheelActive = true
+                                                            lastZoomSent = 0f
+                                                            wheelFrac = wheelFracOf(zoomEquiv)
+                                                        }
+                                                        c.consume()
+                                                        val dx = c.position.x - lastX
+                                                        val dt = (c.uptimeMillis - lastT).coerceAtLeast(1L)
+                                                        lastX = c.position.x
+                                                        lastT = c.uptimeMillis
+                                                        wheelFrac = (wheelFrac - dx / wheelSpanPx).coerceIn(0f, 1f)
+                                                        val instV = -dx / wheelSpanPx * 1000f / dt // frac/s
+                                                        vel = vel * 0.65f + instV * 0.35f
+                                                    }
                                                 }
                                             }
+                                            vel
                                         }
+                                        // 惯性滚动：指数衰减（τ≈220ms），到端点即停
+                                        if (kotlin.math.abs(flingV) > 0.08f) {
+                                            var v = flingV
+                                            var lastT = android.os.SystemClock.uptimeMillis()
+                                            while (kotlin.math.abs(v) > 0.015f) {
+                                                withFrameNanos { }
+                                                val now = android.os.SystemClock.uptimeMillis()
+                                                val dt = (now - lastT).coerceAtLeast(1L)
+                                                lastT = now
+                                                val next = wheelFrac + v * dt / 1000f
+                                                wheelFrac = next.coerceIn(0f, 1f)
+                                                if (next <= 0f || next >= 1f) break
+                                                v *= exp(-dt / 220f)
+                                            }
+                                        }
+                                        wheelActive = false
                                     }
                                 }
                             } else {
