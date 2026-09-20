@@ -114,7 +114,7 @@ fun SettingsScreen(
             var yuv709 by rememberSaveable { mutableStateOf(prefs.getBoolean("yuv_709", false)) }
             SettingSwitchRow(
                 title = "静拍 YUV 解码 BT.709",
-                subtitle = "色彩偏品红时打开（新平台 HAL 多为 709）；同场景 A/B 对比后择一",
+                subtitle = "2026-09-20 实拍 A/B 定量：两种矩阵暗部 R/G 仅差 0.001，已确认 601 正确；此开关保留供未来机型复查",
                 checked = yuv709,
                 onChecked = { v ->
                     yuv709 = v
@@ -126,6 +126,39 @@ fun SettingsScreen(
                     )
                 },
             )
+            var jpegQ by rememberSaveable { mutableStateOf(prefs.getInt("jpeg_quality", 95)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = if (jpegQ >= 100) 95 else 100
+                        jpegQ = v
+                        prefs.edit().putInt("jpeg_quality", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.jpeg_quality",
+                            "{\"q\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("成像质量", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "95 = 标准；100 = 极高（文件体积约为 2–3 倍）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    "$jpegQ",
+                    color = FilmTheme.Accent,
+                    fontSize = 15.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)

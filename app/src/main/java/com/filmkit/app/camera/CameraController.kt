@@ -970,6 +970,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val outH = outBmp.height
         val now = Date()
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.jpg"
+        // 成像质量：设置页可选 95（标准）/ 100（极高），prefs jpeg_quality
+        val jpegQ = context.getSharedPreferences("filmkit", 0).getInt("jpeg_quality", 95)
         try {
             var savedUri: android.net.Uri? = null
             var savedFile: File? = null
@@ -985,7 +987,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     ?.let { uri ->
                         lastPhotoUri = uri
                         context.contentResolver.openOutputStream(uri)?.use {
-                            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
+                            outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, it)
                         }
                         cv.clear()
                         cv.put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -996,7 +998,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
                 dir.mkdirs()
                 File(dir, name).outputStream().use {
-                    outBmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
+                    outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, it)
                 }
                 savedFile = File(dir, name)
             }
@@ -1034,6 +1036,8 @@ class CameraController(private val context: Context, private val render: RenderC
             val dt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(whenShot)
             exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, dt)
             exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, dt)
+            // 成片像素在渲染端已转正，方向恒为标准值 1（默认 0 是非法定义值）
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, "1")
             exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MAKE, Build.MANUFACTURER)
             exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MODEL, Build.MODEL)
             exif.setAttribute(
