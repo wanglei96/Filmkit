@@ -116,15 +116,15 @@ class FrameRenderer {
           black = -1, white = -1, gain = -1, ccm = -1;
   } u_raw_;
   struct {
-    GLint tex = -1, size = -1, cfa = -1, black = -1, white = -1, gain = -1;
+    GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1;
   } u_rcd_dir_;
   struct {
-    GLint tex = -1, dir = -1, size = -1, cfa = -1, black = -1, white = -1,
+    GLint tex = -1, dir = -1, size = -1, cfalut = -1, black = -1, white = -1,
           gain = -1;
   } u_rcd_g_;
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, dir = -1, g = -1, size = -1,
-          cfa = -1, black = -1, white = -1, gain = -1, ccm = -1;
+          cfalut = -1, black = -1, white = -1, gain = -1, ccm = -1;
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,

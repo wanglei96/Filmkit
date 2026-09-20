@@ -149,29 +149,35 @@ void main() {
 // ② CFA 低通图的乘性比值迁移邻居信息（硬边缘不过冲，"Ratio Corrected" 得名处）；
 // ③ 方向置信度连续混合 + 中心/邻域取更确定者（噪声区不翻转）；
 // ④ 色度走"色差 + 方向加权"，并限幅到邻域同色实测范围（伪彩抑制）。
-// 单趟三段：P1 方向场 → P2 G@RB → P3 色度填充+CCM；WB 在线性化时前置
-// （色差恒定假设要求白平衡域）。无迭代——参考实现本就是单趟流水。
+// 单趟三段：P1 方向场+低通图 → P2 G@RB → P3 色度填充+CCM；WB 在线性化时
+// 前置（色差恒定假设要求白平衡域）。无迭代——参考实现本就是单趟流水。
+//
+// 性能版（v0.5.29，真机 gMs 1414ms 定向优化）：
+// - CFA 相位判定改 uniform 查表（uCfaLut，4×2bit），替代逐次调用分支链；
+// - P1 输出预归一化 (vConf, pConf, lpf)：方向置信度与 CFA 低通图一次算全图，
+//   P2/P3 读纹理 1 tap，免每像素重复 9-tap 卷积（P2 采样 ~91→~24 taps）；
+//   注：预归一化后 3×3 均值为"比值的平均"（非"和的比值"），方向场是启发式
+//   统计，近似可接受；
+// - P2 轴向梯度改两项式（|C(d)-C(-d)|+|C-C(2d)|，Hamilton-Adams 判别主体），
+//   同坐标采样手动共享变量。
 // 三个 shader 的公共段（CFA 相位/线性化采样）按 validate-shaders.sh 的
 // 提取方式各写一份完整自包含字符串。
 
-// P1：方向场。输出 rgba16f = (V_Stat, H_Stat, P_Stat, Q_Stat)：
-// V/H = 垂直/水平五点修正高通的相邻 3 行(列)平方和；
-// P/Q = NW-SE / NE-SW 对角同构统计（色度填充的方向判别用）。
+// P1：方向场 + CFA 低通图。输出 rgba16f = (vStat/(vStat+hStat), pStat/(pStat+qStat),
+// LPF, 1)：V/H 与 P/Q 五点修正高通的相邻 3 行(列)平方和之比（置信度 ∈(0,1)）。
 const char* kFsRcdDir = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp usampler2D uRaw;
 uniform ivec2 uSize;
-uniform int uCfa;      // Camera2: 0=RGGB 1=GRBG 2=GBRG 3=BGGR
+uniform int uCfaLut;   // CFA 2×2 相位→通道 LUT（4×2bit，C++ 侧由 cfa 编码）
 uniform vec4 uBlack;   // 按相位 (0,0)(1,0)(0,1)(1,1)
 uniform float uWhite;
-uniform vec3 uGain;    // asShotNeutral 倒数，G 归一
+uniform vec3 uGain;    // asShotNeutral 倒数，G 归一（WB 前置）
+const float EPS = 1e-9;
 int chanAt(ivec2 p) {
-    int px = p.x & 1, py = p.y & 1;
-    if (uCfa == 0) return py == 0 ? (px == 0 ? 0 : 1) : (px == 0 ? 1 : 2);
-    if (uCfa == 1) return py == 0 ? (px == 0 ? 1 : 0) : (px == 0 ? 2 : 1);
-    if (uCfa == 2) return py == 0 ? (px == 0 ? 1 : 2) : (px == 0 ? 0 : 1);
-    return py == 0 ? (px == 0 ? 2 : 1) : (px == 0 ? 1 : 0);
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
 }
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
@@ -201,6 +207,12 @@ float hpQ(ivec2 p) {
          + s(p + ivec2(-3, 3)) - 3.0 * (s(p + ivec2(2, -2)) + s(p + ivec2(-2, 2)))
          + 6.0 * s(p);
 }
+// CFA 低通图：中心 1 + 四正邻 ½ + 四对角 ¼（跨色亮度代理，比值分母）
+float lpf(ivec2 p) {
+    return s(p)
+         + 0.5 * (s(p + ivec2(1, 0)) + s(p + ivec2(-1, 0)) + s(p + ivec2(0, 1)) + s(p + ivec2(0, -1)))
+         + 0.25 * (s(p + ivec2(1, 1)) + s(p + ivec2(-1, -1)) + s(p + ivec2(1, -1)) + s(p + ivec2(-1, 1)));
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float vs = 0.0, hs = 0.0, ps = 0.0, qs = 0.0;
@@ -214,29 +226,26 @@ void main() {
         ps += pq * pq;
         qs += q * q;
     }
-    oColor = vec4(vs, hs, ps, qs);
+    oColor = vec4(vs / (vs + hs + EPS), ps / (ps + qs + EPS), lpf(p), 1.0);
 })";
 
-// P2：G@RB——比值修正核心。R/B 位置用 CFA 低通图的乘性比值迁移轴向邻居，
-// 梯度反比交叉加权，V/H 方向置信度（3×3 低通 + 中心/邻域取更确定者）连续混合；
-// G 位置直通。伪彩抑制：G 结果限幅到四邻实测范围。
+// P2：G@RB——比值修正核心。读 P1 的低通图/方向置信度（各 1 tap）；
+// R/B 位置乘性比值迁移轴向邻居，梯度反比交叉加权，V/H 置信度（中心 vs
+// 3×3 邻域取更确定者）连续混合；G 位置直通。结果限幅到四邻实测范围。
 const char* kFsRcdG = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp usampler2D uRaw;
-uniform highp sampler2D uDir;  // P1 方向场（RGBA16F, NEAREST）
+uniform highp sampler2D uDir;  // P1 输出 (vConf, pConf, lpf, 1)
 uniform ivec2 uSize;
-uniform int uCfa;
+uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 const float EPS = 1e-6;
 int chanAt(ivec2 p) {
-    int px = p.x & 1, py = p.y & 1;
-    if (uCfa == 0) return py == 0 ? (px == 0 ? 0 : 1) : (px == 0 ? 1 : 2);
-    if (uCfa == 1) return py == 0 ? (px == 0 ? 1 : 0) : (px == 0 ? 2 : 1);
-    if (uCfa == 2) return py == 0 ? (px == 0 ? 1 : 2) : (px == 0 ? 0 : 1);
-    return py == 0 ? (px == 0 ? 2 : 1) : (px == 0 ? 1 : 0);
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
 }
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
@@ -245,65 +254,53 @@ float s(ivec2 p) {
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
 }
-vec2 statAt(ivec2 p, int zw) {
-    vec2 acc = vec2(0.0);
+float dirFetch(ivec2 p, int ch) {
+    return texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0)[ch];
+}
+// 方向置信度 = 中心与 3×3 邻域均值中更确定者（离 0.5 更远；噪声区防翻转）
+float dirMix(ivec2 p, int ch) {
+    float c = dirFetch(p, ch);
+    float acc = 0.0;
     for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec4 d = texelFetch(uDir, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0);
-            acc += zw == 0 ? d.xy : d.zw;
-        }
-    return acc / 9.0;
+        for (int dx = -1; dx <= 1; ++dx) acc += dirFetch(p + ivec2(dx, dy), ch);
+    float nb = acc / 9.0;
+    return abs(c - 0.5) > abs(nb - 0.5) ? c : nb;
 }
-// 方向置信度 ∈(0,1)：大 = 该方向变化剧烈 → 换用另一方向估计；
-// 中心值比 3×3 邻域均值更接近 0.5（更不确定）时改用邻域（噪声区防翻转）
-float discAt(ivec2 p, int zw) {
-    vec4 dc = texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0);
-    vec2 cc = zw == 0 ? dc.xy : dc.zw;
-    vec2 nb = statAt(p, zw);
-    float d0 = cc.x / (cc.x + cc.y + EPS);
-    float d1 = nb.x / (nb.x + nb.y + EPS);
-    return abs(d0 - 0.5) > abs(d1 - 0.5) ? d0 : d1;
-}
-// CFA 低通图：中心 1 + 四正邻 ½ + 四对角 ¼（跨色亮度代理，比值分母）
-float lpf(ivec2 p) {
-    return s(p)
-         + 0.5 * (s(p + ivec2(1, 0)) + s(p + ivec2(-1, 0)) + s(p + ivec2(0, 1)) + s(p + ivec2(0, -1)))
-         + 0.25 * (s(p + ivec2(1, 1)) + s(p + ivec2(-1, -1)) + s(p + ivec2(1, -1)) + s(p + ivec2(-1, 1)));
-}
-// 轴向梯度（d = 单位方向）：结构相似性四项 + 防零
-float gradAx(ivec2 p, ivec2 d) {
-    return abs(s(p + d) - s(p - d)) + abs(s(p) - s(p + 2 * d))
-         + abs(s(p + d) - s(p + 3 * d)) + abs(s(p + 2 * d) - s(p + 4 * d)) + EPS;
-}
-// 轴向比值估计：C(d) 按 LPF 比值迁移到本位（乘性，硬边缘不过冲）
-float estAx(ivec2 p, ivec2 d, float l0) {
-    return s(p + d) * 2.0 * l0 / (l0 + lpf(p + d) + EPS);
-}
+float lpfAt(ivec2 p) { return dirFetch(p, 2); }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float g;
     if (chanAt(p) == 1) {
         g = s(p);
     } else {
-        float l0 = lpf(p);
-        float gn = gradAx(p, ivec2(0, -1)), gs = gradAx(p, ivec2(0, 1));
-        float ge = gradAx(p, ivec2(1, 0)), gw = gradAx(p, ivec2(-1, 0));
-        float vEst = (gs * estAx(p, ivec2(0, -1), l0) + gn * estAx(p, ivec2(0, 1), l0)) / (gn + gs);
-        float hEst = (gw * estAx(p, ivec2(1, 0), l0) + ge * estAx(p, ivec2(-1, 0), l0)) / (ge + gw);
-        g = mix(vEst, hEst, discAt(p, 0));
+        float l0 = lpfAt(p);
+        float c0 = s(p);
+        // 垂直 N/S：两项式梯度（Hamilton-Adams 判别主体）+ 比值估计（同坐标共享变量）
+        float cN = s(p + ivec2(0, -1)), cS = s(p + ivec2(0, 1));
+        float gn = abs(cN - cS) + abs(c0 - s(p + ivec2(0, -2))) + EPS;
+        float gs = abs(cS - cN) + abs(c0 - s(p + ivec2(0, 2))) + EPS;
+        float eN = cN * 2.0 * l0 / (l0 + lpfAt(p + ivec2(0, -1)) + EPS);
+        float eS = cS * 2.0 * l0 / (l0 + lpfAt(p + ivec2(0, 1)) + EPS);
+        float vEst = (gs * eN + gn * eS) / (gn + gs);
+        // 水平 E/W
+        float cE = s(p + ivec2(1, 0)), cW = s(p + ivec2(-1, 0));
+        float ge = abs(cE - cW) + abs(c0 - s(p + ivec2(2, 0))) + EPS;
+        float gw = abs(cW - cE) + abs(c0 - s(p + ivec2(-2, 0))) + EPS;
+        float eE = cE * 2.0 * l0 / (l0 + lpfAt(p + ivec2(1, 0)) + EPS);
+        float eW = cW * 2.0 * l0 / (l0 + lpfAt(p + ivec2(-1, 0)) + EPS);
+        float hEst = (gw * eE + ge * eW) / (ge + gw);
+        g = mix(vEst, hEst, dirMix(p, 0));
         // 伪彩抑制：限幅到四邻实测 G 范围
-        float lo = min(min(s(p + ivec2(-1, 0)), s(p + ivec2(1, 0))),
-                       min(s(p + ivec2(0, -1)), s(p + ivec2(0, 1))));
-        float hi = max(max(s(p + ivec2(-1, 0)), s(p + ivec2(1, 0))),
-                       max(s(p + ivec2(0, -1)), s(p + ivec2(0, 1))));
+        float lo = min(min(cN, cS), min(cE, cW));
+        float hi = max(max(cN, cS), max(cE, cW));
         g = clamp(g, lo, hi);
     }
     oColor = vec4(0.0, g, 0.0, 1.0);
 })";
 
-// P3：色度填充 + CCM。R/B 位置补对侧色度（对角色差），G 位置 R 用对角色差、
-// B 用轴向色差；方向判别复用 P1 方向场；全部色差限幅到邻域同色实测范围
-// （伪彩抑制）。输出 = WB 域 RGB → CCM → 场景线性（汇流 pass2/3）。
+// P3：色度填充 + CCM。R/B 位置补对侧色度、G 位置 R 用对角色差、B 用轴向
+// 色差；方向判别读 P1 置信度（十字 5-tap 平滑）；全部色差限幅到邻域同色
+// 实测范围（伪彩抑制）。输出 = WB 域 RGB → CCM → 场景线性（汇流 pass2/3）。
 const char* kFsRcdChroma = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
@@ -312,18 +309,15 @@ uniform highp usampler2D uRaw;
 uniform highp sampler2D uDir;
 uniform highp sampler2D uG;
 uniform ivec2 uSize;
-uniform int uCfa;
+uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform mat3 uCcm;     // sensor→sRGB 行主序
 const float EPS = 1e-6;
 int chanAt(ivec2 p) {
-    int px = p.x & 1, py = p.y & 1;
-    if (uCfa == 0) return py == 0 ? (px == 0 ? 0 : 1) : (px == 0 ? 1 : 2);
-    if (uCfa == 1) return py == 0 ? (px == 0 ? 1 : 0) : (px == 0 ? 2 : 1);
-    if (uCfa == 2) return py == 0 ? (px == 0 ? 1 : 2) : (px == 0 ? 0 : 1);
-    return py == 0 ? (px == 0 ? 2 : 1) : (px == 0 ? 1 : 0);
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
 }
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
@@ -335,64 +329,49 @@ float s(ivec2 p) {
 float gAt(ivec2 p) {
     return texelFetch(uG, clamp(p, ivec2(0), uSize - 1), 0).g;
 }
-vec2 statAt(ivec2 p, int zw) {
-    vec2 acc = vec2(0.0);
-    for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec4 d = texelFetch(uDir, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0);
-            acc += zw == 0 ? d.xy : d.zw;
-        }
-    return acc / 9.0;
+float dirFetch(ivec2 p, int ch) {
+    return texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0)[ch];
 }
-float discAt(ivec2 p, int zw) {
-    vec4 dc = texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0);
-    vec2 cc = zw == 0 ? dc.xy : dc.zw;
-    vec2 nb = statAt(p, zw);
-    float d0 = cc.x / (cc.x + cc.y + EPS);
-    float d1 = nb.x / (nb.x + nb.y + EPS);
-    return abs(d0 - 0.5) > abs(d1 - 0.5) ? d0 : d1;
+// 十字 5-tap 均值：方向场低通（伪彩本质是方向场高频翻转）
+float dir5(ivec2 p, int ch) {
+    float v = dirFetch(p, ch)
+            + dirFetch(p + ivec2(0, -1), ch) + dirFetch(p + ivec2(0, 1), ch)
+            + dirFetch(p + ivec2(1, 0), ch) + dirFetch(p + ivec2(-1, 0), ch);
+    return v / 5.0;
 }
 // 对角色差填充：R/B 位置补对侧色度、G 位置补 R（Bayer 结构保证 4 对角
-// 同为目标色实测位）。P/Q 两方向色差按对角梯度反比交叉加权，pqDisc 混合；
+// 同为目标色实测位）。P/Q 两方向色差按对角梯度反比交叉加权，pq 方向混合；
 // 色差限幅到 4 对角色差范围（伪彩抑制）。
 float chromaDiag(ivec2 p) {
     float g0 = gAt(p);
     ivec2 nw = p + ivec2(-1, -1), se = p + ivec2(1, 1);
     ivec2 ne = p + ivec2(1, -1), sw = p + ivec2(-1, 1);
     float cnw = s(nw), cse = s(se), cne = s(ne), csw = s(sw);
-    float gnw = abs(cnw - cse) + abs(cnw - s(p + ivec2(-3, -3)))
-              + abs(g0 - gAt(p + ivec2(-3, -3))) + EPS;
-    float gse = abs(cse - cnw) + abs(cse - s(p + ivec2(3, 3)))
-              + abs(g0 - gAt(p + ivec2(3, 3))) + EPS;
+    float gnw = abs(cnw - cse) + abs(g0 - gAt(p + ivec2(-3, -3))) + EPS;
+    float gse = abs(cse - cnw) + abs(g0 - gAt(p + ivec2(3, 3))) + EPS;
     float pEst = (gnw * (cse - gAt(se)) + gse * (cnw - gAt(nw))) / (gnw + gse);
-    float gne = abs(cne - csw) + abs(cne - s(p + ivec2(3, -3)))
-              + abs(g0 - gAt(p + ivec2(3, -3))) + EPS;
-    float gsw = abs(csw - cne) + abs(csw - s(p + ivec2(-3, 3)))
-              + abs(g0 - gAt(p + ivec2(-3, 3))) + EPS;
+    float gne = abs(cne - csw) + abs(g0 - gAt(p + ivec2(3, -3))) + EPS;
+    float gsw = abs(csw - cne) + abs(g0 - gAt(p + ivec2(-3, 3))) + EPS;
     float qEst = (gne * (csw - gAt(sw)) + gsw * (cne - gAt(ne))) / (gne + gsw);
-    float d = mix(pEst, qEst, discAt(p, 1));
+    float d = mix(pEst, qEst, dir5(p, 1));
     float lo = min(min(cnw - gAt(nw), cse - gAt(se)), min(cne - gAt(ne), csw - gAt(sw)));
     float hi = max(max(cnw - gAt(nw), cse - gAt(se)), max(cne - gAt(ne), csw - gAt(sw)));
     return clamp(d, lo, hi);
 }
 // 轴向色差填充：G 位置补 B（Bayer 结构保证轴向 ±2 同为 B 实测位）。
-// 垂直/水平两组色差按梯度反比交叉加权，vhDisc 混合 + 限幅。
+// 垂直/水平两组色差按梯度反比交叉加权，vh 方向混合 + 限幅。
 float chromaAxial(ivec2 p) {
     float g0 = gAt(p);
     ivec2 n = p + ivec2(0, -2), st = p + ivec2(0, 2);
     ivec2 e = p + ivec2(2, 0), w = p + ivec2(-2, 0);
     float cn = s(n), cs = s(st), ce = s(e), cw = s(w);
-    float gn = abs(cn - cs) + abs(cn - s(p + ivec2(0, -4)))
-             + abs(g0 - gAt(p + ivec2(0, -4))) + EPS;
-    float gs = abs(cs - cn) + abs(cs - s(p + ivec2(0, 4)))
-             + abs(g0 - gAt(p + ivec2(0, 4))) + EPS;
+    float gn = abs(cn - cs) + abs(g0 - gAt(p + ivec2(0, -4))) + EPS;
+    float gs = abs(cs - cn) + abs(g0 - gAt(p + ivec2(0, 4))) + EPS;
     float vEst = (gn * (cs - gAt(st)) + gs * (cn - gAt(n))) / (gn + gs);
-    float gE = abs(ce - cw) + abs(ce - s(p + ivec2(4, 0)))
-             + abs(g0 - gAt(p + ivec2(4, 0))) + EPS;
-    float gW = abs(cw - ce) + abs(cw - s(p + ivec2(-4, 0)))
-             + abs(g0 - gAt(p + ivec2(-4, 0))) + EPS;
+    float gE = abs(ce - cw) + abs(g0 - gAt(p + ivec2(4, 0))) + EPS;
+    float gW = abs(cw - ce) + abs(g0 - gAt(p + ivec2(-4, 0))) + EPS;
     float hEst = (gE * (cw - gAt(w)) + gW * (ce - gAt(e))) / (gE + gW);
-    float d = mix(vEst, hEst, discAt(p, 0));
+    float d = mix(vEst, hEst, dir5(p, 0));
     float lo = min(min(cn - gAt(n), cs - gAt(st)), min(ce - gAt(e), cw - gAt(w)));
     float hi = max(max(cn - gAt(n), cs - gAt(st)), max(ce - gAt(e), cw - gAt(w)));
     return clamp(d, lo, hi);
@@ -554,6 +533,16 @@ float halfToFloat(unsigned short h) {
   return sign != 0u ? -v : v;
 }
 
+// Camera2 CFA 枚举 → 2×2 相位查表（shader 按 ((y&1)<<1)|(x&1) 位移取 2bit 通道）
+int cfaLutOf(int cfa) {
+  switch (cfa) {
+    case 0: return (0 << 6) | (1 << 4) | (1 << 2) | 2;  // RGGB: R G / G B
+    case 1: return (1 << 6) | (0 << 4) | (2 << 2) | 1;  // GRBG: G R / B G
+    case 2: return (1 << 6) | (2 << 4) | (0 << 2) | 1;  // GBRG: G B / R G
+    default: return (2 << 6) | (1 << 4) | (1 << 2) | 0;  // BGGR: B G / G R
+  }
+}
+
 }  // namespace
 
 FrameRenderer::~FrameRenderer() { release(); }
@@ -633,7 +622,7 @@ bool FrameRenderer::init() {
 
   u_rcd_dir_.tex = glGetUniformLocation(prog_rcd_dir_, "uRaw");
   u_rcd_dir_.size = glGetUniformLocation(prog_rcd_dir_, "uSize");
-  u_rcd_dir_.cfa = glGetUniformLocation(prog_rcd_dir_, "uCfa");
+  u_rcd_dir_.cfalut = glGetUniformLocation(prog_rcd_dir_, "uCfaLut");
   u_rcd_dir_.black = glGetUniformLocation(prog_rcd_dir_, "uBlack");
   u_rcd_dir_.white = glGetUniformLocation(prog_rcd_dir_, "uWhite");
   u_rcd_dir_.gain = glGetUniformLocation(prog_rcd_dir_, "uGain");
@@ -641,7 +630,7 @@ bool FrameRenderer::init() {
   u_rcd_g_.tex = glGetUniformLocation(prog_rcd_g_, "uRaw");
   u_rcd_g_.dir = glGetUniformLocation(prog_rcd_g_, "uDir");
   u_rcd_g_.size = glGetUniformLocation(prog_rcd_g_, "uSize");
-  u_rcd_g_.cfa = glGetUniformLocation(prog_rcd_g_, "uCfa");
+  u_rcd_g_.cfalut = glGetUniformLocation(prog_rcd_g_, "uCfaLut");
   u_rcd_g_.black = glGetUniformLocation(prog_rcd_g_, "uBlack");
   u_rcd_g_.white = glGetUniformLocation(prog_rcd_g_, "uWhite");
   u_rcd_g_.gain = glGetUniformLocation(prog_rcd_g_, "uGain");
@@ -653,7 +642,7 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.dir = glGetUniformLocation(prog_rcd_chroma_, "uDir");
   u_rcd_chroma_.g = glGetUniformLocation(prog_rcd_chroma_, "uG");
   u_rcd_chroma_.size = glGetUniformLocation(prog_rcd_chroma_, "uSize");
-  u_rcd_chroma_.cfa = glGetUniformLocation(prog_rcd_chroma_, "uCfa");
+  u_rcd_chroma_.cfalut = glGetUniformLocation(prog_rcd_chroma_, "uCfaLut");
   u_rcd_chroma_.black = glGetUniformLocation(prog_rcd_chroma_, "uBlack");
   u_rcd_chroma_.white = glGetUniformLocation(prog_rcd_chroma_, "uWhite");
   u_rcd_chroma_.gain = glGetUniformLocation(prog_rcd_chroma_, "uGain");
@@ -1033,7 +1022,7 @@ void FrameRenderer::passRcdDir(int w, int h, int cfa,
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
   glUniform1i(u_rcd_dir_.tex, 0);
   glUniform2i(u_rcd_dir_.size, raw_w_, raw_h_);
-  glUniform1i(u_rcd_dir_.cfa, cfa);
+  glUniform1i(u_rcd_dir_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_rcd_dir_.black, black_phase[0], black_phase[1], black_phase[2],
               black_phase[3]);
   glUniform1f(u_rcd_dir_.white, white_level);
@@ -1055,7 +1044,7 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
   glUniform1i(u_rcd_g_.tex, 0);
   glUniform1i(u_rcd_g_.dir, 1);
   glUniform2i(u_rcd_g_.size, raw_w_, raw_h_);
-  glUniform1i(u_rcd_g_.cfa, cfa);
+  glUniform1i(u_rcd_g_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_rcd_g_.black, black_phase[0], black_phase[1], black_phase[2],
               black_phase[3]);
   glUniform1f(u_rcd_g_.white, white_level);
@@ -1084,7 +1073,7 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniform2i(u_rcd_chroma_.size, raw_w_, raw_h_);
   glUniform1i(u_rcd_chroma_.rot, rot);
   glUniform2f(u_rcd_chroma_.scale, 1.0f, 1.0f);
-  glUniform1i(u_rcd_chroma_.cfa, cfa);
+  glUniform1i(u_rcd_chroma_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_rcd_chroma_.black, black_phase[0], black_phase[1],
               black_phase[2], black_phase[3]);
   glUniform1f(u_rcd_chroma_.white, white_level);
