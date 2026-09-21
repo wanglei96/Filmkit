@@ -1438,9 +1438,16 @@ class CameraController(private val context: Context, private val render: RenderC
         val outW = outBmp.width
         val outH = outBmp.height
         val now = Date()
-        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.jpg"
+        val prefs = context.getSharedPreferences("filmkit", 0)
         // 成像质量：设置页可选 95（标准）/ 100（极高），prefs jpeg_quality
-        val jpegQ = context.getSharedPreferences("filmkit", 0).getInt("jpeg_quality", 95)
+        val jpegQ = prefs.getInt("jpeg_quality", 95)
+        // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
+        // 未选 LUT 时无后缀。只保留字母/数字/下划线/连字符（中文名照常保留），避免非法路径字符。
+        val lutTag = currentLut?.title
+            ?.takeIf { prefs.getBoolean("lut_in_name", true) }
+            ?.replace(Regex("[^\\p{L}\\p{N}_-]"), "")
+        val suffix = if (lutTag.isNullOrEmpty()) "" else "_$lutTag"
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$suffix.jpg"
         try {
             var savedUri: android.net.Uri? = null
             var savedFile: File? = null

@@ -422,6 +422,40 @@ fun SettingsScreen(
                 )
             }
 
+            var lutInName by rememberSaveable { mutableStateOf(prefs.getBoolean("lut_in_name", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !lutInName
+                        lutInName = v
+                        prefs.edit().putBoolean("lut_in_name", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.lut_in_name",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("LUT 名写入文件名", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "成片名追加 _<LUT 名>（如 …_理光正片.jpg）；未选 LUT 时不加",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (lutInName) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)
             SectionHeader("系统")
