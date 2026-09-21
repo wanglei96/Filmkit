@@ -1062,6 +1062,25 @@ bool FrameRenderer::init() {
   glDisable(GL_BLEND);
   glDisable(GL_DEPTH_TEST);
 
+  // M4：默认 1×1×1 恒等 LUT 纹理。
+  // **必须始终**有一张完整的 3D 纹理绑在单元 1：kFsOut/kFsHist 里存在 sampler3D，
+  // Mali 会预测执行 `if (uLutOn > 0.5)` 分支里的 texelFetch —— 未绑定 3D 纹理时
+  // draw 报 GL_INVALID_OPERATION(1282) 并丢弃整帧输出（v0.6.0-m4 真机全黑根因，
+  // 与 LSC「关闭档绑 1×1 全 1 网格」同一类坑）。
+  {
+    const float kIdentityWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glGenTextures(1, &lut_tex_);
+    glBindTexture(GL_TEXTURE_3D, lut_tex_);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, 1, 1, 1, 0, GL_RGBA, GL_FLOAT,
+                 kIdentityWhite);
+    lut_size_ = 1;  // ≤1 = 关闭：uLutOn 恒 0
+  }
+
   Logger::instance().log(LogLevel::kInfo, "engine", "render.init", "{}");
   return true;
 }
@@ -1104,6 +1123,8 @@ void FrameRenderer::release() {
   raw_tex_ = 0;
   lsc_tex_ = 0;
   lsc_w_ = lsc_h_ = 0;
+  lut_tex_ = 0;
+  lut_size_ = 0;
   raw_w_ = raw_h_ = 0;
   tex_dir_ = tex_g_ = 0;
   fbo_dir_ = fbo_g_ = 0;
@@ -1819,7 +1840,7 @@ void FrameRenderer::applyPendingLut() {
     lut_dirty_ = false;
   }
   if (size <= 1 || data.empty()) {
-    lut_size_ = 0;  // 关闭：shader 侧 uLutOn = 0（纹理留着，重选时覆盖）
+    lut_size_ = 1;  // 关闭：uLutOn 恒 0（纹理留着供重选覆盖；size=1 → 采样恒在原点）
     Logger::instance().log(LogLevel::kInfo, "engine", "lut.load",
                            "{\"state\":\"off\"}");
     return;
@@ -1852,22 +1873,24 @@ void FrameRenderer::applyPendingLut() {
 }
 
 // LUT 绑定与 uniform 下发（kFsOut 与 kFsHist 共用）。纹理单元 1 —— 单元 0 是输入帧。
+// 注意：**无论开关都要绑定纹理并下发全部 uniform**。早期版本在关闭时提前 return，
+// 结果 sampler3D 指向未绑定的单元 → Mali 预测执行采样 → draw 报 1282、整帧全黑。
 void FrameRenderer::bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength,
                             GLint loc_dmin, GLint loc_dinv, GLint loc_size,
                             float strength) {
   const float k = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
   const bool on = lut_size_ > 1 && k > 0.0f;
-  glUniform1f(loc_on, on ? 1.0f : 0.0f);
-  if (!on) return;
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_3D, lut_tex_);
   glUniform1i(loc_tex, 1);
-  glUniform1f(loc_strength, k);
+  glUniform1f(loc_on, on ? 1.0f : 0.0f);
+  glUniform1f(loc_strength, on ? k : 0.0f);
   glUniform3f(loc_dmin, lut_dmin_[0], lut_dmin_[1], lut_dmin_[2]);
   glUniform3f(loc_dinv, 1.0f / (lut_dmax_[0] - lut_dmin_[0]),
               1.0f / (lut_dmax_[1] - lut_dmin_[1]),
               1.0f / (lut_dmax_[2] - lut_dmin_[2]));
-  glUniform1f(loc_size, static_cast<float>(lut_size_));
+  // 关闭态用 1（恒等纹理边长）：shader 里 (uLutSize-1) = 0，采样坐标恒为 (0,0,0)，不会越界
+  glUniform1f(loc_size, static_cast<float>(lut_size_ > 1 ? lut_size_ : 1));
 }
 
 // 实时直方图（M3）：tex_work_（胶片输出）→ 显示域亮度 → 256×96 RGBA8 → 读回统计。
