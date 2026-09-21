@@ -167,6 +167,11 @@ class RenderClient {
         val neutral: FloatArray,    // asShotNeutral (r,g,b)
         val ccm: FloatArray,        // sensor→sRGB 行主序 3×3
         val noiseSigma: Float = 0f, // 归一化域噪声 σ（M3-2，0=引擎回退估计）
+        // 镜头阴影增益网格（M3 P0）：RGB 交错，cols×rows，(0,0)=图像左上；
+        // null = 关闭或无数据（引擎用恒等增益）
+        val lsc: FloatArray? = null,
+        val lscCols: Int = 1,
+        val lscRows: Int = 1,
     )
 
     /** 静拍 RAW：u16 Bayer → 引擎 demosaic+胶片链 → 读回，回调在渲染线程。
@@ -192,7 +197,8 @@ class RenderClient {
                     p.buffer, img.width, img.height, p.rowStride / 2,
                     meta.cfa, meta.blackPhase, meta.whiteLevel,
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
-                    meta.ccm, rotation, demosaic, noiseLevel, meta.noiseSigma, film,
+                    meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
+                    rotation, demosaic, noiseLevel, meta.noiseSigma, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

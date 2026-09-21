@@ -65,12 +65,14 @@ object EngineBridge {
      * demosaic：0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）。
      * noiseLevel：0 = 关；1 = 标准；2 = 强（M3-2：RAW 域 bilateral + 色度平滑，仅 RCD 生效）。
      * noiseSigma：归一化域噪声 σ（SENSOR_NOISE_PROFILE，≤0 时引擎内回退估计）。
+     * lsc：镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=图像左上），null = 关闭/无数据（恒等）。
      */
     external fun nativeEngineSubmitRaw(
         raw: ByteBuffer, width: Int, height: Int, rowStridePx: Int,
         cfa: Int, blackPhase: FloatArray, whiteLevel: Int,
         neutralR: Float, neutralG: Float, neutralB: Float,
-        ccm: FloatArray?, rotation: Int, demosaic: Int,
+        ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
+        rotation: Int, demosaic: Int,
         noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
     ): ByteArray?
 

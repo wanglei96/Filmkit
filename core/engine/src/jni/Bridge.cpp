@@ -284,12 +284,14 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
 // demosaic：0=bilinear（速度档）1=RCD 三段管线（质量档，M3-1）
 // noise_level：0=关 1=标准 2=强（M3-2 降噪，仅 RCD 生效）；noise_sigma：归一化域噪声 σ
+// lsc/lsc_cols/lsc_rows：镜头阴影增益网格（RGB 交错，null = 关闭/无数据 → 恒等）
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     JNIEnv* env, jobject, jobject raw_buf, jint w, jint h, jint row_stride_px,
     jint cfa, jfloatArray black_phase, jint white_level, jfloat neutral_r,
-    jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jint rotation,
-    jint demosaic, jint noise_level, jfloat noise_sigma, jdoubleArray film) {
+    jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jfloatArray lsc,
+    jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic, jint noise_level,
+    jfloat noise_sigma, jdoubleArray film) {
   if (!g_renderer || !raw_buf) return nullptr;
   float black4[4] = {0, 0, 0, 0};
   if (black_phase) {
@@ -301,12 +303,24 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     const jsize cn = env->GetArrayLength(ccm);
     if (cn >= 9) env->GetFloatArrayRegion(ccm, 0, 9, ccm9);
   }
+  // LSC 网格：长度不足视为无数据（防呆，避免越界读）
+  std::vector<float> lsc_buf;
+  const float* lsc_ptr = nullptr;
+  if (lsc != nullptr && lsc_cols > 1 && lsc_rows > 1) {
+    const jsize want = static_cast<jsize>(lsc_cols) * lsc_rows * 3;
+    if (env->GetArrayLength(lsc) >= want) {
+      lsc_buf.resize(static_cast<size_t>(want));
+      env->GetFloatArrayRegion(lsc, 0, want, lsc_buf.data());
+      lsc_ptr = lsc_buf.data();
+    }
+  }
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
   const bool ok = g_renderer->submitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
-      rotation, p, demosaic, noise_level, noise_sigma, &rgba);
+      lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_level,
+      noise_sigma, &rgba);
   if (!ok) return nullptr;
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
   env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),

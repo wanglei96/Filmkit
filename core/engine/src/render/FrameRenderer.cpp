@@ -99,6 +99,8 @@ precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp usampler2D uRaw;
+uniform highp sampler2D uLsc;  // LSC 增益网格（RGB，源自 Camera2 4 平面）
+uniform ivec2 uLscSize;
 uniform ivec2 uSize;
 uniform int uCfa;      // Camera2: 0=RGGB 1=GRBG 2=GBRG 3=BGGR
 uniform vec4 uBlack;   // 按相位 (0,0)(1,0)(0,1)(1,1)
@@ -111,6 +113,19 @@ int chanAt(ivec2 p) {
     if (uCfa == 1) return py == 0 ? (px == 0 ? 1 : 0) : (px == 0 ? 2 : 1);
     if (uCfa == 2) return py == 0 ? (px == 0 ? 1 : 2) : (px == 0 ? 0 : 1);
     return py == 0 ? (px == 0 ? 2 : 1) : (px == 0 ? 1 : 0);
+}
+// 镜头阴影增益（LSC，M3 P0）：网格双线性手写 4-tap（float 纹理过滤在 X300 上
+// 不可依赖，见 makeTex 注释）；关闭/无数据时绑 1×1 全 1 纹理 → 恒等，零分支。
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
 }
 float s(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
@@ -139,7 +154,8 @@ void main() {
     vec2 tuv = vec2(vUV0.x, 1.0 - vUV0.y);
     ivec2 p = clamp(ivec2(tuv * vec2(uSize)), ivec2(0), uSize - 1);
     vec3 rgb = vec3(dem(0, p), dem(1, p), dem(2, p));
-    rgb = uCcm * (rgb * uGain);
+    // LSC 在 CCM 前乘（通道增益差异即角落色偏来源）；与 WB 同为乘性，次序无关
+    rgb = uCcm * (rgb * uGain * lscAt(p));
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
@@ -323,6 +339,8 @@ layout(location = 0) out vec4 oColor;
 uniform highp usampler2D uRaw;
 uniform highp sampler2D uDir;
 uniform highp sampler2D uG;
+uniform highp sampler2D uLsc;  // LSC 增益网格（RGB，与 kFsRaw 同源）
+uniform ivec2 uLscSize;
 uniform ivec2 uSize;
 uniform int uCfaLut;
 uniform highp sampler2D uMos;
@@ -366,6 +384,18 @@ float s(ivec2 p) {
     float v = float(texelFetch(uRaw, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+// 镜头阴影增益（LSC，M3 P0）：与 kFsRaw 同款手写 4-tap 双线性
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
 }
 float gAt(ivec2 p) {
     return texelFetch(uG, clamp(p, ivec2(0), uSize - 1), 0).g;
@@ -433,7 +463,9 @@ void main() {
         r = g + axialFill(p, 0);
         b = g + axialFill(p, 2);
     }
-    vec3 rgb = uCcm * hlRecon(vec3(r, g, b));
+    // LSC 在 hlRecon 之后、CCM 之前：饱和判定仍用未校正值（原语义不变），
+    // 校正只作用在 CCM 前的线性 RGB（网格低频，去马赛克前后差异 <1%）
+    vec3 rgb = uCcm * (hlRecon(vec3(r, g, b)) * lscAt(p));
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
@@ -804,6 +836,8 @@ bool FrameRenderer::init() {
   u_raw_.white = glGetUniformLocation(prog_raw_, "uWhite");
   u_raw_.gain = glGetUniformLocation(prog_raw_, "uGain");
   u_raw_.ccm = glGetUniformLocation(prog_raw_, "uCcm");
+  u_raw_.lsc = glGetUniformLocation(prog_raw_, "uLsc");
+  u_raw_.lsc_size = glGetUniformLocation(prog_raw_, "uLscSize");
   if (u_raw_.st >= 0) {  // 同上：kVertRot 的 uST 默认全 0，必须置单位阵
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     glUseProgram(prog_raw_);
@@ -844,6 +878,8 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.gain = glGetUniformLocation(prog_rcd_chroma_, "uGain");
   u_rcd_chroma_.ccm = glGetUniformLocation(prog_rcd_chroma_, "uCcm");
   u_rcd_chroma_.hl_k = glGetUniformLocation(prog_rcd_chroma_, "uHlK");
+  u_rcd_chroma_.lsc = glGetUniformLocation(prog_rcd_chroma_, "uLsc");
+  u_rcd_chroma_.lsc_size = glGetUniformLocation(prog_rcd_chroma_, "uLscSize");
 
   u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
   u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
@@ -937,8 +973,11 @@ void FrameRenderer::release() {
   if (vs_plain_) glDeleteShader(vs_plain_);
   if (still_tex_) glDeleteTextures(1, &still_tex_);
   if (raw_tex_) glDeleteTextures(1, &raw_tex_);
+  if (lsc_tex_) glDeleteTextures(1, &lsc_tex_);
   still_tex_ = 0;
   raw_tex_ = 0;
+  lsc_tex_ = 0;
+  lsc_w_ = lsc_h_ = 0;
   raw_w_ = raw_h_ = 0;
   tex_dir_ = tex_g_ = 0;
   fbo_dir_ = fbo_g_ = 0;
@@ -1212,6 +1251,12 @@ void FrameRenderer::passRaw(int dst_w, int dst_h, int rot, int cfa,
               black_phase[3]);
   glUniform1f(u_raw_.white, white_level);
   glUniform3f(u_raw_.gain, gains[0], gains[1], gains[2]);
+  // LSC 增益纹理（单元 1；1×1 恒等或 HAL 网格，submitRaw 每次准备）
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_raw_.lsc, 1);
+  glUniform2i(u_raw_.lsc_size, lsc_w_, lsc_h_);
+  glActiveTexture(GL_TEXTURE0);
   // ccm 数组是行主序（ColorSpaceTransform 语义），GL 按列主序读取——必须 transpose，
   // 否则实际作用转置矩阵 → 严重偏色（v0.5.20 样张全局品红的根因）
   glUniformMatrix3fv(u_raw_.ccm, 1, GL_TRUE, ccm);
@@ -1388,6 +1433,12 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
               black_phase[2], black_phase[3]);
   glUniform1f(u_rcd_chroma_.white, white_level);
   glUniform3f(u_rcd_chroma_.gain, gains[0], gains[1], gains[2]);
+  // LSC 增益纹理（单元 4；0/1/2/3 已被 raw/mos/dir/g 占用）
+  glActiveTexture(GL_TEXTURE4);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_rcd_chroma_.lsc, 4);
+  glUniform2i(u_rcd_chroma_.lsc_size, lsc_w_, lsc_h_);
+  glActiveTexture(GL_TEXTURE0);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
   glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
   glUniform1f(u_rcd_chroma_.hl_k, hl_k);
@@ -1400,9 +1451,10 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
 bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               int cfa, const float black_phase[4],
                               int white_level, float neutral_r, float neutral_g,
-                              float neutral_b, const float* ccm9, int rotation,
-                              const FilmParams& p, int demosaic, int noise_level,
-                              float noise_sigma,
+                              float neutral_b, const float* ccm9,
+                              const float* lsc, int lsc_cols, int lsc_rows,
+                              int rotation, const FilmParams& p, int demosaic,
+                              int noise_level, float noise_sigma,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
@@ -1456,6 +1508,30 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   if (ccm9) {
     for (int i = 0; i < 9; ++i) ccm[i] = ccm9[i];
   }
+
+  // LSC 增益图（M3 P0 镜头阴影校正）：Java 侧把 HAL 的 4 平面（R/Gr/Gb/B）折成
+  // RGB 交错；无数据或开关关 → 1×1 恒等（shader 里等价于乘 1，零分支）。
+  // 每次拍照重传（17×13×3 float ≈ 2.6KB，可忽略）。
+  const bool lsc_ok = lsc != nullptr && lsc_cols > 1 && lsc_rows > 1;
+  const int lsc_w = lsc_ok ? lsc_cols : 1;
+  const int lsc_h = lsc_ok ? lsc_rows : 1;
+  if (lsc_tex_ == 0 || lsc_w_ != lsc_w || lsc_h_ != lsc_h) {
+    if (lsc_tex_ == 0) glGenTextures(1, &lsc_tex_);
+    glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+    // NEAREST：双线性在 shader 内手写（X300 上 float 纹理过滤不可依赖，见 makeTex）
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, lsc_w, lsc_h, 0, GL_RGB,
+                 GL_FLOAT, nullptr);
+    lsc_w_ = lsc_w;
+    lsc_h_ = lsc_h;
+  }
+  static const float kLscIdent[3] = {1.0f, 1.0f, 1.0f};
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, lsc_w, lsc_h, GL_RGB, GL_FLOAT,
+                  lsc_ok ? lsc : kLscIdent);
 
   // 实际渲染旋转 = 界面方向 + 传感器旋转（与 submitStill 同一约定）
   const int effective_rot = (rotation + 1) % 4;
@@ -1559,6 +1635,11 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
+  // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
+  kv += std::string(",\"lsc\":\"") +
+        (lsc_ok ? std::to_string(lsc_cols) + "x" + std::to_string(lsc_rows)
+                : "off") +
+        "\"";
   if (rcd) kv += ",\"hl\":" + std::to_string(p.hl_recon).substr(0, 3);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);

@@ -52,11 +52,14 @@ class FrameRenderer {
   //   noise_level —— 0 = 关；1 = 标准；2 = 强（M3-2：P0 RAW 域 bilateral + P4
   //                  色度平滑，仅 RCD 路径生效；bilinear 保持纯净基线）
   //   noise_sigma —— 归一化域噪声 σ（SENSOR_NOISE_PROFILE，≤0 时引擎内回退估计）
+  //   lsc/lsc_cols/lsc_rows —— 镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=左上；
+  //                  nullptr 或尺寸 ≤1 = 恒等，即 LSC 关闭（A/B 对照））
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
                  const float black_phase[4], int white_level,
                  float neutral_r, float neutral_g, float neutral_b,
-                 const float* ccm9, int rotation, const FilmParams& p,
-                 int demosaic, int noise_level, float noise_sigma,
+                 const float* ccm9, const float* lsc, int lsc_cols,
+                 int lsc_rows, int rotation, const FilmParams& p, int demosaic,
+                 int noise_level, float noise_sigma,
                  std::vector<uint8_t>* out_rgba);
 
   int64_t frameCount() const { return frames_.load(std::memory_order_relaxed); }
@@ -109,6 +112,9 @@ class FrameRenderer {
   int still_w_ = 0, still_h_ = 0;
   GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
   int raw_w_ = 0, raw_h_ = 0;
+  // LSC 增益网格（RGB16F，NEAREST；1×1 全 1 = 关闭/无数据，见 submitRaw）
+  GLuint lsc_tex_ = 0;
+  int lsc_w_ = 0, lsc_h_ = 0;
   GLuint fbo_dir_ = 0, tex_dir_ = 0;  // RGBA16F，RCD 方向场（vh + pq 统计）
   GLuint fbo_g_ = 0, tex_g_ = 0;      // RGBA16F，RCD 全图 G（g 通道有效）
   int rcd_w_ = 0, rcd_h_ = 0;
@@ -131,7 +137,8 @@ class FrameRenderer {
   } u_still_;
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, size = -1, cfa = -1,
-          black = -1, white = -1, gain = -1, ccm = -1;
+          black = -1, white = -1, gain = -1, ccm = -1, lsc = -1,
+          lsc_size = -1;
   } u_raw_;
   struct {
     GLint tex = -1, mos = -1, mosaic = -1, size = -1, cfalut = -1, black = -1,
@@ -144,7 +151,7 @@ class FrameRenderer {
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, mos = -1, mosaic = -1,
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, ccm = -1, hl_k = -1;
+          gain = -1, ccm = -1, hl_k = -1, lsc = -1, lsc_size = -1;
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,

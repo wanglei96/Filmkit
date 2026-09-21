@@ -1099,26 +1099,6 @@ class CameraController(private val context: Context, private val render: RenderC
             0
         }
         val meta = extractRawMeta(result, ch)
-        // 镜头阴影校正（LSC）可行性评估：Android 的 17×17×4 增益图（R/Gr/Gb/B 平面），
-        // 中心≈1、越靠边越大 —— 用于判断"是否做 LSC"（DNG 的 GainMap 同源，实测角落
-        // 增益可达 3.4，即边缘原始亮度只有中心的 ~30%）。
-        result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.let { m ->
-            val rows = m.rowCount
-            val cols = m.columnCount
-            if (rows > 2 && cols > 2) {
-                fun g(y: Int, x: Int) = m.getGainFactor(0, x, y)  // 通道 0 = R
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "raw.lsc",
-                    kv(
-                        "grid" to "${cols}x${rows}",
-                        "mode" to (result.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE) ?: -1),
-                        "center" to "%.3f".format(g(rows / 2, cols / 2)),
-                        "corner" to "%.3f".format(g(0, 0)),
-                        "cornerBR" to "%.3f".format(g(rows - 1, cols - 1)),
-                    ),
-                )
-            }
-        }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",
             kv(
@@ -1251,9 +1231,46 @@ class CameraController(private val context: Context, private val render: RenderC
                 }
             }
         }
+        // 镜头阴影校正（LSC，M3 P0）：HAL 的 cols×rows×4 增益图（R/Gr/Gb/B 平面，
+        // X300 实测 17×13、中心 1.000、角落 6.236 = 未校正时角落原始亮度仅中心 ~16%）。
+        // 探针日志保留原始口径；prefs "lsc" 关 → lsc = null（引擎用恒等增益，A/B 对照）。
+        var lsc: FloatArray? = null
+        var lscCols = 1
+        var lscRows = 1
+        val lscOn = appPrefs.getBoolean("lsc", true)
+        result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.let { m ->
+            val rows = m.rowCount
+            val cols = m.columnCount
+            if (rows > 1 && cols > 1) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "raw.lsc",
+                    kv(
+                        "grid" to "${cols}x${rows}",
+                        "mode" to (result.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE) ?: -1),
+                        "center" to "%.3f".format(m.getGainFactor(0, cols / 2, rows / 2)),
+                        "corner" to "%.3f".format(m.getGainFactor(0, 0, 0)),
+                        "cornerBR" to "%.3f".format(m.getGainFactor(0, cols - 1, rows - 1)),
+                        "on" to lscOn,
+                    ),
+                )
+                if (lscOn) {
+                    // Gr/Gb 折成均值（两平面增益差异 <1%，色偏主因在 R/B 与 G 之间）
+                    val buf = FloatArray(rows * cols * 3)
+                    var i = 0
+                    for (y in 0 until rows) for (x in 0 until cols) {
+                        buf[i++] = m.getGainFactor(0, x, y)
+                        buf[i++] = 0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y))
+                        buf[i++] = m.getGainFactor(3, x, y)
+                    }
+                    lsc = buf
+                    lscCols = cols
+                    lscRows = rows
+                }
+            }
+        }
         return RenderClient.RawFrameMeta(
             colorFilterArrangement, black4, whiteLevel,
-            floatArrayOf(nR, nG, nB), ccm, noiseSigma,
+            floatArrayOf(nR, nG, nB), ccm, noiseSigma, lsc, lscCols, lscRows,
         )
     }
 

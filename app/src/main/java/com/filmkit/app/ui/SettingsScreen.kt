@@ -200,6 +200,42 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // M3 P0 镜头阴影校正（v0.5.43）：HAL 增益网格治暗角 + 角落色偏。
+            // 常开开关，归设置页（快捷面板只放拍摄时会频繁切的项）。
+            var lscOn by rememberSaveable { mutableStateOf(prefs.getBoolean("lsc", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !lscOn
+                        lscOn = v
+                        prefs.edit().putBoolean("lsc", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.lsc",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("镜头阴影校正", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "HAL 增益网格消暗角与角落色偏（RAW 链、CCM 前，17×13 手写双线性）；" +
+                            "关 = 同机位 A/B 对照",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (lscOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
             // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
             var dnLevel by rememberSaveable {
