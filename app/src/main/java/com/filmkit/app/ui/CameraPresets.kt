@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(31).apply {
+    private fun neutral(): DoubleArray = DoubleArray(34).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -36,6 +36,13 @@ object CameraPresets {
         this[29] = 1.0
         // 30 = 过曝提示阈值（显示域）：0.95 ≈ 242/255，0 = 关；仅预览生效。
         this[30] = 0.95
+        // 31..33 = 色彩外观层（M3 P1）：强度 / 饱和增益 / 色度 S 端点。
+        // 2026-09-21 复核后**参数回中性 = 占位**：真机 A/B 证明"寡淡"是 libraw
+        // 默认 auto_bright 造成的伪测量（见 docs「v0.5.44 复核」节）；浓淡属风格，
+        // 按 §0-D8/D9 交给 M4 的理光系 LUT。开关与通路保留，便于 A/B 与 M4 接管。
+        this[31] = 1.0
+        this[32] = 1.0
+        this[33] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

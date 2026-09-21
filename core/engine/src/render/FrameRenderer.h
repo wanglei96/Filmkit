@@ -62,6 +62,10 @@ class FrameRenderer {
                  int noise_level, float noise_sigma,
                  std::vector<uint8_t>* out_rgba);
 
+  // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
+  // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
+  bool histogram(int* out, int n);
+
   int64_t frameCount() const { return frames_.load(std::memory_order_relaxed); }
   int sceneW() const { return scene_w_; }
   int sceneH() const { return scene_h_; }
@@ -103,7 +107,8 @@ class FrameRenderer {
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
-         prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0;
+         prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
+         prog_hist_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -121,6 +126,8 @@ class FrameRenderer {
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
+  GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
+  int hist_w_ = 0, hist_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
@@ -162,12 +169,16 @@ class FrameRenderer {
   } u_chroma_dn_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
-          sat = -1, split = -1, mono = -1, tone_k = -1;
+          sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
+          look_sat = -1, look_chroma = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
           flip_y = -1, zebra = -1;
   } u_out_;
+  struct {
+    GLint tex = -1;
+  } u_hist_;
   GLint u_fill_st_ = -1;
   struct {
     GLint rot = -1, scale = -1;

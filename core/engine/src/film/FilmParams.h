@@ -7,7 +7,7 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  static constexpr int kCount = 31;
+  static constexpr int kCount = 34;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -32,6 +32,12 @@ struct FilmParams {
   float hl_recon = 1.0f;  // 29
   // 过曝提示阈值（显示域亮度，0 = 关）：仅预览 passOutput 使用，成片一律 0。
   float zebra_thr = 0.95f;  // 30
+  // ── M3 P1 色彩外观层（治"寡淡"）──────────────────────────────────
+  // 诊断：中性色准（R/G 0.987）但饱和 -21%、通道分离 -29%、近中性像素多 10pp
+  // —— 颜色全挤在中性附近。外观层 = 亮度保持的饱和增益 + 色度 S 曲线。
+  float look_strength = 1.0f;  // 31 强度（0 = 恒等，A/B 通路）
+  float look_sat = 1.0f;       // 32 饱和增益（luma 不动，色差放大）；1.0 = 中性占位
+  float look_chroma = 1.0f;    // 33 色度 S 曲线端点增益；1.0 = 中性占位
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -75,6 +81,9 @@ struct FilmParams {
     if (n > 28) tone_strength = static_cast<float>(v[28]);
     if (n > 29) hl_recon = static_cast<float>(v[29]);
     if (n > 30) zebra_thr = static_cast<float>(v[30]);
+    if (n > 31) look_strength = static_cast<float>(v[31]);
+    if (n > 32) look_sat = static_cast<float>(v[32]);
+    if (n > 33) look_chroma = static_cast<float>(v[33]);
   }
 };
 

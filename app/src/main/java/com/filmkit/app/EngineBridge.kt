@@ -76,6 +76,9 @@ object EngineBridge {
         noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
     ): ByteArray?
 
+    /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */
+    external fun nativeEngineHistogram(out: IntArray): Boolean
+
     /** 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709（须在引擎启动后设置） */
     external fun nativeEngineSetYuvMatrix(m: Int)
 }

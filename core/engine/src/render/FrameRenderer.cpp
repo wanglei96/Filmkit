@@ -574,7 +574,10 @@ uniform mat3 uCross;
 uniform vec3 uSat;    // 阴影/中间/高光 饱和度
 uniform vec2 uSplit;  // 阴影暖 / 高光冷
 uniform float uMono;
-uniform float uToneK;  // 基准影调强度（0 = 恒等/旧行为，1 = 完整基准）
+uniform float uToneK;      // 基准影调强度（0 = 恒等/旧行为，1 = 完整基准）
+uniform float uLook;       // 色彩外观层强度（0 = 恒等/A-B 关，M3 P1）
+uniform float uLookSat;    // 亮度保持的饱和增益
+uniform float uLookChroma; // 色度 S 曲线端点增益
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
 // 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
@@ -644,6 +647,21 @@ void main() {
     out3 = mix(vec3(l), out3, sat);
     out3 += uSplit.x * ws * vec3(0.05, 0.02, -0.04)
           + uSplit.y * wh * vec3(-0.03, 0.0, 0.05);
+    // ── 色彩外观层（M3 P1，治"寡淡"）────────────────────────────────
+    // v0.5.42 诊断：中性色准（R/G 0.987）但饱和 -21% / 通道分离 -29% /
+    // 近中性像素多 10pp —— 颜色全挤在中性附近。这里补"外观"（不是风格）：
+    //   ① 亮度保持的饱和增益：luma 不动，色差整体放大；
+    //   ② 色度 S 曲线：knee(=0.25 线性 ≈ 显示域 64/255) 以下线性、以上加速，
+    //      把"灰"推离中性、同时不让已浓郁的色块过冲。
+    // uLook ∈ {0,1} 是 A/B 通路（v0.5.36 教训：影调/色彩类改动必须能关掉）。
+    if (uLook > 0.0) {
+        float la = luma(out3);
+        vec3 cc = out3 - la;
+        float t = clamp(max(max(abs(cc.r), abs(cc.g)), abs(cc.b)) / 0.25, 0.0, 1.0);
+        float sk = t * t * (3.0 - 2.0 * t);
+        out3 = la + cc * (1.0 + (uLookSat - 1.0) * uLook)
+                       * (1.0 + (uLookChroma - 1.0) * sk * uLook);
+    }
     out3 = mix(out3, vec3(luma(clamp(out3, 0.0, 4.0))), uMono);
     oColor = vec4(out3, 1.0);
 })";
@@ -691,6 +709,19 @@ void main() {
         }
     }
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+})";
+
+// 实时直方图采样（M3）：胶片输出下采样到 256×96 RGBA8，OETF 与 kFsOut 一致
+// —— 直方图必须是"显示域、用户实际看到"的分布。每次读回 24KB（UI 侧节流）。
+const char* kFsHist = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+void main() {
+    vec3 c = pow(clamp(texture(uTex, vUV0).rgb, 0.0, 1.0), vec3(1.0 / 2.2));
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    oColor = vec4(l, l, l, 1.0);
 })";
 
 GLuint compileShader(GLenum type, const char* src) {
@@ -768,6 +799,7 @@ bool FrameRenderer::init() {
   const GLuint fs_still = compileShader(GL_FRAGMENT_SHADER, kFsStill);
   const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, kFsFilm);
   const GLuint fs_out = compileShader(GL_FRAGMENT_SHADER, kFsOut);
+  const GLuint fs_hist = compileShader(GL_FRAGMENT_SHADER, kFsHist);
   const GLuint fs_fill = compileShader(GL_FRAGMENT_SHADER, kFsFillTest);
   const GLuint fs_raw = compileShader(GL_FRAGMENT_SHADER, kFsRaw);
   const GLuint fs_rcd_dir = compileShader(GL_FRAGMENT_SHADER, kFsRcdDir);
@@ -777,13 +809,14 @@ bool FrameRenderer::init() {
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
-      !fs_raw_dn || !fs_chroma_dn)
+      !fs_raw_dn || !fs_chroma_dn || !fs_hist)
     return false;
 
   prog_oes_ = linkProgram(vs_rot_, fs_oes);
   prog_still_ = linkProgram(vs_rot_, fs_still);
   prog_film_ = linkProgram(vs_plain_, fs_film);
   prog_out_ = linkProgram(vs_plain_, fs_out);
+  prog_hist_ = linkProgram(vs_plain_, fs_hist);
   prog_fill_ = linkProgram(vs_rot_, fs_fill);
   prog_raw_ = linkProgram(vs_rot_, fs_raw);
   prog_rcd_dir_ = linkProgram(vs_plain_, fs_rcd_dir);
@@ -795,6 +828,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_still);
   glDeleteShader(fs_film);
   glDeleteShader(fs_out);
+  glDeleteShader(fs_hist);
   glDeleteShader(fs_fill);
   glDeleteShader(fs_raw);
   glDeleteShader(fs_rcd_dir);
@@ -804,7 +838,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_chroma_dn);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
-      !prog_raw_dn_ || !prog_chroma_dn_)
+      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_)
     return false;
 
   u_oes_.st = glGetUniformLocation(prog_oes_, "uST");
@@ -918,6 +952,9 @@ bool FrameRenderer::init() {
   u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
   u_film_.mono = glGetUniformLocation(prog_film_, "uMono");
   u_film_.tone_k = glGetUniformLocation(prog_film_, "uToneK");
+  u_film_.look = glGetUniformLocation(prog_film_, "uLook");
+  u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
+  u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -926,6 +963,7 @@ bool FrameRenderer::init() {
   u_out_.time = glGetUniformLocation(prog_out_, "uTime");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
+  u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
 
   u_fill_st_ = glGetUniformLocation(prog_fill_, "uST");
   if (u_fill_st_ >= 0) {  // 填充测试不采样：uST 置单位阵（uniform 默认全 0）
@@ -951,6 +989,7 @@ void FrameRenderer::release() {
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
+  if (tex_hist_) glDeleteTextures(1, &tex_hist_);
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
@@ -958,6 +997,7 @@ void FrameRenderer::release() {
   if (fbo_g_) glDeleteFramebuffers(1, &fbo_g_);
   if (fbo_mos_) glDeleteFramebuffers(1, &fbo_mos_);
   if (fbo_dn_) glDeleteFramebuffers(1, &fbo_dn_);
+  if (fbo_hist_) glDeleteFramebuffers(1, &fbo_hist_);
   if (prog_oes_) glDeleteProgram(prog_oes_);
   if (prog_still_) glDeleteProgram(prog_still_);
   if (prog_film_) glDeleteProgram(prog_film_);
@@ -982,13 +1022,15 @@ void FrameRenderer::release() {
   tex_dir_ = tex_g_ = 0;
   fbo_dir_ = fbo_g_ = 0;
   rcd_w_ = rcd_h_ = 0;
-  tex_mos_ = tex_dn_ = 0;
-  fbo_mos_ = fbo_dn_ = 0;
+  tex_mos_ = tex_dn_ = tex_hist_ = 0;
+  fbo_mos_ = fbo_dn_ = fbo_hist_ = 0;
+  hist_w_ = hist_h_ = 0;
   tex_scene_ = tex_work_ = tex_cap_ = 0;
   fbo_scene_ = fbo_work_ = fbo_cap_ = 0;
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
   prog_raw_dn_ = prog_chroma_dn_ = 0;
+  prog_hist_ = 0;
   vs_rot_ = vs_plain_ = 0;
   oes_tex_ = 0;
   still_w_ = still_h_ = 0;
@@ -1646,6 +1688,32 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   return true;
 }
 
+// 实时直方图（M3）：tex_work_（胶片输出）→ 显示域亮度 → 256×96 RGBA8 → 读回统计。
+// 必须在渲染线程、有当前 context 时调用；尚未渲染过预览帧（tex_work_ 为空）返回 false。
+bool FrameRenderer::histogram(int* out, int n) {
+  if (out == nullptr || n < 2 || tex_work_ == 0 || scene_w_ <= 0) return false;
+  const int hw = 256, hh = 96;
+  if (tex_hist_ == 0) {
+    makeTex(&tex_hist_, &fbo_hist_, GL_RGBA8, hw, hh);
+    hist_w_ = hw;
+    hist_h_ = hh;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_hist_);
+  glViewport(0, 0, hw, hh);
+  glUseProgram(prog_hist_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glUniform1i(u_hist_.tex, 0);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
+  glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+  for (int i = 0; i < n; ++i) out[i] = 0;
+  for (size_t i = 0; i + 3 < px.size(); i += 4) {
+    ++out[px[i] * (n - 1) / 255];
+  }
+  return true;
+}
+
 void FrameRenderer::passFill(int dst_w, int dst_h) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
@@ -1670,6 +1738,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glUniform2f(u_film_.split, p.split_warm, p.split_cool);
   glUniform1f(u_film_.mono, p.monochrome);
   glUniform1f(u_film_.tone_k, p.tone_strength);
+  glUniform1f(u_film_.look, p.look_strength);
+  glUniform1f(u_film_.look_sat, p.look_sat);
+  glUniform1f(u_film_.look_chroma, p.look_chroma);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

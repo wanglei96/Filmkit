@@ -328,6 +328,20 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   return out;
 }
 
+// 预览实时直方图（M3）：out 长度 ≥2（建议 256），填充显示域亮度分布；
+// 返回 false = 还没有可用的预览帧（纹理未就绪）
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineHistogram(JNIEnv* env, jobject,
+                                                        jintArray out) {
+  if (!g_renderer || !out) return JNI_FALSE;
+  const jsize n = env->GetArrayLength(out);
+  if (n < 2) return JNI_FALSE;
+  std::vector<int> h(static_cast<size_t>(n), 0);
+  if (!g_renderer->histogram(h.data(), n)) return JNI_FALSE;
+  env->SetIntArrayRegion(out, 0, n, h.data());
+  return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
   const int64_t frames = g_renderer ? g_renderer->frameCount() : 0;

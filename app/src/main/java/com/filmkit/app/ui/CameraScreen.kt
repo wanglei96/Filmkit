@@ -128,6 +128,7 @@ import kotlin.math.log10
 import kotlin.math.pow
 import kotlin.math.roundToLong
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * M 档专业拍摄界面（方向 C 定稿，v0.5.1）。
@@ -189,6 +190,20 @@ fun CameraScreen(
     var lutOpen by rememberSaveable { mutableStateOf(false) } // LUT 二级菜单
     var flashMode by rememberSaveable { mutableIntStateOf(0) }
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
+    // 实时直方图（M3）：开关开时 ~7fps 从渲染线程取显示域亮度分布（引擎端 256×96
+    // 下采样 + 24KB 读回；主线程不阻塞，取值在 IO 线程，采样口径与成片 OETF 一致）
+    var hist by remember { mutableStateOf<IntArray?>(null) }
+    LaunchedEffect(histOn) {
+        if (!histOn) {
+            hist = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            val a = withContext(Dispatchers.IO) { controller.pollHistogram() }
+            if (a != null) hist = a
+            delay(150)
+        }
+    }
     var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
     var levelOn by rememberSaveable { mutableStateOf(prefs.getBoolean("level", false)) }
     // 过曝提示（斑马纹）：拍摄相关开关，按约定放快捷设置（不进设置页）
@@ -656,22 +671,42 @@ fun CameraScreen(
                     }
                 }
 
-                // 实时直方图（开关；渲染链路 M3 接入，当前为占位）
+                // 实时直方图（M3）：显示域亮度分布（0=黑 左，255=白 右），
+                // 峰值开方压缩——大片同色（天空/墙面）的尖峰不会把其余分布压平
                 if (histOn) {
                     Box(
                         Modifier
                             .align(Alignment.TopStart)
                             .padding(start = 14.dp, top = 12.dp)
+                            .size(116.dp, 44.dp)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(FilmTheme.Panel)
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                            .background(FilmTheme.Panel),
                     ) {
-                        Text(
-                            "直方图 · M3 接入",
-                            color = FilmTheme.CreamDim,
-                            fontSize = 9.sp,
-                            fontFamily = FilmTheme.Mono,
-                        )
+                        val h = hist
+                        if (h == null) {
+                            Text(
+                                "直方图…",
+                                color = FilmTheme.CreamDim,
+                                fontSize = 9.sp,
+                                fontFamily = FilmTheme.Mono,
+                                modifier = Modifier.align(Alignment.Center),
+                            )
+                        } else {
+                            Canvas(Modifier.fillMaxSize().padding(3.dp)) {
+                                var mx = 1
+                                for (v in h) if (v > mx) mx = v
+                                val bw = size.width / h.size
+                                for (i in h.indices) {
+                                    if (h[i] <= 0) continue
+                                    val f = sqrt(h[i].toFloat() / mx)
+                                    drawRect(
+                                        color = FilmTheme.Accent,
+                                        topLeft = Offset(i * bw, size.height * (1f - f)),
+                                        size = Size(bw + 0.6f, size.height * f),
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 

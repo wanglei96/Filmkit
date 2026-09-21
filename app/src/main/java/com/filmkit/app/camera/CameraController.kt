@@ -678,17 +678,22 @@ class CameraController(private val context: Context, private val render: RenderC
         filmParams = p
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
+        lookPref = -1.0  // 同上，[31]
         hlPref = -1.0    // 同上，[29]
         zebraPref = -1.0 // 同上，[30]
         applyTonePref()
         applyHlPref()
         applyZebraPref()
+        applyLookPref()
+        applyLookPref()
     }
 
     private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
     private var tonePref = -1.0
     private var hlPref = -1.0
     private var zebraPref = -1.0
+    private var lookPref = -1.0
+    private var calibLogged = false
 
     /**
      * 基准影调开关（M3 色彩内核 v1）：写 FilmParams[28]（0 = 恒等/旧行为）。
@@ -712,6 +717,15 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
+    /** 色彩外观层开关（M3 P1，治"寡淡"）：写 FilmParams[31]（0 = 恒等/A-B 关）。 */
+    private fun applyLookPref() {
+        val v = if (appPrefs.getBoolean("color_look", true)) 1.0 else 0.0
+        if (v != lookPref) {
+            lookPref = v
+            filmParams[31] = v
+        }
+    }
+
     /** 过曝提示开关（斑马纹，仅预览）：写 FilmParams[30]（0 = 关，0.95 ≈ 242/255）。 */
     private fun applyZebraPref() {
         val v = if (appPrefs.getBoolean("zebra", true)) 0.95 else 0.0
@@ -720,6 +734,9 @@ class CameraController(private val context: Context, private val render: RenderC
             filmParams[30] = v
         }
     }
+
+    /** 预览实时直方图（M3）：渲染线程取值（阻塞 ≤500ms），null = 尚无可用帧。 */
+    fun pollHistogram(): IntArray? = render.pollHistogram()
 
     // 预设自带的白平衡基线（引擎补偿在其上相乘）
     private var presetWbBase = doubleArrayOf(1.0, 1.0, 1.0)
@@ -954,6 +971,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyTonePref()
                     applyHlPref()
                     applyZebraPref()
+                    applyLookPref()
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
                         orientationStep, filmParams, fillTest,
@@ -1044,6 +1062,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyHlPref()
         applyZebraPref()
+        applyLookPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1105,11 +1124,31 @@ class CameraController(private val context: Context, private val render: RenderC
                 "cfa" to meta.cfa, "white" to meta.whiteLevel,
                 "black" to meta.blackPhase.joinToString(",") { "%.0f".format(it) },
                 "neutral" to meta.neutral.joinToString(",") { "%.4f".format(it) },
-                "ccm" to meta.ccm.take(6).joinToString(",") { "%.3f".format(it) },
+                "ccm" to meta.ccm.joinToString(",") { "%.3f".format(it) },
+                "ccmSrc" to if (meta.ccmStd) "std" else "hal",
                 "noise" to "%.4f".format(meta.noiseSigma),
                 "in" to "${img.width}x${img.height}",
             ),
         )
+        // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在
+        // CaptureResult —— v0.5.45 初版记错归属，编译期 Unresolved 才暴露）。
+        // 只在首次拍照记一条，避免每条 raw.meta 重复。
+        if (!calibLogged && ch != null) {
+            calibLogged = true
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "raw.calib",
+                kv(
+                    "ct1" to cst9(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)),
+                    "ct2" to cst9(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)),
+                    "cal1" to cst9(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)),
+                    "cal2" to cst9(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2)),
+                    "fm1" to cst9(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1)),
+                    "fm2" to cst9(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2)),
+                    "illum1" to (ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) ?: -1),
+                    "illum2" to (ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2) ?: -1),
+                ),
+            )
+        }
         if (dngOn && ch != null) {
             try {
                 saveDng(img, result, ch)
@@ -1123,10 +1162,20 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyHlPref()
         applyZebraPref()
+        applyLookPref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
         }
+    }
+
+    /** ColorSpaceTransform → 行主序 9 元素字符串；null → "none"（DNG 标准链回填探针）。
+     *  读取必须 (row, col) 双循环：构造收行主序、getElement(col, row)（v0.5.20 转置教训）。 */
+    private fun cst9(t: android.hardware.camera2.params.ColorSpaceTransform?): String {
+        t ?: return "none"
+        val v = FloatArray(9)
+        for (row in 0..2) for (col in 0..2) v[row * 3 + col] = t.getElement(col, row).toFloat()
+        return v.joinToString(",") { "%.4f".format(it) }
     }
 
     /** CFA 相位 → 通道（0=R 1=G 2=B）；与引擎 shader chanAt 同一映射（Camera2: 0=RGGB 1=GRBG 2=GBRG 3=BGGR） */
@@ -1198,11 +1247,20 @@ class CameraController(private val context: Context, private val render: RenderC
                 nR = 1f; nG = 1f; nB = 1f
             }
         }
-        val ccm = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        val halCcm = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
         result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
             // 构造收行主序、读取 getElement(col,row)——遍历须 (row, col) 双重序防转置
-            for (row in 0..2) for (col in 0..2) ccm[row * 3 + col] = t.getElement(col, row).toFloat()
+            for (row in 0..2) for (col in 0..2) halCcm[row * 3 + col] = t.getElement(col, row).toFloat()
         }
+        // 色彩链（§3.2-7 / §3.4-4）：优先用 characteristics 标定矩阵自建标准链
+        // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB，与 Adobe/libraw 完整链同源）；
+        // 开关关或标定数据缺失 → 回退 HAL 的 COLOR_CORRECTION_TRANSFORM（跨机型兜底）
+        val stdCcm = if (appPrefs.getBoolean("ccm_std", true)) {
+            StdColorMatrix.compute(ch, floatArrayOf(nR, nG, nB))
+        } else {
+            null
+        }
+        val ccm = stdCcm ?: halCcm
         // 噪声 σ（M3-2）：SENSOR_NOISE_PROFILE 按当前增益取最近条目，归一化到
         // [0,1] 线性域（σ_data / whiteLevel）；HAL 不回填时回退 0（引擎内估计）
         var noiseSigma = 0f
@@ -1271,6 +1329,7 @@ class CameraController(private val context: Context, private val render: RenderC
         return RenderClient.RawFrameMeta(
             colorFilterArrangement, black4, whiteLevel,
             floatArrayOf(nR, nG, nB), ccm, noiseSigma, lsc, lscCols, lscRows,
+            ccmStd = stdCcm != null,
         )
     }
 

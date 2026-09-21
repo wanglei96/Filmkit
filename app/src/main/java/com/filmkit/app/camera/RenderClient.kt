@@ -77,6 +77,24 @@ class RenderClient {
     }
 
     /**
+     * 预览实时直方图（M3）：阻塞取一次（统计在渲染线程执行），null = 尚无可用帧。
+     * UI 侧节流轮询（~150ms）；24KB 读回 + 24K 像素统计，单次开销远小于一帧渲染。
+     */
+    fun pollHistogram(): IntArray? {
+        val h = handler ?: return null
+        val latch = CountDownLatch(1)
+        var res: IntArray? = null
+        val posted = h.post {
+            val a = IntArray(256)
+            res = if (EngineBridge.nativeEngineHistogram(a)) a else null
+            latch.countDown()
+        }
+        if (!posted) return null
+        latch.await(500, TimeUnit.MILLISECONDS)
+        return res
+    }
+
+    /**
      * 相机新帧就绪。最多 1 帧排队（pending 丢弃多余帧），保帧率不积压。
      * srcW/H 为 SurfaceTexture 默认缓冲尺寸。
      */
@@ -172,6 +190,8 @@ class RenderClient {
         val lsc: FloatArray? = null,
         val lscCols: Int = 1,
         val lscRows: Int = 1,
+        // true = ccm 来自 characteristics 自建标准链（DNG 路径）；false = HAL CCM
+        val ccmStd: Boolean = false,
     )
 
     /** 静拍 RAW：u16 Bayer → 引擎 demosaic+胶片链 → 读回，回调在渲染线程。

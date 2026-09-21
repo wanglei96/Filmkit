@@ -236,6 +236,79 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // M3 P1 色彩外观层（治"寡淡"）：亮度保持的饱和增益 + 色度 S 曲线。
+            // 常开项 → 设置页；关 = 同机位 A/B 对照（参数在 CameraPresets[32]/[33]）。
+            var lookOn by rememberSaveable { mutableStateOf(prefs.getBoolean("color_look", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !lookOn
+                        lookOn = v
+                        prefs.edit().putBoolean("color_look", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.color_look",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("色彩外观层", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "亮度保持的饱和增益 + 色度 S 曲线；当前参数为中性占位（真机复核证明" +
+                            "「寡淡」是测量口径造成的），浓淡留给 M4 的理光系 LUT",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (lookOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // M3 P2 DNG 标准色彩链（§3.2-7 / §3.4-4）：用 characteristics 的标定矩阵
+            // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB）自建 camera→sRGB，
+            // 替代 HAL 的 COLOR_CORRECTION_TRANSFORM；关 = 用 HAL 的做同机位 A/B。
+            var stdCcmOn by rememberSaveable { mutableStateOf(prefs.getBoolean("ccm_std", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !stdCcmOn
+                        stdCcmOn = v
+                        prefs.edit().putBoolean("ccm_std", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.ccm_std",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("DNG 标准色彩链", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "用相机标定矩阵自建色彩链（与 Adobe/libraw 完整链同源，标定数据缺失" +
+                            "自动回退）；关 = 用 HAL 矩阵做 A/B",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (stdCcmOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
             // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
             var dnLevel by rememberSaveable {
