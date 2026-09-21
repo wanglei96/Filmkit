@@ -677,6 +677,24 @@ class CameraController(private val context: Context, private val render: RenderC
     fun setFilmParams(p: DoubleArray) {
         filmParams = p
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
+        tonePref = -1.0  // 换了新数组，强制重写 [28]
+        applyTonePref()
+    }
+
+    private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
+    private var tonePref = -1.0
+
+    /**
+     * 基准影调开关（M3 色彩内核 v1）：写 FilmParams[28]（0 = 恒等/旧行为）。
+     * 预览每帧传同一数组、成片经 submitStill/submitRaw 传，故三处同步即"所见即所得"。
+     * 默认开；设置页「基准影调」可关（用于同场景 A/B 对照）。
+     */
+    private fun applyTonePref() {
+        val v = if (appPrefs.getBoolean("base_tone", true)) 1.0 else 0.0
+        if (v != tonePref) {
+            tonePref = v
+            filmParams[28] = v
+        }
     }
 
     // 预设自带的白平衡基线（引擎补偿在其上相乘）
@@ -909,6 +927,7 @@ class CameraController(private val context: Context, private val render: RenderC
                             EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
                         )
                     }
+                    applyTonePref()
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
                         orientationStep, filmParams, fillTest,
@@ -996,6 +1015,7 @@ class CameraController(private val context: Context, private val render: RenderC
 
     private fun submitStill(img: Image) {
         // 静拍与预览共用「方向」设定（用户在界面选定；默认 0）
+        applyTonePref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1072,6 +1092,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
             }
         }
+        applyTonePref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
