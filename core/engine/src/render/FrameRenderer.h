@@ -49,8 +49,8 @@ class FrameRenderer {
   //   neutral*    —— JPEG_NEUTRAL_COLOR_POINT（asShotNeutral），增益=其倒数 G 归一
   //   ccm9        —— sensor→sRGB 3×3 行主序；nullptr = 单位阵
   //   demosaic    —— 0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）
-  //   noise_level —— 0 = 关；1 = 标准（M3-2：P0 RAW 域 bilateral + P4 色度平滑，
-  //                  仅 RCD 路径生效；bilinear 保持纯净基线）
+  //   noise_level —— 0 = 关；1 = 标准；2 = 强（M3-2：P0 RAW 域 bilateral + P4
+  //                  色度平滑，仅 RCD 路径生效；bilinear 保持纯净基线）
   //   noise_sigma —— 归一化域噪声 σ（SENSOR_NOISE_PROFILE，≤0 时引擎内回退估计）
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
                  const float black_phase[4], int white_level,
@@ -82,9 +82,11 @@ class FrameRenderer {
                      const float black_phase[4], float white_level,
                      const float gains[3], const float* ccm, bool mosaic);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑
+  // k —— 强度档乘子（标准 1.0 / 强 1.45，缩放值域 σ）
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
-                      float white_level, const float gains[3], float ns);
-  void passChromaDenoise(int dst_w, int dst_h, int rot, float ns);
+                      float white_level, const float gains[3], float ns,
+                      float k);
+  void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
   void passOutput(int w, int h, const FilmParams& p, bool flip_y);
@@ -143,10 +145,10 @@ class FrameRenderer {
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
-          ns = -1;
+          ns = -1, k = -1;
   } u_raw_dn_;
   struct {
-    GLint tex = -1, size = -1, ns = -1;
+    GLint tex = -1, size = -1, ns = -1, k = -1;
   } u_chroma_dn_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,

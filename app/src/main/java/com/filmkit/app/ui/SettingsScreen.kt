@@ -132,17 +132,30 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            var dnOn by rememberSaveable { mutableStateOf(prefs.getBoolean("noise_reduction", true)) }
+            // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
+            // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
+            var dnLevel by rememberSaveable {
+                mutableStateOf(
+                    if (prefs.getBoolean("noise_reduction", true)) {
+                        prefs.getInt("noise_reduction_level", 1)
+                    } else {
+                        0
+                    },
+                )
+            }
             Row(
                 Modifier
                     .fillMaxWidth()
                     .clickable {
-                        val v = !dnOn
-                        dnOn = v
-                        prefs.edit().putBoolean("noise_reduction", v).apply()
+                        val v = (dnLevel + 1) % 3
+                        dnLevel = v
+                        prefs.edit()
+                            .putInt("noise_reduction_level", v)
+                            .putBoolean("noise_reduction", v > 0)
+                            .apply()
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_INFO, "app", "settings.noise_reduction",
-                            "{\"on\":$v}",
+                            "{\"level\":$v}",
                         )
                     }
                     .padding(vertical = 6.dp),
@@ -152,14 +165,18 @@ fun SettingsScreen(
                     Text("RAW 降噪", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
                         "RAW 域双边滤波 + 色度平滑，重点压彩噪；" +
-                            "仅 RCD 质量档生效",
+                            "标准保细节 / 强更干净。仅 RCD 质量档生效",
                         color = FilmTheme.CreamDim,
                         fontSize = 10.sp,
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
                 Text(
-                    if (dnOn) "标准" else "关",
+                    when (dnLevel) {
+                        0 -> "关"
+                        1 -> "标准"
+                        else -> "强"
+                    },
                     color = FilmTheme.Accent,
                     fontSize = 13.sp,
                     fontFamily = FilmTheme.Mono,

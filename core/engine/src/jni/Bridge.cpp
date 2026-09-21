@@ -283,7 +283,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
 
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
 // demosaic：0=bilinear（速度档）1=RCD 三段管线（质量档，M3-1）
-// noise_level：0=关 1=标准（M3-2 降噪，仅 RCD 生效）；noise_sigma：归一化域噪声 σ
+// noise_level：0=关 1=标准 2=强（M3-2 降噪，仅 RCD 生效）；noise_sigma：归一化域噪声 σ
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     JNIEnv* env, jobject, jobject raw_buf, jint w, jint h, jint row_stride_px,

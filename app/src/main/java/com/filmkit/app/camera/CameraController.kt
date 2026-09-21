@@ -1042,8 +1042,14 @@ class CameraController(private val context: Context, private val render: RenderC
         val dngOn = prefs.getBoolean("dng_enabled", false)
         // 去马赛克质量档：1 = RCD 三段管线（默认，M3-1）；0 = bilinear 速度档
         val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
-        // 降噪（M3-2）：1 = 标准（P0 RAW bilateral + P4 色度平滑，仅 RCD 生效）
-        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) 1 else 0
+        // 降噪（M3-2）：0 = 关；1 = 标准；2 = 强（P0 RAW bilateral + P4 色度平滑，
+        // 仅 RCD 生效）。v0.5.33 起两档；旧 bool 开关为 false 时视为关（设置页写入
+        // 时会同步这两个 key，故两者始终一致）。
+        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) {
+            prefs.getInt("noise_reduction_level", 1)
+        } else {
+            0
+        }
         val meta = extractRawMeta(result, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",

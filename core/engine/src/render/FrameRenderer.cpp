@@ -417,9 +417,11 @@ void main() {
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
-// ── M3-2 降噪（v0.5.32）──────────────────────────────────────────────
+// ── M3-2 降噪（v0.5.32 引入 / v0.5.33 两档调参）─────────────────────
 // 量化基线（真机 ISO~1200 平坦区）：亮噪 σ(Y)≈1.5–1.8（达标优），彩噪
 // σ(chroma)≈1.8–2.1（未达优，B-Y 最重）——彩噪是短板。
+// v0.5.32 首版压制到位（彩噪 1.41→0.74）但细节 Laplacian -48% 过猛；
+// v0.5.33 标准档收紧值域系数（保细节）+ 强档 1.45 乘子（近首版强度）。
 // P0：RAW 域同色联合 bilateral。任意 Bayer 相位下"步长 2 的 3×3 网格"
 // 恰为 9 个同色位（含中心），无需相位条件；值域 σ 随信号 √ 增长
 // （shot noise 主导）。输出线性 mosaic（rgb = 该相位通道值），同时让
@@ -434,6 +436,7 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform float uNS;     // 归一化域噪声 σ（SENSOR_NOISE_PROFILE 或回退估计）
+uniform float uDnK;    // 强度档乘子：标准 1.0 / 强 1.45（v0.5.33 调参）
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -448,7 +451,8 @@ float raw0(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = raw0(p);
-    float sr = max(uNS, 0.008) * 1.6 * sqrt(0.2 + 4.0 * c0);
+    // σr 1.6→1.1（v0.5.32 细节 -48% 过猛；只压噪声不钝化边缘）
+    float sr = max(uNS, 0.008) * 1.1 * uDnK * sqrt(0.2 + 4.0 * c0);
     float wsum = 1.0, acc = c0;
     for (int dy = -4; dy <= 4; dy += 2)
         for (int dx = -4; dx <= 4; dx += 2) {
@@ -474,13 +478,15 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uNS;
+uniform float uDnK;    // 强度档乘子（同 P0）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     vec3 c0 = texelFetch(uTex, p, 0).rgb;
     float y0 = dot(c0, LUMA);
     vec3 cd0 = c0 - y0;
-    float sc = max(uNS, 0.008) * 2.4 * sqrt(0.2 + 4.0 * y0) + 0.015;
+    // sc 2.4→1.8（色度值域收紧）；Y 值域权重 2.0→1.2（防边缘色溢）
+    float sc = max(uNS, 0.008) * 1.8 * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
     vec3 acc = cd0;
     float wsum = 1.0;
     for (int dy = -2; dy <= 2; ++dy)
@@ -489,7 +495,7 @@ void main() {
             vec3 c = texelFetch(uTex, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0).rgb;
             float y = dot(c, LUMA);
             vec3 cd = c - y;
-            float wy = (y - y0) / (sc * 2.0);
+            float wy = (y - y0) / (sc * 1.2);
             float wc = length(cd - cd0) / sc;
             float w = exp(-0.5 * (wy * wy + wc * wc)
                           - 0.5 * float(dx * dx + dy * dy) / 5.12);  // σs=1.6
@@ -774,10 +780,12 @@ bool FrameRenderer::init() {
   u_raw_dn_.white = glGetUniformLocation(prog_raw_dn_, "uWhite");
   u_raw_dn_.gain = glGetUniformLocation(prog_raw_dn_, "uGain");
   u_raw_dn_.ns = glGetUniformLocation(prog_raw_dn_, "uNS");
+  u_raw_dn_.k = glGetUniformLocation(prog_raw_dn_, "uDnK");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
   u_chroma_dn_.ns = glGetUniformLocation(prog_chroma_dn_, "uNS");
+  u_chroma_dn_.k = glGetUniformLocation(prog_chroma_dn_, "uDnK");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -1185,7 +1193,7 @@ bool FrameRenderer::ensureDnTarget(int w, int h) {
 void FrameRenderer::passRawDenoise(int w, int h, int cfa,
                                    const float black_phase[4],
                                    float white_level, const float gains[3],
-                                   float ns) {
+                                   float ns, float k) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_raw_dn_);
@@ -1199,12 +1207,13 @@ void FrameRenderer::passRawDenoise(int w, int h, int cfa,
   glUniform1f(u_raw_dn_.white, white_level);
   glUniform3f(u_raw_dn_.gain, gains[0], gains[1], gains[2]);
   glUniform1f(u_raw_dn_.ns, ns);
+  glUniform1f(u_raw_dn_.k, k);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // P4：色度平滑（读 tex_scene_ → tex_dn_）。输出几何与 passRcdChroma 一致
 void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
-                                      float ns) {
+                                      float ns, float k) {
   (void)rot;  // kVertRot 旋转已在顶点层；frag 用 gl_FragCoord 定位
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
   glViewport(0, 0, dst_w, dst_h);
@@ -1214,6 +1223,7 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glUniform1i(u_chroma_dn_.tex, 0);
   glUniform2i(u_chroma_dn_.size, dst_w, dst_h);
   glUniform1f(u_chroma_dn_.ns, ns);
+  glUniform1f(u_chroma_dn_.k, k);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
 }
@@ -1387,6 +1397,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // 仅 RCD 路径生效，bilinear 保持纯净基线。
   const bool rcd = demosaic == 1;
   const bool dn = rcd && noise_level > 0;
+  // v0.5.33 调参：标准档值域系数收紧（P0 σr 1.6→1.1、P4 sc 2.4→1.8 + Y 权重
+  // 2.0→1.2，治 v0.5.32 "细节 -48%"）；强档乘 1.45 回到接近 v0.5.32 的强度。
+  const bool dn_high = noise_level >= 2;
+  const float dn_k = dn_high ? 1.45f : 1.0f;
   const float ns = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
   float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
   if (rcd) {
@@ -1394,7 +1408,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     const auto d0 = std::chrono::steady_clock::now();
     if (dn) {
       passRawDenoise(w, h, cfa, black_phase, static_cast<float>(white_level),
-                     gains, ns);
+                     gains, ns, dn_k);
     }
     passRcdDir(w, h, cfa, black_phase, static_cast<float>(white_level), gains,
                dn);
@@ -1414,7 +1428,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   if (dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return false;
     const auto n0 = std::chrono::steady_clock::now();
-    passChromaDenoise(dst_w, dst_h, effective_rot, ns);
+    passChromaDenoise(dst_w, dst_h, effective_rot, ns, dn_k);
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -1454,7 +1468,9 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"gMs\":" + std::to_string(g_ms).substr(0, 6);
   }
   if (dn) {
-    kv += ",\"dn\":\"std\",\"ns\":" + std::to_string(ns).substr(0, 5) +
+    kv += std::string(",\"dn\":\"") + (dn_high ? "high" : "std") +
+          "\",\"dnK\":" + (dn_high ? "1.45" : "1.0") +
+          ",\"ns\":" + std::to_string(ns).substr(0, 5) +
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += "}";
