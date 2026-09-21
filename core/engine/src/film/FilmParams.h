@@ -7,7 +7,7 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  static constexpr int kCount = 34;
+  static constexpr int kCount = 35;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -38,6 +38,10 @@ struct FilmParams {
   float look_strength = 1.0f;  // 31 强度（0 = 恒等，A/B 通路）
   float look_sat = 1.0f;       // 32 饱和增益（luma 不动，色差放大）；1.0 = 中性占位
   float look_chroma = 1.0f;    // 33 色度 S 曲线端点增益；1.0 = 中性占位
+  // ── M4 3D LUT（display 域，插在输出 OETF 之后）─────────────────────
+  // LUT 资产本身走独立 JNI（nativeEngineSetLut，一次性上传 3D 纹理）；
+  // 这里只带**混合强度**：0 = 旁路（A/B 通路），1 = 全量。未选 LUT 时无意义。
+  float lut_strength = 1.0f;   // 34
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -84,6 +88,7 @@ struct FilmParams {
     if (n > 31) look_strength = static_cast<float>(v[31]);
     if (n > 32) look_sat = static_cast<float>(v[32]);
     if (n > 33) look_chroma = static_cast<float>(v[33]);
+    if (n > 34) lut_strength = static_cast<float>(v[34]);
   }
 };
 

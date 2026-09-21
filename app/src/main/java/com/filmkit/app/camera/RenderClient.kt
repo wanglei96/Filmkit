@@ -95,6 +95,21 @@ class RenderClient {
     }
 
     /**
+     * M4：上传 3D LUT（渲染线程执行 —— 431KB 一次性纹理上传）。null = 关闭 LUT。
+     * 引擎侧按 pending 处理（任意线程安全），这里统一排队以保证与帧渲染串行。
+     */
+    fun setLut(lut: com.filmkit.app.lut.CubeLut?) {
+        val h = handler ?: return
+        h.post {
+            if (lut == null) {
+                EngineBridge.nativeEngineSetLut(0, null, FloatArray(3), FloatArray(3))
+            } else {
+                EngineBridge.nativeEngineSetLut(lut.size, lut.data, lut.domainMin, lut.domainMax)
+            }
+        }
+    }
+
+    /**
      * 相机新帧就绪。最多 1 帧排队（pending 丢弃多余帧），保帧率不积压。
      * srcW/H 为 SurfaceTexture 默认缓冲尺寸。
      */

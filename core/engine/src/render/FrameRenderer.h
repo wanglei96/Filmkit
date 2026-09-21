@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "../film/FilmParams.h"
@@ -28,6 +29,13 @@ class FrameRenderer {
 
   /// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
   void setYuvMatrix(int m) { yuv_matrix_ = m ? 1 : 0; }
+
+  // 3D LUT（M4 §6）：display 域 LUT，域感知插桩在**输出 OETF 之后**（kFsOut 与
+  // kFsHist 同源，保证直方图仍是"用户实际看到"的分布）。可在任意线程调用 ——
+  // 数据暂存，渲染线程在下一帧上传（此处无上下文，不能直接建纹理）。
+  //   data —— RGB 交错，顺序与 .cube 一致（红最快），长度 size³×3
+  //   size ≤ 1 或 data 为空 = 关闭（A/B 通路）；dmin/dmax = .cube 的 DOMAIN
+  void setLut(const float* data, int size, const float dmin[3], const float dmax[3]);
 
   // 预览帧：OES 纹理（Kotlin 侧已 updateTexImage）→ 渲染到当前窗口面。
   //   st      —— SurfaceTexture.getTransformMatrix()（列主序 16 float）
@@ -129,6 +137,21 @@ class FrameRenderer {
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
+  // M4 3D LUT（display 域）：RGBA16F 3D 纹理，LINEAR/CLAMP；lut_size_ ≤ 1 = 关闭
+  GLuint lut_tex_ = 0;
+  int lut_size_ = 0;
+  float lut_dmin_[3] = {0.0f, 0.0f, 0.0f};
+  float lut_dmax_[3] = {1.0f, 1.0f, 1.0f};
+  std::mutex lut_mu_;
+  std::vector<float> pending_lut_;  // RGBA 交错（已补 alpha，供 RGBA16F 上传）
+  int pending_lut_size_ = 0;
+  float pending_lut_dmin_[3] = {0.0f, 0.0f, 0.0f};
+  float pending_lut_dmax_[3] = {1.0f, 1.0f, 1.0f};
+  bool lut_dirty_ = false;
+  float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
+  void applyPendingLut();
+  void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
+               GLint loc_dinv, GLint loc_size, float strength);
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
   GLuint fbo_cap_ = 0, tex_cap_ = 0;      // RGBA8 拍照读回
@@ -174,10 +197,12 @@ class FrameRenderer {
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
-          flip_y = -1, zebra = -1;
+          flip_y = -1, zebra = -1, lut = -1, lut_on = -1, lut_strength = -1,
+          lut_dmin = -1, lut_dinv = -1, lut_size = -1;
   } u_out_;
   struct {
-    GLint tex = -1;
+    GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
+          lut_dinv = -1, lut_size = -1;
   } u_hist_;
   GLint u_fill_st_ = -1;
   struct {

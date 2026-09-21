@@ -261,6 +261,36 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetYuvMatrix(JNIEnv* env, jobject,
   if (g_renderer) g_renderer->setYuvMatrix(m);
 }
 
+// M4：3D LUT（display 域）。data = RGB 交错（.cube 顺序，红最快），长度 size³×3；
+// size ≤ 1 或 data 为空 = 关闭。任意线程可调（引擎内部暂存，渲染线程上传纹理）。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSetLut(JNIEnv* env, jobject, jint size,
+                                                     jfloatArray data,
+                                                     jfloatArray domain_min,
+                                                     jfloatArray domain_max) {
+  if (!g_renderer) return;
+  if (data == nullptr || size <= 1) {
+    g_renderer->setLut(nullptr, 0, nullptr, nullptr);
+    return;
+  }
+  const jsize want = static_cast<jsize>(size) * size * size * 3;
+  if (env->GetArrayLength(data) < want) {
+    // 契约不符：宁可不生效也不越界读（真机日志可由 lut.load 缺项反查）
+    return;
+  }
+  std::vector<float> buf(static_cast<size_t>(want));
+  env->GetFloatArrayRegion(data, 0, want, buf.data());
+  float dmin[3] = {0.0f, 0.0f, 0.0f};
+  float dmax[3] = {1.0f, 1.0f, 1.0f};
+  if (domain_min != nullptr && env->GetArrayLength(domain_min) >= 3) {
+    env->GetFloatArrayRegion(domain_min, 0, 3, dmin);
+  }
+  if (domain_max != nullptr && env->GetArrayLength(domain_max) >= 3) {
+    env->GetFloatArrayRegion(domain_max, 0, 3, dmax);
+  }
+  g_renderer->setLut(buf.data(), size, dmin, dmax);
+}
+
 // 静拍：全分辨率 YUV → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(

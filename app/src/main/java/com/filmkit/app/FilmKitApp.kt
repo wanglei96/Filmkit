@@ -13,7 +13,7 @@ class FilmKitApp : Application() {
         EngineBridge.nativeInitLogger(dir)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "app.start",
-            kv("version" to "0.5.48-m3", "logDir" to dir),
+            kv("version" to "0.6.0-m4", "logDir" to dir),
         )
         installCrashCapture(dir)
     }
@@ -24,7 +24,7 @@ class FilmKitApp : Application() {
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {
                 val stack = "thread=${t.name}\n" + android.util.Log.getStackTraceString(e)
-                File(dir, "crash-latest.txt").writeText("version=0.5.48-m3\n$stack")
+                File(dir, "crash-latest.txt").writeText("version=0.6.0-m4\n$stack")
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "app", "app.crash",
                     kv("thread" to t.name, "stack" to android.util.Log.getStackTraceString(e)),

@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(34).apply {
+    private fun neutral(): DoubleArray = DoubleArray(35).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -43,6 +43,9 @@ object CameraPresets {
         this[31] = 1.0
         this[32] = 1.0
         this[33] = 1.0
+        // 34 = 3D LUT 混合强度（M4）：1.0 = 全量。LUT 资产本身走独立 JNI 上传 3D 纹理，
+        // 这里只带强度；未选 LUT 时引擎按 uLutOn = 0 旁路。
+        this[34] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

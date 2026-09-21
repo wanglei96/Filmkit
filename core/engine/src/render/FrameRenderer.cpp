@@ -678,6 +678,42 @@ uniform float uGrainSize;
 uniform float uTime;
 uniform float uFlipY;  // 拍照读回 GL 底行在前，翻转后 JPEG 方向正确
 uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
+// ── M4 3D LUT（display 域）────────────────────────────────────────────
+// 域感知插桩：display 域 LUT 必须接在输出 OETF 之后（§0-D10 / §6.1）。
+// 采样用四面体插值而非三线性 —— 三线性在 33³ 下有可见色差（§3.3-5）。
+uniform highp sampler3D uLut;
+uniform float uLutOn;        // 0 = 旁路（未选 LUT / 强度 0）
+uniform float uLutStrength;  // 0..1 混合强度
+uniform vec3 uLutDomainMin;  // .cube DOMAIN_MIN
+uniform vec3 uLutDomainInv;  // 1/(DOMAIN_MAX - DOMAIN_MIN)
+uniform float uLutSize;      // 3D 边长 N
+vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
+              vec3 c101, vec3 c011, vec3 c111) {
+    if (f.x >= f.y) {
+        if (f.y >= f.z) return (1.0 - f.x) * c000 + (f.x - f.y) * c100 + (f.y - f.z) * c110 + f.z * c111;
+        if (f.x >= f.z) return (1.0 - f.x) * c000 + (f.x - f.z) * c100 + (f.z - f.y) * c101 + f.y * c111;
+        return (1.0 - f.z) * c000 + (f.z - f.x) * c001 + (f.x - f.y) * c101 + f.y * c111;
+    }
+    if (f.z >= f.y) return (1.0 - f.z) * c000 + (f.z - f.y) * c001 + (f.y - f.x) * c011 + f.x * c111;
+    if (f.z >= f.x) return (1.0 - f.y) * c000 + (f.y - f.z) * c010 + (f.z - f.x) * c011 + f.x * c111;
+    return (1.0 - f.y) * c000 + (f.y - f.x) * c010 + (f.x - f.z) * c110 + f.z * c111;
+}
+vec3 lutApply(vec3 c) {
+    vec3 t = clamp((c - uLutDomainMin) * uLutDomainInv, 0.0, 1.0) * (uLutSize - 1.0);
+    vec3 i0 = floor(t);
+    vec3 f = t - i0;
+    ivec3 i = ivec3(i0);
+    ivec3 mx = ivec3(int(uLutSize) - 1);
+    vec3 c000 = texelFetch(uLut, clamp(i, ivec3(0), mx), 0).rgb;
+    vec3 c100 = texelFetch(uLut, clamp(i + ivec3(1, 0, 0), ivec3(0), mx), 0).rgb;
+    vec3 c010 = texelFetch(uLut, clamp(i + ivec3(0, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c001 = texelFetch(uLut, clamp(i + ivec3(0, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c110 = texelFetch(uLut, clamp(i + ivec3(1, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c101 = texelFetch(uLut, clamp(i + ivec3(1, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c011 = texelFetch(uLut, clamp(i + ivec3(0, 1, 1), ivec3(0), mx), 0).rgb;
+    vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
+    return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
+}
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
@@ -691,6 +727,8 @@ void main() {
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
     vec3 c = texture(uTex, uv).rgb;
     c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+    // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
+    if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     if (uGrainAmount > 0.0) {
         vec2 gp = gl_FragCoord.xy * 6.0 / max(uGrainSize, 0.25) + uTime;
         float l = dot(c, vec3(0.299, 0.587, 0.114));
@@ -713,13 +751,48 @@ void main() {
 
 // 实时直方图采样（M3）：胶片输出下采样到 256×96 RGBA8，OETF 与 kFsOut 一致
 // —— 直方图必须是"显示域、用户实际看到"的分布。每次读回 24KB（UI 侧节流）。
+// M4：与 kFsOut 同样走 LUT，否则选了 LUT 之后直方图/斑马纹会与画面不符。
 const char* kFsHist = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
+uniform highp sampler3D uLut;
+uniform float uLutOn;
+uniform float uLutStrength;
+uniform vec3 uLutDomainMin;
+uniform vec3 uLutDomainInv;
+uniform float uLutSize;
+vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
+              vec3 c101, vec3 c011, vec3 c111) {
+    if (f.x >= f.y) {
+        if (f.y >= f.z) return (1.0 - f.x) * c000 + (f.x - f.y) * c100 + (f.y - f.z) * c110 + f.z * c111;
+        if (f.x >= f.z) return (1.0 - f.x) * c000 + (f.x - f.z) * c100 + (f.z - f.y) * c101 + f.y * c111;
+        return (1.0 - f.z) * c000 + (f.z - f.x) * c001 + (f.x - f.y) * c101 + f.y * c111;
+    }
+    if (f.z >= f.y) return (1.0 - f.z) * c000 + (f.z - f.y) * c001 + (f.y - f.x) * c011 + f.x * c111;
+    if (f.z >= f.x) return (1.0 - f.y) * c000 + (f.y - f.z) * c010 + (f.z - f.x) * c011 + f.x * c111;
+    return (1.0 - f.y) * c000 + (f.y - f.x) * c010 + (f.x - f.z) * c110 + f.z * c111;
+}
+vec3 lutApply(vec3 c) {
+    vec3 t = clamp((c - uLutDomainMin) * uLutDomainInv, 0.0, 1.0) * (uLutSize - 1.0);
+    vec3 i0 = floor(t);
+    vec3 f = t - i0;
+    ivec3 i = ivec3(i0);
+    ivec3 mx = ivec3(int(uLutSize) - 1);
+    vec3 c000 = texelFetch(uLut, clamp(i, ivec3(0), mx), 0).rgb;
+    vec3 c100 = texelFetch(uLut, clamp(i + ivec3(1, 0, 0), ivec3(0), mx), 0).rgb;
+    vec3 c010 = texelFetch(uLut, clamp(i + ivec3(0, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c001 = texelFetch(uLut, clamp(i + ivec3(0, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c110 = texelFetch(uLut, clamp(i + ivec3(1, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c101 = texelFetch(uLut, clamp(i + ivec3(1, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c011 = texelFetch(uLut, clamp(i + ivec3(0, 1, 1), ivec3(0), mx), 0).rgb;
+    vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
+    return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
+}
 void main() {
     vec3 c = pow(clamp(texture(uTex, vUV0).rgb, 0.0, 1.0), vec3(1.0 / 2.2));
+    if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
     oColor = vec4(l, l, l, 1.0);
 })";
@@ -963,7 +1036,19 @@ bool FrameRenderer::init() {
   u_out_.time = glGetUniformLocation(prog_out_, "uTime");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
+  u_out_.lut = glGetUniformLocation(prog_out_, "uLut");
+  u_out_.lut_on = glGetUniformLocation(prog_out_, "uLutOn");
+  u_out_.lut_strength = glGetUniformLocation(prog_out_, "uLutStrength");
+  u_out_.lut_dmin = glGetUniformLocation(prog_out_, "uLutDomainMin");
+  u_out_.lut_dinv = glGetUniformLocation(prog_out_, "uLutDomainInv");
+  u_out_.lut_size = glGetUniformLocation(prog_out_, "uLutSize");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
+  u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
+  u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
+  u_hist_.lut_strength = glGetUniformLocation(prog_hist_, "uLutStrength");
+  u_hist_.lut_dmin = glGetUniformLocation(prog_hist_, "uLutDomainMin");
+  u_hist_.lut_dinv = glGetUniformLocation(prog_hist_, "uLutDomainInv");
+  u_hist_.lut_size = glGetUniformLocation(prog_hist_, "uLutSize");
 
   u_fill_st_ = glGetUniformLocation(prog_fill_, "uST");
   if (u_fill_st_ >= 0) {  // 填充测试不采样：uST 置单位阵（uniform 默认全 0）
@@ -990,6 +1075,7 @@ void FrameRenderer::release() {
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (tex_hist_) glDeleteTextures(1, &tex_hist_);
+  if (lut_tex_) glDeleteTextures(1, &lut_tex_);
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
@@ -1688,6 +1774,102 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   return true;
 }
 
+// setLut：任意线程调用，只暂存（渲染线程在下一帧 applyPendingLut 里建纹理）。
+// RGB → RGBA 补齐（RGBA16F 是 ES 3.0 required 且项目已在用的格式，比 RGB16F 稳）。
+void FrameRenderer::setLut(const float* data, int size, const float dmin[3],
+                           const float dmax[3]) {
+  std::lock_guard<std::mutex> lk(lut_mu_);
+  if (data == nullptr || size <= 1) {
+    pending_lut_.clear();
+    pending_lut_size_ = 0;
+  } else {
+    const size_t n = static_cast<size_t>(size) * size * size;
+    pending_lut_.resize(n * 4);
+    for (size_t i = 0; i < n; ++i) {
+      pending_lut_[i * 4 + 0] = data[i * 3 + 0];
+      pending_lut_[i * 4 + 1] = data[i * 3 + 1];
+      pending_lut_[i * 4 + 2] = data[i * 3 + 2];
+      pending_lut_[i * 4 + 3] = 1.0f;
+    }
+    pending_lut_size_ = size;
+    for (int i = 0; i < 3; ++i) {
+      pending_lut_dmin_[i] = dmin ? dmin[i] : 0.0f;
+      pending_lut_dmax_[i] = dmax ? dmax[i] : 1.0f;
+    }
+  }
+  lut_dirty_ = true;
+}
+
+// M4：把暂存的 LUT 上传为 RGBA16F 3D 纹理（渲染线程、须有当前 context）。
+// 未变更时立即返回 —— 每帧调用一次，开销 = 一次加锁 + 标志判断。
+void FrameRenderer::applyPendingLut() {
+  std::vector<float> data;
+  int size = 0;
+  float dmin[3] = {0.0f, 0.0f, 0.0f};
+  float dmax[3] = {1.0f, 1.0f, 1.0f};
+  {
+    std::lock_guard<std::mutex> lk(lut_mu_);
+    if (!lut_dirty_) return;
+    data.swap(pending_lut_);
+    size = pending_lut_size_;
+    for (int i = 0; i < 3; ++i) {
+      dmin[i] = pending_lut_dmin_[i];
+      dmax[i] = pending_lut_dmax_[i];
+    }
+    lut_dirty_ = false;
+  }
+  if (size <= 1 || data.empty()) {
+    lut_size_ = 0;  // 关闭：shader 侧 uLutOn = 0（纹理留着，重选时覆盖）
+    Logger::instance().log(LogLevel::kInfo, "engine", "lut.load",
+                           "{\"state\":\"off\"}");
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  if (lut_tex_ == 0) glGenTextures(1, &lut_tex_);
+  glBindTexture(GL_TEXTURE_3D, lut_tex_);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, size, size, size, 0, GL_RGBA,
+               GL_FLOAT, data.data());
+  const GLenum err = glGetError();
+  for (int i = 0; i < 3; ++i) {
+    lut_dmin_[i] = dmin[i];
+    lut_dmax_[i] = dmax[i];
+  }
+  lut_size_ = size;
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  Logger::instance().log(
+      LogLevel::kInfo, "engine", "lut.load",
+      std::string("{\"state\":\"") + (err == GL_NO_ERROR ? "ok" : "gl_error") +
+          "\",\"size\":" + std::to_string(size) + ",\"ms\":" + std::to_string(ms) +
+          ",\"err\":" + std::to_string(static_cast<int>(err)) + "}");
+}
+
+// LUT 绑定与 uniform 下发（kFsOut 与 kFsHist 共用）。纹理单元 1 —— 单元 0 是输入帧。
+void FrameRenderer::bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength,
+                            GLint loc_dmin, GLint loc_dinv, GLint loc_size,
+                            float strength) {
+  const float k = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+  const bool on = lut_size_ > 1 && k > 0.0f;
+  glUniform1f(loc_on, on ? 1.0f : 0.0f);
+  if (!on) return;
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_3D, lut_tex_);
+  glUniform1i(loc_tex, 1);
+  glUniform1f(loc_strength, k);
+  glUniform3f(loc_dmin, lut_dmin_[0], lut_dmin_[1], lut_dmin_[2]);
+  glUniform3f(loc_dinv, 1.0f / (lut_dmax_[0] - lut_dmin_[0]),
+              1.0f / (lut_dmax_[1] - lut_dmin_[1]),
+              1.0f / (lut_dmax_[2] - lut_dmin_[2]));
+  glUniform1f(loc_size, static_cast<float>(lut_size_));
+}
+
 // 实时直方图（M3）：tex_work_（胶片输出）→ 显示域亮度 → 256×96 RGBA8 → 读回统计。
 // 必须在渲染线程、有当前 context 时调用；尚未渲染过预览帧（tex_work_ 为空）返回 false。
 bool FrameRenderer::histogram(int* out, int n) {
@@ -1701,9 +1883,12 @@ bool FrameRenderer::histogram(int* out, int n) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_hist_);
   glViewport(0, 0, hw, hh);
   glUseProgram(prog_hist_);
+  applyPendingLut();
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, tex_work_);
   glUniform1i(u_hist_.tex, 0);
+  bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
+          u_hist_.lut_dinv, u_hist_.lut_size, lut_strength_);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -1761,6 +1946,12 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1f(u_out_.flip_y, flip_y ? 1.0f : 0.0f);
   // 斑马纹只走预览：成片路径一律 0（提示不进成片）
   glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);
+  // M4：display 域 LUT（同一 pass 内，不额外增加 pass；斑马纹判定排在 LUT 之后，
+  // 与用户实际看到的画面一致）
+  applyPendingLut();
+  lut_strength_ = p.lut_strength;
+  bindLut(u_out_.lut, u_out_.lut_on, u_out_.lut_strength, u_out_.lut_dmin,
+          u_out_.lut_dinv, u_out_.lut_size, p.lut_strength);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

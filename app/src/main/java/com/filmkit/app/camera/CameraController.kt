@@ -779,6 +779,17 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun orientationStep(): Int = orientationStep
 
+    // ── M4：内置 3D LUT（display 域；引擎接在输出 OETF 之后，四面体插值）──────
+    /** 当前选中的 LUT（null = 无）。会话重建后由 start() 自动重传纹理。 */
+    @Volatile
+    private var currentLut: com.filmkit.app.lut.CubeLut? = null
+
+    /** 选择内置 LUT：null = 关闭（A/B 通路）。解析由调用方在 IO 线程完成，这里只下发。 */
+    fun setLut(lut: com.filmkit.app.lut.CubeLut?) {
+        currentLut = lut
+        render.setLut(lut)
+    }
+
     fun start(surface: Surface) {
         if (started) return  // surfaceCreated 可能多次回调，防重入
         if (!render.start(surface)) {
@@ -794,6 +805,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
             )
         }
+        // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
+        currentLut?.let { render.setLut(it) }
         started = true
         openCamera()
     }

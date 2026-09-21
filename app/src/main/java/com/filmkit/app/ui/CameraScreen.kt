@@ -39,6 +39,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -46,6 +47,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -119,6 +121,7 @@ import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.kv
+import com.filmkit.app.lut.LutLibrary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -271,6 +274,32 @@ fun CameraScreen(
         androidView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         captureTick++
         controller.capture()
+    }
+
+    // ── M4：内置 3D LUT（display 域，引擎接在输出 OETF 之后）──
+    // 选中项持久化；解析在 IO 线程（35937 行 ≈ 数十毫秒），纹理随会话重建由 controller 重传。
+    var lutId by rememberSaveable { mutableStateOf(prefs.getString("lut_id", null)) }
+    var lutPending by remember { mutableStateOf<LutLibrary.Entry?>(null) }
+    LaunchedEffect(Unit) {
+        // 启动恢复：按 prefs 的选择重新加载（切镜头/重进相机后引擎纹理已被释放）
+        lutId?.let { id -> LutLibrary.byId(id)?.let { lutPending = it } }
+    }
+    LaunchedEffect(lutPending) {
+        val e = lutPending ?: return@LaunchedEffect
+        val lut = withContext(Dispatchers.IO) { LutLibrary.load(context, e) }
+        if (lut == null) {
+            lutId = null
+            prefs.edit().remove("lut_id").apply()
+        } else {
+            lutId = e.id
+            prefs.edit().putString("lut_id", e.id).apply()
+        }
+        controller.setLut(lut)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.lut",
+            kv("id" to e.id, "title" to (lut?.title ?: "none"), "ok" to (lut != null)),
+        )
+        lutPending = null
     }
 
     // 启动即应用选中预设与持久化的手动档（WB 走引擎补偿、AE 走手动曝光）
@@ -1006,10 +1035,26 @@ fun CameraScreen(
                 ) {
                     LutMenu(
                         presetIdx = presetIdx,
+                        lutId = lutId,
                         onPick = { i ->
                             presetIdx = i
                             controller.setFilmParams(CameraPresets.byIndex(i))
                             lutOpen = false
+                        },
+                        onPickLut = { e ->
+                            lutOpen = false
+                            if (e == null) {
+                                // 关闭（A/B 通路）：直接下发，无需解析
+                                lutId = null
+                                controller.setLut(null)
+                                prefs.edit().remove("lut_id").apply()
+                                EngineBridge.nativeAppendLog(
+                                    EngineBridge.LEVEL_INFO, "app", "settings.lut",
+                                    kv("id" to "none", "title" to "none", "ok" to true),
+                                )
+                            } else {
+                                lutPending = e
+                            }
                         },
                     )
                 }
@@ -1595,14 +1640,21 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
     return stops.map { v -> (ln(v / 100f) / lnMax).coerceIn(0f, 1f) to "$v" }
 }
 
-/** LUT 二级菜单：内置胶片预设 + LUT（.cube，M4 接入） */
+/** LUT 二级菜单：胶片预设 + 内置 3D LUT（M4：display 域 .cube，显示名取资产 TITLE） */
 @Composable
-private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
+private fun LutMenu(
+    presetIdx: Int,
+    lutId: String?,
+    onPick: (Int) -> Unit,
+    onPickLut: (LutLibrary.Entry?) -> Unit,
+) {
     Column(
         Modifier
             .fillMaxWidth()
+            .heightIn(max = 420.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(FilmTheme.Panel)
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
         Text(
@@ -1614,44 +1666,53 @@ private fun LutMenu(presetIdx: Int, onPick: (Int) -> Unit) {
         )
         Spacer(Modifier.height(2.dp))
         CameraPresets.names.forEachIndexed { i, name ->
-            val selected = i == presetIdx
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable { onPick(i) }
-                    .padding(vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    name,
-                    color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
-                    fontSize = 15.sp,
-                    fontFamily = FilmTheme.Serif,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                    modifier = Modifier.weight(1f),
-                )
-                if (selected) {
-                    Text("✓", color = FilmTheme.Accent, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
-                }
-            }
+            MenuRow(name, selected = i == presetIdx) { onPick(i) }
         }
         Spacer(Modifier.height(6.dp))
         HorizontalDivider(color = FilmTheme.ChipBorder)
         Spacer(Modifier.height(6.dp))
         Text(
-            "LUT",
+            "LUT · 内置",
             color = FilmTheme.Accent,
             fontSize = 11.sp,
             fontFamily = FilmTheme.Mono,
             fontWeight = FontWeight.SemiBold,
         )
         Text(
-            "理光系 .cube · M4 接入",
+            "display 域 3D LUT · 选即生效（预览与成片同链）",
             color = FilmTheme.CreamDim,
-            fontSize = 12.sp,
+            fontSize = 11.sp,
             fontFamily = FilmTheme.Serif,
-            modifier = Modifier.padding(vertical = 6.dp),
+            modifier = Modifier.padding(top = 2.dp, bottom = 4.dp),
         )
+        MenuRow("无", selected = lutId == null) { onPickLut(null) }
+        LutLibrary.builtIn.forEach { e ->
+            MenuRow(e.label, selected = lutId == e.id) { onPickLut(e) }
+        }
+    }
+}
+
+/** 菜单行（预设 / LUT 共用）：选中 = 琥珀 + ✓ */
+@Composable
+private fun MenuRow(label: String, selected: Boolean, onTap: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onTap)
+            .padding(vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
+            fontSize = 15.sp,
+            fontFamily = FilmTheme.Serif,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier.weight(1f),
+        )
+        if (selected) {
+            Text("✓", color = FilmTheme.Accent, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
+        }
     }
 }
 
