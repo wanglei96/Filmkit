@@ -678,11 +678,14 @@ class CameraController(private val context: Context, private val render: RenderC
         filmParams = p
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
+        hlPref = -1.0    // 同上，[29]
         applyTonePref()
+        applyHlPref()
     }
 
     private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
     private var tonePref = -1.0
+    private var hlPref = -1.0
 
     /**
      * 基准影调开关（M3 色彩内核 v1）：写 FilmParams[28]（0 = 恒等/旧行为）。
@@ -694,6 +697,15 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != tonePref) {
             tonePref = v
             filmParams[28] = v
+        }
+    }
+
+    /** 高光重建开关（M3 §3.2 阶段 4）：写 FilmParams[29]，只走 RCD 路径。 */
+    private fun applyHlPref() {
+        val v = if (appPrefs.getBoolean("hl_recon", true)) 1.0 else 0.0
+        if (v != hlPref) {
+            hlPref = v
+            filmParams[29] = v
         }
     }
 
@@ -928,6 +940,7 @@ class CameraController(private val context: Context, private val render: RenderC
                         )
                     }
                     applyTonePref()
+                    applyHlPref()
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
                         orientationStep, filmParams, fillTest,
@@ -1016,6 +1029,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun submitStill(img: Image) {
         // 静拍与预览共用「方向」设定（用户在界面选定；默认 0）
         applyTonePref()
+        applyHlPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1093,6 +1107,7 @@ class CameraController(private val context: Context, private val render: RenderC
             }
         }
         applyTonePref()
+        applyHlPref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)

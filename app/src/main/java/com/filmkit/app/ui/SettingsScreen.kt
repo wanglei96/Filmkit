@@ -166,6 +166,40 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            var hlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hl_recon", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !hlOn
+                        hlOn = v
+                        prefs.edit().putBoolean("hl_recon", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.hl_recon",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("高光重建", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "CCM 前用未饱和通道外推饱和通道（治高光偏色，如灯泡发品红）；" +
+                            "仅 RCD 质量档生效",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (hlOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
             // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
             var dnLevel by rememberSaveable {

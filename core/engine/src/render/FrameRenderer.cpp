@@ -331,7 +331,26 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform mat3 uCcm;     // sensor→sRGB 行主序
+uniform float uHlK;    // 高光重建强度（0 = 关，旧行为）
 const float EPS = 1e-6;
+// ── 高光重建（M3 §3.2 阶段 4）──────────────────────────────────────
+// 传感器饱和后被截断在满阱（s() 里 raw=white → 1.0×gain），CCM 再把这种截断
+// 失真按矩阵混进其它通道 —— 真机实测灯泡 R/B 先饱和、G 未饱和 → 高光偏品红。
+// 这里在 CCM 之前，用未饱和通道反推辐照度（raw 归一化域 1.0 = 满阱），把饱和
+// 通道替换成该辐照度对应的通道值（中性高光假设 = 最保守的估计，宁可趋白也不
+// 停在截断点上）。全饱和像素没有可信参考，保持原值交给后段高光 rolloff。
+vec3 hlRecon(vec3 lin) {
+    vec3 thr = uGain * 0.99;
+    vec3 sat = step(thr, lin);
+    float nsat = sat.r + sat.g + sat.b;
+    if (nsat <= 0.0 || nsat >= 3.0) return lin;
+    vec3 rawv = lin / max(uGain, vec3(1e-6));
+    float x = 0.0;
+    if (sat.r < 0.5) x = max(x, rawv.r);
+    if (sat.g < 0.5) x = max(x, rawv.g);
+    if (sat.b < 0.5) x = max(x, rawv.b);
+    return mix(lin, x * uGain, sat * uHlK);
+}
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -414,7 +433,7 @@ void main() {
         r = g + axialFill(p, 0);
         b = g + axialFill(p, 2);
     }
-    vec3 rgb = uCcm * vec3(r, g, b);
+    vec3 rgb = uCcm * hlRecon(vec3(r, g, b));
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
@@ -809,6 +828,7 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.white = glGetUniformLocation(prog_rcd_chroma_, "uWhite");
   u_rcd_chroma_.gain = glGetUniformLocation(prog_rcd_chroma_, "uGain");
   u_rcd_chroma_.ccm = glGetUniformLocation(prog_rcd_chroma_, "uCcm");
+  u_rcd_chroma_.hl_k = glGetUniformLocation(prog_rcd_chroma_, "uHlK");
 
   u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
   u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
@@ -1324,7 +1344,7 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
-                                  const float* ccm, bool mosaic) {
+                                  const float* ccm, bool mosaic, float hl_k) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_rcd_chroma_);
@@ -1354,6 +1374,7 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniform3f(u_rcd_chroma_.gain, gains[0], gains[1], gains[2]);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
   glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
+  glUniform1f(u_rcd_chroma_.hl_k, hl_k);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
 }
@@ -1466,7 +1487,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, effective_rot, cfa, black_phase,
-                  static_cast<float>(white_level), gains, ccm, dn);
+                  static_cast<float>(white_level), gains, ccm, dn, p.hl_recon);
   } else {
     passRaw(dst_w, dst_h, effective_rot, cfa, black_phase,
             static_cast<float>(white_level), gains, ccm, p);
@@ -1522,6 +1543,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
+  if (rcd) kv += ",\"hl\":" + std::to_string(p.hl_recon).substr(0, 3);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
   return true;
