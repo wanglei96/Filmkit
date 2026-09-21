@@ -568,12 +568,18 @@ void main() {
     g.g = filmCurve(lg.g, uToe.g, uShoulder.g);
     g.b = filmCurve(lg.b, uToe.b, uShoulder.b);
     vec3 out3 = 0.18 * exp2((g - 0.5) * 8.0);
-    // 基准影调（norm-controlled：只作用于亮度范数、按比例缩 RGB —— 避免
-    // per-channel 压缩在暗部造成的色偏）
+    // 基准影调（norm-controlled + 高光去饱和）
     if (uToneK > 0.0) {
         float n0 = max(max(out3.r, out3.g), out3.b);
         float n1 = baseTone(n0);
-        out3 *= mix(1.0, n1 / max(n0, 1e-6), uToneK);
+        vec3 m = out3 * mix(1.0, n1 / max(n0, 1e-6), uToneK);
+        // 高光去饱和：范数越过白点后色度向峰值收敛（过曝光源趋白）。
+        // 必须与亮度压缩成对出现——只做等比压缩会保留暖色比例，让过曝的灯泡
+        // "变红/变粉"（v0.5.37 用户反馈）；硬截断之所以看着正常，是因为它把
+        // 三通道一起顶到 1。Filmic/AgX 的高光处理同样是"压缩 + 去饱和"。
+        float w = uToneK * smoothstep(0.85, 1.30, n0);
+        m = mix(m, vec3(max(max(m.r, m.g), m.b)), w);
+        out3 = m;
     }
     float l = luma(out3);
     float ws = exp(-l * 3.0);
