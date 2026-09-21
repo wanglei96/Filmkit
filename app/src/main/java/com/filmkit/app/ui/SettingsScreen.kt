@@ -132,6 +132,40 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            var dnOn by rememberSaveable { mutableStateOf(prefs.getBoolean("noise_reduction", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !dnOn
+                        dnOn = v
+                        prefs.edit().putBoolean("noise_reduction", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.noise_reduction",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("RAW 降噪", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "RAW 域双边滤波 + 色度平滑，重点压彩噪；" +
+                            "仅 RCD 质量档生效",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (dnOn) "标准" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

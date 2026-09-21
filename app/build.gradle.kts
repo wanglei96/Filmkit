@@ -84,8 +84,8 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 62
-        versionName = "0.5.31-m3"
+        versionCode = 63
+        versionName = "0.5.32-m3"
     }
 
     sourceSets {

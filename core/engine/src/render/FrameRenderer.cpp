@@ -171,6 +171,8 @@ layout(location = 0) out vec4 oColor;
 uniform highp usampler2D uRaw;
 uniform ivec2 uSize;
 uniform int uCfaLut;   // CFA 2×2 相位→通道 LUT（4×2bit，C++ 侧由 cfa 编码）
+uniform highp sampler2D uMos;  // P0 降噪后线性 mosaic（uMosaic>0.5 时启用）
+uniform float uMosaic;
 uniform vec4 uBlack;   // 按相位 (0,0)(1,0)(0,1)(1,1)
 uniform float uWhite;
 uniform vec3 uGain;    // asShotNeutral 倒数，G 归一（WB 前置）
@@ -182,6 +184,11 @@ int chanAt(ivec2 p) {
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
+    if (uMosaic > 0.5) {  // 降噪开：P0 已线性化+WB+压噪
+        vec3 m = texelFetch(uMos, p, 0).rgb;
+        int c = chanAt(p);
+        return c == 0 ? m.r : (c == 1 ? m.g : m.b);
+    }
     float v = float(texelFetch(uRaw, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
@@ -239,6 +246,8 @@ uniform highp usampler2D uRaw;
 uniform highp sampler2D uDir;  // P1 输出 (vConf, pConf, lpf, 1)
 uniform ivec2 uSize;
 uniform int uCfaLut;
+uniform highp sampler2D uMos;
+uniform float uMosaic;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
@@ -250,6 +259,11 @@ int chanAt(ivec2 p) {
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
+    if (uMosaic > 0.5) {
+        vec3 m = texelFetch(uMos, p, 0).rgb;
+        int c = chanAt(p);
+        return c == 0 ? m.r : (c == 1 ? m.g : m.b);
+    }
     float v = float(texelFetch(uRaw, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
@@ -310,6 +324,8 @@ uniform highp sampler2D uDir;
 uniform highp sampler2D uG;
 uniform ivec2 uSize;
 uniform int uCfaLut;
+uniform highp sampler2D uMos;
+uniform float uMosaic;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
@@ -322,6 +338,11 @@ int chanAt(ivec2 p) {
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float s(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
+    if (uMosaic > 0.5) {
+        vec3 m = texelFetch(uMos, p, 0).rgb;
+        int c = chanAt(p);
+        return c == 0 ? m.r : (c == 1 ? m.g : m.b);
+    }
     float v = float(texelFetch(uRaw, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
@@ -394,6 +415,88 @@ void main() {
     }
     vec3 rgb = uCcm * vec3(r, g, b);
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
+})";
+
+// ── M3-2 降噪（v0.5.32）──────────────────────────────────────────────
+// 量化基线（真机 ISO~1200 平坦区）：亮噪 σ(Y)≈1.5–1.8（达标优），彩噪
+// σ(chroma)≈1.8–2.1（未达优，B-Y 最重）——彩噪是短板。
+// P0：RAW 域同色联合 bilateral。任意 Bayer 相位下"步长 2 的 3×3 网格"
+// 恰为 9 个同色位（含中心），无需相位条件；值域 σ 随信号 √ 增长
+// （shot noise 主导）。输出线性 mosaic（rgb = 该相位通道值），同时让
+// P1–P3 免去整型解码/黑阶/WB 重复计算。
+const char* kFsRawDenoise = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp usampler2D uRaw;
+uniform ivec2 uSize;
+uniform int uCfaLut;
+uniform vec4 uBlack;
+uniform float uWhite;
+uniform vec3 uGain;
+uniform float uNS;     // 归一化域噪声 σ（SENSOR_NOISE_PROFILE 或回退估计）
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+float raw0(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    float v = float(texelFetch(uRaw, p, 0).r);
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float c0 = raw0(p);
+    float sr = max(uNS, 0.008) * 1.6 * sqrt(0.2 + 4.0 * c0);
+    float wsum = 1.0, acc = c0;
+    for (int dy = -4; dy <= 4; dy += 2)
+        for (int dx = -4; dx <= 4; dx += 2) {
+            if (dx == 0 && dy == 0) continue;
+            float c = raw0(p + ivec2(dx, dy));
+            float d = (c - c0) / sr;
+            float w = exp(-0.5 * d * d
+                          - 0.5 * float(dx * dx + dy * dy) / 6.48);  // σs=1.8
+            acc += w * c;
+            wsum += w;
+        }
+    float v = acc / wsum;
+    int ch = chanAt(p);
+    oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
+})";
+
+// P4：色度平滑（彩噪主修）。场景线性域（CCM 后）：色差 = RGB − Y(luma)，
+// 色差联合 bilateral（Y 值域防边缘色溢 + 色差值域），Y 原样保留 —— 亮度
+// 细节零损失，只平滑色彩。
+const char* kFsChromaDenoise = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;
+uniform float uNS;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    vec3 c0 = texelFetch(uTex, p, 0).rgb;
+    float y0 = dot(c0, LUMA);
+    vec3 cd0 = c0 - y0;
+    float sc = max(uNS, 0.008) * 2.4 * sqrt(0.2 + 4.0 * y0) + 0.015;
+    vec3 acc = cd0;
+    float wsum = 1.0;
+    for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            vec3 c = texelFetch(uTex, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0).rgb;
+            float y = dot(c, LUMA);
+            vec3 cd = c - y;
+            float wy = (y - y0) / (sc * 2.0);
+            float wc = length(cd - cd0) / sc;
+            float w = exp(-0.5 * (wy * wy + wc * wc)
+                          - 0.5 * float(dx * dx + dy * dy) / 5.12);  // σs=1.6
+            acc += w * cd;
+            wsum += w;
+        }
+    oColor = vec4(y0 + acc / wsum, 1.0);
 })";
 
 // Pass2：胶片模拟内核（M1 简化模型；M3 升级密度域完整模型，§5）。
@@ -561,8 +664,11 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_dir = compileShader(GL_FRAGMENT_SHADER, kFsRcdDir);
   const GLuint fs_rcd_g = compileShader(GL_FRAGMENT_SHADER, kFsRcdG);
   const GLuint fs_rcd_chroma = compileShader(GL_FRAGMENT_SHADER, kFsRcdChroma);
+  const GLuint fs_raw_dn = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoise);
+  const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
-      !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma)
+      !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
+      !fs_raw_dn || !fs_chroma_dn)
     return false;
 
   prog_oes_ = linkProgram(vs_rot_, fs_oes);
@@ -574,6 +680,8 @@ bool FrameRenderer::init() {
   prog_rcd_dir_ = linkProgram(vs_plain_, fs_rcd_dir);
   prog_rcd_g_ = linkProgram(vs_plain_, fs_rcd_g);
   prog_rcd_chroma_ = linkProgram(vs_rot_, fs_rcd_chroma);
+  prog_raw_dn_ = linkProgram(vs_plain_, fs_raw_dn);
+  prog_chroma_dn_ = linkProgram(vs_rot_, fs_chroma_dn);
   glDeleteShader(fs_oes);
   glDeleteShader(fs_still);
   glDeleteShader(fs_film);
@@ -583,8 +691,11 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_rcd_dir);
   glDeleteShader(fs_rcd_g);
   glDeleteShader(fs_rcd_chroma);
+  glDeleteShader(fs_raw_dn);
+  glDeleteShader(fs_chroma_dn);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
-      !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_)
+      !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
+      !prog_raw_dn_ || !prog_chroma_dn_)
     return false;
 
   u_oes_.st = glGetUniformLocation(prog_oes_, "uST");
@@ -623,6 +734,8 @@ bool FrameRenderer::init() {
   }
 
   u_rcd_dir_.tex = glGetUniformLocation(prog_rcd_dir_, "uRaw");
+  u_rcd_dir_.mos = glGetUniformLocation(prog_rcd_dir_, "uMos");
+  u_rcd_dir_.mosaic = glGetUniformLocation(prog_rcd_dir_, "uMosaic");
   u_rcd_dir_.size = glGetUniformLocation(prog_rcd_dir_, "uSize");
   u_rcd_dir_.cfalut = glGetUniformLocation(prog_rcd_dir_, "uCfaLut");
   u_rcd_dir_.black = glGetUniformLocation(prog_rcd_dir_, "uBlack");
@@ -630,6 +743,8 @@ bool FrameRenderer::init() {
   u_rcd_dir_.gain = glGetUniformLocation(prog_rcd_dir_, "uGain");
 
   u_rcd_g_.tex = glGetUniformLocation(prog_rcd_g_, "uRaw");
+  u_rcd_g_.mos = glGetUniformLocation(prog_rcd_g_, "uMos");
+  u_rcd_g_.mosaic = glGetUniformLocation(prog_rcd_g_, "uMosaic");
   u_rcd_g_.dir = glGetUniformLocation(prog_rcd_g_, "uDir");
   u_rcd_g_.size = glGetUniformLocation(prog_rcd_g_, "uSize");
   u_rcd_g_.cfalut = glGetUniformLocation(prog_rcd_g_, "uCfaLut");
@@ -641,6 +756,8 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.rot = glGetUniformLocation(prog_rcd_chroma_, "uRot");
   u_rcd_chroma_.scale = glGetUniformLocation(prog_rcd_chroma_, "uScale");
   u_rcd_chroma_.tex = glGetUniformLocation(prog_rcd_chroma_, "uRaw");
+  u_rcd_chroma_.mos = glGetUniformLocation(prog_rcd_chroma_, "uMos");
+  u_rcd_chroma_.mosaic = glGetUniformLocation(prog_rcd_chroma_, "uMosaic");
   u_rcd_chroma_.dir = glGetUniformLocation(prog_rcd_chroma_, "uDir");
   u_rcd_chroma_.g = glGetUniformLocation(prog_rcd_chroma_, "uG");
   u_rcd_chroma_.size = glGetUniformLocation(prog_rcd_chroma_, "uSize");
@@ -649,6 +766,27 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.white = glGetUniformLocation(prog_rcd_chroma_, "uWhite");
   u_rcd_chroma_.gain = glGetUniformLocation(prog_rcd_chroma_, "uGain");
   u_rcd_chroma_.ccm = glGetUniformLocation(prog_rcd_chroma_, "uCcm");
+
+  u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
+  u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
+  u_raw_dn_.cfalut = glGetUniformLocation(prog_raw_dn_, "uCfaLut");
+  u_raw_dn_.black = glGetUniformLocation(prog_raw_dn_, "uBlack");
+  u_raw_dn_.white = glGetUniformLocation(prog_raw_dn_, "uWhite");
+  u_raw_dn_.gain = glGetUniformLocation(prog_raw_dn_, "uGain");
+  u_raw_dn_.ns = glGetUniformLocation(prog_raw_dn_, "uNS");
+
+  u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
+  u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
+  u_chroma_dn_.ns = glGetUniformLocation(prog_chroma_dn_, "uNS");
+  {
+    // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
+    const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    glUseProgram(prog_chroma_dn_);
+    if (u_chroma_dn_.size >= 0) {
+      GLint st = glGetUniformLocation(prog_chroma_dn_, "uST");
+      if (st >= 0) glUniformMatrix4fv(st, 1, GL_FALSE, ident);
+    }
+  }
   if (u_rcd_chroma_.st >= 0) {  // 同上：kVertRot 的 uST 默认全 0，必须置单位阵
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     glUseProgram(prog_rcd_chroma_);
@@ -693,11 +831,15 @@ void FrameRenderer::release() {
   if (tex_cap_) glDeleteTextures(1, &tex_cap_);
   if (tex_dir_) glDeleteTextures(1, &tex_dir_);
   if (tex_g_) glDeleteTextures(1, &tex_g_);
+  if (tex_mos_) glDeleteTextures(1, &tex_mos_);
+  if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
   if (fbo_dir_) glDeleteFramebuffers(1, &fbo_dir_);
   if (fbo_g_) glDeleteFramebuffers(1, &fbo_g_);
+  if (fbo_mos_) glDeleteFramebuffers(1, &fbo_mos_);
+  if (fbo_dn_) glDeleteFramebuffers(1, &fbo_dn_);
   if (prog_oes_) glDeleteProgram(prog_oes_);
   if (prog_still_) glDeleteProgram(prog_still_);
   if (prog_film_) glDeleteProgram(prog_film_);
@@ -707,6 +849,8 @@ void FrameRenderer::release() {
   if (prog_rcd_dir_) glDeleteProgram(prog_rcd_dir_);
   if (prog_rcd_g_) glDeleteProgram(prog_rcd_g_);
   if (prog_rcd_chroma_) glDeleteProgram(prog_rcd_chroma_);
+  if (prog_raw_dn_) glDeleteProgram(prog_raw_dn_);
+  if (prog_chroma_dn_) glDeleteProgram(prog_chroma_dn_);
   if (vs_rot_) glDeleteShader(vs_rot_);
   if (vs_plain_) glDeleteShader(vs_plain_);
   if (still_tex_) glDeleteTextures(1, &still_tex_);
@@ -717,10 +861,13 @@ void FrameRenderer::release() {
   tex_dir_ = tex_g_ = 0;
   fbo_dir_ = fbo_g_ = 0;
   rcd_w_ = rcd_h_ = 0;
+  tex_mos_ = tex_dn_ = 0;
+  fbo_mos_ = fbo_dn_ = 0;
   tex_scene_ = tex_work_ = tex_cap_ = 0;
   fbo_scene_ = fbo_work_ = fbo_cap_ = 0;
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
+  prog_raw_dn_ = prog_chroma_dn_ = 0;
   vs_rot_ = vs_plain_ = 0;
   oes_tex_ = 0;
   still_w_ = still_h_ = 0;
@@ -821,7 +968,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     passOES(dst_w, dst_h, st, rot, sx, sy, p);
     if (diag) logPassDiag("pass1_oes", fbo_scene_, true);
   }
-  passFilm(dst_w, dst_h, p);
+  passFilm(dst_w, dst_h, p, tex_scene_);
   if (diag) logPassDiag("pass2_film", fbo_work_, true);
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
@@ -943,7 +1090,7 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   }
 
   passStill(dst_w, dst_h, effective_rot, p);
-  passFilm(dst_w, dst_h, p);
+  passFilm(dst_w, dst_h, p, tex_scene_);
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
     if (tex_cap_) {
@@ -990,6 +1137,7 @@ void FrameRenderer::passRaw(int dst_w, int dst_h, int rot, int cfa,
 }
 
 // RCD 中间目标：方向场与全图 G（raw 原始方向，w×h）。尺寸变化时重建。
+// 降噪开时另建 tex_mos_（P0 输出，同 raw 尺寸）。
 bool FrameRenderer::ensureRcdTargets(int w, int h) {
   if (w <= 0 || h <= 0) return false;
   if (w != rcd_w_ || h != rcd_h_) {
@@ -998,11 +1146,14 @@ bool FrameRenderer::ensureRcdTargets(int w, int h) {
       glDeleteFramebuffers(1, &fbo_dir_);
       glDeleteTextures(1, &tex_g_);
       glDeleteFramebuffers(1, &fbo_g_);
+      glDeleteTextures(1, &tex_mos_);
+      glDeleteFramebuffers(1, &fbo_mos_);
     }
-    tex_dir_ = tex_g_ = 0;
-    fbo_dir_ = fbo_g_ = 0;
+    tex_dir_ = tex_g_ = tex_mos_ = 0;
+    fbo_dir_ = fbo_g_ = fbo_mos_ = 0;
     makeTex(&tex_dir_, &fbo_dir_, GL_RGBA16F, w, h);
     makeTex(&tex_g_, &fbo_g_, GL_RGBA16F, w, h);
+    makeTex(&tex_mos_, &fbo_mos_, GL_RGBA16F, w, h);
     rcd_w_ = w;
     rcd_h_ = h;
   }
@@ -1010,19 +1161,79 @@ bool FrameRenderer::ensureRcdTargets(int w, int h) {
   const bool ok1 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_g_);
   const bool ok2 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-  return ok1 && ok2;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
+  const bool ok3 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  return ok1 && ok2 && ok3;
+}
+
+// 降噪输出目标：tex_dn_（旋转后 dst 尺寸，P4 输出，胶片链输入）
+bool FrameRenderer::ensureDnTarget(int w, int h) {
+  if (tex_dn_ != 0 && dn_w_ == w && dn_h_ == h) return true;
+  if (tex_dn_) {
+    glDeleteTextures(1, &tex_dn_);
+    glDeleteFramebuffers(1, &fbo_dn_);
+  }
+  tex_dn_ = fbo_dn_ = 0;
+  makeTex(&tex_dn_, &fbo_dn_, GL_RGBA16F, w, h);
+  dn_w_ = w;
+  dn_h_ = h;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
+  return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+// P0：RAW 域同色联合 bilateral → 线性 mosaic（tex_mos_）
+void FrameRenderer::passRawDenoise(int w, int h, int cfa,
+                                   const float black_phase[4],
+                                   float white_level, const float gains[3],
+                                   float ns) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_raw_dn_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, raw_tex_);
+  glUniform1i(u_raw_dn_.tex, 0);
+  glUniform2i(u_raw_dn_.size, raw_w_, raw_h_);
+  glUniform1i(u_raw_dn_.cfalut, cfaLutOf(cfa));
+  glUniform4f(u_raw_dn_.black, black_phase[0], black_phase[1], black_phase[2],
+              black_phase[3]);
+  glUniform1f(u_raw_dn_.white, white_level);
+  glUniform3f(u_raw_dn_.gain, gains[0], gains[1], gains[2]);
+  glUniform1f(u_raw_dn_.ns, ns);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// P4：色度平滑（读 tex_scene_ → tex_dn_）。输出几何与 passRcdChroma 一致
+void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
+                                      float ns) {
+  (void)rot;  // kVertRot 旋转已在顶点层；frag 用 gl_FragCoord 定位
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_chroma_dn_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_scene_);
+  glUniform1i(u_chroma_dn_.tex, 0);
+  glUniform2i(u_chroma_dn_.size, dst_w, dst_h);
+  glUniform1f(u_chroma_dn_.ns, ns);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glActiveTexture(GL_TEXTURE0);
 }
 
 // RCD P1：方向场（vh + pq 统计），raw 原始方向全屏
 void FrameRenderer::passRcdDir(int w, int h, int cfa,
                                const float black_phase[4], float white_level,
-                               const float gains[3]) {
+                               const float gains[3], bool mosaic) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_dir_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_rcd_dir_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
   glUniform1i(u_rcd_dir_.tex, 0);
+  if (u_rcd_dir_.mos >= 0) {
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_mos_);
+    glUniform1i(u_rcd_dir_.mos, 1);
+  }
+  if (u_rcd_dir_.mosaic >= 0) glUniform1f(u_rcd_dir_.mosaic, mosaic ? 1.0f : 0.0f);
   glUniform2i(u_rcd_dir_.size, raw_w_, raw_h_);
   glUniform1i(u_rcd_dir_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_rcd_dir_.black, black_phase[0], black_phase[1], black_phase[2],
@@ -1035,16 +1246,22 @@ void FrameRenderer::passRcdDir(int w, int h, int cfa,
 // RCD P2：G@RB（比值修正 + 方向混合 + 限幅），输出全图 G 到 tex_g_
 void FrameRenderer::passRcdG(int w, int h, int cfa,
                              const float black_phase[4], float white_level,
-                             const float gains[3]) {
+                             const float gains[3], bool mosaic) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_g_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_rcd_g_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  if (u_rcd_g_.mos >= 0) {
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_mos_);
+    glUniform1i(u_rcd_g_.mos, 1);
+  }
+  if (u_rcd_g_.mosaic >= 0) glUniform1f(u_rcd_g_.mosaic, mosaic ? 1.0f : 0.0f);
   glUniform1i(u_rcd_g_.tex, 0);
-  glUniform1i(u_rcd_g_.dir, 1);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  glUniform1i(u_rcd_g_.dir, 2);
   glUniform2i(u_rcd_g_.size, raw_w_, raw_h_);
   glUniform1i(u_rcd_g_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_rcd_g_.black, black_phase[0], black_phase[1], black_phase[2],
@@ -1059,19 +1276,26 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
-                                  const float* ccm) {
+                                  const float* ccm, bool mosaic) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_rcd_chroma_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  if (u_rcd_chroma_.mos >= 0) {
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_mos_);
+    glUniform1i(u_rcd_chroma_.mos, 1);
+  }
+  if (u_rcd_chroma_.mosaic >= 0)
+    glUniform1f(u_rcd_chroma_.mosaic, mosaic ? 1.0f : 0.0f);
   glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  glActiveTexture(GL_TEXTURE3);
   glBindTexture(GL_TEXTURE_2D, tex_g_);
   glUniform1i(u_rcd_chroma_.tex, 0);
-  glUniform1i(u_rcd_chroma_.dir, 1);
-  glUniform1i(u_rcd_chroma_.g, 2);
+  glUniform1i(u_rcd_chroma_.dir, 2);
+  glUniform1i(u_rcd_chroma_.g, 3);
   glUniform2i(u_rcd_chroma_.size, raw_w_, raw_h_);
   glUniform1i(u_rcd_chroma_.rot, rot);
   glUniform2f(u_rcd_chroma_.scale, 1.0f, 1.0f);
@@ -1092,7 +1316,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               int cfa, const float black_phase[4],
                               int white_level, float neutral_r, float neutral_g,
                               float neutral_b, const float* ccm9, int rotation,
-                              const FilmParams& p, int demosaic,
+                              const FilmParams& p, int demosaic, int noise_level,
+                              float noise_sigma,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
@@ -1157,27 +1382,45 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   }
 
   // RCD 质量档：三段中间计时（各插一次 glFinish，拍照单张路径可接受），
-  // 真机据此定位 pass 瓶颈（M3-1 ≤900ms 出口标准的分解度量）
+  // 真机据此定位 pass 瓶颈（M3-1 ≤900ms 出口标准的分解度量）。
+  // M3-2 降噪：P0 RAW 域 bilateral（mosaic 模式供 P1–P3）+ P4 色度平滑；
+  // 仅 RCD 路径生效，bilinear 保持纯净基线。
   const bool rcd = demosaic == 1;
-  float dir_ms = 0.0f, g_ms = 0.0f;
+  const bool dn = rcd && noise_level > 0;
+  const float ns = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
+  float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
   if (rcd) {
     if (!ensureRcdTargets(w, h)) return false;
     const auto d0 = std::chrono::steady_clock::now();
-    passRcdDir(w, h, cfa, black_phase, static_cast<float>(white_level), gains);
+    if (dn) {
+      passRawDenoise(w, h, cfa, black_phase, static_cast<float>(white_level),
+                     gains, ns);
+    }
+    passRcdDir(w, h, cfa, black_phase, static_cast<float>(white_level), gains,
+               dn);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
-    passRcdG(w, h, cfa, black_phase, static_cast<float>(white_level), gains);
+    passRcdG(w, h, cfa, black_phase, static_cast<float>(white_level), gains, dn);
     glFinish();
     const auto d2 = std::chrono::steady_clock::now();
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, effective_rot, cfa, black_phase,
-                  static_cast<float>(white_level), gains, ccm);
+                  static_cast<float>(white_level), gains, ccm, dn);
   } else {
     passRaw(dst_w, dst_h, effective_rot, cfa, black_phase,
             static_cast<float>(white_level), gains, ccm, p);
   }
-  passFilm(dst_w, dst_h, p);
+  if (dn) {
+    if (!ensureDnTarget(dst_w, dst_h)) return false;
+    const auto n0 = std::chrono::steady_clock::now();
+    passChromaDenoise(dst_w, dst_h, effective_rot, ns);
+    glFinish();
+    dn_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - n0)
+                .count();
+  }
+  passFilm(dst_w, dst_h, p, dn ? tex_dn_ : tex_scene_);
   const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
@@ -1210,6 +1453,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     kv += ",\"dirMs\":" + std::to_string(dir_ms).substr(0, 6) +
           ",\"gMs\":" + std::to_string(g_ms).substr(0, 6);
   }
+  if (dn) {
+    kv += ",\"dn\":\"std\",\"ns\":" + std::to_string(ns).substr(0, 5) +
+          ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
+  }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
   return true;
@@ -1224,12 +1471,12 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void FrameRenderer::passFilm(int w, int h, const FilmParams& p) {
+void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_film_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_scene_);
+  glBindTexture(GL_TEXTURE_2D, src_tex);
   glUniform1i(u_film_.tex, 0);
   glUniform1f(u_film_.contrast, p.contrast);
   glUniform3f(u_film_.shoulder, p.shoulder[0], p.shoulder[1], p.shoulder[2]);

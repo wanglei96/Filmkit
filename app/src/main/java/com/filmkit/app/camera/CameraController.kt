@@ -1042,6 +1042,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val dngOn = prefs.getBoolean("dng_enabled", false)
         // 去马赛克质量档：1 = RCD 三段管线（默认，M3-1）；0 = bilinear 速度档
         val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+        // 降噪（M3-2）：1 = 标准（P0 RAW bilateral + P4 色度平滑，仅 RCD 生效）
+        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) 1 else 0
         val meta = extractRawMeta(result, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",
@@ -1050,6 +1052,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 "black" to meta.blackPhase.joinToString(",") { "%.0f".format(it) },
                 "neutral" to meta.neutral.joinToString(",") { "%.4f".format(it) },
                 "ccm" to meta.ccm.take(6).joinToString(",") { "%.3f".format(it) },
+                "noise" to "%.4f".format(meta.noiseSigma),
                 "in" to "${img.width}x${img.height}",
             ),
         )
@@ -1063,7 +1066,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
             }
         }
-        render.submitRaw(img, meta, orientationStep, filmParams, demosaic) { bytes, w, h ->
+        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
         }
@@ -1143,9 +1146,35 @@ class CameraController(private val context: Context, private val render: RenderC
             // 构造收行主序、读取 getElement(col,row)——遍历须 (row, col) 双重序防转置
             for (row in 0..2) for (col in 0..2) ccm[row * 3 + col] = t.getElement(col, row).toFloat()
         }
+        // 噪声 σ（M3-2）：SENSOR_NOISE_PROFILE 按当前增益取最近条目，归一化到
+        // [0,1] 线性域（σ_data / whiteLevel）；HAL 不回填时回退 0（引擎内估计）
+        var noiseSigma = 0f
+        if (Build.VERSION.SDK_INT >= 28) {
+            // SENSOR_NOISE_PROFILE 条目为 (gain, σ[R,G,B])，泛型经 JNI 擦除需防御性解包；
+            // 取增益最接近当前感度的一组，σ 数据域 → 归一化（/whiteLevel）
+            @Suppress("UNCHECKED_CAST")
+            val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) as? List<Any?>
+            val wantGain = maxOf(result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100, 100) / 100.0
+            var bestGain = Double.MAX_VALUE
+            var bestSigma = 0.0
+            profile?.forEach { item ->
+                val pair = item as? android.util.Pair<*, *> ?: return@forEach
+                val g = (pair.first as? Number)?.toDouble() ?: return@forEach
+                val s = pair.second as? DoubleArray ?: return@forEach
+                if (s.size < 3) return@forEach
+                if (noiseSigma == 0f || kotlin.math.abs(g - wantGain) < bestGain) {
+                    val avg = (s[0] + s[1] + s[2]) / 3.0
+                    if (avg > 0.0 && whiteLevel > 0) {
+                        bestGain = kotlin.math.abs(g - wantGain)
+                        bestSigma = avg
+                        noiseSigma = (avg / whiteLevel).toFloat()
+                    }
+                }
+            }
+        }
         return RenderClient.RawFrameMeta(
             colorFilterArrangement, black4, whiteLevel,
-            floatArrayOf(nR, nG, nB), ccm,
+            floatArrayOf(nR, nG, nB), ccm, noiseSigma,
         )
     }
 
