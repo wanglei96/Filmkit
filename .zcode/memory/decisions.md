@@ -42,3 +42,7 @@ status: active
 - [2026-09-20] **质量档 prefs demosaic_quality 默认 RCD** — submitRaw 加 demosaic 参数贯通；raw.render 日志加 demosaic/dirMs/gMs
 - [2026-09-20] **性能取向：中间量预计算全图复用** — 方向场/低通图 P1 一次算完（预归一化），后续 pass 1-tap 读取；CFA 相位 uniform 查表；两项式梯度——12MP RCD 1969→417ms
 - [2026-09-21] **M3-2 降噪为下一步主线（用户点名"降噪效果待优化"）** — RAW 域传统方法守 ≤900ms 预算；NN+多帧仍 M6 后
+- [2026-09-21] **降噪只接 RCD 质量档** — bilinear 保持纯净基线；速度档无降噪
+- [2026-09-21] **降噪两段式**：P0 RAW 域同色 bilateral（步长 2 网格=9 同色位，压源头）+ P4 色度平滑（色差域、Y 零损失）— 不做 bilinear 式钝化
+- [2026-09-21] **noiseProfile 回退**：X300 不回填时 ns=0.030（归一化域），raw.meta 记录实测
+- [2026-09-21] **handoff/ 交接文件夹不上 git** — gitignore 本地维护，README 按"接手 agent 视角"自包含，等用户指令更新

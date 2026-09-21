@@ -45,7 +45,11 @@ status: active
 - [2026-09-20] X300 RAW result 键真机确认回填：SENSOR_NEUTRAL_COLOR_POINT（如 0.4895/1.0/0.671）、COLOR_CORRECTION_TRANSFORM（对角 ~1.5/1.14）、SENSOR_DYNAMIC_BLACK_LEVEL（64×4）、白阶 1023；raw.meta 日志可核对
 - [2026-09-20] raw.render 日志：uploadMs/passMs/totalMs（glFinish 后计时，真实端到端）；M3 性能出口=12MP 全链路 ≤900ms（标准档）
 - [2026-09-20] shader 校验：tools/validate-shaders.sh（提取 FrameRenderer.cpp 全部 GLSL 按 vert/frag 交 glslang）；本地二进制 tools/bin/glslang（16.6.0，gitignore）；发版前必跑
-- [2026-09-21] 发布现状：最新 v0.5.31-m3（versionCode 62，tag 已推送）；RCD 质量档已验收（477ms/颜色一致），M3-2 降噪为下一步
+- [2026-09-21] 发布现状：最新 v0.5.32-m3（versionCode 63，tag 已推送）；M3-2 降噪 v1 真机验证完成（彩噪达优/细节过猛），下一步调参
+- [2026-09-21] prefs 键新增：noise_reduction（bool，默认 true=降噪标准档，仅 RCD 质量档生效）；设置页「RAW 降噪」行
+- [2026-09-21] raw.render 日志字段追加：dn("std")/ns(实测 σ)/dnMs（P4 计时）；raw.meta 加 noise 字段——X300 实测不回填 SENSOR_NOISE_PROFILE（恒 0），引擎回退 0.030
+- [2026-09-21] 降噪管线资源：tex_mos_（P0 输出线性 mosaic，raw 尺寸）、tex_dn_（P4 输出，dst 尺寸）、程序 prog_raw_dn_/prog_chroma_dn_；shader 共 13 条（校验 13/13）；纹理单元：P2 tex=0/mos=1/dir=2，P3 tex=0/mos=1/dir=2/g=3
+- [2026-09-21] 降噪真机数据（ISO~570 同链路 A/B）：彩噪 1.41→0.74（达优 ≤1.0）、亮噪 1.56→0.68、细节 Laplacian -48% 过猛；耗时 开 640ms / 关 676ms / bilinear 133ms（P0 mosaic float 使 P1 提速）
 - [2026-09-21] prefs 键新增：demosaic_quality（bool，默认 true=RCD 质量档；false=bilinear 快速档）；设置页「RAW 去马赛克」行
 - [2026-09-21] raw.render 日志字段：uploadMs/passMs/totalMs/w/h + demosaic("rcd"/"bilinear") + RCD 时 dirMs/gMs（真机实测 477ms = dir 58 + g 7 + 色度胶片 ~238 + 上传 ~30 + 读回 ~150）
 - [2026-09-21] RCD 管线资源：新增纹理 tex_dir_/tex_g_（RGBA16F，raw 尺寸）、程序 prog_rcd_dir_/g_/chroma_；shader 共 11 条（校验脚本 11/11）；CFA LUT uCfaLut 由 cfaLutOf 编码（k0..k3 依次在 bits 0/2/4/6，GRBG=0x61）

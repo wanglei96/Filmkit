@@ -1,8 +1,8 @@
 ---
 summary: RCD色偏修复收官M3降噪待优化
 created: 2026-09-21 00:10
-updated: 2026-09-21 00:10
-status: active
+updated: 2026-09-21 10:05
+status: absorbed
 ---
 
 # RCD色偏修复收官M3降噪待优化
