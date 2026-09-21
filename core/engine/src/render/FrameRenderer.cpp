@@ -439,7 +439,7 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform float uNS;     // 归一化域噪声 σ（SENSOR_NOISE_PROFILE 或回退估计）
-uniform float uDnK;    // 值域 σ 系数：标准 0.50 / 强 2.20（v0.5.34 重标定）
+uniform float uDnK;    // 值域 σ 系数：标准 0.28 / 强 2.20（v0.5.35 放轻）
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -454,8 +454,8 @@ float raw0(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = raw0(p);
-    // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值）、细节
-    // -59%、且与强档无差别 —— 权重已饱和成无条件平均；0.5 才恢复选择性。
+    // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值），权重已
+    // 饱和成无条件平均；0.50 恢复选择性（强边缘 0% 损失）但画面仍偏平，0.28 更轻。
     float sr = max(uNS, 0.008) * uDnK * sqrt(0.2 + 4.0 * c0);
     float wsum = 1.0, acc = c0;
     for (int dy = -4; dy <= 4; dy += 2)
@@ -482,7 +482,7 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uNS;
-uniform float uDnK;    // 值域 σ 系数：标准 1.80 / 强 2.60（只动色度）
+uniform float uDnK;    // 值域 σ 系数：标准 2.20 / 强 2.60（只动色度）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
@@ -1406,8 +1406,11 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // P0 值域权重饱和退化成 9 点无条件平均）。Laplacian 损失全部来自 P0（P4 保 Y
   // 不动），故 P0 收温和保细节、P4 保持较强只压色度 —— 两档这才拉开真实差距。
   const bool dn_high = noise_level >= 2;
-  const float sr_k = dn_high ? 2.20f : 0.50f;  // P0 值域 σ 系数
-  const float sc_k = dn_high ? 2.60f : 1.80f;  // P4 值域 σ 系数
+  // v0.5.35：标准档仍偏"平"（Lap 3.11 vs 关 5.89、体积 -36%）——用户要更清晰、
+  // 体积别掉太多。P0 是细节与体积的主因（亮度高频），再放轻 0.50→0.28；彩噪改由
+  // P4 补强 1.80→2.20（P4 只动色度、保 Y，不影响亮度细节与体积大头）。
+  const float sr_k = dn_high ? 2.20f : 0.28f;  // P0 值域 σ 系数
+  const float sc_k = dn_high ? 2.60f : 2.20f;  // P4 值域 σ 系数
   const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
   // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
   // 物理量级，夹紧避免异常值让降噪失效或过猛
