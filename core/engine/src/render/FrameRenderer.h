@@ -152,7 +152,7 @@ class FrameRenderer {
   } u_chroma_dn_;
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
-          sat = -1, split = -1, mono = -1;
+          sat = -1, split = -1, mono = -1, tone_k = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,

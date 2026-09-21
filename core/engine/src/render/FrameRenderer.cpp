@@ -523,7 +523,23 @@ uniform mat3 uCross;
 uniform vec3 uSat;    // 阴影/中间/高光 饱和度
 uniform vec2 uSplit;  // 阴影暖 / 高光冷
 uniform float uMono;
+uniform float uToneK;  // 基准影调强度（0 = 恒等/旧行为，1 = 完整基准）
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
+// 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
+// 挤中间（P0.1≈20、>224 占 0.00%、无真黑无真白）。三点锚定的 S 曲线：
+// 黑点 0→0 / 中灰 0.18→0.18 / 白点 1.0→1.0，端部导数→0（rolloff 而非硬截断，
+// 避免暗部钉死出尖峰色带）。t^p/(t^p+(1-t)^p) 保证 t=0/1 精确取到端点。
+float baseTone(float x) {
+    const float blk = 0.0030;   // 黑点 ≈ -5.9EV（去暗部雾感）
+    const float mn  = 0.1776;   // 归一化后的中灰位置（0.18 落在黑/白点之间）
+    const float p   = 1.35;     // S 强度
+    float xn = clamp((x - blk) / (1.0 - blk), 0.0, 1.0);
+    float t = xn <= mn ? xn / mn : (xn - mn) / (1.0 - mn);
+    float tp = pow(t, p);
+    float s = tp / max(tp + pow(1.0 - t, p), 1e-6);
+    return xn <= mn ? mn * s : mn + (1.0 - mn) * s;
+}
 // ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
 // 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）
 float filmCurve(float x, float toe, float shoulder) {
@@ -549,6 +565,13 @@ void main() {
     g.g = filmCurve(lg.g, uToe.g, uShoulder.g);
     g.b = filmCurve(lg.b, uToe.b, uShoulder.b);
     vec3 out3 = 0.18 * exp2((g - 0.5) * 8.0);
+    // 基准影调（norm-controlled：只作用于亮度范数、按比例缩 RGB —— 避免
+    // per-channel 压缩在暗部造成的色偏）
+    if (uToneK > 0.0) {
+        float n0 = max(max(out3.r, out3.g), out3.b);
+        float n1 = baseTone(n0);
+        out3 *= mix(1.0, n1 / max(n0, 1e-6), uToneK);
+    }
     float l = luma(out3);
     float ws = exp(-l * 3.0);
     float wh = smoothstep(0.5, 1.0, l);
@@ -814,6 +837,7 @@ bool FrameRenderer::init() {
   u_film_.sat = glGetUniformLocation(prog_film_, "uSat");
   u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
   u_film_.mono = glGetUniformLocation(prog_film_, "uMono");
+  u_film_.tone_k = glGetUniformLocation(prog_film_, "uToneK");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -1488,6 +1512,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"nsHal\":" + std::to_string(ns_raw).substr(0, 6) +
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
+  kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
   return true;
@@ -1516,6 +1541,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glUniform3f(u_film_.sat, p.sat_shadow, p.sat_mid, p.sat_high);
   glUniform2f(u_film_.split, p.split_warm, p.split_cool);
   glUniform1f(u_film_.mono, p.monochrome);
+  glUniform1f(u_film_.tone_k, p.tone_strength);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

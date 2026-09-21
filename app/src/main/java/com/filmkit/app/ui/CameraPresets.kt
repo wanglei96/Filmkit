@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(28).apply {
+    private fun neutral(): DoubleArray = DoubleArray(29).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -29,6 +29,9 @@ object CameraPresets {
         put3(this, 14, 0.0, 1.0, 0.0)
         put3(this, 17, 0.0, 0.0, 1.0)
         put3(this, 20, 1.0, 1.0, 1.0)     // 分区饱和度
+        // 28 = 基准影调强度：1.0 = 开（黑位 + 中灰锚定 S + 高光 rolloff，
+        // 非风格化；治"发灰"）。0 = 恒等/旧行为。
+        this[28] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */
