@@ -1156,10 +1156,12 @@ class CameraController(private val context: Context, private val render: RenderC
         // [0,1] 线性域（σ_data / whiteLevel）；HAL 不回填时回退 0（引擎内估计）
         var noiseSigma = 0f
         if (Build.VERSION.SDK_INT >= 28) {
-            // SENSOR_NOISE_PROFILE 条目为 (gain, σ[R,G,B])，泛型经 JNI 擦除需防御性解包；
+            // SENSOR_NOISE_PROFILE 的类型是 Pair<Double, Double[]>[]（Java 数组，不是
+            // List）——v0.5.32 误写成 as? List<Any?>，该 cast 永远失败、σ 自适应从未生效
+            //（编译器 "This cast can never succeed" 警告即此）。按数组 + 防御性解包；
             // 取增益最接近当前感度的一组，σ 数据域 → 归一化（/whiteLevel）
             @Suppress("UNCHECKED_CAST")
-            val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) as? List<Any?>
+            val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) as? Array<*>
             val wantGain = maxOf(result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100, 100) / 100.0
             var bestGain = Double.MAX_VALUE
             var bestSigma = 0.0

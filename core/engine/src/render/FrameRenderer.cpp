@@ -1,5 +1,6 @@
 #include "FrameRenderer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -421,7 +422,9 @@ void main() {
 // 量化基线（真机 ISO~1200 平坦区）：亮噪 σ(Y)≈1.5–1.8（达标优），彩噪
 // σ(chroma)≈1.8–2.1（未达优，B-Y 最重）——彩噪是短板。
 // v0.5.32 首版压制到位（彩噪 1.41→0.74）但细节 Laplacian -48% 过猛；
-// v0.5.33 标准档收紧值域系数（保细节）+ 强档 1.45 乘子（近首版强度）。
+// v0.5.33 两档调参真机实测失效：两档无差别、细节 -59%、JPEG 体积腰斩——值域
+// σ 远大于真实噪声，权重饱和退化成无条件 9 点平均；v0.5.34 按"P0 温和保细节 /
+// P4 较强只压色度"重标定（P4 输出保 Y，色度平滑不损 Laplacian 细节）。
 // P0：RAW 域同色联合 bilateral。任意 Bayer 相位下"步长 2 的 3×3 网格"
 // 恰为 9 个同色位（含中心），无需相位条件；值域 σ 随信号 √ 增长
 // （shot noise 主导）。输出线性 mosaic（rgb = 该相位通道值），同时让
@@ -436,7 +439,7 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform float uNS;     // 归一化域噪声 σ（SENSOR_NOISE_PROFILE 或回退估计）
-uniform float uDnK;    // 强度档乘子：标准 1.0 / 强 1.45（v0.5.33 调参）
+uniform float uDnK;    // 值域 σ 系数：标准 0.50 / 强 2.20（v0.5.34 重标定）
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -451,8 +454,9 @@ float raw0(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = raw0(p);
-    // σr 1.6→1.1（v0.5.32 细节 -48% 过猛；只压噪声不钝化边缘）
-    float sr = max(uNS, 0.008) * 1.1 * uDnK * sqrt(0.2 + 4.0 * c0);
+    // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值）、细节
+    // -59%、且与强档无差别 —— 权重已饱和成无条件平均；0.5 才恢复选择性。
+    float sr = max(uNS, 0.008) * uDnK * sqrt(0.2 + 4.0 * c0);
     float wsum = 1.0, acc = c0;
     for (int dy = -4; dy <= 4; dy += 2)
         for (int dx = -4; dx <= 4; dx += 2) {
@@ -478,15 +482,16 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uNS;
-uniform float uDnK;    // 强度档乘子（同 P0）
+uniform float uDnK;    // 值域 σ 系数：标准 1.80 / 强 2.60（只动色度）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     vec3 c0 = texelFetch(uTex, p, 0).rgb;
     float y0 = dot(c0, LUMA);
     vec3 cd0 = c0 - y0;
-    // sc 2.4→1.8（色度值域收紧）；Y 值域权重 2.0→1.2（防边缘色溢）
-    float sc = max(uNS, 0.008) * 1.8 * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
+    // 色度可保持较强：Y 原样输出，压彩噪不损 Laplacian 细节；Y 值域权重
+    // sc*1.2 防边缘色溢
+    float sc = max(uNS, 0.008) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
     vec3 acc = cd0;
     float wsum = 1.0;
     for (int dy = -2; dy <= 2; ++dy)
@@ -1397,18 +1402,23 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // 仅 RCD 路径生效，bilinear 保持纯净基线。
   const bool rcd = demosaic == 1;
   const bool dn = rcd && noise_level > 0;
-  // v0.5.33 调参：标准档值域系数收紧（P0 σr 1.6→1.1、P4 sc 2.4→1.8 + Y 权重
-  // 2.0→1.2，治 v0.5.32 "细节 -48%"）；强档乘 1.45 回到接近 v0.5.32 的强度。
+  // v0.5.34 重标定（v0.5.33 真机实测：两档无差别、细节 -59%、JPEG 体积腰斩 =
+  // P0 值域权重饱和退化成 9 点无条件平均）。Laplacian 损失全部来自 P0（P4 保 Y
+  // 不动），故 P0 收温和保细节、P4 保持较强只压色度 —— 两档这才拉开真实差距。
   const bool dn_high = noise_level >= 2;
-  const float dn_k = dn_high ? 1.45f : 1.0f;
-  const float ns = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
+  const float sr_k = dn_high ? 2.20f : 0.50f;  // P0 值域 σ 系数
+  const float sc_k = dn_high ? 2.60f : 1.80f;  // P4 值域 σ 系数
+  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
+  // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
+  // 物理量级，夹紧避免异常值让降噪失效或过猛
+  const float ns = std::min(std::max(ns_raw, 0.008f), 0.040f);
   float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
   if (rcd) {
     if (!ensureRcdTargets(w, h)) return false;
     const auto d0 = std::chrono::steady_clock::now();
     if (dn) {
       passRawDenoise(w, h, cfa, black_phase, static_cast<float>(white_level),
-                     gains, ns, dn_k);
+                     gains, ns, sr_k);
     }
     passRcdDir(w, h, cfa, black_phase, static_cast<float>(white_level), gains,
                dn);
@@ -1428,7 +1438,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   if (dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return false;
     const auto n0 = std::chrono::steady_clock::now();
-    passChromaDenoise(dst_w, dst_h, effective_rot, ns, dn_k);
+    passChromaDenoise(dst_w, dst_h, effective_rot, ns, sc_k);
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -1469,8 +1479,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   }
   if (dn) {
     kv += std::string(",\"dn\":\"") + (dn_high ? "high" : "std") +
-          "\",\"dnK\":" + (dn_high ? "1.45" : "1.0") +
+          "\",\"srK\":" + std::to_string(sr_k).substr(0, 4) +
+          ",\"scK\":" + std::to_string(sc_k).substr(0, 4) +
           ",\"ns\":" + std::to_string(ns).substr(0, 5) +
+          ",\"nsHal\":" + std::to_string(ns_raw).substr(0, 6) +
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += "}";

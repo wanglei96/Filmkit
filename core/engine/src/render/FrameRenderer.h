@@ -82,7 +82,7 @@ class FrameRenderer {
                      const float black_phase[4], float white_level,
                      const float gains[3], const float* ccm, bool mosaic);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑
-  // k —— 强度档乘子（标准 1.0 / 强 1.45，缩放值域 σ）
+  // k —— 值域 σ 系数（P0 标准 0.50 / 强 2.20；P4 标准 1.80 / 强 2.60）
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
                       float white_level, const float gains[3], float ns,
                       float k);

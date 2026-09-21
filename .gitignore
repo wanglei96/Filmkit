@@ -29,3 +29,8 @@ FILMKIT_*.dng
 # 本地工具二进制（不入库）
 tools/bin/
 handoff/
+
+# Agent 工具配置（DSH / skill 安装，属本机状态，不入库）
+.dsh/
+.agents/
+.learnings/
