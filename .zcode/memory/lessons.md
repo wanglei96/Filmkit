@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-09-21 17:45
+updated: 2026-09-21 19:46
 status: active
 ---
 
@@ -66,3 +66,10 @@ status: active
 - [2026-09-21] **RAW 饱和必须在 WB 域判定**（阈值 = black+(white−black)/gain；本例 R≥520/G≥1023/B≥747，而非各通道自己的 1023）；**从 JPEG 通道反推 RAW 饱和是错的**（曾据此误判 R/B 先饱和；DNG 实测 R+B 饱和而 G 未饱和 = 0.0000%）
 - [2026-09-21] **DNG OpcodeList2 内部是大端、而 TIFF 头是小端 II**（DngCreator 产物）——第三方（Lightroom）兼容性待验
 - [2026-09-21] **Camera2 键名凭记忆必错，用 javap 核 SDK**：Android 没有 STATISTICS_LENS_SHADING_MAP，正确键是 `STATISTICS_LENS_SHADING_CORRECTION_MAP`（返回 LensShadingMap，`getGainFactor(color,col,row)`）
+- [2026-09-21] **libraw 参照默认 `auto_bright=on`**：rawpy `postprocess()` 把亮度自动拉高约 2.5×（本场景 37.6→94.4）——v0.5.42「饱和 −21% / 分离 −29%」的"寡淡"诊断是**亮度差被当成色彩差**。测色度首选 **CIELAB C\***（与亮度解耦）；`sep`/`neutral` 是绝对量，跨图必须同亮度，且"把暗方拉亮"本身会抬高其 C*（libraw 8.42→13.58，凭空造出 −33% 差距）
+- [2026-09-21] **"文件里没有" ≠ "API 拿不到"**：DNG 无 `ForwardMatrix1/2` 是 DngCreator 不写，`CameraCharacteristics.SENSOR_FORWARD_MATRIX1/2` 给全了 —— 数据可得性必须直接探 API，别从产物反推
+- [2026-09-21] **Camera2 标定矩阵键只在 `CameraCharacteristics`**（`CaptureResult` 没有 `SENSOR_COLOR_TRANSFORM1/2` 等）；`SENSOR_REFERENCE_ILLUMINANT2` 类型是 **Byte**（illuminant1 是 Integer）—— 编译期 Unresolved 才暴露，javap 一查即明
+- [2026-09-21] **Kotlin 字符串里写英文双引号会截断字符串**（报 `Unresolved reference '寡淡'`）：中文文案改用「」
+- [2026-09-21] **离线参照必须与实现同式**：Python 参照用"先插值矩阵再作用"，Kotlin 用"各光源相机白点插值"，单测立刻抓出 0.0023 偏差（> 容差）—— 用真机数据 + 离线参照的单测能提前抓实现偏差
+- [2026-09-21] **ForwardMatrix 自洽性检查**：`FM·(1,1,1)` 应等于 D50 白点 (0.9642, 1.0, 0.8251)（不是"行和=1"）；用它验证 HAL/标定矩阵可信度
+- [2026-09-21] **Gradle 构建需写工作区外的 `~/.gradle`**：DSH 沙箱 workspace-write 下直接失败（`gradle-8.13-bin.zip.lck: Operation not permitted`），需更宽权限

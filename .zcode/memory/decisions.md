@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-21 17:45
+updated: 2026-09-21 19:46
 status: active
 ---
 
@@ -54,3 +54,7 @@ status: active
 - [2026-09-21] **影调/色彩类改动必须自带可关闭 A/B 通路** — v0.5.36 无开关导致跨时刻无法归因
 - [2026-09-21] **离线调参只在"同一时刻 A/B 对"上成立** — 跨时刻对比受场景光变化污染（neutral 变化即证据）
 - [2026-09-21] **FilmParams 契约按实际长度读取（下限 26）** — 新增参数末尾追加 + 防呆，避免"整包静默全丢"
+- [2026-09-21] **LSC 接在去马赛克后、CCM 前** — 网格低频（单元≈240px），与 mosaic 域逐像素应用差异 <1%，却省掉 5 个 shader 改动；关闭档绑 1×1 全 1 网格 = 恒等（shader 零分支）
+- [2026-09-21] **色彩外观层（原 P1）参数回中性占位** — 真机复核证明"寡淡"是 libraw 默认 auto_bright 造成的测量伪结论；浓淡属风格，按 §0-D8/D9 交 M4 理光系 LUT（开关与 FilmParams[31..33] 保留）
+- [2026-09-21] **P2 标准色彩链自建** — 用 `CameraCharacteristics` 的 ColorMatrix/ForwardMatrix 双光源 + Bradford D50→D65 自建 camera(白平衡后)→sRGB；默认开（prefs `ccm_std`）、可 A/B、标定缺失回退 HAL CCM
+- [2026-09-21] **出包命名 `filmkit-<versionName>.apk` + 新包覆盖旧包** — 更新 2026-09-18「出包单文件覆盖制」条的命名部分（仍不留历史包）

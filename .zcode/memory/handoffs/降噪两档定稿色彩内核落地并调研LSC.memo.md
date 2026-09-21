@@ -1,8 +1,8 @@
 ---
 summary: 降噪两档定稿色彩内核落地并调研LSC
 created: 2026-09-21 17:45
-updated: 2026-09-21 17:45
-status: active
+updated: 2026-09-21 19:46
+status: absorbed
 ---
 
 # 降噪两档定稿色彩内核落地并调研LSC

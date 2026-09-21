@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-21 17:45
+updated: 2026-09-21 19:46
 status: active
 ---
 
@@ -59,7 +59,13 @@ status: active
 - [2026-09-21] 降噪两档定稿参数：标准 P0 srK 0.28 / P4 scK 2.20、强 P0 2.20 / P4 2.60；raw.render 记 dn/srK/scK/ns/nsHal/dnMs
 - [2026-09-21] 色彩内核参数（kFsFilm baseTone）：黑点 0.0020 / 枢轴 0.2184（线性 0.22）/ p 1.20 / 中间调 gamma 0.90；高光去饱和 smoothstep(0.85,1.30,n0) 向峰值收敛；raw.render 记 tone/hl
 - [2026-09-21] **X300 提供镜头阴影数据**：STATISTICS_LENS_SHADING_CORRECTION_MAP 17×13、MODE=1、中心增益 1.000、角落 6.236（R 通道）→ 未校正时角落原始亮度仅中心 ~16%；日志 camera.raw.lsc
-- [2026-09-21] **色彩量化基准**（同机位 165345 vs libraw 完整 DNG 链）：近中性像素 R/G 0.987（与 libraw 0.986 一致=准）、B/G 0.992；饱和度 S 0.1269 vs 0.1612（-21%）、通道分离 5.12 vs 7.21（-29%）、近中性像素占比 24.3% vs 13.8%
-- [2026-09-21] **DNG 内的色彩与镜头数据**（DngCreator 产物，TIFF 头小端）：ColorMatrix1/2、CameraCalibration1/2、ForwardMatrix1/2、CalibrationIlluminant1/2（21=D65/17=A）、AsShotNeutral、BaselineExposure、OpcodeList2（含 17×17 GainMap：中心 1.049/边缘 1.4–2.7/角落 3.36）；无 HueSatMap/LookTable/ToneCurve
+- [2026-09-21 复核订正] **色彩量化基准**：旧记录（165345 vs libraw：饱和 -21% / 分离 -29% / 近中性 +10pp）**混入了亮度差** —— libraw 侧 rawpy 默认 `auto_bright=on` 把亮度自动拉高约 2.5×（37.6→94.4），`sep`/`neutral` 是绝对量，跨图比较必须同亮度。**各自原生输出下用 CIELAB C\* 比**：我们 9.25 @ 亮度 63.5 vs libraw 标准链（`no_auto_bright=True`）8.42 @ 37.6 → **我们色度不低**；色域裁剪（CCM 后负值仅 0.7%）与影调（base_tone 开关 A/B 反而开更高）均排除。→ "寡淡"是伪结论，真实差异是**色调映射策略**（我们亮度落在 libraw 的 37.6/94.4 之间）；测色度首选 **C\***，别用随亮度漂移的 sat/sep
+- [2026-09-21 更正] **色彩标定数据要分两个面看（别混淆）**：① **DNG 文件**（DngCreator 产物，小端；`tools/dng-color-dump.py` 实测）含 ColorMatrix1/2（D65/A）、CameraCalibration1/2（单位阵）、CalibrationIlluminant1/2（21/17）、AsShotNeutral、BaselineExposure、OpcodeList2（17×17 GainMap），**不含 ForwardMatrix1/2**；② **CameraCharacteristics**（v0.5.45 真机探针 `camera.raw.calib`）**给全**：SENSOR_COLOR_TRANSFORM1/2、SENSOR_FORWARD_MATRIX1/2、SENSOR_CALIBRATION_TRANSFORM1/2（单位阵）、SENSOR_REFERENCE_ILLUMINANT1/2（21/17；**注意 illuminant2 类型是 Byte**）。结论：这些键**只在 CameraCharacteristics**（静态标定）不在 CaptureResult；"DNG 缺标签"只是 DngCreator 没写，"引擎拿不到"是错的
 - [2026-09-21] **DCP 关键事实**（调研核验）：ColorMatrix1/2 不参与颜色校正（只反推 CCT）；决定成色的是 ForwardMatrix + HueSatMap/LookTable（作用在已白平衡的线性数据上）；DCP 的 LUT 不能改灰度/不能提升饱和度；Adobe DNG SDK 许可宽松（可再分发，商业需 indemnify）；dcamprof 为 GPLv3（仅离线生成可用）；厂商 DCP 不可随包分发
 - [2026-09-21] 离线分析工具链（本机）：python3 + numpy + PIL + **rawpy 0.27**（`postprocess(use_camera_wb=True, gamma=(2.222,4.5))`）；样张可从 `~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/.../pictures/filmkit/` 直读
+- [2026-09-21] **LSC 实现（v0.5.43）**：`submitRaw` 新增 lsc/lsc_cols/lsc_rows → RGB16F 网格纹理（NEAREST，shader 内手写 4-tap 双线性）；uniform `uLsc`/`uLscSize`；无数据/关闭 → 1×1 全 1 恒等；prefs `lsc`（设置页「镜头阴影校正」）、日志 `settings.lsc`、`raw.render.lsc`（"17x13"/"off"）
+- [2026-09-21] **实时直方图（v0.5.44）**：`kFsHist` + `FrameRenderer::histogram(int*,int)`（渲染线程，256×96 RGBA8 + readPixels + 256 桶）；JNI `nativeEngineHistogram(IntArray)`；UI 在 IO 线程 ~7fps 轮询（`RenderClient.pollHistogram`）+ Canvas 峰值开方压缩；prefs `histogram`
+- [2026-09-21] **DNG 标准色彩链（v0.5.46）**：`app/src/main/java/com/filmkit/app/camera/StdColorMatrix.kt`（X2S = XYZ D50→线性 sRGB 常量；只支持 illuminant 21/D65 与 17/A）；`prefs ccm_std` 默认开，日志 `settings.ccm_std`、`raw.meta.ccmSrc=std|hal`；真机实测 std 矩阵 = 1.622,-0.554,-0.068,-0.141,1.343,-0.202,0.008,-0.576,1.568
+- [2026-09-21] **出包命名**：`filmkit-<versionName>.apk`（出包前删旧包）；`.gitignore` 的 `*.apk` 已覆盖
+- [2026-09-21] **`luts/`（未入库）**：理光负片/理光正片/富士CC/富士NC/徕卡M9/徕卡黑白 6 个 .cube（33³、~970KB），用户自备资产，商标敏感、待决策
+- [2026-09-21] **色彩外观层实现（v0.5.44，参数已回中性）**：`kFsFilm` 的 `uLook`/`uLookSat`/`uLookChroma`（FilmParams[31..33]）；设置页「色彩外观层」→ prefs `color_look`
