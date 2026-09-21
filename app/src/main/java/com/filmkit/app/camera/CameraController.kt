@@ -679,13 +679,16 @@ class CameraController(private val context: Context, private val render: RenderC
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
         hlPref = -1.0    // 同上，[29]
+        zebraPref = -1.0 // 同上，[30]
         applyTonePref()
         applyHlPref()
+        applyZebraPref()
     }
 
     private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
     private var tonePref = -1.0
     private var hlPref = -1.0
+    private var zebraPref = -1.0
 
     /**
      * 基准影调开关（M3 色彩内核 v1）：写 FilmParams[28]（0 = 恒等/旧行为）。
@@ -706,6 +709,15 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hlPref) {
             hlPref = v
             filmParams[29] = v
+        }
+    }
+
+    /** 过曝提示开关（斑马纹，仅预览）：写 FilmParams[30]（0 = 关，0.95 ≈ 242/255）。 */
+    private fun applyZebraPref() {
+        val v = if (appPrefs.getBoolean("zebra", true)) 0.95 else 0.0
+        if (v != zebraPref) {
+            zebraPref = v
+            filmParams[30] = v
         }
     }
 
@@ -941,6 +953,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     }
                     applyTonePref()
                     applyHlPref()
+                    applyZebraPref()
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
                         orientationStep, filmParams, fillTest,
@@ -1030,6 +1043,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 静拍与预览共用「方向」设定（用户在界面选定；默认 0）
         applyTonePref()
         applyHlPref()
+        applyZebraPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1108,6 +1122,7 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         applyTonePref()
         applyHlPref()
+        applyZebraPref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)

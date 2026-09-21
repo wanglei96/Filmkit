@@ -623,6 +623,7 @@ uniform float uGrainAmount;
 uniform float uGrainSize;
 uniform float uTime;
 uniform float uFlipY;  // 拍照读回 GL 底行在前，翻转后 JPEG 方向正确
+uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
@@ -643,6 +644,16 @@ void main() {
         c += (vnoise(gp) - 0.5) * uGrainAmount * w;
     }
     c += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+    // 过曝斑马纹（仅预览；成片路径由引擎把 uZebra 置 0 —— 提示绝不进成片）：
+    // 显示域亮度达阈值的区域叠 45° 黑白斜纹。高光一旦全饱和就不可恢复
+    // （DNG 实测：高光 1.089% 三通道同时饱和），拍前能看见就能少拍废片。
+    if (uZebra > 0.0) {
+        float l8 = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        if (l8 >= uZebra) {
+            float st = step(0.5, fract((gl_FragCoord.x - gl_FragCoord.y) / 12.0));
+            c = mix(c, vec3(st), 0.9);
+        }
+    }
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 })";
 
@@ -874,6 +885,7 @@ bool FrameRenderer::init() {
   u_out_.grain_size = glGetUniformLocation(prog_out_, "uGrainSize");
   u_out_.time = glGetUniformLocation(prog_out_, "uTime");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
+  u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
 
   u_fill_st_ = glGetUniformLocation(prog_fill_, "uST");
   if (u_fill_st_ >= 0) {  // 填充测试不采样：uST 置单位阵（uniform 默认全 0）
@@ -1039,7 +1051,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  passOutput(dst_w, dst_h, p, false);
+  passOutput(dst_w, dst_h, p, false, true);  // 预览：允许过曝斑马纹
   if (diag) logPassDiag("pass3_out", 0, false);
   return true;
 }
@@ -1168,7 +1180,7 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
     cap_w_ = dst_w;
     cap_h_ = dst_h;
   }
-  passOutput(dst_w, dst_h, p, true);
+  passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   logPassDiag("pass3_still", fbo_cap_, false);
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
@@ -1514,7 +1526,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     cap_w_ = dst_w;
     cap_h_ = dst_h;
   }
-  passOutput(dst_w, dst_h, p, true);
+  passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
   glFinish();
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
@@ -1576,7 +1588,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y) {
+void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
+                               bool zebra) {
   // flip_y 仅在拍照路径使用（渲染到 fbo_cap_）；预览直接渲染到当前窗口面
   if (flip_y) glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
   glViewport(0, 0, w, h);
@@ -1590,6 +1603,8 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y) {
   glUniform1f(u_out_.grain_size, p.grain_size);
   glUniform1f(u_out_.time, static_cast<float>(frames_.load() % 512));
   glUniform1f(u_out_.flip_y, flip_y ? 1.0f : 0.0f);
+  // 斑马纹只走预览：成片路径一律 0（提示不进成片）
+  glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

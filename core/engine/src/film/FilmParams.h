@@ -7,7 +7,7 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  static constexpr int kCount = 30;
+  static constexpr int kCount = 31;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -30,6 +30,8 @@ struct FilmParams {
   float tone_strength = 1.0f;  // 28
   // M3 高光重建强度（0 = 关）：CCM 前用未饱和通道外推饱和通道，默认 1.0。
   float hl_recon = 1.0f;  // 29
+  // 过曝提示阈值（显示域亮度，0 = 关）：仅预览 passOutput 使用，成片一律 0。
+  float zebra_thr = 0.95f;  // 30
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -72,6 +74,7 @@ struct FilmParams {
     if (n > 27) grain_size = static_cast<float>(v[27]);
     if (n > 28) tone_strength = static_cast<float>(v[28]);
     if (n > 29) hl_recon = static_cast<float>(v[29]);
+    if (n > 30) zebra_thr = static_cast<float>(v[30]);
   }
 };
 

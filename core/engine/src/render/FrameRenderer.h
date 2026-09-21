@@ -91,7 +91,8 @@ class FrameRenderer {
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
-  void passOutput(int w, int h, const FilmParams& p, bool flip_y);
+  // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
+  void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
   void passFill(int dst_w, int dst_h);
 
   static void makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w, int h);
@@ -158,7 +159,7 @@ class FrameRenderer {
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
-          flip_y = -1;
+          flip_y = -1, zebra = -1;
   } u_out_;
   GLint u_fill_st_ = -1;
   struct {

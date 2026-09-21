@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(30).apply {
+    private fun neutral(): DoubleArray = DoubleArray(31).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -34,6 +34,8 @@ object CameraPresets {
         this[28] = 1.0
         // 29 = 高光重建强度：1.0 = 开（CCM 前用未饱和通道外推饱和通道）。
         this[29] = 1.0
+        // 30 = 过曝提示阈值（显示域）：0.95 ≈ 242/255，0 = 关；仅预览生效。
+        this[30] = 0.95
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */
