@@ -191,6 +191,8 @@ fun CameraScreen(
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
     var gridOn by rememberSaveable { mutableStateOf(prefs.getBoolean("grid", false)) }
     var levelOn by rememberSaveable { mutableStateOf(prefs.getBoolean("level", false)) }
+    // 过曝提示（斑马纹）：拍摄相关开关，按约定放快捷设置（不进设置页）
+    var zebraOn by rememberSaveable { mutableStateOf(prefs.getBoolean("zebra", true)) }
     // 水平仪显示角（重力方向相对屏幕下方，-180..180 连续，低通平滑后）
     var levelRoll by remember { mutableFloatStateOf(0f) }
     var levelAligned by remember { mutableStateOf(false) } // 模 90° 任一轴水平即对齐（横竖屏均可）
@@ -1152,6 +1154,15 @@ fun CameraScreen(
                         "{\"on\":$levelOn}",
                     )
                 },
+                zebraOn = zebraOn,
+                onZebra = {
+                    zebraOn = !zebraOn
+                    prefs.edit().putBoolean("zebra", zebraOn).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.zebra",
+                        "{\"on\":$zebraOn}",
+                    )
+                },
                 onMoreSettings = {
                     quickOpen = false
                     onOpenSettings()
@@ -1618,6 +1629,8 @@ private fun QuickDropdown(
     onGrid: () -> Unit,
     levelOn: Boolean,
     onLevel: () -> Unit,
+    zebraOn: Boolean,
+    onZebra: () -> Unit,
     onMoreSettings: () -> Unit,
 ) {
     Column(
@@ -1648,10 +1661,11 @@ private fun QuickDropdown(
             }
         }
         HorizontalDivider(color = FilmTheme.ChipBorder)
-        // 构图辅助：三分线 / 水平仪（自顶栏快捷区移入，v0.5.16）
+        // 构图辅助：三分线 / 水平仪（自顶栏快捷区移入，v0.5.16）+ 斑马纹（过曝提示）
         listOf(
             Triple("三分构图线", gridOn, onGrid),
             Triple("水平仪", levelOn, onLevel),
+            Triple("斑马纹（过曝提示）", zebraOn, onZebra),
         ).forEach { (title, on, toggle) ->
             Row(
                 Modifier

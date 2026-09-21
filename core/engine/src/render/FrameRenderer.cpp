@@ -556,11 +556,15 @@ float baseTone(float x) {
     const float blk = 0.0020;   // 黑点 ≈ -6.5EV（去暗部雾感）
     const float mn  = 0.2184;   // 归一化后的中间调枢轴（线性 0.22）
     const float p   = 1.20;     // S 强度（温和）
+    const float g   = 0.90;     // 中间调提亮（<1 提亮，端点 0/1 不变）
     float xn = clamp((x - blk) / (1.0 - blk), 0.0, 1.0);
     float t = xn <= mn ? xn / mn : (xn - mn) / (1.0 - mn);
     float tp = pow(t, p);
     float s = tp / max(tp + pow(1.0 - t, p), 1e-6);
-    return xn <= mn ? mn * s : mn + (1.0 - mn) * s;
+    // v0.5.41：对称 S 对"中灰以下为主"的暗光场景必然整体压暗（v0.5.37 实测
+    // -11%~-16%，用户反馈仍偏暗）。加 gamma 提亮把均值拉回无 tone 水平
+    // （离线校准：均值 49.99→48.74，只差 -2.5%），黑位与高光 rolloff 都不动。
+    return pow(xn <= mn ? mn * s : mn + (1.0 - mn) * s, g);
 }
 // ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
 // 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）

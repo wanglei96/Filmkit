@@ -200,40 +200,6 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            var zebraOn by rememberSaveable { mutableStateOf(prefs.getBoolean("zebra", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !zebraOn
-                        zebraOn = v
-                        prefs.edit().putBoolean("zebra", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.zebra",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("过曝提示", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "预览中亮度 ≥242/255 的区域叠斜纹（全饱和高光不可恢复）；" +
-                            "只影响预览，不进成片",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (zebraOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
             // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
             // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
             var dnLevel by rememberSaveable {
