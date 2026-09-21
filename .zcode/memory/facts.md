@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-21 00:10
+updated: 2026-09-21 17:45
 status: active
 ---
 
@@ -53,3 +53,13 @@ status: active
 - [2026-09-21] prefs 键新增：demosaic_quality（bool，默认 true=RCD 质量档；false=bilinear 快速档）；设置页「RAW 去马赛克」行
 - [2026-09-21] raw.render 日志字段：uploadMs/passMs/totalMs/w/h + demosaic("rcd"/"bilinear") + RCD 时 dirMs/gMs（真机实测 477ms = dir 58 + g 7 + 色度胶片 ~238 + 上传 ~30 + 读回 ~150）
 - [2026-09-21] RCD 管线资源：新增纹理 tex_dir_/tex_g_（RGBA16F，raw 尺寸）、程序 prog_rcd_dir_/g_/chroma_；shader 共 11 条（校验脚本 11/11）；CFA LUT uCfaLut 由 cfaLutOf 编码（k0..k3 依次在 bits 0/2/4/6，GRBG=0x61）
+- [2026-09-21] 发布现状：最新 **v0.5.42-m3（versionCode 73，tag 已推送）**；本窗口连发 v0.5.33–42（降噪两档→色彩内核→高光重建→斑马纹→调研探针）
+- [2026-09-21] **FilmParams 契约 31 项**（DoubleArray，Kotlin=ui/CameraPresets.kt）：28=基准影调强度、29=高光重建 hl_recon、30=过曝提示 zebra_thr(0.95)；引擎按实际长度读取（下限 26）
+- [2026-09-21] prefs 键新增：base_tone（bool，默认 true，基准影调）、hl_recon（bool，默认 true，高光重建仅 RCD）、zebra（bool，默认 true，过曝斑马纹；开关在快捷面板，日志 quick.zebra）
+- [2026-09-21] 降噪两档定稿参数：标准 P0 srK 0.28 / P4 scK 2.20、强 P0 2.20 / P4 2.60；raw.render 记 dn/srK/scK/ns/nsHal/dnMs
+- [2026-09-21] 色彩内核参数（kFsFilm baseTone）：黑点 0.0020 / 枢轴 0.2184（线性 0.22）/ p 1.20 / 中间调 gamma 0.90；高光去饱和 smoothstep(0.85,1.30,n0) 向峰值收敛；raw.render 记 tone/hl
+- [2026-09-21] **X300 提供镜头阴影数据**：STATISTICS_LENS_SHADING_CORRECTION_MAP 17×13、MODE=1、中心增益 1.000、角落 6.236（R 通道）→ 未校正时角落原始亮度仅中心 ~16%；日志 camera.raw.lsc
+- [2026-09-21] **色彩量化基准**（同机位 165345 vs libraw 完整 DNG 链）：近中性像素 R/G 0.987（与 libraw 0.986 一致=准）、B/G 0.992；饱和度 S 0.1269 vs 0.1612（-21%）、通道分离 5.12 vs 7.21（-29%）、近中性像素占比 24.3% vs 13.8%
+- [2026-09-21] **DNG 内的色彩与镜头数据**（DngCreator 产物，TIFF 头小端）：ColorMatrix1/2、CameraCalibration1/2、ForwardMatrix1/2、CalibrationIlluminant1/2（21=D65/17=A）、AsShotNeutral、BaselineExposure、OpcodeList2（含 17×17 GainMap：中心 1.049/边缘 1.4–2.7/角落 3.36）；无 HueSatMap/LookTable/ToneCurve
+- [2026-09-21] **DCP 关键事实**（调研核验）：ColorMatrix1/2 不参与颜色校正（只反推 CCT）；决定成色的是 ForwardMatrix + HueSatMap/LookTable（作用在已白平衡的线性数据上）；DCP 的 LUT 不能改灰度/不能提升饱和度；Adobe DNG SDK 许可宽松（可再分发，商业需 indemnify）；dcamprof 为 GPLv3（仅离线生成可用）；厂商 DCP 不可随包分发
+- [2026-09-21] 离线分析工具链（本机）：python3 + numpy + PIL + **rawpy 0.27**（`postprocess(use_camera_wb=True, gamma=(2.222,4.5))`）；样张可从 `~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/.../pictures/filmkit/` 直读

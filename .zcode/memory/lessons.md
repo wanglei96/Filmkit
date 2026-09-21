@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-09-21 00:10
+updated: 2026-09-21 17:45
 status: active
 ---
 
@@ -57,5 +57,12 @@ status: active
 - [2026-09-20] 确认引擎 so 是否重编看产物时间戳而非构建耗时——9s 增量构建也可能正确重编了单文件（自定义 CMake 任务 inputs.dir(src) 覆盖源码）
 - [2026-09-21] **噪声测量用平坦块法**（8×8 块、梯度阈值 3.5、均值>40 过滤）——全图去均值残差混入纹理会高估 3–4 倍；降噪/色偏评估必须同链路 A/B（开/关），跨版本绝对值受 ISO/场景混杂
 - [2026-09-21] **降噪强度过猛的量化特征**：细节 Laplacian 降幅 ≈ 降噪幅度（-48%/-48%）= 值域权重太松；σr/σc 系数收紧 + Y 值域收紧，保 RCD 细节优势
-- [2026-09-21] SENSOR_NOISE_PROFILE 泛型经 JNI 擦除（平台类型 Pair），Kotlin 需 `as? List<Any?>` + `android.util.Pair<*,*>` 防御性解包；X300 不回填，noiseProfile 自适应必须设计回退估计
+- [2026-09-21] **SENSOR_NOISE_PROFILE 的类型是 Java 数组 `Pair<Double,Double[]>[]`（不是 List）**：写成 `as? List<Any?>` 会永远失败（编译器 This cast can never succeed 警告），σ 自适应静默失效、恒走回退；正确写法 `as? Array<*>` + `android.util.Pair<*,*>` 逐元素防御解包。**修好后才敢断言 X300 不回填**（noise=0、nsHal=0.03）——同位置的旧结论「需 as? List<Any?>」已被本窗口证伪
 - [2026-09-21] 给既有 shader 链加 sampler 时注意纹理单元重排（P2 dir 1→2、P3 dir/g 1,2→2,3 给新纹理让位），漏绑静默采错
+- [2026-09-21] **全图 Laplacian 判"细节损失"会系统性高估**——它把噪声当细节计（σY 2.30 时梯度 P90≈5.7 几乎全是噪声，降噪必然压低它）；正确口径 = **强边缘锐度（梯度 top 0.5% 均值）**，噪声进不了该分位
+- [2026-09-21] **降噪"过猛/两档无差别"的量化特征**：σY 恰降 1/2.8≈1/3（= 9 点平均理论值）+ 强档再乘系数也无变化 ⇒ 值域权重已饱和、滤波退化成无条件平均；JPEG 体积腰斩是同一根因
+- [2026-09-21] **norm-controlled 保色会让过曝区过饱和**（真机：台灯灯泡变红/粉）：亮度压缩与去饱和**必须成对**（Filmic/AgX 同理）；硬截断之所以看着正常，只是因为它把三通道一起顶到 1
+- [2026-09-21] **对称 S 曲线对"中灰以下为主"的暗光场景必然整体压暗**（该场景 P50 线性 0.11 < 中灰 0.18）：提亮只能靠中间调 gamma `pow(f,g)`，移枢轴几乎无效
+- [2026-09-21] **RAW 饱和必须在 WB 域判定**（阈值 = black+(white−black)/gain；本例 R≥520/G≥1023/B≥747，而非各通道自己的 1023）；**从 JPEG 通道反推 RAW 饱和是错的**（曾据此误判 R/B 先饱和；DNG 实测 R+B 饱和而 G 未饱和 = 0.0000%）
+- [2026-09-21] **DNG OpcodeList2 内部是大端、而 TIFF 头是小端 II**（DngCreator 产物）——第三方（Lightroom）兼容性待验
+- [2026-09-21] **Camera2 键名凭记忆必错，用 javap 核 SDK**：Android 没有 STATISTICS_LENS_SHADING_MAP，正确键是 `STATISTICS_LENS_SHADING_CORRECTION_MAP`（返回 LensShadingMap，`getGainFactor(color,col,row)`）
