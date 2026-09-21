@@ -1500,11 +1500,16 @@ class CameraController(private val context: Context, private val render: RenderC
                 androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
                 liveIso.coerceAtLeast(0).toString(),
             )
-            val sec = liveExposureNs / 1e9
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME,
-                if (sec >= 0.25) "%.1f".format(sec) else "1/${(1 / sec).roundToInt()}",
-            )
+            // ExposureTime 属 ExifInterface 的「兼容标签」：setAttribute 内部走 Double.parseDouble，
+            // 传 "1/125" 这类分数串会抛 NumberFormatException 被**静默丢弃**（Log.w 后 return，成片由此一直缺 33434）。
+            // 只能传十进制秒数，由 ExifInterface 自行转 Rational；取不到实测值回退用户设定值。
+            val nsForExif = if (liveExposureNs > 0L) liveExposureNs else exposureNs
+            if (nsForExif > 0L) {
+                exif.setAttribute(
+                    androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME,
+                    "%.6f".format(Locale.US, nsForExif / 1e9),
+                )
+            }
             exif.setAttribute(
                 androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER,
                 "%.1f".format(apertureF.coerceAtLeast(1f)),
