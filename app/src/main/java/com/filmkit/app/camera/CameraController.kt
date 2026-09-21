@@ -1099,6 +1099,26 @@ class CameraController(private val context: Context, private val render: RenderC
             0
         }
         val meta = extractRawMeta(result, ch)
+        // 镜头阴影校正（LSC）可行性评估：Android 的 17×17×4 增益图（R/Gr/Gb/B 平面），
+        // 中心≈1、越靠边越大 —— 用于判断"是否做 LSC"（DNG 的 GainMap 同源，实测角落
+        // 增益可达 3.4，即边缘原始亮度只有中心的 ~30%）。
+        result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.let { m ->
+            val rows = m.rowCount
+            val cols = m.columnCount
+            if (rows > 2 && cols > 2) {
+                fun g(y: Int, x: Int) = m.getGainFactor(0, x, y)  // 通道 0 = R
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "raw.lsc",
+                    kv(
+                        "grid" to "${cols}x${rows}",
+                        "mode" to (result.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE) ?: -1),
+                        "center" to "%.3f".format(g(rows / 2, cols / 2)),
+                        "corner" to "%.3f".format(g(0, 0)),
+                        "cornerBR" to "%.3f".format(g(rows - 1, cols - 1)),
+                    ),
+                )
+            }
+        }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",
             kv(
