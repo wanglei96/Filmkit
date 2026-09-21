@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-09-20 10:50
+updated: 2026-09-21 00:10
 status: active
 ---
 
@@ -20,7 +20,7 @@ status: active
 
 ## 进行中
 
-- [2026-09-20] **M3 RAW 质量与性能（主线）** | 基建已交付（raw.render 分段计时 + tools/validate-shaders.sh 静态校验）；下一步 M3-1 RCD 去马赛克（研读 PhotonCamera 结构+论文自写，GPL 隔离；bilinear A/B）| 无卡点
+- [2026-09-21] **M3 RAW 质量与性能（主线）** | M3-1 RCD 质量档已完成并真机验收（477ms ≤900ms、颜色与 bilinear 一致，v0.5.28–31）；下一步 **M3-2 降噪优化（用户点名）** + 基准色彩内核/高光重建（治整体发灰）| handoffs/RCD色偏修复收官M3降噪待优化.memo.md
 - [2026-09-20] 变焦轮盘优化 | 已搁置（UI 收敛），灵敏度参数待手感反馈 | handoffs/UI收敛与成像专项v0.5.10至v0.5.19.memo.md
 - [2026-09-20] 色温估计校准精校 | 待 M3 灰卡+标准光源（WB_CAL_R=0.923/WB_CAL_B=1.238 单点推得）；601 解码已定论 | facts.md
 - [2026-09-19] MF 滑杆手感复验 | 待真机 | project.md
@@ -28,7 +28,8 @@ status: active
 
 ## 已完成（近期）
 
-- [2026-09-20] **M2 全部完成（含 M2-3 RAW 端到端 v0.5.20–21）**：RAW_SENSOR 采集 + DngCreator 底片 + 引擎 submitRaw（R16UI→黑阶/WB/bilinear/CCM→汇流胶片链）；真机收敛（CCM 转置品红已修、DNG orientation 已修、M 档快捷开关 raw_mode 与 DNG 解耦）；唯一尾巴 DNG Lightroom 打开待用户确认
+- [2026-09-21] **M3-1 RCD 质量档去马赛克（v0.5.28–31）**：三段 fragment 管线（方向场/G@RB/色度+CCM）+ 质量档开关；真机 477ms 达标；连修 G 位填充 Bayer 结构错（饱和度减半）与 CFA LUT 位序反（发红）两 bug，用户确认颜色已一致；算法出处更正（Luis Sanz Rodriguez 开源算法，非"Karacan 论文"）
+- [2026-09-20] **M2 全部完成（含 M2-3 RAW 端到端 v0.5.20–21）**：RAW_SENSOR 采集 + DngCreator 底片 + 引擎 submitRaw（R16UI→黑阶/WB/bilinear/CCM→汇流胶片链）；真机收敛（CCM 转置品红已修、DNG orientation 已修、M 档快捷开关 raw_mode 与 DNG 解耦）；DNG 已验证可打开（M2 尾巴关闭）
 - [2026-09-20] 底部 UI 四轮重构（v0.5.22–26）：预览框 weight(1f, fill=false) 自适应、瓦片移出预览框单行、快门/图库上移；画幅 prefs 持久化
 - [2026-09-20] M3 基建（v0.5.27）：raw.render 分段计时（≤900ms 出口度量）+ shader 构建期静态校验（tools/validate-shaders.sh，8/8 过）
 - [2026-09-20] 开源对标调研固化（PhotonCamera GPL 隔离/降噪 SOTA/Filmic RGB/多帧边界结论）→ 开发计划 M3 节

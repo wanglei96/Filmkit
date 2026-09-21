@@ -1,8 +1,8 @@
 ---
 summary: M2完成M3开工RAW端到端交付
 created: 2026-09-20 17:05
-updated: 2026-09-20 17:05
-status: active
+updated: 2026-09-21 00:10
+status: absorbed
 ---
 
 # M2完成M3开工RAW端到端交付

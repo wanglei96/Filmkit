@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-18 10:20
+updated: 2026-09-21 00:10
 status: active
 ---
 
@@ -38,3 +38,7 @@ status: active
 - [2026-09-20] **降噪两步走** — M3 传统 RAW 域守 ≤900ms；NN 降噪+多帧融合 M6 后立项评估（夜景一流的必经之路）
 - [2026-09-20] **胶片内核 M3 补 norm-controlled 高光处理**（Filmic RGB/AgX 思路自研）；风格层=中性基准+LUT 架构不变，M4 吃社区 CLUT 资产
 - [2026-09-20] **成片样张与本地工具二进制不入库** — FILMKIT_*.jpg/dng、tools/bin/ 进 gitignore
+- [2026-09-20] **RCD 单趟三段 fragment 管线**（P1 方向场+LPF / P2 G@RB / P3 色度+CCM）— 中间图 RGBA16F、WB 线性化前置；无迭代（参考实现本就单趟）；bilinear 保留 A/B
+- [2026-09-20] **质量档 prefs demosaic_quality 默认 RCD** — submitRaw 加 demosaic 参数贯通；raw.render 日志加 demosaic/dirMs/gMs
+- [2026-09-20] **性能取向：中间量预计算全图复用** — 方向场/低通图 P1 一次算完（预归一化），后续 pass 1-tap 读取；CFA 相位 uniform 查表；两项式梯度——12MP RCD 1969→417ms
+- [2026-09-21] **M3-2 降噪为下一步主线（用户点名"降噪效果待优化"）** — RAW 域传统方法守 ≤900ms 预算；NN+多帧仍 M6 后

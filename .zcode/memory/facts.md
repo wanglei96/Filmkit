@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-19 22:30
+updated: 2026-09-21 00:10
 status: active
 ---
 
@@ -45,3 +45,7 @@ status: active
 - [2026-09-20] X300 RAW result 键真机确认回填：SENSOR_NEUTRAL_COLOR_POINT（如 0.4895/1.0/0.671）、COLOR_CORRECTION_TRANSFORM（对角 ~1.5/1.14）、SENSOR_DYNAMIC_BLACK_LEVEL（64×4）、白阶 1023；raw.meta 日志可核对
 - [2026-09-20] raw.render 日志：uploadMs/passMs/totalMs（glFinish 后计时，真实端到端）；M3 性能出口=12MP 全链路 ≤900ms（标准档）
 - [2026-09-20] shader 校验：tools/validate-shaders.sh（提取 FrameRenderer.cpp 全部 GLSL 按 vert/frag 交 glslang）；本地二进制 tools/bin/glslang（16.6.0，gitignore）；发版前必跑
+- [2026-09-21] 发布现状：最新 v0.5.31-m3（versionCode 62，tag 已推送）；RCD 质量档已验收（477ms/颜色一致），M3-2 降噪为下一步
+- [2026-09-21] prefs 键新增：demosaic_quality（bool，默认 true=RCD 质量档；false=bilinear 快速档）；设置页「RAW 去马赛克」行
+- [2026-09-21] raw.render 日志字段：uploadMs/passMs/totalMs/w/h + demosaic("rcd"/"bilinear") + RCD 时 dirMs/gMs（真机实测 477ms = dir 58 + g 7 + 色度胶片 ~238 + 上传 ~30 + 读回 ~150）
+- [2026-09-21] RCD 管线资源：新增纹理 tex_dir_/tex_g_（RGBA16F，raw 尺寸）、程序 prog_rcd_dir_/g_/chroma_；shader 共 11 条（校验脚本 11/11）；CFA LUT uCfaLut 由 cfaLutOf 编码（k0..k3 依次在 bits 0/2/4/6，GRBG=0x61）
