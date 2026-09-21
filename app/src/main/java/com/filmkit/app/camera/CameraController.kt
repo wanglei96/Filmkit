@@ -681,11 +681,12 @@ class CameraController(private val context: Context, private val render: RenderC
         lookPref = -1.0  // 同上，[31]
         hlPref = -1.0    // 同上，[29]
         zebraPref = -1.0 // 同上，[30]
+        lutStrengthPref = -1.0 // 同上，[34]
         applyTonePref()
         applyHlPref()
         applyZebraPref()
         applyLookPref()
-        applyLookPref()
+        applyLutStrengthPref()
     }
 
     private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
@@ -693,6 +694,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private var hlPref = -1.0
     private var zebraPref = -1.0
     private var lookPref = -1.0
+    private var lutStrengthPref = -1.0
     private var calibLogged = false
 
     /**
@@ -723,6 +725,19 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != lookPref) {
             lookPref = v
             filmParams[31] = v
+        }
+    }
+
+    /**
+     * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量）。
+     * 与上述开关同款「偏好覆盖」：UI 只写 prefs，提交前统一回写数组 ——
+     * 预览 / YUV 静拍 / RAW 静拍三条路径共用同一数组，故所见即所得。
+     */
+    private fun applyLutStrengthPref() {
+        val v = appPrefs.getFloat("lut_strength", 1f).toDouble().coerceIn(0.0, 1.0)
+        if (v != lutStrengthPref) {
+            lutStrengthPref = v
+            filmParams[34] = v
         }
     }
 
@@ -985,6 +1000,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyHlPref()
                     applyZebraPref()
                     applyLookPref()
+                    applyLutStrengthPref()
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
                         orientationStep, filmParams, fillTest,
@@ -1076,6 +1092,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHlPref()
         applyZebraPref()
         applyLookPref()
+        applyLutStrengthPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1176,6 +1193,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHlPref()
         applyZebraPref()
         applyLookPref()
+        applyLutStrengthPref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             if (bytes != null) saveJpeg(bytes, w, h)

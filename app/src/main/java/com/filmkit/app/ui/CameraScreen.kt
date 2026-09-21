@@ -131,6 +131,7 @@ import kotlin.math.log10
 import kotlin.math.pow
 import kotlin.math.roundToLong
 import kotlin.math.roundToInt
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -280,6 +281,8 @@ fun CameraScreen(
     // 选中项持久化；解析在 IO 线程（35937 行 ≈ 数十毫秒），纹理随会话重建由 controller 重传。
     var lutId by rememberSaveable { mutableStateOf(prefs.getString("lut_id", null)) }
     var lutPending by remember { mutableStateOf<LutLibrary.Entry?>(null) }
+    // LUT 强度（§6 节点 opacity）：只写 prefs，CameraController 每帧回写 FilmParams[34]
+    var lutStrength by rememberSaveable { mutableFloatStateOf(prefs.getFloat("lut_strength", 1f)) }
     LaunchedEffect(Unit) {
         // 启动恢复：按 prefs 的选择重新加载（切镜头/重进相机后引擎纹理已被释放）
         lutId?.let { id -> LutLibrary.byId(id)?.let { lutPending = it } }
@@ -1036,6 +1039,11 @@ fun CameraScreen(
                     LutMenu(
                         presetIdx = presetIdx,
                         lutId = lutId,
+                        lutStrength = lutStrength,
+                        onStrength = { v ->
+                            lutStrength = v
+                            prefs.edit().putFloat("lut_strength", v).apply()
+                        },
                         onPick = { i ->
                             presetIdx = i
                             controller.setFilmParams(CameraPresets.byIndex(i))
@@ -1645,8 +1653,10 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
 private fun LutMenu(
     presetIdx: Int,
     lutId: String?,
+    lutStrength: Float,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
+    onStrength: (Float) -> Unit,
 ) {
     Column(
         Modifier
@@ -1688,6 +1698,38 @@ private fun LutMenu(
         MenuRow("无", selected = lutId == null) { onPickLut(null) }
         LutLibrary.builtIn.forEach { e ->
             MenuRow(e.label, selected = lutId == e.id) { onPickLut(e) }
+        }
+        // 强度（仅选中 LUT 时有意义）：拖到 0 = 旁路，用于在风格与噪声之间权衡
+        if (lutId != null) {
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "强度",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 11.sp,
+                    fontFamily = FilmTheme.Mono,
+                )
+                androidx.compose.material3.Slider(
+                    value = lutStrength,
+                    onValueChange = onStrength,
+                    valueRange = 0f..1f,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 8.dp),
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = FilmTheme.Cream,
+                        activeTrackColor = FilmTheme.Accent,
+                        inactiveTrackColor = FilmTheme.ChipBorder,
+                    ),
+                )
+                Text(
+                    "${(lutStrength * 100).roundToInt()}%",
+                    color = FilmTheme.Accent,
+                    fontSize = 12.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
         }
     }
 }
