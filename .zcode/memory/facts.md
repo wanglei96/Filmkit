@@ -53,8 +53,8 @@ status: active
 - [2026-09-21] prefs 键新增：demosaic_quality（bool，默认 true=RCD 质量档；false=bilinear 快速档）；设置页「RAW 去马赛克」行
 - [2026-09-21] raw.render 日志字段：uploadMs/passMs/totalMs/w/h + demosaic("rcd"/"bilinear") + RCD 时 dirMs/gMs（真机实测 477ms = dir 58 + g 7 + 色度胶片 ~238 + 上传 ~30 + 读回 ~150）
 - [2026-09-21] RCD 管线资源：新增纹理 tex_dir_/tex_g_（RGBA16F，raw 尺寸）、程序 prog_rcd_dir_/g_/chroma_；shader 共 11 条（校验脚本 11/11）；CFA LUT uCfaLut 由 cfaLutOf 编码（k0..k3 依次在 bits 0/2/4/6，GRBG=0x61）
-- [2026-09-21] 发布现状：最新 **v0.5.42-m3（versionCode 73，tag 已推送）**；本窗口连发 v0.5.33–42（降噪两档→色彩内核→高光重建→斑马纹→调研探针）
-- [2026-09-21] **FilmParams 契约 31 项**（DoubleArray，Kotlin=ui/CameraPresets.kt）：28=基准影调强度、29=高光重建 hl_recon、30=过曝提示 zebra_thr(0.95)；引擎按实际长度读取（下限 26）
+- [2026-09-22] 发布现状：最新 **v0.6.8-m4（versionCode 88）**；本窗口发 v0.5.48-m3（EXIF）→ v0.6.0…v0.6.8-m4（M4-1 全链路）。**tag 规则：每轮对话只打一个 tag（验收版）**、中间验证包不打；远端当前仅 4 个 tag：v0.5.27-m2 / v0.5.47-m3 / v0.5.48-m3 / v0.6.8-m4
+- [2026-09-22] **FilmParams 契约 35 项**（DoubleArray，Kotlin=ui/CameraPresets.kt）：28=基准影调强度、29=高光重建 hl_recon、30=过曝提示 zebra_thr(0.95)、31..33=色彩外观层、**34=LUT 强度**（0=旁路）；引擎按实际长度读取（下限 26）
 - [2026-09-21] prefs 键新增：base_tone（bool，默认 true，基准影调）、hl_recon（bool，默认 true，高光重建仅 RCD）、zebra（bool，默认 true，过曝斑马纹；开关在快捷面板，日志 quick.zebra）
 - [2026-09-21] 降噪两档定稿参数：标准 P0 srK 0.28 / P4 scK 2.20、强 P0 2.20 / P4 2.60；raw.render 记 dn/srK/scK/ns/nsHal/dnMs
 - [2026-09-21] 色彩内核参数（kFsFilm baseTone）：黑点 0.0020 / 枢轴 0.2184（线性 0.22）/ p 1.20 / 中间调 gamma 0.90；高光去饱和 smoothstep(0.85,1.30,n0) 向峰值收敛；raw.render 记 tone/hl
@@ -67,5 +67,7 @@ status: active
 - [2026-09-21] **实时直方图（v0.5.44）**：`kFsHist` + `FrameRenderer::histogram(int*,int)`（渲染线程，256×96 RGBA8 + readPixels + 256 桶）；JNI `nativeEngineHistogram(IntArray)`；UI 在 IO 线程 ~7fps 轮询（`RenderClient.pollHistogram`）+ Canvas 峰值开方压缩；prefs `histogram`
 - [2026-09-21] **DNG 标准色彩链（v0.5.46）**：`app/src/main/java/com/filmkit/app/camera/StdColorMatrix.kt`（X2S = XYZ D50→线性 sRGB 常量；只支持 illuminant 21/D65 与 17/A）；`prefs ccm_std` 默认开，日志 `settings.ccm_std`、`raw.meta.ccmSrc=std|hal`；真机实测 std 矩阵 = 1.622,-0.554,-0.068,-0.141,1.343,-0.202,0.008,-0.576,1.568
 - [2026-09-21] **出包命名**：`filmkit-<versionName>.apk`（出包前删旧包）；`.gitignore` 的 `*.apk` 已覆盖
-- [2026-09-21] **`luts/`（未入库）**：理光负片/理光正片/富士CC/富士NC/徕卡M9/徕卡黑白 6 个 .cube（33³、~970KB），用户自备资产，商标敏感、待决策
+- [2026-09-22] **内置 LUT（已入库，M4-1）**：`app/src/main/assets/luts/` 6 个 .cube（33³、ASCII 文件名，显示名取 TITLE＝原版名、暂不中性化），仓库根 `luts/` 原件已删；`lut/CubeLut.kt` 解析（手写扫描，畸形输入抛异常）、`LutLibrary` 清单+缓存（日志 `lut.parse`）、`LutPreview` 卡片预览（固定测试图 `assets/lut-preview-src.png` × LUT 一次性生成，缓存 `filesDir/lut-preview/<key>@320.png`，日志 `lut.preview`）；引擎 `FrameRenderer::setLut`（RGBA16F 3D 纹理；**init 建 1×1×1 恒等纹理、关闭态也必须绑定**）+ kFsOut/kFsHist 内 tetrahedral 采样（接在 OETF 之后）；JNI `nativeEngineSetLut`（`EngineBridge` → `RenderClient.setLut` → `CameraController.setLut`，会话重建后 start() 自动重传）
+- [2026-09-22] prefs 键新增：`lut_id`（选中内置 LUT）、`lut_strength`（LUT 强度 0..1，默认 1）、`lut_in_name`（LUT 名写入成片文件名，默认开）、`focal_strip`（焦段条显示 `focal`|`mult`，默认 focal）；日志 `settings.lut` / `settings.lut_in_name` / `quick.focal_strip`
+- [2026-09-22] `tools/gen-lut-previews.py`：生成卡片预览用的固定测试图（默认合成场景；`--input 中性照片.jpg` 换图、`--dump DIR` 离线导出各 LUT 预览审查）；测试图来源 CC0（Wikimedia Commons "Fishmonger smiling"，许可见 `app/src/main/assets/lut-preview-src.LICENSE.txt`）
 - [2026-09-21] **色彩外观层实现（v0.5.44，参数已回中性）**：`kFsFilm` 的 `uLook`/`uLookSat`/`uLookChroma`（FilmParams[31..33]）；设置页「色彩外观层」→ prefs `color_look`

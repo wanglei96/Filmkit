@@ -73,3 +73,8 @@ status: active
 - [2026-09-21] **离线参照必须与实现同式**：Python 参照用"先插值矩阵再作用"，Kotlin 用"各光源相机白点插值"，单测立刻抓出 0.0023 偏差（> 容差）—— 用真机数据 + 离线参照的单测能提前抓实现偏差
 - [2026-09-21] **ForwardMatrix 自洽性检查**：`FM·(1,1,1)` 应等于 D50 白点 (0.9642, 1.0, 0.8251)（不是"行和=1"）；用它验证 HAL/标定矩阵可信度
 - [2026-09-21] **Gradle 构建需写工作区外的 `~/.gradle`**：DSH 沙箱 workspace-write 下直接失败（`gradle-8.13-bin.zip.lck: Operation not permitted`），需更宽权限
+- [2026-09-22] **sampler 必须始终有合法绑定（v0.6.0-m4 全黑根因）**：给既有 shader 链加 sampler3D 后，关闭态提前 return 不绑纹理 → 纹理单元残留上一个 pass 的 **2D 纹理** → Mali **预测执行**分支里的 `texelFetch` → draw 报 `GL_INVALID_OPERATION(1282)`、整帧被丢弃、全黑；构建/单测/glslang 全绿都拦不住。诊断特征：`render.diag` 里 pass1/pass2 正常而 **pass3_out glErr=1282 且 r=g=b=0**。修法＝init() 建 1×1×1 恒等纹理 + 无论开关都绑定并下发全部 uniform（与 LSC「关闭档绑 1×1 全 1 网格」同类）
+- [2026-09-22] **ExifInterface 的「兼容标签」只接受十进制数**（FNumber / DigitalZoomRatio / ExposureTime / SubjectDistance / GPSTimeStamp 走 `Double.parseDouble`）：传分数串 `"1/125"` 会 `NumberFormatException` → `Log.w` + 静默 return，标签被丢弃且无异常外露（21 张成片因此全缺 ExposureTime）
+- [2026-09-22] **Kotlin 块注释支持嵌套**：KDoc 里写 `assets/luts/*.cube` 的那个 `/*` 会开启嵌套注释、把整个文件吞进注释（报 `Unclosed comment`，且指向文件末尾而非真凶行）——写路径通配时避开 `/*`
+- [2026-09-22] **预览图分辨率必须 ≥ 显示像素**：卡片 76dp 在 3–3.5x 密度下是 228–266px，v0.6.5 输出 108px → 放大 2.2× 明显发糊；且缓存文件名要带尺寸（`<key>@320.png`），否则改了分辨率仍会读旧糊图
+- [2026-09-22] **`git filter-repo` 的 `reset --hard` 会删掉工作区副本**：本轮 3 张误提交截图因此不可恢复（GitHub 也不允许按任意 SHA fetch 旧对象）→ 重写历史前先把这些文件复制到 /tmp

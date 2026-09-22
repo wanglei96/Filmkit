@@ -1,8 +1,8 @@
 ---
 summary: LSC与标准色彩链落地及寡淡复核
 created: 2026-09-21 19:46
-updated: 2026-09-21 19:46
-status: active
+updated: 2026-09-22 10:15
+status: absorbed
 ---
 
 # LSC与标准色彩链落地及寡淡复核

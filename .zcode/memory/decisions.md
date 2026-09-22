@@ -58,3 +58,8 @@ status: active
 - [2026-09-21] **色彩外观层（原 P1）参数回中性占位** — 真机复核证明"寡淡"是 libraw 默认 auto_bright 造成的测量伪结论；浓淡属风格，按 §0-D8/D9 交 M4 理光系 LUT（开关与 FilmParams[31..33] 保留）
 - [2026-09-21] **P2 标准色彩链自建** — 用 `CameraCharacteristics` 的 ColorMatrix/ForwardMatrix 双光源 + Bradford D50→D65 自建 camera(白平衡后)→sRGB；默认开（prefs `ccm_std`）、可 A/B、标定缺失回退 HAL CCM
 - [2026-09-21] **出包命名 `filmkit-<versionName>.apk` + 新包覆盖旧包** — 更新 2026-09-18「出包单文件覆盖制」条的命名部分（仍不留历史包）
+- [2026-09-22] **每轮对话只打一个 tag（验收版）；中间验证包只出 APK 不打 tag** — 出包与打 tag 解耦（`filmkit-<versionName>.apk` 照出，tag 只在该轮收尾打一次）；本轮清理 56 个中间 tag，只留 v0.5.27-m2 / v0.5.47-m3 / v0.5.48-m3 / v0.6.8-m4，清单与恢复命令在 `docs/git-tags-backup-20260922.txt`
+- [2026-09-22] **内置 LUT 用原版名、暂不中性化**（更新 §0-D9「命名中性化待定」）— 资产文件名用 ASCII（避路径编码风险），显示名取 .cube 的 TITLE
+- [2026-09-22] **LUT 插桩＝display 域、接在输出 OETF 之后**（放在 `kFsOut` 内，同一 pass、不额外加 pass）；**`kFsHist` 必须同源**，否则选了 LUT 后直方图/斑马纹与画面不符
+- [2026-09-22] **LUT 卡片预览＝固定测试图 × 一次性生成并缓存**（编译期 / 首次运行 / 导入时），**不做实时缩略图**（每次开面板 N 次渲染 + GPU 读回，费电）
+- [2026-09-22] **误提交大文件用 `git filter-repo --invert-paths` 重写历史 + force push**；重写前**必须先备份工作区副本**（filter-repo 的 `reset --hard` 会删掉被移除路径的工作区文件）
