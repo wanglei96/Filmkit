@@ -1,0 +1,12 @@
+lut-preview-src.png —— LUT 选择页卡片预览的固定输入图
+
+来源   Wikimedia Commons, "Fishmonger smiling.jpg"
+       https://commons.wikimedia.org/wiki/File:Fishmonger_smiling.jpg
+许可   CC0 1.0 Universal（Public Domain Dedication，作者放弃全部权利）
+       https://creativecommons.org/publicdomain/zero/1.0/
+处理   中心裁方 + 缩放至 256×256（tools/gen-lut-previews.py --input ...）
+用途   仅作 App 内 LUT / 预设卡片缩略图的输入：App 运行时用它 × 各 LUT 采样一次，
+       结果缓存到 filesDir/lut-preview/，之后只读缓存（不做实时渲染，省电）。
+备注   CC0 允许自由使用与再分发、无需署名；此处署名出于礼貌。
+       若将来要替换为自有素材：`python3 tools/gen-lut-previews.py --input 你的中性照片.jpg`
+       重跑即可（必须是未套过 LUT 的 sRGB 中性图，否则会双重套用）。

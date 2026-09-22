@@ -2,6 +2,7 @@ package com.filmkit.app.ui
 
 import android.Manifest
 import android.content.Context
+import android.graphics.Bitmap
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
@@ -123,6 +124,7 @@ import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.kv
 import com.filmkit.app.lut.LutLibrary
+import com.filmkit.app.lut.LutPreview
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -285,13 +287,16 @@ fun CameraScreen(
     // LUT 强度（§6 节点 opacity）：只写 prefs，CameraController 每帧回写 FilmParams[34]
     var lutStrength by rememberSaveable { mutableFloatStateOf(prefs.getFloat("lut_strength", 1f)) }
     var lutTab by rememberSaveable { mutableIntStateOf(0) } // 选择页分类：0 = LUT，1 = 预设
-    // 选择页色卡：启动时后台预载 6 套资产并算好代表色，避免开面板时现算（解析 ≈110–170ms/套）
-    var lutSwatches by remember { mutableStateOf<Map<String, IntArray>>(emptyMap()) }
+    // 卡片预览图：启动时后台用固定测试图 × 各 LUT 生成一次并缓存（见 LutPreview），
+    // 之后开面板只读缓存 —— 一次性生成而非实时渲染，省电
+    var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     LaunchedEffect(Unit) {
-        lutSwatches = withContext(Dispatchers.IO) {
-            LutLibrary.builtIn.associate { e ->
-                e.id to (LutLibrary.load(context, e)?.let { LutLibrary.swatch(it) } ?: IntArray(0))
-            }
+        lutPreviews = withContext(Dispatchers.IO) {
+            LutLibrary.builtIn.mapNotNull { e ->
+                LutLibrary.load(context, e)?.let { lut ->
+                    LutPreview.load(context, e.id, lut)?.let { bmp -> e.id to bmp }
+                }
+            }.toMap()
         }
     }
     LaunchedEffect(Unit) {
@@ -1183,7 +1188,7 @@ fun CameraScreen(
                 presetIdx = presetIdx,
                 lutId = lutId,
                 lutStrength = lutStrength,
-                swatches = lutSwatches,
+                previews = lutPreviews,
                 onStrength = { v ->
                     lutStrength = v
                     prefs.edit().putFloat("lut_strength", v).apply()
@@ -1675,7 +1680,7 @@ private fun LutSheet(
     presetIdx: Int,
     lutId: String?,
     lutStrength: Float,
-    swatches: Map<String, IntArray>,
+    previews: Map<String, Bitmap>,
     onStrength: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
@@ -1763,13 +1768,13 @@ private fun LutSheet(
                 modifier = Modifier.padding(top = 10.dp),
             ) {
                 item {
-                    LutCard(label = "无", selected = lutId == null, colors = null) { onPickLut(null) }
+                    LutCard(label = "无", selected = lutId == null, preview = null) { onPickLut(null) }
                 }
                 items(LutLibrary.builtIn) { e ->
                     LutCard(
                         label = e.label,
                         selected = lutId == e.id,
-                        colors = swatches[e.id],
+                        preview = previews[e.id],
                     ) { onPickLut(e) }
                 }
             }
@@ -1779,7 +1784,7 @@ private fun LutSheet(
                 modifier = Modifier.padding(top = 10.dp),
             ) {
                 itemsIndexed(CameraPresets.names) { i, name ->
-                    LutCard(label = name, selected = i == presetIdx, colors = null) { onPick(i) }
+                    LutCard(label = name, selected = i == presetIdx, preview = null) { onPick(i) }
                 }
             }
         }
@@ -1810,9 +1815,9 @@ private fun SheetPill(label: String, selected: Boolean, onTap: () -> Unit) {
     }
 }
 
-/** 选择卡片：LUT 用代表色卡（纯 Kotlin 采样，无 GPU 开销），无数据/预设时显示名称 */
+/** 选择卡片：LUT 显示「固定测试图 × 该 LUT」的预览图（一次性生成并缓存，见 LutPreview）；无图时显示名称 */
 @Composable
-private fun LutCard(label: String, selected: Boolean, colors: IntArray?, onTap: () -> Unit) {
+private fun LutCard(label: String, selected: Boolean, preview: Bitmap?, onTap: () -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
             Modifier
@@ -1826,17 +1831,13 @@ private fun LutCard(label: String, selected: Boolean, colors: IntArray?, onTap: 
                 )
                 .pressScale(onTap = onTap),
         ) {
-            if (colors != null && colors.isNotEmpty()) {
-                Column(Modifier.fillMaxSize()) {
-                    colors.forEach { c ->
-                        Box(
-                            Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .background(Color(c)),
-                        )
-                    }
-                }
+            if (preview != null) {
+                Image(
+                    bitmap = preview.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
             } else {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(label, color = FilmTheme.CreamDim, fontSize = 13.sp, fontFamily = FilmTheme.Serif)
