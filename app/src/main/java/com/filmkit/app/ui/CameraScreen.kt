@@ -859,49 +859,61 @@ fun CameraScreen(
                                 Modifier
                             },
                         )
-                        .horizontalScroll(rememberScrollState(), enabled = !wheelActive),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        .fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // 倍率 = 等效焦段 / 主摄等效（主摄=1x；70mm≈2.9x、15mm≈0.6x）
-                    val baseE = remember(lensChips) { controller.mainEquiv() }
-                    val mult = zoomEquiv / baseE.coerceAtLeast(1f)
-                    if (Math.abs(mult - 1f) > 0.03f) {
-                        FilmChip(
-                            selected = false,
-                            label = "×%.1f".format(mult),
-                            transparent = true,
-                            onClick = {
-                                zoomEquiv = baseE
-                                controller.setZoomEquiv(baseE)
-                            },
-                        )
-                    }
-                    // 焦段条 = 启用镜头原生焦段 + 自定义焦段（≤3 个，设置页维护），总计 ≤6
-                    val customFocals = remember {
-                        prefs.getString("custom_focals", "")?.split(",")?.mapNotNull { it.toIntOrNull() }
-                            ?.sorted() ?: emptyList<Int>()
-                    }
-                    val chips = (lensChips + customFocals).distinct().sorted().take(6)
-                    chips.forEach { f ->
-                        val isNative = lensChips.contains(f)
-                        FilmChip(
-                            selected = Math.abs(zoomEquiv - f) < 2f,
-                            label = "$f",
-                            transparent = true,
-                            onClick = {
-                                zoomEquiv = f.toFloat()
-                                if (isNative) controller.setFocal(f) else controller.setZoomEquiv(f.toFloat())
-                            },
-                        )
-                    }
-                    Box(
+                    // 可滚动部分（倍率 + 焦段 + 分隔线）：✦ LUT 入口固定在右侧、不参与滚动
+                    // —— v0.6.7 修复：切长焦后焦段变多会把 ✦ 顶出屏幕
+                    Row(
                         Modifier
-                            .padding(horizontal = 6.dp)
-                            .width(1.dp)
-                            .height(16.dp)
-                            .background(FilmTheme.ChipBorder),
-                    )
+                            .weight(1f)
+                            .clip(RoundedCornerShape(16.dp))
+                            .horizontalScroll(rememberScrollState(), enabled = !wheelActive),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // 倍率 = 等效焦段 / 主摄等效（主摄=1x；70mm≈2.9x、15mm≈0.6x）
+                        val baseE = remember(lensChips) { controller.mainEquiv() }
+                        val mult = zoomEquiv / baseE.coerceAtLeast(1f)
+                        if (Math.abs(mult - 1f) > 0.03f) {
+                            FilmChip(
+                                selected = false,
+                                label = "×%.1f".format(mult),
+                                transparent = true,
+                                fontSize = 10.sp,
+                                onClick = {
+                                    zoomEquiv = baseE
+                                    controller.setZoomEquiv(baseE)
+                                },
+                            )
+                        }
+                        // 焦段条 = 启用镜头原生焦段 + 自定义焦段（≤3 个，设置页维护），总计 ≤6
+                        val customFocals = remember {
+                            prefs.getString("custom_focals", "")?.split(",")?.mapNotNull { it.toIntOrNull() }
+                                ?.sorted() ?: emptyList<Int>()
+                        }
+                        val chips = (lensChips + customFocals).distinct().sorted().take(6)
+                        chips.forEach { f ->
+                            val isNative = lensChips.contains(f)
+                            FilmChip(
+                                selected = Math.abs(zoomEquiv - f) < 2f,
+                                label = "$f",
+                                transparent = true,
+                                fontSize = 10.sp,
+                                onClick = {
+                                    zoomEquiv = f.toFloat()
+                                    if (isNative) controller.setFocal(f) else controller.setZoomEquiv(f.toFloat())
+                                },
+                            )
+                        }
+                        Box(
+                            Modifier
+                                .padding(horizontal = 6.dp)
+                                .width(1.dp)
+                                .height(16.dp)
+                                .background(FilmTheme.ChipBorder),
+                        )
+                    }
                     Column(
                         Modifier
                             .padding(horizontal = 4.dp)
