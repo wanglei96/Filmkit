@@ -10,8 +10,8 @@ import java.io.File
  * .cube 解析器自检（M4 §6：解析器需覆盖畸形输入）。
  *
  * 两条线索：① 合成用例钉住格式规则（顺序、DOMAIN、注释、CRLF、各类畸形）；
- * ② 真实内置资产用例钉住"6 个 .cube 真能被解析"——资产损坏要在构建期就暴露，
- * 而不是等到设备上选 LUT 时黑屏。
+ * ② 真实内置资产用例钉住"二进制资产真能被解析"——资产损坏要在构建期就暴露，
+ * 而不是等到设备上选 LUT 时黑屏。ASCII .cube 解析器（用户导入导出用）继续由合成用例覆盖。
  */
 class CubeLutParserTest {
 
@@ -109,29 +109,55 @@ class CubeLutParserTest {
         assertTrue(early, early.contains("之前"))
     }
 
-    /** 内置资产端到端：6 个 33³ 全部可解析、端点为黑/白（资产坏掉不该等到设备上才发现） */
+    /** 内置资产端到端：33³ 二进制资产全部可解析、端点为黑/白（资产坏掉不该等到设备上才发现） */
     @Test
     fun parsesBundledAssets() {
         val dir = File("src/main/assets/luts")
         assumeTrue("工作目录看不到内置资产：${File(".").absolutePath}", dir.isDirectory)
-        val files = dir.listFiles { f -> f.name.endsWith(".cube") }?.sortedBy { it.name }.orEmpty()
-        assertEquals(6, files.size)
+        val files = dir.listFiles { f -> f.name.endsWith(".lut") }?.sortedBy { it.name }.orEmpty()
+        assertTrue("内置资产数偏少：${files.size}", files.size >= 40)
         for (f in files) {
-            val l = CubeLutParser.parse(f.readText(), f.name)
+            val bytes = f.readBytes()
+            val l = CubeLutParser.parseBinary(bytes, f.name)
             assertEquals(f.name, 33, l.size)
             assertEquals(f.name, 33 * 33 * 33 * 3, l.data.size)
-            assertTrue(f.name, l.data[0] < 0.05f)
-            assertTrue(f.name, l.data.last() > 0.9f)
+            // 只做"资产没坏"的通用检查：端点阈值本质是风格假设，会误报
+            // （Fuji-ACROS 白点 0.835、Kodak-5203 首点 R 0.118 = 电影负片抬黑）。
+            // "不是常数"足以抓住全零/截断的坏文件。
+            assertTrue(f.name, l.data.max() - l.data.min() > 0.3f)
             assertTrue("${f.name} TITLE 缺失", l.title.isNotBlank())
+            // 头部元数据（列表渲染依赖）：显示名与分类都不能为空
+            val tl = bytes[1].toInt() and 0xFF
+            assertTrue("${f.name} 显示名缺失", tl > 0)
+            assertTrue("${f.name} 分类缺失", (bytes[2 + tl].toInt() and 0xFF) > 0)
         }
+    }
+
+    /** 二进制头/长度畸形必须抛异常：内置资产格式坏掉要在构建期暴露，不静默降级 */
+    @Test
+    fun rejectsMalformedBinary() {
+        val good = File("src/main/assets/luts/fuji_cc.lut")
+        assumeTrue("工作目录看不到内置资产", good.isFile)
+        val bytes = good.readBytes()
+        val head = expectFailure { CubeLutParser.parseBinary(bytes.copyOf(10)) }
+        assertTrue(head, head.contains("截断") || head.contains("数据不足"))
+        val short = expectFailure { CubeLutParser.parseBinary(bytes.copyOf(bytes.size - 1)) }
+        assertTrue(short, short.contains("数据不足"))
+        val tiny = expectFailure { CubeLutParser.parseBinary(byteArrayOf(1, 0)) }
+        assertTrue(tiny, tiny.contains("超出范围"))
+        val empty = expectFailure { CubeLutParser.parseBinary(ByteArray(1)) }
+        assertTrue(empty, empty.contains("过短"))
+        // TITLE 缺失（titleLen=0、catLen=0）时回退调用侧给的显示名
+        val blank = ByteArray(3 + 33 * 33 * 33 * 3).also { it[0] = 33 }
+        assertEquals("fallback", CubeLutParser.parseBinary(blank, "fallback").title)
     }
 
     /** 黑白 LUT 的 R=G=B 是中性灰——顺带验证"红最快"的数据顺序没被颠倒 */
     @Test
     fun monochromeAssetIsNeutral() {
-        val f = File("src/main/assets/luts/leica_bw.cube")
+        val f = File("src/main/assets/luts/leica_b_w_true.lut")
         assumeTrue("工作目录看不到内置资产", f.isFile)
-        val l = CubeLutParser.parse(f.readText(), f.name)
+        val l = CubeLutParser.parseBinary(f.readBytes(), f.name)
         val idx = ((7 * 33 + 11) * 33 + 23) * 3 // 任取一个内部格点
         assertEquals(l.data[idx], l.data[idx + 1], 1e-6f)
         assertEquals(l.data[idx], l.data[idx + 2], 1e-6f)

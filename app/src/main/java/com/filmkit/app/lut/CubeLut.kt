@@ -91,6 +91,36 @@ object CubeLutParser {
     }
 
     /**
+     * 二进制内置资产解析（`assets/luts/ 下的 .lut`，由 `tools/gen-lut-assets.py` 生成）：
+     * `[size:1][titleLen:1][title][catLen:1][category][size³×3 RGB(uint8)]`。
+     *
+     * **内置打包格式与用户交换格式是两件事**：42 个 33³ 资产用 ASCII .cube 要 40MB，
+     * uint8 只要 4.3MB；源 LUT 数据本身是 8-bit 精度（值落在 1/255 或 1/512 网格）、
+     * 成片也是 8-bit JPEG，量化误差 ≤0.5 LSB 在成片上不可见。
+     * §6.2 的 .cube 导入导出不受影响 —— 见 [parse]。
+     *
+     * 本函数只取 LUT 数据；title/category 由 [LutLibrary] 单独读头部（列表渲染不需要整表）。
+     */
+    fun parseBinary(bytes: ByteArray, fallbackTitle: String = "LUT"): CubeLut {
+        require(bytes.size >= 2) { "资产过短：${bytes.size} 字节" }
+        val size = bytes[0].toInt() and 0xFF
+        require(size in 2..MAX_SIZE) { "LUT_3D_SIZE 超出范围：$size" }
+        val titleLen = bytes[1].toInt() and 0xFF
+        require(bytes.size >= 3 + titleLen) { "头部截断：${bytes.size} 字节" }
+        val catLen = bytes[2 + titleLen].toInt() and 0xFF
+        val need = 3 + titleLen + catLen + size * size * size * 3
+        require(bytes.size >= need) { "数据不足：期望 $need 字节，实得 ${bytes.size}" }
+        val title = if (titleLen > 0) String(bytes, 2, titleLen, Charsets.UTF_8) else ""
+        val data = FloatArray(size * size * size * 3)
+        val o = 3 + titleLen + catLen
+        for (i in data.indices) data[i] = (bytes[o + i].toInt() and 0xFF) / 255f
+        return CubeLut(
+            title.takeIf { it.isNotEmpty() } ?: fallbackTitle,
+            size, data, floatArrayOf(0f, 0f, 0f), floatArrayOf(1f, 1f, 1f),
+        )
+    }
+
+    /**
      * 取 [count] 个浮点。手写扫描而非 split(Regex)：内置资产是 35937 个数据行，
      * 正则拆分在加载时是纯浪费（解析只做一次，但要占用首帧时间）。
      *
