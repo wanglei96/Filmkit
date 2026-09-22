@@ -26,6 +26,9 @@ from PIL import Image, ImageDraw
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUT_DIR = os.path.join(ROOT, "app/src/main/assets/luts")
 SRC_OUT = os.path.join(ROOT, "app/src/main/assets/lut-preview-src.png")
+# 卡片显示 76dp：3–3.5x 密度下是 228–266px，取 320 留余量。
+# （v0.6.5 曾用 108px → 放大后明显发糊，见 docs v0.6.6 节）
+SRC_SIZE = 320
 
 
 def synth_scene(n=256):
@@ -134,16 +137,16 @@ def main():
         w, h = src.size
         s = min(w, h)
         src = src.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
-        base = np.asarray(src.resize((256, 256), Image.LANCZOS), dtype=np.float32) / 255.0
+        base = np.asarray(src.resize((SRC_SIZE, SRC_SIZE), Image.LANCZOS), dtype=np.float32) / 255.0
         print(f"输入：{args.input}")
     else:
-        base = synth_scene(256)
+        base = synth_scene(SRC_SIZE)
         print("输入：合成测试场景（肤色 / 天空 / 植被 / 暖木 / 灰阶条）")
 
     os.makedirs(os.path.dirname(SRC_OUT), exist_ok=True)
     src_im = Image.fromarray((np.clip(base, 0, 1) * 255 + 0.5).astype(np.uint8))
-    if src_im.size != (256, 256):
-        src_im = src_im.resize((256, 256), Image.LANCZOS)
+    if src_im.size != (SRC_SIZE, SRC_SIZE):
+        src_im = src_im.resize((SRC_SIZE, SRC_SIZE), Image.LANCZOS)
     src_im.save(SRC_OUT, optimize=True)
     print(f"测试图 → {os.path.relpath(SRC_OUT, ROOT)}  ({os.path.getsize(SRC_OUT) / 1024:.1f} KB)")
     print("App 运行时用它 × 各 LUT 生成卡片图并缓存（内置与用户导入同一路径，见 LutPreview.kt）")

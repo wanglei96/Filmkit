@@ -23,14 +23,16 @@ import kotlin.math.roundToInt
 object LutPreview {
 
     private const val SRC_ASSET = "lut-preview-src.png"
-    private const val SRC_SIZE = 256
-    private const val OUT_SIZE = 108
+    // 320：卡片 76dp 在 3–3.5x 密度下是 228–266px。v0.6.5 曾缩到 108px 输出，
+    // 显示时被放大 2 倍多 → 明显发糊（用户反馈）。现在**不缩放**，直接输出源尺寸。
+    private const val SRC_SIZE = 320
 
     private var srcPixels: IntArray? = null
 
     /** 取预览图：命中缓存直接解码；否则用测试图采样生成并落盘。IO 线程调用。 */
     fun load(context: Context, key: String, lut: CubeLut): Bitmap? {
-        val f = File(File(context.filesDir, "lut-preview"), "$key.png")
+        // 文件名带尺寸：改了预览分辨率就自动失效旧缓存（否则会读到放大的糊图）
+        val f = File(File(context.filesDir, "lut-preview"), "$key@$SRC_SIZE.png")
         if (f.isFile) {
             runCatching { BitmapFactory.decodeFile(f.absolutePath) }.getOrNull()?.let { return it }
         }
@@ -101,11 +103,9 @@ object LutPreview {
             }
             out[i] = (0xFF shl 24) or (to255(a0) shl 16) or (to255(a1) shl 8) or to255(a2)
         }
-        val big = Bitmap.createBitmap(SRC_SIZE, SRC_SIZE, Bitmap.Config.ARGB_8888)
-        big.setPixels(out, 0, SRC_SIZE, 0, 0, SRC_SIZE, SRC_SIZE)
-        val small = Bitmap.createScaledBitmap(big, OUT_SIZE, OUT_SIZE, true)
-        if (small !== big) big.recycle()
-        return small
+        val bm = Bitmap.createBitmap(SRC_SIZE, SRC_SIZE, Bitmap.Config.ARGB_8888)
+        bm.setPixels(out, 0, SRC_SIZE, 0, 0, SRC_SIZE, SRC_SIZE)
+        return bm
     }
 
     private fun to255(v: Float): Int = (v.coerceIn(0f, 1f) * 255f).roundToInt()
