@@ -63,3 +63,10 @@ status: active
 - [2026-09-22] **LUT 插桩＝display 域、接在输出 OETF 之后**（放在 `kFsOut` 内，同一 pass、不额外加 pass）；**`kFsHist` 必须同源**，否则选了 LUT 后直方图/斑马纹与画面不符
 - [2026-09-22] **LUT 卡片预览＝固定测试图 × 一次性生成并缓存**（编译期 / 首次运行 / 导入时），**不做实时缩略图**（每次开面板 N 次渲染 + GPU 读回，费电）
 - [2026-09-22] **误提交大文件用 `git filter-repo --invert-paths` 重写历史 + force push**；重写前**必须先备份工作区副本**（filter-repo 的 `reset --hard` 会删掉被移除路径的工作区文件）
+- [2026-09-22] **提亮改用线性域曝光，不用幂提亮**（v0.6.17）— `pow(x,g)` 是"抬暗部"（降对比）的旋钮（线性域 0.01 放大 2.35×、0.5 只放大 1.13×），`x*exp2(ev)` 才是亮度旋钮。三个旋钮至此正交：`ev` 亮度 / `p` 对比 / `blk` 黑位
+- [2026-09-22] **自适应影调默认开、可关**（v0.6.18，`FilmParams[35]`，设置页「自适应影调」）— 真机三场景场景白点（显示域 P95）普遍偏低，暗场景要 +1.2EV、亮场景只能承受 +0.3EV，**差 4 倍**，固定补偿无解；白点取 **P95**（P90 会把增益打满上限 4.0×、P99 被小面积高光骗）；增益限幅 [1,4]× 只提亮不压暗；统计放在 `passFilm` 内使预览/YUV 静拍/RAW 静拍三路径共用
+- [2026-09-22] **高光软肩的 knee 必须与增益目标白点对齐**（v0.6.19）— knee 低于目标白点等于让"正常亮部"也落进压缩区（v0.6.18 的 knee 0.75 < 目标 0.90，把 L\*75–85 段梯度从 4.00 压到 0.00）；曲线用指数软肩 `1-exp(-u)`（l=1.0 处斜率 0.37）而非 `t/(1+t)`（0.25）
+- [2026-09-22] **饱和/外观类改动只能用"有边界"的手段** — `look_sat`（全局乘性增益）保持 1.0；色度 S 曲线（`look_chroma`）只放大已浓的色。v0.6.14 用全局 1.5× 补 C\* 时把白平衡残余暖偏同比放大（白墙 b\* +1.63→+2.31）—— 乘性放大器不分"该放大的色"与"该保留的误差"
+- [2026-09-22] **LUT 插桩位置（display 域、输出 OETF 之后）确认正确** — 独立调研核实 PhotonCamera 的预览链 `LutRenderer` 与成片链 `LutImageProcessor` 都在**非线性 sRGB 显示域**，其 `.plut`/`.cube` 的 curve 默认 SRGB、gamut 默认 SRGB，入口变换链 `srgbToLinear → applyLutColorSpace(identity) → applyLutCurve(linearToSrgb)` **恒等抵消**
+- [2026-09-22] **不做"理光/徕卡引擎"，也不照搬 `RawProfile`** — PhotonCamera 的 8 个引擎（AdobeCurve/Hncs/Lumix/Canon/AgX/Spektrafilm/Sigmoid/Filmic）里**没有理光/徕卡**（徕卡仅是 Lumix 的一个 PhotoStyle）；其 `RawProfile`（色彩空间+log+基线 LUT）经核实**是未接线代码**（`rawLut` 指向不存在的 assets、`setColorSpace`/`setLogCurve` 无调用者）
+- [2026-09-22] **调研文档入库 `docs/research/`**（不放 `handoff/`）— `handoff/` 在 .gitignore 内，报告放那里不会被 git 跟踪

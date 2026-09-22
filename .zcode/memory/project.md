@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-09-21 19:46
+updated: 2026-09-22 20:00
 status: active
 ---
 
@@ -16,22 +16,23 @@ status: active
 - `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（渲染线程）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）
 - `core/engine/`：C++20 引擎——pipeline/（FrameRenderer 三段链）、gl/、spike/、log/（JSONL+GPU 计时）、jni/Bridge.cpp
 - `core/engine/src/yuv/` 已删除（RG8 上传在 Mali 静默失败，预览改 SurfaceTexture 路径）
-- `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md
-- `app/src/main/assets/luts/`：6 个内置 .cube（理光负片/正片、富士CC/NC、徕卡M9/黑白，33³，**原版名**）＋ `lut-preview-src.png`（卡片预览的固定测试图，CC0，见同名 LICENSE）
+- `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、**research/（11 份独立调研报告：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR）**
+- `app/src/main/assets/luts/`：**42 个内置 .lut（uint8 二进制、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`，中文显示名 + 品牌分类写在头部；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py` 重采样）＋ `lut-preview-src.png`（卡片预览固定测试图，CC0）
 - `app/src/main/java/com/filmkit/app/lut/`：`CubeLut`（解析）/ `LutLibrary`（清单+缓存）/ `LutPreview`（卡片预览：一次性生成 + 磁盘缓存）
-- `tools/`：validate-shaders.sh、check-lsc-mapping.py、dng-color-dump.py、color-metrics.py、gen-lut-previews.py
+- `tools/`：validate-shaders.sh、check-lsc-mapping.py、dng-color-dump.py、color-metrics.py、gen-lut-previews.py、**gen-lut-assets.py（64³ cube → 33³ 二进制资产）**、**tone-scan.py（成片反推 baseTone 输入 + 参数扫描 + 对照图）**、lut-audit.py
 
 ## 进行中
 
-- [2026-09-22] **M4 资产系统（主线）** | **M4-1 内置 LUT ✅（v0.6.0→v0.6.8-m4）**：6 个 .cube 入库、纯 Kotlin 解析、display 域四面体插桩、强度滑杆、卡片预览、选择页底部弹出 → **下一步＝色彩专项**（用户对现 LUT 效果不满意），随后 .cube/Hald 导入导出、65³ 融合烘焙、预设包 | handoffs/M4内置LUT引擎落地与tag规则收紧.memo.md
-- [2026-09-22] **色彩专项（待启动）** | 用户明确要开新窗口做；起手三件事：LUT 域假设核对、强度混合曲线、基准链与 LUT 职责边界 | handoffs/M4内置LUT引擎落地与tag规则收紧.memo.md
-- [2026-09-22] **LUT 噪点待收口** | 用户反馈开 LUT 后彩噪/亮噪明显增加；离线算得 LUT 放大率仅 0.67–1.30×，缺同场景 A/B（强度滑杆 0% vs 100%）→ 用户说"先不动" | facts.md
-- [2026-09-20] 变焦轮盘优化 | 已搁置（UI 收敛），灵敏度参数待手感反馈
+- [2026-09-22] **基础色彩引擎（主线）** | 真机实测"发闷/色彩淡"根因在基础引擎而非 LUT。已完成 v0.6.9→**v0.6.20-m4**（LUT 资产 42 个 + 中文分类、Material3 暗色主题、baseTone 旋钮正交化、自适应影调、高光软肩、色度降噪与 S 曲线修正）→ **下一步＝调研定案的四项修正**（sRGB 分段 OETF / 色度 knee 0.25→0.12 / 区域加权 AE+切镜头重置 / LUT 采样纹素中心校正）| handoffs/基础色彩引擎实测调优与独立调研定案.memo.md
+- [2026-09-22] **色彩专项（已启动）** | 原三件起手事已答：① 域假设**正确**（LUT 接 display 域、OETF 之后，与 PhotonCamera 同域）② 强度混合曲线**现状已最优**（编码域线性 mix = 感知均匀）③ 职责边界：真正缺的是"基础引擎把 RAW 变成正常照片"这一层 | 同上快照
+- [2026-09-22] **噪点待收口（升级为 MFNR 议题）** | 提亮 1.1EV 使色度 σ +84%；单帧降噪已到瓶颈，根治要**多帧融合** | 同上快照
 - [2026-09-20] 色温估计校准精校 | 待灰卡 + 标准光源（WB_CAL_R=0.923/WB_CAL_B=1.238 单点推得）| facts.md
 - [2026-09-19] MF 滑杆手感复验 | 待真机
 
 ## 已完成（近期）
 
+- [2026-09-22] **基础色彩引擎调优（v0.6.9–v0.6.20-m4）**：42 个 LUT 资产（中文名+品牌分类+可增删分类，强度上限 150%）；Material3 暗色主题（根因是 `MainActivity` 空的 `MaterialTheme{}`）；`baseTone` 旋钮正交化（删 `g` 幂提亮 → 线性域曝光，`ev`/`p`/`blk` 各管一亮/对比/黑位）；**自适应影调**（场景显示域 P95 → 线性增益，限幅 [1,4]×，EMA；设置页可关）；**高光软肩滚降**（`clamp` → 指数软肩 + 去饱和）；P4 色度降噪 3.25/2.75、`look_chroma` 1.25；`raw.calib` 按 cameraId 各记一条
+- [2026-09-22] **独立调研定案**：4 路并行 + ISP 补跑，核实 PhotonCamera 的 LUT 链路（预览/成片都在非线性 sRGB 显示域）、无"理光/徕卡引擎"、`RawProfile` 是未接线代码；拿到 darktable/RawTherapee/AgX/ACES/libplacebo 的做法与 HDR+/Night Sight/libcamera 一手参数
 - [2026-09-22] **M4-1 内置 LUT 引擎（v0.6.0–v0.6.8-m4）**：6 个 .cube 入库为内置 LUT（原版名）、纯 Kotlin 解析器 + 单测、引擎 RGBA16F 3D 纹理 + tetrahedral 插值（接在输出 OETF 之后，kFsHist 同源）、强度滑杆、卡片预览（固定测试图一次性生成 + 缓存）、选择页底部弹出、焦段条单信息与悬浮菜单 3 列；期间修 sampler 未绑定导致的全黑回归与 EXIF 曝光时间静默丢弃
 - [2026-09-22] **仓库治理**：tag 规则改「每轮对话一个 tag」并清理 56 个中间 tag；`git filter-repo` 移除误提交的 3 张截图（仓库 25M→13M）
 - [2026-09-21] **M3 画质四件（v0.5.43–v0.5.47）**：P0 LSC（均匀白柜面角落/中心 0.61–0.67 → 0.90–0.99，中心增益 1.00）；实时直方图（显示域 OETF 同源，7fps 轮询）；DNG 标准色彩链（自建标定矩阵，真机 A/B 同亮度 C* +14% / sep +16% / 近中性 −10.7pp）；色彩外观层参数回中性

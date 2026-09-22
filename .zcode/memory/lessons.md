@@ -78,3 +78,12 @@ status: active
 - [2026-09-22] **Kotlin 块注释支持嵌套**：KDoc 里写 `assets/luts/*.cube` 的那个 `/*` 会开启嵌套注释、把整个文件吞进注释（报 `Unclosed comment`，且指向文件末尾而非真凶行）——写路径通配时避开 `/*`
 - [2026-09-22] **预览图分辨率必须 ≥ 显示像素**：卡片 76dp 在 3–3.5x 密度下是 228–266px，v0.6.5 输出 108px → 放大 2.2× 明显发糊；且缓存文件名要带尺寸（`<key>@320.png`），否则改了分辨率仍会读旧糊图
 - [2026-09-22] **`git filter-repo` 的 `reset --hard` 会删掉工作区副本**：本轮 3 张误提交截图因此不可恢复（GitHub 也不允许按任意 SHA fetch 旧对象）→ 重写历史前先把这些文件复制到 /tmp
+- [2026-09-22] **纯 2.2 幂 OETF 是"发闷"的独立成因**：W3C sRGB 规范原文 `The reason that a viewing gamma of 1.125 is used instead of 1.0 is to compensate for the viewing environment conditions`；纯 2.2 幂配 2.2 显示 = 系统 viewing gamma **1.0**，中间调系统性对比不足。且 sRGB 分段在暗部比 2.2 幂高 **11%–235%**，而 LUT 在 sRGB 编码域制作 → 喂进去的采样坐标整体偏低（修复方向：输出 OETF 改精确 sRGB 分段）
+- [2026-09-22] **"只增强已浓的色"是倒置的色度增强**：`t=clamp(max|cc|/0.25)` + `sk=t²(3-2t)` 的 knee 0.25（≈64/255）意味着中低饱和区几乎不动，而画面大多数颜色恰在该区；工业做法是 darktable `vibrance.c` 的 `sw=sqrt(g²+b²)/256; ss=1+amount*sw`（**增益 ∝ 当前饱和度**）与 DCP `ProfileHueSatMap`（hue×sat×val 三维表）
+- [2026-09-22] **AE 用单点分位且不重置 → 切镜头亮度跳变**：实测同机位主摄 luma 81.7 / 长焦 104.1；libcamera 做法是**区域加权平均**锚定 0.16（`kDefaultRelativeLuminanceTarget`）+ 死区 + 换 mode 时 `filtered_.totalExposure *= ratio; target_ = filtered_;`（按灵敏度比例守恒并**丢弃历史**）
+- [2026-09-22] **局部对比增强若不保护全局对比就会发灰**：Night Sight 论文自己的反面证据 —— `we use CLAHE on the V channel... This increases local contrast but the global contrast is flattened, resulting in a low-contrast appearance.`；正面对策是"限制暗部提亮、保住黑位"与"低光下饱和度与场景亮度**反比**"
+- [2026-09-22] **"从 PhotonCamera 导出"的资产 ≠ 其内部 `.plut`**：内部是 v1 无元数据（`.plut`，33³ 或 UINT16、`dtype` 区分），导出是 **64³（Hald level 8）且会烘进 `colorRecipeParams`**，命名规则也不同（`LEICA M9.cube` vs `Leica_M9_STD.plut`）——我曾据此误判"资产来源不同"，实际是同一项目的两条导出路径
+- [2026-09-22] **在成片上二次套影调曲线是错的**：成片已过 OETF，再套曲线等于二次压缩（对比会爆到 90）；正确做法是从成片**反推** baseTone 的输入（`lin=(d/255)^2.2=baseTone(x)`，标准预设下整链 = baseTone + OETF），反推必须用**生成该成片的那个参数版本**（`tone-scan.py --legacy` 对应 ≤0.6.13 的旧归一化公式）
+- [2026-09-22] **离线 CLI 模拟与真机实测有 5–8 个 L\* 的偏差**（场景光随时间变化 + 反推的量化损失）——离线只能判断趋势与方向，**绝对亮度必须真机**
+- [2026-09-22] **`JAVA_HOME` 必须是 Homebrew openjdk**：本机 `/usr/libexec/java_home` 默认给的是 JDK 8，而 AGP 8.13 要求 ≥11（报 `Dependency requires at least JVM runtime version 11`）；用 `/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`
+- [2026-09-22] **子代理调研会往工作区克隆大仓库**：本轮 `filmulator-gui/` 达 **184MB**（含 .git），提交前必须检查未跟踪目录体积；另 `tools/__pycache__/` 也会出现
