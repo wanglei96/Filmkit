@@ -43,7 +43,9 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("filmkit", 0)
         FilmTheme.setAccent(Color(prefs.getInt("accent_argb", 0xFFE8842C.toInt())))
         setContent {
-            MaterialTheme {
+            // 必须传 colorScheme：空 MaterialTheme 会用默认浅色，Material 组件（对话框 /
+            // 输入框 / 按钮）会渲染成白底 —— 与胶片暗色风格冲突。
+            MaterialTheme(colorScheme = FilmTheme.colorScheme()) {
                 FilmKitNav(onRegisterVolume = { volumeCapture = it })
             }
         }

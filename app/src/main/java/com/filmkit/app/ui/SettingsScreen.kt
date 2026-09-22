@@ -166,6 +166,40 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_tone", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !autoToneOn
+                        autoToneOn = v
+                        prefs.edit().putBoolean("auto_tone", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.auto_tone",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "按场景白点自动算曝光增益（限幅 1–4×，只提亮不压暗）；" +
+                            "关 = 固定 +0.35EV。真机实测 M 档场景普遍欠曝 1–1.2EV",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (autoToneOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             var hlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hl_recon", true)) }
             Row(
                 Modifier
@@ -764,20 +798,21 @@ fun FocalScreen(onBack: () -> Unit = {}) {
         if (addOpen) {
             androidx.compose.material3.AlertDialog(
                 onDismissRequest = { addOpen = false },
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
                 confirmButton = {
                     androidx.compose.material3.TextButton(
                         onClick = {
                             save(focals + sliderV.roundToInt())
                             addOpen = false
                         },
-                    ) { Text("添加", color = FilmTheme.Accent) }
+                    ) { Text("添加", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
                 },
                 dismissButton = {
                     androidx.compose.material3.TextButton(onClick = { addOpen = false }) {
-                        Text("取消", color = FilmTheme.CreamDim)
+                        Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
                     }
                 },
-                title = { Text("添加焦段", color = FilmTheme.Cream) },
+                title = { Text("添加焦段", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
                 text = {
                     Column {
                         Text(

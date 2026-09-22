@@ -1,6 +1,10 @@
 package com.filmkit.app.ui
 
+import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 
@@ -26,6 +30,7 @@ object FilmTheme {
 
     val Body = Color(0xFF0D0D0D) // 机身炭黑（整屏底）
     val Panel = Color(0xE6141414) // 面板半透明炭黑（叠加预览之上）
+    val PanelSolid = Color(0xFF141414) // 不透明面板（对话框底 —— 半透明会透出下层）
     val ChipBg = Color(0xFF1C1C1C) // 未选中控件底
     val ChipBorder = Color(0xFF333333) // 控件描边
     val Cream = Color(0xFFF2EAD9) // 奶油白（主文字 / 快门）
@@ -34,6 +39,38 @@ object FilmTheme {
 
     val Mono = FontFamily.Monospace // 实测数字（ISO/快门/EV/K）
     val Serif = FontFamily.Serif // 胶片型号名
+
+    /**
+     * Material3 暗色方案。项目只用 Material 的少数组件（对话框 / 输入框 / 按钮 / 开关 /
+     * 分隔线），它们一律读 `MaterialTheme.colorScheme` —— **根部不映射就会渲染成默认浅色**
+     * （白底对话框就是这么来的）。与 [Accent] 联动，故用 `remember(accent)` 缓存，
+     * 避免每次组合都造新对象引发全树重组。
+     */
+    @Composable
+    fun colorScheme(): ColorScheme {
+        val accent = Accent
+        return remember(accent) {
+            darkColorScheme(
+                primary = accent,
+                onPrimary = OnAccent,
+                secondary = accent,
+                onSecondary = OnAccent,
+                background = Body,
+                onBackground = Cream,
+                surface = PanelSolid,
+                onSurface = Cream,
+                surfaceVariant = ChipBg,
+                onSurfaceVariant = CreamDim,
+                surfaceContainerHigh = PanelSolid,
+                surfaceContainer = PanelSolid,
+                surfaceContainerLow = PanelSolid,
+                outline = ChipBorder,
+                outlineVariant = ChipBorder,
+                error = Color(0xFFCF6679),
+                onError = OnAccent,
+            )
+        }
+    }
 }
 
 /**

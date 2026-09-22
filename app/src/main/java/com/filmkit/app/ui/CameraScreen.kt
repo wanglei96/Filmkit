@@ -20,6 +20,8 @@ import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -291,12 +293,19 @@ fun CameraScreen(
     // LUT 强度（§6 节点 opacity）：只写 prefs，CameraController 每帧回写 FilmParams[34]
     var lutStrength by rememberSaveable { mutableFloatStateOf(prefs.getFloat("lut_strength", 1f)) }
     var lutTab by rememberSaveable { mutableIntStateOf(0) } // 选择页分类：0 = LUT，1 = 预设
+    // M4-3 分类：默认品牌来自资产头部，用户可改归属 / 新建分类（存 prefs，不动资产）
+    var lutCats by remember { mutableStateOf(LutLibrary.allCategories(context, prefs)) }
+    var lutCatOf by remember {
+        mutableStateOf(LutLibrary.entries(context).associate { it.id to LutLibrary.categoryOf(prefs, it) })
+    }
+    var lutCustomCats by remember { mutableStateOf(LutLibrary.customCategories(prefs)) }
+    var lutFilter by rememberSaveable { mutableStateOf<String?>(null) } // null = 全部
     // 卡片预览图：启动时后台用固定测试图 × 各 LUT 生成一次并缓存（见 LutPreview），
     // 之后开面板只读缓存 —— 一次性生成而非实时渲染，省电
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     LaunchedEffect(Unit) {
         lutPreviews = withContext(Dispatchers.IO) {
-            LutLibrary.builtIn.mapNotNull { e ->
+            LutLibrary.entries(context).mapNotNull { e ->
                 LutLibrary.load(context, e)?.let { lut ->
                     LutPreview.load(context, e.id, lut)?.let { bmp -> e.id to bmp }
                 }
@@ -305,7 +314,7 @@ fun CameraScreen(
     }
     LaunchedEffect(Unit) {
         // 启动恢复：按 prefs 的选择重新加载（切镜头/重进相机后引擎纹理已被释放）
-        lutId?.let { id -> LutLibrary.byId(id)?.let { lutPending = it } }
+        lutId?.let { id -> LutLibrary.byId(context, id)?.let { lutPending = it } }
     }
     LaunchedEffect(lutPending) {
         val e = lutPending ?: return@LaunchedEffect
@@ -1200,6 +1209,28 @@ fun CameraScreen(
                 lutId = lutId,
                 lutStrength = lutStrength,
                 previews = lutPreviews,
+                cats = lutCats,
+                catOf = lutCatOf,
+                filter = lutFilter,
+                onFilter = { lutFilter = it },
+                customCats = lutCustomCats,
+                onNewCat = { name ->
+                    LutLibrary.addCategory(prefs, name)
+                    lutCats = LutLibrary.allCategories(context, prefs)
+                    lutCustomCats = LutLibrary.customCategories(prefs)
+                },
+                onDelCat = { c ->
+                    LutLibrary.removeCategory(context, prefs, c)
+                    lutCats = LutLibrary.allCategories(context, prefs)
+                    lutCustomCats = LutLibrary.customCategories(prefs)
+                    lutCatOf = LutLibrary.entries(context).associate { it.id to LutLibrary.categoryOf(prefs, it) }
+                    if (lutFilter == c) lutFilter = null
+                },
+                onMoveCat = { e, c ->
+                    LutLibrary.setCategory(prefs, e.id, c)
+                    lutCatOf = lutCatOf + (e.id to c)
+                    lutCats = LutLibrary.allCategories(context, prefs)
+                },
                 onStrength = { v ->
                     lutStrength = v
                     prefs.edit().putFloat("lut_strength", v).apply()
@@ -1304,8 +1335,13 @@ fun CameraScreen(
  * 按压缩放 + 波纹点击（规范：自绘可点元素一律用本修饰符，保证「按下有反应」）。
  * 仅供 @Composable 上下文使用。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Modifier.pressScale(pressedScale: Float = 0.92f, onTap: () -> Unit): Modifier {
+private fun Modifier.pressScale(
+    pressedScale: Float = 0.92f,
+    onTap: () -> Unit,
+    onLongTap: (() -> Unit)? = null,
+): Modifier {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val s = if (pressed) pressedScale else 1f
@@ -1314,7 +1350,22 @@ private fun Modifier.pressScale(pressedScale: Float = 0.92f, onTap: () -> Unit):
             scaleX = s
             scaleY = s
         }
-        .clickable(interactionSource = interaction, indication = ripple(bounded = false), onClick = onTap)
+        .then(
+            if (onLongTap == null) {
+                Modifier.clickable(
+                    interactionSource = interaction,
+                    indication = ripple(bounded = false),
+                    onClick = onTap,
+                )
+            } else {
+                Modifier.combinedClickable(
+                    interactionSource = interaction,
+                    indication = ripple(bounded = false),
+                    onClick = onTap,
+                    onLongClick = onLongTap,
+                )
+            },
+        )
 }
 
 /** 顶部快捷区图标钮：40dp 点击区，强调色=开启态 */
@@ -1701,11 +1752,23 @@ private fun LutSheet(
     lutId: String?,
     lutStrength: Float,
     previews: Map<String, Bitmap>,
+    cats: List<String>,
+    catOf: Map<String, String>,
+    filter: String?,
+    onFilter: (String?) -> Unit,
+    customCats: List<String>,
+    onNewCat: (String) -> Unit,
+    onDelCat: (String) -> Unit,
+    onMoveCat: (LutLibrary.Entry, String) -> Unit,
     onStrength: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onClose: () -> Unit,
 ) {
+    val context = LocalContext.current
+    var catNewOpen by remember { mutableStateOf(false) }
+    var catMove by remember { mutableStateOf<LutLibrary.Entry?>(null) }
+    var catDel by remember { mutableStateOf<String?>(null) } // 待确认删除的分类名
     Column(
         Modifier
             .fillMaxWidth()
@@ -1718,7 +1781,7 @@ private fun LutSheet(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (tab == 0) {
-                    LutLibrary.byId(lutId)?.label ?: "无 LUT"
+                    LutLibrary.byId(context, lutId)?.label ?: "无 LUT"
                 } else {
                     CameraPresets.names.getOrElse(presetIdx) { "标准" }
                 },
@@ -1747,6 +1810,21 @@ private fun LutSheet(
             SheetPill("LUT", selected = tab == 0) { onTab(0) }
             SheetPill("预设", selected = tab == 1) { onTab(1) }
         }
+        // 分类筛选（M4-3）：默认品牌；长按卡片改归属，＋ 新建分类
+        if (tab == 0) {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                item { SheetPill("全部", selected = filter == null) { onFilter(null) } }
+                items(cats) { c ->
+                    // 长按自定义分类即删除（内置品牌分类不可删）；删完 LUT 回到默认分类
+                    val del: (() -> Unit)? = if (c in customCats) ({ catDel = c }) else null
+                    SheetPill(c, selected = filter == c, onTap = { onFilter(c) }, onLongTap = del)
+                }
+                item { SheetPill("＋", selected = false) { catNewOpen = true } }
+            }
+        }
         // 强度（仅 LUT 分类且已选中时）：拖到 0 = 旁路，用于在风格与噪声之间权衡
         if (tab == 0 && lutId != null) {
             Row(
@@ -1762,7 +1840,7 @@ private fun LutSheet(
                 androidx.compose.material3.Slider(
                     value = lutStrength,
                     onValueChange = onStrength,
-                    valueRange = 0f..1f,
+                    valueRange = 0f..1.5f,
                     modifier = Modifier
                         .weight(1f)
                         .padding(horizontal = 8.dp),
@@ -1790,11 +1868,12 @@ private fun LutSheet(
                 item {
                     LutCard(label = "无", selected = lutId == null, preview = null) { onPickLut(null) }
                 }
-                items(LutLibrary.builtIn) { e ->
+                items(LutLibrary.entries(context).filter { filter == null || catOf[it.id] == filter }) { e ->
                     LutCard(
                         label = e.label,
                         selected = lutId == e.id,
                         preview = previews[e.id],
+                        onLongTap = { catMove = e },
                     ) { onPickLut(e) }
                 }
             }
@@ -1809,11 +1888,121 @@ private fun LutSheet(
             }
         }
     }
+    if (catNewOpen) {
+        var name by remember { mutableStateOf("") }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { catNewOpen = false },
+            shape = RoundedCornerShape(18.dp),
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { if (name.isNotBlank()) onNewCat(name); catNewOpen = false },
+                ) { Text("新建", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { catNewOpen = false }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("新建分类", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    placeholder = { Text("分类名", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Serif) },
+                    colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = FilmTheme.Cream,
+                        unfocusedTextColor = FilmTheme.Cream,
+                        cursorColor = FilmTheme.Accent,
+                        focusedBorderColor = FilmTheme.Accent,
+                        unfocusedBorderColor = FilmTheme.ChipBorder,
+                        focusedContainerColor = FilmTheme.ChipBg,
+                        unfocusedContainerColor = FilmTheme.ChipBg,
+                    ),
+                )
+            },
+        )
+    }
+    catMove?.let { e ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { catMove = null },
+            shape = RoundedCornerShape(18.dp),
+            confirmButton = {},
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { catMove = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("「${e.label}」归入分类", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Column {
+                    cats.forEach { c ->
+                        val cur = catOf[e.id] == c
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                if (cur) "$c  ✓" else c,
+                                color = if (cur) FilmTheme.Accent else FilmTheme.Cream,
+                                fontSize = 15.sp,
+                                fontFamily = FilmTheme.Serif,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .pressScale(onTap = { onMoveCat(e, c); catMove = null })
+                                    .padding(vertical = 10.dp),
+                            )
+                            // 只有用户新建的分类可删；资产内置的品牌分类不允许删
+                            if (c in customCats) {
+                                Text(
+                                    "删除",
+                                    color = FilmTheme.CreamDim,
+                                    fontSize = 12.sp,
+                                    fontFamily = FilmTheme.Mono,
+                                    modifier = Modifier
+                                        .pressScale(onTap = { catDel = c })
+                                        .padding(8.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }
+    // 删除分类二次确认：不可逆的动作必须确认（LUT 归属会回默认，但分类本身消失）
+    catDel?.let { c ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { catDel = null },
+            shape = RoundedCornerShape(18.dp),
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { onDelCat(c); catDel = null },
+                ) { Text("删除", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { catDel = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("删除分类", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Text(
+                    "「$c」将被删除，归入它的 LUT 会回到默认分类（LUT 本身不受影响）。",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 14.sp,
+                    fontFamily = FilmTheme.Serif,
+                )
+            },
+        )
+    }
 }
 
 /** 分类 pill（LUT / 预设）：选中 = 琥珀描边 + 琥珀字 */
 @Composable
-private fun SheetPill(label: String, selected: Boolean, onTap: () -> Unit) {
+private fun SheetPill(
+    label: String,
+    selected: Boolean,
+    onLongTap: (() -> Unit)? = null,
+    onTap: () -> Unit,
+) {
     Box(
         Modifier
             .clip(RoundedCornerShape(50))
@@ -1822,7 +2011,7 @@ private fun SheetPill(label: String, selected: Boolean, onTap: () -> Unit) {
                 if (selected) FilmTheme.Accent else FilmTheme.ChipBorder,
                 RoundedCornerShape(50),
             )
-            .pressScale(onTap = onTap)
+            .pressScale(onTap = onTap, onLongTap = onLongTap)
             .padding(horizontal = 16.dp, vertical = 7.dp),
     ) {
         Text(
@@ -1837,7 +2026,13 @@ private fun SheetPill(label: String, selected: Boolean, onTap: () -> Unit) {
 
 /** 选择卡片：LUT 显示「固定测试图 × 该 LUT」的预览图（一次性生成并缓存，见 LutPreview）；无图时显示名称 */
 @Composable
-private fun LutCard(label: String, selected: Boolean, preview: Bitmap?, onTap: () -> Unit) {
+private fun LutCard(
+    label: String,
+    selected: Boolean,
+    preview: Bitmap?,
+    onLongTap: (() -> Unit)? = null,
+    onTap: () -> Unit,
+) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
             Modifier
@@ -1849,7 +2044,7 @@ private fun LutCard(label: String, selected: Boolean, preview: Bitmap?, onTap: (
                     if (selected) FilmTheme.Accent else FilmTheme.ChipBorder,
                     RoundedCornerShape(14.dp),
                 )
-                .pressScale(onTap = onTap),
+                .pressScale(onTap = onTap, onLongTap = onLongTap),
         ) {
             if (preview != null) {
                 Image(
