@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-21 19:46
+updated: 2026-09-22 22:13
 status: active
 ---
 
@@ -70,3 +70,10 @@ status: active
 - [2026-09-22] **LUT 插桩位置（display 域、输出 OETF 之后）确认正确** — 独立调研核实 PhotonCamera 的预览链 `LutRenderer` 与成片链 `LutImageProcessor` 都在**非线性 sRGB 显示域**，其 `.plut`/`.cube` 的 curve 默认 SRGB、gamut 默认 SRGB，入口变换链 `srgbToLinear → applyLutColorSpace(identity) → applyLutCurve(linearToSrgb)` **恒等抵消**
 - [2026-09-22] **不做"理光/徕卡引擎"，也不照搬 `RawProfile`** — PhotonCamera 的 8 个引擎（AdobeCurve/Hncs/Lumix/Canon/AgX/Spektrafilm/Sigmoid/Filmic）里**没有理光/徕卡**（徕卡仅是 Lumix 的一个 PhotoStyle）；其 `RawProfile`（色彩空间+log+基线 LUT）经核实**是未接线代码**（`rawLut` 指向不存在的 assets、`setColorSpace`/`setLogCurve` 无调用者）
 - [2026-09-22] **调研文档入库 `docs/research/`**（不放 `handoff/`）— `handoff/` 在 .gitignore 内，报告放那里不会被 git 跟踪
+- [2026-09-22] **色度增强判据用"亮度相对饱和"而非绝对线性色度**（v0.6.22）— 绝对 `max|cc|` 把**饱和度**与**亮度水平**混在一起：暗色物体即使很绿，绝对色度也小。真机实测同一曲线下树叶只得 5.05%、罐体 13.70%（差 2.7×）。改用 `rel = max|cc|/luma` 后还**天然保护近中性色**（暗部中性像素增益仅 0.06%），不必再靠 knee 承担保护职责
+- [2026-09-22] **色度 knee 1.0→0.4 定向补低饱和，不追求对齐 libraw**（v0.6.23）— DNG 对照显示缺口剖面"低饱和重、高饱和轻"（0.15–0.25 只有 0.46–0.68，0.7–1.2 已达 1.10–1.22），故要"低饱和补得多、高饱和补得少"：新剖面低饱和 +9~23%、高饱和 +8%。`FilmParams[33]` 同步 1.25→1.35
+- [2026-09-22] **DNG 对照只能定位缺口、不能当绝对标尺** — 我们的 DNG **`ForwardMatrix1/2` 缺失**（`tools/dng-color-dump.py` 实测），libraw 只能退回 `ColorMatrix1/2`；本 App 走 `CameraCharacteristics` 的 ForwardMatrix（DNG 标准路径，`FM·(1,1,1)`=D50 自洽）。与 `CameraPresets.kt:44` 既有结论一致：**libraw 的 C\* 是它的偏好，不等于"正确"**
+- [2026-09-22] **④ LUT 纹素中心校正废弃** — **恒等 LUT 实测**证明现行 `t=c*(N-1)` 与硬件 `texture()` 路径**数学等价**（差 ≤2e-17；`texelFetch` 取整数索引绕过过滤，`setLut` 的 `GL_LINEAR` 惰性）。报告公式是 PhotonCamera `BasicToneLutShader.kt:20-22` 的**纹理坐标**补偿，照搬会二次偏移（纯白只能查到 0.985）
+- [2026-09-22] **① OETF 改 sRGB 分段仍做，但理由改** — 不是"治发闷"（中间调实测仅 +1.27/255，可忽略）、不是"对齐 LUT 域"（"喂 2.2 削弱 LUT"被实测证伪，反向），而是**暗部压深**（−7.57/255 ⇒ 无 LUT 对比 +9.87、饱和 +2.01pp）＋**域正确性**。⛔ 实现须**三处同步**：`FrameRenderer.cpp:780`(kFsOut) / `:845`(kFsHist) / `:2013`(反解码)
+- [2026-09-22] **③ AE 拆成两件，只做一件** — 做「切镜头重置 + 死区」（`auto_gain_` 跨镜头存活，EMA 0.7/0.3 需 7–8 帧≈0.25s 收敛；置 0 复用既有"首帧直通"分支，1 行）；「改区域加权锚定 0.16」**降级为待真机 A/B 的选项**（libcamera 的 0.16 是区域加权**平均**，与我们"显示域 P95=0.80 白点"是不同目标语义）
+- [2026-09-22] **临时拍摄样片目录 `test_temp/` 不入库** — 用户指定；已加入 `.gitignore`（与既有 `FILMKIT_*.jpg`/`*.dng` 规则叠加）

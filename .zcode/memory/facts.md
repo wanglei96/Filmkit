@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-21 19:46
+updated: 2026-09-22 22:13
 status: active
 ---
 
@@ -80,3 +80,8 @@ status: active
 - [2026-09-22] **日志与 prefs 增量**：`raw.calib` 按 **cameraId 各记一条**并加 `cameraId` 字段；`raw.meta` 加 `lens` 字段；prefs 新增 `auto_tone`、`lut_cat_<id>`、`lut_cats`
 - [2026-09-22] **取证结论：X300 主摄与长焦共用同一套标定矩阵** — 日志实测 `cameraId=0` 与 `cameraId=3` 的 `ct1/fm1` **逐位完全相同**（`ct1=0.6668,-0.1589,…`、`fm1=0.6731,0.1950,…`）；但 `AsShotNeutral` 与 LSC 网格**按镜头分别给**（LSC corner 主摄 6.24 / 长焦 3.43）
 - [2026-09-22] **`tools/tone-scan.py`**：从成片反推 baseTone 输入 + 参数扫描 + 出对照图；`--legacy` 用 ≤0.6.13 的旧归一化公式（`t = xn/mn` 或 `(xn-mn)/(1-mn)`）；前提是标准预设下整链 = baseTone + OETF（filmCurve 中性恒等、`uSat=1`、`uSplit=0`、外观层恒等）
+- [2026-09-22] 发布现状：最新 **v0.6.23-m4（versionCode 103）**，tag `v0.6.23-m4` 已推送；远端共 5 个 tag：v0.5.27-m2 / v0.5.47-m3 / v0.5.48-m3 / v0.6.8-m4 / **v0.6.23-m4**。出包 `filmkit-0.6.23-m4.apk`（根目录，出包前删旧包）
+- [2026-09-22] **色度层现状参数（v0.6.23）**：`FrameRenderer.cpp` 内 `kRelKnee = 0.4` / `kLumaFloor = 0.02`，判据 `t = clamp(max|cc| / (kRelKnee * max(luma, kLumaFloor)))`；`FilmParams[33]`（= `uLookChroma`）**1.35**（满额 +35%）；`[31] uLook`=1.0 为 A/B 开关（prefs `color_look`）、`[32] uLookSat`=1.0
+- [2026-09-22] **版本号单一来源**：`app/src/main/java/com/filmkit/app/FilmKitApp.kt` 的 `companion object { const val VERSION }`，启动日志与 crash 文件共用；须与 `app/build.gradle.kts` 的 `versionName` 同步（此前两处字面量各漂各的，曾陈旧在 0.6.16）
+- [2026-09-22] **样片与临时目录**：`test_temp/`（**已 gitignore，用户指定临时拍摄样片不入库**）；云端 `~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/filmkit/`（同步有延迟，新拍未必立刻可见）
+- [2026-09-22] **离线色彩对比方法（缺口剖面）**：DNG 用 rawpy `postprocess(use_camera_wb=True, no_auto_bright=True, gamma=(2.222,4.5))` 出参照，与成片逐像素配对，按参照的 `rel = max|cc|/luma` 分箱算"我们/参照"。**`rel` 亮度无关可直接比；C\* 随 L\* 增长、跨亮度不可比**
