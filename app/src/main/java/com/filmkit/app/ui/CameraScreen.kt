@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -246,6 +247,9 @@ fun CameraScreen(
     var boxH by remember { mutableIntStateOf(1) }
     var captureTick by remember { mutableIntStateOf(0) } // 每次快门 +1，驱动黑闪与脉冲
     var zoomEquiv by remember { mutableFloatStateOf(24f) } // 捏合变焦目标（35mm 等效焦段）
+    // 焦段条显示内容：focal = 焦段号（15/24/70），mult = 倍率（×0.6/×1.0/×2.9）。
+    // 在悬浮菜单里切换；两种信息**不并存**（v0.6.8）
+    var focalStrip by rememberSaveable { mutableStateOf(prefs.getString("focal_strip", "focal") ?: "focal") }
     var wheelActive by remember { mutableStateOf(false) } // 长按轮盘变焦进行中
     val wheelOn = remember { prefs.getBoolean("wheel_zoom", true) }
     val wheelMinE = (lensChips.minOrNull() ?: 15).toFloat()
@@ -860,34 +864,25 @@ fun CameraScreen(
                             },
                         )
                         .fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // 可滚动部分（倍率 + 焦段 + 分隔线）：✦ LUT 入口固定在右侧、不参与滚动
+                    // 可滚动部分（焦段 / 倍率 + 分隔线）：✦ LUT 入口紧随其后、不参与滚动
                     // —— v0.6.7 修复：切长焦后焦段变多会把 ✦ 顶出屏幕
                     Row(
                         Modifier
-                            .weight(1f)
+                            // fill = false：内容窄时按内容宽 —— 整行居中、✦ 紧邻焦段条；
+                            // 内容超出可用宽时才占满并内部横滚（v0.6.8）
+                            .weight(1f, fill = false)
                             .clip(RoundedCornerShape(16.dp))
                             .horizontalScroll(rememberScrollState(), enabled = !wheelActive),
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        // 倍率 = 等效焦段 / 主摄等效（主摄=1x；70mm≈2.9x、15mm≈0.6x）
+                        // 焦段条 = 启用镜头原生焦段 + 自定义焦段（≤3 个，设置页维护），总计 ≤6。
+                        // 标签按悬浮菜单的「焦段条显示」切换：焦段号 或 倍率；
+                        // 不再额外显示当前倍率 chip —— 两种信息不并存（v0.6.8）
                         val baseE = remember(lensChips) { controller.mainEquiv() }
-                        val mult = zoomEquiv / baseE.coerceAtLeast(1f)
-                        if (Math.abs(mult - 1f) > 0.03f) {
-                            FilmChip(
-                                selected = false,
-                                label = "×%.1f".format(mult),
-                                transparent = true,
-                                fontSize = 10.sp,
-                                onClick = {
-                                    zoomEquiv = baseE
-                                    controller.setZoomEquiv(baseE)
-                                },
-                            )
-                        }
-                        // 焦段条 = 启用镜头原生焦段 + 自定义焦段（≤3 个，设置页维护），总计 ≤6
                         val customFocals = remember {
                             prefs.getString("custom_focals", "")?.split(",")?.mapNotNull { it.toIntOrNull() }
                                 ?.sorted() ?: emptyList<Int>()
@@ -897,7 +892,11 @@ fun CameraScreen(
                             val isNative = lensChips.contains(f)
                             FilmChip(
                                 selected = Math.abs(zoomEquiv - f) < 2f,
-                                label = "$f",
+                                label = if (focalStrip == "mult") {
+                                    "×%.1f".format(f / baseE.coerceAtLeast(1f))
+                                } else {
+                                    "$f"
+                                },
                                 transparent = true,
                                 fontSize = 10.sp,
                                 onClick = {
@@ -1247,6 +1246,15 @@ fun CameraScreen(
         ) {
             QuickDropdown(
                 aspect = aspect,
+                focalStrip = focalStrip,
+                onFocalStrip = { m ->
+                    focalStrip = m
+                    prefs.edit().putString("focal_strip", m).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.focal_strip",
+                        kv("mode" to m),
+                    )
+                },
                 onAspect = { a ->
                     aspect = a
                     prefs.edit().putString("capture_aspect", a).apply()
@@ -1872,6 +1880,8 @@ private fun LutCard(label: String, selected: Boolean, preview: Bitmap?, onTap: (
 @Composable
 private fun QuickDropdown(
     aspect: String,
+    focalStrip: String,
+    onFocalStrip: (String) -> Unit,
     onAspect: (String) -> Unit,
     gridOn: Boolean,
     onGrid: () -> Unit,
@@ -1886,52 +1896,32 @@ private fun QuickDropdown(
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(FilmTheme.Panel)
-            .padding(vertical = 6.dp),
+            .padding(vertical = 10.dp),
     ) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
-            Text(
-                "画幅",
-                color = FilmTheme.Accent,
-                fontSize = 11.sp,
-                fontFamily = FilmTheme.Mono,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+        // 3 列开关格（v0.6.8）：原来单列一行一个开关，宽度利用率太低
+        Column(Modifier.padding(horizontal = 12.dp)) {
+            QuickSectionLabel("画幅")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("4:3", "16:9", "XPAN").forEach { a ->
-                    FilmChip(
-                        selected = aspect == a,
-                        label = a,
-                        fontSize = 12.sp,
-                        onClick = { onAspect(a) },
-                    )
+                    QuickTile(a, on = aspect == a) { onAspect(a) }
                 }
             }
-        }
-        HorizontalDivider(color = FilmTheme.ChipBorder)
-        // 构图辅助：三分线 / 水平仪（自顶栏快捷区移入，v0.5.16）+ 斑马纹（过曝提示）
-        listOf(
-            Triple("三分构图线", gridOn, onGrid),
-            Triple("水平仪", levelOn, onLevel),
-            Triple("斑马纹（过曝提示）", zebraOn, onZebra),
-        ).forEach { (title, on, toggle) ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable { toggle() }
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(title, color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                Text(
-                    if (on) "开" else "关",
-                    color = if (on) FilmTheme.Accent else FilmTheme.CreamDim,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
+            Spacer(Modifier.height(12.dp))
+            QuickSectionLabel("构图辅助")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                QuickTile("三分线", on = gridOn, onTap = onGrid)
+                QuickTile("水平仪", on = levelOn, onTap = onLevel)
+                QuickTile("斑马纹", on = zebraOn, onTap = onZebra)
+            }
+            Spacer(Modifier.height(12.dp))
+            QuickSectionLabel("焦段条显示")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                QuickTile("焦段", on = focalStrip != "mult", onTap = { onFocalStrip("focal") })
+                QuickTile("倍率", on = focalStrip == "mult", onTap = { onFocalStrip("mult") })
+                Spacer(Modifier.weight(1f)) // 占位，与上面两行保持同宽
             }
         }
+        Spacer(Modifier.height(10.dp))
         HorizontalDivider(color = FilmTheme.ChipBorder)
         Row(
             Modifier
@@ -1943,6 +1933,42 @@ private fun QuickDropdown(
             Text("更多设置", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
             Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
         }
+    }
+}
+
+/** 悬浮菜单的分区小标题 */
+@Composable
+private fun QuickSectionLabel(text: String) {
+    Text(
+        text,
+        color = FilmTheme.Accent,
+        fontSize = 11.sp,
+        fontFamily = FilmTheme.Mono,
+        fontWeight = FontWeight.SemiBold,
+    )
+    Spacer(Modifier.height(6.dp))
+}
+
+/** 悬浮菜单的 3 列开关格：底色表达状态（琥珀 = 开 / 选中） */
+@Composable
+private fun RowScope.QuickTile(label: String, on: Boolean, onTap: () -> Unit) {
+    Box(
+        Modifier
+            .weight(1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (on) FilmTheme.Accent else FilmTheme.ChipBg)
+            .pressScale(onTap = onTap)
+            .padding(vertical = 11.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = if (on) FilmTheme.OnAccent else FilmTheme.Cream,
+            fontSize = 12.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+        )
     }
 }
 
