@@ -30,6 +30,9 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,7 +42,6 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -47,7 +49,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -283,6 +284,16 @@ fun CameraScreen(
     var lutPending by remember { mutableStateOf<LutLibrary.Entry?>(null) }
     // LUT 强度（§6 节点 opacity）：只写 prefs，CameraController 每帧回写 FilmParams[34]
     var lutStrength by rememberSaveable { mutableFloatStateOf(prefs.getFloat("lut_strength", 1f)) }
+    var lutTab by rememberSaveable { mutableIntStateOf(0) } // 选择页分类：0 = LUT，1 = 预设
+    // 选择页色卡：启动时后台预载 6 套资产并算好代表色，避免开面板时现算（解析 ≈110–170ms/套）
+    var lutSwatches by remember { mutableStateOf<Map<String, IntArray>>(emptyMap()) }
+    LaunchedEffect(Unit) {
+        lutSwatches = withContext(Dispatchers.IO) {
+            LutLibrary.builtIn.associate { e ->
+                e.id to (LutLibrary.load(context, e)?.let { LutLibrary.swatch(it) } ?: IntArray(0))
+            }
+        }
+    }
     LaunchedEffect(Unit) {
         // 启动恢复：按 prefs 的选择重新加载（切镜头/重进相机后引擎纹理已被释放）
         lutId?.let { id -> LutLibrary.byId(id)?.let { lutPending = it } }
@@ -1020,52 +1031,7 @@ fun CameraScreen(
                     )
                 }
 
-                // ── LUT 二级菜单（✦ 展开；点画面收起）──
-                if (lutOpen) {
-                    Box(
-                        Modifier
-                            .matchParentSize()
-                            .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
-                    )
-                }
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = lutOpen,
-                    enter = FilmMotion.panelEnter,
-                    exit = FilmMotion.panelExit,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(start = 14.dp, end = 14.dp, bottom = 62.dp),
-                ) {
-                    LutMenu(
-                        presetIdx = presetIdx,
-                        lutId = lutId,
-                        lutStrength = lutStrength,
-                        onStrength = { v ->
-                            lutStrength = v
-                            prefs.edit().putFloat("lut_strength", v).apply()
-                        },
-                        onPick = { i ->
-                            presetIdx = i
-                            controller.setFilmParams(CameraPresets.byIndex(i))
-                            lutOpen = false
-                        },
-                        onPickLut = { e ->
-                            lutOpen = false
-                            if (e == null) {
-                                // 关闭（A/B 通路）：直接下发，无需解析
-                                lutId = null
-                                controller.setLut(null)
-                                prefs.edit().remove("lut_id").apply()
-                                EngineBridge.nativeAppendLog(
-                                    EngineBridge.LEVEL_INFO, "app", "settings.lut",
-                                    kv("id" to "none", "title" to "none", "ok" to true),
-                                )
-                            } else {
-                                lutPending = e
-                            }
-                        },
-                    )
-                }
+                // ── LUT / 预设选择页已移到整机层：底部弹出（见下方 LutSheet）──
 
                 // ── 一级悬浮窗移至整机层（锚定屏幕右上、宽度随屏幕）──
             }
@@ -1193,6 +1159,55 @@ fun CameraScreen(
             }
             Spacer(Modifier.size(44.dp))
         }
+        }
+
+        // ── LUT / 预设选择页：底部弹出（浮于整机上层；点面板外任意处收起）──
+        if (lutOpen) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
+            )
+        }
+        androidx.compose.animation.AnimatedVisibility(
+            visible = lutOpen,
+            enter = FilmMotion.panelEnter,
+            exit = FilmMotion.panelExit,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth(),
+        ) {
+            LutSheet(
+                tab = lutTab,
+                onTab = { lutTab = it },
+                presetIdx = presetIdx,
+                lutId = lutId,
+                lutStrength = lutStrength,
+                swatches = lutSwatches,
+                onStrength = { v ->
+                    lutStrength = v
+                    prefs.edit().putFloat("lut_strength", v).apply()
+                },
+                onPick = { i ->
+                    presetIdx = i
+                    controller.setFilmParams(CameraPresets.byIndex(i))
+                },
+                onPickLut = { e ->
+                    if (e == null) {
+                        // 关闭（A/B 通路）：直接下发，无需解析
+                        lutId = null
+                        controller.setLut(null)
+                        prefs.edit().remove("lut_id").apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.lut",
+                            kv("id" to "none", "title" to "none", "ok" to true),
+                        )
+                    } else {
+                        lutPending = e
+                    }
+                },
+                onClose = { lutOpen = false },
+            )
         }
 
         // ── 一级悬浮窗：锚定屏幕右上、宽度随屏幕（浮于整机上层，点任意处收起）──
@@ -1648,61 +1663,71 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
     return stops.map { v -> (ln(v / 100f) / lnMax).coerceIn(0f, 1f) to "$v" }
 }
 
-/** LUT 二级菜单：胶片预设 + 内置 3D LUT（M4：display 域 .cube，显示名取资产 TITLE） */
+/**
+ * LUT / 预设选择页（M4）：底部弹出，参考专业相机 App 的「分类 pill + 横向卡片」布局。
+ * 面板外点击关闭由整机层的拦截层负责；这里只管内容与交互。
+ * 选中项**不自动收起**面板 —— 便于连续切换、当场比较风格。
+ */
 @Composable
-private fun LutMenu(
+private fun LutSheet(
+    tab: Int,
+    onTab: (Int) -> Unit,
     presetIdx: Int,
     lutId: String?,
     lutStrength: Float,
+    swatches: Map<String, IntArray>,
+    onStrength: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
-    onStrength: (Float) -> Unit,
+    onClose: () -> Unit,
 ) {
     Column(
         Modifier
             .fillMaxWidth()
-            .heightIn(max = 420.dp)
-            .clip(RoundedCornerShape(20.dp))
+            .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
             .background(FilmTheme.Panel)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .navigationBarsPadding()
+            .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
     ) {
-        Text(
-            "胶片预设",
-            color = FilmTheme.Accent,
-            fontSize = 11.sp,
-            fontFamily = FilmTheme.Mono,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Spacer(Modifier.height(2.dp))
-        CameraPresets.names.forEachIndexed { i, name ->
-            MenuRow(name, selected = i == presetIdx) { onPick(i) }
+        // 顶行：当前选中名（左）+ 收起（右）
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (tab == 0) {
+                    LutLibrary.byId(lutId)?.label ?: "无 LUT"
+                } else {
+                    CameraPresets.names.getOrElse(presetIdx) { "标准" }
+                },
+                color = FilmTheme.Cream,
+                fontSize = 20.sp,
+                fontFamily = FilmTheme.Serif,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "收起",
+                color = FilmTheme.CreamDim,
+                fontSize = 12.sp,
+                fontFamily = FilmTheme.Mono,
+                modifier = Modifier
+                    .pressScale(onTap = onClose)
+                    .padding(6.dp),
+            )
         }
-        Spacer(Modifier.height(6.dp))
-        HorizontalDivider(color = FilmTheme.ChipBorder)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "LUT · 内置",
-            color = FilmTheme.Accent,
-            fontSize = 11.sp,
-            fontFamily = FilmTheme.Mono,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            "display 域 3D LUT · 选即生效（预览与成片同链）",
-            color = FilmTheme.CreamDim,
-            fontSize = 11.sp,
-            fontFamily = FilmTheme.Serif,
-            modifier = Modifier.padding(top = 2.dp, bottom = 4.dp),
-        )
-        MenuRow("无", selected = lutId == null) { onPickLut(null) }
-        LutLibrary.builtIn.forEach { e ->
-            MenuRow(e.label, selected = lutId == e.id) { onPickLut(e) }
+        // 分类
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(top = 8.dp),
+        ) {
+            SheetPill("LUT", selected = tab == 0) { onTab(0) }
+            SheetPill("预设", selected = tab == 1) { onTab(1) }
         }
-        // 强度（仅选中 LUT 时有意义）：拖到 0 = 旁路，用于在风格与噪声之间权衡
-        if (lutId != null) {
-            Spacer(Modifier.height(4.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        // 强度（仅 LUT 分类且已选中时）：拖到 0 = 旁路，用于在风格与噪声之间权衡
+        if (tab == 0 && lutId != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(top = 6.dp),
+            ) {
                 Text(
                     "强度",
                     color = FilmTheme.CreamDim,
@@ -1731,30 +1756,102 @@ private fun LutMenu(
                 )
             }
         }
+        // 横向卡片
+        if (tab == 0) {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(top = 10.dp),
+            ) {
+                item {
+                    LutCard(label = "无", selected = lutId == null, colors = null) { onPickLut(null) }
+                }
+                items(LutLibrary.builtIn) { e ->
+                    LutCard(
+                        label = e.label,
+                        selected = lutId == e.id,
+                        colors = swatches[e.id],
+                    ) { onPickLut(e) }
+                }
+            }
+        } else {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(top = 10.dp),
+            ) {
+                itemsIndexed(CameraPresets.names) { i, name ->
+                    LutCard(label = name, selected = i == presetIdx, colors = null) { onPick(i) }
+                }
+            }
+        }
     }
 }
 
-/** 菜单行（预设 / LUT 共用）：选中 = 琥珀 + ✓ */
+/** 分类 pill（LUT / 预设）：选中 = 琥珀描边 + 琥珀字 */
 @Composable
-private fun MenuRow(label: String, selected: Boolean, onTap: () -> Unit) {
-    Row(
+private fun SheetPill(label: String, selected: Boolean, onTap: () -> Unit) {
+    Box(
         Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onTap)
-            .padding(vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .clip(RoundedCornerShape(50))
+            .border(
+                if (selected) 1.5.dp else 1.dp,
+                if (selected) FilmTheme.Accent else FilmTheme.ChipBorder,
+                RoundedCornerShape(50),
+            )
+            .pressScale(onTap = onTap)
+            .padding(horizontal = 16.dp, vertical = 7.dp),
     ) {
         Text(
             label,
             color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
-            fontSize = 15.sp,
+            fontSize = 13.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        )
+    }
+}
+
+/** 选择卡片：LUT 用代表色卡（纯 Kotlin 采样，无 GPU 开销），无数据/预设时显示名称 */
+@Composable
+private fun LutCard(label: String, selected: Boolean, colors: IntArray?, onTap: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier
+                .size(76.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(FilmTheme.Body)
+                .border(
+                    if (selected) 2.dp else 1.dp,
+                    if (selected) FilmTheme.Accent else FilmTheme.ChipBorder,
+                    RoundedCornerShape(14.dp),
+                )
+                .pressScale(onTap = onTap),
+        ) {
+            if (colors != null && colors.isNotEmpty()) {
+                Column(Modifier.fillMaxSize()) {
+                    colors.forEach { c ->
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .background(Color(c)),
+                        )
+                    }
+                }
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(label, color = FilmTheme.CreamDim, fontSize = 13.sp, fontFamily = FilmTheme.Serif)
+                }
+            }
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            label,
+            color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
+            fontSize = 11.sp,
             fontFamily = FilmTheme.Serif,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            modifier = Modifier.weight(1f),
+            maxLines = 1,
         )
-        if (selected) {
-            Text("✓", color = FilmTheme.Accent, fontSize = 13.sp, fontFamily = FilmTheme.Mono)
-        }
     }
 }
 

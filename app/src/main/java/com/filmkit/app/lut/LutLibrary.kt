@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
+import kotlin.math.roundToInt
 
 /**
  * 内置 LUT 资产库（M4-1）。
@@ -61,5 +62,71 @@ object LutLibrary {
             )
             null
         }
+    }
+
+    /** 内置资产全部预载（App 启动时后台调一次）：选择页的色卡需要数据，预载后打开面板即时有内容 */
+    fun preload(context: Context) {
+        builtIn.forEach { load(context, it) }
+    }
+
+    /**
+     * 代表色卡（5 个色块）：对典型输入（暗/中/亮灰 + 暖肤色 + 冷调）采样 LUT 输出，
+     * 供选择页卡片做视觉标识。引擎侧的**实时缩略图**是后续项（需要额外一个小 pass 渲染
+     * 当前帧 × 每套 LUT），本函数是零成本的替代：纯 Kotlin、可缓存、无 GPU 开销。
+     */
+    fun swatch(lut: CubeLut): IntArray {
+        val probes = floatArrayOf(
+            0.12f, 0.12f, 0.12f,
+            0.45f, 0.45f, 0.45f,
+            0.82f, 0.82f, 0.82f,
+            0.62f, 0.42f, 0.32f,
+            0.32f, 0.48f, 0.66f,
+        )
+        val out = IntArray(probes.size / 3)
+        for (i in out.indices) {
+            val c = sample(lut, probes[i * 3], probes[i * 3 + 1], probes[i * 3 + 2])
+            out[i] = (0xFF shl 24) or (to255(c[0]) shl 16) or (to255(c[1]) shl 8) or to255(c[2])
+        }
+        return out
+    }
+
+    private fun to255(v: Float): Int = (v.coerceIn(0f, 1f) * 255f).roundToInt()
+
+    /** 三线性采样（仅用于色卡；渲染侧是 shader 里的四面体插值，两者不必一致） */
+    private fun sample(lut: CubeLut, r: Float, g: Float, b: Float): FloatArray {
+        val n = lut.size
+        val max = n - 1
+        val pr = r.coerceIn(0f, 1f) * max
+        val pg = g.coerceIn(0f, 1f) * max
+        val pb = b.coerceIn(0f, 1f) * max
+        val r0 = pr.toInt().coerceIn(0, max - 1)
+        val g0 = pg.toInt().coerceIn(0, max - 1)
+        val b0 = pb.toInt().coerceIn(0, max - 1)
+        val fr = pr - r0
+        val fg = pg - g0
+        val fb = pb - b0
+        fun at(rr: Int, gg: Int, bb: Int): FloatArray {
+            val i = ((bb * n + gg) * n + rr) * 3
+            return floatArrayOf(lut.data[i], lut.data[i + 1], lut.data[i + 2])
+        }
+        val c000 = at(r0, g0, b0)
+        val c100 = at(r0 + 1, g0, b0)
+        val c010 = at(r0, g0 + 1, b0)
+        val c110 = at(r0 + 1, g0 + 1, b0)
+        val c001 = at(r0, g0, b0 + 1)
+        val c101 = at(r0 + 1, g0, b0 + 1)
+        val c011 = at(r0, g0 + 1, b0 + 1)
+        val c111 = at(r0 + 1, g0 + 1, b0 + 1)
+        val o = FloatArray(3)
+        for (k in 0..2) {
+            val c00 = c000[k] * (1 - fr) + c100[k] * fr
+            val c10 = c010[k] * (1 - fr) + c110[k] * fr
+            val c01 = c001[k] * (1 - fr) + c101[k] * fr
+            val c11 = c011[k] * (1 - fr) + c111[k] * fr
+            val c0 = c00 * (1 - fg) + c10 * fg
+            val c1 = c01 * (1 - fg) + c11 * fg
+            o[k] = c0 * (1 - fb) + c1 * fb
+        }
+        return o
     }
 }
