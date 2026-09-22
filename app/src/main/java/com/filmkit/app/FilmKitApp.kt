@@ -5,6 +5,11 @@ import java.io.File
 
 class FilmKitApp : Application() {
 
+    companion object {
+        /** 必须与 app/build.gradle.kts 的 versionName 一致（单一来源，避免两处字面量各漂各的） */
+        const val VERSION = "0.6.23-m4"
+    }
+
     override fun onCreate() {
         super.onCreate()
         EngineBridge.ensureLoaded()
@@ -13,7 +18,7 @@ class FilmKitApp : Application() {
         EngineBridge.nativeInitLogger(dir)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "app.start",
-            kv("version" to "0.6.16-m4", "logDir" to dir),
+            kv("version" to VERSION, "logDir" to dir),
         )
         installCrashCapture(dir)
     }
@@ -24,7 +29,7 @@ class FilmKitApp : Application() {
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {
                 val stack = "thread=${t.name}\n" + android.util.Log.getStackTraceString(e)
-                File(dir, "crash-latest.txt").writeText("version=0.6.16-m4\n$stack")
+                File(dir, "crash-latest.txt").writeText("version=$VERSION\n$stack")
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "app", "app.crash",
                     kv("thread" to t.name, "stack" to android.util.Log.getStackTraceString(e)),
