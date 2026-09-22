@@ -555,9 +555,13 @@ If the total exposure adjustment sum is negative, it's postponed to the tone cur
 **数据源**（同文档逐字）：`The classic 24 patch color checker, here in the form of X-Rite's ColorChecker Passport. Reflectance spectra for the CC24 target.`
 ⇒ **实测色卡光谱 + 用户自标定**，产物是 DCP（HueSatMap / LookTable / ToneCurve）或 ICC。
 
-**darktable 则完全不支持 DCP**：`grep -rli "dcp" src/` 在 darktable 源码树中**无任何命中**；
+**darktable 则没有 DCP 色彩配置文件实现**：`grep -rli "dcp" src/` 在 darktable 源码树中**有 7 处命中，但无一是 DCP profile 实现**
+——`src/imageio/format/j2k.c:711` 是 JPEG-2000 导出器的 "DCP mode"（Digital Cinema Package，同名假朋友），
+其余 6 处是 XMP 基准测试文件里 base64 `darktable:params=` 块内的偶然匹配。
 其 input color profile 只使用 `dt_colorspaces_color_profile_type_t`（默认 `DT_COLORSPACE_ENHANCED_MATRIX`，
 `src/iop/colorin.c:77`）。⇒ **darktable 的相机外观数据源是 ICC profile（而非 DCP）**。
+> **2026-09-22 勘误**：本节原文断言该 grep「无任何命中」——**该断言为假**（复核实得 7 处命中）。
+> 结论（darktable 走 ICC 不走 DCP）不受影响，但证据句已按实测改写。
 
 【源码事实】**结论：存在至少三个层次的"引擎化"：**
 1. **规范/厂商 profile 引擎**（Adobe DCP：参数表 + 编码声明 + 顺序化管线）——数据源是原厂或 Adobe 提供的 profile；
@@ -772,7 +776,11 @@ src/iop/lut3d.c:257   查表输入硬 clip 到 [0,1]
     AgX 在曲线之后还有 `powf(..., curve_gamma)` 做线性化（`src/iop/agx.c:1078–1082`）；
   - filmic rgb 的**代码**同样线性化（`src/iop/filmicrgb.c:1805–1809`，中间灰落 0.1845，`:2184`），
     尽管其元数据自称 "non-linear"——**元数据与代码不一致，属该项目的已知瑕疵**（`01-darktable.md` §4 并列了两者）；
-  - **最终显示 OETF/TRC 只由 `colorout` 从输出 ICC profile 施加**：`src/iop/colorout.c:700–703`、`:361–403`。
+  - **在 pixelpipe 内，最终显示 OETF/TRC 只由 `colorout` 从输出 ICC profile 施加**：`src/iop/colorout.c:361–403`
+    （真正施加 TRC 的 `_process_fastpath_apply_tonecurves`）；`:700–703` 是矩阵/LUT 的**构造**分支（`d->mode != DT_PROFILE_NORMAL || force_lcms2 || dt_colorspaces_get_matrix_from_output_profile(...)`），
+    不是施加点——原引证把构造当成了施加。
+    （限定词「在 pixelpipe 内」必要：`primaries.c:227` 与 `colorbalancergb.c:1357` 也调 `dt_ioppr_apply_trc`，
+    但两者都是 GUI 滑杆绘制辅助（`_paint_hue_slider`），不参与像素管线。）
   - 另：`dt_iop_colorspace_type_t` 只有 `RAW/LAB/RGB/LCH/HSL/JZCZHZ`，**没有 scene/display 枚举**
     （`src/common/colorspaces.h:42–51`）；scene→display 的分界靠"模块 description 字符串 +
     内置 order 表中 tone mapper 与 colorout 的相对位置 + colorout 施加 profile TRC"三者隐式表达。
@@ -780,9 +788,22 @@ src/iop/lut3d.c:257   查表输入硬 clip 到 [0,1]
     它同时违反了两条业界惯例——OETF 是独立层，且应当是明确声明、与 LUT 构建域一致的 TRC。**
 
 > **对本项目症状的直接含义**：若 FilmKit 在这一层用**纯 2.2 幂**，而 LUT 是按 **sRGB 分段**构建的，
-> 则两者在中间调几乎一致（<1%），但**阴影区差异巨大**（线性 0.005 处 +47.5%，0.001 处 +235%；
+> 则两者在中间调几乎一致（<1%），但**阴影区差异巨大**：**纯 2.2 幂比 sRGB 分段高**
+> （线性 0.005 处高 +47.5%，0.001 处高 +235%；即 2.2 幂把暗部坐标抬亮，方向是 2.2 幂 → 更高；
 > 数值为本次自算，见 `06-photoncamera-baseline-engine.md` §6）。
-> 这正好会削弱"压暗阴影、提高对比/饱和"型风格 LUT 的效果，表现为**"更淡、更灰"**。
+> **注意方向**：原句只给了数字未给主语，易被读成"sRGB 更高"——**是 2.2 幂更高**（`lessons.md` 曾据此写反）。
+
+> **2026-09-22 实测修正（本条结论被真实数据部分推翻）**：上句"会削弱风格 LUT 的效果"**未获实测支持**。
+> 用真实内置资产（CineStill 50D）× 真实成片端到端测量：
+> - **换 OETF 的直接收益**（无 LUT）：暗部 −7.57/255、中低 −4.06、中间调 **+1.27**、亮部 +1.34
+>   ⇒ 对比(P95−P5) **+9.87**、平均饱和 **+2.01pp**。收益来自**暗部压深**，与 LUT 无关；
+>   **中间调仅 +1.27/255**，故"viewing gamma 治发闷"的中间调机制**数值上可忽略**。
+> - **LUT 作用强度**：喂 2.2 编码时 LUT 使对比 +11.46 / 饱和 +14.80pp；喂 sRGB 时仅 +5.41 / +12.83pp
+>   ⇒ **喂 2.2 时 LUT 反而更"用力"**，与本条"被削弱"的断言方向相反。
+> - 结论：改 sRGB 分段 OETF **仍值得做**（sRGB 是标准显示编码、也是本仓库 LUT 的设计域，属**域正确性**；
+>   且暗部压深带来真实对比提升），但**理由要改成上述两条**，不是"LUT 被削弱"。
+> 实现耦合（本仓库）：换 OETF 必须**三处同步**，否则违反"kFsHist 必须同源"决策——
+> `FrameRenderer.cpp:780`(kFsOut) / `:845`(kFsHist) / `:2013`(`std::pow(disp,2.2f)` 反解码)。
 
 ### 第 4 层：风格 3D LUT（display-referred）
 - **域**：display-encoded（与第 3 层输出同域），且在**非线性显示域**混合。

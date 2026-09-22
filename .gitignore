@@ -25,6 +25,8 @@ local.properties
 # 成片样张（不入库，仅本地留存）
 FILMKIT_*.jpg
 FILMKIT_*.dng
+# 临时拍摄样片目录（用户指定：放临时样片，绝不入库）
+test_temp/
 
 # 本地工具二进制（不入库）
 tools/bin/
