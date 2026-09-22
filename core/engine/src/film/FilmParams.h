@@ -7,7 +7,7 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  static constexpr int kCount = 35;
+  static constexpr int kCount = 36;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -42,6 +42,12 @@ struct FilmParams {
   // LUT 资产本身走独立 JNI（nativeEngineSetLut，一次性上传 3D 纹理）；
   // 这里只带**混合强度**：0 = 旁路（A/B 通路），1 = 全量。未选 LUT 时无意义。
   float lut_strength = 1.0f;   // 34
+  // ── M4-6 自适应影调（默认开、可关）──────────────────────────────
+  // 真机实测：M 档实拍场景白点（显示域 P95）普遍偏低，即欠曝 1–1.2EV，
+  // 固定曝光补偿救不了 —— 暗场景需要 +1.2EV、亮场景只能承受 +0.3EV，差 4 倍。
+  // 开启后引擎按场景白点自动算线性增益（限幅 [1,4]×，只提亮不压暗）；
+  // 预览 / YUV 静拍 / RAW 静拍三条路径共用 passFilm 内的同一处统计。
+  float auto_tone = 1.0f;      // 35 0 = 关（退回固定 ev 0.35），1 = 开
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -89,6 +95,7 @@ struct FilmParams {
     if (n > 32) look_sat = static_cast<float>(v[32]);
     if (n > 33) look_chroma = static_cast<float>(v[33]);
     if (n > 34) lut_strength = static_cast<float>(v[34]);
+    if (n > 35) auto_tone = static_cast<float>(v[35]);
   }
 };
 

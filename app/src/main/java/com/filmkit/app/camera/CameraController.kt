@@ -681,6 +681,7 @@ class CameraController(private val context: Context, private val render: RenderC
         lookPref = -1.0  // 同上，[31]
         hlPref = -1.0    // 同上，[29]
         zebraPref = -1.0 // 同上，[30]
+        autoTonePref = -1.0 // 同上，[35]
         lutStrengthPref = -1.0 // 同上，[34]
         applyTonePref()
         applyHlPref()
@@ -695,7 +696,12 @@ class CameraController(private val context: Context, private val render: RenderC
     private var zebraPref = -1.0
     private var lookPref = -1.0
     private var lutStrengthPref = -1.0
-    private var calibLogged = false
+    private var autoTonePref = -1.0
+    // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
+    // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
+    // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
+    private var calibLoggedId: String? = null
+    private var currentLensId = ""
 
     /**
      * 基准影调开关（M3 色彩内核 v1）：写 FilmParams[28]（0 = 恒等/旧行为）。
@@ -729,12 +735,13 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /**
-     * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量）。
+     * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量，
+     * 1.5 = 150% —— 沿 LUT 色差外推，与 PhotonCamera 的 >100% 强度语义一致）。
      * 与上述开关同款「偏好覆盖」：UI 只写 prefs，提交前统一回写数组 ——
      * 预览 / YUV 静拍 / RAW 静拍三条路径共用同一数组，故所见即所得。
      */
     private fun applyLutStrengthPref() {
-        val v = appPrefs.getFloat("lut_strength", 1f).toDouble().coerceIn(0.0, 1.0)
+        val v = appPrefs.getFloat("lut_strength", 1f).toDouble().coerceIn(0.0, 1.5)
         if (v != lutStrengthPref) {
             lutStrengthPref = v
             filmParams[34] = v
@@ -747,6 +754,22 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != zebraPref) {
             zebraPref = v
             filmParams[30] = v
+        }
+        // 自适应影调（M4-6）同属"输出域开关"，搭同一批刷新入口（共 4 处调用点）
+        applyAutoTonePref()
+    }
+
+    /**
+     * 自适应影调开关（M4-6）：写 FilmParams[35]。
+     * 1.0 = 开：引擎按场景白点（显示域 P95）自动算线性曝光增益（限幅 [1,4]×）；
+     * 0.0 = 关：退回固定 exp2(0.35)，即 v0.6.17 行为。
+     * 真机实测 M 档实拍场景普遍欠曝 1–1.2EV，固定补偿救不了（差 4 倍）。
+     */
+    private fun applyAutoTonePref() {
+        val v = if (appPrefs.getBoolean("auto_tone", true)) 1.0 else 0.0
+        if (v != autoTonePref) {
+            autoTonePref = v
+            filmParams[35] = v
         }
     }
 
@@ -899,6 +922,7 @@ class CameraController(private val context: Context, private val render: RenderC
         var targetId: String = lens.id
         val ch = cm.getCameraCharacteristics(targetId)
         curCharacteristics = ch
+        currentLensId = targetId
         activeLensIdx = backLenses.indexOf(lens).coerceAtLeast(0)
         // 手动对焦：部分 HAL（X300）不上报屈光度上限，给 10D 试值（≈10cm）
         minFocusDiopter = (ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f)
@@ -1158,16 +1182,19 @@ class CameraController(private val context: Context, private val render: RenderC
                 "ccmSrc" to if (meta.ccmStd) "std" else "hal",
                 "noise" to "%.4f".format(meta.noiseSigma),
                 "in" to "${img.width}x${img.height}",
+                "lens" to currentLensId,
             ),
         )
         // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在
         // CaptureResult —— v0.5.45 初版记错归属，编译期 Unresolved 才暴露）。
-        // 只在首次拍照记一条，避免每条 raw.meta 重复。
-        if (!calibLogged && ch != null) {
-            calibLogged = true
+        // 每个 cameraId 各记一条（v0.6.20）：主摄与长焦的标定矩阵是否相同，
+        // 是"主摄色彩明显差"的头号嫌疑，必须能从日志直接对比。
+        if (calibLoggedId != currentLensId && ch != null) {
+            calibLoggedId = currentLensId
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "raw.calib",
                 kv(
+                    "cameraId" to currentLensId,
                     "ct1" to cst9(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)),
                     "ct2" to cst9(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)),
                     "cal1" to cst9(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)),

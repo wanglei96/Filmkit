@@ -578,6 +578,9 @@ uniform float uToneK;      // 基准影调强度（0 = 恒等/旧行为，1 = �
 uniform float uLook;       // 色彩外观层强度（0 = 恒等/A-B 关，M3 P1）
 uniform float uLookSat;    // 亮度保持的饱和增益
 uniform float uLookChroma; // 色度 S 曲线端点增益
+// M4-6 自适应影调：曝光增益由 C++ 侧算好下发 —— 开启 = 按场景白点自适应，
+// 关闭 = 固定 exp2(0.35)。两条路都只经 baseTone 的线性曝光这一处，语义唯一。
+uniform float uExposureGain;
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
 // 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
@@ -587,19 +590,48 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // v0.5.37：枢轴 0.18→0.22、p 1.35→1.20 —— v0.5.36 真机实测"中灰锚定"对
 // 中灰以下为主的暗光场景整体压暗 29%（均值 88.6→62.8），枢轴上移到 0.22 做
 // 相机 JPEG 式中间调微提亮，黑位与高光 rolloff 保留。
+// v0.6.14（M4-4，治"原片发灰"）：真机同场景 DNG 对照 libraw 标准链 —— 黑位
+// P0.1 = L*31~35（libraw 6.3、厂商直出 0）、对比 45（libraw 61）。
+// v0.6.16（M4-5，第二次修正）：v0.6.14 用"提高 p 到 2.00"去压黑位是**错的旋钮** ——
+// 旧归一化把 [mn,1] 映射成 t∈[0,1] 后再套标准 S 曲线，**右半段的不动点跑到 xn≈0.609**，
+// 于是中灰以上（画面主体）落进"S 曲线下半段"被**压暗**（实测 baseTone(0.4)=0.34 < 0.4、
+// 显示域 0.70→0.66），画面整体变暗发闷，用户报"没眼看"。
+// 修法：把 xn 归一化到"以 mn 为 0.5"的坐标再套 S 曲线 —— **不动点恒为 mn**，
+// 暗部压暗、中灰不动、高光提亮；压黑位改用 blk（黑点），p 退回 1.20。
+// 离线（同场景 DNG）：L* 64.1 / 黑位 0 / P95 86.8 / 对比 54.2；旧包 64.4 / 32.1 /
+// 83.5 / 45.1 —— 亮度持平，黑位与高光同时改善。
+// v0.6.17（M4-6，治"闷"）：v0.6.16 仍留着 g=0.82 幂提亮，而**幂提亮是降对比的旋钮** ——
+// 线性域 pow(x,0.82) 把 0.01 放大 2.35×、把 0.5 只放大 1.13×，等于抬暗部 = 压缩动态范围。
+// 真机实测 0.6.16：对比 66.6 / P5 4.5；厂商直出 89.2 / 2.1 —— 亮度靠 g 补，代价就是"平"。
+// 修法：**提亮改用线性域曝光**（与 PhotonCamera 的 exposureCompensationDomain=Linear 同一约定），
+// 对比交给 p，g 整段删除。三个旋钮至此正交：ev 管亮度、p 管对比、blk 管黑位。
+// 离线（真机成片反推，同场景对照厂商直出）：
+//   旧包 0.6.13  对比 68.4 / P5 13.1 / P95 81.5 / C* 4.14
+//   ev+0.35 p1.60 对比 93.1 / P5  1.9 / P95 95.0 / C* 5.58   ← 对齐厂商直出
+//   厂商直出 336 对比 89.2 / P5  2.1 / P95 91.4 / C* 5.96
+// 注：ev 与 p 都受"高光硬截断"约束（p2.0 时 P95 已 97.2、ev+0.70 时 99.6 溢出），
+// 所以取 p1.60 而非 2.00；高光滚降是下一步，做完才能放开这两个旋钮。
+// v0.6.18（M4-6 补，治"暗"）：v0.6.17 删掉 g 之后**暗场景被整体压暗** —— 真机实拍
+// 阳台 L* 38.3→24.5、书桌 22.5。根因正是 lesson 里早记过的机制：S 曲线对"中灰以下
+// 为主"的场景必然整体压暗，而原来的提亮手段就是 g。真机三场景的场景白点（显示域
+// P95）普遍偏低，等于**欠曝 1–1.2EV**；固定曝光补偿救不了（暗场景要 +1.2EV、
+// 亮场景只能承受 +0.3EV，差 4 倍 —— 合成压力测试：+1EV 时正常曝光场景 27% 像素爆掉）。
+// 本轮改为两条腿：① 引擎按场景白点自适应算曝光增益（updateAutoGain，限幅 [1,4]×，
+// 只提亮不压暗；设置页"自适应影调"可关，关掉即退回固定 exp2(0.35)）；
+// ② kFsOut 加高光滚降（软压缩 + 去饱和），replace 掉 clamp 硬截断 —— 它是放开
+// 增益上限的前提，也让过曝的灯/窗不再变红变粉。
 float baseTone(float x) {
-    const float blk = 0.0020;   // 黑点 ≈ -6.5EV（去暗部雾感）
-    const float mn  = 0.2184;   // 归一化后的中间调枢轴（线性 0.22）
-    const float p   = 1.20;     // S 强度（温和）
-    const float g   = 0.90;     // 中间调提亮（<1 提亮，端点 0/1 不变）
-    float xn = clamp((x - blk) / (1.0 - blk), 0.0, 1.0);
-    float t = xn <= mn ? xn / mn : (xn - mn) / (1.0 - mn);
+    const float blk = 0.0080;   // 黑点 —— 压黑位靠它，不靠 p
+    const float mn  = 0.2184;   // 中间调枢轴（线性 0.22）＝ S 曲线的**不动点**
+    const float p   = 1.60;     // S 强度 —— 对比旋钮（不动点不随它移动）
+    // 曝光增益 uExposureGain：自适应场景白点归一，或关闭时固定 exp2(0.35)
+    float xn = clamp((x * uExposureGain - blk) / (1.0 - blk), 0.0, 1.0);
+    // 归一化到以 mn 为 0.5 的坐标：S 曲线在 t=0.5 处 s=0.5，映射回来正好是 mn
+    float t = xn <= mn ? 0.5 * xn / mn : 0.5 + 0.5 * (xn - mn) / (1.0 - mn);
     float tp = pow(t, p);
     float s = tp / max(tp + pow(1.0 - t, p), 1e-6);
-    // v0.5.41：对称 S 对"中灰以下为主"的暗光场景必然整体压暗（v0.5.37 实测
-    // -11%~-16%，用户反馈仍偏暗）。加 gamma 提亮把均值拉回无 tone 水平
-    // （离线校准：均值 49.99→48.74，只差 -2.5%），黑位与高光 rolloff 都不动。
-    return pow(xn <= mn ? mn * s : mn + (1.0 - mn) * s, g);
+    // 映射回：s=0.5 处回到 mn（不动点），端点 0/1 精确取到
+    return s <= 0.5 ? mn * (s / 0.5) : mn + (1.0 - mn) * ((s - 0.5) / 0.5);
 }
 // ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
 // 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）
@@ -722,10 +754,29 @@ float vnoise(vec2 p) {
     float c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
+// M4-6 高光滚降（线性域）：clamp 硬截断会把 >1 的高光直接拍成死白，而且**保留
+// 色相**，使过曝的灯/窗偏红偏粉（v0.5.37 用户反馈过）。
+// v0.6.19 两处修正（真机报"高光没细节"）：
+//   ① **knee 提到与 updateAutoGain 的 kTarget 相同（0.80）** —— 之前 knee 0.75 < 目标白点
+//      0.90，等于让"正常亮部（P95）"也落进压缩区；对齐后**只有真正超过目标白点的部分
+//      才被压缩**，P95 以下的层次原样保留。
+//   ② 曲线由 t/(1+t) 换成**指数软肩**：两者都满足 f(knee)=knee、f'(knee)=1、l→∞ 趋 1，
+//      但指数版在 l=1.0 处斜率 0.37，t/(1+t) 只有 0.25（压缩 4 倍）—— 高光层次差一倍以上。
+//      指数版同样单调无过冲（Hermite 保斜率曲线会过冲，故不采用）。
+vec3 highlightRolloff(vec3 c) {
+    const float knee = 0.80;  // 必须与 updateAutoGain 的 kTarget 对齐
+    float l = max(max(c.r, c.g), c.b);
+    if (l <= knee) return c;
+    float u = (l - knee) / (1.0 - knee);              // [0, ∞)
+    float lc = knee + (1.0 - knee) * (1.0 - exp(-u)); // → [knee, 1)
+    vec3 cc = c * (lc / l);                           // 等比压缩，保持色相
+    return mix(cc, vec3(lc), smoothstep(knee, 1.6, l));  // 过曝趋白
+}
 void main() {
     vec2 uv = vUV0;
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
     vec3 c = texture(uTex, uv).rgb;
+    c = highlightRolloff(c);
     c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
@@ -1028,6 +1079,7 @@ bool FrameRenderer::init() {
   u_film_.look = glGetUniformLocation(prog_film_, "uLook");
   u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
   u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
+  u_film_.exposure_gain = glGetUniformLocation(prog_film_, "uExposureGain");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -1705,7 +1757,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // 体积别掉太多。P0 是细节与体积的主因（亮度高频），再放轻 0.50→0.28；彩噪改由
   // P4 补强 1.80→2.20（P4 只动色度、保 Y，不影响亮度细节与体积大头）。
   const float sr_k = dn_high ? 2.20f : 0.28f;  // P0 值域 σ 系数
-  const float sc_k = dn_high ? 2.60f : 2.20f;  // P4 值域 σ 系数
+  // v0.6.19：自适应提亮 ~1.1EV 把噪声一起放大（真机同场景 A/B：亮度 σ +21%、
+  // **色度 σ +84%**），故 P4 色度系数再补强约 25%。P4 只动色度、保 Y 不动，
+  // 加强它不影响亮度细节与体积（P0 的 sr_k 刻意不放，避免动到细节大头）。
+  const float sc_k = dn_high ? 3.25f : 2.75f;  // P4 值域 σ 系数
   const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
   // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
   // 物理量级，夹紧避免异常值让降噪失效或过猛
@@ -1896,7 +1951,13 @@ void FrameRenderer::bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength,
 // 实时直方图（M3）：tex_work_（胶片输出）→ 显示域亮度 → 256×96 RGBA8 → 读回统计。
 // 必须在渲染线程、有当前 context 时调用；尚未渲染过预览帧（tex_work_ 为空）返回 false。
 bool FrameRenderer::histogram(int* out, int n) {
-  if (out == nullptr || n < 2 || tex_work_ == 0 || scene_w_ <= 0) return false;
+  return histogramFrom(tex_work_, out, n);
+}
+
+// M4-6：统计源参数化 —— 自适应影调必须对**场景纹理**（baseTone 之前）统计，
+// 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
+bool FrameRenderer::histogramFrom(GLuint src, int* out, int n) {
+  if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   const int hw = 256, hh = 96;
   if (tex_hist_ == 0) {
     makeTex(&tex_hist_, &fbo_hist_, GL_RGBA8, hw, hh);
@@ -1908,7 +1969,7 @@ bool FrameRenderer::histogram(int* out, int n) {
   glUseProgram(prog_hist_);
   applyPendingLut();
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_hist_.tex, 0);
   bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
           u_hist_.lut_dinv, u_hist_.lut_size, lut_strength_);
@@ -1922,6 +1983,44 @@ bool FrameRenderer::histogram(int* out, int n) {
   return true;
 }
 
+// 自适应曝光增益：场景白点（显示域 P95）折回线性后归一到目标白点。
+// 分位实测选型（真机三场景 + 合成亮场景压力测试）：P90 会让 gain 打满上限 4.0×
+// （阳台 L* 52.7，过亮）；P99 被小面积高光骗（书桌笔记本屏幕 → gain 仅 1.15×，
+// 桌面 L* 20.3 偏暗）；**P95 最平衡** —— 阳台 45.6 / 卧室 63.5（厂商同场景 62.1）/
+// 书桌 32.3，且三种场景 clip 全 0%。**限幅只允许提亮**（[1,4]×），不压暗用户
+// 设定的曝光 —— 过曝交给 kFsOut 的高光滚降。
+float FrameRenderer::updateAutoGain(GLuint src) {
+  constexpr int kN = 64;
+  constexpr float kTarget = 0.80f;  // 目标线性白点（须 ≤ 滚降 knee，见 highlightRolloff）
+  constexpr float kMax = 4.0f;
+  const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
+  int hist[kN];
+  if (!histogramFrom(src, hist, kN)) return fallback;
+  long total = 0;
+  for (int i = 0; i < kN; ++i) total += hist[i];
+  if (total <= 0) return fallback;
+  const long want = static_cast<long>(static_cast<double>(total) * 0.95);
+  long acc = 0;
+  int bin = kN - 1;
+  for (int i = 0; i < kN; ++i) {
+    acc += hist[i];
+    if (acc >= want) {
+      bin = i;
+      break;
+    }
+  }
+  const float disp = static_cast<float>(bin) / (kN - 1);
+  const float lin = std::pow(disp, 2.2f);  // 显示域 → 线性
+  float gain = std::clamp(kTarget / std::max(lin, 1e-4f), 1.0f, kMax);
+  // EMA 平滑：首帧直通（静拍只有一帧也必须立即生效），之后缓变防抖动
+  if (auto_gain_ <= 0.0f) {
+    auto_gain_ = gain;
+  } else {
+    auto_gain_ = auto_gain_ * 0.7f + gain * 0.3f;
+  }
+  return auto_gain_;
+}
+
 void FrameRenderer::passFill(int dst_w, int dst_h) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
@@ -1932,12 +2031,19 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 }
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) {
+  // 自适应影调（M4-6）：按场景白点算线性曝光增益。**刻意放在 passFilm 内** ——
+  // 预览 / YUV 静拍 / RAW 静拍三条路径都经过这里，一处实现即全覆盖。
+  // 关闭（auto_tone ≤ 0.5）时退回固定 ev 0.35，与 v0.6.17 行为逐位一致（A/B 通路）。
+  // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。
+  const float gain =
+      p.auto_tone > 0.5f ? updateAutoGain(src_tex) : std::exp2(0.35f);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_film_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src_tex);
   glUniform1i(u_film_.tex, 0);
+  glUniform1f(u_film_.exposure_gain, gain);
   glUniform1f(u_film_.contrast, p.contrast);
   glUniform3f(u_film_.shoulder, p.shoulder[0], p.shoulder[1], p.shoulder[2]);
   glUniform3f(u_film_.toe, p.toe[0], p.toe[1], p.toe[2]);

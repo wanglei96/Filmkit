@@ -104,6 +104,11 @@ class FrameRenderer {
                       float white_level, const float gains[3], float ns,
                       float k);
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
+  // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
+  // 与公开的 histogram() 同一实现），取 P99 折回线性得场景白点 → 曝光增益
+  // （限幅 [1,4]×，只提亮不压暗）。auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
+  bool histogramFrom(GLuint src, int* out, int n);
+  float updateAutoGain(GLuint src);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
@@ -149,6 +154,7 @@ class FrameRenderer {
   float pending_lut_dmax_[3] = {1.0f, 1.0f, 1.0f};
   bool lut_dirty_ = false;
   float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
+  float auto_gain_ = 0.0f;     // 自适应曝光增益（≤ 0 = 未初始化，首帧直通）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
                GLint loc_dinv, GLint loc_size, float strength);
@@ -193,7 +199,7 @@ class FrameRenderer {
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
-          look_sat = -1, look_chroma = -1;
+          look_sat = -1, look_chroma = -1, exposure_gain = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
