@@ -1,65 +1,66 @@
 # FilmKit git tag 备份（清理前）
 # 日期: 2026-09-22 ｜ 原因: 只保留里程碑/验收版 tag，删除中间验证包 tag
 # 恢复方式: git tag <tag> <commit>  &&  git push origin <tag>
+# 注: commit 列已按 git filter-repo 的 commit-map 换成 2026-09-22 历史重写（移除三个误提交截图）后的 hash
 #
 TAG              COMMIT                                     DATE         SUBJECT
 v0.4.5-m2        0857bb0f272571689eca9a513f17279147fb8284   2026-09-18   feat: FilmKit v0.4.5-m2 — film camera app with M-mode capture and GPU film rendering
 v0.4.6-m2        08f973bbf4cbdad5639ac658f588d78d10fc119e   2026-09-18   feat(ui): v0.4.6-m2 camera UI redesign — direction C (Photon skeleton + DAZZ film skin)
-v0.4.7-m2        37165da8739e979408c3d3684c90e979f362aa09   2026-09-18   feat(ui): v0.4.7-m2 feedback iteration — transparent zoom+filter row, quick settings panel
-v0.4.8-m2        1409246d8fde7bdf653961875fec747321566ddb   2026-09-19   feat(ui): v0.4.8-m2 — live control tiles, LUT menu, tab-free navigation, unified settings
-v0.4.9-m2        0a2407dab35ce17400999b4d2bf9b9d8d4645e3f   2026-09-19   feat(ui): v0.4.9-m2 — auto/manual param model, adaptive tick sliders, configurable accent color, settings sub-pages
-v0.5.0-m2        9d69b0804321fd2572e93a0a667362cb6b893b07   2026-09-19   feat(ui): v0.5.0-m2 — quick settings strip (flash/histogram/shutter sound/aspect), drag fix, linear tween
-v0.5.1-m2        f5c751b2d49c743bdf6282f501053d22d822cb26   2026-09-19   feat(ui): v0.5.1-m2 — proactive UX audit round 1: haptics, shutter animation, press feedback, pinch zoom, volume capture, grid, thumbnail, portrait lock
-v0.5.2-m2        2a7b8ed45b2a612ff43f68845e4d380031dbd345   2026-09-19   fix(camera): v0.5.2-m2 — WB transform matrix, MF slider, seamless cross-lens zoom, crop-window aspect preview
-v0.5.3-m2        c826defb50ef743355b0416077b320d5ed06f2f7   2026-09-19   fix(camera): v0.5.3-m2 — full-bleed aspect-cropped preview, live WB kelvin estimate, live MF distance, rotation follow
-v0.5.4-m2        ad85a8d7ccb194036f46f8f273974f792506597e   2026-09-19   fix(camera): v0.5.4-m2 — preview stretch root cause, window=aspect WYSIWYG, real capture crop
-v0.5.5-m2        c7b7511ab007411c733aa4bfd0e32499ea0e1890   2026-09-19   fix(camera): v0.5.5-m2 — 16:9/XPAN preview stretch (shader-parity sx/sy), WB anchor strategy aligned with PhotonCamera
-v0.5.6-m2        02565fb3aeca0305e750f554a33a9bc26bbf2e45   2026-09-19   fix(camera): v0.5.6-m2 — screen-width quick dropdown, WB estimate from COLOR_CORRECTION_GAINS result, crash capture
-v0.5.7-m2        c126a0c4133172e042d954f4c32e484b3e3bfd57   2026-09-19   fix(camera): v0.5.7-m2 — WB manual = full anchored matrix row scaling, transform-estimate device calibration
-v0.5.8-m2        31017196de3ca111e3beeeca4579676aa6082bd6   2026-09-19   fix(camera): v0.5.8-m2 — WB column scaling fixes green cast, zoom-ratio display sync, long-press focal wheel
-v0.5.9-m2        ff2cb69a96a7eb4948b1d3f9087be429a3e437bd   2026-09-19   feat(camera): v0.5.9-m2 — engine-side WB compensation, main-lens zoom baseline, custom focal segments, adaptive EV range
-v0.5.10-m2       10092d8d4c1cc6ef49cef67f42af44595fb7c1bb   2026-09-20   fix(camera): v0.5.10-m2 — semicircle zoom wheel, fix zoom-out jump on lens crossing
-v0.5.11-m2       95397ad4b3ee9e0077aef9b9fae7d1d73eec9f36   2026-09-20   perf(camera): v0.5.11-m2 — faster lens switching, wheel fling inertia
-v0.5.12-m2       3b8cfa5f5cfa8562be217aca6ba6b3f7cf803266   2026-09-20   fix(camera): v0.5.12-m2 — quality-first lens choice, wheel arc clipping
-v0.5.13-m2       3ae6af247a231efdd6021273735fcb4acf790e1d   2026-09-20   fix(engine): v0.5.13-m2 — shadow clipping, EXIF write-back, YUV matrix switch
-v0.5.14-m2       71d8d3c8c75f9123c920a0a8a31cc561ce42c1b7   2026-09-20   hotfix(engine): v0.5.14-m2 — invalid step overload broke shader, black preview
-v0.5.15-m2       4b30ac00b9b10d6c176943edbca0b761d32dd1fd   2026-09-20   feat(ui): v0.5.15-m2 — JPEG quality setting, EXIF orientation fix
-v0.5.16-m2       57ed3f59560cfc183fdf6f631db09ed6e158a2d3   2026-09-20   feat(ui): v0.5.16-m2 — grid/level to quick menu, bubble level
-v0.5.17-m2       a8fa392d512fb1ef7047f1e0c8b03a4081380519   2026-09-20   fix(ui): v0.5.17-m2 — bubble level rebuilt as rotating line
-v0.5.18-m2       0527beff255d8588e90c7bc9f4e86a210e062e16   2026-09-20   fix(ui): v0.5.18-m2 — level aligns in both orientations, smooth 360° sweep
-v0.5.19-m2       14fcaaa0e44e3a55cb2979b11ace3fa1d8776b97   2026-09-20   fix(ui): v0.5.19-m2 — level rotation sign, hysteresis, shorter line
-v0.5.20-m2       ac758abcc0e19bb5882a0f89789e464b67086af6   2026-09-20   feat(raw): v0.5.20-m2 — M2-3 RAW end-to-end (RAW_SENSOR + DngCreator + engine submitRaw)
-v0.5.21-m2       ba9f5adf318134b0d89444b684a8c8033d4cd2e2   2026-09-20   fix(raw): v0.5.21-m2 — M-mode quick toggle, CCM transpose fix, DngCreator orientation
-v0.5.22-m2       db70a049756bba54e66965ceb07c39e7679712ef   2026-09-20   fix(ui): v0.5.22-m2 — persist capture aspect across subpage rebuilds
-v0.5.23-m2       7bd15bda5e5c9477ffa17effced27afb6f99a334   2026-09-20   fix(ui): v0.5.23-m2 — shutter row avoids system gesture bar
-v0.5.24-m2       03323683f4206c98a624d66607e50d7de09a5a3b   2026-09-20   refactor(ui): v0.5.24-m2 — control tiles into preview, shutter row raised
-v0.5.25-m2       425e48d49698569bdc9137a7004c84947913fea1   2026-09-20   refactor(ui): v0.5.25-m2 — swap tiles/focal bar, compact tiles, raise shutter more
-v0.5.26-m2       f2808aeda0564e0127302516230b943fc8fdcfec   2026-09-20   refactor(ui): v0.5.26-m2 — adaptive preview height, tiles out of preview
-v0.5.27-m2       3d2601944c25efeedf95aef74e4c64f66c0e3bb8   2026-09-20   feat(m3): v0.5.27-m2 — M2 closed; RAW chain timing + shader static validation
-v0.5.28-m3       6eb0992260c0cb5f394a2af18bc431a77988d433   2026-09-20   feat(m3): v0.5.28-m3 — M3-1 RCD quality demosaic pipeline
-v0.5.29-m3       8d01960f6c1512dc8c6e8bbd924f501d33348b35   2026-09-20   perf(m3): v0.5.29-m3 — RCD P2 4x sampling cut after on-device profiling
-v0.5.30-m3       4112e548364abda130a301bc5b518545b134b118   2026-09-20   fix(m3): v0.5.30-m3 — RCD P3 G-site chroma fill Bayer structure bug
-v0.5.31-m3       6e7e26bafc58d73fb5c5624755d64a306877db62   2026-09-20   fix(m3): v0.5.31-m3 — CFA LUT k1/k2 bit-order swap caused red cast
-v0.5.32-m3       62f2a8c4ecc238159ea70da634649e9033cf077b   2026-09-21   feat(m3): v0.5.32-m3 — M3-2 noise reduction v1 (RAW bilateral + chroma smooth)
-v0.5.33-m3       bf49fabd25f7a7959986d119872cc063b345bf3e   2026-09-21   feat(m3): v0.5.33-m3 — M3-2 denoise tuning, std/high two levels
-v0.5.34-m3       7bf8a433bcf0eb0691c44d79c0ea56cbd3795ad4   2026-09-21   fix(m3): v0.5.34-m3 — denoise recalibration + SENSOR_NOISE_PROFILE cast fix
-v0.5.35-m3       290b1b87d7ef22df3ce356b51abbbc2eb4fc8b1f   2026-09-21   feat(m3): v0.5.35-m3 — lighten standard denoise (P0 0.28 / P4 2.20)
-v0.5.36-m3       d130d76e8a3fefda4c723b4473e968f7dab3915f   2026-09-21   feat(m3): v0.5.36-m3 — base color kernel v1: pivot-anchored S curve
-v0.5.37-m3       ebf287c73d9b08be2771c610402c0a6bed37558a   2026-09-21   feat(m3): v0.5.37-m3 — soften base tone (pivot 0.22 / p 1.20) + A/B toggle
-v0.5.38-m3       343880a1533069a5710db0b677aceb2f41cc9f20   2026-09-21   fix(m3): v0.5.38-m3 — highlight desaturation (fixes lamp turning red)
-v0.5.39-m3       103caf34b6e31c05fa6d7ea3c3033ae47cd60afc   2026-09-21   feat(m3): v0.5.39-m3 — highlight reconstruction (pre-CCM saturated channel extrapolation)
-v0.5.40-m3       eb720bb2170f2903ce3693219e3d254a823dc827   2026-09-21   feat(m3): v0.5.40-m3 — preview overexposure zebra
-v0.5.41-m3       e1e52594468ed43a8881ba9e1fcefaf98b29a3c5   2026-09-21   feat(m3): v0.5.41-m3 — midtone lift (g 0.90) + zebra toggle moved to quick panel
-v0.5.42-m3       ea38f41bd94d4f49ad3d70e8adfc0b11670aff24   2026-09-21   chore(m3): v0.5.42-m3 — lens-shading availability probe (evaluation build)
-v0.5.43-m3       87f35445596375100b8b05b48ee8a8bc5a6a221f   2026-09-21   feat(m3): lens shading correction in RAW pipeline (v0.5.43-m3)
-v0.5.47-m3       cd7b722347d444a90e597aff37d04a8f09c102d0   2026-09-21   chore(memory): LSC与标准色彩链落地及寡淡复核
-v0.5.48-m3       175e333dd2cac5726cb230e92f0d2a605a20548a   2026-09-21   fix(exif): write ExposureTime as decimal seconds so it lands
-v0.6.0-m4        fc0f8393dcaddd0c1e7f5075c8b9b95d968660b7   2026-09-21   feat(lut): bundle 6 .cube assets as built-in display-domain 3D LUTs
-v0.6.1-m4        90e265b43621d81075898e9f70313da561565750   2026-09-21   fix(lut): always bind a valid 3D texture to the LUT sampler unit
-v0.6.2-m4        743386041a914023eda6f6c0aee790bb45c2796d   2026-09-21   feat(ui): optional LUT name in still filename (prefs lut_in_name)
-v0.6.3-m4        7cdebe94eb2b32bfd33a9ecfaa042a6b28b28bdc   2026-09-21   feat(lut): opacity slider for the active LUT
-v0.6.4-m4        db49a4dcc53578d9e71a161a644b6677c71fec74   2026-09-22   feat(ui): LUT/preset picker as a bottom sheet with category pills and cards
-v0.6.5-m4        9faf838cf3e1c7cb773a508f7ed4661ab46c6d66   2026-09-22   feat(lut): card previews from a fixed test image, generated once and cached
-v0.6.6-m4        ef3faf7923484983838259bc0a0b00f25ea3ca78   2026-09-22   fix(lut): render card previews at 320px instead of upscaling 108px
-v0.6.7-m4        eaf43702f6e98e9a2ad86095d07a108abe5956f1   2026-09-22   fix(ui): pin the LUT entry and shrink focal chips
-v0.6.8-m4        4b6183710f3cd40d4f9e69ecb855146b5719209d   2026-09-22   feat(ui): focal strip shows either focals or multipliers, 3-column quick menu, centred strip
+v0.4.7-m2        af47ea59697b387b7de9c362621295203c07d33f   2026-09-18   feat(ui): v0.4.7-m2 feedback iteration — transparent zoom+filter row, quick settings panel
+v0.4.8-m2        4d14f3ad8fad3e8a2a7cadd6e1744ba4b0e1d2d8   2026-09-19   feat(ui): v0.4.8-m2 — live control tiles, LUT menu, tab-free navigation, unified settings
+v0.4.9-m2        90fa3834402e2c20b1feb425219dae3e35dad85b   2026-09-19   feat(ui): v0.4.9-m2 — auto/manual param model, adaptive tick sliders, configurable accent color, settings sub-pages
+v0.5.0-m2        78b32c1f2087d39f567cd0dc2b887691b79fed6b   2026-09-19   feat(ui): v0.5.0-m2 — quick settings strip (flash/histogram/shutter sound/aspect), drag fix, linear tween
+v0.5.1-m2        a0d7d29251c3c39f7f5e9dc12f6fbd38239ff721   2026-09-19   feat(ui): v0.5.1-m2 — proactive UX audit round 1: haptics, shutter animation, press feedback, pinch zoom, volume capture, grid, thumbnail, portrait lock
+v0.5.2-m2        b64e7ebebf9efa9c8a5a4558b6bba5e2be4ce6bf   2026-09-19   fix(camera): v0.5.2-m2 — WB transform matrix, MF slider, seamless cross-lens zoom, crop-window aspect preview
+v0.5.3-m2        661e441df186446108aa02a02136e0946d122eac   2026-09-19   fix(camera): v0.5.3-m2 — full-bleed aspect-cropped preview, live WB kelvin estimate, live MF distance, rotation follow
+v0.5.4-m2        04b3bf83931916cd6cefe636306756c464eb5cae   2026-09-19   fix(camera): v0.5.4-m2 — preview stretch root cause, window=aspect WYSIWYG, real capture crop
+v0.5.5-m2        c0f73d17f6c915d87f6fd967af38460349f174a1   2026-09-19   fix(camera): v0.5.5-m2 — 16:9/XPAN preview stretch (shader-parity sx/sy), WB anchor strategy aligned with PhotonCamera
+v0.5.6-m2        593785023f8e03a817644cd1dacb07416dda097f   2026-09-19   fix(camera): v0.5.6-m2 — screen-width quick dropdown, WB estimate from COLOR_CORRECTION_GAINS result, crash capture
+v0.5.7-m2        37f7bd4dba856fdbcd281ddc6b71c323be83701a   2026-09-19   fix(camera): v0.5.7-m2 — WB manual = full anchored matrix row scaling, transform-estimate device calibration
+v0.5.8-m2        1e68893923d958be7f693f5f8daa945283cb5366   2026-09-19   fix(camera): v0.5.8-m2 — WB column scaling fixes green cast, zoom-ratio display sync, long-press focal wheel
+v0.5.9-m2        3b4ebf018e5bc0ee7c94e9a710bca2c2b8687753   2026-09-19   feat(camera): v0.5.9-m2 — engine-side WB compensation, main-lens zoom baseline, custom focal segments, adaptive EV range
+v0.5.10-m2       519ff4ea79182f31bf0c0506bb6b67be8e6ccc86   2026-09-20   fix(camera): v0.5.10-m2 — semicircle zoom wheel, fix zoom-out jump on lens crossing
+v0.5.11-m2       c2bf2973eb31c79012bf4680e120f3dbd4deb371   2026-09-20   perf(camera): v0.5.11-m2 — faster lens switching, wheel fling inertia
+v0.5.12-m2       09d46e1fb5f383e11cca437b9b4dfdd3147b379f   2026-09-20   fix(camera): v0.5.12-m2 — quality-first lens choice, wheel arc clipping
+v0.5.13-m2       a5f4a5b054f9f6e070e82b5ab959b502c6918aed   2026-09-20   fix(engine): v0.5.13-m2 — shadow clipping, EXIF write-back, YUV matrix switch
+v0.5.14-m2       b4f36c89eebf90dfdb1bd315765b973c59129043   2026-09-20   hotfix(engine): v0.5.14-m2 — invalid step overload broke shader, black preview
+v0.5.15-m2       b5d2ec02e2b688e8a7b552e4a8dc87da90637ee4   2026-09-20   feat(ui): v0.5.15-m2 — JPEG quality setting, EXIF orientation fix
+v0.5.16-m2       8ff6e0aa1cc6fdefc924ed3d80437c6f3a447741   2026-09-20   feat(ui): v0.5.16-m2 — grid/level to quick menu, bubble level
+v0.5.17-m2       a598afc303ef898b3f1ea00b46cc27381b9aada3   2026-09-20   fix(ui): v0.5.17-m2 — bubble level rebuilt as rotating line
+v0.5.18-m2       3e4394b9c976a8839a31e08398d6faf7787dfee1   2026-09-20   fix(ui): v0.5.18-m2 — level aligns in both orientations, smooth 360° sweep
+v0.5.19-m2       b768e6e3db0db762a3567f1ee726a779baee8a8c   2026-09-20   fix(ui): v0.5.19-m2 — level rotation sign, hysteresis, shorter line
+v0.5.20-m2       244e7cf47cfa17bd83bcc2ec2a5394b7f6ef554b   2026-09-20   feat(raw): v0.5.20-m2 — M2-3 RAW end-to-end (RAW_SENSOR + DngCreator + engine submitRaw)
+v0.5.21-m2       c95fae827907a7bda2cde03c1aa5c61b31622925   2026-09-20   fix(raw): v0.5.21-m2 — M-mode quick toggle, CCM transpose fix, DngCreator orientation
+v0.5.22-m2       8d3f43ce52e0415642c966f46305a70dca622204   2026-09-20   fix(ui): v0.5.22-m2 — persist capture aspect across subpage rebuilds
+v0.5.23-m2       f95ff4b9ae8a2debdebcd58a7421e194fa293f73   2026-09-20   fix(ui): v0.5.23-m2 — shutter row avoids system gesture bar
+v0.5.24-m2       534f4994e3e3b104b9932145ec372ef65a429393   2026-09-20   refactor(ui): v0.5.24-m2 — control tiles into preview, shutter row raised
+v0.5.25-m2       1a05315f2c662ceaa2feb0e49b45acc8bce211b3   2026-09-20   refactor(ui): v0.5.25-m2 — swap tiles/focal bar, compact tiles, raise shutter more
+v0.5.26-m2       327ec0374ef13c479e570ef66eb0e77b5ad45249   2026-09-20   refactor(ui): v0.5.26-m2 — adaptive preview height, tiles out of preview
+v0.5.27-m2       669ff88b205a6415fd4410493139940676d97a35   2026-09-20   feat(m3): v0.5.27-m2 — M2 closed; RAW chain timing + shader static validation
+v0.5.28-m3       965d298c89387443f274add7b1133d169dbef620   2026-09-20   feat(m3): v0.5.28-m3 — M3-1 RCD quality demosaic pipeline
+v0.5.29-m3       e0b971224814bf6995332b26aa4acb480264f456   2026-09-20   perf(m3): v0.5.29-m3 — RCD P2 4x sampling cut after on-device profiling
+v0.5.30-m3       389afe5791acfaa5ca50f2041b6be1398391c13d   2026-09-20   fix(m3): v0.5.30-m3 — RCD P3 G-site chroma fill Bayer structure bug
+v0.5.31-m3       11e22daa0d4a64b633c7108e054a6b90a416c24b   2026-09-20   fix(m3): v0.5.31-m3 — CFA LUT k1/k2 bit-order swap caused red cast
+v0.5.32-m3       f7ef07f438cf88d44fcded5c8614697d8d5eefe7   2026-09-21   feat(m3): v0.5.32-m3 — M3-2 noise reduction v1 (RAW bilateral + chroma smooth)
+v0.5.33-m3       82c1f1a53b71a456422eb7b2da2e6ab82f54441a   2026-09-21   feat(m3): v0.5.33-m3 — M3-2 denoise tuning, std/high two levels
+v0.5.34-m3       22707db98121cb2c1916dbb2d1c608bc17174c84   2026-09-21   fix(m3): v0.5.34-m3 — denoise recalibration + SENSOR_NOISE_PROFILE cast fix
+v0.5.35-m3       731871a45f2ee6bdfd782849cef8fa35116e7839   2026-09-21   feat(m3): v0.5.35-m3 — lighten standard denoise (P0 0.28 / P4 2.20)
+v0.5.36-m3       fe4c1832e9209310afd34e1e5ce2990eaf198b34   2026-09-21   feat(m3): v0.5.36-m3 — base color kernel v1: pivot-anchored S curve
+v0.5.37-m3       5f71a46fab743fa1f729636a80bce25515ec0769   2026-09-21   feat(m3): v0.5.37-m3 — soften base tone (pivot 0.22 / p 1.20) + A/B toggle
+v0.5.38-m3       75702ed9bf0b8be2ccce2e597d083080ed966616   2026-09-21   fix(m3): v0.5.38-m3 — highlight desaturation (fixes lamp turning red)
+v0.5.39-m3       51134a08fbb0500d64b9edf08d4ef6ed09c39f42   2026-09-21   feat(m3): v0.5.39-m3 — highlight reconstruction (pre-CCM saturated channel extrapolation)
+v0.5.40-m3       56a981b7d4f4b45a9c75efd7605f61781bc902ec   2026-09-21   feat(m3): v0.5.40-m3 — preview overexposure zebra
+v0.5.41-m3       5891d1524e229df008cd413d30b507bb1f53520c   2026-09-21   feat(m3): v0.5.41-m3 — midtone lift (g 0.90) + zebra toggle moved to quick panel
+v0.5.42-m3       f94d15cfbbcaf09dcd29f052f1cbfb77bd2d087e   2026-09-21   chore(m3): v0.5.42-m3 — lens-shading availability probe (evaluation build)
+v0.5.43-m3       4233690b24009df461247451e1affdf9d20e9d95   2026-09-21   feat(m3): lens shading correction in RAW pipeline (v0.5.43-m3)
+v0.5.47-m3       e552131277320badf4c39aba14dd834224a810a5   2026-09-21   chore(memory): LSC与标准色彩链落地及寡淡复核
+v0.5.48-m3       5e83255a2787cd6d80cca37c0966d8effde43ac8   2026-09-21   fix(exif): write ExposureTime as decimal seconds so it lands
+v0.6.0-m4        025754bd8af12244b8d5b3c485129da9bd7bba71   2026-09-21   feat(lut): bundle 6 .cube assets as built-in display-domain 3D LUTs
+v0.6.1-m4        a97ecbd6d272ac2c6e60ac81bb290f58312239a6   2026-09-21   fix(lut): always bind a valid 3D texture to the LUT sampler unit
+v0.6.2-m4        29faf8e05b44c751556d128fc8ad92512ebebfe6   2026-09-21   feat(ui): optional LUT name in still filename (prefs lut_in_name)
+v0.6.3-m4        824f8f7dc66a72000600180c4325fb79920da76a   2026-09-21   feat(lut): opacity slider for the active LUT
+v0.6.4-m4        f89166754dde957a420cfadea6782004e9850bb2   2026-09-22   feat(ui): LUT/preset picker as a bottom sheet with category pills and cards
+v0.6.5-m4        70dad4d5f3b81e24166cad3b397affbc231cd988   2026-09-22   feat(lut): card previews from a fixed test image, generated once and cached
+v0.6.6-m4        80d9e5dafb74df6287a9b2c12a81eacbfff0da5c   2026-09-22   fix(lut): render card previews at 320px instead of upscaling 108px
+v0.6.7-m4        3986323941ac5f135b19a95c8c7dd4cb5f55efc7   2026-09-22   fix(ui): pin the LUT entry and shrink focal chips
+v0.6.8-m4        49f68f2501c14d26cba0a266be58bbaf4b3edfc0   2026-09-22   feat(ui): focal strip shows either focals or multipliers, 3-column quick menu, centred strip
