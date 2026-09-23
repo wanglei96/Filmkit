@@ -968,9 +968,17 @@ class CameraController(private val context: Context, private val render: RenderC
         val sizes = map.getOutputSizes(SurfaceTexture::class.java)
             .sortedByDescending { it.width.toLong() * it.height }
 
-        // sizes 为降序：firstOrNull{ ≤1440 } = 不超过上限的最大 4:3 尺寸
+        // sizes 为降序：取不超过上限的最大 4:3 尺寸。
+        // v0.6.37：上限 1440 → **2160**（真机反馈"预览分辨率很低"）。低在哪可查：
+        // 引擎的渲染目标是预览区尺寸（日志 engine.start 的 w/h ≈ 1216×1621），而
+        // 1440×1080 的流旋转后只有 1080×1440 —— **比渲染目标还小 1.13 倍**，预览
+        // 一直在放大显示，所以发糊；1920×1440 / 2160×1620 才留出降采样余量。
+        // 两级回退保留：HAL 给不出大尺寸时自动降级，实际选中的尺寸记在日志
+        // camera.session_ready.preview，可据此核对。
         previewSize = sizes.filter { it.width.toLong() * 3 == it.height.toLong() * 4 }
-            .firstOrNull { it.width <= 1440 }
+            .firstOrNull { it.width <= 2160 }
+            ?: sizes.filter { it.width.toLong() * 3 == it.height.toLong() * 4 }
+                .firstOrNull { it.width <= 1440 }
             ?: sizes.firstOrNull { it.width.toLong() * it.height <= 1920L * 1080 }
             ?: sizes.last()
 
