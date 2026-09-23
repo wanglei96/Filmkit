@@ -698,7 +698,8 @@ class CameraController(private val context: Context, private val render: RenderC
     private var lutStrengthPref = -1.0
     private var autoTonePref = -1.0
     // 局部色调映射（M4-7）：强度与 CameraPresets[36] 默认值一致；0 = 关（A/B 通路）。
-    private val LOCAL_TONE = 0.6
+    // v0.6.33：0.6 → 0.25（roadmap 立项定的上限就是 ≤0.2–0.3）。
+    private val LOCAL_TONE = 0.25
     private var localTonePref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
