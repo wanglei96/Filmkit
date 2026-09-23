@@ -599,6 +599,7 @@ uniform highp sampler2D uLocal;
 uniform float uLocalStrength;  // 0 = 关（A/B 通路）
 uniform float uLocalKnee;      // 提亮衰减 knee（局部亮度 / 画面基准 的比值）
 uniform float uLocalRef;       // 画面基准亮度（局部图中位，CPU 侧下发）
+uniform vec2 uLocalSize;       // 局部图尺寸（用于手写双线性）
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
 // 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
@@ -683,7 +684,20 @@ void main() {
     // 判据必须用**比值**而非绝对阈值：实拍场景普遍欠曝，绝对阈值（如"局部 < 0.45"）
     // 几乎全图命中，会退化成全局提亮（离线实测亮场景中央也被抬 20–32%）。
     if (uLocalStrength > 0.0) {
-        float ll = texture(uLocal, vUV0).r;
+        // 手写双线性（texelFetch 绕过硬件过滤）：X300 的 Mali 上纹理过滤不可靠
+        // （RGBA16F 实测无 LINEAR，项目 LSC 同样手写 4-tap）。若退回 NEAREST，
+        // 32×24 会被放大成 128×128 的方块 —— 真机"亮斑"的另一半原因。
+        vec2 t = vUV0 * uLocalSize - 0.5;
+        vec2 i0 = floor(t);
+        vec2 fr = t - i0;
+        ivec2 sz = ivec2(uLocalSize);
+        ivec2 b = clamp(ivec2(i0), ivec2(0), sz - 1);
+        ivec2 bx = clamp(ivec2(i0) + ivec2(1, 0), ivec2(0), sz - 1);
+        ivec2 by = clamp(ivec2(i0) + ivec2(0, 1), ivec2(0), sz - 1);
+        ivec2 bxy = clamp(ivec2(i0) + ivec2(1, 1), ivec2(0), sz - 1);
+        float ll = mix(mix(texelFetch(uLocal, b, 0).r, texelFetch(uLocal, bx, 0).r, fr.x),
+                       mix(texelFetch(uLocal, by, 0).r, texelFetch(uLocal, bxy, 0).r, fr.x),
+                       fr.y);
         float ratio = ll / max(uLocalRef, 1e-3);
         out3 *= 1.0 + uLocalStrength * (1.0 - smoothstep(uLocalKnee, 1.0, ratio));
     }
@@ -907,6 +921,29 @@ void main() {
     oColor = vec4(l, l, l, 1.0);
 })";
 
+// M4-7 局部色调映射的低频亮度图：从 src 做 8×8 盒式平均 → 显示域 luma。
+// **不能用 kFsHist 的单点采样**：32×24 的每格覆盖源图约 128×128 像素，单点若恰好
+// 落在深色物体上，整格被判为"暗"而满额提亮 —— 成片上就是亮斑（真机反馈）。
+// 64 样本 × 768 输出像素 ≈ 49K 次采样/帧，成本可忽略。
+const char* kFsLocal = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform vec2 uStep;  // 一个输出格在源纹理 UV 上的跨度 = 1/输出尺寸
+void main() {
+    vec3 acc = vec3(0.0);
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            vec2 o = (vec2(float(x), float(y)) + 0.5) / 8.0 - 0.5;
+            acc += texture(uTex, vUV0 + o * uStep).rgb;
+        }
+    }
+    vec3 c = pow(clamp(acc / 64.0, 0.0, 1.0), vec3(1.0 / 2.2));
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    oColor = vec4(l, l, l, 1.0);
+})";
+
 GLuint compileShader(GLenum type, const char* src) {
   GLuint sh = glCreateShader(type);
   glShaderSource(sh, 1, &src, nullptr);
@@ -983,6 +1020,7 @@ bool FrameRenderer::init() {
   const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, kFsFilm);
   const GLuint fs_out = compileShader(GL_FRAGMENT_SHADER, kFsOut);
   const GLuint fs_hist = compileShader(GL_FRAGMENT_SHADER, kFsHist);
+  const GLuint fs_local = compileShader(GL_FRAGMENT_SHADER, kFsLocal);
   const GLuint fs_fill = compileShader(GL_FRAGMENT_SHADER, kFsFillTest);
   const GLuint fs_raw = compileShader(GL_FRAGMENT_SHADER, kFsRaw);
   const GLuint fs_rcd_dir = compileShader(GL_FRAGMENT_SHADER, kFsRcdDir);
@@ -992,7 +1030,7 @@ bool FrameRenderer::init() {
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
-      !fs_raw_dn || !fs_chroma_dn || !fs_hist)
+      !fs_raw_dn || !fs_chroma_dn || !fs_hist || !fs_local)
     return false;
 
   prog_oes_ = linkProgram(vs_rot_, fs_oes);
@@ -1000,6 +1038,7 @@ bool FrameRenderer::init() {
   prog_film_ = linkProgram(vs_plain_, fs_film);
   prog_out_ = linkProgram(vs_plain_, fs_out);
   prog_hist_ = linkProgram(vs_plain_, fs_hist);
+  prog_local_ = linkProgram(vs_plain_, fs_local);
   prog_fill_ = linkProgram(vs_rot_, fs_fill);
   prog_raw_ = linkProgram(vs_rot_, fs_raw);
   prog_rcd_dir_ = linkProgram(vs_plain_, fs_rcd_dir);
@@ -1012,6 +1051,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_film);
   glDeleteShader(fs_out);
   glDeleteShader(fs_hist);
+  glDeleteShader(fs_local);
   glDeleteShader(fs_fill);
   glDeleteShader(fs_raw);
   glDeleteShader(fs_rcd_dir);
@@ -1021,7 +1061,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_chroma_dn);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
-      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_)
+      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_ || !prog_local_)
     return false;
 
   u_oes_.st = glGetUniformLocation(prog_oes_, "uST");
@@ -1143,6 +1183,7 @@ bool FrameRenderer::init() {
   u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
   u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
   u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
+  u_film_.local_size = glGetUniformLocation(prog_film_, "uLocalSize");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -1164,6 +1205,8 @@ bool FrameRenderer::init() {
   u_hist_.lut_dmin = glGetUniformLocation(prog_hist_, "uLutDomainMin");
   u_hist_.lut_dinv = glGetUniformLocation(prog_hist_, "uLutDomainInv");
   u_hist_.lut_size = glGetUniformLocation(prog_hist_, "uLutSize");
+  u_local_src_.tex = glGetUniformLocation(prog_local_, "uTex");
+  u_local_src_.step = glGetUniformLocation(prog_local_, "uStep");
 
   u_fill_st_ = glGetUniformLocation(prog_fill_, "uST");
   if (u_fill_st_ >= 0) {  // 填充测试不采样：uST 置单位阵（uniform 默认全 0）
@@ -1263,6 +1306,7 @@ void FrameRenderer::release() {
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
   prog_raw_dn_ = prog_chroma_dn_ = 0;
   prog_hist_ = 0;
+  prog_local_ = 0;
   vs_rot_ = vs_plain_ = 0;
   oes_tex_ = 0;
   still_w_ = still_h_ = 0;
@@ -2030,22 +2074,30 @@ bool FrameRenderer::histogram(int* out, int n) {
   return histogramFrom(tex_work_, out, n);
 }
 
-// 把 src 的**显示域亮度图**渲染到 fbo（w×h）：kFsHist 自带 OETF（与 kFsOut 同源），
-// 输出 luma 到 RGBA8。两个用途共用这一次 draw：
-//   ① 直方图统计（256×96 → readPixels 后算分位）；
-//   ② 局部色调映射的低频亮度图（32×24，只留在 GPU 上给 kFsFilm 采样）。
+// 把 src 的**显示域亮度图**渲染到 fbo（w×h）。两个用途：
+//   ① 直方图统计（256×96、单点采样 → readPixels 后算分位）；
+//   ② 局部色调映射的低频图（32×24、**8×8 盒式平均**，只留在 GPU 上给 kFsFilm 采样）。
+// ② 必须平均而非单点：每格覆盖源图 ~128×128 像素，单点采到深色物体就会整格提亮
+// → 成片亮斑（真机反馈）。
 // lut_strength 传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）。
 void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
-                              float lut_strength) {
+                              float lut_strength, bool box_filter) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glViewport(0, 0, w, h);
-  glUseProgram(prog_hist_);
-  applyPendingLut();
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src);
-  glUniform1i(u_hist_.tex, 0);
-  bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
-          u_hist_.lut_dinv, u_hist_.lut_size, lut_strength);
+  if (box_filter) {
+    glUseProgram(prog_local_);
+    glUniform1i(u_local_src_.tex, 0);
+    glUniform2f(u_local_src_.step, 1.0f / static_cast<float>(w),
+                1.0f / static_cast<float>(h));
+  } else {
+    glUseProgram(prog_hist_);
+    applyPendingLut();
+    glUniform1i(u_hist_.tex, 0);
+    bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
+            u_hist_.lut_dinv, u_hist_.lut_size, lut_strength);
+  }
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -2060,7 +2112,7 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
     hist_w_ = hw;
     hist_h_ = hh;
   }
-  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_);
+  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_, false);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
@@ -2140,7 +2192,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   const float local = (p.local_tone > 0.0f && src_tex != 0) ? p.local_tone : 0.0f;
   float local_ref = 0.5f;  // 局部图未生成时的兜底基准（中灰）
   if (local > 0.0f) {
-    renderLuma(src_tex, fbo_local_, kLocalW, kLocalH, 0.0f);
+    renderLuma(src_tex, fbo_local_, kLocalW, kLocalH, 0.0f, /*box_filter=*/true);
     // 读回 32×24 小图（3KB）取中位亮度当"画面基准"—— 判据必须相对它算，
     // 绝对阈值在普遍欠曝的实拍场景里会退化成全局提亮（见 shader 注释）。
     std::vector<uint8_t> px(static_cast<size_t>(kLocalW) * kLocalH * 4);
@@ -2175,6 +2227,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glUniform1f(u_film_.local_strength, local);
   glUniform1f(u_film_.local_knee, kLocalKnee);
   glUniform1f(u_film_.local_ref, local_ref);
+  glUniform2f(u_film_.local_size, static_cast<float>(kLocalW),
+              static_cast<float>(kLocalH));
   glActiveTexture(GL_TEXTURE2);
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glUniform1i(u_film_.local, 2);

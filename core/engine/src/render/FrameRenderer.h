@@ -110,9 +110,11 @@ class FrameRenderer {
   // auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
   // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
-  // 把 src 的"显示域亮度图"（kFsHist，OETF 同 kFsOut）渲染到 fbo（w×h）。
-  // 直方图统计与局部色调映射的低频图共用这一次 draw。
-  void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength);
+  // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
+  // box_filter=false → kFsHist 单点采样（直方图统计用）；
+  // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
+  void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength,
+                  bool box_filter);
   float updateAutoGain(GLuint src);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
@@ -126,7 +128,7 @@ class FrameRenderer {
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
-         prog_hist_ = 0;
+         prog_hist_ = 0, prog_local_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -210,7 +212,7 @@ class FrameRenderer {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
           look_sat = -1, look_chroma = -1, exposure_gain = -1, local = -1,
-          local_strength = -1, local_knee = -1, local_ref = -1;
+          local_strength = -1, local_knee = -1, local_ref = -1, local_size = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
@@ -221,6 +223,10 @@ class FrameRenderer {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
           lut_dinv = -1, lut_size = -1;
   } u_hist_;
+  // kFsLocal（局部低频图的下采样 shader）
+  struct {
+    GLint tex = -1, step = -1;
+  } u_local_src_;
   GLint u_fill_st_ = -1;
   struct {
     GLint rot = -1, scale = -1;
