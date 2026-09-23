@@ -1883,7 +1883,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // **色度 σ +84%**），故 P4 色度系数再补强约 25%。P4 只动色度、保 Y 不动，
   // 加强它不影响亮度细节与体积（P0 的 sr_k 刻意不放，避免动到细节大头）。
   const float sc_k = dn_high ? 3.25f : 2.75f;  // P4 值域 σ 系数
-  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.008f;  // 回退估计
+  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.015f;  // 回退估计
   // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
   // 物理量级，夹紧避免异常值让降噪失效或过猛。
   // v0.6.30：下限 0.008 → 0.004、回退 0.030 → 0.008 —— 旧值比 DNG 实测（ISO 50–767
@@ -2152,7 +2152,19 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   constexpr int kN = 64;
   constexpr float kTarget = 0.26f;  // 场景中位亮度的目标（线性）
-  constexpr float kMax = 4.0f;
+  // 上限 4.0 → 2.0（v0.6.31）：中位锚定在极端逆光场景（室内暗 + 窗外亮）会一路算到
+  // 8×，clamp 后打满 4.0 —— 把窗上那个红色"福"字推到 R228/G177/B162 的粉白，而
+  // PhotonCamera 单帧同场景是 L*57 / C*75 的鲜红，对应我们约 1.7× 的增益；4.0 还把
+  // 噪声放大 4 倍（真机同时报"彩噪爆炸"）。
+  // 注意：**基于场景 P95 的高光约束在这里救不了** —— 该场景场景 P95 只有 0.238
+  // （画面整体很暗），约束算出来是 8.4，等于不限制。只能压绝对上限。
+  // 暗部少掉的 1EV 交给局部色调映射补（它只碰暗区、不动高光）。
+  constexpr float kMax = 2.0f;
+  // 高光约束：场景白点（P95）提亮后的上限。逆光场景（室内暗 + 窗外亮到饱和）里
+  // 中位锚定会给出 gain 4.0 —— 整幅乘性提亮把高光推过 rolloff 的去饱和区：
+  // 真机 v0.6.30 实测窗口场景 ag=4.0，福字 R227/G110 变粉白。gain 2.0 时福字
+  // L*≈66（PhotonCamera 单帧同场景 57），是可接受的上限。
+  constexpr float kHiLimit = 2.0f;
   const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
   int hist[kN];
   // 旁路 LUT：风格层不该改曝光（判据本身见上方注释）
@@ -2160,19 +2172,20 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return fallback;
-  const long want = static_cast<long>(static_cast<double>(total) * 0.50);  // 中位
-  long acc = 0;
-  int bin = kN - 1;
-  for (int i = 0; i < kN; ++i) {
-    acc += hist[i];
-    if (acc >= want) {
-      bin = i;
-      break;
+  const auto binAt = [&](double q) {
+    const long want = static_cast<long>(static_cast<double>(total) * q);
+    long acc = 0;
+    for (int i = 0; i < kN; ++i) {
+      acc += hist[i];
+      if (acc >= want) return i;
     }
-  }
-  const float disp = static_cast<float>(bin) / (kN - 1);
-  const float lin = std::pow(disp, 2.2f);  // 显示域 → 线性
-  float gain = std::clamp(kTarget / std::max(lin, 1e-4f), 1.0f, kMax);
+    return kN - 1;
+  };
+  const float lin_med = std::pow(static_cast<float>(binAt(0.50)) / (kN - 1), 2.2f);
+  const float lin_hi = std::pow(static_cast<float>(binAt(0.95)) / (kN - 1), 2.2f);
+  const float gain_mid = kTarget / std::max(lin_med, 1e-4f);
+  const float gain_hi = kHiLimit / std::max(lin_hi, 1e-4f);
+  float gain = std::clamp(std::min(gain_mid, gain_hi), 1.0f, kMax);
   // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
   // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
   // 暗场景的滞后值），2 秒后预览已收敛到 1.164 —— 福字因此被推进 rolloff 的去饱和
