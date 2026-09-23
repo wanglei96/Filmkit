@@ -1365,6 +1365,16 @@ class CameraController(private val context: Context, private val render: RenderC
                 }
             }
         }
+        // HAL 不回填时的回退：**按 ISO 估算**（v0.6.30）。
+        // 旧实现是固定 0.030，而 DNG 平坦块法实测 ISO 50–767 的 RAW σ 只有
+        // 0.0013–0.0033 —— 高估约 4~10 倍，于是 P4 把**真实色度**当噪声一起平滑掉了：
+        // 真机对照 PhotonCamera 同机位，暗部（桌面）C*/L* 只有对方的 54%，而 libraw
+        // 原始数据里暗部色度是完好的（rel 0.285 vs 我们 0.093）。
+        // 0.008 + 8e-6·ISO：ISO 50 → 0.0084、ISO 3200 → 0.034（与旧值衔接，高 ISO 不放松）。
+        if (noiseSigma == 0f) {
+            val iso = (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 200).coerceAtLeast(50)
+            noiseSigma = (0.008 + 0.000008 * iso).toFloat()
+        }
         // 镜头阴影校正（LSC，M3 P0）：HAL 的 cols×rows×4 增益图（R/Gr/Gb/B 平面，
         // X300 实测 17×13、中心 1.000、角落 6.236 = 未校正时角落原始亮度仅中心 ~16%）。
         // 探针日志保留原始口径；prefs "lsc" 关 → lsc = null（引擎用恒等增益，A/B 对照）。

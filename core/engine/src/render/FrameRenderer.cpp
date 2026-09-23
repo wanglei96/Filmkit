@@ -518,7 +518,7 @@ void main() {
     float c0 = raw0(p);
     // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值），权重已
     // 饱和成无条件平均；0.50 恢复选择性（强边缘 0% 损失）但画面仍偏平，0.28 更轻。
-    float sr = max(uNS, 0.008) * uDnK * sqrt(0.2 + 4.0 * c0);
+    float sr = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * c0);
     float wsum = 1.0, acc = c0;
     for (int dy = -4; dy <= 4; dy += 2)
         for (int dx = -4; dx <= 4; dx += 2) {
@@ -553,7 +553,7 @@ void main() {
     vec3 cd0 = c0 - y0;
     // 色度可保持较强：Y 原样输出，压彩噪不损 Laplacian 细节；Y 值域权重
     // sc*1.2 防边缘色溢
-    float sc = max(uNS, 0.008) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
+    float sc = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
     vec3 acc = cd0;
     float wsum = 1.0;
     for (int dy = -2; dy <= 2; ++dy)
@@ -1883,10 +1883,14 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // **色度 σ +84%**），故 P4 色度系数再补强约 25%。P4 只动色度、保 Y 不动，
   // 加强它不影响亮度细节与体积（P0 的 sr_k 刻意不放，避免动到细节大头）。
   const float sc_k = dn_high ? 3.25f : 2.75f;  // P4 值域 σ 系数
-  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.030f;  // 回退估计
+  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.008f;  // 回退估计
   // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
-  // 物理量级，夹紧避免异常值让降噪失效或过猛
-  const float ns = std::min(std::max(ns_raw, 0.008f), 0.040f);
+  // 物理量级，夹紧避免异常值让降噪失效或过猛。
+  // v0.6.30：下限 0.008 → 0.004、回退 0.030 → 0.008 —— 旧值比 DNG 实测（ISO 50–767
+  // 的 RAW σ 仅 0.0013–0.0033）高 4~10 倍，P4 的 σc 正比于它，于是**真实色度被当
+  // 噪声抹掉**（真机同机位对照：暗部 C*/L* 只有 PhotonCamera 的 54%，而同场景 libraw
+  // 原始数据的暗部色度完好，rel 0.285 vs 我们 0.093）。
+  const float ns = std::min(std::max(ns_raw, 0.004f), 0.040f);
   float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
   if (rcd) {
     if (!ensureRcdTargets(w, h)) return false;
