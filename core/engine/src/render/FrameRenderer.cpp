@@ -544,7 +544,7 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uNS;
-uniform float uDnK;    // 值域 σ 系数：标准 2.20 / 强 2.60（只动色度）
+uniform float uDnK;    // 值域 σ 系数：标准 2.75 / 强 3.25（只动色度）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
@@ -552,12 +552,27 @@ void main() {
     float y0 = dot(c0, LUMA);
     vec3 cd0 = c0 - y0;
     // 色度可保持较强：Y 原样输出，压彩噪不损 Laplacian 细节；Y 值域权重
-    // sc*1.2 防边缘色溢
-    float sc = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.015;
+    // sc*1.2 防边缘色溢。
+    // ── v0.6.32：靠**空间半径**降彩噪，靠**收紧 σc** 把色度代价补回来 ────
+    // 离线评估（DNG→libraw 重建 P4 输入域，样片暗部，口径 lag-1 差分/√2）：
+    //   变体                彩噪残余   真实色度边缘保留
+    //   r2 σs1.6（旧）       28.5%     0.624
+    //   r2 σs2.2             27.1%     （几乎没用）
+    //   r3 σs2.2 σc=0.035    18.5%     0.477
+    //   r3 σs2.2 σc=0.024    20.0%     0.506   ← 采用
+    // 两条结论都**反直觉**，写下来防止再犯：
+    //  ① **σs 不是旋钮**：半径锁死 2 时 σs 1.6→2.2 仅改善 6% —— σs 超过半径就被
+    //     截断（σs=3.0/4.0 同样停在 ~6%）。真正的杠杆是把半径放到 3（7×7）。
+    //  ② **σc 调大是错方向**：旧值 0.035 在暗部已是"真实色度差 0.014"的 2.5 倍、
+    //     逐像素噪声 0.0033 的 10 倍 —— 真实色度被当噪声吞掉（这正是"桌面颜色不如
+    //     PhotonCamera"的一半原因）。收紧到 0.024 后边缘保留 0.477→0.506。
+    // 地板 0.015 → 0.008：它占暗部 σc 的 43% 且与噪声无关，是"暗部必然抹色"的主因。
+    // 降噪改由半径承担，值域阈值只负责保住真实色度边缘。
+    float sc = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.008;
     vec3 acc = cd0;
     float wsum = 1.0;
-    for (int dy = -2; dy <= 2; ++dy)
-        for (int dx = -2; dx <= 2; ++dx) {
+    for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
             if (dx == 0 && dy == 0) continue;
             vec3 c = texelFetch(uTex, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0).rgb;
             float y = dot(c, LUMA);
@@ -565,7 +580,7 @@ void main() {
             float wy = (y - y0) / (sc * 1.2);
             float wc = length(cd - cd0) / sc;
             float w = exp(-0.5 * (wy * wy + wc * wc)
-                          - 0.5 * float(dx * dx + dy * dy) / 5.12);  // σs=1.6
+                          - 0.5 * float(dx * dx + dy * dy) / 9.68);  // σs=2.2（v0.6.32）
             acc += w * cd;
             wsum += w;
         }
@@ -1883,7 +1898,9 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   // **色度 σ +84%**），故 P4 色度系数再补强约 25%。P4 只动色度、保 Y 不动，
   // 加强它不影响亮度细节与体积（P0 的 sr_k 刻意不放，避免动到细节大头）。
   const float sc_k = dn_high ? 3.25f : 2.75f;  // P4 值域 σ 系数
-  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.015f;  // 回退估计
+  // v0.6.32：回退 0.015 → 0.012。σc 的降噪职责已交给半径（见 kFsChromaDenoise），
+  // 值域阈值只负责保住真实色度边缘 —— 所以它不再需要"暗中当降噪量用"。
+  const float ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.012f;  // 回退估计
   // 防呆（修好 SENSOR_NOISE_PROFILE 解包后 HAL 值可能首次生效）：HAL 与回退值同处
   // 物理量级，夹紧避免异常值让降噪失效或过猛。
   // v0.6.30：下限 0.008 → 0.004、回退 0.030 → 0.008 —— 旧值比 DNG 实测（ISO 50–767

@@ -698,7 +698,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private var lutStrengthPref = -1.0
     private var autoTonePref = -1.0
     // 局部色调映射（M4-7）：强度与 CameraPresets[36] 默认值一致；0 = 关（A/B 通路）。
-    private val LOCAL_TONE = 0.5
+    private val LOCAL_TONE = 0.6
     private var localTonePref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
@@ -1374,9 +1374,15 @@ class CameraController(private val context: Context, private val render: RenderC
         // 噪声，而 P4 的 σc 要压的是**色度**噪声（WB 增益把 R/B 通道差放大 2~3 倍，
         // 再叠加曝光增益）。取 0.015 + 8e-6·ISO：ISO 50 → 0.0154、ISO 3200 → 0.041
         // （≈旧值，高 ISO 不放松），即比旧的固定 0.030 保守一半。
+        // v0.6.32：0.015 → 0.012，**同时把 σc 的地板 0.015 → 0.008、P4 半径 2 → 3**。
+        // 三者是一套：降噪职责从"值域阈值"移到"空间半径"（半径只压高频噪声，不动
+        // 真实色度；值域阈值大则连真实色度一起吞）。离线评估的净效果（暗部彩噪
+        // lag-1 残余 / 真实色度边缘保留）：0.0352σc+25tap = 28.5%/0.624 →
+        // 0.0242σc+49tap = 20.0%/0.506。σc 变小不是放松降噪，是把降噪换成更强的
+        // 空间平均；若真机彩噪仍偏高，把设置页 RAW 降噪切"强"档（sc_k 3.25，σc +18%）。
         if (noiseSigma == 0f) {
             val iso = (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 200).coerceAtLeast(50)
-            noiseSigma = (0.015 + 0.000008 * iso).toFloat()
+            noiseSigma = (0.012 + 0.000008 * iso).toFloat()
         }
         // 镜头阴影校正（LSC，M3 P0）：HAL 的 cols×rows×4 增益图（R/Gr/Gb/B 平面，
         // X300 实测 17×13、中心 1.000、角落 6.236 = 未校正时角落原始亮度仅中心 ~16%）。

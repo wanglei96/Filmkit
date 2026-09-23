@@ -19,7 +19,10 @@ M0 验收标准：spike 三段 pass 全部成功（`readbackOk=true`），逐段
 
 ## 环境要求
 
-- JDK 17、Android SDK（compileSdk 36）、NDK（AGP 默认或 29.x）、CMake 3.22.1
+- JDK 17+、Android SDK（compileSdk 36）、NDK（AGP 默认或 29.x）、CMake 3.22.1
+  - 本机默认 `java` 是 JDK 8，直接跑 `./gradlew` 会报
+    `Dependency requires at least JVM runtime version 11`。显式指定：
+    `JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug`
 - 引擎 C++20，OpenGL ES 3.1（compute）；无 ES 3.1 的设备自动降级 fragment 路径
 
 ## 目录
