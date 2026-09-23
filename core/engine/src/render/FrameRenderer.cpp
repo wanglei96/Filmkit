@@ -516,21 +516,27 @@ float raw0(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = raw0(p);
-    // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值），权重已
-    // 饱和成无条件平均；0.50 恢复选择性（强边缘 0% 损失）但画面仍偏平，0.28 更轻。
-    float sr = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * c0);
-    float wsum = 1.0, acc = c0;
-    for (int dy = -4; dy <= 4; dy += 2)
-        for (int dx = -4; dx <= 4; dx += 2) {
-            if (dx == 0 && dy == 0) continue;
-            float c = raw0(p + ivec2(dx, dy));
-            float d = (c - c0) / sr;
-            float w = exp(-0.5 * d * d
-                          - 0.5 * float(dx * dx + dy * dy) / 6.48);  // σs=1.8
-            acc += w * c;
-            wsum += w;
-        }
-    float v = acc / wsum;
+    float v = c0;
+    // v0.6.34：uDnK <= 0 = 关降噪档，只做线性化+WB、**不取任何邻居**（1 次采样，
+    // 其余 8 个同色位全跳过）。这条路径与 P1 直读 RAW 整型纹理完全等价，但省掉了
+    // P1 在那条路上的重复解码 —— 真机实测关降噪反而比开降噪慢 4-7 倍的原因。
+    if (uDnK > 0.0) {
+        // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值），权重已
+        // 饱和成无条件平均；0.50 恢复选择性（强边缘 0% 损失）但画面仍偏平，0.28 更轻。
+        float sr = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * c0);
+        float wsum = 1.0, acc = c0;
+        for (int dy = -4; dy <= 4; dy += 2)
+            for (int dx = -4; dx <= 4; dx += 2) {
+                if (dx == 0 && dy == 0) continue;
+                float c = raw0(p + ivec2(dx, dy));
+                float d = (c - c0) / sr;
+                float w = exp(-0.5 * d * d
+                              - 0.5 * float(dx * dx + dy * dy) / 6.48);  // σs=1.8
+                acc += w * c;
+                wsum += w;
+            }
+        v = acc / wsum;
+    }
     int ch = chanAt(p);
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
 })";
@@ -1246,6 +1252,8 @@ bool FrameRenderer::init() {
   // （v0.6.0-m4 全黑同族事故；LSC 关闭档绑 1×1 全 1 网格是同一处理）。
   // 过滤必须 LINEAR：makeTex 默认 NEAREST，会把 32×24 的格子放大成可见方块。
   makeTex(&tex_local_, &fbo_local_, GL_RGBA8, kLocalW, kLocalH);
+  local_w_ = kLocalW;
+  local_h_ = kLocalH;
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1646,6 +1654,35 @@ bool FrameRenderer::ensureDnTarget(int w, int h) {
   return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 }
 
+// M4-7 局部低频图：尺寸随渲染分辨率（v0.6.34）。init 建的 32×24 是**兜底绑定**，
+// kFsFilm 里存在 sampler2D，Mali 会预测执行 `if (uLocalStrength > 0)` 里的
+// texture() —— 未绑合法纹理会让整帧 draw 报 1282（v0.6.0-m4 全黑同族事故）。
+// 所以这里**失败也保证 tex_local_ 非 0**（退回 1×1），此时调用方关掉局部提亮。
+bool FrameRenderer::ensureLocalTarget(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  if (tex_local_ != 0 && local_w_ == w && local_h_ == h) return true;
+  if (tex_local_) {
+    glDeleteTextures(1, &tex_local_);
+    glDeleteFramebuffers(1, &fbo_local_);
+  }
+  tex_local_ = fbo_local_ = 0;
+  makeTex(&tex_local_, &fbo_local_, GL_RGBA8, w, h);
+  // 过滤必须 LINEAR：makeTex 默认 NEAREST，会把格子放大成可见方块（真机"亮斑"）
+  glBindTexture(GL_TEXTURE_2D, tex_local_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  local_w_ = w;
+  local_h_ = h;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_local_);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) return true;
+  // 兜底：退回 1×1（局部提亮退化成全局基准，调用方据返回值决定是否启用）
+  glDeleteTextures(1, &tex_local_);
+  glDeleteFramebuffers(1, &fbo_local_);
+  makeTex(&tex_local_, &fbo_local_, GL_RGBA8, 1, 1);
+  local_w_ = local_h_ = 1;
+  return false;
+}
+
 // P0：RAW 域同色联合 bilateral → 线性 mosaic（tex_mos_）
 void FrameRenderer::passRawDenoise(int w, int h, int cfa,
                                    const float black_phase[4],
@@ -1912,21 +1949,27 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   if (rcd) {
     if (!ensureRcdTargets(w, h)) return false;
     const auto d0 = std::chrono::steady_clock::now();
-    if (dn) {
-      passRawDenoise(w, h, cfa, black_phase, static_cast<float>(white_level),
-                     gains, ns, sr_k);
-    }
+    // ── v0.6.34：P0 **无条件执行**（关降噪时 k=0 = 只做线性化+WB，零邻域操作）──
+    // 起因（真机 v0.6.33 日志）：关降噪反而慢得多 —— dirMs 232–244ms（开降噪
+    // 34–60ms）、passMs 484–700（开 225–487）。因为 dn=false 时 P1 直接读 R16UI
+    // 整型 RAW 纹理、自己解码黑阶/WB，比读 P0 的 float mosaic 慢 4–7 倍。
+    // 安全性：P0 的 raw0() 与 P1 的 s() RAW 分支**逐字相同**（黑阶相位、白阶归一、
+    // WB 增益都同一式），所以 k=0 的 P0 与"P1 直读 RAW"数学等价 —— 关降噪的成片
+    // 只差一次 RGBA16F 量化（开降噪档本来就走这条路），**零细节代价**（无邻域采样）。
+    // 故下面三处 mosaic 标志恒为 true。
+    passRawDenoise(w, h, cfa, black_phase, static_cast<float>(white_level), gains,
+                   ns, dn ? sr_k : 0.0f);
     passRcdDir(w, h, cfa, black_phase, static_cast<float>(white_level), gains,
-               dn);
+               true);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
-    passRcdG(w, h, cfa, black_phase, static_cast<float>(white_level), gains, dn);
+    passRcdG(w, h, cfa, black_phase, static_cast<float>(white_level), gains, true);
     glFinish();
     const auto d2 = std::chrono::steady_clock::now();
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, effective_rot, cfa, black_phase,
-                  static_cast<float>(white_level), gains, ccm, dn, p.hl_recon);
+                  static_cast<float>(white_level), gains, ccm, true, p.hl_recon);
   } else {
     passRaw(dst_w, dst_h, effective_rot, cfa, black_phase,
             static_cast<float>(white_level), gains, ccm, p);
@@ -2220,20 +2263,28 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   const float gain =
       p.auto_tone > 0.5f ? updateAutoGain(src_tex, still) : std::exp2(0.35f);
   film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
-  // M4-7 局部色调映射：低频亮度图（32×24）与直方图同源、同一次 kFsHist 实现。
+  // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
   // 强度 ≤ 0 时不重渲染，但仍绑**已存在的** tex_local_ 并下发 0 —— sampler 必须有
   // 合法绑定（v0.6.0-m4 全黑事故），shader 侧靠 uLocalStrength > 0 短路。
-  const float local = (p.local_tone > 0.0f && src_tex != 0) ? p.local_tone : 0.0f;
+  // v0.6.34：低频图尺寸**随渲染分辨率**（每格目标 ≈128px ≈ 3% 画面宽），不再固定
+  // 32×24 —— 固定尺寸只在成片（4080×3072）成立，预览（1216×1621）每格仅 38×67px、
+  // 等效提亮半径缩到 1/3，于是预览与成片的局部提亮分布对不上
+  //（真机反馈"预览和成片差很多"）。kFsLocal 的采样跨度取 uStep=1/输出尺寸，
+  // 所以采样密度不随格子数变化。
+  float local = (p.local_tone > 0.0f && src_tex != 0) ? p.local_tone : 0.0f;
+  const int lw = std::clamp(w / 128, 4, 64);
+  const int lh = std::clamp(h / 128, 4, 64);
   float local_ref = 0.5f;  // 局部图未生成时的兜底基准（中灰）
+  if (local > 0.0f && !ensureLocalTarget(lw, lh)) local = 0.0f;  // 建不出就退回关闭
   if (local > 0.0f) {
-    renderLuma(src_tex, fbo_local_, kLocalW, kLocalH, 0.0f, /*box_filter=*/true);
-    // 读回 32×24 小图（3KB）取中位亮度当"画面基准"—— 判据必须相对它算，
-    // 绝对阈值在普遍欠曝的实拍场景里会退化成全局提亮（见 shader 注释）。
-    std::vector<uint8_t> px(static_cast<size_t>(kLocalW) * kLocalH * 4);
-    glReadPixels(0, 0, kLocalW, kLocalH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    renderLuma(src_tex, fbo_local_, local_w_, local_h_, 0.0f, /*box_filter=*/true);
+    // 读回小图取中位亮度当"画面基准"—— 判据必须相对它算，绝对阈值在普遍欠曝的
+    // 实拍场景里会退化成全局提亮（见 shader 注释）。
+    std::vector<uint8_t> px(static_cast<size_t>(local_w_) * local_h_ * 4);
+    glReadPixels(0, 0, local_w_, local_h_, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     std::vector<uint8_t> lum;
-    lum.reserve(static_cast<size_t>(kLocalW) * kLocalH);
+    lum.reserve(static_cast<size_t>(local_w_) * local_h_);
     for (size_t i = 0; i + 3 < px.size(); i += 4) lum.push_back(px[i]);
     if (!lum.empty()) {
       const size_t mid = lum.size() / 2;
@@ -2263,8 +2314,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glUniform1f(u_film_.local_knee, kLocalKnee);
   glUniform1f(u_film_.local_knee_hi, kLocalKneeHi);
   glUniform1f(u_film_.local_ref, local_ref);
-  glUniform2f(u_film_.local_size, static_cast<float>(kLocalW),
-              static_cast<float>(kLocalH));
+  // 手写双线性的尺寸必须与实际绑定的低频图一致（v0.6.34：尺寸随渲染分辨率）
+  glUniform2f(u_film_.local_size, static_cast<float>(local_w_),
+              static_cast<float>(local_h_));
   glActiveTexture(GL_TEXTURE2);
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glUniform1i(u_film_.local, 2);

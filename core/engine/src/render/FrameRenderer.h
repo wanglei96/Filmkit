@@ -104,6 +104,8 @@ class FrameRenderer {
                       float white_level, const float gains[3], float ns,
                       float k);
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
+  // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
+  bool ensureLocalTarget(int w, int h);
   // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
   // 与公开的 histogram() 同一实现），取**中位**折回线性归一到 baseTone 的中间调
   // 不动点（0.2184）→ 曝光增益（限幅 [1,4]×，只提亮不压暗）。
@@ -150,10 +152,13 @@ class FrameRenderer {
   int dn_w_ = 0, dn_h_ = 0;
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
-  // M4-7 局部色调映射的低频亮度图（RGBA8，32×24、LINEAR 上采样）。与 tex_hist_
-  // 同源（都走 kFsHist 的显示域 luma），但**分辨率低得多**才叫"局部"：256×96 在
-  // 4080×3072 上等效半径只有 16×32px，等于逐像素亮度，会把暗部内部的细节压平。
+  // M4-7 局部色调映射的低频亮度图（RGBA8、LINEAR 上采样）。与 tex_hist_
+  // 同源（都走 kFsHist 的显示域 luma），但**分辨率低得多**才叫"局部"。
+  // v0.6.34：尺寸不再固定 32×24，改为**随渲染分辨率**按"每格 ≈128px"算
+  //（ensureLocalTarget），否则预览（1216×1621）的等效提亮半径只有成片的 1/3，
+  // 预览与成片的局部提亮分布对不上。init 仍建 32×24 作兜底绑定。
   GLuint fbo_local_ = 0, tex_local_ = 0;
+  int local_w_ = 0, local_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
   // M4 3D LUT（display 域）：RGBA16F 3D 纹理，LINEAR/CLAMP；lut_size_ ≤ 1 = 关闭
   GLuint lut_tex_ = 0;

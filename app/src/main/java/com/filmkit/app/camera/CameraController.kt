@@ -56,9 +56,8 @@ class CameraController(private val context: Context, private val render: RenderC
      *  都就绪才处理；两者回调同绑渲染线程 looper，天然串行无锁 */
     private var pendingRawImage: Image? = null
     private var pendingResult: TotalCaptureResult? = null
-
-    @Volatile
-    private var rawResultWarned = false
+    /** Image 到达时刻（elapsedRealtime），用于量化"等 result"的真实耗时（v0.6.34） */
+    private var rawImageAtMs = 0L
 
     /** 当前激活 reader 的格式标记（ImageReader.getFormat 需 API29，用引用比对替代） */
     private var rawReader: ImageReader? = null
@@ -469,6 +468,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 EngineBridge.LEVEL_INFO, "camera", "controls.applied",
                 kv(
                     "evSteps" to evSteps, "ae" to (if (manualExposure) "OFF" else "AUTO"),
+                    // 注意：这两个是**滑杆存量值**，AUTO 档下不代表实际生效曝光（曾被
+                    // 误读成"预览用 ISO 100"）。预览的实际曝光见 raw.meta 的 pvIso/pvSec。
                     "iso" to iso, "sec" to "%.4f".format(exposureNs / 1e9f),
                     "wb" to "AUTO+eng",
                     "zoom" to "%.2f".format(zoomRatio), "focus" to (focusSig != "null"),
@@ -884,7 +885,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 // RAW 路径需要 TotalCaptureResult（DngCreator/黑阶/WB/CCM 元数据）：
                 // 回调暂存 result，与 reader listener 的 Image 在渲染线程汇合
                 pendingResult = null
-                rawResultWarned = false
+                rawImageAtMs = 0L
                 s.capture(b.build(), rawCaptureCb, render.looper?.let { android.os.Handler(it) })
             } else {
                 s.capture(b.build(), null, render.looper?.let { android.os.Handler(it) })
@@ -1013,6 +1014,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     if (img.format == ImageFormat.RAW_SENSOR) {
                         pendingRawImage?.close()
                         pendingRawImage = img
+                        rawImageAtMs = android.os.SystemClock.elapsedRealtime()
                         tryProcessRaw()
                     } else {
                         submitStill(img)
@@ -1156,20 +1158,27 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /** Image/result 双事件汇合（均在渲染线程串行回调，无锁）；缺 result 不处理等回调 */
+    // v0.6.34：原先把"Image 先到、TotalCaptureResult 后到"这个**正常竞态**记成 WARN
+    // 且字段为空 {} —— 每次拍照都误报一条、还看不出等了多久，反而掩盖真正的异常。
+    // 改为静默等待（回调到齐会自然再进来），等 result 到达后按**实际耗时**决定是否记，
+    // >50ms 才记一条并带上 waitMs。
     private fun tryProcessRaw() {
         val img = pendingRawImage ?: return
-        val result = pendingResult
-        if (result == null) {
-            if (!rawResultWarned) {
-                rawResultWarned = true
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_WARN, "camera", "raw.wait_result", "{}",
-                )
-            }
-            return
+        val result = pendingResult ?: return
+        val waitMs = if (rawImageAtMs > 0L) {
+            android.os.SystemClock.elapsedRealtime() - rawImageAtMs
+        } else {
+            0L
         }
+        rawImageAtMs = 0L
         pendingRawImage = null
         pendingResult = null
+        if (waitMs > 50L) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "raw.result_late",
+                kv("waitMs" to waitMs),
+            )
+        }
         processRaw(img, result)
     }
 
@@ -1202,6 +1211,17 @@ class CameraController(private val context: Context, private val render: RenderC
                 "noise" to "%.4f".format(meta.noiseSigma),
                 "in" to "${img.width}x${img.height}",
                 "lens" to currentLensId,
+                // ── v0.6.34：预览实际曝光 vs 拍照实际曝光 ──────────────────
+                // 用户反馈"预览与成片差很多"。此前这两个量在日志里**无法对比**：
+                // controls.applied 的 iso/sec 是**滑杆存量值**（AUTO 档下不代表实际，
+                // 曾被误读成"预览用 ISO 100"），而预览的实际值只回填给 UI 的
+                // liveIso/liveExposureNs、从不落盘。这里一次记全，一次真机即可定位。
+                "pvIso" to liveIso,
+                "pvSec" to "%.4f".format(liveExposureNs / 1e9f),
+                "stIso" to (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0),
+                "stSec" to "%.4f".format(
+                    (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e9f,
+                ),
             ),
         )
         // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在

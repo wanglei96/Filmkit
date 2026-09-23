@@ -7,7 +7,7 @@ class FilmKitApp : Application() {
 
     companion object {
         /** 必须与 app/build.gradle.kts 的 versionName 一致（单一来源，避免两处字面量各漂各的） */
-        const val VERSION = "0.6.33-m4"
+        const val VERSION = "0.6.34-m4"
     }
 
     override fun onCreate() {
