@@ -19,8 +19,11 @@ namespace {
 // 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
 // 跟着细节走、把暗部内部对比压平。
 constexpr int kLocalW = 32, kLocalH = 24;
-// ratio knee：局部亮度 / 画面基准 < 此值 → 满额提亮，到 1.0（即与基准齐平）归零。
-constexpr float kLocalKnee = 0.7f;
+// ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
+// "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
+// 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
+// 放宽到 0.6→1.3（宽 0.7）后分布收窄到 0.18–0.40，满额占比 27%→21%。
+constexpr float kLocalKnee = 0.6f, kLocalKneeHi = 1.3f;
 
 // 顶点：全屏三角 + 90° 步进旋转 + center-crop，最后经 SurfaceTexture 矩阵
 // （含生产者翻转）映射到 OES 纹理坐标。
@@ -597,7 +600,8 @@ uniform float uExposureGain;
 // 亮区强度归零，因此高光不受影响、黑位乘性保持。
 uniform highp sampler2D uLocal;
 uniform float uLocalStrength;  // 0 = 关（A/B 通路）
-uniform float uLocalKnee;      // 提亮衰减 knee（局部亮度 / 画面基准 的比值）
+uniform float uLocalKnee;      // 提亮衰减 knee 下界（局部亮度 / 画面基准 的比值）
+uniform float uLocalKneeHi;    // 上界：ratio 高于它完全不提亮
 uniform float uLocalRef;       // 画面基准亮度（局部图中位，CPU 侧下发）
 uniform vec2 uLocalSize;       // 局部图尺寸（用于手写双线性）
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -699,7 +703,7 @@ void main() {
                        mix(texelFetch(uLocal, by, 0).r, texelFetch(uLocal, bxy, 0).r, fr.x),
                        fr.y);
         float ratio = ll / max(uLocalRef, 1e-3);
-        out3 *= 1.0 + uLocalStrength * (1.0 - smoothstep(uLocalKnee, 1.0, ratio));
+        out3 *= 1.0 + uLocalStrength * (1.0 - smoothstep(uLocalKnee, uLocalKneeHi, ratio));
     }
     // 基准影调（norm-controlled + 高光去饱和）
     if (uToneK > 0.0) {
@@ -1182,6 +1186,7 @@ bool FrameRenderer::init() {
   u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
   u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
   u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
+  u_film_.local_knee_hi = glGetUniformLocation(prog_film_, "uLocalKneeHi");
   u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
   u_film_.local_size = glGetUniformLocation(prog_film_, "uLocalSize");
 
@@ -2135,9 +2140,14 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 // 漏了 kFsOut 的高光滚降（rolloff 会把 >0.80 的部分压回 <1.0）。补上后实测 clip 全 0%，
 // 高光 P95 只到 245–246（PC 是 247）。**别再据那个错结论否掉它。**
 // 限幅仍只允许提亮（[1,4]×）—— 压暗用户设定的曝光不在引擎职责内。
+// v0.6.28：目标 0.2184 → **0.26**。两个独立依据交叉：① 与 PhotonCamera **单帧**
+// （关 HDR/包围）同机位对照，其 P50 落在显示域 139/255 → 线性 0.263；
+// ② v0.6.17 实测"HAL 曝光普遍欠曝 0.35EV"，即正确曝光应为 0.2184×2^0.35 = 0.277。
+// 同时修掉一个真机反馈：目标 0.2184 时，中位本已达标的中亮场景 gain 落到 1.0，
+// 而关闭自适应影调是固定 1.274 —— **开着反而更暗**，用户觉得"开关看不出效果"。
 float FrameRenderer::updateAutoGain(GLuint src) {
   constexpr int kN = 64;
-  constexpr float kTarget = 0.2184f;  // baseTone 的中间调不动点 mn（线性）
+  constexpr float kTarget = 0.26f;  // 场景中位亮度的目标（线性）
   constexpr float kMax = 4.0f;
   const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
   int hist[kN];
@@ -2226,6 +2236,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glUniform1f(u_film_.look_chroma, p.look_chroma);
   glUniform1f(u_film_.local_strength, local);
   glUniform1f(u_film_.local_knee, kLocalKnee);
+  glUniform1f(u_film_.local_knee_hi, kLocalKneeHi);
   glUniform1f(u_film_.local_ref, local_ref);
   glUniform2f(u_film_.local_size, static_cast<float>(kLocalW),
               static_cast<float>(kLocalH));
