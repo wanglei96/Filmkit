@@ -115,8 +115,10 @@ class FrameRenderer {
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
   void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength,
                   bool box_filter);
-  float updateAutoGain(GLuint src);
-  void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
+  // still=true（静拍）：只有单帧可渲染，必须用**当帧**算出的增益，不做 EMA ——
+  // EMA 会让静拍拿到取景早期的历史值（真机实测同场景两秒内 ag 3.04→1.16）。
+  float updateAutoGain(GLuint src, bool still);
+  void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
   void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);

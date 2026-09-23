@@ -1412,7 +1412,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     passOES(dst_w, dst_h, st, rot, sx, sy, p);
     if (diag) logPassDiag("pass1_oes", fbo_scene_, true);
   }
-  passFilm(dst_w, dst_h, p, tex_scene_);
+  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false);
   if (diag) logPassDiag("pass2_film", fbo_work_, true);
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
@@ -1534,7 +1534,7 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   }
 
   passStill(dst_w, dst_h, effective_rot, p);
-  passFilm(dst_w, dst_h, p, tex_scene_);
+  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/true);
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
     if (tex_cap_) {
@@ -1919,7 +1919,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                 std::chrono::steady_clock::now() - n0)
                 .count();
   }
-  passFilm(dst_w, dst_h, p, dn ? tex_dn_ : tex_scene_);
+  passFilm(dst_w, dst_h, p, dn ? tex_dn_ : tex_scene_, /*still=*/true);
   const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
@@ -2145,7 +2145,7 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 // ② v0.6.17 实测"HAL 曝光普遍欠曝 0.35EV"，即正确曝光应为 0.2184×2^0.35 = 0.277。
 // 同时修掉一个真机反馈：目标 0.2184 时，中位本已达标的中亮场景 gain 落到 1.0，
 // 而关闭自适应影调是固定 1.274 —— **开着反而更暗**，用户觉得"开关看不出效果"。
-float FrameRenderer::updateAutoGain(GLuint src) {
+float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   constexpr int kN = 64;
   constexpr float kTarget = 0.26f;  // 场景中位亮度的目标（线性）
   constexpr float kMax = 4.0f;
@@ -2169,7 +2169,12 @@ float FrameRenderer::updateAutoGain(GLuint src) {
   const float disp = static_cast<float>(bin) / (kN - 1);
   const float lin = std::pow(disp, 2.2f);  // 显示域 → 线性
   float gain = std::clamp(kTarget / std::max(lin, 1e-4f), 1.0f, kMax);
-  // EMA 平滑：首帧直通（静拍只有一帧也必须立即生效），之后缓变防抖动
+  // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
+  // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
+  // 暗场景的滞后值），2 秒后预览已收敛到 1.164 —— 福字因此被推进 rolloff 的去饱和
+  // 区，L* 79 / C* 25 变成粉白，而正确增益（≈1.5）下应是 L* 57 的鲜红。
+  // 静拍不写回 auto_gain_，以免污染预览的平滑状态。
+  if (still) return gain;
   if (auto_gain_ <= 0.0f) {
     auto_gain_ = gain;
   } else {
@@ -2187,13 +2192,14 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) {
+void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
+                             bool still) {
   // 自适应影调（M4-6）：按场景中位亮度算线性曝光增益。**刻意放在 passFilm 内** ——
   // 预览 / YUV 静拍 / RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 关闭（auto_tone ≤ 0.5）时退回固定 ev 0.35，与 v0.6.17 行为逐位一致（A/B 通路）。
   // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。
   const float gain =
-      p.auto_tone > 0.5f ? updateAutoGain(src_tex) : std::exp2(0.35f);
+      p.auto_tone > 0.5f ? updateAutoGain(src_tex, still) : std::exp2(0.35f);
   film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
   // M4-7 局部色调映射：低频亮度图（32×24）与直方图同源、同一次 kFsHist 实现。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
