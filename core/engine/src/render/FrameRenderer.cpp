@@ -1869,6 +1869,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
+  kv += ",\"ag\":" + std::to_string(film_gain_).substr(0, 5);
+  kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
   kv += std::string(",\"lsc\":\"") +
         (lsc_ok ? std::to_string(lsc_cols) + "x" + std::to_string(lsc_rows)
@@ -1986,7 +1988,8 @@ bool FrameRenderer::histogram(int* out, int n) {
 
 // M4-6：统计源参数化 —— 自适应影调必须对**场景纹理**（baseTone 之前）统计，
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
-bool FrameRenderer::histogramFrom(GLuint src, int* out, int n) {
+// v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
+bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   const int hw = 256, hh = 96;
   if (tex_hist_ == 0) {
@@ -2001,8 +2004,9 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n) {
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_hist_.tex, 0);
+  // 强度传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）
   bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
-          u_hist_.lut_dinv, u_hist_.lut_size, lut_strength_);
+          u_hist_.lut_dinv, u_hist_.lut_size, bypass_lut ? 0.0f : lut_strength_);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -2019,13 +2023,23 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n) {
 // 桌面 L* 20.3 偏暗）；**P95 最平衡** —— 阳台 45.6 / 卧室 63.5（厂商同场景 62.1）/
 // 书桌 32.3，且三种场景 clip 全 0%。**限幅只允许提亮**（[1,4]×），不压暗用户
 // 设定的曝光 —— 过曝交给 kFsOut 的高光滚降。
+// v0.6.24（真机报"画面边缘有高光则中央被压暗"）诊断：P95 是**全图**分位，只要画面里
+// 有 ≥5% 的亮区（白天几乎必然：天空/窗/白墙，且常在边缘），P95 就被顶到目标以上、
+// gain 落回下限 1.0，中央暗部不再获得任何补偿（清晨 10 张白天样片实测 gain≈1.00）。
+// 离线验证过两条替代判据，**都不可行**（勿重复尝试）：
+//   ① 中心加权 P95（权重 1.0→0.25）：分位只降 10/255，gain 1.00→1.10，等于没改；
+//   ② 中位数锚定中灰（0.2184）：暗场景 gain 冲到 4.0，高光 clip 6.6%–13% —— 逆光
+//      场景的高光本就在 clip 边缘，放弃白点判据必然拍爆。
+// 结论：边缘高光 + 中央暗部是**全局曲线的 HDR 两难**，全局手段只能把问题挪边
+// （保高光则中央暗、提中央则高光爆）；正解是局部色调映射，见 docs/开发计划.md。
 float FrameRenderer::updateAutoGain(GLuint src) {
   constexpr int kN = 64;
   constexpr float kTarget = 0.80f;  // 目标线性白点（须 ≤ 滚降 knee，见 highlightRolloff）
   constexpr float kMax = 4.0f;
   const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
   int hist[kN];
-  if (!histogramFrom(src, hist, kN)) return fallback;
+  // 旁路 LUT：风格层不该改曝光（判据本身仍为 P95 白点，见上方注释）
+  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true)) return fallback;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return fallback;
@@ -2067,6 +2081,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。
   const float gain =
       p.auto_tone > 0.5f ? updateAutoGain(src_tex) : std::exp2(0.35f);
+  film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_film_);

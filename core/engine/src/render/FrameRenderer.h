@@ -105,9 +105,10 @@ class FrameRenderer {
                       float k);
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
   // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
-  // 与公开的 histogram() 同一实现），取 P99 折回线性得场景白点 → 曝光增益
+  // 与公开的 histogram() 同一实现），取 P95 折回线性得场景白点 → 曝光增益
   // （限幅 [1,4]×，只提亮不压暗）。auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
-  bool histogramFrom(GLuint src, int* out, int n);
+  // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
+  bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
   float updateAutoGain(GLuint src);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
@@ -155,6 +156,7 @@ class FrameRenderer {
   bool lut_dirty_ = false;
   float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
   float auto_gain_ = 0.0f;     // 自适应曝光增益（≤ 0 = 未初始化，首帧直通）
+  float film_gain_ = 1.0f;     // 本帧 passFilm 实际用的曝光增益（raw.render 记 ag）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
                GLint loc_dinv, GLint loc_size, float strength);
