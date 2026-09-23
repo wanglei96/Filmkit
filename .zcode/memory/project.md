@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-09-22 22:13
+updated: 2026-09-23 17:15
 status: active
 ---
 
@@ -19,19 +19,19 @@ status: active
 - `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、**research/（11 份独立调研报告：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR）**
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8 二进制、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`，中文显示名 + 品牌分类写在头部；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py` 重采样）＋ `lut-preview-src.png`（卡片预览固定测试图，CC0）
 - `app/src/main/java/com/filmkit/app/lut/`：`CubeLut`（解析）/ `LutLibrary`（清单+缓存）/ `LutPreview`（卡片预览：一次性生成 + 磁盘缓存）
-- `tools/`：validate-shaders.sh、check-lsc-mapping.py、dng-color-dump.py、color-metrics.py、gen-lut-previews.py、**gen-lut-assets.py（64³ cube → 33³ 二进制资产）**、**tone-scan.py（成片反推 baseTone 输入 + 参数扫描 + 对照图）**、lut-audit.py
+- `tools/`：validate-shaders.sh、check-lsc-mapping.py、dng-color-dump.py、color-metrics.py、gen-lut-previews.py、**gen-lut-assets.py（64³ cube → 33³ 二进制资产）**、**tone-scan.py（成片反推 baseTone 输入 + 参数扫描 + 对照图）**、lut-audit.py、**chroma-denoise-eval.py（v0.6.37 新增：从 DNG 重建 P4 输入域，评估暗部彩噪残余 / 真实色度边缘保留 / 低频偏差）**
 
 ## 进行中
 
-- [2026-09-22] **基础色彩引擎（主线）** | 真机实测"发闷/色彩淡"根因在基础引擎而非 LUT。已完成 v0.6.9→**v0.6.23-m4**（42 个 LUT 资产 + 中文分类、Material3 暗色主题、baseTone 旋钮正交化、自适应影调、高光软肩、色度降噪、**色度判据三次修正：域错误 0.25→0.06 → 亮度相对 rel=max\|cc\|/luma → knee 0.4 定向补中间调弱彩**）→ **下一步＝① sRGB 分段 OETF（三处同步）/ ③ 切镜头 AE 重置 / 黄绿色相偏差定案 / 暗场景局部色调映射** | handoffs/调研复核与色度判据三次修正.memo.md
-- [2026-09-22] **待定案两件（本轮新增）** | ① **黄绿带色相偏差 −3~8°**（用户"树叶绿不准"的真正形态）：已排除色度层与全局色偏，指向 CCM 路径；动手前须先定基准（灰卡/色卡或厂商直出，libraw 不作绝对标尺）② **暗场景亮度**（"456 比真实场景暗"）：全局曲线已到高光硬顶，只能靠局部色调映射 | 同上快照
-- [2026-09-22] **色彩专项（已启动）** | 原三件起手事已答：① 域假设**正确**（LUT 接 display 域、OETF 之后，与 PhotonCamera 同域）② 强度混合曲线**现状已最优**（编码域线性 mix = 感知均匀）③ 职责边界：真正缺的是"基础引擎把 RAW 变成正常照片"这一层 | 同上快照
-- [2026-09-22] **噪点待收口（升级为 MFNR 议题）** | 提亮 1.1EV 使色度 σ +84%；单帧降噪已到瓶颈，根治要**多帧融合** | 同上快照
+- [2026-09-23] **基础色彩引擎（主线）** | 进行中 | 已完成 v0.6.9→**v0.6.37-m4**。本轮落地 **M4-7 局部色调映射**；自适应影调判据来回改了 5 次后**回归中间调锚定**（职责＝**提中间调以提色彩**，`gain = clamp(0.26/lin_mid, 1, 1.6)`）；P4 降噪职责从值域阈值 σc 换到**空间半径**（半径 2→3）；修三个真机缺陷（关降噪反而慢 4–7 倍 / 局部低频图固定尺寸致预览与成片不一致 / `raw.wait_result` 误报）；预览流上限 1440→2160。**未打 tag** | handoffs/自适应影调回归中间调与降噪换径.memo.md
+- [2026-09-23] **M 档 RAW 所见即所得预览** | 待立项（用户拍板"先不做"）| 卡点是**性能非功能**：RAW 全链路 12.5MP 需 210–500ms，实时需 <33ms。决定性未知量＝**X300 的 RAW 输出尺寸列表**（`CameraAudit.kt:86` 已记录，导审计即可判）。**LUT/预设已在预览生效**（与拍照同一 `passFilm`/`passOutput`），缺的只是 RAW 链 | 同上快照
+- [2026-09-23] **多帧融合（MFNR）＝ 彩噪的根治方案** | 待立项 | 彩噪跨帧独立、信号跨帧相关 ⇒ 时间维度完美可分离；HDR+ 一手原话 "Fusing a burst…**makes aggressive spatial denoising unnecessary**"。上了多帧即不需要大尺度色度平滑（后者亮度细节零损失、色度边缘只剩 8–20%）。N=4 约 0.7–1.0s、N=8 约 1.0–1.5s | 同上快照
+- [2026-09-23] **待标定/定案三件** | 待基准 | ① 黄绿带色相 −3~8°（须先定基准：灰卡/色卡或厂商直出）② 提亮方式（若室外仍偏灰 → 中间调曲线 `pow(y,g)`，增益会把高光一起推高）③ ag 目标值标定（现 0.26 让绝大多数场景打满，"自适应"只剩很亮场景起作用）| 同上快照
 - [2026-09-20] 色温估计校准精校 | 待灰卡 + 标准光源（WB_CAL_R=0.923/WB_CAL_B=1.238 单点推得）| facts.md
-- [2026-09-19] MF 滑杆手感复验 | 待真机
 
 ## 已完成（近期）
 
+- [2026-09-23] **局部色调映射与自适应影调判据收敛（v0.6.24–v0.6.37-m4）**：落地 **M4-7 局部色调映射**（比值判据＋8×8 盒式下采样＋手写双线性上采样，修掉真机"亮斑"）；自适应影调判据 P95→中位→P95→P99→**中位** 五次反复后定稿（**职责＝提中间调以提色彩**，`kTarget 0.26` / `kMax 1.6`）；**P4 色度降噪换径**（σs 会被半径截断 ⇒ 半径 2→3、σc 地板 0.015→0.008、`ns` 回退改按 ISO 估算）；静拍 EMA 直通；三个真机缺陷修复（关降噪反而慢 4–7 倍 / `raw.wait_result` 误报 / 局部低频图固定尺寸致预览与成片提亮尺度差 3.4 倍）；`raw.meta` 加预览/拍照曝光对（**实测一致**，排除曝光差异假设）；预览流上限 1440→2160；`abiFilters` 固定 arm64（APK 39.2→28.2MB）；新增 `tools/chroma-denoise-eval.py`
 - [2026-09-22] **调研结论复核 + 色度判据三次修正（v0.6.21–v0.6.23-m4，已验收 tag）**：独立复核推翻 ④（纹素中心校正，恒等 LUT 实测证明现行已等价）、修正 ① 的机制（中间调仅 +1.27/255、"削弱 LUT"反向）、拆分 ③；色度层判据改**亮度相对**并定向调 knee（真机剖面 0.59/0.81/0.86/1.00 → 0.68/0.93/1.07/1.03，clip 全 0%）；建立 **DNG+libraw 缺口剖面**方法定案"淡在中间调弱彩"；版本号改单一来源；`test_temp/` 入 gitignore
 - [2026-09-22] **基础色彩引擎调优（v0.6.9–v0.6.20-m4）**：42 个 LUT 资产（中文名+品牌分类+可增删分类，强度上限 150%）；Material3 暗色主题（根因是 `MainActivity` 空的 `MaterialTheme{}`）；`baseTone` 旋钮正交化（删 `g` 幂提亮 → 线性域曝光，`ev`/`p`/`blk` 各管一亮/对比/黑位）；**自适应影调**（场景显示域 P95 → 线性增益，限幅 [1,4]×，EMA；设置页可关）；**高光软肩滚降**（`clamp` → 指数软肩 + 去饱和）；P4 色度降噪 3.25/2.75、`look_chroma` 1.25；`raw.calib` 按 cameraId 各记一条
 - [2026-09-22] **独立调研定案**：4 路并行 + ISP 补跑，核实 PhotonCamera 的 LUT 链路（预览/成片都在非线性 sRGB 显示域）、无"理光/徕卡引擎"、`RawProfile` 是未接线代码；拿到 darktable/RawTherapee/AgX/ACES/libplacebo 的做法与 HDR+/Night Sight/libcamera 一手参数
