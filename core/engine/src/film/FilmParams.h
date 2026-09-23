@@ -7,7 +7,10 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  static constexpr int kCount = 36;
+  // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
+  // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
+  // 与 Kotlin 侧 `DoubleArray(37)` 不符 —— 留着会继续误导，按实际项数维护。
+  static constexpr int kCount = 37;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -54,7 +57,7 @@ struct FilmParams {
   // 提中央则高光爆（离线实测中位锚定会让 6.6%–13% 像素过曝）。
   // 本项 = 暗部线性提亮比例（局部亮度越低越满额，到 knee 以上归零）：
   // 0 = 关（A/B 通路），>0 = 强度。高光区强度为 0，故与自适应影调互不冲突。
-  float local_tone = 0.6f;     // 36 0 = 关；>0 = 暗部线性提亮比例（标定旋钮）
+  float local_tone = 0.25f;    // 36 0 = 关；>0 = 暗部线性提亮比例（标定旋钮）
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
