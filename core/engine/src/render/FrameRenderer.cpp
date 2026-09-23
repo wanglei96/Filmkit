@@ -2070,33 +2070,31 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
   return true;
 }
 
-// 自适应曝光增益：场景白点（显示域 P95）折回线性后归一到目标白点。
-// 分位实测选型（真机三场景 + 合成亮场景压力测试）：P90 会让 gain 打满上限 4.0×
-// （阳台 L* 52.7，过亮）；P99 被小面积高光骗（书桌笔记本屏幕 → gain 仅 1.15×，
-// 桌面 L* 20.3 偏暗）；**P95 最平衡** —— 阳台 45.6 / 卧室 63.5（厂商同场景 62.1）/
-// 书桌 32.3，且三种场景 clip 全 0%。**限幅只允许提亮**（[1,4]×），不压暗用户
-// 设定的曝光 —— 过曝交给 kFsOut 的高光滚降。
-// v0.6.24（真机报"画面边缘有高光则中央被压暗"）诊断：P95 是**全图**分位，只要画面里
-// 有 ≥5% 的亮区（白天几乎必然：天空/窗/白墙，且常在边缘），P95 就被顶到目标以上、
-// gain 落回下限 1.0，中央暗部不再获得任何补偿（清晨 10 张白天样片实测 gain≈1.00）。
-// 离线验证过两条替代判据，**都不可行**（勿重复尝试）：
-//   ① 中心加权 P95（权重 1.0→0.25）：分位只降 10/255，gain 1.00→1.10，等于没改；
-//   ② 中位数锚定中灰（0.2184）：暗场景 gain 冲到 4.0，高光 clip 6.6%–13% —— 逆光
-//      场景的高光本就在 clip 边缘，放弃白点判据必然拍爆。
-// 结论：边缘高光 + 中央暗部是**全局曲线的 HDR 两难**，全局手段只能把问题挪边
-// （保高光则中央暗、提中央则高光爆）；正解是局部色调映射，见 docs/开发计划.md。
+// 自适应曝光增益：场景亮度折回线性后归一到**中间调不动点**。
+// v0.6.26 第三次改判据（真机"中央还不够亮 / 不如 PhotonCamera 明亮有层次"）：
+// 从"显示域 P95 → 线性白点 0.80"改为"**显示域中位 → 0.2184（baseTone 的不动点 mn）**"。
+// 证据（与 PhotonCamera 同机位成片的分位数映射）：差距**不在高光也不在暗部，而在中间调** ——
+// PC 的 P50 = 131/255（线性 0.230）vs 我们 79（0.076），线性差 3.0×；而 P90 以上只差
+// 1.1×、P10 以下 PC 反而更黑（4 vs 20，它有真正的黑位）。中位锚定到不动点后 P50 落到
+// 128/255 —— 与 PC 的 131 几乎重合（离线 6 张样片：P50 120–131、gain 1.56–2.59、clip 全 0%）。
+// 旧 P95 判据在白天逆光场景恒为 1.0 的原因：画面里 ≥5% 的亮区（天空/窗/白墙）就把 P95
+// 顶到目标以上，gain 直接落到下限。
+// ⚠ 更正：v0.6.24 曾据"中位锚定会让 6.6%–13% 像素过曝"否掉本方案 —— 那个离线模拟
+// 漏了 kFsOut 的高光滚降（rolloff 会把 >0.80 的部分压回 <1.0）。补上后实测 clip 全 0%，
+// 高光 P95 只到 245–246（PC 是 247）。**别再据那个错结论否掉它。**
+// 限幅仍只允许提亮（[1,4]×）—— 压暗用户设定的曝光不在引擎职责内。
 float FrameRenderer::updateAutoGain(GLuint src) {
   constexpr int kN = 64;
-  constexpr float kTarget = 0.80f;  // 目标线性白点（须 ≤ 滚降 knee，见 highlightRolloff）
+  constexpr float kTarget = 0.2184f;  // baseTone 的中间调不动点 mn（线性）
   constexpr float kMax = 4.0f;
   const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
   int hist[kN];
-  // 旁路 LUT：风格层不该改曝光（判据本身仍为 P95 白点，见上方注释）
+  // 旁路 LUT：风格层不该改曝光（判据本身见上方注释）
   if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true)) return fallback;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return fallback;
-  const long want = static_cast<long>(static_cast<double>(total) * 0.95);
+  const long want = static_cast<long>(static_cast<double>(total) * 0.50);  // 中位
   long acc = 0;
   int bin = kN - 1;
   for (int i = 0; i < kN; ++i) {
@@ -2128,7 +2126,7 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 }
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) {
-  // 自适应影调（M4-6）：按场景白点算线性曝光增益。**刻意放在 passFilm 内** ——
+  // 自适应影调（M4-6）：按场景中位亮度算线性曝光增益。**刻意放在 passFilm 内** ——
   // 预览 / YUV 静拍 / RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 关闭（auto_tone ≤ 0.5）时退回固定 ev 0.35，与 v0.6.17 行为逐位一致（A/B 通路）。
   // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。

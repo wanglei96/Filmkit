@@ -105,8 +105,9 @@ class FrameRenderer {
                       float k);
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
   // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
-  // 与公开的 histogram() 同一实现），取 P95 折回线性得场景白点 → 曝光增益
-  // （限幅 [1,4]×，只提亮不压暗）。auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
+  // 与公开的 histogram() 同一实现），取**中位**折回线性归一到 baseTone 的中间调
+  // 不动点（0.2184）→ 曝光增益（限幅 [1,4]×，只提亮不压暗）。
+  // auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
   // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
   // 把 src 的"显示域亮度图"（kFsHist，OETF 同 kFsOut）渲染到 fbo（w×h）。
