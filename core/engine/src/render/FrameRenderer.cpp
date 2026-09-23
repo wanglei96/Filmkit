@@ -14,6 +14,14 @@
 namespace filmkit {
 namespace {
 
+// M4-7 局部色调映射的低频亮度图尺寸与 knee（都是设备端标定旋钮）。
+// 32×24 在 4080×3072 上等效模糊半径约 128px ≈ 3% 画面宽：再小会退化成全局曲线
+// 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
+// 跟着细节走、把暗部内部对比压平。
+constexpr int kLocalW = 32, kLocalH = 24;
+// ratio knee：局部亮度 / 画面基准 < 此值 → 满额提亮，到 1.0（即与基准齐平）归零。
+constexpr float kLocalKnee = 0.7f;
+
 // 顶点：全屏三角 + 90° 步进旋转 + center-crop，最后经 SurfaceTexture 矩阵
 // （含生产者翻转）映射到 OES 纹理坐标。
 const char* kVertRot = R"(#version 300 es
@@ -581,6 +589,16 @@ uniform float uLookChroma; // 色度 S 曲线端点增益
 // M4-6 自适应影调：曝光增益由 C++ 侧算好下发 —— 开启 = 按场景白点自适应，
 // 关闭 = 固定 exp2(0.35)。两条路都只经 baseTone 的线性曝光这一处，语义唯一。
 uniform float uExposureGain;
+// ── M4-7 局部色调映射 ────────────────────────────────────────────────
+// 低频亮度图（32×24、显示域 luma、硬件 LINEAR 上采样）+ 强度 + knee。
+// 为什么必须局部：全局曲线在"边缘高光 + 中央暗部"的高 DR 场景里两难 ——
+// 保高光则中央暗（自适应影调 gain 被 P95 锁在 1.0）、提中央则高光爆
+// （离线实测中位锚定会让 6.6%–13% 像素过曝）。局部图只让**暗区**吃到提亮，
+// 亮区强度归零，因此高光不受影响、黑位乘性保持。
+uniform highp sampler2D uLocal;
+uniform float uLocalStrength;  // 0 = 关（A/B 通路）
+uniform float uLocalKnee;      // 提亮衰减 knee（局部亮度 / 画面基准 的比值）
+uniform float uLocalRef;       // 画面基准亮度（局部图中位，CPU 侧下发）
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
 // 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
@@ -658,6 +676,17 @@ void main() {
     g.g = filmCurve(lg.g, uToe.g, uShoulder.g);
     g.b = filmCurve(lg.b, uToe.b, uShoulder.b);
     vec3 out3 = 0.18 * exp2((g - 0.5) * 8.0);
+    // M4-7 局部色调映射：按**局部相对画面基准**的暗度补光 —— 比基准暗得越多补得越多，
+    // 到 uLocalKnee 以上（含所有亮区/高光）归零。刻意放在 baseTone **之前**：这里还是
+    // 线性域，S 曲线对暗部的弹性约 2（离线实测 +60% 线性 → 显示域 +45~55%），同样的
+    // 强度比乘在曲线之后有效得多，语义也仍是"局部曝光补偿"。
+    // 判据必须用**比值**而非绝对阈值：实拍场景普遍欠曝，绝对阈值（如"局部 < 0.45"）
+    // 几乎全图命中，会退化成全局提亮（离线实测亮场景中央也被抬 20–32%）。
+    if (uLocalStrength > 0.0) {
+        float ll = texture(uLocal, vUV0).r;
+        float ratio = ll / max(uLocalRef, 1e-3);
+        out3 *= 1.0 + uLocalStrength * (1.0 - smoothstep(uLocalKnee, 1.0, ratio));
+    }
     // 基准影调（norm-controlled + 高光去饱和）
     if (uToneK > 0.0) {
         float n0 = max(max(out3.r, out3.g), out3.b);
@@ -1110,6 +1139,10 @@ bool FrameRenderer::init() {
   u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
   u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
   u_film_.exposure_gain = glGetUniformLocation(prog_film_, "uExposureGain");
+  u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
+  u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
+  u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
+  u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -1143,6 +1176,16 @@ bool FrameRenderer::init() {
 
   glDisable(GL_BLEND);
   glDisable(GL_DEPTH_TEST);
+
+  // M4-7 局部色调映射的低频亮度图：init 就建好（32×24、RGBA8）。
+  // 与 LUT 同理 —— kFsFilm 里存在 sampler2D，关闭档也必须绑合法纹理，否则 Mali
+  // 预测执行 `if (uLocalStrength > 0.0)` 分支里的 texture() 会让整帧 draw 报 1282
+  // （v0.6.0-m4 全黑同族事故；LSC 关闭档绑 1×1 全 1 网格是同一处理）。
+  // 过滤必须 LINEAR：makeTex 默认 NEAREST，会把 32×24 的格子放大成可见方块。
+  makeTex(&tex_local_, &fbo_local_, GL_RGBA8, kLocalW, kLocalH);
+  glBindTexture(GL_TEXTURE_2D, tex_local_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
   // M4：默认 1×1×1 恒等 LUT 纹理。
   // **必须始终**有一张完整的 3D 纹理绑在单元 1：kFsOut/kFsHist 里存在 sampler3D，
@@ -1871,6 +1914,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += ",\"ag\":" + std::to_string(film_gain_).substr(0, 5);
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
+  kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
   kv += std::string(",\"lsc\":\"") +
         (lsc_ok ? std::to_string(lsc_cols) + "x" + std::to_string(lsc_rows)
@@ -1986,6 +2030,25 @@ bool FrameRenderer::histogram(int* out, int n) {
   return histogramFrom(tex_work_, out, n);
 }
 
+// 把 src 的**显示域亮度图**渲染到 fbo（w×h）：kFsHist 自带 OETF（与 kFsOut 同源），
+// 输出 luma 到 RGBA8。两个用途共用这一次 draw：
+//   ① 直方图统计（256×96 → readPixels 后算分位）；
+//   ② 局部色调映射的低频亮度图（32×24，只留在 GPU 上给 kFsFilm 采样）。
+// lut_strength 传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）。
+void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
+                              float lut_strength) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_hist_);
+  applyPendingLut();
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src);
+  glUniform1i(u_hist_.tex, 0);
+  bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
+          u_hist_.lut_dinv, u_hist_.lut_size, lut_strength);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
 // M4-6：统计源参数化 —— 自适应影调必须对**场景纹理**（baseTone 之前）统计，
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
@@ -1997,17 +2060,7 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
     hist_w_ = hw;
     hist_h_ = hh;
   }
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_hist_);
-  glViewport(0, 0, hw, hh);
-  glUseProgram(prog_hist_);
-  applyPendingLut();
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, src);
-  glUniform1i(u_hist_.tex, 0);
-  // 强度传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）
-  bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
-          u_hist_.lut_dinv, u_hist_.lut_size, bypass_lut ? 0.0f : lut_strength_);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
@@ -2082,6 +2135,27 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   const float gain =
       p.auto_tone > 0.5f ? updateAutoGain(src_tex) : std::exp2(0.35f);
   film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
+  // M4-7 局部色调映射：低频亮度图（32×24）与直方图同源、同一次 kFsHist 实现。
+  // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
+  // 强度 ≤ 0 时不重渲染，但仍绑**已存在的** tex_local_ 并下发 0 —— sampler 必须有
+  // 合法绑定（v0.6.0-m4 全黑事故），shader 侧靠 uLocalStrength > 0 短路。
+  const float local = (p.local_tone > 0.0f && src_tex != 0) ? p.local_tone : 0.0f;
+  float local_ref = 0.5f;  // 局部图未生成时的兜底基准（中灰）
+  if (local > 0.0f) {
+    renderLuma(src_tex, fbo_local_, kLocalW, kLocalH, 0.0f);
+    // 读回 32×24 小图（3KB）取中位亮度当"画面基准"—— 判据必须相对它算，
+    // 绝对阈值在普遍欠曝的实拍场景里会退化成全局提亮（见 shader 注释）。
+    std::vector<uint8_t> px(static_cast<size_t>(kLocalW) * kLocalH * 4);
+    glReadPixels(0, 0, kLocalW, kLocalH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    std::vector<uint8_t> lum;
+    lum.reserve(static_cast<size_t>(kLocalW) * kLocalH);
+    for (size_t i = 0; i + 3 < px.size(); i += 4) lum.push_back(px[i]);
+    if (!lum.empty()) {
+      const size_t mid = lum.size() / 2;
+      std::nth_element(lum.begin(), lum.begin() + mid, lum.end());
+      local_ref = std::max(lum[mid] / 255.0f, 1e-3f);
+    }
+  }
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_film_);
@@ -2100,6 +2174,12 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex) 
   glUniform1f(u_film_.look, p.look_strength);
   glUniform1f(u_film_.look_sat, p.look_sat);
   glUniform1f(u_film_.look_chroma, p.look_chroma);
+  glUniform1f(u_film_.local_strength, local);
+  glUniform1f(u_film_.local_knee, kLocalKnee);
+  glUniform1f(u_film_.local_ref, local_ref);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_local_);
+  glUniform1i(u_film_.local, 2);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

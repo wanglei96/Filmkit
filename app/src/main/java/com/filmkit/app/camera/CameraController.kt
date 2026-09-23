@@ -697,6 +697,9 @@ class CameraController(private val context: Context, private val render: RenderC
     private var lookPref = -1.0
     private var lutStrengthPref = -1.0
     private var autoTonePref = -1.0
+    // 局部色调映射（M4-7）：强度与 CameraPresets[36] 默认值一致；0 = 关（A/B 通路）。
+    private val LOCAL_TONE = 0.6
+    private var localTonePref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -755,8 +758,10 @@ class CameraController(private val context: Context, private val render: RenderC
             zebraPref = v
             filmParams[30] = v
         }
-        // 自适应影调（M4-6）同属"输出域开关"，搭同一批刷新入口（共 4 处调用点）
+        // 自适应影调（M4-6）与局部色调映射（M4-7）同属"输出域开关"，
+        // 搭同一批刷新入口（共 4 处调用点）
         applyAutoTonePref()
+        applyLocalTonePref()
     }
 
     /**
@@ -770,6 +775,19 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != autoTonePref) {
             autoTonePref = v
             filmParams[35] = v
+        }
+    }
+
+    /**
+     * 局部色调映射开关（M4-7）：写 FilmParams[36]。
+     * >0 = 暗部线性提亮比例（[LOCAL_TONE] 与 CameraPresets 默认值一致），
+     * 0.0 = 关（A/B 通路）。只让暗区吃到提亮、亮区强度归零，故与自适应影调不冲突。
+     */
+    private fun applyLocalTonePref() {
+        val v = if (appPrefs.getBoolean("local_tone", true)) LOCAL_TONE else 0.0
+        if (v != localTonePref) {
+            localTonePref = v
+            filmParams[36] = v
         }
     }
 

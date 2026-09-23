@@ -200,6 +200,40 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            var localToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("local_tone", true)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = !localToneOn
+                        localToneOn = v
+                        prefs.edit().putBoolean("local_tone", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.local_tone",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("局部色调映射", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。" +
+                            "治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (localToneOn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             var hlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hl_recon", true)) }
             Row(
                 Modifier

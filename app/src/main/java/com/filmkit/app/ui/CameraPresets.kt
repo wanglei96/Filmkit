@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(36).apply {
+    private fun neutral(): DoubleArray = DoubleArray(37).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -62,6 +62,12 @@ object CameraPresets {
         // 固定补偿救不了 —— 暗场景要 +1.2EV、亮场景只能承受 +0.3EV，差 4 倍。
         // 设置页开关写 prefs("auto_tone")，CameraController 组装参数时覆盖此值。
         this[35] = 1.0
+        // 36 = 局部色调映射（M4-7）：0 = 关（A/B 通路），>0 = 暗部线性提亮比例。
+        // 全局曲线在"边缘高光 + 中央暗部"的高 DR 场景里两难（保高光则中央暗、
+        // 提中央则高光爆 —— 离线实测中位锚定会让 6.6%–13% 像素过曝）；局部手段只让
+        // 暗区吃到提亮、亮区强度归零，故高光不动、黑位乘性保持。
+        // 0.6 ≈ 暗部线性 ×1.6（经 S 曲线放大后显示域约 +55%）。标定旋钮。
+        this[36] = 0.6
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

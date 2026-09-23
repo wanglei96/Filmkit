@@ -48,6 +48,12 @@ struct FilmParams {
   // 开启后引擎按场景白点自动算线性增益（限幅 [1,4]×，只提亮不压暗）；
   // 预览 / YUV 静拍 / RAW 静拍三条路径共用 passFilm 内的同一处统计。
   float auto_tone = 1.0f;      // 35 0 = 关（退回固定 ev 0.35），1 = 开
+  // ── M4-7 局部色调映射（默认开、可关）────────────────────────────
+  // 全局曲线在高 DR 场景（边缘高光 + 中央暗部）里两难：保高光则中央暗、
+  // 提中央则高光爆（离线实测中位锚定会让 6.6%–13% 像素过曝）。
+  // 本项 = 暗部线性提亮比例（局部亮度越低越满额，到 knee 以上归零）：
+  // 0 = 关（A/B 通路），>0 = 强度。高光区强度为 0，故与自适应影调互不冲突。
+  float local_tone = 0.6f;     // 36 0 = 关；>0 = 暗部线性提亮比例（标定旋钮）
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -96,6 +102,7 @@ struct FilmParams {
     if (n > 33) look_chroma = static_cast<float>(v[33]);
     if (n > 34) lut_strength = static_cast<float>(v[34]);
     if (n > 35) auto_tone = static_cast<float>(v[35]);
+    if (n > 36) local_tone = static_cast<float>(v[36]);
   }
 };
 

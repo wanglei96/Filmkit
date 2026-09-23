@@ -109,6 +109,9 @@ class FrameRenderer {
   // （限幅 [1,4]×，只提亮不压暗）。auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
   // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
+  // 把 src 的"显示域亮度图"（kFsHist，OETF 同 kFsOut）渲染到 fbo（w×h）。
+  // 直方图统计与局部色调映射的低频图共用这一次 draw。
+  void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength);
   float updateAutoGain(GLuint src);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex);
   void passFilm(int w, int h, const FilmParams& p);
@@ -142,6 +145,10 @@ class FrameRenderer {
   int dn_w_ = 0, dn_h_ = 0;
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
+  // M4-7 局部色调映射的低频亮度图（RGBA8，32×24、LINEAR 上采样）。与 tex_hist_
+  // 同源（都走 kFsHist 的显示域 luma），但**分辨率低得多**才叫"局部"：256×96 在
+  // 4080×3072 上等效半径只有 16×32px，等于逐像素亮度，会把暗部内部的细节压平。
+  GLuint fbo_local_ = 0, tex_local_ = 0;
   std::vector<uint8_t> rgb_stage_;
   // M4 3D LUT（display 域）：RGBA16F 3D 纹理，LINEAR/CLAMP；lut_size_ ≤ 1 = 关闭
   GLuint lut_tex_ = 0;
@@ -201,7 +208,8 @@ class FrameRenderer {
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
-          look_sat = -1, look_chroma = -1, exposure_gain = -1;
+          look_sat = -1, look_chroma = -1, exposure_gain = -1, local = -1,
+          local_strength = -1, local_knee = -1, local_ref = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
