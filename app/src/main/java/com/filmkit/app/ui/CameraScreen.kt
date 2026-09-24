@@ -467,23 +467,17 @@ fun CameraScreen(
     val maxIso = controller.maxAnalogIso
     // EV 补偿实际范围/步进来自 characteristics（部分设备不支持负补偿，UI 自适应）
     val (evLo, evHi, evStp) = controller.evInfo()
-    // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）。
-    // ⚠️ 方向链路（v0.6.42 踩过两次，务必按顺序理解）：
-    //   ① **窗口方向必须跟随设备物理姿态**（下面 LaunchedEffect 主动设 requestedOrientation）——
-    //      系统"自动旋转"关掉时窗口不会自己转，而 PC 的做法也是自己控制、不依赖系统。
-    //   ② 取景框比例再跟着**窗口**走（`LocalConfiguration.orientation`）：窗口竖 → 3:4 竖框，
-    //      窗口横 → 4:3 横框。
-    //   只做 ②（v0.6.42 的第一版）会在竖窗口里塞一个横框 → 取景框变成屏幕上部一条、下方大片空白，
-    //   布局直接不可用；只做 ① 则窗口转了但取景框比例不动。
-    val activity = context as? android.app.Activity
-    LaunchedEffect(controller.orientationStep) {
-        activity?.requestedOrientation =
-            if (controller.orientationStep % 2 == 0) {
-                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            } else {
-                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            }
-    }
+    // 取景窗口 = 所选画幅（WYSIWYG）。
+    // 方向链路现状（v0.6.44，回退了 v0.6.42/43 的"转窗口"方案）：
+    //   · **窗口不主动转** —— 横屏垂直空间只有 ~347dp，顶栏+参数+快门吃掉大半，
+    //     取景框会缩成 524×393（真机日志 preview.frame dstW/dstH），且窗口转了 STMatrix
+    //     不变、预览内容相对屏幕躺倒。PhotonCamera 也不转窗口：它让 GL 渲染器收设备旋转、
+    //     UI 另用 Modifier.autoRotate 整体旋转 —— 那是下一步要照抄的做法。
+    //   · 取景框比例跟随**窗口**（LocalConfiguration）：竖窗口给 3:4，布局不会被撑坏。
+    //   · 成片裁切比例跟随**设备姿态**（见下面的 captureAspectValue）：横拿出横幅，
+    //     与窗口方向解耦 —— 这正是"横拍成片被裁成竖屏"的修复。
+    //   代价：窗口竖而设备横时，取景框是竖的、预览只能看到画面中央部分（WYSIWYG 暂不成立），
+    //   直到 UI 旋转方案落地。
     val portrait = LocalConfiguration.current.orientation ==
         android.content.res.Configuration.ORIENTATION_PORTRAIT
     val guideAspect = when (aspect) {
@@ -491,9 +485,15 @@ fun CameraScreen(
         "XPAN" -> if (portrait) 24f / 65f else 65f / 24f
         else -> if (portrait) 3f / 4f else 4f / 3f
     }
-    // 成片按同一比例居中裁切（与取景窗口一致）
-    LaunchedEffect(guideAspect) {
-        controller.setCaptureAspect(guideAspect)
+    // 成片裁切比例：跟随**设备姿态**（orientationStep 0/2=竖、1/3=横），不看窗口
+    val posturePortrait = controller.orientationStep % 2 == 0
+    val captureAspectValue = when (aspect) {
+        "16:9" -> if (posturePortrait) 9f / 16f else 16f / 9f
+        "XPAN" -> if (posturePortrait) 24f / 65f else 65f / 24f
+        else -> if (posturePortrait) 3f / 4f else 4f / 3f
+    }
+    LaunchedEffect(captureAspectValue) {
+        controller.setCaptureAspect(captureAspectValue)
     }
 
     // 底部不留白：只让出状态栏，内容延伸到手势条之下；悬浮窗浮于整机上层（不受取景框约束）
