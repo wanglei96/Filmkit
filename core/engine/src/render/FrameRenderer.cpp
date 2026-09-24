@@ -675,8 +675,15 @@ float baseTone(float x) {
     const float blk = 0.0080;   // 黑点 —— 压黑位靠它，不靠 p
     const float mn  = 0.2184;   // 中间调枢轴（线性 0.22）＝ S 曲线的**不动点**
     const float p   = 1.60;     // S 强度 —— 对比旋钮（不动点不随它移动）
-    // 曝光增益 uExposureGain：自适应场景白点归一，或关闭时固定 exp2(0.35)
-    float xn = clamp((x * uExposureGain - blk) / (1.0 - blk), 0.0, 1.0);
+    // v0.6.49：曝光增益对**高光淡出**（x ≥ kAgFadeHi 处增益退化为 1）。
+    // 动机：ag 是**全局**增益，暗场景打满 3.0 时会把画面里本来就亮的部分（白柜子/
+    // 白墙）一起推过滚降白点。真机实测（室内 ISO 254，ag 2.386）：n0 P90 0.399
+    // ×2.386 = 0.95 > 0.80 → 显示域 244/255，用户报"柜子高光溢出"；淡出后 P90 落到
+    // 0.61（显示 231）。中位（n0 0.151）与暗部完全不受影响，室外场景 P90 仅 0.58→0.53。
+    const float kAgFadeLo = 0.20;
+    const float kAgFadeHi = 0.50;
+    float agEff = mix(uExposureGain, 1.0, smoothstep(kAgFadeLo, kAgFadeHi, x));
+    float xn = clamp((x * agEff - blk) / (1.0 - blk), 0.0, 1.0);
     // 归一化到以 mn 为 0.5 的坐标：S 曲线在 t=0.5 处 s=0.5，映射回来正好是 mn
     float t = xn <= mn ? 0.5 * xn / mn : 0.5 + 0.5 * (xn - mn) / (1.0 - mn);
     float tp = pow(t, p);
@@ -775,6 +782,16 @@ void main() {
         // 代价：全图 C* 5.41→4.21（PC 6.51）—— 我们的缺口本就在中间调/暗部，
         // 不归这条去饱和管（见 decisions"暗部提色"待办）。
         float w = uToneK * smoothstep(0.32, 0.60, n0);
+        // v0.6.49：**色度保护** —— max 通道判据会把"单通道高的浓色物体"误判成高光：
+        // 红色水杯的 R 通道高（n0 由 R 决定）但 G/B 仍很低，**根本没有过曝**，却被
+        // 整段去饱和 → 用户报"红色水杯泛白"。判据取的是色度（rel = max|cc|/luma，
+        // 与外观层同式）：rel 越高说明颜色越浓、离"过曝趋白"越远。
+        // 真机实测室内场景 n0 中位 0.357（远高于室外的 0.148），去饱和区间正好压在
+        // 中间调上，所以这个误伤在室内尤其明显。天空 rel≈0.38 < 0.45，**不受影响**。
+        float lw = luma(out3);
+        float devw = max(max(abs(out3.r - lw), abs(out3.g - lw)), abs(out3.b - lw));
+        float relw = devw / max(lw, 0.02);
+        w *= 1.0 - smoothstep(0.45, 0.85, relw);
         m = mix(m, vec3(max(max(m.r, m.g), m.b)), w);
         out3 = m;
     }
