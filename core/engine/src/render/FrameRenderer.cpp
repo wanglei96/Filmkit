@@ -791,7 +791,12 @@ void main() {
         float lw = luma(out3);
         float devw = max(max(abs(out3.r - lw), abs(out3.g - lw)), abs(out3.b - lw));
         float relw = devw / max(lw, 0.02);
-        w *= 1.0 - smoothstep(0.45, 0.85, relw);
+        // v0.6.50：保护必须**排除过曝的高光** —— v0.6.49 只用 rel 一刀切，把台灯灯管
+        // 也保护了（它 R/B 已饱和、G 未饱和 ⇒ rel 高），于是灯管保持粉紫，重现了
+        // v0.5.37"过曝灯泡变红/变粉"的老 bug（真机 ISO 2208 室内样片，右上角灯管）。
+        // DNG 重建实测把两者分开：灯管 luma **1.04** / RGB (1.49,0.83,1.84)；
+        // 红杯这类"没过曝的浓色物体" luma < 0.4。加 luma 门限后灯管回到 w=1（纯白）。
+        w *= 1.0 - smoothstep(0.45, 0.85, relw) * (1.0 - smoothstep(0.40, 0.70, lw));
         m = mix(m, vec3(max(max(m.r, m.g), m.b)), w);
         out3 = m;
     }
