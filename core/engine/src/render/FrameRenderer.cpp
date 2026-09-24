@@ -613,6 +613,13 @@ uniform float uLookChroma; // 色度 S 曲线端点增益
 // M4-6 自适应影调：曝光增益由 C++ 侧算好下发 —— 开启 = 按场景白点自适应，
 // 关闭 = 固定 exp2(0.35)。两条路都只经 baseTone 的线性曝光这一处，语义唯一。
 uniform float uExposureGain;
+// 预览直通（v0.6.48）：HAL 的 OES 预览流是**已被 ISP tone 过的 8bit 显示域**，动态范围
+// 已经定死；再套 baseTone 的 S 曲线（围绕 mn=0.2184、以下压暗）会把它的暗部直接压到 0
+// —— 真机实测 pass1 0.0174 → pass2 0.000295（压 59×），预览暗部死黑 11.4%（成片 0%），
+// 而线性增益无法同时对齐中位与暗部（ag 0.838 中位对/暗部黑；ag 1.95 暗部对/中位过亮 195）。
+// 所以预览只做 pass3 的高光滚降 + LUT，保留 HAL 自身的观感。
+// 后续可换成"域映射曲线"（把 HAL 线性映射回 RAW 等效域）以恢复 WYSIWYG。
+uniform float uPreviewBypass;
 // ── M4-7 局部色调映射 ────────────────────────────────────────────────
 // 低频亮度图（32×24、显示域 luma、硬件 LINEAR 上采样）+ 强度 + knee。
 // 为什么必须局部：全局曲线在"边缘高光 + 中央暗部"的高 DR 场景里两难 ——
@@ -689,6 +696,11 @@ float filmCurve(float x, float toe, float shoulder) {
 }
 void main() {
     vec3 lin = texture(uTex, vUV0).rgb;
+    // 预览直通：HAL 流已是成品显示域，本 pass 的影调链会把它压死（见 uPreviewBypass 注释）
+    if (uPreviewBypass > 0.5) {
+        oColor = vec4(lin, 1.0);
+        return;
+    }
     // log 域：以 0.18 中灰为轴。±4EV 有效域斜率 0.125（对比不变），
     // 域外 -6.5..-4 / 4..6.5EV 半斜率延展，更暗/更亮继续线性外推到 ~±9EV
     vec3 e = log2(max(lin, vec3(1e-6)) / 0.18);
@@ -1219,6 +1231,7 @@ bool FrameRenderer::init() {
   }
 
   u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
+  u_film_.preview_bypass = glGetUniformLocation(prog_film_, "uPreviewBypass");
   u_film_.contrast = glGetUniformLocation(prog_film_, "uContrast");
   u_film_.shoulder = glGetUniformLocation(prog_film_, "uShoulder");
   u_film_.toe = glGetUniformLocation(prog_film_, "uToe");
@@ -2367,6 +2380,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glBindTexture(GL_TEXTURE_2D, src_tex);
   glUniform1i(u_film_.tex, 0);
   glUniform1f(u_film_.exposure_gain, gain);
+  // 预览直通（v0.6.48）：HAL 流是成品显示域，本 pass 的影调链会压死它的暗部 ——
+  // 只保留 pass3 的高光滚降 + LUT。静拍不受影响（仍走完整影调链）。
+  glUniform1f(u_film_.preview_bypass, still ? 0.0f : 1.0f);
   glUniform1f(u_film_.contrast, p.contrast);
   glUniform3f(u_film_.shoulder, p.shoulder[0], p.shoulder[1], p.shoulder[2]);
   glUniform3f(u_film_.toe, p.toe[0], p.toe[1], p.toe[2]);

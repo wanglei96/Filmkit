@@ -224,7 +224,7 @@ class FrameRenderer {
           sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
           look_sat = -1, look_chroma = -1, exposure_gain = -1, local = -1,
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
-          local_size = -1;
+          local_size = -1, preview_bypass = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
