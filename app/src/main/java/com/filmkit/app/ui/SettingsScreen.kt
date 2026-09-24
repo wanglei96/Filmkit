@@ -185,8 +185,8 @@ fun SettingsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
-                        "按场景动态范围自动标定 filmic 的黑白点（EV，相对 18.45% 中灰）；" +
-                            "关 = 固定 −7.65/+4.56EV（曲线不随场景变）",
+                        "按场景自动标定 filmic 的黑点（EV，相对 18.45% 中灰）；" +
+                            "白点固定 +4.56EV；关 = 黑白点都固定为 −7.65/+4.56EV",
                         color = FilmTheme.CreamDim,
                         fontSize = 10.sp,
                         style = MaterialTheme.typography.labelSmall,

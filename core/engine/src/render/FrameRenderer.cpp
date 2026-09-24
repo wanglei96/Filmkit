@@ -2484,21 +2484,23 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
 void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on) {
   constexpr float kGrey = 0.1845f;
   constexpr float kFixedBlack = -7.65f, kFixedWhite = 4.56f;  // darktable 默认
-  // white 下限保护：窄动态范围场景（画面里没有高光）会被 filmic 拉满 → 对比过冲、
-  // 死黑 30%+。离线实测 10 场景：室外两张自动算出 +1.2EV，死黑 29.7%/33.1%；
-  // clamp 到 3.0 后 11.7%/8.1%，死黑波动极差 24.6 → 13.0。
-  constexpr float kWhiteMin = 3.0f, kWhiteMax = 6.0f;
-  float b = kFixedBlack, w = kFixedWhite;
+  // ── v0.7.5：白点改**常量**（撤掉 v0.7.3 我自己加的 clamp[3,6]）──────────────
+  // 白点是"显示上限锚在哪"，属**常量**（darktable 默认约 +4EV、PhotonCamera 固化
+  // +4.56EV，两者一致），不该随场景内容变：
+  //   ① 分位法会把"画面里高光少"的场景判成窄动态范围 → 白点被压到 2EV 附近；
+  //   ② DR 变小 ⇒ v3 的 slope = contrast·DR/8 变小 ⇒ contrast 撞 min_c 下限被**强制抬高**。
+  // 实测（v0.7.4 真机日志）：**每个场景都撞在我加的 clamp 下限 3.0**，fCon 被抬到 1.01
+  // （PC 1.434）⇒ 对比过硬、高光压早 ⇒ 同场景同曝光下画面比 PC 暗 21%（mean 108.9 vs
+  // 137.6）。那个 3.0 是当时按 10 个场景的死黑统计挑出来的 —— **属于调参，撤掉**。
+  // **黑点跟随场景**（P0.5 分位）：这才是 filmic 自适应的价值 —— 决定"多暗算黑"，
+  // 而且不引入自由参数（场景暗部深，黑点自然低）。
+  float b = kFixedBlack;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
-  if (st.valid) {
+  if (st.valid && auto_on) {
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
-    w = std::clamp(std::log2(std::max(st.p_hi, 1e-6f) / kGrey), 1.0f, 16.0f);
-    w = std::clamp(w, kWhiteMin, kWhiteMax);
   }
-  if (!auto_on) {
-    b = kFixedBlack;
-    w = kFixedWhite;
-  }
+  if (!auto_on) b = kFixedBlack;
+  const float w = kFixedWhite;  // 常量，见上
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
   //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
   if (still) {

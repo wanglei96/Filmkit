@@ -139,9 +139,9 @@ class FrameRenderer {
     float contrast = 1.0f;
   };
   static FilmicSpline computeFilmicSpline(float black_ev, float white_ev);
-  // 自动 EV 标定：开关开 = 按场景分位（whiteEV 走 clamp[3,6] 保护），
-  // 关 = 固定 darktable 默认（−7.65/+4.56）。still=true（静拍）用当帧值不做 EMA
-  // —— 单帧机会，历史值等于用错曝光（v0.6.28 实测 ag 3.04→1.16）。
+  // 自动 EV 标定（v0.7.5）：**黑点**按场景分位自动（白点是**常量** 4.56 —— 显示上限
+  // 锚不该随场景变，理由见 .cpp）；开关关 = 黑白点都用 darktable 默认（−7.65/+4.56）。
+  // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
   void updateFilmicEV(GLuint src, bool still, bool auto_on);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
