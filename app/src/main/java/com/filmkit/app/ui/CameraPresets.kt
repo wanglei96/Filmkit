@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(37).apply {
+    private fun neutral(): DoubleArray = DoubleArray(39).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -62,7 +62,7 @@ object CameraPresets {
         // 0 = 关（固定 darktable 默认 −7.65/+4.56，曲线不随场景变）。
         // ⚠️ v0.7.3 之前的"按场景中位亮度算曝光增益"（kTarget 中位锚定）**已整体废除** ——
         // 它把"曝光"这一维抹掉了（压 EV / 降 AE 都会被 gain 补偿回来）。
-        // 设置页开关写 prefs("auto_tone")，CameraController 覆盖此值。
+        // 设置页开关写 prefs("auto_black_ev")，CameraController 覆盖此值。
         this[35] = 1.0
         // 36 = 局部色调映射（M4-7）：0 = 关（A/B 通路），>0 = 暗部线性提亮比例。
         // 全局曲线在"边缘高光 + 中央暗部"的高 DR 场景里两难（保高光则中央暗、
@@ -80,6 +80,11 @@ object CameraPresets {
         // 补偿增益的责任归还给 updateAutoGain（其上限已单列），局部层只做温和的暗部
         // 补偿，不再兼任全局曝光。
         this[36] = 0.25
+        // 37/38 = filmic 黑白点（v0.7.6，单位 = 相对中灰 18.45% 的 EV）：
+        // −7.65/+4.56 是 darktable 默认值，也是 PhotonCamera 的固化值（两边一致，有出处）。
+        // 用户可在设置页自由调整（PC 的做法）；auto_tone 开时**黑点**改由场景分位自动。
+        this[37] = -7.65
+        this[38] = 4.56
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

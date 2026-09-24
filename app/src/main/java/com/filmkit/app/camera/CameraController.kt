@@ -757,6 +757,9 @@ class CameraController(private val context: Context, private val render: RenderC
     private var lookPref = -1.0
     private var lutStrengthPref = -1.0
     private var autoTonePref = -1.0
+    // filmic 黑白点（v0.7.6）：哨兵 = 未初始化（用户可配，默认 −7.65/+4.56 EV）
+    private var filmicBlackPref = -999.0
+    private var filmicWhitePref = -999.0
     // 局部色调映射（M4-7）：强度与 CameraPresets[36] 默认值一致；0 = 关（A/B 通路）。
     // v0.6.33：0.6 → 0.25（roadmap 立项定的上限就是 ≤0.2–0.3）。
     private val LOCAL_TONE = 0.25
@@ -823,16 +826,37 @@ class CameraController(private val context: Context, private val render: RenderC
         // 搭同一批刷新入口（共 4 处调用点）
         applyAutoTonePref()
         applyLocalTonePref()
+        applyFilmicRangePrefs()
     }
 
     /**
-     * 自适应影调开关（M4-6）：写 FilmParams[35]。
-     * 1.0 = 开：引擎按场景白点（显示域 P95）自动算线性曝光增益（限幅 [1,4]×）；
-     * 0.0 = 关：退回固定 exp2(0.35)，即 v0.6.17 行为。
-     * 真机实测 M 档实拍场景普遍欠曝 1–1.2EV，固定补偿救不了（差 4 倍）。
+     * filmic 黑白点（v0.7.6）：写 FilmParams[37]/[38]，单位 = 相对中灰 18.45% 的 EV。
+     * 默认 −7.65/+4.56（darktable 默认 = PhotonCamera 固化值）。用户可在设置页自由调整。
+     * auto_tone 开时黑点由引擎按场景分位自动（[37] 被忽略）。
+     */
+    private fun applyFilmicRangePrefs() {
+        val b = appPrefs.getFloat("filmic_black_ev", -7.65f).toDouble()
+        val w = appPrefs.getFloat("filmic_white_ev", 4.56f).toDouble()
+        if (b != filmicBlackPref) {
+            filmicBlackPref = b
+            filmParams[37] = b
+        }
+        if (w != filmicWhitePref) {
+            filmicWhitePref = w
+            filmParams[38] = w
+        }
+    }
+
+    /**
+     * 自适应影调开关（v0.7.6 语义）：写 FilmParams[35]。
+     * 1.0 = **黑点**由引擎按场景分位自动标定（白点仍用 [38] 的用户配置）；
+     * 0.0 = 黑白点都用用户配置（[37]/[38]）—— **默认**，即 PC 的做法：曲线固定、曝光交给 AE。
+     * 旧的"按场景中位算曝光增益"（kTarget 中位锚定）已在 v0.7.3 整体废除。
      */
     private fun applyAutoTonePref() {
-        val v = if (appPrefs.getBoolean("auto_tone", true)) 1.0 else 0.0
+        // v0.7.6：prefs 键改名 auto_tone → **auto_black_ev** —— 语义已从"曝光增益"
+        // 变成"黑点是否自动"，沿用旧键会让老用户残留的 true 覆盖新默认值（关）。
+        val v = if (appPrefs.getBoolean("auto_black_ev", false)) 1.0 else 0.0
         if (v != autoTonePref) {
             autoTonePref = v
             filmParams[35] = v

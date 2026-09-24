@@ -166,16 +166,16 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_tone", true)) }
+            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_black_ev", false)) }
             Row(
                 Modifier
                     .fillMaxWidth()
                     .clickable {
                         val v = !autoToneOn
                         autoToneOn = v
-                        prefs.edit().putBoolean("auto_tone", v).apply()
+                        prefs.edit().putBoolean("auto_black_ev", v).apply()
                         EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.auto_tone",
+                            EngineBridge.LEVEL_INFO, "app", "settings.auto_black_ev",
                             "{\"on\":$v}",
                         )
                     }
@@ -185,8 +185,8 @@ fun SettingsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
-                        "按场景自动标定 filmic 的黑点（EV，相对 18.45% 中灰）；" +
-                            "白点固定 +4.56EV；关 = 黑白点都固定为 −7.65/+4.56EV",
+                        "开 = 黑点按场景自动标定；关（默认）= 用下方配置的黑白点" +
+                            "（darktable 默认 −7.65/+4.56EV）",
                         color = FilmTheme.CreamDim,
                         fontSize = 10.sp,
                         style = MaterialTheme.typography.labelSmall,
@@ -198,6 +198,31 @@ fun SettingsScreen(
                     fontSize = 13.sp,
                     fontFamily = FilmTheme.Mono,
                     fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
+            // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
+            // "配置项"而不是需要标定的数值。默认 −7.65/+4.56 = darktable 默认值。
+            EvSliderRow(
+                "黑点（多暗算黑）",
+                "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
+                prefs.getFloat("filmic_black_ev", -7.65f),
+                -12f..-1f,
+            ) { v ->
+                prefs.edit().putFloat("filmic_black_ev", v).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.filmic_black_ev", "{\"v\":$v}",
+                )
+            }
+            EvSliderRow(
+                "白点（多亮算白）",
+                "比它更亮的压到白；拖右 = 高光更亮、更容易过曝",
+                prefs.getFloat("filmic_white_ev", 4.56f),
+                1f..8f,
+            ) { v ->
+                prefs.edit().putFloat("filmic_white_ev", v).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.filmic_white_ev", "{\"v\":$v}",
                 )
             }
             var localToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("local_tone", true)) }
@@ -872,5 +897,49 @@ fun FocalScreen(onBack: () -> Unit = {}) {
                 containerColor = FilmTheme.Panel,
             )
         }
+    }
+}
+
+/**
+ * 一行 EV 滑杆（v0.7.6）：用于 filmic 黑白点这类"物理量配置项"。
+ * 拖动时只更新本地状态，**松手才提交**（避免每帧写 prefs）。
+ */
+@Composable
+private fun EvSliderRow(
+    label: String,
+    desc: String,
+    initial: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onCommit: (Float) -> Unit,
+) {
+    var v by rememberSaveable { mutableStateOf(initial) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            Text(
+                "%+.2f EV".format(v),
+                color = FilmTheme.Accent,
+                fontSize = 13.sp,
+                fontFamily = FilmTheme.Mono,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Text(
+            desc,
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            style = MaterialTheme.typography.labelSmall,
+        )
+        androidx.compose.material3.Slider(
+            value = v,
+            onValueChange = { v = it },
+            onValueChangeFinished = { onCommit(v) },
+            valueRange = range,
+            colors = androidx.compose.material3.SliderDefaults.colors(
+                thumbColor = FilmTheme.Cream,
+                activeTrackColor = FilmTheme.Accent,
+                inactiveTrackColor = FilmTheme.ChipBorder,
+            ),
+        )
     }
 }

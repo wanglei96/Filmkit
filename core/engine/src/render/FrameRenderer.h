@@ -139,10 +139,12 @@ class FrameRenderer {
     float contrast = 1.0f;
   };
   static FilmicSpline computeFilmicSpline(float black_ev, float white_ev);
-  // 自动 EV 标定（v0.7.5）：**黑点**按场景分位自动（白点是**常量** 4.56 —— 显示上限
-  // 锚不该随场景变，理由见 .cpp）；开关关 = 黑白点都用 darktable 默认（−7.65/+4.56）。
+  // filmic 黑白点（v0.7.6）：来自**用户配置**（FilmParams[37]/[38]，默认 −7.65/+4.56，
+  // 即 darktable 默认 / PhotonCamera 固化值）。auto_on=true 时黑点改由场景分位自动
+  // （白点仍用配置值）。理由见 .cpp。
   // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
-  void updateFilmicEV(GLuint src, bool still, bool auto_on);
+  void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
+                      float user_white);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）

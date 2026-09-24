@@ -2481,26 +2481,23 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
 // 中灰锚点固定 18.45%。于是**不同场景输出不同亮度**（暗的地方暗），而压 EV / 降 AE
 // 曝光能真的传导到成片 —— 旧的"中位锚定"会把它们补偿掉（v0.7.2 的死结）。
 // auto_on=false：用 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
-void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on) {
+void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
+                                  float user_black, float user_white) {
   constexpr float kGrey = 0.1845f;
-  constexpr float kFixedBlack = -7.65f, kFixedWhite = 4.56f;  // darktable 默认
-  // ── v0.7.5：白点改**常量**（撤掉 v0.7.3 我自己加的 clamp[3,6]）──────────────
-  // 白点是"显示上限锚在哪"，属**常量**（darktable 默认约 +4EV、PhotonCamera 固化
-  // +4.56EV，两者一致），不该随场景内容变：
-  //   ① 分位法会把"画面里高光少"的场景判成窄动态范围 → 白点被压到 2EV 附近；
-  //   ② DR 变小 ⇒ v3 的 slope = contrast·DR/8 变小 ⇒ contrast 撞 min_c 下限被**强制抬高**。
-  // 实测（v0.7.4 真机日志）：**每个场景都撞在我加的 clamp 下限 3.0**，fCon 被抬到 1.01
-  // （PC 1.434）⇒ 对比过硬、高光压早 ⇒ 同场景同曝光下画面比 PC 暗 21%（mean 108.9 vs
-  // 137.6）。那个 3.0 是当时按 10 个场景的死黑统计挑出来的 —— **属于调参，撤掉**。
-  // **黑点跟随场景**（P0.5 分位）：这才是 filmic 自适应的价值 —— 决定"多暗算黑"，
-  // 而且不引入自由参数（场景暗部深，黑点自然低）。
-  float b = kFixedBlack;
+  // ── v0.7.6：黑白点由**用户配置**（FilmParams[37]/[38]），PC 的做法 ────────────
+  // 默认 −7.65/+4.56 = darktable 默认值 = PhotonCamera 固化值（两边一致，有出处）；
+  // 单位是"相对中灰 18.45% 的 EV"，物理量 ⇒ 换机型/换曲线都成立。
+  //   black_ev = "多暗算黑"（曲线的 toe 端点，不是硬截断）；white_ev = "多亮算白"。
+  // auto_tone 开时**黑点**改由场景分位自动（白点仍用用户值）；**默认关** = 曲线固定、
+  // 曝光交给 AE。为什么不默认自动：实测自动黑点（P0.5 分位）比 darktable 默认高 2EV
+  // （−5.6 vs −7.65）⇒ 等于把每个场景最暗的 0.5% 都钉在显示黑 ⇒ 暗部压死、画面更暗，
+  // 与已被否掉的 kTarget 中位锚定同型（抹掉"这个场景暗部有多深"这一维）。
+  float b = user_black;
+  const float w = user_white;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
   if (st.valid && auto_on) {
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
   }
-  if (!auto_on) b = kFixedBlack;
-  const float w = kFixedWhite;  // 常量，见上
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
   //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
   if (still) {
@@ -2533,10 +2530,11 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
                              bool still) {
   // filmic 的自动 EV 标定（v0.7.3）：**刻意放在 passFilm 内** —— 预览 / YUV 静拍 /
   // RAW 静拍三条路径都经过这里，一处实现即全覆盖。
-  // 开关语义（v0.7.3 起）：auto_tone 开 = black/white relative exposure 按场景分位
-  // 自动标定；关 = 固定 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
+  // 开关语义（v0.7.6）：黑白点来自用户配置（FilmParams[37]/[38]，默认 −7.65/+4.56）；
+  // auto_tone 开 = **黑点**改由场景分位自动（白点仍用配置值），默认关。
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
-  updateFilmicEV(src_tex, still, p.auto_tone > 0.5f);
+  updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
+                 p.filmic_white_ev);
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
   // 强度 ≤ 0 时不重渲染，但仍绑**已存在的** tex_local_ 并下发 0 —— sampler 必须有

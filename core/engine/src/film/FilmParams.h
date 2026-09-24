@@ -9,8 +9,9 @@ namespace filmkit {
 struct FilmParams {
   // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
-  // 与 Kotlin 侧 `DoubleArray(37)` 不符 —— 留着会继续误导，按实际项数维护。
-  static constexpr int kCount = 37;
+  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(39)` 保持一致（v0.7.6 起）；
+  // 数组越界会直接崩，改这里必须同步改那边。
+  static constexpr int kCount = 39;  // v0.7.6：+[37] filmic_black_ev +[38] filmic_white_ev
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -48,16 +49,29 @@ struct FilmParams {
   // ── M4-6 自适应影调（默认开、可关）──────────────────────────────
   // 真机实测：M 档实拍场景的**中间调**普遍偏低（与 PhotonCamera 同机位对照，
   // 中位 79/255 vs 131，而高光只差 1.1×）—— 固定曝光补偿救不了。
-  // 开启后引擎按场景**中位亮度**自动算线性增益（归一到 baseTone 的中间调不动点
-  // 0.2184，限幅 [1,4]×、只提亮不压暗）；预览 / YUV 静拍 / RAW 静拍三条路径
-  // 共用 passFilm 内的同一处统计。
-  float auto_tone = 1.0f;      // 35 0 = 关（退回固定 ev 0.35），1 = 开
+  // ── v0.7.3 起语义变更，v0.7.6 默认改为 0 ─────────────────────────────
+  // 现在是"**filmic 黑点是否按场景分位自动标定**"：1 = 开（黑点跟场景），
+  // 0 = 关（黑点用 [37] 的配置值）—— **默认 0**，即 PC 的做法（曲线固定、曝光交给 AE）。
+  // 旧的"按场景中位算曝光增益"（kTarget 中位锚定）已在 v0.7.3 整体废除：
+  // 它把"曝光"这一维抹掉了（压 EV / 降 AE 都被 gain 补偿回来）。
+  float auto_tone = 0.0f;      // 35 0 = 关（黑点用 [37]）；1 = 黑点自动
   // ── M4-7 局部色调映射（默认开、可关）────────────────────────────
   // 全局曲线在高 DR 场景（边缘高光 + 中央暗部）里两难：保高光则中央暗、
   // 提中央则高光爆（离线实测中位锚定会让 6.6%–13% 像素过曝）。
   // 本项 = 暗部线性提亮比例（局部亮度越低越满额，到 knee 以上归零）：
   // 0 = 关（A/B 通路），>0 = 强度。高光区强度为 0，故与自适应影调互不冲突。
   float local_tone = 0.25f;    // 36 0 = 关；>0 = 暗部线性提亮比例（标定旋钮）
+  // ── v0.7.6：filmic 的黑白点交给用户配置（PC 的做法）─────────────────
+  // 单位 = **相对中灰 18.45% 的 EV**，物理量，与机型/曲线无关：
+  //   black_ev = "多暗算黑"（黑点是曲线的 toe 端点，不是硬截断）
+  //   white_ev = "多亮算白"（显示上限锚在哪）
+  // 默认 −7.65 / +4.56 = darktable 默认值，也是 PhotonCamera 的固化值（两边一致）。
+  // 为什么不自动：v0.7.3–v0.7.5 实测自动黑点（P0.5 分位）本质是"把每个场景最暗的
+  // 0.5% 钉在显示黑"—— 与已被否掉的 kTarget 中位锚定同型（抹掉"这个场景暗部有多深"），
+  // 实测比 PC 的固定值高 2EV ⇒ 暗部压得更死、画面更暗。
+  // auto_tone 开时黑点改由场景分位自动，白点仍用这里配置的值。
+  float filmic_black_ev = -7.65f;  // 37
+  float filmic_white_ev = 4.56f;   // 38
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -107,6 +121,9 @@ struct FilmParams {
     if (n > 34) lut_strength = static_cast<float>(v[34]);
     if (n > 35) auto_tone = static_cast<float>(v[35]);
     if (n > 36) local_tone = static_cast<float>(v[36]);
+    // v0.7.6：filmic 黑白点（用户可配，默认 −7.65/+4.56）；旧长度时保持默认值
+    if (n > 37) filmic_black_ev = static_cast<float>(v[37]);
+    if (n > 38) filmic_white_ev = static_cast<float>(v[38]);
   }
 };
 
