@@ -2053,6 +2053,9 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += ",\"ag\":" + std::to_string(film_gain_).substr(0, 5);
+  // 判据输入（提亮前场景中位，线性）—— 与 preview.ag 的 linMid 对比可判定
+  // "预览与静拍的统计源是否同一标定"。见 updateAutoGain 的 last_lin_mid_。
+  kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
   kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
@@ -2283,6 +2286,7 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // = 0.163（显示域 >116）时开始降。
   const float lin_mid = std::pow(static_cast<float>(binAt(0.50)) / (kN - 1), 2.2f);
   const float gain = std::clamp(kTarget / std::max(lin_mid, 1e-4f), 1.0f, kMax);
+  last_lin_mid_ = lin_mid;  // 供 preview.ag / raw.render 观测（排查预览 vs 成片判据差异）
   // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
   // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
   // 暗场景的滞后值），2 秒后预览已收敛到 1.164 —— 福字因此被推进 rolloff 的去饱和
@@ -2373,6 +2377,18 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glUniform1i(u_film_.local, 2);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 预览 ag 观测（排查"预览过曝 vs 成片正常"）：每 120 帧一条，与 raw.render 的
+  // ag/linMid 直接对比 —— 若同场景下预览的 linMid 明显偏小（ag 偏大），说明 OES
+  // 预览流与 RAW/YUV 链的线性亮度标定不一致（两条源的判据不同）。
+  if (!still && ++ag_log_tick_ >= 120) {
+    ag_log_tick_ = 0;
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "preview.ag",
+        "{\"ag\":" + std::to_string(gain).substr(0, 5) +
+            ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
+            ",\"localRef\":" + std::to_string(local_ref).substr(0, 5) +
+            ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
+  }
 }
 
 void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,

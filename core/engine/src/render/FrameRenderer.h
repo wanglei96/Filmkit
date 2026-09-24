@@ -174,6 +174,10 @@ class FrameRenderer {
   float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
   float auto_gain_ = 0.0f;     // 自适应曝光增益（≤ 0 = 未初始化，首帧直通）
   float film_gain_ = 1.0f;     // 本帧 passFilm 实际用的曝光增益（raw.render 记 ag）
+  // 排查"预览过曝 vs 成片正常"：预览统计 OES 预览流(passOES)、静拍统计 RAW/YUV 链，
+  // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
+  float last_lin_mid_ = 0.0f;  // 最近一次 updateAutoGain 用的场景中位（线性）
+  int ag_log_tick_ = 0;        // 预览 ag 日志节流（每 120 帧一条）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
                GLint loc_dinv, GLint loc_size, float strength);
