@@ -118,6 +118,10 @@ uniform vec4 uBlack;   // 按相位 (0,0)(1,0)(0,1)(1,1)
 uniform float uWhite;
 uniform vec3 uGain;    // asShotNeutral 倒数，G 归一
 uniform mat3 uCcm;     // sensor→sRGB 行主序
+// v0.7.7：RAW 路径的 EV。原先只有 OES 预览与 CPU-RGB888 静拍声明了 uExposure，
+// **RAW 静拍的两条路径都没有** ⇒ 真机验证"提 EV 没用"。曝光是线性域整体缩放，
+// 放在 CCM 之后、clamp 之内（与 kFsOes 的 `* uExposure` 同一语义）。
+uniform float uExposure;
 int chanAt(ivec2 p) {
     int px = p.x & 1, py = p.y & 1;
     if (uCfa == 0) return py == 0 ? (px == 0 ? 0 : 1) : (px == 0 ? 1 : 2);
@@ -167,7 +171,7 @@ void main() {
     vec3 rgb = vec3(dem(0, p), dem(1, p), dem(2, p));
     // LSC 在 CCM 前乘（通道增益差异即角落色偏来源）；与 WB 同为乘性，次序无关
     rgb = uCcm * (rgb * uGain * lscAt(p));
-    oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
+    oColor = vec4(clamp(rgb * uExposure, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
 // ── RCD 质量档（M3-1）────────────────────────────────────────────────
@@ -361,6 +365,7 @@ uniform float uWhite;
 uniform vec3 uGain;
 uniform mat3 uCcm;     // sensor→sRGB 行主序
 uniform float uHlK;    // 高光重建强度（0 = 关，旧行为）
+uniform float uExposure;  // v0.7.7：RAW 路径的 EV（见 kFsRaw 的注释）
 const float EPS = 1e-6;
 // ── 高光重建（M3 §3.2 阶段 4）──────────────────────────────────────
 // 传感器饱和后被截断在满阱（s() 里 raw=white → 1.0×gain），CCM 再把这种截断
@@ -477,7 +482,7 @@ void main() {
     // LSC 在 hlRecon 之后、CCM 之前：饱和判定仍用未校正值（原语义不变），
     // 校正只作用在 CCM 前的线性 RGB（网格低频，去马赛克前后差异 <1%）
     vec3 rgb = uCcm * (hlRecon(vec3(r, g, b)) * lscAt(p));
-    oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
+    oColor = vec4(clamp(rgb * uExposure, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
 // ── M3-2 降噪（v0.5.32 引入 / v0.5.33 两档调参）─────────────────────
@@ -1176,6 +1181,7 @@ bool FrameRenderer::init() {
   u_raw_.black = glGetUniformLocation(prog_raw_, "uBlack");
   u_raw_.white = glGetUniformLocation(prog_raw_, "uWhite");
   u_raw_.gain = glGetUniformLocation(prog_raw_, "uGain");
+  u_raw_.exposure = glGetUniformLocation(prog_raw_, "uExposure");
   u_raw_.ccm = glGetUniformLocation(prog_raw_, "uCcm");
   u_raw_.lsc = glGetUniformLocation(prog_raw_, "uLsc");
   u_raw_.lsc_size = glGetUniformLocation(prog_raw_, "uLscSize");
@@ -1221,6 +1227,7 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.hl_k = glGetUniformLocation(prog_rcd_chroma_, "uHlK");
   u_rcd_chroma_.lsc = glGetUniformLocation(prog_rcd_chroma_, "uLsc");
   u_rcd_chroma_.lsc_size = glGetUniformLocation(prog_rcd_chroma_, "uLscSize");
+  u_rcd_chroma_.exposure = glGetUniformLocation(prog_rcd_chroma_, "uExposure");
 
   u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
   u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
@@ -1656,10 +1663,12 @@ void FrameRenderer::passRaw(int dst_w, int dst_h, int rot, int cfa,
                             const float black_phase[4], float white_level,
                             const float gains[3], const float* ccm,
                             const FilmParams& p) {
-  (void)p;  // WB/曝光已在 RAW 线性域由 uGain 承担；胶片链在 pass2
+  // v0.7.7：RAW 路径接上 EV（原注释假设"曝光由 uGain 承担"是错的 —— uGain 只是
+  // WB 增益，EV 从未参与 RAW 链，见 kFsRaw 注释）。胶片链仍在 pass2。
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_raw_);
+  glUniform1f(u_raw_.exposure, std::exp2(p.exposure_ev));
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
   glUniform1i(u_raw_.tex, 0);
@@ -1854,10 +1863,12 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
-                                  const float* ccm, bool mosaic, float hl_k) {
+                                  const float* ccm, bool mosaic, float hl_k,
+                                  float exposure_ev) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_rcd_chroma_);
+  glUniform1f(u_rcd_chroma_.exposure, std::exp2(exposure_ev));
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, raw_tex_);
   if (u_rcd_chroma_.mos >= 0) {
@@ -2043,7 +2054,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, effective_rot, cfa, black_phase,
-                  static_cast<float>(white_level), gains, ccm, true, p.hl_recon);
+                  static_cast<float>(white_level), gains, ccm, true, p.hl_recon,
+                  p.exposure_ev);
   } else {
     passRaw(dst_w, dst_h, effective_rot, cfa, black_phase,
             static_cast<float>(white_level), gains, ccm, p);
