@@ -107,8 +107,9 @@ class FrameRenderer {
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
-  // 与公开的 histogram() 同一实现），取**中位**折回线性归一到 baseTone 的中间调
-  // 不动点（0.2184）→ 曝光增益（限幅 [1,4]×，只提亮不压暗）。
+  // 与公开的 histogram() 同一实现），取**中位**折回线性作为场景中位。
+  // v0.7.2 起判据/限幅见 updateAutoGain（kTarget 0.02 / [0.20, 3.0]）；旧注释里的
+  // "归一到中间调不动点 0.2184、限幅 [1,4]、只提亮不压暗"是 v0.7.0 前的旧曲线，已失效。
   // auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
   // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
@@ -117,6 +118,10 @@ class FrameRenderer {
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
   void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength,
                   bool box_filter);
+  // 场景中位（线性）测量：只统计、不算增益；测到就写 last_lin_mid_（日志诊断用）。
+  // v0.7.2：**无论自适应开关都调用** —— 否则关掉自适应时 linMid 恒为 0，排查会瞎。
+  // 返回线性中位；< 0 = 统计失败（此时不改 last_lin_mid_）。
+  float measureLinMid(GLuint src);
   // still=true（静拍）：只有单帧可渲染，必须用**当帧**算出的增益，不做 EMA ——
   // EMA 会让静拍拿到取景早期的历史值（真机实测同场景两秒内 ag 3.04→1.16）。
   float updateAutoGain(GLuint src, bool still);

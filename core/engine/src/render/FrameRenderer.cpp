@@ -2273,10 +2273,36 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 // 恢复 v0.6.18 定稿的 **P95 白点判据**（尊重场景自身的亮度范围：暗场景提亮、亮
 // 场景不动），并把上限从 2.0 收到 1.5（暗场景 +0.58EV 封顶）。
 // v0.6.35 再把判据本体从 P95 换成 **P99**（原因见下方 lin_hi 处），上限提到 1.6。
-// kTarget 0.80 必须与 kFsFilm 的 knee 一致（v0.6.19 决策）：白点落在滚降起点。
-// 限幅仍只允许提亮（≥1.0）—— 压暗用户设定的曝光不在引擎职责内。
-float FrameRenderer::updateAutoGain(GLuint src, bool still) {
+// ⚠️ 上面 v0.6.19 那句"kTarget 0.80 必须与 kFsFilm 的 knee 一致"指的是**软肩 knee
+// 0.80**，与现行 kTarget（线性中位目标 0.02）**不是同一个量**，别照着改；
+// "限幅只许提亮（≥1.0）"也已在 v0.7.0 废除（新曲线自带暗部提亮，亮场景必须能压暗）。
+// ── v0.7.2：场景中位测量独立成函数 ──────────────────────────────────────────
+// 自适应**开关两边**都要记录（关掉时也测一次），否则日志里 linMid 恒为 0，
+// 诊断"预览 vs 成片判据差异"时会瞎。旁路 LUT：风格层不该改曝光判据。
+// 返回线性中位；< 0 = 统计失败（此时不改 last_lin_mid_，避免被误读成"场景全黑"）。
+float FrameRenderer::measureLinMid(GLuint src) {
   constexpr int kN = 64;
+  int hist[kN];
+  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true)) return -1.0f;
+  long total = 0;
+  for (int i = 0; i < kN; ++i) total += hist[i];
+  if (total <= 0) return -1.0f;
+  const long want = static_cast<long>(static_cast<double>(total) * 0.50);
+  long acc = 0;
+  int bin = kN - 1;
+  for (int i = 0; i < kN; ++i) {
+    acc += hist[i];
+    if (acc >= want) {
+      bin = i;
+      break;
+    }
+  }
+  const float mid = std::pow(static_cast<float>(bin) / (kN - 1), 2.2f);
+  last_lin_mid_ = mid;
+  return mid;
+}
+
+float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // 场景**中位**（中间调）的目标亮度（线性）—— 不是白点，见下方判据注释。
   // ── v0.7.1：0.07 → **0.04**（用户复核"整体画面过亮；PC 是真实还原的，暗的地方暗
   // 亮的地方亮"）。同场景对标（FILMKIT 140039 vs PC 哈苏 140058，均为台灯书桌）：
@@ -2287,30 +2313,30 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // HAL 的 AE 高曝光 + 曲线又提亮一次，暗部被抬了两遍，于是"又亮又平"。
   // 引擎侧唯一能做的是把整体压下去（0.07→0.04 使显示中位 150→123），恢复明暗对比；
   // 若要更接近 PC 需配合 EV 补偿（HAL 的 AE 目标，属相机侧，见决策记录）。
-  constexpr float kTarget = 0.04f;
+  // ── v0.7.2：0.04 → **0.02**（用户复核"关掉自适应反而更亮"，据此定位）─────────
+  // 真机同场景 A/B（2026-09-24 15:04:51 vs 15:05:36，ISO 3666→3236，均 1/60s）：
+  //   自适应开：ag 0.448 / 平均 122.8 / 中位 130.7
+  //   自适应关：ag 1.274 / 平均 165.5 / 中位 179.6   ← 松开刹车当然更亮
+  // 结论：自适应是**唯一在压暗**的机制，"太亮"的锅不在它；但它压得不够 ——
+  // 同场景对标 PC 哈苏成片 P50 68.8，我们 130.7。原因：0.04 会被 Reinhard 曲线
+  // 放大 5×（baseTone(0.04)=0.1996 → 显示 122），目标值必须按**目标显示中位**反推：
+  // 显示 93 ← baseTone⁻¹(0.109) = 0.02。真正"暗的地方暗"（暗部落到黑）要等带
+  // 黑白相对曝光的曲线重构（filmic 式），那是下一步。
+  constexpr float kTarget = 0.02f;
   // 上限 4.0（v0.6.18）→ … → 1.9（v0.6.38）→ 3.0（v0.6.46）。新曲线下 3.0 对应
   // lin_mid ≥ 0.023，仍给极暗场景留余量。
   constexpr float kMax = 3.0f;
   // v0.7.0：**下限放开到 0.35（静拍同样）** —— 新曲线自带 2–4EV 暗部提亮，亮场景
   // 必须允许压暗才能把中位拉回 kTarget（室外 lin_mid 0.241 需要 ag≈0.29）。
   // 旧链"只许提亮"的约定（≥1.0）在新曲线下会让亮场景整体过曝。
-  constexpr float kMinGain = 0.35f;
+  // ── v0.7.2：0.35 → **0.20**（配套 kTarget 0.02，否则新目标值根本达不到）──────
+  // 实测场景 lin_mid 0.0891 要落到 kTarget 0.02 需要 ag 0.224，**被 0.35 卡住就等于
+  // kTarget 白改**（实际只到 0.35，中位仍 131）。下限是"引擎最多允许压多暗"的授权：
+  // 0.20 = 压 2.3EV，比当前需要量留一档余量；真正的曝光归属应回到 AE（相机侧）。
+  constexpr float kMinGain = 0.20f;
   const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
-  int hist[kN];
-  // 旁路 LUT：风格层不该改曝光（判据本身见上方注释）
-  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true)) return fallback;
-  long total = 0;
-  for (int i = 0; i < kN; ++i) total += hist[i];
-  if (total <= 0) return fallback;
-  const auto binAt = [&](double q) {
-    const long want = static_cast<long>(static_cast<double>(total) * q);
-    long acc = 0;
-    for (int i = 0; i < kN; ++i) {
-      acc += hist[i];
-      if (acc >= want) return i;
-    }
-    return kN - 1;
-  };
+  const float lin_mid = measureLinMid(src);
+  if (lin_mid < 0.0f) return fallback;  // 统计失败：沿用上一帧增益（不改 last_lin_mid_）
   // 判据：**中间调锚定**（场景中位 → kTarget），不是高光判据。
   // ── v0.6.36 把 v0.6.35 的 P99 换回中位（真机"室外又灰了、室内反而亮"）──
   // v0.6.35 用 P99 的动机是"曝光正确性看高光"，但那**丢掉了本功能真正的职责**：
@@ -2324,7 +2350,6 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // 好"。所以保留 0.26 让绝大多数场景打满，把**上限**当作真正的控制量（那是用户
   // 能直接感知、也直接说出口的数）。很亮的场景仍会自动少提：中位线性 > 0.26/1.6
   // = 0.163（显示域 >116）时开始降。
-  const float lin_mid = std::pow(static_cast<float>(binAt(0.50)) / (kN - 1), 2.2f);
   // v0.6.47：**预览允许压暗**（下限 0.35），静拍仍只提亮（下限 1.0）。
   // 真机实测（2026-09-24，同场景同曝光，pvSec/stSec 完全相同）—— 预览的统计源是
   // HAL 的 OES 预览流，**已被 ISP tone 过**，其线性中位是 RAW 链的 1.7–3.1 倍：
@@ -2337,7 +2362,7 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // ⚠️ 只是**线性**增益:ISP tone 是非线性的(暗部提得多),中位对齐后分布形状仍有差,
   // 要完全一致需按域映射曲线校正(kFsOes 侧),留待真机复核后再定。
   const float gain = std::clamp(kTarget / std::max(lin_mid, 1e-4f), kMinGain, kMax);
-  last_lin_mid_ = lin_mid;  // 供 preview.ag / raw.render 观测（排查预览 vs 成片判据差异）
+  // last_lin_mid_ 已由 measureLinMid 写入（v0.7.2 抽出；自适应开关两边都记录）
   // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
   // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
   // 暗场景的滞后值），2 秒后预览已收敛到 1.164 —— 福字因此被推进 rolloff 的去饱和
@@ -2367,8 +2392,18 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 预览 / YUV 静拍 / RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 关闭（auto_tone ≤ 0.5）时退回固定 ev 0.35，与 v0.6.17 行为逐位一致（A/B 通路）。
   // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。
-  const float gain =
-      p.auto_tone > 0.5f ? updateAutoGain(src_tex, still) : std::exp2(0.35f);
+  // ── v0.7.2：关掉自适应时的固定基线 1.274（exp2(0.35)）→ **0.5（exp2(-1.0)）** ──
+  // exp2(0.35) 是 v0.6.17 配**旧 S 曲线**（blk 0.008 + mn 0.2184 以下压暗）调的值：
+  // 那条曲线压暗部，所以要 +0.35EV 抬回来。v0.7.0 换成 Reinhard（暗部自带 4–6× 提亮）
+  // 后这个补偿变成**重复提亮** —— 真机实测（同场景、均 1/60s）：关掉自适应
+  // 平均 165.5 / 中位 179.6，比开着（122.8 / 130.7）**更亮**，正是它干的。
+  // 0.5 = 固定压 1EV，作为"不做场景自适应"的中性锚点（真正的锚点应随曲线重构改成
+  // EV 形式，此处是止血值）。
+  constexpr float kFixedGain = 0.5f;  // exp2(-1.0)
+  const bool auto_tone = p.auto_tone > 0.5f;
+  const float gain = auto_tone ? updateAutoGain(src_tex, still) : kFixedGain;
+  // 关掉自适应也测一次场景中位：开关两边都要能在日志里读到 linMid（诊断不留盲区）
+  if (!auto_tone) measureLinMid(src_tex);
   film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
