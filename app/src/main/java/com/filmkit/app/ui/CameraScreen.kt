@@ -476,15 +476,6 @@ fun CameraScreen(
         "XPAN" -> if (portrait) 24f / 65f else 65f / 24f
         else -> if (portrait) 3f / 4f else 4f / 3f
     }
-    // 对焦区域映射随显示旋转补偿（X300 sensor 90，竖屏 k=1）
-    val winMgr = remember {
-        context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
-    }
-    @Suppress("DEPRECATION")
-    val displayRot = winMgr.defaultDisplay.rotation
-    LaunchedEffect(displayRot) {
-        controller.setOrientationStep(displayRot)
-    }
     // 成片按同一比例居中裁切（与取景窗口一致）
     LaunchedEffect(guideAspect) {
         controller.setCaptureAspect(guideAspect)

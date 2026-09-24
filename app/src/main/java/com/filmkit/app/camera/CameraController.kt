@@ -79,6 +79,29 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var orientationStep = 0
 
+    /** 设备物理方向监听（v0.6.39）。
+     *  原实现是 CameraScreen 里读 `winMgr.defaultDisplay.rotation` 快照 + `LaunchedEffect(displayRot)`，
+     *  但**设备旋转不会触发 Compose 重组** → displayRot 永远停在初值 0 → orientationStep 恒为 0。
+     *  后果（2026-09-24 横拍样片实测）：引擎按"竖"旋转，成片输出 3072×4080 且内容躺倒，
+     *  而 EXIF orientation 是恒 1 → 相册照原样显示躺倒（PhotonCamera 同场景是 4080×3072 正常横向）；
+     *  同一条链路还让 focusAt 的区域映射转置（横拍点哪儿对焦都不在哪儿）。
+     *  改用平台原生的 OrientationEventListener：主动回调，与重组无关。 */
+    private val orientationListener by lazy {
+        object : android.view.OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return // 设备平放时保持上次值
+                setOrientationStep(
+                    when (orientation) {
+                        in 45..134 -> 3  // 设备顺时针 90°（右侧横）＝ Surface.ROTATION_270
+                        in 135..224 -> 2 // 倒竖
+                        in 225..314 -> 1 // 设备逆时针 90°（左侧横）＝ Surface.ROTATION_90
+                        else -> 0
+                    },
+                )
+            }
+        }
+    }
+
     @Volatile
     private var started = false
 
@@ -828,7 +851,9 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     fun setOrientationStep(step: Int) {
-        orientationStep = ((step % 4) + 4) % 4
+        val s = ((step % 4) + 4) % 4
+        if (s == orientationStep) return // OrientationEventListener 高频回调：只记变化
+        orientationStep = s
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "orientation.set",
             kv("step" to orientationStep),
@@ -865,6 +890,7 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
+        orientationListener.enable() // 设备方向 → orientationStep（成片旋转 + 对焦区域映射）
         started = true
         openCamera()
     }
@@ -902,6 +928,7 @@ class CameraController(private val context: Context, private val render: RenderC
     fun stop() {
         started = false
         pendingOpenId = null
+        orientationListener.disable()
         render.post {
             try { session?.stopRepeating() } catch (_: Throwable) {}
             camera?.close()
