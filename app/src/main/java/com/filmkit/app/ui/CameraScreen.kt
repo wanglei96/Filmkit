@@ -468,9 +468,12 @@ fun CameraScreen(
     // EV 补偿实际范围/步进来自 characteristics（部分设备不支持负补偿，UI 自适应）
     val (evLo, evHi, evStp) = controller.evInfo()
     // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）；
-    // 比例随屏幕方向取向：竖屏 4:3 = 3:4 铺满宽度、16:9 = 9:16、XPAN = 24:65 竖长条
-    val portrait = LocalConfiguration.current.orientation ==
-        android.content.res.Configuration.ORIENTATION_PORTRAIT
+    // 比例随**设备物理方向**取向：竖 4:3 = 3:4 铺满宽度、16:9 = 9:16、XPAN = 24:65 竖长条。
+    // ⚠️ v0.6.42：这里**不能**用 `LocalConfiguration.current.orientation` —— 系统关闭"自动旋转"时
+    // Activity 会一直自认竖屏，横拿拍就被裁成竖幅（真机日志 `photo.crop srcA:1.328 dstA:0.750
+    // out:2304x3072`，用户报"横拍成片还是被裁剪成竖屏图"）。`orientationStep` 是设备物理旋转步进
+    // （Compose state，转动手机即触发重组），0/2=竖、1/3=横。
+    val portrait = controller.orientationStep % 2 == 0
     val guideAspect = when (aspect) {
         "16:9" -> if (portrait) 9f / 16f else 16f / 9f
         "XPAN" -> if (portrait) 24f / 65f else 65f / 24f

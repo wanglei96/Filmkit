@@ -20,6 +20,9 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Size
 import android.view.Surface
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
 import com.filmkit.app.ui.CameraPresets
@@ -81,9 +84,12 @@ class CameraController(private val context: Context, private val render: RenderC
      *  `(sensorOrientation/90 + step) % 4` 使用它，等价于 PC 的 `(sensorOrientation + deviceRotation) % 360`。
      *  ⚠️ 历史坑：v0.6.37 之前这里喂的是 `Display.getRotation()`，而它的定义是"**屏幕内容**要转的角度"
      *  = **与设备物理旋转相反**。竖拍(0)与倒竖(2)下两者恰好相同，所以一直没暴露；横拍下差 180°
-     *  → 成片倒置（v0.6.40 真机复现）。**改这个值时务必对照 PC 公式验算四个姿态。** */
-    @Volatile
-    private var orientationStep = 0
+     *  → 成片倒置（v0.6.40 真机复现）。**改这个值时务必对照 PC 公式验算四个姿态。**
+     *  Compose state：**画幅比例（取景框与成片裁切）依赖它** —— 不能用 Activity 的
+     *  `LocalConfiguration.orientation`，因为系统关闭"自动旋转"时 Activity 会一直自认竖屏，
+     *  横拿拍就被裁成竖幅（v0.6.42 真机日志 `photo.crop srcA:1.328 dstA:0.750`）。 */
+    var orientationStep by mutableStateOf(0)
+        private set
 
     /** 平放检测（抄 PhotonCamera `OrientationObserver`：z 轴重力分量 > 7.5 视为平放）。
      *  平放（俯拍/放桌面）时 OrientationEventListener 的角度会随轻微晃动在区间边界跳变，
@@ -113,7 +119,7 @@ class CameraController(private val context: Context, private val render: RenderC
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation == ORIENTATION_UNKNOWN) return
                 if (isNearFlat) return // 平放：角度不可靠，保持上次值
-                setOrientationStep(orientationToStep(orientation))
+                updateOrientationStep(orientationToStep(orientation))
             }
         }
     }
@@ -880,7 +886,7 @@ class CameraController(private val context: Context, private val render: RenderC
         fillTest = v
     }
 
-    fun setOrientationStep(step: Int) {
+    fun updateOrientationStep(step: Int) {
         val s = ((step % 4) + 4) % 4
         if (s == orientationStep) return // OrientationEventListener 高频回调：只记变化
         orientationStep = s
@@ -1540,12 +1546,16 @@ class CameraController(private val context: Context, private val render: RenderC
         ch: CameraCharacteristics,
     ) {
         val creator = android.hardware.camera2.DngCreator(ch, result)
-        // setOrientation 只收 EXIF orientation（1..8）：sensor 0/90/180/270 → 1/6/3/8
+        // DNG 存的是**传感器原始方向**的像素（DngCreator 不旋转），所以方向必须由 EXIF 标签表达，
+        // 且要**随拍摄方向变** —— 与 JPG 路径同源：显示所需旋转 = (sensorOrientation/90 + step) % 4，
+        // 再映射到 EXIF 的 1/6/3/8。
+        // v0.6.42 修复：此前只按 sensorOrientation 恒写 6，横拍时像素明明是横的、
+        // 相册却按"顺时针转 90°"显示 → 方向反了（真机 2026-09-24 复现）。
         creator.setOrientation(
-            when (sensorOrientation) {
-                90 -> 6
-                180 -> 3
-                270 -> 8
+            when ((sensorOrientation / 90 + orientationStep) % 4) {
+                1 -> 6 // 需顺时针 90°
+                2 -> 3 // 需 180°
+                3 -> 8 // 需逆时针 90°
                 else -> 1
             },
         )
