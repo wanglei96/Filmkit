@@ -2278,15 +2278,16 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   constexpr int kN = 64;
   // 场景**中位**（中间调）的目标亮度（线性）—— 不是白点，见下方判据注释。
-  // ── v0.7.0：kTarget 0.26 → **0.07**（配合 Reinhard 曲线重标定）────────────
-  // 新曲线的关键性质：`baseTone(lin_mid × ag)` 在 ag 未触限时恒等于 `baseTone(kTarget)`
-  // —— 即**所有场景的输出中位都归一到同一个显示值**：kTarget 0.07 → 0.376 线性
-  // → 显示 163/255。这正是哈苏的做法（`FILM_CURVE_GAIN = 1f` 固定，不随场景变），
-  // 也解释了为什么旧链要反复调 kTarget/kMax 却总能被某个场景打脸：旧的 S 曲线在
-  // mn 以下压暗，增益与曲线互相抵消，"锚定"名存实亡。
-  // 三个真机场景校验（输出中位 vs PC）：室外 174 / PC 180；阳台逆光 163 / PC 145；
-  // 室内暗光 163（无 PC 对照，与旧链 153 相当）。
-  constexpr float kTarget = 0.07f;
+  // ── v0.7.1：0.07 → **0.04**（用户复核"整体画面过亮；PC 是真实还原的，暗的地方暗
+  // 亮的地方亮"）。同场景对标（FILMKIT 140039 vs PC 哈苏 140058，均为台灯书桌）：
+  //   我们 luma P50 158.7 / L* P5 38.1 / 动态范围 44.9
+  //   PC   luma P50  68.8 / L* P5  0.8 / 动态范围 60.0
+  // **PC 的暗部是真黑而我们的不是** —— 查 DNG：我们桌面的 RAW 值 0.028（显示 51/255），
+  // 本来就不黑，说明差异主要来自**曝光**：PC 用低曝光保住暗部再靠曲线提亮，我们是
+  // HAL 的 AE 高曝光 + 曲线又提亮一次，暗部被抬了两遍，于是"又亮又平"。
+  // 引擎侧唯一能做的是把整体压下去（0.07→0.04 使显示中位 150→123），恢复明暗对比；
+  // 若要更接近 PC 需配合 EV 补偿（HAL 的 AE 目标，属相机侧，见决策记录）。
+  constexpr float kTarget = 0.04f;
   // 上限 4.0（v0.6.18）→ … → 1.9（v0.6.38）→ 3.0（v0.6.46）。新曲线下 3.0 对应
   // lin_mid ≥ 0.023，仍给极暗场景留余量。
   constexpr float kMax = 3.0f;
