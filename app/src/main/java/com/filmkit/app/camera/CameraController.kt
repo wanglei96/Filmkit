@@ -75,29 +75,45 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var fillTest = false
 
-    /** 显示方向步进（0..3）。X300 实测 0 为正确方向（用户已验证），界面可循环切换 */
+    /** 拍摄方向步进（0..3）＝ 设备**物理**顺时针旋转角 / 90：
+     *  0=竖、1=顺时针 90°（左侧朝上）、2=倒竖、3=逆时针 90°（右侧朝上）。
+     *  **语义必须与 PhotonCamera 的 `captureRotationDegrees/90` 一致** —— 引擎与 focusAt 都按
+     *  `(sensorOrientation/90 + step) % 4` 使用它，等价于 PC 的 `(sensorOrientation + deviceRotation) % 360`。
+     *  ⚠️ 历史坑：v0.6.37 之前这里喂的是 `Display.getRotation()`，而它的定义是"**屏幕内容**要转的角度"
+     *  = **与设备物理旋转相反**。竖拍(0)与倒竖(2)下两者恰好相同，所以一直没暴露；横拍下差 180°
+     *  → 成片倒置（v0.6.40 真机复现）。**改这个值时务必对照 PC 公式验算四个姿态。** */
     @Volatile
     private var orientationStep = 0
 
-    /** 设备物理方向监听（v0.6.39）。
+    /** 平放检测（抄 PhotonCamera `OrientationObserver`：z 轴重力分量 > 7.5 视为平放）。
+     *  平放（俯拍/放桌面）时 OrientationEventListener 的角度会随轻微晃动在区间边界跳变，
+     *  必须在平放期间**冻结**方向、保持上一次的有效值。 */
+    @Volatile
+    private var isNearFlat = false
+    private val gravityListener by lazy {
+        object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(event: android.hardware.SensorEvent?) {
+                val v = event?.values ?: return
+                isNearFlat = kotlin.math.abs(v[2]) > FLAT_AXIS_THRESHOLD
+            }
+
+            override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) = Unit
+        }
+    }
+
+    /** 设备物理方向监听（v0.6.39 引入 → v0.6.41 对齐 PhotonCamera）。
      *  原实现是 CameraScreen 里读 `winMgr.defaultDisplay.rotation` 快照 + `LaunchedEffect(displayRot)`，
-     *  但**设备旋转不会触发 Compose 重组** → displayRot 永远停在初值 0 → orientationStep 恒为 0。
-     *  后果（2026-09-24 横拍样片实测）：引擎按"竖"旋转，成片输出 3072×4080 且内容躺倒，
-     *  而 EXIF orientation 是恒 1 → 相册照原样显示躺倒（PhotonCamera 同场景是 4080×3072 正常横向）；
-     *  同一条链路还让 focusAt 的区域映射转置（横拍点哪儿对焦都不在哪儿）。
-     *  改用平台原生的 OrientationEventListener：主动回调，与重组无关。 */
+     *  但**设备旋转不会触发 Compose 重组** → displayRot 永远停在初值 → orientationStep 恒为 0。
+     *  后果：横拍成片按"竖"旋转、输出 3072×4080 且内容躺倒（EXIF 又恒 1），focusAt 的区域映射也转置。
+     *  改用平台原生的 OrientationEventListener：主动回调，与重组无关。
+     *  角度→step 的对应关系取自 Android 官方文档（`onOrientationChanged`：90 = 左侧朝上、270 = 右侧朝上）
+     *  —— 这两个区间**最容易写反**，写反的后果正是横拍成片倒置。 */
     private val orientationListener by lazy {
         object : android.view.OrientationEventListener(context) {
             override fun onOrientationChanged(orientation: Int) {
-                if (orientation == ORIENTATION_UNKNOWN) return // 设备平放时保持上次值
-                setOrientationStep(
-                    when (orientation) {
-                        in 45..134 -> 3  // 设备顺时针 90°（右侧横）＝ Surface.ROTATION_270
-                        in 135..224 -> 2 // 倒竖
-                        in 225..314 -> 1 // 设备逆时针 90°（左侧横）＝ Surface.ROTATION_90
-                        else -> 0
-                    },
-                )
+                if (orientation == ORIENTATION_UNKNOWN) return
+                if (isNearFlat) return // 平放：角度不可靠，保持上次值
+                setOrientationStep(orientationToStep(orientation))
             }
         }
     }
@@ -532,6 +548,20 @@ class CameraController(private val context: Context, private val render: RenderC
         // M3 用灰卡在两三个标准光源下复核。
         private const val WB_CAL_R = 0.923f
         private const val WB_CAL_B = 1.238f
+
+        /** 平放判定的重力 z 分量阈值（m/s²），抄 PhotonCamera `OrientationObserver.FLAT_AXIS_THRESHOLD` */
+        private const val FLAT_AXIS_THRESHOLD = 7.5f
+
+        /** `OrientationEventListener` 角度 → 设备**物理**旋转步进（0=竖 / 1=顺时针 90° / 2=倒竖 / 3=逆时针 90°）。
+         *  角度语义取自 Android 官方文档：90 = 左侧朝上、270 = 右侧朝上（**这两个区间最容易写反**）。
+         *  抽成 internal 是为了让单测能直接对照 PhotonCamera 的
+         *  `(sensorOrientation + deviceRotation) % 360` 验算四个姿态 —— 写反的后果是横拍成片倒置。 */
+        internal fun orientationToStep(orientation: Int): Int = when (orientation) {
+            in 45..134 -> 1  // 左侧朝上 = 设备顺时针 90°
+            in 135..224 -> 2 // 倒竖
+            in 225..314 -> 3 // 右侧朝上 = 设备逆时针 90°
+            else -> 0        // 竖（含 ORIENTATION_UNKNOWN 之外的所有残角）
+        }
     }
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
@@ -891,6 +921,13 @@ class CameraController(private val context: Context, private val render: RenderC
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
         orientationListener.enable() // 设备方向 → orientationStep（成片旋转 + 对焦区域映射）
+        // 平放检测（TYPE_GRAVITY 可能缺失，取不到就退化为"永不平放"）
+        (context.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager)
+            ?.let { sm ->
+                sm.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let {
+                    sm.registerListener(gravityListener, it, android.hardware.SensorManager.SENSOR_DELAY_UI)
+                }
+            }
         started = true
         openCamera()
     }
@@ -929,6 +966,8 @@ class CameraController(private val context: Context, private val render: RenderC
         started = false
         pendingOpenId = null
         orientationListener.disable()
+        (context.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager)
+            ?.unregisterListener(gravityListener)
         render.post {
             try { session?.stopRepeating() } catch (_: Throwable) {}
             camera?.close()
@@ -1081,9 +1120,18 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyZebraPref()
                     applyLookPref()
                     applyLutStrengthPref()
+                    // 预览旋转恒 0（v0.6.39 事故修复）：
+                    // SurfaceTexture 的 STMatrix 已含传感器侧的变换，**显示方向由 Activity
+                    // 跟随系统旋转处理**（本 Activity 未锁 screenOrientation）。所以预览
+                    // 不需要也不应该再叠加一次旋转 —— 而 v0.6.39 把 orientationStep 接上来
+                    // 之后，设备一转预览就被多转 90°，方向与手机相反、完全无法取景。
+                    // 注意 orientationStep 与静拍的旋转量**语义不同**：静拍走 CPU 纹理，
+                    // 需要引擎自己补传感器 90°（RenderClient 里 effectiveRot = (rot+1)%4），
+                    // 预览走 STMatrix 则不需要。PhotonCamera 同样把"像素方向"与"显示方向"
+                    // 解耦（成片像素转正 + EXIF 恒 ORIENTATION_NORMAL）。
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
-                        orientationStep, filmParams, fillTest,
+                        0, filmParams, fillTest,
                     )
                 }, render.looper?.let { android.os.Handler(it) })
             }
