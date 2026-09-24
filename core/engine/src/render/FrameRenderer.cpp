@@ -2285,7 +2285,19 @@ float FrameRenderer::updateAutoGain(GLuint src, bool still) {
   // 能直接感知、也直接说出口的数）。很亮的场景仍会自动少提：中位线性 > 0.26/1.6
   // = 0.163（显示域 >116）时开始降。
   const float lin_mid = std::pow(static_cast<float>(binAt(0.50)) / (kN - 1), 2.2f);
-  const float gain = std::clamp(kTarget / std::max(lin_mid, 1e-4f), 1.0f, kMax);
+  // v0.6.47：**预览允许压暗**（下限 0.35），静拍仍只提亮（下限 1.0）。
+  // 真机实测（2026-09-24，同场景同曝光，pvSec/stSec 完全相同）—— 预览的统计源是
+  // HAL 的 OES 预览流，**已被 ISP tone 过**，其线性中位是 RAW 链的 1.7–3.1 倍：
+  //   室外   预览 linMid 0.4100 / 静拍 0.2410（1.70×）
+  //   阳台逆光 预览 linMid 0.2744 / 静拍 0.0891（3.08×）
+  // 中位锚定对"已经偏亮"的输入只能算出 ag<1，却被下限卡在 1.0 → HAL 的提亮与
+  // baseTone 的 S 曲线叠加 → 用户报"预览过曝、成片正常"。截图实测显示域中位
+  // **225/255（预览）vs 161/255（成片）**。放开下限后两条路径的显示中位都落在
+  // kTarget：预览 0.26/0.410=0.63、成片 0.26/0.241=1.08，输出一致。
+  // ⚠️ 只是**线性**增益:ISP tone 是非线性的(暗部提得多),中位对齐后分布形状仍有差,
+  // 要完全一致需按域映射曲线校正(kFsOes 侧),留待真机复核后再定。
+  const float kMinGain = still ? 1.0f : 0.35f;
+  const float gain = std::clamp(kTarget / std::max(lin_mid, 1e-4f), kMinGain, kMax);
   last_lin_mid_ = lin_mid;  // 供 preview.ag / raw.render 观测（排查预览 vs 成片判据差异）
   // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
   // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
