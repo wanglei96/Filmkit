@@ -467,13 +467,25 @@ fun CameraScreen(
     val maxIso = controller.maxAnalogIso
     // EV 补偿实际范围/步进来自 characteristics（部分设备不支持负补偿，UI 自适应）
     val (evLo, evHi, evStp) = controller.evInfo()
-    // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）；
-    // 比例随**设备物理方向**取向：竖 4:3 = 3:4 铺满宽度、16:9 = 9:16、XPAN = 24:65 竖长条。
-    // ⚠️ v0.6.42：这里**不能**用 `LocalConfiguration.current.orientation` —— 系统关闭"自动旋转"时
-    // Activity 会一直自认竖屏，横拿拍就被裁成竖幅（真机日志 `photo.crop srcA:1.328 dstA:0.750
-    // out:2304x3072`，用户报"横拍成片还是被裁剪成竖屏图"）。`orientationStep` 是设备物理旋转步进
-    // （Compose state，转动手机即触发重组），0/2=竖、1/3=横。
-    val portrait = controller.orientationStep % 2 == 0
+    // 取景窗口 = 所选画幅（WYSIWYG：预览 center-crop 与成片裁切一致）。
+    // ⚠️ 方向链路（v0.6.42 踩过两次，务必按顺序理解）：
+    //   ① **窗口方向必须跟随设备物理姿态**（下面 LaunchedEffect 主动设 requestedOrientation）——
+    //      系统"自动旋转"关掉时窗口不会自己转，而 PC 的做法也是自己控制、不依赖系统。
+    //   ② 取景框比例再跟着**窗口**走（`LocalConfiguration.orientation`）：窗口竖 → 3:4 竖框，
+    //      窗口横 → 4:3 横框。
+    //   只做 ②（v0.6.42 的第一版）会在竖窗口里塞一个横框 → 取景框变成屏幕上部一条、下方大片空白，
+    //   布局直接不可用；只做 ① 则窗口转了但取景框比例不动。
+    val activity = context as? android.app.Activity
+    LaunchedEffect(controller.orientationStep) {
+        activity?.requestedOrientation =
+            if (controller.orientationStep % 2 == 0) {
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            }
+    }
+    val portrait = LocalConfiguration.current.orientation ==
+        android.content.res.Configuration.ORIENTATION_PORTRAIT
     val guideAspect = when (aspect) {
         "16:9" -> if (portrait) 9f / 16f else 16f / 9f
         "XPAN" -> if (portrait) 24f / 65f else 65f / 24f

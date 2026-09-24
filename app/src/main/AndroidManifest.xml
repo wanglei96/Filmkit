@@ -11,8 +11,12 @@
         android:theme="@style/Theme.FilmKit"
         android:supportsRtl="true">
 
+        <!-- configChanges：窗口方向由相机页按**设备物理姿态**主动设置（见 CameraScreen 的
+             requestedOrientation）。必须自行处理方向变化，否则每次横竖切换都会重建 Activity
+             → 相机 session 被拆掉重开（黑屏/卡顿）。 -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
