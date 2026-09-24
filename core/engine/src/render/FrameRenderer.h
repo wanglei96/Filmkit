@@ -106,25 +106,43 @@ class FrameRenderer {
   void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
-  // M4-6 自适应影调：从 src 纹理统计"显示域亮度直方图"（kFsHist 自带 OETF，
-  // 与公开的 histogram() 同一实现），取**中位**折回线性作为场景中位。
-  // v0.7.2 起判据/限幅见 updateAutoGain（kTarget 0.02 / [0.20, 3.0]）；旧注释里的
-  // "归一到中间调不动点 0.2184、限幅 [1,4]、只提亮不压暗"是 v0.7.0 前的旧曲线，已失效。
-  // auto_gain_ 做 EMA 平滑（首帧直通）防抖动。
-  // bypass_lut：自适应影调统计场景本体，不让风格 LUT 改曝光（UI 直方图仍含 LUT）。
-  bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false);
+  // 显示域直方图统计（kFsHist 自带 OETF，与公开的 histogram() 同一实现）。
+  // stat_ch：统计通道 —— 0 = luma（UI 直方图，用户看的亮度分布）；
+  //          1 = max 通道（filmic 自动 EV 的判据：filmic 内部按 max RGB 做归一，
+  //              用 luma 会系统性偏低；darktable 的 auto-tune 同样取 max 通道）。
+  // bypass_lut：程序性统计（自动 EV）不该被风格 LUT 改判据（UI 直方图仍含 LUT）。
+  bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false,
+                     int stat_ch = 0);
   // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
   // box_filter=false → kFsHist 单点采样（直方图统计用）；
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
   void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength,
-                  bool box_filter);
-  // 场景中位（线性）测量：只统计、不算增益；测到就写 last_lin_mid_（日志诊断用）。
-  // v0.7.2：**无论自适应开关都调用** —— 否则关掉自适应时 linMid 恒为 0，排查会瞎。
-  // 返回线性中位；< 0 = 统计失败（此时不改 last_lin_mid_）。
-  float measureLinMid(GLuint src);
-  // still=true（静拍）：只有单帧可渲染，必须用**当帧**算出的增益，不做 EMA ——
-  // EMA 会让静拍拿到取景早期的历史值（真机实测同场景两秒内 ag 3.04→1.16）。
-  float updateAutoGain(GLuint src, bool still);
+                  bool box_filter, int stat_ch = 0);
+  // ── 场景分位统计（v0.7.3：中位 → 分位）───────────────────────────────────
+  // 服务 filmic 的自动 EV 标定。取 max 通道（见 histogramFrom 的 stat_ch），
+  // **一次直方图算三个分位**：P0.5 → black relative exposure，P99.5 → white。
+  // 测到就写 last_* 供日志；valid=false = 统计失败（调用方保持上一帧参数）。
+  struct SceneStats {
+    float p_lo = 0.0f, p_mid = 0.0f, p_hi = 0.0f;  // 线性（P0.5 / P50 / P99.5）
+    bool valid = false;
+  };
+  SceneStats measureSceneStats(GLuint src);
+  // ── filmic spline（darktable `dt_iop_filmic_rgb_compute_spline` 的 v3 分支）──
+  // 公式出处与逐项对照见 .cpp；纯函数，可离线用同一组 EV 复算系数对拍。
+  struct FilmicSpline {
+    float m1[3] = {0, 0, 0}, m2[3] = {1, 1, 1}, m3[3] = {0, 0, 0};
+    float m4[3] = {0, 0, 0}, m5[3] = {0, 0, 0};   // [0]=toe [1]=shoulder [2]=线性段
+    float lat_min = 0.0f, lat_max = 1.0f;         // toe_log / shoulder_log
+    float black_ev = -7.65f, white_ev = 4.56f, dynamic_range = 12.21f;
+    float input_min = 0.0f, input_max = 1.0f;
+    float output_power = 4.0f, black_disp = 0.0f, grey_log = 0.5f;
+    float contrast = 1.0f;
+  };
+  static FilmicSpline computeFilmicSpline(float black_ev, float white_ev);
+  // 自动 EV 标定：开关开 = 按场景分位（whiteEV 走 clamp[3,6] 保护），
+  // 关 = 固定 darktable 默认（−7.65/+4.56）。still=true（静拍）用当帧值不做 EMA
+  // —— 单帧机会，历史值等于用错曝光（v0.6.28 实测 ag 3.04→1.16）。
+  void updateFilmicEV(GLuint src, bool still, bool auto_on);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
@@ -177,12 +195,15 @@ class FrameRenderer {
   float pending_lut_dmax_[3] = {1.0f, 1.0f, 1.0f};
   bool lut_dirty_ = false;
   float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
-  float auto_gain_ = 0.0f;     // 自适应曝光增益（≤ 0 = 未初始化，首帧直通）
-  float film_gain_ = 1.0f;     // 本帧 passFilm 实际用的曝光增益（raw.render 记 ag）
+  // ── filmic 状态（v0.7.3）─────────────────────────────────────────────────
+  FilmicSpline filmic_{};                       // 本帧下发的 spline（CPU 侧算好）
+  float ev_black_ = -7.65f, ev_white_ = 4.56f;  // 本帧实际 EV（日志用）
+  float ev_smooth_black_ = 0.0f, ev_smooth_white_ = 0.0f;  // EMA（0 = 未初始化）
   // 排查"预览过曝 vs 成片正常"：预览统计 OES 预览流(passOES)、静拍统计 RAW/YUV 链，
   // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
-  float last_lin_mid_ = 0.0f;  // 最近一次 updateAutoGain 用的场景中位（线性）
-  int ag_log_tick_ = 0;        // 预览 ag 日志节流（每 120 帧一条）
+  float last_lin_mid_ = 0.0f;   // 场景中位（线性）
+  float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
+  int ag_log_tick_ = 0;         // 预览统计日志节流（每 120 帧一条）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
                GLint loc_dinv, GLint loc_size, float strength);
@@ -227,9 +248,16 @@ class FrameRenderer {
   struct {
     GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
           sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
-          look_sat = -1, look_chroma = -1, exposure_gain = -1, local = -1,
+          look_sat = -1, look_chroma = -1, local = -1,
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
-          local_size = -1, preview_bypass = -1;
+          local_size = -1, preview_bypass = -1,
+          // ── filmic（v0.7.3，darktable v3 spline）────────────────────────────
+          // 三段四次多项式 y = M1 + x·(M2 + x·(M3 + x·(M4 + x·M5)))，下标
+          // [0]=toe [1]=shoulder [2]=中间线性段。系数由 CPU 侧 computeFilmicSpline 求解。
+          filmic_m1 = -1, filmic_m2 = -1, filmic_m3 = -1, filmic_m4 = -1,
+          filmic_m5 = -1, filmic_lat_min = -1, filmic_lat_max = -1,
+          filmic_black_ev = -1, filmic_dr = -1, filmic_input_min = -1,
+          filmic_input_max = -1, filmic_power = -1, filmic_black_disp = -1;
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
@@ -238,7 +266,7 @@ class FrameRenderer {
   } u_out_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
-          lut_dinv = -1, lut_size = -1;
+          lut_dinv = -1, lut_size = -1, stat_ch = -1;
   } u_hist_;
   // kFsLocal（局部低频图的下采样 shader）
   struct {

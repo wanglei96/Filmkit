@@ -185,8 +185,8 @@ fun SettingsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
-                        "按场景中位亮度自动算曝光增益（目标显示中位 ≈93，" +
-                            "限幅 0.20–3.0×，可提亮也可压暗）；关 = 固定 −1EV",
+                        "按场景动态范围自动标定 filmic 的黑白点（EV，相对 18.45% 中灰）；" +
+                            "关 = 固定 −7.65/+4.56EV（曲线不随场景变）",
                         color = FilmTheme.CreamDim,
                         fontSize = 10.sp,
                         style = MaterialTheme.typography.labelSmall,

@@ -610,9 +610,9 @@ uniform float uToneK;      // 基准影调强度（0 = 恒等/旧行为，1 = �
 uniform float uLook;       // 色彩外观层强度（0 = 恒等/A-B 关，M3 P1）
 uniform float uLookSat;    // 亮度保持的饱和增益
 uniform float uLookChroma; // 色度 S 曲线端点增益
-// M4-6 自适应影调：曝光增益由 C++ 侧算好下发 —— 开启 = 按场景白点自适应，
-// 关闭 = 固定 exp2(0.35)。两条路都只经 baseTone 的线性曝光这一处，语义唯一。
-uniform float uExposureGain;
+// v0.7.3：**场景曝光增益整体废除**（原 M4-6 uExposureGain）。filmic 的 black/white
+// relative exposure 已经把"中灰落在显示域哪个位置"固定住，再叠一层按场景算的增益
+// 就等于回到被否掉的"中位锚定"—— 那样压 EV / 降 AE 曝光都会被重新补偿掉，曝光这一维失效。
 // 预览直通（v0.6.48）：HAL 的 OES 预览流是**已被 ISP tone 过的 8bit 显示域**，动态范围
 // 已经定死；再套 baseTone 的 S 曲线（围绕 mn=0.2184、以下压暗）会把它的暗部直接压到 0
 // —— 真机实测 pass1 0.0174 → pass2 0.000295（压 59×），预览暗部死黑 11.4%（成片 0%），
@@ -671,29 +671,50 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // 只提亮不压暗；设置页"自适应影调"可关，关掉即退回固定 exp2(0.35)）；
 // ② kFsOut 加高光滚降（软压缩 + 去饱和），replace 掉 clamp 硬截断 —— 它是放开
 // 增益上限的前提，也让过曝的灯/窗不再变红变粉。
-float baseTone(float x) {
-    // ── v0.7.0：换成 HNCS（哈苏）形状的曲线 ────────────────────────────────
-    // 旧实现是"blk 黑点截断 + 以 mn=0.2184 为不动点的 S 曲线"：**mn 以下压暗**。
-    // 实测它与哈苏曲线的差距（线性入 → 线性出）：
-    //     x=0.01  哈苏 0.0455 / 我们 0.0001（**565×**）
-    //     x=0.05  哈苏 0.2700 / 我们 0.0120（23×）
-    //     x=0.10  哈苏 0.4380 / 我们 0.0478（9.2×）
-    // 暗部被压死的代价在实拍里全面暴露：暗部死黑、室内"糊了一层"、白水壶/塑料袋
-    // 无层次、红杯被全局增益推白（ag=3.0 时 n0 0.276 → 0.83 → 显示 249）。
-    // 哈苏的曲线是一条**全程平滑提亮**的曲线（无黑点、暗部斜率 0.6–1.16、高光降到 0.17），
-    // 实测其形状与 **Reinhard 曲线 y=(1+k)x/(1+kx)** 高度吻合（k 拟合在 5.4–7.2）。
-    // 这里取同一形状的自研参数化实现（不复制其数据资产 —— 该曲线来自哈苏专有 SDK）。
-    // 结构仍是"按 max 通道等比缩放"（保持色相/饱和度）：哈苏是逐通道查表，但它有
-    // YCbCr 色度映射补偿饱和度，我们没有，纯逐通道会让浓色变淡。
-    const float k = 5.0;   // 压缩强度：暗部提亮量 + 高光滚降的综合旋钮
-    // k 的取值（真机 DNG 实测，室内 ISO 365 / ag 打满场景，线性入 → 显示域）：
-    //   k=7 红杯 226 / 白水壶 214 / 木桌 118 / 中位 138
-    //   k=5 红杯 220 / 白水壶 204 / 木桌 105 / 中位 125  ← 取此：中位与旧链(153)持平，
-    //       而红杯 245→220、白水壶 229→204、木桌 56→105（暗部大幅回升）
-    //   k=4 红杯 213 / 白水壶 198 / 木桌  99 / 中位 117（高光更好但暗部开始变暗）
-    // 中位另有 +~15 来自外观层（保亮度），故实际成片中位 ≈150，与旧链一致。
-    float t = max(x * uExposureGain, 0.0);
-    return (1.0 + k) * t / (1.0 + k * t);
+// ── filmic 基准影调（v0.7.3）：darktable v3 spline 取代 Reinhard ──────────────
+// 为什么换：Reinhard 没有黑点 ⇒ 暗部被整体抬亮、画面"没有黑"（实测死黑 0.3%，
+// PhotonCamera 同场景 16.8%）。filmic 的 **black relative exposure 把黑点做成曲线
+// 端点**（不是硬截断 —— 旧 `blk=0.008` 那种截断会丢暗部信息），暗部能真落到黑
+// （同场景死黑 → 11.7%）。参数是 **EV（相对中灰 18.45%）**，与机型无关：换手机/
+// 换场景都由场景分位自动标定（v0.7.3 起不再有"归一到固定中位"的曝光增益）。
+//
+// 公式出处：darktable `src/iop/filmicrgb.c`（commit 92f6c28）——
+//   `_compute_output_power` / `dt_iop_filmic_rgb_compute_spline` 的 v3 分支 /
+//   POLY_4 toe·shoulder 的 5×5 线性系统（f(0)=black / f'(0)=0 / f(T)=y / f'(T)=c / f''(T)=0）。
+// 系数在 CPU 侧算好（computeFilmicSpline），这里只做 log 编码 + 三段多项式求值；
+// 与 PhotonCamera 的同名实现逐项一致（见其 RawDemosaicProcessor.kt / DarktableFilmicToneAlgorithm.kt）。
+uniform vec3 uFilmicM1, uFilmicM2, uFilmicM3, uFilmicM4, uFilmicM5;
+uniform float uFilmicLatMin, uFilmicLatMax;
+uniform float uFilmicBlackEv, uFilmicDr, uFilmicInputMin, uFilmicInputMax;
+uniform float uFilmicPower, uFilmicBlackDisp;
+const float kFilmicGrey = 0.1845;               // darktable grey_source（18.45% 中灰）
+const float kFilmicNormMin = 1.52587890625e-5;  // 2^-16，与 darktable NORM_MIN 一致
+float filmicSpline(float e) {
+    if (e < uFilmicLatMin)
+        return uFilmicM1.x + e * (uFilmicM2.x + e * (uFilmicM3.x + e * (uFilmicM4.x + e * uFilmicM5.x)));
+    if (e > uFilmicLatMax)
+        return uFilmicM1.y + e * (uFilmicM2.y + e * (uFilmicM3.y + e * (uFilmicM4.y + e * uFilmicM5.y)));
+    return uFilmicM1.z + e * uFilmicM2.z;
+}
+float filmicScalar(float v, float lo) {
+    float s = max(v, kFilmicNormMin);
+    float e = clamp((log2(s / kFilmicGrey) - uFilmicBlackEv) / max(uFilmicDr, 0.2), 0.0, 1.0);
+    float c = clamp(filmicSpline(e), lo, 1.0);
+    return pow(max(c, 0.0), uFilmicPower);
+}
+// darktable 的颜色模式：0.5 × 逐通道 + 0.5 × max-RGB 归一。
+// ⚠️ 本函数**只压亮度、保色相**：过曝的灯管（R/B 高、G 低）会留品红 —— 这是
+// v0.5.37「过曝灯泡变红」与 v0.6.50 反复出现的老问题。所以后面的高光去饱和（w）
+// **不是可选项**：离线实测同一场景，缺它时高光 R/G 1.277，补上后 1.000。
+vec3 filmicTone(vec3 c) {
+    vec3 p = max(c, vec3(0.0));
+    vec3 naive = vec3(filmicScalar(p.r, 0.0), filmicScalar(p.g, 0.0),
+                      filmicScalar(p.b, 0.0));
+    float mx = max(max(p.r, p.g), p.b);
+    float ratioNorm = max(mx, uFilmicInputMin);
+    float toneNorm = clamp(mx, uFilmicInputMin, uFilmicInputMax);
+    vec3 normed = (p / ratioNorm) * filmicScalar(toneNorm, uFilmicBlackDisp);
+    return 0.5 * naive + 0.5 * normed;
 }
 // ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
 // 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）
@@ -752,8 +773,8 @@ void main() {
     // 基准影调（norm-controlled + 高光去饱和）
     if (uToneK > 0.0) {
         float n0 = max(max(out3.r, out3.g), out3.b);
-        float n1 = baseTone(n0);
-        vec3 m = out3 * mix(1.0, n1 / max(n0, 1e-6), uToneK);
+        // filmic 直接作用在三通道上（内含 max-RGB 归一半段），不再是"按 max 等比缩放"
+        vec3 m = mix(out3, filmicTone(out3), uToneK);
         // 高光去饱和：范数越过白点后色度向峰值收敛（过曝光源趋白）。
         // 必须与亮度压缩成对出现——只做等比压缩会保留暖色比例，让过曝的灯泡
         // "变红/变粉"（v0.5.37 用户反馈）；硬截断之所以看着正常，是因为它把
@@ -977,6 +998,9 @@ uniform float uLutStrength;
 uniform vec3 uLutDomainMin;
 uniform vec3 uLutDomainInv;
 uniform float uLutSize;
+// v0.7.3：统计通道 —— 0 = luma（UI 直方图，用户看的亮度分布）；
+// 1 = max 通道（filmic 自动 EV 的判据，见 measureSceneStats）。
+uniform float uStatCh;
 vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
               vec3 c101, vec3 c011, vec3 c111) {
     if (f.x >= f.y) {
@@ -1007,7 +1031,9 @@ vec3 lutApply(vec3 c) {
 void main() {
     vec3 c = pow(clamp(texture(uTex, vUV0).rgb, 0.0, 1.0), vec3(1.0 / 2.2));
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
-    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    // max 与 luma 都在显示域；pow 单调 ⇒ CPU 侧 pow(·, 2.2) 折回线性后仍是 max 通道
+    float l = (uStatCh > 0.5) ? max(max(c.r, c.g), c.b)
+                              : dot(c, vec3(0.2126, 0.7152, 0.0722));
     oColor = vec4(l, l, l, 1.0);
 })";
 
@@ -1269,7 +1295,20 @@ bool FrameRenderer::init() {
   u_film_.look = glGetUniformLocation(prog_film_, "uLook");
   u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
   u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
-  u_film_.exposure_gain = glGetUniformLocation(prog_film_, "uExposureGain");
+  // v0.7.3：filmic 的 spline 系数与 EV 标定（替代已废除的 uExposureGain）
+  u_film_.filmic_m1 = glGetUniformLocation(prog_film_, "uFilmicM1");
+  u_film_.filmic_m2 = glGetUniformLocation(prog_film_, "uFilmicM2");
+  u_film_.filmic_m3 = glGetUniformLocation(prog_film_, "uFilmicM3");
+  u_film_.filmic_m4 = glGetUniformLocation(prog_film_, "uFilmicM4");
+  u_film_.filmic_m5 = glGetUniformLocation(prog_film_, "uFilmicM5");
+  u_film_.filmic_lat_min = glGetUniformLocation(prog_film_, "uFilmicLatMin");
+  u_film_.filmic_lat_max = glGetUniformLocation(prog_film_, "uFilmicLatMax");
+  u_film_.filmic_black_ev = glGetUniformLocation(prog_film_, "uFilmicBlackEv");
+  u_film_.filmic_dr = glGetUniformLocation(prog_film_, "uFilmicDr");
+  u_film_.filmic_input_min = glGetUniformLocation(prog_film_, "uFilmicInputMin");
+  u_film_.filmic_input_max = glGetUniformLocation(prog_film_, "uFilmicInputMax");
+  u_film_.filmic_power = glGetUniformLocation(prog_film_, "uFilmicPower");
+  u_film_.filmic_black_disp = glGetUniformLocation(prog_film_, "uFilmicBlackDisp");
   u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
   u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
   u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
@@ -1297,6 +1336,7 @@ bool FrameRenderer::init() {
   u_hist_.lut_dmin = glGetUniformLocation(prog_hist_, "uLutDomainMin");
   u_hist_.lut_dinv = glGetUniformLocation(prog_hist_, "uLutDomainInv");
   u_hist_.lut_size = glGetUniformLocation(prog_hist_, "uLutSize");
+  u_hist_.stat_ch = glGetUniformLocation(prog_hist_, "uStatCh");
   u_local_src_.tex = glGetUniformLocation(prog_local_, "uTex");
   u_local_src_.step = glGetUniformLocation(prog_local_, "uStep");
 
@@ -2091,10 +2131,28 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
-  kv += ",\"ag\":" + std::to_string(film_gain_).substr(0, 5);
-  // 判据输入（提亮前场景中位，线性）—— 与 preview.ag 的 linMid 对比可判定
-  // "预览与静拍的统计源是否同一标定"。见 updateAutoGain 的 last_lin_mid_。
+  // v0.7.3：ag 一并废除 —— 记录 filmic 的实际标定（EV，相对中灰 18.45%）与场景分位，
+  // 供离线用同一组 EV 复算 spline 系数对拍（test_temp/filmic_offline.py 的 compute_spline）。
+  kv += ",\"blackEv\":" + std::to_string(ev_black_).substr(0, 6);
+  kv += ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 5);
   kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
+  kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
+  kv += ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7);
+  // spline 系数（v0.7.3 自检）：真机日志 → 用 test_temp/filmic_offline.py 的
+  // compute_spline 按同一组 EV 复算，逐项对比 m1..m5 —— 系数不一致就是实现错了。
+  {
+    const auto j3 = [](const float* v) {
+      return "[" + std::to_string(v[0]) + "," + std::to_string(v[1]) + "," +
+             std::to_string(v[2]) + "]";
+    };
+    kv += ",\"fM1\":" + j3(filmic_.m1) + ",\"fM2\":" + j3(filmic_.m2) +
+          ",\"fM3\":" + j3(filmic_.m3) + ",\"fM4\":" + j3(filmic_.m4) +
+          ",\"fM5\":" + j3(filmic_.m5);
+    kv += ",\"fLat\":[" + std::to_string(filmic_.lat_min) + "," +
+          std::to_string(filmic_.lat_max) + "]";
+    kv += ",\"fPow\":" + std::to_string(filmic_.output_power) +
+          ",\"fCon\":" + std::to_string(filmic_.contrast);
+  }
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
   kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
@@ -2219,7 +2277,7 @@ bool FrameRenderer::histogram(int* out, int n) {
 // → 成片亮斑（真机反馈）。
 // lut_strength 传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）。
 void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
-                              float lut_strength, bool box_filter) {
+                              float lut_strength, bool box_filter, int stat_ch) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glViewport(0, 0, w, h);
   glActiveTexture(GL_TEXTURE0);
@@ -2233,6 +2291,8 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
     glUseProgram(prog_hist_);
     applyPendingLut();
     glUniform1i(u_hist_.tex, 0);
+    // v0.7.3：0 = luma（UI 直方图）；1 = max 通道（filmic 自动 EV 判据）
+    glUniform1f(u_hist_.stat_ch, stat_ch > 0 ? 1.0f : 0.0f);
     bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
             u_hist_.lut_dinv, u_hist_.lut_size, lut_strength);
   }
@@ -2242,7 +2302,8 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 // M4-6：统计源参数化 —— 自适应影调必须对**场景纹理**（baseTone 之前）统计，
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
-bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) {
+bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
+                                 int stat_ch) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   const int hw = 256, hh = 96;
   if (tex_hist_ == 0) {
@@ -2250,7 +2311,7 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
     hist_w_ = hw;
     hist_h_ = hh;
   }
-  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_, false);
+  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_, false, stat_ch);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
@@ -2276,105 +2337,217 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut) 
 // ⚠️ 上面 v0.6.19 那句"kTarget 0.80 必须与 kFsFilm 的 knee 一致"指的是**软肩 knee
 // 0.80**，与现行 kTarget（线性中位目标 0.02）**不是同一个量**，别照着改；
 // "限幅只许提亮（≥1.0）"也已在 v0.7.0 废除（新曲线自带暗部提亮，亮场景必须能压暗）。
-// ── v0.7.2：场景中位测量独立成函数 ──────────────────────────────────────────
-// 自适应**开关两边**都要记录（关掉时也测一次），否则日志里 linMid 恒为 0，
-// 诊断"预览 vs 成片判据差异"时会瞎。旁路 LUT：风格层不该改曝光判据。
-// 返回线性中位；< 0 = 统计失败（此时不改 last_lin_mid_，避免被误读成"场景全黑"）。
-float FrameRenderer::measureLinMid(GLuint src) {
+// ── 场景分位统计（v0.7.3：中位 → 分位，服务 filmic 的自动 EV 标定）──────────────
+// 为什么取 **max 通道**：filmic 内部按 max RGB 归一（darktable 的 norm），用 luma 会
+// 系统性偏低（luma ≤ max），算出的黑点/白点都会往里收。旁路 LUT：风格层不该改 EV 判据。
+// **一次直方图出三个分位**：P0.5 → black relative exposure，P50 → 诊断，P99.5 → white。
+// 统计失败返回 valid=false（调用方保持上一帧参数，不写 last_*）。
+FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   constexpr int kN = 64;
+  SceneStats st;
   int hist[kN];
-  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true)) return -1.0f;
+  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1)) return st;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
-  if (total <= 0) return -1.0f;
-  const long want = static_cast<long>(static_cast<double>(total) * 0.50);
-  long acc = 0;
-  int bin = kN - 1;
-  for (int i = 0; i < kN; ++i) {
-    acc += hist[i];
-    if (acc >= want) {
-      bin = i;
-      break;
+  if (total <= 0) return st;
+  const auto pct = [&](double q) {
+    const long want = static_cast<long>(static_cast<double>(total) * q);
+    long acc = 0;
+    for (int i = 0; i < kN; ++i) {
+      acc += hist[i];
+      if (acc >= want) return static_cast<float>(i) / static_cast<float>(kN - 1);
     }
-  }
-  const float mid = std::pow(static_cast<float>(bin) / (kN - 1), 2.2f);
-  last_lin_mid_ = mid;
-  return mid;
+    return 1.0f;
+  };
+  // 直方图在**显示域**（kFsHist 内部已过 OETF）；pow 单调 ⇒ pow(·, 2.2) 折回线性后
+  // 仍是同一像素的 max 通道值，不是近似。
+  const auto to_lin = [](float v) { return std::pow(v, 2.2f); };
+  st.p_lo = to_lin(pct(0.005));
+  st.p_mid = to_lin(pct(0.50));
+  st.p_hi = to_lin(pct(0.995));
+  st.valid = true;
+  last_lin_mid_ = st.p_mid;  // 诊断字段（raw.render / preview.filmic）
+  last_p_lo_ = st.p_lo;
+  last_p_hi_ = st.p_hi;
+  return st;
 }
 
-float FrameRenderer::updateAutoGain(GLuint src, bool still) {
-  // 场景**中位**（中间调）的目标亮度（线性）—— 不是白点，见下方判据注释。
-  // ── v0.7.1：0.07 → **0.04**（用户复核"整体画面过亮；PC 是真实还原的，暗的地方暗
-  // 亮的地方亮"）。同场景对标（FILMKIT 140039 vs PC 哈苏 140058，均为台灯书桌）：
-  //   我们 luma P50 158.7 / L* P5 38.1 / 动态范围 44.9
-  //   PC   luma P50  68.8 / L* P5  0.8 / 动态范围 60.0
-  // **PC 的暗部是真黑而我们的不是** —— 查 DNG：我们桌面的 RAW 值 0.028（显示 51/255），
-  // 本来就不黑，说明差异主要来自**曝光**：PC 用低曝光保住暗部再靠曲线提亮，我们是
-  // HAL 的 AE 高曝光 + 曲线又提亮一次，暗部被抬了两遍，于是"又亮又平"。
-  // 引擎侧唯一能做的是把整体压下去（0.07→0.04 使显示中位 150→123），恢复明暗对比；
-  // 若要更接近 PC 需配合 EV 补偿（HAL 的 AE 目标，属相机侧，见决策记录）。
-  // ── v0.7.2：0.04 → **0.02**（用户复核"关掉自适应反而更亮"，据此定位）─────────
-  // 真机同场景 A/B（2026-09-24 15:04:51 vs 15:05:36，ISO 3666→3236，均 1/60s）：
-  //   自适应开：ag 0.448 / 平均 122.8 / 中位 130.7
-  //   自适应关：ag 1.274 / 平均 165.5 / 中位 179.6   ← 松开刹车当然更亮
-  // 结论：自适应是**唯一在压暗**的机制，"太亮"的锅不在它；但它压得不够 ——
-  // 同场景对标 PC 哈苏成片 P50 68.8，我们 130.7。原因：0.04 会被 Reinhard 曲线
-  // 放大 5×（baseTone(0.04)=0.1996 → 显示 122），目标值必须按**目标显示中位**反推：
-  // 显示 93 ← baseTone⁻¹(0.109) = 0.02。真正"暗的地方暗"（暗部落到黑）要等带
-  // 黑白相对曝光的曲线重构（filmic 式），那是下一步。
-  constexpr float kTarget = 0.02f;
-  // 上限 4.0（v0.6.18）→ … → 1.9（v0.6.38）→ 3.0（v0.6.46）。新曲线下 3.0 对应
-  // lin_mid ≥ 0.023，仍给极暗场景留余量。
-  constexpr float kMax = 3.0f;
-  // v0.7.0：**下限放开到 0.35（静拍同样）** —— 新曲线自带 2–4EV 暗部提亮，亮场景
-  // 必须允许压暗才能把中位拉回 kTarget（室外 lin_mid 0.241 需要 ag≈0.29）。
-  // 旧链"只许提亮"的约定（≥1.0）在新曲线下会让亮场景整体过曝。
-  // ── v0.7.2：0.35 → **0.20**（配套 kTarget 0.02，否则新目标值根本达不到）──────
-  // 实测场景 lin_mid 0.0891 要落到 kTarget 0.02 需要 ag 0.224，**被 0.35 卡住就等于
-  // kTarget 白改**（实际只到 0.35，中位仍 131）。下限是"引擎最多允许压多暗"的授权：
-  // 0.20 = 压 2.3EV，比当前需要量留一档余量；真正的曝光归属应回到 AE（相机侧）。
-  constexpr float kMinGain = 0.20f;
-  const float fallback = auto_gain_ > 0.0f ? auto_gain_ : 1.0f;
-  const float lin_mid = measureLinMid(src);
-  if (lin_mid < 0.0f) return fallback;  // 统计失败：沿用上一帧增益（不改 last_lin_mid_）
-  // 判据：**中间调锚定**（场景中位 → kTarget），不是高光判据。
-  // ── v0.6.36 把 v0.6.35 的 P99 换回中位（真机"室外又灰了、室内反而亮"）──
-  // v0.6.35 用 P99 的动机是"曝光正确性看高光"，但那**丢掉了本功能真正的职责**：
-  // 提亮中间调。C* 随 L* 上升，所以"提中间调"是**为了色彩**，不是为了曝光。改成
-  // P99 后室外（有天空/高光）落到 gain 1.0–1.12 → 中间调不动 → 色彩回淡；实测
-  // 165347 的 P90 线性 0.745（已进 rolloff 去饱和区）而参照只有 0.19 —— 那就是"灰"。
-  // v0.6.32 的中位锚定被否掉，是因为**目标值 0.26 的推导错了**（拿 PhotonCamera
-  // **成片**、已提亮的显示域中位 139/255 折回线性，当成**提亮前**的目标），**不是
-  // 因为方向错**——两者本该分开判断，我上轮把它们一起毙了。
-  // 现在目标值有独立依据：真机 v0.6.34 实测"全场景 1.5 时室内偏暗一丢丢，1.6 比较
-  // 好"。所以保留 0.26 让绝大多数场景打满，把**上限**当作真正的控制量（那是用户
-  // 能直接感知、也直接说出口的数）。很亮的场景仍会自动少提：中位线性 > 0.26/1.6
-  // = 0.163（显示域 >116）时开始降。
-  // v0.6.47：**预览允许压暗**（下限 0.35），静拍仍只提亮（下限 1.0）。
-  // 真机实测（2026-09-24，同场景同曝光，pvSec/stSec 完全相同）—— 预览的统计源是
-  // HAL 的 OES 预览流，**已被 ISP tone 过**，其线性中位是 RAW 链的 1.7–3.1 倍：
-  //   室外   预览 linMid 0.4100 / 静拍 0.2410（1.70×）
-  //   阳台逆光 预览 linMid 0.2744 / 静拍 0.0891（3.08×）
-  // 中位锚定对"已经偏亮"的输入只能算出 ag<1，却被下限卡在 1.0 → HAL 的提亮与
-  // baseTone 的 S 曲线叠加 → 用户报"预览过曝、成片正常"。截图实测显示域中位
-  // **225/255（预览）vs 161/255（成片）**。放开下限后两条路径的显示中位都落在
-  // kTarget：预览 0.26/0.410=0.63、成片 0.26/0.241=1.08，输出一致。
-  // ⚠️ 只是**线性**增益:ISP tone 是非线性的(暗部提得多),中位对齐后分布形状仍有差,
-  // 要完全一致需按域映射曲线校正(kFsOes 侧),留待真机复核后再定。
-  const float gain = std::clamp(kTarget / std::max(lin_mid, 1e-4f), kMinGain, kMax);
-  // last_lin_mid_ 已由 measureLinMid 写入（v0.7.2 抽出；自适应开关两边都记录）
-  // EMA 平滑：**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光。
-  // 真机实测（v0.6.28）：同一个窗口场景，10:25:09 的静拍拿到 ag=3.042（取景早期
-  // 暗场景的滞后值），2 秒后预览已收敛到 1.164 —— 福字因此被推进 rolloff 的去饱和
-  // 区，L* 79 / C* 25 变成粉白，而正确增益（≈1.5）下应是 L* 57 的鲜红。
-  // 静拍不写回 auto_gain_，以免污染预览的平滑状态。
-  if (still) return gain;
-  if (auto_gain_ <= 0.0f) {
-    auto_gain_ = gain;
-  } else {
-    auto_gain_ = auto_gain_ * 0.7f + gain * 0.3f;
+namespace {
+// 5×5 线性系统：列主元高斯消元 + 回代（A 行主序，解写回 x）。奇异返回 false。
+// 供 filmic 的 toe/shoulder 系数求解用（darktable 用 gauss_solve，等价）。
+bool solve5(double a[5][5], double b[5], double x[5]) {
+  for (int col = 0; col < 5; ++col) {
+    int piv = col;
+    for (int r = col + 1; r < 5; ++r)
+      if (std::abs(a[r][col]) > std::abs(a[piv][col])) piv = r;
+    if (std::abs(a[piv][col]) < 1e-12) return false;
+    if (piv != col) {  // 手写交换：不依赖 <utility> 的 std::swap 可见性
+      for (int c = 0; c < 5; ++c) {
+        const double t = a[piv][c];
+        a[piv][c] = a[col][c];
+        a[col][c] = t;
+      }
+      const double tb = b[piv];
+      b[piv] = b[col];
+      b[col] = tb;
+    }
+    for (int r = col + 1; r < 5; ++r) {
+      const double f = a[r][col] / a[col][col];
+      for (int c = col; c < 5; ++c) a[r][c] -= f * a[col][c];
+      b[r] -= f * b[col];
+    }
   }
-  return auto_gain_;
+  for (int r = 4; r >= 0; --r) {
+    double s = b[r];
+    for (int c = r + 1; c < 5; ++c) s -= a[r][c] * x[c];
+    x[r] = s / a[r][r];
+  }
+  return true;
+}
+}  // namespace
+
+// ── filmic spline（darktable `dt_iop_filmic_rgb_compute_spline` 的 v3 分支）────────
+// 公式逐项对照 darktable commit 92f6c28（src/iop/filmicrgb.c）；系数组织与
+// PhotonCamera 的 computeFilmicToneCurveUniforms 一致（便于交叉核对，两边数学等价）。
+// ⚠️ output_power **不是自由参数**：darktable `_compute_output_power` 由
+// black/white/grey 派生（PC 固化 3.6148 就是该式在它那组参数下的值，复算差 0.04%）。
+// 系数顺序：m1..m5 各 3 个（下标 [0]=toe [1]=shoulder [2]=中间线性段），
+// 每段 y = m1 + x·(m2 + x·(m3 + x·(m4 + x·m5)))。
+FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, float white_ev) {
+  // 全程 double：shoulder 的 5×5 系统条件数差，用 float 中间量会把 1e-7 的舍入放大到
+  // 1e-5（与 float64 参考实现对拍时可见）。虽然远低于 8bit 量化精度（1/255 ≈ 4e-3），
+  // 但没有理由把它引进来 —— darktable 的 gauss_solve 同样在 double 下求解。
+  constexpr double kGrey = 0.1845;                // grey_source（18.45% 中灰）
+  constexpr double kSafety = 0.01;                // darktable SAFETY_MARGIN
+  constexpr double kBlackTargetPct = 0.01517634;  // black_point_target 默认（%）
+  constexpr double kContrastParam = 1.0;          // darktable contrast 默认
+  constexpr double kLatitude = 0.01;              // darktable latitude 默认（%）
+  FilmicSpline sp;
+  const double black =
+      std::min(static_cast<double>(black_ev), static_cast<double>(white_ev) - 0.2);
+  const double white = std::max(static_cast<double>(white_ev), black + 0.2);
+  const double dr = white - black;
+  const double power = std::log(kGrey) / std::log(-black / dr);
+  const double black_disp = std::pow(kBlackTargetPct / 100.0, 1.0 / power);
+  const double white_disp = 1.0;
+  const double grey_disp = std::pow(kGrey, 1.0 / power);
+  const double grey_log = std::abs(black) / dr;
+
+  const double slope = kContrastParam * dr / 8.0;
+  double min_c = 1.0;  // 低于它黑/白点都够不到
+  min_c = std::max(min_c, (white_disp - grey_disp) / (1.0 - grey_log));
+  min_c = std::max(min_c, (grey_disp - black_disp) / grey_log);
+  min_c += kSafety;
+  double contrast = slope / (power * std::pow(grey_disp, power - 1.0));
+  contrast = std::min(std::max(contrast, min_c), 100.0);
+
+  const double li = grey_disp - contrast * grey_log;
+  const double xmin = (black_disp + kSafety * (white_disp - black_disp) - li) / contrast;
+  const double xmax = (white_disp - kSafety * (white_disp - black_disp) - li) / contrast;
+  const double toe_log = (1.0 - kLatitude) * grey_log + kLatitude * xmin;
+  const double sh_log = (1.0 - kLatitude) * grey_log + kLatitude * xmax;
+  const double toe_d = toe_log * contrast + li;
+  const double sh_d = sh_log * contrast + li;
+
+  // POLY_4 toe：f(0)=black_disp / f'(0)=0 / f(Tl)=toe_d / f'(Tl)=contrast / f''(Tl)=0
+  {
+    const double t = toe_log;
+    double a[5][5] = {{0, 0, 0, 0, 1},
+                      {0, 0, 0, 1, 0},
+                      {t * t * t * t, t * t * t, t * t, t, 1},
+                      {4 * t * t * t, 3 * t * t, 2 * t, 1, 0},
+                      {12 * t * t, 6 * t, 2, 0, 0}};
+    double b[5] = {black_disp, 0.0, toe_d, contrast, 0.0};
+    double x[5] = {0, 0, 0, 0, 0};
+    if (solve5(a, b, x)) {  // 解按 x⁴..x⁰ 排列 → m5..m1
+      sp.m5[0] = static_cast<float>(x[0]);
+      sp.m4[0] = static_cast<float>(x[1]);
+      sp.m3[0] = static_cast<float>(x[2]);
+      sp.m2[0] = static_cast<float>(x[3]);
+      sp.m1[0] = static_cast<float>(x[4]);
+    }
+  }
+  // POLY_4 shoulder：f(1)=white_disp / f'(1)=0 / f(Sl)=sh_d / f'(Sl)=contrast / f''(Sl)=0
+  {
+    const double s = sh_log;
+    double a[5][5] = {{1, 1, 1, 1, 1},
+                      {4, 3, 2, 1, 0},
+                      {s * s * s * s, s * s * s, s * s, s, 1},
+                      {4 * s * s * s, 3 * s * s, 2 * s, 1, 0},
+                      {12 * s * s, 6 * s, 2, 0, 0}};
+    double b[5] = {white_disp, 0.0, sh_d, contrast, 0.0};
+    double x[5] = {0, 0, 0, 0, 0};
+    if (solve5(a, b, x)) {
+      sp.m5[1] = static_cast<float>(x[0]);
+      sp.m4[1] = static_cast<float>(x[1]);
+      sp.m3[1] = static_cast<float>(x[2]);
+      sp.m2[1] = static_cast<float>(x[3]);
+      sp.m1[1] = static_cast<float>(x[4]);
+    }
+  }
+  // 中间线性段：y = (toe_d − contrast·toe_log) + contrast·x
+  sp.m1[2] = static_cast<float>(toe_d - contrast * toe_log);
+  sp.m2[2] = static_cast<float>(contrast);
+  sp.m3[2] = 0.0f;
+  sp.m4[2] = 0.0f;
+  sp.m5[2] = 0.0f;
+
+  sp.lat_min = static_cast<float>(toe_log);
+  sp.lat_max = static_cast<float>(sh_log);
+  sp.black_ev = static_cast<float>(black);
+  sp.white_ev = static_cast<float>(white);
+  sp.dynamic_range = static_cast<float>(dr);
+  sp.input_min = static_cast<float>(std::max(std::pow(2.0, black) * kGrey, 1e-8));
+  sp.input_max =
+      static_cast<float>(std::max(std::pow(2.0, white) * kGrey,
+                                  static_cast<double>(sp.input_min) + 1e-8));
+  sp.output_power = static_cast<float>(power);
+  sp.black_disp = static_cast<float>(black_disp);
+  sp.grey_log = static_cast<float>(grey_log);
+  sp.contrast = static_cast<float>(contrast);
+  return sp;
+}
+
+// ── 自动 EV 标定（v0.7.3）────────────────────────────────────────────────────
+// 自适应对象从"亮度"换成"动态范围"：black/white relative exposure 由场景分位算出，
+// 中灰锚点固定 18.45%。于是**不同场景输出不同亮度**（暗的地方暗），而压 EV / 降 AE
+// 曝光能真的传导到成片 —— 旧的"中位锚定"会把它们补偿掉（v0.7.2 的死结）。
+// auto_on=false：用 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
+void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on) {
+  constexpr float kGrey = 0.1845f;
+  constexpr float kFixedBlack = -7.65f, kFixedWhite = 4.56f;  // darktable 默认
+  // white 下限保护：窄动态范围场景（画面里没有高光）会被 filmic 拉满 → 对比过冲、
+  // 死黑 30%+。离线实测 10 场景：室外两张自动算出 +1.2EV，死黑 29.7%/33.1%；
+  // clamp 到 3.0 后 11.7%/8.1%，死黑波动极差 24.6 → 13.0。
+  constexpr float kWhiteMin = 3.0f, kWhiteMax = 6.0f;
+  float b = kFixedBlack, w = kFixedWhite;
+  const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
+  if (st.valid) {
+    b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
+    w = std::clamp(std::log2(std::max(st.p_hi, 1e-6f) / kGrey), 1.0f, 16.0f);
+    w = std::clamp(w, kWhiteMin, kWhiteMax);
+  }
+  if (!auto_on) {
+    b = kFixedBlack;
+    w = kFixedWhite;
+  }
+  // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
+  //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
+  if (still) {
+    ev_black_ = b;
+    ev_white_ = w;  // 不写 EMA 状态，避免污染预览
+  } else if (ev_smooth_black_ == 0.0f) {
+    ev_smooth_black_ = b;
+    ev_smooth_white_ = w;
+    ev_black_ = b;
+    ev_white_ = w;
+  } else {
+    ev_smooth_black_ = ev_smooth_black_ * 0.7f + b * 0.3f;
+    ev_smooth_white_ = ev_smooth_white_ * 0.7f + w * 0.3f;
+    ev_black_ = ev_smooth_black_;
+    ev_white_ = ev_smooth_white_;
+  }
+  filmic_ = computeFilmicSpline(ev_black_, ev_white_);
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -2388,23 +2561,12 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
                              bool still) {
-  // 自适应影调（M4-6）：按场景中位亮度算线性曝光增益。**刻意放在 passFilm 内** ——
-  // 预览 / YUV 静拍 / RAW 静拍三条路径都经过这里，一处实现即全覆盖。
-  // 关闭（auto_tone ≤ 0.5）时退回固定 ev 0.35，与 v0.6.17 行为逐位一致（A/B 通路）。
-  // 注意：updateAutoGain 内部会切 FBO/viewport，必须先于下面的绑定调用。
-  // ── v0.7.2：关掉自适应时的固定基线 1.274（exp2(0.35)）→ **0.5（exp2(-1.0)）** ──
-  // exp2(0.35) 是 v0.6.17 配**旧 S 曲线**（blk 0.008 + mn 0.2184 以下压暗）调的值：
-  // 那条曲线压暗部，所以要 +0.35EV 抬回来。v0.7.0 换成 Reinhard（暗部自带 4–6× 提亮）
-  // 后这个补偿变成**重复提亮** —— 真机实测（同场景、均 1/60s）：关掉自适应
-  // 平均 165.5 / 中位 179.6，比开着（122.8 / 130.7）**更亮**，正是它干的。
-  // 0.5 = 固定压 1EV，作为"不做场景自适应"的中性锚点（真正的锚点应随曲线重构改成
-  // EV 形式，此处是止血值）。
-  constexpr float kFixedGain = 0.5f;  // exp2(-1.0)
-  const bool auto_tone = p.auto_tone > 0.5f;
-  const float gain = auto_tone ? updateAutoGain(src_tex, still) : kFixedGain;
-  // 关掉自适应也测一次场景中位：开关两边都要能在日志里读到 linMid（诊断不留盲区）
-  if (!auto_tone) measureLinMid(src_tex);
-  film_gain_ = gain;  // 本帧实际增益（raw.render 记 ag —— 自适应影调的唯一可观测点）
+  // filmic 的自动 EV 标定（v0.7.3）：**刻意放在 passFilm 内** —— 预览 / YUV 静拍 /
+  // RAW 静拍三条路径都经过这里，一处实现即全覆盖。
+  // 开关语义（v0.7.3 起）：auto_tone 开 = black/white relative exposure 按场景分位
+  // 自动标定；关 = 固定 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
+  // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
+  updateFilmicEV(src_tex, still, p.auto_tone > 0.5f);
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
   // 强度 ≤ 0 时不重渲染，但仍绑**已存在的** tex_local_ 并下发 0 —— sampler 必须有
@@ -2440,7 +2602,20 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src_tex);
   glUniform1i(u_film_.tex, 0);
-  glUniform1f(u_film_.exposure_gain, gain);
+  // filmic：spline 系数 + EV 标定（CPU 侧算好，见 computeFilmicSpline）
+  glUniform3f(u_film_.filmic_m1, filmic_.m1[0], filmic_.m1[1], filmic_.m1[2]);
+  glUniform3f(u_film_.filmic_m2, filmic_.m2[0], filmic_.m2[1], filmic_.m2[2]);
+  glUniform3f(u_film_.filmic_m3, filmic_.m3[0], filmic_.m3[1], filmic_.m3[2]);
+  glUniform3f(u_film_.filmic_m4, filmic_.m4[0], filmic_.m4[1], filmic_.m4[2]);
+  glUniform3f(u_film_.filmic_m5, filmic_.m5[0], filmic_.m5[1], filmic_.m5[2]);
+  glUniform1f(u_film_.filmic_lat_min, filmic_.lat_min);
+  glUniform1f(u_film_.filmic_lat_max, filmic_.lat_max);
+  glUniform1f(u_film_.filmic_black_ev, filmic_.black_ev);
+  glUniform1f(u_film_.filmic_dr, filmic_.dynamic_range);
+  glUniform1f(u_film_.filmic_input_min, filmic_.input_min);
+  glUniform1f(u_film_.filmic_input_max, filmic_.input_max);
+  glUniform1f(u_film_.filmic_power, filmic_.output_power);
+  glUniform1f(u_film_.filmic_black_disp, filmic_.black_disp);
   // 预览直通（v0.6.48）：HAL 流是成品显示域，本 pass 的影调链会压死它的暗部 ——
   // 只保留 pass3 的高光滚降 + LUT。静拍不受影响（仍走完整影调链）。
   glUniform1f(u_film_.preview_bypass, still ? 0.0f : 1.0f);
@@ -2466,15 +2641,18 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glUniform1i(u_film_.local, 2);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  // 预览 ag 观测（排查"预览过曝 vs 成片正常"）：每 120 帧一条，与 raw.render 的
-  // ag/linMid 直接对比 —— 若同场景下预览的 linMid 明显偏小（ag 偏大），说明 OES
-  // 预览流与 RAW/YUV 链的线性亮度标定不一致（两条源的判据不同）。
+  // 预览统计观测（排查"预览过曝 vs 成片正常"）：每 120 帧一条，与 raw.render 的
+  // blackEv/whiteEv/linMid 直接对比 —— 若同场景下预览的 linMid 与成片明显不一致，
+  // 说明 OES 预览流与 RAW/YUV 链的线性亮度标定不同（两条源的判据不同）。
   if (!still && ++ag_log_tick_ >= 120) {
     ag_log_tick_ = 0;
     Logger::instance().log(
-        LogLevel::kInfo, "engine", "preview.ag",
-        "{\"ag\":" + std::to_string(gain).substr(0, 5) +
+        LogLevel::kInfo, "engine", "preview.filmic",
+        "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 6) +
+            ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 5) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
+            ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7) +
+            ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7) +
             ",\"localRef\":" + std::to_string(local_ref).substr(0, 5) +
             ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
   }
