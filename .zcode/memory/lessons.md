@@ -108,3 +108,11 @@ status: active
 - [2026-09-23] **记忆库过时条目会实际误导判断**：`facts.md` 的"最新 v0.6.23"、"自适应影调 `clamp(0.80/lin,1,4)`"、"P4 系数 2.20"三处与仓库实际冲突。**收尾时按仓库实际状态回写**
 - [2026-09-23] **"彩噪"的形态要先分清**：放大看是**大块低频色偏**（场景固有 —— 归一化后我们比 libraw 还小 22%，只是被提亮 3.6 倍才可见）而非细碎噪点；bilateral 这类高频工具对前者无效
 - [2026-09-23] **无引用者的过时常量也会误导**：`FilmParams.h` 的 `kCount` 停在 36（实际 37 项）且无任何代码引用它，但记忆库据它记成了 36。过时常量要么修正要么删
+- [2026-09-24] **`Display.getRotation()` 的语义与设备物理旋转相反**：Android 文档原文 "The angle is the rotation of the **drawn graphics** on the screen, which is the **opposite direction** of the physical rotation of the device"。竖拍(0)与倒竖(2)下两种语义**恰好重合**，所以这个 bug 从 v0.6.37 之前就藏着、只有横拍差 180° —— **"竖拍正确"会掩盖一切，方向类判据必须四姿态全验**（已固化为 `OrientationStepTest` 4 断言）
+- [2026-09-24] **不要用 `LocalConfiguration.orientation` 判断设备姿态**：它反映的是**窗口**方向；系统"自动旋转"关闭时窗口与设备姿态**解耦**，横拿拍会被按竖幅裁（真机 `photo.crop srcA:1.328 dstA:0.750 out:2304x3072`）
+- [2026-09-24] **SurfaceView 的内容不随 View 变换旋转**：它是独立图层，View 旋转只改它的位置/形状，画面不动 → 想让预览内容转，必须让 GL 自己转（PhotonCamera 的 `setDeviceRotation` 正是为此）
+- [2026-09-24] **转窗口是错方案**：横屏只剩 ~347dp 高，顶栏+参数+快门吃掉大半 → 取景框缩成 **524×393**（日志 `preview.frame dstW:524 dstH:393`）；且窗口转了 STMatrix 不变 → 预览内容相对屏幕躺倒。两个症状同一个错误方案
+- [2026-09-24] **先看日志再动手**：本窗口两个独立缺陷（旋转语义 / 画幅方向源）被混成一个"方向不对"猜了三版；`photo.crop` 那行日志**本来就在代码里**（`CameraController` 1611–1620），一取即分清
+- [2026-09-24] **JPG 与 DNG 是两条独立的方向链路**：JPG = 旋转像素 + EXIF 恒 1；DNG = 存传感器原始像素 + 用 EXIF 表达方向。改一处必须同时检查另一处（`DngCreator.setOrientation` 曾只按 `sensorOrientation` 恒写 6，横拍时相册方向反了）
+- [2026-09-24] **`weight(1f, fill=false)` + `aspectRatio` 在空间不足时不会报错**，只会把取景框缩得很小 —— 不崩但不可用，比崩溃更难发现
+- [2026-09-24] **离线复现的域差异会掩盖真相**：本窗口用 libraw 域测 P4 只抹 15%，而真机 A/B 显示降噪整体抹 **24.8%** —— 趋势可信、绝对值不可照搬（老教训的又一次实例）
