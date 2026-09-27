@@ -653,6 +653,24 @@ fun CameraScreen(
                     Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
                 }
 
+                // MFNR 多帧合成中（v0.9.0）：burst 4 帧到齐、引擎对齐融合期间
+                if (controller.capturePhase == 2) {
+                    Box(
+                        Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 42.dp)
+                            .background(FilmTheme.Panel.copy(alpha = 0.82f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "多帧合成中…",
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            fontFamily = FilmTheme.Mono,
+                        )
+                    }
+                }
+
                 // 圆角机框：窗口即成片范围，机身色环带遮出圆角 + 奶油细线勾边
                 Canvas(Modifier.matchParentSize()) {
                     val inset = 5.dp.toPx()

@@ -3,8 +3,10 @@
 #include <GLES3/gl31.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "../film/FilmParams.h"
@@ -70,6 +72,21 @@ class FrameRenderer {
                  int noise_level, float noise_sigma,
                  std::vector<uint8_t>* out_rgba);
 
+  // RAW 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域
+  // tile 对齐（Align.cpp，CPU 金字塔搜索）+ 置信度加权时域均值 → P0 降噪位
+  //（demosaic 前）→ 与 submitRaw 完全相同的 RCD/胶片链 → RGBA8 读回。
+  //   frames[0] = 参考帧（DNG 底片同一帧）；count 必须 == 4（融合 shader 固定
+  //   4 输入）。元数据统一取帧 0（burst 恒曝光，逐帧黑阶/WB 视为一致，
+  //   mfnr.capture 日志可核对）。noise_sigma/demosaic 语义同 submitRaw。
+  bool submitRawBurst(const void* const* frames, int count,
+                      const int* row_strides_px, int w, int h, int cfa,
+                      const float black_phase[4], int white_level,
+                      float neutral_r, float neutral_g, float neutral_b,
+                      const float* ccm9, const float* lsc, int lsc_cols,
+                      int lsc_rows, int rotation, const FilmParams& p,
+                      int demosaic, int noise_level, float noise_sigma,
+                      std::vector<uint8_t>* out_rgba);
+
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
   bool histogram(int* out, int n);
@@ -82,6 +99,57 @@ class FrameRenderer {
   bool ensureTargets(int w, int h);
   bool ensureRcdTargets(int w, int h);
   bool ensureDnTarget(int w, int h);
+  // MFNR 阶段一（v0.9.0）：raw 尺寸的 burst 纹理 / 金字塔 / 融合目标
+  bool ensureMfnrTargets(int w, int h);
+  // u16 Bayer 上传（submitRaw / submitRawBurst 共用）：rowStride 跳行 + 失败日志
+  bool uploadRawTex(GLuint tex, const void* raw, int w, int h,
+                    int row_stride_px);
+  // raw_tex_ 的建/复用（尺寸变化时重建），返回纹理 id（0 = 失败）
+  GLuint ensureRawTex(int w, int h);
+  // 金字塔 pass：raw → 1/2 灰度（kFsMfnrPyr，sqrt 预编码）；再逐层 2× box（kFsMfnrDown）
+  void passMfnrPyr(GLuint raw_tex, int cfa, const float black_phase[4],
+                   float white_level, const float gains[3]);
+  void passMfnrDown(GLuint src, GLuint fbo, int sw, int sh);
+  // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
+  void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
+                    float white_level, const float gains[3]);
+  // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
+  void passRawDenoiseFused(int w, int h, int cfa, float ns, float k);
+  // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
+  // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
+  struct ChainCtx {
+    int w = 0, h = 0, dst_w = 0, dst_h = 0;
+    int cfa = 0;
+    const float* black_phase = nullptr;
+    float white_level = 0.f;
+    const float* gains = nullptr;
+    const float* ccm = nullptr;
+    const FilmParams* p = nullptr;
+    int effective_rot = 0;
+    bool rcd = false, dn = false, dn_high = false;
+    float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
+    bool lsc_ok = false;
+    int lsc_cols = 0, lsc_rows = 0;
+    float upload_ms = 0.f;  // t0 → 传参时刻（MFNR 时含上传+对齐+融合）
+    bool mfnr_fused = false;
+    std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
+  };
+  void finishStillChain(const ChainCtx& c,
+                        std::chrono::steady_clock::time_point t0,
+                        std::vector<uint8_t>* out_rgba);
+  // WB 增益 / CCM / LSC 纹理准备（两条静拍路径共用）
+  struct RawCommon {
+    float gains[3] = {1.f, 1.f, 1.f};
+    float ccm[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    bool lsc_ok = false;
+    int lsc_w = 1, lsc_h = 1;
+  };
+  RawCommon prepareRawCommon(float neutral_r, float neutral_g, float neutral_b,
+                             const float* ccm9, const float* lsc, int lsc_cols,
+                             int lsc_rows);
+  // 降噪参数（两档系数/σ 夹紧，两条静拍路径共用）
+  static void denoiseParams(int noise_level, float noise_sigma, bool* dn_high,
+                            float* sr_k, float* sc_k, float* ns, float* ns_raw);
   void passOES(int dst_w, int dst_h, const float* st, int rot, float sx,
                float sy, const FilmParams& p);
   void passStill(int dst_w, int dst_h, int rot, const FilmParams& p);
@@ -166,6 +234,19 @@ class FrameRenderer {
   int still_w_ = 0, still_h_ = 0;
   GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
   int raw_w_ = 0, raw_h_ = 0;
+  // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────
+  GLuint prog_mfnr_pyr_ = 0, prog_mfnr_down_ = 0, prog_mfnr_fuse_ = 0,
+         prog_raw_dn_fused_ = 0;
+  GLuint tex_mfnr_[3] = {0, 0, 0};  // R16UI，burst 帧 1..3（帧 0 复用 raw_tex_）
+  GLuint tex_pyr1_ = 0, fbo_pyr1_ = 0;  // RGBA8，1/2 灰度（sqrt 预编码）
+  GLuint tex_pyr2_ = 0, fbo_pyr2_ = 0;  // RGBA8，1/4（readback 层）
+  GLuint tex_pyr3_ = 0, fbo_pyr3_ = 0;  // RGBA8，1/8（readback 层）
+  GLuint tex_pyr4_ = 0, fbo_pyr4_ = 0;  // RGBA8，1/16（readback 层）
+  int pyr1_w_ = 0, pyr1_h_ = 0;
+  GLuint tex_fused_ = 0, fbo_fused_ = 0;  // R16F，融合后线性 mosaic（raw 尺寸）
+  GLuint tex_off_[3] = {0, 0, 0};         // RGBA16F 位移场（tiles×tiles）
+  int mfnr_w_ = 0, mfnr_h_ = 0;
+  int tiles_w_ = 0, tiles_h_ = 0;
   // LSC 增益网格（RGB16F，NEAREST；1×1 全 1 = 关闭/无数据，见 submitRaw）
   GLuint lsc_tex_ = 0;
   int lsc_w_ = 0, lsc_h_ = 0;
@@ -251,6 +332,19 @@ class FrameRenderer {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
           ns = -1, k = -1;
   } u_raw_dn_;
+  struct {
+    GLint tex = -1, size = -1, cfalut = -1, ns = -1, k = -1;
+  } u_raw_dn_f_;
+  struct {
+    GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
+  } u_mfnr_pyr_;
+  struct {
+    GLint tex = -1, size = -1;
+  } u_mfnr_down_;
+  struct {
+    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
+          tiles = -1, black = -1, white = -1, gain = -1, cfalut = -1;
+  } u_mfnr_fuse_;
   struct {
     GLint tex = -1, size = -1, ns = -1, k = -1;
   } u_chroma_dn_;

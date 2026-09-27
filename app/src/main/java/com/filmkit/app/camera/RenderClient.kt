@@ -246,6 +246,53 @@ class RenderClient {
         }
     }
 
+    /** 多帧融合 RAW（MFNR 阶段一，v0.9.0）：4 帧 Bayer → 引擎对齐+均值+成片链，
+     *  回调在渲染线程。images 全部在本函数消费后关闭；DNG 原片（参考帧）须在
+     *  本调用前写出。meta 取参考帧（burst 恒曝光）。 */
+    fun submitRawBurst(
+        images: List<android.media.Image>,
+        meta: RawFrameMeta,
+        rotation: Int,
+        film: DoubleArray,
+        demosaic: Int,
+        noiseLevel: Int,
+        onDone: (ByteArray?, Int, Int) -> Unit,
+    ) {
+        val h = handler
+        if (h == null) {
+            images.forEach { runCatching { it.close() } }
+            onDone(null, 0, 0)
+            return
+        }
+        h.post {
+            // 与 submitRaw 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
+            val effectiveRot = (rotation + 1) % 4
+            val ref = images.firstOrNull()
+            val rotatedW = if (ref != null && effectiveRot % 2 == 1) ref.height else ref?.width ?: 0
+            val rotatedH = if (ref != null && effectiveRot % 2 == 1) ref.width else ref?.height ?: 0
+            var bytes: ByteArray? = null
+            try {
+                val bufs = images.map { it.planes[0].buffer }.toTypedArray()
+                val strides = images.map { it.planes[0].rowStride / 2 }.toIntArray()
+                bytes = EngineBridge.nativeEngineSubmitRawBurst(
+                    bufs, bufs.size, strides,
+                    ref?.width ?: 0, ref?.height ?: 0,
+                    meta.cfa, meta.blackPhase, meta.whiteLevel,
+                    meta.neutral[0], meta.neutral[1], meta.neutral[2],
+                    meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
+                    rotation, demosaic, noiseLevel, meta.noiseSigma, film,
+                )
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.raw_burst_error",
+                    com.filmkit.app.kv("error" to (t.message ?: t.toString())),
+                )
+            }
+            images.forEach { runCatching { it.close() } }
+            onDone(bytes, rotatedW, rotatedH)
+        }
+    }
+
     fun stop() {
         synchronized(this) { stopInternal() }
     }

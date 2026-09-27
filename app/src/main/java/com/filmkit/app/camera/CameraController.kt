@@ -137,6 +137,21 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var capturing = false
 
+    // ── MFNR 多帧融合（v0.9.0 阶段一）────────────────────────────────
+    /** 拍摄阶段（Compose state，取景框内提示用）：0 = 空闲、1 = 采集/处理中、
+     *  2 = 多帧合成中（burst 4 帧到齐后、融合渲染期间） */
+    var capturePhase by mutableStateOf(0)
+        private set
+
+    /** burst 采集中的 4 帧 Image / TotalCaptureResult（同渲染 looper 串行，无锁）。
+     *  Image 槽位在融合 JNI 消费后统一 close（参考帧的 DNG 在其之前写出）。 */
+    private val burstImages = arrayOfNulls<Image>(MFNR_FRAMES)
+    private val burstResults = arrayOfNulls<TotalCaptureResult>(MFNR_FRAMES)
+    private var burstImageCount = 0
+    private var burstResultCount = 0
+    private var burstActive = false
+    private var burstStartMs = 0L
+
     /** 传感器 CFA 排布（M2-4 RAW 去马赛克相位用） */
     @Volatile
     var colorFilterArrangement = 0
@@ -575,6 +590,29 @@ class CameraController(private val context: Context, private val render: RenderC
             in 225..314 -> 3 // 右侧朝上 = 设备逆时针 90°
             else -> 0        // 竖（含 ORIENTATION_UNKNOWN 之外的所有残角）
         }
+
+        /** MFNR 阶段一固定帧数（融合 shader 固定 4 输入） */
+        const val MFNR_FRAMES = 4
+
+        /** burst 集齐兜底超时：4 帧全分辨率 RAW 正常 ≤2s，5s 仍不齐按失败释放 */
+        const val MFNR_TIMEOUT_MS = 5000L
+
+        /** 自动档暗光触发阈值：预览实时 ISO 或曝光任一超过即触发（Night Sight
+         *  手持单帧上限 333ms 的量级之下；ISO 阈值对应用户暗光 A/B 场景） */
+        const val MFNR_ISO_THRESHOLD = 600
+        const val MFNR_EXPOSURE_THRESHOLD_NS = 25_000_000L
+
+        /** MFNR 触发判定（纯函数供单测）：
+         *  mode 0 = 关（永不）；1 = 自动（RAW+RCD 质量档 + 暗光阈值）；
+         *  2 = 强制（RAW+RCD 即触发，白天也 4 帧，便于 A/B）。 */
+        fun mfnrShouldTrigger(mode: Int, rawMode: Boolean, demosaicRcd: Boolean,
+                              liveIso: Int, liveExposureNs: Long): Boolean {
+            if (mode <= 0) return false
+            if (!rawMode || !demosaicRcd) return false
+            if (mode >= 2) return true
+            return liveIso >= MFNR_ISO_THRESHOLD ||
+                liveExposureNs >= MFNR_EXPOSURE_THRESHOLD_NS
+        }
     }
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
@@ -992,21 +1030,105 @@ class CameraController(private val context: Context, private val render: RenderC
                 applyControls(this) // 静拍继承 M 档控制（WB/EV/OIS/变焦/对焦区域）
             }
             if (rawMode) {
+                // MFNR（v0.9.0）：三档 prefs mfnr（0 关 / 1 自动暗光 / 2 强制），
+                // 触发时 4 帧同参 captureBurst（HDR+：恒曝光使对齐鲁棒）。
+                val prefs = context.getSharedPreferences("filmkit", 0)
+                val mode = prefs.getInt("mfnr", 1)
+                val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+                val trigger = mfnrShouldTrigger(
+                    mode, rawMode, demosaic == 1, liveIso, liveExposureNs,
+                )
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "mfnr.trigger",
+                    kv(
+                        "mode" to mode, "trigger" to trigger,
+                        "iso" to liveIso, "sec" to "%.4f".format(liveExposureNs / 1e9f),
+                    ),
+                )
+                if (trigger) {
+                    startBurst(s, b)
+                    return
+                }
                 // RAW 路径需要 TotalCaptureResult（DngCreator/黑阶/WB/CCM 元数据）：
                 // 回调暂存 result，与 reader listener 的 Image 在渲染线程汇合
+                capturePhase = 1
                 pendingResult = null
                 rawImageAtMs = 0L
                 s.capture(b.build(), rawCaptureCb, render.looper?.let { android.os.Handler(it) })
             } else {
+                capturePhase = 1
                 s.capture(b.build(), null, render.looper?.let { android.os.Handler(it) })
             }
         } catch (t: Throwable) {
             capturing = false
+            capturePhase = 0
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "camera", "capture.submit_failed",
                 kv("error" to (t.message ?: t.toString())),
             )
         }
+    }
+
+    // ── MFNR burst 采集（v0.9.0 阶段一）─────────────────────────────────
+
+    private var burstTimeout: Runnable? = null
+
+    /** 4 帧同参 captureBurst（恒曝光）。Image/Result 桶按回调序配对——
+     *  burst 的 onCaptureCompleted 与提交顺序一致且同 looper 串行。 */
+    private fun startBurst(s: CameraCaptureSession, b: CaptureRequest.Builder) {
+        capturePhase = 1
+        burstActive = true
+        burstImageCount = 0
+        burstResultCount = 0
+        burstImages.fill(null)
+        burstResults.fill(null)
+        burstStartMs = android.os.SystemClock.elapsedRealtime()
+        val reqs = List(MFNR_FRAMES) { b.build() }  // 同参独立 request
+        s.captureBurst(reqs, rawCaptureCb, render.looper?.let { android.os.Handler(it) })
+        val timeout = Runnable { onBurstTimeout() }
+        burstTimeout = timeout
+        render.looper?.let { lo ->
+            android.os.Handler(lo).postDelayed(timeout, MFNR_TIMEOUT_MS)
+        }
+    }
+
+    private fun onBurstTimeout() {
+        if (!burstActive) return
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_ERROR, "camera", "mfnr.timeout",
+            kv(
+                "images" to burstImageCount, "results" to burstResultCount,
+                "waitMs" to (android.os.SystemClock.elapsedRealtime() - burstStartMs),
+            ),
+        )
+        releaseBurst()
+        capturing = false
+        capturePhase = 0
+    }
+
+    /** 关闭已收帧并复位桶（超时路径；正常路径由 RenderClient 消费后 close） */
+    private fun releaseBurst() {
+        burstActive = false
+        burstImages.forEach { runCatching { it?.close() } }
+        burstImages.fill(null)
+        burstResults.fill(null)
+        burstImageCount = 0
+        burstResultCount = 0
+        burstTimeout?.let { r ->
+            render.looper?.let { lo -> android.os.Handler(lo).removeCallbacks(r) }
+        }
+        burstTimeout = null
+    }
+
+    /** Image/Result 双桶汇合：4+4 齐 → processRawBurst（同渲染线程串行，无锁） */
+    private fun tryProcessBurst() {
+        if (!burstActive) return
+        if (burstImageCount < MFNR_FRAMES || burstResultCount < MFNR_FRAMES) return
+        val imgs = burstImages.mapNotNull { it }
+        val results = burstResults.mapNotNull { it }
+        burstActive = false  // 摘标志：超时兜底不再触发；数组在 onDone 清引用
+        capturePhase = 2
+        processRawBurst(imgs, results)
     }
 
     fun stop() {
@@ -1023,8 +1145,11 @@ class CameraController(private val context: Context, private val render: RenderC
             stillReader?.close()
             stillReader = null
             rawReader = null
+            releaseBurst()  // MFNR burst 在途帧：close 并复位桶（stop 竞态兜底）
             pendingRawImage = null
             pendingResult = null
+            capturing = false
+            capturePhase = 0
             surfaceTexture?.release()
             surfaceTexture = null
             previewSurface?.release()
@@ -1128,15 +1253,30 @@ class CameraController(private val context: Context, private val render: RenderC
             pendingRawImage = null
             pendingResult = null
             ImageReader.newInstance(
-                stillSize.width, stillSize.height, stillFormat, 2,
+                // maxImages：MFNR burst（v0.9.0）需 4 帧同时在途 + 1 headroom，
+                // 否则第 3 帧起 acquire 抛 IllegalStateException（槽位耗尽）
+                stillSize.width, stillSize.height, stillFormat, 5,
             ).apply {
                 setOnImageAvailableListener({ r ->
-                    val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    // burst 期间 acquireLatestImage 的"丢旧帧"语义会吃掉 4 帧中的
+                    // 3 帧 —— 必须按队列逐帧 acquireNextImage
+                    val img =
+                        if (burstActive) r.acquireNextImage() else r.acquireLatestImage()
+                        ?: return@setOnImageAvailableListener
                     if (img.format == ImageFormat.RAW_SENSOR) {
-                        pendingRawImage?.close()
-                        pendingRawImage = img
-                        rawImageAtMs = android.os.SystemClock.elapsedRealtime()
-                        tryProcessRaw()
+                        if (burstActive) {
+                            if (burstImageCount < MFNR_FRAMES) {
+                                burstImages[burstImageCount++] = img
+                                tryProcessBurst()
+                            } else {
+                                runCatching { img.close() }  // 溢出帧（正常不发生）
+                            }
+                        } else {
+                            pendingRawImage?.close()
+                            pendingRawImage = img
+                            rawImageAtMs = android.os.SystemClock.elapsedRealtime()
+                            tryProcessRaw()
+                        }
                     } else {
                         submitStill(img)
                     }
@@ -1268,6 +1408,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLutStrengthPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
+            capturePhase = 0
             if (bytes != null) saveJpeg(bytes, w, h)
         }
     }
@@ -1280,8 +1421,16 @@ class CameraController(private val context: Context, private val render: RenderC
             request: CaptureRequest,
             result: android.hardware.camera2.TotalCaptureResult,
         ) {
-            pendingResult = result
-            tryProcessRaw()
+            if (burstActive) {
+                // burst：按回调序入桶（同 looper 串行保证与提交顺序一致）
+                if (burstResultCount < MFNR_FRAMES) {
+                    burstResults[burstResultCount++] = result
+                    tryProcessBurst()
+                }
+            } else {
+                pendingResult = result
+                tryProcessRaw()
+            }
         }
     }
 
@@ -1328,6 +1477,31 @@ class CameraController(private val context: Context, private val render: RenderC
             0
         }
         val meta = extractRawMeta(result, ch)
+        logRawMeta(img, result, meta)
+        if (dngOn && ch != null) {
+            try {
+                saveDng(img, result, ch)
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "camera", "dng.save_failed",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+            }
+        }
+        applyTonePref()
+        applyHlPref()
+        applyZebraPref()
+        applyLutStrengthPref()
+        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
+            capturing = false
+            capturePhase = 0
+            if (bytes != null) saveJpeg(bytes, w, h)
+        }
+    }
+
+    /** raw.meta / raw.calib 日志（单帧与 MFNR burst 共用；原 processRaw 内联块抽出） */
+    private fun logRawMeta(img: Image, result: TotalCaptureResult, meta: RenderClient.RawFrameMeta) {
+        val ch = curCharacteristics
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.meta",
             kv(
@@ -1340,10 +1514,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 "in" to "${img.width}x${img.height}",
                 "lens" to currentLensId,
                 // ── v0.6.34：预览实际曝光 vs 拍照实际曝光 ──────────────────
-                // 用户反馈"预览与成片差很多"。此前这两个量在日志里**无法对比**：
-                // controls.applied 的 iso/sec 是**滑杆存量值**（AUTO 档下不代表实际，
-                // 曾被误读成"预览用 ISO 100"），而预览的实际值只回填给 UI 的
-                // liveIso/liveExposureNs、从不落盘。这里一次记全，一次真机即可定位。
+                // controls.applied 的 iso/sec 是滑杆存量值（AUTO 档下不代表实际），
+                // 预览实际值只回填 UI；这里一次记全，一次真机即可定位。
                 "pvIso" to liveIso,
                 "pvSec" to "%.4f".format(liveExposureNs / 1e9f),
                 "stIso" to (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0),
@@ -1354,8 +1526,7 @@ class CameraController(private val context: Context, private val render: RenderC
         )
         // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在
         // CaptureResult —— v0.5.45 初版记错归属，编译期 Unresolved 才暴露）。
-        // 每个 cameraId 各记一条（v0.6.20）：主摄与长焦的标定矩阵是否相同，
-        // 是"主摄色彩明显差"的头号嫌疑，必须能从日志直接对比。
+        // 每个 cameraId 各记一条（v0.6.20）。
         if (calibLoggedId != currentLensId && ch != null) {
             calibLoggedId = currentLensId
             EngineBridge.nativeAppendLog(
@@ -1373,9 +1544,40 @@ class CameraController(private val context: Context, private val render: RenderC
                 ),
             )
         }
+    }
+
+    /** MFNR burst 端到端：4+4 帧齐后处理。元数据/DNG 全用帧 0（参考帧，恒曝光）；
+     *  mfnr.capture 记录逐帧实际曝光（HAL 是否逐帧重 AE 用日志核对——若漂移大，
+     *  二步修复是锁定首帧曝光）。Image 由 RenderClient.submitRawBurst 消费后关闭。 */
+    private fun processRawBurst(images: List<Image>, results: List<TotalCaptureResult>) {
+        val ch = curCharacteristics
+        val prefs = context.getSharedPreferences("filmkit", 0)
+        val dngOn = prefs.getBoolean("dng_enabled", false)
+        val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) {
+            prefs.getInt("noise_reduction_level", 1)
+        } else {
+            0
+        }
+        val ref = images[0]
+        val refResult = results[0]
+        val meta = extractRawMeta(refResult, ch)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "mfnr.capture",
+            kv(
+                "frames" to images.size,
+                "iso" to results.joinToString(",") { (it.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0).toString() },
+                "sec" to results.joinToString(",") {
+                    "%.4f".format((it.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e9f)
+                },
+                "ms" to (android.os.SystemClock.elapsedRealtime() - burstStartMs),
+                "lens" to currentLensId,
+            ),
+        )
+        logRawMeta(ref, refResult, meta)
         if (dngOn && ch != null) {
             try {
-                saveDng(img, result, ch)
+                saveDng(ref, refResult, ch)
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "camera", "dng.save_failed",
@@ -1387,8 +1589,13 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHlPref()
         applyZebraPref()
         applyLutStrengthPref()
-        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
+        render.submitRawBurst(images, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
+            capturePhase = 0
+            burstImages.fill(null)
+            burstResults.fill(null)
+            burstImageCount = 0
+            burstResultCount = 0
             if (bytes != null) saveJpeg(bytes, w, h)
         }
     }

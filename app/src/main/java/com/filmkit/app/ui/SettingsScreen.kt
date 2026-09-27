@@ -437,6 +437,46 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // MFNR 多帧融合（v0.9.0 阶段一）：关 / 自动（暗光触发）/ 开（强制）三档。
+            // 触发判定在 CameraController.mfnrShouldTrigger（与单测同源）。
+            var mfnrMode by rememberSaveable { mutableStateOf(prefs.getInt("mfnr", 1)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = (mfnrMode + 1) % 3
+                        mfnrMode = v
+                        prefs.edit().putInt("mfnr", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.mfnr",
+                            "{\"mode\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("多帧融合", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "暗光连拍 4 帧对齐合成降噪（彩噪 √4 根治）；" +
+                            "仅 M 档 RAW + RCD 质量档生效。「开」= 每次都连拍",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    when (mfnrMode) {
+                        0 -> "关"
+                        1 -> "自动"
+                        else -> "开"
+                    },
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

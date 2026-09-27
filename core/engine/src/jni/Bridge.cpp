@@ -358,6 +358,65 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   return out;
 }
 
+// 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域对齐 + 加权
+// 均值（引擎内）→ 与 nativeEngineSubmitRaw 相同的成片链。
+// frames[i] = 第 i 帧的 direct ByteBuffer（Image plane[0]，参考帧 = frames[0]）；
+// row_strides_px[i] = 像素单位行距；其余元数据语义同 nativeEngineSubmitRaw，
+// 统一取帧 0（burst 恒曝光）。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
+    JNIEnv* env, jobject, jobjectArray frames, jint count,
+    jintArray row_strides_px, jint w, jint h, jint cfa, jfloatArray black_phase,
+    jint white_level, jfloat neutral_r, jfloat neutral_g, jfloat neutral_b,
+    jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
+    jint rotation, jint demosaic, jint noise_level, jfloat noise_sigma,
+    jdoubleArray film) {
+  if (!g_renderer || !frames || count <= 0) return nullptr;
+  std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
+  for (int i = 0; i < count; ++i) {
+    jobject buf = env->GetObjectArrayElement(frames, i);
+    if (!buf) return nullptr;
+    bufs[static_cast<size_t>(i)] = env->GetDirectBufferAddress(buf);
+    env->DeleteLocalRef(buf);
+    if (!bufs[static_cast<size_t>(i)]) return nullptr;
+  }
+  std::vector<int> strides(static_cast<size_t>(count), 0);
+  if (env->GetArrayLength(row_strides_px) >= count) {
+    env->GetIntArrayRegion(row_strides_px, 0, count, strides.data());
+  }
+  float black4[4] = {0, 0, 0, 0};
+  if (black_phase) {
+    const jsize bn = env->GetArrayLength(black_phase);
+    if (bn >= 4) env->GetFloatArrayRegion(black_phase, 0, 4, black4);
+  }
+  float ccm9[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  if (ccm) {
+    const jsize cn = env->GetArrayLength(ccm);
+    if (cn >= 9) env->GetFloatArrayRegion(ccm, 0, 9, ccm9);
+  }
+  std::vector<float> lsc_buf;
+  const float* lsc_ptr = nullptr;
+  if (lsc != nullptr && lsc_cols > 1 && lsc_rows > 1) {
+    const jsize want = static_cast<jsize>(lsc_cols) * lsc_rows * 3;
+    if (env->GetArrayLength(lsc) >= want) {
+      lsc_buf.resize(static_cast<size_t>(want));
+      env->GetFloatArrayRegion(lsc, 0, want, lsc_buf.data());
+      lsc_ptr = lsc_buf.data();
+    }
+  }
+  const FilmParams p = paramsFromJava(env, film);
+  std::vector<uint8_t> rgba;
+  const bool ok = g_renderer->submitRawBurst(
+      bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
+      neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,
+      lsc_rows, rotation, p, demosaic, noise_level, noise_sigma, &rgba);
+  if (!ok) return nullptr;
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
+  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
+                          reinterpret_cast<const jbyte*>(rgba.data()));
+  return out;
+}
+
 // 预览实时直方图（M3）：out 长度 ≥2（建议 256），填充显示域亮度分布；
 // 返回 false = 还没有可用的预览帧（纹理未就绪）
 extern "C" JNIEXPORT jboolean JNICALL

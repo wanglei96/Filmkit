@@ -76,6 +76,22 @@ object EngineBridge {
         noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
     ): ByteArray?
 
+    /**
+     * 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域 tile 对齐 +
+     * 置信度加权时域均值（引擎内）→ 与 nativeEngineSubmitRaw 相同的成片链。
+     * frames[0] = 参考帧（DNG 底片同一帧），count 必须 = 4；其余元数据语义同
+     * nativeEngineSubmitRaw，统一取帧 0（burst 恒曝光，逐帧黑阶/WB 视为一致）。
+     */
+    external fun nativeEngineSubmitRawBurst(
+        frames: Array<ByteBuffer>, count: Int, rowStridesPx: IntArray,
+        width: Int, height: Int,
+        cfa: Int, blackPhase: FloatArray, whiteLevel: Int,
+        neutralR: Float, neutralG: Float, neutralB: Float,
+        ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
+        rotation: Int, demosaic: Int,
+        noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
+    ): ByteArray?
+
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */
     external fun nativeEngineHistogram(out: IntArray): Boolean
 
