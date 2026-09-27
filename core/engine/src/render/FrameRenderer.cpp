@@ -2630,6 +2630,14 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   }
   frames_.fetch_add(1, std::memory_order_relaxed);
   const auto t0 = std::chrono::steady_clock::now();
+  // 阶段日志（v0.9.1）：fwrite 有 FILE 缓冲，进程崩溃时缓冲丢失——每个阶段
+  // 写完立即 flush，崩溃后日志的最后一条 stage 就是断点。
+  const auto stage = [&](const char* s) {
+    Logger::instance().log(LogLevel::kInfo, "engine", "mfnr.stage",
+                           std::string("{\"s\":\"") + s + "\"}");
+    Logger::instance().flush();
+  };
+  stage("upload");
 
   // 上传：帧 0 → raw_tex_（参考帧），帧 1..3 → tex_mfnr_
   if (ensureRawTex(w, h) == 0) return false;
@@ -2643,6 +2651,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       prepareRawCommon(neutral_r, neutral_g, neutral_b, ccm9, lsc, lsc_cols,
                        lsc_rows);
   const float wl = static_cast<float>(white_level);
+  stage("pyr");
 
   // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile 32 → tiles。
   const int w2 = (pyr1_w_ + 1) / 2, h2 = (pyr1_h_ + 1) / 2;
@@ -2674,12 +2683,14 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   };
   MfnrPyramid ref;
   capturePyr(raw_tex_, &ref);
+  stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   int fallback = 0;
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
+    stage("align_frame");
     // 打包位移场（xy=mosaic 域位移、z=conf、w=1）上传
     std::vector<float> pack(static_cast<size_t>(tiles_w_) * tiles_h_ * 4, 1.f);
     for (int t = 0; t < tiles_w_ * tiles_h_; ++t) {
@@ -2702,8 +2713,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
 
   // 融合 → tex_fused_（R16F 线性 mosaic）
   const auto tf = std::chrono::steady_clock::now();
+  stage("fuse");
   passMfnrFuse(w, h, cfa, black_phase, wl, rc.gains);
   glFinish();
+  stage("chain");
   const float fuse_ms = std::chrono::duration<float, std::milli>(
                             std::chrono::steady_clock::now() - tf)
                             .count();

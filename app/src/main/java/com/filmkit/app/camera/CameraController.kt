@@ -143,9 +143,15 @@ class CameraController(private val context: Context, private val render: RenderC
     var capturePhase by mutableStateOf(0)
         private set
 
-    /** burst 采集中的 4 帧 Image / TotalCaptureResult（同渲染 looper 串行，无锁）。
-     *  Image 槽位在融合 JNI 消费后统一 close（参考帧的 DNG 在其之前写出）。 */
+    /** burst 采集中的帧桶（同渲染 looper 串行，无锁）。v0.9.1 改架构：
+     *  **帧 1-3 拷贝到 direct buffer 后立即 close**（HAL 槽位 ~50ms 内释放，
+     *  maxImages=4 够 4 帧循环），**仅参考帧（帧 0）保留 Image**——DngCreator
+     *  只吃 Image，DNG 底片写出后关闭。v0.9.0 的 maxImages=5 + 4 Image 全程
+     *  持有让 HAL 一次预配 125MB graphic buffer 且全程占满，是本次闪退的头号
+     *  嫌疑（session_ready/预览正常、Activity 随后被系统销毁）。 */
     private val burstImages = arrayOfNulls<Image>(MFNR_FRAMES)
+    private val burstBuffers = arrayOfNulls<java.nio.ByteBuffer>(MFNR_FRAMES)
+    private val burstStrides = IntArray(MFNR_FRAMES)
     private val burstResults = arrayOfNulls<TotalCaptureResult>(MFNR_FRAMES)
     private var burstImageCount = 0
     private var burstResultCount = 0
@@ -1045,6 +1051,8 @@ class CameraController(private val context: Context, private val render: RenderC
                         "iso" to liveIso, "sec" to "%.4f".format(liveExposureNs / 1e9f),
                     ),
                 )
+                // fwrite 缓冲在崩溃时丢内容：拍照入口日志立即落盘（v0.9.1）
+                EngineBridge.nativeFlushLogs()
                 if (trigger) {
                     startBurst(s, b)
                     return
@@ -1081,14 +1089,39 @@ class CameraController(private val context: Context, private val render: RenderC
         burstImageCount = 0
         burstResultCount = 0
         burstImages.fill(null)
+        burstBuffers.fill(null)
+        burstStrides.fill(0)
         burstResults.fill(null)
         burstStartMs = android.os.SystemClock.elapsedRealtime()
         val reqs = List(MFNR_FRAMES) { b.build() }  // 同参独立 request
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
+            kv("frames" to MFNR_FRAMES),
+        )
+        EngineBridge.nativeFlushLogs()
         s.captureBurst(reqs, rawCaptureCb, render.looper?.let { android.os.Handler(it) })
         val timeout = Runnable { onBurstTimeout() }
         burstTimeout = timeout
         render.looper?.let { lo ->
             android.os.Handler(lo).postDelayed(timeout, MFNR_TIMEOUT_MS)
+        }
+    }
+
+    /** 帧 1-3：RAW plane 拷贝到 direct buffer 后立即 close（HAL 槽位快速释放）。
+     *  rowStride 可能含对齐填充，整 capacity 拷贝（多拷 padding 无害），引擎侧按
+     *  rowStride/2 跳行上传。 */
+    private fun copyRawAndClose(img: Image, slot: Int) {
+        try {
+            val p = img.planes[0]
+            val buf = java.nio.ByteBuffer.allocateDirect(p.buffer.capacity())
+            val src = p.buffer.duplicate()
+            src.position(0)
+            buf.put(src)
+            buf.position(0)
+            burstBuffers[slot] = buf
+            burstStrides[slot] = p.rowStride / 2
+        } finally {
+            runCatching { img.close() }
         }
     }
 
@@ -1106,11 +1139,13 @@ class CameraController(private val context: Context, private val render: RenderC
         capturePhase = 0
     }
 
-    /** 关闭已收帧并复位桶（超时路径；正常路径由 RenderClient 消费后 close） */
+    /** 关闭已收帧并复位桶（超时路径；正常路径由 processRawBurst/RenderClient 收尾） */
     private fun releaseBurst() {
         burstActive = false
         burstImages.forEach { runCatching { it?.close() } }
         burstImages.fill(null)
+        burstBuffers.fill(null)
+        burstStrides.fill(0)
         burstResults.fill(null)
         burstImageCount = 0
         burstResultCount = 0
@@ -1253,9 +1288,10 @@ class CameraController(private val context: Context, private val render: RenderC
             pendingRawImage = null
             pendingResult = null
             ImageReader.newInstance(
-                // maxImages：MFNR burst（v0.9.0）需 4 帧同时在途 + 1 headroom，
-                // 否则第 3 帧起 acquire 抛 IllegalStateException（槽位耗尽）
-                stillSize.width, stillSize.height, stillFormat, 5,
+                // maxImages=4（v0.9.1）：MFNR 4 帧循环 + 回调内拷贝即 close 释放
+                // 槽位。v0.9.0 用 5 且全程持有 4 张 Image —— HAL 一次预配 125MB
+                // graphic buffer，是本次闪退头号嫌疑，回退保守值。
+                stillSize.width, stillSize.height, stillFormat, 4,
             ).apply {
                 setOnImageAvailableListener({ r ->
                     // burst 期间 acquireLatestImage 的"丢旧帧"语义会吃掉 4 帧中的
@@ -1266,7 +1302,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     if (img.format == ImageFormat.RAW_SENSOR) {
                         if (burstActive) {
                             if (burstImageCount < MFNR_FRAMES) {
-                                burstImages[burstImageCount++] = img
+                                val idx = burstImageCount++
+                                if (idx == 0) {
+                                    // 参考帧保留 Image（DngCreator 只吃 Image）
+                                    burstImages[0] = img
+                                    burstStrides[0] = img.planes[0].rowStride / 2
+                                } else {
+                                    copyRawAndClose(img, idx)
+                                }
                                 tryProcessBurst()
                             } else {
                                 runCatching { img.close() }  // 溢出帧（正常不发生）
@@ -1546,9 +1589,11 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
-    /** MFNR burst 端到端：4+4 帧齐后处理。元数据/DNG 全用帧 0（参考帧，恒曝光）；
-     *  mfnr.capture 记录逐帧实际曝光（HAL 是否逐帧重 AE 用日志核对——若漂移大，
-     *  二步修复是锁定首帧曝光）。Image 由 RenderClient.submitRawBurst 消费后关闭。 */
+    /** MFNR burst 端到端：4+4 帧齐后处理（帧 1-3 已拷贝 close，帧 0 仍持 Image）。
+     *  元数据/DNG 全用帧 0（参考帧，恒曝光）；mfnr.capture 记录逐帧实际曝光
+     *  （HAL 是否逐帧重 AE 用日志核对——若漂移大，二步修复是锁定首帧曝光）。
+     *  流程：DNG 用帧 0 Image 写出 → 帧 0 拷贝并 close（4 个 HAL 槽位全部释放）
+     *  → 4 buffer 提交引擎融合。 */
     private fun processRawBurst(images: List<Image>, results: List<TotalCaptureResult>) {
         val ch = curCharacteristics
         val prefs = context.getSharedPreferences("filmkit", 0)
@@ -1561,11 +1606,13 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         val ref = images[0]
         val refResult = results[0]
+        val refW = ref.width
+        val refH = ref.height
         val meta = extractRawMeta(refResult, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.capture",
             kv(
-                "frames" to images.size,
+                "frames" to results.size,
                 "iso" to results.joinToString(",") { (it.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0).toString() },
                 "sec" to results.joinToString(",") {
                     "%.4f".format((it.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e9f)
@@ -1585,14 +1632,22 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
             }
         }
+        // 帧 0 拷贝并 close：此时 HAL 槽位全部释放，只剩 4 个 direct buffer
+        copyRawAndClose(ref, 0)
+        burstImages.fill(null)
+        EngineBridge.nativeFlushLogs()
         applyTonePref()
         applyHlPref()
         applyZebraPref()
         applyLutStrengthPref()
-        render.submitRawBurst(images, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
+        val buffers = burstBuffers.mapNotNull { it }
+        val strides = burstStrides.copyOf()
+        render.submitRawBurst(buffers, strides, refW, refH, meta,
+            orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false
             capturePhase = 0
-            burstImages.fill(null)
+            burstBuffers.fill(null)
+            burstStrides.fill(0)
             burstResults.fill(null)
             burstImageCount = 0
             burstResultCount = 0

@@ -10,17 +10,19 @@ namespace {
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 // SAD：a 的 (x0,y0) tile 对 b 的 (x0+dx, y0+dy) tile，步长 step 采样。
-// 双侧都 clamp 到图像边界（位移大时贴边 tile 仍可评估）。
+// 所有读地址逐点 clamp（tile 32/16/8 不整除图像尺寸时，末行末列 tile 的
+// x0+采样点会跨过图像宽 —— 基址不带 x0、索引单独 clamp，杜绝越界读）。
 inline int sadTile(const uint8_t* a, const uint8_t* b, int w, int h, int x0,
                    int y0, int dx, int dy, int tw, int th, int step) {
   int s = 0;
   for (int y = 0; y < th; y += step) {
     const int ay = clampi(y0 + y, 0, h - 1);
     const int by = clampi(y0 + y + dy, 0, h - 1);
-    const uint8_t* pa = a + static_cast<size_t>(ay) * w + x0;
+    const uint8_t* pa = a + static_cast<size_t>(ay) * w;
     const uint8_t* pb = b + static_cast<size_t>(by) * w;
     for (int x = 0; x < tw; x += step) {
-      s += std::abs(pa[x] - pb[clampi(x0 + x + dx, 0, w - 1)]);
+      s += std::abs(pa[clampi(x0 + x, 0, w - 1)] -
+                    pb[clampi(x0 + x + dx, 0, w - 1)]);
     }
   }
   return s;
@@ -31,14 +33,14 @@ inline float gradTile(const uint8_t* a, int w, int h, int x0, int y0, int tw,
                       int th, int step) {
   int g = 0, n = 0;
   for (int y = 0; y < th; y += step) {
-    const int yy = clampi(y0 + y, 0, h - 1);
-    const int y1 = clampi(y0 + y + 1, 0, h - 1);
-    const uint8_t* pa = a + static_cast<size_t>(yy) * w + x0;
-    const uint8_t* pb = a + static_cast<size_t>(y1) * w + x0;
+    const int ay = clampi(y0 + y, 0, h - 1);
+    const int ay1 = clampi(y0 + y + 1, 0, h - 1);
+    const uint8_t* pa = a + static_cast<size_t>(ay) * w;
+    const uint8_t* pb = a + static_cast<size_t>(ay1) * w;
     for (int x = 0; x < tw; x += step) {
       const int xx = clampi(x0 + x, 0, w - 1);
-      const int x1 = clampi(x0 + x + 1, 0, w - 1);
-      g += std::abs(pa[x1] - pa[xx]) + std::abs(pb[xx] - pa[xx]);
+      const int xx1 = clampi(x0 + x + 1, 0, w - 1);
+      g += std::abs(pa[xx1] - pa[xx]) + std::abs(pb[xx] - pa[xx]);
       ++n;
     }
   }
