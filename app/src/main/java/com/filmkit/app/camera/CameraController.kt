@@ -834,6 +834,9 @@ class CameraController(private val context: Context, private val render: RenderC
     // v0.6.33：0.6 → 0.25（roadmap 立项定的上限就是 ≤0.2–0.3）。
     private val LOCAL_TONE = 0.25
     private var localTonePref = -1.0
+    // 轻度锐化（v0.9.6）：强度与 CameraPresets[39] 默认值一致；0 = 关（A/B 通路）。
+    private val SHARPEN = 0.5
+    private var sharpenPref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -887,6 +890,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 搭同一批刷新入口（共 4 处调用点）
         applyAutoTonePref()
         applyLocalTonePref()
+        applySharpenPref()
         applyFilmicRangePrefs()
     }
 
@@ -934,6 +938,19 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != localTonePref) {
             localTonePref = v
             filmParams[36] = v
+        }
+    }
+
+    /**
+     * 轻度锐化开关（v0.9.6）：写 FilmParams[39]。
+     * luma USM，kFsOut 内高光滚降后、OETF 前的线性显示域（管线顺序与用户定稿一致）。
+     * [SHARPEN] 与 CameraPresets 默认值一致，0.0 = 关（A/B 通路）。
+     */
+    private fun applySharpenPref() {
+        val v = if (appPrefs.getBoolean("sharpen", true)) SHARPEN else 0.0
+        if (v != sharpenPref) {
+            sharpenPref = v
+            filmParams[39] = v
         }
     }
 

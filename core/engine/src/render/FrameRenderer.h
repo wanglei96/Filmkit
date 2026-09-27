@@ -367,8 +367,8 @@ class FrameRenderer {
   } u_film_;
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
-          flip_y = -1, zebra = -1, lut = -1, lut_on = -1, lut_strength = -1,
-          lut_dmin = -1, lut_dinv = -1, lut_size = -1;
+          flip_y = -1, zebra = -1, sharpen = -1, lut = -1, lut_on = -1,
+          lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1;
   } u_out_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

@@ -9,9 +9,9 @@ namespace filmkit {
 struct FilmParams {
   // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
-  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(39)` 保持一致（v0.7.6 起）；
+  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(40)` 保持一致（v0.9.6 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 39;  // v0.7.6：+[37] filmic_black_ev +[38] filmic_white_ev
+  static constexpr int kCount = 40;  // v0.9.6：+[39] sharpen（v0.7.6 曾 +[37]/[38] filmic 黑白点）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -72,6 +72,12 @@ struct FilmParams {
   // auto_tone 开时黑点改由场景分位自动，白点仍用这里配置的值。
   float filmic_black_ev = -7.65f;  // 37
   float filmic_white_ev = 4.56f;   // 38
+  // ── v0.9.6：轻度锐化（luma USM，OETF 前线性显示域）─────────────────────
+  // 管线定稿顺序：滚降后、OETF 前（kFsOut 内）。为什么不在 OETF 后（PC 的
+  // sharpen 在 sRGB 域）：sRGB 斜率在暗部 >1，会放大暗部噪声。乘法式相对增益
+  // 保色度坐标。0 = 关（A/B 通路）；默认 0 = 缺参/旧长度时保持旧行为，
+  // Kotlin 侧 CameraPresets[39] 给标定值（0.5）。
+  float sharpen = 0.0f;        // 39
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -124,6 +130,7 @@ struct FilmParams {
     // v0.7.6：filmic 黑白点（用户可配，默认 −7.65/+4.56）；旧长度时保持默认值
     if (n > 37) filmic_black_ev = static_cast<float>(v[37]);
     if (n > 38) filmic_white_ev = static_cast<float>(v[38]);
+    if (n > 39) sharpen = static_cast<float>(v[39]);
   }
 };
 

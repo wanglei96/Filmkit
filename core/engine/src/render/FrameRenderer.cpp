@@ -1072,6 +1072,7 @@ uniform float uGrainSize;
 uniform float uTime;
 uniform float uFlipY;  // 拍照读回 GL 底行在前，翻转后 JPEG 方向正确
 uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
+uniform float uSharpen;  // v0.9.6 轻度锐化强度（0 = 关，A/B 通路；FilmParams[39]）
 // ── M4 3D LUT（display 域）────────────────────────────────────────────
 // 域感知插桩：display 域 LUT 必须接在输出 OETF 之后（§0-D10 / §6.1）。
 // 采样用四面体插值而非三线性 —— 三线性在 33³ 下有可见色差（§3.3-5）。
@@ -1139,11 +1140,52 @@ vec3 highlightRolloff(vec3 c) {
     vec3 cc = c * (lc / l);                           // 等比压缩，保持色相
     return mix(cc, vec3(lc), smoothstep(knee, 1.0, l));  // 过曝趋白（终点 = 显示上限）
 }
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// ── v0.9.6 轻度锐化（luma USM，OETF 前线性显示域）─────────────────────────
+// 管线定稿顺序（2026-09-27 决策）：filmic → EV → 高光滚降 → **锐化** → OETF。
+// 为什么在 OETF 前（PC 的 sharpen 在 sRGB 显示域）：sRGB 的斜率在暗部 >1，
+// 同一 USM 的 detail 被斜率放大，暗部噪声权重最高；线性域 detail 对应物理反差，
+// 增益用"相对 luma"形式表达后暗部天然少拿增益。
+// 为什么在滚降后：滚降先把高光压平，高反差亮边缘的 detail 随之变小 —— halo
+// 天然更小；锐化若产生过冲，下一行的 pow 前值域已由滚降有界化。
+// 核 = 3×3 的 1-2-1 外积高斯（中心 4/边 2/角 1，/16），步长恒 1 texel：
+// 预览与成片同核（预览观感略强于成片，验收以成片为准）。邻域 tap **各自过
+// highlightRolloff** 与中心同域 —— 直接用原始域邻域会与滚降后的中心混域，
+// detail 在高光边缘系统性偏负（暗 halo）。
+// 形式 = 乘法 luma USM：c *= 1 + gain，RGB 同乘一个标量 ⇒ CIE xy 色度坐标
+// 不变（零色度污染，与 MFNR 每通道融合同一关注点）；÷l0 的相对形式近似
+// 感知均匀（Weber ΔI/I，sRGB 域 USM 的观感等价物）。
+// 标定旋钮：uSharpen 全局量（默认 0.5）；增益限幅 ±0.4 拦高反差边缘过冲与
+// 暗部小 l0 处 ÷l0 的放大；luma 地板 0.01（显示域 ≈ 42/255）防除零。
+// 8 邻手动展开 —— GLSL ES 不支持数组初始化器（desktop 4.2+ 特性，本仓库两次踩坑）。
+void sharpenLuma(inout vec3 c, vec2 uv) {
+    float l0 = luma(c);
+    float lb = 4.0 * l0;
+    vec3 t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, 0.0)).rgb);
+    lb += 2.0 * luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, 0.0)).rgb);
+    lb += 2.0 * luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(0.0, -1.0)).rgb);
+    lb += 2.0 * luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(0.0, 1.0)).rgb);
+    lb += 2.0 * luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, -1.0)).rgb);
+    lb += luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, -1.0)).rgb);
+    lb += luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, 1.0)).rgb);
+    lb += luma(t);
+    t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, 1.0)).rgb);
+    lb += luma(t);
+    float gain = uSharpen * (l0 - lb / 16.0) / max(l0, 0.01);
+    c *= 1.0 + clamp(gain, -0.4, 0.4);
+}
 void main() {
     vec2 uv = vUV0;
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
     vec3 c = texture(uTex, uv).rgb;
     c = highlightRolloff(c);
+    if (uSharpen > 0.0) sharpenLuma(c, uv);
     c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
@@ -1550,6 +1592,7 @@ bool FrameRenderer::init() {
   u_out_.time = glGetUniformLocation(prog_out_, "uTime");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
+  u_out_.sharpen = glGetUniformLocation(prog_out_, "uSharpen");
   u_out_.lut = glGetUniformLocation(prog_out_, "uLut");
   u_out_.lut_on = glGetUniformLocation(prog_out_, "uLutOn");
   u_out_.lut_strength = glGetUniformLocation(prog_out_, "uLutStrength");
@@ -2465,6 +2508,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
   kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
+  kv += ",\"sh\":" + std::to_string(p.sharpen).substr(0, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
   kv += std::string(",\"lsc\":\"") +
         (c.lsc_ok ? std::to_string(c.lsc_cols) + "x" + std::to_string(c.lsc_rows)
@@ -3328,6 +3372,8 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1f(u_out_.flip_y, flip_y ? 1.0f : 0.0f);
   // 斑马纹只走预览：成片路径一律 0（提示不进成片）
   glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);
+  // v0.9.6 轻度锐化（luma USM，滚降后 OETF 前；0 = 关 = A/B 通路）
+  glUniform1f(u_out_.sharpen, p.sharpen);
   // M4：display 域 LUT（同一 pass 内，不额外增加 pass；斑马纹判定排在 LUT 之后，
   // 与用户实际看到的画面一致）
   applyPendingLut();

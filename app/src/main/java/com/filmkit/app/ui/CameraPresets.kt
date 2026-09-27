@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(39).apply {
+    private fun neutral(): DoubleArray = DoubleArray(40).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -92,6 +92,12 @@ object CameraPresets {
         // 用户可在设置页自由调整（PC 的做法）；auto_tone 开时**黑点**改由场景分位自动。
         this[37] = -7.65
         this[38] = 4.56
+        // 39 = 轻度锐化（v0.9.6）：luma USM，kFsOut 内高光滚降后、OETF 前的线性
+        // 显示域（管线顺序与用户定稿一致）。乘法式相对增益，保色度坐标。
+        // 为什么不在 OETF 后（PC 的 sharpen 在 sRGB 域）：sRGB 斜率暗部 >1，
+        // 同一 USM 放大暗部噪声。0.5 = 标定旋钮，0 = 关（A/B 通路）；
+        // 设置页开关写 prefs("sharpen")，CameraController 覆盖此值。
+        this[39] = 0.5
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

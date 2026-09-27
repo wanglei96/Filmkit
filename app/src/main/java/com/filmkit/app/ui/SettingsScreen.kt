@@ -477,6 +477,22 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 轻度锐化（v0.9.6）：OETF 前线性显示域 luma USM，补 MFNR 后观感细节。
+            // 关 = A/B 通路（同场景对照归因）。
+            var sharpenOn by rememberSaveable { mutableStateOf(prefs.getBoolean("sharpen", true)) }
+            SettingSwitchRow(
+                title = "轻度锐化",
+                subtitle = "线性显示域 luma USM（OETF 前，暗部噪声不放大），补观感细节；关 = 同场景 A/B 对照",
+                checked = sharpenOn,
+                onChecked = { v ->
+                    sharpenOn = v
+                    prefs.edit().putBoolean("sharpen", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.sharpen",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
