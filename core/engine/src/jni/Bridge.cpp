@@ -370,7 +370,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jint white_level, jfloat neutral_r, jfloat neutral_g, jfloat neutral_b,
     jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
     jint rotation, jint demosaic, jint noise_level, jfloat noise_sigma,
-    jdoubleArray film) {
+    jfloat ref_noise_scale, jdoubleArray film) {
   if (!g_renderer || !frames || count <= 0) return nullptr;
   std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
   for (int i = 0; i < count; ++i) {
@@ -409,7 +409,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
   const bool ok = g_renderer->submitRawBurst(
       bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
       neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,
-      lsc_rows, rotation, p, demosaic, noise_level, noise_sigma, &rgba);
+      lsc_rows, rotation, p, demosaic, noise_level, noise_sigma,
+      ref_noise_scale, &rgba);
   if (!ok) return nullptr;
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
   env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),

@@ -1098,8 +1098,18 @@ class CameraController(private val context: Context, private val render: RenderC
 
     private var burstTimeout: Runnable? = null
 
+    // 短参考帧（v0.10.1）：参考帧噪声相对典型帧的倍率 √(AE_sec/secRef)，1.0 = 未压短。
+    // 经 submitRawBurst 传引擎：mismatch 的 σ 用参考帧域（×rn），P0/P4 折减用典型帧域。
+    private var burstRefNoiseScale = 1.0f
+    private val MFNR_REF_MAX_EXPOSURE_NS = 15_000_000L  // 快门锚 15ms（拖影减半）
+
     /** 4 帧同参 captureBurst（恒曝光）。Image/Result 桶按回调序配对——
-     *  burst 的 onCaptureCompleted 与提交顺序一致且同 looper 串行。 */
+     *  burst 的 onCaptureCompleted 与提交顺序一致且同 looper 串行。
+     *  v0.10.1 短参考帧：帧 0（参考帧 + DNG 底片）压短快门（min(AE, 15ms)），
+     *  ISO 等比补偿曝光量守恒（AE_MODE_OFF 手动下发，M 档滑杆同路径）——
+     *  单帧运动模糊 ∝ 快门，参考帧清晰则运动 tile 由 mismatch 自动回退到它
+     *  （融合结构里参考帧权重恒 1，它糊了谁也救不了）。帧 1-3 保持 AE 曝光
+     *  承担降噪量。光线好时 AE ≤15ms，secRef == AE，结构自动退化为等权。 */
     private fun startBurst(s: CameraCaptureSession, b: CaptureRequest.Builder) {
         capturePhase = 1
         burstActive = true
@@ -1110,10 +1120,43 @@ class CameraController(private val context: Context, private val render: RenderC
         burstStrides.fill(0)
         burstResults.fill(null)
         burstStartMs = android.os.SystemClock.elapsedRealtime()
-        val reqs = List(MFNR_FRAMES) { b.build() }  // 同参独立 request
+        // 快门锚 15ms；ISO 等比补偿（曝光量 iso×sec 守恒），clamp 到机型上限。
+        // 上限内补不满时曝光量不足（欠曝）由 filmic 显示亮度补偿兜底（已知 tradeoff）。
+        val secRef = minOf(liveExposureNs, MFNR_REF_MAX_EXPOSURE_NS)
+        var isoRef = if (liveIso > 0 && secRef > 0) {
+            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt()
+        } else {
+            liveIso
+        }
+        curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?.let { isoRef = isoRef.coerceIn(it.lower, it.upper) }
+        burstRefNoiseScale = if (liveIso > 0 && liveExposureNs > 0 && secRef > 0) {
+            kotlin.math.sqrt(liveExposureNs.toDouble() / secRef).toFloat()
+        } else {
+            1.0f
+        }
+        val refReq = if (secRef < liveExposureNs && liveIso > 0 && secRef > 0) {
+            camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(stillReader!!.surface)
+                applyControls(this)
+                // AE_OFF + 手动传感器参数（与 M 档手动滑杆同一路径，非 AE 补偿通道）
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_SENSITIVITY, isoRef)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, secRef)
+            }.build()
+        } else {
+            null
+        }
+        val reqs = List(MFNR_FRAMES) { i ->
+            if (i == 0) refReq ?: b.build() else b.build()
+        }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
-            kv("frames" to MFNR_FRAMES),
+            kv(
+                "frames" to MFNR_FRAMES,
+                "refIso" to isoRef, "refSec" to "%.4f".format(secRef / 1e9f),
+                "rn" to "%.3f".format(burstRefNoiseScale),
+            ),
         )
         EngineBridge.nativeFlushLogs()
         s.captureBurst(reqs, rawCaptureCb, render.looper?.let { android.os.Handler(it) })
@@ -1660,7 +1703,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val buffers = burstBuffers.mapNotNull { it }
         val strides = burstStrides.copyOf()
         render.submitRawBurst(buffers, strides, refW, refH, meta,
-            orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
+            orientationStep, filmParams, demosaic, noiseLevel, burstRefNoiseScale) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)

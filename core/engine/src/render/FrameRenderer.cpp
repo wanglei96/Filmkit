@@ -2891,6 +2891,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    int lsc_cols, int lsc_rows, int rotation,
                                    const FilmParams& p, int demosaic,
                                    int noise_level, float noise_sigma,
+                                   float ref_noise_scale,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -2958,11 +2959,18 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
-  // σ（单帧，线性域 WB 后）：mismatch 归一化（uSigma）与融合后折减共用
+  // σ（单帧，线性域 WB 后）：v0.10.1 短参考帧下参考帧噪声比典型帧高
+  // ref_noise_scale（= √(AE_sec/secRef)，1.0 = 未压短）。denoiseParams 用
+  // **典型帧（alt）域**（P0/P4 的融合输入以 alt 为主）；mismatch 的 σ 用
+  // **参考帧域**（d = ref−alt 的噪声底 = σr²+σa²，σr 大则底大，不归一会让
+  // 静止 tile 的 mismatch 系统性偏高、权重白掉）。
   bool dn_high = false;
   float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
-  denoiseParams(noise_level, noise_sigma, &dn_high, &sr_k, &sc_k, &ns, &ns_raw);
+  const float rn = std::max(ref_noise_scale, 1.0f);
+  denoiseParams(noise_level, noise_sigma / rn, &dn_high, &sr_k, &sc_k, &ns,
+                &ns_raw);
   const float ns_single = ns;
+  const float ns_ref = ns_single * rn;
   // 阶段二：保存每帧位移场（mismatch 后连同权重一起重写 z 通道）
   std::vector<std::vector<float>> offs(
       static_cast<size_t>(count - 1),
@@ -3008,7 +3016,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // ── 阶段二 robust merge（v0.10.0）：mismatch map → 权重写回 z 通道 ────
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
-  passMfnrMismatch(cfa, black_phase, wl, rc.gains, ns_single, kMfnrMisS);
+  passMfnrMismatch(cfa, black_phase, wl, rc.gains, ns_ref, kMfnrMisS);
   const int n_tiles = tiles_w_ * tiles_h_;
   std::vector<uint8_t> mis(static_cast<size_t>(n_tiles) * 4);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
@@ -3113,6 +3121,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"mMed\":" + f3(m_med) +
               ",\"mP90\":" + f3(m_p90) +
               ",\"neff\":" + f3(neff) +
+              ",\"rn\":" + f3(rn) +
               ",\"dMed\":" + f3(dx_med_max) +
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);

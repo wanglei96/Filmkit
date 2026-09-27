@@ -89,7 +89,8 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
+        noiseLevel: Int, noiseSigma: Float, refNoiseScale: Float,
+        film: DoubleArray,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */
