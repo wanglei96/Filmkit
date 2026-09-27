@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-27 16:10
+updated: 2026-09-27 20:05
 status: active
 ---
 
@@ -106,3 +106,9 @@ status: active
 - [2026-09-27] **调参脚本在 `tools/tuning/`**：whole_cmp（全图对比）/ sky（天空 C*）/ filmic_offline（compute_spline 参考）/ filmic_verify（真机日志对拍）/ filmic_preview（可视化）；已删 ag_scan/desat_scan/chain_probe/preview_domain（旧引擎专属）；CLI 入口已加 realpath 消毒；`__pycache__/` 入 gitignore
 - [2026-09-27] **环境**：mimosa 插件已禁用（`~/.zcode/cli/config.json` enabledPlugins，备份 config.json.bak-mimosa，重启 ZCode 生效）——其 git gate 拦 commit/push（CLI 工具 path-traversal 误报）；本会话曾用 `git hash-object -t commit -w` + `git update-ref` 提交
 - [2026-09-27] **管线顺序定稿（与用户确认）**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化(待做,线性显示域 luma USM) → OETF → 3D LUT → 颗粒 → JPEG；LUT 必须在 OETF 后（.lut 设计域 sRGB）
+
+- [2026-09-27] 发布现状：最新 **v0.9.5-m4（versionCode 149）**，tag v0.9.5-m4 已推送，main=22e37ac；根目录只留 filmkit-0.9.5-m4.apk（旧包已清）
+- [2026-09-27] **MFNR 阶段一实现布局**：`core/engine/src/render/Align.{h,cpp}`（kMfnrTile=64，L4 全局±16→L3/L2 每 tile ±2+亚像素，输出 mosaic 域位移场+conf）；`FrameRenderer.cpp` 新增 kFsMfnrPyr/Down/Fuse、kFsRawDenoiseFused（P0 变体，输入 tex_fused_ R16F）、ensureMfnrTargets、submitRawBurst；submitRaw 抽出 ensureRawTex/uploadRawTex/prepareRawCommon/denoiseParams/finishStillChain 共享；JNI `nativeEngineSubmitRawBurst(frames[],count,strides[],meta…)`；CMakeLists 显式加 Align.cpp；shader 总数 19
+- [2026-09-27] **MFNR 日志字段**：`mfnr.trigger`（mode/trigger/iso/sec）、`mfnr.burst_submit`、`mfnr.capture`（frames/iso/sec 逐帧/ms/lens）、`mfnr.stage`（upload/pyr/align/align_frame×3/fuse/chain，各阶段强制 flush）、`raw.render` 追加 `mfnr:"on"/alignMs/fuseMs/gx/gy/confMed/dMed/dP90/tiles`；prefs `mfnr`（int 0/1/2，默认 1）、设置页「多帧融合」三态行（RAW 降噪后）、取景框「多帧合成中…」（capturePhase==2）
+- [2026-09-27] **MFNR 验收数据（v0.9.5）**：纯融合/裸帧严格 A/B（双侧无空间降噪）σ 比值 **0.442-0.451 ≈ √4 理论 0.500**（低频判据无偏口径）；融合+P0 σluma 1.48 vs PC 1.25（同场景 ISO~1200）；彩噪 5.91 vs PC 6.23；细节 Lap99.5 差距 26%→10%；dMed/dP90 0.3-2.6px；对齐 180-260ms、融合 18-43ms、burst 采集 220-420ms
+- [2026-09-27] **测量方法定案**：噪声 σ 用「低频判据选块 + 高频残差」——32×32 box 低频图梯度（<1.5）选平坦块（判据与噪声水平解耦、无幸存者偏差），16 块级高频残差 std；自适应梯度 mask 跨噪声水平比较无效（lessons 同条）；验证插值相位映射可用「线性场景逐点精确」性质离线跑 python 镜像

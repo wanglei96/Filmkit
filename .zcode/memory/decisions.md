@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-27 16:10
+updated: 2026-09-27 20:05
 status: active
 ---
 
@@ -106,3 +106,11 @@ status: active
 - [2026-09-27] **管线顺序与用户确认定稿**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化 → OETF → 3D LUT → 颗粒 → JPEG。硬约束：LUT 必须 OETF 之后（42 个 .lut 设计域 sRGB）
 - [2026-09-27] **mimosa 插件禁用（用户授权）**——官方市场 ZIP 非用户配置，L3 git gate 的 path-traversal 报告为 CLI 工具误报且无豁免通道；`~/.zcode/cli/config.json` enabledPlugins=false（备份 config.json.bak-mimosa）
 - [2026-09-27] **调参脚本迁 `tools/tuning/`，test_temp 只存样片（用户要求）**——删旧引擎专属脚本 ag_scan/desat_scan/chain_probe/preview_domain；CLI 工具入口加 realpath 消毒
+
+- [2026-09-27] **MFNR 对齐 tile 直接进阶段一（用户拍板）**——调研定案：HDR+/Night Sight/PhotonCamera 全部 tile-based 粗到细，手持下全局单一位移不成立（HDR+ Fig.5 明示 hierarchical 必须）；P2 只剩 mismatch/运动检测
+- [2026-09-27] **MFNR 设置三档**（用户定稿）：prefs `mfnr` 0 关 / 1 自动暗光（ISO≥600 或曝光≥25ms）/ 2 强制；判定纯函数 `mfnrShouldTrigger` 与单测同源
+- [2026-09-27] **MFNR 融合 = 等权均值**（阶段一）——自加的"残差/纹理度"置信度加权否定：暗部残差与梯度均被噪声主导，比值系统性落进不可信区（confMed 0.005、回退 9095/9216 tile），而暗部恰是主战场；防鬼影归 P2（HDR+ DFT 维纳收缩 + Night Sight mismatch map）
+- [2026-09-27] **空间降噪 σ 融合后 ÷√N**——P0/P4 的值域 σ 正比 ns，融合后仍喂单帧 σ 会错配：残余噪声（>4σr）漏过而纹理（1-2σr）被抹（"糊+降噪一般"双重观感）；HDR+ σ²/N 同思路
+- [2026-09-27] **MFNR 融合 = tile 64 + 每通道网格亚像素双线性**（用户拍板一步到位）——把 mosaic 视为 2×2 打包点阵（无损重排），R/G/Gb/B 各自间隔 2px 的采样阵上同相位 4-tap 插值，零色度污染；2px 偶数量化与 1px+phaseFix 路线均退役（dMed/dP90 实测 8-21px 位移下量化残差是细节差距来源）
+- [2026-09-27] **MFNR 采集 = maxImages 4 + 帧 1-3 拷贝即 close**——v0.9.0 的 maxImages 5+4 Image 全程持有让 HAL 一次预配 125MB graphic buffer，闪退（进程存活、Activity 销毁、capture 未执行）；仅参考帧持 Image 供 DngCreator，DNG 写完关闭
+- [2026-09-27] **噪声测量必须用与噪声水平无关的选块判据**（低频图梯度）——自适应梯度 mask 跨噪声水平比较有幸存者偏差：裸帧组平坦块 400/77K 幸存，σ 被低估 45%，曾误判"融合量不足/FPN 主导"；无偏口径实测融合/裸帧 = 0.442-0.451 ≈ √4 理论，FPN 假设否定

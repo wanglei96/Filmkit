@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-09-27 16:10
+updated: 2026-09-27 20:05
 status: active
 ---
 
@@ -118,3 +118,11 @@ status: active
 - [2026-09-27] **"恒等的旧层"在域外是失真源**：旧 log 链 ±4EV 内恒等，但域外半斜率延展把最暗 0.5%（pLo≈-5.6EV）压缩后才进 filmic，而 blackEv 标定用原始分位——标定域与渲染域不一致。中性恒等的旧层（尤其带域外行为的）应删链而非保留
 - [2026-09-27] **Mimosa git gate 应对**：env 传不进 hook 进程、realpath 消毒不改其 Python 判定、MCP 密封扫描不被消费、commit-tree 也被语义识别——只有 hash-object -t commit -w + update-ref 可行（或重启客户端后正常 commit）
 - [2026-09-27] **成员变量跨 engine 会话丢失**：nativeEngineStart 每次 new FrameRenderer——跨会话状态（如域比）必须进程级 static 或外部持久化，否则"冷启动永远不收敛"
+
+- [2026-09-27] **ImageReader maxImages 提高且全程持有 Image 的 HAL buffer 压力**：maxImages=5+4 张 25MB Image 全程持有 → HAL 一次预配 125MB → 闪退形态特殊（进程存活、Activity 反复销毁、`capture()` 从未执行，且 `mfnr.trigger` 与 `engine.stop` 同一 FILE 缓冲 FIFO 排除"日志丢失"）；修复 = 拷贝即 close（帧 1-3），仅参考帧持 Image（DngCreator 只吃 Image，DNG 写完关闭）
+- [2026-09-27] **Logger fwrite 缓冲在崩溃时丢日志**：JSONL 的 FILE 缓冲约 4KB，进程死亡时未落盘内容丢失——同一缓冲 FIFO 排序可用于反证（后写的出现而先写的缺失 = 先写的从未执行）；关键路径（拍照入口、mfnr.stage 各阶段）必须主动 flush
+- [2026-09-27] **GLSL ES 两个编译期黑屏级坑（glslang 校验器可拦）**：① 不支持数组初始化器 `ivec2 a[4] = {...}`（desktop 4.2+ 特性），改条件链展开；② sampler 类型函数参数必须显式精度限定 `highp usampler2D t`（ES 无 sampler 默认精度）——本项目已两次踩中②
+- [2026-09-27] **shell 管道吞退出码**：`bash validate-shaders.sh | tail && ...` 的 `&&` 看到的是 tail 的退出码，带病 shader 曾被打进 APK 并推送（amend 重发）——校验类命令必须 `RC=$?` 判断真实退出码后再放行构建
+- [2026-09-27] **亚像素双线性的边界外推**：负位移+图像边缘时 `floor(s)=-1` 使双线性权重 >1 变外推（python 镜像 27648 样本验证抓出）——网格坐标 s 先 clamp 到 [0, gmax]（CLAMP_TO_EDGE 语义），右端 tap min 收敛；相位映射可用"线性场景插值逐点精确"性质离线验证
+- [2026-09-27] **噪声测量的幸存者偏差**：自适应梯度阈值选平坦块时，噪声越大被排除的块越多（裸帧 400 块 vs 融合 77K 块幸存），σ 被系统性低估且两组偏差方向相反——跨噪声水平比较必须用与噪声无关的判据（低频 box 图梯度）且两组块数相当；DNG 是参考帧底片（未融合），raw 域测不了融合结果，只能验证输入一致性
+- [2026-09-27] **参考实现事实**：timothybrooks/hdr-plus（MIT）是 HDR+ 最忠实开源复现（tile 对齐+DFT 鲁棒合并=维纳收缩），阶段二合并首选参考；IPOL 2021 HDR+ 分析版（AGPL）更好读；Sabre=Handheld MFSR 论文（arXiv:1905.03277）是超分路线（kernel regression），对纯降噪收益不匹配；Google 未开源任何 merging 代码，PhotonCamera 亦为按论文自写（GLSL）而非逆向
