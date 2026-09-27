@@ -32,6 +32,9 @@ struct MfnrAlignOut {
   float gx = 0.f, gy = 0.f; // 全局位移（mosaic 域，日志）
   float gcost = 0.f;        // 全局最优 SAD（8bit 灰度和，日志）
   float conf_med = 1.f;     // 置信度中位（日志）
+  // 位移幅度分布（|off|，mosaic 域；日志用——判定帧间位移量级，
+  // 决定亚像素融合升级的必要性）
+  float dx_med = 0.f, dx_p90 = 0.f;
 };
 
 // tile 32×32 @ 1/2 域（= 64×64 mosaic；Night Sight 暗光档 tile 同量级）

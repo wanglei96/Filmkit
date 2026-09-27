@@ -2685,6 +2685,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   capturePyr(raw_tex_, &ref);
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
+  float dx_med_max = 0.f, dx_p90_max = 0.f;
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
@@ -2709,6 +2710,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     gx_sum += a.gx;
     gy_sum += a.gy;
     conf_sum += a.conf_med;
+    dx_med_max = std::max(dx_med_max, a.dx_med);
+    dx_p90_max = std::max(dx_p90_max, a.dx_p90);
   }
   align_ms = std::chrono::duration<float, std::milli>(
                  std::chrono::steady_clock::now() - t0)
@@ -2736,6 +2739,13 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   bool dn_high = false;
   float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
   denoiseParams(noise_level, noise_sigma, &dn_high, &sr_k, &sc_k, &ns, &ns_raw);
+  // MFNR（v0.9.3）：融合把噪声 σ 降为单帧的 1/√N，P0/P4 的值域 σ 正比于 ns，
+  // 仍喂单帧 σ 会错配 —— 真机 A/B（v0.9.2）实测：残余噪声（>4σr）依旧漏过、
+  // 低对比纹理（1-2σr）反被抹掉（"降噪一般 + 糊"的双重观感）。σ 折减后值域
+  // 重新对准融合后的信噪比：对残余噪声恢复作用、对纹理保持选择性。
+  // （HDR+ 同款思路：merge 后按实际合并帧数更新噪声方差 σ²/N。）
+  const float ns_single = ns;
+  ns /= 2.0f;  // √N，N=4
   ChainCtx c;
   c.w = w;
   c.h = h;
@@ -2754,7 +2764,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.sr_k = sr_k;
   c.sc_k = sc_k;
   c.ns = ns;
-  c.ns_raw = ns_raw;
+  c.ns_raw = ns_single;
   c.lsc_ok = rc.lsc_ok;
   c.lsc_cols = lsc_cols;
   c.lsc_rows = lsc_rows;
@@ -2767,6 +2777,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"gx\":" + f3(gx_sum / (count - 1)) +
               ",\"gy\":" + f3(gy_sum / (count - 1)) +
               ",\"confMed\":" + f3(conf_sum / (count - 1)) +
+              ",\"dMed\":" + f3(dx_med_max) +
+              ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
   finishStillChain(c, t0, out_rgba);
   return true;

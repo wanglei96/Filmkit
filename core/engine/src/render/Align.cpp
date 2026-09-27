@@ -178,6 +178,20 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   out.conf_med = n_tiles > 0 ? conf_sum / n_tiles : 0.f;
   out.gx = static_cast<float>(bgx) * 4.f;
   out.gy = static_cast<float>(bgy) * 4.f;
+  // 位移幅度分布（仅统计有纹理的 tile：conf > 0.2）
+  std::vector<float> mags;
+  mags.reserve(static_cast<size_t>(n_tiles));
+  for (int t = 0; t < n_tiles; ++t) {
+    if (out.conf[static_cast<size_t>(t)] <= 0.2f) continue;
+    const float dx = out.off[static_cast<size_t>(t) * 2];
+    const float dy = out.off[static_cast<size_t>(t) * 2 + 1];
+    mags.push_back(std::sqrt(dx * dx + dy * dy));
+  }
+  if (!mags.empty()) {
+    std::sort(mags.begin(), mags.end());
+    out.dx_med = mags[mags.size() / 2];
+    out.dx_p90 = mags[mags.size() * 9 / 10];
+  }
   return out;
 }
 
