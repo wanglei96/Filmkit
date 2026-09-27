@@ -725,8 +725,25 @@ vec3 off3At(vec2 uv) {
     return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
 }
 ivec2 evenNear(vec2 o) {
-    // 最近偶数：round 到 2 的倍数，保证采样点与参考帧同 Bayer 相位
-    return ivec2(floor(o.x * 0.5 + 0.5) * 2.0, floor(o.y * 0.5 + 0.5) * 2.0);
+    // v0.9.4：位移 round 到 **1px 整数**（v0.9.0-0.9.3 是 round 到最近偶数=2px
+    // 网格）。真机 dMed/dP90 实测帧间位移 8-21px，2px 量化残差 ±1px 在 4 帧均值
+    // 时把细节平均掉（PC 对照：Lap 29.8 vs 40.4）。奇数位移的 CFA 相位差由
+    // phaseFix 补偿 —— 采样点向最近的同相位像素挪 ≤1px，保证永远同色平均。
+    return ivec2(floor(o.x + 0.5), floor(o.y + 0.5));
+}
+ivec2 phaseFix(ivec2 p, ivec2 d) {
+    int c0 = chanAt(p);
+    if (chanAt(p + d) == c0) return d;  // 偶数位移：相位天然相同，零修正
+    // GLSL ES 无数组初始化器（desktop 4.2+ 特性），直白展开 8 个候选位
+    if (chanAt(p + d + ivec2(1, 0)) == c0) return d + ivec2(1, 0);
+    if (chanAt(p + d + ivec2(-1, 0)) == c0) return d + ivec2(-1, 0);
+    if (chanAt(p + d + ivec2(0, 1)) == c0) return d + ivec2(0, 1);
+    if (chanAt(p + d + ivec2(0, -1)) == c0) return d + ivec2(0, -1);
+    if (chanAt(p + d + ivec2(1, 1)) == c0) return d + ivec2(1, 1);
+    if (chanAt(p + d + ivec2(1, -1)) == c0) return d + ivec2(1, -1);
+    if (chanAt(p + d + ivec2(-1, 1)) == c0) return d + ivec2(-1, 1);
+    if (chanAt(p + d + ivec2(-1, -1)) == c0) return d + ivec2(-1, -1);
+    return d;  // 不可达：2×2 周期内 4 个相位必有一个与 c0 相等
 }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -735,15 +752,15 @@ void main() {
     vec2 uv = (vec2(p) + 0.5) / (uTiles * 64.0);
     vec3 f1 = off1At(uv);
     float w1 = f1.z;
-    acc += w1 * linAt(uRaw1, p + evenNear(f1.xy));
+    acc += w1 * linAt(uRaw1, p + phaseFix(p, evenNear(f1.xy)));
     wsum += w1;
     vec3 f2 = off2At(uv);
     float w2 = f2.z;
-    acc += w2 * linAt(uRaw2, p + evenNear(f2.xy));
+    acc += w2 * linAt(uRaw2, p + phaseFix(p, evenNear(f2.xy)));
     wsum += w2;
     vec3 f3 = off3At(uv);
     float w3 = f3.z;
-    acc += w3 * linAt(uRaw3, p + evenNear(f3.xy));
+    acc += w3 * linAt(uRaw3, p + phaseFix(p, evenNear(f3.xy)));
     wsum += w3;
     float v = acc / max(wsum, 1e-4);
     oColor = vec4(v, v, v, 1.0);
