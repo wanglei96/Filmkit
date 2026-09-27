@@ -37,8 +37,10 @@ struct MfnrAlignOut {
   float dx_med = 0.f, dx_p90 = 0.f;
 };
 
-// tile 32×32 @ 1/2 域（= 64×64 mosaic；Night Sight 暗光档 tile 同量级）
-constexpr int kMfnrTile = 32;
+// tile 64×64 @ 1/2 域（= 128×128 mosaic；Night Sight 暗光档 tile 64@1/4 同量级
+// —— v0.9.4 的 dMed/dP90 实测手持帧间位移 8-21px，32 tile 的 256 采样点在
+// ISO 1000+ 被 SAD 抹平，翻倍后采样 ×4、tile 数减半，对齐时间基本不变）
+constexpr int kMfnrTile = 64;
 
 // 对 cur 帧对齐到 ref。tiles_x/y = 1/2 域 tile 网格（FrameRenderer 按
 // w1=(w+1)/2、tiles=ceil(w1/32) 算出后传入）。

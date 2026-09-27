@@ -343,7 +343,8 @@ class FrameRenderer {
   } u_mfnr_down_;
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
-          tiles = -1, black = -1, white = -1, gain = -1, cfalut = -1;
+          tiles = -1, tile_m = -1, black = -1, white = -1, gain = -1,
+          cfalut = -1;
   } u_mfnr_fuse_;
   struct {
     GLint tex = -1, size = -1, ns = -1, k = -1;

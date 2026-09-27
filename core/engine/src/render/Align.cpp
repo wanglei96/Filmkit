@@ -94,8 +94,11 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   }
   out.gcost = static_cast<float>(best4) / std::max(samples4, 1);
 
-  // ── 2) L3（1/8 域）每 tile 精化：tile 8×8，初值 = 2×L4 全局位移 ──────
-  constexpr int kTile3 = 8, kTile2 = 16, kRange = 2;
+  // ── 2) L3（1/8 域）每 tile 精化：初值 = 2×L4 全局位移 ────────────────
+  // 3) L2（1/4 域）每 tile 精化：±2。tile 随 kMfnrTile 逐级减半（1/2 域 64 →
+  //    L2 域 32 → L3 域 16，同一物理区域），输出到 1/2 域 tile 网格（tiles_x/y）。
+  //    位移域换算 L2→mosaic = ×4。
+  constexpr int kTile3 = kMfnrTile / 4, kTile2 = kMfnrTile / 2, kRange = 2;
   const int nx3 = (ref.w3 + kTile3 - 1) / kTile3;
   const int ny3 = (ref.h3 + kTile3 - 1) / kTile3;
   std::vector<int> d3x(static_cast<size_t>(nx3 * ny3), 0);
@@ -122,8 +125,8 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   }
 
   // ── 3) L2（1/4 域）每 tile 精化（±2）+ 亚像素 + 置信度 ──────────────
-  // 输出到 1/2 域 tile 网格（tiles_x/y）。1/2 域 32px tile = L2 域 16px tile =
-  // L3 域 8px tile 的同一区域；位移域换算 L2→mosaic = ×4。
+  // 输出到 1/2 域 tile 网格（tiles_x/y）。1/2 域 64px tile ≡ L3 域 16px tile
+  //（同一区域逐级减半），位移域换算 L2→mosaic = ×4。
   constexpr float kConf0 = 0.40f, kConf1 = 0.90f, kGradEps = 4.0f;
   float conf_sum = 0.f;
   for (int ty = 0; ty < tiles_y; ++ty) {
