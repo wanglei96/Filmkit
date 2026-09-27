@@ -2685,20 +2685,23 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   capturePyr(raw_tex_, &ref);
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
-  int fallback = 0;
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
     stage("align_frame");
-    // 打包位移场（xy=mosaic 域位移、z=conf、w=1）上传
+    // 打包位移场（xy=mosaic 域位移、z=权重恒 1）。v0.9.2 定案：阶段一 =
+    // 对齐 + **等权**时域均值（立项字面范围）。v0.9.1 曾用"残差/纹理度"算
+    // 置信度加权，真机 A/B 确诊失效（confMed 0.005、fbTiles 9095/9216）——
+    // 暗部的 SAD 残差与梯度都被噪声主导，比值系统性落进"不可信"区，而暗部
+    // 恰是 MFNR 的主战场。防鬼影（mismatch map/运动检测）是 P2 的职责，
+    // 届时换 HDR+ 式频域收缩，不再用这个比值。conf 仅保留日志观测。
     std::vector<float> pack(static_cast<size_t>(tiles_w_) * tiles_h_ * 4, 1.f);
     for (int t = 0; t < tiles_w_ * tiles_h_; ++t) {
       pack[static_cast<size_t>(t) * 4 + 0] = a.off[static_cast<size_t>(t) * 2];
       pack[static_cast<size_t>(t) * 4 + 1] =
           a.off[static_cast<size_t>(t) * 2 + 1];
-      pack[static_cast<size_t>(t) * 4 + 2] = a.conf[static_cast<size_t>(t)];
-      if (a.conf[static_cast<size_t>(t)] < 0.1f) ++fallback;
+      pack[static_cast<size_t>(t) * 4 + 2] = 1.0f;
     }
     glBindTexture(GL_TEXTURE_2D, tex_off_[i - 1]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tiles_w_, tiles_h_, GL_RGBA,
@@ -2764,7 +2767,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"gx\":" + f3(gx_sum / (count - 1)) +
               ",\"gy\":" + f3(gy_sum / (count - 1)) +
               ",\"confMed\":" + f3(conf_sum / (count - 1)) +
-              ",\"fbTiles\":" + std::to_string(fallback) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
   finishStillChain(c, t0, out_rgba);
   return true;
