@@ -426,6 +426,12 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun setEv(ev: Float) {
         evSteps = (ev / evStep).toInt().coerceIn(evRange.lower, evRange.upper)
+        // v0.7.8：EV 同步进引擎（FilmParams[0] = exposure_ev）。原先只写 HAL 的
+        // CONTROL_AE_EXPOSURE_COMPENSATION，而 X300 在 RAW 静拍上对它几乎不执行
+        // （+0.7EV 实测只给 +0.1EV：sec 0.0014→0.0015s），RAW 成片纹丝不动；
+        // 且引擎侧若在统计前乘 EV，auto 黑点又会把它归一（kFsFilm 注释）。
+        // 现在语义 = 显示亮度补偿（filmic 之后 ×2^EV），HAL 补偿撤除，单一来源。
+        filmParams[0] = (evSteps * evStep).toDouble()
         rebuildRepeating()
     }
 
@@ -680,7 +686,11 @@ class CameraController(private val context: Context, private val render: RenderC
                     else -> CaptureRequest.CONTROL_AE_MODE_ON
                 },
             )
-            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
+            // v0.7.8：不再写 CONTROL_AE_EXPOSURE_COMPENSATION —— EV 滑杆改走引擎
+            // 显示亮度补偿（filmParams[0]）。X300 对 RAW 静拍流的 HAL 补偿几乎不执行
+            // （+0.7EV 实测只给 +0.1EV），且 HAL 补偿会改变 DNG 底片本体；引擎补偿
+            // 只动渲染、底片保持原始曝光（符合 RAW 语义）。预览由 kFsOes 的
+            // uExposure 承担同一值，预览/成片一致。
         }
         // WB 恒为 AWB AUTO：手动白平衡走引擎侧补偿（updateWbCompensation），
         // 不再 AWB OFF + 矩阵（X300 实测 CCT 忽略、矩阵路径观感不可控）
@@ -736,6 +746,9 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun setFilmParams(p: DoubleArray) {
         filmParams = p
+        // [0] = 用户 EV（setEv 维护）：预设基线里是 0，换数组后必须回填当前滑杆值，
+        // 否则初始化序列（setFilmParams → setEv 之外的任何重置）会把 EV 静默清零
+        p[0] = (evSteps * evStep).toDouble()
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
         lookPref = -1.0  // 同上，[31]
