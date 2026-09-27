@@ -27,6 +27,14 @@ float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范
 // 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
 // 跟着细节走、把暗部内部对比压平。
 constexpr int kLocalW = 32, kLocalH = 24;
+// ── MFNR 阶段二（v0.10.0）robust merge 标定常数 ─────────────────────────
+// s：mismatch 的 σ 缩放 —— m = d²/(d²+s·σ²)。噪声底（d²≈2σ²，两独立噪声样本之
+// 差）时 m = 2/(2+s)：s=16 → m≈0.11（权重 0.89，基本满融）；运动 tile 的 d² 远超
+// 噪声底 → m→1（权重→0，回退参考帧）。离线扫描（tools/tuning 同法）真机再调。
+constexpr float kMfnrMisS = 16.0f;
+// c（Night Sight "temporal strength" 的稳健端）：w = max(1 − c·m, 0)。c=1 = m=1
+// 完全弃帧；c=0 退化为阶段一等权均值（A/B 通路，也等于关掉 robust merge）。
+constexpr float kMfnrRobust = 1.0f;
 // ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
 // "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
 // 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
@@ -768,6 +776,131 @@ void main() {
     oColor = vec4(v, v, v, 1.0);
 })";
 
+// kFsMfnrMismatch：阶段二 robust merge（v0.10.0）—— Night Sight 式 mismatch map。
+// 每 tile 归约"对齐后残差" mean(d²)：d = ref(p) − alt_sub(p+off)，采样与 kFsMfnrFuse
+// **逐字同构**（同相位 linSub 4-tap）—— d 恰是融合权重为 1 时该帧实际注入的误差，
+// 这保证 mismatch 度量与融合行为严格一致。m = d²/(d² + s·σ²)：σ = 单帧线性域噪声
+//（WB 后同域），噪声自适应 —— 噪声越大容忍度越高（纯噪声 tile 的 d²≈2σ² 只给
+// 小 mismatch），运动/鬼影 tile 的 d² 远超噪声底才被压权重。
+// 为什么不用 hdr-plus 的 L1 硬阈值反比（其实现 factor 8 / min 10 / max 300 是
+// 针对自身域的常数，不随噪声走）：Night Sight §3.2 的 m_tz = d²/(d²+s·σ_tz²)
+// 是同一思想的噪声归一化形式，暗光（主战场）必需。为什么不做 DFT 维纳收缩：
+// HDR+ 论文 Fig.6 自己证明 DFT 域收缩对单个离群帧脆弱（离群抬高全部系数使信号
+// 非稀疏），Night Sight 也演进为 pairwise+mismatch；且 16×16 DFT 在 GPU 上
+// 不现实（hdr-plus 是 CPU OpenMP 实现）。
+// 输出 RGBA8：R/G/B = 帧 1/2/3 的 m ∈ [0,1]（8bit 量化 0.4% 对权重可忽略），
+// A = 1 占位。CPU 读回后算 w = max(1−c·m, 0) 写回位移场 z 通道（Fuse 零改动，
+// z 的双线性插值天然给出 64px 平滑过渡），并统计 N_eff 供 σ 联动。
+const char* kFsMfnrMismatch = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp usampler2D uRaw0;
+uniform highp usampler2D uRaw1;
+uniform highp usampler2D uRaw2;
+uniform highp usampler2D uRaw3;
+uniform highp sampler2D uOff1;
+uniform highp sampler2D uOff2;
+uniform highp sampler2D uOff3;
+uniform ivec2 uSize;
+uniform vec2 uTiles;
+uniform float uTileM;
+uniform float uSigma;  // 单帧线性域 σ（WB 后，= denoiseParams 的 ns_raw）
+uniform float uS;      // mismatch 的 σ 缩放常数（标定旋钮）
+uniform int uCfaLut;
+uniform vec4 uBlack;
+uniform float uWhite;
+uniform vec3 uGain;
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+float linAt(highp usampler2D t, ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    float v = float(texelFetch(t, p, 0).r);
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+vec3 off1At(vec2 uv) {
+    vec2 px = uv * uTiles - 0.5;
+    vec2 fr = fract(px);
+    ivec2 i0 = ivec2(floor(px));
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    vec3 a = texelFetch(uOff1, lo, 0).rgb;
+    vec3 b = texelFetch(uOff1, ivec2(hi.x, lo.y), 0).rgb;
+    vec3 c = texelFetch(uOff1, ivec2(lo.x, hi.y), 0).rgb;
+    vec3 d = texelFetch(uOff1, hi, 0).rgb;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+vec3 off2At(vec2 uv) {
+    vec2 px = uv * uTiles - 0.5;
+    vec2 fr = fract(px);
+    ivec2 i0 = ivec2(floor(px));
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    vec3 a = texelFetch(uOff2, lo, 0).rgb;
+    vec3 b = texelFetch(uOff2, ivec2(hi.x, lo.y), 0).rgb;
+    vec3 c = texelFetch(uOff2, ivec2(lo.x, hi.y), 0).rgb;
+    vec3 d = texelFetch(uOff2, hi, 0).rgb;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+vec3 off3At(vec2 uv) {
+    vec2 px = uv * uTiles - 0.5;
+    vec2 fr = fract(px);
+    ivec2 i0 = ivec2(floor(px));
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    vec3 a = texelFetch(uOff3, lo, 0).rgb;
+    vec3 b = texelFetch(uOff3, ivec2(hi.x, lo.y), 0).rgb;
+    vec3 c = texelFetch(uOff3, ivec2(lo.x, hi.y), 0).rgb;
+    vec3 d = texelFetch(uOff3, hi, 0).rgb;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+float linSub(highp usampler2D t, ivec2 p, vec2 d) {
+    ivec2 ph = ivec2(p.x & 1, p.y & 1);
+    vec2 gmax = vec2(uSize - 1 - ph) * 0.5;
+    vec2 s = clamp((vec2(p) + d - vec2(ph)) * 0.5, vec2(0.0), gmax);
+    vec2 s0 = floor(s);
+    vec2 w = s - s0;
+    ivec2 hi = ph + ((uSize - 1 - ph) & ~1);
+    ivec2 b = ph + ivec2(s0) * 2;
+    float v00 = linAt(t, b);
+    float v10 = linAt(t, min(b + ivec2(2, 0), hi));
+    float v01 = linAt(t, min(b + ivec2(0, 2), hi));
+    float v11 = linAt(t, min(b + ivec2(2, 2), hi));
+    return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+}
+void main() {
+    ivec2 t = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(t) + 0.5) / uTiles;  // tile 中心（fuse 同式，取本 tile 位移）
+    vec2 o1 = off1At(uv).xy;
+    vec2 o2 = off2At(uv).xy;
+    vec2 o3 = off3At(uv).xy;
+    ivec2 base = t * int(uTileM);
+    int tm = int(uTileM);
+    float s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    float n = 0.0;
+    for (int dy = 0; dy < tm; dy += 4) {
+        for (int dx = 0; dx < tm; dx += 4) {
+            ivec2 p = base + ivec2(dx, dy);
+            if (p.x >= uSize.x || p.y >= uSize.y) continue;
+            float r = linAt(uRaw0, p);
+            float d1 = r - linSub(uRaw1, p, o1);
+            float d2 = r - linSub(uRaw2, p, o2);
+            float d3 = r - linSub(uRaw3, p, o3);
+            s1 += d1 * d1;
+            s2 += d2 * d2;
+            s3 += d3 * d3;
+            n += 1.0;
+        }
+    }
+    float inv = 1.0 / max(n, 1.0);
+    float v1 = s1 * inv, v2 = s2 * inv, v3 = s3 * inv;
+    float k = uS * uSigma * uSigma;
+    oColor = vec4(v1 / (v1 + k), v2 / (v2 + k), v3 / (v3 + k), 1.0);
+})";
+
 // kFsRawDenoiseFused：P0 同色 bilateral 的 MFNR 变体——输入换成 tex_fused_
 //（融合后的线性 mosaic 值，已扣黑阶/WB），bilateral 逻辑与 kFsRawDenoise 逐字
 // 相同。CFA 掩码在输出端补上（fused 纹理只存单通道值）。写成完整独立 shader
@@ -1372,11 +1505,14 @@ bool FrameRenderer::init() {
   const GLuint fs_mfnr_pyr = compileShader(GL_FRAGMENT_SHADER, kFsMfnrPyr);
   const GLuint fs_mfnr_down = compileShader(GL_FRAGMENT_SHADER, kFsMfnrDown);
   const GLuint fs_mfnr_fuse = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFuse);
+  const GLuint fs_mfnr_mis =
+      compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
       !fs_raw_dn || !fs_chroma_dn || !fs_hist || !fs_local ||
-      !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_raw_dn_f)
+      !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
+      !fs_raw_dn_f)
     return false;
 
   prog_oes_ = linkProgram(vs_rot_, fs_oes);
@@ -1395,6 +1531,7 @@ bool FrameRenderer::init() {
   prog_mfnr_pyr_ = linkProgram(vs_plain_, fs_mfnr_pyr);
   prog_mfnr_down_ = linkProgram(vs_plain_, fs_mfnr_down);
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
+  prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
   glDeleteShader(fs_oes);
   glDeleteShader(fs_still);
@@ -1412,12 +1549,13 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_mfnr_pyr);
   glDeleteShader(fs_mfnr_down);
   glDeleteShader(fs_mfnr_fuse);
+  glDeleteShader(fs_mfnr_mis);
   glDeleteShader(fs_raw_dn_f);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
       !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
-      !prog_raw_dn_fused_)
+      !prog_mfnr_mis_ || !prog_raw_dn_fused_)
     return false;
 
   u_oes_.st = glGetUniformLocation(prog_oes_, "uST");
@@ -1532,6 +1670,24 @@ bool FrameRenderer::init() {
   u_mfnr_fuse_.black = glGetUniformLocation(prog_mfnr_fuse_, "uBlack");
   u_mfnr_fuse_.white = glGetUniformLocation(prog_mfnr_fuse_, "uWhite");
   u_mfnr_fuse_.gain = glGetUniformLocation(prog_mfnr_fuse_, "uGain");
+
+  for (int i = 0; i < 4; ++i) {
+    u_mfnr_mis_.raw[i] =
+        glGetUniformLocation(prog_mfnr_mis_, ("uRaw" + std::to_string(i)).c_str());
+  }
+  for (int i = 0; i < 3; ++i) {
+    u_mfnr_mis_.off[i] =
+        glGetUniformLocation(prog_mfnr_mis_, ("uOff" + std::to_string(i + 1)).c_str());
+  }
+  u_mfnr_mis_.size = glGetUniformLocation(prog_mfnr_mis_, "uSize");
+  u_mfnr_mis_.tiles = glGetUniformLocation(prog_mfnr_mis_, "uTiles");
+  u_mfnr_mis_.tile_m = glGetUniformLocation(prog_mfnr_mis_, "uTileM");
+  u_mfnr_mis_.sigma = glGetUniformLocation(prog_mfnr_mis_, "uSigma");
+  u_mfnr_mis_.s = glGetUniformLocation(prog_mfnr_mis_, "uS");
+  u_mfnr_mis_.cfalut = glGetUniformLocation(prog_mfnr_mis_, "uCfaLut");
+  u_mfnr_mis_.black = glGetUniformLocation(prog_mfnr_mis_, "uBlack");
+  u_mfnr_mis_.white = glGetUniformLocation(prog_mfnr_mis_, "uWhite");
+  u_mfnr_mis_.gain = glGetUniformLocation(prog_mfnr_mis_, "uGain");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
@@ -1689,6 +1845,7 @@ void FrameRenderer::release() {
   if (prog_mfnr_pyr_) glDeleteProgram(prog_mfnr_pyr_);
   if (prog_mfnr_down_) glDeleteProgram(prog_mfnr_down_);
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
+  if (prog_mfnr_mis_) glDeleteProgram(prog_mfnr_mis_);
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
   for (auto& t : tex_mfnr_) {
     if (t) glDeleteTextures(1, &t);
@@ -1698,6 +1855,9 @@ void FrameRenderer::release() {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
+  if (tex_mis_) glDeleteTextures(1, &tex_mis_);
+  if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
+  tex_mis_ = fbo_mis_ = 0;
   if (tex_pyr1_) glDeleteTextures(1, &tex_pyr1_);
   if (fbo_pyr1_) glDeleteFramebuffers(1, &fbo_pyr1_);
   if (tex_pyr2_) glDeleteTextures(1, &tex_pyr2_);
@@ -1708,10 +1868,14 @@ void FrameRenderer::release() {
   if (fbo_pyr4_) glDeleteFramebuffers(1, &fbo_pyr4_);
   if (tex_fused_) glDeleteTextures(1, &tex_fused_);
   if (fbo_fused_) glDeleteFramebuffers(1, &fbo_fused_);
+  if (tex_mis_) glDeleteTextures(1, &tex_mis_);
+  if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
   prog_mfnr_pyr_ = prog_mfnr_down_ = prog_mfnr_fuse_ = prog_raw_dn_fused_ = 0;
+  prog_mfnr_mis_ = 0;
   tex_pyr1_ = tex_pyr2_ = tex_pyr3_ = tex_pyr4_ = 0;
   fbo_pyr1_ = fbo_pyr2_ = fbo_pyr3_ = fbo_pyr4_ = 0;
   tex_fused_ = fbo_fused_ = 0;
+  tex_mis_ = fbo_mis_ = 0;
   pyr1_w_ = pyr1_h_ = 0;
   mfnr_w_ = mfnr_h_ = 0;
   tiles_w_ = tiles_h_ = 0;
@@ -2589,6 +2753,12 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0, GL_RGBA,
                  GL_HALF_FLOAT, nullptr);
   }
+  // mismatch map（RGBA8，tiles 尺寸；m∈[0,1] 8bit 量化 0.4% 对权重可忽略）
+  if (tex_mis_) {
+    glDeleteTextures(1, &tex_mis_);
+    glDeleteFramebuffers(1, &fbo_mis_);
+  }
+  makeTex(&tex_mis_, &fbo_mis_, GL_RGBA8, tw, th);
   mfnr_w_ = w;
   mfnr_h_ = h;
   tiles_w_ = tw;
@@ -2654,6 +2824,43 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(u_mfnr_fuse_.white, white_level);
   glUniform3f(u_mfnr_fuse_.gain, gains[0], gains[1], gains[2]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// mismatch pass（阶段二）：位移场 xy + 4 帧 → tex_mis_（RGBA8 tiles 网格）。
+// 采样路径与 kFsMfnrFuse 逐字同构 —— d = ref(p) − alt_sub(p+off) 正是融合
+// 权重为 1 时该帧注入的误差，mismatch 与融合行为严格一致。σ = 单帧线性域。
+void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
+                                     float white_level, const float gains[3],
+                                     float sigma, float s_const) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
+  glViewport(0, 0, tiles_w_, tiles_h_);
+  glUseProgram(prog_mfnr_mis_);
+  const GLenum units[7] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
+                           GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6};
+  const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
+  for (int i = 0; i < 4; ++i) {
+    glActiveTexture(units[i]);
+    glBindTexture(GL_TEXTURE_2D, raws[i]);
+    glUniform1i(u_mfnr_mis_.raw[i], i);
+  }
+  for (int i = 0; i < 3; ++i) {
+    glActiveTexture(units[4 + i]);
+    glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
+    glUniform1i(u_mfnr_mis_.off[i], 4 + i);
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glUniform2i(u_mfnr_mis_.size, mfnr_w_, mfnr_h_);
+  glUniform2f(u_mfnr_mis_.tiles, static_cast<float>(tiles_w_),
+              static_cast<float>(tiles_h_));
+  glUniform1f(u_mfnr_mis_.tile_m, static_cast<float>(kMfnrTile) * 2.0f);
+  glUniform1f(u_mfnr_mis_.sigma, sigma);
+  glUniform1f(u_mfnr_mis_.s, s_const);
+  glUniform1i(u_mfnr_mis_.cfalut, cfaLutOf(cfa));
+  glUniform4f(u_mfnr_mis_.black, black_phase[0], black_phase[1], black_phase[2],
+              black_phase[3]);
+  glUniform1f(u_mfnr_mis_.white, white_level);
+  glUniform3f(u_mfnr_mis_.gain, gains[0], gains[1], gains[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -2751,6 +2958,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
+  // σ（单帧，线性域 WB 后）：mismatch 归一化（uSigma）与融合后折减共用
+  bool dn_high = false;
+  float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
+  denoiseParams(noise_level, noise_sigma, &dn_high, &sr_k, &sc_k, &ns, &ns_raw);
+  const float ns_single = ns;
+  // 阶段二：保存每帧位移场（mismatch 后连同权重一起重写 z 通道）
+  std::vector<std::vector<float>> offs(
+      static_cast<size_t>(count - 1),
+      std::vector<float>(static_cast<size_t>(tiles_w_) * tiles_h_ * 2, 0.f));
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
@@ -2760,11 +2976,18 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     // 对齐 + **等权**时域均值（立项字面范围）。v0.9.1 曾用"残差/纹理度"算
     // 置信度加权，真机 A/B 确诊失效（confMed 0.005、fbTiles 9095/9216）——
     // 暗部的 SAD 残差与梯度都被噪声主导，比值系统性落进"不可信"区，而暗部
-    // 恰是 MFNR 的主战场。防鬼影（mismatch map/运动检测）是 P2 的职责，
-    // 届时换 HDR+ 式频域收缩，不再用这个比值。conf 仅保留日志观测。
+    // 恰是 MFNR 的主战场。阶段二（v0.10.0）的 mismatch 权重与该比值不同构：
+    // m = d²/(d²+s·σ²) 的分母是**噪声方差**而非"纹理度"——噪声越大容忍度
+    // 越高（残差被噪声解释 = 不惩罚），只有显著超出噪声底的残差（运动/鬼影）
+    // 才压权重，因此不会被暗部噪声系统性误杀。
     std::vector<float> pack(static_cast<size_t>(tiles_w_) * tiles_h_ * 4, 1.f);
     for (int t = 0; t < tiles_w_ * tiles_h_; ++t) {
-      pack[static_cast<size_t>(t) * 4 + 0] = a.off[static_cast<size_t>(t) * 2];
+      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 0] =
+          a.off[static_cast<size_t>(t) * 2 + 0];
+      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 1] =
+          a.off[static_cast<size_t>(t) * 2 + 1];
+      pack[static_cast<size_t>(t) * 4 + 0] =
+          a.off[static_cast<size_t>(t) * 2 + 0];
       pack[static_cast<size_t>(t) * 4 + 1] =
           a.off[static_cast<size_t>(t) * 2 + 1];
       pack[static_cast<size_t>(t) * 4 + 2] = 1.0f;
@@ -2781,6 +3004,51 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   align_ms = std::chrono::duration<float, std::milli>(
                  std::chrono::steady_clock::now() - t0)
                  .count();
+
+  // ── 阶段二 robust merge（v0.10.0）：mismatch map → 权重写回 z 通道 ────
+  stage("mismatch");
+  const auto tmis = std::chrono::steady_clock::now();
+  passMfnrMismatch(cfa, black_phase, wl, rc.gains, ns_single, kMfnrMisS);
+  const int n_tiles = tiles_w_ * tiles_h_;
+  std::vector<uint8_t> mis(static_cast<size_t>(n_tiles) * 4);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
+  glReadPixels(0, 0, tiles_w_, tiles_h_, GL_RGBA, GL_UNSIGNED_BYTE, mis.data());
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  // w = max(1 − c·m, 0) 重写位移场 z 通道；Fuse 读 z 加权 + 双线性插值
+  //（64px 过渡带，tile 边界无跳变）。wsum 含参考帧恒权重 1。
+  std::vector<float> wsum(static_cast<size_t>(n_tiles), 1.0f);
+  std::vector<float> mags;
+  mags.reserve(static_cast<size_t>(n_tiles) * (count - 1));
+  for (int z = 0; z < count - 1; ++z) {
+    std::vector<float> pack(static_cast<size_t>(n_tiles) * 4);
+    for (int t = 0; t < n_tiles; ++t) {
+      const size_t ti = static_cast<size_t>(t);
+      const float m = static_cast<float>(mis[ti * 4 + z]) / 255.0f;
+      const float wgt = std::max(1.0f - kMfnrRobust * m, 0.0f);
+      pack[ti * 4 + 0] = offs[static_cast<size_t>(z)][ti * 2 + 0];
+      pack[ti * 4 + 1] = offs[static_cast<size_t>(z)][ti * 2 + 1];
+      pack[ti * 4 + 2] = wgt;
+      pack[ti * 4 + 3] = 1.0f;
+      wsum[ti] += wgt;
+      mags.push_back(m);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex_off_[z]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tiles_w_, tiles_h_, GL_RGBA,
+                    GL_FLOAT, pack.data());
+  }
+  double neff_acc = 0.0;
+  for (float w : wsum) neff_acc += w;
+  const float neff = static_cast<float>(neff_acc / std::max(n_tiles, 1));
+  std::sort(mags.begin(), mags.end());
+  const float m_med = mags.empty()
+                          ? 0.f
+                          : mags[mags.size() / 2];
+  const float m_p90 = mags.empty()
+                          ? 0.f
+                          : mags[mags.size() * 9 / 10];
+  const float mis_ms = std::chrono::duration<float, std::milli>(
+                           std::chrono::steady_clock::now() - tmis)
+                           .count();
 
   // 融合 → tex_fused_（R16F 线性 mosaic）
   const auto tf = std::chrono::steady_clock::now();
@@ -2801,16 +3069,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   while (glGetError() != GL_NO_ERROR) {
   }
   const bool rcd = demosaic == 1;
-  bool dn_high = false;
-  float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
-  denoiseParams(noise_level, noise_sigma, &dn_high, &sr_k, &sc_k, &ns, &ns_raw);
   // MFNR（v0.9.3）：融合把噪声 σ 降为单帧的 1/√N，P0/P4 的值域 σ 正比于 ns，
   // 仍喂单帧 σ 会错配 —— 真机 A/B（v0.9.2）实测：残余噪声（>4σr）依旧漏过、
   // 低对比纹理（1-2σr）反被抹掉（"降噪一般 + 糊"的双重观感）。σ 折减后值域
   // 重新对准融合后的信噪比：对残余噪声恢复作用、对纹理保持选择性。
   // （HDR+ 同款思路：merge 后按实际合并帧数更新噪声方差 σ²/N。）
-  const float ns_single = ns;
-  ns /= 2.0f;  // √N，N=4
+  // v0.10.0：√N 用**实际等效帧数 N_eff**（robust merge 下运动 tile 权重 <1，
+  // 实际融合量 <N —— Night Sight §3.3：按实际融合量算 σ，该区域自动多拿
+  // 空间降噪补偿）。N_eff 接近 4 时与旧硬编码 √4 等价。
+  ns = ns_single / std::sqrt(std::max(neff, 1.0f));
   ChainCtx c;
   c.w = w;
   c.h = h;
@@ -2838,10 +3105,14 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"alignMs\":" + f3(align_ms) +
+              ",\"misMs\":" + f3(mis_ms) +
               ",\"fuseMs\":" + f3(fuse_ms) +
               ",\"gx\":" + f3(gx_sum / (count - 1)) +
               ",\"gy\":" + f3(gy_sum / (count - 1)) +
               ",\"confMed\":" + f3(conf_sum / (count - 1)) +
+              ",\"mMed\":" + f3(m_med) +
+              ",\"mP90\":" + f3(m_p90) +
+              ",\"neff\":" + f3(neff) +
               ",\"dMed\":" + f3(dx_med_max) +
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);

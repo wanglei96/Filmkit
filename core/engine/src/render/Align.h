@@ -43,7 +43,7 @@ struct MfnrAlignOut {
 constexpr int kMfnrTile = 64;
 
 // 对 cur 帧对齐到 ref。tiles_x/y = 1/2 域 tile 网格（FrameRenderer 按
-// w1=(w+1)/2、tiles=ceil(w1/32) 算出后传入）。
+// w1=(w+1)/2、tiles=ceil(w1/kMfnrTile) 算出后传入）。
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
                        int tiles_x, int tiles_y);
 

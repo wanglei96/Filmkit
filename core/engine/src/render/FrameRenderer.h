@@ -110,6 +110,11 @@ class FrameRenderer {
   void passMfnrPyr(GLuint raw_tex, int cfa, const float black_phase[4],
                    float white_level, const float gains[3]);
   void passMfnrDown(GLuint src, GLuint fbo, int sw, int sh);
+  // 阶段二 robust merge（v0.10.0）：Night Sight 式 mismatch map —— per-tile
+  // 对齐后残差 mean(d²) → m = d²/(d²+s·σ²)，渲染到 tex_mis_（RGBA8 tiles 网格，
+  // R/G/B = 帧 1/2/3）。CPU 读回算 w = max(1−c·m, 0) 写回位移场 z 通道。
+  void passMfnrMismatch(int cfa, const float black_phase[4], float white_level,
+                        const float gains[3], float sigma, float s_const);
   // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3]);
@@ -237,6 +242,7 @@ class FrameRenderer {
   // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────
   GLuint prog_mfnr_pyr_ = 0, prog_mfnr_down_ = 0, prog_mfnr_fuse_ = 0,
          prog_raw_dn_fused_ = 0;
+  GLuint prog_mfnr_mis_ = 0;  // 阶段二（v0.10.0）：mismatch map
   GLuint tex_mfnr_[3] = {0, 0, 0};  // R16UI，burst 帧 1..3（帧 0 复用 raw_tex_）
   GLuint tex_pyr1_ = 0, fbo_pyr1_ = 0;  // RGBA8，1/2 灰度（sqrt 预编码）
   GLuint tex_pyr2_ = 0, fbo_pyr2_ = 0;  // RGBA8，1/4（readback 层）
@@ -245,6 +251,7 @@ class FrameRenderer {
   int pyr1_w_ = 0, pyr1_h_ = 0;
   GLuint tex_fused_ = 0, fbo_fused_ = 0;  // R16F，融合后线性 mosaic（raw 尺寸）
   GLuint tex_off_[3] = {0, 0, 0};         // RGBA16F 位移场（tiles×tiles）
+  GLuint tex_mis_ = 0, fbo_mis_ = 0;      // RGBA8 mismatch map（tiles×tiles）
   int mfnr_w_ = 0, mfnr_h_ = 0;
   int tiles_w_ = 0, tiles_h_ = 0;
   // LSC 增益网格（RGB16F，NEAREST；1×1 全 1 = 关闭/无数据，见 submitRaw）
@@ -346,6 +353,11 @@ class FrameRenderer {
           tiles = -1, tile_m = -1, black = -1, white = -1, gain = -1,
           cfalut = -1;
   } u_mfnr_fuse_;
+  struct {
+    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
+          tiles = -1, tile_m = -1, sigma = -1, s = -1, black = -1, white = -1,
+          gain = -1, cfalut = -1;
+  } u_mfnr_mis_;
   struct {
     GLint tex = -1, size = -1, ns = -1, k = -1;
   } u_chroma_dn_;
