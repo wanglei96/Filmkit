@@ -14,6 +14,13 @@
 namespace filmkit {
 namespace {
 
+// 预览域映射的在线标定状态（v0.8.2 提为**进程级**）：nativeEngineStart 每次
+// new FrameRenderer，放在成员里会随 engine stop/start 归零 —— 真机日志实测
+// ratio 长期钉在初值 2.0 不收敛。进程存活期间跨实例保持；App 冷启动回落
+// 初值、拍一张静拍即重新收敛（EMA α=0.3）。
+float g_pv_mid_ema = 0.0f;   // 预览统计中位的 EMA（0 = 未初始化）
+float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范围 1.70–3.87 的中位）
+
 // M4-7 局部色调映射的低频亮度图尺寸与 knee（都是设备端标定旋钮）。
 // 32×24 在 4080×3072 上等效模糊半径约 128px ≈ 3% 画面宽：再小会退化成全局曲线
 // 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
@@ -2535,13 +2542,13 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 预览除以它回到 RAW 等效域（shader 的 uPreviewMap 分支），filmic 曲线因此与
   // 成片共用（WYSIWYG）。首拍前 ratio 用初值 2.0（实测范围中位）兜底。
   if (still) {
-    if (pv_mid_ema_ > 1e-4f && last_lin_mid_ > 1e-6f) {
-      const float r = std::clamp(pv_mid_ema_ / last_lin_mid_, 1.2f, 4.5f);
-      domain_ratio_ = domain_ratio_ * 0.7f + r * 0.3f;
+    if (g_pv_mid_ema > 1e-4f && last_lin_mid_ > 1e-6f) {
+      const float r = std::clamp(g_pv_mid_ema / last_lin_mid_, 1.2f, 4.5f);
+      g_domain_ratio = g_domain_ratio * 0.7f + r * 0.3f;
     }
   } else {
-    pv_mid_ema_ = pv_mid_ema_ > 1e-4f ? pv_mid_ema_ * 0.7f + last_lin_mid_ * 0.3f
-                                      : last_lin_mid_;
+    g_pv_mid_ema = g_pv_mid_ema > 1e-4f ? g_pv_mid_ema * 0.7f + last_lin_mid_ * 0.3f
+                                        : last_lin_mid_;
   }
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
@@ -2594,7 +2601,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glUniform1f(u_film_.filmic_black_disp, filmic_.black_disp);
   // 预览域映射（v0.8.0）：预览先 /uDomainRatio 回 RAW 等效域再走 filmic；静拍=1。
   glUniform1f(u_film_.preview_map, still ? 0.0f : 1.0f);
-  glUniform1f(u_film_.domain_ratio, domain_ratio_);
+  glUniform1f(u_film_.domain_ratio, g_domain_ratio);
   // 用户 EV 滑杆 = 显示亮度补偿（v0.7.8 影调链之后乘；预览在域映射后同乘）
   glUniform1f(u_film_.exposure, std::exp2(p.exposure_ev));
   glUniform3f(u_film_.sat, p.sat_shadow, p.sat_mid, p.sat_high);
@@ -2625,7 +2632,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
         "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 9) +
             ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
-            ",\"ratio\":" + std::to_string(domain_ratio_).substr(0, 6) +
+            ",\"ratio\":" + std::to_string(g_domain_ratio).substr(0, 6) +
             ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7) +
             ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7) +
             ",\"localRef\":" + std::to_string(local_ref).substr(0, 5) +

@@ -209,8 +209,9 @@ class FrameRenderer {
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
   // 初值 2.0 = 实测范围的中位；首次静拍前预览用它兜底。
-  float pv_mid_ema_ = 0.0f;     // 0 = 未初始化
-  float domain_ratio_ = 2.0f;
+  // ⚠️ v0.8.2：两值提为 .cpp 的进程级 static —— nativeEngineStart 每次 new
+  // FrameRenderer，成员变量会随 engine stop/start 归零（真机日志：ratio 长期
+  // 钉在初值 2.0，跨会话不收敛）。
   int ag_log_tick_ = 0;         // 预览统计日志节流（每 120 帧一条）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
