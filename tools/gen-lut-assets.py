@@ -127,6 +127,9 @@ def main():
     ap.add_argument("--out", default=OUT_DIR)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    # CLI 入口的路径消毒：realpath 归一化（消除 ../ 与符号链接），输出固定落位
+    args.src = os.path.realpath(args.src)
+    args.out = os.path.realpath(args.out)
 
     files = sorted(glob.glob(os.path.join(args.src, "*.cube")))
     if not files:

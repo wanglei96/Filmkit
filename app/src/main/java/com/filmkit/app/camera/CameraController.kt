@@ -751,7 +751,6 @@ class CameraController(private val context: Context, private val render: RenderC
         p[0] = (evSteps * evStep).toDouble()
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
-        lookPref = -1.0  // 同上，[31]
         hlPref = -1.0    // 同上，[29]
         zebraPref = -1.0 // 同上，[30]
         autoTonePref = -1.0 // 同上，[35]
@@ -759,7 +758,6 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyHlPref()
         applyZebraPref()
-        applyLookPref()
         applyLutStrengthPref()
     }
 
@@ -767,7 +765,6 @@ class CameraController(private val context: Context, private val render: RenderC
     private var tonePref = -1.0
     private var hlPref = -1.0
     private var zebraPref = -1.0
-    private var lookPref = -1.0
     private var lutStrengthPref = -1.0
     private var autoTonePref = -1.0
     // filmic 黑白点（v0.7.6）：哨兵 = 未初始化（用户可配，默认 −7.65/+4.56 EV）
@@ -802,15 +799,6 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hlPref) {
             hlPref = v
             filmParams[29] = v
-        }
-    }
-
-    /** 色彩外观层开关（M3 P1，治"寡淡"）：写 FilmParams[31]（0 = 恒等/A-B 关）。 */
-    private fun applyLookPref() {
-        val v = if (appPrefs.getBoolean("color_look", true)) 1.0 else 0.0
-        if (v != lookPref) {
-            lookPref = v
-            filmParams[31] = v
         }
     }
 
@@ -1161,7 +1149,6 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyTonePref()
                     applyHlPref()
                     applyZebraPref()
-                    applyLookPref()
                     applyLutStrengthPref()
                     // 预览旋转恒 0（v0.6.39 事故修复）：
                     // SurfaceTexture 的 STMatrix 已含传感器侧的变换，**显示方向由 Activity
@@ -1262,7 +1249,6 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyHlPref()
         applyZebraPref()
-        applyLookPref()
         applyLutStrengthPref()
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
@@ -1384,7 +1370,6 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyHlPref()
         applyZebraPref()
-        applyLookPref()
         applyLutStrengthPref()
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
             capturing = false

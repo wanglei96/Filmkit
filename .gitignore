@@ -30,6 +30,8 @@ test_temp/
 
 # 本地工具二进制（不入库）
 tools/bin/
+# Python 字节码缓存（跑 tools/tuning 调参脚本时生成）
+__pycache__/
 handoff/
 
 # Agent 工具配置（DSH / skill 安装，属本机状态，不入库）

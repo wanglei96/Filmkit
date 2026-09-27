@@ -205,6 +205,12 @@ class FrameRenderer {
   // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
   float last_lin_mid_ = 0.0f;   // 场景中位（线性）
   float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
+  // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
+  // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
+  // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
+  // 初值 2.0 = 实测范围的中位；首次静拍前预览用它兜底。
+  float pv_mid_ema_ = 0.0f;     // 0 = 未初始化
+  float domain_ratio_ = 2.0f;
   int ag_log_tick_ = 0;         // 预览统计日志节流（每 120 帧一条）
   void applyPendingLut();
   void bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength, GLint loc_dmin,
@@ -217,7 +223,7 @@ class FrameRenderer {
   std::atomic<int64_t> frames_{0};
 
   struct {
-    GLint st = -1, rot = -1, scale = -1, tex = -1, wb = -1, exposure = -1;
+    GLint st = -1, rot = -1, scale = -1, tex = -1, wb = -1;
   } u_oes_;
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, wb = -1;
@@ -248,11 +254,12 @@ class FrameRenderer {
     GLint tex = -1, size = -1, ns = -1, k = -1;
   } u_chroma_dn_;
   struct {
-    GLint tex = -1, contrast = -1, shoulder = -1, toe = -1, cross = -1,
-          sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
+    // v0.7.9：contrast/shoulder/toe/cross（旧 log 域胶片链）已随链删除；
+    // FilmParams 槽位保留解析（契约不移位），引擎不再消费。
+    GLint tex = -1, sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
           look_sat = -1, look_chroma = -1, local = -1,
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
-          local_size = -1, preview_bypass = -1,
+          local_size = -1, preview_map = -1, domain_ratio = -1,
           // ── filmic（v0.7.3，darktable v3 spline）────────────────────────────
           // 三段四次多项式 y = M1 + x·(M2 + x·(M3 + x·(M4 + x·M5)))，下标
           // [0]=toe [1]=shoulder [2]=中间线性段。系数由 CPU 侧 computeFilmicSpline 求解。

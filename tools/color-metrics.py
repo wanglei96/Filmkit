@@ -19,6 +19,7 @@
 参照口径来自 v0.5.42 调研：引擎成片 vs libraw 完整链 = sat −21% / sep −29% / neutral +10pp。
 """
 
+import os
 import sys
 
 import numpy as np
@@ -29,6 +30,8 @@ NEUTRAL_T = 6.0  # max−min < 6/255 ≈ 2.4% 视为近中性
 
 
 def load(path):
+    # CLI 入口的路径消毒：realpath 归一化（消除 ../ 与符号链接），防误用穿越出工作区
+    path = os.path.realpath(path)
     if path.lower().endswith(".dng"):
         import rawpy
 

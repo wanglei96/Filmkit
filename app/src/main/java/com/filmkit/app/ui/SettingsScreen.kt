@@ -329,42 +329,9 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            // M3 P1 色彩外观层（治"寡淡"）：亮度保持的饱和增益 + 色度 S 曲线。
-            // 常开项 → 设置页；关 = 同机位 A/B 对照（参数在 CameraPresets[32]/[33]）。
-            var lookOn by rememberSaveable { mutableStateOf(prefs.getBoolean("color_look", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !lookOn
-                        lookOn = v
-                        prefs.edit().putBoolean("color_look", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.color_look",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("色彩外观层", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "亮度保持的饱和增益 + 色度 S 曲线；当前参数为中性占位（真机复核证明" +
-                            "「寡淡」是测量口径造成的），浓淡留给 M4 的理光系 LUT",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (lookOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
+            // v0.7.9：「色彩外观层」设置项已删除 —— 该层（M3 P1 治"寡淡"）在 filmic 链下
+            // 恒等（v0.7.7 起 look_sat/look_chroma = 1.0，`1+(c-1)*sk` ≡ 1），开关只控制
+            // 一个空操作，还占设置页心智。FilmParams[31..33] 槽位保留（契约不移位）。
             // M3 P2 DNG 标准色彩链（§3.2-7 / §3.4-4）：用 characteristics 的标定矩阵
             // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB）自建 camera→sRGB，
             // 替代 HAL 的 COLOR_CORRECTION_TRANSFORM；关 = 用 HAL 的做同机位 A/B。

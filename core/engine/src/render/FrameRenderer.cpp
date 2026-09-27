@@ -67,10 +67,9 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform samplerExternalOES uTex;
 uniform vec3 uWb;
-uniform float uExposure;
 void main() {
     vec3 rgb = clamp(texture(uTex, vUV0).rgb, 0.0, 1.0);
-    vec3 lin = pow(rgb, vec3(2.2)) * uWb * uExposure;
+    vec3 lin = pow(rgb, vec3(2.2)) * uWb;
     oColor = vec4(lin, 1.0);
 })";
 
@@ -592,16 +591,17 @@ void main() {
     oColor = vec4(y0 + acc / wsum, 1.0);
 })";
 
-// Pass2：胶片模拟内核（M1 简化模型；M3 升级密度域完整模型，§5）。
+// Pass2：胶片模拟内核 —— v0.7.9 起 = **filmic 专属**。
+// 旧的 log 域胶片链（±4EV 编码 + contrast/toe/shoulder/cross 染料串扰）已整体删除：
+// filmic 主导后它在中性参数下域内恒等、纯烧 GPU；而**域外半斜率延展不是恒等** ——
+// 实测最暗 0.5%（pLo≈-5.6EV）在 ±4EV 域外被压缩后才进 filmic，而 blackEv 标定用的是
+// 原始分位 ⇒ 标定与渲染不一致（老补丁悄悄改变 filmic 的输入动态范围）。
+// 分区饱和/分离色调/单色/色彩外观层保留：是风格能力（中性恒等），不是补丁。
 const char* kFsFilm = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
-uniform float uContrast;
-uniform vec3 uShoulder;
-uniform vec3 uToe;
-uniform mat3 uCross;
 uniform vec3 uSat;    // 阴影/中间/高光 饱和度
 uniform vec2 uSplit;  // 阴影暖 / 高光冷
 uniform float uMono;
@@ -612,13 +612,18 @@ uniform float uLookChroma; // 色度 S 曲线端点增益
 // v0.7.3：**场景曝光增益整体废除**（原 M4-6 uExposureGain）。filmic 的 black/white
 // relative exposure 已经把"中灰落在显示域哪个位置"固定住，再叠一层按场景算的增益
 // 就等于回到被否掉的"中位锚定"—— 那样压 EV / 降 AE 曝光都会被重新补偿掉，曝光这一维失效。
-// 预览直通（v0.6.48）：HAL 的 OES 预览流是**已被 ISP tone 过的 8bit 显示域**，动态范围
-// 已经定死；再套 baseTone 的 S 曲线（围绕 mn=0.2184、以下压暗）会把它的暗部直接压到 0
-// —— 真机实测 pass1 0.0174 → pass2 0.000295（压 59×），预览暗部死黑 11.4%（成片 0%），
-// 而线性增益无法同时对齐中位与暗部（ag 0.838 中位对/暗部黑；ag 1.95 暗部对/中位过亮 195）。
-// 所以预览只做 pass3 的高光滚降 + LUT，保留 HAL 自身的观感。
-// 后续可换成"域映射曲线"（把 HAL 线性映射回 RAW 等效域）以恢复 WYSIWYG。
-uniform float uPreviewBypass;
+// 预览域映射（v0.8.0，取代 v0.6.48 的"直通"）：HAL 的 OES 预览流是**已被 ISP tone
+// 过的 8bit 显示域**，与 RAW 链的线性域同场景差 1.70–3.87×（v0.6.48 实测）。直通在
+// EV=0 时代勉强成立（两者亮度巧合接近）；EV 补偿上线后直通×2^EV 把预览中位推到
+// 229/255，整体过亮+高光溢出（v0.7.9 真机）。v0.8.0 起预览输入先 **除以在线估计的
+// 域比 uDomainRatio**（= 预览统计中位 / 最近一次静拍统计中位，EMA 平滑），映射回
+// RAW 等效域后**走与成片完全相同的 filmic 链** —— 真 WYSIWYG，且 filmicTone 输出
+// 数学有界（永不爆白）。auto_black_ev 关（黑白点为用户固定值）时曲线与成片严格一致；
+// 开时预览按 HAL 域统计自标定（各自自洽，与成片近似）。
+// 注：旧的"直通"理由（baseTone S 曲线压死 HAL 暗部 59×）已随旧链删除而消失；
+// filmic 吃线性输入 + 域映射后不再有压死问题。
+uniform float uPreviewMap;
+uniform float uDomainRatio;
 // ── M4-7 局部色调映射 ────────────────────────────────────────────────
 // 低频亮度图（32×24、显示域 luma、硬件 LINEAR 上采样）+ 强度 + knee。
 // 为什么必须局部：全局曲线在"边缘高光 + 中央暗部"的高 DR 场景里两难 ——
@@ -722,36 +727,19 @@ vec3 filmicTone(vec3 c) {
     vec3 normed = (p / ratioNorm) * filmicScalar(toneNorm, uFilmicBlackDisp);
     return 0.5 * naive + 0.5 * normed;
 }
-// ±4EV 内为有效域（toe/shoulder 只在这里数值安全）；域外线性延展——
-// 硬截断曾把 -4.5EV 的暗部 14% 像素钉死在同一灰度（直方图尖峰+色带）
-float filmCurve(float x, float toe, float shoulder) {
-    if (x < 0.0 || x > 1.0) return x; // 域外延展段：无 toe/shoulder（exp 会发散）
-    x = clamp((x - 0.5) * uContrast + 0.5, 0.0, 1.0);
-    float y = x;
-    y -= toe * exp(-x * 6.0) * x * (1.0 - x);
-    y += shoulder * exp(-(1.0 - x) * 6.0) * x * (1.0 - x);
-    return clamp(y, 0.0, 1.0);
-}
 void main() {
     vec3 lin = texture(uTex, vUV0).rgb;
-    // 预览直通：HAL 流已是成品显示域，本 pass 的影调链会把它压死（见 uPreviewBypass 注释）
-    if (uPreviewBypass > 0.5) {
-        oColor = vec4(lin, 1.0);
+    // 预览域映射（v0.8.0，取代直通）：先除以在线估计的 HAL/RAW 域比，映射回 RAW
+    // 等效域，再走与成片完全相同的 filmic 链 —— 真 WYSIWYG；EV 在统计之后乘（v0.7.9）。
+    // filmicTone 输出 pow(clamp(spline), power) ∈ [0,1]，数学有界 —— 预览不再可能爆白。
+    if (uPreviewMap > 0.5) {
+        vec3 mapped = max(lin, vec3(0.0)) / uDomainRatio * uExposure;
+        oColor = vec4(filmicTone(mapped), 1.0);
         return;
     }
-    // log 域：以 0.18 中灰为轴。±4EV 有效域斜率 0.125（对比不变），
-    // 域外 -6.5..-4 / 4..6.5EV 半斜率延展，更暗/更亮继续线性外推到 ~±9EV
-    vec3 e = log2(max(lin, vec3(1e-6)) / 0.18);
-    vec3 lg = e * 0.125 + 0.5;
-    // step 参数必须同维（vec3,vec3）——step(e,-4.0) 无此重载，编译失败=全链路黑屏
-    lg = mix(lg, 1.0 + (e - 4.0) * 0.0625, step(vec3(4.0), e));
-    lg = mix(lg, (e + 4.0) * 0.0625, step(e, vec3(-4.0)));
-    lg = uCross * lg;
-    vec3 g;
-    g.r = filmCurve(lg.r, uToe.r, uShoulder.r);
-    g.g = filmCurve(lg.g, uToe.g, uShoulder.g);
-    g.b = filmCurve(lg.b, uToe.b, uShoulder.b);
-    vec3 out3 = 0.18 * exp2((g - 0.5) * 8.0);
+    // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
+    // filmic 直接吃线性场景输入 —— blackEv/whiteEv 的标定域与渲染域首次严格一致。
+    vec3 out3 = max(lin, vec3(0.0));
     // M4-7 局部色调映射：按**局部相对画面基准**的暗度补光 —— 比基准暗得越多补得越多，
     // 到 uLocalKnee 以上（含所有亮区/高光）归零。刻意放在 baseTone **之前**：这里还是
     // 线性域，S 曲线对暗部的弹性约 2（离线实测 +60% 线性 → 显示域 +45~55%），同样的
@@ -1159,7 +1147,6 @@ bool FrameRenderer::init() {
   u_oes_.scale = glGetUniformLocation(prog_oes_, "uScale");
   u_oes_.tex = glGetUniformLocation(prog_oes_, "uTex");
   u_oes_.wb = glGetUniformLocation(prog_oes_, "uWb");
-  u_oes_.exposure = glGetUniformLocation(prog_oes_, "uExposure");
 
   u_still_.st = glGetUniformLocation(prog_still_, "uST");
   u_still_.rot = glGetUniformLocation(prog_still_, "uRot");
@@ -1256,11 +1243,8 @@ bool FrameRenderer::init() {
   }
 
   u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
-  u_film_.preview_bypass = glGetUniformLocation(prog_film_, "uPreviewBypass");
-  u_film_.contrast = glGetUniformLocation(prog_film_, "uContrast");
-  u_film_.shoulder = glGetUniformLocation(prog_film_, "uShoulder");
-  u_film_.toe = glGetUniformLocation(prog_film_, "uToe");
-  u_film_.cross = glGetUniformLocation(prog_film_, "uCross");
+  u_film_.preview_map = glGetUniformLocation(prog_film_, "uPreviewMap");
+  u_film_.domain_ratio = glGetUniformLocation(prog_film_, "uDomainRatio");
   u_film_.sat = glGetUniformLocation(prog_film_, "uSat");
   u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
   u_film_.mono = glGetUniformLocation(prog_film_, "uMono");
@@ -1540,7 +1524,6 @@ void FrameRenderer::passOES(int dst_w, int dst_h, const float* st, int rot,
   glUniform2f(u_oes_.scale, sx, sy);
   glUniform1i(u_oes_.tex, 0);
   glUniform3f(u_oes_.wb, p.wb_r, p.wb_g, p.wb_b);
-  glUniform1f(u_oes_.exposure, std::exp2(p.exposure_ev));
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -2108,13 +2091,15 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += ",\"ev\":" + std::to_string(p.exposure_ev).substr(0, 5);
   // v0.7.3：ag 一并废除 —— 记录 filmic 的实际标定（EV，相对中灰 18.45%）与场景分位，
-  // 供离线用同一组 EV 复算 spline 系数对拍（test_temp/filmic_offline.py 的 compute_spline）。
-  kv += ",\"blackEv\":" + std::to_string(ev_black_).substr(0, 6);
-  kv += ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 5);
+  // 供离线用同一组 EV 复算 spline 系数对拍（tools/tuning/filmic_offline.py 的 compute_spline）。
+  // substr(0,9)：filmic_verify.py 用这些值复算 spline，截断到 "-5.024" 会把
+  // 1.4e-4 的输入误差放大成 2.4e-4 的 power 误差，自检假阳性（v0.7.9 实测）
+  kv += ",\"blackEv\":" + std::to_string(ev_black_).substr(0, 9);
+  kv += ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9);
   kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
   kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
   kv += ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7);
-  // spline 系数（v0.7.3 自检）：真机日志 → 用 test_temp/filmic_offline.py 的
+  // spline 系数（v0.7.3 自检）：真机日志 → 用 tools/tuning/filmic_offline.py 的
   // compute_spline 按同一组 EV 复算，逐项对比 m1..m5 —— 系数不一致就是实现错了。
   {
     const auto j3 = [](const float* v) {
@@ -2543,6 +2528,21 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
                  p.filmic_white_ev);
+  // 预览域映射的在线标定（v0.8.0）：updateFilmicEV 刚把 last_lin_mid_ 更新为本帧
+  // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替
+  // 到达，用 EMA 各记一侧，静拍时对出比值：
+  //   ratio = 预览中位 / RAW 中位（v0.6.48 实测范围 1.70–3.87，EMA 平滑 AE/构图抖动）
+  // 预览除以它回到 RAW 等效域（shader 的 uPreviewMap 分支），filmic 曲线因此与
+  // 成片共用（WYSIWYG）。首拍前 ratio 用初值 2.0（实测范围中位）兜底。
+  if (still) {
+    if (pv_mid_ema_ > 1e-4f && last_lin_mid_ > 1e-6f) {
+      const float r = std::clamp(pv_mid_ema_ / last_lin_mid_, 1.2f, 4.5f);
+      domain_ratio_ = domain_ratio_ * 0.7f + r * 0.3f;
+    }
+  } else {
+    pv_mid_ema_ = pv_mid_ema_ > 1e-4f ? pv_mid_ema_ * 0.7f + last_lin_mid_ * 0.3f
+                                      : last_lin_mid_;
+  }
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。
   // 强度 ≤ 0 时不重渲染，但仍绑**已存在的** tex_local_ 并下发 0 —— sampler 必须有
@@ -2592,15 +2592,11 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glUniform1f(u_film_.filmic_input_max, filmic_.input_max);
   glUniform1f(u_film_.filmic_power, filmic_.output_power);
   glUniform1f(u_film_.filmic_black_disp, filmic_.black_disp);
-  // 预览直通（v0.6.48）：HAL 流是成品显示域，本 pass 的影调链会压死它的暗部 ——
-  // 只保留 pass3 的高光滚降 + LUT。静拍不受影响（仍走完整影调链）。
-  glUniform1f(u_film_.preview_bypass, still ? 0.0f : 1.0f);
-  // 用户 EV 滑杆 = 显示亮度补偿（v0.7.8，乘在影调链之后；预览走 kFsOes 另下发）
+  // 预览域映射（v0.8.0）：预览先 /uDomainRatio 回 RAW 等效域再走 filmic；静拍=1。
+  glUniform1f(u_film_.preview_map, still ? 0.0f : 1.0f);
+  glUniform1f(u_film_.domain_ratio, domain_ratio_);
+  // 用户 EV 滑杆 = 显示亮度补偿（v0.7.8 影调链之后乘；预览在域映射后同乘）
   glUniform1f(u_film_.exposure, std::exp2(p.exposure_ev));
-  glUniform1f(u_film_.contrast, p.contrast);
-  glUniform3f(u_film_.shoulder, p.shoulder[0], p.shoulder[1], p.shoulder[2]);
-  glUniform3f(u_film_.toe, p.toe[0], p.toe[1], p.toe[2]);
-  glUniformMatrix3fv(u_film_.cross, 1, GL_FALSE, p.cross);
   glUniform3f(u_film_.sat, p.sat_shadow, p.sat_mid, p.sat_high);
   glUniform2f(u_film_.split, p.split_warm, p.split_cool);
   glUniform1f(u_film_.mono, p.monochrome);
@@ -2626,9 +2622,10 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
     ag_log_tick_ = 0;
     Logger::instance().log(
         LogLevel::kInfo, "engine", "preview.filmic",
-        "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 6) +
-            ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 5) +
+        "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 9) +
+            ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
+            ",\"ratio\":" + std::to_string(domain_ratio_).substr(0, 6) +
             ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7) +
             ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7) +
             ",\"localRef\":" + std::to_string(local_ref).substr(0, 5) +
