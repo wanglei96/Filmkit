@@ -431,7 +431,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // （+0.7EV 实测只给 +0.1EV：sec 0.0014→0.0015s），RAW 成片纹丝不动；
         // 且引擎侧若在统计前乘 EV，auto 黑点又会把它归一（kFsFilm 注释）。
         // 现在语义 = 显示亮度补偿（filmic 之后 ×2^EV），HAL 补偿撤除，单一来源。
-        filmParams[0] = (evSteps * evStep).toDouble()
+        // v0.8.1：[0] = 基准曝光（base_ev，机型校准常量）+ 用户 EV。
+        filmParams[0] = baseEvPref + (evSteps * evStep).toDouble()
         rebuildRepeating()
     }
 
@@ -746,9 +747,11 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun setFilmParams(p: DoubleArray) {
         filmParams = p
-        // [0] = 用户 EV（setEv 维护）：预设基线里是 0，换数组后必须回填当前滑杆值，
-        // 否则初始化序列（setFilmParams → setEv 之外的任何重置）会把 EV 静默清零
-        p[0] = (evSteps * evStep).toDouble()
+        // [0] = 基准曝光 + 用户 EV：预设基线里是 0，换数组后必须回填，否则初始化序列
+        // 会把曝光静默清零（v0.7.8 教训）。applyBaseEvPref 先把 prefs 的基准值灌进
+        // baseEvPref，再统一写入（v0.8.1 起含基准偏置）
+        applyBaseEvPref()
+        p[0] = baseEvPref + (evSteps * evStep).toDouble()
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
         hlPref = -1.0    // 同上，[29]
@@ -770,6 +773,19 @@ class CameraController(private val context: Context, private val render: RenderC
     // filmic 黑白点（v0.7.6）：哨兵 = 未初始化（用户可配，默认 −7.65/+4.56 EV）
     private var filmicBlackPref = -999.0
     private var filmicWhitePref = -999.0
+    // 基准曝光偏置（v0.8.1，FilmParams[0] 的常量部分）：校正机型 AE 基准差。
+    // 实测本机（X300）HAL 的 AE 比 PhotonCamera 策略暗 0.5–0.9 EV（室外 0.67 / 室内
+    // 逆光 ~0.9）—— 影调引擎（filmic）只做映射、不产生曝光，这个差只能在校准层补。
+    // 与 Lightroom/DNG 的 BaselineExposure 同语义；范围 −2..+2 覆盖机型间差异，
+    // 默认 0 = 不偏置。用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user。
+    private var baseEvPref = 0.0
+
+    private fun applyBaseEvPref() {
+        val v = appPrefs.getFloat("base_ev", 0f).toDouble().coerceIn(-2.0, 2.0)
+        if (v != baseEvPref) {
+            baseEvPref = v
+        }
+    }
     // 局部色调映射（M4-7）：强度与 CameraPresets[36] 默认值一致；0 = 关（A/B 通路）。
     // v0.6.33：0.6 → 0.25（roadmap 立项定的上限就是 ≤0.2–0.3）。
     private val LOCAL_TONE = 0.25
