@@ -1120,6 +1120,10 @@ class CameraController(private val context: Context, private val render: RenderC
         burstStrides.fill(0)
         burstResults.fill(null)
         burstStartMs = android.os.SystemClock.elapsedRealtime()
+        // v0.10.10 门控修正：X300 的 SENSOR_MAX_ANALOG_SENSITIVITY 报 11467（无
+        // 参考价值），SENSOR_INFO_SENSITIVITY_RANGE.upper=3200 才是真实 ISO 顶。
+        // 压短条件 = ① liveIso **未触 ISO 顶**（触顶=暗光，压短代价失控）且
+        // ② isoRef=1.5×liveIso 不被 clamp（否则守恒破坏 → rn<1 的"慢参考"怪相）。
         // v0.10.4 三重约束：
         // ① 暗光门控：liveIso 超过**模拟增益上限**（SENSOR_MAX_ANALOG_SENSITIVITY）
         //   时不压短 —— 数字增益区压快门 = 光子更少 + 纯数字放大，噪声双重恶化
@@ -1129,11 +1133,14 @@ class CameraController(private val context: Context, private val render: RenderC
         // ② 压缩比上限 1.5×：secRef = min(sec, max(15ms, sec×2/3)) —— 长曝光
         //   场景的压缩比失控（40ms→15ms = 2.67×）让 rn 冲到 1.63。
         // ③ isoRef clamp 到 min(range.upper, maxAnalog)：参考帧不进纯数字增益区。
-        val maxAnalog = curCharacteristics?.get(
-            android.hardware.camera2.CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY,
-        ) ?: 3200
-        val gated = liveIso > maxAnalog
-        val secRef = if (gated) {
+        var isoUpperGate = Int.MAX_VALUE
+        curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?.let { isoUpperGate = it.upper }
+        val isoTouchesTop = liveIso >= isoUpperGate        // 触顶 = 暗光
+        val isoHeadroomOk = liveIso * 3 / 2 <= isoUpperGate  // isoRef 不会被 clamp
+        val canShorten = liveIso > 0 && liveExposureNs > 0 &&
+            !isoTouchesTop && isoHeadroomOk
+        val secRef = if (!canShorten) {
             liveExposureNs
         } else {
             minOf(
@@ -1145,17 +1152,14 @@ class CameraController(private val context: Context, private val render: RenderC
         // 快门，否则 ref 欠曝（实测 ISO 2544/30ms → 想要 3816/20ms 但 ISO clamp
         // 到 3200 后仍是 20ms = 曝光量 64000 vs alt 的 76680，ref 系统性欠 0.26EV，
         // 给残差判据引入 18% 的全图亮度差）。
-        var isoUpper = Int.MAX_VALUE
-        curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-            ?.let { isoUpper = it.upper }
-        val isoCap = minOf(isoUpper, maxAnalog)
         var isoRef = if (liveIso > 0 && secRef > 0) {
-            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt().coerceAtMost(isoCap)
+            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt()
+                .coerceAtMost(isoUpperGate)
         } else {
             liveIso
         }
         isoRef = isoRef.coerceAtLeast(1)
-        // 守恒反算：secRef' = iso×sec/isoRef（≥ 快门下限，通常远大于下限）
+        // 守恒反算（canShorten 已保证 isoRef 不被 clamp，此处精确守恒）
         val secRefFinal = if (liveIso > 0 && liveExposureNs > 0 && isoRef > 0) {
             Math.round(liveIso.toDouble() * liveExposureNs / isoRef)
         } else {

@@ -55,6 +55,12 @@ constexpr int kMisDilate = 2;     // m 场膨胀半径（cell）：2 = 5×5，�
 constexpr float kResFadeLo = 0.02f;
 constexpr float kResFadeHi = 0.04f;
 constexpr float kResFadeMin = 0.3f;
+// 位移一致性门控（v0.10.10）：真运动位移连片（刚体平移，邻域一致）；对齐假峰
+// （弱纹理/暗部 SAD 无区分度，argmin 随机落在搜索边界 ±8-15px）是孤立随机的。
+// dev = |off − 3×3 邻域中值| > kOffDev → 假峰 → m_mot 清零。插桩数据（v0.10.9）：
+// 暗光误报 100% 来自位移判据（misD 0.99 干净、motD 高 m 20-56%、motMed 仅
+// 1.8-3.3px 的双峰分布）；残差侧重修两轮全都看错方向。
+constexpr float kOffDev = 6.f;
 // ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
 // "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
 // 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
@@ -3133,13 +3139,44 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                               : mags_all[mags_all.size() / 4];
     mot.assign(static_cast<size_t>(count - 1),
                std::vector<float>(static_cast<size_t>(n_tiles), 0.f));
+    float msbuf[9];
     for (int z = 0; z < count - 1; ++z) {
+      const std::vector<float>& off = offs[static_cast<size_t>(z)];
       for (int t = 0; t < n_tiles; ++t) {
-        const float dx = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2];
-        const float dy = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2 + 1];
-        const float excess = std::sqrt(dx * dx + dy * dy) - mag_p25;
-        mot[static_cast<size_t>(z)][static_cast<size_t>(t)] =
-            std::min(std::max((excess - kMotLo) / (kMotHi - kMotLo), 0.f), 1.f);
+        const int tx = t % tiles_w_, ty = t / tiles_w_;
+        const float dx = off[static_cast<size_t>(t) * 2];
+        const float dy = off[static_cast<size_t>(t) * 2 + 1];
+        // 3×3 邻域位移中值（x/y 独立），边界 clamp
+        auto med3 = [&](int comp) {
+          int n = 0;
+          for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+              const int xx = std::min(std::max(tx + i, 0), tiles_w_ - 1);
+              const int yy = std::min(std::max(ty + j, 0), tiles_h_ - 1);
+              msbuf[n++] =
+                  off[(static_cast<size_t>(yy) * tiles_w_ + xx) * 2 + comp];
+            }
+          }
+          for (int a = 1; a < n; ++a) {
+            const float key = msbuf[a];
+            int b = a - 1;
+            while (b >= 0 && msbuf[b] > key) {
+              msbuf[b + 1] = msbuf[b];
+              --b;
+            }
+            msbuf[b + 1] = key;
+          }
+          return msbuf[n / 2];
+        };
+        const float mdx = med3(0), mdy = med3(1);
+        const float dev = std::sqrt((dx - mdx) * (dx - mdx) +
+                                    (dy - mdy) * (dy - mdy));
+        float mval = 0.f;
+        if (dev <= kOffDev) {
+          const float excess = std::sqrt(dx * dx + dy * dy) - mag_p25;
+          mval = std::min(std::max((excess - kMotLo) / (kMotHi - kMotLo), 0.f), 1.f);
+        }
+        mot[static_cast<size_t>(z)][static_cast<size_t>(t)] = mval;
       }
     }
     mot_med = mag_p25;
