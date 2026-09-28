@@ -1084,6 +1084,8 @@ uniform vec3 uFilmicM1, uFilmicM2, uFilmicM3, uFilmicM4, uFilmicM5;
 uniform float uFilmicLatMin, uFilmicLatMax;
 uniform float uFilmicBlackEv, uFilmicDr, uFilmicInputMin, uFilmicInputMax;
 uniform float uFilmicPower, uFilmicBlackDisp;
+// v0.10.13：darktable filmic v5 gamut mapping 开关（1 = 开/标准，0 = A/B 关）
+uniform float uGamut;
 // v0.7.8：用户 EV 滑杆 = **显示亮度补偿**，乘在整条影调链**之后**。
 // 为什么不放在 RAW 链（v0.7.7 曾接在 CCM 后）：那里在 updateFilmicEV 的场景统计
 // **之前** —— auto 黑点（P0.5 分位）会跟着输入一起漂，filmic 又把它压回来，
@@ -1120,6 +1122,185 @@ vec3 filmicTone(vec3 c) {
     vec3 normed = (p / ratioNorm) * filmicScalar(toneNorm, uFilmicBlackDisp);
     return 0.5 * naive + 0.5 * normed;
 }
+// ── darktable filmic v5 gamut mapping（v0.10.13，标准算法补全）──────────────
+// 出处：darktable src/iop/filmicrgb.c（filmic_v5 / gamut_mapping / gamut_check_RGB /
+// filmic_desaturate_v4）+ src/common/colorspaces_inline_conversions.h（RGB↔Ych，
+// Kirk 2006 LMS + Filmlight Yrg）+ src/common/gamut_mapping.h（clip chroma）。
+// 2026-09-28 逐项核对 darktable master：Y 权重 0.68990272/0.34832189、D65 锚点
+// 0.21902143/0.54371398、Y1931→2006 因子 1.05785528、clip 系数 0.97938…/0.42750…/
+// 0.85649…/0.55499… 全部一致；PhotonCamera 的移植（DarktableFilmicToneShader.kt）
+// 与 master 等价（管线工作域 BT.2020 vs 我们 sRGB —— 它 gamut check 后回 BT.2020，
+// 我们管线本就是 sRGB 线性，check 完即输出，无需回转）。
+// 为什么必须（v0.10.12 审核定案差距 #2）：tone mapping 之后色度可能被推到
+// ① 超过 tone 前的色度（亮度压缩+max-RGB 归一在色度比上的次生效应）——标准做法
+//   是色度取 min + 色相锁定；② Yrg 锥空间 r<0/g<0/r+g>1（物理不可实现的颜色）
+//   —— 常色度常色相裁剪；③ Y 合法后仍可能单通道越界 —— 恒 Y 恒色相下解析解
+//   最大合法色度（白/黑两边界）。此前"过曝灯管留品红/高饱和边缘过冲/色相漂移"
+//   的直接机制就在这三步的缺失。
+// 常量：全部来自 darktable 源码，不可调。
+const float kYchY1931To2006 = 1.05785528;
+const float kYchD65R = 0.21902143;
+const float kYchD65G = 0.54371398;
+const vec3 kLmsSrgbToLmsL = vec3(0.2986531876, 0.7060763220, 0.0656966248);
+const vec3 kLmsSrgbToLmsM = vec3(0.0959000021, 0.7198304285, 0.1011531117);
+const vec3 kLmsSrgbToLmsS = vec3(0.0224644230, 0.0449176289, 0.5270630110);
+const vec3 kLmsToSrgbRowR = vec3(4.8627131007, -4.7893329888, 0.3130405567);
+const vec3 kLmsToSrgbRowG = vec3(-0.6262137162, 2.0228185813, -0.3101607577);
+const vec3 kLmsToSrgbRowB = vec3(-0.1538905312, 0.0317407724, 1.9103966448);
+const vec3 kLmsToFilmRowR = vec3(1.08771930, -0.66666667, 0.02061856);
+const vec3 kLmsToFilmRowG = vec3(-0.08771930, 1.66666667, -0.05154639);
+const vec3 kLmsToFilmRowB = vec3(0.0, 0.0, 1.03092784);
+const vec3 kFilmToLmsRowL = vec3(0.95, 0.38, 0.0);
+const vec3 kFilmToLmsRowM = vec3(0.05, 0.62, 0.03);
+const vec3 kFilmToLmsRowS = vec3(0.0, 0.0, 0.97);
+vec3 gamutSrgbToLms(vec3 c) {
+    return vec3(dot(kLmsSrgbToLmsL, c), dot(kLmsSrgbToLmsM, c), dot(kLmsSrgbToLmsS, c));
+}
+vec3 gamutLmsToSrgb(vec3 l) {
+    return vec3(dot(kLmsToSrgbRowR, l), dot(kLmsToSrgbRowG, l), dot(kLmsToSrgbRowB, l));
+}
+vec3 gamutLmsToFilmlight(vec3 l) {
+    return vec3(dot(kLmsToFilmRowR, l), dot(kLmsToFilmRowG, l), dot(kLmsToFilmRowB, l));
+}
+vec3 gamutFilmlightToLms(vec3 f) {
+    return vec3(dot(kFilmToLmsRowL, f), dot(kFilmToLmsRowM, f), dot(kFilmToLmsRowS, f));
+}
+vec3 gamutLmsToYrg(vec3 lms) {
+    // Y = Vwright 加权（未归一 LMS）；色度坐标用归一化 LMS（sum=1 的锥空间）
+    float y = 0.68990272 * lms.x + 0.34832189 * lms.y;
+    float sum = lms.x + lms.y + lms.z;
+    vec3 n = abs(sum) > 1e-8 ? lms / sum : vec3(0.0);
+    vec3 frgb = gamutLmsToFilmlight(n);
+    return vec3(y, frgb.x, frgb.y);
+}
+vec3 gamutYrgToLms(vec3 yrg) {
+    vec3 frgb = vec3(yrg.y, yrg.z, 1.0 - yrg.y - yrg.z);
+    vec3 n = gamutFilmlightToLms(frgb);
+    float denom = 0.68990272 * n.x + 0.34832189 * n.y;
+    float s = abs(denom) > 1e-8 ? yrg.x / denom : 0.0;
+    return n * s;
+}
+vec4 gamutYrgToYch(vec3 yrg) {
+    // Ych = (Y, chroma, cos hue, sin hue)——存 cos/sin 免三角函数（darktable 同）
+    float r = yrg.y - kYchD65R;
+    float g = yrg.z - kYchD65G;
+    float chroma = length(vec2(r, g));
+    float cosH = chroma > 0.0 ? r / chroma : 1.0;
+    float sinH = chroma > 0.0 ? g / chroma : 0.0;
+    return vec4(yrg.x, chroma, cosH, sinH);
+}
+vec3 gamutYchToYrg(vec4 ych) {
+    return vec3(ych.x, ych.y * ych.z + kYchD65R, ych.y * ych.w + kYchD65G);
+}
+vec4 gamutRgbToYch(vec3 c) { return gamutYrgToYch(gamutLmsToYrg(gamutSrgbToLms(c))); }
+vec3 gamutYchToRgb(vec4 ych) { return gamutLmsToSrgb(gamutYrgToLms(gamutYchToYrg(ych))); }
+// filmic_desaturate_v4 的 saturation=0 特化（darktable/PC 的 filmic 默认；我们的
+// 风格饱和在 uSat/uLook 层，filmic 的 saturation 职责不由本层承担）：
+// 唯一生效分支 = filmic 同时"提亮且增饱和"时把 chroma 拉回中点（抑制 tone mapping
+// 自身的增饱和），user_resat/user_desat 在 saturation=0 下恒假。
+vec4 gamutDesaturateV4(vec4 ychOrig, vec4 ychFin) {
+    float chromaOrig = ychOrig.y * ychOrig.x;  // c×Y = 绝对色度
+    float chromaFin = ychFin.y * ychFin.x;
+    bool brightens = ychFin.x > ychOrig.x;
+    bool resat = chromaOrig < chromaFin;
+    if (brightens && resat) chromaFin = 0.5 * (chromaOrig + chromaFin);
+    ychFin.y = max(chromaFin / max(ychFin.x, 1e-8), 0.0);
+    return ychFin;
+}
+// Yrg 锥空间合法性：r<0 / g<0 / r+g>1 时按常 Y 常色相解最大合法 chroma
+vec4 gamutCheckYrg(vec4 ych) {
+    vec3 yrg = gamutYchToYrg(ych);
+    float maxC = max(ych.y, 0.0);
+    float cosH = ych.z;
+    float sinH = ych.w;
+    if (yrg.y < 0.0 && abs(cosH) > 1e-8) maxC = min(-kYchD65R / cosH, maxC);
+    if (yrg.z < 0.0 && abs(sinH) > 1e-8) maxC = min(-kYchD65G / sinH, maxC);
+    if (yrg.y + yrg.z > 1.0 && abs(cosH + sinH) > 1e-8) {
+        maxC = min((1.0 - kYchD65R - kYchD65G) / (cosH + sinH), maxC);
+    }
+    ych.y = max(maxC, 0.0);
+    return ych;
+}
+// sRGB 色域边界上恒 Y 恒色相的最大 chroma（darktable gamut_mapping.h 的解析解，
+// 系数为 LMS2006↔Filmlight 组合的常数，不可调）
+float gamutClipChromaWhiteRaw(vec3 coeffs, float targetWhite, float y,
+                              float cosH, float sinH) {
+    float denY = coeffs.x * (0.979381443298969 * cosH + 0.391752577319588 * sinH)
+               + coeffs.y * (0.0206185567010309 * cosH + 0.608247422680412 * sinH)
+               - coeffs.z * (cosH + sinH);
+    float denT = targetWhite * (0.68285981628866 * cosH + 0.482137060515464 * sinH);
+    if (abs(denY) <= 1e-8) return 1.0e20;
+    float yAsymptote = denT / denY;
+    if (y <= yAsymptote) return 1.0e20;
+    float den = y * denY - denT;
+    if (abs(den) <= 1e-8) return 1.0e20;
+    float num = -0.427506877216495
+              * (y * (coeffs.x + 0.856492345150334 * coeffs.y + 0.554995960637719 * coeffs.z)
+                 - 0.988237752433297 * targetWhite);
+    float maxC = num / den;
+    return maxC >= 0.0 ? maxC : 1.0e20;
+}
+float gamutClipChromaWhite(vec3 coeffs, float targetWhite, float y,
+                           float cosH, float sinH) {
+    const float eps = 0.001;
+    float maxY = kYchY1931To2006 * targetWhite;
+    float dy = max(maxY - y, 0.0);
+    float maxC;
+    if (dy < eps) {
+        maxC = dy / max(eps * maxY, 1e-8)
+             * gamutClipChromaWhiteRaw(coeffs, targetWhite, (1.0 - eps) * maxY, cosH, sinH);
+    } else {
+        maxC = gamutClipChromaWhiteRaw(coeffs, targetWhite, y, cosH, sinH);
+    }
+    return maxC >= 0.0 ? maxC : 1.0e20;
+}
+float gamutClipChromaBlack(vec3 coeffs, float cosH, float sinH) {
+    float den = coeffs.x * (0.979381443298969 * cosH + 0.391752577319588 * sinH)
+              + coeffs.y * (0.0206185567010309 * cosH + 0.608247422680412 * sinH)
+              - coeffs.z * (cosH + sinH);
+    if (abs(den) <= 1e-8) return 1.0e20;
+    float num = -0.427506877216495
+              * (coeffs.x + 0.856492345150334 * coeffs.y + 0.554995960637719 * coeffs.z);
+    float maxC = num / den;
+    return maxC >= 0.0 ? maxC : 1.0e20;
+}
+float gamutClipChroma(vec3 rowR, vec3 rowG, vec3 rowB, float targetWhite, float y,
+                      float cosH, float sinH, float chroma) {
+    float cw = min(min(gamutClipChromaWhite(rowR, targetWhite, y, cosH, sinH),
+                       gamutClipChromaWhite(rowG, targetWhite, y, cosH, sinH)),
+                   gamutClipChromaWhite(rowB, targetWhite, y, cosH, sinH));
+    float cb = min(min(gamutClipChromaBlack(rowR, cosH, sinH),
+                       gamutClipChromaBlack(rowG, cosH, sinH)),
+                   gamutClipChromaBlack(rowB, cosH, sinH));
+    return max(min(min(chroma, cw), cb), 0.0);
+}
+// gamut_check_RGB：Y 合法后仍可能单通道越界 —— 先把越界像素抬回域内测 Y，
+// Y 取两态中点，再在恒 Y 恒色相下解最大合法 chroma
+vec3 gamutCheckRgb(vec4 ychIn) {
+    vec3 brightened = gamutYchToRgb(ychIn);
+    float minP = min(brightened.x, min(brightened.y, brightened.z));
+    brightened += max(-minP, 0.0);
+    vec4 ychB = gamutRgbToYch(brightened);
+    float y = clamp(0.5 * (ychIn.x + ychB.x),
+                    kYchY1931To2006 * 0.0001517634, kYchY1931To2006);
+    float newC = gamutClipChroma(kLmsToSrgbRowR, kLmsToSrgbRowG, kLmsToSrgbRowB,
+                                 1.0, y, ychIn.z, ychIn.w, ychIn.y);
+    return clamp(gamutYchToRgb(vec4(y, newC, ychIn.z, ychIn.w)), 0.0, 1.0);
+}
+// darktable v5 的完整色彩收尾（gamut_mapping + 主循环的色度 min）：
+// ① 色度收缩 min(orig, fin) + 色相锁定 ② Y clamp 到显示域 ③ desaturate(0)
+// ④ Yrg 检查 ⑤ RGB 检查。original = tone 前线性输入、toned = filmicTone 输出。
+vec3 gamutMapV5(vec3 original, vec3 toned) {
+    vec4 ychOrig = gamutRgbToYch(original);
+    vec4 ychFin = gamutRgbToYch(toned);
+    ychFin.y = min(ychOrig.y, ychFin.y);
+    ychFin.z = ychOrig.z;
+    ychFin.w = ychOrig.w;
+    ychFin.x = clamp(ychFin.x, kYchY1931To2006 * 0.0001517634, kYchY1931To2006);
+    ychFin = gamutDesaturateV4(ychOrig, ychFin);
+    ychFin = gamutCheckYrg(ychFin);
+    return gamutCheckRgb(ychFin);
+}
 void main() {
     vec3 lin = texture(uTex, vUV0).rgb;
     // 预览域映射（v0.8.0，取代直通）：先除以在线估计的 HAL/RAW 域比，映射回 RAW
@@ -1127,7 +1308,9 @@ void main() {
     // filmicTone 输出 pow(clamp(spline), power) ∈ [0,1]，数学有界 —— 预览不再可能爆白。
     if (uPreviewMap > 0.5) {
         vec3 mapped = max(lin, vec3(0.0)) / uDomainRatio * uExposure;
-        oColor = vec4(filmicTone(mapped), 1.0);
+        vec3 toned = filmicTone(mapped);
+        // 预览与成片同链（WYSIWYG）：gamut mapping 同样生效
+        oColor = vec4(uGamut > 0.5 ? gamutMapV5(mapped, toned) : toned, 1.0);
         return;
     }
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
@@ -1173,7 +1356,11 @@ void main() {
     //      （就是"离显示上限多近"）—— 判断过曝该看输出，不该看输入。
     // 若将来实测发现"正常明亮区域仍过饱和"，再引入去饱和时判据必须挂在输出域。
     if (uToneK > 0.0) {
-        out3 = mix(out3, filmicTone(out3), uToneK);
+        // v0.10.13：filmicTone 之后接 darktable v5 gamut mapping（标准算法组成，
+        // 非风格）。original = tone 前线性输入；uGamut=0 = A/B 关（回到旧行为）。
+        vec3 toned = filmicTone(out3);
+        if (uGamut > 0.5) toned = gamutMapV5(out3, toned);
+        out3 = mix(out3, toned, uToneK);
     }
     float l = luma(out3);
     float ws = exp(-l * 3.0);
@@ -1773,14 +1960,14 @@ bool FrameRenderer::init() {
   u_film_.filmic_dr = glGetUniformLocation(prog_film_, "uFilmicDr");
   u_film_.filmic_input_min = glGetUniformLocation(prog_film_, "uFilmicInputMin");
   u_film_.filmic_input_max = glGetUniformLocation(prog_film_, "uFilmicInputMax");
-  u_film_.filmic_power = glGetUniformLocation(prog_film_, "uFilmicPower");
-  u_film_.filmic_black_disp = glGetUniformLocation(prog_film_, "uFilmicBlackDisp");
+  u_film_.filmic_power = glGetUniformLocation(prog_film_, "uFilmicPower");  u_film_.filmic_black_disp = glGetUniformLocation(prog_film_, "uFilmicBlackDisp");
   u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
   u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
   u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
   u_film_.local_knee_hi = glGetUniformLocation(prog_film_, "uLocalKneeHi");
   u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
   u_film_.local_size = glGetUniformLocation(prog_film_, "uLocalSize");
+  u_film_.gamut = glGetUniformLocation(prog_film_, "uGamut");
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -2718,6 +2905,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
   kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
   kv += ",\"sh\":" + std::to_string(p.sharpen).substr(0, 4);
+  kv += ",\"gm\":" + std::to_string(p.gamut).substr(0, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
   kv += std::string(",\"lsc\":\"") +
         (c.lsc_ok ? std::to_string(c.lsc_cols) + "x" + std::to_string(c.lsc_rows)
@@ -3864,6 +4052,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glUniform1f(u_film_.filmic_input_max, filmic_.input_max);
   glUniform1f(u_film_.filmic_power, filmic_.output_power);
   glUniform1f(u_film_.filmic_black_disp, filmic_.black_disp);
+  // v0.10.13：darktable v5 gamut mapping 开关（1 = 标准，0 = A/B 关）
+  glUniform1f(u_film_.gamut, p.gamut);
   // 预览域映射（v0.8.0）：预览先 /uDomainRatio 回 RAW 等效域再走 filmic；静拍=1。
   glUniform1f(u_film_.preview_map, still ? 0.0f : 1.0f);
   glUniform1f(u_film_.domain_ratio, g_domain_ratio);

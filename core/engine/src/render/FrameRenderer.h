@@ -377,6 +377,7 @@ class FrameRenderer {
           filmic_m5 = -1, filmic_lat_min = -1, filmic_lat_max = -1,
           filmic_black_ev = -1, filmic_dr = -1, filmic_input_min = -1,
           filmic_input_max = -1, filmic_power = -1, filmic_black_disp = -1,
+          gamut = -1,  // v0.10.13：darktable filmic v5 gamut mapping（0 = A/B 关）
           exposure = -1;  // v0.7.8：用户 EV 滑杆（影调链后的显示亮度补偿）
   } u_film_;
   struct {

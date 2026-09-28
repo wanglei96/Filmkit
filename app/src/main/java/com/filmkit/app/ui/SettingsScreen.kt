@@ -493,6 +493,23 @@ fun SettingsScreen(
                     )
                 },
             )
+            // 色域映射（v0.10.13）：darktable filmic v5 标准算法的组成部分——
+            // tone mapping 后色度收缩 + Yrg 锥空间检查 + sRGB 色域映射。
+            // 关 = A/B 通路（同场景对照归因）。
+            var gamutOn by rememberSaveable { mutableStateOf(prefs.getBoolean("gamut", true)) }
+            SettingSwitchRow(
+                title = "色域映射",
+                subtitle = "filmic 标准色彩收尾（darktable v5）：色度收缩 + sRGB 色域映射，治高光偏色/过饱和；关 = 同场景 A/B 对照",
+                checked = gamutOn,
+                onChecked = { v ->
+                    gamutOn = v
+                    prefs.edit().putBoolean("gamut", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.gamut",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

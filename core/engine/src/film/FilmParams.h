@@ -9,9 +9,9 @@ namespace filmkit {
 struct FilmParams {
   // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
-  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(40)` 保持一致（v0.9.6 起）；
+  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(41)` 保持一致（v0.10.13 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 40;  // v0.9.6：+[39] sharpen（v0.7.6 曾 +[37]/[38] filmic 黑白点）
+  static constexpr int kCount = 41;  // v0.10.13：+[40] gamut（v0.9.6 +[39] sharpen）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -78,6 +78,13 @@ struct FilmParams {
   // 保色度坐标。0 = 关（A/B 通路）；默认 0 = 缺参/旧长度时保持旧行为，
   // Kotlin 侧 CameraPresets[39] 给标定值（0.5）。
   float sharpen = 0.0f;        // 39
+  // ── v0.10.13：darktable filmic v5 gamut mapping（标准算法补全）─────────
+  // tone mapping（0.5 naive + 0.5 max-RGB）之后的三步（darktable filmicrgb.c
+  // gamut_mapping + colorspaces_inline_conversions.h，PC 已完整移植、我们 v0.10.12
+  // 审核定案时发现全缺）：① 色度收缩（tone mapping 不得增色度）+ 色相锁定；
+  // ② Yrg 锥空间负值/越界检查；③ 恒 Y 恒色相下的解析 clip chroma（sRGB 色域映射）。
+  // 这是标准算法的组成部分不是风格 —— 默认 1.0（开），0 = A/B 通路。
+  float gamut = 1.0f;          // 40
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -131,6 +138,7 @@ struct FilmParams {
     if (n > 37) filmic_black_ev = static_cast<float>(v[37]);
     if (n > 38) filmic_white_ev = static_cast<float>(v[38]);
     if (n > 39) sharpen = static_cast<float>(v[39]);
+    if (n > 40) gamut = static_cast<float>(v[40]);
   }
 };
 

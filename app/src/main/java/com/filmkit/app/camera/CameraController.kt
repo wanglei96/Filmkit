@@ -842,6 +842,9 @@ class CameraController(private val context: Context, private val render: RenderC
     // 轻度锐化（v0.9.6）：强度与 CameraPresets[39] 默认值一致；0 = 关（A/B 通路）。
     private val SHARPEN = 0.5
     private var sharpenPref = -1.0
+    // darktable filmic v5 gamut mapping（v0.10.13）：标准算法组成部分，默认开。
+    private val GAMUT = 1.0
+    private var gamutPref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -896,6 +899,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyAutoTonePref()
         applyLocalTonePref()
         applySharpenPref()
+        applyGamutPref()
         applyFilmicRangePrefs()
     }
 
@@ -956,6 +960,19 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != sharpenPref) {
             sharpenPref = v
             filmParams[39] = v
+        }
+    }
+
+    /**
+     * darktable filmic v5 gamut mapping 开关（v0.10.13）：写 FilmParams[40]。
+     * tone mapping 后的色度收缩 + Yrg 检查 + clip chroma（sRGB 色域映射），
+     * 标准算法的组成部分（非风格）；0 = 关（A/B 通路）。
+     */
+    private fun applyGamutPref() {
+        val v = if (appPrefs.getBoolean("gamut", true)) GAMUT else 0.0
+        if (v != gamutPref) {
+            gamutPref = v
+            filmParams[40] = v
         }
     }
 
