@@ -32,11 +32,21 @@ constexpr int kLocalW = 32, kLocalH = 24;
 // 差）时 m = 2/(2+s)：s=16 → m≈0.11（权重 0.89，基本满融）；运动 tile 的 d² 远超
 // 噪声底 → m→1（权重→0，回退参考帧）。离线扫描（tools/tuning 同法）真机再调。
 constexpr float kMfnrMisS = 16.0f;
-// c（Night Sight "temporal strength" 的稳健端）：w = max(1 − c·m, 0)。c=1 = m=1
-// 完全弃帧；c=0 退化为阶段一等权均值（A/B 通路，也等于关掉 robust merge）。
-// v0.10.2：1.0 → 1.5（子块 max 归约配套加大压制：手 w→0、叶 0.31、静止 0.91，
-// 见 kFsMfnrMismatch 尾注）。
-constexpr float kMfnrRobust = 1.5f;
+// v0.10.5：权重从线性压制改**分段**（用户验收标准：允许自然拖影、不容重叠错误）：
+//   m ≤ kMisLo 全融合（静止/准静止 —— 比线性式更满，保细节）
+//   m ≥ kMisHi 权重硬清零（运动区域整体回退参考帧 —— 宁可糊/噪，不容叠影）
+// 线性中间带只留过渡。v0.10.4 及以前的 w = max(1−c·m,0) 线性式退役。
+constexpr float kMisLo = 0.10f;   // ≤ 全融合
+constexpr float kMisHi = 0.35f;   // ≥ 全回退
+// 位移幅度运动检测（v0.10.5）：残差判据对"平滑皮肤"有物理盲区 —— 手掌内部
+// 帧间错位后残差≈0（皮肤自相似），alt 帧的手指边缘以全权叠进参考帧的手掌
+// （用户指认的"重叠错误"，v0.10.4 的 32px cell + 膨胀无法覆盖手掌宽 500px
+// 的内部）。物体运动（挥手 20-30px）与相机抖动（全局一致 ~6px）的差异在
+// **位移场**里清晰可见：局部位移显著超过全图中位 = 运动，与纹理无关。
+// m_motion = clamp((mag − magMed − kMotLo) / (kMotHi − kMotLo), 0, 1)
+constexpr float kMotLo = 8.f;     // 超出全图中位位移 8px（mosaic）起步
+constexpr float kMotHi = 20.f;    // 超出 20px 满分（硬回退）
+constexpr int kMisDilate = 2;     // m 场膨胀半径（cell）：2 = 5×5，覆盖 64px 带
 // ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
 // "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
 // 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
@@ -3011,11 +3021,22 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                 &ns_raw);
   const float ns_single = ns;
   const float ns_ref = ns_single * rn;
+  // v0.10.5：保存每帧位移场（位移幅度运动检测用；v0.10.3 曾因权重独立成图而删）
+  const int n_tiles = tiles_w_ * tiles_h_;
+  std::vector<std::vector<float>> offs(
+      static_cast<size_t>(count - 1),
+      std::vector<float>(static_cast<size_t>(n_tiles) * 2, 0.f));
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
     stage("align_frame");
+    for (int t = 0; t < n_tiles; ++t) {
+      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 0] =
+          a.off[static_cast<size_t>(t) * 2 + 0];
+      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 1] =
+          a.off[static_cast<size_t>(t) * 2 + 1];
+    }
     // 打包位移场（xy=mosaic 域位移、z=权重恒 1）。v0.9.2 定案：阶段一 =
     // 对齐 + **等权**时域均值（立项字面范围）。v0.9.1 曾用"残差/纹理度"算
     // 置信度加权，真机 A/B 确诊失效（confMed 0.005、fbTiles 9095/9216）——
@@ -3057,20 +3078,19 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glReadPixels(0, 0, cw, chh, GL_RGBA, GL_UNSIGNED_BYTE, mis.data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  // m 场 3×3 膨胀（per-frame）：运动区域（手/叶片）是**连通区域**，残差只在
-  // 其边缘 cell 高 —— 不膨胀时物体内部以残权重混入 alt 帧（手内透背景、叶片
-  // 残影的机制），膨胀让物体整体回退参考帧。膨胀一圈 = 32px 过渡带外扩，代价
-  // 是运动区域边界略扩。静态区域 m 全低，膨胀后不变。
+  // m 场 (2kMisDilate+1)² 膨胀（per-frame）：运动区域（手/叶片）是**连通区域**，
+  // 残差只在其边缘 cell 高 —— 膨胀让物体整体回退参考帧。v0.10.5 半径 1→2
+  // （5×5 = 覆盖 64px 带）。
   std::vector<uint8_t> dil(static_cast<size_t>(n_cells) * 4);
   for (int y = 0; y < chh; ++y) {
     for (int x = 0; x < cw; ++x) {
       const int t = y * cw + x;
       for (int z = 0; z < count - 1; ++z) {
         uint8_t mx = 0;
-        for (int dy = -1; dy <= 1; ++dy) {
+        for (int dy = -kMisDilate; dy <= kMisDilate; ++dy) {
           const int yy = y + dy;
           if (yy < 0 || yy >= chh) continue;
-          for (int dx = -1; dx <= 1; ++dx) {
+          for (int dx = -kMisDilate; dx <= kMisDilate; ++dx) {
             const int xx = x + dx;
             if (xx < 0 || xx >= cw) continue;
             const uint8_t v = mis[(static_cast<size_t>(yy) * cw + xx) * 4 + z];
@@ -3081,16 +3101,53 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       }
     }
   }
+  // 位移幅度运动检测（v0.10.5）：mag 超出全图中位（相机抖动基线）+kMotLo 起步、
+  // +kMotHi 满分。与残差无关 —— 补上"平滑皮肤运动"的残差盲区（手掌叠影）。
+  std::vector<std::vector<float>> mot;
+  float mot_med = 0.f;
+  {
+    std::vector<float> mags_all;
+    mags_all.reserve(static_cast<size_t>(n_tiles) * (count - 1));
+    for (int z = 0; z < count - 1; ++z) {
+      for (int t = 0; t < n_tiles; ++t) {
+        const float dx = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2];
+        const float dy = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2 + 1];
+        mags_all.push_back(std::sqrt(dx * dx + dy * dy));
+      }
+    }
+    std::sort(mags_all.begin(), mags_all.end());
+    const float mag_med = mags_all.empty() ? 0.f : mags_all[mags_all.size() / 2];
+    mot.assign(static_cast<size_t>(count - 1),
+               std::vector<float>(static_cast<size_t>(n_tiles), 0.f));
+    for (int z = 0; z < count - 1; ++z) {
+      for (int t = 0; t < n_tiles; ++t) {
+        const float dx = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2];
+        const float dy = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2 + 1];
+        const float excess = std::sqrt(dx * dx + dy * dy) - mag_med;
+        mot[static_cast<size_t>(z)][static_cast<size_t>(t)] =
+            std::min(std::max((excess - kMotLo) / (kMotHi - kMotLo), 0.f), 1.f);
+      }
+    }
+    mot_med = mag_med;
+  }
   std::vector<uint8_t> wtex(static_cast<size_t>(n_cells) * 4);
   double neff_acc = 0.0;
   std::vector<float> mags;
   mags.reserve(static_cast<size_t>(n_cells) * (count - 1));
   for (int t = 0; t < n_cells; ++t) {
     const size_t ti = static_cast<size_t>(t);
+    const int tile_idx = (t / cw / 4) * tiles_w_ + ((t % cw) / 4);
     double wsum_cell = 1.0;  // 参考帧恒权重 1
     for (int z = 0; z < count - 1; ++z) {
-      const float m = static_cast<float>(dil[ti * 4 + z]) / 255.0f;
-      const float wgt = std::max(1.0f - kMfnrRobust * m, 0.0f);
+      const float m_res = static_cast<float>(dil[ti * 4 + z]) / 255.0f;
+      const float m_mot = mot[static_cast<size_t>(z)][static_cast<size_t>(tile_idx)];
+      const float m = std::max(m_res, m_mot);
+      // 分段：≤kMisLo 全融合（保细节）；≥kMisHi 硬清零（不容重叠）；中间线性
+      const float wgt = m <= kMisLo
+                            ? 1.0f
+                            : (m >= kMisHi
+                                   ? 0.0f
+                                   : (kMisHi - m) / (kMisHi - kMisLo));
       wtex[ti * 4 + z] = static_cast<uint8_t>(wgt * 255.0f + 0.5f);
       wsum_cell += wgt;
       mags.push_back(m);
@@ -3178,6 +3235,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"mP90\":" + f3(m_p90) +
               ",\"neff\":" + f3(neff) +
               ",\"rn\":" + f3(rn) +
+              ",\"motMed\":" + f3(mot_med) +
               ",\"dMed\":" + f3(dx_med_max) +
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
