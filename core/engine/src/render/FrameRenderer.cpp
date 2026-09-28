@@ -3203,17 +3203,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                 std::chrono::steady_clock::now() - n0)
                 .count();
   }
-  // v0.10.15：darktable filmic 高光重建（HR）——P4 后、filmic 前（与 darktable
-  // 一致：重建是 filmic 模块的第一步，结果直接作为 tone mapping 输入）。
-  // blocks == 0（无裁剪像素）或分配失败时 runHighlightReconstruct 返回原纹理。
-  GLuint film_src = c.dn ? tex_dn_ : tex_scene_;
-  int hr_blocks = -1;
-  float hr_ms = 0.0f;
-  if (p.hr_wavelet > 0.5f) {
-    film_src = runHighlightReconstruct(film_src, dst_w, dst_h,
-                                       p.filmic_white_ev, &hr_blocks, &hr_ms);
-  }
-  passFilm(dst_w, dst_h, p, film_src, /*still=*/true);
+  // v0.10.16：HR 已移入 passFilm（黑白点标定之后、still 才跑）——darktable 的
+  // 高光重建与黑白点 autodetect 是配套的（裁剪阈值由 white_source 决定）。
+  passFilm(dst_w, dst_h, p, c.dn ? tex_dn_ : tex_scene_, /*still=*/true);
   const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
@@ -3290,11 +3282,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                   : "off") +
         "\"";
   if (c.rcd) kv += ",\"hl\":" + std::to_string(p.hl_recon).substr(0, 3);
-  // v0.10.15：HR 观测（hrMs = 高光重建耗时；clipBlocks = 64×48 块中命中裁剪的块数，
-  // -1 = 未执行/开关关）
+  // v0.10.15/16：HR 观测（hrMs = 高光重建耗时；clipB = 64×48 块中命中裁剪的块数，
+  // -1 = 未执行/开关关/无裁剪）。值由 passFilm 内的 HR 写入成员变量。
   kv += ",\"hr\":" + std::to_string(p.hr_wavelet).substr(0, 3);
-  kv += ",\"hrMs\":" + std::to_string(hr_ms).substr(0, 6);
-  kv += ",\"clipB\":" + std::to_string(hr_blocks);
+  kv += ",\"hrMs\":" + std::to_string(hr_ms_).substr(0, 6);
+  kv += ",\"clipB\":" + std::to_string(hr_blocks_);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
@@ -4609,10 +4601,19 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   // （−5.6 vs −7.65）⇒ 等于把每个场景最暗的 0.5% 都钉在显示黑 ⇒ 暗部压死、画面更暗，
   // 与已被否掉的 kTarget 中位锚定同型（抹掉"这个场景暗部有多深"这一维）。
   float b = user_black;
-  const float w = user_white;
+  float w = user_white;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
   if (st.valid && auto_on) {
+    // v0.10.16：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
+    // （apply_auto_black / apply_auto_white_point_source）：
+    //   black = 取样域最小像素 → EVmin = clamp(log2(black/grey), −16, −1)
+    //   white = 取样域最大像素 → EVmax = clamp(log2(white/grey), 1, 16)
+    //   security_factor 默认 0。取样统计量 = P0.5 / P99.5（max 通道，用户拍板起步
+    //   组合）。白点自动是**高光重建的触发前提**：HR 的裁剪阈值 = 2^white_source×grey，
+    //   固定默认白点（+4.56EV → 阈值 4.36）高于 RAW 饱和数据白点（≈2.4EV）时 mask
+    //   永远全零（v0.10.15 真机 clipB=0 的根因）。
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
+    w = std::clamp(std::log2(std::max(st.p_hi, 1e-6f) / kGrey), 1.0f, 16.0f);
   }
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
   //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
@@ -4651,6 +4652,20 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
                  p.filmic_white_ev);
+  // ── v0.10.15/16：darktable filmic 高光重建（HR），仅成片路径 ─────────────
+  // 刻意放在 updateFilmicEV **之后**：裁剪阈值 threshold = 2^white_source × grey
+  // 必须用**本帧标定后的白点**——darktable 的 HR 与黑白点 autodetect 是配套的，
+  // 固定默认白点（+4.56EV → 阈值 4.36）高于 RAW 饱和数据白点（≈2.4EV）时 mask
+  // 永远全零（v0.10.15 真机 clipB=0、"粉边未修复"的根因）。重建结果直接替换
+  // filmic 的输入（darktable: in = reconstructed）。blocks == 0（无裁剪像素）或
+  // 分配失败时返回原纹理。
+  hr_blocks_ = -1;
+  hr_ms_ = 0.0f;
+  GLuint film_src = src_tex;
+  if (still && p.hr_wavelet > 0.5f) {
+    film_src = runHighlightReconstruct(src_tex, w, h, ev_white_, &hr_blocks_,
+                                       &hr_ms_);
+  }
   // 预览域映射的在线标定（v0.8.0）：updateFilmicEV 刚把 last_lin_mid_ 更新为本帧
   // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替
   // 到达，用 EMA 各记一侧，静拍时对出比值：
@@ -4699,7 +4714,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glViewport(0, 0, w, h);
   glUseProgram(prog_film_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, src_tex);
+  glBindTexture(GL_TEXTURE_2D, film_src);  // v0.10.16：HR 重建结果替换 filmic 输入
   glUniform1i(u_film_.tex, 0);
   // filmic：spline 系数 + EV 标定（CPU 侧算好，见 computeFilmicSpline）
   glUniform3f(u_film_.filmic_m1, filmic_.m1[0], filmic_.m1[1], filmic_.m1[2]);

@@ -303,6 +303,9 @@ class FrameRenderer {
                                  int* out_clipped_blocks, float* out_ms);
   bool ensureHrTargets(int w, int h);
   void releaseHrTargets();
+  // passFilm 内的 HR 观测（raw.render 的 hr/hrMs/clipB 由 finishStillChain 读取）
+  int hr_blocks_ = -1;
+  float hr_ms_ = 0.0f;
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
   // M4-7 局部色调映射的低频亮度图（RGBA8、LINEAR 上采样）。与 tex_hist_

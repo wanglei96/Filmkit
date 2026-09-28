@@ -183,7 +183,7 @@ fun SettingsScreen(
                     EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
                 )
             }
-            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_black_ev", false)) }
+            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_black_ev", true)) }
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -202,8 +202,9 @@ fun SettingsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
-                        "开 = 黑点按场景自动标定；关（默认）= 用下方配置的黑白点" +
-                            "（darktable 默认 −7.65/+4.56EV）",
+                        "开（默认）= 黑白点按场景自动标定（darktable autodetect：" +
+                            "黑=P0.5、白=P99.5，成对）；关 = 用下方配置的黑白点" +
+                            "（darktable 默认 −7.65/+4.56EV）。白点自动是高光重建的触发前提",
                         color = FilmTheme.CreamDim,
                         fontSize = 10.sp,
                         style = MaterialTheme.typography.labelSmall,
