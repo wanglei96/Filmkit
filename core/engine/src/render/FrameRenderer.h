@@ -252,7 +252,8 @@ class FrameRenderer {
   int pyr1_w_ = 0, pyr1_h_ = 0;
   GLuint tex_fused_ = 0, fbo_fused_ = 0;  // R16F，融合后线性 mosaic（raw 尺寸）
   GLuint tex_off_[3] = {0, 0, 0};         // RGBA16F 位移场（tiles×tiles）
-  GLuint tex_mis_ = 0, fbo_mis_ = 0;      // RGBA8 mismatch map（tiles×tiles）
+  GLuint tex_mis_ = 0, fbo_mis_ = 0;      // RGBA8 mismatch map（4×tiles 网格）
+  GLuint tex_w_ = 0;                      // RGBA8 LINEAR 权重图（4×tiles，→Fuse uW）
   int mfnr_w_ = 0, mfnr_h_ = 0;
   int tiles_w_ = 0, tiles_h_ = 0;
   // LSC 增益网格（RGB16F，NEAREST；1×1 全 1 = 关闭/无数据，见 submitRaw）
@@ -350,14 +351,14 @@ class FrameRenderer {
     GLint tex = -1, size = -1;
   } u_mfnr_down_;
   struct {
-    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
-          tiles = -1, tile_m = -1, black = -1, white = -1, gain = -1,
-          cfalut = -1;
+    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, w = -1,
+          size = -1, tiles = -1, tile_m = -1, black = -1, white = -1,
+          gain = -1, cfalut = -1;
   } u_mfnr_fuse_;
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
-          tiles = -1, tile_m = -1, sigma = -1, s = -1, black = -1, white = -1,
-          gain = -1, cfalut = -1;
+          tiles = -1, off_tiles = -1, tile_m = -1, sigma = -1, s = -1,
+          black = -1, white = -1, gain = -1, cfalut = -1;
   } u_mfnr_mis_;
   struct {
     GLint tex = -1, size = -1, ns = -1, k = -1;

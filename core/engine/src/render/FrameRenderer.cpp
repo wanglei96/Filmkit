@@ -681,6 +681,8 @@ uniform highp usampler2D uRaw3;
 uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
+uniform highp sampler2D uW;  // v0.10.3：mismatch 权重图（4×tiles 网格、RGBA8
+                             // LINEAR——8bit 纹理硬件双线性，32px 过渡带）
 uniform ivec2 uSize;
 uniform vec2 uTiles;
 uniform float uTileM;   // mosaic 域 tile 尺寸（= 2×1/2 域 tile，kMfnrTile×2）
@@ -762,16 +764,19 @@ void main() {
     float acc = linAt(uRaw0, p);
     float wsum = 1.0;
     vec2 uv = (vec2(p) + 0.5) / (uTiles * uTileM);
+    // 权重（v0.10.3）：独立权重图（32px cell，LINEAR 双线性过渡），与位移场解耦
+    // —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
+    vec4 wv = texture(uW, uv);
     vec3 f1 = off1At(uv);
-    float w1 = f1.z;
+    float w1 = wv.r;
     acc += w1 * linSub(uRaw1, p, f1.xy);
     wsum += w1;
     vec3 f2 = off2At(uv);
-    float w2 = f2.z;
+    float w2 = wv.g;
     acc += w2 * linSub(uRaw2, p, f2.xy);
     wsum += w2;
     vec3 f3 = off3At(uv);
-    float w3 = f3.z;
+    float w3 = wv.b;
     acc += w3 * linSub(uRaw3, p, f3.xy);
     wsum += w3;
     float v = acc / max(wsum, 1e-4);
@@ -804,8 +809,9 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform ivec2 uSize;
-uniform vec2 uTiles;
-uniform float uTileM;
+uniform vec2 uTiles;    // mismatch 网格 = 4×tile 网格（cell = 32 mosaic px，v0.10.3）
+uniform vec2 uOffTiles; // 位移场网格（tile 级，采样 off 用）
+uniform float uTileM;   // cell 尺寸（mosaic px，= kMfnrTile/2）
 uniform float uSigma;  // 单帧线性域 σ（WB 后，= denoiseParams 的 ns_raw）
 uniform float uS;      // mismatch 的 σ 缩放常数（标定旋钮）
 uniform int uCfaLut;
@@ -824,7 +830,7 @@ float linAt(highp usampler2D t, ivec2 p) {
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
 }
 vec3 off1At(vec2 uv) {
-    vec2 px = uv * uTiles - 0.5;
+    vec2 px = uv * uOffTiles - 0.5;
     vec2 fr = fract(px);
     ivec2 i0 = ivec2(floor(px));
     ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
@@ -875,41 +881,37 @@ float linSub(highp usampler2D t, ivec2 p, vec2 d) {
 }
 void main() {
     ivec2 t = ivec2(gl_FragCoord.xy);
-    vec2 uv = (vec2(t) + 0.5) / uTiles;  // tile 中心（fuse 同式，取本 tile 位移）
-    vec2 o1 = off1At(uv).xy;
-    vec2 o2 = off2At(uv).xy;
-    vec2 o3 = off3At(uv).xy;
+    // cell 中心 → 整图 uv → 采样所属 tile（uOffTiles 网格）的位移。
+    // v0.10.3：网格 4×tiles（cell = 32 mosaic px）。为什么细：128px tile 的
+    // mean(d²) 把叶缘带的局部运动残差摊薄到检不出（离线：叶缘 32px cell 错位
+    // 8px 时 m 中位 0.68，128px tile 只有 ~0.06）—— 残影叶子正是这种"边缘带
+    // 运动 + tile 主体静止"的混合。cell 细到 32px 后 mean 归约即够（无需子块
+    // max）：可见残影来自高对比叶缘（cell 检出强），暗部平滑区的错位不可见、
+    // 不需要检出 —— 逻辑自洽。
+    vec2 uvFull = (vec2(t) + 0.5) / uTiles;
+    vec2 o1 = off1At(uvFull).xy;
+    vec2 o2 = off2At(uvFull).xy;
+    vec2 o3 = off3At(uvFull).xy;
     ivec2 base = t * int(uTileM);
-    int th = int(uTileM) / 2;
-    // 2×2 子块各自归约、取最大 —— v0.10.2：局部运动（手/单叶，占 tile 一部分）
-    // 在整 tile mean 归约下被静止区域稀释（手占 1/4 时 w 仍 0.43，重影保留）；
-    // 子块 max 把灵敏度提回运动子块本身。离线（σ=0.0166、s=16）：
-    // 手占 25% 错位 40px：w 0.43→0.28；叶 30% 自相似错位：w 0.70→0.54；
-    // 静止噪声底不变（0.94）。配合 c=1.5（kMfnrRobust）：手 w→0、叶 0.31、静止 0.91。
-    float v1 = 0.0, v2 = 0.0, v3 = 0.0;
-    for (int sy = 0; sy < 2; sy++) {
-        for (int sx = 0; sx < 2; sx++) {
-            float a1 = 0.0, a2 = 0.0, a3 = 0.0, n = 0.0;
-            for (int dy = 0; dy < th; dy += 4) {
-                for (int dx = 0; dx < th; dx += 4) {
-                    ivec2 p = base + ivec2(sy * th + dy, sx * th + dx);
-                    if (p.x >= uSize.x || p.y >= uSize.y) continue;
-                    float r = linAt(uRaw0, p);
-                    float d1 = r - linSub(uRaw1, p, o1);
-                    float d2 = r - linSub(uRaw2, p, o2);
-                    float d3 = r - linSub(uRaw3, p, o3);
-                    a1 += d1 * d1;
-                    a2 += d2 * d2;
-                    a3 += d3 * d3;
-                    n += 1.0;
-                }
-            }
-            float inv = 1.0 / max(n, 1.0);
-            v1 = max(v1, a1 * inv);
-            v2 = max(v2, a2 * inv);
-            v3 = max(v3, a3 * inv);
+    int cm = int(uTileM);
+    float s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    float n = 0.0;
+    for (int dy = 0; dy < cm; dy += 4) {
+        for (int dx = 0; dx < cm; dx += 4) {
+            ivec2 p = base + ivec2(dx, dy);
+            if (p.x >= uSize.x || p.y >= uSize.y) continue;
+            float r = linAt(uRaw0, p);
+            float d1 = r - linSub(uRaw1, p, o1);
+            float d2 = r - linSub(uRaw2, p, o2);
+            float d3 = r - linSub(uRaw3, p, o3);
+            s1 += d1 * d1;
+            s2 += d2 * d2;
+            s3 += d3 * d3;
+            n += 1.0;
         }
     }
+    float inv = 1.0 / max(n, 1.0);
+    float v1 = s1 * inv, v2 = s2 * inv, v3 = s3 * inv;
     float kk = uS * uSigma * uSigma;
     oColor = vec4(v1 / (v1 + kk), v2 / (v2 + kk), v3 / (v3 + kk), 1.0);
 })";
@@ -1676,6 +1678,7 @@ bool FrameRenderer::init() {
     u_mfnr_fuse_.off[i] =
         glGetUniformLocation(prog_mfnr_fuse_, ("uOff" + std::to_string(i + 1)).c_str());
   }
+  u_mfnr_fuse_.w = glGetUniformLocation(prog_mfnr_fuse_, "uW");
   u_mfnr_fuse_.size = glGetUniformLocation(prog_mfnr_fuse_, "uSize");
   u_mfnr_fuse_.tiles = glGetUniformLocation(prog_mfnr_fuse_, "uTiles");
   u_mfnr_fuse_.tile_m = glGetUniformLocation(prog_mfnr_fuse_, "uTileM");
@@ -1694,6 +1697,7 @@ bool FrameRenderer::init() {
   }
   u_mfnr_mis_.size = glGetUniformLocation(prog_mfnr_mis_, "uSize");
   u_mfnr_mis_.tiles = glGetUniformLocation(prog_mfnr_mis_, "uTiles");
+  u_mfnr_mis_.off_tiles = glGetUniformLocation(prog_mfnr_mis_, "uOffTiles");
   u_mfnr_mis_.tile_m = glGetUniformLocation(prog_mfnr_mis_, "uTileM");
   u_mfnr_mis_.sigma = glGetUniformLocation(prog_mfnr_mis_, "uSigma");
   u_mfnr_mis_.s = glGetUniformLocation(prog_mfnr_mis_, "uS");
@@ -1870,7 +1874,9 @@ void FrameRenderer::release() {
   }
   if (tex_mis_) glDeleteTextures(1, &tex_mis_);
   if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
+  if (tex_w_) glDeleteTextures(1, &tex_w_);
   tex_mis_ = fbo_mis_ = 0;
+  tex_w_ = 0;
   if (tex_pyr1_) glDeleteTextures(1, &tex_pyr1_);
   if (fbo_pyr1_) glDeleteFramebuffers(1, &fbo_pyr1_);
   if (tex_pyr2_) glDeleteTextures(1, &tex_pyr2_);
@@ -1883,6 +1889,8 @@ void FrameRenderer::release() {
   if (fbo_fused_) glDeleteFramebuffers(1, &fbo_fused_);
   if (tex_mis_) glDeleteTextures(1, &tex_mis_);
   if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
+  if (tex_w_) glDeleteTextures(1, &tex_w_);
+  tex_w_ = 0;
   prog_mfnr_pyr_ = prog_mfnr_down_ = prog_mfnr_fuse_ = prog_raw_dn_fused_ = 0;
   prog_mfnr_mis_ = 0;
   tex_pyr1_ = tex_pyr2_ = tex_pyr3_ = tex_pyr4_ = 0;
@@ -2766,12 +2774,25 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0, GL_RGBA,
                  GL_HALF_FLOAT, nullptr);
   }
-  // mismatch map（RGBA8，tiles 尺寸；m∈[0,1] 8bit 量化 0.4% 对权重可忽略）
+  // mismatch map（RGBA8，4×tiles 网格 = 32px cell；m∈[0,1] 8bit 量化 0.4% 可忽略）
+  const int cw = tw * 4, chh = th * 4;
   if (tex_mis_) {
     glDeleteTextures(1, &tex_mis_);
     glDeleteFramebuffers(1, &fbo_mis_);
   }
-  makeTex(&tex_mis_, &fbo_mis_, GL_RGBA8, tw, th);
+  makeTex(&tex_mis_, &fbo_mis_, GL_RGBA8, cw, chh);
+  // 权重图（RGBA8 **LINEAR**——8bit 纹理硬件双线性可用，Fuse 采样即 32px 平滑过渡；
+  // 与 tex_mis_ 同网格）
+  if (tex_w_) glDeleteTextures(1, &tex_w_);
+  tex_w_ = 0;
+  glGenTextures(1, &tex_w_);
+  glBindTexture(GL_TEXTURE_2D, tex_w_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cw, chh, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, nullptr);
   mfnr_w_ = w;
   mfnr_h_ = h;
   tiles_w_ = tw;
@@ -2814,8 +2835,8 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_mfnr_fuse_);
-  const GLenum units[7] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
-                           GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6};
+  const GLenum units[8] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
+                           GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6, GL_TEXTURE7};
   const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
   for (int i = 0; i < 4; ++i) {
     glActiveTexture(units[i]);
@@ -2827,6 +2848,9 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
     glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
     glUniform1i(u_mfnr_fuse_.off[i], 4 + i);
   }
+  glActiveTexture(GL_TEXTURE7);
+  glBindTexture(GL_TEXTURE_2D, tex_w_);
+  glUniform1i(u_mfnr_fuse_.w, 7);
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_mfnr_fuse_.size, w, h);
   glUniform2f(u_mfnr_fuse_.tiles, static_cast<float>(tiles_w_),
@@ -2847,7 +2871,7 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
                                      float white_level, const float gains[3],
                                      float sigma, float s_const) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
-  glViewport(0, 0, tiles_w_, tiles_h_);
+  glViewport(0, 0, tiles_w_ * 4, tiles_h_ * 4);
   glUseProgram(prog_mfnr_mis_);
   const GLenum units[7] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
                            GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6};
@@ -2864,9 +2888,12 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   }
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_mfnr_mis_.size, mfnr_w_, mfnr_h_);
-  glUniform2f(u_mfnr_mis_.tiles, static_cast<float>(tiles_w_),
+  // uTiles = 4×tile 网格（32px cell）；uOffTiles = 位移场网格（tile 级）
+  glUniform2f(u_mfnr_mis_.tiles, static_cast<float>(tiles_w_ * 4),
+              static_cast<float>(tiles_h_ * 4));
+  glUniform2f(u_mfnr_mis_.off_tiles, static_cast<float>(tiles_w_),
               static_cast<float>(tiles_h_));
-  glUniform1f(u_mfnr_mis_.tile_m, static_cast<float>(kMfnrTile) * 2.0f);
+  glUniform1f(u_mfnr_mis_.tile_m, static_cast<float>(kMfnrTile) / 2.0f);
   glUniform1f(u_mfnr_mis_.sigma, sigma);
   glUniform1f(u_mfnr_mis_.s, s_const);
   glUniform1i(u_mfnr_mis_.cfalut, cfaLutOf(cfa));
@@ -2984,10 +3011,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                 &ns_raw);
   const float ns_single = ns;
   const float ns_ref = ns_single * rn;
-  // 阶段二：保存每帧位移场（mismatch 后连同权重一起重写 z 通道）
-  std::vector<std::vector<float>> offs(
-      static_cast<size_t>(count - 1),
-      std::vector<float>(static_cast<size_t>(tiles_w_) * tiles_h_ * 2, 0.f));
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
@@ -3003,10 +3026,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     // 才压权重，因此不会被暗部噪声系统性误杀。
     std::vector<float> pack(static_cast<size_t>(tiles_w_) * tiles_h_ * 4, 1.f);
     for (int t = 0; t < tiles_w_ * tiles_h_; ++t) {
-      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 0] =
-          a.off[static_cast<size_t>(t) * 2 + 0];
-      offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 1] =
-          a.off[static_cast<size_t>(t) * 2 + 1];
       pack[static_cast<size_t>(t) * 4 + 0] =
           a.off[static_cast<size_t>(t) * 2 + 0];
       pack[static_cast<size_t>(t) * 4 + 1] =
@@ -3026,40 +3045,40 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                  std::chrono::steady_clock::now() - t0)
                  .count();
 
-  // ── 阶段二 robust merge（v0.10.0）：mismatch map → 权重写回 z 通道 ────
+  // ── 阶段二 robust merge：mismatch map（4×tiles / 32px cell）→ 权重图 ──
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
   passMfnrMismatch(cfa, black_phase, wl, rc.gains, ns_ref, kMfnrMisS);
-  const int n_tiles = tiles_w_ * tiles_h_;
-  std::vector<uint8_t> mis(static_cast<size_t>(n_tiles) * 4);
+  // v0.10.3：网格 = 4×tiles（32px cell）。权重独立成图（tex_w_，LINEAR），
+  // 与位移场解耦 —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
+  const int cw = tiles_w_ * 4, chh = tiles_h_ * 4;
+  const int n_cells = cw * chh;
+  std::vector<uint8_t> mis(static_cast<size_t>(n_cells) * 4);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
-  glReadPixels(0, 0, tiles_w_, tiles_h_, GL_RGBA, GL_UNSIGNED_BYTE, mis.data());
+  glReadPixels(0, 0, cw, chh, GL_RGBA, GL_UNSIGNED_BYTE, mis.data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  // w = max(1 − c·m, 0) 重写位移场 z 通道；Fuse 读 z 加权 + 双线性插值
-  //（64px 过渡带，tile 边界无跳变）。wsum 含参考帧恒权重 1。
-  std::vector<float> wsum(static_cast<size_t>(n_tiles), 1.0f);
+  std::vector<uint8_t> wtex(static_cast<size_t>(n_cells) * 4);
+  double neff_acc = 0.0;
   std::vector<float> mags;
-  mags.reserve(static_cast<size_t>(n_tiles) * (count - 1));
-  for (int z = 0; z < count - 1; ++z) {
-    std::vector<float> pack(static_cast<size_t>(n_tiles) * 4);
-    for (int t = 0; t < n_tiles; ++t) {
-      const size_t ti = static_cast<size_t>(t);
+  mags.reserve(static_cast<size_t>(n_cells) * (count - 1));
+  for (int t = 0; t < n_cells; ++t) {
+    const size_t ti = static_cast<size_t>(t);
+    double wsum_cell = 1.0;  // 参考帧恒权重 1
+    for (int z = 0; z < count - 1; ++z) {
       const float m = static_cast<float>(mis[ti * 4 + z]) / 255.0f;
       const float wgt = std::max(1.0f - kMfnrRobust * m, 0.0f);
-      pack[ti * 4 + 0] = offs[static_cast<size_t>(z)][ti * 2 + 0];
-      pack[ti * 4 + 1] = offs[static_cast<size_t>(z)][ti * 2 + 1];
-      pack[ti * 4 + 2] = wgt;
-      pack[ti * 4 + 3] = 1.0f;
-      wsum[ti] += wgt;
+      wtex[ti * 4 + z] = static_cast<uint8_t>(wgt * 255.0f + 0.5f);
+      wsum_cell += wgt;
       mags.push_back(m);
     }
-    glBindTexture(GL_TEXTURE_2D, tex_off_[z]);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tiles_w_, tiles_h_, GL_RGBA,
-                    GL_FLOAT, pack.data());
+    wtex[ti * 4 + 3] = 255;
+    neff_acc += wsum_cell;
   }
-  double neff_acc = 0.0;
-  for (float w : wsum) neff_acc += w;
-  const float neff = static_cast<float>(neff_acc / std::max(n_tiles, 1));
+  const float neff = static_cast<float>(
+      neff_acc / std::max(n_cells, 1));
+  glBindTexture(GL_TEXTURE_2D, tex_w_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, chh, GL_RGBA, GL_UNSIGNED_BYTE,
+                  wtex.data());
   std::sort(mags.begin(), mags.end());
   const float m_med = mags.empty()
                           ? 0.f
