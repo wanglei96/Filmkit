@@ -1,8 +1,8 @@
 ---
 summary: MFNR阶段一四轮迭代验收达标
 created: 2026-09-27 20:05
-updated: 2026-09-27 20:05
-status: active
+updated: 2026-09-28 10:45
+status: absorbed
 ---
 
 # MFNR阶段一四轮迭代验收达标
