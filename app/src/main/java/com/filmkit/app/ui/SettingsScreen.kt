@@ -277,40 +277,6 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            var hlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hl_recon", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !hlOn
-                        hlOn = v
-                        prefs.edit().putBoolean("hl_recon", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.hl_recon",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("高光重建", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "CCM 前用未饱和通道外推饱和通道（治高光偏色，如灯泡发品红）；" +
-                            "仅 RCD 质量档生效",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (hlOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
             // M3 P0 镜头阴影校正（v0.5.43）：HAL 增益网格治暗角 + 角落色偏。
             // 常开开关，归设置页（快捷面板只放拍摄时会频繁切的项）。
             var lscOn by rememberSaveable { mutableStateOf(prefs.getBoolean("lsc", true)) }

@@ -167,11 +167,9 @@ class FrameRenderer {
                   float white_level, const float gains[3], bool mosaic);
   void passRcdG(int w, int h, int cfa, const float black_phase[4],
                 float white_level, const float gains[3], bool mosaic);
-  // hl_k —— 高光重建强度（FilmParams.hl_recon，0 = 关；CCM 前做，见 .cpp）
   void passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                      const float black_phase[4], float white_level,
-                     const float gains[3], const float* ccm, bool mosaic,
-                     float hl_k);
+                     const float gains[3], const float* ccm, bool mosaic);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑
   // k —— 值域 σ 系数（P0 标准 0.50 / 强 2.20；P4 标准 1.80 / 强 2.60）
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
@@ -376,7 +374,7 @@ class FrameRenderer {
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, mos = -1, mosaic = -1,
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, ccm = -1, hl_k = -1, lsc = -1, lsc_size = -1;
+          gain = -1, ccm = -1, lsc = -1, lsc_size = -1;
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,

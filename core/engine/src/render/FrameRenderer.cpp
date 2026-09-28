@@ -400,26 +400,11 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 uniform mat3 uCcm;     // sensor→sRGB 行主序
-uniform float uHlK;    // 高光重建强度（0 = 关，旧行为）
 const float EPS = 1e-6;
-// ── 高光重建（M3 §3.2 阶段 4）──────────────────────────────────────
-// 传感器饱和后被截断在满阱（s() 里 raw=white → 1.0×gain），CCM 再把这种截断
-// 失真按矩阵混进其它通道 —— 真机实测灯泡 R/B 先饱和、G 未饱和 → 高光偏品红。
-// 这里在 CCM 之前，用未饱和通道反推辐照度（raw 归一化域 1.0 = 满阱），把饱和
-// 通道替换成该辐照度对应的通道值（中性高光假设 = 最保守的估计，宁可趋白也不
-// 停在截断点上）。全饱和像素没有可信参考，保持原值交给后段高光 rolloff。
-vec3 hlRecon(vec3 lin) {
-    vec3 thr = uGain * 0.99;
-    vec3 sat = step(thr, lin);
-    float nsat = sat.r + sat.g + sat.b;
-    if (nsat <= 0.0 || nsat >= 3.0) return lin;
-    vec3 rawv = lin / max(uGain, vec3(1e-6));
-    float x = 0.0;
-    if (sat.r < 0.5) x = max(x, rawv.r);
-    if (sat.g < 0.5) x = max(x, rawv.g);
-    if (sat.b < 0.5) x = max(x, rawv.b);
-    return mix(lin, x * uGain, sat * uHlK);
-}
+// ── 高光重建（M3 §3.2 阶段 4）——v0.10.20 移除 ──────────────────────
+// 自研"中性外推"（2026-09-28 审计定性为 darktable 原生高光处理的简化替代），
+// 原生 à trous 小波重建（kFsHr* 组，filmic 前）已完整接管：裁剪像素的通道
+// 修复由小波插值完成（含 ratios 域色相修正），本处不再外推。
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -514,9 +499,8 @@ void main() {
         r = g + axialFill(p, 0);
         b = g + axialFill(p, 2);
     }
-    // LSC 在 hlRecon 之后、CCM 之前：饱和判定仍用未校正值（原语义不变），
-    // 校正只作用在 CCM 前的线性 RGB（网格低频，去马赛克前后差异 <1%）
-    vec3 rgb = uCcm * (hlRecon(vec3(r, g, b)) * lscAt(p));
+    // LSC 在 CCM 前（网格低频，去马赛克前后差异 <1%）
+    vec3 rgb = uCcm * (vec3(r, g, b) * lscAt(p));
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
@@ -2184,7 +2168,6 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.white = glGetUniformLocation(prog_rcd_chroma_, "uWhite");
   u_rcd_chroma_.gain = glGetUniformLocation(prog_rcd_chroma_, "uGain");
   u_rcd_chroma_.ccm = glGetUniformLocation(prog_rcd_chroma_, "uCcm");
-  u_rcd_chroma_.hl_k = glGetUniformLocation(prog_rcd_chroma_, "uHlK");
   u_rcd_chroma_.lsc = glGetUniformLocation(prog_rcd_chroma_, "uLsc");
   u_rcd_chroma_.lsc_size = glGetUniformLocation(prog_rcd_chroma_, "uLscSize");
 
@@ -2961,7 +2944,7 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
-                                  const float* ccm, bool mosaic, float hl_k) {
+                                  const float* ccm, bool mosaic) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_rcd_chroma_);
@@ -2997,7 +2980,6 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glActiveTexture(GL_TEXTURE0);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
   glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
-  glUniform1f(u_rcd_chroma_.hl_k, hl_k);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
 }
@@ -3202,7 +3184,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase,
-                  c.white_level, c.gains, c.ccm, true, p.hl_recon);
+                  c.white_level, c.gains, c.ccm, true);
   } else {
     passRaw(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase, c.white_level,
             c.gains, c.ccm, p);
@@ -3294,7 +3276,6 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         (c.lsc_ok ? std::to_string(c.lsc_cols) + "x" + std::to_string(c.lsc_rows)
                   : "off") +
         "\"";
-  if (c.rcd) kv += ",\"hl\":" + std::to_string(p.hl_recon).substr(0, 3);
   // v0.10.15/16：HR 观测（hrMs = 高光重建耗时；clipB = 64×48 块中命中裁剪的块数，
   // -1 = 未执行/开关关/无裁剪）。值由 passFilm 内的 HR 写入成员变量。
   kv += ",\"hr\":" + std::to_string(p.hr_wavelet).substr(0, 3);
