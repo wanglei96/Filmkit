@@ -3117,15 +3117,43 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     }
     std::sort(mags_all.begin(), mags_all.end());
     const float mag_med = mags_all.empty() ? 0.f : mags_all[mags_all.size() / 2];
+    // v0.10.6：m_motion **逐 cell 用双线性插值位移**计算 —— v0.10.5 直接复制
+    // tile 值，权重场每 128px 一个 0/1 硬跳变，跳变处"融合版手臂边缘（alt 混入
+    // 略宽）"与"参考帧手臂边缘（略窄）"跳换 → 手臂沿线的方块锯齿缺口（用户
+    // 指认）。位移场在融合采样时本就是插值使用的，运动判据也应连续。
     mot.assign(static_cast<size_t>(count - 1),
-               std::vector<float>(static_cast<size_t>(n_tiles), 0.f));
+               std::vector<float>(static_cast<size_t>(n_cells), 0.f));
     for (int z = 0; z < count - 1; ++z) {
-      for (int t = 0; t < n_tiles; ++t) {
-        const float dx = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2];
-        const float dy = offs[static_cast<size_t>(z)][static_cast<size_t>(t) * 2 + 1];
-        const float excess = std::sqrt(dx * dx + dy * dy) - mag_med;
-        mot[static_cast<size_t>(z)][static_cast<size_t>(t)] =
-            std::min(std::max((excess - kMotLo) / (kMotHi - kMotLo), 0.f), 1.f);
+      const std::vector<float>& off = offs[static_cast<size_t>(z)];
+      for (int y = 0; y < chh; ++y) {
+        for (int x = 0; x < cw; ++x) {
+          // cell 中心 → tile 网格连续坐标（双线性，边界 clamp）
+          const float tx = (x + 0.5f) * 0.25f - 0.5f;
+          const float ty = (y + 0.5f) * 0.25f - 0.5f;
+          const int x0 = std::min(std::max(static_cast<int>(std::floor(tx)), 0),
+                                  tiles_w_ - 1);
+          const int y0 = std::min(std::max(static_cast<int>(std::floor(ty)), 0),
+                                  tiles_h_ - 1);
+          const int x1 = std::min(x0 + 1, tiles_w_ - 1);
+          const int y1 = std::min(y0 + 1, tiles_h_ - 1);
+          const float fx = tx - static_cast<float>(x0);
+          const float fy = ty - static_cast<float>(y0);
+          const auto ox = [&](int xx, int yy) {
+            return off[(static_cast<size_t>(yy) * tiles_w_ + xx) * 2 + 0];
+          };
+          const auto oy = [&](int xx, int yy) {
+            return off[(static_cast<size_t>(yy) * tiles_w_ + xx) * 2 + 1];
+          };
+          const float dx =
+              (1 - fy) * ((1 - fx) * ox(x0, y0) + fx * ox(x1, y0)) +
+              fy * ((1 - fx) * ox(x0, y1) + fx * ox(x1, y1));
+          const float dy =
+              (1 - fy) * ((1 - fx) * oy(x0, y0) + fx * oy(x1, y0)) +
+              fy * ((1 - fx) * oy(x0, y1) + fx * oy(x1, y1));
+          const float excess = std::sqrt(dx * dx + dy * dy) - mag_med;
+          mot[static_cast<size_t>(z)][static_cast<size_t>(y) * cw + x] =
+              std::min(std::max((excess - kMotLo) / (kMotHi - kMotLo), 0.f), 1.f);
+        }
       }
     }
     mot_med = mag_med;
@@ -3136,11 +3164,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   mags.reserve(static_cast<size_t>(n_cells) * (count - 1));
   for (int t = 0; t < n_cells; ++t) {
     const size_t ti = static_cast<size_t>(t);
-    const int tile_idx = (t / cw / 4) * tiles_w_ + ((t % cw) / 4);
     double wsum_cell = 1.0;  // 参考帧恒权重 1
     for (int z = 0; z < count - 1; ++z) {
       const float m_res = static_cast<float>(dil[ti * 4 + z]) / 255.0f;
-      const float m_mot = mot[static_cast<size_t>(z)][static_cast<size_t>(tile_idx)];
+      const float m_mot = mot[static_cast<size_t>(z)][ti];
       const float m = std::max(m_res, m_mot);
       // 分段：≤kMisLo 全融合（保细节）；≥kMisHi 硬清零（不容重叠）；中间线性
       const float wgt = m <= kMisLo
