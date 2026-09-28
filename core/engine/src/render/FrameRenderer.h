@@ -299,7 +299,7 @@ class FrameRenderer {
   GLint u_hr_restore_ratios_ = -1, u_hr_restore_norms_ = -1;
   GLint u_hr_stat_mask_ = -1, u_hr_stat_size_ = -1, u_hr_stat_out_ = -1;
   // 返回重建后的纹理：未触发/失败/关闭时返回 src（调用方零分支）。
-  GLuint runHighlightReconstruct(GLuint src, int w, int h, float white_ev,
+  GLuint runHighlightReconstruct(GLuint src, int w, int h,
                                  int* out_clipped_blocks, float* out_ms);
   bool ensureHrTargets(int w, int h);
   void releaseHrTargets();

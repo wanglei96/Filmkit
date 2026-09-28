@@ -3603,7 +3603,6 @@ bool FrameRenderer::ensureHrTargets(int w, int h) {
 }
 
 GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
-                                              float white_ev,
                                               int* out_clipped_blocks,
                                               float* out_ms) {
   if (out_clipped_blocks) *out_clipped_blocks = -1;
@@ -3616,8 +3615,14 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   //   normalize = feather / threshold；noise_level 0.2；
   //   gamma/gamma_comp = 0.5/0.5（structure_vs_texture 0 的换算 (p/100+1)/2）；
   //   beta/beta_comp 1/0；delta 1；HQ 迭代 1。
+  // v0.10.18：threshold 与 filmic 的 white_source **解耦，恒 = RAW 饱和数据白点
+  // 1.0**（= 2^2.4383EV × 0.1845）。原因：0.10.17 真机——white 自动（P99）在无
+  // 饱和场景掉到 1.44EV → 阈值 0.5 → 比 P99 亮的普通像素全被当"裁剪"送进小波
+  // 重建（clipB=1435/3072 = 47% 的块，灾难）。darktable 语境里 white_source 由
+  // 用户设在数据 max 附近 → 阈值 ≈ 数据白点；自动语境下"裁剪重建"的物理语义 =
+  // RAW 饱和（线性 1.0），恒定阈值是该行为的忠实落地。
   constexpr float kGrey = 0.1845f;
-  const float threshold = std::exp2(white_ev) * kGrey;
+  const float threshold = 1.0f;
   const float feather = 16.0f;
   const float normalize = feather / threshold;
   const float noise_level = 0.2f;
@@ -4625,16 +4630,21 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   float w = user_white;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
   if (st.valid && auto_on) {
-    // v0.10.16：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
-    // （apply_auto_black / apply_auto_white_point_source）：
-    //   black = 取样域最小像素 → EVmin = clamp(log2(black/grey), −16, −1)
-    //   white = 取样域最大像素 → EVmax = clamp(log2(white/grey), 1, 16)
-    //   security_factor 默认 0。取样统计量 = P0.5 / P99.5（max 通道，用户拍板起步
-    //   组合）。白点自动是**高光重建的触发前提**：HR 的裁剪阈值 = 2^white_source×grey，
-    //   固定默认白点（+4.56EV → 阈值 4.36）高于 RAW 饱和数据白点（≈2.4EV）时 mask
-    //   永远全零（v0.10.15 真机 clipB=0 的根因）。
+    // v0.10.16/18：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
+    // （apply_auto_black / apply_auto_white_point_source），取样统计量 = P0.1 / P99
+    // （max 通道）。v0.10.17 真机教训：分位必须钳在**物理量**上，否则自动化自毁——
+    //   ① black：暗光噪声把 P0.1 拉到噪声底（预览 blackEv 撞 −16 clamp）→ 下限钉
+    //      darktable 固定默认 −7.65（场景没有比默认更暗的东西时用默认）；
+    //   ② white：无饱和场景（暗光室内）P99 = 场景最亮 0.5 → white_ev 1.44 →
+    //      dr 7.75 → power 被派生公式推到 8.2（中间调对比爆炸）→ 下限钉 **RAW 饱和
+    //      数据白点** 2.44EV（= log2(1.0/0.1845)，数据天花板）；上限 darktable 默认
+    //      4.56（数据 max = 1.0 → P99 恒 ≤ 2.44，上限是防御）。
+    //   结果：暗光 ≈ black −7.65 / white 2.44（dr 10.1 → power ≈ 4.2，darktable
+    //   autodetect 的正常区间）；白天 black 随场景收紧（−4.5~−6）。
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
     w = std::clamp(std::log2(std::max(st.p_hi, 1e-6f) / kGrey), 1.0f, 16.0f);
+    b = std::max(b, -7.654144f);
+    w = std::clamp(w, 2.438307f, 4.556152f);
   }
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
   //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
@@ -4673,19 +4683,16 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
                  p.filmic_white_ev);
-  // ── v0.10.15/16：darktable filmic 高光重建（HR），仅成片路径 ─────────────
-  // 刻意放在 updateFilmicEV **之后**：裁剪阈值 threshold = 2^white_source × grey
-  // 必须用**本帧标定后的白点**——darktable 的 HR 与黑白点 autodetect 是配套的，
-  // 固定默认白点（+4.56EV → 阈值 4.36）高于 RAW 饱和数据白点（≈2.4EV）时 mask
-  // 永远全零（v0.10.15 真机 clipB=0、"粉边未修复"的根因）。重建结果直接替换
-  // filmic 的输入（darktable: in = reconstructed）。blocks == 0（无裁剪像素）或
-  // 分配失败时返回原纹理。
+  // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────
+  // 裁剪阈值恒 = RAW 饱和数据白点 1.0（物理量，与 filmic 白点解耦——0.10.17 的
+  // 阈值随 white 自动掉到 0.5 曾把 47% 的块送进重建）。重建结果直接替换 filmic
+  // 的输入（darktable: in = reconstructed）。blocks == 0（无裁剪像素）或分配
+  // 失败时返回原纹理。
   hr_blocks_ = -1;
   hr_ms_ = 0.0f;
   GLuint film_src = src_tex;
   if (still && p.hr_wavelet > 0.5f) {
-    film_src = runHighlightReconstruct(src_tex, w, h, ev_white_, &hr_blocks_,
-                                       &hr_ms_);
+    film_src = runHighlightReconstruct(src_tex, w, h, &hr_blocks_, &hr_ms_);
   }
   // 预览域映射的在线标定（v0.8.0）：updateFilmicEV 刚把 last_lin_mid_ 更新为本帧
   // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替
