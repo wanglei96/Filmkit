@@ -1120,16 +1120,36 @@ class CameraController(private val context: Context, private val render: RenderC
         burstStrides.fill(0)
         burstResults.fill(null)
         burstStartMs = android.os.SystemClock.elapsedRealtime()
-        // 快门锚 15ms；ISO 等比补偿（曝光量 iso×sec 守恒），clamp 到机型上限。
-        // 上限内补不满时曝光量不足（欠曝）由 filmic 显示亮度补偿兜底（已知 tradeoff）。
-        val secRef = minOf(liveExposureNs, MFNR_REF_MAX_EXPOSURE_NS)
+        // v0.10.4 三重约束：
+        // ① 暗光门控：liveIso 超过**模拟增益上限**（SENSOR_MAX_ANALOG_SENSITIVITY）
+        //   时不压短 —— 数字增益区压快门 = 光子更少 + 纯数字放大，噪声双重恶化
+        //   （实测 ISO 11467 时参考帧 σ=0.104 = alt 的 1.63 倍，运动区域回退后
+        //   "噪点恐怖"）。暗光拖影由 mismatch 压重影，压短留给帧数档位（8 帧的
+        //   噪声预算才付得起）。
+        // ② 压缩比上限 1.5×：secRef = min(sec, max(15ms, sec×2/3)) —— 长曝光
+        //   场景的压缩比失控（40ms→15ms = 2.67×）让 rn 冲到 1.63。
+        // ③ isoRef clamp 到 min(range.upper, maxAnalog)：参考帧不进纯数字增益区。
+        val maxAnalog = curCharacteristics?.get(
+            android.hardware.camera2.CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY,
+        ) ?: 3200
+        val gated = liveIso > maxAnalog
+        val secRef = if (gated) {
+            liveExposureNs
+        } else {
+            minOf(
+                liveExposureNs,
+                maxOf(MFNR_REF_MAX_EXPOSURE_NS, liveExposureNs * 2 / 3),
+            )
+        }
         var isoRef = if (liveIso > 0 && secRef > 0) {
             Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt()
         } else {
             liveIso
         }
+        var isoUpper = Int.MAX_VALUE
         curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-            ?.let { isoRef = isoRef.coerceIn(it.lower, it.upper) }
+            ?.let { isoUpper = it.upper }
+        isoRef = isoRef.coerceIn(1, minOf(isoUpper, maxAnalog))
         burstRefNoiseScale = if (liveIso > 0 && liveExposureNs > 0 && secRef > 0) {
             kotlin.math.sqrt(liveExposureNs.toDouble() / secRef).toFloat()
         } else {

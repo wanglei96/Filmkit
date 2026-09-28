@@ -3057,6 +3057,30 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glReadPixels(0, 0, cw, chh, GL_RGBA, GL_UNSIGNED_BYTE, mis.data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  // m 场 3×3 膨胀（per-frame）：运动区域（手/叶片）是**连通区域**，残差只在
+  // 其边缘 cell 高 —— 不膨胀时物体内部以残权重混入 alt 帧（手内透背景、叶片
+  // 残影的机制），膨胀让物体整体回退参考帧。膨胀一圈 = 32px 过渡带外扩，代价
+  // 是运动区域边界略扩。静态区域 m 全低，膨胀后不变。
+  std::vector<uint8_t> dil(static_cast<size_t>(n_cells) * 4);
+  for (int y = 0; y < chh; ++y) {
+    for (int x = 0; x < cw; ++x) {
+      const int t = y * cw + x;
+      for (int z = 0; z < count - 1; ++z) {
+        uint8_t mx = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+          const int yy = y + dy;
+          if (yy < 0 || yy >= chh) continue;
+          for (int dx = -1; dx <= 1; ++dx) {
+            const int xx = x + dx;
+            if (xx < 0 || xx >= cw) continue;
+            const uint8_t v = mis[(static_cast<size_t>(yy) * cw + xx) * 4 + z];
+            if (v > mx) mx = v;
+          }
+        }
+        dil[static_cast<size_t>(t) * 4 + z] = mx;
+      }
+    }
+  }
   std::vector<uint8_t> wtex(static_cast<size_t>(n_cells) * 4);
   double neff_acc = 0.0;
   std::vector<float> mags;
@@ -3065,7 +3089,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     const size_t ti = static_cast<size_t>(t);
     double wsum_cell = 1.0;  // 参考帧恒权重 1
     for (int z = 0; z < count - 1; ++z) {
-      const float m = static_cast<float>(mis[ti * 4 + z]) / 255.0f;
+      const float m = static_cast<float>(dil[ti * 4 + z]) / 255.0f;
       const float wgt = std::max(1.0f - kMfnrRobust * m, 0.0f);
       wtex[ti * 4 + z] = static_cast<uint8_t>(wgt * 255.0f + 0.5f);
       wsum_cell += wgt;
