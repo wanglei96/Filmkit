@@ -136,3 +136,6 @@ status: active
 
 - [2026-09-28] 发布现状：最新 **v0.10.17-m4（versionCode 168）**，main 已推 GitHub；根目录 filmkit-0.10.17-m4.apk；未打 tag
 - [2026-09-28] **v0.10.17**：① gamut mapping 恢复**完整五步原版**（色度 min+色相锁定+Y clamp+desaturate(0)+Yrg+clip chroma，用户批评"先完整按人家原版做出来再评估删不删"）② 自适应影调分位校准 P0.1/P99 ③ HR 统计纹理 R16F→RGBA8（readback 兼容，HR 首次具备触发条件）④ AGENTS.md 固化"先 100% 原版→真机→数据评估"铁律。**待真机观察：原生 min 回归后暗部是否重现泛白（0.10.16 语境 vs 当时不同）——这是完整原版的第一次真机数据**
+
+- [2026-09-28] 发布现状：最新 **v0.10.18-m4（versionCode 169）**，main 已推 GitHub；根目录 filmkit-0.10.18-m4.apk；未打 tag
+- [2026-09-28] **v0.10.18**：黑白点自动钳物理界（black=max(P0.1,−7.65)、white=clamp(max(P99,2.438),…,4.556)）；**HR 裁剪阈值恒 1.0**（RAW 饱和物理语义，与 filmic 白点解耦——0.10.17 曾跟 white_ev 掉到 0.5 导致 47% 块被重建）。预期：暗光 black −7.65/white 2.44（power≈4.2，darktable autodetect 正常区间）、白天 black 随场景收紧、HR 只碰真饱和区（clipB 大幅回落）、hrMs≈280ms 需观察拍照时延
