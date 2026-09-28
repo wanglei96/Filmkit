@@ -464,7 +464,7 @@ fun CameraScreen(
         else "%.1fS".format(ns / 1_000_000_000.0)
 
     val shutterNs = 10f.pow(5f + 4f * shutterV).roundToLong()
-    val maxIso = controller.maxAnalogIso
+    val maxIso = controller.isoRangeUpper
     // EV 补偿实际范围/步进来自 characteristics（部分设备不支持负补偿，UI 自适应）
     val (evLo, evHi, evStp) = controller.evInfo()
     // 取景窗口 = 所选画幅（WYSIWYG）。

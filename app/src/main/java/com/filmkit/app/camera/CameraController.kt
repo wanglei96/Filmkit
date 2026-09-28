@@ -266,7 +266,12 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var wbK = 5000
 
-    var maxAnalogIso = 3200
+    // 手动 ISO 滑杆上限 = SENSOR_INFO_SENSITIVITY_RANGE.upper（规范保证"设下去
+    // 有效"的范围）。v0.10.11 修正（对齐 PhotonCamera 语义）：此前误用
+    // SENSOR_MAX_ANALOG_SENSITIVITY（X300 报 11467）——那是"模拟增益上限"
+    // （用于"别进数字增益"类判断），不是手动可设范围；真机 AE 实测能到 3687+
+    // 属 HAL 的 AE 扩展，不代表手动设置有效。
+    var isoRangeUpper = 3200
         private set
     var baseFocalMm = 23f
         private set
@@ -317,7 +322,7 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     fun setIso(v: Int) {
-        iso = v.coerceIn(100, maxAnalogIso)
+        iso = v.coerceIn(100, isoRangeUpper)
         if (manualExposure) rebuildRepeating()
     }
 
@@ -1326,7 +1331,31 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         colorFilterArrangement = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
-        maxAnalogIso = ch.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY) ?: 3200
+        isoRangeUpper = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?.upper ?: 3200
+        // 一次性能力探针（v0.10.11/12）：**遍历全部 cameraId** —— 用户实测
+        // PhotonCamera 滑杆到 19200，其 isoRange 取"当前活动相机"特性，疑似
+        // 物理相机（非逻辑 id0）报的范围不同（我们 id0 读到 3200）。
+        try {
+            val mgr = context.getSystemService(android.content.Context.CAMERA_SERVICE)
+                as android.hardware.camera2.CameraManager
+            for (cid in mgr.cameraIdList) {
+                val c = mgr.getCameraCharacteristics(cid)
+                val r = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                val m = c.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY)
+                val b = c.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "camera.iso_caps_id",
+                    com.filmkit.app.kv(
+                        "id" to cid,
+                        "range" to (if (r != null) "${r.lower}..${r.upper}" else "none"),
+                        "maxAnalog" to (m ?: -1),
+                        "boost" to (if (b != null) "${b.lower}..${b.upper}" else "none"),
+                    ),
+                )
+            }
+        } catch (_: Throwable) {
+        }
         ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()?.let {
             baseFocalMm = it
         }
