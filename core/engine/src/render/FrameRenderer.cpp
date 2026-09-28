@@ -1562,25 +1562,37 @@ vec3 gamutCheckRgb(vec4 ychIn) {
                                  1.0, y, ychIn.z, ychIn.w, ychIn.y);
     return clamp(gamutYchToRgb(vec4(y, newC, ychIn.z, ychIn.w)), 0.0, 1.0);
 }
-// ── gamut 收尾（v0.10.14 修正版）────────────────────────────────────────
-// 初版（v0.10.13）实装了 darktable v7 的完整五步。真机 A/B（用户：画面泛白）+
-// 链级模拟（真实 DNG + 日志 spline 系数，2026-09-28）定位到其中两步是**跨域比较**：
-//   ① Ych 色度 min(orig, fin)：orig 在场景线性域、fin 在显示域。filmic 的逐通道
-//      pow（output_power 2.62 × OETF 0.4545，净 1.19 次幂）系统性放大显示域色度比
-//      ⇒ c_fin > c_orig 几乎处处成立 ⇒ min 把色度钉回场景域值：实测暗部 **91%**
-//      像素触发、色度损失中位 **26.8%**，中间调 85%/8.8%，样片暗部 rel 中位
-//      0.69→0.54（-22%，与真机 -17~-33% 吻合）= **全局去饱和滤镜**。
-//   ② desaturate 中点分支：同一跨域问题（绝对色度 c×Y，ΔY 大时语义错位）。
-// darktable 桌面版对①的行为有 saturation 滑杆（+方向）补偿、且其工作流 filmic 前
-// 有 exposure 场景归一（ΔY 小）；手机直出链两者皆无，且已验收基线 = gm 关的观感。
-// 故只保留 gamut mapping 的**保险丝职责**（Y 显示域 clamp / Yrg 锥空间检查 /
-// 恒 Y 恒色相解析 clip chroma）——只作用于病态与色域外像素。抽样验证（142517.dng
-// 200k 像素）：暗部 rel 0.690、中间调 0.268 = gm=0 基线逐位一致（零色度损失）；
-// 灯管粉边仍被压淡（R-G 中位 4.0→0.0，与 A/B 实测 = clip chroma 之功）。
-// 色度风格归 uSat/uLook 层（darktable 的 saturation 语义）。
-vec3 gamutMapV5(vec3 toned) {
+// filmic_desaturate_v4 的 saturation=0 特化（darktable filmic_v5 主循环调用
+// gamut_mapping 时硬编码传 0.0f，与 PC 移植一致；风格饱和在 uSat/uLook 层）。
+// 唯一生效分支 = filmic 同时"提亮且增饱和"时把绝对色度拉回中点。
+vec4 gamutDesaturateV4(vec4 ychOrig, vec4 ychFin) {
+    float chromaOrig = ychOrig.y * ychOrig.x;  // c×Y = 绝对色度
+    float chromaFin = ychFin.y * ychFin.x;
+    bool brightens = ychFin.x > ychOrig.x;
+    bool resat = chromaOrig < chromaFin;
+    if (brightens && resat) chromaFin = 0.5 * (chromaOrig + chromaFin);
+    ychFin.y = max(chromaFin / max(ychFin.x, 1e-8), 0.0);
+    return ychFin;
+}
+// ── darktable filmic_v5 主循环的 gamut 段，完整五步逐行对齐 ──────────────
+// （filmicrgb.c filmic_v5：Ych_final[1] = fminf(orig, fin) → gamut_mapping
+//   = 色相锁定 → Y clamp → filmic_desaturate_v4(saturation=0) → gamut_check_Yrg
+//   → gamut_check_RGB。2026-09-28 用户定调：先 100% 原版跑起来，再按真机数据
+//   评估——此前按自研分析预删两步的做法废弃。）
+// original = tone 前线性输入（darktable 的 pix_in）、toned = filmicTone 输出。
+vec3 gamutMapV5(vec3 original, vec3 toned) {
+    vec4 ychOrig = gamutRgbToYch(original);
     vec4 ychFin = gamutRgbToYch(toned);
+    // ① 色度收缩：tone mapping 不得增色度（相对色度域 min）
+    ychFin.y = min(ychOrig.y, ychFin.y);
+    // ② 色相锁定（gamut_mapping 开头）
+    ychFin.z = ychOrig.z;
+    ychFin.w = ychOrig.w;
+    // ③ Y clamp 到显示域（CIE 1931→2006 因子）
     ychFin.x = clamp(ychFin.x, kYchY1931To2006 * 0.0001517634, kYchY1931To2006);
+    // ④ desaturate(saturation=0)
+    ychFin = gamutDesaturateV4(ychOrig, ychFin);
+    // ⑤ Yrg 锥空间检查 + sRGB 色域映射
     ychFin = gamutCheckYrg(ychFin);
     return gamutCheckRgb(ychFin);
 }
@@ -1593,7 +1605,7 @@ void main() {
         vec3 mapped = max(lin, vec3(0.0)) / uDomainRatio * uExposure;
         vec3 toned = filmicTone(mapped);
         // 预览与成片同链（WYSIWYG）：gamut mapping 同样生效
-        oColor = vec4(uGamut > 0.5 ? gamutMapV5(toned) : toned, 1.0);
+        oColor = vec4(uGamut > 0.5 ? gamutMapV5(mapped, toned) : toned, 1.0);
         return;
     }
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
@@ -1639,10 +1651,11 @@ void main() {
     //      （就是"离显示上限多近"）—— 判断过曝该看输出，不该看输入。
     // 若将来实测发现"正常明亮区域仍过饱和"，再引入去饱和时判据必须挂在输出域。
     if (uToneK > 0.0) {
-        // v0.10.13：filmicTone 之后接 gamut 收尾（保险丝：Y clamp/Yrg/clip
-        // chroma；v0.10.14 移除跨域的 min 色度与 desaturate，见 gamutMapV5）。
+        // v0.10.17：filmicTone 之后接 darktable filmic_v5 的完整 gamut 段
+        // （色度 min + 色相锁定 + Y clamp + desaturate(0) + Yrg/RGB 检查，
+        // 逐行对齐原版；original = tone 前线性输入 out3）。
         vec3 toned = filmicTone(out3);
-        if (uGamut > 0.5) toned = gamutMapV5(toned);
+        if (uGamut > 0.5) toned = gamutMapV5(out3, toned);
         out3 = mix(out3, toned, uToneK);
     }
     float l = luma(out3);
@@ -3563,7 +3576,10 @@ bool FrameRenderer::ensureHrTargets(int w, int h) {
   makeTex(&tex_hr_recon_[1], &fbo_hr_recon_[1], GL_RGBA16F, w, h);
   makeR16F(&tex_hr_mask_, &fbo_hr_mask_, w, h);
   makeR16F(&tex_hr_norms_, &fbo_hr_norms_, w, h);
-  makeR16F(&tex_hr_stat_, &fbo_hr_stat_, 64, 48);
+  // v0.10.17：stat 用 RGBA8（makeTex）——R16F attachment 配 GL_UNSIGNED_BYTE
+  // readback 在 ES 3.0 不保证可用（X300 实测静默回零 → clipB 恒 0、HR 永不触发）。
+  // mask ∈ [0,1] 的 8bit 量化对"块内 max > 1/17"判据足够。
+  makeTex(&tex_hr_stat_, &fbo_hr_stat_, GL_RGBA8, 64, 48);
   // 任一 FBO 不完整 = 该 pass 被驱动整体丢弃（X300 上 RGBA8+HALF_FLOAT 事故同型）
   bool ok = true;
   const GLuint fbos[10] = {fbo_hr_lf_[0], fbo_hr_lf_[1], fbo_hr_hf_, fbo_hr_hfrgb_,
@@ -4437,10 +4453,15 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   };
   // 直方图在**显示域**（kFsHist 内部已过 OETF）；pow 单调 ⇒ pow(·, 2.2) 折回线性后
   // 仍是同一像素的 max 通道值，不是近似。
+  // v0.10.17：分位 P0.5/P99.5 → **P0.1/P99**（真机 0.10.16 校准）——P0.5 把 black 收到
+  // −5.6EV，dr 从 12.2 收到 8.0，power 被派生公式推到 4.7+ ⇒ 中间调压暗 + 色度比
+  // 放大（用户实测"中间调低、天空过饱和"）；P99.5 的 shoulder 过渡太窄 ⇒ 水壶高光
+  // 推白。P0.1 更贴近 darktable autodetect"框选最暗"的 min 语义，P99 给 shoulder 留
+  // 过渡带。
   const auto to_lin = [](float v) { return std::pow(v, 2.2f); };
-  st.p_lo = to_lin(pct(0.005));
+  st.p_lo = to_lin(pct(0.001));
   st.p_mid = to_lin(pct(0.50));
-  st.p_hi = to_lin(pct(0.995));
+  st.p_hi = to_lin(pct(0.99));
   st.valid = true;
   last_lin_mid_ = st.p_mid;  // 诊断字段（raw.render / preview.filmic）
   last_p_lo_ = st.p_lo;
