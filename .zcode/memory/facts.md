@@ -122,3 +122,8 @@ status: active
 - [2026-09-28] **验收数据（阶段二）**：手部达标（v0.10.7 用户确认）；101741 motD 高 m 0-1%/neff 3.58（101754 残余 17-37%/2.97）；PC 对比：墙 σ 0.29 vs 2.34（8×）、叶缘 p99.5 17.1 vs 20.8；PC 成片比我们暗 24%（PC EXIF 2011/30.3ms vs 我们 1829/30ms）；锐化 A/B：Lap99.5 ×1.25、σ ×1.21（混杂上界）
 - [2026-09-28] **PC 参照源码位置（/tmp/photoncamera）**：`MultiFrameExposurePlanner.kt`/`MultiFrameConfig.kt`（长帧 10ms 上限+模拟增益 cap）、`DarktableFilmicToneAlgorithm.kt`（filmic v5 固定参数）、`RawToneMappingGl.kt computeFilmicToneCurveUniforms`（中灰锚定公式）、`MeteringSystem.kt`、`GlesMgcRawSpatialStacker.kt`（GCam SpatialDenoise 移植）、`RawToneMappingParameters.kt`（FILMIC_BLACK/WHITE_RELATIVE_EXPOSURE_DEFAULT = -7.65/4.56）
 - [2026-09-28] **我们的 DNG 未写 BaselineExposure**（vivo DngCreator 不写该 tag）——PC 的 `DngBaselineExposure` 环节对处理我们的 DNG 为空
+
+- [2026-09-28] 发布现状：最新 **v0.10.13-m4（versionCode 164）**，main=`5374dbb` 已推 GitHub；根目录 filmkit-0.10.13-m4.apk；**未打 tag**
+- [2026-09-28] **项目大前提已写入仓库根 `AGENTS.md`**（质量为先、严禁简化关键质量管线、对标口径=标准做法非 PC）——每会话自动加载
+- [2026-09-28] **gamut mapping（v0.10.13）实现**：`kFsFilm` 内 `gamutMapV5()`（色度 min+色相锁定→Y clamp→desaturate(0)→Yrg check→clip chroma 白/黑解析解），插桩 filmicTone 后、风格层前；预览分支同链；矩阵/常数与 darktable master 逐项核对一致（源码副本 /tmp/dt-filmicrgb.c、/tmp/dt-gamut.h、/tmp/dt-csic.h；验证脚本 /tmp/gamut_verify*.py）；`FilmParams[40]`（kCount 41）、prefs `gamut` 默认开、设置页「色域映射」、raw.render 加 `gm`
+- [2026-09-28] **审核定案六项差距与队列**（用户批准顺序，见 decisions.md 2026-09-28 条）：② MFNR 参考帧回标准（最锐帧，撤 15ms 压短——当前参考帧权重恒 1 且 rn>1 使融合噪声下限抬高 ~32%）③ 运动区补偿降噪（NS §3.3）④ 频域逐频维纳（HDR+ §5/NS 式 7——我们注释"Fig.6 批 DFT"是误读，批的是全局单次 DFT；Night Sight 合并仍在 DFT 域、mismatch 只是空间调制因子）⑤ 场景曝光归一 ⑥ 8 帧档位
