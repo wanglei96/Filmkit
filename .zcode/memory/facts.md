@@ -143,3 +143,6 @@ status: active
 - [2026-09-28] 发布现状：最新 **v0.10.20-m4（versionCode 171）**，main 已推 GitHub；未打 tag
 - [2026-09-28] **v0.10.19/20**：黑白点自动默认关（三版证伪撤销；PC SDR 链实锤无场景归一，sceneExposureGain = HDR 链专用——"亮度差在 tone 链"归因纠正，差距在 AE 曝光决策）；旧「高光重建」hl_recon **删除**（自研简化替代，原生小波 [41] 接管；[29] 槽位保留引擎不消费）。固定曲线 = 0.10.12 影调基线 + 原生 HR/gamut 五步/锐化
 - [2026-09-28] **用户新观察"比 0.10.12 更灰"**：归因 = 原生色度 min 在固定曲线下仍全局去饱和（暗部 rel −17% 实测）；darktable 同样有此行为（论坛投诉），官方解法 = 工作流下一环 **color balance rgb**（未实现）。**待用户拍板：补 color balance rgb（原生工作流完整化，大）vs 其他**
+
+- [2026-09-28] 发布现状：最新 **v0.10.21-m4（versionCode 172）**，main 已推 GitHub；未打 tag
+- [2026-09-28] **饱和补偿标定包（v0.10.21）**：设置页「饱和补偿」滑杆 0~30% → prefs sat_comp → FilmParams[20]/[21]=1+v（阴影/中间调；[22] 高光恒 1.0）——原生色度 min 的低饱和由**风格层 uSat** 标定补偿（分层对应 darktable filmic→color balance、PC filmic→LUT；PC 源码核实**无 color balance**、保留 min 靠用户 LUT 兜）。待用户定值后固化默认
