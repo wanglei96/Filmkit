@@ -127,3 +127,6 @@ status: active
 - [2026-09-28] **项目大前提已写入仓库根 `AGENTS.md`**（质量为先、严禁简化关键质量管线、对标口径=标准做法非 PC）——每会话自动加载
 - [2026-09-28] **gamut mapping（v0.10.13）实现**：`kFsFilm` 内 `gamutMapV5()`（色度 min+色相锁定→Y clamp→desaturate(0)→Yrg check→clip chroma 白/黑解析解），插桩 filmicTone 后、风格层前；预览分支同链；矩阵/常数与 darktable master 逐项核对一致（源码副本 /tmp/dt-filmicrgb.c、/tmp/dt-gamut.h、/tmp/dt-csic.h；验证脚本 /tmp/gamut_verify*.py）；`FilmParams[40]`（kCount 41）、prefs `gamut` 默认开、设置页「色域映射」、raw.render 加 `gm`
 - [2026-09-28] **审核定案六项差距与队列**（用户批准顺序，见 decisions.md 2026-09-28 条）：② MFNR 参考帧回标准（最锐帧，撤 15ms 压短——当前参考帧权重恒 1 且 rn>1 使融合噪声下限抬高 ~32%）③ 运动区补偿降噪（NS §3.3）④ 频域逐频维纳（HDR+ §5/NS 式 7——我们注释"Fig.6 批 DFT"是误读，批的是全局单次 DFT；Night Sight 合并仍在 DFT 域、mismatch 只是空间调制因子）⑤ 场景曝光归一 ⑥ 8 帧档位
+
+- [2026-09-28] 发布现状：最新 **v0.10.14-m4（versionCode 165）**，main=`eab8260` 已推 GitHub；根目录 filmkit-0.10.14-m4.apk；未打 tag
+- [2026-09-28] **gamut 收尾 v0.10.14 修正版**：`gamutMapV5(toned)` 只留 Y 显示域 clamp + Yrg 锥空间检查 + 解析 clip chroma（暗部/中间调 rel = gm=0 基线逐位一致；全链 4000 点零越界；域内 1e-8 恒等）；**移除** darktable 的跨域 Ych 色度 min 与 desaturate(0)（泛白根因，见 lessons 2026-09-28）；**">)" 原始字符串坑再次触发**（GLSL 注释里 `min(orig,fin)"` 提前终止字面量 → C++ 编译错 1197 行；规避：GLSL 注释内数字后接括号一律用全角）
