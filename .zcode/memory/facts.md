@@ -130,3 +130,6 @@ status: active
 
 - [2026-09-28] 发布现状：最新 **v0.10.14-m4（versionCode 165）**，main=`eab8260` 已推 GitHub；根目录 filmkit-0.10.14-m4.apk；未打 tag
 - [2026-09-28] **gamut 收尾 v0.10.14 修正版**：`gamutMapV5(toned)` 只留 Y 显示域 clamp + Yrg 锥空间检查 + 解析 clip chroma（暗部/中间调 rel = gm=0 基线逐位一致；全链 4000 点零越界；域内 1e-8 恒等）；**移除** darktable 的跨域 Ych 色度 min 与 desaturate(0)（泛白根因，见 lessons 2026-09-28）；**">)" 原始字符串坑再次触发**（GLSL 注释里 `min(orig,fin)"` 提前终止字面量 → C++ 编译错 1197 行；规避：GLSL 注释内数字后接括号一律用全角）
+
+- [2026-09-28] 发布现状：最新 **v0.10.16-m4（versionCode 167）**，main 已推 GitHub；根目录 filmkit-0.10.16-m4.apk；未打 tag
+- [2026-09-28] **v0.10.15 真机 A/B 定案（用户样片 + 日志）**：HR 开/关两张粉边无差——**HR 从未触发**（clipB=0：mask 阈值 2^4.556×0.1845=4.36 高于 RAW 饱和数据白点 1.0/‖rgb‖≤√3）；**根因 = darktable 的 HR 与黑白点 autodetect 是配套件**，单独移植固定默认白点时永不命中。v0.10.16 修复：① 自适应影调升级为**黑白点成对自动**（darktable autotune：black=P0.5→clamp(−16,−1)、white=P99.5→clamp(1,16)，security 0；统计本就是 max 通道 P0.5/P50/P99.5）默认开 ② HR 移入 passFilm 的 updateFilmicEV 之后（threshold 用本帧标定白点 ev_white_），仍限 still ③ prefs auto_black_ev 默认 true ④ hl_recon[29] 注释定性为 darktable RAW 域 highlights 模块的自研简化替代（对齐后移除）
