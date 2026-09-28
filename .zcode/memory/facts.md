@@ -139,3 +139,7 @@ status: active
 
 - [2026-09-28] 发布现状：最新 **v0.10.18-m4（versionCode 169）**，main 已推 GitHub；根目录 filmkit-0.10.18-m4.apk；未打 tag
 - [2026-09-28] **v0.10.18**：黑白点自动钳物理界（black=max(P0.1,−7.65)、white=clamp(max(P99,2.438),…,4.556)）；**HR 裁剪阈值恒 1.0**（RAW 饱和物理语义，与 filmic 白点解耦——0.10.17 曾跟 white_ev 掉到 0.5 导致 47% 块被重建）。预期：暗光 black −7.65/white 2.44（power≈4.2，darktable autodetect 正常区间）、白天 black 随场景收紧、HR 只碰真饱和区（clipB 大幅回落）、hrMs≈280ms 需观察拍照时延
+
+- [2026-09-28] 发布现状：最新 **v0.10.20-m4（versionCode 171）**，main 已推 GitHub；未打 tag
+- [2026-09-28] **v0.10.19/20**：黑白点自动默认关（三版证伪撤销；PC SDR 链实锤无场景归一，sceneExposureGain = HDR 链专用——"亮度差在 tone 链"归因纠正，差距在 AE 曝光决策）；旧「高光重建」hl_recon **删除**（自研简化替代，原生小波 [41] 接管；[29] 槽位保留引擎不消费）。固定曲线 = 0.10.12 影调基线 + 原生 HR/gamut 五步/锐化
+- [2026-09-28] **用户新观察"比 0.10.12 更灰"**：归因 = 原生色度 min 在固定曲线下仍全局去饱和（暗部 rel −17% 实测）；darktable 同样有此行为（论坛投诉），官方解法 = 工作流下一环 **color balance rgb**（未实现）。**待用户拍板：补 color balance rgb（原生工作流完整化，大）vs 其他**
