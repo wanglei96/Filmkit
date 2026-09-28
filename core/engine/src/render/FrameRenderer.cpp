@@ -47,6 +47,14 @@ constexpr float kMisHi = 0.35f;   // ≥ 全回退
 constexpr float kMotLo = 8.f;     // 超出全图中位位移 8px（mosaic）起步
 constexpr float kMotHi = 20.f;    // 超出 20px 满分（硬回退）
 constexpr int kMisDilate = 2;     // m 场膨胀半径（cell）：2 = 5×5，覆盖 64px 带
+// 暗光残差衰减（v0.10.8）：暗光的对齐置信度趋零（confMed 0.004 @ISO3347）、实际
+// 噪声/对齐误差超过 HAL profile 假设 —— 残差判据大面积误报（无运动的场景
+// mMed 0.68/mP90 1.0），回退块（单帧高噪）与融合块交错 = "块状噪点"。
+// ns 代理 ISO：ns_alt > 0.02（≈ISO 1000+）开始衰减，0.04 时降到 0.3 —— 暗光
+// 只信位移判据（与噪声无关）。
+constexpr float kResFadeLo = 0.02f;
+constexpr float kResFadeHi = 0.04f;
+constexpr float kResFadeMin = 0.3f;
 // ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
 // "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
 // 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
@@ -3142,13 +3150,20 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // ② cell 级 3×3 box 平滑 —— 把 tile 方块边界化开（96px 过渡，防 v0.10.5 锯齿；
   //    两种手臂轮廓的"换源"变为缓慢渐变）。
   // ③ 分段权重（低 m 全融合 / 高 m 硬清零）。
+  // 残差项暗光衰减（ns_alt 代理 ISO；rn 已在 ns_single 里折回 alt 域）
+  const float res_fade =
+      ns_single <= kResFadeLo
+          ? 1.f
+          : std::max(kResFadeMin,
+                     1.f - (ns_single - kResFadeLo) / (kResFadeHi - kResFadeLo) * 0.7f);
   std::vector<float> mfield(static_cast<size_t>(n_cells) * (count - 1), 0.f);
   for (int y = 0; y < chh; ++y) {
     for (int x = 0; x < cw; ++x) {
       const int t = y * cw + x;
       const int tcx = x / 4, tcy = y / 4;
       for (int z = 0; z < count - 1; ++z) {
-        const float m_res = static_cast<float>(dil[static_cast<size_t>(t) * 4 + z]) / 255.0f;
+        const float m_res =
+            static_cast<float>(dil[static_cast<size_t>(t) * 4 + z]) / 255.0f * res_fade;
         float m_mot = 0.f;
         for (int dy = -1; dy <= 1; ++dy) {
           const int ty = tcy + dy;
@@ -3166,24 +3181,36 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       }
     }
   }
+  // v0.10.8：box 平滑 → **3×3 中值** —— 暗光残差误报是散点式（每 tile 随机），
+  // 中值把散点杀掉而真实运动区域（连片高 m）完整保留；box 均值做不到（散点被
+  // 摊开成"低幅大面积"——正是块状噪声的成因之一）。
   std::vector<float> msm(mfield.size());
+  float medbuf[9];
   for (int y = 0; y < chh; ++y) {
     for (int x = 0; x < cw; ++x) {
       const int t = y * cw + x;
       for (int z = 0; z < count - 1; ++z) {
-        float acc = 0.f;
-        float n = 0.f;
+        int n = 0;
         for (int dy = -1; dy <= 1; ++dy) {
           const int yy = y + dy;
           if (yy < 0 || yy >= chh) continue;
           for (int dx = -1; dx <= 1; ++dx) {
             const int xx = x + dx;
             if (xx < 0 || xx >= cw) continue;
-            acc += mfield[(static_cast<size_t>(yy) * cw + xx) * (count - 1) + z];
-            n += 1.f;
+            medbuf[n++] = mfield[(static_cast<size_t>(yy) * cw + xx) * (count - 1) + z];
           }
         }
-        msm[(static_cast<size_t>(t)) * (count - 1) + z] = acc / std::max(n, 1.f);
+        // 插入排序取中位（n ≤ 9）
+        for (int a = 1; a < n; ++a) {
+          const float key = medbuf[a];
+          int b = a - 1;
+          while (b >= 0 && medbuf[b] > key) {
+            medbuf[b + 1] = medbuf[b];
+            --b;
+          }
+          medbuf[b + 1] = key;
+        }
+        msm[(static_cast<size_t>(t)) * (count - 1) + z] = medbuf[n / 2];
       }
     }
   }
