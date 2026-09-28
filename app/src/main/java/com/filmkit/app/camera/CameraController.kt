@@ -1718,6 +1718,19 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
+    /**
+     * HAL 原生色彩矩阵（`COLOR_CORRECTION_TRANSFORM`，行主序 9 元素）。
+     * v0.10.24 从内联块抽出：raw.meta 日志与 ccm 选择两处复用。
+     * 构造收行主序、读取 getElement(col,row)——遍历须 (row, col) 双重序防转置（v0.5.20 教训）。
+     */
+    private fun halCcmOf(result: CaptureResult): FloatArray {
+        val m = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
+            for (row in 0..2) for (col in 0..2) m[row * 3 + col] = t.getElement(col, row).toFloat()
+        }
+        return m
+    }
+
     /** raw.meta / raw.calib 日志（单帧与 MFNR burst 共用；原 processRaw 内联块抽出） */
     private fun logRawMeta(img: Image, result: TotalCaptureResult, meta: RenderClient.RawFrameMeta) {
         val ch = curCharacteristics
@@ -1729,6 +1742,16 @@ class CameraController(private val context: Context, private val render: RenderC
                 "neutral" to meta.neutral.joinToString(",") { "%.4f".format(it) },
                 "ccm" to meta.ccm.joinToString(",") { "%.3f".format(it) },
                 "ccmSrc" to if (meta.ccmStd) "std" else "hal",
+                // ── v0.10.24（诊断）：两条色彩链的矩阵**同时**入日志 ──────────────
+                // 为什么：色度差距定位到 filmic 之前的色彩变换后（大色块 C* 低 17%，
+                // 已排除降噪/LSC/去马赛克/工作域），需要区分"StdColorMatrix 的
+                // ForwardMatrix 双光源插值链"与"HAL 原生 COLOR_CORRECTION_TRANSFORM"
+                // 各自的饱和度传递。此前只能来回切 ccm_std 开关靠两张照片比 —— 现在
+                // 一张照片就能离线对拍两条链。
+                // std 链**无条件**计算（纯 3×3 矩阵运算，开销可忽略），即使当前用的是 HAL。
+                "ccmStd" to (ch?.let { StdColorMatrix.compute(it, meta.neutral) }
+                    ?.joinToString(",") { "%.4f".format(it) } ?: "null"),
+                "ccmHal" to halCcmOf(result).joinToString(",") { "%.4f".format(it) },
                 "noise" to "%.4f".format(meta.noiseSigma),
                 "in" to "${img.width}x${img.height}",
                 "lens" to currentLensId,
@@ -1908,11 +1931,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 nR = 1f; nG = 1f; nB = 1f
             }
         }
-        val halCcm = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
-        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
-            // 构造收行主序、读取 getElement(col,row)——遍历须 (row, col) 双重序防转置
-            for (row in 0..2) for (col in 0..2) halCcm[row * 3 + col] = t.getElement(col, row).toFloat()
-        }
+        val halCcm = halCcmOf(result)
         // 色彩链（§3.2-7 / §3.4-4）：优先用 characteristics 标定矩阵自建标准链
         // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB，与 Adobe/libraw 完整链同源）；
         // 开关关或标定数据缺失 → 回退 HAL 的 COLOR_CORRECTION_TRANSFORM（跨机型兜底）
