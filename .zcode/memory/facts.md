@@ -133,3 +133,6 @@ status: active
 
 - [2026-09-28] 发布现状：最新 **v0.10.16-m4（versionCode 167）**，main 已推 GitHub；根目录 filmkit-0.10.16-m4.apk；未打 tag
 - [2026-09-28] **v0.10.15 真机 A/B 定案（用户样片 + 日志）**：HR 开/关两张粉边无差——**HR 从未触发**（clipB=0：mask 阈值 2^4.556×0.1845=4.36 高于 RAW 饱和数据白点 1.0/‖rgb‖≤√3）；**根因 = darktable 的 HR 与黑白点 autodetect 是配套件**，单独移植固定默认白点时永不命中。v0.10.16 修复：① 自适应影调升级为**黑白点成对自动**（darktable autotune：black=P0.5→clamp(−16,−1)、white=P99.5→clamp(1,16)，security 0；统计本就是 max 通道 P0.5/P50/P99.5）默认开 ② HR 移入 passFilm 的 updateFilmicEV 之后（threshold 用本帧标定白点 ev_white_），仍限 still ③ prefs auto_black_ev 默认 true ④ hl_recon[29] 注释定性为 darktable RAW 域 highlights 模块的自研简化替代（对齐后移除）
+
+- [2026-09-28] 发布现状：最新 **v0.10.17-m4（versionCode 168）**，main 已推 GitHub；根目录 filmkit-0.10.17-m4.apk；未打 tag
+- [2026-09-28] **v0.10.17**：① gamut mapping 恢复**完整五步原版**（色度 min+色相锁定+Y clamp+desaturate(0)+Yrg+clip chroma，用户批评"先完整按人家原版做出来再评估删不删"）② 自适应影调分位校准 P0.1/P99 ③ HR 统计纹理 R16F→RGBA8（readback 兼容，HR 首次具备触发条件）④ AGENTS.md 固化"先 100% 原版→真机→数据评估"铁律。**待真机观察：原生 min 回归后暗部是否重现泛白（0.10.16 语境 vs 当时不同）——这是完整原版的第一次真机数据**
