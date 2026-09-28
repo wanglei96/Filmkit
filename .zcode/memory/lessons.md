@@ -144,3 +144,5 @@ status: active
 
 - [2026-09-28] **自动判据必须钳在物理量上，否则自动化自毁（0.10.17 全线糟糕化的三连根因）**：① white 自动=P99 在无饱和暗光场景 = 场景最亮 0.5 → white_ev 1.44 → power 派生 8.2（中间调对比爆炸）；② black=P0.1 暗光下 = 噪声底（预览 blackEv 撞 −16 clamp）；③ HR 阈值跟 white_ev 掉到 0.5 → 47% 的块被当"裁剪"送进小波重建（clipB=1435/3072）。修：black=max(P0.1, −7.65)（darktable 默认为下限）、white=clamp(max(P99, 2.438), …, 4.556)（RAW 饱和数据白点为下限）、**HR 裁剪阈值与 filmic 白点解耦恒 = 1.0**（RAW 饱和物理语义）。规律：分位统计描述"场景"，但曲线端点与重建判据必须有物理下限/上限兜底。
 - [2026-09-28] **浮点 attachment 的 readback 组合陷阱**（R16F + GL_UNSIGNED_BYTE 在 ES 3.0 不保证、X300 静默回零）：HR 统计因此两版从未触发（clipB 恒 0）。浮点 FBO 要回读时改用 RGBA8 目标（值域 [0,1] 时无损失）或确认驱动的合法组合。
+
+- [2026-09-28] **"PC 的 sceneExposureGain = SDR 场景归一"是误判（源码实锤）**：hdrNetSceneExposureGain = sourceToShortGain × hdrRatio × 2^ev 只是 **HDR 参考渲染的坐标增益**（RawHdrReferencePass 注释原文 "The output is a scalar HDR/SDR ratio"）；**PC 的 SDR 亮度链 = 固定 filmic 默认参数（−7.65/4.56）+ DngBaselineExposure + MGC-AE 曝光决策，无 tone 侧场景归一**。此前"PC 中位 98 vs 我们 116 差在 tone 链"归因错误——差距在 AE 曝光决策（MGC-AE），我们侧对应物 = base_ev 校准（+0.50 用户已验收）。由此：黑白点自动三版真机证伪（0.10.16/17/18）后默认关，固定曲线 = PC 行为；"场景曝光归一"专项撤销，改列"MGC-AE 曝光决策复刻"为远期专项。
