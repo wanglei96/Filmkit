@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-27 20:05
+updated: 2026-09-28 20:13
 status: active
 ---
 
@@ -146,3 +146,10 @@ status: active
 
 - [2026-09-28] 发布现状：最新 **v0.10.21-m4（versionCode 172）**，main 已推 GitHub；未打 tag
 - [2026-09-28] **饱和补偿标定包（v0.10.21）**：设置页「饱和补偿」滑杆 0~30% → prefs sat_comp → FilmParams[20]/[21]=1+v（阴影/中间调；[22] 高光恒 1.0）——原生色度 min 的低饱和由**风格层 uSat** 标定补偿（分层对应 darktable filmic→color balance、PC filmic→LUT；PC 源码核实**无 color balance**、保留 min 靠用户 LUT 兜）。待用户定值后固化默认
+
+- [2026-09-28] 发布现状：最新 **v0.10.22-m4（versionCode 173）**，commit `869ffa9` main 已推；根目录 filmkit-0.10.22-m4.apk；**未打 tag**
+- [2026-09-28] **v0.10.22 实现**：EV 前置——kFsFilm 链首 `out3 = max(lin,0) × uExposure`（lt/gamut 前）；删除链末乘性乘法；预览分支 `mapped = max(lin,0)×uExposure` 后 `/uDomainRatio`（两侧同构）；FilmParams[0] 语义注释同步
+- [2026-09-28] **"灰 vs PC"区域级数据（195052 vs PC_185013，同矩形口径）**：红杯区域 luma 0.167/0.166（一致）；木桌区域 0.223/0.226（一致）但局部对比 cv 0.172/0.217、HF 0.0048/0.0060；白壶区域 0.589/0.726（PC 1.6× ≈ 0.7EV）；PC 引擎默认 EV=0.7（RawRenderingEngine.DarktableFilmic，Linear 域）
+- [2026-09-28] **PhotonCamera 局部色调映射**：`DngPhotonLocalToneMapper.kt`（Photon Local Laplacian，GLES3.1 compute）+ `DngPhotonProfileGainTable*`（PGTM 生成器）——出现在 Photon HDR 路径（`photonHdrRequested` / `isPhotonHdr && hasProfileGainTableMap`），**普通 SDR 生效条件未确认**（下窗口查）
+- [2026-09-28] **PC 的 gamut 段与 darktable 原版逐行同构**（/tmp/photoncamera/DarktableFilmicToneAlgorithm.kt）：min 在 BT.2020 工作域、gamut check 用 sRGB 矩阵（useSrgb=true）、`uOutputTransform`=BT.2020→sRGB（D50 Bradford 相消，与 D65 构造等价）；工作域对照（/tmp/gray_domain.py）证明域非主因（rel 比 0.94–1.15）
+- [2026-09-28] **min 触发域实测**（链级模拟）：min 只在**输入域** luma<0.26 触发（<0.14 触发 99%、0.26 以上 0%），触发处钳制比 ≈1.19；这些像素经 toe 提亮落在显示域中亮段

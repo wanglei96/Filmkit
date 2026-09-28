@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-27 20:05
+updated: 2026-09-28 20:13
 status: active
 ---
 
@@ -127,3 +127,7 @@ status: active
 - [2026-09-28] **项目大前提：一切以质量为先，严禁简化关键质量管线（用户拍板）**——质量 > 成本/工期；成像链一律按正确的标准做法（论文一手算法 + 成熟开源实现）实现，不做"先简化后补"；性能取舍必须实测给数据，不许替用户决定。**对标口径纠正：PC 是"质量不行"的证据不是目标，目标是全面超越 PC**；对齐对象 = 标准做法（HDR+/Night Sight 论文、darktable 源码）。已写入项目根 AGENTS.md 约束后续会话。审核定案的两条线差距（优先级用户已批）：① filmic 补 darktable v5 gamut mapping（色度 min + Yrg/gamut check，PC 已完整移植我们全缺）② MFNR 参考帧策略回标准（最锐帧，撤压短，真机 A/B）③ 运动区补偿性空间降噪（Night Sight §3.3）④ 频域逐频维纳收缩专项立项（HDR+ §5/NS 式 7，先实测 GPU 成本）⑤ 场景曝光归一 ⑥ 帧数档位 8 帧。
 
 - [2026-09-28] **场景曝光归一（队列⑤）改道：以 darktable 原版为准，不用 PC 的 MGC**——原版核实（filmicrgb.c apply_auto_black/apply_auto_white_point_source + exposure.c deflicker）：① darktable 的场景自适应 = **filmic 黑白点拾取器 autodetect**：black = 取样域最小像素的 max-RGB norm → EVmin = clamp(log2(black/grey), −16, −1)×(1+security)，white = 取样域最大像素 → EVmax = clamp(log2(white/grey), 1, 16)；security 默认 0。② exposure 模块的 deflicker（RAW p50 → target EV）是**闪光灯专用**，非常规工作流。③ **darktable 没有"全自动场景归一"**（桌面靠用户框选/滑杆）；手机自动化的唯一自研点 = 取样统计量（min/max 的稳健分位替代）。**推翻 v0.7.3 旧结论**：当时"自动黑点比固定差"的实测用的是 P0.5 分位（比固定 −7.65 高 2EV、暗部压死）——**不是原生 min 语义的对照**（min 会更低、toe 更长），旧结论不成立，需原生语义重测。收敛路径：autodetect 落地 → base_ev 删除、EV 移 filmic 前、rolloff 删除、gamut 的 min/desaturate 恢复 → filmic 链 100% 原生。
+
+- [2026-09-28] **EV = filmic 前线性域（v0.10.22，更新 v0.7.8 链末乘性条）**：PC/Darktable BaselineExposure 语义，静拍/预览统一（修复 EV≠0 的 WYSIWYG 分叉）；乘性 EV 不改 Ych chroma（2e-8），min 语义不受影响；v0.7.7"统计归一"顾虑随 auto 黑点默认关而解除。理由：链末乘性只平移亮度、黑位/对比不动（−0.3EV 真机复拍仍灰）
+- [2026-09-28] **全局参数实验路线关闭**（"灰"的求解）：界面 EV +0.3/−0.3/+0.507/−1.1 四档真机实测全部无效（−1.1 全区域等比变暗、局部对比反降 0.415→0.286；+0.507 前置红杯 rel 0.708→0.286）——正解必须靠局部手段（区域级差异：木桌局部对比 −26%、白壶高光 −0.7EV）
+- [2026-09-28] **gamut min 保留 + 其暗部灰化为原版行为**：PC 源码逐行同构（Ych_original 同取 tone 前输入）、同触发同钳制（链级模拟暗端 0.216 vs 真实 PC 0.219 吻合）；工作域（BT.2020 vs sRGB）单变量对照 ±10% 亦非主因——min 不是"PC 不灰"的差异所在
