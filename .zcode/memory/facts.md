@@ -153,3 +153,11 @@ status: active
 - [2026-09-28] **PhotonCamera 局部色调映射**：`DngPhotonLocalToneMapper.kt`（Photon Local Laplacian，GLES3.1 compute）+ `DngPhotonProfileGainTable*`（PGTM 生成器）——出现在 Photon HDR 路径（`photonHdrRequested` / `isPhotonHdr && hasProfileGainTableMap`），**普通 SDR 生效条件未确认**（下窗口查）
 - [2026-09-28] **PC 的 gamut 段与 darktable 原版逐行同构**（/tmp/photoncamera/DarktableFilmicToneAlgorithm.kt）：min 在 BT.2020 工作域、gamut check 用 sRGB 矩阵（useSrgb=true）、`uOutputTransform`=BT.2020→sRGB（D50 Bradford 相消，与 D65 构造等价）；工作域对照（/tmp/gray_domain.py）证明域非主因（rel 比 0.94–1.15）
 - [2026-09-28] **min 触发域实测**（链级模拟）：min 只在**输入域** luma<0.26 触发（<0.14 触发 99%、0.26 以上 0%），触发处钳制比 ≈1.19；这些像素经 toe 提亮落在显示域中亮段
+
+- [2026-09-28] 发布现状：最新 **v0.10.24-m4（versionCode 175）**，commits `0e6cb44`/`aac5c98`/`d1dcb34`/`9c9caa4` 均已推 main；根目录 filmkit-0.10.24-m4.apk；**未打 tag**
+- [2026-09-28] **OETF = 真 sRGB（v0.10.23）**：`kFsOut`/`kFsHist`/`measureSceneStats.to_lin` 三处同步（`srgbEncode()`）；`kFsLocal` 保留 2.2（local_tone 判据域）；自检 `tools/check-srgb-oetf.py`（写反 step 即 exit 1）
+- [2026-09-28] **LSC 实测增益（DNG 链 vs 成片逐像素对拍，中心 0.981 自证）**：全图中位 **1.432×（+0.52EV）**、半径 0.8-1.0 为 1.616×（+0.69EV）；两边同构（PC 亦 `rgb *= vec3(shading.r, 0.5(g+b), shading.a)`）
+- [2026-09-28] **两条色彩链实测（同场景切开关）**：红杯 C* std **32.48** / hal **29.19** / PC **37.2**；矩阵（日志 `ccmStd`/`ccmHal`）：std `1.6192,-0.5497,-0.0695,-0.1419,1.3399,-0.1980,0.0075,-0.5839,1.5763`、hal `1.4883,-0.5078,0.0176,-0.1211,1.1484,-0.0273,0.0723,-0.6875,1.6152`（行和均=1）
+- [2026-09-28] **PC 色彩体系 = Hncs**：`HncsProfile.kt`/`HncsToneAlgorithm.kt`/`EquivalentCameraCalibration.kt`；`colorCorrection` 只是低光去饱和（`uHncsLowLightDesaturation`），**无 filmic 后加饱和环节**；`EquivalentCameraCalibration` 可等效到 LumixS9/HasselbladX2DII100C/CanonEOSR5（DCP），但**用户实测本次 PC 选 filmic、不经 DCP**
+- [2026-09-28] **PC 的 Ych 常量两套**：`DT_FILMIC_BT2020_TO_LMS_*`（BT.2020 工作域）与 `DT_FILMIC_SRGB_TO_LMS_*`（同我们），数值互逆一致（偏差 0.0000）
+- [2026-09-28] **验证工具**：`tools/ccm-chain-ab.py`（日志 `ccmStd`/`ccmHal` + 同一 DNG → 两条链的"进 filmic 前"C* 对拍）

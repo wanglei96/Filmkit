@@ -2,7 +2,7 @@
 summary: EV前置落地与灰根因收窄
 created: 2026-09-28 20:13
 updated: 2026-09-28 20:13
-status: active
+status: absorbed
 ---
 
 # EV前置落地与灰根因收窄
