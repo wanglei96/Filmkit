@@ -845,6 +845,10 @@ class CameraController(private val context: Context, private val render: RenderC
     // darktable filmic 高光重建（v0.10.15）：原生算法完整实现，默认开。
     private val HR_WAVELET = 1.0
     private var hrPref = -1.0
+    // 饱和补偿标定旋钮（v0.10.21）：原生 gamut 色度 min 的低饱和副作用由**风格层**
+    // （uSat 分区饱和，FilmParams[20..22]）标定补偿——分层架构对应 darktable 的
+    // filmic → color balance、PC 的 filmic → LUT。只作用阴影/中间调，高光不动。
+    private var satCompPref = Double.NaN
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -892,6 +896,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applySharpenPref()
         applyGamutPref()
         applyHrWaveletPref()
+        applySatCompPref()
         applyFilmicRangePrefs()
     }
 
@@ -986,6 +991,20 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hrPref) {
             hrPref = v
             filmParams[41] = v
+        }
+    }
+
+    /**
+     * 饱和补偿（v0.10.21 标定旋钮）：prefs "sat_comp" 0..0.30，写 FilmParams[20]/[21]
+     * （阴影/中间调分区饱和 = 1+v；[22] 高光恒 1.0 防过饱和）。原生 gamut 色度 min
+     * 的低饱和由风格层补偿——对标 darktable color balance / PC 的 LUT 职责。
+     */
+    private fun applySatCompPref() {
+        val v = appPrefs.getFloat("sat_comp", 0f).toDouble().coerceIn(0.0, 0.30)
+        if (v != satCompPref) {
+            satCompPref = v
+            filmParams[20] = 1.0 + v
+            filmParams[21] = 1.0 + v
         }
     }
 
@@ -1503,6 +1522,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyTonePref()
                     applyZebraPref()
                     applyLutStrengthPref()
+                    applySatCompPref()
                     // 预览旋转恒 0（v0.6.39 事故修复）：
                     // SurfaceTexture 的 STMatrix 已含传感器侧的变换，**显示方向由 Activity
                     // 跟随系统旋转处理**（本 Activity 未锁 screenOrientation）。所以预览

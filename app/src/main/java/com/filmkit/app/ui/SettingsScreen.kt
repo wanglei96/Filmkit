@@ -183,6 +183,49 @@ fun SettingsScreen(
                     EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
                 )
             }
+            // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
+            // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
+            // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
+            // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
+            var satComp by rememberSaveable { mutableStateOf(prefs.getFloat("sat_comp", 0f)) }
+            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("饱和补偿", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Text(
+                        "+%d%%".format((satComp * 100).toInt()),
+                        color = FilmTheme.Accent,
+                        fontSize = 13.sp,
+                        fontFamily = FilmTheme.Mono,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                Text(
+                    "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。" +
+                        "对照同场景样张调到灰感消失，定值后回传",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                androidx.compose.material3.Slider(
+                    value = satComp,
+                    onValueChange = { satComp = it },
+                    onValueChangeFinished = {
+                        val v = (satComp * 100).toInt() / 100f
+                        satComp = v
+                        prefs.edit().putFloat("sat_comp", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.sat_comp",
+                            "{\"v\":$v}",
+                        )
+                    },
+                    valueRange = 0f..0.30f,
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = FilmTheme.Cream,
+                        activeTrackColor = FilmTheme.Accent,
+                        inactiveTrackColor = FilmTheme.ChipBorder,
+                    ),
+                )
+            }
             var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_black_ev", false)) }
             Row(
                 Modifier
