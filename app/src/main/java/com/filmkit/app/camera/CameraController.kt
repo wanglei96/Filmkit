@@ -934,10 +934,14 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun applyAutoTonePref() {
         // v0.7.6：prefs 键改名 auto_tone → **auto_black_ev** —— 语义已从"曝光增益"
         // 变成"黑点是否自动"，沿用旧键会让老用户残留的 true 覆盖新默认值（关）。
-        // v0.10.16：语义再升级 = **黑白点成对自动**（darktable autotune 原生语义，
-        // P0.5/P99.5），且默认改为开——白点自动是高光重建的触发前提（HR 的裁剪
-        // 阈值由 white_source 决定）。
-        val v = if (appPrefs.getBoolean("auto_black_ev", true)) 1.0 else 0.0
+        // v0.10.19：黑白点自动**默认关**（三版真机证伪后撤销：0.10.16 中间调低/
+        // 水壶过曝/天空过饱和、0.10.17 全面糟糕化、0.10.18 power 5.17 无改善——
+        // 自动分位定曲线端点会把 power 推离固定曲线的 3.62 设计值。PC 的 SDR 链
+        // 实锤无场景归一：固定 filmic 默认参数 + DngBaselineExposure + AE 曝光决策；
+        // sceneExposureGain 只是 HDR 参考链的坐标增益）。HR 裁剪阈值已与曲线解耦
+        // （恒 1.0），黑白点自动降级为可选工具（darktable 的 autodetect 本就是
+        // 手动拾取器），亮度校准回归 base_ev 机制。
+        val v = if (appPrefs.getBoolean("auto_black_ev", false)) 1.0 else 0.0
         if (v != autoTonePref) {
             autoTonePref = v
             filmParams[35] = v
