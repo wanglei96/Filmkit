@@ -9,9 +9,9 @@ namespace filmkit {
 struct FilmParams {
   // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
-  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(41)` 保持一致（v0.10.13 起）；
+  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 41;  // v0.10.13：+[40] gamut（v0.9.6 +[39] sharpen）
+  static constexpr int kCount = 42;  // v0.10.15：+[41] hr_wavelet（v0.10.13 +[40] gamut）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -85,6 +85,13 @@ struct FilmParams {
   // 解析 clip chroma（sRGB 色域映射）——只作用于病态与域外像素，域内零改动。
   // 默认 1.0（开），0 = A/B 通路。
   float gamut = 1.0f;          // 40
+  // ── v0.10.15：darktable filmic 高光重建（à trous 小波）───────────────────
+  // darktable filmicrgb.c 的原生功能（enable_highlight_reconstruction +
+  // mask/inpaint/wavelets 全链，参数 = darktable 默认）；PC 完整移植、我们此前
+  // 用自研"中性外推"（[29] hl_recon，RAW 域）替代并在审核中定为简化。
+  // 本层作用于线性 RGB 域（CCM 后、filmic 前），修复部分通道裁剪高光
+  // （灯管/过曝边缘的品红残留即此类）。默认开；0 = A/B 通路。
+  float hr_wavelet = 1.0f;     // 41
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -139,6 +146,7 @@ struct FilmParams {
     if (n > 38) filmic_white_ev = static_cast<float>(v[38]);
     if (n > 39) sharpen = static_cast<float>(v[39]);
     if (n > 40) gamut = static_cast<float>(v[40]);
+    if (n > 41) hr_wavelet = static_cast<float>(v[41]);
   }
 };
 

@@ -265,6 +265,44 @@ class FrameRenderer {
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
+  // ── v0.10.15：darktable filmic 高光重建（HR，dst 尺寸；8+1 张全分辨率）──
+  // 出处 darktable filmicrgb.c 的 mask_clipped_pixels/inpaint_noise/
+  // reconstruct_highlights（à trous 小波）。生命周期：仅拍照路径（finishStillChain
+  // 内 P4 后、passFilm 前），结果纹理直接作为 filmic 输入。
+  GLuint prog_hr_mask_ = 0, prog_hr_inpaint_ = 0, prog_hr_blur_ = 0,
+         prog_hr_hf_ = 0, prog_hr_rin_ = 0, prog_hr_step_ = 0,
+         prog_hr_norms_ = 0, prog_hr_ratios_ = 0, prog_hr_restore_ = 0,
+         prog_hr_stat_ = 0;
+  GLuint tex_hr_mask_ = 0, fbo_hr_mask_ = 0;    // R16F（sigmoid 权重）
+  GLuint tex_hr_lf_[2] = {0, 0}, fbo_hr_lf_[2] = {0, 0};  // RGBA16F（LF 乒乓）
+  GLuint tex_hr_hf_ = 0, fbo_hr_hf_ = 0;        // RGBA16F（HF = detail − LF）
+  GLuint tex_hr_hfrgb_ = 0, fbo_hr_hfrgb_ = 0;  // RGBA16F（blur(HF)）
+  GLuint tex_hr_temp_ = 0, fbo_hr_temp_ = 0;    // RGBA16F（blur 垂直 pass 中间）
+  GLuint tex_hr_recon_[2] = {0, 0}, fbo_hr_recon_[2] = {0, 0};  // RGBA16F 乒乓
+  GLuint tex_hr_norms_ = 0, fbo_hr_norms_ = 0;  // R16F（HQ ratios 轮的 norm）
+  GLuint tex_hr_stat_ = 0, fbo_hr_stat_ = 0;    // R16F 64×48（裁剪统计 readback）
+  int hr_w_ = 0, hr_h_ = 0;
+  GLint u_hr_mask_ = -1, u_hr_mask_norm_ = -1, u_hr_mask_feather_ = -1;
+  GLint u_hr_inp_tex_ = -1, u_hr_inp_mask_ = -1, u_hr_inp_noise_ = -1,
+        u_hr_inp_thr_ = -1;
+  GLint u_hr_blur_tex_ = -1, u_hr_blur_size_ = -1, u_hr_blur_mult_ = -1,
+        u_hr_blur_dir_ = -1;
+  GLint u_hr_hf_detail_ = -1, u_hr_hf_lf_ = -1;
+  GLint u_hr_rin_tex_ = -1, u_hr_rin_mask_ = -1;
+  GLint u_hr_step_hfrgb_ = -1, u_hr_step_lf_ = -1, u_hr_step_hf_ = -1,
+        u_hr_step_mask_ = -1, u_hr_step_recon_ = -1, u_hr_step_gamma_ = -1,
+        u_hr_step_gammac_ = -1, u_hr_step_beta_ = -1, u_hr_step_betac_ = -1,
+        u_hr_step_delta_ = -1, u_hr_step_variant_ = -1, u_hr_step_si_ = -1,
+        u_hr_step_sc_ = -1;
+  GLint u_hr_norms_tex_ = -1;
+  GLint u_hr_ratios_tex_ = -1, u_hr_ratios_norms_ = -1;
+  GLint u_hr_restore_ratios_ = -1, u_hr_restore_norms_ = -1;
+  GLint u_hr_stat_mask_ = -1, u_hr_stat_size_ = -1, u_hr_stat_out_ = -1;
+  // 返回重建后的纹理：未触发/失败/关闭时返回 src（调用方零分支）。
+  GLuint runHighlightReconstruct(GLuint src, int w, int h, float white_ev,
+                                 int* out_clipped_blocks, float* out_ms);
+  bool ensureHrTargets(int w, int h);
+  void releaseHrTargets();
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
   // M4-7 局部色调映射的低频亮度图（RGBA8、LINEAR 上采样）。与 tex_hist_

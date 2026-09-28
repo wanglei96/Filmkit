@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(41).apply {
+    private fun neutral(): DoubleArray = DoubleArray(42).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -104,6 +104,11 @@ object CameraPresets {
         // min/desaturate 两步已移除（真机 A/B 泛白，见 FrameRenderer 注释）。
         // 默认开；0 = A/B 通路。设置页开关写 prefs("gamut")。
         this[40] = 1.0
+        // 41 = darktable filmic 高光重建（v0.10.15）：à trous 小波重建部分通道
+        // 裁剪的高光（治过曝边缘品红残留），线性 RGB 域、filmic 前。原生算法
+        // 完整实现（mask/inpaint/小波/RGB+ratios 两轮），参数 = darktable 默认。
+        // 默认开；0 = A/B 通路。设置页开关写 prefs("hr_wavelet")。
+        this[41] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

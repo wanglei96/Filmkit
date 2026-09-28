@@ -509,6 +509,22 @@ fun SettingsScreen(
                     )
                 },
             )
+            // 高光重建·小波（v0.10.15）：darktable filmic 原生高光重建（à trous 小波，
+            // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
+            var hrWaveletOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hr_wavelet", true)) }
+            SettingSwitchRow(
+                title = "高光重建·小波",
+                subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；关 = 同场景 A/B 对照",
+                checked = hrWaveletOn,
+                onChecked = { v ->
+                    hrWaveletOn = v
+                    prefs.edit().putBoolean("hr_wavelet", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.hr_wavelet",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

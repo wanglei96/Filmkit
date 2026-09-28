@@ -845,6 +845,9 @@ class CameraController(private val context: Context, private val render: RenderC
     // darktable filmic v5 gamut mapping（v0.10.13）：标准算法组成部分，默认开。
     private val GAMUT = 1.0
     private var gamutPref = -1.0
+    // darktable filmic 高光重建（v0.10.15）：原生算法完整实现，默认开。
+    private val HR_WAVELET = 1.0
+    private var hrPref = -1.0
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -900,6 +903,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLocalTonePref()
         applySharpenPref()
         applyGamutPref()
+        applyHrWaveletPref()
         applyFilmicRangePrefs()
     }
 
@@ -973,6 +977,20 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != gamutPref) {
             gamutPref = v
             filmParams[40] = v
+        }
+    }
+
+    /**
+     * darktable filmic 高光重建开关（v0.10.15）：写 FilmParams[41]。
+     * à trous 小波重建部分通道裁剪的高光（线性 RGB 域、filmic 前），原生算法
+     * 完整实现（mask/inpaint/小波/RGB+ratios 两轮），参数 = darktable 默认。
+     * 0 = 关（A/B 通路）。
+     */
+    private fun applyHrWaveletPref() {
+        val v = if (appPrefs.getBoolean("hr_wavelet", true)) HR_WAVELET else 0.0
+        if (v != hrPref) {
+            hrPref = v
+            filmParams[41] = v
         }
     }
 
