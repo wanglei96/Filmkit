@@ -110,6 +110,10 @@ android {
 
     buildFeatures {
         compose = true
+        // v0.10.23：开 BuildConfig，让 FilmKitApp.VERSION 直接读 versionName —— 此前是
+        // 另一处硬编码字面量（注释写着"必须与 build.gradle.kts 一致"，实际各漂各的：
+        // 174 的包在日志里仍报 0.10.22，直接导致真机版本判读错误）。
+        buildConfig = true
     }
 }
 

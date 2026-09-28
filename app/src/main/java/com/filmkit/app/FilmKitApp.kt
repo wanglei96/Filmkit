@@ -6,8 +6,16 @@ import java.io.File
 class FilmKitApp : Application() {
 
     companion object {
-        /** 必须与 app/build.gradle.kts 的 versionName 一致（单一来源，避免两处字面量各漂各的） */
-        const val VERSION = "0.10.22-m4"
+        /**
+         * 版本号 = `app/build.gradle.kts` 的 versionName（Gradle 生成的 BuildConfig 常量）。
+         *
+         * v0.10.23 修根因：此前这里是**另一处硬编码字面量**，注释写着"必须与
+         * build.gradle.kts 一致（单一来源）"——实际并未做到，两处各漂各的：
+         * versionCode 174 / versionName 0.10.23 的包，`app.start` 日志与崩溃快照里
+         * 仍报 0.10.22-m4，真机版本判读（以及"这版到底测没测"）被直接误导。
+         * 现在字面量只剩 build.gradle.kts 一处，漂不了。
+         */
+        val VERSION = BuildConfig.VERSION_NAME
     }
 
     override fun onCreate() {
