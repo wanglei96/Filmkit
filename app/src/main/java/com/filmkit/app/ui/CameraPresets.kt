@@ -98,10 +98,11 @@ object CameraPresets {
         // 同一 USM 放大暗部噪声。0.5 = 标定旋钮，0 = 关（A/B 通路）；
         // 设置页开关写 prefs("sharpen")，CameraController 覆盖此值。
         this[39] = 0.5
-        // 40 = darktable filmic v5 gamut mapping（v0.10.13）：tone mapping 后的
-        // 色度收缩（min(orig,fin)+色相锁定）+ Yrg 锥空间检查 + 解析 clip chroma
-        // （sRGB 色域映射）。标准算法的组成部分不是风格，默认开；0 = A/B 通路。
-        // 设置页开关写 prefs("gamut")，CameraController 覆盖此值。
+        // 40 = filmic 之后的 gamut 收尾（v0.10.13，v0.10.14 实测修正）：保留
+        // Y 显示域 clamp / Yrg 检查 / 解析 clip chroma（sRGB 色域映射）——
+        // 只作用于病态与色域外像素（域内零改动）；darktable 的跨域色度
+        // min/desaturate 两步已移除（真机 A/B 泛白，见 FrameRenderer 注释）。
+        // 默认开；0 = A/B 通路。设置页开关写 prefs("gamut")。
         this[40] = 1.0
     }
 

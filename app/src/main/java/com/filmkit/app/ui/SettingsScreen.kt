@@ -493,13 +493,12 @@ fun SettingsScreen(
                     )
                 },
             )
-            // 色域映射（v0.10.13）：darktable filmic v5 标准算法的组成部分——
-            // tone mapping 后色度收缩 + Yrg 锥空间检查 + sRGB 色域映射。
-            // 关 = A/B 通路（同场景对照归因）。
+            // 色域映射（v0.10.13，v0.10.14 修正）：治色域外/病态像素的越界色
+            // （高光偏色、过饱和过冲）——域内像素零改动。关 = A/B 通路。
             var gamutOn by rememberSaveable { mutableStateOf(prefs.getBoolean("gamut", true)) }
             SettingSwitchRow(
                 title = "色域映射",
-                subtitle = "filmic 标准色彩收尾（darktable v5）：色度收缩 + sRGB 色域映射，治高光偏色/过饱和；关 = 同场景 A/B 对照",
+                subtitle = "filmic 色彩收尾：sRGB 色域内映射（治高光偏色/过饱和），域内像素不动；关 = 同场景 A/B 对照",
                 checked = gamutOn,
                 onChecked = { v ->
                     gamutOn = v

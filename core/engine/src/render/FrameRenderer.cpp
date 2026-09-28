@@ -1194,19 +1194,8 @@ vec3 gamutYchToYrg(vec4 ych) {
 }
 vec4 gamutRgbToYch(vec3 c) { return gamutYrgToYch(gamutLmsToYrg(gamutSrgbToLms(c))); }
 vec3 gamutYchToRgb(vec4 ych) { return gamutLmsToSrgb(gamutYrgToLms(gamutYchToYrg(ych))); }
-// filmic_desaturate_v4 的 saturation=0 特化（darktable/PC 的 filmic 默认；我们的
-// 风格饱和在 uSat/uLook 层，filmic 的 saturation 职责不由本层承担）：
-// 唯一生效分支 = filmic 同时"提亮且增饱和"时把 chroma 拉回中点（抑制 tone mapping
-// 自身的增饱和），user_resat/user_desat 在 saturation=0 下恒假。
-vec4 gamutDesaturateV4(vec4 ychOrig, vec4 ychFin) {
-    float chromaOrig = ychOrig.y * ychOrig.x;  // c×Y = 绝对色度
-    float chromaFin = ychFin.y * ychFin.x;
-    bool brightens = ychFin.x > ychOrig.x;
-    bool resat = chromaOrig < chromaFin;
-    if (brightens && resat) chromaFin = 0.5 * (chromaOrig + chromaFin);
-    ychFin.y = max(chromaFin / max(ychFin.x, 1e-8), 0.0);
-    return ychFin;
-}
+// ⚠️ darktable 的 filmic_desaturate_v4（saturation=0）与「Ych 色度取 min」两步
+// 在 2026-09-28 真机 A/B 后被**移除**——原因见 gamutMapV5 的实测数据。
 // Yrg 锥空间合法性：r<0 / g<0 / r+g>1 时按常 Y 常色相解最大合法 chroma
 vec4 gamutCheckYrg(vec4 ych) {
     vec3 yrg = gamutYchToYrg(ych);
@@ -1287,17 +1276,25 @@ vec3 gamutCheckRgb(vec4 ychIn) {
                                  1.0, y, ychIn.z, ychIn.w, ychIn.y);
     return clamp(gamutYchToRgb(vec4(y, newC, ychIn.z, ychIn.w)), 0.0, 1.0);
 }
-// darktable v5 的完整色彩收尾（gamut_mapping + 主循环的色度 min）：
-// ① 色度收缩 min(orig, fin) + 色相锁定 ② Y clamp 到显示域 ③ desaturate(0)
-// ④ Yrg 检查 ⑤ RGB 检查。original = tone 前线性输入、toned = filmicTone 输出。
-vec3 gamutMapV5(vec3 original, vec3 toned) {
-    vec4 ychOrig = gamutRgbToYch(original);
+// ── gamut 收尾（v0.10.14 修正版）────────────────────────────────────────
+// 初版（v0.10.13）实装了 darktable v7 的完整五步。真机 A/B（用户：画面泛白）+
+// 链级模拟（真实 DNG + 日志 spline 系数，2026-09-28）定位到其中两步是**跨域比较**：
+//   ① Ych 色度 min(orig, fin)：orig 在场景线性域、fin 在显示域。filmic 的逐通道
+//      pow（output_power 2.62 × OETF 0.4545，净 1.19 次幂）系统性放大显示域色度比
+//      ⇒ c_fin > c_orig 几乎处处成立 ⇒ min 把色度钉回场景域值：实测暗部 **91%**
+//      像素触发、色度损失中位 **26.8%**，中间调 85%/8.8%，样片暗部 rel 中位
+//      0.69→0.54（-22%，与真机 -17~-33% 吻合）= **全局去饱和滤镜**。
+//   ② desaturate 中点分支：同一跨域问题（绝对色度 c×Y，ΔY 大时语义错位）。
+// darktable 桌面版对①的行为有 saturation 滑杆（+方向）补偿、且其工作流 filmic 前
+// 有 exposure 场景归一（ΔY 小）；手机直出链两者皆无，且已验收基线 = gm 关的观感。
+// 故只保留 gamut mapping 的**保险丝职责**（Y 显示域 clamp / Yrg 锥空间检查 /
+// 恒 Y 恒色相解析 clip chroma）——只作用于病态与色域外像素。抽样验证（142517.dng
+// 200k 像素）：暗部 rel 0.690、中间调 0.268 = gm=0 基线逐位一致（零色度损失）；
+// 灯管粉边仍被压淡（R-G 中位 4.0→0.0，与 A/B 实测 = clip chroma 之功）。
+// 色度风格归 uSat/uLook 层（darktable 的 saturation 语义）。
+vec3 gamutMapV5(vec3 toned) {
     vec4 ychFin = gamutRgbToYch(toned);
-    ychFin.y = min(ychOrig.y, ychFin.y);
-    ychFin.z = ychOrig.z;
-    ychFin.w = ychOrig.w;
     ychFin.x = clamp(ychFin.x, kYchY1931To2006 * 0.0001517634, kYchY1931To2006);
-    ychFin = gamutDesaturateV4(ychOrig, ychFin);
     ychFin = gamutCheckYrg(ychFin);
     return gamutCheckRgb(ychFin);
 }
@@ -1310,7 +1307,7 @@ void main() {
         vec3 mapped = max(lin, vec3(0.0)) / uDomainRatio * uExposure;
         vec3 toned = filmicTone(mapped);
         // 预览与成片同链（WYSIWYG）：gamut mapping 同样生效
-        oColor = vec4(uGamut > 0.5 ? gamutMapV5(mapped, toned) : toned, 1.0);
+        oColor = vec4(uGamut > 0.5 ? gamutMapV5(toned) : toned, 1.0);
         return;
     }
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
@@ -1356,10 +1353,10 @@ void main() {
     //      （就是"离显示上限多近"）—— 判断过曝该看输出，不该看输入。
     // 若将来实测发现"正常明亮区域仍过饱和"，再引入去饱和时判据必须挂在输出域。
     if (uToneK > 0.0) {
-        // v0.10.13：filmicTone 之后接 darktable v5 gamut mapping（标准算法组成，
-        // 非风格）。original = tone 前线性输入；uGamut=0 = A/B 关（回到旧行为）。
+        // v0.10.13：filmicTone 之后接 gamut 收尾（保险丝：Y clamp/Yrg/clip
+        // chroma；v0.10.14 移除跨域的 min 色度与 desaturate，见 gamutMapV5）。
         vec3 toned = filmicTone(out3);
-        if (uGamut > 0.5) toned = gamutMapV5(out3, toned);
+        if (uGamut > 0.5) toned = gamutMapV5(toned);
         out3 = mix(out3, toned, uToneK);
     }
     float l = luma(out3);

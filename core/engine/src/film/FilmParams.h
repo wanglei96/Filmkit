@@ -78,12 +78,12 @@ struct FilmParams {
   // 保色度坐标。0 = 关（A/B 通路）；默认 0 = 缺参/旧长度时保持旧行为，
   // Kotlin 侧 CameraPresets[39] 给标定值（0.5）。
   float sharpen = 0.0f;        // 39
-  // ── v0.10.13：darktable filmic v5 gamut mapping（标准算法补全）─────────
-  // tone mapping（0.5 naive + 0.5 max-RGB）之后的三步（darktable filmicrgb.c
-  // gamut_mapping + colorspaces_inline_conversions.h，PC 已完整移植、我们 v0.10.12
-  // 审核定案时发现全缺）：① 色度收缩（tone mapping 不得增色度）+ 色相锁定；
-  // ② Yrg 锥空间负值/越界检查；③ 恒 Y 恒色相下的解析 clip chroma（sRGB 色域映射）。
-  // 这是标准算法的组成部分不是风格 —— 默认 1.0（开），0 = A/B 通路。
+  // ── v0.10.13/14：filmic 之后的 gamut 收尾（标准算法补全 + 实测修正）──────
+  // v0.10.13 实装 darktable v7 完整五步；真机 A/B 泛白（暗部色度 -17~33%，链级
+  // 模拟定位 = 跨域的 Ych 色度 min + desaturate 在无场景归一链上成全局去饱和）。
+  // v0.10.14 只保留保险丝职责：Y 显示域 clamp / Yrg 锥空间检查 / 恒 Y 恒色相
+  // 解析 clip chroma（sRGB 色域映射）——只作用于病态与域外像素，域内零改动。
+  // 默认 1.0（开），0 = A/B 通路。
   float gamut = 1.0f;          // 40
 
   void fromDoubles(const double* v, int n) {
