@@ -34,7 +34,9 @@ constexpr int kLocalW = 32, kLocalH = 24;
 constexpr float kMfnrMisS = 16.0f;
 // c（Night Sight "temporal strength" 的稳健端）：w = max(1 − c·m, 0)。c=1 = m=1
 // 完全弃帧；c=0 退化为阶段一等权均值（A/B 通路，也等于关掉 robust merge）。
-constexpr float kMfnrRobust = 1.0f;
+// v0.10.2：1.0 → 1.5（子块 max 归约配套加大压制：手 w→0、叶 0.31、静止 0.91，
+// 见 kFsMfnrMismatch 尾注）。
+constexpr float kMfnrRobust = 1.5f;
 // ratio knee 区间：低于下界满额提亮，高于上界完全不提亮。区间要**宽** —— 真机反馈
 // "画面有亮斑"：原 0.7→1.0（宽 0.3）在"大面积白墙 + 暗桌面"的场景里让 27% 的画面
 // 满额提亮 60%、而一半区域几乎不提亮（lift 0.011），提亮量空间分布过陡 → 可见分区。
@@ -878,27 +880,38 @@ void main() {
     vec2 o2 = off2At(uv).xy;
     vec2 o3 = off3At(uv).xy;
     ivec2 base = t * int(uTileM);
-    int tm = int(uTileM);
-    float s1 = 0.0, s2 = 0.0, s3 = 0.0;
-    float n = 0.0;
-    for (int dy = 0; dy < tm; dy += 4) {
-        for (int dx = 0; dx < tm; dx += 4) {
-            ivec2 p = base + ivec2(dx, dy);
-            if (p.x >= uSize.x || p.y >= uSize.y) continue;
-            float r = linAt(uRaw0, p);
-            float d1 = r - linSub(uRaw1, p, o1);
-            float d2 = r - linSub(uRaw2, p, o2);
-            float d3 = r - linSub(uRaw3, p, o3);
-            s1 += d1 * d1;
-            s2 += d2 * d2;
-            s3 += d3 * d3;
-            n += 1.0;
+    int th = int(uTileM) / 2;
+    // 2×2 子块各自归约、取最大 —— v0.10.2：局部运动（手/单叶，占 tile 一部分）
+    // 在整 tile mean 归约下被静止区域稀释（手占 1/4 时 w 仍 0.43，重影保留）；
+    // 子块 max 把灵敏度提回运动子块本身。离线（σ=0.0166、s=16）：
+    // 手占 25% 错位 40px：w 0.43→0.28；叶 30% 自相似错位：w 0.70→0.54；
+    // 静止噪声底不变（0.94）。配合 c=1.5（kMfnrRobust）：手 w→0、叶 0.31、静止 0.91。
+    float v1 = 0.0, v2 = 0.0, v3 = 0.0;
+    for (int sy = 0; sy < 2; sy++) {
+        for (int sx = 0; sx < 2; sx++) {
+            float a1 = 0.0, a2 = 0.0, a3 = 0.0, n = 0.0;
+            for (int dy = 0; dy < th; dy += 4) {
+                for (int dx = 0; dx < th; dx += 4) {
+                    ivec2 p = base + ivec2(sy * th + dy, sx * th + dx);
+                    if (p.x >= uSize.x || p.y >= uSize.y) continue;
+                    float r = linAt(uRaw0, p);
+                    float d1 = r - linSub(uRaw1, p, o1);
+                    float d2 = r - linSub(uRaw2, p, o2);
+                    float d3 = r - linSub(uRaw3, p, o3);
+                    a1 += d1 * d1;
+                    a2 += d2 * d2;
+                    a3 += d3 * d3;
+                    n += 1.0;
+                }
+            }
+            float inv = 1.0 / max(n, 1.0);
+            v1 = max(v1, a1 * inv);
+            v2 = max(v2, a2 * inv);
+            v3 = max(v3, a3 * inv);
         }
     }
-    float inv = 1.0 / max(n, 1.0);
-    float v1 = s1 * inv, v2 = s2 * inv, v3 = s3 * inv;
-    float k = uS * uSigma * uSigma;
-    oColor = vec4(v1 / (v1 + k), v2 / (v2 + k), v3 / (v3 + k), 1.0);
+    float kk = uS * uSigma * uSigma;
+    oColor = vec4(v1 / (v1 + kk), v2 / (v2 + kk), v3 / (v3 + kk), 1.0);
 })";
 
 // kFsRawDenoiseFused：P0 同色 bilateral 的 MFNR 变体——输入换成 tex_fused_
