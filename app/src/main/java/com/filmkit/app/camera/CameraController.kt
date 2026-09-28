@@ -1141,28 +1141,39 @@ class CameraController(private val context: Context, private val render: RenderC
                 maxOf(MFNR_REF_MAX_EXPOSURE_NS, liveExposureNs * 2 / 3),
             )
         }
-        var isoRef = if (liveIso > 0 && secRef > 0) {
-            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt()
-        } else {
-            liveIso
-        }
+        // v0.10.9：**曝光量守恒优先** —— iso 被 clamp（range/模拟上限）后必须反算
+        // 快门，否则 ref 欠曝（实测 ISO 2544/30ms → 想要 3816/20ms 但 ISO clamp
+        // 到 3200 后仍是 20ms = 曝光量 64000 vs alt 的 76680，ref 系统性欠 0.26EV，
+        // 给残差判据引入 18% 的全图亮度差）。
         var isoUpper = Int.MAX_VALUE
         curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             ?.let { isoUpper = it.upper }
-        isoRef = isoRef.coerceIn(1, minOf(isoUpper, maxAnalog))
-        burstRefNoiseScale = if (liveIso > 0 && liveExposureNs > 0 && secRef > 0) {
-            kotlin.math.sqrt(liveExposureNs.toDouble() / secRef).toFloat()
+        val isoCap = minOf(isoUpper, maxAnalog)
+        var isoRef = if (liveIso > 0 && secRef > 0) {
+            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt().coerceAtMost(isoCap)
+        } else {
+            liveIso
+        }
+        isoRef = isoRef.coerceAtLeast(1)
+        // 守恒反算：secRef' = iso×sec/isoRef（≥ 快门下限，通常远大于下限）
+        val secRefFinal = if (liveIso > 0 && liveExposureNs > 0 && isoRef > 0) {
+            Math.round(liveIso.toDouble() * liveExposureNs / isoRef)
+        } else {
+            secRef
+        }
+        burstRefNoiseScale = if (liveIso > 0 && liveExposureNs > 0 && secRefFinal > 0) {
+            kotlin.math.sqrt(liveExposureNs.toDouble() / secRefFinal).toFloat()
         } else {
             1.0f
         }
-        val refReq = if (secRef < liveExposureNs && liveIso > 0 && secRef > 0) {
+        val refReq = if (secRefFinal < liveExposureNs && liveIso > 0 && secRefFinal > 0) {
             camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
                 applyControls(this)
                 // AE_OFF + 手动传感器参数（与 M 档手动滑杆同一路径，非 AE 补偿通道）
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 set(CaptureRequest.SENSOR_SENSITIVITY, isoRef)
-                set(CaptureRequest.SENSOR_EXPOSURE_TIME, secRef)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, secRefFinal)
             }.build()
         } else {
             null
@@ -1174,7 +1185,8 @@ class CameraController(private val context: Context, private val render: RenderC
             EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
             kv(
                 "frames" to MFNR_FRAMES,
-                "refIso" to isoRef, "refSec" to "%.4f".format(secRef / 1e9f),
+                "refIso" to isoRef, "refSec" to "%.4f".format(secRefFinal / 1e9f),
+                "altIso" to liveIso, "altSec" to "%.4f".format(liveExposureNs / 1e9f),
                 "rn" to "%.3f".format(burstRefNoiseScale),
             ),
         )

@@ -3218,6 +3218,38 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   double neff_acc = 0.0;
   std::vector<float> mags;
   mags.reserve(static_cast<size_t>(n_cells) * (count - 1));
+  // v0.10.9 诊断：m 链各阶段的分布（每帧）——排查暗光误报，不改算法
+  std::string mis_diag, dil_diag, mot_diag, msm_diag;
+  {
+    const auto stat3 = [&](const auto& get, const char* prefix) {
+      std::string out = prefix;
+      for (int z = 0; z < count - 1; ++z) {
+        int a = 0, b = 0, c = 0;
+        for (int t = 0; t < n_cells; ++t) {
+          const float v = get(z, t);
+          if (v < 0.10f) ++a; else if (v < 0.35f) ++b; else ++c;
+        }
+        const float n = static_cast<float>(std::max(n_cells, 1));
+        const auto f2 = [](float x) {
+          return std::to_string(x).substr(0, 4);
+        };
+        out += f2(a / n) + "/" + f2(b / n) + "/" + f2(c / n) + " ";
+      }
+      return out;
+    };
+    mis_diag = stat3([&](int z, int t) {
+      return static_cast<float>(mis[static_cast<size_t>(t) * 4 + z]) / 255.0f;
+    }, "");
+    dil_diag = stat3([&](int z, int t) {
+      return static_cast<float>(dil[static_cast<size_t>(t) * 4 + z]) / 255.0f;
+    }, "");
+    mot_diag = stat3([&](int z, int t) {
+      return mot[static_cast<size_t>(z)][static_cast<size_t>((t / cw / 4) * tiles_w_ + (t % cw) / 4)];
+    }, "");
+    msm_diag = stat3(
+        [&](int z, int t) { return msm[static_cast<size_t>(t) * (count - 1) + z]; },
+        "");
+  }
   for (int t = 0; t < n_cells; ++t) {
     const size_t ti = static_cast<size_t>(t);
     double wsum_cell = 1.0;  // 参考帧恒权重 1
@@ -3317,6 +3349,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"neff\":" + f3(neff) +
               ",\"rn\":" + f3(rn) +
               ",\"motMed\":" + f3(mot_med) +
+              ",\"resFade\":" + f3(res_fade) +
+              ",\"nsSng\":" + f3(ns_single) +
+              ",\"misD\":\"" + mis_diag + "\"" +
+              ",\"dilD\":\"" + dil_diag + "\"" +
+              ",\"motD\":\"" + mot_diag + "\"" +
+              ",\"msmD\":\"" + msm_diag + "\"" +
               ",\"dMed\":" + f3(dx_med_max) +
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
