@@ -1829,13 +1829,30 @@ void sharpenLuma(inout vec3 c, vec2 uv) {
     float gain = uSharpen * (l0 - lb / 16.0) / max(l0, 0.01);
     c *= 1.0 + clamp(gain, -0.4, 0.4);
 }
+// ── v0.10.23：真 sRGB 传递函数（IEC 61966-2-1）取代 pow(c, 1/2.2) ──────────────
+// 为什么必须换：pow(1/2.2) **不是 sRGB**。两者在中灰以上几乎重合（线性 0.18 处
+// 0.4614 vs 0.4618；1.0 处同为 1.0），但**暗部差最多 ~9/255** —— pow 在 0 处斜率
+// 无穷，任何极暗值都被抬成可见灰度；真 sRGB 的线性段（12.92·x）让黑保持是黑。
+// 实测（FILMKIT_20260928-184958 vs PhotonCamera_185013，同机位）：我们 P1 = 11/255、
+// PC = 1/255；把**同一张成片**按真 sRGB 重编码后 P1 → 3/255，而 P50/P95 几乎不动
+// （test_temp/analysis/g_oetf.py）。JPEG 打的本来就是 sRGB ICC（此前名不副实），
+// PC（TransferCurve.SRGB）与 darktable 也用真 sRGB ⇒ 这是"黑场不黑、画面发灰"的
+// 独立来源之一（另一半在 filmic 之前的输入域，待逐层定位）。
+// 常量全部取 IEC 61966-2-1：分段点 0.0031308、1.055、1/2.4、0.055、12.92。
+// mix+step 而非 if：此处无性能顾虑，且避免 Mali 对分支的预测执行。
+vec3 srgbEncode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;  // 幂段（c=0 → −0.055，被 step 丢弃）
+    vec3 lo = 12.92 * c;                                // 线性段（暗部）
+    return mix(hi, lo, step(c, vec3(0.0031308)));
+}
 void main() {
     vec2 uv = vUV0;
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
     vec3 c = texture(uTex, uv).rgb;
     c = highlightRolloff(c);
     if (uSharpen > 0.0) sharpenLuma(c, uv);
-    c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+    c = srgbEncode(c);
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     if (uGrainAmount > 0.0) {
@@ -1902,10 +1919,19 @@ vec3 lutApply(vec3 c) {
     vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
     return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
 }
+// 与 kFsOut 同一传递函数（v0.10.23：真 sRGB）—— 直方图/斑马纹必须与用户看到的
+// 画面同域，否则"直方图与画面不符"会重现。
+vec3 srgbEncode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    vec3 lo = 12.92 * c;
+    return mix(hi, lo, step(c, vec3(0.0031308)));
+}
 void main() {
-    vec3 c = pow(clamp(texture(uTex, vUV0).rgb, 0.0, 1.0), vec3(1.0 / 2.2));
+    vec3 c = srgbEncode(texture(uTex, vUV0).rgb);
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
-    // max 与 luma 都在显示域；pow 单调 ⇒ CPU 侧 pow(·, 2.2) 折回线性后仍是 max 通道
+    // max 与 luma 都在显示域；sRGB 编码单调 ⇒ CPU 侧按 sRGB EOTF 折回线性后仍是
+    // 同一像素的 max 通道值，不是近似。
     float l = (uStatCh > 0.5) ? max(max(c.r, c.g), c.b)
                               : dot(c, vec3(0.2126, 0.7152, 0.0722));
     oColor = vec4(l, l, l, 1.0);
@@ -1929,6 +1955,10 @@ void main() {
             acc += texture(uTex, vUV0 + o * uStep).rgb;
         }
     }
+    // 注意：这里**保留 pow(1/2.2)**（v0.10.23 只把 kFsOut / kFsHist / 统计折回换成真
+    // sRGB）：这张低频图是 local_tone 的**判据域**，uLocalKnee/uLocalKneeHi 是在 2.2 域
+    // 标定的，换编码会移动 knee 的生效点（暗部两域差可达 1.6×）。local_tone 当前默认关
+    // （日志 lt=0.00），等它启用时连 knee 一起重新标定 —— 不要单独改这一处。
     vec3 c = pow(clamp(acc / 64.0, 0.0, 1.0), vec3(1.0 / 2.2));
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
     oColor = vec4(l, l, l, 1.0);
@@ -4447,14 +4477,21 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
     }
     return 1.0f;
   };
-  // 直方图在**显示域**（kFsHist 内部已过 OETF）；pow 单调 ⇒ pow(·, 2.2) 折回线性后
-  // 仍是同一像素的 max 通道值，不是近似。
+  // 直方图在**显示域**（kFsHist 内部已过 OETF）；编码单调 ⇒ 按其逆折回线性后仍是
+  // 同一像素的 max 通道值，不是近似。
   // v0.10.17：分位 P0.5/P99.5 → **P0.1/P99**（真机 0.10.16 校准）——P0.5 把 black 收到
   // −5.6EV，dr 从 12.2 收到 8.0，power 被派生公式推到 4.7+ ⇒ 中间调压暗 + 色度比
   // 放大（用户实测"中间调低、天空过饱和"）；P99.5 的 shoulder 过渡太窄 ⇒ 水壶高光
   // 推白。P0.1 更贴近 darktable autodetect"框选最暗"的 min 语义，P99 给 shoulder 留
   // 过渡带。
-  const auto to_lin = [](float v) { return std::pow(v, 2.2f); };
+  // v0.10.23：折回函数与 kFsOut/kFsHist 的编码**必须同步**（原先 pow(v, 2.2)，现为
+  // 真 sRGB EOTF）。不同步的后果隐蔽且危险：linMid/pLo/pHi 会与成片显示域错位，
+  // 暗部尤其大（显示域 0.1 处线性值 0.0100 vs pow(2.2) 的 0.0063，差 1.59×），而
+  // 自动黑白点判据正是吃这三个数，日志诊断口径也会跟着失真。
+  const auto to_lin = [](float v) {
+    return v <= 0.04045f ? v / 12.92f
+                         : std::pow((v + 0.055f) / 1.055f, 2.4f);
+  };
   st.p_lo = to_lin(pct(0.001));
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));
