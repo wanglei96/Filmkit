@@ -1356,12 +1356,13 @@ uniform float uFilmicBlackEv, uFilmicDr, uFilmicInputMin, uFilmicInputMax;
 uniform float uFilmicPower, uFilmicBlackDisp;
 // v0.10.13：darktable filmic v5 gamut mapping 开关（1 = 开/标准，0 = A/B 关）
 uniform float uGamut;
-// v0.7.8：用户 EV 滑杆 = **显示亮度补偿**，乘在整条影调链**之后**。
-// 为什么不放在 RAW 链（v0.7.7 曾接在 CCM 后）：那里在 updateFilmicEV 的场景统计
-// **之前** —— auto 黑点（P0.5 分位）会跟着输入一起漂，filmic 又把它压回来，
-// 用户拉 ±1EV 成片纹丝不动（v0.7.7 真机 A/B 实测：+0.7EV 两张 P50 差 1.93/255）。
-// 放在链后：统计与曲线都不受扰动，输出严格 ×2^EV，滑杆多少补多少；
-// 提亮逼近显示上限时由 pass3 的输出域 rolloff 兜高光。
+// v0.10.22：EV = **filmic 前线性域曝光**（PC/Darktable 的 BaselineExposure 语义）。
+// 历史：v0.7.7 曾接在 CCM 后，被 auto 黑点统计归一（拉 ±1EV 成片纹丝不动）→ v0.7.8
+// 改链末乘性；v0.10.21 真机验证链末乘性只整体平移亮度、黑位/对比不动（−0.3EV 复拍
+// 仍灰），且与预览分支（历来前置）分叉。现两侧统一前置：EV 进曲线改变工作点，
+// 负向沉黑位、正向顶高光。乘性 EV 不改 Ych 色度（2e-8），gamut min 语义不受影响；
+// auto 黑点现默认关（v0.10.19），统计归一的旧前提已不成立。提亮逼近显示上限时
+// 由 pass3 的输出域 rolloff 兜高光。
 uniform float uExposure;
 const float kFilmicGrey = 0.1845;               // darktable grey_source（18.45% 中灰）
 const float kFilmicNormMin = 1.52587890625e-5;  // 2^-16，与 darktable NORM_MIN 一致
@@ -1464,8 +1465,10 @@ vec3 gamutYchToYrg(vec4 ych) {
 }
 vec4 gamutRgbToYch(vec3 c) { return gamutYrgToYch(gamutLmsToYrg(gamutSrgbToLms(c))); }
 vec3 gamutYchToRgb(vec4 ych) { return gamutLmsToSrgb(gamutYrgToLms(gamutYchToYrg(ych))); }
-// ⚠️ darktable 的 filmic_desaturate_v4（saturation=0）与「Ych 色度取 min」两步
-// 在 2026-09-28 真机 A/B 后被**移除**——原因见 gamutMapV5 的实测数据。
+// 历史注（勿再误读）：v0.10.14 曾按链级模拟预删「Ych 色度取 min」与 desaturate(0)
+// 两步，v0.10.17 起已按用户铁律**全量恢复**（先 100% 原版跑通→真机→数据评估）——
+// 下面的 gamutMapV5 函数体是完整五步，本注释仅为历史记录。2026-09-28 定性：min 的
+// 灰化是原版行为在本链语境的副作用（PC 同样带着它），根源在亮度结构不在 min。
 // Yrg 锥空间合法性：r<0 / g<0 / r+g>1 时按常 Y 常色相解最大合法 chroma
 vec4 gamutCheckYrg(vec4 ych) {
     vec3 yrg = gamutYchToYrg(ych);
@@ -1582,19 +1585,26 @@ vec3 gamutMapV5(vec3 original, vec3 toned) {
 }
 void main() {
     vec3 lin = texture(uTex, vUV0).rgb;
+    // v0.10.22：EV = filmic **前**线性域曝光（PC/Darktable 的 BaselineExposure 语义）——
+    // 预览分支历来如此（uDomainRatio 同域），静拍此前却是链末乘性（v0.7.8），EV≠0 时
+    // 两侧分叉、WYSIWYG 破绽。乘性 EV 不改 Ych 色度（离线验证 2e-8），min 语义不变；
+    // 改变的是曲线工作点：负向沉黑位、正向顶高光，滑杆有形状语义。v0.10.21 真机
+    // 验证（−0.3EV）：后置乘性只整体平移亮度（黑位/对比不动，红杯 rel 0.65→0.76 仍灰），
+    // 形状必须由曲线内的曝光决定。
+    vec3 mapped = max(lin, vec3(0.0)) * uExposure;
     // 预览域映射（v0.8.0，取代直通）：先除以在线估计的 HAL/RAW 域比，映射回 RAW
-    // 等效域，再走与成片完全相同的 filmic 链 —— 真 WYSIWYG；EV 在统计之后乘（v0.7.9）。
+    // 等效域，再走与成片完全相同的 filmic 链 —— 真 WYSIWYG。
     // filmicTone 输出 pow(clamp(spline), power) ∈ [0,1]，数学有界 —— 预览不再可能爆白。
     if (uPreviewMap > 0.5) {
-        vec3 mapped = max(lin, vec3(0.0)) / uDomainRatio * uExposure;
-        vec3 toned = filmicTone(mapped);
+        vec3 evMapped = mapped / uDomainRatio;
+        vec3 toned = filmicTone(evMapped);
         // 预览与成片同链（WYSIWYG）：gamut mapping 同样生效
-        oColor = vec4(uGamut > 0.5 ? gamutMapV5(mapped, toned) : toned, 1.0);
+        oColor = vec4(uGamut > 0.5 ? gamutMapV5(evMapped, toned) : toned, 1.0);
         return;
     }
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
     // filmic 直接吃线性场景输入 —— blackEv/whiteEv 的标定域与渲染域首次严格一致。
-    vec3 out3 = max(lin, vec3(0.0));
+    vec3 out3 = mapped;
     // M4-7 局部色调映射：按**局部相对画面基准**的暗度补光 —— 比基准暗得越多补得越多，
     // 到 uLocalKnee 以上（含所有亮区/高光）归零。刻意放在 baseTone **之前**：这里还是
     // 线性域，S 曲线对暗部的弹性约 2（离线实测 +60% 线性 → 显示域 +45~55%），同样的
@@ -1696,7 +1706,7 @@ void main() {
                        * (1.0 + (uLookChroma - 1.0) * sk * uLook);
     }
     out3 = mix(out3, vec3(luma(clamp(out3, 0.0, 4.0))), uMono);
-    oColor = vec4(out3 * uExposure, 1.0);
+    oColor = vec4(out3, 1.0);
 })";
 
 // Pass3：输出变换（OETF + 颗粒 + dither），量化到 8bit

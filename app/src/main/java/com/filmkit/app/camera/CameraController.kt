@@ -454,10 +454,12 @@ class CameraController(private val context: Context, private val render: RenderC
         evSteps = (ev / evStep).toInt().coerceIn(evRange.lower, evRange.upper)
         // v0.7.8：EV 同步进引擎（FilmParams[0] = exposure_ev）。原先只写 HAL 的
         // CONTROL_AE_EXPOSURE_COMPENSATION，而 X300 在 RAW 静拍上对它几乎不执行
-        // （+0.7EV 实测只给 +0.1EV：sec 0.0014→0.0015s），RAW 成片纹丝不动；
-        // 且引擎侧若在统计前乘 EV，auto 黑点又会把它归一（kFsFilm 注释）。
-        // 现在语义 = 显示亮度补偿（filmic 之后 ×2^EV），HAL 补偿撤除，单一来源。
+        // （+0.7EV 实测只给 +0.1EV：sec 0.0014→0.0015s），RAW 成片纹丝不动。
         // v0.8.1：[0] = 基准曝光（base_ev，机型校准常量）+ 用户 EV。
+        // v0.10.22：语义 = **filmic 前线性域曝光**（PC/Darktable BaselineExposure 语义，
+        // 进曲线改工作点），与预览分支统一——此前链末乘性与预览分叉，且后置乘性
+        // 只平移亮度、黑位/对比不动（−0.3EV 真机复拍仍灰）。auto 黑点已默认关，
+        // v0.7.7"统计归一"的旧顾虑不再成立。
         filmParams[0] = baseEvPref + (evSteps * evStep).toDouble()
         rebuildRepeating()
     }
@@ -824,6 +826,8 @@ class CameraController(private val context: Context, private val render: RenderC
     // 逆光 ~0.9）—— 影调引擎（filmic）只做映射、不产生曝光，这个差只能在校准层补。
     // 与 Lightroom/DNG 的 BaselineExposure 同语义；范围 −2..+2 覆盖机型间差异，
     // 默认 0 = 不偏置。用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user。
+    // v0.10.22：作用点移到 filmic 前（曲线工作点语义，与 PC 的 Linear 域 EV 同构）。
+    // 原按显示域标定的 +0.50 在曲线内的实际效果不同，待真机复验后定新默认。
     private var baseEvPref = 0.0
 
     private fun applyBaseEvPref() {
