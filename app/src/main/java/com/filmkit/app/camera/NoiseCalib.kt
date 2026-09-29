@@ -48,13 +48,15 @@ class GcamNoiseCalib private constructor(
             s4[p] = (a[p] * isoD + b[p]).coerceAtLeast(0.0)
             o4[p] = (c[p] * isoD * isoD + d[p] * dg2).coerceAtLeast(0.0)
         }
-        val sg = 0.5 * (s4[1] + s4[2])
-        val og = 0.5 * (o4[1] + o4[2])
-        if (s4[0] <= 0.0 || sg <= 0.0 || s4[3] <= 0.0) return null
-        if (o4[0] <= 0.0 && og <= 0.0 && o4[3] <= 0.0) return null
+        // 数组通道序 = R, Gr, B, Gb（GCam 标准序）——注意不是 R,G1,G2,B：
+        // 曾把 idx2/idx3 当 G2/B，实际是 B/Gb（真机日志 211342 的 S 输出坐实）。
+        val sg = 0.5 * (s4[1] + s4[3])
+        val og = 0.5 * (o4[1] + o4[3])
+        if (s4[0] <= 0.0 || sg <= 0.0 || s4[2] <= 0.0) return null
+        if (o4[0] <= 0.0 && og <= 0.0 && o4[2] <= 0.0) return null
         return floatArrayOf(
-            s4[0].toFloat(), sg.toFloat(), s4[3].toFloat(),
-            o4[0].toFloat(), og.toFloat(), o4[3].toFloat(),
+            s4[0].toFloat(), sg.toFloat(), s4[2].toFloat(),
+            o4[0].toFloat(), og.toFloat(), o4[2].toFloat(),
         )
     }
 

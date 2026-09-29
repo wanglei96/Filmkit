@@ -49,16 +49,35 @@ class GcamNoiseCalibTest {
         val m = cal!!.evaluate(100)!!
         // S(plane0) = A0*100 + B0
         assertNear(1.8326389269617373e-07 * 100 - 2.0598894168819969e-07, m[0].toDouble())
-        // G = (Gr + Gb)/2
+        // G = (Gr + Gb)/2 —— .c 数组序 R, Gr, B, Gb（idx1 与 idx3）
         val sg = 0.5 * (1.8310841760634264e-07 * 100 - 5.0396057411973582e-07 +
-            1.8257826701051919e-07 * 100 - 5.3241333186416879e-07)
+            1.8157910951989409e-07 * 100 - 3.924086360945215e-07)
         assertNear(sg, m[1].toDouble())
-        assertNear(1.8157910951989409e-07 * 100 - 3.924086360945215e-07, m[2].toDouble())
+        // B = idx2
+        assertNear(1.8257826701051919e-07 * 100 - 5.3241333186416879e-07, m[2].toDouble())
         // O（iso ≤ maxAnalog → dg=1）：C*iso² + D
         assertNear(1.5467896663927581e-13 * 1e4 + 2.438361775816499e-07, m[3].toDouble())
         val og = 0.5 * (1.5399684699652229e-13 * 1e4 + 2.3725323086979802e-07 +
-            1.5462212604176862e-13 * 1e4 + 2.3872211548107904e-07)
+            1.5095015122305481e-13 * 1e4 + 2.3799350248210071e-07)
         assertNear(og, m[4].toDouble())
+        assertNear(1.5462212604176862e-13 * 1e4 + 2.3872211548107904e-07, m[5].toDouble())
+    }
+
+    @Test
+    fun channelOrder_isRGrBGb_notRG1G2B() {
+        // 真机日志 211342 坐实的 bug：曾把 .c 的 idx2/idx3 当 G2/B（实际是 B/Gb）。
+        // 用不对称系数让 G 与 B 的期望值可分：(A1+A3)/2 != A2。
+        val text = "static double noise_model_A[] = {1e-6, 2e-6, 9e-6, 8e-6};\n" +
+            "static double noise_model_B[] = {0,0,0,0};\n" +
+            "static double noise_model_C[] = {0,0,0,0};\n" +
+            "static double noise_model_D[] = {1e-7, 2e-7, 9e-7, 8e-7};"
+        val m = GcamNoiseCalib.parse("x", "x", text)!!.evaluate(100)!!
+        assertNear(1e-4, m[0].toDouble())  // R  = A0*100
+        assertNear(5e-4, m[1].toDouble())  // G  = (2e-6+8e-6)/2*100
+        assertNear(9e-4, m[2].toDouble())  // B  = A2*100（不是 Gb）
+        assertNear(1e-7, m[3].toDouble())  // O_R
+        assertNear(5e-7, m[4].toDouble())  // O_G = (2e-7+8e-7)/2
+        assertNear(9e-7, m[5].toDouble())  // O_B = D2（不是 Gb）
     }
 
     @Test
