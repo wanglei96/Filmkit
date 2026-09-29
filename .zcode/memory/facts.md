@@ -161,3 +161,8 @@ status: active
 - [2026-09-28] **PC 色彩体系 = Hncs**：`HncsProfile.kt`/`HncsToneAlgorithm.kt`/`EquivalentCameraCalibration.kt`；`colorCorrection` 只是低光去饱和（`uHncsLowLightDesaturation`），**无 filmic 后加饱和环节**；`EquivalentCameraCalibration` 可等效到 LumixS9/HasselbladX2DII100C/CanonEOSR5（DCP），但**用户实测本次 PC 选 filmic、不经 DCP**
 - [2026-09-28] **PC 的 Ych 常量两套**：`DT_FILMIC_BT2020_TO_LMS_*`（BT.2020 工作域）与 `DT_FILMIC_SRGB_TO_LMS_*`（同我们），数值互逆一致（偏差 0.0000）
 - [2026-09-28] **验证工具**：`tools/ccm-chain-ab.py`（日志 `ccmStd`/`ccmHal` + 同一 DNG → 两条链的"进 filmic 前"C* 对拍）
+
+- [2026-09-29] 发布现状：最新 **v0.10.26-m4（versionCode 177）**，commits `6d0dbab`/`38ef8c5`/`1c437dc` 均已推 main；根目录 filmkit-0.10.26-m4.apk；**未打 tag**
+- [2026-09-29] **base_ev 默认 0 → +0.7（v0.10.25）**：同 DNG 双渲染实证（PC 渲我们 RAW C* 37.9 vs 我们 33.1，中性区净差 +0.57EV）——PC 链首恒乘 0.7EV 而我们为 0，工作点上移是色度差的主项；prefs base_ev 与设置页滑杆同步
+- [2026-09-29] **手动 WB 补偿覆盖三条渲染链（v0.10.26 修复）**：`prepareRawCommon(neutral…, wb_r, wb_g, wb_b, …)` 把 FilmParams[1]/[3] 以 G 归一乘进 asShotNeutral 增益（黑阶后、CCM 前的 raw 域），`submitRaw` 与 `submitRawBurst` 共用；预览 OES / YUV 静拍维持 pass-1 乘 uWb；raw.render 加 **`wb:[r,g,b]`** 字段（1,1,1 = 自动/中性）供真机核对
+- [2026-09-29] LSC 边缘软限幅（v0.10.25，prefs lsc_damp 默认开）：knee 2.5 以上压缩比 0.5，四平面共享阻尼因子（per-grid-point max 增益算压缩比、三通道同乘）严格保持通道比——平面间角落增益差 R6.31/B5.85 的色度漂移被抑制；保留 ~0.4EV 边缘晕影

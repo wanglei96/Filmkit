@@ -1,8 +1,8 @@
 ---
 summary: OETF修正与色度差定位到前置链
 created: 2026-09-28 22:25
-updated: 2026-09-28 22:25
-status: active
+updated: 2026-09-29 12:00
+status: absorbed
 ---
 
 # OETF修正与色度差定位到前置链
