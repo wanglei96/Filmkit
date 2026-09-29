@@ -3326,6 +3326,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"w99\":" + std::to_string(last_w99_).substr(0, 6);
   kv += ",\"w999\":" + std::to_string(last_w999_).substr(0, 6);
   kv += ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6);
+  kv += ",\"w9999\":" + std::to_string(last_w9999_).substr(0, 6);
   kv += ",\"cp\":" + std::to_string(last_cp_).substr(0, 6);
   kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
   kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
@@ -4548,6 +4549,7 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));
   st.p_hi999 = to_lin(pct(0.999));
+  st.p_hi9999 = to_lin(pct(0.9999));
   // v0.10.28：p_max = **采样到的最高非空桶**（darktable autodetect 的 max 语义）。
   // 对数编码上限 2^8（= +8EV）后 max 不再被显示域 clamp 淹没——0.10.18 当时
   // 改用分位正是迫于此；现在分位保留（P99 驱动 black/基础判据），max 只驱动
@@ -4762,11 +4764,22 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // 点后 max 语义可以忠实落地：w_max = log2(p_max/grey)，+0.4EV security；
     // w99+1.5 幅度闸与物理钳制不变。max 被 P0 降噪/MFNR 融合先行压掉坏点，
     // 噪声尖峰由幅度闸与上限兜底。
+    // ── v0.10.29：**断档判据**——max 不盲用（165802 天空变白定案）────────────
+    // 真机（165802 阳台蓝天）：画面里 0.005% 的太阳反光带（渲染域 +4.7EV，与天空
+    // 主体断档 2.2EV）把 white 顶到 4.02 → power 4.5→3.1、cp 1.46（contrast 1.76）
+    // → cp 只守中灰斜率守不住 gamma，**全图地景压暗 24%** → 蓝天 C* 虽未变但相对
+    // 突显 + 中间调下沉 = "天空变白"。修正：max 与 P99.99 的**断档** ≤0.5EV（高光
+    // 连续分布，白壶身渐变带型）才用 max+0.4 驱动；断档大（孤立强点）退回 P99.9
+    // 驱动（与 178 行为同值）。逐场景核对：白壶（断档 0.2）保持修复、165800（0.67）
+    // 回 178、161903/161704/162117（连续大面积窗光）不变。
     w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
     const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
+    const float w9999 = std::log2(std::max(st.p_hi9999, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
-      w = std::max(w99, std::min(w_max + 0.4f, w99 + 1.5f));
+      const bool continuous = w_max - w9999 <= 0.5f;
+      const float driven = continuous ? w_max + 0.4f : w999;
+      w = std::max(w99, std::min(driven, w99 + 1.5f));
     } else {
       w = w99;  // v0.10.18 行为（A/B 通路）
     }
@@ -4814,6 +4827,9 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   last_cp_ = cp;
   last_wmax_ = st.valid && auto_on ? std::log2(std::max(st.p_max, 1e-6f) / kGrey)
                                    : 0.0f;
+  last_w9999_ = st.valid && auto_on
+                    ? std::log2(std::max(st.p_hi9999, 1e-6f) / kGrey)
+                    : 0.0f;
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -4946,6 +4962,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
             ",\"w99\":" + std::to_string(last_w99_).substr(0, 6) +
             ",\"w999\":" + std::to_string(last_w999_).substr(0, 6) +
             ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6) +
+            ",\"w9999\":" + std::to_string(last_w9999_).substr(0, 6) +
             ",\"cp\":" + std::to_string(last_cp_).substr(0, 6) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
             ",\"ratio\":" + std::to_string(g_domain_ratio).substr(0, 6) +

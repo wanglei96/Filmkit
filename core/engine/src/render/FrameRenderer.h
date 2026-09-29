@@ -207,6 +207,10 @@ class FrameRenderer {
     // 白点上探的主驱动量：小面积近饱和高光（白壶身镜面，占比 0.001% 级）
     // 任何分位都看不见，见 162012 真机定案。
     float p_max = 0.0f;
+    // v0.10.29：P99.99 —— 与 p_max 组成**断档判据**：wmax − w9999 小 = 高光连续
+    // 分布（白壶身渐变带，max 该驱动）；大 = 孤立强点（太阳反光，max 会把白点
+    // 顶飞、power 崩、地景压暗 → 有色度高光"变白"，见 165802 真机定案）。
+    float p_hi9999 = 0.0f;
     bool valid = false;
   };
   SceneStats measureSceneStats(GLuint src);
@@ -353,7 +357,9 @@ class FrameRenderer {
   // v0.10.27：白点判据的诊断量（EV，相对中灰）——w99/w999 = P99/P99.9 的 raw 判据值，
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。
   // v0.10.28：wmax = 采样 max 判据值（上探主驱动）。
-  float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
+  // v0.10.29：w9999 = P99.99 判据值（断档诊断：wmax − w9999 大 = 孤立强点）。
+  float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f,
+        last_w9999_ = 0.0f;
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
