@@ -4764,22 +4764,18 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // 点后 max 语义可以忠实落地：w_max = log2(p_max/grey)，+0.4EV security；
     // w99+1.5 幅度闸与物理钳制不变。max 被 P0 降噪/MFNR 融合先行压掉坏点，
     // 噪声尖峰由幅度闸与上限兜底。
-    // ── v0.10.29：**断档判据**——max 不盲用（165802 天空变白定案）────────────
-    // 真机（165802 阳台蓝天）：画面里 0.005% 的太阳反光带（渲染域 +4.7EV，与天空
-    // 主体断档 2.2EV）把 white 顶到 4.02 → power 4.5→3.1、cp 1.46（contrast 1.76）
-    // → cp 只守中灰斜率守不住 gamma，**全图地景压暗 24%** → 蓝天 C* 虽未变但相对
-    // 突显 + 中间调下沉 = "天空变白"。修正：max 与 P99.99 的**断档** ≤0.5EV（高光
-    // 连续分布，白壶身渐变带型）才用 max+0.4 驱动；断档大（孤立强点）退回 P99.9
-    // 驱动（与 178 行为同值）。逐场景核对：白壶（断档 0.2）保持修复、165800（0.67）
-    // 回 178、161903/161704/162117（连续大面积窗光）不变。
+    // ── v0.10.30：断档判据**撤回**（真机证伪），回归纯 max 驱动 + cp 封顶 ──────
+    // 180 的断档判据（wmax−w9999>0.5 视为孤立强点回退）在真机上不可分：水壶断档
+    // 0.55（超阈值→水壶回退，观感回退实锤）、天空/阳台 0.63——阈值卡在两者之间
+    // 无安全空间。且同 DNG 双渲染（170639，光照固定）证明 **max 驱动的天空比
+    // 回退/无上探更亮更饱和**（60/48.2% vs 35/43.5%）——"179 天空变白"实为
+    // 跨时刻日落光照污染（16:19→16:57→17:06 天空饱和 48.7%→30.7%→16.0% 单调
+    // 变化，与判据版本无关）。真正该修的是 165802 暴露的 **cp 过冲**（见下）。
     w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
     const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
-    const float w9999 = std::log2(std::max(st.p_hi9999, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
-      const bool continuous = w_max - w9999 <= 0.5f;
-      const float driven = continuous ? w_max + 0.4f : w999;
-      w = std::max(w99, std::min(driven, w99 + 1.5f));
+      w = std::max(w99, std::min(w_max + 0.4f, w99 + 1.5f));
     } else {
       w = w99;  // v0.10.18 行为（A/B 通路）
     }
@@ -4787,9 +4783,12 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // ── contrast_param 补偿（darktable contrast 滑杆的自动化用法）────────────
     // 上探拉大 dr → power 派生回落（151748 型场景 4.70→~3.2），中灰以上提亮变少
     // = 用户验收过的"通透感"回退。补偿 = 上探前后 power 比（cp = power_old/new，
-    // clamp [1.0, 1.6] 只补不降）：spline v3 里中灰斜率 = contrast_param/8 与
-    // power 无关，cp 直接抬对数域斜率，把上探前曲线的中间调梯度找回来；肩部
-    // 过渡宽度由 dr 决定不受 cp 影响 —— 高光余量与中间调对比同时保住。
+    // clamp [1.0, **1.25**] 只补不降）：spline v3 里中灰斜率 = contrast_param/8 与
+    // power 无关，cp 直接抬对数域斜率，把上探前曲线的中间调梯度找回来。
+    // v0.10.30：上限 1.6 → **1.25**。165802 定案：wmax 驱动的满幅上探场景 cp 冲到
+    // 1.46（contrast 1.76，darktable 滑杆高段）→ 地景对比过冲、全图压暗 24%（cp
+    // 补斜率补不了 gamma），观感"天空衬白"。1.25 是温和补偿——斜率增益 25% 足以
+    // 软化 power 回落，不会把画面变硬。水壶场景 cp 1.12 不受影响。
     // 未上探（w == w_old）时 cp 恒 1.0，固定曲线（auto=0）不走此分支恒 1.0。
     const float w_old = std::clamp(w99, 2.438307f, 4.556152f);
     if (w > w_old + 1e-3f) {
@@ -4802,7 +4801,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
       const double pow_old = derive_power(w_old);
       const double pow_new = derive_power(w);
       cp = static_cast<float>(std::clamp(pow_old / std::max(pow_new, 1e-6),
-                                         1.0, 1.6));
+                                         1.0, 1.25));
     }
   }
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
