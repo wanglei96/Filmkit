@@ -118,9 +118,10 @@ Java_com_filmkit_app_EngineBridge_nativeRunSpike(JNIEnv* env, jobject, jint w,
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_filmkit_app_EngineBridge_nativeRunFftSpike(JNIEnv* env, jobject, jint w,
                                                     jint h, jint iters,
-                                                    jboolean overlap) {
+                                                    jboolean overlap,
+                                                    jint variant) {
   const filmkit::FftSpikeResult r =
-      runSpikeFftMerge(w, h, iters, overlap == JNI_TRUE);
+      runSpikeFftMerge(w, h, iters, overlap == JNI_TRUE, variant);
   return toJString(env, r.toJson());
 }
 

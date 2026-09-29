@@ -202,6 +202,394 @@ void main() {
 }
 )";
 
+// ── 优化变体 1：twiddle 查表（消 SFU sin/cos）──────────────────────────
+// 16 点 radix-2 的 twiddle 全部落在 2π·i/16（i=0..7）八个值上（按 idx=(16k)/len
+// 归一）。表由 host 上传 uniform vec2 uTw[8] = (cos, sin)。
+const char* kFftMergeCsTw = R"(#version 310 es
+precision highp float;
+precision highp int;
+precision highp sampler2DArray;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform highp sampler2DArray uFrames;
+layout(rgba16f, binding = 0) uniform writeonly highp image2D uOut;
+uniform highp ivec2 uSize;
+uniform highp int uStride;
+uniform highp float uSigma;
+uniform highp float uC;
+uniform highp vec2 uTw[8];
+
+shared float sre[2][4][16][16];
+shared float sim[2][4][16][16];
+
+const float TWO_PI = 6.283185307179586;
+
+void fftRow(int t, int z, int y, float sgn) {
+    int j = 0;
+    for (int i = 1; i < 16; ++i) {
+        int bit = 8;
+        for (int b = 0; b < 4; ++b) {
+            if ((j & bit) == 0) { break; }
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if (i < j) {
+            float tr = sre[t][z][y][i];
+            sre[t][z][y][i] = sre[t][z][y][j];
+            sre[t][z][y][j] = tr;
+            float ti = sim[t][z][y][i];
+            sim[t][z][y][i] = sim[t][z][y][j];
+            sim[t][z][y][j] = ti;
+        }
+    }
+    for (int len = 2; len <= 16; len <<= 1) {
+        int hlen = len >> 1;
+        for (int blk = 0; blk < 16; blk += len) {
+            for (int k = 0; k < hlen; ++k) {
+                int idx = (16 * k) / len;
+                float wr = uTw[idx].x;
+                float wi = sgn * uTw[idx].y;
+                int i0 = blk + k;
+                int i1 = i0 + hlen;
+                float xr = sre[t][z][y][i1];
+                float xi = sim[t][z][y][i1];
+                float tr = xr * wr - xi * wi;
+                float ti = xr * wi + xi * wr;
+                sre[t][z][y][i1] = sre[t][z][y][i0] - tr;
+                sim[t][z][y][i1] = sim[t][z][y][i0] - ti;
+                sre[t][z][y][i0] += tr;
+                sim[t][z][y][i0] += ti;
+            }
+        }
+    }
+}
+
+void fftCol(int t, int z, int x, float sgn) {
+    int j = 0;
+    for (int i = 1; i < 16; ++i) {
+        int bit = 8;
+        for (int b = 0; b < 4; ++b) {
+            if ((j & bit) == 0) { break; }
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if (i < j) {
+            float tr = sre[t][z][i][x];
+            sre[t][z][i][x] = sre[t][z][j][x];
+            sre[t][z][j][x] = tr;
+            float ti = sim[t][z][i][x];
+            sim[t][z][i][x] = sim[t][z][j][x];
+            sim[t][z][j][x] = ti;
+        }
+    }
+    for (int len = 2; len <= 16; len <<= 1) {
+        int hlen = len >> 1;
+        for (int blk = 0; blk < 16; blk += len) {
+            for (int k = 0; k < hlen; ++k) {
+                int idx = (16 * k) / len;
+                float wr = uTw[idx].x;
+                float wi = sgn * uTw[idx].y;
+                int i0 = blk + k;
+                int i1 = i0 + hlen;
+                float xr = sre[t][z][i1][x];
+                float xi = sim[t][z][i1][x];
+                float tr = xr * wr - xi * wi;
+                float ti = xr * wi + xi * wr;
+                sre[t][z][i1][x] = sre[t][z][i0][x] - tr;
+                sim[t][z][i1][x] = sim[t][z][i0][x] - ti;
+                sre[t][z][i0][x] += tr;
+                sim[t][z][i0][x] += ti;
+            }
+        }
+    }
+}
+
+void main() {
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    ivec2 wg = ivec2(gl_WorkGroupID.xy);
+    int tid = lid.y * 16 + lid.x;
+    int stride = uStride;
+    ivec2 origin = ivec2(wg.x * 2 * stride, wg.y * stride);
+
+    if (tid < 128) {
+        int tt = tid / 64;
+        int zz = (tid / 16) % 4;
+        int yy = tid % 16;
+        ivec2 base = origin + ivec2(tt * stride, 0);
+        float wy = 0.5 - 0.5 * cos(TWO_PI * (float(yy) + 0.5) / 16.0);
+        for (int x = 0; x < 16; ++x) {
+            ivec2 p = clamp(base + ivec2(x, yy), ivec2(0), uSize - 1);
+            float v = texelFetch(uFrames, ivec3(p, zz), 0).r;
+            float wx = 0.5 - 0.5 * cos(TWO_PI * (float(x) + 0.5) / 16.0);
+            sre[tt][zz][yy][x] = v * wx * wy;
+            sim[tt][zz][yy][x] = 0.0;
+        }
+        fftRow(tt, zz, yy, -1.0);
+    }
+    barrier();
+
+    if (tid < 128) {
+        int tt = tid / 64;
+        int zz = (tid / 16) % 4;
+        int xx = tid % 16;
+        fftCol(tt, zz, xx, -1.0);
+    }
+    barrier();
+
+    for (int rep = 0; rep < 2; ++rep) {
+        int idx = tid * 2 + rep;
+        int tt = idx / 256;
+        int bin = idx % 256;
+        int by = bin / 16;
+        int bx = bin % 16;
+        float r0 = sre[tt][0][by][bx];
+        float i0 = sim[tt][0][by][bx];
+        float accR = r0;
+        float accI = i0;
+        for (int zz = 1; zz < 4; ++zz) {
+            float rz = sre[tt][zz][by][bx];
+            float iz = sim[tt][zz][by][bx];
+            float dr = r0 - rz;
+            float di = i0 - iz;
+            float d2 = dr * dr + di * di;
+            float a = d2 / (d2 + uC * uSigma * uSigma + 1e-12);
+            accR += rz + a * dr;
+            accI += iz + a * di;
+        }
+        sre[tt][0][by][bx] = accR * 0.25;
+        sim[tt][0][by][bx] = accI * 0.25;
+    }
+    barrier();
+
+    if (tid < 32) {
+        int tt = tid / 16;
+        int xx = tid % 16;
+        fftCol(tt, 0, xx, 1.0);
+    }
+    barrier();
+
+    if (tid < 32) {
+        int tt = tid / 16;
+        int yy = tid % 16;
+        fftRow(tt, 0, yy, 1.0);
+        ivec2 base = origin + ivec2(tt * stride, 0);
+        for (int x = 0; x < 16; ++x) {
+            ivec2 p = base + ivec2(x, yy);
+            if (p.x < uSize.x && p.y < uSize.y) {
+                imageStore(uOut, p, vec4(sre[tt][0][yy][x] * 0.00390625, 0.0, 0.0, 1.0));
+            }
+        }
+    }
+}
+)";
+
+// ── 优化变体 2：twiddle 查表 + 寄存器内 1D FFT ────────────────────────
+// 每线程把一行/列装入局部数组（循环边界全常量，驱动可展开 → 索引常量 → 寄存器），
+// 蝶形不再逐次读写 shared；shared 流量从每 FFT 128 次降到 32 次。
+const char* kFftMergeCsReg = R"(#version 310 es
+precision highp float;
+precision highp int;
+precision highp sampler2DArray;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform highp sampler2DArray uFrames;
+layout(rgba16f, binding = 0) uniform writeonly highp image2D uOut;
+uniform highp ivec2 uSize;
+uniform highp int uStride;
+uniform highp float uSigma;
+uniform highp float uC;
+uniform highp vec2 uTw[8];
+
+shared float sre[2][4][16][16];
+shared float sim[2][4][16][16];
+
+const float TWO_PI = 6.283185307179586;
+
+void fftRow(int t, int z, int y, float sgn) {
+    float re[16];
+    float im[16];
+    for (int i = 0; i < 16; ++i) {
+        re[i] = sre[t][z][y][i];
+        im[i] = sim[t][z][y][i];
+    }
+    int j = 0;
+    for (int i = 1; i < 16; ++i) {
+        int bit = 8;
+        for (int b = 0; b < 4; ++b) {
+            if ((j & bit) == 0) { break; }
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if (i < j) {
+            float tr = re[i];
+            re[i] = re[j];
+            re[j] = tr;
+            float ti = im[i];
+            im[i] = im[j];
+            im[j] = ti;
+        }
+    }
+    for (int len = 2; len <= 16; len <<= 1) {
+        int hlen = len >> 1;
+        for (int blk = 0; blk < 16; blk += len) {
+            for (int k = 0; k < hlen; ++k) {
+                int idx = (16 * k) / len;
+                float wr = uTw[idx].x;
+                float wi = sgn * uTw[idx].y;
+                int i0 = blk + k;
+                int i1 = i0 + hlen;
+                float xr = re[i1];
+                float xi = im[i1];
+                float tr = xr * wr - xi * wi;
+                float ti = xr * wi + xi * wr;
+                re[i1] = re[i0] - tr;
+                im[i1] = im[i0] - ti;
+                re[i0] += tr;
+                im[i0] += ti;
+            }
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        sre[t][z][y][i] = re[i];
+        sim[t][z][y][i] = im[i];
+    }
+}
+
+void fftCol(int t, int z, int x, float sgn) {
+    float re[16];
+    float im[16];
+    for (int i = 0; i < 16; ++i) {
+        re[i] = sre[t][z][i][x];
+        im[i] = sim[t][z][i][x];
+    }
+    int j = 0;
+    for (int i = 1; i < 16; ++i) {
+        int bit = 8;
+        for (int b = 0; b < 4; ++b) {
+            if ((j & bit) == 0) { break; }
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if (i < j) {
+            float tr = re[i];
+            re[i] = re[j];
+            re[j] = tr;
+            float ti = im[i];
+            im[i] = im[j];
+            im[j] = ti;
+        }
+    }
+    for (int len = 2; len <= 16; len <<= 1) {
+        int hlen = len >> 1;
+        for (int blk = 0; blk < 16; blk += len) {
+            for (int k = 0; k < hlen; ++k) {
+                int idx = (16 * k) / len;
+                float wr = uTw[idx].x;
+                float wi = sgn * uTw[idx].y;
+                int i0 = blk + k;
+                int i1 = i0 + hlen;
+                float xr = re[i1];
+                float xi = im[i1];
+                float tr = xr * wr - xi * wi;
+                float ti = xr * wi + xi * wr;
+                re[i1] = re[i0] - tr;
+                im[i1] = im[i0] - ti;
+                re[i0] += tr;
+                im[i0] += ti;
+            }
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        sre[t][z][i][x] = re[i];
+        sim[t][z][i][x] = im[i];
+    }
+}
+
+void main() {
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    ivec2 wg = ivec2(gl_WorkGroupID.xy);
+    int tid = lid.y * 16 + lid.x;
+    int stride = uStride;
+    ivec2 origin = ivec2(wg.x * 2 * stride, wg.y * stride);
+
+    if (tid < 128) {
+        int tt = tid / 64;
+        int zz = (tid / 16) % 4;
+        int yy = tid % 16;
+        ivec2 base = origin + ivec2(tt * stride, 0);
+        float wy = 0.5 - 0.5 * cos(TWO_PI * (float(yy) + 0.5) / 16.0);
+        for (int x = 0; x < 16; ++x) {
+            ivec2 p = clamp(base + ivec2(x, yy), ivec2(0), uSize - 1);
+            float v = texelFetch(uFrames, ivec3(p, zz), 0).r;
+            float wx = 0.5 - 0.5 * cos(TWO_PI * (float(x) + 0.5) / 16.0);
+            sre[tt][zz][yy][x] = v * wx * wy;
+            sim[tt][zz][yy][x] = 0.0;
+        }
+        fftRow(tt, zz, yy, -1.0);
+    }
+    barrier();
+
+    if (tid < 128) {
+        int tt = tid / 64;
+        int zz = (tid / 16) % 4;
+        int xx = tid % 16;
+        fftCol(tt, zz, xx, -1.0);
+    }
+    barrier();
+
+    for (int rep = 0; rep < 2; ++rep) {
+        int idx = tid * 2 + rep;
+        int tt = idx / 256;
+        int bin = idx % 256;
+        int by = bin / 16;
+        int bx = bin % 16;
+        float r0 = sre[tt][0][by][bx];
+        float i0 = sim[tt][0][by][bx];
+        float accR = r0;
+        float accI = i0;
+        for (int zz = 1; zz < 4; ++zz) {
+            float rz = sre[tt][zz][by][bx];
+            float iz = sim[tt][zz][by][bx];
+            float dr = r0 - rz;
+            float di = i0 - iz;
+            float d2 = dr * dr + di * di;
+            float a = d2 / (d2 + uC * uSigma * uSigma + 1e-12);
+            accR += rz + a * dr;
+            accI += iz + a * di;
+        }
+        sre[tt][0][by][bx] = accR * 0.25;
+        sim[tt][0][by][bx] = accI * 0.25;
+    }
+    barrier();
+
+    if (tid < 32) {
+        int tt = tid / 16;
+        int xx = tid % 16;
+        fftCol(tt, 0, xx, 1.0);
+    }
+    barrier();
+
+    if (tid < 32) {
+        int tt = tid / 16;
+        int yy = tid % 16;
+        fftRow(tt, 0, yy, 1.0);
+        ivec2 base = origin + ivec2(tt * stride, 0);
+        for (int x = 0; x < 16; ++x) {
+            ivec2 p = base + ivec2(x, yy);
+            if (p.x < uSize.x && p.y < uSize.y) {
+                imageStore(uOut, p, vec4(sre[tt][0][yy][x] * 0.00390625, 0.0, 0.0, 1.0));
+            }
+        }
+    }
+}
+)";
+
 GLuint compileCs(const char* src, std::string* err) {
   GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
   glShaderSource(sh, 1, &src, nullptr);
@@ -271,9 +659,11 @@ float halfToFloat(uint16_t h) {
 
 }  // namespace
 
-FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
+FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap,
+                                int variant) {
   FftSpikeResult r;
   r.overlap = overlap;
+  r.variant = variant;
   auto& logger = Logger::instance();
   auto fail = [&](const std::string& msg) {
     r.error = msg;
@@ -303,7 +693,10 @@ FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
   }
 
   std::string err;
-  const GLuint cs = compileCs(kFftMergeCs, &err);
+  const char* shader_src = variant == 1 ? kFftMergeCsTw
+                                         : variant == 2 ? kFftMergeCsReg
+                                                        : kFftMergeCs;
+  const GLuint cs = compileCs(shader_src, &err);
   if (!cs) return fail(err);
   GLuint prog = glCreateProgram();
   glAttachShader(prog, cs);
@@ -361,6 +754,16 @@ FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
   const GLint u_stride = glGetUniformLocation(prog, "uStride");
   const GLint u_sigma = glGetUniformLocation(prog, "uSigma");
   const GLint u_c = glGetUniformLocation(prog, "uC");
+  const GLint u_tw = glGetUniformLocation(prog, "uTw");
+
+  // twiddle 表：2π·i/16 的 (cos, sin)，i = 0..7（变体 1/2 使用；变体 0 无此
+  // uniform，location = -1 时 glUniform 为 no-op）。
+  float tw[16];
+  for (int i = 0; i < 8; ++i) {
+    const float ang = 6.283185307179586f * static_cast<float>(i) / 16.0f;
+    tw[2 * i] = std::cos(ang);
+    tw[2 * i + 1] = std::sin(ang);
+  }
 
   const int gx = w / unit;
   const int gy = h / stride;
@@ -373,6 +776,7 @@ FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
     glUniform1i(u_stride, stride);
     glUniform1f(u_sigma, 0.02f);
     glUniform1f(u_c, 256.0f);
+    if (u_tw >= 0) glUniform2fv(u_tw, 8, tw);
     glBindImageTexture(0, tex_out, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glDispatchCompute(gx, gy, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -472,6 +876,7 @@ std::string FftSpikeResult::toJson() const {
   j += ",\"height\":" + std::to_string(height);
   j += ",\"iterations\":" + std::to_string(iterations);
   j += ",\"overlap\":" + boolean(overlap);
+  j += ",\"variant\":" + std::to_string(variant);
   j += ",\"tiles\":" + std::to_string(tiles);
   j += ",\"sharedBytes\":" + std::to_string(shared_bytes);
   j += ",\"maxSharedMemory\":" + std::to_string(max_shared);

@@ -108,22 +108,23 @@ class SpikeGLView(
             onStatus(if (result != null && JSONObject(result).optBoolean("ok")) "完成" else "失败")
         }
 
-        /** DFT 合并成本实测：非重叠（基线）与半重叠（HDR+ 真实密度）各一轮。 */
+        /** DFT 合并成本实测：3 变体（基线 / +twiddle 查表 / +寄存器 FFT）× 2 密度，
+         *  同轮连跑 6 组以消除热状态差异。 */
         fun runFftSpike() {
             val w = 4096
             val h = 3072
             val iters = 6
-            onStatus("DFT 合并 spike：非重叠 ${w}×$h ×$iters …")
-            onFftResult(
-                EngineBridge.nativeRunFftSpike(w, h, iters, false)
-                    ?: "{\"ok\":false,\"error\":\"引擎返回空\"}",
-            )
-            onStatus("DFT 合并 spike：半重叠 ${w}×$h ×$iters …")
-            onFftResult(
-                EngineBridge.nativeRunFftSpike(w, h, iters, true)
-                    ?: "{\"ok\":false,\"error\":\"引擎返回空\"}",
-            )
-            onStatus("DFT 合并 spike 完成")
+            val names = arrayOf("基线", "+twiddle 查表", "+twiddle+寄存器 FFT")
+            for (variant in 0..2) {
+                for (overlap in listOf(false, true)) {
+                    onStatus("DFT ${names[variant]}｜${if (overlap) "半重叠" else "非重叠"} ${w}×$h ×$iters …")
+                    onFftResult(
+                        EngineBridge.nativeRunFftSpike(w, h, iters, overlap, variant)
+                            ?: "{\"ok\":false,\"error\":\"引擎返回空\"}",
+                    )
+                }
+            }
+            onStatus("DFT 合并 spike 完成（6 组）")
         }
     }
 
@@ -217,11 +218,12 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
             Section("Spike 结果", spikeLines(JSONObject(spikeJson)))
         }
         fftResults.forEachIndexed { i, json ->
+            val obj = JSONObject(json)
+            val names = arrayOf("基线", "+twiddle 查表", "+twiddle+寄存器 FFT")
+            val vn = names.getOrElse(obj.optInt("variant", 0)) { "变体${obj.optInt("variant", 0)}" }
+            val density = if (obj.optBoolean("overlap")) "半重叠" else "非重叠"
             Spacer(Modifier.height(8.dp))
-            Section(
-                "DFT 合并 Spike #${i + 1}（${if (i == 0) "非重叠" else "半重叠"}）",
-                flatten(JSONObject(json)),
-            )
+            Section("DFT #${i + 1}｜$vn｜$density", flatten(obj))
         }
     }
 }

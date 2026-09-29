@@ -20,6 +20,7 @@ struct FftSpikeResult {
   int height = 0;
   int iterations = 0;
   bool overlap = false;
+  int variant = 0;  // 0=基线（即时 sin/cos）1=+twiddle 查表 2=+寄存器 FFT
   long long tiles = 0;      // 本次 dispatch 的 tile 总数
   int shared_bytes = 0;     // 每 workgroup shared 用量
   int max_shared = 0;       // 设备 GL_MAX_COMPUTE_SHARED_MEMORY_SIZE
@@ -40,7 +41,9 @@ struct FftSpikeResult {
 };
 
 // w/h 须为 32 的倍数（非重叠）/ 16 的倍数（重叠），否则自动收缩到最大合法尺寸。
+// variant：0=基线 1=+twiddle 查表 2=+twiddle 查表+寄存器 FFT（同轮对照用）。
 // 须在持有 GL 上下文的线程调用。
-FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap);
+FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap,
+                                int variant = 0);
 
 }  // namespace filmkit
