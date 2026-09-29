@@ -49,6 +49,10 @@ struct NoiseModel {
 struct NoiseCoef {
   float p0a[3] = {0.f, 0.f, 0.f}, p0b[3] = {0.f, 0.f, 0.f};
   float p4a[3] = {0.f, 0.f, 0.f}, p4b[3] = {0.f, 0.f, 0.f};
+  // mismatch / tile-RMS 用：k=1（与降噪档位无关）的 WB 后 (A,B)。legacy 回退时
+  // mma=0、mmb=ns²/2 —— 使 shader 的 var(ref)+var(alt) = ns²，与旧常数 σ 判据
+  // 一致（2026-09-29 真机回归：模型无效时这里曾传全零，m≡1 → neff=1 融合失效）。
+  float mma[3] = {0.f, 0.f, 0.f}, mmb[3] = {0.f, 0.f, 0.f};
   float k_p0 = 0.f, k_p4 = 0.f;   // 强度乘子（日志）
   float ns_typ = 0.f;             // 中灰典型 σ（WB 后 G 通道，单帧；resFade/日志）
   bool model_src = false;         // true = Camera2 模型，false = legacy σ 回退
@@ -165,10 +169,11 @@ class FrameRenderer {
   // 阶段二 robust merge（v0.10.0）：Night Sight 式 mismatch map —— per-tile
   // 对齐后残差 mean(d²) → m = d²/(d²+s·σ²)，渲染到 tex_mis_（RGBA8 tiles 网格，
   // R/G/B = 帧 1/2/3）。CPU 读回算 w = max(1−c·m, 0) 写回位移场 z 通道。
-  // C 专项：σ² 由常数改为逐像素模型（var(r) + var(r_alt)，WB 后参考帧域）。
+  // C 专项：σ² 由常数改为逐像素模型（var(r) + var(r_alt)），a/b = k=1 的 WB 后
+  // 系数（NoiseCoef::mma/mmb —— legacy 回退也保证非零，见其注释）。
   void passMfnrMismatch(int cfa, const float black_phase[4], float white_level,
-                        const float gains[3], const NoiseModel& model,
-                        float s_const);
+                        const float gains[3], const float a[3],
+                        const float b[3], float s_const);
   // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3]);
@@ -186,9 +191,8 @@ class FrameRenderer {
     const FilmParams* p = nullptr;
     int effective_rot = 0;
     bool rcd = false, dn = false, dn_high = false;
-    NoiseCoef nc;         // (A,B) 系数（P0/P4，C 专项）
-    NoiseModel nm;        // 原始噪声模型（WB 前、单帧；tile RMS 诊断/日志）
-    float nz_iso = 0.f;   // 传感器增益（ISO/100，日志）
+    NoiseCoef nc;         // (A,B) 系数（P0/P4/mismatch，C 专项）
+    NoiseModel nm;        // 原始噪声模型（WB 前、单帧；日志 nzS/nzO）
     TileRmsResult rms;    // tile RMS 归约诊断（P0 后）
     float ns = 0.f;       // 典型 σ（融合折减后；resFade/日志）
     float ns_raw = 0.f;   // 单帧典型 σ（日志 nsHal / nsSng 兼容）
@@ -241,9 +245,9 @@ class FrameRenderer {
   void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc);
   // C 专项：tile RMS 归约（HDR+ §5 —— 逐 tile RMS 代入噪声模型得 σ，A 的输入
   // 底座）。每像素输出一个 tile 的 RMS（mosaic 信号，线性域）。dst = tiles 网格。
-  // 返回读回诊断（中心/四角采样 + σ），供 raw.render 日志。
-  TileRmsResult passTileRms(GLuint src_tex, int w, int h,
-                            const NoiseModel& model);
+  // a/b = k=1 的 WB 后系数（NoiseCoef::mma/mmb），用于读回诊断 σ。返回诊断供日志。
+  TileRmsResult passTileRms(GLuint src_tex, int w, int h, const float a[3],
+                            const float b[3]);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // 显示域直方图统计（kFsHist 自带 OETF，与公开的 histogram() 同一实现）。

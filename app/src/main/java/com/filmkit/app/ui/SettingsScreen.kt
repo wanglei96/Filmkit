@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
+import com.filmkit.app.camera.NoiseCalibStore
 import kotlin.math.roundToInt
 
 /**
@@ -484,6 +485,172 @@ fun SettingsScreen(
                     fontSize = 13.sp,
                     fontFamily = FilmTheme.Mono,
                     fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
+            //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
+            //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与
+            //   MFNR mismatch 的噪声底；选择立即对后续拍照生效。
+            var nmSel by rememberSaveable {
+                mutableStateOf(
+                    prefs.getString("noise_model_src", NoiseCalibStore.AUTO)
+                        ?: NoiseCalibStore.AUTO,
+                )
+            }
+            var nmDialog by remember { mutableStateOf(false) }
+            var nmList by remember { mutableStateOf(NoiseCalibStore.list(context)) }
+            val nmImport = androidx.activity.compose.rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+            ) { uri ->
+                if (uri != null) {
+                    val nm = NoiseCalibStore.importFrom(context, uri, uri.lastPathSegment)
+                    if (nm != null) {
+                        nmSel = nm
+                        prefs.edit().putString("noise_model_src", nm).apply()
+                        nmList = NoiseCalibStore.list(context)
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
+                            "{\"src\":\"$nm\",\"act\":\"import\"}",
+                        )
+                    } else {
+                        android.widget.Toast.makeText(
+                            context, "导入失败：不是有效的 GCam 噪声标定文件（.c）",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        nmList = NoiseCalibStore.list(context)
+                        nmDialog = true
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("噪声模型", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "降噪与 MFNR 的噪声底来源：自动 = 相机 HAL 标定；可导入 GCam " +
+                            "标定文件（.c）按 ISO 生效",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (nmSel == NoiseCalibStore.AUTO) "自动" else nmSel.removeSuffix(".c"),
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (nmDialog) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { nmDialog = false },
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                    confirmButton = {
+                        androidx.compose.material3.TextButton(onClick = { nmDialog = false }) {
+                            Text("关闭", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                        }
+                    },
+                    title = { Text("噪声模型", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+                    text = {
+                        Column(Modifier.verticalScroll(rememberScrollState())) {
+                            val pick: (String) -> Unit = { id ->
+                                nmSel = id
+                                prefs.edit().putString("noise_model_src", id).apply()
+                                EngineBridge.nativeAppendLog(
+                                    EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
+                                    "{\"src\":\"$id\",\"act\":\"select\"}",
+                                )
+                                nmDialog = false
+                            }
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { pick(NoiseCalibStore.AUTO) }
+                                    .padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "自动（相机标定）",
+                                    color = FilmTheme.Cream,
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                if (nmSel == NoiseCalibStore.AUTO) {
+                                    Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
+                                }
+                            }
+                            nmList.forEach { cal ->
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clickable { pick(cal.id) }
+                                        .padding(vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        cal.name,
+                                        color = FilmTheme.Cream,
+                                        fontSize = 14.sp,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (nmSel == cal.id) {
+                                        Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
+                                    }
+                                    Text(
+                                        "删除",
+                                        color = FilmTheme.CreamDim,
+                                        fontSize = 11.sp,
+                                        fontFamily = FilmTheme.Mono,
+                                        modifier = Modifier
+                                            .clickable {
+                                                NoiseCalibStore.delete(context, cal.id)
+                                                if (nmSel == cal.id) {
+                                                    nmSel = NoiseCalibStore.AUTO
+                                                    prefs.edit()
+                                                        .putString(
+                                                            "noise_model_src",
+                                                            NoiseCalibStore.AUTO,
+                                                        )
+                                                        .apply()
+                                                }
+                                                nmList = NoiseCalibStore.list(context)
+                                            }
+                                            .padding(start = 12.dp),
+                                    )
+                                }
+                            }
+                            HorizontalDivider(color = FilmTheme.ChipBorder)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { nmImport.launch(arrayOf("*/*")) }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "+ 导入 .c 标定文件",
+                                    color = FilmTheme.Accent,
+                                    fontSize = 14.sp,
+                                    fontFamily = FilmTheme.Mono,
+                                )
+                            }
+                            Text(
+                                "文件为 GCam 噪声标定格式（noise_model_A/B/C/D 四数组）；" +
+                                    "可从相机社区获取或自行标定生成",
+                                color = FilmTheme.CreamDim,
+                                fontSize = 10.sp,
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    },
+                    containerColor = FilmTheme.Panel,
                 )
             }
             // 轻度锐化（v0.9.6）：OETF 前线性显示域 luma USM，补 MFNR 后观感细节。

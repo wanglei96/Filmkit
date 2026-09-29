@@ -17,18 +17,42 @@ package com.filmkit.app.camera
  */
 object NoiseProfile {
 
+    /**
+     * Cast 兼容层（2026-09-29 真机实锤）：Camera2 的 SENSOR_NOISE_PROFILE 泛型是
+     * `Pair<Double, Double[]>`——`Double[]` 是**装箱数组**，Kotlin 里 `as? DoubleArray`
+     * （原始 double[]）**永远失败**。旧代码（v0.5.32 起）一直这么写，叠加更早的
+     * List cast bug，σ 自适应从未真正生效。兼容 DoubleArray / Array<*> / List<*> 三种。
+     */
+    fun asDoubleArray(v: Any?): DoubleArray? = when (v) {
+        is DoubleArray -> v
+        is Array<*> -> {
+            val out = DoubleArray(v.size)
+            for (i in v.indices) out[i] = (v[i] as? Number)?.toDouble() ?: return null
+            out
+        }
+        is List<*> -> {
+            val out = DoubleArray(v.size)
+            for (i in v.indices) out[i] = (v[i] as? Number)?.toDouble() ?: return null
+            out
+        }
+        else -> null
+    }
+
     /** 解析结果：model = [S_r,S_g,S_b,O_r,O_g,O_b]（null = 不可用）；供日志的原始数据 */
     class Result(
         val model: FloatArray?,
         val gain: Double,
         val raw: DoubleArray?,
         val len: Int,
+        /** 第二个元素的实际类型名（诊断 cast 问题，如 "[Ljava.lang.Double;"） */
+        val elemType: String = "?",
     )
 
     fun parse(
         entries: List<Pair<Double, DoubleArray>>,
         cfa: Int,
         iso: Int,
+        elemType: String = "?",
     ): Result {
         var bestDist = Double.MAX_VALUE
         var bestGain = 0.0
@@ -43,7 +67,7 @@ object NoiseProfile {
                 bestS = s
             }
         }
-        val s = bestS ?: return Result(null, 0.0, null, 0)
+        val s = bestS ?: return Result(null, 0.0, null, 0, elemType)
         // 相位序 → (R, G0, G1, B) 索引；6 值布局（3 通道 R,G,B）则直取
         val ph = when (cfa % 4) {
             0 -> intArrayOf(0, 1, 2, 3)   // RGGB
@@ -75,6 +99,6 @@ object NoiseProfile {
         } else {
             null
         }
-        return Result(model, bestGain, s, s.size)
+        return Result(model, bestGain, s, s.size, elemType)
     }
 }

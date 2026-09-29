@@ -3050,7 +3050,7 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
 // C 专项：tile RMS 归约（P0 输出 → tiles 网格 R16F）。每 tile 16×16 = 256 点
 // 全采样（覆盖 2×2 全相位）。诊断读回：中心 + 三角 tile 的 RMS 与模型 σ。
 TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
-                                         const NoiseModel& model) {
+                                         const float a[3], const float b[3]) {
   TileRmsResult r;
   const int tw = w / 16, th = h / 16;
   if (tw <= 0 || th <= 0) return r;
@@ -3078,11 +3078,8 @@ TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
     float v[4] = {0.f, 0.f, 0.f, 0.f};
     glReadPixels(sx[i], sy[i], 1, 1, GL_RGBA, GL_FLOAT, v);
     r.rms[i] = std::isfinite(v[0]) ? v[0] : 0.f;
-    // 代入模型（G 通道典型：σ = √(S_g·RMS + O_g)）
-    r.sigma[i] = model.valid()
-                     ? std::sqrt(std::max(model.S[1] * r.rms[i] + model.O[1],
-                                          0.f))
-                     : 0.f;
+    // 代入模型（G 通道典型的 k=1 系数：σ = √(A_g·RMS + B_g)；legacy 回退亦非零）
+    r.sigma[i] = std::sqrt(std::max(a[1] * r.rms[i] + b[1], 0.f));
   }
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -3384,6 +3381,9 @@ void FrameRenderer::denoiseParams(int noise_level, const NoiseModel& model,
       out->p0b[c] = wb.O[c] * k_p0 * k_p0;
       out->p4a[c] = wb.S[c] * k_p4 * k_p4;
       out->p4b[c] = wb.O[c] * k_p4 * k_p4;
+      // mismatch/tile-RMS：k=1 的真实噪声（与档位无关）
+      out->mma[c] = wb.S[c];
+      out->mmb[c] = wb.O[c];
     }
     out->model_src = true;
     // 典型 σ（中灰 0.18，G 通道——gains[1] 恒 = 1）
@@ -3398,6 +3398,9 @@ void FrameRenderer::denoiseParams(int noise_level, const NoiseModel& model,
       out->p0b[c] = 0.2f * ns * ns * sr_k * sr_k;
       out->p4a[c] = 4.0f * ns * ns * sc_k * sc_k;
       out->p4b[c] = 0.2f * ns * ns * sc_k * sc_k + 0.008f * 0.008f;
+      // mismatch 等效：mma=0、mmb=ns²/2 ⇒ shader 的 var(r)+var(alt)=ns²（旧常数 σ 判据）
+      out->mma[c] = 0.f;
+      out->mmb[c] = 0.5f * ns * ns;
     }
     out->model_src = false;
     out->ns_typ = std::min(std::max(ns, 0.004f), 0.040f);
@@ -3436,7 +3439,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     }
     // C 专项：tile RMS 归约（HDR+ §5，A 的 σ 输入底座；诊断读回进 raw.render）。
     // 位置 = P0 之后（tex_mos_ = 线性 mosaic，与模型同域），每 tile 256 采样。
-    rms_res = passTileRms(tex_mos_, w, h, c.nm.afterWb(c.gains));
+    // σ 诊断用 k=1 的真实噪声系数（mma/mmb；融合时已折减）。
+    rms_res = passTileRms(tex_mos_, w, h, c.nc.mma, c.nc.mmb);
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
@@ -3511,7 +3515,6 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     };
     kv += std::string(",\"dn\":\"") + (c.dn_high ? "high" : "std") +
           "\",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
-          ",\"nzIso\":" + std::to_string(c.nz_iso).substr(0, 6) +
           ",\"nzS\":" + fa3(c.nm.S) + ",\"nzO\":" + fa3(c.nm.O) +
           ",\"nzG\":[" + std::to_string(c.gains[0]).substr(0, 6) + "," +
           std::to_string(c.gains[1]).substr(0, 6) + "," +
@@ -3755,7 +3758,8 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // 权重为 1 时该帧注入的误差，mismatch 与融合行为严格一致。σ = 单帧线性域。
 void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
                                      float white_level, const float gains[3],
-                                     const NoiseModel& model, float s_const) {
+                                     const float a[3], const float b[3],
+                                     float s_const) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glViewport(0, 0, tiles_w_ * 4, tiles_h_ * 4);
   glUseProgram(prog_mfnr_mis_);
@@ -3780,10 +3784,10 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   glUniform2f(u_mfnr_mis_.off_tiles, static_cast<float>(tiles_w_),
               static_cast<float>(tiles_h_));
   glUniform1f(u_mfnr_mis_.tile_m, static_cast<float>(kMfnrTile) / 2.0f);
-  // C 专项：σ² 由常数改为逐像素模型（WB 后域；shader 内用各帧实测信号代入）
-  const NoiseModel wb = model.afterWb(gains);
-  glUniform3f(u_mfnr_mis_.noise_a, wb.S[0], wb.S[1], wb.S[2]);
-  glUniform3f(u_mfnr_mis_.noise_b, wb.O[0], wb.O[1], wb.O[2]);
+  // C 专项：σ² 由常数改为逐像素模型（WB 后、k=1 的真实噪声；legacy 回退也非零，
+  // 见 NoiseCoef::mma/mmb —— 模型无效时全零会让 m≡1、融合整体失效）
+  glUniform3f(u_mfnr_mis_.noise_a, a[0], a[1], a[2]);
+  glUniform3f(u_mfnr_mis_.noise_b, b[0], b[1], b[2]);
   glUniform1f(u_mfnr_mis_.s, s_const);
   glUniform1i(u_mfnr_mis_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_mfnr_mis_.black, black_phase[0], black_phase[1], black_phase[2],
@@ -4246,7 +4250,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // ── 阶段二 robust merge：mismatch map（4×tiles / 32px cell）→ 权重图 ──
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
-  passMfnrMismatch(cfa, black_phase, wl, rc.gains, model, kMfnrMisS);
+  passMfnrMismatch(cfa, black_phase, wl, rc.gains, nc_single.mma, nc_single.mmb,
+                   kMfnrMisS);
   // v0.10.3：网格 = 4×tiles（32px cell）。权重独立成图（tex_w_，LINEAR），
   // 与位移场解耦 —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
   const int cw = tiles_w_ * 4, chh = tiles_h_ * 4;
@@ -4519,6 +4524,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     nc.p0b[i] = nc_single.p0b[i] / neff_n;
     nc.p4a[i] = nc_single.p4a[i] / neff_n;
     nc.p4b[i] = nc_single.p4b[i] / neff_n;
+    // mismatch/tile-RMS 系数同折减（融合后输入的真实噪声 = 单帧/neff）
+    nc.mma[i] = nc_single.mma[i] / neff_n;
+    nc.mmb[i] = nc_single.mmb[i] / neff_n;
   }
   const float ns = ns_single / std::sqrt(neff_n);
   ChainCtx c;
