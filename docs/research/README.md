@@ -21,7 +21,7 @@ RawTherapee / Blender AgX / ACES-libplacebo / 厂商外观引擎 / filmulator）
 | `06-photoncamera-baseline-engine.md` | PhotonCamera RAW→外观管线、用户 LUT 承载域、与 FilmKit 量化差异 | 部分**已被实测推翻**，见下方"过时点" |
 | `07-取证清单-HDR+夜景多帧.md` | 论文级逐字引用：HDR+ (Hasinoff 2016)、Night Sight、HDRNet、MFNR 阈值 | 未落地（MFNR 立项时用） |
 | `08-取证清单-影调曝光与AGC.md` | 平台/源码侧：AOSP camera2 枚举、camera3.h AE 状态机、DNG/DCP、18% 灰、libcamera AGC | libcamera 0.16 已进 AE 决策 |
-| `09-专项调研-频域降噪与降噪链对标.md` | 频域降噪专项（2026-09-29）：HDR+/NS 式 6/7 一手原文、PC（MGC）三条降噪链源码取证（**修正"PC 优势=频域维纳"旧归因**）、我方差距矩阵、DFT 合并内核 GPU 成本实测（两轮真机：非重叠 110ms / 半重叠 393–404ms 跨判据线，见 §4） | **实测完成**（立项决策待用户） |
+| `09-专项调研-频域降噪与降噪链对标.md` | 频域降噪专项（2026-09-29）：HDR+/NS 式 6/7 一手原文、PC（MGC）三条降噪链源码取证（**修正"PC 优势=频域维纳"旧归因**）、我方差距矩阵、DFT 合并内核 GPU 成本实测（三轮真机：优化版半重叠 **207.5ms 达标**） | **优化复测达标**（立项决策待用户） |
 | `filmulator-filmsim-forensics.md` | Filmulator 显影物理模型 30 条英文逐字证据 | 未落地（本项目走参数化外观层 + LUT） |
 | `90-工作流原始转储-未整理.txt` | workflow「color-engine-research」4 agents 的原始 JSON | **含独有结论，勿删**，见下 |
 
