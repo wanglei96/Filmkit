@@ -2014,27 +2014,32 @@ class CameraController(private val context: Context, private val render: RenderC
                 if (lscOn) {
                     // Gr/Gb 折成均值（两平面增益差异 <1%，色偏主因在 R/B 与 G 之间）。
                     // v0.10.25 边缘软限幅（prefs lsc_damp，默认开）：只压高增益区
-                    // （knee 2.5 以上 ×0.5），中心 1.0 与 knee 内线性段不动。依据：
-                    // ① HAL 平面间角落增益差（R 5.28 vs B 5.00）经限幅后 0.28→0.14，
-                    //   中性色度的中心-边缘漂移（b* −2.1→−1.1）同步减半；
+                    // （knee 2.5 以上），中心 1.0 与 knee 内线性段不动。
+                    // 实现 = 通道共享阻尼因子：每网格点按四平面的最大增益算压缩比，
+                    // 三通道同乘 —— 严格保持通道比（否则各通道压缩比略异会在边缘
+                    // 引入 a* ±0.9 的色度漂移，v0.10.25 首版实测）。
+                    // 依据：① 平面间角落增益差（R 6.31 vs B 5.85）的色度漂移被抑制；
                     // ② 与渲染 EV +0.7 叠加后边缘净亮度 +0.3EV，避免外圈过曝。
                     // 代价：保留 ~0.4EV 的边缘晕影（阻尼后校正不足），温和暗角。
                     val damp = appPrefs.getBoolean("lsc_damp", true)
-                    fun dampGain(g: Float): Float =
-                        if (!damp || g <= 2.5f) g else 2.5f + (g - 2.5f) * 0.5f
                     val buf = FloatArray(rows * cols * 3)
                     var i = 0
                     for (y in 0 until rows) for (x in 0 until cols) {
-                        buf[i++] = dampGain(m.getGainFactor(0, x, y))
-                        buf[i++] = dampGain(0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y)))
-                        buf[i++] = dampGain(m.getGainFactor(3, x, y))
+                        val g0 = m.getGainFactor(0, x, y)
+                        val g1 = 0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y))
+                        val g2 = m.getGainFactor(3, x, y)
+                        val gMax = maxOf(g0, g1, g2)
+                        val f = if (!damp || gMax <= 2.5f) 1f else (2.5f + (gMax - 2.5f) * 0.5f) / gMax
+                        buf[i++] = g0 * f
+                        buf[i++] = g1 * f
+                        buf[i++] = g2 * f
                     }
                     lsc = buf
                     lscCols = cols
                     lscRows = rows
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "camera", "raw.lsc.damp",
-                        kv("on" to damp, "knee" to "2.5", "ratio" to "0.5"),
+                        kv("on" to damp, "knee" to "2.5", "ratio" to "0.5", "shared" to "per-pixel-max"),
                     )
                 }
             }
