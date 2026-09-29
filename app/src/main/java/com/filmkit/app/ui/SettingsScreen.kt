@@ -396,55 +396,67 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            // M3-2 降噪两档（v0.5.33）：关 → 标准 → 强 循环。旧 bool key 为 false
-            // 时视为关（与 CameraController 读取逻辑一致）；写入时同步两个 key。
-            var dnLevel by rememberSaveable {
+            // RAW 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01）——
+            // 0 = 关、1 = 真实噪声 σ（标准做法）、2 = 2×σ。作用于 P0/P4 的逐像素
+            // 值域 σ（噪声模型 σ²=A·x+B，逐通道）；写入时同步旧 keys 供回退读取。
+            var dnStr by rememberSaveable {
                 mutableStateOf(
-                    if (prefs.getBoolean("noise_reduction", true)) {
-                        prefs.getInt("noise_reduction_level", 1)
-                    } else {
-                        0
-                    },
+                    CameraController.denoiseStrength(
+                        prefs.contains("noise_reduction_strength"),
+                        prefs.getFloat("noise_reduction_strength", 1f),
+                        prefs.getBoolean("noise_reduction", true),
+                        prefs.getInt("noise_reduction_level", 1),
+                    ),
                 )
             }
-            Row(
+            Column(
                 Modifier
                     .fillMaxWidth()
-                    .clickable {
-                        val v = (dnLevel + 1) % 3
-                        dnLevel = v
+                    .padding(vertical = 6.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("RAW 降噪", color = FilmTheme.Cream, fontSize = 14.sp)
+                        Text(
+                            "RAW 域双边 + 色度平滑，σ 由噪声模型逐像素给出；" +
+                                "0 = 关、1 = 真实 σ、2 = 2×σ。仅 RCD 质量档生效",
+                            color = FilmTheme.CreamDim,
+                            fontSize = 10.sp,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    Text(
+                        "%.2f".format(dnStr),
+                        color = FilmTheme.Accent,
+                        fontSize = 13.sp,
+                        fontFamily = FilmTheme.Mono,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                androidx.compose.material3.Slider(
+                    value = dnStr,
+                    onValueChange = { dnStr = it },
+                    onValueChangeFinished = {
                         prefs.edit()
-                            .putInt("noise_reduction_level", v)
-                            .putBoolean("noise_reduction", v > 0)
+                            .putFloat("noise_reduction_strength", dnStr)
+                            .putBoolean("noise_reduction", dnStr > 0f)
+                            .putInt(
+                                "noise_reduction_level",
+                                if (dnStr <= 0f) 0 else if (dnStr <= 1.5f) 1 else 2,
+                            )
                             .apply()
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_INFO, "app", "settings.noise_reduction",
-                            "{\"level\":$v}",
+                            "{\"strength\":\"%.2f\"}".format(dnStr),
                         )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("RAW 降噪", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "RAW 域双边滤波 + 色度平滑，重点压彩噪；" +
-                            "标准保细节 / 强更干净。仅 RCD 质量档生效",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    when (dnLevel) {
-                        0 -> "关"
-                        1 -> "标准"
-                        else -> "强"
                     },
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
+                    valueRange = 0f..2f,
+                    steps = 199,
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = FilmTheme.Cream,
+                        activeTrackColor = FilmTheme.Accent,
+                        inactiveTrackColor = FilmTheme.ChipBorder,
+                    ),
                 )
             }
             // MFNR 多帧融合（v0.9.0 阶段一）：关 / 自动（暗光触发）/ 开（强制）三档。

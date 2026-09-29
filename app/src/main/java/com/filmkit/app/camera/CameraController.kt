@@ -626,6 +626,26 @@ class CameraController(private val context: Context, private val render: RenderC
             return liveIso >= MFNR_ISO_THRESHOLD ||
                 liveExposureNs >= MFNR_EXPOSURE_THRESHOLD_NS
         }
+
+        /**
+         * 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、
+         * 2 = 2×σ）。含旧三档 prefs 的一次性迁移（level 0/1/2 → 0/1/2；旧 bool
+         * 开关 false 视为 0）。纯函数供单测。
+         */
+        fun denoiseStrength(
+            hasNewKey: Boolean,
+            newValue: Float,
+            oldEnabled: Boolean,
+            oldLevel: Int,
+        ): Float {
+            if (hasNewKey) return newValue.coerceIn(0f, 2f)
+            if (!oldEnabled) return 0f
+            return when (oldLevel) {
+                0 -> 0f
+                1 -> 1f
+                else -> 2f
+            }
+        }
     }
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
@@ -1707,14 +1727,14 @@ class CameraController(private val context: Context, private val render: RenderC
         val dngOn = prefs.getBoolean("dng_enabled", false)
         // 去马赛克质量档：1 = RCD 三段管线（默认，M3-1）；0 = bilinear 速度档
         val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
-        // 降噪（M3-2）：0 = 关；1 = 标准；2 = 强（P0 RAW bilateral + P4 色度平滑，
-        // 仅 RCD 生效）。v0.5.33 起两档；旧 bool 开关为 false 时视为关（设置页写入
-        // 时会同步这两个 key，故两者始终一致）。
-        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) {
-            prefs.getInt("noise_reduction_level", 1)
-        } else {
-            0
-        }
+        // 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、
+        // 2 = 2×σ；仅 RCD 生效）。旧三档 key 自动迁移（见 denoiseStrength）。
+        val noiseStrength = denoiseStrength(
+            prefs.contains("noise_reduction_strength"),
+            prefs.getFloat("noise_reduction_strength", 1f),
+            prefs.getBoolean("noise_reduction", true),
+            prefs.getInt("noise_reduction_level", 1),
+        )
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -1730,7 +1750,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
-        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseLevel) { bytes, w, h ->
+        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseStrength) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             if (bytes != null) saveJpeg(bytes, w, h)
@@ -1817,11 +1837,13 @@ class CameraController(private val context: Context, private val render: RenderC
         val prefs = context.getSharedPreferences("filmkit", 0)
         val dngOn = prefs.getBoolean("dng_enabled", false)
         val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
-        val noiseLevel = if (prefs.getBoolean("noise_reduction", true)) {
-            prefs.getInt("noise_reduction_level", 1)
-        } else {
-            0
-        }
+        // 降噪强度（C 专项：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、2 = 2×σ）
+        val noiseStrength = denoiseStrength(
+            prefs.contains("noise_reduction_strength"),
+            prefs.getFloat("noise_reduction_strength", 1f),
+            prefs.getBoolean("noise_reduction", true),
+            prefs.getInt("noise_reduction_level", 1),
+        )
         val ref = images[0]
         val refResult = results[0]
         val refW = ref.width
@@ -1860,7 +1882,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val buffers = burstBuffers.mapNotNull { it }
         val strides = burstStrides.copyOf()
         render.submitRawBurst(buffers, strides, refW, refH, meta,
-            orientationStep, filmParams, demosaic, noiseLevel, burstRefNoiseScale) { bytes, w, h ->
+            orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)
@@ -1982,34 +2004,56 @@ class CameraController(private val context: Context, private val render: RenderC
             }
         }
         var npDiag: NoiseProfile.Result? = null
+        var camPairsTxt = "-"
+        var camLen = 0
         if (noiseModel == null && Build.VERSION.SDK_INT >= 28) {
             @Suppress("UNCHECKED_CAST")
             val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) as? Array<*>
-            // android.util.Pair 数组 → Kotlin Pair 列表（解析核心为纯函数，可单测）；
-            // 第二元素是**装箱** Double[]（Camera2 泛型 Pair<Double, Double[]>），
-            // 用 asDoubleArray 兼容三种容器（旧 as? DoubleArray 对装箱数组永败）。
-            var elemType = "none"
-            val entries = profile?.mapNotNull { item ->
-                val pair = item as? android.util.Pair<*, *> ?: return@mapNotNull null
-                val g = (pair.first as? Number)?.toDouble() ?: return@mapNotNull null
-                if (elemType == "none") elemType = pair.second?.javaClass?.name ?: "null"
-                val s = NoiseProfile.asDoubleArray(pair.second) ?: return@mapNotNull null
-                g to s
-            } ?: emptyList()
-            val np = NoiseProfile.parse(entries, colorFilterArrangement, isoNow, elemType)
-            npDiag = np
-            noiseModel = np.model
-            if (noiseModel != null) nzSrc = "cam2"
+            camLen = profile?.size ?: 0
+            // 原始全量 dump（值 | 类型一次到位，防布局再猜错）
+            camPairsTxt = profile?.joinToString(";") { item ->
+                val p = item as? android.util.Pair<*, *>
+                if (p == null) "?" else "${p.first}|${p.second}"
+            } ?: "-"
+            val firstSecond = (profile?.firstOrNull() as? android.util.Pair<*, *>)?.second
+            when {
+                // 结构 A（真机实测 X300，PC 同款语义）：4 个 (S,O) 标量对 =
+                // 4 个 CFA 相位（per-frame，HAL 已按当前增益给，无 gain 字段）
+                firstSecond is Number -> {
+                    val pairs = profile!!.mapNotNull { item ->
+                        val p = item as? android.util.Pair<*, *> ?: return@mapNotNull null
+                        val sh = (p.first as? Number)?.toDouble() ?: return@mapNotNull null
+                        val rd = (p.second as? Number)?.toDouble() ?: return@mapNotNull null
+                        sh to rd
+                    }
+                    noiseModel = NoiseProfile.fromScalarPairs(pairs, colorFilterArrangement)
+                    nzSrc = if (noiseModel != null) "cam2" else "cam2bad"
+                }
+                // 结构 B（SDK 文档形态）：(gain, Double[])，按 ISO 选择 + 相位映射
+                firstSecond is Array<*> || firstSecond is List<*> -> {
+                    val elemType = firstSecond.javaClass.name
+                    val entries = profile!!.mapNotNull { item ->
+                        val pair = item as? android.util.Pair<*, *> ?: return@mapNotNull null
+                        val g = (pair.first as? Number)?.toDouble() ?: return@mapNotNull null
+                        val s = NoiseProfile.asDoubleArray(pair.second) ?: return@mapNotNull null
+                        g to s
+                    }
+                    val np = NoiseProfile.parse(entries, colorFilterArrangement, isoNow, elemType)
+                    npDiag = np
+                    noiseModel = np.model
+                    if (noiseModel != null) nzSrc = "cam2b"
+                }
+                else -> nzSrc = "cam2none"
+            }
         }
-        // 诊断日志（每次拍照；来源/布局/量级真机核对 —— 2026-09-29 起必须每次打，
-        // 首版只在解析成功时打，导致"为何无效"无法定位）
+        // 诊断日志（每次拍照；来源/布局/量级真机核对）
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "raw.noise",
             kv(
                 "src" to nzSrc, "sel" to nmSel, "iso" to isoNow,
                 "cfa" to colorFilterArrangement,
-                "len" to (npDiag?.len ?: 0),
-                "elem" to (npDiag?.elemType ?: "-"),
+                "len" to camLen,
+                "pairs" to camPairsTxt,
                 "gain" to "%.2f".format(npDiag?.gain ?: 0.0),
                 "raw" to (npDiag?.raw?.joinToString(",") { "%.3e".format(it) } ?: "-"),
                 "S" to (noiseModel?.let { "%.3e,%.3e,%.3e".format(it[0], it[1], it[2]) } ?: "-"),

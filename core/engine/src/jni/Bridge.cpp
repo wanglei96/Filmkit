@@ -325,7 +325,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
 
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
 // demosaic：0=bilinear（速度档）1=RCD 三段管线（质量档，M3-1）
-// noise_level：0=关 1=标准 2=强（M3-2 降噪，仅 RCD 生效）
+// noise_strength：降噪强度 0-2（C 专项滑杆：0=关 1=真实 σ 2=2×σ，仅 RCD 生效）
 // noise_model：6 float [S_r,S_g,S_b,O_r,O_g,O_b]（C 专项，[0,1] 归一化 raw 域）；
 //              null/长度不足 = 无效 → 走 noise_sigma legacy 回退
 // noise_sigma：归一化域噪声 σ（legacy 回退；≤0 时引擎内估计）
@@ -335,8 +335,9 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     JNIEnv* env, jobject, jobject raw_buf, jint w, jint h, jint row_stride_px,
     jint cfa, jfloatArray black_phase, jint white_level, jfloat neutral_r,
     jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jfloatArray lsc,
-    jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic, jint noise_level,
-    jfloatArray noise_model, jfloat noise_sigma, jdoubleArray film) {
+    jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic,
+    jfloat noise_strength, jfloatArray noise_model, jfloat noise_sigma,
+    jdoubleArray film) {
   if (!g_renderer || !raw_buf) return nullptr;
   float black4[4] = {0, 0, 0, 0};
   if (black_phase) {
@@ -371,7 +372,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   const bool ok = g_renderer->submitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
-      lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_level,
+      lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, &rgba);
   if (!ok) return nullptr;
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
@@ -391,7 +392,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jintArray row_strides_px, jint w, jint h, jint cfa, jfloatArray black_phase,
     jint white_level, jfloat neutral_r, jfloat neutral_g, jfloat neutral_b,
     jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
-    jint rotation, jint demosaic, jint noise_level, jfloatArray noise_model,
+    jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jdoubleArray film) {
   if (!g_renderer || !frames || count <= 0) return nullptr;
   std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
@@ -438,7 +439,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
   const bool ok = g_renderer->submitRawBurst(
       bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
       neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,
-      lsc_rows, rotation, p, demosaic, noise_level,
+      lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale, &rgba);
   if (!ok) return nullptr;
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));

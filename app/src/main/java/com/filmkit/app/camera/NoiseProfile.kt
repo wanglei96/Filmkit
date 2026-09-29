@@ -48,6 +48,50 @@ object NoiseProfile {
         val elemType: String = "?",
     )
 
+    /**
+     * CFA 枚举（0=RGGB..3=BGGR）→ 相位序 (R, G0, G1, B) 索引。
+     * 实测依据：X300 返回 cfa=1（GRBG）→ R=ph1、G=ph0/ph3、B=ph2，与 SDK
+     * 常量（SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG = 1）及引擎 cfaLutOf 一致。
+     */
+    fun phaseMap(cfa: Int): IntArray = when (cfa % 4) {
+        0 -> intArrayOf(0, 1, 2, 3)   // RGGB
+        1 -> intArrayOf(1, 0, 3, 2)   // GRBG（X300）
+        2 -> intArrayOf(2, 3, 0, 1)   // GBRG
+        else -> intArrayOf(3, 2, 1, 0) // BGGR
+    }
+
+    /**
+     * 结构 A —— **真机实测（X300，2026-09-29）的 Camera2 实际形态**：
+     * 4 个 (S, O) 标量对 = 4 个 CFA 相位 (0,0)(1,0)(0,1)(1,1) 的模型（PC 源码同款
+     * 语义：MGC "reads exactly four Camera2 pairs in CFA phase order"，无 gain
+     * 字段——HAL 按帧上报当前增益的模型，不需要 ISO 选择）。
+     * 注意：与 SDK 声明类型 `Pair<Double, Double[]>` 不同（文档与实际不符，实测
+     * `pair.second` 运行时是 java.lang.Double；旧的 `as? DoubleArray` 因此永远失败）。
+     * 输入用 Kotlin Pair（android.util.Pair 解包在调用方，便于纯 JVM 单测）。
+     */
+    fun fromScalarPairs(pairs: List<Pair<Double, Double>>, cfa: Int): FloatArray? {
+        if (pairs.size < 4) return null
+        val s = DoubleArray(4)
+        val o = DoubleArray(4)
+        for (c in 0 until 4) {
+            s[c] = pairs[c].first
+            o[c] = pairs[c].second
+        }
+        if (s.any { !it.isFinite() || it < 0.0 } || o.any { !it.isFinite() || it < 0.0 }) {
+            return null
+        }
+        val (ri, g0, g1, bi) = phaseMap(cfa)
+        val sg = 0.5 * (s[g0] + s[g1])
+        val og = 0.5 * (o[g0] + o[g1])
+        // 有效条件（MGC 口径）：S 全 >0 且 O 有 >0
+        if (s[ri] <= 0.0 || sg <= 0.0 || s[bi] <= 0.0) return null
+        if (o[ri] <= 0.0 && og <= 0.0 && o[bi] <= 0.0) return null
+        return floatArrayOf(
+            s[ri].toFloat(), sg.toFloat(), s[bi].toFloat(),
+            o[ri].toFloat(), og.toFloat(), o[bi].toFloat(),
+        )
+    }
+
     fun parse(
         entries: List<Pair<Double, DoubleArray>>,
         cfa: Int,
@@ -69,12 +113,7 @@ object NoiseProfile {
         }
         val s = bestS ?: return Result(null, 0.0, null, 0, elemType)
         // 相位序 → (R, G0, G1, B) 索引；6 值布局（3 通道 R,G,B）则直取
-        val ph = when (cfa % 4) {
-            0 -> intArrayOf(0, 1, 2, 3)   // RGGB
-            1 -> intArrayOf(1, 0, 3, 2)   // GRBG（X300）
-            2 -> intArrayOf(2, 3, 0, 1)   // GBRG
-            else -> intArrayOf(3, 2, 1, 0) // BGGR
-        }
+        val ph = phaseMap(cfa)
         val (ri, g0, g1, bi) = ph
         val c6 = s.size < 8
         val idxR = if (c6) 0 else ri

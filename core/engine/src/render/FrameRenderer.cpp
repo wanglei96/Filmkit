@@ -3196,7 +3196,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               float neutral_b, const float* ccm9,
                               const float* lsc, int lsc_cols, int lsc_rows,
                               int rotation, const FilmParams& p, int demosaic,
-                              int noise_level, const float* noise_model,
+                              float noise_strength, const float* noise_model,
                               float noise_sigma,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
@@ -3236,7 +3236,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
     if (!ok) model = NoiseModel{};
   }
   NoiseCoef nc;
-  denoiseParams(noise_level, model, rc.gains, noise_sigma, &nc);
+  denoiseParams(noise_strength, model, rc.gains, noise_sigma, &nc);
   ChainCtx c;
   c.w = w;
   c.h = h;
@@ -3250,8 +3250,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
-  c.dn = rcd && noise_level > 0;
-  c.dn_high = noise_level >= 2;
+  c.dn = rcd && noise_strength > 0.f;
+  c.dn_k = noise_strength;
   c.nc = nc;
   c.nm = model;
   c.ns = nc.ns_typ;
@@ -3366,12 +3366,13 @@ FrameRenderer::RawCommon FrameRenderer::prepareRawCommon(
 //     地板进 B（忽略交叉项，仅回退路径）。
 // 档位强度（作用于真实 σ 的乘子）：P0 标准 1.0（= σ 真值，1σ 内平均）/ 强 2.5；
 // P4 标准 1.5 / 强 2.5（色差噪声 ≈ √2·σ_ch，且 P4 后还有提亮放大 ~1.1EV）。
-void FrameRenderer::denoiseParams(int noise_level, const NoiseModel& model,
+void FrameRenderer::denoiseParams(float strength, const NoiseModel& model,
                                   const float gains[3], float noise_sigma,
                                   NoiseCoef* out) {
-  const bool high = noise_level >= 2;
-  const float k_p0 = high ? 2.5f : 1.0f;
-  const float k_p4 = high ? 2.5f : 1.5f;
+  // 强度滑杆（0–2，步长 0.01）：σ 乘子 —— 0 = 关（A=B=0 精确跳过）、1 = 真实 σ、
+  // 2 = 2×σ。P4 保持 1.5× 的比例（色差噪声 ≈ √2·σ_ch 且后续提亮再放大）。
+  const float k_p0 = strength;
+  const float k_p4 = 1.5f * strength;
   out->k_p0 = k_p0;
   out->k_p4 = k_p4;
   if (model.valid()) {
@@ -3391,8 +3392,8 @@ void FrameRenderer::denoiseParams(int noise_level, const NoiseModel& model,
   } else {
     // legacy：旧式等效（σ 回退值按 ISO 估算，见 Kotlin 侧；引擎兜底 0.012）
     const float ns = noise_sigma > 0.0f ? noise_sigma : 0.012f;
-    const float sr_k = high ? 2.20f : 0.28f;
-    const float sc_k = high ? 3.25f : 2.75f;
+    const float sr_k = k_p0;
+    const float sc_k = k_p4;
     for (int c = 0; c < 3; ++c) {
       out->p0a[c] = 4.0f * ns * ns * sr_k * sr_k;
       out->p0b[c] = 0.2f * ns * ns * sr_k * sr_k;
@@ -3513,8 +3514,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     const auto fa3 = [&](const float* v) {
       return "[" + fe(v[0]) + "," + fe(v[1]) + "," + fe(v[2]) + "]";
     };
-    kv += std::string(",\"dn\":\"") + (c.dn_high ? "high" : "std") +
-          "\",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
+    kv += std::string(",\"dn\":") + std::to_string(c.dn_k).substr(0, 4) +
+          ",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
           ",\"nzS\":" + fa3(c.nm.S) + ",\"nzO\":" + fa3(c.nm.O) +
           ",\"nzG\":[" + std::to_string(c.gains[0]).substr(0, 6) + "," +
           std::to_string(c.gains[1]).substr(0, 6) + "," +
@@ -4111,7 +4112,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    const float* ccm9, const float* lsc,
                                    int lsc_cols, int lsc_rows, int rotation,
                                    const FilmParams& p, int demosaic,
-                                   int noise_level, const float* noise_model,
+                                   float noise_strength, const float* noise_model,
                                    float noise_sigma,
                                    float ref_noise_scale,
                                    std::vector<uint8_t>* out_rgba) {
@@ -4200,7 +4201,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     if (!ok) model = NoiseModel{};
   }
   NoiseCoef nc_single;  // 单帧系数（mismatch 用）
-  denoiseParams(noise_level, model, rc.gains, noise_sigma, &nc_single);
+  denoiseParams(noise_strength, model, rc.gains, noise_sigma, &nc_single);
   const float ns_single = nc_single.ns_typ;
   // v0.10.5：保存每帧位移场（位移幅度运动检测用；v0.10.3 曾因权重独立成图而删）
   const int n_tiles = tiles_w_ * tiles_h_;
@@ -4542,8 +4543,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
-  c.dn = rcd && noise_level > 0;
-  c.dn_high = noise_level >= 2;
+  c.dn = rcd && noise_strength > 0.f;
+  c.dn_k = noise_strength;
   c.nc = nc;
   c.nm = model;
   c.ns = ns;

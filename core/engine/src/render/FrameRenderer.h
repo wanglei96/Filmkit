@@ -112,8 +112,8 @@ class FrameRenderer {
   //   neutral*    —— JPEG_NEUTRAL_COLOR_POINT（asShotNeutral），增益=其倒数 G 归一
   //   ccm9        —— sensor→sRGB 3×3 行主序；nullptr = 单位阵
   //   demosaic    —— 0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）
-  //   noise_level —— 0 = 关；1 = 标准；2 = 强（M3-2：P0 RAW 域 bilateral + P4
-  //                  色度平滑，仅 RCD 路径生效；bilinear 保持纯净基线）
+  //   noise_strength —— 降噪强度 0–2（C 专项滑杆：0 = 关（A=B=0 精确跳过）、
+  //                  1 = 真实 σ、2 = 2×σ；仅 RCD 路径生效，bilinear 保持纯净基线）
   //   noise_model —— 6 float [S_r,S_g,S_b,O_r,O_g,O_b]（C 专项，Camera2
   //                  SENSOR_NOISE_PROFILE，[0,1] 归一化 raw 域）；nullptr/非法 = 无效
   //   noise_sigma —— 归一化域噪声 σ（模型无效时的 legacy 回退；≤0 时引擎内估计）
@@ -124,8 +124,8 @@ class FrameRenderer {
                  float neutral_r, float neutral_g, float neutral_b,
                  const float* ccm9, const float* lsc, int lsc_cols,
                  int lsc_rows, int rotation, const FilmParams& p, int demosaic,
-                 int noise_level, const float* noise_model, float noise_sigma,
-                 std::vector<uint8_t>* out_rgba);
+                 float noise_strength, const float* noise_model,
+                 float noise_sigma, std::vector<uint8_t>* out_rgba);
 
   // RAW 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域
   // tile 对齐（Align.cpp，CPU 金字塔搜索）+ 置信度加权时域均值 → P0 降噪位
@@ -139,9 +139,9 @@ class FrameRenderer {
                       float neutral_r, float neutral_g, float neutral_b,
                       const float* ccm9, const float* lsc, int lsc_cols,
                       int lsc_rows, int rotation, const FilmParams& p,
-                      int demosaic, int noise_level, const float* noise_model,
-                      float noise_sigma, float ref_noise_scale,
-                      std::vector<uint8_t>* out_rgba);
+                      int demosaic, float noise_strength,
+                      const float* noise_model, float noise_sigma,
+                      float ref_noise_scale, std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
@@ -190,7 +190,8 @@ class FrameRenderer {
     const float* ccm = nullptr;
     const FilmParams* p = nullptr;
     int effective_rot = 0;
-    bool rcd = false, dn = false, dn_high = false;
+    bool rcd = false, dn = false;
+    float dn_k = 0.f;  // 降噪强度（日志）
     NoiseCoef nc;         // (A,B) 系数（P0/P4/mismatch，C 专项）
     NoiseModel nm;        // 原始噪声模型（WB 前、单帧；日志 nzS/nzO）
     TileRmsResult rms;    // tile RMS 归约诊断（P0 后）
@@ -220,7 +221,7 @@ class FrameRenderer {
                              int lsc_rows);
   // 降噪参数（C 专项）：模型（或 legacy σ）→ P0/P4 的 (A,B) 系数（含强度两档
   // 与 WB 传播）。model 无效时退 legacy：σ(x) = ns·k·√(0.2+4x) 的等效 (A,B)。
-  static void denoiseParams(int noise_level, const NoiseModel& model,
+  static void denoiseParams(float strength, const NoiseModel& model,
                             const float gains[3], float noise_sigma,
                             NoiseCoef* out);
   void passOES(int dst_w, int dst_h, const float* st, int rot, float sx,

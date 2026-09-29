@@ -73,6 +73,55 @@ class NoiseProfileTest {
     }
 
     @Test
+    fun scalarPairs_x300Shape_mapsToRgb() {
+        // 结构 A（真机实测形态）：4 个 (S,O) 标量对 = CFA 相位序。
+        // GRBG(cfa=1) 相位序 = [Gr, R, B, Gb] → R=p1, G=(p0+p3)/2, B=p2
+        val pairs = listOf(
+            sG to oG,          // ph0 = Gr
+            sR to oR,          // ph1 = R
+            sB to oB,          // ph2 = B
+            sG * 1.05 to oG * 1.02, // ph3 = Gb
+        )
+        val m = NoiseProfile.fromScalarPairs(pairs, cfa = 1)!!
+        assertEquals(sR, m[0].toDouble(), 1e-9)
+        assertEquals(0.5 * (sG + sG * 1.05), m[1].toDouble(), 1e-9)
+        assertEquals(sB, m[2].toDouble(), 1e-9)
+        assertEquals(oR, m[3].toDouble(), 1e-9)
+        assertEquals(0.5 * (oG + oG * 1.02), m[4].toDouble(), 1e-9)
+        assertEquals(oB, m[5].toDouble(), 1e-9)
+        // RGGB(cfa=0) 直取
+        val m0 = NoiseProfile.fromScalarPairs(
+            listOf(sR to oR, sG to oG, sG * 1.02 to oG, sB to oB), cfa = 0,
+        )!!
+        assertEquals(sR, m0[0].toDouble(), 1e-9)
+        assertEquals(sB, m0[2].toDouble(), 1e-9)
+    }
+
+    @Test
+    fun scalarPairs_invalidReturnNull() {
+        assertNull(NoiseProfile.fromScalarPairs(emptyList(), 1))
+        assertNull(NoiseProfile.fromScalarPairs(listOf(1.0 to 1.0), 1))
+        // 全零 O
+        assertNull(
+            NoiseProfile.fromScalarPairs(
+                listOf(sR to 0.0, sG to 0.0, sB to 0.0, sG to 0.0), 1,
+            ),
+        )
+        // 负 S
+        assertNull(
+            NoiseProfile.fromScalarPairs(
+                listOf(-sG to oG, sR to oR, sB to oB, sG to oG), 1,
+            ),
+        )
+        // NaN
+        assertNull(
+            NoiseProfile.fromScalarPairs(
+                listOf(sG to oG, sR to Double.NaN, sB to oB, sG to oG), 1,
+            ),
+        )
+    }
+
+    @Test
     fun picksNearestGainEntry() {
         val p1 = doubleArrayOf(sR, oR, sG, oG, sB, oB)
         val p2 = doubleArrayOf(sR * 2, oR * 2, sG * 2, oG * 2, sB * 2, oB * 2)

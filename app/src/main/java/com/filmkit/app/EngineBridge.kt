@@ -67,7 +67,7 @@ object EngineBridge {
      * → demosaic → CCM → 胶片链 → 读回 RGBA（旋转后尺寸）。
      * blackPhase 按相位 (0,0)(1,0)(0,1)(1,1)；ccm 为 sensor→sRGB 行主序 3×3（null=单位阵）。
      * demosaic：0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）。
-     * noiseLevel：0 = 关；1 = 标准；2 = 强（M3-2：RAW 域 bilateral + 色度平滑，仅 RCD 生效）。
+     * noiseStrength：降噪强度 0–2（C 专项：0 = 关、1 = 真实 σ、2 = 2×σ；仅 RCD 生效）。
      * noiseModel：6 float [S_r,S_g,S_b,O_r,O_g,O_b]（C 专项：Camera2 SENSOR_NOISE_PROFILE，
      *   var(x)=S·x+O，x = [0,1] 归一化 raw 域；null = 无效 → noiseSigma legacy 回退）。
      * noiseSigma：归一化域噪声 σ（legacy 回退；≤0 时引擎内估计）。
@@ -79,7 +79,7 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseLevel: Int, noiseModel: FloatArray?, noiseSigma: Float, film: DoubleArray,
+        noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float, film: DoubleArray,
     ): ByteArray?
 
     /**
@@ -95,7 +95,7 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseLevel: Int, noiseModel: FloatArray?, noiseSigma: Float,
+        noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, film: DoubleArray,
     ): ByteArray?
 
