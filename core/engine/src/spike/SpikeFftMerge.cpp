@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "../gl/Capabilities.h"
@@ -240,6 +241,34 @@ float hashNoise(uint32_t x, uint32_t y, uint32_t z) {
   return static_cast<float>(h & 0xFFFFu) / 65536.0f - 0.5f;
 }
 
+// IEEE 754 half → float（读回诊断用；GL_HALF_FLOAT 路径）。
+float halfToFloat(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t f = 0;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign;
+    } else {
+      exp = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x3FFu;
+      f = sign | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    f = sign | 0x7F800000u | (mant << 13);
+  } else {
+    f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float out = 0.0f;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+
 }  // namespace
 
 FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
@@ -372,6 +401,9 @@ FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
 
   // 读回校验：非重叠模式下输出应回到"压噪后的参考帧 × 窗"（单 tile 语义，
   // 半重叠 overlap-add 才恢复无窗图）。取 tile 内坐标 8（窗值 ≈0.98）避开门窗零区。
+  // Mali 上 RGBA16F + GL_FLOAT 的 readPixels 组合可能不被支持（2026-09-29 真机
+  // 首跑 readbackOk=false）——先试 GL_FLOAT，GL 错误则退回 GL_HALF_FLOAT，并把
+  // 实测/期望值记入结果供日志诊断。
   if (!overlap && out_renderable) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     const int xs[4] = {16 * 3 + 8, w / 2 + 8, w / 4 + 8, w - 16 * 3 - 8};
@@ -380,18 +412,38 @@ FftSpikeResult runSpikeFftMerge(int w, int h, int iters, bool overlap) {
       const int t = v & 15;
       return 0.5f - 0.5f * std::cos(6.283185307179586f * (t + 0.5f) / 16.0f);
     };
-    bool finite = true;
-    bool close = true;
     for (int k = 0; k < 4; ++k) {
-      float px[4] = {0, 0, 0, 0};
-      glReadPixels(xs[k], ys[k], 1, 1, GL_RGBA, GL_FLOAT, px);
-      if (!std::isfinite(px[0])) finite = false;
-      const float expected =
+      r.readback_expected[k] =
           basePattern(xs[k], ys[k]) * winAt(xs[k]) * winAt(ys[k]);
-      if (std::fabs(px[0] - expected) > 0.06f) close = false;
     }
-    r.readback_ok = finite && close;
-    if (glGetError() != GL_NO_ERROR) r.readback_ok = false;
+    bool finite = false;
+    bool close = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      finite = true;
+      close = true;
+      for (int k = 0; k < 4; ++k) {
+        float v = 0.0f;
+        if (attempt == 0) {
+          float px[4] = {0, 0, 0, 0};
+          glReadPixels(xs[k], ys[k], 1, 1, GL_RGBA, GL_FLOAT, px);
+          v = px[0];
+        } else {
+          uint16_t px[4] = {0, 0, 0, 0};
+          glReadPixels(xs[k], ys[k], 1, 1, GL_RGBA, GL_HALF_FLOAT, px);
+          v = halfToFloat(px[0]);
+        }
+        r.readback_vals[k] = v;
+        if (!std::isfinite(v)) finite = false;
+        if (std::fabs(v - r.readback_expected[k]) > 0.06f) close = false;
+      }
+      if (glGetError() == GL_NO_ERROR) {
+        r.readback_format = attempt + 1;
+        break;
+      }
+    }
+    r.readback_ok = r.readback_format != 0 && finite && close;
   } else {
     r.readback_ok = out_renderable;
   }
@@ -425,6 +477,18 @@ std::string FftSpikeResult::toJson() const {
   j += ",\"maxSharedMemory\":" + std::to_string(max_shared);
   j += ",\"gpuTimerUsed\":" + boolean(gpu_timer_used);
   j += ",\"readbackOk\":" + boolean(readback_ok);
+  j += ",\"readbackFormat\":" + std::to_string(readback_format);
+  j += ",\"readbackVals\":[";
+  for (int i = 0; i < 4; ++i) {
+    if (i) j += ",";
+    j += num(readback_vals[i]);
+  }
+  j += "],\"readbackExpected\":[";
+  for (int i = 0; i < 4; ++i) {
+    if (i) j += ",";
+    j += num(readback_expected[i]);
+  }
+  j += "]";
   j += ",\"gpuMedianMs\":" + num(gpu_median_ms);
   j += ",\"gpuP90Ms\":" + num(gpu_p90_ms);
   j += ",\"cpuMedianMs\":" + num(cpu_median_ms);

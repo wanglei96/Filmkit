@@ -25,6 +25,11 @@ struct FftSpikeResult {
   int max_shared = 0;       // 设备 GL_MAX_COMPUTE_SHARED_MEMORY_SIZE
   bool gpu_timer_used = false;
   bool readback_ok = false;  // 输出有限、与合成基准一致（仅非重叠模式校验）
+  // 读回诊断（2026-09-29 真机首跑 readbackOk=false 后新增）：
+  // 实际像素格式 0=未读 1=GL_FLOAT 2=GL_HALF_FLOAT，及 4 个采样点的实测/期望值。
+  int readback_format = 0;
+  float readback_vals[4] = {0, 0, 0, 0};
+  float readback_expected[4] = {0, 0, 0, 0};
   double gpu_median_ms = -1.0;
   double gpu_p90_ms = -1.0;
   double cpu_median_ms = -1.0;
