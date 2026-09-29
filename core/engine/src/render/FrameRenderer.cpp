@@ -1892,6 +1892,13 @@ uniform float uLutSize;
 // v0.7.3：统计通道 —— 0 = luma（UI 直方图，用户看的亮度分布）；
 // 1 = max 通道（filmic 自动 EV 的判据，见 measureSceneStats）。
 uniform float uStatCh;
+// v0.10.27：统计编码 —— 0 = 显示域 sRGB（UI 直方图，与画面同域）；
+// 1 = **对数域** max 通道（自动 EV 判据专用）。为什么必须有 1：显示域编码前
+// clamp(c,0,1) 把线性 ≥1.0 的强光源（窗/灯，占比常 <1%）全部并进顶桶 —— P99 撞顶
+// 读回恒 1.0，白点判据对高光**完全失明**（真机实证：auto 模式 whiteEv 恒钉 2.438
+// 下限、成片高光平顶白墙 8%）。对数域 [2^-12, 2^8] 线性映射 [0,1]，8bit readback
+// 每级 0.078EV，高光段不再拥挤；暗部端撞底的读数由 black 判据的 −7.65 物理下限兜底。
+uniform float uStatMode;
 vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
               vec3 c101, vec3 c011, vec3 c111) {
     if (f.x >= f.y) {
@@ -1928,12 +1935,21 @@ vec3 srgbEncode(vec3 c) {
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
 void main() {
-    vec3 c = srgbEncode(texture(uTex, vUV0).rgb);
+    vec3 raw = texture(uTex, vUV0).rgb;
+    vec3 c = srgbEncode(raw);
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     // max 与 luma 都在显示域；sRGB 编码单调 ⇒ CPU 侧按 sRGB EOTF 折回线性后仍是
     // 同一像素的 max 通道值，不是近似。
-    float l = (uStatCh > 0.5) ? max(max(c.r, c.g), c.b)
-                              : dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float l;
+    if (uStatMode > 0.5) {
+        // 对数域：enc = (log2(m) + 12) / 20，线性 [2^-12, 2^8] → [0,1]（CPU 侧同式反折）。
+        // 取**编码前**的原始 max 通道 —— 这是 uStatMode 存在的全部意义。
+        float m = max(max(raw.r, max(raw.g, raw.b)), 1.52587890625e-5);
+        l = (log2(m) + 12.0) / 20.0;
+    } else {
+        l = (uStatCh > 0.5) ? max(max(c.r, c.g), c.b)
+                            : dot(c, vec3(0.2126, 0.7152, 0.0722));
+    }
     oColor = vec4(l, l, l, 1.0);
 })";
 
@@ -2384,6 +2400,7 @@ bool FrameRenderer::init() {
   u_hist_.lut_dinv = glGetUniformLocation(prog_hist_, "uLutDomainInv");
   u_hist_.lut_size = glGetUniformLocation(prog_hist_, "uLutSize");
   u_hist_.stat_ch = glGetUniformLocation(prog_hist_, "uStatCh");
+  u_hist_.stat_mode = glGetUniformLocation(prog_hist_, "uStatMode");
   u_local_src_.tex = glGetUniformLocation(prog_local_, "uTex");
   u_local_src_.step = glGetUniformLocation(prog_local_, "uStep");
 
@@ -3302,6 +3319,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 1.4e-4 的输入误差放大成 2.4e-4 的 power 误差，自检假阳性（v0.7.9 实测）
   kv += ",\"blackEv\":" + std::to_string(ev_black_).substr(0, 9);
   kv += ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9);
+  // v0.10.27：白点高光感知判据诊断 —— w99/w999 = P99/P99.9 的 raw 判据值（EV，钳制前），
+  // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。white 上探 = w999 驱动、
+  // w > clamp(w99, 2.438, 4.556)；固定曲线/未上探时 cp 恒 1。
+  kv += ",\"w99\":" + std::to_string(last_w99_).substr(0, 6);
+  kv += ",\"w999\":" + std::to_string(last_w999_).substr(0, 6);
+  kv += ",\"cp\":" + std::to_string(last_cp_).substr(0, 6);
   kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
   kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
   kv += ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7);
@@ -4408,7 +4431,8 @@ bool FrameRenderer::histogram(int* out, int n) {
 // → 成片亮斑（真机反馈）。
 // lut_strength 传 0 = 恒等（bindLut 仍会绑定纹理并下发全部 uniform，见其注释）。
 void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
-                              float lut_strength, bool box_filter, int stat_ch) {
+                              float lut_strength, bool box_filter, int stat_ch,
+                              int stat_mode) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glViewport(0, 0, w, h);
   glActiveTexture(GL_TEXTURE0);
@@ -4424,6 +4448,8 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
     glUniform1i(u_hist_.tex, 0);
     // v0.7.3：0 = luma（UI 直方图）；1 = max 通道（filmic 自动 EV 判据）
     glUniform1f(u_hist_.stat_ch, stat_ch > 0 ? 1.0f : 0.0f);
+    // v0.10.27：0 = 显示域 sRGB 编码（UI 直方图）；1 = 对数域（自动 EV 判据，见 kFsHist）
+    glUniform1f(u_hist_.stat_mode, stat_mode > 0 ? 1.0f : 0.0f);
     bindLut(u_hist_.lut, u_hist_.lut_on, u_hist_.lut_strength, u_hist_.lut_dmin,
             u_hist_.lut_dinv, u_hist_.lut_size, lut_strength);
   }
@@ -4434,7 +4460,7 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
 bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
-                                 int stat_ch) {
+                                 int stat_ch, int stat_mode) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   const int hw = 256, hh = 96;
   if (tex_hist_ == 0) {
@@ -4442,7 +4468,8 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
     hist_w_ = hw;
     hist_h_ = hh;
   }
-  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_, false, stat_ch);
+  renderLuma(src, fbo_hist_, hw, hh, bypass_lut ? 0.0f : lut_strength_, false,
+             stat_ch, stat_mode);
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
@@ -4474,10 +4501,13 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
 // **一次直方图出三个分位**：P0.5 → black relative exposure，P50 → 诊断，P99.5 → white。
 // 统计失败返回 valid=false（调用方保持上一帧参数，不写 last_*）。
 FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
-  constexpr int kN = 64;
+  // v0.10.27：64 → 256 桶。对数域统计编码下 readback 的 256 级与桶一一对应
+  // （px[i] ∈ [0,255] → out[px[i]]），每级 0.078EV；旧 64 桶会把这分辨率扔掉 3/4。
+  constexpr int kN = 256;
   SceneStats st;
   int hist[kN];
-  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1)) return st;
+  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1,
+                     /*stat_mode=*/1)) return st;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return st;
@@ -4490,24 +4520,26 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
     }
     return 1.0f;
   };
-  // 直方图在**显示域**（kFsHist 内部已过 OETF）；编码单调 ⇒ 按其逆折回线性后仍是
-  // 同一像素的 max 通道值，不是近似。
+  // 对数域反折（与 kFsHist 的 uStatMode=1 编码同式）：enc = (log2(m)+12)/20
+  //   ⇒ m = exp2(enc·20 − 12)。撞底桶读成 2^-12 的截断语义由 black 判据的
+  //   −7.65 物理下限兜底；撞顶读成 2^8 由 white 的 4.556 上限兜底。
+  // 编码单调 ⇒ 折回后仍是同一像素的 max 通道值，不是近似。
+  // 旧显示域统计的真问题（v0.10.27 定案）：srgbEncode 先 clamp(c,0,1)，线性 ≥1.0
+  // 的强光源全部并进顶桶 —— P99 撞顶恒 1.0，白点对高光失明（真机 auto 模式
+  // whiteEv 恒钉 2.438 下限的直接原因），成片高光平顶白墙。
   // v0.10.17：分位 P0.5/P99.5 → **P0.1/P99**（真机 0.10.16 校准）——P0.5 把 black 收到
   // −5.6EV，dr 从 12.2 收到 8.0，power 被派生公式推到 4.7+ ⇒ 中间调压暗 + 色度比
   // 放大（用户实测"中间调低、天空过饱和"）；P99.5 的 shoulder 过渡太窄 ⇒ 水壶高光
   // 推白。P0.1 更贴近 darktable autodetect"框选最暗"的 min 语义，P99 给 shoulder 留
-  // 过渡带。
-  // v0.10.23：折回函数与 kFsOut/kFsHist 的编码**必须同步**（原先 pow(v, 2.2)，现为
-  // 真 sRGB EOTF）。不同步的后果隐蔽且危险：linMid/pLo/pHi 会与成片显示域错位，
-  // 暗部尤其大（显示域 0.1 处线性值 0.0100 vs pow(2.2) 的 0.0063，差 1.59×），而
-  // 自动黑白点判据正是吃这三个数，日志诊断口径也会跟着失真。
-  const auto to_lin = [](float v) {
-    return v <= 0.04045f ? v / 12.92f
-                         : std::pow((v + 0.055f) / 1.055f, 2.4f);
-  };
+  // 过渡带。（P99 的"撞顶失明"由 updateFilmicEV 的 P99.9 上探修正，见彼处。）
+  // v0.10.23：折回函数与 kFsOut/kFsHist 的编码**必须同步**的教训继承于此 ——
+  // 对数编码与反折两处必须逐字一致，否则 linMid/pLo/pHi 与成片域错位、自动判据
+  // 吃进失真值。
+  const auto to_lin = [](float enc) { return std::exp2(enc * 20.0f - 12.0f); };
   st.p_lo = to_lin(pct(0.001));
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));
+  st.p_hi999 = to_lin(pct(0.999));
   st.valid = true;
   last_lin_mid_ = st.p_mid;  // 诊断字段（raw.render / preview.filmic）
   last_p_lo_ = st.p_lo;
@@ -4556,15 +4588,21 @@ bool solve5(double a[5][5], double b[5], double x[5]) {
 // black/white/grey 派生（PC 固化 3.6148 就是该式在它那组参数下的值，复算差 0.04%）。
 // 系数顺序：m1..m5 各 3 个（下标 [0]=toe [1]=shoulder [2]=中间线性段），
 // 每段 y = m1 + x·(m2 + x·(m3 + x·(m4 + x·m5)))。
-FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, float white_ev) {
+FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, float white_ev,
+                                                               float contrast_param_in,
+                                                               float latitude_in) {
   // 全程 double：shoulder 的 5×5 系统条件数差，用 float 中间量会把 1e-7 的舍入放大到
   // 1e-5（与 float64 参考实现对拍时可见）。虽然远低于 8bit 量化精度（1/255 ≈ 4e-3），
   // 但没有理由把它引进来 —— darktable 的 gauss_solve 同样在 double 下求解。
   constexpr double kGrey = 0.1845;                // grey_source（18.45% 中灰）
   constexpr double kSafety = 0.01;                // darktable SAFETY_MARGIN
   constexpr double kBlackTargetPct = 0.01517634;  // black_point_target 默认（%）
-  constexpr double kContrastParam = 1.0;          // darktable contrast 默认
-  constexpr double kLatitude = 0.01;              // darktable latitude 默认（%）
+  // v0.10.27：contrast/latitude 由 constexpr 提升为函数参数 —— darktable 原版就是
+  // 四个独立滑杆（black/white/latitude/contrast），此前 latitude 恒 0.01、contrast 恒
+  // 1.0 只是不带滑杆的默认值。自动白点高光上探用 contrast 参数补偿 power 回退
+  // （updateFilmicEV）；latitude 保持 darktable 默认（0.01）。
+  const double kContrastParam = static_cast<double>(contrast_param_in);
+  const double kLatitude = static_cast<double>(latitude_in);
   FilmicSpline sp;
   const double black =
       std::min(static_cast<double>(black_ev), static_cast<double>(white_ev) - 0.2);
@@ -4648,6 +4686,7 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
   sp.black_disp = static_cast<float>(black_disp);
   sp.grey_log = static_cast<float>(grey_log);
   sp.contrast = static_cast<float>(contrast);
+  sp.contrast_param = contrast_param_in;
   return sp;
 }
 
@@ -4657,7 +4696,8 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
 // 曝光能真的传导到成片 —— 旧的"中位锚定"会把它们补偿掉（v0.7.2 的死结）。
 // auto_on=false：用 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
 void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
-                                  float user_black, float user_white) {
+                                  float user_black, float user_white,
+                                  float white_hl) {
   constexpr float kGrey = 0.1845f;
   // ── v0.7.6：黑白点由**用户配置**（FilmParams[37]/[38]），PC 的做法 ────────────
   // 默认 −7.65/+4.56 = darktable 默认值 = PhotonCamera 固化值（两边一致，有出处）；
@@ -4669,6 +4709,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   // 与已被否掉的 kTarget 中位锚定同型（抹掉"这个场景暗部有多深"这一维）。
   float b = user_black;
   float w = user_white;
+  float w99 = 0.0f, w999 = 0.0f, cp = 1.0f;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
   if (st.valid && auto_on) {
     // v0.10.16/18：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
@@ -4683,9 +4724,46 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     //   结果：暗光 ≈ black −7.65 / white 2.44（dr 10.1 → power ≈ 4.2，darktable
     //   autodetect 的正常区间）；白天 black 随场景收紧（−4.5~−6）。
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
-    w = std::clamp(std::log2(std::max(st.p_hi, 1e-6f) / kGrey), 1.0f, 16.0f);
     b = std::max(b, -7.654144f);
+    // ── v0.10.27：白点高光感知（"高光太白压不住"的修正）──────────────────────
+    // 真机定案（151748）：显示域统计 clamp 使 P99 撞顶恒 1.0 → whiteEv 恒钉 2.44
+    // 下限 → dr 只剩 black−2.44（室内 black −5.63 时 dr 8.07、power 4.70）→ 肩部
+    // 只覆盖线性 0.19→1.04（2.5EV）→ +1.5EV→209 / +2.0EV→242 / +2.5EV→255 顶格，
+    // 高光块(245+) 7.99%、最大连片 7.49% 全图。占帧 <1% 的窗/灯强光源 P99 分位
+    // 看不见（这正是当年选 P99 而非 P99.5 的理由），但对白点它是真实存在的内容。
+    // 修正 = P99.9 驱动上探（对数统计后才有分辨率），两道闸防失控：
+    //   ① 上探幅度 ≤ +1.5EV（P99 与 P99.9 之间常夹着噪声尾/孤立高光，无限上探会把
+    //      power 压垮、画面变灰）；
+    //   ② 物理钳制 [2.438, 4.556] 不变（下限防 power 爆炸、上限 = darktable 默认）。
+    // 真暗光（无强光源）P99.9 ≈ P99 → 行为与 v0.10.18 逐位一致。
+    w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
+    w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+    if (white_hl > 0.5f) {
+      w = std::max(w99, std::min(w999, w99 + 1.5f));
+    } else {
+      w = w99;  // v0.10.18 行为（A/B 通路）
+    }
     w = std::clamp(w, 2.438307f, 4.556152f);
+    // ── contrast_param 补偿（darktable contrast 滑杆的自动化用法）────────────
+    // 上探拉大 dr → power 派生回落（151748 型场景 4.70→~3.2），中灰以上提亮变少
+    // = 用户验收过的"通透感"回退。补偿 = 上探前后 power 比（cp = power_old/new，
+    // clamp [1.0, 1.6] 只补不降）：spline v3 里中灰斜率 = contrast_param/8 与
+    // power 无关，cp 直接抬对数域斜率，把上探前曲线的中间调梯度找回来；肩部
+    // 过渡宽度由 dr 决定不受 cp 影响 —— 高光余量与中间调对比同时保住。
+    // 未上探（w == w_old）时 cp 恒 1.0，固定曲线（auto=0）不走此分支恒 1.0。
+    const float w_old = std::clamp(w99, 2.438307f, 4.556152f);
+    if (w > w_old + 1e-3f) {
+      auto derive_power = [&](float wv) {
+        const float bl = std::min(b, wv - 0.2f);
+        const float wh = std::max(wv, bl + 0.2f);
+        return std::log(kGrey) / std::log(-static_cast<double>(bl) /
+                                         static_cast<double>(wh - bl));
+      };
+      const double pow_old = derive_power(w_old);
+      const double pow_new = derive_power(w);
+      cp = static_cast<float>(std::clamp(pow_old / std::max(pow_new, 1e-6),
+                                         1.0, 1.6));
+    }
   }
   // EMA 平滑防闪；**静拍与首帧直通** —— 静拍只有这一帧可渲染，用历史值等于用错曝光
   //（v0.6.28 实测：静拍拿到取景早期的 ag=3.042 而正确值 ≈1.5，福字被推成粉白）。
@@ -4703,7 +4781,10 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     ev_black_ = ev_smooth_black_;
     ev_white_ = ev_smooth_white_;
   }
-  filmic_ = computeFilmicSpline(ev_black_, ev_white_);
+  filmic_ = computeFilmicSpline(ev_black_, ev_white_, cp);
+  last_w99_ = w99;
+  last_w999_ = w999;
+  last_cp_ = cp;
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -4723,7 +4804,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // auto_tone 开 = **黑点**改由场景分位自动（白点仍用配置值），默认关。
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
-                 p.filmic_white_ev);
+                 p.filmic_white_ev, p.white_hl);
   // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────
   // 裁剪阈值恒 = RAW 饱和数据白点 1.0（物理量，与 filmic 白点解耦——0.10.17 的
   // 阈值随 white 自动掉到 0.5 曾把 47% 的块送进重建）。重建结果直接替换 filmic
@@ -4833,6 +4914,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
         LogLevel::kInfo, "engine", "preview.filmic",
         "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 9) +
             ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9) +
+            ",\"w99\":" + std::to_string(last_w99_).substr(0, 6) +
+            ",\"w999\":" + std::to_string(last_w999_).substr(0, 6) +
+            ",\"cp\":" + std::to_string(last_cp_).substr(0, 6) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
             ",\"ratio\":" + std::to_string(g_domain_ratio).substr(0, 6) +
             ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7) +

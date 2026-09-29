@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(42).apply {
+    private fun neutral(): DoubleArray = DoubleArray(43).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -112,6 +112,12 @@ object CameraPresets {
         // 完整实现（mask/inpaint/小波/RGB+ratios 两轮），参数 = darktable 默认。
         // 默认开；0 = A/B 通路。设置页开关写 prefs("hr_wavelet")。
         this[41] = 1.0
+        // 42 = 白点高光感知（v0.10.27，auto_tone 开时生效）：对数域场景统计 +
+        // P99.9 驱动白点上探（≤+1.5EV、物理钳制不变）+ darktable contrast 参数
+        // 按 power 前后比补偿中间调回退。治"高光太白压不住"（统计 clamp 使 P99
+        // 对强光源失明 → 白点恒钉 2.438 下限 → 肩部挤压 → 高光平顶白墙）。
+        // 默认开；0 = A/B 通路（v0.10.18 行为）。设置页开关写 prefs("white_hl")。
+        this[42] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

@@ -534,6 +534,22 @@ fun SettingsScreen(
                     )
                 },
             )
+            // 白点高光感知（v0.10.27）：自适应影调开启时，对数域统计的 P99.9 驱动
+            // filmic 白点上探（≤+1.5EV）+ contrast 参数补偿，治"高光太白压不住"。
+            var whiteHlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("white_hl", true)) }
+            SettingSwitchRow(
+                title = "高光自适应白点",
+                subtitle = "开自适应影调时按场景高光自动扩展 filmic 白点（含对比补偿），治高光平顶泛白；关 = 旧判据 A/B 对照",
+                checked = whiteHlOn,
+                onChecked = { v ->
+                    whiteHlOn = v
+                    prefs.edit().putBoolean("white_hl", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.white_hl",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

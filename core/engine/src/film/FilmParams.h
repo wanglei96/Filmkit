@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 42;  // v0.10.15：+[41] hr_wavelet（v0.10.13 +[40] gamut）
+  static constexpr int kCount = 43;  // v0.10.27：+[42] white_hl（v0.10.15 +[41] hr_wavelet、v0.10.13 +[40] gamut）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -98,6 +98,13 @@ struct FilmParams {
   // 本层作用于线性 RGB 域（CCM 后、filmic 前），修复部分通道裁剪高光
   // （灯管/过曝边缘的品红残留即此类）。默认开；0 = A/B 通路。
   float hr_wavelet = 1.0f;     // 41
+  // ── v0.10.27：白点高光感知（auto_tone 开时生效）──────────────────────────
+  // 真机定案："高光太白压不住"的根因 = 显示域统计 clamp 使 P99 对线性 ≥1.0 的
+  // 强光源失明 → whiteEv 恒钉 2.438 下限 → dr 被压到 ~8EV → 肩部只覆盖 2.5EV，
+  // 高光平顶白墙（151748 高光块 7.99%）。修正 = 对数域统计（256 桶）+ P99.9 驱动
+  // 白点上探（≤+1.5EV、物理钳制不变）+ darktable contrast 参数按 power 前后比
+  // 补偿中间调回退。1 = 开（默认）；0 = A/B 通路（v0.10.18 行为）。
+  float white_hl = 1.0f;       // 42
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -153,6 +160,7 @@ struct FilmParams {
     if (n > 39) sharpen = static_cast<float>(v[39]);
     if (n > 40) gamut = static_cast<float>(v[40]);
     if (n > 41) hr_wavelet = static_cast<float>(v[41]);
+    if (n > 42) white_hl = static_cast<float>(v[42]);
   }
 };
 

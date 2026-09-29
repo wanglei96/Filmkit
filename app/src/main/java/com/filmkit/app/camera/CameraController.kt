@@ -849,7 +849,10 @@ class CameraController(private val context: Context, private val render: RenderC
     private var gamutPref = -1.0
     // darktable filmic 高光重建（v0.10.15）：原生算法完整实现，默认开。
     private val HR_WAVELET = 1.0
+    // v0.10.27：白点高光感知（FilmParams[42]，auto_tone 开时生效）
+    private val WHITE_HL = 1.0
     private var hrPref = -1.0
+    private var whiteHlPref = -1.0
     // 饱和补偿标定旋钮（v0.10.21）：原生 gamut 色度 min 的低饱和副作用由**风格层**
     // （uSat 分区饱和，FilmParams[20..22]）标定补偿——分层架构对应 darktable 的
     // filmic → color balance、PC 的 filmic → LUT。只作用阴影/中间调，高光不动。
@@ -901,6 +904,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applySharpenPref()
         applyGamutPref()
         applyHrWaveletPref()
+        applyWhiteHlPref()
         applySatCompPref()
         applyFilmicRangePrefs()
     }
@@ -996,6 +1000,20 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hrPref) {
             hrPref = v
             filmParams[41] = v
+        }
+    }
+
+    /**
+     * 白点高光感知开关（v0.10.27）：写 FilmParams[42]。
+     * auto_tone 开时，对数域统计的 P99.9 驱动白点上探（≤+1.5EV、物理钳制不变）+
+     * darktable contrast 参数补偿中间调回退，治"高光太白压不住"；
+     * 0 = A/B 通路（v0.10.18 行为：P99 判据、恒 2.438 下限）。
+     */
+    private fun applyWhiteHlPref() {
+        val v = if (appPrefs.getBoolean("white_hl", true)) WHITE_HL else 0.0
+        if (v != whiteHlPref) {
+            whiteHlPref = v
+            filmParams[42] = v
         }
     }
 

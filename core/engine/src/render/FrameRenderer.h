@@ -187,18 +187,22 @@ class FrameRenderer {
   //              用 luma 会系统性偏低；darktable 的 auto-tune 同样取 max 通道）。
   // bypass_lut：程序性统计（自动 EV）不该被风格 LUT 改判据（UI 直方图仍含 LUT）。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false,
-                     int stat_ch = 0);
+                     int stat_ch = 0, int stat_mode = 0);
   // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
   // box_filter=false → kFsHist 单点采样（直方图统计用）；
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
+  // stat_mode=1 → 对数域统计编码（measureSceneStats 专用，见 kFsHist 的 uStatMode）。
   void renderLuma(GLuint src, GLuint fbo, int w, int h, float lut_strength,
-                  bool box_filter, int stat_ch = 0);
+                  bool box_filter, int stat_ch = 0, int stat_mode = 0);
   // ── 场景分位统计（v0.7.3：中位 → 分位）───────────────────────────────────
   // 服务 filmic 的自动 EV 标定。取 max 通道（见 histogramFrom 的 stat_ch），
   // **一次直方图算三个分位**：P0.5 → black relative exposure，P99.5 → white。
   // 测到就写 last_* 供日志；valid=false = 统计失败（调用方保持上一帧参数）。
   struct SceneStats {
-    float p_lo = 0.0f, p_mid = 0.0f, p_hi = 0.0f;  // 线性（P0.5 / P50 / P99.5）
+    float p_lo = 0.0f, p_mid = 0.0f, p_hi = 0.0f;  // 线性（P0.1 / P50 / P99）
+    // v0.10.27：P99.9（对数域统计才有分辨率，见 measureSceneStats）—— 高光感知
+    // 白点判据的驱动量：占比 <1% 的窗/灯强光源 P99 看不见，P99.9 能。
+    float p_hi999 = 0.0f;
     bool valid = false;
   };
   SceneStats measureSceneStats(GLuint src);
@@ -212,14 +216,19 @@ class FrameRenderer {
     float input_min = 0.0f, input_max = 1.0f;
     float output_power = 4.0f, black_disp = 0.0f, grey_log = 0.5f;
     float contrast = 1.0f;
+    // v0.10.27：darktable contrast 滑杆参数（默认 1.0 = 中性）。自动白点高光上探
+    // 时由 updateFilmicEV 按 power 前后比设定，补偿 gamma 回退；固定曲线恒 1.0。
+    float contrast_param = 1.0f;
   };
-  static FilmicSpline computeFilmicSpline(float black_ev, float white_ev);
+  static FilmicSpline computeFilmicSpline(float black_ev, float white_ev,
+                                          float contrast_param = 1.0f,
+                                          float latitude = 0.01f);
   // filmic 黑白点（v0.7.6）：来自**用户配置**（FilmParams[37]/[38]，默认 −7.65/+4.56，
   // 即 darktable 默认 / PhotonCamera 固化值）。auto_on=true 时黑点改由场景分位自动
   // （白点仍用配置值）。理由见 .cpp。
   // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
   void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
-                      float user_white);
+                      float user_white, float white_hl);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
@@ -337,6 +346,9 @@ class FrameRenderer {
   // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
   float last_lin_mid_ = 0.0f;   // 场景中位（线性）
   float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
+  // v0.10.27：白点判据的诊断量（EV，相对中灰）——w99/w999 = P99/P99.9 的 raw 判据值，
+  // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。
+  float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f;
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
@@ -429,7 +441,7 @@ class FrameRenderer {
   } u_out_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
-          lut_dinv = -1, lut_size = -1, stat_ch = -1;
+          lut_dinv = -1, lut_size = -1, stat_ch = -1, stat_mode = -1;
   } u_hist_;
   // kFsLocal（局部低频图的下采样 shader）
   struct {
