@@ -203,6 +203,10 @@ class FrameRenderer {
     // v0.10.27：P99.9（对数域统计才有分辨率，见 measureSceneStats）—— 高光感知
     // 白点判据的驱动量：占比 <1% 的窗/灯强光源 P99 看不见，P99.9 能。
     float p_hi999 = 0.0f;
+    // v0.10.28：采样 max（最高非空桶，darktable autodetect 的 max 语义）——
+    // 白点上探的主驱动量：小面积近饱和高光（白壶身镜面，占比 0.001% 级）
+    // 任何分位都看不见，见 162012 真机定案。
+    float p_max = 0.0f;
     bool valid = false;
   };
   SceneStats measureSceneStats(GLuint src);
@@ -228,7 +232,7 @@ class FrameRenderer {
   // （白点仍用配置值）。理由见 .cpp。
   // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
   void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
-                      float user_white, float white_hl);
+                      float user_white, float white_hl, float user_ev);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
@@ -348,7 +352,8 @@ class FrameRenderer {
   float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
   // v0.10.27：白点判据的诊断量（EV，相对中灰）——w99/w999 = P99/P99.9 的 raw 判据值，
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。
-  float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f;
+  // v0.10.28：wmax = 采样 max 判据值（上探主驱动）。
+  float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
