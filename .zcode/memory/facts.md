@@ -36,7 +36,16 @@ status: active
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig，v0.10.22 起 `FilmKitApp.VERSION = BuildConfig.VERSION_NAME`）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag；tag 清单与恢复命令 `docs/git-tags-backup-20260922.txt`
 - [2026-09-29] **发布现状**：最新 **v0.10.31-m4（versionCode 183，`fde052f`）**，已推 main，根目录 `filmkit-0.10.31-m4.apk`；**未打 tag**（高光线待明天光线复验后收）；测量包 `filmkit-spike-fft.apk` 并存
-- [2026-09-29] **版本沿革速查**：177（0.10.26 WB 修复）→178（0.10.27 对数统计+白点探针）→179（0.10.28 max 驱动，水壶修复）→180（断档判据，撤）→181（回 max+cp1.25，撤）→182（178 回退版）→**183（0.10.31 = 179+white+ev，当前）**
+- [2026-09-29] **版本沿革速查**：177（WB 修复）→178→…→183（0.10.31，高光线待复验）→
+  184（0.10.32 C 模型全链）→185（0.10.33 回归修复+导入/切换）→186（0.10.34 结构 A+滑杆）→
+  187（0.10.35 AE 锁定+多摄标定）→**188（0.10.36-m4 通道序修复，tag `v0.10.36-m4` 已推）**
+- [2026-09-29] **Camera2 SENSOR_NOISE_PROFILE 真机形态**：Array<Pair<Double,Double>> =
+  4 个 (S,O) **标量对**（CFA 相位序、per-frame 无 gain 字段）——SDK 签名
+  `Pair<Double, Double[]>` 与真机不符；`as? DoubleArray` 对装箱数组永败
+- [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同）；
+  实测真实倍数 70MM=3.56×、15MM=2.16×（DNG 差分比值法）；内置标定
+  `assets/noise_models/x300_{70mm,15mm}.c`（A=S/iso、D=HAL O）按"V2509A+等效焦距"匹配；
+  同刻三镜头 A/B 残余噪声 1.22×/1.45×（1.0 档）
 
 ## 引擎实现现状（2026-09-29）
 
@@ -44,7 +53,11 @@ status: active
 - [2026-09-29] **FilmParams 契约 kCount=43**：`[0] exposure_ev=base_ev+用户EV`（filmic 前线性域）、`[1]/[3] wb`、`[20..22] sat_comp`、`[29] hl_recon`（槽位保留不消费）、`[39] sharpen`、`[40] gamut`、`[42] white_hl`；按实际长度读取（下限 26）
 - [2026-09-29] **影调链现状**：filmic 原生件（darktable v5 固定参数）——固定曲线（base_ev 默认 +0.7，v0.10.25）；黑白点自动三版真机证伪后默认关；`updateFilmicEV` 的 white 判据 = max 驱动探针 + **整体 +ev**（渲染域对齐，v0.10.31）；statistics 512×288、P99/P99.9/P100，诊断字段 `w99/w999/wmax/cp` 在 raw.render/preview.filmic
 - [2026-09-29] **gamut mapping v5**（v0.10.17 恢复完整五步：色度 min+相锁+Y clamp+desaturate(0)+Yrg+clip chroma）；**输出 OETF 真 sRGB**（三处同步：kFsOut/kFsHist/measureSceneStats.to_lin）；**原生小波高光重建**（[41]，阈值恒 1.0）；锐化 = 线性显示域 luma USM（kFsOut 内，[39]）
-- [2026-09-29] **降噪现状**：P0 同色 bilateral（σr = max(ns,0.004)·0.28·√(0.2+4c0)）+ P4 色度（半径 3、σc = max(ns,0.004)·2.75·√(0.2+4y0)+0.008）；**ns 为单值**（ns_raw 或 0.012 回退，clamp 0.004–0.040）——**C 专项将升级为 σ²=A·x+B**
+- [2026-09-29] **降噪现状（C 专项后）**：P0/P4/mismatch 全部走噪声模型 **σ²=A·x+B**
+  逐像素（P0 `sr=√(A_c·x+B_c)`；P4 同域 + LSC 增益传播；mismatch = var(ref)+var(alt)；
+  融合后系数 ÷neff）；强度 = 滑杆 0–2（prefs `noise_reduction_strength`，1.0=真实 σ，
+  k_p0=s / k_p4=1.5s）；**tile RMS 归约 pass 就位**（A 的 σ 输入底座）；
+  模型优先级：用户导入标定 > 内置实测（型号+焦距）> Camera2 > ISO 估算
 - [2026-09-27] **MFNR 实现**：对齐 `render/Align.{h,cpp}`（kMfnrTile=64@1/2 域 = 128 mosaic；L4→L2 金字塔 SAD + 亚像素）；融合 `kFsMfnrFuse`（4 帧、逐通道网格亚像素双线性、权重来自 mismatch）；`kFsMfnrMismatch`（m=d²/(d²+sσ²)，32px cell）；日志 `mfnr.stage`/`raw.render`（motMed/nsSng/misD 等）
 - [2026-09-27] MFNR 采集：maxImages 4 + 帧 1-3 拷贝即 close；设置三档 prefs `mfnr`（0/1 自动暗光 ISO≥600 或 ≥25ms/2 强制）
 - [2026-09-28] MFNR 阶段二参数：`kMisLo=0.10/kMisHi=0.35/kMotLo=8/kMotHi=20/kOffDev=6/kMisDilate=2`；ns 折减 `ns = ns_single/√neff`；短参考帧 `MFNR_REF_MAX_EXPOSURE_NS=15ms`、压缩比 ≤1.5×
