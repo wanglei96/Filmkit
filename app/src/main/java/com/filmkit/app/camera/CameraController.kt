@@ -1279,8 +1279,25 @@ class CameraController(private val context: Context, private val render: RenderC
         } else {
             null
         }
+        // v0.10.35（2026-09-29 真机取证）：**alt 帧同样固定 AE_OFF + 预览收敛的
+        // ISO/曝光** —— 原实现帧 1-3 直接复用预览的 repeating 请求（AE AUTO），
+        // HAL 在拍摄时重新收敛曝光：70MM 实测预期 1070 → 实际 1179（+10%），
+        // ref/alt 曝光量不守恒（42.8 vs 47.2）→ 对齐 SAD 残差被亮度差淹没
+        // （confMed=0 → 位移场全零 → neff=1.45，MFNR 整体失效）。主摄/15MM 因
+        // AE 恰好稳定而侥幸守恒（±0.7%）。
+        val altReq = if (liveIso > 0 && liveExposureNs > 0) {
+            camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(stillReader!!.surface)
+                applyControls(this)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_SENSITIVITY, liveIso)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, liveExposureNs)
+            }.build()
+        } else {
+            null
+        }
         val reqs = List(MFNR_FRAMES) { i ->
-            if (i == 0) refReq ?: b.build() else b.build()
+            if (i == 0) (refReq ?: altReq ?: b.build()) else (altReq ?: b.build())
         }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
@@ -2001,6 +2018,20 @@ class CameraController(private val context: Context, private val render: RenderC
             if (m != null) {
                 noiseModel = m
                 nzSrc = "calib"
+            }
+        }
+        // 内置实测标定（v0.10.35）：按设备型号 + 当前镜头等效焦距匹配（X300 的
+        // 70MM/15MM —— HAL 对隐藏物理镜头返回主摄模型，实测低估 3.56×/2.16×，
+        // 见 NoiseCalibStore.BUILT_IN）。优先级：用户选定 > 内置实测 > Camera2。
+        if (noiseModel == null) {
+            val lens = backLenses.firstOrNull { it.id == currentLensId }
+            val bi = lens?.let {
+                NoiseCalibStore.builtInFor(context, android.os.Build.MODEL, it.equivMm)
+            }
+            val m = bi?.evaluate(isoNow)
+            if (m != null) {
+                noiseModel = m
+                nzSrc = "builtin"
             }
         }
         var npDiag: NoiseProfile.Result? = null

@@ -102,6 +102,46 @@ class GcamNoiseCalib private constructor(
 object NoiseCalibStore {
     const val AUTO = "auto"
     private const val DIR = "noise_models"
+    private const val ASSET_DIR = "noise_models"
+
+    /**
+     * 内置实测标定（assets）：设备型号 → (等效焦距 mm → asset 文件)。
+     * v0.10.35（2026-09-29 真机取证）：X300 的 HAL 对隐藏物理镜头（id 3=70MM、
+     * id 4=15MM）返回**主摄的噪声模型**（三摄 pairs 完全相同），而实测长焦 shot
+     * 噪声是主摄 3.56×、超广 2.16×（DNG 差分拟合 + 成片交叉验证）—— 内置实测
+     * 标定用于修正该低估；auto 模式下优先于 Camera2（仅当有匹配项时）。
+     */
+    private val BUILT_IN: Map<String, Map<Float, String>> = mapOf(
+        "V2509A" to mapOf(
+            70f to "x300_70mm.c",
+            15f to "x300_15mm.c",
+        ),
+    )
+    private val assetCache = HashMap<String, GcamNoiseCalib?>()
+
+    /** 按（设备型号, 等效焦距）取内置标定；无匹配（含型号不符/焦距差 >1mm）→ null */
+    fun builtInFor(context: Context, model: String, equivMm: Float): GcamNoiseCalib? {
+        val key = BUILT_IN.keys.firstOrNull { model.contains(it) } ?: return null
+        val table = BUILT_IN[key] ?: return null
+        val hit = table.entries
+            .filter { kotlin.math.abs(it.key - equivMm) <= 1f }
+            .minByOrNull { kotlin.math.abs(it.key - equivMm) } ?: return null
+        return loadAsset(context, hit.value)
+    }
+
+    private fun loadAsset(context: Context, name: String): GcamNoiseCalib? {
+        assetCache[name]?.let { return it }
+        val c = runCatching {
+            context.assets.open("$ASSET_DIR/$name").use { ins ->
+                GcamNoiseCalib.parse(
+                    name, name.removeSuffix(".c"),
+                    ins.readBytes().toString(Charsets.UTF_8),
+                )
+            }
+        }.getOrNull()
+        assetCache[name] = c
+        return c
+    }
 
     private class Entry(val modified: Long, val calib: GcamNoiseCalib?)
 
