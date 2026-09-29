@@ -3322,8 +3322,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // v0.10.27：白点高光感知判据诊断 —— w99/w999 = P99/P99.9 的 raw 判据值（EV，钳制前），
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。white 上探 = w999 驱动、
   // w > clamp(w99, 2.438, 4.556)；固定曲线/未上探时 cp 恒 1。
+  // v0.10.28：wmax = 采样 max 判据值（上探主驱动，+0.4 security 后与 w99+1.5 取小）。
   kv += ",\"w99\":" + std::to_string(last_w99_).substr(0, 6);
   kv += ",\"w999\":" + std::to_string(last_w999_).substr(0, 6);
+  kv += ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6);
   kv += ",\"cp\":" + std::to_string(last_cp_).substr(0, 6);
   kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
   kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
@@ -4462,7 +4464,13 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
                                  int stat_ch, int stat_mode) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
-  const int hw = 256, hh = 96;
+  // v0.10.28：256×96 → 512×288。24K 采样点上 P99.99 = 前 2.5 名、max 采样对
+  // 0.001% 级的小面积高光（水壶镜面/白壶身）几乎必然 miss——真机 162012 实证：
+  // 渲染域最亮 1.02（LSC 1.2× 抬升后刚好过数据白点）但统计 w999 只见 2.05，
+  // 白点不上探、4.1% 的白壶身渐变被肩部压进 245+ 平台。147K 点让 P99.99 有
+  // 15 个样本、max 有望命中 0.002% 级目标；readback 590KB/帧（≈0.3ms）可接受。
+  // UI 直方图共用本 FBO（桶映射按 8bit 值，与 FBO 尺寸无关）。
+  const int hw = 512, hh = 288;
   if (tex_hist_ == 0) {
     makeTex(&tex_hist_, &fbo_hist_, GL_RGBA8, hw, hh);
     hist_w_ = hw;
@@ -4540,6 +4548,16 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));
   st.p_hi999 = to_lin(pct(0.999));
+  // v0.10.28：p_max = **采样到的最高非空桶**（darktable autodetect 的 max 语义）。
+  // 对数编码上限 2^8（= +8EV）后 max 不再被显示域 clamp 淹没——0.10.18 当时
+  // 改用分位正是迫于此；现在分位保留（P99 驱动 black/基础判据），max 只驱动
+  // 白点上探（见 updateFilmicEV：+0.4EV security、w99+1.5 幅度闸、4.556 上限）。
+  for (int i = kN - 1; i >= 0; --i) {
+    if (hist[i] > 0) {
+      st.p_max = to_lin(static_cast<float>(i) / static_cast<float>(kN - 1));
+      break;
+    }
+  }
   st.valid = true;
   last_lin_mid_ = st.p_mid;  // 诊断字段（raw.render / preview.filmic）
   last_p_lo_ = st.p_lo;
@@ -4736,10 +4754,19 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     //      power 压垮、画面变灰）；
     //   ② 物理钳制 [2.438, 4.556] 不变（下限防 power 爆炸、上限 = darktable 默认）。
     // 真暗光（无强光源）P99.9 ≈ P99 → 行为与 v0.10.18 逐位一致。
+    // ── v0.10.28：上探主驱动改 **max 语义**（darktable autodetect 原版）────────
+    // 178 真机（162012 白壶）：P99.9 也看不见 0.002% 级的近饱和高光——渲染域最亮
+    // 1.02（LSC 1.2× 把 0.85 抬过数据白点）但 w999 只见 2.05，白点不上探，4.1% 的
+    // 白壶身渐变被肩部压进 245+ 平台（"水壶压不住"）。darktable autodetect 的
+    // white 本义 = **取样域最大像素 + security**——对数统计（上限 2^8）+ 147K 采样
+    // 点后 max 语义可以忠实落地：w_max = log2(p_max/grey)，+0.4EV security；
+    // w99+1.5 幅度闸与物理钳制不变。max 被 P0 降噪/MFNR 融合先行压掉坏点，
+    // 噪声尖峰由幅度闸与上限兜底。
     w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+    const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
-      w = std::max(w99, std::min(w999, w99 + 1.5f));
+      w = std::max(w99, std::min(w_max + 0.4f, w99 + 1.5f));
     } else {
       w = w99;  // v0.10.18 行为（A/B 通路）
     }
@@ -4785,6 +4812,8 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   last_w99_ = w99;
   last_w999_ = w999;
   last_cp_ = cp;
+  last_wmax_ = st.valid && auto_on ? std::log2(std::max(st.p_max, 1e-6f) / kGrey)
+                                   : 0.0f;
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -4916,6 +4945,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
             ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9) +
             ",\"w99\":" + std::to_string(last_w99_).substr(0, 6) +
             ",\"w999\":" + std::to_string(last_w999_).substr(0, 6) +
+            ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6) +
             ",\"cp\":" + std::to_string(last_cp_).substr(0, 6) +
             ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
             ",\"ratio\":" + std::to_string(g_domain_ratio).substr(0, 6) +
