@@ -825,13 +825,14 @@ class CameraController(private val context: Context, private val render: RenderC
     // 实测本机（X300）HAL 的 AE 比 PhotonCamera 策略暗 0.5–0.9 EV（室外 0.67 / 室内
     // 逆光 ~0.9）—— 影调引擎（filmic）只做映射、不产生曝光，这个差只能在校准层补。
     // 与 Lightroom/DNG 的 BaselineExposure 同语义；范围 −2..+2 覆盖机型间差异，
-    // 默认 0 = 不偏置。用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user。
+    // 用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user。
     // v0.10.22：作用点移到 filmic 前（曲线工作点语义，与 PC 的 Linear 域 EV 同构）。
-    // 原按显示域标定的 +0.50 在曲线内的实际效果不同，待真机复验后定新默认。
-    private var baseEvPref = 0.0
+    // v0.10.25：默认 +0.70 —— 同 DNG 双渲染实测（205833/205832，中性区净差 +0.57EV、
+    // 红杯 C* 差 14.5%）标定：PC 链首恒乘 0.7EV 而我们为 0，工作点上移是色度差的主项。
+    private var baseEvPref = 0.7
 
     private fun applyBaseEvPref() {
-        val v = appPrefs.getFloat("base_ev", 0f).toDouble().coerceIn(-2.0, 2.0)
+        val v = appPrefs.getFloat("base_ev", 0.7f).toDouble().coerceIn(-2.0, 2.0)
         if (v != baseEvPref) {
             baseEvPref = v
         }
@@ -2011,17 +2012,30 @@ class CameraController(private val context: Context, private val render: RenderC
                     ),
                 )
                 if (lscOn) {
-                    // Gr/Gb 折成均值（两平面增益差异 <1%，色偏主因在 R/B 与 G 之间）
+                    // Gr/Gb 折成均值（两平面增益差异 <1%，色偏主因在 R/B 与 G 之间）。
+                    // v0.10.25 边缘软限幅（prefs lsc_damp，默认开）：只压高增益区
+                    // （knee 2.5 以上 ×0.5），中心 1.0 与 knee 内线性段不动。依据：
+                    // ① HAL 平面间角落增益差（R 5.28 vs B 5.00）经限幅后 0.28→0.14，
+                    //   中性色度的中心-边缘漂移（b* −2.1→−1.1）同步减半；
+                    // ② 与渲染 EV +0.7 叠加后边缘净亮度 +0.3EV，避免外圈过曝。
+                    // 代价：保留 ~0.4EV 的边缘晕影（阻尼后校正不足），温和暗角。
+                    val damp = appPrefs.getBoolean("lsc_damp", true)
+                    fun dampGain(g: Float): Float =
+                        if (!damp || g <= 2.5f) g else 2.5f + (g - 2.5f) * 0.5f
                     val buf = FloatArray(rows * cols * 3)
                     var i = 0
                     for (y in 0 until rows) for (x in 0 until cols) {
-                        buf[i++] = m.getGainFactor(0, x, y)
-                        buf[i++] = 0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y))
-                        buf[i++] = m.getGainFactor(3, x, y)
+                        buf[i++] = dampGain(m.getGainFactor(0, x, y))
+                        buf[i++] = dampGain(0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y)))
+                        buf[i++] = dampGain(m.getGainFactor(3, x, y))
                     }
                     lsc = buf
                     lscCols = cols
                     lscRows = rows
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "camera", "raw.lsc.damp",
+                        kv("on" to damp, "knee" to "2.5", "ratio" to "0.5"),
+                    )
                 }
             }
         }

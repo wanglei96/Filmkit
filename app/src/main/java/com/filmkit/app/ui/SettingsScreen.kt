@@ -167,15 +167,14 @@ fun SettingsScreen(
                 )
             }
             // ── 基准曝光（v0.8.1）：机型 AE 基准差的校准常量 ─────────────────────────
-            // 与 Lightroom/DNG 的 BaselineExposure 同语义。实测 X300 的 HAL AE 比同类
-            // 参照暗 0.5–0.9 EV（室外 0.67 / 室内逆光 ~0.9），影调引擎只做映射不产生
-            // 曝光，这个差只能在机型校准层补。范围 −2..+2 覆盖机型间差异，默认 0。
+            // 与 Lightroom/DNG 的 BaselineExposure 同语义。X300 对同场景参照渲染
+            // 净差 +0.57 EV（v0.10.25 同 DNG 双渲染实测标定），默认 +0.7。
             // 用户 EV 滑杆叠加在其上（[0] = base + user），对齐参照后滑杆可归零。
             EvSliderRow(
                 "基准曝光",
                 "校正机型自动曝光的基准差：成片整体偏暗拖右、偏亮拖左。" +
                     "对齐同场景参照后，EV 滑杆归零即可",
-                prefs.getFloat("base_ev", 0f),
+                prefs.getFloat("base_ev", 0.7f),
                 -2f..2f,
             ) { v ->
                 prefs.edit().putFloat("base_ev", v).apply()
