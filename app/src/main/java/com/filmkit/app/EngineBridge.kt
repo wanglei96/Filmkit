@@ -38,6 +38,9 @@ object EngineBridge {
     external fun nativeDetectCapabilities(): String?
     external fun nativeRunSpike(width: Int, height: Int, iterations: Int, useCompute: Boolean): String?
 
+    /** 频域降噪专项（2026-09-29）：HDR+ §5 式 6/7 DFT 合并内核的 GPU 成本实测。 */
+    external fun nativeRunFftSpike(width: Int, height: Int, iterations: Int, overlap: Boolean): String?
+
     // ── M1 相机引擎（SurfaceTexture + OES 路径）──
     external fun nativeEngineStart(surface: Surface): Boolean
     external fun nativeEngineStop()

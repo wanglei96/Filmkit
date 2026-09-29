@@ -9,6 +9,7 @@
 #include "../gl/EglCore.h"
 #include "../log/Logger.h"
 #include "../render/FrameRenderer.h"
+#include "../spike/SpikeFftMerge.h"
 #include "../spike/SpikePass.h"
 
 // JNI 桥：
@@ -24,6 +25,7 @@ using filmkit::jsonEscape;
 using filmkit::Logger;
 using filmkit::LogLevel;
 using filmkit::runSpikePass;
+using filmkit::runSpikeFftMerge;
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
@@ -110,6 +112,15 @@ Java_com_filmkit_app_EngineBridge_nativeRunSpike(JNIEnv* env, jobject, jint w,
                                                  jboolean use_compute) {
   const filmkit::SpikeResult r =
       runSpikePass(w, h, iters, use_compute == JNI_TRUE);
+  return toJString(env, r.toJson());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeRunFftSpike(JNIEnv* env, jobject, jint w,
+                                                    jint h, jint iters,
+                                                    jboolean overlap) {
+  const filmkit::FftSpikeResult r =
+      runSpikeFftMerge(w, h, iters, overlap == JNI_TRUE);
   return toJString(env, r.toJson());
 }
 

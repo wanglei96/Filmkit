@@ -17,7 +17,8 @@ add_library(filmengine SHARED
         src/pipeline/Pipeline.cpp
         src/render/Align.cpp
         src/render/FrameRenderer.cpp
-        src/spike/SpikePass.cpp)
+        src/spike/SpikePass.cpp
+        src/spike/SpikeFftMerge.cpp)
 
 target_include_directories(filmengine PRIVATE src)
 

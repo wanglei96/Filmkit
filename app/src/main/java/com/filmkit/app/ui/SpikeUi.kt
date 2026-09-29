@@ -79,12 +79,14 @@ class SpikeGLView(
     context: Context,
     private val onCapabilities: (String) -> Unit,
     private val onSpikeResult: (String) -> Unit,
+    private val onFftResult: (String) -> Unit,
     private val onStatus: (String) -> Unit,
 ) : GLSurfaceView(context) {
 
     private class Renderer(
         val onCapabilities: (String) -> Unit,
         val onSpikeResult: (String) -> Unit,
+        val onFftResult: (String) -> Unit,
         val onStatus: (String) -> Unit,
     ) : GLSurfaceView.Renderer {
 
@@ -105,9 +107,27 @@ class SpikeGLView(
             onSpikeResult(result ?: "{\"ok\":false,\"error\":\"引擎返回空\"}")
             onStatus(if (result != null && JSONObject(result).optBoolean("ok")) "完成" else "失败")
         }
+
+        /** DFT 合并成本实测：非重叠（基线）与半重叠（HDR+ 真实密度）各一轮。 */
+        fun runFftSpike() {
+            val w = 4096
+            val h = 3072
+            val iters = 6
+            onStatus("DFT 合并 spike：非重叠 ${w}×$h ×$iters …")
+            onFftResult(
+                EngineBridge.nativeRunFftSpike(w, h, iters, false)
+                    ?: "{\"ok\":false,\"error\":\"引擎返回空\"}",
+            )
+            onStatus("DFT 合并 spike：半重叠 ${w}×$h ×$iters …")
+            onFftResult(
+                EngineBridge.nativeRunFftSpike(w, h, iters, true)
+                    ?: "{\"ok\":false,\"error\":\"引擎返回空\"}",
+            )
+            onStatus("DFT 合并 spike 完成")
+        }
     }
 
-    private val renderer = Renderer(onCapabilities, onSpikeResult, onStatus)
+    private val renderer = Renderer(onCapabilities, onSpikeResult, onFftResult, onStatus)
 
     init {
         setEGLContextClientVersion(3)
@@ -118,6 +138,10 @@ class SpikeGLView(
     fun rerun() {
         queueEvent { renderer.runSpike() }
     }
+
+    fun rerunFft() {
+        queueEvent { renderer.runFftSpike() }
+    }
 }
 
 @Composable
@@ -125,6 +149,7 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var capsJson by remember { mutableStateOf("{}") }
     var spikeJson by remember { mutableStateOf("") }
+    var fftResults by remember { mutableStateOf(listOf<String>()) }
     var status by remember { mutableStateOf("等待 surface…") }
     var view by remember { mutableStateOf<SpikeGLView?>(null) }
     var auditPath by remember { mutableStateOf<String?>(null) }
@@ -149,6 +174,13 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
                 ),
             ) { Text("重新运行 spike") }
             Button(
+                onClick = { view?.rerunFft() },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Accent,
+                    contentColor = FilmTheme.OnAccent,
+                ),
+            ) { Text("DFT 合并 spike（4096×3072）") }
+            Button(
                 onClick = {
                     auditPath = com.filmkit.app.camera.CameraAudit.export(context)
                 },
@@ -168,6 +200,7 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
                     ctx,
                     onCapabilities = { capsJson = it },
                     onSpikeResult = { spikeJson = it },
+                    onFftResult = { fftResults = fftResults + it },
                     onStatus = { status = it },
                 ).also { view = it }
             },
@@ -182,6 +215,13 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
         Spacer(Modifier.height(8.dp))
         if (spikeJson.isNotEmpty()) {
             Section("Spike 结果", spikeLines(JSONObject(spikeJson)))
+        }
+        fftResults.forEachIndexed { i, json ->
+            Spacer(Modifier.height(8.dp))
+            Section(
+                "DFT 合并 Spike #${i + 1}（${if (i == 0) "非重叠" else "半重叠"}）",
+                flatten(JSONObject(json)),
+            )
         }
     }
 }
