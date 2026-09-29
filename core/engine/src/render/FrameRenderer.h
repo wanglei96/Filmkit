@@ -150,7 +150,10 @@ class FrameRenderer {
     bool lsc_ok = false;
     int lsc_w = 1, lsc_h = 1;
   };
+  // wb_r/g/b = FilmParams 的用户 WB 补偿（与预览 OES / YUV 静拍的 uWb 同源）：
+  // RAW 链在 asShotNeutral 增益之上相乘，缺它则手动 WB 只动预览不动 M 档成片。
   RawCommon prepareRawCommon(float neutral_r, float neutral_g, float neutral_b,
+                             float wb_r, float wb_g, float wb_b,
                              const float* ccm9, const float* lsc, int lsc_cols,
                              int lsc_rows);
   // 降噪参数（两档系数/σ 夹紧，两条静拍路径共用）

@@ -3044,8 +3044,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   const auto t1 = std::chrono::steady_clock::now();
 
   const RawCommon rc =
-      prepareRawCommon(neutral_r, neutral_g, neutral_b, ccm9, lsc, lsc_cols,
-                       lsc_rows);
+      prepareRawCommon(neutral_r, neutral_g, neutral_b, p.wb_r, p.wb_g,
+                       p.wb_b, ccm9, lsc, lsc_cols, lsc_rows);
 
   // 实际渲染旋转 = 界面方向 + 传感器旋转（与 submitStill 同一约定）
   const int effective_rot = (rotation + 1) % 4;
@@ -3128,7 +3128,8 @@ bool FrameRenderer::uploadRawTex(GLuint tex, const void* raw, int w, int h,
 }
 
 FrameRenderer::RawCommon FrameRenderer::prepareRawCommon(
-    float neutral_r, float neutral_g, float neutral_b, const float* ccm9,
+    float neutral_r, float neutral_g, float neutral_b,
+    float wb_r, float wb_g, float wb_b, const float* ccm9,
     const float* lsc, int lsc_cols, int lsc_rows) {
   RawCommon rc;
   // WB 增益 = asShotNeutral 的倒数，G 归一；非法值回中性（防全 0/负数防呆）
@@ -3140,6 +3141,13 @@ FrameRenderer::RawCommon FrameRenderer::prepareRawCommon(
       rc.gains[2] = gb;
     }
   }
+  // 用户 WB 补偿（updateWbCompensation 的目标/估计增益比）乘在 asShotNeutral
+  // 之上：作用点在黑阶扣除后、CCM 前的 raw 域（darktable temperature / libraw
+  // scale_colors 的标准位置）。G 归一除以 wb_g，保持 G 增益 = 1 不改整体亮度；
+  // 预览 OES / YUV 静拍在 pass1 乘同一组 (wb_r, wb_g, wb_b)，三条链语义一致。
+  // 防呆：单值非法（≤0）时跳过该通道，与 FilmParams::fromDoubles 的全 0 回退互补。
+  if (wb_r > 1e-6f && wb_g > 1e-6f) rc.gains[0] *= wb_r / wb_g;
+  if (wb_b > 1e-6f && wb_g > 1e-6f) rc.gains[2] *= wb_b / wb_g;
   // CCM 行主序 sensor→sRGB；缺失=单位阵
   if (ccm9) {
     for (int i = 0; i < 9; ++i) rc.ccm[i] = ccm9[i];
@@ -3283,6 +3291,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += ",\"ev\":" + std::to_string(p.exposure_ev).substr(0, 5);
+  // 实际进 RAW 链的用户 WB 补偿（目标/估计增益比）：1,1 = 自动/中性。
+  // 与预览 OES 的 uWb 同值——两者不一致即"M 档 WB 与预览不符"的直接证据。
+  kv += ",\"wb\":[" + std::to_string(p.wb_r).substr(0, 6) + "," +
+        std::to_string(p.wb_g).substr(0, 6) + "," +
+        std::to_string(p.wb_b).substr(0, 6) + "]";
   // v0.7.3：ag 一并废除 —— 记录 filmic 的实际标定（EV，相对中灰 18.45%）与场景分位，
   // 供离线用同一组 EV 复算 spline 系数对拍（tools/tuning/filmic_offline.py 的 compute_spline）。
   // substr(0,9)：filmic_verify.py 用这些值复算 spline，截断到 "-5.024" 会把
@@ -3870,8 +3883,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       return false;
   }
   const RawCommon rc =
-      prepareRawCommon(neutral_r, neutral_g, neutral_b, ccm9, lsc, lsc_cols,
-                       lsc_rows);
+      prepareRawCommon(neutral_r, neutral_g, neutral_b, p.wb_r, p.wb_g,
+                       p.wb_b, ccm9, lsc, lsc_cols, lsc_rows);
   const float wl = static_cast<float>(white_level);
   stage("pyr");
 
