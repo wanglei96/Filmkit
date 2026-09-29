@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <string>
 
 #include "../log/Logger.h"
@@ -524,8 +525,12 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
-uniform float uNS;     // 归一化域噪声 σ（SENSOR_NOISE_PROFILE 或回退估计）
-uniform float uDnK;    // 值域 σ 系数：标准 0.28 / 强 2.20（v0.5.35 放轻）
+// C 专项（2026-09-29）：σ²(x) = A·x + B（逐通道；x = 本 pass 域信号——黑阶后/
+// 白阶归一/WB 后。A = shot·g·k²、B = read·g²·k²，k = 强度档系数）。
+// 来源 Camera2 SENSOR_NOISE_PROFILE（模型）或 legacy σ 等效（见 denoiseParams）。
+// A=B=0 精确表示"关降噪档"（只做线性化+WB）。
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -541,13 +546,18 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = raw0(p);
     float v = c0;
-    // v0.6.34：uDnK <= 0 = 关降噪档，只做线性化+WB、**不取任何邻居**（1 次采样，
+    int ch = chanAt(p);
+    float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
+    float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
+    // v0.6.34：关降噪档 = A=B=0，只做线性化+WB、**不取任何邻居**（1 次采样，
     // 其余 8 个同色位全跳过）。这条路径与 P1 直读 RAW 整型纹理完全等价，但省掉了
     // P1 在那条路上的重复解码 —— 真机实测关降噪反而比开降噪慢 4-7 倍的原因。
-    if (uDnK > 0.0) {
-        // v0.5.33 实测：系数 1.1 时 σY 恰降 1/2.8≈1/3（9 点平均的理论值），权重已
-        // 饱和成无条件平均；0.50 恢复选择性（强边缘 0% 损失）但画面仍偏平，0.28 更轻。
-        float sr = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * c0);
+    float sr2 = av * c0 + bv;
+    if (sr2 > 1e-12) {
+        // 值域 σ 逐像素由模型给出（C 专项）——旧式 ns·k·√(0.2+4x) 是纯经验项，
+        // 且 ns 长期被夹到下限 0.004（σ 只有真实值的 1/5~1/2），权重近透传；
+        // 真实 σ 恢复"1σ 内平均、之外衰减"的选择性（标准做法）。
+        float sr = sqrt(sr2);
         float wsum = 1.0, acc = c0;
         for (int dy = -4; dy <= 4; dy += 2)
             for (int dx = -4; dx <= 4; dx += 2) {
@@ -561,7 +571,6 @@ void main() {
             }
         v = acc / wsum;
     }
-    int ch = chanAt(p);
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
 })";
 
@@ -573,9 +582,26 @@ precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
-uniform float uNS;
-uniform float uDnK;    // 值域 σ 系数：标准 2.75 / 强 3.25（只动色度）
+// C 专项（2026-09-29）：σ²(y) = A·y + B（luma 权重合并的逐像素模型；系数 =
+// WB 后 raw 域，强度档 k 已折入）。y = 本 pass 输入 luma（CCM 后，已含 LSC 放大）。
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
+// LSC 增益网格（C 专项：增益传播）。shot 项随被放大的信号 y0 自然增长；
+// read 项不随信号，需显式 ×g²（var' = A·g·x + B·g²，见 NoiseModel::afterWb）。
+uniform highp sampler2D uLsc;
+uniform ivec2 uLscSize;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     vec3 c0 = texelFetch(uTex, p, 0).rgb;
@@ -598,7 +624,15 @@ void main() {
     //     PhotonCamera"的一半原因）。收紧到 0.024 后边缘保留 0.477→0.506。
     // 地板 0.015 → 0.008：它占暗部 σc 的 43% 且与噪声无关，是"暗部必然抹色"的主因。
     // 降噪改由半径承担，值域阈值只负责保住真实色度边缘。
-    float sc = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * y0) + 0.008;
+    // ── C 专项（2026-09-29）：σc 从"经验式 + 常数地板"改为真实噪声模型 ──
+    // σc² = Ā·y0 + B̄·g_lsc²（Ā/B̄ = 模型 3 通道的 luma 权重合并；g_lsc = 该点
+    // LSC 实际施加增益的 luma 值，边缘 3~5× ⇒ read 项贡献随之放大）。地板由
+    // 模型 B 项自然给出（暗部 √B̄·g），旧的 +0.008 常数地板删除。
+    float ay = dot(uNoiseA, LUMA);
+    float by = dot(uNoiseB, LUMA);
+    vec3 gl = lscAt(p);
+    float glY = dot(gl, LUMA);
+    float sc = sqrt(max(ay * y0 + by * glY * glY, 1e-12));
     vec3 acc = cd0;
     float wsum = 1.0;
     for (int dy = -3; dy <= 3; ++dy)
@@ -820,7 +854,11 @@ uniform ivec2 uSize;
 uniform vec2 uTiles;    // mismatch 网格 = 4×tile 网格（cell = 32 mosaic px，v0.10.3）
 uniform vec2 uOffTiles; // 位移场网格（tile 级，采样 off 用）
 uniform float uTileM;   // cell 尺寸（mosaic px，= kMfnrTile/2）
-uniform float uSigma;  // 单帧线性域 σ（WB 后，= denoiseParams 的 ns_raw）
+// C 专项（2026-09-29）：σ² 从常数改为逐像素模型 var(x) = A·x + B（WB 后域）。
+// d = ref − alt 的噪声底 = var(ref) + var(alt) = A·(r+a) + 2B（两独立样本），
+// 随信号空间变化（暗部小、亮部大）——比旧的全局 ns_raw² 更贴合真实。
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
 uniform float uS;      // mismatch 的 σ 缩放常数（标定旋钮）
 uniform int uCfaLut;
 uniform vec4 uBlack;
@@ -903,25 +941,38 @@ void main() {
     ivec2 base = t * int(uTileM);
     int cm = int(uTileM);
     float s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    float va1 = 0.0, va2 = 0.0, va3 = 0.0;  // 逐点噪声底 var(ref)+var(alt)
     float n = 0.0;
     for (int dy = 0; dy < cm; dy += 4) {
         for (int dx = 0; dx < cm; dx += 4) {
             ivec2 p = base + ivec2(dx, dy);
             if (p.x >= uSize.x || p.y >= uSize.y) continue;
+            int ch = chanAt(p);
+            float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
+            float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
             float r = linAt(uRaw0, p);
-            float d1 = r - linSub(uRaw1, p, o1);
-            float d2 = r - linSub(uRaw2, p, o2);
-            float d3 = r - linSub(uRaw3, p, o3);
+            float a1 = linSub(uRaw1, p, o1);
+            float a2 = linSub(uRaw2, p, o2);
+            float a3 = linSub(uRaw3, p, o3);
+            float d1 = r - a1;
+            float d2 = r - a2;
+            float d3 = r - a3;
             s1 += d1 * d1;
             s2 += d2 * d2;
             s3 += d3 * d3;
+            // var(r)+var(a) = A·r+B + A·a+B = A·(r+a) + 2B（同域同模型）
+            va1 += av * (r + a1) + 2.0 * bv;
+            va2 += av * (r + a2) + 2.0 * bv;
+            va3 += av * (r + a3) + 2.0 * bv;
             n += 1.0;
         }
     }
     float inv = 1.0 / max(n, 1.0);
     float v1 = s1 * inv, v2 = s2 * inv, v3 = s3 * inv;
-    float kk = uS * uSigma * uSigma;
-    oColor = vec4(v1 / (v1 + kk), v2 / (v2 + kk), v3 / (v3 + kk), 1.0);
+    float kk1 = uS * max(va1 * inv, 1e-12);
+    float kk2 = uS * max(va2 * inv, 1e-12);
+    float kk3 = uS * max(va3 * inv, 1e-12);
+    oColor = vec4(v1 / (v1 + kk1), v2 / (v2 + kk2), v3 / (v3 + kk3), 1.0);
 })";
 
 // kFsRawDenoiseFused：P0 同色 bilateral 的 MFNR 变体——输入换成 tex_fused_
@@ -935,8 +986,9 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform int uCfaLut;
-uniform float uNS;
-uniform float uDnK;
+// C 专项：σ²(x) = A·x + B（同 kFsRawDenoise；融合输入的系数已 ÷neff）
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -949,8 +1001,12 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = fused0(p);
     float v = c0;
-    if (uDnK > 0.0) {
-        float sr = max(uNS, 0.004) * uDnK * sqrt(0.2 + 4.0 * c0);
+    int ch = chanAt(p);
+    float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
+    float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
+    float sr2 = av * c0 + bv;
+    if (sr2 > 1e-12) {
+        float sr = sqrt(sr2);
         float wsum = 1.0, acc = c0;
         for (int dy = -4; dy <= 4; dy += 2)
             for (int dx = -4; dx <= 4; dx += 2) {
@@ -964,8 +1020,33 @@ void main() {
             }
         v = acc / wsum;
     }
-    int ch = chanAt(p);
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
+})";
+
+// kFsTileRms（C 专项，2026-09-29）：逐 tile RMS 归约 —— HDR+ §5 的做法："For
+// each tile, we compute the variance by evaluating our noise model using a single
+// value, the root-mean-square (RMS) of the samples in the tile."
+// 输入 = P0 输出的线性 mosaic（RGB 中恰一路非零）；每像素输出一个 16×16 tile
+// 的 RMS（R16F 单通道）。这是 A（DFT 逐频收缩合并）的 σ 输入底座：合并时
+// σ_tile = √(A·RMS + B) 即模型代入。分块在 [0,1] 线性域，与模型同域。
+// 每个输出像素采 tile 内全部 16×16 = 256 点（覆盖 2×2 全相位，避免单相位偏差）。
+const char* kFsTileRms = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;   // mosaic 全尺寸
+void main() {
+    ivec2 t = ivec2(gl_FragCoord.xy);
+    ivec2 base = t * 16;
+    float acc = 0.0;
+    for (int dy = 0; dy < 16; ++dy)
+        for (int dx = 0; dx < 16; ++dx) {
+            ivec2 p = clamp(base + ivec2(dx, dy), ivec2(0), uSize - 1);
+            vec3 c = texelFetch(uTex, p, 0).rgb;
+            float v = c.r + c.g + c.b;
+            acc += v * v;
+        }
+    oColor = vec4(sqrt(acc * (1.0 / 256.0)), 0.0, 0.0, 1.0);
 })";
 
 // ══ darktable filmic 高光重建（highlight reconstruction，v0.10.15）══════════
@@ -2070,6 +2151,7 @@ bool FrameRenderer::init() {
   const GLuint fs_mfnr_mis =
       compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
+  const GLuint fs_tile_rms = compileShader(GL_FRAGMENT_SHADER, kFsTileRms);
   // v0.10.15：darktable filmic 高光重建（9 个）
   const GLuint fs_hr_mask = compileShader(GL_FRAGMENT_SHADER, kFsHrMask);
   const GLuint fs_hr_inp = compileShader(GL_FRAGMENT_SHADER, kFsHrInpaint);
@@ -2085,8 +2167,8 @@ bool FrameRenderer::init() {
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
       !fs_raw_dn || !fs_chroma_dn || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
-      !fs_raw_dn_f || !fs_hr_mask || !fs_hr_inp || !fs_hr_blur || !fs_hr_hf ||
-      !fs_hr_rin || !fs_hr_step || !fs_hr_norms || !fs_hr_ratios ||
+      !fs_raw_dn_f || !fs_tile_rms || !fs_hr_mask || !fs_hr_inp || !fs_hr_blur ||
+      !fs_hr_hf || !fs_hr_rin || !fs_hr_step || !fs_hr_norms || !fs_hr_ratios ||
       !fs_hr_restore || !fs_hr_stat)
     return false;
 
@@ -2108,6 +2190,7 @@ bool FrameRenderer::init() {
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
   prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
+  prog_tile_rms_ = linkProgram(vs_plain_, fs_tile_rms);
   prog_hr_mask_ = linkProgram(vs_plain_, fs_hr_mask);
   prog_hr_inpaint_ = linkProgram(vs_plain_, fs_hr_inp);
   prog_hr_blur_ = linkProgram(vs_plain_, fs_hr_blur);
@@ -2136,6 +2219,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_mfnr_fuse);
   glDeleteShader(fs_mfnr_mis);
   glDeleteShader(fs_raw_dn_f);
+  glDeleteShader(fs_tile_rms);
   glDeleteShader(fs_hr_mask);
   glDeleteShader(fs_hr_inp);
   glDeleteShader(fs_hr_blur);
@@ -2150,7 +2234,8 @@ bool FrameRenderer::init() {
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
       !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
-      !prog_mfnr_mis_ || !prog_raw_dn_fused_ || !prog_hr_mask_ ||
+      !prog_mfnr_mis_ || !prog_raw_dn_fused_ || !prog_tile_rms_ ||
+      !prog_hr_mask_ ||
       !prog_hr_inpaint_ || !prog_hr_blur_ || !prog_hr_hf_ || !prog_hr_rin_ ||
       !prog_hr_step_ || !prog_hr_norms_ || !prog_hr_ratios_ ||
       !prog_hr_restore_ || !prog_hr_stat_)
@@ -2233,14 +2318,19 @@ bool FrameRenderer::init() {
   u_raw_dn_.black = glGetUniformLocation(prog_raw_dn_, "uBlack");
   u_raw_dn_.white = glGetUniformLocation(prog_raw_dn_, "uWhite");
   u_raw_dn_.gain = glGetUniformLocation(prog_raw_dn_, "uGain");
-  u_raw_dn_.ns = glGetUniformLocation(prog_raw_dn_, "uNS");
-  u_raw_dn_.k = glGetUniformLocation(prog_raw_dn_, "uDnK");
+  u_raw_dn_.noise_a = glGetUniformLocation(prog_raw_dn_, "uNoiseA");
+  u_raw_dn_.noise_b = glGetUniformLocation(prog_raw_dn_, "uNoiseB");
 
   u_raw_dn_f_.tex = glGetUniformLocation(prog_raw_dn_fused_, "uTex");
   u_raw_dn_f_.size = glGetUniformLocation(prog_raw_dn_fused_, "uSize");
   u_raw_dn_f_.cfalut = glGetUniformLocation(prog_raw_dn_fused_, "uCfaLut");
-  u_raw_dn_f_.ns = glGetUniformLocation(prog_raw_dn_fused_, "uNS");
-  u_raw_dn_f_.k = glGetUniformLocation(prog_raw_dn_fused_, "uDnK");
+  u_raw_dn_f_.noise_a = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseA");
+  u_raw_dn_f_.noise_b = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseB");
+
+  u_tile_rms_.tex = glGetUniformLocation(prog_tile_rms_, "uTex");
+  u_tile_rms_.size = glGetUniformLocation(prog_tile_rms_, "uSize");
+  u_tile_rms_.noise_a = glGetUniformLocation(prog_tile_rms_, "uNoiseA");
+  u_tile_rms_.noise_b = glGetUniformLocation(prog_tile_rms_, "uNoiseB");
 
   // v0.10.15：HR 各 shader 的 uniform
   u_hr_mask_ = glGetUniformLocation(prog_hr_mask_, "uTex");
@@ -2319,7 +2409,8 @@ bool FrameRenderer::init() {
   u_mfnr_mis_.tiles = glGetUniformLocation(prog_mfnr_mis_, "uTiles");
   u_mfnr_mis_.off_tiles = glGetUniformLocation(prog_mfnr_mis_, "uOffTiles");
   u_mfnr_mis_.tile_m = glGetUniformLocation(prog_mfnr_mis_, "uTileM");
-  u_mfnr_mis_.sigma = glGetUniformLocation(prog_mfnr_mis_, "uSigma");
+  u_mfnr_mis_.noise_a = glGetUniformLocation(prog_mfnr_mis_, "uNoiseA");
+  u_mfnr_mis_.noise_b = glGetUniformLocation(prog_mfnr_mis_, "uNoiseB");
   u_mfnr_mis_.s = glGetUniformLocation(prog_mfnr_mis_, "uS");
   u_mfnr_mis_.cfalut = glGetUniformLocation(prog_mfnr_mis_, "uCfaLut");
   u_mfnr_mis_.black = glGetUniformLocation(prog_mfnr_mis_, "uBlack");
@@ -2328,8 +2419,10 @@ bool FrameRenderer::init() {
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
-  u_chroma_dn_.ns = glGetUniformLocation(prog_chroma_dn_, "uNS");
-  u_chroma_dn_.k = glGetUniformLocation(prog_chroma_dn_, "uDnK");
+  u_chroma_dn_.noise_a = glGetUniformLocation(prog_chroma_dn_, "uNoiseA");
+  u_chroma_dn_.noise_b = glGetUniformLocation(prog_chroma_dn_, "uNoiseB");
+  u_chroma_dn_.lsc = glGetUniformLocation(prog_chroma_dn_, "uLsc");
+  u_chroma_dn_.lsc_size = glGetUniformLocation(prog_chroma_dn_, "uLscSize");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -2496,6 +2589,9 @@ void FrameRenderer::release() {
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
   if (prog_mfnr_mis_) glDeleteProgram(prog_mfnr_mis_);
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
+  if (prog_tile_rms_) glDeleteProgram(prog_tile_rms_);
+  if (tex_rms_) glDeleteTextures(1, &tex_rms_);
+  if (fbo_rms_) glDeleteFramebuffers(1, &fbo_rms_);
   for (auto& t : tex_mfnr_) {
     if (t) glDeleteTextures(1, &t);
     t = 0;
@@ -2524,6 +2620,9 @@ void FrameRenderer::release() {
   if (tex_w_) glDeleteTextures(1, &tex_w_);
   tex_w_ = 0;
   prog_mfnr_pyr_ = prog_mfnr_down_ = prog_mfnr_fuse_ = prog_raw_dn_fused_ = 0;
+  prog_tile_rms_ = 0;
+  tex_rms_ = fbo_rms_ = 0;
+  rms_w_ = rms_h_ = 0;
   prog_mfnr_mis_ = 0;
   tex_pyr1_ = tex_pyr2_ = tex_pyr3_ = tex_pyr4_ = 0;
   fbo_pyr1_ = fbo_pyr2_ = fbo_pyr3_ = fbo_pyr4_ = 0;
@@ -2908,7 +3007,7 @@ bool FrameRenderer::ensureLocalTarget(int w, int h) {
 void FrameRenderer::passRawDenoise(int w, int h, int cfa,
                                    const float black_phase[4],
                                    float white_level, const float gains[3],
-                                   float ns, float k) {
+                                   const NoiseCoef& nc) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_raw_dn_);
@@ -2921,14 +3020,14 @@ void FrameRenderer::passRawDenoise(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(u_raw_dn_.white, white_level);
   glUniform3f(u_raw_dn_.gain, gains[0], gains[1], gains[2]);
-  glUniform1f(u_raw_dn_.ns, ns);
-  glUniform1f(u_raw_dn_.k, k);
+  glUniform3f(u_raw_dn_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+  glUniform3f(u_raw_dn_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // P4：色度平滑（读 tex_scene_ → tex_dn_）。输出几何与 passRcdChroma 一致
 void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
-                                      float ns, float k) {
+                                      const NoiseCoef& nc) {
   (void)rot;  // kVertRot 旋转已在顶点层；frag 用 gl_FragCoord 定位
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
   glViewport(0, 0, dst_w, dst_h);
@@ -2936,11 +3035,62 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, tex_scene_);
   glUniform1i(u_chroma_dn_.tex, 0);
+  // C 专项：LSC 增益网格（传播 read 项 ×g²；关闭态绑 1×1 恒等 → 零分支）
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_chroma_dn_.lsc, 1);
+  glUniform2i(u_chroma_dn_.lsc_size, lsc_w_, lsc_h_);
   glUniform2i(u_chroma_dn_.size, dst_w, dst_h);
-  glUniform1f(u_chroma_dn_.ns, ns);
-  glUniform1f(u_chroma_dn_.k, k);
+  glUniform3f(u_chroma_dn_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
+  glUniform3f(u_chroma_dn_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
+}
+
+// C 专项：tile RMS 归约（P0 输出 → tiles 网格 R16F）。每 tile 16×16 = 256 点
+// 全采样（覆盖 2×2 全相位）。诊断读回：中心 + 三角 tile 的 RMS 与模型 σ。
+TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
+                                         const NoiseModel& model) {
+  TileRmsResult r;
+  const int tw = w / 16, th = h / 16;
+  if (tw <= 0 || th <= 0) return r;
+  if (tex_rms_ == 0 || rms_w_ != tw || rms_h_ != th) {
+    if (tex_rms_) glDeleteTextures(1, &tex_rms_);
+    if (fbo_rms_) glDeleteFramebuffers(1, &fbo_rms_);
+    // RGBA16F（R16F + 部分读回组合在 ES 3.0 不保证；RGBA16F + GL_FLOAT 是
+    // X300 已验证组合，见 v0.6.48 浮点 readback 教训）
+    makeTex(&tex_rms_, &fbo_rms_, GL_RGBA16F, tw, th);
+    rms_w_ = tw;
+    rms_h_ = th;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_rms_);
+  glViewport(0, 0, tw, th);
+  glUseProgram(prog_tile_rms_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src_tex);
+  glUniform1i(u_tile_rms_.tex, 0);
+  glUniform2i(u_tile_rms_.size, w, h);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 诊断读回：中心 + 左上/右上/左下 4 点
+  const int sx[4] = {tw / 2, 0, tw - 1, 0};
+  const int sy[4] = {th / 2, th - 1, th - 1, 0};
+  for (int i = 0; i < 4; ++i) {
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    glReadPixels(sx[i], sy[i], 1, 1, GL_RGBA, GL_FLOAT, v);
+    r.rms[i] = std::isfinite(v[0]) ? v[0] : 0.f;
+    // 代入模型（G 通道典型：σ = √(S_g·RMS + O_g)）
+    r.sigma[i] = model.valid()
+                     ? std::sqrt(std::max(model.S[1] * r.rms[i] + model.O[1],
+                                          0.f))
+                     : 0.f;
+  }
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  r.ok = true;
+  r.tiles_w = tw;
+  r.tiles_h = th;
+  return r;
 }
 
 // RCD P1：方向场（vh + pq 统计），raw 原始方向全屏
@@ -3049,7 +3199,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               float neutral_b, const float* ccm9,
                               const float* lsc, int lsc_cols, int lsc_rows,
                               int rotation, const FilmParams& p, int demosaic,
-                              int noise_level, float noise_sigma,
+                              int noise_level, const float* noise_model,
+                              float noise_sigma,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
@@ -3074,9 +3225,21 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   }
 
   const bool rcd = demosaic == 1;
-  bool dn_high = false;
-  float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
-  denoiseParams(noise_level, noise_sigma, &dn_high, &sr_k, &sc_k, &ns, &ns_raw);
+  // C 专项：模型解析（6 float：S_r,S_g,S_b,O_r,O_g,O_b；nullptr/非有限/全 ≤0 = 无效）
+  NoiseModel model;
+  if (noise_model != nullptr) {
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+      model.S[i] = noise_model[i];
+      model.O[i] = noise_model[3 + i];
+      if (!std::isfinite(model.S[i]) || !std::isfinite(model.O[i]) ||
+          model.S[i] < 0.f || model.O[i] < 0.f)
+        ok = false;
+    }
+    if (!ok) model = NoiseModel{};
+  }
+  NoiseCoef nc;
+  denoiseParams(noise_level, model, rc.gains, noise_sigma, &nc);
   ChainCtx c;
   c.w = w;
   c.h = h;
@@ -3091,11 +3254,11 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.effective_rot = effective_rot;
   c.rcd = rcd;
   c.dn = rcd && noise_level > 0;
-  c.dn_high = dn_high;
-  c.sr_k = sr_k;
-  c.sc_k = sc_k;
-  c.ns = ns;
-  c.ns_raw = ns_raw;
+  c.dn_high = noise_level >= 2;
+  c.nc = nc;
+  c.nm = model;
+  c.ns = nc.ns_typ;
+  c.ns_raw = nc.ns_typ;
   c.lsc_ok = rc.lsc_ok;
   c.lsc_cols = lsc_cols;
   c.lsc_rows = lsc_rows;
@@ -3195,22 +3358,50 @@ FrameRenderer::RawCommon FrameRenderer::prepareRawCommon(
   return rc;
 }
 
-void FrameRenderer::denoiseParams(int noise_level, float noise_sigma,
-                                  bool* dn_high, float* sr_k, float* sc_k,
-                                  float* ns, float* ns_raw) {
-  // v0.5.34 重标定（v0.5.33 真机实测：两档无差别、细节 -59%、JPEG 体积腰斩 =
-  // P0 值域权重饱和退化成 9 点无条件平均）。Laplacian 损失全部来自 P0（P4 保 Y
-  // 不动），故 P0 收温和保细节、P4 保持较强只压色度 —— 两档这才拉开真实差距。
-  *dn_high = noise_level >= 2;
-  // v0.5.35：标准档仍偏"平"。P0 是细节与体积的主因，再放轻 0.50→0.28；彩噪由
-  // P4 补强 1.80→2.20（P4 只动色度、保 Y，不影响亮度细节与体积大头）。
-  *sr_k = *dn_high ? 2.20f : 0.28f;  // P0 值域 σ 系数
-  // v0.6.19：自适应提亮 ~1.1EV 把噪声一起放大（真机同场景 A/B：色度 σ +84%），
-  // P4 色度系数再补强约 25%。
-  *sc_k = *dn_high ? 3.25f : 2.75f;  // P4 值域 σ 系数
-  // 回退估计 + 防呆夹紧（v0.6.30：下限 0.004、上限 0.040——详见 kFsChromaDenoise 注）
-  *ns_raw = noise_sigma > 0.0f ? noise_sigma : 0.012f;
-  *ns = std::min(std::max(*ns_raw, 0.004f), 0.040f);
+// C 专项（2026-09-29）：噪声模型 → 降噪系数。
+// 旧实现是"单值 ns × 档位系数 × 经验项 √(0.2+4x)"，且 ns 长期被夹到下限
+// 0.004（真实 σ 在 [0,1] 域约 0.006–0.02 @ISO1970）——值域权重近透传。
+// 现在：σ²(x) = A·x + B，A/B 逐通道（R,G,B）：
+//   model 有效（Camera2 SENSOR_NOISE_PROFILE）：A = S_c·g_c·k²、B = O_c·g_c²·k²
+//     （g = WB 增益，即 afterWb 传播；k = 档位强度乘子，作用于 σ）
+//   model 无效（legacy 回退）：把旧经验式精确改写为 (A,B) 等效 ——
+//     σ(x) = ns·k·√(0.2+4x) ⇒ σ² = (4·ns²k²)·x + (0.2·ns²k²)；P4 再补 0.008²
+//     地板进 B（忽略交叉项，仅回退路径）。
+// 档位强度（作用于真实 σ 的乘子）：P0 标准 1.0（= σ 真值，1σ 内平均）/ 强 2.5；
+// P4 标准 1.5 / 强 2.5（色差噪声 ≈ √2·σ_ch，且 P4 后还有提亮放大 ~1.1EV）。
+void FrameRenderer::denoiseParams(int noise_level, const NoiseModel& model,
+                                  const float gains[3], float noise_sigma,
+                                  NoiseCoef* out) {
+  const bool high = noise_level >= 2;
+  const float k_p0 = high ? 2.5f : 1.0f;
+  const float k_p4 = high ? 2.5f : 1.5f;
+  out->k_p0 = k_p0;
+  out->k_p4 = k_p4;
+  if (model.valid()) {
+    const NoiseModel wb = model.afterWb(gains);  // P0 域（WB 后）
+    for (int c = 0; c < 3; ++c) {
+      out->p0a[c] = wb.S[c] * k_p0 * k_p0;
+      out->p0b[c] = wb.O[c] * k_p0 * k_p0;
+      out->p4a[c] = wb.S[c] * k_p4 * k_p4;
+      out->p4b[c] = wb.O[c] * k_p4 * k_p4;
+    }
+    out->model_src = true;
+    // 典型 σ（中灰 0.18，G 通道——gains[1] 恒 = 1）
+    out->ns_typ = std::sqrt(std::max(wb.S[1] * 0.18f + wb.O[1], 1e-12f));
+  } else {
+    // legacy：旧式等效（σ 回退值按 ISO 估算，见 Kotlin 侧；引擎兜底 0.012）
+    const float ns = noise_sigma > 0.0f ? noise_sigma : 0.012f;
+    const float sr_k = high ? 2.20f : 0.28f;
+    const float sc_k = high ? 3.25f : 2.75f;
+    for (int c = 0; c < 3; ++c) {
+      out->p0a[c] = 4.0f * ns * ns * sr_k * sr_k;
+      out->p0b[c] = 0.2f * ns * ns * sr_k * sr_k;
+      out->p4a[c] = 4.0f * ns * ns * sc_k * sc_k;
+      out->p4b[c] = 0.2f * ns * ns * sc_k * sc_k + 0.008f * 0.008f;
+    }
+    out->model_src = false;
+    out->ns_typ = std::min(std::max(ns, 0.004f), 0.040f);
+  }
 }
 
 // 成片链共享后半段（v0.9.0）：P0（raw 或 fused 输入）→ RCD/bilinear → P4 →
@@ -3222,6 +3413,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const int w = c.w, h = c.h, dst_w = c.dst_w, dst_h = c.dst_h;
   const FilmParams& p = *c.p;
   float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
+  TileRmsResult rms_res;  // C 专项：tile RMS 诊断（P0 后计算，日志用）
   if (c.rcd) {
     if (!ensureRcdTargets(w, h)) return;
     const auto d0 = std::chrono::steady_clock::now();
@@ -3234,12 +3426,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 故下面三处 mosaic 标志恒为 true。
     // MFNR（v0.9.0）：P0 输入换成 tex_fused_（融合后线性 mosaic，已扣黑阶/WB），
     // bilateral 逻辑同款（kFsRawDenoiseFused）。
+    // C 专项：关档 = 全零系数（A=B=0，shader 里精确跳过邻域）。
+    static const NoiseCoef kNoDn{};
     if (c.mfnr_fused) {
-      passRawDenoiseFused(w, h, c.cfa, c.ns, c.dn ? c.sr_k : 0.0f);
+      passRawDenoiseFused(w, h, c.cfa, c.dn ? c.nc : kNoDn);
     } else {
-      passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains, c.ns,
-                     c.dn ? c.sr_k : 0.0f);
+      passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                     c.dn ? c.nc : kNoDn);
     }
+    // C 专项：tile RMS 归约（HDR+ §5，A 的 σ 输入底座；诊断读回进 raw.render）。
+    // 位置 = P0 之后（tex_mos_ = 线性 mosaic，与模型同域），每 tile 256 采样。
+    rms_res = passTileRms(tex_mos_, w, h, c.nm.afterWb(c.gains));
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
@@ -3257,7 +3454,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   if (c.dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return;
     const auto n0 = std::chrono::steady_clock::now();
-    passChromaDenoise(dst_w, dst_h, c.effective_rot, c.ns, c.sc_k);
+    passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc);
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -3299,12 +3496,42 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"gMs\":" + std::to_string(g_ms).substr(0, 6);
   }
   if (c.dn) {
+    // C 专项（2026-09-29）：噪声模型诊断族 —— nzSrc/nzIso/nzS/nzO = 模型来源与
+    // 逐 ISO 系数（WB 前，[0,1] 域）；p0A/p0B/p4A/p4B = 实际下发 shader 的 (A,B)
+    // （WB 后、含强度 k²；σ² = A·x + B）；ns/nsHal = 典型 σ（融合后/单帧）；
+    // rms/rmsSig = tile RMS 采样（中心/左上/右上/左下）与模型代入后的 σ ——
+    // 验收口径：σ 随 ISO（nzS/O 变）与信号（rmsSig 随 rms）变化，P0/P4/A 同源。
+    const auto fe = [](float v) {
+      char b[32];
+      snprintf(b, sizeof(b), "%.4e", v);
+      return std::string(b);
+    };
+    const auto fa3 = [&](const float* v) {
+      return "[" + fe(v[0]) + "," + fe(v[1]) + "," + fe(v[2]) + "]";
+    };
     kv += std::string(",\"dn\":\"") + (c.dn_high ? "high" : "std") +
-          "\",\"srK\":" + std::to_string(c.sr_k).substr(0, 4) +
-          ",\"scK\":" + std::to_string(c.sc_k).substr(0, 4) +
-          ",\"ns\":" + std::to_string(c.ns).substr(0, 5) +
+          "\",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
+          ",\"nzIso\":" + std::to_string(c.nz_iso).substr(0, 6) +
+          ",\"nzS\":" + fa3(c.nm.S) + ",\"nzO\":" + fa3(c.nm.O) +
+          ",\"nzG\":[" + std::to_string(c.gains[0]).substr(0, 6) + "," +
+          std::to_string(c.gains[1]).substr(0, 6) + "," +
+          std::to_string(c.gains[2]).substr(0, 6) + "]" +
+          ",\"kP0\":" + std::to_string(c.nc.k_p0).substr(0, 4) +
+          ",\"kP4\":" + std::to_string(c.nc.k_p4).substr(0, 4) +
+          ",\"p0A\":" + fa3(c.nc.p0a) + ",\"p0B\":" + fa3(c.nc.p0b) +
+          ",\"p4A\":" + fa3(c.nc.p4a) + ",\"p4B\":" + fa3(c.nc.p4b) +
+          ",\"ns\":" + std::to_string(c.ns).substr(0, 6) +
           ",\"nsHal\":" + std::to_string(c.ns_raw).substr(0, 6) +
           ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
+    if (rms_res.ok) {
+      kv += ",\"rms\":[" + std::to_string(rms_res.rms[0]).substr(0, 6) + "," +
+            std::to_string(rms_res.rms[1]).substr(0, 6) + "," +
+            std::to_string(rms_res.rms[2]).substr(0, 6) + "," +
+            std::to_string(rms_res.rms[3]).substr(0, 6) + "]";
+      char sb[4][32];
+      for (int i = 0; i < 4; ++i) snprintf(sb[i], sizeof(sb[i]), "%.4e", rms_res.sigma[i]);
+      kv += std::string(",\"rmsSig\":[") + sb[0] + "," + sb[1] + "," + sb[2] + "," + sb[3] + "]";
+    }
   }
   kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
   kv += ",\"ev\":" + std::to_string(p.exposure_ev).substr(0, 5);
@@ -3528,7 +3755,7 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // 权重为 1 时该帧注入的误差，mismatch 与融合行为严格一致。σ = 单帧线性域。
 void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
                                      float white_level, const float gains[3],
-                                     float sigma, float s_const) {
+                                     const NoiseModel& model, float s_const) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glViewport(0, 0, tiles_w_ * 4, tiles_h_ * 4);
   glUseProgram(prog_mfnr_mis_);
@@ -3553,7 +3780,10 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   glUniform2f(u_mfnr_mis_.off_tiles, static_cast<float>(tiles_w_),
               static_cast<float>(tiles_h_));
   glUniform1f(u_mfnr_mis_.tile_m, static_cast<float>(kMfnrTile) / 2.0f);
-  glUniform1f(u_mfnr_mis_.sigma, sigma);
+  // C 专项：σ² 由常数改为逐像素模型（WB 后域；shader 内用各帧实测信号代入）
+  const NoiseModel wb = model.afterWb(gains);
+  glUniform3f(u_mfnr_mis_.noise_a, wb.S[0], wb.S[1], wb.S[2]);
+  glUniform3f(u_mfnr_mis_.noise_b, wb.O[0], wb.O[1], wb.O[2]);
   glUniform1f(u_mfnr_mis_.s, s_const);
   glUniform1i(u_mfnr_mis_.cfalut, cfaLutOf(cfa));
   glUniform4f(u_mfnr_mis_.black, black_phase[0], black_phase[1], black_phase[2],
@@ -3563,8 +3793,8 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa, float ns,
-                                        float k) {
+void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
+                                        const NoiseCoef& nc) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_raw_dn_fused_);
@@ -3573,8 +3803,8 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa, float ns,
   glUniform1i(u_raw_dn_f_.tex, 0);
   glUniform2i(u_raw_dn_f_.size, w, h);
   glUniform1i(u_raw_dn_f_.cfalut, cfaLutOf(cfa));
-  glUniform1f(u_raw_dn_f_.ns, ns);
-  glUniform1f(u_raw_dn_f_.k, k);
+  glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+  glUniform3f(u_raw_dn_f_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -3877,7 +4107,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    const float* ccm9, const float* lsc,
                                    int lsc_cols, int lsc_rows, int rotation,
                                    const FilmParams& p, int demosaic,
-                                   int noise_level, float noise_sigma,
+                                   int noise_level, const float* noise_model,
+                                   float noise_sigma,
                                    float ref_noise_scale,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
@@ -3947,17 +4178,26 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
   // σ（单帧，线性域 WB 后）：v0.10.1 短参考帧下参考帧噪声比典型帧高
-  // ref_noise_scale（= √(AE_sec/secRef)，1.0 = 未压短）。denoiseParams 用
-  // **典型帧（alt）域**（P0/P4 的融合输入以 alt 为主）；mismatch 的 σ 用
-  // **参考帧域**（d = ref−alt 的噪声底 = σr²+σa²，σr 大则底大，不归一会让
-  // 静止 tile 的 mismatch 系统性偏高、权重白掉）。
-  bool dn_high = false;
-  float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
+  // ref_noise_scale（= √(AE_sec/secRef)，1.0 = 未压短）。
+  // C 专项（2026-09-29）：σ² 由常数改为模型 var(x)=A·x+B —— P0/P4 用融合域
+  // （融合后折减 ÷neff，见下）；mismatch 的噪声底 = var(ref)+var(alt)，shader
+  // 内按各帧实测信号代入（不再需要 rn 归一）。rn 仅保留在日志。
   const float rn = std::max(ref_noise_scale, 1.0f);
-  denoiseParams(noise_level, noise_sigma / rn, &dn_high, &sr_k, &sc_k, &ns,
-                &ns_raw);
-  const float ns_single = ns;
-  const float ns_ref = ns_single * rn;
+  NoiseModel model;
+  if (noise_model != nullptr) {
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+      model.S[i] = noise_model[i];
+      model.O[i] = noise_model[3 + i];
+      if (!std::isfinite(model.S[i]) || !std::isfinite(model.O[i]) ||
+          model.S[i] < 0.f || model.O[i] < 0.f)
+        ok = false;
+    }
+    if (!ok) model = NoiseModel{};
+  }
+  NoiseCoef nc_single;  // 单帧系数（mismatch 用）
+  denoiseParams(noise_level, model, rc.gains, noise_sigma, &nc_single);
+  const float ns_single = nc_single.ns_typ;
   // v0.10.5：保存每帧位移场（位移幅度运动检测用；v0.10.3 曾因权重独立成图而删）
   const int n_tiles = tiles_w_ * tiles_h_;
   std::vector<std::vector<float>> offs(
@@ -4006,7 +4246,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // ── 阶段二 robust merge：mismatch map（4×tiles / 32px cell）→ 权重图 ──
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
-  passMfnrMismatch(cfa, black_phase, wl, rc.gains, ns_ref, kMfnrMisS);
+  passMfnrMismatch(cfa, black_phase, wl, rc.gains, model, kMfnrMisS);
   // v0.10.3：网格 = 4×tiles（32px cell）。权重独立成图（tex_w_，LINEAR），
   // 与位移场解耦 —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
   const int cw = tiles_w_ * 4, chh = tiles_h_ * 4;
@@ -4271,7 +4511,16 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // v0.10.0：√N 用**实际等效帧数 N_eff**（robust merge 下运动 tile 权重 <1，
   // 实际融合量 <N —— Night Sight §3.3：按实际融合量算 σ，该区域自动多拿
   // 空间降噪补偿）。N_eff 接近 4 时与旧硬编码 √4 等价。
-  ns = ns_single / std::sqrt(std::max(neff, 1.0f));
+  // C 专项：折减直接作用于模型系数（var/N ⇒ A,B ÷N；ns_typ ÷√N 保持 σ 语义）。
+  const float neff_n = std::max(neff, 1.0f);
+  NoiseCoef nc = nc_single;
+  for (int i = 0; i < 3; ++i) {
+    nc.p0a[i] = nc_single.p0a[i] / neff_n;
+    nc.p0b[i] = nc_single.p0b[i] / neff_n;
+    nc.p4a[i] = nc_single.p4a[i] / neff_n;
+    nc.p4b[i] = nc_single.p4b[i] / neff_n;
+  }
+  const float ns = ns_single / std::sqrt(neff_n);
   ChainCtx c;
   c.w = w;
   c.h = h;
@@ -4286,9 +4535,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.effective_rot = effective_rot;
   c.rcd = rcd;
   c.dn = rcd && noise_level > 0;
-  c.dn_high = dn_high;
-  c.sr_k = sr_k;
-  c.sc_k = sc_k;
+  c.dn_high = noise_level >= 2;
+  c.nc = nc;
+  c.nm = model;
   c.ns = ns;
   c.ns_raw = ns_single;
   c.lsc_ok = rc.lsc_ok;

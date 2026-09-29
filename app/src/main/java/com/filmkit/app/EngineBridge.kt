@@ -68,7 +68,9 @@ object EngineBridge {
      * blackPhase 按相位 (0,0)(1,0)(0,1)(1,1)；ccm 为 sensor→sRGB 行主序 3×3（null=单位阵）。
      * demosaic：0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）。
      * noiseLevel：0 = 关；1 = 标准；2 = 强（M3-2：RAW 域 bilateral + 色度平滑，仅 RCD 生效）。
-     * noiseSigma：归一化域噪声 σ（SENSOR_NOISE_PROFILE，≤0 时引擎内回退估计）。
+     * noiseModel：6 float [S_r,S_g,S_b,O_r,O_g,O_b]（C 专项：Camera2 SENSOR_NOISE_PROFILE，
+     *   var(x)=S·x+O，x = [0,1] 归一化 raw 域；null = 无效 → noiseSigma legacy 回退）。
+     * noiseSigma：归一化域噪声 σ（legacy 回退；≤0 时引擎内估计）。
      * lsc：镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=图像左上），null = 关闭/无数据（恒等）。
      */
     external fun nativeEngineSubmitRaw(
@@ -77,7 +79,7 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseLevel: Int, noiseSigma: Float, film: DoubleArray,
+        noiseLevel: Int, noiseModel: FloatArray?, noiseSigma: Float, film: DoubleArray,
     ): ByteArray?
 
     /**
@@ -93,8 +95,8 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseLevel: Int, noiseSigma: Float, refNoiseScale: Float,
-        film: DoubleArray,
+        noiseLevel: Int, noiseModel: FloatArray?, noiseSigma: Float,
+        refNoiseScale: Float, film: DoubleArray,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

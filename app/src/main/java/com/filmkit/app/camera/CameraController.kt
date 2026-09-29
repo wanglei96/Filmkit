@@ -1960,35 +1960,46 @@ class CameraController(private val context: Context, private val render: RenderC
             null
         }
         val ccm = stdCcm ?: halCcm
-        // 噪声 σ（M3-2）：SENSOR_NOISE_PROFILE 按当前增益取最近条目，归一化到
-        // [0,1] 线性域（σ_data / whiteLevel）；HAL 不回填时回退 0（引擎内估计）
+        // ── 噪声模型（C 专项，2026-09-29）────────────────────────────────
+        // SENSOR_NOISE_PROFILE → (S,O) 模型（var(x)=S·x+O，[0,1] 归一化 raw 域，
+        // 与渲染域/DNG NoiseProfile 同源）——解析与相位映射见 NoiseProfile.kt
+        // 与其单测。旧实现（v0.5.32 起）取 (s[0]+s[1]+s[2])/3 是 S/O 混合垃圾值、
+        // 再除以 whiteLevel(≈959) 后 ~4e-7，被引擎 clamp 到下限 0.004 —— σ 自适应
+        // 从未真正生效；本次重写为完整 (S,O) 模型提取。
+        var noiseModel: FloatArray? = null
         var noiseSigma = 0f
         if (Build.VERSION.SDK_INT >= 28) {
-            // SENSOR_NOISE_PROFILE 的类型是 Pair<Double, Double[]>[]（Java 数组，不是
-            // List）——v0.5.32 误写成 as? List<Any?>，该 cast 永远失败、σ 自适应从未生效
-            //（编译器 "This cast can never succeed" 警告即此）。按数组 + 防御性解包；
-            // 取增益最接近当前感度的一组，σ 数据域 → 归一化（/whiteLevel）
             @Suppress("UNCHECKED_CAST")
             val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) as? Array<*>
-            val wantGain = maxOf(result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100, 100) / 100.0
-            var bestGain = Double.MAX_VALUE
-            var bestSigma = 0.0
-            profile?.forEach { item ->
-                val pair = item as? android.util.Pair<*, *> ?: return@forEach
-                val g = (pair.first as? Number)?.toDouble() ?: return@forEach
-                val s = pair.second as? DoubleArray ?: return@forEach
-                if (s.size < 3) return@forEach
-                if (noiseSigma == 0f || kotlin.math.abs(g - wantGain) < bestGain) {
-                    val avg = (s[0] + s[1] + s[2]) / 3.0
-                    if (avg > 0.0 && whiteLevel > 0) {
-                        bestGain = kotlin.math.abs(g - wantGain)
-                        bestSigma = avg
-                        noiseSigma = (avg / whiteLevel).toFloat()
-                    }
-                }
+            val isoNow = (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100).coerceAtLeast(50)
+            // android.util.Pair 数组 → Kotlin Pair 列表（解析核心为纯函数，可单测）
+            val entries = profile?.mapNotNull { item ->
+                val pair = item as? android.util.Pair<*, *> ?: return@mapNotNull null
+                val g = (pair.first as? Number)?.toDouble() ?: return@mapNotNull null
+                val s = pair.second as? DoubleArray ?: return@mapNotNull null
+                g to s
+            } ?: emptyList()
+            val np = NoiseProfile.parse(entries, colorFilterArrangement, isoNow)
+            noiseModel = np.model
+            val raw = np.raw
+            if (raw != null) {
+                // 原始数组全量入日志（布局/量级真机核对：len≥8 则相位序、6 则 RGB）
+                val m = np.model
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "raw.noise",
+                    kv(
+                        "len" to np.len, "gain" to "%.2f".format(np.gain),
+                        "iso" to isoNow, "cfa" to colorFilterArrangement,
+                        "raw" to raw.joinToString(",") { "%.3e".format(it) },
+                        "S" to (if (m != null) "%.3e,%.3e,%.3e".format(m[0], m[1], m[2]) else "na"),
+                        "O" to (if (m != null) "%.3e,%.3e,%.3e".format(m[3], m[4], m[5]) else "na"),
+                        "ok" to (m != null),
+                    ),
+                )
             }
         }
-        // HAL 不回填时的回退：**按 ISO 估算**（v0.6.30）。
+        // HAL 不回填 / 布局不可识别时的回退：**按 ISO 估算**（v0.6.30；模型无效
+        // 才走这条 legacy 路径，引擎侧等效旧经验式 —— 见 denoiseParams）。
         // 旧实现是固定 0.030，而 DNG 平坦块法实测 ISO 50–767 的 RAW σ 只有
         // 0.0013–0.0033 —— 高估约 4~10 倍，于是 P4 把**真实色度**当噪声一起平滑掉了：
         // 真机对照 PhotonCamera 同机位，暗部（桌面）C*/L* 只有对方的 54%，而 libraw
@@ -2003,7 +2014,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // lag-1 残余 / 真实色度边缘保留）：0.0352σc+25tap = 28.5%/0.624 →
         // 0.0242σc+49tap = 20.0%/0.506。σc 变小不是放松降噪，是把降噪换成更强的
         // 空间平均；若真机彩噪仍偏高，把设置页 RAW 降噪切"强"档（sc_k 3.25，σc +18%）。
-        if (noiseSigma == 0f) {
+        if (noiseModel == null) {
             val iso = (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 200).coerceAtLeast(50)
             noiseSigma = (0.012 + 0.000008 * iso).toFloat()
         }
@@ -2064,7 +2075,8 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         return RenderClient.RawFrameMeta(
             colorFilterArrangement, black4, whiteLevel,
-            floatArrayOf(nR, nG, nB), ccm, noiseSigma, lsc, lscCols, lscRows,
+            floatArrayOf(nR, nG, nB), ccm, noiseModel, noiseSigma,
+            lsc, lscCols, lscRows,
             ccmStd = stdCcm != null,
         )
     }

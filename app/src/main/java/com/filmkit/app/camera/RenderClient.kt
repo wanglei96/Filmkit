@@ -199,7 +199,10 @@ class RenderClient {
         val whiteLevel: Int,
         val neutral: FloatArray,    // asShotNeutral (r,g,b)
         val ccm: FloatArray,        // sensor→sRGB 行主序 3×3
-        val noiseSigma: Float = 0f, // 归一化域噪声 σ（M3-2，0=引擎回退估计）
+        // C 专项（2026-09-29）：噪声模型 [S_r,S_g,S_b,O_r,O_g,O_b]（var(x)=S·x+O，
+        // x = [0,1] 归一化 raw 域，SENSOR_NOISE_PROFILE 按 ISO 最近组）；null = 无
+        val noiseModel: FloatArray? = null,
+        val noiseSigma: Float = 0f, // legacy 回退 σ（模型无效时；0=引擎回退估计）
         // 镜头阴影增益网格（M3 P0）：RGB 交错，cols×rows，(0,0)=图像左上；
         // null = 关闭或无数据（引擎用恒等增益）
         val lsc: FloatArray? = null,
@@ -233,7 +236,8 @@ class RenderClient {
                     meta.cfa, meta.blackPhase, meta.whiteLevel,
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
-                    rotation, demosaic, noiseLevel, meta.noiseSigma, film,
+                    rotation, demosaic, noiseLevel, meta.noiseModel,
+                    meta.noiseSigma, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -280,8 +284,8 @@ class RenderClient {
                     meta.cfa, meta.blackPhase, meta.whiteLevel,
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
-                    rotation, demosaic, noiseLevel, meta.noiseSigma,
-                    refNoiseScale, film,
+                    rotation, demosaic, noiseLevel, meta.noiseModel,
+                    meta.noiseSigma, refNoiseScale, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

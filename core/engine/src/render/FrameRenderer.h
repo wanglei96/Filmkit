@@ -13,6 +13,55 @@
 
 namespace filmkit {
 
+// ── 噪声模型（C 专项，2026-09-29）────────────────────────────────────
+// 传感器噪声 = read + shot：var_c(x) = S_c·x + O_c，x = 渲染线性域信号
+// （黑阶后 / 白阶归一，[0,1]，与 DNG NoiseProfile 同域），WB 前。
+// 来源 = Camera2 SENSOR_NOISE_PROFILE（每 ISO 一组，MGC 语义：4 通道 × (S,O)
+// CFA 相位序），X300 实测与写出的 DNG 51041 tag 同源同域（S≈7e-4 @ISO1970）。
+// 通道序对外固定 R,G,B（G = 两绿相位均值）。
+struct NoiseModel {
+  float S[3] = {0.f, 0.f, 0.f};
+  float O[3] = {0.f, 0.f, 0.f};
+  bool valid() const { return S[0] > 0.f || S[1] > 0.f || S[2] > 0.f; }
+  // 方差折减（融合 N 帧：var/N ⇒ 系数 /N）
+  NoiseModel scaled(float k) const {
+    NoiseModel m;
+    for (int c = 0; c < 3; ++c) {
+      m.S[c] = S[c] / k;
+      m.O[c] = O[c] / k;
+    }
+    return m;
+  }
+  // WB 传播（乘性增益：shot ×g、read ×g²；x' = g·x 域）
+  NoiseModel afterWb(const float gains[3]) const {
+    NoiseModel m;
+    for (int c = 0; c < 3; ++c) {
+      m.S[c] = S[c] * gains[c];
+      m.O[c] = O[c] * gains[c] * gains[c];
+    }
+    return m;
+  }
+};
+
+// 降噪系数（模型 → shader 的 (A,B)，即 σ²(x) = A·x + B，单位方差域；
+// 强度系数 k 已折入：A = S'·k², B = O'·k²）。P0 = mosaic 域（WB 后），
+// P4 = 同一域（LSC 增益在 shader 内按格点传播）。全部 3 通道（R,G,B）。
+struct NoiseCoef {
+  float p0a[3] = {0.f, 0.f, 0.f}, p0b[3] = {0.f, 0.f, 0.f};
+  float p4a[3] = {0.f, 0.f, 0.f}, p4b[3] = {0.f, 0.f, 0.f};
+  float k_p0 = 0.f, k_p4 = 0.f;   // 强度乘子（日志）
+  float ns_typ = 0.f;             // 中灰典型 σ（WB 后 G 通道，单帧；resFade/日志）
+  bool model_src = false;         // true = Camera2 模型，false = legacy σ 回退
+};
+
+// tile RMS 归约的诊断结果（C 专项；A 的 σ 输入底座）
+struct TileRmsResult {
+  bool ok = false;
+  int tiles_w = 0, tiles_h = 0;
+  float rms[4] = {0, 0, 0, 0};   // 采样 tile 的 RMS（中心/左上/右上/左下）
+  float sigma[4] = {0, 0, 0, 0}; // 代入模型后的 σ（G 通道）
+};
+
 // 共享后段渲染器：SurfaceTexture(OES) → 场景线性 → 胶片曲线 → 输出。
 // pass1 采用系统 SurfaceTexture 路径（参照 PhotonCamera）；
 // M2 RAW 路径在此层替换 pass1，pass2/3 复用。
@@ -61,7 +110,9 @@ class FrameRenderer {
   //   demosaic    —— 0 = bilinear 单 pass（速度档）；1 = RCD 三段管线（质量档，M3-1）
   //   noise_level —— 0 = 关；1 = 标准；2 = 强（M3-2：P0 RAW 域 bilateral + P4
   //                  色度平滑，仅 RCD 路径生效；bilinear 保持纯净基线）
-  //   noise_sigma —— 归一化域噪声 σ（SENSOR_NOISE_PROFILE，≤0 时引擎内回退估计）
+  //   noise_model —— 6 float [S_r,S_g,S_b,O_r,O_g,O_b]（C 专项，Camera2
+  //                  SENSOR_NOISE_PROFILE，[0,1] 归一化 raw 域）；nullptr/非法 = 无效
+  //   noise_sigma —— 归一化域噪声 σ（模型无效时的 legacy 回退；≤0 时引擎内估计）
   //   lsc/lsc_cols/lsc_rows —— 镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=左上；
   //                  nullptr 或尺寸 ≤1 = 恒等，即 LSC 关闭（A/B 对照））
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
@@ -69,7 +120,7 @@ class FrameRenderer {
                  float neutral_r, float neutral_g, float neutral_b,
                  const float* ccm9, const float* lsc, int lsc_cols,
                  int lsc_rows, int rotation, const FilmParams& p, int demosaic,
-                 int noise_level, float noise_sigma,
+                 int noise_level, const float* noise_model, float noise_sigma,
                  std::vector<uint8_t>* out_rgba);
 
   // RAW 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域
@@ -77,15 +128,15 @@ class FrameRenderer {
   //（demosaic 前）→ 与 submitRaw 完全相同的 RCD/胶片链 → RGBA8 读回。
   //   frames[0] = 参考帧（DNG 底片同一帧）；count 必须 == 4（融合 shader 固定
   //   4 输入）。元数据统一取帧 0（burst 恒曝光，逐帧黑阶/WB 视为一致，
-  //   mfnr.capture 日志可核对）。noise_sigma/demosaic 语义同 submitRaw。
+  //   mfnr.capture 日志可核对）。noise_model/noise_sigma/demosaic 语义同 submitRaw。
   bool submitRawBurst(const void* const* frames, int count,
                       const int* row_strides_px, int w, int h, int cfa,
                       const float black_phase[4], int white_level,
                       float neutral_r, float neutral_g, float neutral_b,
                       const float* ccm9, const float* lsc, int lsc_cols,
                       int lsc_rows, int rotation, const FilmParams& p,
-                      int demosaic, int noise_level, float noise_sigma,
-                      float ref_noise_scale,
+                      int demosaic, int noise_level, const float* noise_model,
+                      float noise_sigma, float ref_noise_scale,
                       std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
@@ -114,13 +165,15 @@ class FrameRenderer {
   // 阶段二 robust merge（v0.10.0）：Night Sight 式 mismatch map —— per-tile
   // 对齐后残差 mean(d²) → m = d²/(d²+s·σ²)，渲染到 tex_mis_（RGBA8 tiles 网格，
   // R/G/B = 帧 1/2/3）。CPU 读回算 w = max(1−c·m, 0) 写回位移场 z 通道。
+  // C 专项：σ² 由常数改为逐像素模型（var(r) + var(r_alt)，WB 后参考帧域）。
   void passMfnrMismatch(int cfa, const float black_phase[4], float white_level,
-                        const float gains[3], float sigma, float s_const);
+                        const float gains[3], const NoiseModel& model,
+                        float s_const);
   // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
-  void passRawDenoiseFused(int w, int h, int cfa, float ns, float k);
+  void passRawDenoiseFused(int w, int h, int cfa, const NoiseCoef& nc);
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
   struct ChainCtx {
@@ -133,7 +186,12 @@ class FrameRenderer {
     const FilmParams* p = nullptr;
     int effective_rot = 0;
     bool rcd = false, dn = false, dn_high = false;
-    float sr_k = 0.f, sc_k = 0.f, ns = 0.f, ns_raw = 0.f;
+    NoiseCoef nc;         // (A,B) 系数（P0/P4，C 专项）
+    NoiseModel nm;        // 原始噪声模型（WB 前、单帧；tile RMS 诊断/日志）
+    float nz_iso = 0.f;   // 传感器增益（ISO/100，日志）
+    TileRmsResult rms;    // tile RMS 归约诊断（P0 后）
+    float ns = 0.f;       // 典型 σ（融合折减后；resFade/日志）
+    float ns_raw = 0.f;   // 单帧典型 σ（日志 nsHal / nsSng 兼容）
     bool lsc_ok = false;
     int lsc_cols = 0, lsc_rows = 0;
     float upload_ms = 0.f;  // t0 → 传参时刻（MFNR 时含上传+对齐+融合）
@@ -156,9 +214,11 @@ class FrameRenderer {
                              float wb_r, float wb_g, float wb_b,
                              const float* ccm9, const float* lsc, int lsc_cols,
                              int lsc_rows);
-  // 降噪参数（两档系数/σ 夹紧，两条静拍路径共用）
-  static void denoiseParams(int noise_level, float noise_sigma, bool* dn_high,
-                            float* sr_k, float* sc_k, float* ns, float* ns_raw);
+  // 降噪参数（C 专项）：模型（或 legacy σ）→ P0/P4 的 (A,B) 系数（含强度两档
+  // 与 WB 传播）。model 无效时退 legacy：σ(x) = ns·k·√(0.2+4x) 的等效 (A,B)。
+  static void denoiseParams(int noise_level, const NoiseModel& model,
+                            const float gains[3], float noise_sigma,
+                            NoiseCoef* out);
   void passOES(int dst_w, int dst_h, const float* st, int rot, float sx,
                float sy, const FilmParams& p);
   void passStill(int dst_w, int dst_h, int rot, const FilmParams& p);
@@ -173,12 +233,17 @@ class FrameRenderer {
   void passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                      const float black_phase[4], float white_level,
                      const float gains[3], const float* ccm, bool mosaic);
-  // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑
-  // k —— 值域 σ 系数（P0 标准 0.50 / 强 2.20；P4 标准 1.80 / 强 2.60）
+  // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑。
+  // C 专项起值域 σ 由 (A,B) 模型逐像素给出（nc，强度已折入系数）。
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
-                      float white_level, const float gains[3], float ns,
-                      float k);
-  void passChromaDenoise(int dst_w, int dst_h, int rot, float ns, float k);
+                      float white_level, const float gains[3],
+                      const NoiseCoef& nc);
+  void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc);
+  // C 专项：tile RMS 归约（HDR+ §5 —— 逐 tile RMS 代入噪声模型得 σ，A 的输入
+  // 底座）。每像素输出一个 tile 的 RMS（mosaic 信号，线性域）。dst = tiles 网格。
+  // 返回读回诊断（中心/四角采样 + σ），供 raw.render 日志。
+  TileRmsResult passTileRms(GLuint src_tex, int w, int h,
+                            const NoiseModel& model);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // 显示域直方图统计（kFsHist 自带 OETF，与公开的 histogram() 同一实现）。
@@ -245,7 +310,7 @@ class FrameRenderer {
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
-         prog_hist_ = 0, prog_local_ = 0;
+         prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -279,6 +344,9 @@ class FrameRenderer {
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
+  // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
+  GLuint fbo_rms_ = 0, tex_rms_ = 0;
+  int rms_w_ = 0, rms_h_ = 0;
   // ── v0.10.15：darktable filmic 高光重建（HR，dst 尺寸；8+1 张全分辨率）──
   // 出处 darktable filmicrgb.c 的 mask_clipped_pixels/inpaint_noise/
   // reconstruct_highlights（à trous 小波）。生命周期：仅拍照路径（finishStillChain
@@ -398,10 +466,10 @@ class FrameRenderer {
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
-          ns = -1, k = -1;
+          noise_a = -1, noise_b = -1;
   } u_raw_dn_;
   struct {
-    GLint tex = -1, size = -1, cfalut = -1, ns = -1, k = -1;
+    GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1;
   } u_raw_dn_f_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
@@ -416,12 +484,16 @@ class FrameRenderer {
   } u_mfnr_fuse_;
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
-          tiles = -1, off_tiles = -1, tile_m = -1, sigma = -1, s = -1,
-          black = -1, white = -1, gain = -1, cfalut = -1;
+          tiles = -1, off_tiles = -1, tile_m = -1, noise_a = -1, noise_b = -1,
+          s = -1, black = -1, white = -1, gain = -1, cfalut = -1;
   } u_mfnr_mis_;
   struct {
-    GLint tex = -1, size = -1, ns = -1, k = -1;
+    GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
+          lsc_size = -1;
   } u_chroma_dn_;
+  struct {
+    GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
+  } u_tile_rms_;
   struct {
     // v0.7.9：contrast/shoulder/toe/cross（旧 log 域胶片链）已随链删除；
     // FilmParams 槽位保留解析（契约不移位），引擎不再消费。
