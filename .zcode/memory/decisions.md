@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-29 19:45
+updated: 2026-09-30 12:30
 status: active
 ---
 
@@ -100,3 +100,24 @@ status: active
 - [2026-09-29] **多摄标定方法学**：DNG 水平差分拟合的**横向比值** × HAL 主摄模型
   （绝对值含 PSF 系统偏差、两来源同向 ~15%；O 沿用 HAL 读出噪声）
 - [2026-09-29] **设备内自动标定（拍平场向导）用户拍板暂不做**；X300 用内置实测标定兜底
+
+## A 专项（09-30）
+
+- [2026-09-30] **A 落地形态**：kFsMfnrFft compute 按 CFA 平面独立合并（HDR+
+  原文语义），16×16 平面 tile = mosaic 32×32、半重叠步长 8 + 修改升余弦窗
+  （tile 网格含 -1 行/列使窗和恒 1）；位移 tile 中心采样 round 偶数（像素级
+  对齐 = HDR+ 原版，免相位校正）；c=256；输出 4 张 RGBA16F image2D writeonly
+  （相位组静态分支）→ 收口 pass 进 tex_fused_（后段链零改动）；**neff 恒 4**
+  （HDR+ 原版 σ²/N，NS §3.3 按实际合并留 SSBO 后续）；**不叠 mismatch/conf
+  权重**（逐频收缩自身鲁棒）
+- [2026-09-30] **compute program 现场创建、用完删除（spike 模式）**——init
+  创建的 compute program 在该 Mali 上写入全丢（0.10.38–48 十一轮实锤，主内核
+  与 1-texel 微测试一致失败、现场创建的 spike 一致成功）；机理疑似预览链大量
+  program 创建损坏早期 compute pipeline
+- [2026-09-30] **实验路径严禁进 init 阻塞检查**：shader 编译/链接失败仅日志 +
+  运行时回退 mismatch（0.10.37 首包黑屏教训）；回退判据用 store_check
+  （dispatch 后读输出中心点，全 0 = 写入丢失）
+- [2026-09-30] **CI 不上传 APK artifact**（私有仓库 Actions 存储 500MB 配额，
+  清理只解一次）；出包 = 本地单文件覆盖制
+- [2026-09-30] **高光线复验通过**（0.10.31 阳台+水壶肉眼验收）——不打 tag；
+  0.10.31 相关待办销项

@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-29 19:45
+updated: 2026-09-30 12:30
 status: active
 ---
 
@@ -36,9 +36,10 @@ status: active
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig，v0.10.22 起 `FilmKitApp.VERSION = BuildConfig.VERSION_NAME`）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag；tag 清单与恢复命令 `docs/git-tags-backup-20260922.txt`
 - [2026-09-29] **发布现状**：最新 **v0.10.31-m4（versionCode 183，`fde052f`）**，已推 main，根目录 `filmkit-0.10.31-m4.apk`；**未打 tag**（高光线待明天光线复验后收）；测量包 `filmkit-spike-fft.apk` 并存
-- [2026-09-29] **版本沿革速查**：177（WB 修复）→178→…→183（0.10.31，高光线待复验）→
-  184（0.10.32 C 模型全链）→185（0.10.33 回归修复+导入/切换）→186（0.10.34 结构 A+滑杆）→
-  187（0.10.35 AE 锁定+多摄标定）→**188（0.10.36-m4 通道序修复，tag `v0.10.36-m4` 已推）**
+- [2026-09-29] **版本沿革速查**：177（WB 修复）→178→…→183（0.10.31，高光线已复验通过未打 tag）→
+  184–188（0.10.32–0.10.36 C 专项，**tag `v0.10.36-m4` 已推**）→
+  189–201（0.10.37–0.10.49 A 专项攻坚，见 handoffs/A专项DFT合并与Mali写入丢失攻坚；
+  当前 **0.10.49-m4（201）= compute program 现场创建，待真机验证**）
 - [2026-09-29] **Camera2 SENSOR_NOISE_PROFILE 真机形态**：Array<Pair<Double,Double>> =
   4 个 (S,O) **标量对**（CFA 相位序、per-frame 无 gain 字段）——SDK 签名
   `Pair<Double, Double[]>` 与真机不符；`as? DoubleArray` 对装箱数组永败
@@ -65,6 +66,20 @@ status: active
 - [2026-09-27] **测量方法（噪声）**：低频判据选块（32×32 box 低频图梯度 <1.5）+ 16 块级高频残差 std；跨噪声水平比较必须无偏；σ/亮度归一后跨图可比
 - [2026-09-29] **高光白的全链证据**（172002）：RAW 满井饱和 0.001%；LSC 网格（OpcodeList3 提取：4 平面 13×17、四角 5.0~5.3、中心 1.0、damp 后 ~3.85）应用后渲染域 ≥1.0 占 9.88%——白是渲染域产物非采集过曝
 - [2026-09-29] **DNG OpcodeList3 的 LSC 网格提取**：tag 51009、大端 f32、4 平面（R/Gr/Gb/B）×221 点（13 行×17 列）、数据偏移 `allf[24/268/512/756]`；opcode 头部 top/left/bottom/right 解析仍错位、覆盖范围假设未验证（模拟先怀疑模拟）
+
+- [2026-09-30] **A 专项（DFT 合并）实现现状**：`kFsMfnrFft` compute（按 CFA
+  平面独立合并、16×16 平面 tile 半重叠、寄存器 FFT、内核内 tile RMS→σ、
+  输出 4 张 RGBA16F image2D writeonly 相位组静态分支）+ `kFsMfnrFftSum` 收口
+  进 tex_fused_；**compute program 拍照时现场创建用完删除**（init 创建的在该
+  Mali 上写入丢失）；prefs `mfnr_dft`；诊断 `mfnr.fft.store_check`
+  （sum/micro/spikeOk）+ `store_lost` 自检回退 mismatch；dftGpu 实测 477–798ms
+  （门槛 250ms，8×8 tile 储备未动）；`tools/fft-mirror` 离线镜像通过
+- [2026-09-30] **CI（android.yml）不再上传 APK artifact**（500MB 配额）；
+  validate-shaders.sh 的 comp 校验 = 430 core 转换（有 ESSL 严格性盲区，见
+  lessons）；glslang ES profile 只放行 r32f image
+- [2026-09-30] X300 Mali compute program 规律：**init 创建 → 写入全丢；现场
+  创建 → 正常**（spikeOk:true ×2 对照实锤）；GLSL 混链（跨版本 vs/fs）报
+  "Shader languages do not match"
 
 ## PhotonCamera 参照事实（/tmp/photoncamera，hinnka 版）
 

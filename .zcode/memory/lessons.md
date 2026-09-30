@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-09-29 19:45
+updated: 2026-09-30 12:30
 status: active
 ---
 
@@ -110,3 +110,32 @@ status: active
 - [2026-09-29] **测试跟着错误实现写 = 通过但错**（.c 通道序 R,Gr,B,Gb 的 G/B 映射，
   测试与实现同样写错照过；补不对称系数专测）；**KDoc 的 `/*` 嵌套注释坑又踩**
   （`noise_models/*.c`）；float 断言必须用相对容差（1e-4 的 float 实为 9.9999997e-5）
+
+## A 专项攻坚（09-30）
+
+- [2026-09-30] **GLSL ES 3.2 的 r16f/rgba16f image 禁止 load+store 混合**
+  （readonly/writeonly only）；image2DArray 的 imageStore 在 X300 Mali 上
+  "计算照跑、写入全丢"——表象相同根因可以完全不同，别在单一路线上重复押注
+- [2026-09-30] **glslang ES profile 的 image 格式只放行 r32f**（rgba16f/r16f
+  误拒，ES 3.2 规范实际支持）——compute 校验用 430 core 转换；**盲区：GL 4.x
+  允许 int→uint 隐式而 ESSL 不允许**（0.10.45 微测试漏检）——转换校验不能
+  替代真机编译
+- [2026-09-30] **Mali 拒绝混链 GLSL 版本**（vs 300 es + fs 310 es →
+  "Shader languages do not match"→ init 失败整链黑屏）——同 program 内
+  shader 必须同版本；sum 收口 pass 用 300 es
+- [2026-09-30] **批量脚本编辑中途 assert 失败 = 部分修改未写盘**（0.10.41
+  坏提交：shader 仍是 r32f 旧声明而 host 已绑 RGBA16F，格式错配污染多轮
+  调试）——多点修改逐项落地 + 端到端状态核对（源码 grep + glslang + host
+  grep）后才出包
+- [2026-09-30] **R16F fbo + GL_RGBA + GL_FLOAT 读回也是静默回零组合**
+  （补 v0.6.48 教训：不止 R16F+UNSIGNED_BYTE）——probe 数据不可信，成片黑
+  的硬证据用 avgLuma（JPEG 统计）与 rms（采样链）
+- [2026-09-30] **"计算照跑、写入全丢"用参考路径对照二分**：把真机验证过的
+  spike 完整路径原样搬进现场跑一次（spikeOk），一次定案"上下文无罪、问题在
+  我方代码"——比逐个猜格式/绑定/时机快得多；GPU 时间正常（μs/tile 量级
+  吻合）恰是"计算真实执行"的证据
+- [2026-09-30] **glClearTexImage 不是 ES 命令**（NDK 头无声明）；首组 dispatch
+  直写 + 后续组累加可免清零（但须保证首组覆盖全图）
+- [2026-09-30] **离线镜像先行**（tools/fft-merge-mirror.py）：真机调试期间
+  用 numpy 镜像验证算式性质（窗和恒 1、抑制比 0.581≈spike 0.578、DC 错位
+  逐频拒绝），真机问题就被隔离在"实现/驱动"层而非"算法"层

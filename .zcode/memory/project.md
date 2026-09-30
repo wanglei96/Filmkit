@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-09-28 20:13
+updated: 2026-09-30 12:30
 status: active
 ---
 
@@ -21,13 +21,13 @@ status: active
 - `app/src/main/java/com/filmkit/app/lut/`：`CubeLut`（解析）/ `LutLibrary`（清单+缓存）/ `LutPreview`（卡片预览：一次性生成 + 磁盘缓存）
 - `tools/`：validate-shaders.sh、check-lsc-mapping.py、dng-color-dump.py、color-metrics.py、gen-lut-previews.py、**gen-lut-assets.py（64³ cube → 33³ 二进制资产）**、**tone-scan.py（成片反推 baseTone 输入 + 参数扫描 + 对照图）**、lut-audit.py、**chroma-denoise-eval.py（v0.6.37 新增：从 DNG 重建 P4 输入域，评估暗部彩噪残余 / 真实色度边缘保留 / 低频偏差）**
 
-## 进行中（2026-09-29 晚重排：色彩主观降级，客观画质主线优先）
+## 进行中（2026-09-30 更新：A 专项攻坚中）
 
-- [2026-09-29] **v0.10.31 高光线复验（明天光线好时）** | 待用户 | 阳台场景+水壶
-  场景同刻 A/B；183=`fde052f`，详见"本轮（高光线收线）后现状"
-- [2026-09-29] **降噪专项：C→A→D（用户拍板立项）** | **C 完成**（`v0.10.36-m4`
-  收线，tag 已推）→ **下一步 A（DFT 合并，σ/RMS 底座已就绪）或 D（补偿降噪，
-  15MM 融合不足与边缘噪点块的目标）** | handoffs/C 专项噪声模型全链与多摄标定.memo.md
+- [2026-09-30] **降噪专项 A（DFT 逐频收缩合并）** | 最高 | 内核完整实现 +
+  12 轮真机攻坚定位"Mali init 创建的 compute program 写入丢失"，0.10.49 改
+  现场创建（spike 模式）**待真机验证**（store_check sum>0 → 进验收）；
+  验收口径见快照 Next | handoffs/A专项DFT合并与Mali写入丢失攻坚.memo.md
+- [2026-09-30] **高光线复验通过**（0.10.31，用户肉眼验收，不打 tag）| 已销项
 - [2026-09-29] **MFNR 阶段二收尾** | 待做 | 参考帧回最锐帧 + 8 帧档位（运动区
   补偿降噪已升为降噪专项 D）| 队列②③⑥
 - [2026-09-29] **MGC-AE 曝光决策** | 远期（本次高光事件提升关注） | 172004 等帧
