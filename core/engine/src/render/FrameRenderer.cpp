@@ -1400,7 +1400,10 @@ void main() {
 // kFsMfnrFftSum（降噪专项 A）：overlap-add 的收口 pass —— 把 R32F 累加
 // scratch（4 次 dispatch 串行叠加，半重叠窗和恒 1）转渲染进 tex_fused_
 //（R16F，与 fuse 路径同域同格式，后段 P0/RCD/胶片链零改动）。
-const char* kFsMfnrFftSum = R"(#version 310 es
+// ⚠️ 必须 #version 300 es：vs_plain_ 与全部现有 fragment 均为 300 es，Mali
+// 拒绝不同 GLSL 版本混链（"Shader languages do not match"，v0.10.37 首包
+// init_failed 黑屏事故）—— sum 只是采样+相加，300 es 完全够用。
+const char* kFsMfnrFftSum = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uAcc;  // R32F（NEAREST；R32F 无硬件过滤）
@@ -2480,9 +2483,10 @@ bool FrameRenderer::init() {
       compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
   const GLuint fs_tile_rms = compileShader(GL_FRAGMENT_SHADER, kFsTileRms);
-  // 降噪专项 A：DFT 逐频收缩合并（compute，无顶点着色器）。#version 320 es
-  // 在非 ES 3.2 设备会编译失败 —— 记日志、prog 置 0，运行时回退 mismatch 路径
-  // （X300 专项管线不可因实验路径阻塞基础功能）。
+  // 降噪专项 A：DFT 逐频收缩合并（compute，无顶点着色器）。实验路径，任何
+  // 编译/链接失败都只记日志、prog 置 0（passMfnrFft 首行检查 → 运行时回退
+  // mismatch 路径）—— 严禁进 init 的阻塞检查（v0.10.37 首包 sum 混链失败
+  // 阻塞 init → 预览黑屏事故的教训）。
   const GLuint cs_mfnr_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
   const GLuint fs_mfnr_fft_sum = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFftSum);
   // v0.10.15：darktable filmic 高光重建（9 个）
@@ -2500,7 +2504,7 @@ bool FrameRenderer::init() {
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
       !fs_raw_dn || !fs_chroma_dn || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
-      !fs_raw_dn_f || !fs_tile_rms || !fs_mfnr_fft_sum || !fs_hr_mask ||
+      !fs_raw_dn_f || !fs_tile_rms || !fs_hr_mask ||
       !fs_hr_inp || !fs_hr_blur ||
       !fs_hr_hf || !fs_hr_rin || !fs_hr_step || !fs_hr_norms || !fs_hr_ratios ||
       !fs_hr_restore || !fs_hr_stat)
@@ -2527,10 +2531,10 @@ bool FrameRenderer::init() {
   prog_tile_rms_ = linkProgram(vs_plain_, fs_tile_rms);
   // 降噪专项 A：compute 程序（单 shader，无 vs/fs attach）+ 相位组求和 pass。
   // 编译/链接失败不阻塞 init（置 0，运行时 use_dft 回退 mismatch 路径）。
-  prog_mfnr_fft_ = glCreateProgram();
-  glAttachShader(prog_mfnr_fft_, cs_mfnr_fft);
-  glLinkProgram(prog_mfnr_fft_);
-  {
+  if (cs_mfnr_fft) {
+    prog_mfnr_fft_ = glCreateProgram();
+    glAttachShader(prog_mfnr_fft_, cs_mfnr_fft);
+    glLinkProgram(prog_mfnr_fft_);
     GLint linked = 0;
     glGetProgramiv(prog_mfnr_fft_, GL_LINK_STATUS, &linked);
     if (!linked) {
@@ -2542,8 +2546,16 @@ bool FrameRenderer::init() {
       glDeleteProgram(prog_mfnr_fft_);
       prog_mfnr_fft_ = 0;
     }
+  } else {
+    Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.compile_fail",
+                           "{\"stage\":\"compute\"}");
   }
-  prog_mfnr_fft_sum_ = linkProgram(vs_plain_, fs_mfnr_fft_sum);
+  if (fs_mfnr_fft_sum) {
+    prog_mfnr_fft_sum_ = linkProgram(vs_plain_, fs_mfnr_fft_sum);
+  } else {
+    Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.compile_fail",
+                           "{\"stage\":\"sum\"}");
+  }
   prog_hr_mask_ = linkProgram(vs_plain_, fs_hr_mask);
   prog_hr_inpaint_ = linkProgram(vs_plain_, fs_hr_inp);
   prog_hr_blur_ = linkProgram(vs_plain_, fs_hr_blur);
@@ -2590,7 +2602,6 @@ bool FrameRenderer::init() {
       !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
       !prog_mfnr_mis_ || !prog_raw_dn_fused_ || !prog_tile_rms_ ||
-      !prog_mfnr_fft_sum_ ||
       !prog_hr_mask_ ||
       !prog_hr_inpaint_ || !prog_hr_blur_ || !prog_hr_hf_ || !prog_hr_rin_ ||
       !prog_hr_step_ || !prog_hr_norms_ || !prog_hr_ratios_ ||
@@ -2708,19 +2719,23 @@ bool FrameRenderer::init() {
   u_mfnr_fft_.c = glGetUniformLocation(prog_mfnr_fft_, "uC");
   u_mfnr_fft_.group = glGetUniformLocation(prog_mfnr_fft_, "uGroup");
   u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
-  // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置）
-  glUseProgram(prog_mfnr_fft_);
-  if (u_mfnr_fft_.burst >= 0) glUniform1i(u_mfnr_fft_.burst, 0);
-  for (int i = 0; i < 3; ++i) {
-    if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 1 + i);
+  // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置；prog 0 = 已置回退）
+  if (prog_mfnr_fft_) {
+    glUseProgram(prog_mfnr_fft_);
+    if (u_mfnr_fft_.burst >= 0) glUniform1i(u_mfnr_fft_.burst, 0);
+    for (int i = 0; i < 3; ++i) {
+      if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 1 + i);
+    }
+    if (u_mfnr_fft_.out >= 0) glUniform1i(u_mfnr_fft_.out, 0);
+    if (u_mfnr_fft_.neff >= 0) glUniform1i(u_mfnr_fft_.neff, 1);
   }
-  if (u_mfnr_fft_.out >= 0) glUniform1i(u_mfnr_fft_.out, 0);
-  if (u_mfnr_fft_.neff >= 0) glUniform1i(u_mfnr_fft_.neff, 1);
-  // 收口 pass 的采样器单元固定 0
-  glUseProgram(prog_mfnr_fft_sum_);
-  u_mfnr_fft_sum_.acc = glGetUniformLocation(prog_mfnr_fft_sum_, "uAcc");
-  if (u_mfnr_fft_sum_.acc >= 0) glUniform1i(u_mfnr_fft_sum_.acc, 0);
-  u_mfnr_fft_sum_.size = glGetUniformLocation(prog_mfnr_fft_sum_, "uSize");
+  // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
+  if (prog_mfnr_fft_sum_) {
+    glUseProgram(prog_mfnr_fft_sum_);
+    u_mfnr_fft_sum_.acc = glGetUniformLocation(prog_mfnr_fft_sum_, "uAcc");
+    if (u_mfnr_fft_sum_.acc >= 0) glUniform1i(u_mfnr_fft_sum_.acc, 0);
+    u_mfnr_fft_sum_.size = glGetUniformLocation(prog_mfnr_fft_sum_, "uSize");
+  }
 
   // v0.10.15：HR 各 shader 的 uniform
   u_hr_mask_ = glGetUniformLocation(prog_hr_mask_, "uTex");
