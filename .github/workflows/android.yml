@@ -1,9 +1,12 @@
 name: android-ci
 
+# 2026-09-30：改为**仅手动触发**。此前 push: branches:[main] 会在每次推送时
+# 自动构建，而私有仓库 Actions storage 配额只有 500MB —— 一轮对话推了 6 个
+# tag/多次 commit，直接把配额顶爆、CI 报红。出包本来就是本地做
+#（filmkit-<versionName>.apk 单文件覆盖制），CI 的价值只在"偶尔验证一次
+# 干净环境能否 build + 单测"，手动触发足够。
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
