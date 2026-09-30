@@ -804,12 +804,19 @@ void main() {
     float Jxx = gx * gx + 1e-9, Jyy = gy * gy + 1e-9, Jxy = gx * gy;
     float th = 0.5 * atan(2.0 * Jxy, Jxx - Jyy);
     vec2 tv = vec2(-sin(th), cos(th));          // 切向（沿边缘）
+    // ⚠️ v0.10.54 事故：长核无条件施加 → 平坦/无方向处也取 ±uL，等于 33 点平均
+    // 抹平纹理（真机"叶片纹理被抹"）。核长必须随 coherence=(λ1−λ2)/(λ1+λ2)
+    // 收缩 —— 无结构处退化为短核，这正是 Sabre 核回归"平坦区退回小高斯"的语义。
+    float jt = sqrt(max((Jxx - Jyy) * (Jxx - Jyy) + 4.0 * Jxy * Jxy, 0.0));
+    float l1 = (Jxx + Jyy + jt) * 0.5;
+    float l2 = max((Jxx + Jyy - jt) * 0.5, 1e-9);
+    int lmax = int(float(uL) * ((l1 - l2) / (l1 + l2)));
     float ay = dot(uNoiseA, LUMA), by = dot(uNoiseB, LUMA);
     float glY = dot(lscAt(p), LUMA);
     float sr = max(uKr * sqrt(max(ay * y + by * glY * glY, 1e-12)), 1e-5);
     float acc = y, ws = 1.0;
     for (int k = -kLMax; k <= kLMax; ++k) {
-        if (k == 0 || abs(k) > uL) continue;
+        if (k == 0 || abs(k) > lmax) continue;
         ivec2 q = clamp(p + ivec2(round(float(k) * tv)), ivec2(0), uSize - 1);
         float yq = dot(texelFetch(uTex, q, 0).rgb, LUMA);
         float d = (yq - y) / sr;
@@ -3767,8 +3774,8 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glUniform2i(u_chroma_apply_.lsc_size, lsc_w_, lsc_h_);
   glUniform3f(u_chroma_apply_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
   glUniform3f(u_chroma_apply_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
-  glUniform1i(u_chroma_apply_.l, 16);
-  glUniform1f(u_chroma_apply_.kr, 3.5f);
+  glUniform1i(u_chroma_apply_.l, 6);
+  glUniform1f(u_chroma_apply_.kr, 2.5f);
   glActiveTexture(GL_TEXTURE0);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   return true;
