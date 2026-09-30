@@ -393,7 +393,7 @@ class FrameRenderer {
     GLint burst = -1, off[3] = {-1, -1, -1}, out = -1, neff = -1, size = -1,
           off_tiles = -1, fft_tiles = -1, tx_max = -1, black = -1, white = -1,
           gain = -1, plane_a = -1, plane_b = -1, c = -1, group = -1, tw = -1,
-          layer = -1;
+          layer = -1, rows = -1;
   } u_mfnr_fft_;
   struct {
     GLint layers = -1, size = -1;

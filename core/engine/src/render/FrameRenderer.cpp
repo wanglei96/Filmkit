@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <string>
 
+#include "../log/GpuTimer.h"
 #include "../log/Logger.h"
 #include "Align.h"
 
@@ -1093,7 +1094,9 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform int uCfaLut;
-layout(r32f, binding = 0) uniform highp image2D uOut;  // overlap-add 累加（R32F）
+layout(rgba16f, binding = 0) writeonly uniform highp image2DArray uOut;
+uniform int uLayer;  // 本 dispatch 的输出层 = gy*2+gx（组内 tile 互不重叠）
+uniform int uRows;   // 本组 tile 行数（plane 并入 y 维：wgRow = wg.y % uRows）
 layout(rgba16f, binding = 1) writeonly uniform highp image2DArray uNeff;
 uniform ivec2 uSize;      // mosaic 尺寸
 uniform ivec2 uOffTiles;  // 位移场网格（对齐 tile 128 mosaic px）
@@ -1105,7 +1108,6 @@ uniform vec4 uPlaneA;     // 平面 0..3 的 A 系数（按 cfaLut 展开，含�
 uniform vec4 uPlaneB;
 uniform float uC;         // 收缩常数（256）
 uniform ivec2 uGroup;     // 本轮 dispatch 的 tile 相位组 (gx, gy) ∈ {0,1}²
-uniform int uAccum;       // 0 = 首组 dispatch（直写 scratch）、1 = 后续组（累加）
 uniform highp vec2 uTw[8];
 
 shared float sre[2][4][16][16];
@@ -1252,13 +1254,16 @@ void main() {
     ivec2 lid = ivec2(gl_LocalInvocationID.xy);
     ivec2 wg = ivec2(gl_WorkGroupID.xy);
     int tid = lid.y * 16 + lid.x;
-    int plane = int(gl_WorkGroupID.z);
+    // plane 并入 y 维（z 恒 1 = spike 真机口径；v0.10.40/41 的 gl_WorkGroupID.z
+    // 疑似被驱动放弃——实为 0.10.41 的 image 格式错配，双保险都做）
+    int plane = int(wg.y) / uRows;
+    int wgRow = int(wg.y) % uRows;
     int ox = plane & 1;
     int oy = plane >> 1;
     // 本 workgroup 的两个水平相邻同组 tile（组内 tx ≡ 2gx−1 (mod 2)，间隔 2）
     int tx0 = 4 * wg.x + 2 * uGroup.x - 1;
     int tx1 = tx0 + 2;
-    int ty = 2 * wg.y + 2 * uGroup.y - 1;
+    int ty = 2 * wgRow + 2 * uGroup.y - 1;
     bool has1 = tx1 <= uTxMax;
 
     if (tid < 128) {
@@ -1388,9 +1393,7 @@ void main() {
                 ivec2 m = ivec2(2 * px + ox, 2 * py + oy);
                 if (m.x >= 0 && m.y >= 0 && m.x < uSize.x && m.y < uSize.y) {
                     float v = sre[tt][0][yy][lx] * 0.00390625;  // 1/256 = IDFT 归一
-                    // 首组覆盖全图（每像素恰 1 tile）→ 直写省清零；后续组累加
-                    float old = (uAccum > 0) ? imageLoad(uOut, m).r : 0.0;
-                    imageStore(uOut, m, vec4(old + v, 0.0, 0.0, 1.0));
+                    imageStore(uOut, ivec3(m, uLayer), vec4(v, v, v, 1.0));
                 }
             }
         }
@@ -2722,6 +2725,7 @@ bool FrameRenderer::init() {
   u_mfnr_fft_.c = glGetUniformLocation(prog_mfnr_fft_, "uC");
   u_mfnr_fft_.group = glGetUniformLocation(prog_mfnr_fft_, "uGroup");
   u_mfnr_fft_.layer = glGetUniformLocation(prog_mfnr_fft_, "uLayer");
+  u_mfnr_fft_.rows = glGetUniformLocation(prog_mfnr_fft_, "uRows");
   u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
   // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置；prog 0 = 已置回退）
   if (prog_mfnr_fft_) {
@@ -4278,6 +4282,9 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // 3) 4 次 dispatch（tile 相位组 (gx,gy)）：每次 xy = 组内 tile 网格的一半
   //    （每 workgroup 2 个水平相邻同组 tile）、z = 4 平面
   const auto t_dsp = std::chrono::steady_clock::now();
+  GpuTimer gpu_fft;
+  const bool gpu_ok = GpuTimer::supported();
+  if (gpu_ok) gpu_fft.begin();
   const int pw = (w + 1) / 2, ph = (h + 1) / 2;
   const int tx_max = (pw + 7) / 8 - 1, ty_max = (ph + 7) / 8 - 1;
   glUseProgram(prog_mfnr_fft_);
@@ -4323,13 +4330,16 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     }
     glUniform2i(u_mfnr_fft_.group, gx, gy);
     glUniform1i(u_mfnr_fft_.layer, gy * 2 + gx);
-    glDispatchCompute((n + 1) / 2, m, 4);
+    glUniform1i(u_mfnr_fft_.rows, m);
+    // plane 并入 y 维（z 恒 1 = spike 真机口径）：wg.y / uRows = plane
+    glDispatchCompute((n + 1) / 2, m * 4, 1);
     // 层间无写竞争（各写各层），无需组间 barrier
   }
   // 末组写入要被**收口 pass 的纹理采样**与 **neff 的 framebuffer 读回**看到
   // —— TEXTURE_FETCH / FRAMEBUFFER barrier（ALL_BARRIER_BITS 一次覆盖；
   // v0.10.38 只下 SHADER_IMAGE_ACCESS 时收口读全 0 的教训保留）。
   glMemoryBarrier(GL_ALL_BARRIER_BITS);
+  const float gpu_ms = gpu_ok ? gpu_fft.endMs() : -1.f;
   const auto t_rb = std::chrono::steady_clock::now();
   // 3b) overlap-add 收口：4 层相位组 → tex_fused_（窗和恒 1，直接相加）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
@@ -4380,6 +4390,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   out_ms[0] = ms(t_up, t_dsp);
   out_ms[1] = ms(t_dsp, t_rb);
   out_ms[2] = ms(t_rb, t_end);
+  out_ms[3] = gpu_ms;
   return true;
 }
 
@@ -4885,7 +4896,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // use_dft = false：原阶段二 robust merge（mismatch map + 分段权重 + fuse）。
   float fuse_ms = 0.f, neff = 0.f, m_med = 0.f, m_p90 = 0.f, mis_ms = 0.f,
         mot_med = 0.f, res_fade = 1.f, neff_dft = 0.f,
-        dft_probe[4] = {-1, -1, -1, -1}, dft_ms[3] = {0, 0, 0};
+        dft_probe[4] = {-1, -1, -1, -1}, dft_ms[4] = {0, 0, 0, 0};
   int dft_cnt = 0;
   std::string mis_diag, dil_diag, mot_diag, msm_diag;
   bool dft_active = false;
@@ -5223,6 +5234,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                 ",\"dftUp\":" + f3(dft_ms[0]) +
                                 ",\"dftDsp\":" + f3(dft_ms[1]) +
                                 ",\"dftRb\":" + f3(dft_ms[2]) +
+                                ",\"dftGpu\":" + f3(dft_ms[3]) +
                                 ",\"dftCnt\":" + std::to_string(dft_cnt) +
                                 ",\"dftProbe\":[" +
                                 f3(dft_probe[0]) + "," + f3(dft_probe[1]) + "," +
