@@ -146,6 +146,10 @@ class CameraController(private val context: Context, private val render: RenderC
     private val rendersInFlight = java.util.concurrent.atomic.AtomicInteger(0)
     private val maxRendersInFlight = 2
 
+    // 拍照专用渲染线程（v0.10.83）：独立 EGL context + 独立引擎实例，
+    // 让 1.6~3.4s 的合成链不再阻塞预览渲染线程（"拍完挪手机画面冻住"的根因）。
+    private val stillRender = StillRenderClient()
+
     // ── 后台保存队列（2026-09-30 性能收口）────────────────────────────────
     // JPEG 编码 + 落盘实测 0.34~0.40s（q100 的 Bitmap.compress 是大头），
     // DNG 落盘 0.13~0.17s。原来它们都在拍照回调里同步跑 —— 渲染完成后主线程
@@ -1145,6 +1149,9 @@ class CameraController(private val context: Context, private val render: RenderC
                 if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
             )
         }
+        // 预热拍照渲染线程（v0.10.83）：预览就绪即在后台把独立 context + 引擎
+        // 实例建好，首次拍照不必再等初始化（不阻塞本线程）。
+        stillRender.prewarm()
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
         orientationListener.enable() // 设备方向 → orientationStep（成片旋转 + 对焦区域映射）
@@ -1430,6 +1437,7 @@ class CameraController(private val context: Context, private val render: RenderC
             previewSurface = null
         }
         render.stop()
+        stillRender.stop()
     }
 
     @SuppressLint("MissingPermission")
@@ -1941,15 +1949,24 @@ class CameraController(private val context: Context, private val render: RenderC
         val p0Sub = prefs.getBoolean("p0_sub", true)
         // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
         rendersInFlight.incrementAndGet()
-        render.submitRawBurst(buffers, strides, refW, refH, meta,
-            orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-            useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
+        val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
             if (bytes != null) queueJpegSave(bytes, w, h)
+        }
+        // 优先走拍照专用线程（独立 context）；初始化失败则退回预览线程，
+        // 保证"卡"总比"拍不了"好。
+        if (stillRender.ensureStarted()) {
+            stillRender.submitRawBurst(buffers, strides, refW, refH, meta,
+                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                useDft, alignL1, alignAb, p0Sub, done)
+        } else {
+            render.submitRawBurst(buffers, strides, refW, refH, meta,
+                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                useDft, alignL1, alignAb, p0Sub, done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
