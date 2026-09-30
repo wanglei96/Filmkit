@@ -1291,7 +1291,12 @@ void main() {
                 if (dx == 0 && dy == 0) continue;
                 float c = linZ(z, p + off + ivec2(dx, dy));
                 float d = (c - ref) / sr;
-                float w = exp(-0.5 * d * d - 0.5 * float(dx * dx + dy * dy) / 6.48);
+                // v0.10.65：空间 σ² 6.48 → 25。原值下内圈(d=2)权重 0.735、外圈(d=5.66)
+                // 仅 0.085（差 8.6 倍）→ 少数内圈样本主导，96 个样本的有效独立数
+                // 只有 ~16，真机实测 P0 降噪仅 2.3x（nzPre/nzPost = 0.0201→0.0084）。
+                // 核范围不变（仍 ±4 mosaic = ±2 平面像素），只提高外圈样本权重，
+                // 不加大空间模糊 —— 纹理红线优先。回退路径保持已验证原样。
+                float w = exp(-0.5 * d * d - 0.5 * float(dx * dx + dy * dy) / 25.0);
                 acc += w * c;
                 wsum += w;
             }
