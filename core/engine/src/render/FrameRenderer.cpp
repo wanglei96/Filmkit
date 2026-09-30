@@ -3739,8 +3739,13 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   // ② 5 级 à trous：每级 MRT 写 (a_l, dp_l)。k/revert = 离线镜像定稿值
   glUseProgram(prog_chroma_at_);
   glUniform2i(u_chroma_at_.size, hw, hh);
-  glUniform1f(u_chroma_at_.k, 8.0f);
-  glUniform1f(u_chroma_at_.revert, 0.08f);
+  // v0.10.57：k 8.0 → 2.5、revert 0.08 → 0.20。8σ 的收缩阈值把幅度 2–5σ 的
+  // **真实彩色纹理**（木纹/布纹等以色度为主的细节）整片压掉 —— 真机同刻诊断：
+  // 色度 2/4/8px 带通只剩 PC 的 0.47/0.72/0.79，而亮度 1.34/1.08/1.02（未丢）。
+  // Wiener 收缩的标准阈值是 1–3σ，8σ 属过度抑制；离线选参时只优化了 σC
+  // （噪声），没看色度纹理，是第五次同类口径事故。
+  glUniform1f(u_chroma_at_.k, 2.5f);
+  glUniform1f(u_chroma_at_.revert, 0.20f);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
   glUniform1i(u_chroma_at_.sigma, 1);
@@ -3784,7 +3789,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glUniform2i(u_chroma_apply_.lsc_size, lsc_w_, lsc_h_);
   glUniform3f(u_chroma_apply_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
   glUniform3f(u_chroma_apply_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
-  glUniform1i(u_chroma_apply_.l, 6);
+  glUniform1i(u_chroma_apply_.l, 0);   // v0.10.57：**真正**停用（0.10.56 只加了 shader 门控却没把 uniform 置 0，核仍在跑）
   glUniform1f(u_chroma_apply_.kr, 2.5f);
   glActiveTexture(GL_TEXTURE0);
   glDrawArrays(GL_TRIANGLES, 0, 3);
