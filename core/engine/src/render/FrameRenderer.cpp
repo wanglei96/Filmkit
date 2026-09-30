@@ -2507,6 +2507,14 @@ vec3 lutApply(vec3 c) {
     return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
 }
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// v0.10.67 dither 专用 hash：现有的 sin 版在 gl_FragCoord 大坐标（3072×4080）下
+// highp sin 精度不足，会产生**规律性图案** —— dither 一旦有规律就等于没有。
+// Dave Hoskins 的无 sin 整数风格 hash。单独一个函数，避免改动 grain 的既有观感。
+float dhash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
 float vnoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
@@ -2609,7 +2617,12 @@ void main() {
         float w = 4.0 * l * (1.0 - l);
         c += (vnoise(gp) - 0.5) * uGrainAmount * w;
     }
-    c += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+    // v0.10.67：RPDF ±0.5LSB → **TPDF ±1LSB**（两个独立均匀分布之和 = 三角分布）。
+    // 依据：真机成片最平坦块实测 44.7% 相邻像素完全相同、行间 |Δ| 恰好 1.000 ——
+    // 规则量化斜坡被人眼 Mach band 放大成条带（用户报的"边缘断层"）。TPDF 把
+    // 零变占比降到 35.6%，即把规则台阶打散为随机台阶。均匀分布(RPDF)只能移动
+    // 台阶、不能打散，故必须用三角分布。
+    c += (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / 255.0;
     // 过曝斑马纹（仅预览；成片路径由引擎把 uZebra 置 0 —— 提示绝不进成片）：
     // 显示域亮度达阈值的区域叠 45° 黑白斜纹。高光一旦全饱和就不可恢复
     // （DNG 实测：高光 1.089% 三通道同时饱和），拍前能看见就能少拍废片。
