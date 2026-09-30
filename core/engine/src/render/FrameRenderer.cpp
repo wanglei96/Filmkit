@@ -4282,6 +4282,11 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(uni("uWhite"), white_level);
   glUniform3f(uni("uGain"), gains[0], gains[1], gains[2]);
+  // ⚠️ uCfaLut 必须下发（v0.10.52）：漏了则默认 0 → chanAt() 恒 0 →
+  // gainAt() 四相位全取 uGain.x（R 增益）→ G/B 被乘上 R 增益、通道平衡丢失，
+  // 成片全绿（真机 dftProbe 2×2 = [0.089,0.049,0.051,0.098] 与 DNG 同点
+  // [0.0479,0.0260,0.0271,0.0573] 之比四相位同为 1.85 = gains[0] 实锤）。
+  glUniform1i(uni("uCfaLut"), lut);
   glUniform4f(uni("uPlaneA"), pa[0], pa[1], pa[2], pa[3]);
   glUniform4f(uni("uPlaneB"), pb[0], pb[1], pb[2], pb[3]);
   glUniform1f(uni("uC"), 256.0f);
