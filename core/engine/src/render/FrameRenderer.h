@@ -383,9 +383,9 @@ class FrameRenderer {
   // compute 一次绑定；层序 = 帧序，层 0 = 参考帧）
   GLuint tex_burst_ = 0;
   int burst_w_ = 0, burst_h_ = 0;
-  // R32F 累加 scratch（首组 dispatch 直写、后续组 load+add —— R32F 非
-  // color-renderable 无 FBO 清零路径，也不依赖非 ES 的 glClearTexImage）
-  GLuint tex_fft_scratch_ = 0;
+  // 相位组输出层 ×4（RGBA16F 2DArray；writeonly store——r32f image
+  // load+store 在 X300 Mali 静默不执行，v0.10.40 真机实锤）
+  GLuint tex_fft_out_ = 0;
   // per-tile neff 输出（RGBA16F 2DArray 4 层 = CFA 平面；索引 = (tx+1, ty+1)）
   GLuint tex_fft_neff_ = 0, fbo_fft_neff_ = 0;
   int fft_neff_w_ = 0, fft_neff_h_ = 0;
@@ -393,10 +393,10 @@ class FrameRenderer {
     GLint burst = -1, off[3] = {-1, -1, -1}, out = -1, neff = -1, size = -1,
           off_tiles = -1, fft_tiles = -1, tx_max = -1, black = -1, white = -1,
           gain = -1, plane_a = -1, plane_b = -1, c = -1, group = -1, tw = -1,
-          accum = -1;
+          layer = -1;
   } u_mfnr_fft_;
   struct {
-    GLint acc = -1, size = -1;
+    GLint layers = -1, size = -1;
   } u_mfnr_fft_sum_;
   // ── v0.10.15：darktable filmic 高光重建（HR，dst 尺寸；8+1 张全分辨率）──
   // 出处 darktable filmicrgb.c 的 mask_clipped_pixels/inpaint_noise/

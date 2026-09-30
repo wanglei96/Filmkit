@@ -1,7 +1,10 @@
 // meow-recall 会话标题改写(Node 零依赖:node:sqlite)
 // 用法:node scripts/set-session-title.mjs "<标题>" [--session-id <id>] [--dry-run] [--no-live]
 //
-// 为什么需要:/recall 只有 7 个字符,低于 ZCode 标题生成的 10 字符守卫,标题会永久
+// 只在 ZCode 客户端下有意义:检测到 DSH_SESSION_ID / DSH_HOME(DSH 客户端)时直接跳过——否则会按
+// "最近写入的会话日志"误定位到另一个 ZCode 会话并改掉它的标题。
+//
+// 为什么需要(ZCode):/recall 只有 7 个字符,低于 ZCode 标题生成的 10 字符守卫,标题会永久
 // 停在首句截断("/recall"),而客户端没有"重新生成标题"的入口。这里直接改写两个库的
 // 标题字段,做法与 ZCode 官方 restore-legacy-sessions 插件一致:
 //   ~/.zcode/cli/db/db.sqlite      session.title + title_source='custom'
@@ -45,6 +48,13 @@ function usage() {
 
 if (!title) { console.error("缺少标题参数。"); usage(); process.exit(2); }
 if (title.length > TITLE_MAX) { console.error(`标题过长(${title.length} 字符,上限 ${TITLE_MAX})。`); process.exit(2); }
+
+// DSH 客户端没有 ZCode 的会话库可写,继续跑只会误伤最近活动的 ZCode 会话。exit 0:对 /recall
+// 来说这是"本客户端无需改标题"的正常分支,不当作失败。
+if (process.env.DSH_SESSION_ID || process.env.DSH_HOME) {
+  console.log("检测到 DSH 客户端(DSH_SESSION_ID/DSH_HOME):本脚本只改 ZCode 的会话库,已跳过标题改写。");
+  process.exit(0);
+}
 
 // 会话定位:显式参数 > 环境变量 > 最近写入的 rollout 文件(文件名即会话 id)
 function resolveSession() {

@@ -1397,21 +1397,24 @@ void main() {
     }
 })";
 
-// kFsMfnrFftSum（降噪专项 A）：overlap-add 的收口 pass —— 把 R32F 累加
-// scratch（4 次 dispatch 串行叠加，半重叠窗和恒 1）转渲染进 tex_fused_
-//（R16F，与 fuse 路径同域同格式，后段 P0/RCD/胶片链零改动）。
+// kFsMfnrFftSum（降噪专项 A）：overlap-add 的收口 pass —— 4 个相位组层
+//（组内 tile 互不重叠、每 texel 至多 1 tile 写入）按窗和恒 1 直接相加，
+// 渲染进 tex_fused_（R16F，与 fuse 路径同域同格式，后段零改动）。
 // ⚠️ 必须 #version 300 es：vs_plain_ 与全部现有 fragment 均为 300 es，Mali
 // 拒绝不同 GLSL 版本混链（"Shader languages do not match"，v0.10.37 首包
 // init_failed 黑屏事故）—— sum 只是采样+相加，300 es 完全够用。
 const char* kFsMfnrFftSum = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
-uniform highp sampler2D uAcc;  // R32F（NEAREST；R32F 无硬件过滤）
+uniform highp sampler2DArray uLayers;  // 4 层相位组（NEAREST）
 uniform ivec2 uSize;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     if (p.x >= uSize.x || p.y >= uSize.y) { oColor = vec4(0.0); return; }
-    float v = texelFetch(uAcc, p, 0).r;
+    float v = texelFetch(uLayers, ivec3(p, 0), 0).r +
+              texelFetch(uLayers, ivec3(p, 1), 0).r +
+              texelFetch(uLayers, ivec3(p, 2), 0).r +
+              texelFetch(uLayers, ivec3(p, 3), 0).r;
     oColor = vec4(v, v, v, 1.0);
 })";
 
@@ -2718,7 +2721,7 @@ bool FrameRenderer::init() {
   u_mfnr_fft_.plane_b = glGetUniformLocation(prog_mfnr_fft_, "uPlaneB");
   u_mfnr_fft_.c = glGetUniformLocation(prog_mfnr_fft_, "uC");
   u_mfnr_fft_.group = glGetUniformLocation(prog_mfnr_fft_, "uGroup");
-  u_mfnr_fft_.accum = glGetUniformLocation(prog_mfnr_fft_, "uAccum");
+  u_mfnr_fft_.layer = glGetUniformLocation(prog_mfnr_fft_, "uLayer");
   u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
   // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置；prog 0 = 已置回退）
   if (prog_mfnr_fft_) {
@@ -2729,12 +2732,14 @@ bool FrameRenderer::init() {
     }
     if (u_mfnr_fft_.out >= 0) glUniform1i(u_mfnr_fft_.out, 0);
     if (u_mfnr_fft_.neff >= 0) glUniform1i(u_mfnr_fft_.neff, 1);
+    if (u_mfnr_fft_.layer >= 0) glUniform1i(u_mfnr_fft_.layer, 0);
   }
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
   if (prog_mfnr_fft_sum_) {
     glUseProgram(prog_mfnr_fft_sum_);
-    u_mfnr_fft_sum_.acc = glGetUniformLocation(prog_mfnr_fft_sum_, "uAcc");
-    if (u_mfnr_fft_sum_.acc >= 0) glUniform1i(u_mfnr_fft_sum_.acc, 0);
+    u_mfnr_fft_sum_.layers =
+        glGetUniformLocation(prog_mfnr_fft_sum_, "uLayers");
+    if (u_mfnr_fft_sum_.layers >= 0) glUniform1i(u_mfnr_fft_sum_.layers, 0);
     u_mfnr_fft_sum_.size = glGetUniformLocation(prog_mfnr_fft_sum_, "uSize");
   }
 
@@ -2999,12 +3004,12 @@ void FrameRenderer::release() {
   if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
   if (tex_burst_) glDeleteTextures(1, &tex_burst_);
-  if (tex_fft_scratch_) glDeleteTextures(1, &tex_fft_scratch_);
+  if (tex_fft_out_) glDeleteTextures(1, &tex_fft_out_);
   if (tex_fft_neff_) glDeleteTextures(1, &tex_fft_neff_);
   if (fbo_fft_neff_) glDeleteFramebuffers(1, &fbo_fft_neff_);
   prog_mfnr_fft_ = prog_mfnr_fft_sum_ = 0;
   tex_burst_ = 0;
-  tex_fft_scratch_ = 0;
+  tex_fft_out_ = 0;
   burst_w_ = burst_h_ = 0;
   tex_fft_neff_ = fbo_fft_neff_ = 0;
   fft_neff_w_ = fft_neff_h_ = 0;
@@ -4179,11 +4184,11 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   if (burst_w_ == w && burst_h_ == h && tex_burst_ != 0) return true;
   if (tex_burst_) glDeleteTextures(1, &tex_burst_);
-  if (tex_fft_scratch_) glDeleteTextures(1, &tex_fft_scratch_);
+  if (tex_fft_out_) glDeleteTextures(1, &tex_fft_out_);
   if (tex_fft_neff_) glDeleteTextures(1, &tex_fft_neff_);
   if (fbo_fft_neff_) glDeleteFramebuffers(1, &fbo_fft_neff_);
   tex_burst_ = 0;
-  tex_fft_scratch_ = 0;
+  tex_fft_out_ = 0;
   tex_fft_neff_ = fbo_fft_neff_ = 0;
   // burst 数组：4 层 R16UI（NEAREST + CLAMP，texelFetch 不受影响但保持一致）
   glGenTextures(1, &tex_burst_);
@@ -4207,19 +4212,21 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, ntx, nty, 4, 0, GL_RGBA,
                GL_HALF_FLOAT, nullptr);
   glGenFramebuffers(1, &fbo_fft_neff_);
-  // R32F 累加 scratch（NEAREST；R32F 无过滤、非 color-renderable）
-  glGenTextures(1, &tex_fft_scratch_);
-  glBindTexture(GL_TEXTURE_2D, tex_fft_scratch_);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT, nullptr);
+  // 相位组输出层 ×4（RGBA16F 2DArray，writeonly store；每层被本组 tile
+  // 全图覆盖，免清零免累加）
+  glGenTextures(1, &tex_fft_out_);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_fft_out_);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, w, h, 4, 0, GL_RGBA,
+               GL_HALF_FLOAT, nullptr);
   burst_w_ = w;
   burst_h_ = h;
   fft_neff_w_ = ntx;
   fft_neff_h_ = nty;
-  return tex_burst_ != 0 && tex_fft_neff_ != 0 && tex_fft_scratch_ != 0;
+  return tex_burst_ != 0 && tex_fft_neff_ != 0 && tex_fft_out_ != 0;
 }
 
 bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
@@ -4291,7 +4298,6 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   glUniform4f(u_mfnr_fft_.plane_a, pa[0], pa[1], pa[2], pa[3]);
   glUniform4f(u_mfnr_fft_.plane_b, pb[0], pb[1], pb[2], pb[3]);
   glUniform1f(u_mfnr_fft_.c, 256.0f);
-  glUniform1i(u_mfnr_fft_.accum, 0);  // location 填充见 init；每次 dispatch 前重设
   // twiddle 表（spike 同款：2π·i/16 的 (cos, sin)，i = 0..7）
   float tw[16];
   for (int i = 0; i < 8; ++i) {
@@ -4302,8 +4308,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   if (u_mfnr_fft_.tw >= 0) glUniform2fv(u_mfnr_fft_.tw, 8, tw);
   glBindImageTexture(1, tex_fft_neff_, 0, GL_TRUE, 0, GL_WRITE_ONLY,
                      GL_RGBA16F);
-  glBindImageTexture(0, tex_fft_scratch_, 0, GL_FALSE, 0, GL_READ_WRITE,
-                     GL_R32F);
+  glBindImageTexture(0, tex_fft_out_, 0, GL_TRUE, 0, GL_WRITE_ONLY,
+                     GL_RGBA16F);
   for (int g = 0; g < 4; ++g) {
     const int gx = g & 1, gy = g >> 1;
     // 组内 tile：tx ≡ 2gx−1 (mod 2)，x ∈ [-1, tx_max]；每 workgroup 2 tile
@@ -4316,23 +4322,21 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       if (((ty + 1) & 1) == gy) ++m;
     }
     glUniform2i(u_mfnr_fft_.group, gx, gy);
-    glUniform1i(u_mfnr_fft_.accum, g > 0 ? 1 : 0);
+    glUniform1i(u_mfnr_fft_.layer, gy * 2 + gx);
     glDispatchCompute((n + 1) / 2, m, 4);
-    // 组间累加：本组 imageStore 对下一组的 imageLoad 可见
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    // 层间无写竞争（各写各层），无需组间 barrier
   }
-  // v0.10.39：末组写入要被**收口 pass 的纹理采样**与 **neff 的 framebuffer
-  // 读回**看到 —— 必须下 TEXTURE_FETCH / FRAMEBUFFER barrier（v0.10.38 只下
-  // SHADER_IMAGE_ACCESS → 收口读 scratch 全 0 = 成片全黑、neff 读回全 0 =
-  // dftNeff 恒 4.000 兜底，真机日志实锤）。ALL_BARRIER_BITS 一次覆盖。
+  // 末组写入要被**收口 pass 的纹理采样**与 **neff 的 framebuffer 读回**看到
+  // —— TEXTURE_FETCH / FRAMEBUFFER barrier（ALL_BARRIER_BITS 一次覆盖；
+  // v0.10.38 只下 SHADER_IMAGE_ACCESS 时收口读全 0 的教训保留）。
   glMemoryBarrier(GL_ALL_BARRIER_BITS);
   const auto t_rb = std::chrono::steady_clock::now();
-  // 3b) overlap-add 收口：R32F scratch → tex_fused_（窗和恒 1，直接转渲染）
+  // 3b) overlap-add 收口：4 层相位组 → tex_fused_（窗和恒 1，直接相加）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_mfnr_fft_sum_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_fft_scratch_);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_fft_out_);
   glUniform2i(u_mfnr_fft_sum_.size, w, h);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   // 4) per-tile neff 读回（4 层 × ~50KB，取有效值均值）
