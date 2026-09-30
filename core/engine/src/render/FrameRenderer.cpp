@@ -736,8 +736,11 @@ void main() {
     oDetail = vec4(dp, 0.0, 1.0);
 })";
 
-// ③ 收口：全分辨率下 Cb/Cr = a_L + Σ dp_l（手动双线性上采样，RGBA16F 无线性
-//    过滤），与 Y 合成回 RGB
+// ③ 收口：色度 Cb/Cr = a_L + Σ dp_l（手动双线性上采样，RGBA16F 无线性过滤）
+//    + **亮度各向异性长核**（D-2，v0.10.54）：结构张量切向采样 + 逐像素噪声
+//    阈值（σ(x)=√(A·x+B)，暗部自适应）。离线实测（L=16/kr=3.5，同一 4 帧口径）：
+//    σY 暗 2.87→1.08 / 中 2.03→1.12 / 亮 1.44→0.55（PC 0.72/0.94/0.63），
+//    边缘等效宽度 4.86 vs PC 4.62。并入本 pass = 不新增纹理与 pass。
 const char* kFsChromaApply = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
@@ -750,7 +753,14 @@ uniform highp sampler2D uD3;
 uniform highp sampler2D uD4;
 uniform ivec2 uSize;
 uniform ivec2 uHalf;
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
+uniform highp sampler2D uLsc;
+uniform ivec2 uLscSize;
+uniform int uL;        // 切向采样半长（≤ kLMax）
+uniform float uKr;     // 值域阈值系数（× 逐像素 σ）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const int kLMax = 16;
 vec2 sampleUp(highp sampler2D t, vec2 uv) {
     vec2 g = uv * vec2(uHalf) - 0.5;
     ivec2 i0 = ivec2(floor(g));
@@ -762,6 +772,20 @@ vec2 sampleUp(highp sampler2D t, vec2 uv) {
     vec2 c11 = texelFetch(t, clamp(i0 + ivec2(1, 1), ivec2(0), mx), 0).rg;
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
+float lumAt(ivec2 p) {
+    return dot(texelFetch(uTex, clamp(p, ivec2(0), uSize - 1), 0).rgb, LUMA);
+}
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec3 c = texelFetch(uTex, p, 0).rgb;
@@ -769,8 +793,33 @@ void main() {
     vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
     vec2 ch = sampleUp(uCoarse, uv) + sampleUp(uD0, uv) + sampleUp(uD1, uv) +
               sampleUp(uD2, uv) + sampleUp(uD3, uv) + sampleUp(uD4, uv);
-    vec3 o = vec3(y + ch.y, 0.0, y + ch.x);   // R = Y + Cr, B = Y + Cb
-    o.g = (y - 0.2126 * o.r - 0.0722 * o.b) / 0.7152;
+    // ── 亮度各向异性核：3×3 luma → 结构张量 → 切向长核 + 值域权重 ──
+    float y00 = lumAt(p + ivec2(-1, -1)), y10 = lumAt(p + ivec2(0, -1)),
+          y20 = lumAt(p + ivec2(1, -1));
+    float y01 = lumAt(p + ivec2(-1, 0)),   y21 = lumAt(p + ivec2(1, 0));
+    float y02 = lumAt(p + ivec2(-1, 1)),   y12 = lumAt(p + ivec2(0, 1)),
+          y22 = lumAt(p + ivec2(1, 1));
+    float gx = ((y20 + y21 + y22) - (y00 + y01 + y02)) / 6.0;   // 右列 − 左列
+    float gy = ((y02 + y12 + y22) - (y00 + y10 + y20)) / 6.0;   // 下行 − 上行
+    float Jxx = gx * gx + 1e-9, Jyy = gy * gy + 1e-9, Jxy = gx * gy;
+    float th = 0.5 * atan(2.0 * Jxy, Jxx - Jyy);
+    vec2 tv = vec2(-sin(th), cos(th));          // 切向（沿边缘）
+    float ay = dot(uNoiseA, LUMA), by = dot(uNoiseB, LUMA);
+    float glY = dot(lscAt(p), LUMA);
+    float sr = max(uKr * sqrt(max(ay * y + by * glY * glY, 1e-12)), 1e-5);
+    float acc = y, ws = 1.0;
+    for (int k = -kLMax; k <= kLMax; ++k) {
+        if (k == 0 || abs(k) > uL) continue;
+        ivec2 q = clamp(p + ivec2(round(float(k) * tv)), ivec2(0), uSize - 1);
+        float yq = dot(texelFetch(uTex, q, 0).rgb, LUMA);
+        float d = (yq - y) / sr;
+        float w = exp(-0.5 * d * d);
+        acc += w * yq;
+        ws += w;
+    }
+    float dyn = acc / ws - y;                   // 加性回写（乘性会在暗部放大噪声）
+    vec3 o = vec3(y + ch.y + dyn, 0.0, y + ch.x + dyn);   // R = Y+Cr, B = Y+Cb
+    o.g = (y + dyn - 0.2126 * o.r - 0.0722 * o.b) / 0.7152;
     oColor = vec4(o, 1.0);
 })";
 
@@ -2972,6 +3021,12 @@ bool FrameRenderer::init() {
   }
   u_chroma_apply_.size = glGetUniformLocation(prog_chroma_apply_, "uSize");
   u_chroma_apply_.half = glGetUniformLocation(prog_chroma_apply_, "uHalf");
+  u_chroma_apply_.noise_a = glGetUniformLocation(prog_chroma_apply_, "uNoiseA");
+  u_chroma_apply_.noise_b = glGetUniformLocation(prog_chroma_apply_, "uNoiseB");
+  u_chroma_apply_.lsc = glGetUniformLocation(prog_chroma_apply_, "uLsc");
+  u_chroma_apply_.lsc_size = glGetUniformLocation(prog_chroma_apply_, "uLscSize");
+  u_chroma_apply_.l = glGetUniformLocation(prog_chroma_apply_, "uL");
+  u_chroma_apply_.kr = glGetUniformLocation(prog_chroma_apply_, "uKr");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -3705,6 +3760,16 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_chroma_apply_.size, dst_w, dst_h);
   glUniform2i(u_chroma_apply_.half, hw, hh);
+  // D-2：亮度各向异性核（逐像素噪声阈值 + LSC 传播，与 P4 同源）
+  glActiveTexture(GL_TEXTURE7);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_chroma_apply_.lsc, 7);
+  glUniform2i(u_chroma_apply_.lsc_size, lsc_w_, lsc_h_);
+  glUniform3f(u_chroma_apply_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
+  glUniform3f(u_chroma_apply_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
+  glUniform1i(u_chroma_apply_.l, 16);
+  glUniform1f(u_chroma_apply_.kr, 3.5f);
+  glActiveTexture(GL_TEXTURE0);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   return true;
 }

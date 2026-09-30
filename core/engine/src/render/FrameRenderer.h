@@ -549,7 +549,8 @@ class FrameRenderer {
   } u_chroma_at_;
   struct {
     GLint tex = -1, coarse = -1, d[5] = {-1, -1, -1, -1, -1}, size = -1,
-          half = -1;
+          half = -1, noise_a = -1, noise_b = -1, lsc = -1, lsc_size = -1, l = -1,
+          kr = -1;
   } u_chroma_apply_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
