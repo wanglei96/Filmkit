@@ -1400,7 +1400,7 @@ precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(rgba16f, binding = 0) writeonly uniform highp image2D uMicro;
 void main() {
-    if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == 0u) {
         imageStore(uMicro, ivec2(0, 0), vec4(1.0, 1.0, 1.0, 1.0));
     }
 })";
@@ -4413,10 +4413,6 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
         std::string("{\"sum\":") +
             std::to_string(chk_sum).substr(0, 8) +
             ",\"micro\":" + (micro_ok ? "true" : "false") + "}");
-    Logger::instance().log(
-        LogLevel::kInfo, "engine", "mfnr.fft.store_check",
-        std::string("{\"sum\":") +
-            std::to_string(chk_sum).substr(0, 8) + "}");
     if (!(chk_sum > 0.f) || !std::isfinite(chk_sum)) {
       Logger::instance().log(
           LogLevel::kError, "engine", "mfnr.fft.store_lost",
