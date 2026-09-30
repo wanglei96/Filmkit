@@ -20,9 +20,6 @@ jobs:
       - name: Build & unit test
         run: ./gradlew assembleDebug testDebugUnitTest --stacktrace
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: filmkit-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 3
+      # v0.10.39：不再上传 APK artifact —— 私有仓库 Actions storage 配额
+      # 500MB，29MB/次很快占满，push 后 artifact 上传失败报红。出包一律本地
+      # （filmkit-<versionName>.apk 单文件覆盖制），CI 只做构建+单测验证。

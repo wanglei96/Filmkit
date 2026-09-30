@@ -191,11 +191,16 @@ class FrameRenderer {
   // 不参与（逐频收缩自身鲁棒）。输出每 tile 的频率平均等效 neff（NS §3.3
   // "按实际合并更新 σ"），CPU 读回取均值供 P0/P4 折减与日志。
   bool ensureMfnrFftTargets(int w, int h);
-  // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径
+  // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
+  // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
+  // out_cnt = neff 读回的有效 texel 数（0 = 输出全空，真机诊断用）；
+  // out_probe[4] = 收口后 tex_fused_ 的 4 个采样点（黑图归因探针）。
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
-                   float* out_neff);
+                   const void* const* frames, const int* row_strides_px,
+                   float* out_neff, int* out_cnt, float* out_probe,
+                   float* out_ms);  // out_ms = {直传, dispatch, 收口+读回} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
   struct ChainCtx {

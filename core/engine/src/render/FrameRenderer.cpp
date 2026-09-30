@@ -4225,8 +4225,14 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
 bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const float plane_a[3],
-                                const float plane_b[3], float* out_neff) {
+                                const float plane_b[3],
+                                const void* const* frames,
+                                const int* row_strides_px, float* out_neff,
+                                int* out_cnt, float* out_probe,
+                                float* out_ms) {
   *out_neff = 0.f;
+  *out_cnt = 0;
+  out_probe[0] = out_probe[1] = out_probe[2] = out_probe[3] = -1.f;
   if (burst_w_ != w || burst_h_ != h) return false;
   if (prog_mfnr_fft_ == 0 || prog_mfnr_fft_sum_ == 0) {
     Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.unavailable",
@@ -4242,14 +4248,21 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     pa[p] = plane_a[ch];
     pb[p] = plane_b[ch];
   }
-  // 1) 4 帧 GPU-GPU 汇集到 2DArray（层 0 = 参考帧）
-  const GLuint srcs[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
-  while (glGetError() != GL_NO_ERROR) {
-  }
+  // 1) 4 帧直传 2DArray（层 0 = 参考帧）。v0.10.38/39 真机实锤不用
+  //    glCopyImageSubData：Mali 对 R16UI 2D→2D_ARRAY 静默不拷贝（不报 GL
+  //    错误但层内容全 0 → 内核输入全 0 → Az≡0 → dftNeff 恰 4.000、成片全
+  //    黑）。CPU 侧 frames[] 直传数据源确定；GPU-GPU copy 的正确性验证
+  //    留给「能力 Spike」（性能差 ~30ms 级，正确性优先）。
+  const auto t_up = std::chrono::steady_clock::now();
+  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_burst_);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
   for (int i = 0; i < 4; ++i) {
-    glCopyImageSubData(srcs[i], GL_TEXTURE_2D, 0, 0, 0, 0, tex_burst_,
-                       GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, w, h, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_strides_px[i]);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, w, h, 1, GL_RED_INTEGER,
+                    GL_UNSIGNED_SHORT, frames[i]);
   }
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   if (glGetError() != GL_NO_ERROR) {
     Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.copy_fail",
                            "{}");
@@ -4257,6 +4270,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   }
   // 3) 4 次 dispatch（tile 相位组 (gx,gy)）：每次 xy = 组内 tile 网格的一半
   //    （每 workgroup 2 个水平相邻同组 tile）、z = 4 平面
+  const auto t_dsp = std::chrono::steady_clock::now();
   const int pw = (w + 1) / 2, ph = (h + 1) / 2;
   const int tx_max = (pw + 7) / 8 - 1, ty_max = (ph + 7) / 8 - 1;
   glUseProgram(prog_mfnr_fft_);
@@ -4312,6 +4326,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // SHADER_IMAGE_ACCESS → 收口读 scratch 全 0 = 成片全黑、neff 读回全 0 =
   // dftNeff 恒 4.000 兜底，真机日志实锤）。ALL_BARRIER_BITS 一次覆盖。
   glMemoryBarrier(GL_ALL_BARRIER_BITS);
+  const auto t_rb = std::chrono::steady_clock::now();
   // 3b) overlap-add 收口：R32F scratch → tex_fused_（窗和恒 1，直接转渲染）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
@@ -4339,10 +4354,28 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       }
     }
   }
+  // 黑图归因探针：收口后 tex_fused_ 中心 4 点（fuse 正常应有非零值；
+  // 全 0 = 合并输出为 0，对照 frames 直传与 neff cnt 判"输入空"还是"写丢"）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
+  const int px4[4] = {w / 4, w / 2, w * 3 / 4, w / 2};
+  const int py4[4] = {h / 4, h / 2, h * 3 / 4, h / 2};
+  for (int k = 0; k < 4; ++k) {
+    float v[4] = {0, 0, 0, 0};
+    glReadPixels(px4[k], py4[k], 1, 1, GL_RGBA, GL_FLOAT, v);
+    out_probe[k] = v[0];
+  }
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   while (glGetError() != GL_NO_ERROR) {
   }
   *out_neff = cnt > 0 ? static_cast<float>(acc / cnt) : 4.0f;
+  *out_cnt = cnt;
+  const auto t_end = std::chrono::steady_clock::now();
+  const auto ms = [](auto a, auto b) {
+    return std::chrono::duration<float, std::milli>(b - a).count();
+  };
+  out_ms[0] = ms(t_up, t_dsp);
+  out_ms[1] = ms(t_dsp, t_rb);
+  out_ms[2] = ms(t_rb, t_end);
   return true;
 }
 
@@ -4847,7 +4880,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 读回（NS §3.3"按实际合并更新 σ"）。
   // use_dft = false：原阶段二 robust merge（mismatch map + 分段权重 + fuse）。
   float fuse_ms = 0.f, neff = 0.f, m_med = 0.f, m_p90 = 0.f, mis_ms = 0.f,
-        mot_med = 0.f, res_fade = 1.f, neff_dft = 0.f;
+        mot_med = 0.f, res_fade = 1.f, neff_dft = 0.f,
+        dft_probe[4] = {-1, -1, -1, -1}, dft_ms[3] = {0, 0, 0};
+  int dft_cnt = 0;
   std::string mis_diag, dil_diag, mot_diag, msm_diag;
   bool dft_active = false;
   // upload_ms 语义 = t0 → 融合开始（两路径统一：upload+align+合并前段）
@@ -4857,7 +4892,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     tf = std::chrono::steady_clock::now();
     if (!ensureMfnrFftTargets(w, h)) return false;
     dft_active = passMfnrFft(w, h, cfa, black_phase, wl, rc.gains, nc_single.p0a,
-                             nc_single.p0b, &neff_dft);
+                             nc_single.p0b, frames, row_strides_px, &neff_dft,
+                             &dft_cnt, dft_probe, dft_ms);
     if (dft_active) {
       glFinish();
       stage("chain");
@@ -5179,7 +5215,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"fuse\":\"" + (dft_active ? "dft" : "mm") + "\"" +
-              (use_dft ? ",\"dftNeff\":" + f3(neff_dft) : "") +
+              (dft_active ? ",\"dftNeff\":" + f3(neff_dft) +
+                                ",\"dftUp\":" + f3(dft_ms[0]) +
+                                ",\"dftDsp\":" + f3(dft_ms[1]) +
+                                ",\"dftRb\":" + f3(dft_ms[2]) +
+                                ",\"dftCnt\":" + std::to_string(dft_cnt) +
+                                ",\"dftProbe\":[" +
+                                f3(dft_probe[0]) + "," + f3(dft_probe[1]) + "," +
+                                f3(dft_probe[2]) + "," + f3(dft_probe[3]) + "]"
+                          : "") +
               ",\"alignMs\":" + f3(align_ms) +
               ",\"misMs\":" + f3(mis_ms) +
               ",\"fuseMs\":" + f3(fuse_ms) +
