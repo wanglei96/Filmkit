@@ -197,7 +197,6 @@ class FrameRenderer {
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
-                   const void* const* frames, const int* row_strides_px,
                    float* out_neff, float* out_probe,
                    float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
@@ -379,17 +378,14 @@ class FrameRenderer {
   // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
   GLuint prog_mfnr_fft_ = 0, prog_mfnr_fft_sum_ = 0;
   GLuint prog_micro_store_ = 0;  // 1-texel imageStore 微测试(上下文判定)
-  // burst 4 帧 R16UI 2DArray（glCopyImageSubData 自 raw_tex_/tex_mfnr_ 汇集，
-  // compute 一次绑定；层序 = 帧序，层 0 = 参考帧）
-  GLuint tex_burst_ = 0;
-  int burst_w_ = 0, burst_h_ = 0;
+  int burst_w_ = 0, burst_h_ = 0;  // 输出纹理尺寸标记(输入直接用 4 张 2D)
   // 相位组输出 ×4（R32F image2D writeonly；glslang ES profile 只放行 r32f、
   // image2DArray 的 store 在 X300 Mali 上静默丢失 —— v0.10.42 dftGpu 577ms
   // vs dftCnt 0 实锤）
   GLuint tex_fft_out_[4] = {0, 0, 0, 0};
   struct {
-    GLint burst = -1, off[3] = {-1, -1, -1}, out = -1, neff = -1, size = -1,
-          off_tiles = -1, fft_tiles = -1, tx_max = -1, black = -1, white = -1,
+    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, out = -1, size = -1,
+          off_tiles = -1, tx_max = -1, black = -1, white = -1,
           gain = -1, plane_a = -1, plane_b = -1, c = -1, group = -1, tw = -1,
           layer = -1, rows = -1;
   } u_mfnr_fft_;

@@ -1085,12 +1085,19 @@ void main() {
 const char* kFsMfnrFft = R"(#version 310 es
 precision highp float;
 precision highp int;
-precision highp sampler2DArray;
-precision highp usampler2DArray;
+precision highp usampler2D;
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-uniform highp usampler2DArray uBurst;  // 4 帧 u16 Bayer（层 0 = 参考帧）
+// 输入 = 4 张独立 usampler2D（v0.10.48）：usampler2DArray 是全部失败版本里
+// 唯一从未单独验证过的采样路径 —— spike（sampler2DArray R16F）在同一拍照
+// 上下文完美工作（spikeOk:true），而已验证的 usampler 采样全部是 2D 版
+//（kFsMfnrFuse/Pyr/mismatch）。若 array 版返回全 0，则"输入全 0 → 输出全 0"
+// 能解释 0.10.38 以来的全部观测（dftGpu 477-798ms = 真实计算、输出恒 0）。
+uniform highp usampler2D uRaw0;
+uniform highp usampler2D uRaw1;
+uniform highp usampler2D uRaw2;
+uniform highp usampler2D uRaw3;
 uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
@@ -1130,9 +1137,19 @@ int chanAt(ivec2 p) {
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 float linAt(int z, ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
-    float v = float(texelFetch(uBurst, ivec3(p, z), 0).r);
+    // image/sampler uniform 均须静态索引 —— z 是载入循环常量展开
+    uint v;
+    if (z == 0) {
+        v = texelFetch(uRaw0, p, 0).r;
+    } else if (z == 1) {
+        v = texelFetch(uRaw1, p, 0).r;
+    } else if (z == 2) {
+        v = texelFetch(uRaw2, p, 0).r;
+    } else {
+        v = texelFetch(uRaw3, p, 0).r;
+    }
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+    return max((float(v) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
 }
 // 位移场双线性（与 kFsMfnrFuse 的 offNAt 同式；uOffTiles 为其网格）。
 vec2 offAt(highp sampler2D t, vec2 m) {
@@ -2730,16 +2747,16 @@ bool FrameRenderer::init() {
   u_tile_rms_.noise_b = glGetUniformLocation(prog_tile_rms_, "uNoiseB");
 
   // 降噪专项 A：DFT 合并 compute 的 uniform（image binding 0/1 由 layout 固定）
-  u_mfnr_fft_.burst = glGetUniformLocation(prog_mfnr_fft_, "uBurst");
+  for (int i = 0; i < 4; ++i) {
+    u_mfnr_fft_.raw[i] =
+        glGetUniformLocation(prog_mfnr_fft_, ("uRaw" + std::to_string(i)).c_str());
+  }
   for (int i = 0; i < 3; ++i) {
     u_mfnr_fft_.off[i] = glGetUniformLocation(prog_mfnr_fft_,
                                               ("uOff" + std::to_string(i + 1)).c_str());
   }
-  u_mfnr_fft_.out = glGetUniformLocation(prog_mfnr_fft_, "uOut");
-  u_mfnr_fft_.neff = glGetUniformLocation(prog_mfnr_fft_, "uNeff");
   u_mfnr_fft_.size = glGetUniformLocation(prog_mfnr_fft_, "uSize");
   u_mfnr_fft_.off_tiles = glGetUniformLocation(prog_mfnr_fft_, "uOffTiles");
-  u_mfnr_fft_.fft_tiles = glGetUniformLocation(prog_mfnr_fft_, "uFftTiles");
   u_mfnr_fft_.tx_max = glGetUniformLocation(prog_mfnr_fft_, "uTxMax");
   u_mfnr_fft_.black = glGetUniformLocation(prog_mfnr_fft_, "uBlack");
   u_mfnr_fft_.white = glGetUniformLocation(prog_mfnr_fft_, "uWhite");
@@ -2751,12 +2768,14 @@ bool FrameRenderer::init() {
   u_mfnr_fft_.layer = glGetUniformLocation(prog_mfnr_fft_, "uLayer");
   u_mfnr_fft_.rows = glGetUniformLocation(prog_mfnr_fft_, "uRows");
   u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
-  // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置；prog 0 = 已置回退）
+  // uRaw0..3 → unit 0..3、uOff1..3 → unit 4..6（dispatch 前绑纹理;prog 0 = 已置回退）
   if (prog_mfnr_fft_) {
     glUseProgram(prog_mfnr_fft_);
-    if (u_mfnr_fft_.burst >= 0) glUniform1i(u_mfnr_fft_.burst, 0);
+    for (int i = 0; i < 4; ++i) {
+      if (u_mfnr_fft_.raw[i] >= 0) glUniform1i(u_mfnr_fft_.raw[i], i);
+    }
     for (int i = 0; i < 3; ++i) {
-      if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 1 + i);
+      if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 4 + i);
     }
     // v0.10.45:uOut0..3 的 image unit 必须**显式** glUniform1i —— 0.10.44
     // 只查了旧名 "uOut"(改名后 -1 no-op),而部分 Mali 驱动不采用
@@ -3041,14 +3060,12 @@ void FrameRenderer::release() {
   if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
   if (prog_micro_store_) glDeleteProgram(prog_micro_store_);
-  if (tex_burst_) glDeleteTextures(1, &tex_burst_);
   for (auto& t : tex_fft_out_) {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
   prog_mfnr_fft_ = prog_mfnr_fft_sum_ = 0;
   prog_micro_store_ = 0;
-  tex_burst_ = 0;
   burst_w_ = burst_h_ = 0;
   if (tex_rms_) glDeleteTextures(1, &tex_rms_);
   if (fbo_rms_) glDeleteFramebuffers(1, &fbo_rms_);
@@ -4219,22 +4236,13 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // dispatch（tile 相位组串行化 overlap-add）→ per-tile neff 读回均值。
 // 输出写进 tex_fused_（与 fuse 路径同域同格式），后段 P0/RCD/胶片链零改动。
 bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
-  if (burst_w_ == w && burst_h_ == h && tex_burst_ != 0) return true;
-  if (tex_burst_) glDeleteTextures(1, &tex_burst_);
+  if (burst_w_ == w && burst_h_ == h && tex_fft_out_[3] != 0) return true;
   for (auto& t : tex_fft_out_) {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
-  tex_burst_ = 0;
-  // burst 数组：4 层 R16UI（NEAREST + CLAMP，texelFetch 不受影响但保持一致）
-  glGenTextures(1, &tex_burst_);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_burst_);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R16UI, w, h, 4, 0, GL_RED_INTEGER,
-               GL_UNSIGNED_SHORT, nullptr);
+  // 输入直接用现有 raw_tex_/tex_mfnr_（usampler2D，与 kFsMfnrFuse 同款已验证
+  // 采样路径），无独立 burst 纹理
   // 相位组输出 ×4（RGBA16F image2D writeonly = spike 真机验证过的写入
   // 语义；每张被本组 tile 全图覆盖免清零）
   for (auto& t : tex_fft_out_) {
@@ -4249,15 +4257,13 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   }
   burst_w_ = w;
   burst_h_ = h;
-  return tex_burst_ != 0 && tex_fft_out_[0] != 0 && tex_fft_out_[3] != 0;
+  return tex_fft_out_[0] != 0 && tex_fft_out_[3] != 0;
 }
 
 bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const float plane_a[3],
-                                const float plane_b[3],
-                                const void* const* frames,
-                                const int* row_strides_px, float* out_neff,
+                                const float plane_b[3], float* out_neff,
                                 float* out_probe,
                                 float* out_ms) {
   *out_neff = 0.f;
@@ -4277,28 +4283,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     pa[p] = plane_a[ch];
     pb[p] = plane_b[ch];
   }
-  // 1) 4 帧直传 2DArray（层 0 = 参考帧）。v0.10.38/39 真机实锤不用
-  //    glCopyImageSubData：Mali 对 R16UI 2D→2D_ARRAY 静默不拷贝（不报 GL
-  //    错误但层内容全 0 → 内核输入全 0 → Az≡0 → dftNeff 恰 4.000、成片全
-  //    黑）。CPU 侧 frames[] 直传数据源确定；GPU-GPU copy 的正确性验证
-  //    留给「能力 Spike」（性能差 ~30ms 级，正确性优先）。
-  const auto t_up = std::chrono::steady_clock::now();
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_burst_);
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
-  for (int i = 0; i < 4; ++i) {
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_strides_px[i]);
-    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, w, h, 1, GL_RED_INTEGER,
-                    GL_UNSIGNED_SHORT, frames[i]);
-  }
-  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-  if (glGetError() != GL_NO_ERROR) {
-    Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.copy_fail",
-                           "{}");
-    return false;
-  }
-  // 3) 4 次 dispatch（tile 相位组 (gx,gy)）：每次 xy = 组内 tile 网格的一半
-  //    （每 workgroup 2 个水平相邻同组 tile）、z = 4 平面
+  // 2) 4 次 dispatch（tile 相位组 (gx,gy)）：每次 xy = 组内 tile 网格的一半
+  //    （每 workgroup 2 个水平相邻同组 tile）
   const auto t_dsp = std::chrono::steady_clock::now();
   GpuTimer gpu_fft;
   const bool gpu_ok = GpuTimer::supported();
@@ -4306,10 +4292,15 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   const int pw = (w + 1) / 2, ph = (h + 1) / 2;
   const int tx_max = (pw + 7) / 8 - 1, ty_max = (ph + 7) / 8 - 1;
   glUseProgram(prog_mfnr_fft_);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_burst_);
+  // 输入直接绑现有纹理(raw_tex_ = 帧 0,与 passMfnrFuse 同源同款 usampler2D)
+  const GLuint fft_raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1],
+                              tex_mfnr_[2]};
+  for (int i = 0; i < 4; ++i) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, fft_raws[i]);
+  }
   for (int i = 0; i < 3; ++i) {
-    glActiveTexture(GL_TEXTURE1 + i);
+    glActiveTexture(GL_TEXTURE4 + i);
     glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
   }
   glActiveTexture(GL_TEXTURE0);
@@ -4374,10 +4365,12 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 16, 16, 0, GL_RGBA,
                    GL_HALF_FLOAT, nullptr);
-      glBindImageTexture(7, micro_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
-                         GL_RGBA16F);
+      // 绑定顺序逐字复刻 spike:use → uniform → **bind image** → dispatch
+      //（0.10.46 的 micro:false 与此顺序差异共现,一并消掉该变量）
       glUseProgram(prog_micro_store_);
-      glUniform1i(glGetUniformLocation(prog_micro_store_, "uMicro"), 7);
+      glUniform1i(glGetUniformLocation(prog_micro_store_, "uMicro"), 0);
+      glBindImageTexture(0, micro_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                         GL_RGBA16F);
       glDispatchCompute(1, 1, 1);
       glMemoryBarrier(GL_ALL_BARRIER_BITS);
       glGenFramebuffers(1, &micro_fbo);
@@ -4386,7 +4379,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                              GL_TEXTURE_2D, micro_tex, 0);
       glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, micro_v);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      glBindImageTexture(7, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+      glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
       glDeleteFramebuffers(1, &micro_fbo);
       glDeleteTextures(1, &micro_tex);
       while (glGetError() != GL_NO_ERROR) {
@@ -4463,7 +4456,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   const auto ms = [](auto a, auto b) {
     return std::chrono::duration<float, std::milli>(b - a).count();
   };
-  out_ms[0] = ms(t_up, t_dsp);
+  out_ms[0] = 0.f;  // 上传段已随输入切换删除(输入直接用现有纹理)
   out_ms[1] = ms(t_dsp, t_rb);
   out_ms[2] = ms(t_rb, t_end);
   out_ms[3] = gpu_ms;
@@ -4982,8 +4975,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     tf = std::chrono::steady_clock::now();
     if (!ensureMfnrFftTargets(w, h)) return false;
     dft_active = passMfnrFft(w, h, cfa, black_phase, wl, rc.gains, nc_single.p0a,
-                             nc_single.p0b, frames, row_strides_px, &neff_dft,
-                             dft_probe, dft_ms);
+                             nc_single.p0b, &neff_dft, dft_probe, dft_ms);
     if (dft_active) {
       glFinish();
       stage("chain");
