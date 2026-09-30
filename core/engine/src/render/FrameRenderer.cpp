@@ -3970,16 +3970,41 @@ TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
   glUniform1i(u_tile_rms_.tex, 0);
   glUniform2i(u_tile_rms_.size, w, h);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  // 诊断读回：中心 + 左上/右上/左下 4 点
+  // 诊断读回：一次读回整张 tiles 网格（RGBA16F ≈783KB），既取原来的 4 个采样
+  // 点，也算全网格的稳健统计（nz 中位/p90）。此前 4 点分别读回、且只有 2 个 nz
+  // 进日志 —— 单张 A/B 的样本量不足（2026-09-30 对齐 A/B 被此卡住）。
   const int sx[4] = {tw / 2, 0, tw - 1, 0};
   const int sy[4] = {th / 2, th - 1, th - 1, 0};
+  std::vector<float> grid(static_cast<size_t>(tw) * th * 4);
+  glReadPixels(0, 0, tw, th, GL_RGBA, GL_FLOAT, grid.data());
   for (int i = 0; i < 4; ++i) {
-    float v[4] = {0.f, 0.f, 0.f, 0.f};
-    glReadPixels(sx[i], sy[i], 1, 1, GL_RGBA, GL_FLOAT, v);
-    r.rms[i] = std::isfinite(v[0]) ? v[0] : 0.f;
-    r.nz[i] = std::isfinite(v[1]) ? v[1] : 0.f;   // 去信号的噪声 σ（差分法）
+    const size_t o = (static_cast<size_t>(sy[i]) * tw + sx[i]) * 4;
+    r.rms[i] = std::isfinite(grid[o]) ? grid[o] : 0.f;
+    r.nz[i] = std::isfinite(grid[o + 1]) ? grid[o + 1] : 0.f;  // 去信号 σ（差分法）
     // 代入模型（G 通道典型的 k=1 系数：σ = √(A_g·RMS + B_g)；legacy 回退亦非零）
     r.sigma[i] = std::sqrt(std::max(a[1] * r.rms[i] + b[1], 0.f));
+  }
+  {
+    std::vector<float> nzs, rmss;
+    nzs.reserve(grid.size() / 4);
+    rmss.reserve(grid.size() / 4);
+    for (size_t k = 0; k + 1 < grid.size(); k += 4) {
+      const float nz = grid[k + 1];
+      if (!std::isfinite(nz) || nz <= 0.f) continue;  // 纯黑/无效 tile 不计
+      nzs.push_back(nz);
+      rmss.push_back(std::isfinite(grid[k]) ? grid[k] : 0.f);
+    }
+    if (!nzs.empty()) {
+      double sum = 0.0;
+      for (float v : nzs) sum += v;
+      r.nz_mean = static_cast<float>(sum / nzs.size());
+      std::sort(nzs.begin(), nzs.end());
+      std::sort(rmss.begin(), rmss.end());
+      r.nz_med = nzs[nzs.size() / 2];
+      r.nz_p90 = nzs[nzs.size() * 9 / 10];
+      r.rms_med = rmss[rmss.size() / 2];
+      r.nz_n = static_cast<int>(nzs.size());
+    }
   }
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -4523,6 +4548,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           std::to_string(rms_pre_res.nz[1]).substr(0, 8) + "]";
     kv += ",\"nzPost\":[" + std::to_string(rms_res.nz[0]).substr(0, 8) + "," +
           std::to_string(rms_res.nz[1]).substr(0, 8) + "]";
+    // 全网格稳健统计（v0.10.72）：降噪倍数用 nzPreMed/nzPostMed 的比值判定 ——
+    // 单点读数会被"这次手抖幅度/场景内容"带偏，中位数不会。
+    kv += ",\"nzPreMed\":" + std::to_string(rms_pre_res.nz_med).substr(0, 8);
+    kv += ",\"nzPostMed\":" + std::to_string(rms_res.nz_med).substr(0, 8);
+    kv += ",\"nzPreP90\":" + std::to_string(rms_pre_res.nz_p90).substr(0, 8);
+    kv += ",\"nzPostP90\":" + std::to_string(rms_res.nz_p90).substr(0, 8);
+    kv += ",\"nzN\":" + std::to_string(rms_pre_res.nz_n);
   }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
