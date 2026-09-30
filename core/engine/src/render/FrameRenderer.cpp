@@ -4305,6 +4305,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
                      c.dn ? c.nc : kNoDn);
     }
+    // D-2 诊断（v0.10.62）：P0 **之前**也测一次 tile RMS（tex_fused_），与 P0 之后的
+    // 同网格结果对比即可读出 P0 的实际降噪量 —— 否则只能靠跨场景成片猜测
+    //（0.10.57→0.10.58 的"1.5 倍"就是这么来的，不可信）。
+    if (c.mfnr_fused && tex_fused_) {
+      rms_pre_res = passTileRms(tex_fused_, w, h, c.nc.mma, c.nc.mmb);
+    }
     // C 专项：tile RMS 归约（HDR+ §5，A 的 σ 输入底座；诊断读回进 raw.render）。
     // 位置 = P0 之后（tex_mos_ = 线性 mosaic，与模型同域），每 tile 256 采样。
     // σ 诊断用 k=1 的真实噪声系数（mma/mmb；融合时已折减）。
@@ -4472,6 +4478,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"cmsK\":" + std::to_string(dbg_cms_k_).substr(0, 4);
   // p0w = 中心点权重和；接近 9 = 样本几乎全被值域权重拒绝，接近 97 = 全采纳
   kv += ",\"p0w\":" + std::to_string(dbg_p0w_).substr(0, 6);
+  // P0 前后 tile RMS（同网格）→ 直接读出 P0 的实际降噪倍数
+  if (rms_pre_res.ok && rms_res.ok) {
+    kv += ",\"rmsPre\":[" + std::to_string(rms_pre_res.rms[0]).substr(0, 7) + "," +
+          std::to_string(rms_pre_res.rms[1]).substr(0, 7) + "]";
+    kv += ",\"rmsPost\":[" + std::to_string(rms_res.rms[0]).substr(0, 7) + "," +
+          std::to_string(rms_res.rms[1]).substr(0, 7) + "]";
+  }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
 }
@@ -5851,6 +5864,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
+  rms_pre_res = TileRmsResult{};
   const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"fuse\":\"" + (dft_active ? "dft" : "mm") + "\"" +

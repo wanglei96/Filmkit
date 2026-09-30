@@ -388,6 +388,7 @@ class FrameRenderer {
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
+  TileRmsResult rms_pre_res;   // P0 之前的 tile RMS（诊断）
   // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
   GLuint fbo_rms_ = 0, tex_rms_ = 0;
   int rms_w_ = 0, rms_h_ = 0;
