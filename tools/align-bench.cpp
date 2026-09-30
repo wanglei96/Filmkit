@@ -95,17 +95,14 @@ int main(int argc, char** argv) {
   if (std::fread(truth.data(), 4, truth.size(), f) != truth.size()) return 1;
   std::fclose(f);
 
-  if (!use_l1) {
-    for (int k = 0; k < 2; ++k) {
-      py[k].l1.clear();
-      py[k].l1.shrink_to_fit();
-      py[k].w1 = py[k].h1 = 0;
-    }
-  }
+  // 注意：不再清空 l1 —— --no-l1 改为给 mfnrAlign 传 allow_l1=false，
+  // 这样两条路径的残差都在同一层（1/2 域）上评估，才可比。
 
   const int n_tiles = tx * ty;
   const auto t0 = std::chrono::steady_clock::now();
-  const MfnrAlignOut a = mfnrAlign(py[0], py[1], tx, ty);
+  const MfnrAlignOut a = mfnrAlign(py[0], py[1], tx, ty, use_l1);
+  const float resid =
+      filmkit::mfnrAlignResidual(py[0], py[1], a.off, tx, ty);
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
@@ -134,13 +131,13 @@ int main(int argc, char** argv) {
       "[%s] tiles=%d conf>0.2=%d (%.0f%%) confMed=%.3f | all |ex| p50=%.2f p90=%.2f "
       "|ey| p50=%.2f p90=%.2f | >1px=%.0f%% >2px=%.0f%% | "
       "conf>0.2 err p50=%.2f p90=%.2f max=%.2f | "
-      "gx=%.1f gy=%.1f | %.0fms\n",
+      "gx=%.1f gy=%.1f | resid=%.3f | %.0fms\n",
       tag, n_tiles, n_ok, 100.0 * n_ok / std::max(n_tiles, 1), a.conf_med,
       pct(ex_all, 0.5f), pct(ex_all, 0.9f), pct(ey_all, 0.5f), pct(ey_all, 0.9f),
       100.0 * n_bad1 / std::max(n_tiles, 1), 100.0 * n_bad2 / std::max(n_tiles, 1),
       pct(ex_ok, 0.5f), pct(ex_ok, 0.9f),
       d_ok.empty() ? -1.f : *std::max_element(d_ok.begin(), d_ok.end()),
-      a.gx, a.gy, ms);
+      a.gx, a.gy, resid, ms);
   // 离群 tile（误差 > 4 mosaic px）：打印位置/位移/真值，用于判断是"边界
   // 不完整 tile""无纹理区"还是"匹配失败"。
   int shown = 0;

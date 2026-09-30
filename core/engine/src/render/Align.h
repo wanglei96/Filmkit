@@ -56,7 +56,21 @@ constexpr int kMfnrTile = 64;
 
 // 对 cur 帧对齐到 ref。tiles_x/y = 1/2 域 tile 网格（FrameRenderer 按
 // w1=(w+1)/2、tiles=ceil(w1/kMfnrTile) 算出后传入）。
+// allow_l1=false 强制走旧路径（最细层 1/4 域）—— 用于同帧 A/B 诊断：同一次
+// 拍摄的同一 burst 跑两遍对齐，唯一差异就是最细层。
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
-                       int tiles_x, int tiles_y);
+                       int tiles_x, int tiles_y, bool allow_l1 = true);
+
+// 对齐残差（诊断，v0.10.74）：给定位移场，在 1/2 域（无 l1 时退 1/4 域）上按
+// **与实际融合采样一致**的取整（mosaic 位移 round 到最近偶数）逐 tile 算
+// |ref − cur(shifted)| 的平均值，返回全图**中位**残差（8bit sqrt 域灰度级）。
+//
+// 为什么需要它：2026-09-30 连续 4 轮真机 A/B（7 张）全部作废 —— 每张的
+// ISO（2368…10160）、场景纹理、手抖幅度都不同，"降噪倍数"这类端到端指标
+// 被这些混杂因素主导，看不出对齐层的影响。同一帧数据下跑两种对齐、比较
+// 同一个残差量，才能把"对齐质量"单独隔离出来。
+float mfnrAlignResidual(const MfnrPyramid& ref, const MfnrPyramid& cur,
+                        const std::vector<float>& off, int tiles_x,
+                        int tiles_y);
 
 }  // namespace filmkit

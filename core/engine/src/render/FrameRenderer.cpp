@@ -3394,6 +3394,10 @@ void FrameRenderer::release() {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
+  for (auto& t : tex_off_ab_) {
+    if (t) glDeleteTextures(1, &t);
+    t = 0;
+  }
   if (tex_mis_) glDeleteTextures(1, &tex_mis_);
   if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
   if (tex_w_) glDeleteTextures(1, &tex_w_);
@@ -4374,6 +4378,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // C 专项：关档 = 全零系数（A=B=0，shader 里精确跳过邻域）。
     static const NoiseCoef kNoDn{};
     if (c.mfnr_fused) {
+      // 同帧 A/B 诊断（v0.10.74）：先用**旧层**位移场跑一遍 P0 + tile RMS
+      //（结果不进成片），紧接着跑正常那遍覆盖 tex_mos_。同一帧数据、同一
+      // 抖动、同一场景，唯一差异 = 最细对齐层 —— 这是唯一没有混杂的对照。
+      if (c.align_ab && tex_off_ab_[2] != 0) {
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                            c.dn ? c.nc : kNoDn, tex_off_ab_);
+        const TileRmsResult ab = passTileRms(tex_mos_, w, h, c.nc.p0a, c.nc.p0b);
+        dbg_ab_p0w_ = dbg_p0w_;
+        dbg_ab_nz_post_ = ab.ok ? ab.nz_med : 0.f;
+        dbg_ab_ok_ = ab.ok;
+      }
       passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
                           c.gains, c.dn ? c.nc : kNoDn);
     } else {
@@ -4572,6 +4587,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"nzPostP90\":" + jnum(rms_res.nz_p90, 8);
     kv += ",\"nzN\":" + std::to_string(rms_pre_res.nz_n);
   }
+  // 同帧 A/B（v0.10.74）：旧层那遍的读数。与上面的 nzPostMed / p0w 直接对比 ——
+  // 同一帧数据同一抖动，差异只可能来自最细对齐层。
+  if (dbg_ab_ok_) {
+    kv += ",\"abP0w\":" + jnum(dbg_ab_p0w_, 6);
+    kv += ",\"abNzPostMed\":" + jnum(dbg_ab_nz_post_, 8);
+  }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
 }
@@ -4633,18 +4654,24 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                          tex_fused_, 0);
   // 位移场纹理（RGBA16F，tiles 尺寸；CPU 侧 GL_FLOAT 上传由驱动转 half）
-  for (auto& t : tex_off_) {
-    if (t) glDeleteTextures(1, &t);
-    t = 0;
-    glGenTextures(1, &t);
-    glBindTexture(GL_TEXTURE_2D, t);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0, GL_RGBA,
-                 GL_HALF_FLOAT, nullptr);
-  }
+  // tex_off_ab_ = A/B 诊断的第二组（旧层对齐），同规格。
+  const auto mkOff = [&](GLuint* arr, int n) {
+    for (int i = 0; i < n; ++i) {
+      GLuint& t = arr[i];
+      if (t) glDeleteTextures(1, &t);
+      t = 0;
+      glGenTextures(1, &t);
+      glBindTexture(GL_TEXTURE_2D, t);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0, GL_RGBA,
+                   GL_HALF_FLOAT, nullptr);
+    }
+  };
+  mkOff(tex_off_, 3);
+  mkOff(tex_off_ab_, 3);
   // mismatch map（RGBA8，4×tiles 网格 = 32px cell；m∈[0,1] 8bit 量化 0.4% 可忽略）
   const int cw = tw * 4, chh = th * 4;
   if (tex_mis_) {
@@ -5116,12 +5143,14 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
                                         const float black_phase[4],
                                         float white_level, const float gains[3],
-                                        const NoiseCoef& nc) {
+                                        const NoiseCoef& nc,
+                                        const GLuint* off_tex) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   // D-2（v0.10.58）：时域 × 空间联合（4 帧各取 3×3 同相位邻域 = 36 独立样本）。
   // 缺任一输入（无位移场/无原始帧）则回落到旧的"融合后 9 样本"路径。
-  if (prog_raw_dn_ts_ && tex_off_[2] != 0 && tex_mfnr_[2] != 0) {
+  const GLuint* offs = off_tex != nullptr ? off_tex : tex_off_;
+  if (prog_raw_dn_ts_ && offs[2] != 0 && tex_mfnr_[2] != 0) {
     glUseProgram(prog_raw_dn_ts_);
     const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
     for (int i = 0; i < 4; ++i) {
@@ -5131,7 +5160,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     }
     for (int i = 0; i < 3; ++i) {
       glActiveTexture(GL_TEXTURE4 + i);
-      glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
+      glBindTexture(GL_TEXTURE_2D, offs[i]);
       glUniform1i(u_raw_dn_ts_.off[i], 4 + i);
     }
     glActiveTexture(GL_TEXTURE7);
@@ -5480,7 +5509,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float noise_strength, const float* noise_model,
                                    float noise_sigma,
                                    float ref_noise_scale, bool use_dft,
-                                   bool align_l1,
+                                   bool align_l1, bool align_ab,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -5594,6 +5623,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     capturePyr(tex_mfnr_[i - 1], &cur);
     const auto cpu0 = std::chrono::steady_clock::now();
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
+    // 同帧 A/B 诊断：再算一遍**旧路径**（最细层 1/4 域）的位移场，上传到第二
+    // 组纹理。两遍用的是同一对金字塔，唯一差异 = 最细对齐层。
+    MfnrAlignOut a_ab;
+    if (align_ab) a_ab = mfnrAlign(ref, cur, tiles_w_, tiles_h_, false);
     align_cpu_ms += std::chrono::duration<float, std::milli>(
                         std::chrono::steady_clock::now() - cpu0)
                         .count();
@@ -5623,6 +5656,17 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     glBindTexture(GL_TEXTURE_2D, tex_off_[i - 1]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tiles_w_, tiles_h_, GL_RGBA,
                     GL_FLOAT, pack.data());
+    if (align_ab) {
+      for (int t = 0; t < tiles_w_ * tiles_h_; ++t) {
+        pack[static_cast<size_t>(t) * 4 + 0] =
+            a_ab.off[static_cast<size_t>(t) * 2 + 0];
+        pack[static_cast<size_t>(t) * 4 + 1] =
+            a_ab.off[static_cast<size_t>(t) * 2 + 1];
+      }
+      glBindTexture(GL_TEXTURE_2D, tex_off_ab_[i - 1]);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tiles_w_, tiles_h_, GL_RGBA,
+                      GL_FLOAT, pack.data());
+    }
     gx_sum += a.gx;
     gy_sum += a.gy;
     conf_sum += a.conf_med;
@@ -5972,6 +6016,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
+  dbg_ab_p0w_ = 0.f; dbg_ab_nz_post_ = 0.f; dbg_ab_ok_ = false;
+  c.align_ab = align_ab;
   rms_pre_res = TileRmsResult{};
   const auto f3 = [](float v) { return jnum(v, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +

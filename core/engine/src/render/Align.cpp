@@ -125,7 +125,7 @@ inline TileMatch matchTile(const uint8_t* a, const uint8_t* b, int aw, int ah,
 }  // namespace
 
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
-                       int tiles_x, int tiles_y) {
+                       int tiles_x, int tiles_y, bool allow_l1) {
   MfnrAlignOut out;
   const int n_tiles = tiles_x * tiles_y;
   out.off.assign(static_cast<size_t>(n_tiles) * 2, 0.f);
@@ -190,7 +190,7 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   // 1/2 域 64px tile ≡ L3 域 16px tile（同一区域逐级减半），网格同
   // tiles_x/y。有 L1（1/2 域）时本层只作**初值**（整数位移，省亚像素与置信度）；
   // 无 L1 = 旧路径，本层就是最细层（位移域换算 L2→mosaic = ×4）。
-  const bool use_l1 = ref.w1 > 0 && cur.w1 > 0 &&
+  const bool use_l1 = allow_l1 && ref.w1 > 0 && cur.w1 > 0 &&
                       ref.l1.size() == static_cast<size_t>(ref.w1) * ref.h1 &&
                       cur.l1.size() == static_cast<size_t>(cur.w1) * cur.h1 &&
                       ref.l1.size() > 0;
@@ -263,5 +263,62 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   }
   return out;
 }
+
+
+// 对齐残差（诊断，v0.10.74）：见 Align.h 的说明。评估层优先 1/2 域（最接近
+// 融合实际采样：融合按 mosaic round 到最近偶数采样，等价于 1/2 域整数位移），
+// 无 l1 数据时退 1/4 域。位移用**与融合一致的取整**（round 到 mosaic 偶数），
+// 保证评的是"实际会被平均进去的那个位置"，而不是理想亚像素。
+float mfnrAlignResidual(const MfnrPyramid& ref, const MfnrPyramid& cur,
+                        const std::vector<float>& off, int tiles_x,
+                        int tiles_y) {
+  const bool use1 = ref.w1 > 0 && cur.w1 > 0 &&
+                    ref.l1.size() == static_cast<size_t>(ref.w1) * ref.h1 &&
+                    cur.l1.size() == static_cast<size_t>(cur.w1) * cur.h1;
+  const uint8_t* a = use1 ? ref.l1.data() : ref.l2.data();
+  const uint8_t* b = use1 ? cur.l1.data() : cur.l2.data();
+  const int aw = use1 ? ref.w1 : ref.w2;
+  const int ah = use1 ? ref.h1 : ref.h2;
+  const int tile = use1 ? kMfnrTile : kMfnrTile / 2;
+  const int scale = use1 ? 2 : 4;  // 评估层 → mosaic 的倍数
+  const int n_tiles = tiles_x * tiles_y;
+  if (!a || !b || aw <= 0 || ah <= 0 || n_tiles <= 0 ||
+      off.size() < static_cast<size_t>(n_tiles) * 2) {
+    return -1.f;
+  }
+  std::vector<float> per_tile;
+  per_tile.reserve(static_cast<size_t>(n_tiles));
+  for (int ty = 0; ty < tiles_y; ++ty) {
+    for (int tx = 0; tx < tiles_x; ++tx) {
+      const int t = ty * tiles_x + tx;
+      // mosaic 位移 → round 到最近偶数（= 融合采样的相位保持取整）→ 评估层像素
+      const float mx = off[static_cast<size_t>(t) * 2 + 0];
+      const float my = off[static_cast<size_t>(t) * 2 + 1];
+      const int dx = static_cast<int>(std::floor(mx * 0.5f + 0.5f)) * 2 / scale;
+      const int dy = static_cast<int>(std::floor(my * 0.5f + 0.5f)) * 2 / scale;
+      const int x0 = tx * tile, y0 = ty * tile;
+      long acc = 0;
+      int n = 0;
+      for (int y = 0; y < tile; y += 2) {
+        const int ry = clampi(y0 + y, 0, ah - 1);
+        const int cy2 = clampi(y0 + y + dy, 0, ah - 1);
+        const uint8_t* pa = a + static_cast<size_t>(ry) * aw;
+        const uint8_t* pb = b + static_cast<size_t>(cy2) * aw;
+        for (int x = 0; x < tile; x += 2) {
+          const int rx = clampi(x0 + x, 0, aw - 1);
+          const int cx2 = clampi(x0 + x + dx, 0, aw - 1);
+          acc += std::abs(static_cast<int>(pa[rx]) - static_cast<int>(pb[cx2]));
+          ++n;
+        }
+      }
+      if (n > 0) per_tile.push_back(static_cast<float>(acc) / n);
+    }
+  }
+  if (per_tile.empty()) return -1.f;
+  std::sort(per_tile.begin(), per_tile.end());
+  return per_tile[per_tile.size() / 2];  // 全图中位（抗局部运动/无纹理区）
+}
+
+
 
 }  // namespace filmkit

@@ -149,7 +149,7 @@ class FrameRenderer {
                       int demosaic, float noise_strength,
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
-                      std::vector<uint8_t>* out_rgba);
+                      bool align_ab, std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
@@ -187,9 +187,10 @@ class FrameRenderer {
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
+  // off_tex = nullptr 时用正常位移场 tex_off_；A/B 诊断传 tex_off_ab_。
   void passRawDenoiseFused(int w, int h, int cfa, const float black_phase[4],
                            float white_level, const float gains[3],
-                           const NoiseCoef& nc);
+                           const NoiseCoef& nc, const GLuint* off_tex = nullptr);
   // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
   // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
   // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
@@ -231,6 +232,10 @@ class FrameRenderer {
     int lsc_cols = 0, lsc_rows = 0;
     float upload_ms = 0.f;  // t0 → 传参时刻（MFNR 时含上传+对齐+融合）
     bool mfnr_fused = false;
+    // 同帧 A/B 诊断（v0.10.74）：同一次 burst 用**旧层**位移场再跑一遍 P0，
+    // 与正常那遍比降噪倍数。四轮真机 A/B 全因 ISO/场景/手抖不同而作废，
+    // 唯一干净的对照就是同一帧数据。
+    bool align_ab = false;
     std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
   };
   void finishStillChain(const ChainCtx& c,
@@ -371,6 +376,7 @@ class FrameRenderer {
   int pyr1_w_ = 0, pyr1_h_ = 0;
   GLuint tex_fused_ = 0, fbo_fused_ = 0;  // R16F，融合后线性 mosaic（raw 尺寸）
   GLuint tex_off_[3] = {0, 0, 0};         // RGBA16F 位移场（tiles×tiles）
+  GLuint tex_off_ab_[3] = {0, 0, 0};      // 同上，A/B 诊断的第二组（旧层对齐）
   GLuint tex_mis_ = 0, fbo_mis_ = 0;      // RGBA8 mismatch map（4×tiles 网格）
   GLuint tex_w_ = 0;                      // RGBA8 LINEAR 权重图（4×tiles，→Fuse uW）
   int mfnr_w_ = 0, mfnr_h_ = 0;
@@ -395,6 +401,10 @@ class FrameRenderer {
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
+  // 同帧 A/B 诊断（v0.10.74）：旧层位移场那遍 P0 的读数
+  float dbg_ab_p0w_ = 0.f;
+  float dbg_ab_nz_post_ = 0.f;
+  bool dbg_ab_ok_ = false;
   TileRmsResult rms_pre_res;   // P0 之前的 tile RMS（诊断）
   // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
   GLuint fbo_rms_ = 0, tex_rms_ = 0;

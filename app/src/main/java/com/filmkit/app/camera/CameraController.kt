@@ -1904,9 +1904,11 @@ class CameraController(private val context: Context, private val render: RenderC
         // D-2 对齐精度 A/B（2026-09-30）：prefs align_l1 = true 时最细对齐层用
         // 1/2 域（新，需 readback 1/2 域），false 退回 1/4 域旧路径
         val alignL1 = prefs.getBoolean("align_l1", true)
+        // 同帧 A/B 诊断（v0.10.74）：prefs align_ab = true 时同一帧再跑一遍旧层
+        val alignAb = prefs.getBoolean("align_ab", false)
         render.submitRawBurst(buffers, strides, refW, refH, meta,
             orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-            useDft, alignL1) { bytes, w, h ->
+            useDft, alignL1, alignAb) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)

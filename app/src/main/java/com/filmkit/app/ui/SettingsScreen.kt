@@ -573,6 +573,43 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 同帧 A/B 诊断（v0.10.74）：同一帧数据再跑一遍旧层对齐 + P0，
+            // 两组降噪倍数写进同一条 raw.render —— 唯一无混杂的 A/B 口径。
+            var alignAb by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("align_ab", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        alignAb = !alignAb
+                        prefs.edit().putBoolean("align_ab", alignAb).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.align_ab",
+                            "{\"on\":$alignAb}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("对齐 A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "开 = 每张照片额外算一遍旧版对齐，日志里同时给出两层的降噪" +
+                            "倍数（abNzPostMed / abP0w）；拍照慢约 0.3 秒",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (alignAb) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
             //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
             //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与
