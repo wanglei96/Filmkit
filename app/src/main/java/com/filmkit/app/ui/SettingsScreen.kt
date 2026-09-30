@@ -575,7 +575,7 @@ fun SettingsScreen(
             }
             // P0 亚像素采样（D-2 杠杆 B，v0.10.75）：时域样本不再 round 到偶数
             var p0Sub by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("p0_sub", false))
+                mutableStateOf(prefs.getBoolean("p0_sub", true))
             }
             Row(
                 Modifier
@@ -592,7 +592,7 @@ fun SettingsScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("P0 亚像素采样（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text("P0 亚像素采样", color = FilmTheme.Cream, fontSize = 14.sp)
                     Text(
                         "开 = 时域样本按亚像素取（更准，GPU 采样成本 ×4）；" +
                             "关 = 旧版按 2 像素网格取整",

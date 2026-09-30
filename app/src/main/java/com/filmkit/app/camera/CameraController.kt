@@ -1906,8 +1906,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val alignL1 = prefs.getBoolean("align_l1", true)
         // 同帧 A/B 诊断（v0.10.74）：prefs align_ab = true 时同一帧再跑一遍旧层
         val alignAb = prefs.getBoolean("align_ab", false)
-        // D-2 杠杆 B（v0.10.75）：P0 时域采样走亚像素（prefs p0_sub）
-        val p0Sub = prefs.getBoolean("p0_sub", false)
+        // D-2 杠杆 B（v0.10.75，0.10.76 起默认开）：P0 时域采样走亚像素。
+        // 真机同帧 A/B 实测收益 +43.7%/+46.5%（残余噪声降到基线的 70%），
+        // dnMs 未见显著上升，画质验收（DNG 自参照 100% 裁剪）无细节损失。
+        val p0Sub = prefs.getBoolean("p0_sub", true)
         render.submitRawBurst(buffers, strides, refW, refH, meta,
             orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
             useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
