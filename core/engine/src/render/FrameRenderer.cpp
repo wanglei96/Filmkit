@@ -18,6 +18,22 @@
 namespace filmkit {
 namespace {
 
+// 数值 → JSON 合法字符串（截断到 n 字符）。
+// 必须去掉截断后**孤立的尾部符号**：jnum(1139.4, 5) = "1139."
+// 是非法 JSON —— 整行日志会被任何 JSON 解析工具静默丢弃。2026-09-30 实测：
+// 4 次拍照只有 1 条 raw.render 能被 python json.loads 解析出来，另 3 条（dftDsp
+// 四位数 + 5 字符截断）全部消失，一度被误判成"日志链路缺数据"。历史日志抽样
+// 12145 行里 25 行（0.2%）非法，全部是这种尾部孤立 '.'。
+inline std::string jnum(float v, size_t n) {
+  std::string s = std::to_string(v);
+  if (s.size() > n) s.resize(n);
+  while (!s.empty() && (s.back() == '.' || s.back() == 'e' || s.back() == 'E' ||
+                        s.back() == '-' || s.back() == '+')) {
+    s.pop_back();
+  }
+  return s.empty() ? std::string("0") : s;
+}
+
 // 预览域映射的在线标定状态（v0.8.2 提为**进程级**）：nativeEngineStart 每次
 // new FrameRenderer，放在成员里会随 engine stop/start 归零 —— 真机日志实测
 // ratio 长期钉在初值 2.0 不收敛。进程存活期间跨实例保持；App 冷启动回落
@@ -4429,14 +4445,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
   std::string kv =
-      std::string("{\"uploadMs\":") + std::to_string(c.upload_ms).substr(0, 6) +
-      ",\"passMs\":" + std::to_string(ms(t1, t2)).substr(0, 6) +
-      ",\"totalMs\":" + std::to_string(ms(t0, t3)).substr(0, 7) +
+      std::string("{\"uploadMs\":") + jnum(c.upload_ms, 6) +
+      ",\"passMs\":" + jnum(ms(t1, t2), 6) +
+      ",\"totalMs\":" + jnum(ms(t0, t3), 7) +
       ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) +
       ",\"demosaic\":\"" + (c.rcd ? "rcd" : "bilinear") + "\"";
   if (c.rcd) {
-    kv += ",\"dirMs\":" + std::to_string(dir_ms).substr(0, 6) +
-          ",\"gMs\":" + std::to_string(g_ms).substr(0, 6);
+    kv += ",\"dirMs\":" + jnum(dir_ms, 6) +
+          ",\"gMs\":" + jnum(g_ms, 6);
   }
   if (c.dn) {
     // C 专项（2026-09-29）：噪声模型诊断族 —— nzSrc/nzIso/nzS/nzO = 模型来源与
@@ -4452,53 +4468,53 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     const auto fa3 = [&](const float* v) {
       return "[" + fe(v[0]) + "," + fe(v[1]) + "," + fe(v[2]) + "]";
     };
-    kv += std::string(",\"dn\":") + std::to_string(c.dn_k).substr(0, 4) +
+    kv += std::string(",\"dn\":") + jnum(c.dn_k, 4) +
           ",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
           ",\"nzS\":" + fa3(c.nm.S) + ",\"nzO\":" + fa3(c.nm.O) +
-          ",\"nzG\":[" + std::to_string(c.gains[0]).substr(0, 6) + "," +
-          std::to_string(c.gains[1]).substr(0, 6) + "," +
-          std::to_string(c.gains[2]).substr(0, 6) + "]" +
-          ",\"kP0\":" + std::to_string(c.nc.k_p0).substr(0, 4) +
-          ",\"kP4\":" + std::to_string(c.nc.k_p4).substr(0, 4) +
+          ",\"nzG\":[" + jnum(c.gains[0], 6) + "," +
+          jnum(c.gains[1], 6) + "," +
+          jnum(c.gains[2], 6) + "]" +
+          ",\"kP0\":" + jnum(c.nc.k_p0, 4) +
+          ",\"kP4\":" + jnum(c.nc.k_p4, 4) +
           ",\"p0A\":" + fa3(c.nc.p0a) + ",\"p0B\":" + fa3(c.nc.p0b) +
           ",\"p4A\":" + fa3(c.nc.p4a) + ",\"p4B\":" + fa3(c.nc.p4b) +
-          ",\"ns\":" + std::to_string(c.ns).substr(0, 6) +
-          ",\"nsHal\":" + std::to_string(c.ns_raw).substr(0, 6) +
-          ",\"dnMs\":" + std::to_string(dn_ms).substr(0, 6);
+          ",\"ns\":" + jnum(c.ns, 6) +
+          ",\"nsHal\":" + jnum(c.ns_raw, 6) +
+          ",\"dnMs\":" + jnum(dn_ms, 6);
     if (rms_res.ok) {
-      kv += ",\"rms\":[" + std::to_string(rms_res.rms[0]).substr(0, 6) + "," +
-            std::to_string(rms_res.rms[1]).substr(0, 6) + "," +
-            std::to_string(rms_res.rms[2]).substr(0, 6) + "," +
-            std::to_string(rms_res.rms[3]).substr(0, 6) + "]";
+      kv += ",\"rms\":[" + jnum(rms_res.rms[0], 6) + "," +
+            jnum(rms_res.rms[1], 6) + "," +
+            jnum(rms_res.rms[2], 6) + "," +
+            jnum(rms_res.rms[3], 6) + "]";
       char sb[4][32];
       for (int i = 0; i < 4; ++i) snprintf(sb[i], sizeof(sb[i]), "%.4e", rms_res.sigma[i]);
       kv += std::string(",\"rmsSig\":[") + sb[0] + "," + sb[1] + "," + sb[2] + "," + sb[3] + "]";
     }
   }
-  kv += ",\"tone\":" + std::to_string(p.tone_strength).substr(0, 3);
-  kv += ",\"ev\":" + std::to_string(p.exposure_ev).substr(0, 5);
+  kv += ",\"tone\":" + jnum(p.tone_strength, 3);
+  kv += ",\"ev\":" + jnum(p.exposure_ev, 5);
   // 实际进 RAW 链的用户 WB 补偿（目标/估计增益比）：1,1 = 自动/中性。
   // 与预览 OES 的 uWb 同值——两者不一致即"M 档 WB 与预览不符"的直接证据。
-  kv += ",\"wb\":[" + std::to_string(p.wb_r).substr(0, 6) + "," +
-        std::to_string(p.wb_g).substr(0, 6) + "," +
-        std::to_string(p.wb_b).substr(0, 6) + "]";
+  kv += ",\"wb\":[" + jnum(p.wb_r, 6) + "," +
+        jnum(p.wb_g, 6) + "," +
+        jnum(p.wb_b, 6) + "]";
   // v0.7.3：ag 一并废除 —— 记录 filmic 的实际标定（EV，相对中灰 18.45%）与场景分位，
   // 供离线用同一组 EV 复算 spline 系数对拍（tools/tuning/filmic_offline.py 的 compute_spline）。
   // substr(0,9)：filmic_verify.py 用这些值复算 spline，截断到 "-5.024" 会把
   // 1.4e-4 的输入误差放大成 2.4e-4 的 power 误差，自检假阳性（v0.7.9 实测）
-  kv += ",\"blackEv\":" + std::to_string(ev_black_).substr(0, 9);
-  kv += ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9);
+  kv += ",\"blackEv\":" + jnum(ev_black_, 9);
+  kv += ",\"whiteEv\":" + jnum(ev_white_, 9);
   // v0.10.27：白点高光感知判据诊断 —— w99/w999 = P99/P99.9 的 raw 判据值（EV，钳制前），
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。white 上探 = w999 驱动、
   // w > clamp(w99, 2.438, 4.556)；固定曲线/未上探时 cp 恒 1。
   // v0.10.28：wmax = 采样 max 判据值（上探主驱动，+0.4 security 后与 w99+1.5 取小）。
-  kv += ",\"w99\":" + std::to_string(last_w99_).substr(0, 6);
-  kv += ",\"w999\":" + std::to_string(last_w999_).substr(0, 6);
-  kv += ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6);
-  kv += ",\"cp\":" + std::to_string(last_cp_).substr(0, 6);
-  kv += ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6);
-  kv += ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7);
-  kv += ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7);
+  kv += ",\"w99\":" + jnum(last_w99_, 6);
+  kv += ",\"w999\":" + jnum(last_w999_, 6);
+  kv += ",\"wmax\":" + jnum(last_wmax_, 6);
+  kv += ",\"cp\":" + jnum(last_cp_, 6);
+  kv += ",\"linMid\":" + jnum(last_lin_mid_, 6);
+  kv += ",\"pLo\":" + jnum(last_p_lo_, 7);
+  kv += ",\"pHi\":" + jnum(last_p_hi_, 7);
   // spline 系数（v0.7.3 自检）：真机日志 → 用 tools/tuning/filmic_offline.py 的
   // compute_spline 按同一组 EV 复算，逐项对比 m1..m5 —— 系数不一致就是实现错了。
   {
@@ -4515,9 +4531,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"fCon\":" + std::to_string(filmic_.contrast);
   }
   kv += ",\"auto\":" + std::to_string(p.auto_tone > 0.5 ? 1 : 0);
-  kv += ",\"lt\":" + std::to_string(p.local_tone).substr(0, 4);
-  kv += ",\"sh\":" + std::to_string(p.sharpen).substr(0, 4);
-  kv += ",\"gm\":" + std::to_string(p.gamut).substr(0, 4);
+  kv += ",\"lt\":" + jnum(p.local_tone, 4);
+  kv += ",\"sh\":" + jnum(p.sharpen, 4);
+  kv += ",\"gm\":" + jnum(p.gamut, 4);
   // LSC：网格尺寸（"off" = 恒等/A-B 关闭档）
   kv += std::string(",\"lsc\":\"") +
         (c.lsc_ok ? std::to_string(c.lsc_cols) + "x" + std::to_string(c.lsc_rows)
@@ -4525,8 +4541,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         "\"";
   // v0.10.15/16：HR 观测（hrMs = 高光重建耗时；clipB = 64×48 块中命中裁剪的块数，
   // -1 = 未执行/开关关/无裁剪）。值由 passFilm 内的 HR 写入成员变量。
-  kv += ",\"hr\":" + std::to_string(p.hr_wavelet).substr(0, 3);
-  kv += ",\"hrMs\":" + std::to_string(hr_ms_).substr(0, 6);
+  kv += ",\"hr\":" + jnum(p.hr_wavelet, 3);
+  kv += ",\"hrMs\":" + jnum(hr_ms_, 6);
   kv += ",\"clipB\":" + std::to_string(hr_blocks_);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
@@ -4534,26 +4550,26 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // submitRawBurst 的 c.mfnr_kv 与调用点之后，均读不到值（0.10.59 真机 p0s 缺失）。
   kv += ",\"p0s\":" + std::to_string(dbg_p0s_);
   kv += ",\"cms\":" + std::to_string(dbg_cms_);
-  kv += ",\"cmsK\":" + std::to_string(dbg_cms_k_).substr(0, 4);
+  kv += ",\"cmsK\":" + jnum(dbg_cms_k_, 4);
   // p0w = 中心点权重和；接近 9 = 样本几乎全被值域权重拒绝，接近 97 = 全采纳
-  kv += ",\"p0w\":" + std::to_string(dbg_p0w_).substr(0, 6);
+  kv += ",\"p0w\":" + jnum(dbg_p0w_, 6);
   // P0 前后 tile RMS（同网格）→ 直接读出 P0 的实际降噪倍数
   if (rms_pre_res.ok && rms_res.ok) {
-    kv += ",\"rmsPre\":[" + std::to_string(rms_pre_res.rms[0]).substr(0, 7) + "," +
-          std::to_string(rms_pre_res.rms[1]).substr(0, 7) + "]";
-    kv += ",\"rmsPost\":[" + std::to_string(rms_res.rms[0]).substr(0, 7) + "," +
-          std::to_string(rms_res.rms[1]).substr(0, 7) + "]";
+    kv += ",\"rmsPre\":[" + jnum(rms_pre_res.rms[0], 7) + "," +
+          jnum(rms_pre_res.rms[1], 7) + "]";
+    kv += ",\"rmsPost\":[" + jnum(rms_res.rms[0], 7) + "," +
+          jnum(rms_res.rms[1], 7) + "]";
     // 去信号的噪声 σ（差分法）：nzPre/nzPost 的比值才是 P0 的真实降噪倍数
-    kv += ",\"nzPre\":[" + std::to_string(rms_pre_res.nz[0]).substr(0, 8) + "," +
-          std::to_string(rms_pre_res.nz[1]).substr(0, 8) + "]";
-    kv += ",\"nzPost\":[" + std::to_string(rms_res.nz[0]).substr(0, 8) + "," +
-          std::to_string(rms_res.nz[1]).substr(0, 8) + "]";
+    kv += ",\"nzPre\":[" + jnum(rms_pre_res.nz[0], 8) + "," +
+          jnum(rms_pre_res.nz[1], 8) + "]";
+    kv += ",\"nzPost\":[" + jnum(rms_res.nz[0], 8) + "," +
+          jnum(rms_res.nz[1], 8) + "]";
     // 全网格稳健统计（v0.10.72）：降噪倍数用 nzPreMed/nzPostMed 的比值判定 ——
     // 单点读数会被"这次手抖幅度/场景内容"带偏，中位数不会。
-    kv += ",\"nzPreMed\":" + std::to_string(rms_pre_res.nz_med).substr(0, 8);
-    kv += ",\"nzPostMed\":" + std::to_string(rms_res.nz_med).substr(0, 8);
-    kv += ",\"nzPreP90\":" + std::to_string(rms_pre_res.nz_p90).substr(0, 8);
-    kv += ",\"nzPostP90\":" + std::to_string(rms_res.nz_p90).substr(0, 8);
+    kv += ",\"nzPreMed\":" + jnum(rms_pre_res.nz_med, 8);
+    kv += ",\"nzPostMed\":" + jnum(rms_res.nz_med, 8);
+    kv += ",\"nzPreP90\":" + jnum(rms_pre_res.nz_p90, 8);
+    kv += ",\"nzPostP90\":" + jnum(rms_res.nz_p90, 8);
     kv += ",\"nzN\":" + std::to_string(rms_pre_res.nz_n);
   }
   kv += "}";
@@ -4994,17 +5010,17 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     Logger::instance().log(
         LogLevel::kInfo, "engine", "mfnr.fft.store_check",
         std::string("{\"sum\":") +
-            std::to_string(chk_sum).substr(0, 8) +
+            jnum(chk_sum, 8) +
             ",\"micro\":" + (micro_ok ? "true" : "false") +
             ",\"microSt\":" + (micro_st_ok ? "true" : "false") +
             ",\"microProg\":\"live\"" +
             ",\"spikeOk\":" + (sp.readback_ok ? "true" : "false") +
-            ",\"spikeGpu\":" + std::to_string(sp.gpu_median_ms).substr(0, 8) +
+            ",\"spikeGpu\":" + jnum(sp.gpu_median_ms, 8) +
             ",\"spikeErr\":\"" + jsonEscape(sp.error) + "\"}");
     if (!(chk_sum > 0.f) || !std::isfinite(chk_sum)) {
       Logger::instance().log(
           LogLevel::kError, "engine", "mfnr.fft.store_lost",
-          "{\"fuseMs\":" + std::to_string(gpu_ms).substr(0, 8) + "}");
+          "{\"fuseMs\":" + jnum(gpu_ms, 8) + "}");
       glDeleteProgram(prog_fft);
       *out_neff = 0.f;
       return false;  // 调用方回退 mismatch 路径
@@ -5837,7 +5853,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
         }
         const float n = static_cast<float>(std::max(n_cells, 1));
         const auto f2 = [](float x) {
-          return std::to_string(x).substr(0, 4);
+          return jnum(x, 4);
         };
         out += f2(a / n) + "/" + f2(b / n) + "/" + f2(c / n) + " ";
       }
@@ -5957,7 +5973,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.mfnr_fused = true;
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
   rms_pre_res = TileRmsResult{};
-  const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
+  const auto f3 = [](float v) { return jnum(v, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"fuse\":\"" + (dft_active ? "dft" : "mm") + "\"" +
 
@@ -6631,17 +6647,17 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
     ag_log_tick_ = 0;
     Logger::instance().log(
         LogLevel::kInfo, "engine", "preview.filmic",
-        "{\"blackEv\":" + std::to_string(ev_black_).substr(0, 9) +
-            ",\"whiteEv\":" + std::to_string(ev_white_).substr(0, 9) +
-            ",\"w99\":" + std::to_string(last_w99_).substr(0, 6) +
-            ",\"w999\":" + std::to_string(last_w999_).substr(0, 6) +
-            ",\"wmax\":" + std::to_string(last_wmax_).substr(0, 6) +
-            ",\"cp\":" + std::to_string(last_cp_).substr(0, 6) +
-            ",\"linMid\":" + std::to_string(last_lin_mid_).substr(0, 6) +
-            ",\"ratio\":" + std::to_string(g_domain_ratio).substr(0, 6) +
-            ",\"pLo\":" + std::to_string(last_p_lo_).substr(0, 7) +
-            ",\"pHi\":" + std::to_string(last_p_hi_).substr(0, 7) +
-            ",\"localRef\":" + std::to_string(local_ref).substr(0, 5) +
+        "{\"blackEv\":" + jnum(ev_black_, 9) +
+            ",\"whiteEv\":" + jnum(ev_white_, 9) +
+            ",\"w99\":" + jnum(last_w99_, 6) +
+            ",\"w999\":" + jnum(last_w999_, 6) +
+            ",\"wmax\":" + jnum(last_wmax_, 6) +
+            ",\"cp\":" + jnum(last_cp_, 6) +
+            ",\"linMid\":" + jnum(last_lin_mid_, 6) +
+            ",\"ratio\":" + jnum(g_domain_ratio, 6) +
+            ",\"pLo\":" + jnum(last_p_lo_, 7) +
+            ",\"pHi\":" + jnum(last_p_hi_, 7) +
+            ",\"localRef\":" + jnum(local_ref, 5) +
             ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
   }
 }
