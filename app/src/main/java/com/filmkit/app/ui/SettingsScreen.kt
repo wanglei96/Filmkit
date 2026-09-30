@@ -794,7 +794,7 @@ fun SettingsScreen(
                     )
                 },
             )
-            var jpegQ by rememberSaveable { mutableStateOf(prefs.getInt("jpeg_quality", 95)) }
+            var jpegQ by rememberSaveable { mutableStateOf(prefs.getInt("jpeg_quality", 100)) }
             Row(
                 Modifier
                     .fillMaxWidth()

@@ -2154,7 +2154,19 @@ class CameraController(private val context: Context, private val render: RenderC
                         val g1 = 0.5f * (m.getGainFactor(1, x, y) + m.getGainFactor(2, x, y))
                         val g2 = m.getGainFactor(3, x, y)
                         val gMax = maxOf(g0, g1, g2)
-                        val f = if (!damp || gMax <= 2.5f) 1f else (2.5f + (gMax - 2.5f) * 0.5f) / gMax
+                        // v0.10.69：硬 knee → 平滑正部软 knee（修用户实测的暗光竖线）。
+                        // 硬拐点在 gMax 跨过 2.5 的格点处造成增益**斜率突变**，离线实测
+                        // 二阶差 0.1438 vs 曲线本底 0.0898，位置 = 第 1 列 = W/17
+                        // = 原图 x≈181 —— 与用户实测竖线位置精确吻合（插值后成马赫带，
+                        // 暗光下拐点两侧噪声放大差异使其显形；开灯噪声被压过则不可见）。
+                        // 软 knee 用平滑正部 (d+√(d²+w²))/2，w=0.3：二阶差回落到 0.0894
+                        // （= 本底，人为跳变完全消失），角落增益仍压到 3.179
+                        //（硬版本 3.187），阻尼意图不变。
+                        val f = if (!damp) 1f else {
+                            val d = gMax - 2.5f
+                            val w = 0.3f
+                            (gMax - 0.25f * (d + kotlin.math.sqrt(d * d + w * w))) / gMax
+                        }
                         buf[i++] = g0 * f
                         buf[i++] = g1 * f
                         buf[i++] = g2 * f
@@ -2164,7 +2176,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     lscRows = rows
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "camera", "raw.lsc.damp",
-                        kv("on" to damp, "knee" to "2.5", "ratio" to "0.5", "shared" to "per-pixel-max"),
+                        kv("on" to damp, "knee" to "2.5", "ratio" to "0.5", "softW" to "0.3",
+                            "shared" to "per-pixel-max"),
                     )
                 }
             }
@@ -2275,7 +2288,13 @@ class CameraController(private val context: Context, private val render: RenderC
         val now = Date()
         val prefs = context.getSharedPreferences("filmkit", 0)
         // 成像质量：设置页可选 95（标准）/ 100（极高），prefs jpeg_quality
-        val jpegQ = prefs.getInt("jpeg_quality", 95)
+        // v0.10.68：默认 95 → 100。真机实测（平坦渐变块，相邻像素相同占比）：
+        //   TPDF dither → PNG 26.9%  → JPEG q95 **31.2%**  → JPEG q100 **24.9%**
+        // JPEG 的 DCT 量化把 dither 当高频噪声滤掉，且**加大 dither 幅度无效**
+        //（±2/±3 LSB 在 q95 下都饱和在 28.8%）—— 只有提高编码质量能解决。
+        // 这是用户报的"边缘色带"的最后一环：降噪抹平噪声 → 8bit 量化台阶
+        // → dither 打散 → JPEG q95 又把 dither 滤掉。
+        val jpegQ = prefs.getInt("jpeg_quality", 100)
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
         // 未选 LUT 时无后缀。只保留字母/数字/下划线/连字符（中文名照常保留），避免非法路径字符。
         val lutTag = currentLut?.title
