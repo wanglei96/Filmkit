@@ -114,3 +114,13 @@ status: active
 - [2026-09-30] **工具**：`tools/chroma-scale-eval.py`（σC 1–32px + 色斑可视化
   ×12）、`tools/check-fft-tile-cover.py`（tile 覆盖/窗和守卫，`--buggy` 复现
   旧故障）、`test_temp/analysis/atrous_tune.py`（à trous 离线镜像）
+- [2026-09-30] **降噪版本现状（0.10.56-m4 / 208）**：A 专项已收（DFT 相位组 4×
+  RGBA16F image2D，**必须 glTexStorage2D**；tile 索引 `4·wg.x+gx−1`；uCfaLut 必须
+  下发）；D-1 色度多尺度（半分辨率 à trous 5 级、k=8、revert=0.08）**已超 PC**
+  （σC 1–32px 优 1.6–2.4×）；亮度各向异性核**已停用**（`uL=0`，两次真机判抹纹理）
+- [2026-09-30] **纹理保真口径**：`tools/texture-fidelity-eval.py` —— 纹理块取自
+  低噪参照（PC）的低频梯度，测 **2/4/8/16px 多尺度带通比** + 局部对比度；同刻
+  实测 0.10.55 的 8px 带通 3.17 vs PC 3.59（−12%）而局部对比度仅 −1.4%
+  （细纹在 2–4px，粗尺度指标会漏）
+- [2026-09-30] **单帧后段空间降噪上限**：à trous 逐点收缩 40–50%；等方双边
+  r=4/8/12 无差异；各向异性长核在保纹理约束下 ≈25–30% 且已证抹纹理
