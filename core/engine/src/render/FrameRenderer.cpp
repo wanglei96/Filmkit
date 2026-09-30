@@ -4304,9 +4304,14 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glUniform2i(u_mfnr_fft_.group, gx, gy);
     glUniform1i(u_mfnr_fft_.accum, g > 0 ? 1 : 0);
     glDispatchCompute((n + 1) / 2, m, 4);
+    // 组间累加：本组 imageStore 对下一组的 imageLoad 可见
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
   }
-  glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+  // v0.10.39：末组写入要被**收口 pass 的纹理采样**与 **neff 的 framebuffer
+  // 读回**看到 —— 必须下 TEXTURE_FETCH / FRAMEBUFFER barrier（v0.10.38 只下
+  // SHADER_IMAGE_ACCESS → 收口读 scratch 全 0 = 成片全黑、neff 读回全 0 =
+  // dftNeff 恒 4.000 兜底，真机日志实锤）。ALL_BARRIER_BITS 一次覆盖。
+  glMemoryBarrier(GL_ALL_BARRIER_BITS);
   // 3b) overlap-add 收口：R32F scratch → tex_fused_（窗和恒 1，直接转渲染）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
