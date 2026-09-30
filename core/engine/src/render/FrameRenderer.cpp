@@ -7,6 +7,7 @@
 #include <string>
 
 #include "../log/GpuTimer.h"
+#include "../spike/SpikeFftMerge.h"
 #include "../log/Logger.h"
 #include "Align.h"
 
@@ -4408,11 +4409,21 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glDeleteFramebuffers(1, &chk_fbo);
     while (glGetError() != GL_NO_ERROR) {
     }
+    // spike 对照:v0.10.46 的微测试与 spike 代码几乎一致却结果相反,唯一剩
+    // 的系统性差异是执行时机/周边状态 —— 把真机验证过的 spike 完整路径
+    // (自建纹理/program/dispatch/readback)在同上下文跑一次三分定案:
+    //   spikeOk=true  → 上下文没问题,丢失在我方内核的绑定细节
+    //   spikeOk=false → 拍照上下文让 compute 写入整体失效,换实现路线
+    const FftSpikeResult sp = runSpikeFftMerge(256, 256, 1, false, 2);
     Logger::instance().log(
         LogLevel::kInfo, "engine", "mfnr.fft.store_check",
         std::string("{\"sum\":") +
             std::to_string(chk_sum).substr(0, 8) +
-            ",\"micro\":" + (micro_ok ? "true" : "false") + "}");
+            ",\"micro\":" + (micro_ok ? "true" : "false") +
+            ",\"microProg\":" + (prog_micro_store_ != 0 ? "true" : "false") +
+            ",\"spikeOk\":" + (sp.readback_ok ? "true" : "false") +
+            ",\"spikeGpu\":" + std::to_string(sp.gpu_median_ms).substr(0, 8) +
+            ",\"spikeErr\":\"" + jsonEscape(sp.error) + "\"}");
     if (!(chk_sum > 0.f) || !std::isfinite(chk_sum)) {
       Logger::instance().log(
           LogLevel::kError, "engine", "mfnr.fft.store_lost",
