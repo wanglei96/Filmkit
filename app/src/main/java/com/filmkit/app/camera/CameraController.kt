@@ -135,8 +135,16 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var firstFrameLogged = false
 
+    // @Volatile：capturing 现在由相机回调线程**提前**置 false（v0.10.81 起不再等
+    // 渲染回调），UI 线程在 capture() 里读 —— 跨线程可见性必须显式声明。
     @Volatile
     private var capturing = false
+
+    // 在飞渲染数（v0.10.81）。渲染线程是串行的，而每张照片的 4 帧数据是独立的
+    // direct buffer（≈100MB）要活到渲染完成 —— 不设上限连拍会把内存堆爆。
+    // 上限 2（用户拍板）：1 张在渲染 + 1 张排队，第 3 张按下时忽略并记 capture.busy。
+    private val rendersInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+    private val maxRendersInFlight = 2
 
     // ── 后台保存队列（2026-09-30 性能收口）────────────────────────────────
     // JPEG 编码 + 落盘实测 0.34~0.40s（q100 的 Bitmap.compress 是大头），
@@ -1154,6 +1162,13 @@ class CameraController(private val context: Context, private val render: RenderC
     fun capture() {
         val s = session ?: return
         if (capturing) return
+        if (rendersInFlight.get() >= maxRendersInFlight) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "capture.busy",
+                kv("inFlight" to rendersInFlight.get()),
+            )
+            return
+        }
         capturing = true
         if (shutterSound) {
             shutterSoundPlayer.play(android.media.MediaActionSound.SHUTTER_CLICK)
@@ -1924,18 +1939,25 @@ class CameraController(private val context: Context, private val render: RenderC
         // 真机同帧 A/B 实测收益 +43.7%/+46.5%（残余噪声降到基线的 70%），
         // dnMs 未见显著上升，画质验收（DNG 自参照 100% 裁剪）无细节损失。
         val p0Sub = prefs.getBoolean("p0_sub", true)
+        // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
+        rendersInFlight.incrementAndGet()
         render.submitRawBurst(buffers, strides, refW, refH, meta,
             orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
             useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
-            capturing = false
+            rendersInFlight.decrementAndGet()
             capturePhase = 0
-            burstBuffers.fill(null)
-            burstStrides.fill(0)
-            burstResults.fill(null)
-            burstImageCount = 0
-            burstResultCount = 0
+            // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
+            // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
+            // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
             if (bytes != null) queueJpegSave(bytes, w, h)
         }
+        // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
+        // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
+        //（buffers 是局部 List，捕获的是当次采集的 direct buffer 引用），
+        // 渲染完全在后台。原来把 capturing 拖到渲染回调（约 1.6s 后）才置
+        // false，等于把"能不能再拍"绑在整条渲染链上 —— 这是"按完快门卡 2 秒"
+        // 的主因。现在解锁点提前到"采集+DNG+拷贝"完成（约 0.5s）。
+        capturing = false
     }
 
     /** ColorSpaceTransform → 行主序 9 元素字符串；null → "none"（DNG 标准链回填探针）。
