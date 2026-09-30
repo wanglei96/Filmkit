@@ -1413,6 +1413,8 @@ void main() {
 
 // kFsMicroStore（v0.10.45）：1-texel imageStore 微测试 —— 与 DFT 内核完全
 // 解耦,判定拍照上下文里 image 写入是否工作(写 16×16 图的 (0,0) = 常量 1)。
+// v0.10.50 起同一 program 跑两次（glTexImage2D / glTexStorage2D 各一次）做
+// 纹理创建方式的 A/B 对照。
 const char* kFsMicroStore = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -4166,12 +4168,18 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   for (auto& t : tex_fft_out_) {
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
+    // **必须 glTexStorage2D（不可变存储）**（v0.10.50 真机定案）：glTexImage2D
+    // 创建的可变 RGBA16F 纹理在该 Mali 上 imageStore 写入全丢（主内核 sum 恒
+    // 0、1-texel 微测试同款失败），而全部读回成功的 imageStore 路径
+    //（SpikeFftMerge 的 tex_out、SpikePass 的 makeTex）都用 glTexStorage2D。
+    // 0.10.37–49 的"init 创建的 compute program 写入全丢"是**误归因**：0.10.49
+    // 现场创建后照样丢写（store_check micro:false + sum:0），真变量一直是
+    // 纹理创建方式（spike 恰好同时具备两个差异，把相关当成了因果）。
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, w, h);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA,
-                 GL_HALF_FLOAT, nullptr);
   }
   burst_w_ = w;
   burst_h_ = h;
@@ -4201,12 +4209,12 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     pa[p] = plane_a[ch];
     pb[p] = plane_b[ch];
   }
-  // ── compute program **现场创建、用完删除**（spike 模式，v0.10.49）──────
-  // 0.10.48 实锤规律:init 创建的 compute program 写入全丢（主内核 + 1-texel
-  // 微测试一致失败），而现场创建的 spike program 在同一上下文、紧挨着完美
-  // 工作（spikeOk:true）。机理疑似该 Mali 驱动在 init 后经预览链大量
-  // program 创建使早期 compute pipeline 内部状态损坏。编译成本（CPU）在
-  // 拍照路径可接受，换取正确性。
+  // ── compute program 现场创建、用完删除（v0.10.49 起；**事后判定为无关变量**）
+  // 0.10.48 曾据"现场创建的 spike 成功、init 创建的微测试失败"推断 init 创建的
+  // program 写入丢失，0.10.49 改为现场创建——0.10.49 真机 store_check
+  //（micro:false + sum:0 + spikeOk:true）证伪该推断：现场创建的微测试同样失败。
+  // 真变量是输出纹理的创建方式（glTexStorage2D，见 ensureMfnrFftTargets）。
+  // 现场创建暂留（一次只动一个变量），验收通过后可回退到 init 创建省 CPU 编译。
   const GLuint cs_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
   GLuint prog_fft = 0;
   if (cs_fft) {
@@ -4318,17 +4326,21 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // v0.10.38 只下 SHADER_IMAGE_ACCESS 时收口读全 0 的教训保留）。
   glMemoryBarrier(GL_ALL_BARRIER_BITS);
   const float gpu_ms = gpu_ok ? gpu_fft.endMs() : -1.f;
-  // ── store 自检（v0.10.44）：r32f/2DArray 变体的 imageStore 在该 Mali 上
-  // "计算照跑、写入全丢"（dftGpu 477-577ms vs 输出恒 0），成片连续 4 版全黑
-  // —— dispatch 后立即读每组输出中心 1px，全 0 判定写入丢失并回退 mismatch
-  // 路径（成片从机制上不黑）。读回组合 = RGBA16F + GL_FLOAT（X300 已验证）。
+  // ── store 自检（v0.10.44）：imageStore 曾在该 Mali 上"计算照跑、写入全丢"
+  //（dftGpu 477-577ms vs 输出恒 0；0.10.37–49 连续多版全黑）——dispatch 后
+  // 立即读每组输出中心 1px，全 0 判定写入丢失并回退 mismatch 路径（成片从机制
+  // 上不黑）。读回组合 = RGBA16F + GL_FLOAT（X300 已验证）。
+  // 根因（v0.10.50 定案，见 ensureMfnrFftTargets）：输出纹理必须 glTexStorage2D。
   {
-    // 微测试:1-texel imageStore(与内核解耦,program 现场 spike 模式创建)。
-    // lost = 上下文级 image 写入失败(换实现路线);ok = 上下文 image 可写,
-    // 丢失是内核细节。微测试跑在主内核 dispatch 之后,image unit 0 已绑
-    // tex_fft_out_[0] —— 用完须重绑回去。
-    GLuint micro_tex = 0, micro_fbo = 0, micro_prog = 0;
-    float micro_v[4] = {0, 0, 0, 0};
+    // 微测试（v0.10.50 双分支对照）:1-texel imageStore,与内核完全解耦,
+    // **唯一变量 = 输出纹理的创建方式**——同 program、同绑定顺序、同 dispatch、
+    // 同读回,一次真机定案根因:
+    //   micro:false + microSt:true → 真变量是 glTexImage2D 可变纹理（该 Mali
+    //     对可变存储的 imageStore 丢写），主内核改 glTexStorage2D 即修复
+    //   micro:false + microSt:false → 差异不止纹理创建,回到 spike 逐行 diff
+    // 绑定顺序逐字复刻 spike:use → uniform → **bind image** → dispatch。
+    GLuint micro_fbo = 0, micro_prog = 0;
+    float micro_v[4] = {0, 0, 0, 0}, micro_st_v[4] = {0, 0, 0, 0};
     {
       const GLuint cs = compileShader(GL_COMPUTE_SHADER, kFsMicroStore);
       if (cs) {
@@ -4345,39 +4357,51 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       if (cs) glDeleteShader(cs);
     }
     if (micro_prog != 0) {
-      glGenTextures(1, &micro_tex);
-      glBindTexture(GL_TEXTURE_2D, micro_tex);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 16, 16, 0, GL_RGBA,
-                   GL_HALF_FLOAT, nullptr);
-      // 绑定顺序逐字复刻 spike:use → uniform → **bind image** → dispatch
-      glUseProgram(micro_prog);
-      glUniform1i(glGetUniformLocation(micro_prog, "uMicro"), 0);
-      glBindImageTexture(0, micro_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
-                         GL_RGBA16F);
-      glDispatchCompute(1, 1, 1);
-      glMemoryBarrier(GL_ALL_BARRIER_BITS);
       glGenFramebuffers(1, &micro_fbo);
       glBindFramebuffer(GL_FRAMEBUFFER, micro_fbo);
-      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                             GL_TEXTURE_2D, micro_tex, 0);
-      glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, micro_v);
+      for (int k = 0; k < 2; ++k) {
+        GLuint mtex = 0;
+        glGenTextures(1, &mtex);
+        glBindTexture(GL_TEXTURE_2D, mtex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        if (k == 0) {
+          // 旧路径（0.10.37–49 一直丢写的那条）
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 16, 16, 0, GL_RGBA,
+                       GL_HALF_FLOAT, nullptr);
+        } else {
+          // spike 同款（真机唯一验证过写入成功的创建方式）
+          glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, 16, 16);
+        }
+        glUseProgram(micro_prog);
+        glUniform1i(glGetUniformLocation(micro_prog, "uMicro"), 0);
+        glBindImageTexture(0, mtex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        glFinish();  // spike 同款同步:排除"读得太早"的假阴性
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, mtex, 0);
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT,
+                     k == 0 ? micro_v : micro_st_v);
+        glDeleteTextures(1, &mtex);
+      }
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glDeleteFramebuffers(1, &micro_fbo);
+      // image unit 0 用毕重绑回 tex_fft_out_[0]（主内核输出）
       glBindImageTexture(0, tex_fft_out_[0], 0, GL_FALSE, 0, GL_WRITE_ONLY,
                          GL_RGBA16F);
-      glDeleteFramebuffers(1, &micro_fbo);
-      glDeleteTextures(1, &micro_tex);
       glDeleteProgram(micro_prog);
       while (glGetError() != GL_NO_ERROR) {
       }
     }
     const bool micro_ok = micro_v[0] > 0.5f;
+    const bool micro_st_ok = micro_st_v[0] > 0.5f;
 
     GLuint chk_fbo = 0;
     glGenFramebuffers(1, &chk_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, chk_fbo);
     float chk_sum = 0.f;
+    glFinish();  // 读回前同步（spike 同款）：避免把"未完成"误判成"写入丢失"
     for (int g = 0; g < 4; ++g) {
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                              GL_TEXTURE_2D, tex_fft_out_[g], 0);
@@ -4389,17 +4413,17 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glDeleteFramebuffers(1, &chk_fbo);
     while (glGetError() != GL_NO_ERROR) {
     }
-    // spike 对照:v0.10.46 的微测试与 spike 代码几乎一致却结果相反,唯一剩
-    // 的系统性差异是执行时机/周边状态 —— 把真机验证过的 spike 完整路径
-    // (自建纹理/program/dispatch/readback)在同上下文跑一次三分定案:
-    //   spikeOk=true  → 上下文没问题,丢失在我方内核的绑定细节
-    //   spikeOk=false → 拍照上下文让 compute 写入整体失效,换实现路线
+    // spike 对照（v0.10.46 起保留）：真机验证过的完整参考路径在同上下文跑
+    // 一次，spikeOk=false 即可判定"拍照上下文整体写入失效"（换实现路线）。
+    // 0.10.49 起它同时是"我方内核 vs 参考路径"的活体对照：一直 true，说明
+    // 上下文与 program 创建时机都不是变量（真变量见 ensureMfnrFftTargets）。
     const FftSpikeResult sp = runSpikeFftMerge(256, 256, 1, false, 2);
     Logger::instance().log(
         LogLevel::kInfo, "engine", "mfnr.fft.store_check",
         std::string("{\"sum\":") +
             std::to_string(chk_sum).substr(0, 8) +
             ",\"micro\":" + (micro_ok ? "true" : "false") +
+            ",\"microSt\":" + (micro_st_ok ? "true" : "false") +
             ",\"microProg\":\"live\"" +
             ",\"spikeOk\":" + (sp.readback_ok ? "true" : "false") +
             ",\"spikeGpu\":" + std::to_string(sp.gpu_median_ms).substr(0, 8) +
