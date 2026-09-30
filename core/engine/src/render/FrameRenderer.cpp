@@ -1319,14 +1319,28 @@ void main() {
     ivec2 t = ivec2(gl_FragCoord.xy);
     ivec2 base = t * 16;
     float acc = 0.0;
+    float dacc = 0.0;
+    int dn = 0;
     for (int dy = 0; dy < 16; ++dy)
         for (int dx = 0; dx < 16; ++dx) {
             ivec2 p = clamp(base + ivec2(dx, dy), ivec2(0), uSize - 1);
             vec3 c = texelFetch(uTex, p, 0).rgb;
             float v = c.r + c.g + c.b;
             acc += v * v;
+            // v0.10.63 诊断：同相位（步长 2）水平 lag-2 差分 —— 平坦区里信号抵消，
+            // 残差 std/√2 = 纯噪声 σ。tile RMS 是**信号主导**的（实测 tile0 = 0.43
+            // 而 σ 仅 0.0137），噪声降 8 倍在 RMS 上只动 0.0002，根本测不出来。
+            if (dx + 2 < 16) {
+                vec3 c2 = texelFetch(uTex, clamp(base + ivec2(dx + 2, dy),
+                                                 ivec2(0), uSize - 1), 0).rgb;
+                float d = (c2.r + c2.g + c2.b) - v;
+                dacc += d * d;
+                dn += 1;
+            }
         }
-    oColor = vec4(sqrt(acc * (1.0 / 256.0)), 0.0, 0.0, 1.0);
+    float rms = sqrt(acc * (1.0 / 256.0));
+    float nz = dn > 0 ? sqrt(dacc / float(dn) * 0.5) : 0.0;
+    oColor = vec4(rms, nz, 0.0, 1.0);
 })";
 
 // kFsMfnrFft（降噪专项 A，2026-09-29）：HDR+ §5 式 6/7 的 pairwise DFT 逐频
@@ -3944,6 +3958,7 @@ TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
     float v[4] = {0.f, 0.f, 0.f, 0.f};
     glReadPixels(sx[i], sy[i], 1, 1, GL_RGBA, GL_FLOAT, v);
     r.rms[i] = std::isfinite(v[0]) ? v[0] : 0.f;
+    r.nz[i] = std::isfinite(v[1]) ? v[1] : 0.f;   // 去信号的噪声 σ（差分法）
     // 代入模型（G 通道典型的 k=1 系数：σ = √(A_g·RMS + B_g)；legacy 回退亦非零）
     r.sigma[i] = std::sqrt(std::max(a[1] * r.rms[i] + b[1], 0.f));
   }
@@ -4484,6 +4499,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           std::to_string(rms_pre_res.rms[1]).substr(0, 7) + "]";
     kv += ",\"rmsPost\":[" + std::to_string(rms_res.rms[0]).substr(0, 7) + "," +
           std::to_string(rms_res.rms[1]).substr(0, 7) + "]";
+    // 去信号的噪声 σ（差分法）：nzPre/nzPost 的比值才是 P0 的真实降噪倍数
+    kv += ",\"nzPre\":[" + std::to_string(rms_pre_res.nz[0]).substr(0, 8) + "," +
+          std::to_string(rms_pre_res.nz[1]).substr(0, 8) + "]";
+    kv += ",\"nzPost\":[" + std::to_string(rms_res.nz[0]).substr(0, 8) + "," +
+          std::to_string(rms_res.nz[1]).substr(0, 8) + "]";
   }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);

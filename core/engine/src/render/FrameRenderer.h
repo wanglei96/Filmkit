@@ -64,6 +64,7 @@ struct TileRmsResult {
   int tiles_w = 0, tiles_h = 0;
   float rms[4] = {0, 0, 0, 0};   // 采样 tile 的 RMS（中心/左上/右上/左下）
   float sigma[4] = {0, 0, 0, 0}; // 代入模型后的 σ（G 通道）
+  float nz[4] = {0, 0, 0, 0};    // 去信号噪声 σ（同相位 lag-2 差分，v0.10.63）
 };
 
 // 共享后段渲染器：SurfaceTexture(OES) → 场景线性 → 胶片曲线 → 输出。
