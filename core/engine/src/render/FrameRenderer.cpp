@@ -1097,10 +1097,10 @@ uniform int uCfaLut;
 // v0.10.43：image2DArray 的 imageStore 在 X300 Mali 上计算照跑、写入全丢
 //（dftGpu 577ms vs dftCnt 0）—— spike 真机验证过的 writeonly 是 **image2D**。
 // uOut 拆 4 张（每相位组一张，shader 内静态分支选择）；uLayer 保留作分支量。
-layout(r32f, binding = 0) writeonly uniform highp image2D uOut0;
-layout(r32f, binding = 1) writeonly uniform highp image2D uOut1;
-layout(r32f, binding = 2) writeonly uniform highp image2D uOut2;
-layout(r32f, binding = 3) writeonly uniform highp image2D uOut3;
+layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut0;
+layout(rgba16f, binding = 1) writeonly uniform highp image2D uOut1;
+layout(rgba16f, binding = 2) writeonly uniform highp image2D uOut2;
+layout(rgba16f, binding = 3) writeonly uniform highp image2D uOut3;
 uniform int uLayer;  // 本 dispatch 的输出层 = gy*2+gx（组内 tile 互不重叠）
 uniform int uRows;   // 本组 tile 行数（plane 并入 y 维：wgRow = wg.y % uRows）
 uniform ivec2 uSize;      // mosaic 尺寸
@@ -1379,13 +1379,13 @@ void main() {
                     float v = sre[tt][0][yy][lx] * 0.00390625;  // 1/256 = IDFT 归一
                     // image uniform 必须静态索引 —— uLayer 是 dispatch 级常量
                     if (uLayer == 0) {
-                        imageStore(uOut0, m, vec4(v, 0.0, 0.0, 1.0));
+                        imageStore(uOut0, m, vec4(v, v, v, 1.0));
                     } else if (uLayer == 1) {
-                        imageStore(uOut1, m, vec4(v, 0.0, 0.0, 1.0));
+                        imageStore(uOut1, m, vec4(v, v, v, 1.0));
                     } else if (uLayer == 2) {
-                        imageStore(uOut2, m, vec4(v, 0.0, 0.0, 1.0));
+                        imageStore(uOut2, m, vec4(v, v, v, 1.0));
                     } else {
-                        imageStore(uOut3, m, vec4(v, 0.0, 0.0, 1.0));
+                        imageStore(uOut3, m, vec4(v, v, v, 1.0));
                     }
                 }
             }
@@ -4197,8 +4197,8 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R16UI, w, h, 4, 0, GL_RED_INTEGER,
                GL_UNSIGNED_SHORT, nullptr);
-  // 相位组输出 ×4（R32F image2D writeonly；r32f 是 ES 3.1 规范保证 image
-  // store 的格式且 glslang ES profile 放行；每张被本组 tile 全图覆盖免清零）
+  // 相位组输出 ×4（RGBA16F image2D writeonly = spike 真机验证过的写入
+  // 语义；每张被本组 tile 全图覆盖免清零）
   for (auto& t : tex_fft_out_) {
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
@@ -4206,8 +4206,8 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT,
-                 nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
   }
   burst_w_ = w;
   burst_h_ = h;
@@ -4295,7 +4295,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   if (u_mfnr_fft_.tw >= 0) glUniform2fv(u_mfnr_fft_.tw, 8, tw);
   for (int g = 0; g < 4; ++g) {
     glBindImageTexture(g, tex_fft_out_[g], 0, GL_FALSE, 0, GL_WRITE_ONLY,
-                       GL_R32F);
+                       GL_RGBA16F);
   }
   for (int g = 0; g < 4; ++g) {
     const int gx = g & 1, gy = g >> 1;
@@ -4320,6 +4320,38 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // v0.10.38 只下 SHADER_IMAGE_ACCESS 时收口读全 0 的教训保留）。
   glMemoryBarrier(GL_ALL_BARRIER_BITS);
   const float gpu_ms = gpu_ok ? gpu_fft.endMs() : -1.f;
+  // ── store 自检（v0.10.44）：r32f/2DArray 变体的 imageStore 在该 Mali 上
+  // "计算照跑、写入全丢"（dftGpu 477-577ms vs 输出恒 0），成片连续 4 版全黑
+  // —— dispatch 后立即读每组输出中心 1px，全 0 判定写入丢失并回退 mismatch
+  // 路径（成片从机制上不黑）。读回组合 = RGBA16F + GL_FLOAT（X300 已验证）。
+  {
+    GLuint chk_fbo = 0;
+    glGenFramebuffers(1, &chk_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, chk_fbo);
+    float chk_sum = 0.f;
+    for (int g = 0; g < 4; ++g) {
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, tex_fft_out_[g], 0);
+      float pv[4] = {0, 0, 0, 0};
+      glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_FLOAT, pv);
+      chk_sum += std::fabs(pv[0]);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &chk_fbo);
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "mfnr.fft.store_check",
+        std::string("{\"sum\":") +
+            std::to_string(chk_sum).substr(0, 8) + "}");
+    if (!(chk_sum > 0.f) || !std::isfinite(chk_sum)) {
+      Logger::instance().log(
+          LogLevel::kError, "engine", "mfnr.fft.store_lost",
+          "{\"fuseMs\":" + std::to_string(gpu_ms).substr(0, 8) + "}");
+      *out_neff = 0.f;
+      return false;  // 调用方回退 mismatch 路径
+    }
+  }
   const auto t_rb = std::chrono::steady_clock::now();
   // 3b) overlap-add 收口：4 层相位组 → tex_fused_（窗和恒 1，直接相加）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);

@@ -43,6 +43,12 @@ for i, s in enumerate(glsl):
         stage = "comp"
     else:
         stage = "frag"
+    if stage == "comp":
+        # glslang 的 ES profile 只放行 r32f image；ES 3.1/3.2 规范与 X300 实机
+        # 支持的 rgba16f 等格式会被误拒 —— compute 转成 430 core 做语法/类型校验
+        #（image 限定符等语义 GL4.3 ⊇ ES3.2，等价性足够）。
+        s = s.replace("#version 310 es", "#version 430 core").replace(
+            "#version 320 es", "#version 430 core")
     (out / f"shader_{i}.{stage}").write_text(s)
 print(f"提取 {len(glsl)} 个 GLSL 字符串")
 PY
