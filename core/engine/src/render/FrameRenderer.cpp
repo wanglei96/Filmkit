@@ -1094,10 +1094,15 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform int uCfaLut;
-layout(rgba16f, binding = 0) writeonly uniform highp image2DArray uOut;
+// v0.10.43：image2DArray 的 imageStore 在 X300 Mali 上计算照跑、写入全丢
+//（dftGpu 577ms vs dftCnt 0）—— spike 真机验证过的 writeonly 是 **image2D**。
+// uOut 拆 4 张（每相位组一张，shader 内静态分支选择）；uLayer 保留作分支量。
+layout(r32f, binding = 0) writeonly uniform highp image2D uOut0;
+layout(r32f, binding = 1) writeonly uniform highp image2D uOut1;
+layout(r32f, binding = 2) writeonly uniform highp image2D uOut2;
+layout(r32f, binding = 3) writeonly uniform highp image2D uOut3;
 uniform int uLayer;  // 本 dispatch 的输出层 = gy*2+gx（组内 tile 互不重叠）
 uniform int uRows;   // 本组 tile 行数（plane 并入 y 维：wgRow = wg.y % uRows）
-layout(rgba16f, binding = 1) writeonly uniform highp image2DArray uNeff;
 uniform ivec2 uSize;      // mosaic 尺寸
 uniform ivec2 uOffTiles;  // 位移场网格（对齐 tile 128 mosaic px）
 uniform int uTxMax;       // 平面 tile x 上限（ceil(pw/8)-1；ty 同理由 dispatch 保证）
@@ -1114,7 +1119,6 @@ shared float sre[2][4][16][16];
 shared float sim[2][4][16][16];
 shared float sRmsRow[2][16];  // 参考帧行平方和（未加窗 RMS 归约用）
 shared float sRms[2];
-shared float sF[2][128];      // per-tile neff 归约缓冲
 
 const float TWO_PI = 6.283185307179586;
 
@@ -1319,7 +1323,6 @@ void main() {
             sRms[tt] = 0.0;
         }
     }
-    sF[tid >> 7][tid & 127] = 0.0;
     barrier();
 
     // 式 6/7 收缩合并（spike 同构）+ per-bin 方差折减
@@ -1328,7 +1331,6 @@ void main() {
         int idx = tid * 2 + rep;
         int tt = idx / 256;   // tid<128 → 0、tid≥128 → 1
         int bin = idx % 256;
-        float fbin = 0.0;
         if ((tt == 0) || has1) {
             int by = bin / 16;
             int bx = bin % 16;
@@ -1336,8 +1338,6 @@ void main() {
             float i0 = sim[tt][0][by][bx];
             float accR = r0;
             float accI = i0;
-            float a0 = 1.0;   // 1 + ΣAz
-            float s2 = 0.0;   // Σ (1 − Az)²
             float cs2 = uC * sig2 + 1e-12;
             for (int zz = 1; zz < 4; ++zz) {
                 float rz = sre[tt][zz][by][bx];
@@ -1348,16 +1348,10 @@ void main() {
                 float a = d2 / (d2 + cs2);
                 accR += rz + a * dr;
                 accI += iz + a * di;
-                a0 += a;
-                float e = 1.0 - a;
-                s2 += e * e;
             }
             sre[tt][0][by][bx] = accR * 0.25;
             sim[tt][0][by][bx] = accI * 0.25;
-            // N=4：f = 16 / [(1+ΣAz)² + Σ(1−Az)²]
-            fbin = 16.0 / (a0 * a0 + s2);
         }
-        sF[tt][tid & 127] += fbin;
     }
     barrier();
 
@@ -1366,19 +1360,9 @@ void main() {
         int xx = tid % 16;
         if ((tt == 0) || has1) fftCol(tt, 0, xx, 1.0);
     }
-    if (tid == 0) {
-        // neff = 256 bin 的 f 均值；索引 (tx+1, ty+1)（tx=-1 → 0），越界 tile 写 0
-        float s0 = 0.0;
-        for (int j = 0; j < 128; ++j) s0 += sF[0][j];
-        imageStore(uNeff, ivec3(tx0 + 1, ty + 1, plane),
-                   vec4(s0 * (1.0 / 256.0), 0.0, 0.0, 1.0));
-        float s1 = 0.0;
-        if (has1) {
-            for (int j = 0; j < 128; ++j) s1 += sF[1][j];
-        }
-        imageStore(uNeff, ivec3(tx1 + 1, ty + 1, plane),
-                   vec4(s1 * (1.0 / 256.0), 0.0, 0.0, 1.0));
-    }
+    // per-tile neff 输出删除（v0.10.43）：HDR+ 原版语义 = 假设 N 帧完美平均
+    //（σ²/N，neff≡4）；NS §3.3 的"按实际合并更新 σ"是改进项，等输出链真机
+    // 验证通过后再用 SSBO 方案做（image2DArray 写入在该 Mali 上丢失）。
     barrier();
 
     if (tid < 32) {
@@ -1393,7 +1377,16 @@ void main() {
                 ivec2 m = ivec2(2 * px + ox, 2 * py + oy);
                 if (m.x >= 0 && m.y >= 0 && m.x < uSize.x && m.y < uSize.y) {
                     float v = sre[tt][0][yy][lx] * 0.00390625;  // 1/256 = IDFT 归一
-                    imageStore(uOut, ivec3(m, uLayer), vec4(v, v, v, 1.0));
+                    // image uniform 必须静态索引 —— uLayer 是 dispatch 级常量
+                    if (uLayer == 0) {
+                        imageStore(uOut0, m, vec4(v, 0.0, 0.0, 1.0));
+                    } else if (uLayer == 1) {
+                        imageStore(uOut1, m, vec4(v, 0.0, 0.0, 1.0));
+                    } else if (uLayer == 2) {
+                        imageStore(uOut2, m, vec4(v, 0.0, 0.0, 1.0));
+                    } else {
+                        imageStore(uOut3, m, vec4(v, 0.0, 0.0, 1.0));
+                    }
                 }
             }
         }
@@ -1409,15 +1402,16 @@ void main() {
 const char* kFsMfnrFftSum = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
-uniform highp sampler2DArray uLayers;  // 4 层相位组（NEAREST）
+uniform highp sampler2D uG0;  // 4 张相位组图（R32F，NEAREST）
+uniform highp sampler2D uG1;
+uniform highp sampler2D uG2;
+uniform highp sampler2D uG3;
 uniform ivec2 uSize;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     if (p.x >= uSize.x || p.y >= uSize.y) { oColor = vec4(0.0); return; }
-    float v = texelFetch(uLayers, ivec3(p, 0), 0).r +
-              texelFetch(uLayers, ivec3(p, 1), 0).r +
-              texelFetch(uLayers, ivec3(p, 2), 0).r +
-              texelFetch(uLayers, ivec3(p, 3), 0).r;
+    float v = texelFetch(uG0, p, 0).r + texelFetch(uG1, p, 0).r +
+              texelFetch(uG2, p, 0).r + texelFetch(uG3, p, 0).r;
     oColor = vec4(v, v, v, 1.0);
 })";
 
@@ -2741,9 +2735,12 @@ bool FrameRenderer::init() {
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
   if (prog_mfnr_fft_sum_) {
     glUseProgram(prog_mfnr_fft_sum_);
-    u_mfnr_fft_sum_.layers =
-        glGetUniformLocation(prog_mfnr_fft_sum_, "uLayers");
-    if (u_mfnr_fft_sum_.layers >= 0) glUniform1i(u_mfnr_fft_sum_.layers, 0);
+    const char* gnames[4] = {"uG0", "uG1", "uG2", "uG3"};
+    for (int i = 0; i < 4; ++i) {
+      u_mfnr_fft_sum_.g[i] =
+          glGetUniformLocation(prog_mfnr_fft_sum_, gnames[i]);
+      if (u_mfnr_fft_sum_.g[i] >= 0) glUniform1i(u_mfnr_fft_sum_.g[i], i);
+    }
     u_mfnr_fft_sum_.size = glGetUniformLocation(prog_mfnr_fft_sum_, "uSize");
   }
 
@@ -3008,15 +3005,13 @@ void FrameRenderer::release() {
   if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
   if (tex_burst_) glDeleteTextures(1, &tex_burst_);
-  if (tex_fft_out_) glDeleteTextures(1, &tex_fft_out_);
-  if (tex_fft_neff_) glDeleteTextures(1, &tex_fft_neff_);
-  if (fbo_fft_neff_) glDeleteFramebuffers(1, &fbo_fft_neff_);
+  for (auto& t : tex_fft_out_) {
+    if (t) glDeleteTextures(1, &t);
+    t = 0;
+  }
   prog_mfnr_fft_ = prog_mfnr_fft_sum_ = 0;
   tex_burst_ = 0;
-  tex_fft_out_ = 0;
   burst_w_ = burst_h_ = 0;
-  tex_fft_neff_ = fbo_fft_neff_ = 0;
-  fft_neff_w_ = fft_neff_h_ = 0;
   if (tex_rms_) glDeleteTextures(1, &tex_rms_);
   if (fbo_rms_) glDeleteFramebuffers(1, &fbo_rms_);
   for (auto& t : tex_mfnr_) {
@@ -4188,12 +4183,11 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   if (burst_w_ == w && burst_h_ == h && tex_burst_ != 0) return true;
   if (tex_burst_) glDeleteTextures(1, &tex_burst_);
-  if (tex_fft_out_) glDeleteTextures(1, &tex_fft_out_);
-  if (tex_fft_neff_) glDeleteTextures(1, &tex_fft_neff_);
-  if (fbo_fft_neff_) glDeleteFramebuffers(1, &fbo_fft_neff_);
+  for (auto& t : tex_fft_out_) {
+    if (t) glDeleteTextures(1, &t);
+    t = 0;
+  }
   tex_burst_ = 0;
-  tex_fft_out_ = 0;
-  tex_fft_neff_ = fbo_fft_neff_ = 0;
   // burst 数组：4 层 R16UI（NEAREST + CLAMP，texelFetch 不受影响但保持一致）
   glGenTextures(1, &tex_burst_);
   glBindTexture(GL_TEXTURE_2D_ARRAY, tex_burst_);
@@ -4203,34 +4197,21 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R16UI, w, h, 4, 0, GL_RED_INTEGER,
                GL_UNSIGNED_SHORT, nullptr);
-  // per-tile neff：4 层（层 = CFA 平面），尺寸 = (txMax+2)×(tyMax+2)
-  //（索引 = tile+1，含 -1 行/列；tile x 上限 = ceil(pw/8)-1）
-  const int pw = (w + 1) / 2, ph = (h + 1) / 2;
-  const int ntx = (pw + 7) / 8 + 1, nty = (ph + 7) / 8 + 1;
-  glGenTextures(1, &tex_fft_neff_);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_fft_neff_);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, ntx, nty, 4, 0, GL_RGBA,
-               GL_HALF_FLOAT, nullptr);
-  glGenFramebuffers(1, &fbo_fft_neff_);
-  // 相位组输出层 ×4（RGBA16F 2DArray，writeonly store；每层被本组 tile
-  // 全图覆盖，免清零免累加）
-  glGenTextures(1, &tex_fft_out_);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_fft_out_);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, w, h, 4, 0, GL_RGBA,
-               GL_HALF_FLOAT, nullptr);
+  // 相位组输出 ×4（R32F image2D writeonly；r32f 是 ES 3.1 规范保证 image
+  // store 的格式且 glslang ES profile 放行；每张被本组 tile 全图覆盖免清零）
+  for (auto& t : tex_fft_out_) {
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT,
+                 nullptr);
+  }
   burst_w_ = w;
   burst_h_ = h;
-  fft_neff_w_ = ntx;
-  fft_neff_h_ = nty;
-  return tex_burst_ != 0 && tex_fft_neff_ != 0 && tex_fft_out_ != 0;
+  return tex_burst_ != 0 && tex_fft_out_[0] != 0 && tex_fft_out_[3] != 0;
 }
 
 bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
@@ -4239,10 +4220,9 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                                 const float plane_b[3],
                                 const void* const* frames,
                                 const int* row_strides_px, float* out_neff,
-                                int* out_cnt, float* out_probe,
+                                float* out_probe,
                                 float* out_ms) {
   *out_neff = 0.f;
-  *out_cnt = 0;
   out_probe[0] = out_probe[1] = out_probe[2] = out_probe[3] = -1.f;
   if (burst_w_ != w || burst_h_ != h) return false;
   if (prog_mfnr_fft_ == 0 || prog_mfnr_fft_sum_ == 0) {
@@ -4313,10 +4293,10 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     tw[2 * i + 1] = std::sin(ang);
   }
   if (u_mfnr_fft_.tw >= 0) glUniform2fv(u_mfnr_fft_.tw, 8, tw);
-  glBindImageTexture(1, tex_fft_neff_, 0, GL_TRUE, 0, GL_WRITE_ONLY,
-                     GL_RGBA16F);
-  glBindImageTexture(0, tex_fft_out_, 0, GL_TRUE, 0, GL_WRITE_ONLY,
-                     GL_RGBA16F);
+  for (int g = 0; g < 4; ++g) {
+    glBindImageTexture(g, tex_fft_out_[g], 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                       GL_R32F);
+  }
   for (int g = 0; g < 4; ++g) {
     const int gx = g & 1, gy = g >> 1;
     // 组内 tile：tx ≡ 2gx−1 (mod 2)，x ∈ [-1, tx_max]；每 workgroup 2 tile
@@ -4345,31 +4325,14 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_mfnr_fft_sum_);
+  for (int g = 0; g < 4; ++g) {
+    glActiveTexture(GL_TEXTURE0 + g);
+    glBindTexture(GL_TEXTURE_2D, tex_fft_out_[g]);
+  }
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, tex_fft_out_);
   glUniform2i(u_mfnr_fft_sum_.size, w, h);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  // 4) per-tile neff 读回（4 层 × ~50KB，取有效值均值）
-  double acc = 0.0;
-  int cnt = 0;
-  const int nw = fft_neff_w_, nh = fft_neff_h_;
-  std::vector<float> nbuf(static_cast<size_t>(nw) * nh * 4);
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_fft_neff_);
-  glViewport(0, 0, nw, nh);
-  for (int layer = 0; layer < 4; ++layer) {
-    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                              tex_fft_neff_, 0, layer);
-    glReadPixels(0, 0, nw, nh, GL_RGBA, GL_FLOAT, nbuf.data());
-    for (int i = 0; i < nw * nh; ++i) {
-      const float v = nbuf[static_cast<size_t>(i) * 4];
-      if (v > 0.f && std::isfinite(v)) {
-        acc += v;
-        ++cnt;
-      }
-    }
-  }
-  // 黑图归因探针：收口后 tex_fused_ 中心 4 点（fuse 正常应有非零值；
-  // 全 0 = 合并输出为 0，对照 frames 直传与 neff cnt 判"输入空"还是"写丢"）
+  // 黑图归因探针：收口后 tex_fused_ 中心 4 点（fuse 正常应有非零值）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   const int px4[4] = {w / 4, w / 2, w * 3 / 4, w / 2};
   const int py4[4] = {h / 4, h / 2, h * 3 / 4, h / 2};
@@ -4381,8 +4344,9 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   while (glGetError() != GL_NO_ERROR) {
   }
-  *out_neff = cnt > 0 ? static_cast<float>(acc / cnt) : 4.0f;
-  *out_cnt = cnt;
+  // neff 恒 4 = HDR+ 原版"假设 N 帧完美平均"（σ²/N）；NS §3.3 的按实际
+  // 合并更新留待输出链真机验证通过后做（SSBO 方案）
+  *out_neff = 4.0f;
   const auto t_end = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
     return std::chrono::duration<float, std::milli>(b - a).count();
@@ -4897,7 +4861,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   float fuse_ms = 0.f, neff = 0.f, m_med = 0.f, m_p90 = 0.f, mis_ms = 0.f,
         mot_med = 0.f, res_fade = 1.f, neff_dft = 0.f,
         dft_probe[4] = {-1, -1, -1, -1}, dft_ms[4] = {0, 0, 0, 0};
-  int dft_cnt = 0;
   std::string mis_diag, dil_diag, mot_diag, msm_diag;
   bool dft_active = false;
   // upload_ms 语义 = t0 → 融合开始（两路径统一：upload+align+合并前段）
@@ -4908,7 +4871,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     if (!ensureMfnrFftTargets(w, h)) return false;
     dft_active = passMfnrFft(w, h, cfa, black_phase, wl, rc.gains, nc_single.p0a,
                              nc_single.p0b, frames, row_strides_px, &neff_dft,
-                             &dft_cnt, dft_probe, dft_ms);
+                             dft_probe, dft_ms);
     if (dft_active) {
       glFinish();
       stage("chain");
@@ -5235,7 +5198,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                 ",\"dftDsp\":" + f3(dft_ms[1]) +
                                 ",\"dftRb\":" + f3(dft_ms[2]) +
                                 ",\"dftGpu\":" + f3(dft_ms[3]) +
-                                ",\"dftCnt\":" + std::to_string(dft_cnt) +
+
                                 ",\"dftProbe\":[" +
                                 f3(dft_probe[0]) + "," + f3(dft_probe[1]) + "," +
                                 f3(dft_probe[2]) + "," + f3(dft_probe[3]) + "]"

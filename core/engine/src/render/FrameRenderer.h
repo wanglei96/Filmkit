@@ -193,14 +193,13 @@ class FrameRenderer {
   bool ensureMfnrFftTargets(int w, int h);
   // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
   // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
-  // out_cnt = neff 读回的有效 texel 数（0 = 输出全空，真机诊断用）；
   // out_probe[4] = 收口后 tex_fused_ 的 4 个采样点（黑图归因探针）。
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
                    const void* const* frames, const int* row_strides_px,
-                   float* out_neff, int* out_cnt, float* out_probe,
-                   float* out_ms);  // out_ms = {直传, dispatch, 收口+读回} 分段 ms
+                   float* out_neff, float* out_probe,
+                   float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
   struct ChainCtx {
@@ -383,12 +382,10 @@ class FrameRenderer {
   // compute 一次绑定；层序 = 帧序，层 0 = 参考帧）
   GLuint tex_burst_ = 0;
   int burst_w_ = 0, burst_h_ = 0;
-  // 相位组输出层 ×4（RGBA16F 2DArray；writeonly store——r32f image
-  // load+store 在 X300 Mali 静默不执行，v0.10.40 真机实锤）
-  GLuint tex_fft_out_ = 0;
-  // per-tile neff 输出（RGBA16F 2DArray 4 层 = CFA 平面；索引 = (tx+1, ty+1)）
-  GLuint tex_fft_neff_ = 0, fbo_fft_neff_ = 0;
-  int fft_neff_w_ = 0, fft_neff_h_ = 0;
+  // 相位组输出 ×4（R32F image2D writeonly；glslang ES profile 只放行 r32f、
+  // image2DArray 的 store 在 X300 Mali 上静默丢失 —— v0.10.42 dftGpu 577ms
+  // vs dftCnt 0 实锤）
+  GLuint tex_fft_out_[4] = {0, 0, 0, 0};
   struct {
     GLint burst = -1, off[3] = {-1, -1, -1}, out = -1, neff = -1, size = -1,
           off_tiles = -1, fft_tiles = -1, tx_max = -1, black = -1, white = -1,
@@ -396,7 +393,7 @@ class FrameRenderer {
           layer = -1, rows = -1;
   } u_mfnr_fft_;
   struct {
-    GLint layers = -1, size = -1;
+    GLint g[4] = {-1, -1, -1, -1}, size = -1;
   } u_mfnr_fft_sum_;
   // ── v0.10.15：darktable filmic 高光重建（HR，dst 尺寸；8+1 张全分辨率）──
   // 出处 darktable filmicrgb.c 的 mask_clipped_pixels/inpaint_noise/
