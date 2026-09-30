@@ -149,7 +149,8 @@ class FrameRenderer {
                       int demosaic, float noise_strength,
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
-                      bool align_ab, std::vector<uint8_t>* out_rgba);
+                      bool align_ab, bool p0_sub,
+                      std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
@@ -188,9 +189,11 @@ class FrameRenderer {
                     float white_level, const float gains[3]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
   // off_tex = nullptr 时用正常位移场 tex_off_；A/B 诊断传 tex_off_ab_。
+  // subpixel = true 走逐通道网格亚像素采样（uSub=1，v0.10.75 杠杆 B）。
   void passRawDenoiseFused(int w, int h, int cfa, const float black_phase[4],
                            float white_level, const float gains[3],
-                           const NoiseCoef& nc, const GLuint* off_tex = nullptr);
+                           const NoiseCoef& nc, const GLuint* off_tex = nullptr,
+                           bool subpixel = false);
   // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
   // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
   // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
@@ -236,6 +239,7 @@ class FrameRenderer {
     // 与正常那遍比降噪倍数。四轮真机 A/B 全因 ISO/场景/手抖不同而作废，
     // 唯一干净的对照就是同一帧数据。
     bool align_ab = false;
+    bool p0_sub = false;   // P0 亚像素采样（prefs p0_sub，v0.10.75）
     std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
   };
   void finishStillChain(const ChainCtx& c,
@@ -550,7 +554,7 @@ class FrameRenderer {
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, fused = -1,
           size = -1, off_tiles = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1;
+          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1;
   } u_raw_dn_ts_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;

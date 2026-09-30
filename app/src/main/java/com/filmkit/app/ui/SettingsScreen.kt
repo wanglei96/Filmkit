@@ -573,6 +573,42 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // P0 亚像素采样（D-2 杠杆 B，v0.10.75）：时域样本不再 round 到偶数
+            var p0Sub by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("p0_sub", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        p0Sub = !p0Sub
+                        prefs.edit().putBoolean("p0_sub", p0Sub).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.p0_sub",
+                            "{\"on\":$p0Sub}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("P0 亚像素采样（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "开 = 时域样本按亚像素取（更准，GPU 采样成本 ×4）；" +
+                            "关 = 旧版按 2 像素网格取整",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (p0Sub) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 同帧 A/B 诊断（v0.10.74）：同一帧数据再跑一遍旧层对齐 + P0，
             // 两组降噪倍数写进同一条 raw.render —— 唯一无混杂的 A/B 口径。
             var alignAb by rememberSaveable {

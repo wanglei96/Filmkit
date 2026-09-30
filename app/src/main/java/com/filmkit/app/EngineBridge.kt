@@ -93,6 +93,9 @@ object EngineBridge {
      * 多读回 1/2 域 ≈3MB/帧），false 退回 1/4 域旧路径。
      * alignAb = true 时**同一帧数据**再跑一遍旧层对齐 + P0，两组降噪倍数都写进
      * 同一条 raw.render（abNzPostMed/abP0w）—— 唯一无混杂的 A/B（prefs align_ab）。
+     * 诊断那遍固定 = v0.10.69 基线（1/4 域最细层 + 整数采样），所以一次只改一个
+     * 设置（align_l1 或 p0_sub）就是单变量对照。
+     * p0Sub = true 时 P0 的时域采样走逐通道网格亚像素双线性（prefs p0_sub）。
      */
     external fun nativeEngineSubmitRawBurst(
         frames: Array<ByteBuffer>, count: Int, rowStridesPx: IntArray,
@@ -103,7 +106,7 @@ object EngineBridge {
         rotation: Int, demosaic: Int,
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
-        alignAb: Boolean, film: DoubleArray,
+        alignAb: Boolean, p0Sub: Boolean, film: DoubleArray,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

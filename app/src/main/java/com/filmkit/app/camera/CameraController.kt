@@ -1906,9 +1906,11 @@ class CameraController(private val context: Context, private val render: RenderC
         val alignL1 = prefs.getBoolean("align_l1", true)
         // 同帧 A/B 诊断（v0.10.74）：prefs align_ab = true 时同一帧再跑一遍旧层
         val alignAb = prefs.getBoolean("align_ab", false)
+        // D-2 杠杆 B（v0.10.75）：P0 时域采样走亚像素（prefs p0_sub）
+        val p0Sub = prefs.getBoolean("p0_sub", false)
         render.submitRawBurst(buffers, strides, refW, refH, meta,
             orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-            useDft, alignL1, alignAb) { bytes, w, h ->
+            useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)

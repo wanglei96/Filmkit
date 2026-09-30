@@ -60,6 +60,14 @@ inline float smoothstepf(float t0, float t1, float x) {
   return t * t * (3.f - 2.f * t);
 }
 
+// SAD 采样窗口（1/2 域像素）。**输出网格（kMfnrTile）不变**，只是每层匹配时
+// 看的范围 —— 暗光下匹配不稳的根源是采样点数不足（√N），窗口放大 2× 让采样点
+// 数 ×4。相邻 tile 的窗口因此重叠（计算冗余，但网格密度不变）。
+// 离线扫描用（2026-09-30，σ=0.008 暗光档）：见 tools/align-bench.cpp。
+#ifndef ALIGN_SAD_TILE
+#define ALIGN_SAD_TILE kMfnrTile
+#endif
+
 // 置信度判据参数：残差（每采样平均 SAD）相对 ref tile 纹理度 —— 见 matchTile。
 constexpr float kConf0 = 0.40f, kConf1 = 0.90f, kGradEps = 4.0f;
 
@@ -227,9 +235,10 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
     for (int ty = 0; ty < tiles_y; ++ty) {
       for (int tx = 0; tx < tiles_x; ++tx) {
         const int idx = ty * tiles_x + tx;
-        const int x0 = tx * kMfnrTile, y0 = ty * kMfnrTile;
+        const int x0 = tx * kMfnrTile + kMfnrTile / 2 - ALIGN_SAD_TILE / 2;
+        const int y0 = ty * kMfnrTile + kMfnrTile / 2 - ALIGN_SAD_TILE / 2;
         const TileMatch m = matchTile(
-            ref.l1.data(), cur.l1.data(), ref.w1, ref.h1, x0, y0, kMfnrTile, 2,
+            ref.l1.data(), cur.l1.data(), ref.w1, ref.h1, x0, y0, ALIGN_SAD_TILE, 2,
             2 * d2x[static_cast<size_t>(idx)], 2 * d2y[static_cast<size_t>(idx)],
             kRange, true);
         out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 2.f;

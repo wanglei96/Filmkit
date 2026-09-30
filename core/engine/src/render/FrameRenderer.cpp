@@ -1257,6 +1257,12 @@ uniform vec3 uGain;
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
 uniform float uSrScale;
+// v0.10.75（D-2 杠杆 B）：0 = 位移 round 到最近偶数（旧行为，保相位但量化
+// 2 mosaic px）；1 = 逐通道网格亚像素双线性（linSubZ，量化降到亚像素）。
+// 离线评估（tools/p0-subpixel-eval.py，与真值直接比误差）：σ=0.002 时旧行为
+// 残余噪声 0.00136 **比不做邻域平均（0.00104）还差 31%** —— 错位偏差大于它
+// 换来的降噪；亚像素 0.00107。σ=0.004/0.008 时亚像素分别好 14%/12%。
+uniform float uSub;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -1284,6 +1290,23 @@ vec2 offAt(highp sampler2D t, vec2 m) {
     vec3 d = texelFetch(t, hi, 0).rgb;
     return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y).xy;
 }
+// 逐通道网格亚像素双线性（与 kFsMfnrFuse 的 linSub 同式）：mosaic 视为 2×2
+// 打包网格，R/G/Gb/B 各自是间隔 2px 的完整点阵 —— 4 个 tap 全部同相位，
+// R 只与 R 插值，零色度污染。位移因此可以是任意亚像素，不必偶数化。
+float linSubZ(int z, ivec2 p, vec2 d) {
+    ivec2 ph = ivec2(p.x & 1, p.y & 1);
+    vec2 gmax = vec2(uSize - 1 - ph) * 0.5;
+    vec2 s = clamp((vec2(p) + d - vec2(ph)) * 0.5, vec2(0.0), gmax);
+    vec2 s0 = floor(s);
+    vec2 w = s - s0;
+    ivec2 hi = ph + ((uSize - 1 - ph) & ~1);
+    ivec2 b = ph + ivec2(s0) * 2;
+    float v00 = linZ(z, b);
+    float v10 = linZ(z, min(b + ivec2(2, 0), hi));
+    float v01 = linZ(z, min(b + ivec2(0, 2), hi));
+    float v11 = linZ(z, min(b + ivec2(2, 2), hi));
+    return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float ref = texelFetch(uFused, p, 0).r;
@@ -1295,17 +1318,19 @@ void main() {
     vec2 ctr = vec2(p) + 0.5;
     for (int z = 0; z < 4; ++z) {
         ivec2 off = ivec2(0);
+        vec2 dz = vec2(0.0);
         if (z > 0) {
-            vec2 dz;
             if (z == 1) dz = offAt(uOff1, ctr);
             else if (z == 2) dz = offAt(uOff2, ctr);
             else dz = offAt(uOff3, ctr);
-            off = ivec2(floor(dz * 0.5 + 0.5)) * 2;   // round 偶数保相位
+            off = ivec2(floor(dz * 0.5 + 0.5)) * 2;   // round 偶数保相位（uSub=0）
         }
         for (int dy = -4; dy <= 4; dy += 2)
             for (int dx = -4; dx <= 4; dx += 2) {
                 if (dx == 0 && dy == 0) continue;
-                float c = linZ(z, p + off + ivec2(dx, dy));
+                float c = uSub > 0.5
+                              ? linSubZ(z, p + ivec2(dx, dy), dz)
+                              : linZ(z, p + off + ivec2(dx, dy));
                 float d = (c - ref) / sr;
                 // v0.10.66：σ² 25 回退到 6.48。放宽权重后真机 nzPre→nzPost 从 2.38x
                 // **降到** 1.68x（p0w 26.4→35.3），且用户观察到边缘"降噪断层"。
@@ -3070,6 +3095,7 @@ bool FrameRenderer::init() {
   u_raw_dn_ts_.noise_a = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseA");
   u_raw_dn_ts_.noise_b = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseB");
   u_raw_dn_ts_.sr_scale = glGetUniformLocation(prog_raw_dn_ts_, "uSrScale");
+  u_raw_dn_ts_.sub = glGetUniformLocation(prog_raw_dn_ts_, "uSub");
 
   u_tile_rms_.tex = glGetUniformLocation(prog_tile_rms_, "uTex");
   u_tile_rms_.size = glGetUniformLocation(prog_tile_rms_, "uSize");
@@ -4383,14 +4409,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 抖动、同一场景，唯一差异 = 最细对齐层 —— 这是唯一没有混杂的对照。
       if (c.align_ab && tex_off_ab_[2] != 0) {
         passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
-                            c.dn ? c.nc : kNoDn, tex_off_ab_);
+                            c.dn ? c.nc : kNoDn, tex_off_ab_, /*subpixel=*/false);
         const TileRmsResult ab = passTileRms(tex_mos_, w, h, c.nc.p0a, c.nc.p0b);
         dbg_ab_p0w_ = dbg_p0w_;
         dbg_ab_nz_post_ = ab.ok ? ab.nz_med : 0.f;
         dbg_ab_ok_ = ab.ok;
       }
       passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
-                          c.gains, c.dn ? c.nc : kNoDn);
+                          c.gains, c.dn ? c.nc : kNoDn, nullptr, c.p0_sub);
     } else {
       passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
                      c.dn ? c.nc : kNoDn);
@@ -5144,7 +5170,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
                                         const float black_phase[4],
                                         float white_level, const float gains[3],
                                         const NoiseCoef& nc,
-                                        const GLuint* off_tex) {
+                                        const GLuint* off_tex, bool subpixel) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   // D-2（v0.10.58）：时域 × 空间联合（4 帧各取 3×3 同相位邻域 = 36 独立样本）。
@@ -5177,6 +5203,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
     glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
+    glUniform1f(u_raw_dn_ts_.sub, subpixel ? 1.f : 0.f);
     dbg_p0s_ = 96;                                   // 4 帧 × 24（±4 mosaic 内同相位）
     glDrawArrays(GL_TRIANGLES, 0, 3);
     // 诊断读回：alpha = wsum。平均权重 ≈ wsum / 97（96 邻域 + 中心）
@@ -5509,7 +5536,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float noise_strength, const float* noise_model,
                                    float noise_sigma,
                                    float ref_noise_scale, bool use_dft,
-                                   bool align_l1, bool align_ab,
+                                   bool align_l1, bool align_ab, bool p0_sub,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -6018,6 +6045,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
   dbg_ab_p0w_ = 0.f; dbg_ab_nz_post_ = 0.f; dbg_ab_ok_ = false;
   c.align_ab = align_ab;
+  c.p0_sub = p0_sub;
   rms_pre_res = TileRmsResult{};
   const auto f3 = [](float v) { return jnum(v, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
