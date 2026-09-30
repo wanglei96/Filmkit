@@ -2,7 +2,7 @@
 summary: A专项DFT收线与D专项色度超越PC
 created: 2026-09-30 15:35
 updated: 2026-09-30 16:05
-status: active
+status: absorbed
 ---
 
 # A专项DFT收线与D专项色度超越PC
