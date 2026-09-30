@@ -1212,6 +1212,94 @@ void main() {
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
 })";
 
+// kFsRawDenoiseFusedTs（D-2 / v0.10.58）：融合阶段的**时域 × 空间联合**采样。
+// 依据：PC 的 Spatial merge 是"每帧 3×3 quad × 多帧"，而我们的 P0 只能对**已融合**
+// 的 tex_fused_ 取 9 个空间样本 —— 样本彼此不独立（融合已重塑其噪声结构），
+// 这就是实测总降噪只有 2.3× 而理论应为 √(4×9)=6× 的原因。本 shader 改为对
+// **4 张原始帧各自**取 3×3 同相位邻域 = 36 个独立噪声样本；空间核尺寸与现有 P0
+// 完全相同（±4 mosaic、步长 2 = ±2 quad，真机已验证不糊纹理），只增加时域维度
+// 的独立样本，不加大空间模糊。
+// 值域阈值：样本 c 与参考 ref（tex_fused_）之差的方差 = σ_single² + σ_fused²
+//   = σ_fused²·(neff + 1)，故 sr = σ_fused·√(neff+1) = √5·σ_fused（uSrScale）。
+const char* kFsRawDenoiseFusedTs = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp usampler2D uRaw0;
+uniform highp usampler2D uRaw1;
+uniform highp usampler2D uRaw2;
+uniform highp usampler2D uRaw3;
+uniform highp sampler2D uOff1;
+uniform highp sampler2D uOff2;
+uniform highp sampler2D uOff3;
+uniform highp sampler2D uFused;
+uniform ivec2 uSize;
+uniform ivec2 uOffTiles;
+uniform int uCfaLut;
+uniform vec4 uBlack;
+uniform float uWhite;
+uniform vec3 uGain;
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
+uniform float uSrScale;
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+float linZ(int z, ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    uint raw;
+    if (z == 0) raw = texelFetch(uRaw0, p, 0).r;
+    else if (z == 1) raw = texelFetch(uRaw1, p, 0).r;
+    else if (z == 2) raw = texelFetch(uRaw2, p, 0).r;
+    else raw = texelFetch(uRaw3, p, 0).r;
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    return max((float(raw) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+vec2 offAt(highp sampler2D t, vec2 m) {
+    vec2 px = (m / vec2(uSize)) * vec2(uOffTiles) - 0.5;
+    vec2 fr = fract(px);
+    ivec2 i0 = ivec2(floor(px));
+    ivec2 lo = clamp(i0, ivec2(0), uOffTiles - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), uOffTiles - 1);
+    vec3 a = texelFetch(t, lo, 0).rgb;
+    vec3 b = texelFetch(t, ivec2(hi.x, lo.y), 0).rgb;
+    vec3 c = texelFetch(t, ivec2(lo.x, hi.y), 0).rgb;
+    vec3 d = texelFetch(t, hi, 0).rgb;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y).xy;
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float ref = texelFetch(uFused, p, 0).r;
+    int ch = chanAt(p);
+    float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
+    float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
+    float sr = sqrt(max(av * ref + bv, 1e-12)) * uSrScale;
+    float wsum = 1.0, acc = ref;
+    vec2 ctr = vec2(p) + 0.5;
+    for (int z = 0; z < 4; ++z) {
+        ivec2 off = ivec2(0);
+        if (z > 0) {
+            vec2 dz;
+            if (z == 1) dz = offAt(uOff1, ctr);
+            else if (z == 2) dz = offAt(uOff2, ctr);
+            else dz = offAt(uOff3, ctr);
+            off = ivec2(floor(dz * 0.5 + 0.5)) * 2;   // round 偶数保相位
+        }
+        for (int dy = -4; dy <= 4; dy += 2)
+            for (int dx = -4; dx <= 4; dx += 2) {
+                if (dx == 0 && dy == 0) continue;
+                float c = linZ(z, p + off + ivec2(dx, dy));
+                float d = (c - ref) / sr;
+                float w = exp(-0.5 * d * d - 0.5 * float(dx * dx + dy * dy) / 6.48);
+                acc += w * c;
+                wsum += w;
+            }
+    }
+    float v = acc / wsum;
+    oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
+})";
+
 // kFsTileRms（C 专项，2026-09-29）：逐 tile RMS 归约 —— HDR+ §5 的做法："For
 // each tile, we compute the variance by evaluating our noise model using a single
 // value, the root-mean-square (RMS) of the samples in the tile."
@@ -2710,6 +2798,7 @@ bool FrameRenderer::init() {
   const GLuint fs_mfnr_mis =
       compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
+  const GLuint fs_raw_dn_ts = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFusedTs);
   const GLuint fs_tile_rms = compileShader(GL_FRAGMENT_SHADER, kFsTileRms);
   // 降噪专项 A（v0.10.49）：compute program 一律**拍照时现场创建、用完删除**
   //（spike 模式）—— 实锤:init 创建的 compute program 在该 Mali 驱动上经
@@ -2733,7 +2822,7 @@ bool FrameRenderer::init() {
       !fs_raw_dn || !fs_chroma_dn || !fs_chroma_down || !fs_chroma_at ||
       !fs_chroma_apply || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
-      !fs_raw_dn_f || !fs_tile_rms || !fs_hr_mask ||
+      !fs_raw_dn_f || !fs_raw_dn_ts || !fs_tile_rms || !fs_hr_mask ||
       !fs_hr_inp || !fs_hr_blur ||
       !fs_hr_hf || !fs_hr_rin || !fs_hr_step || !fs_hr_norms || !fs_hr_ratios ||
       !fs_hr_restore || !fs_hr_stat)
@@ -2760,6 +2849,7 @@ bool FrameRenderer::init() {
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
   prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
+  prog_raw_dn_ts_ = linkProgram(vs_plain_, fs_raw_dn_ts);
   prog_tile_rms_ = linkProgram(vs_plain_, fs_tile_rms);
   // 相位组求和 pass（fragment;主 compute program 见 passMfnrFft 现场创建）。
   if (fs_mfnr_fft_sum) {
@@ -2799,6 +2889,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_mfnr_fuse);
   glDeleteShader(fs_mfnr_mis);
   glDeleteShader(fs_raw_dn_f);
+  glDeleteShader(fs_raw_dn_ts);
   glDeleteShader(fs_tile_rms);
   glDeleteShader(fs_mfnr_fft_sum);
   glDeleteShader(fs_hr_mask);
@@ -2908,6 +2999,25 @@ bool FrameRenderer::init() {
   u_raw_dn_f_.cfalut = glGetUniformLocation(prog_raw_dn_fused_, "uCfaLut");
   u_raw_dn_f_.noise_a = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseA");
   u_raw_dn_f_.noise_b = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseB");
+  // D-2（v0.10.58）时域 × 空间联合 P0
+  for (int i = 0; i < 4; ++i) {
+    u_raw_dn_ts_.raw[i] = glGetUniformLocation(
+        prog_raw_dn_ts_, (std::string("uRaw") + std::to_string(i)).c_str());
+  }
+  for (int i = 0; i < 3; ++i) {
+    u_raw_dn_ts_.off[i] = glGetUniformLocation(
+        prog_raw_dn_ts_, (std::string("uOff") + std::to_string(i + 1)).c_str());
+  }
+  u_raw_dn_ts_.fused = glGetUniformLocation(prog_raw_dn_ts_, "uFused");
+  u_raw_dn_ts_.size = glGetUniformLocation(prog_raw_dn_ts_, "uSize");
+  u_raw_dn_ts_.off_tiles = glGetUniformLocation(prog_raw_dn_ts_, "uOffTiles");
+  u_raw_dn_ts_.cfalut = glGetUniformLocation(prog_raw_dn_ts_, "uCfaLut");
+  u_raw_dn_ts_.black = glGetUniformLocation(prog_raw_dn_ts_, "uBlack");
+  u_raw_dn_ts_.white = glGetUniformLocation(prog_raw_dn_ts_, "uWhite");
+  u_raw_dn_ts_.gain = glGetUniformLocation(prog_raw_dn_ts_, "uGain");
+  u_raw_dn_ts_.noise_a = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseA");
+  u_raw_dn_ts_.noise_b = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseB");
+  u_raw_dn_ts_.sr_scale = glGetUniformLocation(prog_raw_dn_ts_, "uSrScale");
 
   u_tile_rms_.tex = glGetUniformLocation(prog_tile_rms_, "uTex");
   u_tile_rms_.size = glGetUniformLocation(prog_tile_rms_, "uSize");
@@ -3213,6 +3323,7 @@ void FrameRenderer::release() {
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
   if (prog_mfnr_mis_) glDeleteProgram(prog_mfnr_mis_);
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
+  if (prog_raw_dn_ts_) glDeleteProgram(prog_raw_dn_ts_);
   if (prog_tile_rms_) glDeleteProgram(prog_tile_rms_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
   for (auto& t : tex_fft_out_) {
@@ -3251,6 +3362,7 @@ void FrameRenderer::release() {
   if (tex_w_) glDeleteTextures(1, &tex_w_);
   tex_w_ = 0;
   prog_mfnr_pyr_ = prog_mfnr_down_ = prog_mfnr_fuse_ = prog_raw_dn_fused_ = 0;
+  prog_raw_dn_ts_ = 0;
   prog_tile_rms_ = 0;
   tex_rms_ = fbo_rms_ = 0;
   rms_w_ = rms_h_ = 0;
@@ -4182,7 +4294,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // C 专项：关档 = 全零系数（A=B=0，shader 里精确跳过邻域）。
     static const NoiseCoef kNoDn{};
     if (c.mfnr_fused) {
-      passRawDenoiseFused(w, h, c.cfa, c.dn ? c.nc : kNoDn);
+      passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                          c.gains, c.dn ? c.nc : kNoDn);
     } else {
       passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
                      c.dn ? c.nc : kNoDn);
@@ -4888,9 +5001,43 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 }
 
 void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
+                                        const float black_phase[4],
+                                        float white_level, const float gains[3],
                                         const NoiseCoef& nc) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
+  // D-2（v0.10.58）：时域 × 空间联合（4 帧各取 3×3 同相位邻域 = 36 独立样本）。
+  // 缺任一输入（无位移场/无原始帧）则回落到旧的"融合后 9 样本"路径。
+  if (prog_raw_dn_ts_ && tex_off_[2] != 0 && tex_mfnr_[2] != 0) {
+    glUseProgram(prog_raw_dn_ts_);
+    const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
+    for (int i = 0; i < 4; ++i) {
+      glActiveTexture(GL_TEXTURE0 + i);
+      glBindTexture(GL_TEXTURE_2D, raws[i]);
+      glUniform1i(u_raw_dn_ts_.raw[i], i);
+    }
+    for (int i = 0; i < 3; ++i) {
+      glActiveTexture(GL_TEXTURE4 + i);
+      glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
+      glUniform1i(u_raw_dn_ts_.off[i], 4 + i);
+    }
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, tex_fused_);
+    glUniform1i(u_raw_dn_ts_.fused, 7);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform2i(u_raw_dn_ts_.size, w, h);
+    glUniform2i(u_raw_dn_ts_.off_tiles, tiles_w_, tiles_h_);
+    glUniform1i(u_raw_dn_ts_.cfalut, cfaLutOf(cfa));
+    glUniform4f(u_raw_dn_ts_.black, black_phase[0], black_phase[1],
+                black_phase[2], black_phase[3]);
+    glUniform1f(u_raw_dn_ts_.white, white_level);
+    glUniform3f(u_raw_dn_ts_.gain, gains[0], gains[1], gains[2]);
+    glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+    glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
+    glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    return;
+  }
   glUseProgram(prog_raw_dn_fused_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, tex_fused_);

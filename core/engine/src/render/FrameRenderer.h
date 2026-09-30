@@ -180,7 +180,9 @@ class FrameRenderer {
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
-  void passRawDenoiseFused(int w, int h, int cfa, const NoiseCoef& nc);
+  void passRawDenoiseFused(int w, int h, int cfa, const float black_phase[4],
+                           float white_level, const float gains[3],
+                           const NoiseCoef& nc);
   // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
   // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
   // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
@@ -339,6 +341,7 @@ class FrameRenderer {
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
+         prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
@@ -520,6 +523,12 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1;
   } u_raw_dn_f_;
+  // D-2（v0.10.58）：时域 × 空间联合 P0（4 帧 × 3×3 同相位邻域）
+  struct {
+    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, fused = -1,
+          size = -1, off_tiles = -1, cfalut = -1, black = -1, white = -1,
+          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1;
+  } u_raw_dn_ts_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
   } u_mfnr_pyr_;
