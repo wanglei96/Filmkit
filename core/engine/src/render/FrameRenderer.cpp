@@ -793,7 +793,16 @@ void main() {
     vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
     vec2 ch = sampleUp(uCoarse, uv) + sampleUp(uD0, uv) + sampleUp(uD1, uv) +
               sampleUp(uD2, uv) + sampleUp(uD3, uv) + sampleUp(uD4, uv);
-    // ── 亮度各向异性核：3×3 luma → 结构张量 → 切向长核 + 值域权重 ──
+    // ── 亮度各向异性核（v0.10.56 起**默认关闭**，uL=0 时整段跳过）──────────
+    // 事故记录：0.10.54（L=16 无条件）与 0.10.55（L=6 + coherence 门控）两版
+    // 真机的 8px 尺度纹理能量都掉（0.10.55 同刻实测 3.17 vs PC 3.59 = −12%），
+    // 用户两次判定"画面比 PC 糊"。根因是**单帧去马赛克后**的空间核在噪声与
+    // 中尺度纹理同量级时必然二选一 —— 收益（σY 2.87→1.30）是拿纹理买的，
+    // 细节优先是红线，故整条路径停用。真正的杠杆在 merge 阶段的多帧空间核
+    //（PC：每帧 3×3 quad × 4 帧 = 加样本不加空间模糊），代码保留待那边落地后
+    // 以"小核 + 多帧"的形态重开，而不是这里放大核。
+    float dyn = 0.0;
+    if (uL > 0) {
     float y00 = lumAt(p + ivec2(-1, -1)), y10 = lumAt(p + ivec2(0, -1)),
           y20 = lumAt(p + ivec2(1, -1));
     float y01 = lumAt(p + ivec2(-1, 0)),   y21 = lumAt(p + ivec2(1, 0));
@@ -824,7 +833,8 @@ void main() {
         acc += w * yq;
         ws += w;
     }
-    float dyn = acc / ws - y;                   // 加性回写（乘性会在暗部放大噪声）
+    dyn = acc / ws - y;                         // 加性回写（乘性会在暗部放大噪声）
+    }
     vec3 o = vec3(y + ch.y + dyn, 0.0, y + ch.x + dyn);   // R = Y+Cr, B = Y+Cb
     o.g = (y + dyn - 0.2126 * o.r - 0.0722 * o.b) / 0.7152;
     oColor = vec4(o, 1.0);
