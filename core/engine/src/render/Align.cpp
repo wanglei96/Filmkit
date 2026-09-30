@@ -60,6 +60,52 @@ inline float smoothstepf(float t0, float t1, float x) {
   return t * t * (3.f - 2.f * t);
 }
 
+// 置信度判据参数：残差（每采样平均 SAD）相对 ref tile 纹理度 —— 见 matchTile。
+constexpr float kConf0 = 0.40f, kConf1 = 0.90f, kGradEps = 4.0f;
+
+// 单 tile 匹配结果（层内像素单位）。
+struct TileMatch {
+  int bx = 0, by = 0;   // 整数位移
+  float sx = 0.f, sy = 0.f;  // 抛物线亚像素（±0.5 内）
+  float conf = 0.f;     // [0,1]，0 = 弱纹理/失败 → 融合回退参考帧
+  int cost = 1 << 30;
+};
+
+// 在 (cx,cy) 的 ±range 邻域搜 SAD 最小位移，再做抛物线亚像素。
+// full=false 时跳过亚像素与置信度（只取初值用，省两次 SAD 重算）。
+inline TileMatch matchTile(const uint8_t* a, const uint8_t* b, int aw, int ah,
+                           int x0, int y0, int tile, int step, int cx, int cy,
+                           int range, bool full) {
+  TileMatch m;
+  for (int dy = cy - range; dy <= cy + range; ++dy) {
+    for (int dx = cx - range; dx <= cx + range; ++dx) {
+      const int s = sadTile(a, b, aw, ah, x0, y0, dx, dy, tile, tile, step);
+      if (s < m.cost) {
+        m.cost = s;
+        m.bx = dx;
+        m.by = dy;
+      }
+    }
+  }
+  if (!full) return m;
+  // 亚像素：x/y 各自的 ±1 邻域 cost（独立重算）
+  const int cp = sadTile(a, b, aw, ah, x0, y0, m.bx + 1, m.by, tile, tile, step);
+  const int cm = sadTile(a, b, aw, ah, x0, y0, m.bx - 1, m.by, tile, tile, step);
+  const int cy1 = sadTile(a, b, aw, ah, x0, y0, m.bx, m.by + 1, tile, tile, step);
+  const int cym = sadTile(a, b, aw, ah, x0, y0, m.bx, m.by - 1, tile, tile, step);
+  m.sx = subpixel(static_cast<float>(cm), static_cast<float>(m.cost),
+                  static_cast<float>(cp));
+  m.sy = subpixel(static_cast<float>(cym), static_cast<float>(m.cost),
+                  static_cast<float>(cy1));
+  // 置信度：对齐残差（每采样平均）相对 ref tile 纹理度 —— 残差被梯度解释得
+  // 越充分越可信；弱纹理（梯度→0）或噪声主导 → conf→0 回退参考帧。
+  const float grad = gradTile(a, aw, ah, x0, y0, tile, tile, 2);
+  const float sad_norm =
+      static_cast<float>(m.cost) / static_cast<float>(tile * tile / 4);
+  m.conf = 1.f - smoothstepf(kConf0, kConf1, sad_norm / std::max(grad, kGradEps));
+  return m;
+}
+
 }  // namespace
 
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
@@ -124,10 +170,17 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
     }
   }
 
-  // ── 3) L2（1/4 域）每 tile 精化（±2）+ 亚像素 + 置信度 ──────────────
-  // 输出到 1/2 域 tile 网格（tiles_x/y）。1/2 域 64px tile ≡ L3 域 16px tile
-  //（同一区域逐级减半），位移域换算 L2→mosaic = ×4。
-  constexpr float kConf0 = 0.40f, kConf1 = 0.90f, kGradEps = 4.0f;
+  // ── 3) L2（1/4 域）每 tile 精化（±2） ───────────────────────────────
+  // 1/2 域 64px tile ≡ L3 域 16px tile（同一区域逐级减半），网格同
+  // tiles_x/y。有 L1（1/2 域）时本层只作**初值**（整数位移，省亚像素与置信度）；
+  // 无 L1 = 旧路径，本层就是最细层（位移域换算 L2→mosaic = ×4）。
+  const bool use_l1 = ref.w1 > 0 && cur.w1 > 0 &&
+                      ref.l1.size() == static_cast<size_t>(ref.w1) * ref.h1 &&
+                      cur.l1.size() == static_cast<size_t>(cur.w1) * cur.h1 &&
+                      ref.l1.size() > 0;
+  out.used_l1 = use_l1;
+  std::vector<int> d2x(static_cast<size_t>(n_tiles), 0);
+  std::vector<int> d2y(static_cast<size_t>(n_tiles), 0);
   float conf_sum = 0.f;
   for (int ty = 0; ty < tiles_y; ++ty) {
     for (int tx = 0; tx < tiles_x; ++tx) {
@@ -135,53 +188,50 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
       // 1/2 域 32px tile ≡ L3 域 8px tile（同一区域逐级减半），网格同尺寸
       const int i3 = clampi(tx, 0, nx3 - 1) + clampi(ty, 0, ny3 - 1) * nx3;
       const int vx = d3x[static_cast<size_t>(i3)], vy = d3y[static_cast<size_t>(i3)];
-      int best2 = 1 << 30;
-      int bx = 0, by = 0;
-      for (int dy = 2 * vy - kRange; dy <= 2 * vy + kRange; ++dy) {
-        for (int dx = 2 * vx - kRange; dx <= 2 * vx + kRange; ++dx) {
-          const int s = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2,
-                                x0, y0, dx, dy, kTile2, kTile2, 1);
-          if (s < best2) {
-            best2 = s;
-            bx = dx;
-            by = dy;
-          }
-        }
-      }
-      // 亚像素：x/y 各自的 ±1 邻域 cost（独立重算）
-      const int c0 = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0,
-                             y0, bx, by, kTile2, kTile2, 1);
-      const int cp = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0,
-                             y0, bx + 1, by, kTile2, kTile2, 1);
-      const int cm = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0,
-                             y0, bx - 1, by, kTile2, kTile2, 1);
-      const int cy1 = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0,
-                              y0, bx, by + 1, kTile2, kTile2, 1);
-      const int cym = sadTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0,
-                              y0, bx, by - 1, kTile2, kTile2, 1);
-      const float sx = subpixel(static_cast<float>(cm), static_cast<float>(c0),
-                                static_cast<float>(cp));
-      const float sy = subpixel(static_cast<float>(cym), static_cast<float>(c0),
-                                static_cast<float>(cy1));
-      // 置信度：对齐残差（每采样平均）相对 ref tile 纹理度 —— 残差被梯度
-      // 解释得越充分越可信；弱纹理（梯度→0）或噪声主导 → conf→0 回退参考帧。
-      const float grad = gradTile(ref.l2.data(), ref.w2, ref.h2, x0, y0, kTile2,
-                                  kTile2, 2);
-      const float sad_norm =
-          static_cast<float>(best2) / static_cast<float>(kTile2 * kTile2 / 4);
-      const float conf =
-          1.f - smoothstepf(kConf0, kConf1, sad_norm / std::max(grad, kGradEps));
+      const TileMatch m =
+          matchTile(ref.l2.data(), cur.l2.data(), ref.w2, ref.h2, x0, y0, kTile2, 1,
+                    2 * vx, 2 * vy, kRange, !use_l1);
       const int idx = ty * tiles_x + tx;
-      out.off[static_cast<size_t>(idx) * 2 + 0] = (bx + sx) * 4.f;
-      out.off[static_cast<size_t>(idx) * 2 + 1] = (by + sy) * 4.f;
-      out.conf[static_cast<size_t>(idx)] = conf;
-      conf_sum += conf;
+      d2x[static_cast<size_t>(idx)] = m.bx;
+      d2y[static_cast<size_t>(idx)] = m.by;
+      if (!use_l1) {
+        out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 4.f;
+        out.off[static_cast<size_t>(idx) * 2 + 1] = (m.by + m.sy) * 4.f;
+        out.conf[static_cast<size_t>(idx)] = m.conf;
+        conf_sum += m.conf;
+      }
+    }
+  }
+
+  // ── 4) L1（1/2 域）每 tile 精化（±2）+ 亚像素 + 置信度 ───────────────
+  // 最细层 = 2×2 Bayer 块平均灰度（HDR+ §4 原版最细层），初值 = 2×L2 位移。
+  // 位移域换算 L1→mosaic = ×2：量化从 4 mosaic px 降到 2，是 P0 同相位邻域
+  // （±4 mosaic px）精度提升的直接来源。tile 与输出网格同为 tiles_x/y。
+  if (use_l1) {
+    for (int ty = 0; ty < tiles_y; ++ty) {
+      for (int tx = 0; tx < tiles_x; ++tx) {
+        const int idx = ty * tiles_x + tx;
+        const int x0 = tx * kMfnrTile, y0 = ty * kMfnrTile;
+        const TileMatch m = matchTile(
+            ref.l1.data(), cur.l1.data(), ref.w1, ref.h1, x0, y0, kMfnrTile, 2,
+            2 * d2x[static_cast<size_t>(idx)], 2 * d2y[static_cast<size_t>(idx)],
+            kRange, true);
+        out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 2.f;
+        out.off[static_cast<size_t>(idx) * 2 + 1] = (m.by + m.sy) * 2.f;
+        out.conf[static_cast<size_t>(idx)] = m.conf;
+        conf_sum += m.conf;
+      }
     }
   }
   out.conf_med = n_tiles > 0 ? conf_sum / n_tiles : 0.f;
-  out.gx = static_cast<float>(bgx) * 4.f;
-  out.gy = static_cast<float>(bgy) * 4.f;
-  // 位移幅度分布（仅统计有纹理的 tile：conf > 0.2）
+  // 全局位移：L4 是 1/16 域，1px = 16 mosaic px（旧版写 ×4 = L2 域，口径修正）。
+  out.gx = static_cast<float>(bgx) * 16.f;
+  out.gy = static_cast<float>(bgy) * 16.f;
+  // 位移幅度分布。过滤条件 conf > 0.2 在 L1 路径下形同不过滤 —— 离线基准
+  // （tools/align-bench.cpp + align-bench-gen.py，2026-09-30 实测）该"残差/纹理度"
+  // 判据在 1/4 域误杀 87% 好 tile、换到 1/2 域后 38 个失败 tile 只检出 0 个，
+  // **两代都无判别力**，故仅作幅度统计的粗过滤，不可用作对齐门控（门控走
+  // mismatch 权重）。真正识别重复纹理误匹配需要峰值锐度类判据，未做。
   std::vector<float> mags;
   mags.reserve(static_cast<size_t>(n_tiles));
   for (int t = 0; t < n_tiles; ++t) {

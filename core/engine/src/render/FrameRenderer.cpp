@@ -5466,10 +5466,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   const float wl = static_cast<float>(white_level);
   stage("pyr");
 
-  // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile 32 → tiles。
+  // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile kMfnrTile → tiles。
   const int w2 = (pyr1_w_ + 1) / 2, h2 = (pyr1_h_ + 1) / 2;
   const int w3 = (w2 + 1) / 2, h3 = (h2 + 1) / 2;
   const int w4 = (w3 + 1) / 2, h4 = (h3 + 1) / 2;
+  // D-2 对齐精度专项（2026-09-30）：最细精化层移到 1/2 域（HDR+ §4 原版的
+  // 2×2 Bayer 平均灰度最细层），因此需要 readback 1/2 域（w1*h1 ≈ 3MB/帧）。
+  // readback 与 CPU SAD 分开计时（alignRbMs / alignCpuMs）—— 成本必须实测后
+  // 交用户拍板，不能替用户决定（项目铁律）。
+  float align_rb_ms = 0.f, align_cpu_ms = 0.f;
   auto capturePyr = [&](GLuint raw_tex, MfnrPyramid* py) {
     passMfnrPyr(raw_tex, cfa, black_phase, wl, rc.gains);
     passMfnrDown(tex_pyr1_, fbo_pyr2_, pyr1_w_, pyr1_h_);
@@ -5483,9 +5488,16 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       dst->resize(static_cast<size_t>(ww) * hh);
       for (size_t k = 0; k < dst->size(); ++k) (*dst)[k] = rgba[k * 4];
     };
+    const auto rb0 = std::chrono::steady_clock::now();
+    readL(fbo_pyr1_, pyr1_w_, pyr1_h_, &py->l1);
     readL(fbo_pyr2_, w2, h2, &py->l2);
     readL(fbo_pyr3_, w3, h3, &py->l3);
     readL(fbo_pyr4_, w4, h4, &py->l4);
+    align_rb_ms += std::chrono::duration<float, std::milli>(
+                       std::chrono::steady_clock::now() - rb0)
+                       .count();
+    py->w1 = pyr1_w_;
+    py->h1 = pyr1_h_;
     py->w2 = w2;
     py->h2 = h2;
     py->w3 = w3;
@@ -5499,6 +5511,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
+  int align_l1_frames = 0;  // 实际走 1/2 域最细层的帧数（应为 count-1 = 3）
   // σ（单帧，线性域 WB 后）：v0.10.1 短参考帧下参考帧噪声比典型帧高
   // ref_noise_scale（= √(AE_sec/secRef)，1.0 = 未压短）。
   // C 专项（2026-09-29）：σ² 由常数改为模型 var(x)=A·x+B —— P0/P4 用融合域
@@ -5528,7 +5541,11 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur);
+    const auto cpu0 = std::chrono::steady_clock::now();
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
+    align_cpu_ms += std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() - cpu0)
+                        .count();
     stage("align_frame");
     for (int t = 0; t < n_tiles; ++t) {
       offs[static_cast<size_t>(i - 1)][static_cast<size_t>(t) * 2 + 0] =
@@ -5558,6 +5575,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     gx_sum += a.gx;
     gy_sum += a.gy;
     conf_sum += a.conf_med;
+    if (a.used_l1) ++align_l1_frames;
     dx_med_max = std::max(dx_med_max, a.dx_med);
     dx_p90_max = std::max(dx_p90_max, a.dx_p90);
   }
@@ -5919,6 +5937,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                 f3(dft_probe[2]) + "," + f3(dft_probe[3]) + "]"
                           : "") +
               ",\"alignMs\":" + f3(align_ms) +
+              ",\"alignRbMs\":" + f3(align_rb_ms) +
+              ",\"alignCpuMs\":" + f3(align_cpu_ms) +
+              ",\"alignL1\":" + std::to_string(align_l1_frames) +
               ",\"misMs\":" + f3(mis_ms) +
               ",\"fuseMs\":" + f3(fuse_ms) +
               ",\"gx\":" + f3(gx_sum / (count - 1)) +
