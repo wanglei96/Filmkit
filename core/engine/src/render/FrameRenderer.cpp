@@ -3825,6 +3825,7 @@ bool FrameRenderer::ensureChromaMst(int w, int h) {
 // （= P5 之后 passFilm 的输入）。返回 false = 未执行（调用方回落 tex_dn_）。
 bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
                                         const NoiseCoef& nc) {
+  dbg_cms_ = 0; dbg_cms_k_ = 0.f;
   if (!prog_chroma_down_ || !prog_chroma_at_ || !prog_chroma_apply_) return false;
   if (!ensureChromaMst(dst_w, dst_h)) return false;
   const int hw = ch_w_, hh = ch_h_;
@@ -3858,6 +3859,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   // （噪声），没看色度纹理，是第五次同类口径事故。
   glUniform1f(u_chroma_at_.k, 2.5f);
   glUniform1f(u_chroma_at_.revert, 0.20f);
+  dbg_cms_ = 1; dbg_cms_k_ = 2.5f;
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
   glUniform1i(u_chroma_at_.sigma, 1);
@@ -5035,6 +5037,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
     glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
+    dbg_p0s_ = 36;                                   // 4 帧 × 3×3 同相位
     glDrawArrays(GL_TRIANGLES, 0, 3);
     return;
   }
@@ -5046,6 +5049,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   glUniform1i(u_raw_dn_f_.cfalut, cfaLutOf(cfa));
   glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
   glUniform3f(u_raw_dn_f_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
+  dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -5821,9 +5825,11 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
+  dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f;
   const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"fuse\":\"" + (dft_active ? "dft" : "mm") + "\"" +
+
               (dft_active ? ",\"dftNeff\":" + f3(neff_dft) +
                                 ",\"dftUp\":" + f3(dft_ms[0]) +
                                 ",\"dftDsp\":" + f3(dft_ms[1]) +
@@ -5855,6 +5861,11 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
   finishStillChain(c, t0, out_rgba);
+  // v0.10.59：新增算法的生效字段必须在渲染链**之后**拼装 —— 两个 pass 都在
+  // finishStillChain 内执行，写在日志串前缀里会读到重置后的 0（本次自查抓到）。
+  c.mfnr_kv += std::string(",\"p0s\":") + std::to_string(dbg_p0s_) +
+               ",\"cms\":" + std::to_string(dbg_cms_) +
+               ",\"cmsK\":" + f3(dbg_cms_k_);
   return true;
 }
 
