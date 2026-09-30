@@ -376,19 +376,12 @@ class FrameRenderer {
   // overlap-add = R32F scratch（ES 3.1 规范保证 image load+store）× 4 次
   // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
   // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
-  GLuint prog_mfnr_fft_ = 0, prog_mfnr_fft_sum_ = 0;
-  GLuint prog_micro_store_ = 0;  // 1-texel imageStore 微测试(上下文判定)
+  GLuint prog_mfnr_fft_sum_ = 0;  // 相位组求和 pass(fragment,init 创建)
   int burst_w_ = 0, burst_h_ = 0;  // 输出纹理尺寸标记(输入直接用 4 张 2D)
   // 相位组输出 ×4（R32F image2D writeonly；glslang ES profile 只放行 r32f、
   // image2DArray 的 store 在 X300 Mali 上静默丢失 —— v0.10.42 dftGpu 577ms
   // vs dftCnt 0 实锤）
   GLuint tex_fft_out_[4] = {0, 0, 0, 0};
-  struct {
-    GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, out = -1, size = -1,
-          off_tiles = -1, tx_max = -1, black = -1, white = -1,
-          gain = -1, plane_a = -1, plane_b = -1, c = -1, group = -1, tw = -1,
-          layer = -1, rows = -1;
-  } u_mfnr_fft_;
   struct {
     GLint g[4] = {-1, -1, -1, -1}, size = -1;
   } u_mfnr_fft_sum_;

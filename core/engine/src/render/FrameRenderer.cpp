@@ -2513,29 +2513,12 @@ bool FrameRenderer::init() {
       compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
   const GLuint fs_tile_rms = compileShader(GL_FRAGMENT_SHADER, kFsTileRms);
-  // 降噪专项 A：DFT 逐频收缩合并（compute，无顶点着色器）。实验路径，任何
-  // 编译/链接失败都只记日志、prog 置 0（passMfnrFft 首行检查 → 运行时回退
-  // mismatch 路径）—— 严禁进 init 的阻塞检查（v0.10.37 首包 sum 混链失败
-  // 阻塞 init → 预览黑屏事故的教训）。
-  const GLuint cs_mfnr_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
+  // 降噪专项 A（v0.10.49）：compute program 一律**拍照时现场创建、用完删除**
+  //（spike 模式）—— 实锤:init 创建的 compute program 在该 Mali 驱动上经
+  // 预览链大量 program 创建后写入全丢（主内核 + 1-texel 微测试一致失败），
+  // 现场创建的 spike program 一致成功（spikeOk:true,0.10.47/48 双轮）。
+  // init 只留 sum 收口 pass（fragment,300 es,不受影响）。
   const GLuint fs_mfnr_fft_sum = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFftSum);
-  // 微测试 program(imageStore 上下文判定用;失败仅影响诊断)
-  GLuint cs_micro = compileShader(GL_COMPUTE_SHADER, kFsMicroStore);
-  prog_micro_store_ = 0;
-  if (cs_micro) {
-    prog_micro_store_ = glCreateProgram();
-    glAttachShader(prog_micro_store_, cs_micro);
-    glLinkProgram(prog_micro_store_);
-    GLint linked = 0;
-    glGetProgramiv(prog_micro_store_, GL_LINK_STATUS, &linked);
-    if (!linked) {
-      glDeleteProgram(prog_micro_store_);
-      prog_micro_store_ = 0;
-    }
-  } else {
-    prog_micro_store_ = 0;
-  }
-  if (cs_micro) glDeleteShader(cs_micro);
   // v0.10.15：darktable filmic 高光重建（9 个）
   const GLuint fs_hr_mask = compileShader(GL_FRAGMENT_SHADER, kFsHrMask);
   const GLuint fs_hr_inp = compileShader(GL_FRAGMENT_SHADER, kFsHrInpaint);
@@ -2576,27 +2559,7 @@ bool FrameRenderer::init() {
   prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
   prog_tile_rms_ = linkProgram(vs_plain_, fs_tile_rms);
-  // 降噪专项 A：compute 程序（单 shader，无 vs/fs attach）+ 相位组求和 pass。
-  // 编译/链接失败不阻塞 init（置 0，运行时 use_dft 回退 mismatch 路径）。
-  if (cs_mfnr_fft) {
-    prog_mfnr_fft_ = glCreateProgram();
-    glAttachShader(prog_mfnr_fft_, cs_mfnr_fft);
-    glLinkProgram(prog_mfnr_fft_);
-    GLint linked = 0;
-    glGetProgramiv(prog_mfnr_fft_, GL_LINK_STATUS, &linked);
-    if (!linked) {
-      char buf[512];
-      glGetProgramInfoLog(prog_mfnr_fft_, sizeof(buf), nullptr, buf);
-      Logger::instance().log(
-          LogLevel::kError, "engine", "mfnr.fft.link_fail",
-          "{\"log\":\"" + jsonEscape(buf) + "\"}");
-      glDeleteProgram(prog_mfnr_fft_);
-      prog_mfnr_fft_ = 0;
-    }
-  } else {
-    Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.compile_fail",
-                           "{\"stage\":\"compute\"}");
-  }
+  // 相位组求和 pass（fragment;主 compute program 见 passMfnrFft 现场创建）。
   if (fs_mfnr_fft_sum) {
     prog_mfnr_fft_sum_ = linkProgram(vs_plain_, fs_mfnr_fft_sum);
   } else {
@@ -2632,7 +2595,6 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_mfnr_mis);
   glDeleteShader(fs_raw_dn_f);
   glDeleteShader(fs_tile_rms);
-  glDeleteShader(cs_mfnr_fft);
   glDeleteShader(fs_mfnr_fft_sum);
   glDeleteShader(fs_hr_mask);
   glDeleteShader(fs_hr_inp);
@@ -2746,47 +2708,6 @@ bool FrameRenderer::init() {
   u_tile_rms_.noise_a = glGetUniformLocation(prog_tile_rms_, "uNoiseA");
   u_tile_rms_.noise_b = glGetUniformLocation(prog_tile_rms_, "uNoiseB");
 
-  // 降噪专项 A：DFT 合并 compute 的 uniform（image binding 0/1 由 layout 固定）
-  for (int i = 0; i < 4; ++i) {
-    u_mfnr_fft_.raw[i] =
-        glGetUniformLocation(prog_mfnr_fft_, ("uRaw" + std::to_string(i)).c_str());
-  }
-  for (int i = 0; i < 3; ++i) {
-    u_mfnr_fft_.off[i] = glGetUniformLocation(prog_mfnr_fft_,
-                                              ("uOff" + std::to_string(i + 1)).c_str());
-  }
-  u_mfnr_fft_.size = glGetUniformLocation(prog_mfnr_fft_, "uSize");
-  u_mfnr_fft_.off_tiles = glGetUniformLocation(prog_mfnr_fft_, "uOffTiles");
-  u_mfnr_fft_.tx_max = glGetUniformLocation(prog_mfnr_fft_, "uTxMax");
-  u_mfnr_fft_.black = glGetUniformLocation(prog_mfnr_fft_, "uBlack");
-  u_mfnr_fft_.white = glGetUniformLocation(prog_mfnr_fft_, "uWhite");
-  u_mfnr_fft_.gain = glGetUniformLocation(prog_mfnr_fft_, "uGain");
-  u_mfnr_fft_.plane_a = glGetUniformLocation(prog_mfnr_fft_, "uPlaneA");
-  u_mfnr_fft_.plane_b = glGetUniformLocation(prog_mfnr_fft_, "uPlaneB");
-  u_mfnr_fft_.c = glGetUniformLocation(prog_mfnr_fft_, "uC");
-  u_mfnr_fft_.group = glGetUniformLocation(prog_mfnr_fft_, "uGroup");
-  u_mfnr_fft_.layer = glGetUniformLocation(prog_mfnr_fft_, "uLayer");
-  u_mfnr_fft_.rows = glGetUniformLocation(prog_mfnr_fft_, "uRows");
-  u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
-  // uRaw0..3 → unit 0..3、uOff1..3 → unit 4..6（dispatch 前绑纹理;prog 0 = 已置回退）
-  if (prog_mfnr_fft_) {
-    glUseProgram(prog_mfnr_fft_);
-    for (int i = 0; i < 4; ++i) {
-      if (u_mfnr_fft_.raw[i] >= 0) glUniform1i(u_mfnr_fft_.raw[i], i);
-    }
-    for (int i = 0; i < 3; ++i) {
-      if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 4 + i);
-    }
-    // v0.10.45:uOut0..3 的 image unit 必须**显式** glUniform1i —— 0.10.44
-    // 只查了旧名 "uOut"(改名后 -1 no-op),而部分 Mali 驱动不采用
-    // layout(binding=) 默认值 → 4 个 image uniform 全部默认 unit 0,写入未定义
-    const char* outnames[4] = {"uOut0", "uOut1", "uOut2", "uOut3"};
-    for (int i = 0; i < 4; ++i) {
-      const GLint loc = glGetUniformLocation(prog_mfnr_fft_, outnames[i]);
-      if (loc >= 0) glUniform1i(loc, i);
-    }
-    if (u_mfnr_fft_.layer >= 0) glUniform1i(u_mfnr_fft_.layer, 0);
-  }
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
   if (prog_mfnr_fft_sum_) {
     glUseProgram(prog_mfnr_fft_sum_);
@@ -3057,15 +2978,12 @@ void FrameRenderer::release() {
   if (prog_mfnr_mis_) glDeleteProgram(prog_mfnr_mis_);
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
   if (prog_tile_rms_) glDeleteProgram(prog_tile_rms_);
-  if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
-  if (prog_micro_store_) glDeleteProgram(prog_micro_store_);
   for (auto& t : tex_fft_out_) {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
-  prog_mfnr_fft_ = prog_mfnr_fft_sum_ = 0;
-  prog_micro_store_ = 0;
+  prog_mfnr_fft_sum_ = 0;
   burst_w_ = burst_h_ = 0;
   if (tex_rms_) glDeleteTextures(1, &tex_rms_);
   if (fbo_rms_) glDeleteFramebuffers(1, &fbo_rms_);
@@ -4269,7 +4187,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   *out_neff = 0.f;
   out_probe[0] = out_probe[1] = out_probe[2] = out_probe[3] = -1.f;
   if (burst_w_ != w || burst_h_ != h) return false;
-  if (prog_mfnr_fft_ == 0 || prog_mfnr_fft_sum_ == 0) {
+  if (prog_mfnr_fft_sum_ == 0) {
     Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.unavailable",
                            "{}");
     return false;
@@ -4283,6 +4201,43 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     pa[p] = plane_a[ch];
     pb[p] = plane_b[ch];
   }
+  // ── compute program **现场创建、用完删除**（spike 模式，v0.10.49）──────
+  // 0.10.48 实锤规律:init 创建的 compute program 写入全丢（主内核 + 1-texel
+  // 微测试一致失败），而现场创建的 spike program 在同一上下文、紧挨着完美
+  // 工作（spikeOk:true）。机理疑似该 Mali 驱动在 init 后经预览链大量
+  // program 创建使早期 compute pipeline 内部状态损坏。编译成本（CPU）在
+  // 拍照路径可接受，换取正确性。
+  const GLuint cs_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
+  GLuint prog_fft = 0;
+  if (cs_fft) {
+    prog_fft = glCreateProgram();
+    glAttachShader(prog_fft, cs_fft);
+    glLinkProgram(prog_fft);
+    GLint linked = 0;
+    glGetProgramiv(prog_fft, GL_LINK_STATUS, &linked);
+    if (!linked) {
+      char buf[512];
+      glGetProgramInfoLog(prog_fft, sizeof(buf), nullptr, buf);
+      Logger::instance().log(
+          LogLevel::kError, "engine", "mfnr.fft.link_fail",
+          "{\"log\":\"" + jsonEscape(buf) + "\"}");
+      glDeleteProgram(prog_fft);
+      prog_fft = 0;
+    }
+  }
+  if (cs_fft) glDeleteShader(cs_fft);
+  if (prog_fft == 0) {
+    Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.compile_fail",
+                           "{}");
+    return false;
+  }
+  glUseProgram(prog_fft);
+  // image units（uOut0..3 = 相位组输出；sampler units 见下）
+  const char* outnames[4] = {"uOut0", "uOut1", "uOut2", "uOut3"};
+  for (int i = 0; i < 4; ++i) {
+    const GLint loc = glGetUniformLocation(prog_fft, outnames[i]);
+    if (loc >= 0) glUniform1i(loc, i);
+  }
   // 2) 4 次 dispatch（tile 相位组 (gx,gy)）：每次 xy = 组内 tile 网格的一半
   //    （每 workgroup 2 个水平相邻同组 tile）
   const auto t_dsp = std::chrono::steady_clock::now();
@@ -4291,7 +4246,6 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   if (gpu_ok) gpu_fft.begin();
   const int pw = (w + 1) / 2, ph = (h + 1) / 2;
   const int tx_max = (pw + 7) / 8 - 1, ty_max = (ph + 7) / 8 - 1;
-  glUseProgram(prog_mfnr_fft_);
   // 输入直接绑现有纹理(raw_tex_ = 帧 0,与 passMfnrFuse 同源同款 usampler2D)
   const GLuint fft_raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1],
                               tex_mfnr_[2]};
@@ -4304,16 +4258,31 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glBindTexture(GL_TEXTURE_2D, tex_off_[i]);
   }
   glActiveTexture(GL_TEXTURE0);
-  glUniform2i(u_mfnr_fft_.size, w, h);
-  glUniform2i(u_mfnr_fft_.off_tiles, tiles_w_, tiles_h_);
-  glUniform1i(u_mfnr_fft_.tx_max, tx_max);
-  glUniform4f(u_mfnr_fft_.black, black_phase[0], black_phase[1], black_phase[2],
+  const auto uni = [&](const char* n) {
+    return glGetUniformLocation(prog_fft, n);
+  };
+  glUniform2i(uni("uSize"), w, h);
+  glUniform2i(uni("uOffTiles"), tiles_w_, tiles_h_);
+  glUniform1i(uni("uTxMax"), tx_max);
+  glUniform4f(uni("uBlack"), black_phase[0], black_phase[1], black_phase[2],
               black_phase[3]);
-  glUniform1f(u_mfnr_fft_.white, white_level);
-  glUniform3f(u_mfnr_fft_.gain, gains[0], gains[1], gains[2]);
-  glUniform4f(u_mfnr_fft_.plane_a, pa[0], pa[1], pa[2], pa[3]);
-  glUniform4f(u_mfnr_fft_.plane_b, pb[0], pb[1], pb[2], pb[3]);
-  glUniform1f(u_mfnr_fft_.c, 256.0f);
+  glUniform1f(uni("uWhite"), white_level);
+  glUniform3f(uni("uGain"), gains[0], gains[1], gains[2]);
+  glUniform4f(uni("uPlaneA"), pa[0], pa[1], pa[2], pa[3]);
+  glUniform4f(uni("uPlaneB"), pb[0], pb[1], pb[2], pb[3]);
+  glUniform1f(uni("uC"), 256.0f);
+  {
+    const GLint l0 = uni("uRaw0"), l1 = uni("uRaw1"), l2 = uni("uRaw2"),
+                l3 = uni("uRaw3");
+    if (l0 >= 0) glUniform1i(l0, 0);
+    if (l1 >= 0) glUniform1i(l1, 1);
+    if (l2 >= 0) glUniform1i(l2, 2);
+    if (l3 >= 0) glUniform1i(l3, 3);
+    const GLint o1 = uni("uOff1"), o2 = uni("uOff2"), o3 = uni("uOff3");
+    if (o1 >= 0) glUniform1i(o1, 4);
+    if (o2 >= 0) glUniform1i(o2, 5);
+    if (o3 >= 0) glUniform1i(o3, 6);
+  }
   // twiddle 表（spike 同款：2π·i/16 的 (cos, sin)，i = 0..7）
   float tw[16];
   for (int i = 0; i < 8; ++i) {
@@ -4321,7 +4290,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     tw[2 * i] = std::cos(ang);
     tw[2 * i + 1] = std::sin(ang);
   }
-  if (u_mfnr_fft_.tw >= 0) glUniform2fv(u_mfnr_fft_.tw, 8, tw);
+  glUniform2fv(uni("uTw"), 8, tw);
   for (int g = 0; g < 4; ++g) {
     glBindImageTexture(g, tex_fft_out_[g], 0, GL_FALSE, 0, GL_WRITE_ONLY,
                        GL_RGBA16F);
@@ -4337,9 +4306,9 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     for (int ty = -1; ty <= ty_max; ++ty) {
       if (((ty + 1) & 1) == gy) ++m;
     }
-    glUniform2i(u_mfnr_fft_.group, gx, gy);
-    glUniform1i(u_mfnr_fft_.layer, gy * 2 + gx);
-    glUniform1i(u_mfnr_fft_.rows, m);
+    glUniform2i(uni("uGroup"), gx, gy);
+    glUniform1i(uni("uLayer"), gy * 2 + gx);
+    glUniform1i(uni("uRows"), m);
     // plane 并入 y 维（z 恒 1 = spike 真机口径）：wg.y / uRows = plane
     glDispatchCompute((n + 1) / 2, m * 4, 1);
     // 层间无写竞争（各写各层），无需组间 barrier
@@ -4354,11 +4323,28 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // —— dispatch 后立即读每组输出中心 1px，全 0 判定写入丢失并回退 mismatch
   // 路径（成片从机制上不黑）。读回组合 = RGBA16F + GL_FLOAT（X300 已验证）。
   {
-    // 微测试:1-texel imageStore(与内核解耦)。lost = 上下文级 image 写入
-    // 失败(换实现路线);ok = 上下文 image 可写,丢失是内核绑定/uniform 细节。
-    GLuint micro_tex = 0, micro_fbo = 0;
+    // 微测试:1-texel imageStore(与内核解耦,program 现场 spike 模式创建)。
+    // lost = 上下文级 image 写入失败(换实现路线);ok = 上下文 image 可写,
+    // 丢失是内核细节。微测试跑在主内核 dispatch 之后,image unit 0 已绑
+    // tex_fft_out_[0] —— 用完须重绑回去。
+    GLuint micro_tex = 0, micro_fbo = 0, micro_prog = 0;
     float micro_v[4] = {0, 0, 0, 0};
-    if (prog_micro_store_ != 0) {
+    {
+      const GLuint cs = compileShader(GL_COMPUTE_SHADER, kFsMicroStore);
+      if (cs) {
+        micro_prog = glCreateProgram();
+        glAttachShader(micro_prog, cs);
+        glLinkProgram(micro_prog);
+        GLint linked = 0;
+        glGetProgramiv(micro_prog, GL_LINK_STATUS, &linked);
+        if (!linked) {
+          glDeleteProgram(micro_prog);
+          micro_prog = 0;
+        }
+      }
+      if (cs) glDeleteShader(cs);
+    }
+    if (micro_prog != 0) {
       glGenTextures(1, &micro_tex);
       glBindTexture(GL_TEXTURE_2D, micro_tex);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -4366,9 +4352,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 16, 16, 0, GL_RGBA,
                    GL_HALF_FLOAT, nullptr);
       // 绑定顺序逐字复刻 spike:use → uniform → **bind image** → dispatch
-      //（0.10.46 的 micro:false 与此顺序差异共现,一并消掉该变量）
-      glUseProgram(prog_micro_store_);
-      glUniform1i(glGetUniformLocation(prog_micro_store_, "uMicro"), 0);
+      glUseProgram(micro_prog);
+      glUniform1i(glGetUniformLocation(micro_prog, "uMicro"), 0);
       glBindImageTexture(0, micro_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
                          GL_RGBA16F);
       glDispatchCompute(1, 1, 1);
@@ -4379,9 +4364,11 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                              GL_TEXTURE_2D, micro_tex, 0);
       glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, micro_v);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+      glBindImageTexture(0, tex_fft_out_[0], 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                         GL_RGBA16F);
       glDeleteFramebuffers(1, &micro_fbo);
       glDeleteTextures(1, &micro_tex);
+      glDeleteProgram(micro_prog);
       while (glGetError() != GL_NO_ERROR) {
       }
     }
@@ -4413,7 +4400,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
         std::string("{\"sum\":") +
             std::to_string(chk_sum).substr(0, 8) +
             ",\"micro\":" + (micro_ok ? "true" : "false") +
-            ",\"microProg\":" + (prog_micro_store_ != 0 ? "true" : "false") +
+            ",\"microProg\":\"live\"" +
             ",\"spikeOk\":" + (sp.readback_ok ? "true" : "false") +
             ",\"spikeGpu\":" + std::to_string(sp.gpu_median_ms).substr(0, 8) +
             ",\"spikeErr\":\"" + jsonEscape(sp.error) + "\"}");
@@ -4421,6 +4408,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       Logger::instance().log(
           LogLevel::kError, "engine", "mfnr.fft.store_lost",
           "{\"fuseMs\":" + std::to_string(gpu_ms).substr(0, 8) + "}");
+      glDeleteProgram(prog_fft);
       *out_neff = 0.f;
       return false;  // 调用方回退 mismatch 路径
     }
@@ -4460,6 +4448,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   out_ms[1] = ms(t_dsp, t_rb);
   out_ms[2] = ms(t_rb, t_end);
   out_ms[3] = gpu_ms;
+  glDeleteProgram(prog_fft);
   return true;
 }
 
