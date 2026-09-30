@@ -1393,6 +1393,18 @@ void main() {
     }
 })";
 
+// kFsMicroStore（v0.10.45）：1-texel imageStore 微测试 —— 与 DFT 内核完全
+// 解耦,判定拍照上下文里 image 写入是否工作(写 16×16 图的 (0,0) = 常量 1)。
+const char* kFsMicroStore = R"(#version 310 es
+precision highp float;
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba16f, binding = 0) writeonly uniform highp image2D uMicro;
+void main() {
+    if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+        imageStore(uMicro, ivec2(0, 0), vec4(1.0, 1.0, 1.0, 1.0));
+    }
+})";
+
 // kFsMfnrFftSum（降噪专项 A）：overlap-add 的收口 pass —— 4 个相位组层
 //（组内 tile 互不重叠、每 texel 至多 1 tile 写入）按窗和恒 1 直接相加，
 // 渲染进 tex_fused_（R16F，与 fuse 路径同域同格式，后段零改动）。
@@ -2489,6 +2501,23 @@ bool FrameRenderer::init() {
   // 阻塞 init → 预览黑屏事故的教训）。
   const GLuint cs_mfnr_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
   const GLuint fs_mfnr_fft_sum = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFftSum);
+  // 微测试 program(imageStore 上下文判定用;失败仅影响诊断)
+  GLuint cs_micro = compileShader(GL_COMPUTE_SHADER, kFsMicroStore);
+  prog_micro_store_ = 0;
+  if (cs_micro) {
+    prog_micro_store_ = glCreateProgram();
+    glAttachShader(prog_micro_store_, cs_micro);
+    glLinkProgram(prog_micro_store_);
+    GLint linked = 0;
+    glGetProgramiv(prog_micro_store_, GL_LINK_STATUS, &linked);
+    if (!linked) {
+      glDeleteProgram(prog_micro_store_);
+      prog_micro_store_ = 0;
+    }
+  } else {
+    prog_micro_store_ = 0;
+  }
+  if (cs_micro) glDeleteShader(cs_micro);
   // v0.10.15：darktable filmic 高光重建（9 个）
   const GLuint fs_hr_mask = compileShader(GL_FRAGMENT_SHADER, kFsHrMask);
   const GLuint fs_hr_inp = compileShader(GL_FRAGMENT_SHADER, kFsHrInpaint);
@@ -2728,8 +2757,14 @@ bool FrameRenderer::init() {
     for (int i = 0; i < 3; ++i) {
       if (u_mfnr_fft_.off[i] >= 0) glUniform1i(u_mfnr_fft_.off[i], 1 + i);
     }
-    if (u_mfnr_fft_.out >= 0) glUniform1i(u_mfnr_fft_.out, 0);
-    if (u_mfnr_fft_.neff >= 0) glUniform1i(u_mfnr_fft_.neff, 1);
+    // v0.10.45:uOut0..3 的 image unit 必须**显式** glUniform1i —— 0.10.44
+    // 只查了旧名 "uOut"(改名后 -1 no-op),而部分 Mali 驱动不采用
+    // layout(binding=) 默认值 → 4 个 image uniform 全部默认 unit 0,写入未定义
+    const char* outnames[4] = {"uOut0", "uOut1", "uOut2", "uOut3"};
+    for (int i = 0; i < 4; ++i) {
+      const GLint loc = glGetUniformLocation(prog_mfnr_fft_, outnames[i]);
+      if (loc >= 0) glUniform1i(loc, i);
+    }
     if (u_mfnr_fft_.layer >= 0) glUniform1i(u_mfnr_fft_.layer, 0);
   }
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
@@ -3004,12 +3039,14 @@ void FrameRenderer::release() {
   if (prog_tile_rms_) glDeleteProgram(prog_tile_rms_);
   if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
+  if (prog_micro_store_) glDeleteProgram(prog_micro_store_);
   if (tex_burst_) glDeleteTextures(1, &tex_burst_);
   for (auto& t : tex_fft_out_) {
     if (t) glDeleteTextures(1, &t);
     t = 0;
   }
   prog_mfnr_fft_ = prog_mfnr_fft_sum_ = 0;
+  prog_micro_store_ = 0;
   tex_burst_ = 0;
   burst_w_ = burst_h_ = 0;
   if (tex_rms_) glDeleteTextures(1, &tex_rms_);
@@ -4325,6 +4362,37 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // —— dispatch 后立即读每组输出中心 1px，全 0 判定写入丢失并回退 mismatch
   // 路径（成片从机制上不黑）。读回组合 = RGBA16F + GL_FLOAT（X300 已验证）。
   {
+    // 微测试:1-texel imageStore(与内核解耦)。lost = 上下文级 image 写入
+    // 失败(换实现路线);ok = 上下文 image 可写,丢失是内核绑定/uniform 细节。
+    GLuint micro_tex = 0, micro_fbo = 0;
+    float micro_v[4] = {0, 0, 0, 0};
+    if (prog_micro_store_ != 0) {
+      glGenTextures(1, &micro_tex);
+      glBindTexture(GL_TEXTURE_2D, micro_tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 16, 16, 0, GL_RGBA,
+                   GL_HALF_FLOAT, nullptr);
+      glBindImageTexture(7, micro_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                         GL_RGBA16F);
+      glUseProgram(prog_micro_store_);
+      glUniform1i(glGetUniformLocation(prog_micro_store_, "uMicro"), 7);
+      glDispatchCompute(1, 1, 1);
+      glMemoryBarrier(GL_ALL_BARRIER_BITS);
+      glGenFramebuffers(1, &micro_fbo);
+      glBindFramebuffer(GL_FRAMEBUFFER, micro_fbo);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, micro_tex, 0);
+      glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, micro_v);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glBindImageTexture(7, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+      glDeleteFramebuffers(1, &micro_fbo);
+      glDeleteTextures(1, &micro_tex);
+      while (glGetError() != GL_NO_ERROR) {
+      }
+    }
+    const bool micro_ok = micro_v[0] > 0.5f;
+
     GLuint chk_fbo = 0;
     glGenFramebuffers(1, &chk_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, chk_fbo);
@@ -4340,6 +4408,11 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glDeleteFramebuffers(1, &chk_fbo);
     while (glGetError() != GL_NO_ERROR) {
     }
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "mfnr.fft.store_check",
+        std::string("{\"sum\":") +
+            std::to_string(chk_sum).substr(0, 8) +
+            ",\"micro\":" + (micro_ok ? "true" : "false") + "}");
     Logger::instance().log(
         LogLevel::kInfo, "engine", "mfnr.fft.store_check",
         std::string("{\"sum\":") +

@@ -378,6 +378,7 @@ class FrameRenderer {
   // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
   // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
   GLuint prog_mfnr_fft_ = 0, prog_mfnr_fft_sum_ = 0;
+  GLuint prog_micro_store_ = 0;  // 1-texel imageStore 微测试(上下文判定)
   // burst 4 帧 R16UI 2DArray（glCopyImageSubData 自 raw_tex_/tex_mfnr_ 汇集，
   // compute 一次绑定；层序 = 帧序，层 0 = 参考帧）
   GLuint tex_burst_ = 0;
