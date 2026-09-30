@@ -156,6 +156,7 @@ class FrameRenderer {
   bool ensureTargets(int w, int h);
   bool ensureRcdTargets(int w, int h);
   bool ensureDnTarget(int w, int h);
+  bool ensureChromaMst(int w, int h);
   // MFNR 阶段一（v0.9.0）：raw 尺寸的 burst 纹理 / 金字塔 / 融合目标
   bool ensureMfnrTargets(int w, int h);
   // u16 Bayer 上传（submitRaw / submitRawBurst 共用）：rowStride 跳行 + 失败日志
@@ -264,6 +265,9 @@ class FrameRenderer {
                       float white_level, const float gains[3],
                       const NoiseCoef& nc);
   void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc);
+  // D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 5 级）
+  bool passChromaMultiScale(int dst_w, int dst_h, const NoiseCoef& nc);
+  static constexpr int kChromaLevels = 5;
   // C 专项：tile RMS 归约（HDR+ §5 —— 逐 tile RMS 代入噪声模型得 σ，A 的输入
   // 底座）。每像素输出一个 tile 的 RMS（mosaic 信号，线性域）。dst = tiles 网格。
   // a/b = k=1 的 WB 后系数（NoiseCoef::mma/mmb），用于读回诊断 σ。返回诊断供日志。
@@ -335,6 +339,7 @@ class FrameRenderer {
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
+         prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
@@ -369,6 +374,12 @@ class FrameRenderer {
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
+  // D 专项：半分辨率 à trous 色度降噪缓冲（2× 近似层 ping-pong + 5× 细节层
+  // + 1× σ 图；RGBA16F、1/2 分辨率 ≈ 25MB/张）
+  GLuint tex_ch_a_[2] = {0, 0}, fbo_ch_a_[2] = {0, 0};
+  GLuint tex_ch_dp_[kChromaLevels] = {0}, fbo_ch_dp_[kChromaLevels] = {0};
+  GLuint tex_ch_sig_ = 0, fbo_ch_sig_ = 0;
+  int ch_w_ = 0, ch_h_ = 0;
   // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
   GLuint fbo_rms_ = 0, tex_rms_ = 0;
   int rms_w_ = 0, rms_h_ = 0;
@@ -529,6 +540,17 @@ class FrameRenderer {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1;
   } u_chroma_dn_;
+  struct {
+    GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
+          lsc_size = -1;
+  } u_chroma_down_;
+  struct {
+    GLint prev = -1, sigma = -1, size = -1, step = -1, k = -1, revert = -1;
+  } u_chroma_at_;
+  struct {
+    GLint tex = -1, coarse = -1, d[5] = {-1, -1, -1, -1, -1}, size = -1,
+          half = -1;
+  } u_chroma_apply_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
   } u_tile_rms_;

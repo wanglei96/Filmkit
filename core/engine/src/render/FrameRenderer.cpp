@@ -653,6 +653,127 @@ void main() {
     oColor = vec4(y0 + acc / wsum, 1.0);
 })";
 
+// ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
+// 对标 PhotonCamera FullResolutionDenoise（多尺度金字塔 + luma/chroma 独立 +
+// detail revert factor）与 darktable wavelet denoise：undecimated à trous 分解
+// （B3 样条、逐级 dilate 2^l）+ Wiener 逐点收缩 + detail reconstruction。
+// 在 **1/2 分辨率**上做：色斑是 8-32px 低频，半分辨率足够，显存/成本降到 1/4。
+// 离线镜像（test_temp/analysis/atrous_tune.py 半分辨率验证）：
+//   原始 σC 1/4/8/16/32px = 9.87/8.29/5.99/3.15/1.78；PC = 1.56/1.08/0.94/0.66/0.56
+//   L=5 k=8 revert=0.08 → 1.01/0.86/0.62/0.34/0.35（**全尺度优于 PC**）
+//   边缘等效宽度 4.05 vs PC 4.11（细节不退化）
+// 分级职责：P4（kFsChromaDenoise，半径 3）管 1-3px 彩点；本 pass 管 4-32px 色斑。
+// ① 全分辨率 → 半分辨率：Cb/Cr 2×2 box 平均 + 该处噪声 σ（方差平均后 ÷2）
+const char* kFsChromaDown = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oChroma;
+layout(location = 1) out vec4 oSigma;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
+uniform highp sampler2D uLsc;
+uniform ivec2 uLscSize;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy) * 2;
+    vec2 acc = vec2(0.0);
+    float sacc = 0.0;
+    float ay = dot(uNoiseA, LUMA);
+    float by = dot(uNoiseB, LUMA);
+    for (int i = 0; i < 4; ++i) {
+        ivec2 q = clamp(p + ivec2(i & 1, i >> 1), ivec2(0), uSize - 1);
+        vec3 c = texelFetch(uTex, q, 0).rgb;
+        float y = dot(c, LUMA);
+        acc += vec2(c.b - y, c.r - y);
+        float glY = dot(lscAt(q), LUMA);
+        sacc += sqrt(max(ay * y + by * glY * glY, 1e-12));
+    }
+    oChroma = vec4(acc * 0.25, 0.0, 1.0);
+    // 2×2 box 平均使白噪 σ 减半：σ_half = mean(σ_full)/2
+    oSigma = vec4(sacc * 0.125, 0.0, 0.0, 1.0);
+})";
+
+// ② 每级：a_l = B3_dilated(a_{l-1}, step)；d = a_{l-1} − a_l；收缩 + revert
+//    MRT 输出 (a_l, dp_l)；σ 逐像素取自 ① 的 σ 图（乘 uK）
+const char* kFsChromaAtrous = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oNext;
+layout(location = 1) out vec4 oDetail;
+uniform highp sampler2D uPrev;
+uniform highp sampler2D uSigma;
+uniform ivec2 uSize;
+uniform int uStep;
+uniform float uK;
+uniform float uRevert;
+const float B3[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    vec2 a0 = texelFetch(uPrev, p, 0).rg;
+    vec2 s = vec2(0.0);
+    for (int i = 0; i < 5; ++i)
+        for (int j = 0; j < 5; ++j) {
+            ivec2 q = clamp(p + ivec2((j - 2) * uStep, (i - 2) * uStep),
+                            ivec2(0), uSize - 1);
+            s += (B3[i] * B3[j]) * texelFetch(uPrev, q, 0).rg;
+        }
+    vec2 d = a0 - s;
+    float sig = max(texelFetch(uSigma, p, 0).r * uK, 1e-6);
+    vec2 dp = d * (d * d) / (d * d + vec2(sig * sig) + vec2(1e-12));
+    dp += uRevert * (d - dp);          // detail reconstruction（PC revert factor）
+    oNext = vec4(s, 0.0, 1.0);
+    oDetail = vec4(dp, 0.0, 1.0);
+})";
+
+// ③ 收口：全分辨率下 Cb/Cr = a_L + Σ dp_l（手动双线性上采样，RGBA16F 无线性
+//    过滤），与 Y 合成回 RGB
+const char* kFsChromaApply = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform highp sampler2D uCoarse;
+uniform highp sampler2D uD0;
+uniform highp sampler2D uD1;
+uniform highp sampler2D uD2;
+uniform highp sampler2D uD3;
+uniform highp sampler2D uD4;
+uniform ivec2 uSize;
+uniform ivec2 uHalf;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+vec2 sampleUp(highp sampler2D t, vec2 uv) {
+    vec2 g = uv * vec2(uHalf) - 0.5;
+    ivec2 i0 = ivec2(floor(g));
+    vec2 f = g - vec2(i0);
+    ivec2 mx = uHalf - 1;
+    vec2 c00 = texelFetch(t, clamp(i0, ivec2(0), mx), 0).rg;
+    vec2 c10 = texelFetch(t, clamp(i0 + ivec2(1, 0), ivec2(0), mx), 0).rg;
+    vec2 c01 = texelFetch(t, clamp(i0 + ivec2(0, 1), ivec2(0), mx), 0).rg;
+    vec2 c11 = texelFetch(t, clamp(i0 + ivec2(1, 1), ivec2(0), mx), 0).rg;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 c = texelFetch(uTex, p, 0).rgb;
+    float y = dot(c, LUMA);
+    vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
+    vec2 ch = sampleUp(uCoarse, uv) + sampleUp(uD0, uv) + sampleUp(uD1, uv) +
+              sampleUp(uD2, uv) + sampleUp(uD3, uv) + sampleUp(uD4, uv);
+    vec3 o = vec3(y + ch.y, 0.0, y + ch.x);   // R = Y + Cr, B = Y + Cb
+    o.g = (y - 0.2126 * o.r - 0.0722 * o.b) / 0.7152;
+    oColor = vec4(o, 1.0);
+})";
+
 // ── MFNR 阶段一（v0.9.0）────────────────────────────────────────────
 // 多帧融合降噪：4 帧 RAW 的 Bayer 域对齐 + 时域均值，插在 P0 降噪位（demosaic 前）。
 // 依据：HDR+（Hasinoff 2016 §4-5）与 Night Sight（Liba 2019 §3）——彩噪跨帧独立、
@@ -2514,6 +2635,9 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_chroma = compileShader(GL_FRAGMENT_SHADER, kFsRcdChroma);
   const GLuint fs_raw_dn = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoise);
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
+  const GLuint fs_chroma_down = compileShader(GL_FRAGMENT_SHADER, kFsChromaDown);
+  const GLuint fs_chroma_at = compileShader(GL_FRAGMENT_SHADER, kFsChromaAtrous);
+  const GLuint fs_chroma_apply = compileShader(GL_FRAGMENT_SHADER, kFsChromaApply);
   const GLuint fs_mfnr_pyr = compileShader(GL_FRAGMENT_SHADER, kFsMfnrPyr);
   const GLuint fs_mfnr_down = compileShader(GL_FRAGMENT_SHADER, kFsMfnrDown);
   const GLuint fs_mfnr_fuse = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFuse);
@@ -2540,7 +2664,8 @@ bool FrameRenderer::init() {
   const GLuint fs_hr_stat = compileShader(GL_FRAGMENT_SHADER, kFsHrStat);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
-      !fs_raw_dn || !fs_chroma_dn || !fs_hist || !fs_local ||
+      !fs_raw_dn || !fs_chroma_dn || !fs_chroma_down || !fs_chroma_at ||
+      !fs_chroma_apply || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
       !fs_raw_dn_f || !fs_tile_rms || !fs_hr_mask ||
       !fs_hr_inp || !fs_hr_blur ||
@@ -2561,6 +2686,9 @@ bool FrameRenderer::init() {
   prog_rcd_chroma_ = linkProgram(vs_rot_, fs_rcd_chroma);
   prog_raw_dn_ = linkProgram(vs_plain_, fs_raw_dn);
   prog_chroma_dn_ = linkProgram(vs_rot_, fs_chroma_dn);
+  prog_chroma_down_ = linkProgram(vs_rot_, fs_chroma_down);
+  prog_chroma_at_ = linkProgram(vs_rot_, fs_chroma_at);
+  prog_chroma_apply_ = linkProgram(vs_rot_, fs_chroma_apply);
   prog_mfnr_pyr_ = linkProgram(vs_plain_, fs_mfnr_pyr);
   prog_mfnr_down_ = linkProgram(vs_plain_, fs_mfnr_down);
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
@@ -2597,6 +2725,9 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_rcd_chroma);
   glDeleteShader(fs_raw_dn);
   glDeleteShader(fs_chroma_dn);
+  glDeleteShader(fs_chroma_down);
+  glDeleteShader(fs_chroma_at);
+  glDeleteShader(fs_chroma_apply);
   glDeleteShader(fs_mfnr_pyr);
   glDeleteShader(fs_mfnr_down);
   glDeleteShader(fs_mfnr_fuse);
@@ -2616,7 +2747,8 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_hr_stat);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
-      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_hist_ || !prog_local_ ||
+      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_chroma_down_ ||
+      !prog_chroma_at_ || !prog_chroma_apply_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
       !prog_mfnr_mis_ || !prog_raw_dn_fused_ || !prog_tile_rms_ ||
       !prog_hr_mask_ ||
@@ -2819,6 +2951,27 @@ bool FrameRenderer::init() {
   u_chroma_dn_.noise_b = glGetUniformLocation(prog_chroma_dn_, "uNoiseB");
   u_chroma_dn_.lsc = glGetUniformLocation(prog_chroma_dn_, "uLsc");
   u_chroma_dn_.lsc_size = glGetUniformLocation(prog_chroma_dn_, "uLscSize");
+  // D 专项（v0.10.53）色度多尺度降噪
+  u_chroma_down_.tex = glGetUniformLocation(prog_chroma_down_, "uTex");
+  u_chroma_down_.size = glGetUniformLocation(prog_chroma_down_, "uSize");
+  u_chroma_down_.noise_a = glGetUniformLocation(prog_chroma_down_, "uNoiseA");
+  u_chroma_down_.noise_b = glGetUniformLocation(prog_chroma_down_, "uNoiseB");
+  u_chroma_down_.lsc = glGetUniformLocation(prog_chroma_down_, "uLsc");
+  u_chroma_down_.lsc_size = glGetUniformLocation(prog_chroma_down_, "uLscSize");
+  u_chroma_at_.prev = glGetUniformLocation(prog_chroma_at_, "uPrev");
+  u_chroma_at_.sigma = glGetUniformLocation(prog_chroma_at_, "uSigma");
+  u_chroma_at_.size = glGetUniformLocation(prog_chroma_at_, "uSize");
+  u_chroma_at_.step = glGetUniformLocation(prog_chroma_at_, "uStep");
+  u_chroma_at_.k = glGetUniformLocation(prog_chroma_at_, "uK");
+  u_chroma_at_.revert = glGetUniformLocation(prog_chroma_at_, "uRevert");
+  u_chroma_apply_.tex = glGetUniformLocation(prog_chroma_apply_, "uTex");
+  u_chroma_apply_.coarse = glGetUniformLocation(prog_chroma_apply_, "uCoarse");
+  for (int i = 0; i < kChromaLevels; ++i) {
+    u_chroma_apply_.d[i] = glGetUniformLocation(
+        prog_chroma_apply_, (std::string("uD") + std::to_string(i)).c_str());
+  }
+  u_chroma_apply_.size = glGetUniformLocation(prog_chroma_apply_, "uSize");
+  u_chroma_apply_.half = glGetUniformLocation(prog_chroma_apply_, "uHalf");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -2980,6 +3133,9 @@ void FrameRenderer::release() {
   if (prog_rcd_chroma_) glDeleteProgram(prog_rcd_chroma_);
   if (prog_raw_dn_) glDeleteProgram(prog_raw_dn_);
   if (prog_chroma_dn_) glDeleteProgram(prog_chroma_dn_);
+  if (prog_chroma_down_) glDeleteProgram(prog_chroma_down_);
+  if (prog_chroma_at_) glDeleteProgram(prog_chroma_at_);
+  if (prog_chroma_apply_) glDeleteProgram(prog_chroma_apply_);
   if (prog_mfnr_pyr_) glDeleteProgram(prog_mfnr_pyr_);
   if (prog_mfnr_down_) glDeleteProgram(prog_mfnr_down_);
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
@@ -3057,6 +3213,7 @@ void FrameRenderer::release() {
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
   prog_raw_dn_ = prog_chroma_dn_ = 0;
+  prog_chroma_down_ = prog_chroma_at_ = prog_chroma_apply_ = 0;
   prog_hist_ = 0;
   prog_local_ = 0;
   vs_rot_ = vs_plain_ = 0;
@@ -3448,6 +3605,108 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glUniform3f(u_chroma_dn_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
+}
+
+// D 专项（v0.10.53）：半分辨率 à trous 色度降噪缓冲（2× 近似层 + 5× 细节层 + σ）
+bool FrameRenderer::ensureChromaMst(int w, int h) {
+  const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+  if (ch_w_ == hw && ch_h_ == hh && tex_ch_a_[0] != 0 && tex_ch_sig_ != 0) {
+    return true;
+  }
+  for (int i = 0; i < 2; ++i) {
+    if (tex_ch_a_[i]) glDeleteTextures(1, &tex_ch_a_[i]);
+    if (fbo_ch_a_[i]) glDeleteFramebuffers(1, &fbo_ch_a_[i]);
+    tex_ch_a_[i] = fbo_ch_a_[i] = 0;
+    makeTex(&tex_ch_a_[i], &fbo_ch_a_[i], GL_RGBA16F, hw, hh);
+  }
+  for (int l = 0; l < kChromaLevels; ++l) {
+    if (tex_ch_dp_[l]) glDeleteTextures(1, &tex_ch_dp_[l]);
+    if (fbo_ch_dp_[l]) glDeleteFramebuffers(1, &fbo_ch_dp_[l]);
+    tex_ch_dp_[l] = fbo_ch_dp_[l] = 0;
+    makeTex(&tex_ch_dp_[l], &fbo_ch_dp_[l], GL_RGBA16F, hw, hh);
+  }
+  if (tex_ch_sig_) glDeleteTextures(1, &tex_ch_sig_);
+  if (fbo_ch_sig_) glDeleteFramebuffers(1, &fbo_ch_sig_);
+  tex_ch_sig_ = fbo_ch_sig_ = 0;
+  makeTex(&tex_ch_sig_, &fbo_ch_sig_, GL_RGBA16F, hw, hh);
+  if (tex_ch_a_[0] == 0 || tex_ch_sig_ == 0 || tex_ch_dp_[kChromaLevels - 1] == 0) {
+    ch_w_ = ch_h_ = 0;                       // 分配失败 → 调用方保持 P4 输出
+    return false;
+  }
+  ch_w_ = hw; ch_h_ = hh;
+  return true;
+}
+
+// D 专项：色度多尺度降噪。输入 tex_dn_（P4 已平滑的输出），输出 tex_scene_
+// （= P5 之后 passFilm 的输入）。返回 false = 未执行（调用方回落 tex_dn_）。
+bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
+                                        const NoiseCoef& nc) {
+  if (!prog_chroma_down_ || !prog_chroma_at_ || !prog_chroma_apply_) return false;
+  if (!ensureChromaMst(dst_w, dst_h)) return false;
+  const int hw = ch_w_, hh = ch_h_;
+  const GLenum bufs2[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+  // ① 全分辨率 → 半分辨率 Cb/Cr + σ（MRT：a_0 容器 + attachment1 临时挂 σ 图）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[0]);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
+                         tex_ch_sig_, 0);
+  glDrawBuffers(2, bufs2);
+  glViewport(0, 0, hw, hh);
+  glUseProgram(prog_chroma_down_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glUniform1i(u_chroma_down_.tex, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_chroma_down_.lsc, 1);
+  glUniform2i(u_chroma_down_.lsc_size, lsc_w_, lsc_h_);
+  glUniform2i(u_chroma_down_.size, dst_w, dst_h);
+  glUniform3f(u_chroma_down_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
+  glUniform3f(u_chroma_down_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+  // ② 5 级 à trous：每级 MRT 写 (a_l, dp_l)。k/revert = 离线镜像定稿值
+  glUseProgram(prog_chroma_at_);
+  glUniform2i(u_chroma_at_.size, hw, hh);
+  glUniform1f(u_chroma_at_.k, 8.0f);
+  glUniform1f(u_chroma_at_.revert, 0.08f);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
+  glUniform1i(u_chroma_at_.sigma, 1);
+  for (int l = 0; l < kChromaLevels; ++l) {
+    const int src = l & 1, dst = (l + 1) & 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[dst]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
+                           tex_ch_dp_[l], 0);
+    glDrawBuffers(2, bufs2);
+    glViewport(0, 0, hw, hh);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_ch_a_[src]);
+    glUniform1i(u_chroma_at_.prev, 0);
+    glUniform1i(u_chroma_at_.step, 1 << l);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+  }
+  // ③ 收口：Cb/Cr = a_L + Σ dp_l → 与 Y 合成写 tex_scene_
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+  glDrawBuffers(1, bufs2);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_chroma_apply_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glUniform1i(u_chroma_apply_.tex, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_ch_a_[kChromaLevels & 1]);
+  glUniform1i(u_chroma_apply_.coarse, 1);
+  for (int l = 0; l < kChromaLevels; ++l) {
+    glActiveTexture(GL_TEXTURE2 + l);
+    glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[l]);
+    glUniform1i(u_chroma_apply_.d[l], 2 + l);
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glUniform2i(u_chroma_apply_.size, dst_w, dst_h);
+  glUniform2i(u_chroma_apply_.half, hw, hh);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  return true;
 }
 
 // C 专项：tile RMS 归约（P0 输出 → tiles 网格 R16F）。每 tile 16×16 = 256 点
@@ -3859,10 +4118,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     passRaw(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase, c.white_level,
             c.gains, c.ccm, p);
   }
+  bool mst_ok = false;
   if (c.dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return;
     const auto n0 = std::chrono::steady_clock::now();
     passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc);
+    // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
+    mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc);
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -3870,7 +4132,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   // v0.10.16：HR 已移入 passFilm（黑白点标定之后、still 才跑）——darktable 的
   // 高光重建与黑白点 autodetect 是配套的（裁剪阈值由 white_source 决定）。
-  passFilm(dst_w, dst_h, p, c.dn ? tex_dn_ : tex_scene_, /*still=*/true);
+  // D 专项：P5 成功时结果在 tex_scene_；否则回落 P4 的 tex_dn_
+  passFilm(dst_w, dst_h, p,
+           (c.dn && mst_ok) ? tex_scene_ : (c.dn ? tex_dn_ : tex_scene_),
+           /*still=*/true);
   const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
