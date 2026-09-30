@@ -1898,8 +1898,12 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLutStrengthPref()
         val buffers = burstBuffers.mapNotNull { it }
         val strides = burstStrides.copyOf()
+        // 降噪专项 A（2026-09-29）：prefs mfnr_dft = true 走 DFT 逐频收缩合并
+        //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
+        val useDft = prefs.getBoolean("mfnr_dft", false)
         render.submitRawBurst(buffers, strides, refW, refH, meta,
-            orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale) { bytes, w, h ->
+            orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+            useDft) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)

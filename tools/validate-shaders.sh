@@ -28,7 +28,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # 提取 R"( ... )" 原始字符串（GLSL 均以 #version 开头，可精确切分）；
-# 含 gl_Position 的是顶点着色器（.vert），其余按 fragment（.frag）校验
+# 含 gl_Position 的是顶点着色器（.vert）、含 local_size 的是 compute（.comp），
+# 其余按 fragment（.frag）校验
 python3 - "$SRC" "$TMP" <<'PY'
 import re, sys, pathlib
 src = pathlib.Path(sys.argv[1]).read_text()
@@ -36,13 +37,18 @@ out = pathlib.Path(sys.argv[2])
 shaders = re.findall(r'R"\((.*?)\)"', src, re.DOTALL)
 glsl = [s for s in shaders if s.lstrip().startswith("#version")]
 for i, s in enumerate(glsl):
-    stage = "vert" if "gl_Position" in s else "frag"
+    if "gl_Position" in s:
+        stage = "vert"
+    elif "local_size" in s:
+        stage = "comp"
+    else:
+        stage = "frag"
     (out / f"shader_{i}.{stage}").write_text(s)
 print(f"提取 {len(glsl)} 个 GLSL 字符串")
 PY
 
 FAIL=0
-for f in "$TMP"/shader_*.vert "$TMP"/shader_*.frag; do
+for f in "$TMP"/shader_*.vert "$TMP"/shader_*.frag "$TMP"/shader_*.comp; do
   [ -e "$f" ] || continue
   STAGE="${f##*.}"
   if OUT="$("$GLSLANG_BIN" -S "$STAGE" "$f" 2>&1)"; then

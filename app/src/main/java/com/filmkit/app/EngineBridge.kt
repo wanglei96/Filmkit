@@ -87,6 +87,8 @@ object EngineBridge {
      * 置信度加权时域均值（引擎内）→ 与 nativeEngineSubmitRaw 相同的成片链。
      * frames[0] = 参考帧（DNG 底片同一帧），count 必须 = 4；其余元数据语义同
      * nativeEngineSubmitRaw，统一取帧 0（burst 恒曝光，逐帧黑阶/WB 视为一致）。
+     * useDft = true 走降噪专项 A 的 DFT 逐频收缩合并（HDR+ 式 6/7），false 走
+     * mismatch 加权融合（并联 A/B 口径，prefs mfnr_dft）。
      */
     external fun nativeEngineSubmitRawBurst(
         frames: Array<ByteBuffer>, count: Int, rowStridesPx: IntArray,
@@ -96,7 +98,7 @@ object EngineBridge {
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
-        refNoiseScale: Float, film: DoubleArray,
+        refNoiseScale: Float, useDft: Boolean, film: DoubleArray,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

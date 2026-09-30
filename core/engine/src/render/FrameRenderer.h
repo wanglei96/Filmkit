@@ -1,6 +1,6 @@
 #pragma once
 
-#include <GLES3/gl31.h>
+#include <GLES3/gl32.h>
 
 #include <atomic>
 #include <chrono>
@@ -141,7 +141,8 @@ class FrameRenderer {
                       int lsc_rows, int rotation, const FilmParams& p,
                       int demosaic, float noise_strength,
                       const float* noise_model, float noise_sigma,
-                      float ref_noise_scale, std::vector<uint8_t>* out_rgba);
+                      float ref_noise_scale, bool use_dft,
+                      std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
@@ -179,6 +180,22 @@ class FrameRenderer {
                     float white_level, const float gains[3]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
   void passRawDenoiseFused(int w, int h, int cfa, const NoiseCoef& nc);
+  // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
+  // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
+  // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
+  // tile 内 CPU 对齐位移取整到 mosaic 偶数（像素级对齐 = HDR+ 原版语义，平面域
+  // 整数平移免相位校正），行/列 radix-2 FFT（spike v2 寄存器架构）→ 逐频收缩
+  // Az=|Dz|²/(|Dz|²+cσ²)（c=8·n²/4²·2=256，σ²=A_c·RMS+B_c 由内核内 tile RMS
+  // 归约代入）→ IDFT → 半重叠 overlap-add 累加进 tex_fused_（与 fuse 路径
+  // 同域同格式，后段 P0/RCD/胶片链零改动）。mismatch/conf 权重按 HDR+ 原版
+  // 不参与（逐频收缩自身鲁棒）。输出每 tile 的频率平均等效 neff（NS §3.3
+  // "按实际合并更新 σ"），CPU 读回取均值供 P0/P4 折减与日志。
+  bool ensureMfnrFftTargets(int w, int h);
+  // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径
+  bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
+                   float white_level, const float gains[3],
+                   const float plane_a[3], const float plane_b[3],
+                   float* out_neff);
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
   struct ChainCtx {
@@ -352,6 +369,30 @@ class FrameRenderer {
   // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
   GLuint fbo_rms_ = 0, tex_rms_ = 0;
   int rms_w_ = 0, rms_h_ = 0;
+  // ── 降噪专项 A：DFT 逐频收缩合并（compute）──────────────────────────
+  // overlap-add = R32F scratch（ES 3.1 规范保证 image load+store）× 4 次
+  // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
+  // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
+  GLuint prog_mfnr_fft_ = 0, prog_mfnr_fft_sum_ = 0;
+  // burst 4 帧 R16UI 2DArray（glCopyImageSubData 自 raw_tex_/tex_mfnr_ 汇集，
+  // compute 一次绑定；层序 = 帧序，层 0 = 参考帧）
+  GLuint tex_burst_ = 0;
+  int burst_w_ = 0, burst_h_ = 0;
+  // R32F 累加 scratch（首组 dispatch 直写、后续组 load+add —— R32F 非
+  // color-renderable 无 FBO 清零路径，也不依赖非 ES 的 glClearTexImage）
+  GLuint tex_fft_scratch_ = 0;
+  // per-tile neff 输出（RGBA16F 2DArray 4 层 = CFA 平面；索引 = (tx+1, ty+1)）
+  GLuint tex_fft_neff_ = 0, fbo_fft_neff_ = 0;
+  int fft_neff_w_ = 0, fft_neff_h_ = 0;
+  struct {
+    GLint burst = -1, off[3] = {-1, -1, -1}, out = -1, neff = -1, size = -1,
+          off_tiles = -1, fft_tiles = -1, tx_max = -1, black = -1, white = -1,
+          gain = -1, plane_a = -1, plane_b = -1, c = -1, group = -1, tw = -1,
+          accum = -1;
+  } u_mfnr_fft_;
+  struct {
+    GLint acc = -1, size = -1;
+  } u_mfnr_fft_sum_;
   // ── v0.10.15：darktable filmic 高光重建（HR，dst 尺寸；8+1 张全分辨率）──
   // 出处 darktable filmicrgb.c 的 mask_clipped_pixels/inpaint_noise/
   // reconstruct_highlights（à trous 小波）。生命周期：仅拍照路径（finishStillChain

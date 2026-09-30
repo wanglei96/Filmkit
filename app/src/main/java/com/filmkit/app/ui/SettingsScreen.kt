@@ -499,6 +499,43 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
+            // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
+            var mfnrDft by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("mfnr_dft", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        mfnrDft = !mfnrDft
+                        prefs.edit().putBoolean("mfnr_dft", mfnrDft).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.mfnr_dft",
+                            "{\"on\":$mfnrDft}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("频域合并（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "HDR+ 式 DFT 逐频收缩（16×16 tile 半重叠，暗光 σ 更优）；" +
+                            "关 = mismatch 加权融合",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (mfnrDft) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
             //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
             //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与
