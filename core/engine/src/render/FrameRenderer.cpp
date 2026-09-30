@@ -1282,10 +1282,16 @@ void main() {
     int wgRow = int(wg.y) % uRows;
     int ox = plane & 1;
     int oy = plane >> 1;
-    // 本 workgroup 的两个水平相邻同组 tile（组内 tx ≡ 2gx−1 (mod 2)，间隔 2）
-    int tx0 = 4 * wg.x + 2 * uGroup.x - 1;
+    // 本 workgroup 的两个水平相邻同组 tile。组 gx 的 host 列举是
+    // tx ∈ {-1, 1, 3, ...}（gx=0）/ {0, 2, 4, ...}（gx=1），即 tx = (gx−1) + 2k；
+    // 每 wg 取 k = 2·wg.x, 2·wg.x+1 → **tx0 = 4·wg.x + gx − 1**。
+    // ⚠️ v0.10.50 真机是 4·wg.x + 2·gx − 1：gx=1 也落到奇数 tile，两组重复处理
+    // 同一批 tile、偶数 tile 整批漏写 → 每层覆盖错位，收口 4 层相加混入未定义
+    // 内容（绿色网格纹 + 偏亮，avgLuma 191）。镜像复算见
+    // test_temp/analysis/fft_tile_cover.py（修正后窗和恒 1.0000）。
+    int tx0 = 4 * wg.x + uGroup.x - 1;
     int tx1 = tx0 + 2;
-    int ty = 2 * wgRow + 2 * uGroup.y - 1;
+    int ty = 2 * wgRow + uGroup.y - 1;
     bool has1 = tx1 <= uTxMax;
 
     if (tid < 128) {
@@ -4449,10 +4455,14 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_mfnr_fft_sum_.size, w, h);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  // 黑图归因探针：收口后 tex_fused_ 中心 4 点（fuse 正常应有非零值）
+  // 网格纹探针：中心 2×2 mosaic 块（4 个 CFA 相位各一点）。DFT 正确时四点值应
+  // 彼此接近（同一物理位置的相邻采样）；相位组/层错位会立刻表现为块内跳变
+  // ——v0.10.50 绿色网格事故就是 dftProbe 两点同址但 0.494 vs 0.042/0.030 的
+  // 散点布局掩盖了块内跳变。
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
-  const int px4[4] = {w / 4, w / 2, w * 3 / 4, w / 2};
-  const int py4[4] = {h / 4, h / 2, h * 3 / 4, h / 2};
+  const int pcx = (w / 2) & ~1, pcy = (h / 2) & ~1;
+  const int px4[4] = {pcx, pcx + 1, pcx, pcx + 1};
+  const int py4[4] = {pcy, pcy, pcy + 1, pcy + 1};
   for (int k = 0; k < 4; ++k) {
     float v[4] = {0, 0, 0, 0};
     glReadPixels(px4[k], py4[k], 1, 1, GL_RGBA, GL_FLOAT, v);
