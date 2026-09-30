@@ -1456,6 +1456,13 @@ uniform int uTxMax;       // 平面 tile x 上限（ceil(pw/8)-1；ty 同理由 
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// v0.10.78 性能收口：把"每点都要做一次"的归一化与增益选择提到 host ——
+// uBlRcp[i] = 1/max(white − black[i])、uGainPh[i] = 相位 i 所属 CFA 通道的 gain
+//（i = (y&1)*2 + (x&1)，与 chanAt 同一套位运算）。省掉每点一次除法 + 一次
+// chanAt/gainAt 分支，每 workgroup 2048 点。浮点上 (v−bl)*(1/wb) 与 (v−bl)/wb
+// 相差 ~1e-7（无感），换掉的是货真价实的 SFU 除法。
+uniform vec4 uBlRcp;
+uniform vec4 uGainPh;
 uniform vec4 uPlaneA;     // 平面 0..3 的 A 系数（按 cfaLut 展开，含强度 k²）
 uniform vec4 uPlaneB;
 uniform float uC;         // 收缩常数（256）
@@ -1492,8 +1499,8 @@ float linAt(int z, ivec2 p) {
     } else {
         v = texelFetch(uRaw3, p, 0).r;
     }
-    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-    return max((float(v) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+    int ph = (p.y & 1) * 2 + (p.x & 1);
+    return max((float(v) - uBlack[ph]) * uBlRcp[ph], 0.0) * uGainPh[ph];
 }
 // 位移场双线性（与 kFsMfnrFuse 的 offNAt 同式；uOffTiles 为其网格）。
 vec2 offAt(highp sampler2D t, vec2 m) {
@@ -1736,27 +1743,38 @@ void main() {
     barrier();
 
     if (tid < 32) {
+        // 逆行 FFT 仍是 32 个任务（2 tile × 16 行）—— 16 点 FFT 无法再拆；
+        // 写回已从这段里拆出去单独并行（见下）。
         int tt = tid / 16;
         int yy = tid % 16;
+        if ((tt == 0) || has1) fftRow(tt, 0, yy, 1.0);
+    }
+    barrier();
+    // 写回（v0.10.78）：原来只有 32 线程各写 16 点（12.5% 利用率），imageStore
+    // 是全局内存写入、延迟高 —— 改成 256 线程各写 2 点，密集段并行度 ×8。
+    // 2 tile × 16×16 = 512 点 = 256 线程 × 2。
+    for (int rep = 0; rep < 2; ++rep) {
+        int i = tid * 2 + rep;
+        int tt = i >> 8;
+        int rem = i & 255;
+        int yy = rem >> 4;
+        int lx = rem & 15;
         if ((tt == 0) || has1) {
-            fftRow(tt, 0, yy, 1.0);
             int tx = (tt == 0) ? tx0 : tx1;
-            for (int lx = 0; lx < 16; ++lx) {
-                int px = tx * 8 + lx;
-                int py = ty * 8 + yy;
-                ivec2 m = ivec2(2 * px + ox, 2 * py + oy);
-                if (m.x >= 0 && m.y >= 0 && m.x < uSize.x && m.y < uSize.y) {
-                    float v = sre[tt][0][yy][lx] * 0.00390625;  // 1/256 = IDFT 归一
-                    // image uniform 必须静态索引 —— uLayer 是 dispatch 级常量
-                    if (uLayer == 0) {
-                        imageStore(uOut0, m, vec4(v, v, v, 1.0));
-                    } else if (uLayer == 1) {
-                        imageStore(uOut1, m, vec4(v, v, v, 1.0));
-                    } else if (uLayer == 2) {
-                        imageStore(uOut2, m, vec4(v, v, v, 1.0));
-                    } else {
-                        imageStore(uOut3, m, vec4(v, v, v, 1.0));
-                    }
+            int px = tx * 8 + lx;
+            int py = ty * 8 + yy;
+            ivec2 m = ivec2(2 * px + ox, 2 * py + oy);
+            if (m.x >= 0 && m.y >= 0 && m.x < uSize.x && m.y < uSize.y) {
+                float v = sre[tt][0][yy][lx] * 0.00390625;  // 1/256 = IDFT 归一
+                // image uniform 必须静态索引 —— uLayer 是 dispatch 级常量
+                if (uLayer == 0) {
+                    imageStore(uOut0, m, vec4(v, v, v, 1.0));
+                } else if (uLayer == 1) {
+                    imageStore(uOut1, m, vec4(v, v, v, 1.0));
+                } else if (uLayer == 2) {
+                    imageStore(uOut2, m, vec4(v, v, v, 1.0));
+                } else {
+                    imageStore(uOut3, m, vec4(v, v, v, 1.0));
                 }
             }
         }
@@ -4925,6 +4943,18 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // 成片全绿（真机 dftProbe 2×2 = [0.089,0.049,0.051,0.098] 与 DNG 同点
   // [0.0479,0.0260,0.0271,0.0573] 之比四相位同为 1.85 = gains[0] 实锤）。
   glUniform1i(uni("uCfaLut"), lut);
+  {
+    // 每相位 LUT（与 chanAt 同一套相位→通道映射）
+    float bl_rcp[4], gain_ph[4];
+    for (int i = 0; i < 4; ++i) {
+      const float bl = black_phase[i];
+      bl_rcp[i] = 1.0f / std::max(white_level - bl, 1.0f);
+      const int ch = (lut >> (i << 1)) & 3;
+      gain_ph[i] = ch == 0 ? gains[0] : (ch == 1 ? gains[1] : gains[2]);
+    }
+    glUniform4f(uni("uBlRcp"), bl_rcp[0], bl_rcp[1], bl_rcp[2], bl_rcp[3]);
+    glUniform4f(uni("uGainPh"), gain_ph[0], gain_ph[1], gain_ph[2], gain_ph[3]);
+  }
   glUniform4f(uni("uPlaneA"), pa[0], pa[1], pa[2], pa[3]);
   glUniform4f(uni("uPlaneB"), pb[0], pb[1], pb[2], pb[3]);
   glUniform1f(uni("uC"), 256.0f);
