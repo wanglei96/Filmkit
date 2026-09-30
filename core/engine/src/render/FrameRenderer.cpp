@@ -2718,6 +2718,7 @@ bool FrameRenderer::init() {
   u_mfnr_fft_.plane_b = glGetUniformLocation(prog_mfnr_fft_, "uPlaneB");
   u_mfnr_fft_.c = glGetUniformLocation(prog_mfnr_fft_, "uC");
   u_mfnr_fft_.group = glGetUniformLocation(prog_mfnr_fft_, "uGroup");
+  u_mfnr_fft_.accum = glGetUniformLocation(prog_mfnr_fft_, "uAccum");
   u_mfnr_fft_.tw = glGetUniformLocation(prog_mfnr_fft_, "uTw");
   // uBurst/uOffN 采样器单元固定 0/1/2/3（dispatch 前设置；prog 0 = 已置回退）
   if (prog_mfnr_fft_) {
