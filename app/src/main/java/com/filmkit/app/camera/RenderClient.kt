@@ -265,6 +265,7 @@ class RenderClient {
         noiseStrength: Float,
         refNoiseScale: Float,
         useDft: Boolean,
+        alignL1: Boolean,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -286,7 +287,7 @@ class RenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, refNoiseScale, useDft, film,
+                    meta.noiseSigma, refNoiseScale, useDft, alignL1, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

@@ -536,6 +536,43 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 对齐精度 A/B（D-2 专项，2026-09-30）：最细对齐层 1/2 域（新）vs
+            // 1/4 域（旧）。同一场景切换各拍一张即可对比；日志 alignL1 = 3(新)/0(旧)。
+            var alignL1 by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("align_l1", true))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        alignL1 = !alignL1
+                        prefs.edit().putBoolean("align_l1", alignL1).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.align_l1",
+                            "{\"on\":$alignL1}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("对齐精度（A/B 对比）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "开 = 高精度对齐（新，中光更少错位，拍照慢约 40%）；" +
+                            "关 = 旧版行为。日志 alignL1：3 = 新 / 0 = 旧",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (alignL1) "高精度" else "旧版",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
             //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
             //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与

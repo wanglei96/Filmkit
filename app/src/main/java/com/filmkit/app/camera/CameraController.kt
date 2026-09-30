@@ -1901,9 +1901,12 @@ class CameraController(private val context: Context, private val render: RenderC
         // 降噪专项 A（2026-09-29）：prefs mfnr_dft = true 走 DFT 逐频收缩合并
         //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
         val useDft = prefs.getBoolean("mfnr_dft", false)
+        // D-2 对齐精度 A/B（2026-09-30）：prefs align_l1 = true 时最细对齐层用
+        // 1/2 域（新，需 readback 1/2 域），false 退回 1/4 域旧路径
+        val alignL1 = prefs.getBoolean("align_l1", true)
         render.submitRawBurst(buffers, strides, refW, refH, meta,
             orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-            useDft) { bytes, w, h ->
+            useDft, alignL1) { bytes, w, h ->
             capturing = false
             capturePhase = 0
             burstBuffers.fill(null)

@@ -112,9 +112,22 @@ def down_u8(a):
     return np.round(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def pyramid_lin(lin):
-    """线性图 → 完整金字塔 u8（L1..L4），与 GPU 侧链一致。"""
+def pyramid_lin(lin, smooth=0):
+    """线性图 → 完整金字塔 u8（L1..L4），与 GPU 侧链一致。
+
+    smooth>0 时在 L1（sqrt 域 u8）上做 N×N 盒式平滑后再下采样 —— 模拟"金字塔
+    层预平滑"（HDR+ 的高斯金字塔本身带平滑；我们的 kFsMfnrDown 是纯 2×2 盒式，
+    层上残留高频噪声会喂给 SAD）。该 pass 在 GPU 上是一次全屏读写，SAD 成本不变。
+    """
     l1 = encode_l1(lin)
+    if smooth > 1:
+        p = smooth // 2
+        a = np.pad(l1.astype(np.float32), p, mode="edge")
+        acc = np.zeros_like(l1, dtype=np.float32)
+        for dy in range(smooth):
+            for dx in range(smooth):
+                acc += a[dy : dy + l1.shape[0], dx : dx + l1.shape[1]]
+        l1 = np.round(acc / (smooth * smooth)).astype(np.uint8)
     l2 = down_u8(l1)
     l3 = down_u8(l2)
     l4 = down_u8(l3)
@@ -133,6 +146,8 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="bench")
     ap.add_argument("--tile", type=int, default=64, help="1/2 域 tile（= kMfnrTile）")
+    ap.add_argument("--smooth", type=int, default=0,
+                    help="L1 层 N×N 盒式预平滑（0=不平滑，模拟 GPU 侧新 pass）")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -163,8 +178,8 @@ def main():
                            if sig > 0 else 0.0)
         cur_n = cur_lin + (rng.standard_normal(cur_lin.shape).astype(np.float32) * sig
                            if sig > 0 else 0.0)
-        rr = pyramid_lin(ref_n)
-        cc = pyramid_lin(cur_n)
+        rr = pyramid_lin(ref_n, args.smooth)
+        cc = pyramid_lin(cur_n, args.smooth)
         name = f"{args.tag}_s{sig:g}.alb"
         path = os.path.join(args.out, name)
         with open(path, "wb") as f:

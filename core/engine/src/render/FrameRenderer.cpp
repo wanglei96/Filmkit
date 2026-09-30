@@ -5432,6 +5432,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float noise_strength, const float* noise_model,
                                    float noise_sigma,
                                    float ref_noise_scale, bool use_dft,
+                                   bool align_l1,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -5489,15 +5490,17 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       for (size_t k = 0; k < dst->size(); ++k) (*dst)[k] = rgba[k * 4];
     };
     const auto rb0 = std::chrono::steady_clock::now();
-    readL(fbo_pyr1_, pyr1_w_, pyr1_h_, &py->l1);
+    // align_l1 = false（prefs align_l1，A/B 开关）时不读 1/2 域：l1 为空 →
+    // mfnrAlign 自动走旧路径（use_l1=false），日志 alignL1 记 0。
+    if (align_l1) readL(fbo_pyr1_, pyr1_w_, pyr1_h_, &py->l1);
     readL(fbo_pyr2_, w2, h2, &py->l2);
     readL(fbo_pyr3_, w3, h3, &py->l3);
     readL(fbo_pyr4_, w4, h4, &py->l4);
     align_rb_ms += std::chrono::duration<float, std::milli>(
                        std::chrono::steady_clock::now() - rb0)
                        .count();
-    py->w1 = pyr1_w_;
-    py->h1 = pyr1_h_;
+    py->w1 = align_l1 ? pyr1_w_ : 0;
+    py->h1 = align_l1 ? pyr1_h_ : 0;
     py->w2 = w2;
     py->h2 = h2;
     py->w3 = w3;

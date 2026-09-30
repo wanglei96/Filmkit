@@ -142,7 +142,7 @@ class FrameRenderer {
                       int lsc_rows, int rotation, const FilmParams& p,
                       int demosaic, float noise_strength,
                       const float* noise_model, float noise_sigma,
-                      float ref_noise_scale, bool use_dft,
+                      float ref_noise_scale, bool use_dft, bool align_l1,
                       std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96

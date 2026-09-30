@@ -111,11 +111,15 @@ int main(int argc, char** argv) {
                         .count();
 
   std::vector<float> ex_all, ey_all, ex_ok, ey_ok, d_ok;
-  int n_ok = 0;
+  int n_ok = 0, n_bad1 = 0, n_bad2 = 0;
   for (int t = 0; t < n_tiles; ++t) {
     const float dx = a.off[static_cast<size_t>(t) * 2] - truth[static_cast<size_t>(t) * 2];
     const float dy =
         a.off[static_cast<size_t>(t) * 2 + 1] - truth[static_cast<size_t>(t) * 2 + 1];
+    const float e = std::sqrt(dx * dx + dy * dy);
+    // P0 口径：同相位邻域半径 ±4 mosaic px，错 1px 就已经改变邻域内容
+    if (e > 1.f) ++n_bad1;
+    if (e > 2.f) ++n_bad2;
     ex_all.push_back(std::fabs(dx));
     ey_all.push_back(std::fabs(dy));
     if (a.conf[static_cast<size_t>(t)] > 0.2f) {
@@ -128,10 +132,12 @@ int main(int argc, char** argv) {
   const char* tag = use_l1 ? "L1" : "L2";
   std::printf(
       "[%s] tiles=%d conf>0.2=%d (%.0f%%) confMed=%.3f | all |ex| p50=%.2f p90=%.2f "
-      "|ey| p50=%.2f p90=%.2f | conf>0.2 err p50=%.2f p90=%.2f max=%.2f | "
+      "|ey| p50=%.2f p90=%.2f | >1px=%.0f%% >2px=%.0f%% | "
+      "conf>0.2 err p50=%.2f p90=%.2f max=%.2f | "
       "gx=%.1f gy=%.1f | %.0fms\n",
       tag, n_tiles, n_ok, 100.0 * n_ok / std::max(n_tiles, 1), a.conf_med,
       pct(ex_all, 0.5f), pct(ex_all, 0.9f), pct(ey_all, 0.5f), pct(ey_all, 0.9f),
+      100.0 * n_bad1 / std::max(n_tiles, 1), 100.0 * n_bad2 / std::max(n_tiles, 1),
       pct(ex_ok, 0.5f), pct(ex_ok, 0.9f),
       d_ok.empty() ? -1.f : *std::max_element(d_ok.begin(), d_ok.end()),
       a.gx, a.gy, ms);
