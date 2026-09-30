@@ -1466,6 +1466,11 @@ shared float sre[2][4][16][16];
 shared float sim[2][4][16][16];
 shared float sRmsRow[2][16];  // 参考帧行平方和（未加窗 RMS 归约用）
 shared float sRms[2];
+// 修改升余弦窗查表（v0.10.77 性能收口）：16 个值只有 16 种，原来在内层循环里
+// 逐点算 wx/wyy —— 每个 workgroup **4096 次 cos**（128 行 × 16 点 × 2），而
+// Mali 上 cos 走 SFU（吞吐远低于 FMA）。改为算 16 次存 shared。数值完全一致：
+// 仍是同一个 0.5−0.5cos(2π(i+0.5)/16) 表达式，只是不再重复求值。
+shared float sWin[16];
 
 const float TWO_PI = 6.283185307179586;
 
@@ -1615,6 +1620,10 @@ void main() {
     ivec2 lid = ivec2(gl_LocalInvocationID.xy);
     ivec2 wg = ivec2(gl_WorkGroupID.xy);
     int tid = lid.y * 16 + lid.x;
+    if (tid < 16) {
+        sWin[tid] = 0.5 - 0.5 * cos(TWO_PI * (float(tid) + 0.5) / 16.0);
+    }
+    barrier();
     // plane 并入 y 维（z 恒 1 = spike 真机口径；v0.10.40/41 的 gl_WorkGroupID.z
     // 疑似被驱动放弃——实为 0.10.41 的 image 格式错配，双保险都做）
     int plane = int(wg.y) / uRows;
@@ -1656,9 +1665,7 @@ void main() {
                           (zz > 0 ? doff : ivec2(0));
                 float v = linAt(zz, m);
                 if (zz == 0) rmsRow += v * v;  // 未加窗 RMS（HDR+ §5）
-                float wx = 0.5 - 0.5 * cos(TWO_PI * (float(lx) + 0.5) / 16.0);
-                float wyy = 0.5 - 0.5 * cos(TWO_PI * (float(yy) + 0.5) / 16.0);
-                sre[tt][zz][yy][lx] = v * wx * wyy;
+                sre[tt][zz][yy][lx] = v * sWin[lx] * sWin[yy];
                 sim[tt][zz][yy][lx] = 0.0;
             }
             if (zz == 0) sRmsRow[tt][yy] = rmsRow;
