@@ -4461,6 +4461,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"hrMs\":" + std::to_string(hr_ms_).substr(0, 6);
   kv += ",\"clipB\":" + std::to_string(hr_blocks_);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
+  // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
+  // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
+  // submitRawBurst 的 c.mfnr_kv 与调用点之后，均读不到值（0.10.59 真机 p0s 缺失）。
+  kv += ",\"p0s\":" + std::to_string(dbg_p0s_);
+  kv += ",\"cms\":" + std::to_string(dbg_cms_);
+  kv += ",\"cmsK\":" + std::to_string(dbg_cms_k_).substr(0, 4);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
 }
@@ -5861,11 +5867,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
   finishStillChain(c, t0, out_rgba);
-  // v0.10.59：新增算法的生效字段必须在渲染链**之后**拼装 —— 两个 pass 都在
-  // finishStillChain 内执行，写在日志串前缀里会读到重置后的 0（本次自查抓到）。
-  c.mfnr_kv += std::string(",\"p0s\":") + std::to_string(dbg_p0s_) +
-               ",\"cms\":" + std::to_string(dbg_cms_) +
-               ",\"cmsK\":" + f3(dbg_cms_k_);
   return true;
 }
 
