@@ -653,23 +653,10 @@ fun CameraScreen(
                     Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
                 }
 
-                // MFNR 多帧合成中（v0.9.0）：burst 4 帧到齐、引擎对齐融合期间
-                if (controller.capturePhase == 2) {
-                    Box(
-                        Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 42.dp)
-                            .background(FilmTheme.Panel.copy(alpha = 0.82f), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                    ) {
-                        Text(
-                            "多帧合成中…",
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            fontFamily = FilmTheme.Mono,
-                        )
-                    }
-                }
+                // v0.10.82：删除"多帧合成中…"提示（用户要求）。合成已经彻底后台化
+                // —— 快门在采集结束（~0.5s）就解锁，用户不需要知道后台还在跑；
+                // 常驻一个提示条反而暗示"被阻塞"。
+                // capturePhase 仍在 controller 内部维护（拍照各阶段用），只是不再上屏。
 
                 // 圆角机框：窗口即成片范围，机身色环带遮出圆角 + 奶油细线勾边
                 Canvas(Modifier.matchParentSize()) {
