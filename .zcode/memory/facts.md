@@ -95,3 +95,22 @@ status: active
 - [2026-09-22] `tools/`：validate-shaders.sh、dng-color-dump.py、color-metrics.py、gen-lut-assets.py（64³ cube→33³）、gen-lut-previews.py、tone-scan.py、chroma-denoise-eval.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py
 - [2026-09-22] 内置 LUT 资产：42 个 `.lut`（uint8、33³、4.3MB；格式 `[size][titleLen][title][catLen][category][data]`）；与 `~/Downloads/LUT/滤镜.cube/` 64³ 逐点一致；显示名/分类在资产头，prefs `lut_cat_*`/`lut_cats` 存覆盖
 - [2026-09-24] `docs/research/` 11 份 + README 索引（00=活入口、01–08 证据附录、**09=频域降噪专项（2026-09-29）**、90=原始转储勿删）
+
+## D 专项实现现状（2026-09-30，v0.10.53）
+
+- [2026-09-30] **DFT（A 专项）落地形态**：相位组输出 4×RGBA16F image2D
+  writeonly，**必须 glTexStorage2D**；tile 索引 `tx0 = 4·wg.x + gx − 1`、
+  `ty = 2·wgRow + gy − 1`；uCfaLut 必须下发；compute program 拍照时现场创建；
+  `mfnr.fft.store_check`（sum/micro/microSt/spikeOk）+ store_lost 回落 mismatch
+- [2026-09-30] **D-1 色度多尺度**（`kFsChromaDown/Atrous/Apply`，0.10.53）：
+  半分辨率 à trous 5 级、B3 样条、Wiener 收缩 k=8、revert=0.08；缓冲 = 2× 近似
+  层 + 5× 细节层 + 1× σ 图（RGBA16F，1/2 分辨率 ≈25MB/张）；MRT 分级绑定、
+  手动双线性上采样；失败回落 P4（tex_dn_）
+- [2026-09-30] **实测（15:16 组，ISO 1269，强度 1.2）**：σC 1/4/8/16/32px =
+  0.81/0.48/0.31/0.18/0.22 vs PC 1.33/0.78/0.65/0.44/0.39；σY 2.87/2.03/1.44
+  vs PC 0.72/0.94/0.63；边缘宽 4.84 vs 4.62；dnMs 253ms
+- [2026-09-30] **各向异性长核离线（D-2 前瞻）**：L=16/kr=2.5 → σY 暗 1.80 /
+  中 1.32 / 亮 0.59（PC 0.72/0.94/0.63），边缘 4.78 vs 4.62
+- [2026-09-30] **工具**：`tools/chroma-scale-eval.py`（σC 1–32px + 色斑可视化
+  ×12）、`tools/check-fft-tile-cover.py`（tile 覆盖/窗和守卫，`--buggy` 复现
+  旧故障）、`test_temp/analysis/atrous_tune.py`（à trous 离线镜像）
