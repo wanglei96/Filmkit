@@ -31,6 +31,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 /**
@@ -136,6 +137,19 @@ class CameraController(private val context: Context, private val render: RenderC
 
     @Volatile
     private var capturing = false
+
+    // ── 后台保存队列（2026-09-30 性能收口）────────────────────────────────
+    // JPEG 编码 + 落盘实测 0.34~0.40s（q100 的 Bitmap.compress 是大头），
+    // DNG 落盘 0.13~0.17s。原来它们都在拍照回调里同步跑 —— 渲染完成后主线程
+    // 还要被占住 0.4s，表现就是"按完快门后画面卡住、按不动"。
+    // 这里把**数据已经独立**的 JPEG 保存挪到后台（ByteArray 与相机缓冲无关，
+    // 无生命周期问题）；单线程串行 = 保持照片顺序、连拍时也不会堆积多份
+    // 25MB 位图。DNG 不能这样挪：DngCreator 必须持有 Camera2 的 Image，
+    // 而 Image 由渲染路径消费后立即 close（见 RenderClient 的 img.close()），
+    // 跨线程延后保存会读到已释放的缓冲。
+    private val saver = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "filmkit-save").apply { priority = Thread.NORM_PRIORITY - 1 }
+    }
 
     // ── MFNR 多帧融合（v0.9.0 阶段一）────────────────────────────────
     /** 拍摄阶段（Compose state，取景框内提示用）：0 = 空闲、1 = 采集/处理中、
@@ -1685,7 +1699,7 @@ class CameraController(private val context: Context, private val render: RenderC
         render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
             capturing = false
             capturePhase = 0
-            if (bytes != null) saveJpeg(bytes, w, h)
+            if (bytes != null) queueJpegSave(bytes, w, h)
         }
     }
 
@@ -1770,7 +1784,7 @@ class CameraController(private val context: Context, private val render: RenderC
         render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseStrength) { bytes, w, h ->
             capturing = false
             capturePhase = 0
-            if (bytes != null) saveJpeg(bytes, w, h)
+            if (bytes != null) queueJpegSave(bytes, w, h)
         }
     }
 
@@ -1920,7 +1934,7 @@ class CameraController(private val context: Context, private val render: RenderC
             burstResults.fill(null)
             burstImageCount = 0
             burstResultCount = 0
-            if (bytes != null) saveJpeg(bytes, w, h)
+            if (bytes != null) queueJpegSave(bytes, w, h)
         }
     }
 
@@ -2257,7 +2271,22 @@ class CameraController(private val context: Context, private val render: RenderC
         creator.close()
     }
 
-    private fun saveJpeg(rgba: ByteArray, w: Int, h: Int) {
+    /** 把一帧成片投给后台保存队列。主线程在这里只做两件事：快照拍摄参数、
+     *  入队 —— 返回后调用方（相机回调 / 渲染回调）立刻可以继续工作。
+     *  日志 photo.save_queued 与 photo.saved 的时间差 = 后台实际耗时，用于验证
+     *  主线程确实没被编码阻塞。 */
+    private fun queueJpegSave(bytes: ByteArray, w: Int, h: Int) {
+        val iso = liveIso
+        val secNs = liveExposureNs
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
+            kv("bytes" to bytes.size),
+        )
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs) }
+    }
+
+    /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。 */
+    private fun saveJpeg(rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long) {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
         // 16×16 网格采样平均亮度：诊断「管线输出是否全黑」
@@ -2348,7 +2377,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 kv(
                     "name" to name, "w" to outW, "h" to outH,
                     "avgLuma" to (sum / n.coerceAtLeast(1)),
-                    "iso" to liveIso, "sec" to "%.4f".format(liveExposureNs / 1e9f),
+                    "iso" to iso, "sec" to "%.4f".format(secNs / 1e9f),
                 ),
             )
         } catch (t: Throwable) {
