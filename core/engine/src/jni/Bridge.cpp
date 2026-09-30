@@ -51,22 +51,6 @@ EglCore& engineEgl() {
   return egl;
 }
 FrameRenderer* g_renderer = nullptr;
-
-// ── 拍照侧引擎（v0.10.83）：独立线程 + 独立 EGL context + 独立 FrameRenderer ──
-// 起因（真机）：预览与拍照共用一个渲染线程/context 时，拍照那条 1.6~3.4s 的
-// 合成链会把预览帧的 updateTexImage 全部排在它后面 —— 用户"拍完立刻挪手机，
-// 画面完全冻住 1~2 秒"。PhotonCamera 正是每个后处理器各自 eglCreateContext
-// （GlesMgcRawSpatialStacker / GlesMgcRawBaseFrameSelector / OglBokehProcessor
-// 都能查到），预览线程因此不受影响。
-// 我们的拍照链输入是 CPU 侧 4 帧 ByteBuffer、输出是读回的 RGBA，**全程不碰
-// 预览纹理**，所以两侧天然隔离，不需要共享 context（省掉 PC 那套 context
-// 共享的复杂度）。EglCore 每实例一个 context，两个实例 = 两个 context。
-EglCore& stillEgl() {
-  static EglCore egl;
-  return egl;
-}
-FrameRenderer* g_renderer_still = nullptr;
-EGLSurface g_still_surface = EGL_NO_SURFACE;
 EGLSurface g_win_surface = EGL_NO_SURFACE;
 EGLSurface g_pb_surface = EGL_NO_SURFACE;
 ANativeWindow* g_window = nullptr;
@@ -201,43 +185,6 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStop(JNIEnv*, jobject) {
     g_window = nullptr;
   }
   Logger::instance().log(LogLevel::kInfo, "engine", "engine.stop", "{}");
-}
-
-// 拍照渲染线程的引擎初始化：在**调用线程**上建独立 context 并挂 1×1 pbuffer
-// （拍照链只渲染到自己的 FBO，不上屏，所以不需要 window surface）。
-// 必须由 still 渲染线程自己调用 —— EGL context 是 per-thread current 的。
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
-  if (!stillEgl().init()) return JNI_FALSE;
-  if (g_still_surface == EGL_NO_SURFACE) {
-    g_still_surface = stillEgl().createPbufferSurface(1, 1);
-  }
-  if (g_still_surface == EGL_NO_SURFACE) return JNI_FALSE;
-  if (!stillEgl().makeCurrent(g_still_surface)) return JNI_FALSE;
-  if (g_renderer_still == nullptr) g_renderer_still = new FrameRenderer();
-  if (!g_renderer_still->init()) {
-    Logger::instance().log(LogLevel::kError, "engine", "engine.still_init_failed",
-                           "{}");
-    return JNI_FALSE;
-  }
-  Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start", "{}");
-  return JNI_TRUE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_filmkit_app_EngineBridge_nativeStillStop(JNIEnv*, jobject) {
-  if (g_renderer_still) {
-    stillEgl().makeCurrent(g_still_surface);
-    g_renderer_still->release();
-    delete g_renderer_still;
-    g_renderer_still = nullptr;
-  }
-  if (g_still_surface != EGL_NO_SURFACE) {
-    stillEgl().destroySurface(g_still_surface);
-    g_still_surface = EGL_NO_SURFACE;
-  }
-  stillEgl().makeCurrent(EGL_NO_SURFACE);
-  Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_stop", "{}");
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -447,15 +394,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
-    jboolean align_ab, jboolean p0_sub, jdoubleArray film,
-    jboolean use_still) {
-  // v0.10.83：拍照走独立实例（独立线程 + 独立 context），预览线程不再被这条
-  // 1.6~3.4s 的链阻塞。context 是 per-thread current 的，调用线程在
-  // nativeStillStart 里已 makeCurrent；这里再确认一次，防止线程被复用后
-  // current 漂移（makeCurrent 幂等，开销可忽略）。
-  FrameRenderer* r = use_still == JNI_TRUE ? g_renderer_still : g_renderer;
-  if (use_still == JNI_TRUE) stillEgl().makeCurrent(g_still_surface);
-  if (!r || !frames || count <= 0) return nullptr;
+    jboolean align_ab, jboolean p0_sub, jdoubleArray film) {
+  if (!g_renderer || !frames || count <= 0) return nullptr;
   std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
   for (int i = 0; i < count; ++i) {
     jobject buf = env->GetObjectArrayElement(frames, i);
@@ -497,7 +437,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
   }
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
-  const bool ok = r->submitRawBurst(
+  const bool ok = g_renderer->submitRawBurst(
       bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
       neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,
       lsc_rows, rotation, p, demosaic, noise_strength,

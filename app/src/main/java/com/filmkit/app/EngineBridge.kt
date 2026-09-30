@@ -107,16 +107,7 @@ object EngineBridge {
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
         alignAb: Boolean, p0Sub: Boolean, film: DoubleArray,
-        useStill: Boolean = false,
     ): ByteArray?
-
-    /**
-     * 拍照侧引擎的初始化 / 反初始化（v0.10.83）：必须在**拍照渲染线程**上调用 ——
-     * EGL context 是 per-thread current 的。建独立 context + 1×1 pbuffer +
-     * 独立 FrameRenderer 实例，使拍照合成链不再占用预览渲染线程。
-     */
-    external fun nativeStillStart(): Boolean
-    external fun nativeStillStop()
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */
     external fun nativeEngineHistogram(out: IntArray): Boolean
