@@ -1297,7 +1297,10 @@ void main() {
             }
     }
     float v = acc / wsum;
-    oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
+    // v0.10.61 诊断：alpha = 权重和 wsum（含中心 1.0）。样本数已足够（每帧 24 个
+    // 同相位邻域 × 4 帧 = 96），实测收益却远低于 √96 —— 需知**实际采纳了多少**，
+    // 故把 wsum 带出（tex_mos_ 的 alpha 无下游消费者），由 host 读回记入日志。
+    oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, wsum);
 })";
 
 // kFsTileRms（C 专项，2026-09-29）：逐 tile RMS 归约 —— HDR+ §5 的做法："For
@@ -4467,6 +4470,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"p0s\":" + std::to_string(dbg_p0s_);
   kv += ",\"cms\":" + std::to_string(dbg_cms_);
   kv += ",\"cmsK\":" + std::to_string(dbg_cms_k_).substr(0, 4);
+  // p0w = 中心点权重和；接近 9 = 样本几乎全被值域权重拒绝，接近 97 = 全采纳
+  kv += ",\"p0w\":" + std::to_string(dbg_p0w_).substr(0, 6);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
 }
@@ -5043,8 +5048,21 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
     glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
-    dbg_p0s_ = 36;                                   // 4 帧 × 3×3 同相位
+    dbg_p0s_ = 96;                                   // 4 帧 × 24（±4 mosaic 内同相位）
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    // 诊断读回：alpha = wsum。平均权重 ≈ wsum / 97（96 邻域 + 中心）
+    {
+      GLuint dfbo = 0;
+      glGenFramebuffers(1, &dfbo);
+      glBindFramebuffer(GL_FRAMEBUFFER, dfbo);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                             tex_mos_, 0);
+      float pv[4] = {0, 0, 0, 0};
+      glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_FLOAT, pv);
+      dbg_p0w_ = pv[3];
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glDeleteFramebuffers(1, &dfbo);
+    }
     return;
   }
   glUseProgram(prog_raw_dn_fused_);
@@ -5056,6 +5074,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
   glUniform3f(u_raw_dn_f_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
   dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
+  dbg_p0w_ = -1.f;                                   // 旧路径无 wsum 诊断
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -5831,7 +5850,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
-  dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f;
+  dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
   const auto f3 = [](float v) { return std::to_string(v).substr(0, 5); };
   c.mfnr_kv = std::string("\"mfnr\":\"on\"") +
               ",\"fuse\":\"" + (dft_active ? "dft" : "mm") + "\"" +

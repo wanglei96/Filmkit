@@ -23,6 +23,7 @@ EXPECT = {
     "p0s": ("finishStillChain", ["passRawDenoiseFused(", "passChromaMultiScale("]),
     "cms": ("finishStillChain", ["passChromaMultiScale("]),
     "cmsK": ("finishStillChain", ["passChromaMultiScale("]),
+    "p0w": ("finishStillChain", ["passRawDenoiseFused("]),
 }
 
 
