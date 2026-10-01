@@ -97,16 +97,76 @@ class CubeLutParserTest {
     }
 
     @Test
-    fun rejectsMissingSizeAnd1dAndBadSize() {
+    fun rejectsMissingSizeAndBadSize() {
         val missing = expectFailure { CubeLutParser.parse(cube2.replace("LUT_3D_SIZE 2", "")) }
         assertTrue(missing, missing.contains("LUT_3D_SIZE"))
-        val oneD = expectFailure { CubeLutParser.parse(cube2.replace("LUT_3D_SIZE 2", "LUT_1D_SIZE 2")) }
-        assertTrue(oneD, oneD.contains("1D"))
         val tiny = expectFailure { CubeLutParser.parse(cube2.replace("LUT_3D_SIZE 2", "LUT_3D_SIZE 1")) }
         assertTrue(tiny, tiny.contains("超出范围"))
         // 数据行必须排在 LUT_3D_SIZE 之后，否则尺寸未知
         val early = expectFailure { CubeLutParser.parse("0.0 0.0 0.0\nLUT_3D_SIZE 2") }
         assertTrue(early, early.contains("之前"))
+    }
+
+    /** 1D → 3D 展开（M4 §6.2）：三通道独立曲线，展开是数学等价而非近似 */
+    @Test
+    fun parses1dAsThreeIndependentCurves() {
+        // 1D 表：R 曲线 = x+0.1（抬红）、G/B 曲线 = 恒等
+        val oneD = """
+            TITLE "curve"
+            LUT_1D_SIZE 2
+            0.1 0.0 0.0
+            1.0 1.0 1.0
+        """.trimIndent()
+        val l = CubeLutParser.parse(oneD)
+        assertEquals("curve", l.title)
+        assertEquals(2, l.size)
+        assertEquals(24, l.data.size)
+        // 3D 展开 (r,g,b) → (fR(r), fG(g), fB(b))：首格点 = (fR(0), fG(0), fB(0)) = (0.1, 0, 0)
+        assertEquals(0.1f, l.data[0], 1e-6f)
+        assertEquals(0f, l.data[1], 1e-6f)
+        // (r=1,g=0,b=0)（红最快，第 2 组）= (fR(1), fG(0), fB(0)) = (1, 0, 0)
+        assertEquals(1f, l.data[3], 1e-6f)
+        assertEquals(0f, l.data[4], 1e-6f)
+        // (r=0,g=1,b=0)（第 3 组）= (fR(0), fG(1), fB(0)) = (0.1, 1, 0)
+        assertEquals(0.1f, l.data[6], 1e-6f)
+        assertEquals(1f, l.data[7], 1e-6f)
+        assertEquals(0f, l.data[8], 1e-6f)
+        // 展开后的 3D 域恒 [0,1]（INPUT_RANGE 折进格点）
+        assertEquals(0f, l.domainMin[0], 0f)
+        assertEquals(1f, l.domainMax[0], 0f)
+    }
+
+    /** 1D INPUT_RANGE：输入域 [0.2, 0.8] → 3D 引擎均匀采样 [0,1] 时线性映射回表 */
+    @Test
+    fun applies1dInputRange() {
+        // 表 2 项：0 = 黑、1 = 白；INPUT_RANGE [0.5, 1.0] —— 3D 输入 0.5 处应输出 0（表首）、
+        // 输入 1.0 处输出 1（表尾）、0.25 处 clamp 到表首
+        val oneD = """
+            TITLE "ranged"
+            LUT_1D_SIZE 2
+            LUT_1D_INPUT_RANGE 0.5 1.0
+            0.0 0.0 0.0
+            1.0 1.0 1.0
+        """.trimIndent()
+        val l = CubeLutParser.parse(oneD)
+        assertEquals(2, l.size)
+        // 输入 0（< range 下限）→ clamp 表首 = 0；输入 0.5（= 下限）→ 表首 0
+        val first = l.data[0]
+        assertEquals(0f, first, 1e-6f)
+        // 输入 1.0（= 上限）→ 表尾 = 1
+        val idx = ((1 * 2 + 1) * 2 + 1) * 3
+        assertEquals(1f, l.data[idx], 1e-6f)
+    }
+
+    @Test
+    fun rejects1dBadRowsAndRange() {
+        val oneD = "TITLE t\nLUT_1D_SIZE 2\n0.0 0.0 0.0\n"
+        val few = expectFailure { CubeLutParser.parse(oneD) }
+        assertTrue(few, few.contains("1D 数据行不足"))
+        val badRange = expectFailure {
+            CubeLutParser.parse(oneD + "1.0 1.0 1.0\nLUT_1D_INPUT_RANGE 0.8 0.2")
+        }
+        assertTrue(badRange, badRange.contains("INPUT_RANGE"))
     }
 
     /** 内置资产端到端：33³ 二进制资产全部可解析、端点为黑/白（资产坏掉不该等到设备上才发现） */

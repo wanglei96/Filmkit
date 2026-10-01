@@ -68,6 +68,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -126,10 +127,12 @@ import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.kv
+import com.filmkit.app.lut.LutIO
 import com.filmkit.app.lut.LutLibrary
 import com.filmkit.app.lut.LutPreview
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.exp
 import kotlin.math.ln
@@ -306,7 +309,14 @@ fun CameraScreen(
     // 卡片预览图：启动时后台用固定测试图 × 各 LUT 生成一次并缓存（见 LutPreview），
     // 之后开面板只读缓存 —— 一次性生成而非实时渲染，省电
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
-    LaunchedEffect(Unit) {
+    // LUT 库版本（v0.10.94）：导入/删除后 ++，随 entries 生成的预览随之重建
+    var lutLibVersion by remember { mutableIntStateOf(0) }
+    fun refreshLutLib() {
+        lutCats = LutLibrary.allCategories(context, prefs)
+        lutCatOf = LutLibrary.entries(context).associate { it.id to LutLibrary.categoryOf(prefs, it) }
+        lutCustomCats = LutLibrary.customCategories(prefs)
+    }
+    LaunchedEffect(lutLibVersion) {
         lutPreviews = withContext(Dispatchers.IO) {
             LutLibrary.entries(context).mapNotNull { e ->
                 LutLibrary.load(context, e)?.let { lut ->
@@ -314,6 +324,67 @@ fun CameraScreen(
                 }
             }.toMap()
         }
+    }
+
+    // ── 用户 LUT 导入 / 导出（M4 §6.2，SAF）────────────────────────────────
+    val scope = rememberCoroutineScope()
+    // .cube/.3dl 无注册 MIME，Hald 是 PNG —— 入口放 */*，格式由内容嗅探白名单把关
+    val lutImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { LutLibrary.import(context, uri) }
+                }
+                res.onSuccess { e ->
+                    lutLibVersion++
+                    refreshLutLib()
+                    lutFilter = null  // 新 LUT 落在「导入」分类，清筛选保证可见
+                    lutPending = e    // 导入即选中（走既有加载链）
+                }.onFailure { t ->
+                    android.widget.Toast.makeText(
+                        context, "导入失败：${t.message}", android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+    // 导出：lutExportPend 记住「哪个 LUT + 是否 Hald」，CreateDocument 回调里落盘
+    var lutExportPend by remember { mutableStateOf<Pair<LutLibrary.Entry, Boolean>?>(null) }
+    val lutExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri ->
+        val pend = lutExportPend
+        lutExportPend = null
+        if (uri != null && pend != null) {
+            val (e, hald) = pend
+            scope.launch {
+                val res = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val lut = LutLibrary.load(context, e)
+                            ?: throw IllegalStateException("LUT 解析失败")
+                        context.contentResolver.openOutputStream(uri)!!.use { out ->
+                            if (hald) LutIO.writeHaldPng(lut, out) else LutIO.writeCube(lut, out)
+                        }
+                    }
+                }
+                res.onSuccess {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "engine", "lut.export",
+                        kv("id" to e.id, "kind" to if (hald) "hald" else "cube"),
+                    )
+                }.onFailure { t ->
+                    android.widget.Toast.makeText(
+                        context, "导出失败：${t.message}", android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+    fun exportLut(e: LutLibrary.Entry, hald: Boolean) {
+        lutExportPend = e to hald
+        lutExportLauncher.launch("${e.label}.${if (hald) "png" else "cube"}")
     }
     LaunchedEffect(Unit) {
         // 启动恢复：按 prefs 的选择重新加载（切镜头/重进相机后引擎纹理已被释放）
@@ -1267,6 +1338,24 @@ fun CameraScreen(
                         lutPending = e
                     }
                 },
+                onImport = { lutImportLauncher.launch(arrayOf("*/*")) },
+                onExport = { e, hald -> exportLut(e, hald) },
+                onDeleteLut = { e ->
+                    if (LutLibrary.deleteUser(context, prefs, e.id)) {
+                        lutLibVersion++
+                        refreshLutLib()
+                        // 删除的是当前选中：摘选择 + 引擎旁路（回「无 LUT」）
+                        if (lutId == e.id) {
+                            lutId = null
+                            controller.setLut(null)
+                            prefs.edit().remove("lut_id").apply()
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_INFO, "app", "settings.lut",
+                                kv("id" to "none", "title" to "none", "ok" to true),
+                            )
+                        }
+                    }
+                },
                 onClose = { lutOpen = false },
             )
         }
@@ -1777,12 +1866,16 @@ private fun LutSheet(
     onStrength: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
+    onImport: () -> Unit,
+    onExport: (LutLibrary.Entry, Boolean) -> Unit,
+    onDeleteLut: (LutLibrary.Entry) -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
     var catNewOpen by remember { mutableStateOf(false) }
     var catMove by remember { mutableStateOf<LutLibrary.Entry?>(null) }
     var catDel by remember { mutableStateOf<String?>(null) } // 待确认删除的分类名
+    var lutDel by remember { mutableStateOf<LutLibrary.Entry?>(null) } // 待确认删除的用户 LUT
     Column(
         Modifier
             .fillMaxWidth()
@@ -1837,6 +1930,8 @@ private fun LutSheet(
                     SheetPill(c, selected = filter == c, onTap = { onFilter(c) }, onLongTap = del)
                 }
                 item { SheetPill("＋", selected = false) { catNewOpen = true } }
+                // 用户 LUT 导入（M4 §6.2）：SAF 选 .cube / Hald PNG，内容嗅探把关
+                item { SheetPill("导入", selected = false) { onImport() } }
             }
         }
         // 强度（仅 LUT 分类且已选中时）：拖到 0 = 旁路，用于在风格与噪声之间权衡
@@ -1977,7 +2072,64 @@ private fun LutSheet(
                             }
                         }
                     }
+                    // 用户 LUT（M4 §6.2）：导出 .cube / 导出 Hald PNG / 删除 ——
+                    // 内置资产不可删（只读交付），也不需要导出（用户拿得到原版 .cube）
+                    if (e.user) {
+                        Text(
+                            "导出 .cube",
+                            color = FilmTheme.Cream,
+                            fontSize = 15.sp,
+                            fontFamily = FilmTheme.Serif,
+                            modifier = Modifier
+                                .pressScale(onTap = { onExport(e, false); catMove = null })
+                                .padding(vertical = 10.dp),
+                        )
+                        Text(
+                            "导出 Hald PNG",
+                            color = FilmTheme.Cream,
+                            fontSize = 15.sp,
+                            fontFamily = FilmTheme.Serif,
+                            modifier = Modifier
+                                .pressScale(onTap = { onExport(e, true); catMove = null })
+                                .padding(vertical = 10.dp),
+                        )
+                        Text(
+                            "删除此 LUT",
+                            color = FilmTheme.Accent,
+                            fontSize = 15.sp,
+                            fontFamily = FilmTheme.Serif,
+                            modifier = Modifier
+                                .pressScale(onTap = { lutDel = e; catMove = null })
+                                .padding(vertical = 10.dp),
+                        )
+                    }
                 }
+            },
+        )
+    }
+    // 删除用户 LUT 二次确认：不可逆（存档文件一并删除，选中它的会话回「无 LUT」）
+    lutDel?.let { e ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { lutDel = null },
+            shape = RoundedCornerShape(18.dp),
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { onDeleteLut(e); lutDel = null },
+                ) { Text("删除", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { lutDel = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("删除 LUT", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Text(
+                    "「${e.label}」将从库中删除（含导入的原文件），正在使用它会回到「无 LUT」。",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 14.sp,
+                    fontFamily = FilmTheme.Serif,
+                )
             },
         )
     }

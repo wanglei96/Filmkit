@@ -28,15 +28,24 @@ class CubeLut(
  */
 object CubeLutParser {
 
-    /** 边长上限：33³ 是常规上限，64³ 只为挡住畸形文件导致的巨型分配 */
-    private const val MAX_SIZE = 64
+    /**
+     * 边长上限（M4 §6.2：尺寸上限 128³）。内置 33³ 不受影响；放宽是为用户导入
+     * （65³ .cube 常见、Hald Level 10 = 100³）。128³ float = 25MB，largeHeap 下安全。
+     */
+    const val MAX_SIZE = 128
 
     fun parse(text: String, fallbackTitle: String = "LUT"): CubeLut {
         var title: String? = null
         var size = 0
+        var is1d = false
         val dmin = floatArrayOf(0f, 0f, 0f)
         val dmax = floatArrayOf(1f, 1f, 1f)
-        var acc: FloatArray? = null
+        // 1D 输入范围（LUT_1D_INPUT_RANGE min max，缺省 [0,1]）——与 3D 的 DOMAIN 不同：
+        // 它作用于表项的输入位置，展开 3D 时折进格点值（见 expand1d）。
+        var inMin = 0f
+        var inMax = 1f
+        var acc: FloatArray? = null      // 3D：size³×3
+        var table: FloatArray? = null    // 1D：size×3（逐通道曲线）
         var filled = 0
         var lineNo = 0
 
@@ -47,8 +56,20 @@ object CubeLutParser {
             when {
                 line.startsWith("TITLE") ->
                     title = line.removePrefix("TITLE").trim().trim('"')
-                line.startsWith("LUT_1D_SIZE") ->
-                    throw IllegalArgumentException("1D LUT 暂未支持（第 $lineNo 行）")
+                line.startsWith("LUT_1D_INPUT_RANGE") -> {
+                    val t = FloatArray(2)
+                    parseN(line.substringAfter(' '), t, 2, lineNo)
+                    inMin = t[0]
+                    inMax = t[1]
+                }
+                line.startsWith("LUT_1D_SIZE") -> {
+                    size = line.removePrefix("LUT_1D_SIZE").trim().toIntOrNull()
+                        ?: throw IllegalArgumentException("LUT_1D_SIZE 非法（第 $lineNo 行）：$line")
+                    require(size in 2..MAX_SIZE) { "LUT_1D_SIZE 超出范围（第 $lineNo 行）：$size" }
+                    is1d = true
+                    table = FloatArray(size * 3)
+                    filled = 0
+                }
                 line.startsWith("LUT_3D_INPUT_RANGE") -> {
                     // Resolve 写法：3 个 min + 3 个 max，与 DOMAIN_MIN/MAX 同义
                     val t = FloatArray(6)
@@ -62,32 +83,101 @@ object CubeLutParser {
                     size = line.removePrefix("LUT_3D_SIZE").trim().toIntOrNull()
                         ?: throw IllegalArgumentException("LUT_3D_SIZE 非法（第 $lineNo 行）：$line")
                     require(size in 2..MAX_SIZE) { "LUT_3D_SIZE 超出范围（第 $lineNo 行）：$size" }
+                    is1d = false
                     acc = FloatArray(size * size * size * 3)
+                    filled = 0
                 }
                 line.startsWith("DOMAIN_MIN") -> parseN(line.substringAfter(' '), dmin, 3, lineNo)
                 line.startsWith("DOMAIN_MAX") -> parseN(line.substringAfter(' '), dmax, 3, lineNo)
                 else -> {
-                    val a = acc
-                        ?: throw IllegalArgumentException("数据行出现在 LUT_3D_SIZE 之前（第 $lineNo 行）")
                     val t = FloatArray(3)
                     parseN(line, t, 3, lineNo)
-                    if (filled + 3 > a.size) {
-                        throw IllegalArgumentException("数据行多于 LUT_3D_SIZE³（第 $lineNo 行）")
+                    if (is1d) {
+                        val tb = table
+                            ?: throw IllegalArgumentException("数据行出现在 LUT_1D_SIZE 之前（第 $lineNo 行）")
+                        if (filled + 3 > tb.size) {
+                            throw IllegalArgumentException("数据行多于 LUT_1D_SIZE（第 $lineNo 行）")
+                        }
+                        tb[filled] = t[0]
+                        tb[filled + 1] = t[1]
+                        tb[filled + 2] = t[2]
+                        filled += 3
+                    } else {
+                        val a = acc
+                            ?: throw IllegalArgumentException("数据行出现在 LUT_3D_SIZE 之前（第 $lineNo 行）")
+                        if (filled + 3 > a.size) {
+                            throw IllegalArgumentException("数据行多于 LUT_3D_SIZE³（第 $lineNo 行）")
+                        }
+                        a[filled] = t[0]
+                        a[filled + 1] = t[1]
+                        a[filled + 2] = t[2]
+                        filled += 3
                     }
-                    a[filled] = t[0]
-                    a[filled + 1] = t[1]
-                    a[filled + 2] = t[2]
-                    filled += 3
                 }
             }
         }
 
+        if (is1d) {
+            val tb = table ?: throw IllegalArgumentException("缺少 LUT_1D_SIZE")
+            require(filled == tb.size) {
+                "1D 数据行不足：期望 $size 个 RGB 三元组，实得 ${filled / 3}"
+            }
+            require(inMin < inMax) { "LUT_1D_INPUT_RANGE 非法：$inMin..$inMax" }
+            return expand1d(
+                title?.takeIf { it.isNotEmpty() } ?: fallbackTitle, size, tb, inMin, inMax,
+            )
+        }
         val d = acc ?: throw IllegalArgumentException("缺少 LUT_3D_SIZE")
         require(filled == d.size) { "数据行不足：期望 ${d.size / 3} 个 RGB 三元组，实得 ${filled / 3}" }
         require(dmin[0] < dmax[0] && dmin[1] < dmax[1] && dmin[2] < dmax[2]) {
             "DOMAIN_MIN/MAX 非法：${dmin.toList()} / ${dmax.toList()}"
         }
         return CubeLut(title?.takeIf { it.isNotEmpty() } ?: fallbackTitle, size, d, dmin, dmax)
+    }
+
+    /**
+     * 1D → 3D 展开（M4 §6.2 的 1D 导入）：1D 语义 = 三条独立曲线 out=(fR(r),fG(g),fB(b))，
+     * 通道间不交叉，展开成 N³ 是**数学等价**（不是近似）。
+     *
+     * LUT_1D_INPUT_RANGE 折进展开：3D 引擎采样输入是均匀 [0,1]，1D 表项 j 的输入是
+     * min+(max-min)·j/(N-1) —— 3D 格点 i 的值取 1D 表在位置 p=((i/(N-1))-min)/(max-min)·(N-1)
+     * 处的线性插值。INPUT_RANGE 缺省 [0,1] 时 p=i，逐点复制（无损路径）。
+     * 展开后的 3D 域恒为 [0,1]（输入归一已完成）。
+     */
+    private fun expand1d(title: String, size: Int, table: FloatArray, inMin: Float, inMax: Float): CubeLut {
+        val out = FloatArray(size * size * size * 3)
+        val last = size - 1
+        // 三条曲线的采样位置表：pos[c][i] = 通道 c 曲线在格点 i 的浮点索引
+        val curves = Array(3) { FloatArray(size) }
+        for (i in 0 until size) {
+            val p = if (inMin == 0f && inMax == 1f) {
+                i.toFloat()
+            } else {
+                (((i.toFloat() / last) - inMin) / (inMax - inMin)) * last
+            }
+            val clamped = p.coerceIn(0f, last.toFloat())
+            val i0 = clamped.toInt().coerceAtMost(last - 1).coerceAtLeast(0)
+            val frac = clamped - i0
+            for (c in 0..2) {
+                val v0 = table[i0 * 3 + c]
+                val v1 = table[(i0 + 1) * 3 + c]
+                curves[c][i] = v0 + (v1 - v0) * frac
+            }
+        }
+        var idx = 0
+        for (b in 0 until size) {
+            val fb = curves[2][b]
+            for (g in 0 until size) {
+                val fg = curves[1][g]
+                for (r in 0 until size) {
+                    out[idx] = curves[0][r]
+                    out[idx + 1] = fg
+                    out[idx + 2] = fb
+                    idx += 3
+                }
+            }
+        }
+        return CubeLut(title, size, out, floatArrayOf(0f, 0f, 0f), floatArrayOf(1f, 1f, 1f))
     }
 
     /**
