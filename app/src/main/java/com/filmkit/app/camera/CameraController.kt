@@ -668,6 +668,35 @@ class CameraController(private val context: Context, private val render: RenderC
                 else -> 2f
             }
         }
+
+        /** 成片输出摘要（同帧 A/B 用，v0.10.85）：CRC32 全量（逐字节等价的硬证据）
+         *  + 16×16 网格采样均值（诊断"整张黑 / 亮度漂移"）。只在 still_ab 打开时
+         *  计算，纯函数供单测。bytes 为 RGBA（与 Bitmap ARGB_8888 内存序一致）。 */
+        class OutDigest(val crc: Long, val mean: Double)
+
+        fun outDigest(bytes: ByteArray, w: Int, h: Int): OutDigest {
+            val c = java.util.zip.CRC32()
+            c.update(bytes)
+            val step = maxOf(1, minOf(w, h) / 16)
+            var sum = 0L
+            var n = 0
+            var y = 0
+            while (y < h) {
+                var x = 0
+                while (x < w) {
+                    val i = (y * w + x) * 4
+                    if (i + 2 < bytes.size) {
+                        sum += (bytes[i].toInt() and 0xFF) +
+                            (bytes[i + 1].toInt() and 0xFF) +
+                            (bytes[i + 2].toInt() and 0xFF)
+                        n += 3
+                    }
+                    x += step
+                }
+                y += step
+            }
+            return OutDigest(c.value, if (n > 0) sum.toDouble() / n else -1.0)
+        }
     }
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
@@ -1196,6 +1225,12 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
                 // fwrite 缓冲在崩溃时丢内容：拍照入口日志立即落盘（v0.9.1）
                 EngineBridge.nativeFlushLogs()
+                if (trigger && prefs.getBoolean("still_thread", false)) {
+                    // 拍照线程异步预热（v0.10.85）：与 burst 采集（≈0.5s）并行。
+                    // 否则首次拍照时 ensureStarted 会在**预览渲染线程**上干等整段
+                    // 引擎 init（编译全部 shader）—— 那本身就是一次可见卡顿。
+                    StillRenderClient.startAsync()
+                }
                 if (trigger) {
                     startBurst(s, b)
                     return
@@ -1430,6 +1465,10 @@ class CameraController(private val context: Context, private val render: RenderC
             previewSurface = null
         }
         render.stop()
+        // 拍照线程（StillRenderClient）**故意不在这里销毁**（v0.10.85）：它可能
+        // 正跑着 1.6~3.4s 的合成，quitSafely/delete 会杀掉正在跑 GL 的线程
+        // （v0.10.83 就是这样丢照片 + 闪退的）。线程与引擎实例进程级常驻，
+        // 在飞的合成照常跑完并落盘 —— 相机页退出不该以照片为代价。
     }
 
     @SuppressLint("MissingPermission")
@@ -1941,15 +1980,44 @@ class CameraController(private val context: Context, private val render: RenderC
         val p0Sub = prefs.getBoolean("p0_sub", true)
         // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
         rendersInFlight.incrementAndGet()
-        render.submitRawBurst(buffers, strides, refW, refH, meta,
-            orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-            useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
+        val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
             if (bytes != null) queueJpegSave(bytes, w, h)
+        }
+        // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
+        // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
+        // 后面，"拍完挪手机画面完全冻住 1~2 秒"。启动失败即回退预览线程。
+        val useStill = prefs.getBoolean("still_thread", false) &&
+            StillRenderClient.ensureStarted()
+        if (useStill && prefs.getBoolean("still_ab", false)) {
+            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+                useDft, alignL1, alignAb, p0Sub, done)
+        } else if (useStill) {
+            StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
+                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
+                if (bytes != null) {
+                    done(bytes, w, h)
+                } else {
+                    // 拍照线程合成失败（GL/OOM 等）：回退预览线程重跑一次 ——
+                    // 用户红线：失败不以丢照片为代价（v0.10.83 就是这么丢的）
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_WARN, "camera", "render.still_fallback", "{}",
+                    )
+                    EngineBridge.nativeFlushLogs()
+                    render.submitRawBurst(buffers, strides, refW, refH, meta,
+                        orientationStep, filmParams, demosaic, noiseStrength,
+                        burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, done)
+                }
+            }
+        } else {
+            render.submitRawBurst(buffers, strides, refW, refH, meta,
+                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                useDft, alignL1, alignAb, p0Sub, done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -1958,6 +2026,61 @@ class CameraController(private val context: Context, private val render: RenderC
         // false，等于把"能不能再拍"绑在整条渲染链上 —— 这是"按完快门卡 2 秒"
         // 的主因。现在解锁点提前到"采集+DNG+拷贝"完成（约 0.5s）。
         capturing = false
+    }
+
+    /** 同帧 A/B（v0.10.85，诊断用 prefs still_ab）：**同一帧数据**先走拍照线程
+     *  （独立 context）、再走预览线程，比较两遍的输出摘要 —— 唯一无混杂地验证
+     *  "换执行路径不改画质"（项目口径：跨拍摄的 A/B 会被场景/曝光/手抖污染）。
+     *  落盘第一遍（拍照线程）的成片，第二遍只做对照。
+     *  代价：多一遍完整合成（第二遍期间预览会卡，这正是要修的那个现象）+
+     *  峰值多一张 RGBA（≈50MB）—— 只在验收时打开。 */
+    private fun submitStillAb(
+        buffers: List<ByteBuffer>,
+        strides: IntArray,
+        width: Int,
+        height: Int,
+        meta: RenderClient.RawFrameMeta,
+        demosaic: Int,
+        noiseStrength: Float,
+        useDft: Boolean,
+        alignL1: Boolean,
+        alignAb: Boolean,
+        p0Sub: Boolean,
+        done: (ByteArray?, Int, Int) -> Unit,
+    ) {
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        // 参数快照：两遍相隔 1.6s+，中间用户可能转手机/改设置 —— 直接读成员会让
+        // A/B 混进第二个变量（本项目"跨时刻对比"翻车过多次）
+        val rot = orientationStep
+        val film = filmParams
+        val rn = burstRefNoiseScale
+        StillRenderClient.submitRawBurst(buffers, strides, width, height, meta,
+            rot, film, demosaic, noiseStrength, rn,
+            useDft, alignL1, alignAb, p0Sub) { b1, w1, h1 ->
+            val d1 = if (b1 != null) outDigest(b1, w1, h1) else null
+            render.submitRawBurst(buffers, strides, width, height, meta,
+                rot, film, demosaic, noiseStrength, rn,
+                useDft, alignL1, alignAb, p0Sub) { b2, w2, h2 ->
+                val d2 = if (b2 != null) outDigest(b2, w2, h2) else null
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "render.still_ab",
+                    kv(
+                        "crcStill" to (d1?.crc ?: -1L),
+                        "crcPreview" to (d2?.crc ?: -1L),
+                        "same" to (d1 != null && d2 != null && d1.crc == d2.crc),
+                        "meanStill" to "%.3f".format(d1?.mean ?: -1.0),
+                        "meanPreview" to "%.3f".format(d2?.mean ?: -1.0),
+                        "sizeStill" to "${w1}x${h1}",
+                        "sizePreview" to "${w2}x${h2}",
+                        "abMs" to (android.os.SystemClock.elapsedRealtime() - t0),
+                    ),
+                )
+                EngineBridge.nativeFlushLogs()
+                // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
+                // 否则"照片已算出却不落盘"（v0.10.85 审查 R1）
+                if (b1 != null) done(b1, w1, h1) else done(b2, w2, h2)
+            }
+        }
     }
 
     /** ColorSpaceTransform → 行主序 9 元素字符串；null → "none"（DNG 标准链回填探针）。

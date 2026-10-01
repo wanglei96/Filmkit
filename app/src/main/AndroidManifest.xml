@@ -5,10 +5,18 @@
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
+    <!-- largeHeap（2026-10-01，v0.10.86）：连拍时 MFNR 每张在飞要持 4 帧
+         direct buffer（4×25MB=100MB），而 Android 的 ByteBuffer.allocateDirect 走
+         VMRuntime.trackExternalAllocation —— **外部内存照样计入 ART 的 OOM 额度**。
+         在飞 2 张（200MB）+ 成片回传的 50MB byte[] 撞上默认 256MB growth limit →
+         OOM 发生在 JNI SetByteArrayRegion 里 → pending exception → ART abort
+         （SIGABRT in FilmStill，真机 2026-10-01 11:22:59 实测，tombstone_07）。
+         这里把额度抬到设备上限；native 侧的 ExceptionCheck 防护见 Bridge.cpp。 -->
     <application
         android:name=".FilmKitApp"
         android:label="@string/app_name"
         android:theme="@style/Theme.FilmKit"
+        android:largeHeap="true"
         android:supportsRtl="true">
 
         <!-- configChanges：窗口方向由相机页按**设备物理姿态**主动设置（见 CameraScreen 的

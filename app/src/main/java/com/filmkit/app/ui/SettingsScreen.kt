@@ -646,6 +646,81 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 拍照独立渲染线程（v0.10.85）：合成链 1.6~3.4s 原来跑在预览渲染线程上，
+            // 预览的 updateTexImage 全排在它后面 → "拍完挪手机画面完全冻住 1~2 秒"。
+            // 开 = 独立线程 + 独立 EGL context（PhotonCamera 同构）；默认关 = 旧行为。
+            var stillThread by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("still_thread", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        stillThread = !stillThread
+                        prefs.edit().putBoolean("still_thread", stillThread).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.still_thread",
+                            "{\"on\":$stillThread}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("拍照独立渲染线程", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "开 = 多帧合成走独立线程/上下文，拍完预览不再冻住 1~2 秒" +
+                            "（首张多付一次引擎初始化）；关 = 旧行为（拍照期间预览停更）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (stillThread) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // 同帧 A/B（v0.10.85 诊断）：同一帧数据先走拍照线程、再走预览线程，
+            // 比较两遍输出的 CRC32 与采样均值 —— 验证"换路径不改画质"。
+            var stillAb by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("still_ab", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        stillAb = !stillAb
+                        prefs.edit().putBoolean("still_ab", stillAb).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.still_ab",
+                            "{\"on\":$stillAb}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("独立线程 A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "仅在上面的开关打开时生效：每张照片额外在预览线程算一遍，" +
+                            "日志 render.still_ab 给出两遍的 CRC32/均值；拍照慢约 1.6 秒",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (stillAb) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
             //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
             //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与
@@ -892,7 +967,7 @@ fun SettingsScreen(
             var yuv709 by rememberSaveable { mutableStateOf(prefs.getBoolean("yuv_709", false)) }
             SettingSwitchRow(
                 title = "静拍 YUV 解码 BT.709",
-                subtitle = "2026-09-20 实拍 A/B 定量：两种矩阵暗部 R/G 仅差 0.001，已确认 601 正确；此开关保留供未来机型复查",
+                subtitle = "2026-09-20 实拍 A/B 定量：两种矩阵暗部 R/G 仅差 0.001，已确认 601 正确；此开关保留供未来机型复查（改动下次进入相机生效）",
                 checked = yuv709,
                 onChecked = { v ->
                     yuv709 = v

@@ -45,6 +45,25 @@ object EngineBridge {
     // ── M1 相机引擎（SurfaceTexture + OES 路径）──
     external fun nativeEngineStart(surface: Surface): Boolean
     external fun nativeEngineStop()
+
+    /**
+     * 拍照侧引擎初始化（v0.10.85）：必须在**拍照渲染线程**上调用 —— EGL context
+     * 是 per-thread current 的。建独立 context + 1×1 pbuffer + 独立 FrameRenderer
+     * 实例，让 1.6~3.4s 的合成链不再占用预览渲染线程（"拍完挪手机画面冻住"的
+     * 根因）。幂等；**没有对应的 stop** —— 线程与实例进程级常驻，从根上消除
+     * "新线程复用旧实例 / stop 杀掉正在跑 GL 的线程"这类竞态（v0.10.83 教训）。
+     * 返回 false 时调用方回退预览线程。
+     */
+    external fun nativeStillStart(): Boolean
+
+    /**
+     * 空闲释放（v0.10.88）：销毁拍照侧 FrameRenderer（**保留 EGL context**），
+     * 释放合成链留下的约 2GB 全分辨率中间纹理。必须在拍照线程上调用；因为所有
+     * GL 调用都排在同一条 Handler 队列上串行，它天然排在在飞合成之后，安全。
+     * 下次拍照 nativeStillStart 会重建（~60ms，LUT 由 start 里的快照补齐）。
+     */
+    external fun nativeStillDestroy()
+
     external fun nativeCreateOesTexture(): Int
     external fun nativeEngineGetStats(): String?
 
@@ -96,6 +115,9 @@ object EngineBridge {
      * 诊断那遍固定 = v0.10.69 基线（1/4 域最细层 + 整数采样），所以一次只改一个
      * 设置（align_l1 或 p0_sub）就是单变量对照。
      * p0Sub = true 时 P0 的时域采样走逐通道网格亚像素双线性（prefs p0_sub）。
+     * useStill = true（v0.10.85，prefs still_thread）时走**拍照侧实例**（独立线程
+     *  + 独立 EGL context），预览线程不再被这条链阻塞；调用前必须
+     *  nativeStillStart 成功，且必须在拍照线程上调用。
      */
     external fun nativeEngineSubmitRawBurst(
         frames: Array<ByteBuffer>, count: Int, rowStridesPx: IntArray,
@@ -107,6 +129,7 @@ object EngineBridge {
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
         alignAb: Boolean, p0Sub: Boolean, film: DoubleArray,
+        useStill: Boolean = false,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

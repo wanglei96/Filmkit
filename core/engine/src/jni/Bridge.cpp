@@ -1,7 +1,10 @@
 #include <android/native_window_jni.h>
 #include <jni.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -55,6 +58,86 @@ EGLSurface g_win_surface = EGL_NO_SURFACE;
 EGLSurface g_pb_surface = EGL_NO_SURFACE;
 ANativeWindow* g_window = nullptr;
 unsigned int g_oes_tex = 0;
+
+// ── 拍照侧引擎（v0.10.85）：独立线程 + 独立 EGL context + 独立 FrameRenderer ──
+// 起因（真机）：预览与拍照共用一个渲染线程/context 时，拍照那条 1.6~3.4s 的
+// 合成链把预览帧的 updateTexImage 全排在它后面 —— "拍完挪手机画面完全冻住
+// 1~2 秒"。PhotonCamera 正是每个后处理器各自 eglCreateContext
+// （GlesMgcRawSpatialStacker / GlesMgcRawBaseFrameSelector / OglBokehProcessor
+// 均可查证），预览线程因此不受影响。
+// 拍照链的输入是 CPU 侧 4 帧 ByteBuffer、输出是读回的 RGBA，**全程不碰预览
+// 纹理**，所以两侧天然隔离，不需要 PC 那套 context 共享。
+// v0.10.83 曾按此实现后在真机崩溃+丢照片（stop 时旧线程仍在跑合成，Kotlin
+// 侧已置空 handler → 新线程复用同一 g_renderer_still → 并发/释放后使用）。
+// 本版把生命周期钉死：**只有 start，没有 stop**（线程常驻、实例常驻），
+// 且全部调用都排在同一条 Handler 队列上串行 —— 不存在"杀掉正在跑 GL 的线程"
+// 的路径（Kotlin 侧见 StillRenderClient）。
+EglCore& stillEgl() {
+  static EglCore egl;
+  return egl;
+}
+// 拍照实例指针必须原子（v0.10.85 审查 R3）：它在拍照线程写（nativeStillStart），
+// 却在预览线程读（nativeEngineSetLut 下发 LUT）—— 非原子就是形式上的 data race。
+// 指针本身原子化即可：实例只创建、从不销毁，不存在"读到已释放实例"的窗口。
+std::atomic<FrameRenderer*> g_renderer_still{nullptr};
+EGLSurface g_still_surface = EGL_NO_SURFACE;
+
+// 单帧 YUV 解码矩阵（0=BT.601 / 1=BT.709）：改成进程级快照后，设置页在主线程
+// 调 nativeEngineSetYuvMatrix 不再直接碰 g_renderer（那与预览线程 delete
+// g_renderer 是 UAF，v0.10.85 审查 R4）；实际下发在 nativeEngineStart 里。
+std::atomic<int> g_yuv_matrix{0};
+
+// burst 序号（native 侧自增）：把 raw.render / render.burst_done 等日志按"第几张"
+// 串起来，连拍时"第三张按不动"才能归因（v0.10.85 审查 P2）。
+std::atomic<int> g_burst_seq{0};
+
+int64_t nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// 3D LUT 进程级快照：拍照侧实例是**后建**的，必须能补齐当前风格层 ——
+// 否则独立线程拍出的照片会静默丢掉 LUT（画质红线，v0.10.83 的隐藏回归）。
+std::mutex g_lut_mu;
+std::vector<float> g_lut_data;   // RGB 交错（.cube 顺序，红最快）
+int g_lut_size = 0;
+float g_lut_dmin[3] = {0.0f, 0.0f, 0.0f};
+float g_lut_dmax[3] = {1.0f, 1.0f, 1.0f};
+
+// 把当前 LUT 快照下发到指定实例（setLut 内部有锁 + dirty 标志，
+// 任意线程可调；纹理上传发生在该实例自己的渲染线程）。
+void applyLutSnapshot(FrameRenderer* r) {
+  if (!r) return;
+  std::lock_guard<std::mutex> lk(g_lut_mu);
+  if (g_lut_size <= 1 || g_lut_data.empty()) {
+    r->setLut(nullptr, 0, nullptr, nullptr);
+  } else {
+    r->setLut(g_lut_data.data(), g_lut_size, g_lut_dmin, g_lut_dmax);
+  }
+}
+
+// 成片 RGBA 交回 Java（v0.10.86 OOM 防护）。
+// NewByteArray/SetByteArrayRegion 在 Java 堆不足时会**留下一个待决的
+// OutOfMemoryError**。带着 pending exception 返回 Kotlin 后，紧接着的任何 JNI
+// 调用（或 ART 的 JNI 校验）都会直接 abort —— 真机 2026-10-01 11:22:59 实测：
+// SIGABRT in FilmStill，Java 崩溃捕获根本没机会写 crash-latest.txt，现场只能靠
+// tombstone。这里清掉异常并返回 nullptr：照片这一张失败，但进程活着、日志有记录。
+jbyteArray rgbaToJavaArray(JNIEnv* env, const std::vector<uint8_t>& rgba) {
+  const jsize n = static_cast<jsize>(rgba.size());
+  jbyteArray out = env->NewByteArray(n);
+  if (out != nullptr && !env->ExceptionCheck()) {
+    env->SetByteArrayRegion(out, 0, n,
+                            reinterpret_cast<const jbyte*>(rgba.data()));
+  }
+  if (out == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    Logger::instance().log(LogLevel::kError, "engine", "render.oom_drop",
+                           "{\"bytes\":" + std::to_string(rgba.size()) + "}");
+    return nullptr;
+  }
+  return out;
+}
 
 FilmParams paramsFromJava(JNIEnv* env, jdoubleArray film) {
   FilmParams p;
@@ -156,6 +239,11 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStart(JNIEnv* env, jobject,
                            "{}");
     return JNI_FALSE;
   }
+  // LUT 是进程级设置（v0.10.85）：实例重建后补齐当前风格层。Kotlin 侧
+  // 预览就绪时也会重传，这里是第二道保险。
+  applyLutSnapshot(g_renderer);
+  // YUV 解码矩阵同理（v0.10.85，审查 R4）：设置页只写快照，这里下发。
+  g_renderer->setYuvMatrix(g_yuv_matrix.load());
   Logger::instance().log(
       LogLevel::kInfo, "engine", "engine.start",
       "{\"w\":" + std::to_string(ANativeWindow_getWidth(g_window)) +
@@ -185,6 +273,74 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStop(JNIEnv*, jobject) {
     g_window = nullptr;
   }
   Logger::instance().log(LogLevel::kInfo, "engine", "engine.stop", "{}");
+}
+
+// 拍照渲染线程的引擎初始化（v0.10.85）：在**调用线程**上建独立 context，挂
+// 1×1 pbuffer（拍照链只渲染到自己的 FBO，不上屏，不需要 window surface），
+// 并建独立 FrameRenderer。必须由 still 渲染线程自己调用 —— EGL context 是
+// per-thread current 的。
+// 幂等：已就绪时只重新 makeCurrent（线程复用后 current 可能漂移），不重建实例
+// —— 重建会丢掉 LUT/程序，且与本函数"只 start 不 stop"的生命周期约定一致。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
+  if (!stillEgl().init()) return JNI_FALSE;
+  if (g_still_surface == EGL_NO_SURFACE) {
+    g_still_surface = stillEgl().createPbufferSurface(1, 1);
+  }
+  if (g_still_surface == EGL_NO_SURFACE) return JNI_FALSE;
+  if (!stillEgl().makeCurrent(g_still_surface)) return JNI_FALSE;
+  if (g_renderer_still.load() == nullptr) {
+    FrameRenderer* r = new FrameRenderer();
+    if (!r->init()) {
+      delete r;
+      Logger::instance().log(LogLevel::kError, "engine",
+                             "engine.still_init_failed", "{}");
+      return JNI_FALSE;  // 调用方（Kotlin）回退预览线程
+    }
+    g_renderer_still.store(r);
+    // 补齐风格层：后建实例默认没有 LUT，不补就是"照片少一层"的静默回归
+    applyLutSnapshot(g_renderer_still.load());
+    Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
+                           "{\"fresh\":true}");
+  } else {
+    Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
+                           "{\"fresh\":false}");
+  }
+  return JNI_TRUE;
+}
+
+// 空闲释放（v0.10.88）：合成链在全分辨率下会留下约 2GB 中间纹理（RCD 三段 +
+// DFT + 高光重建的 RGBA16F 全分辨率 target），实测拍完常驻 2418MB 不回落
+// （对照：单实例路径拍完回到 459MB）。这里在**空闲一段时间后**把拍照实例整体
+// 销毁、下次拍照再重建：
+//   - context / pbuffer **保留**（只销毁 FrameRenderer，省掉 EGL 重建）
+//   - 所有 GL 调用都排在同一条 Handler 队列上串行，销毁必然排在在飞合成之后
+//     —— 不存在 v0.10.83 那个"新线程复用旧实例"的竞态
+//   - 重建 ~60ms（实测 initMs 50~117ms，Mali shader 缓存命中），首张可接受
+// 与 nativeStillStart 的幂等约定配套：置空后下一次 start 会重新 new + init，
+// 并由 start 里的 applyLutSnapshot 补齐风格层。
+//
+// v0.10.89 修正：**context 也一起销毁**。真机实测（0.10.88 日志）发现只销毁
+// FrameRenderer 时，重建后的首次合成会在 `ensureRawTex` 的 glTexImage2D
+// （4080×3072 R16UI，25MB）上失败（`raw.upload_failed`），进而回退预览线程、
+// 造成 3.4s 停更——同一个 context 内反复创建/销毁大批全分辨率纹理后，Mali 的
+// 分配状态不干净。整条销毁掉、下次 init 重建，则与"首次启动"完全同构
+//（实测首次 initMs 59ms，重建 67ms，代价相同）。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeStillDestroy(JNIEnv*, jobject) {
+  FrameRenderer* r = g_renderer_still.load();
+  if (r != nullptr) {
+    if (stillEgl().makeCurrent(g_still_surface)) r->release();
+    delete r;
+    g_renderer_still.store(nullptr);
+  }
+  if (g_still_surface != EGL_NO_SURFACE) {
+    stillEgl().destroySurface(g_still_surface);
+    g_still_surface = EGL_NO_SURFACE;
+  }
+  stillEgl().makeCurrent(EGL_NO_SURFACE);
+  stillEgl().release();  // 连 context 一起销毁（display 常驻，下次 init 重建）
+  Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_destroy", "{}");
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -267,22 +423,36 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
 }
 
 // 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
+// v0.10.85（审查 R4）：设置页在**主线程**调本函数，而 g_renderer 由预览线程
+// 创建/delete —— 直接写 g_renderer->yuv_matrix_（无锁内联）是既存的 UAF 崩溃点。
+// 现在只写进程级快照，实际下发在 nativeEngineStart（预览线程）。代价：切换开关
+// 需下次进入相机生效（设置页文案已注明）。
+// 注：YUV 单帧静拍路径仍在预览渲染线程上（未迁移到拍照侧实例），所以只作用于
+// g_renderer；将来迁移这条路径时要一并同步到 g_renderer_still。
 extern "C" JNIEXPORT void JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSetYuvMatrix(JNIEnv* env, jobject,
                                                            jint m) {
-  if (g_renderer) g_renderer->setYuvMatrix(m);
+  (void)env;
+  g_yuv_matrix.store(m);
 }
 
 // M4：3D LUT（display 域）。data = RGB 交错（.cube 顺序，红最快），长度 size³×3；
 // size ≤ 1 或 data 为空 = 关闭。任意线程可调（引擎内部暂存，渲染线程上传纹理）。
+// v0.10.85：同时写入进程级快照并下发到预览 / 拍照两个实例 —— 拍照侧实例可能
+// 还没建（懒创建），快照保证它建起来时立刻补齐风格层。
 extern "C" JNIEXPORT void JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSetLut(JNIEnv* env, jobject, jint size,
                                                      jfloatArray data,
                                                      jfloatArray domain_min,
                                                      jfloatArray domain_max) {
-  if (!g_renderer) return;
   if (data == nullptr || size <= 1) {
-    g_renderer->setLut(nullptr, 0, nullptr, nullptr);
+    {
+      std::lock_guard<std::mutex> lk(g_lut_mu);
+      g_lut_data.clear();
+      g_lut_size = 0;
+    }
+    applyLutSnapshot(g_renderer);
+    applyLutSnapshot(g_renderer_still.load());
     return;
   }
   const jsize want = static_cast<jsize>(size) * size * size * 3;
@@ -300,7 +470,17 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetLut(JNIEnv* env, jobject, jint 
   if (domain_max != nullptr && env->GetArrayLength(domain_max) >= 3) {
     env->GetFloatArrayRegion(domain_max, 0, 3, dmax);
   }
-  g_renderer->setLut(buf.data(), size, dmin, dmax);
+  {
+    std::lock_guard<std::mutex> lk(g_lut_mu);
+    g_lut_data = buf;
+    g_lut_size = size;
+    for (int i = 0; i < 3; ++i) {
+      g_lut_dmin[i] = dmin[i];
+      g_lut_dmax[i] = dmax[i];
+    }
+  }
+  applyLutSnapshot(g_renderer);
+  applyLutSnapshot(g_renderer_still.load());
 }
 
 // 静拍：全分辨率 YUV → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）
@@ -317,10 +497,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
       v_buf ? env->GetDirectBufferAddress(v_buf) : nullptr, w, h, y_stride,
       uv_stride, uv_pix, rotation, p, &rgba);
   if (!ok) return nullptr;
-  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
-  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
-                          reinterpret_cast<const jbyte*>(rgba.data()));
-  return out;
+  return rgbaToJavaArray(env, rgba);
 }
 
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
@@ -375,10 +552,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
       lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, &rgba);
   if (!ok) return nullptr;
-  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
-  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
-                          reinterpret_cast<const jbyte*>(rgba.data()));
-  return out;
+  return rgbaToJavaArray(env, rgba);
 }
 
 // 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域对齐 + 加权
@@ -394,8 +568,24 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
-    jboolean align_ab, jboolean p0_sub, jdoubleArray film) {
-  if (!g_renderer || !frames || count <= 0) return nullptr;
+    jboolean align_ab, jboolean p0_sub, jdoubleArray film,
+    jboolean use_still) {
+  // v0.10.85：use_still = 走拍照侧实例（独立线程 + 独立 context），预览线程不再
+  // 被这条 1.6~3.4s 的链阻塞。context 是 per-thread current，调用线程已在
+  // nativeStillStart 里 makeCurrent；这里再确认一次（幂等）。
+  FrameRenderer* r = g_renderer;
+  if (use_still == JNI_TRUE) {
+    if (g_renderer_still.load() == nullptr) {
+      // Kotlin 侧 ensureStarted 成功才会走这条路，走到这里说明生命周期出错：
+      // 明确报错而不是偷偷退回预览实例（那个 context 不在本线程上 current）
+      Logger::instance().log(LogLevel::kError, "engine", "engine.still_missing",
+                             "{}");
+      return nullptr;
+    }
+    if (!stillEgl().makeCurrent(g_still_surface)) return nullptr;
+    r = g_renderer_still.load();
+  }
+  if (!r || !frames || count <= 0) return nullptr;
   std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
   for (int i = 0; i < count; ++i) {
     jobject buf = env->GetObjectArrayElement(frames, i);
@@ -437,18 +627,25 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
   }
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
-  const bool ok = g_renderer->submitRawBurst(
+  const int64_t t0 = nowMs();
+  const bool ok = r->submitRawBurst(
       bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
       neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,
       lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale,
       use_dft == JNI_TRUE, align_l1 == JNI_TRUE, align_ab == JNI_TRUE,
       p0_sub == JNI_TRUE, &rgba);
+  // 每次 burst 落一条路径/耗时/结果记录（v0.10.85 审查 P2）：raw.render 不区分实例，
+  // 靠这条把"哪条路、第几张、多久、成没成"钉住；失败也必须留痕。
+  Logger::instance().log(
+      LogLevel::kInfo, "camera", "render.burst_done",
+      "{\"seq\":" + std::to_string(g_burst_seq.fetch_add(1) + 1) +
+          ",\"path\":\"" + (use_still == JNI_TRUE ? "still" : "preview") +
+          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          ",\"ok\":" + (ok ? "true" : "false") +
+          ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
-  jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
-  env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()),
-                          reinterpret_cast<const jbyte*>(rgba.data()));
-  return out;
+  return rgbaToJavaArray(env, rgba);
 }
 
 // 预览实时直方图（M3）：out 长度 ≥2（建议 256），填充显示域亮度分布；

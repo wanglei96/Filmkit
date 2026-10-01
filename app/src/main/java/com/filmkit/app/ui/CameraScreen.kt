@@ -188,7 +188,10 @@ fun CameraScreen(
     }
 
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
-    val controller = remember { CameraController(context, RenderClient()) }
+    // applicationContext（v0.10.85）：CameraController 持有后台保存队列（单线程
+    // executor，故意不 shutdown —— 相机页退出后在飞的照片仍要落盘），用 Activity
+    // context 会让每次 Activity 重建泄漏一个 Activity。
+    val controller = remember { CameraController(context.applicationContext, RenderClient()) }
     var surface by remember { mutableStateOf<Surface?>(null) }
     var resumed by remember { mutableStateOf(true) }
     var lensChips by remember { mutableStateOf(emptyList<Int>()) } // 启用镜头等效焦段（变焦刻度）

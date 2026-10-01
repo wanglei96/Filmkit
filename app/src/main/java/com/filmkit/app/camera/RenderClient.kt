@@ -26,6 +26,21 @@ class RenderClient {
     private val pending = AtomicBoolean(false)
     private val stMat = FloatArray(16)
 
+    // 预览停更量化（v0.10.85）：渲染线程被长链阻塞时，相邻两次渲染的间隔会拉大
+    // ——"拍完挪手机画面冻住 1~2 秒"的验收口径 = 这条日志的最大 gapMs
+    //（改前 ≈1600~3400ms，独立线程后应不再出现；采集期 150~250ms 的正常停顿
+    //  被 400ms 阈值挡在外面）。
+    private var lastPresentMs = 0L
+
+    // 预览帧率曲线（v0.10.87）：preview_gap 只抓 >400ms 的"停更"，抓不到"降帧"
+    // ——拍照时 still 线程跑 DFT/RCD 与预览争同一颗 GPU，30fps 掉到十几 fps 时
+    // 没有任何一条日志会响。这里按秒统计**实际渲染帧数**（pending 闸门丢掉的帧
+    // 不算），每 5 秒输出一条 render.fps，分析时与 mfnr.stage / render.burst_done
+    // 的时间轴对齐，就能把"轻微卡顿"变成可比的数字（拍照 vs 空闲）。
+    private var fpsSecStart = 0L
+    private var fpsInSec = 0
+    private val fpsWindow = ArrayList<Int>(5)
+
     @Volatile
     private var acceptingFrames = false
 
@@ -144,6 +159,36 @@ class RenderClient {
                     com.filmkit.app.kv("error" to (t.message ?: t.toString())),
                 )
             }
+            // 渲染完成时刻：与上一次的间隔 > 400ms 说明预览停更过一次。
+            // 阈值取 400 而非 250：拍照采集期本身有 DNG 落盘 + 4 帧拷贝
+            //（≈150~250ms，走独立线程时也照旧发生在预览线程上），别把它误报成"冻住"。
+            // 上限 10s：切后台/切镜头造成的会话级空档不算（那是重建预览，不是被链阻塞）。
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (lastPresentMs > 0) {
+                val gap = (now - lastPresentMs).toInt()
+                if (gap in 401..10_000) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_WARN, "engine", "render.preview_gap",
+                        com.filmkit.app.kv("gapMs" to gap),
+                    )
+                }
+            }
+            lastPresentMs = now
+            // 帧率统计（见字段处说明）：按秒计数，攒够 5 秒发一条
+            if (fpsSecStart == 0L) fpsSecStart = now
+            fpsInSec++
+            if (now - fpsSecStart >= 1000L) {
+                fpsWindow.add(fpsInSec)
+                fpsInSec = 0
+                fpsSecStart = now
+                if (fpsWindow.size >= 5) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "engine", "render.fps",
+                        com.filmkit.app.kv("fps" to fpsWindow.joinToString(",")),
+                    )
+                    fpsWindow.clear()
+                }
+            }
             pending.set(false)
         }
         // post 失败（线程正在退出）：必须回滚 pending，否则永久卡 true，
@@ -188,7 +233,22 @@ class RenderClient {
                 )
             }
             img.close()
+            if (bytes == null) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.still_failed", "{}",
+                )
+            }
             onDone(bytes, rotatedW, rotatedH)
+        }.let { posted ->
+            // post 失败（线程正在退出）：必须回调 + close，否则调用方永久等待、
+            // Image 泄漏（v0.10.85 审查 R1）
+            if (!posted) {
+                img.close()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "engine", "render.still_dropped", "{}",
+                )
+                onDone(null, 0, 0)
+            }
         }
     }
 
@@ -246,7 +306,20 @@ class RenderClient {
                 )
             }
             img.close()
+            if (bytes == null) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.raw_failed", "{}",
+                )
+            }
             onDone(bytes, rotatedW, rotatedH)
+        }.let { posted ->
+            if (!posted) {
+                img.close()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "engine", "render.raw_dropped", "{}",
+                )
+                onDone(null, 0, 0)
+            }
         }
     }
 
@@ -275,7 +348,8 @@ class RenderClient {
             onDone(null, 0, 0)
             return
         }
-        h.post {
+        val tPost = android.os.SystemClock.elapsedRealtime()
+        val posted = h.post {
             // 与 submitRaw 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
             val effectiveRot = (rotation + 1) % 4
             val rotatedW = if (effectiveRot % 2 == 1) height else width
@@ -297,7 +371,24 @@ class RenderClient {
                     com.filmkit.app.kv("error" to (t.message ?: t.toString())),
                 )
             }
+            if (bytes == null) {
+                // 失败必须留痕：上一版"只留 DNG、没有成像"最难查的洞就是这里静默
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.raw_burst_failed",
+                    com.filmkit.app.kv(
+                        "queuedMs" to (android.os.SystemClock.elapsedRealtime() - tPost),
+                    ),
+                )
+            }
             onDone(bytes, rotatedW, rotatedH)
+        }
+        // post 失败（相机页退出后 looper 已退出）：必须回调，否则调用方永久等待、
+        // 在飞计数泄漏（v0.10.85 审查 R1 —— A/B 第二遍正是从拍照线程 post 过来的）
+        if (!posted) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "engine", "render.burst_dropped", "{}",
+            )
+            onDone(null, 0, 0)
         }
     }
 
