@@ -26,11 +26,15 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.lazy.LazyRow
@@ -68,6 +72,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +103,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -2229,21 +2235,91 @@ private fun LutSheet(
 }
 
 /**
+ * 相对拖动滑杆（v0.10.98）：替换 M3 Slider —— 后者**按下即 snap 到手指位置**，
+ * 用户在拇指附近"按住继续微调"时，指腹落点偏向目标方向几 dp，值直接跳 +3~5%
+ *（真机日志实锤：state 收到 1.051，即用户报的"99 下一个值直接跳 103"）。
+ * 相对模式 = 按下不改值、拖动按增量累加（专业相机 App 的标准交互），从机制上
+ * 根除按下跳变；跨手势仍按最新值定位（rememberUpdatedState 回流）。
+ * 视觉与原 M3 Slider 一致：ChipBorder 轨道 + Accent 已作用段 + Cream thumb。
+ */
+@Composable
+private fun RelativeSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onDragEnd: () -> Unit,
+    modifier: Modifier = Modifier,
+    range: ClosedFloatingPointRange<Float> = 0f..1.5f,
+) {
+    val span = range.endInclusive - range.start
+    val fraction = ((value - range.start) / span).coerceIn(0f, 1f)
+    var widthPx by remember { mutableStateOf(1f) }
+    val currentValue by rememberUpdatedState(value)
+    val onChange by rememberUpdatedState(onValueChange)
+    val onEnd by rememberUpdatedState(onDragEnd)
+    val density = LocalDensity.current
+    val thumbPx = with(density) { 20.dp.toPx() }
+    Box(
+        modifier
+            .height(32.dp)
+            .onSizeChanged { widthPx = it.width.toFloat() }
+            .pointerInput(range) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    down.consume()  // 按下不改值 —— 相对模式的核心
+                    var v = currentValue  // 手势内局部累加（不依赖重组回流）
+                    drag(down.id) { change ->
+                        change.consume()
+                        v = (v + change.positionChange().x / widthPx * span)
+                            .coerceIn(range.start, range.endInclusive)
+                        onChange(v)
+                    }
+                    onEnd()
+                }
+            },
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        // 轨道：全宽 inactive + 到 thumb 为止的 active 段
+        Canvas(
+            Modifier
+                .fillMaxWidth()
+                .height(4.dp),
+        ) {
+            val r = CornerRadius(size.height / 2f)
+            drawRoundRect(color = FilmTheme.ChipBorder, cornerRadius = r)
+            val activeW = size.width * fraction
+            if (activeW > 0.5f) {
+                drawRoundRect(
+                    color = FilmTheme.Accent,
+                    size = Size(activeW, size.height),
+                    cornerRadius = r,
+                )
+            }
+        }
+        // thumb：随 fraction 平移（offset lambda 用 px，留 inset 防出界）
+        Box(
+            Modifier
+                .offset { IntOffset(((widthPx - thumbPx) * fraction).roundToInt(), 0) }
+                .size(20.dp)
+                .background(FilmTheme.Cream, CircleShape),
+        )
+    }
+}
+
+/**
  * LUT 强度行（v0.10.96 抽出）：拖动 state 留在本 Composable 内部，拖动每帧只重组
  * 这一行。[initial] 只在面板打开时读一次 prefs。
  *
- * v0.10.97 两处升级（"滑杆读数断档 99→103"第二轮）：
- *  - 拖动中不再写 SharedPrefs（onCommit 走 controller.setLutStrength 直通引擎），
- *    prefs 只在 onValueChangeFinished 写一次 —— 60 次/秒的 apply 在 QueuedWork 上
- *    的锁竞争是主线程抖动的已知来源，也是手势事件合并（读数断档）的头号嫌疑；
- *  - 拖动回调带节流诊断日志（>100ms 才记一条，gap = 距上次回调的间隔）：真机拖一次
- *    就能从日志分辨"采样断档"（gap 大）与"值跳变"（gap 正常但 v 差 0.04），
- *    验收后删除。
+ * v0.10.97：拖动中不写 SharedPrefs（onCommit 走 controller.setLutStrength 直通
+ * 引擎），prefs 只在拖动结束写一次；拖动回调带节流诊断日志。
+ * v0.10.98：滑杆换 RelativeSlider —— 日志实锤 state 收到 1.051（用户停在 99 附近
+ * 重新按住拇指微调时被 M3 的按下 snap 跳走），相对拖动从机制上根除该跳变。
+ * 诊断日志加值差条件：|Δv|>0.02 记录（不再只看间隔），验收后移除。
  */
 @Composable
 private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
     var v by remember { mutableFloatStateOf(initial) }
-    var lastDragMs by remember { mutableStateOf(0L) }
+    var lastLogMs by remember { mutableStateOf(0L) }
+    var lastLogV by remember { mutableStateOf(Float.NaN) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 6.dp),
@@ -2254,32 +2330,28 @@ private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (
             fontSize = 11.sp,
             fontFamily = FilmTheme.Mono,
         )
-        androidx.compose.material3.Slider(
+        RelativeSlider(
             value = v,
             onValueChange = { nv ->
                 val now = android.os.SystemClock.elapsedRealtime()
-                val gap = now - lastDragMs
-                // 诊断（临时）：采样间隔与值序列 —— 验收"读数断档"后移除
-                if (gap > 100) {
+                val gap = now - lastLogMs
+                val dV = if (lastLogV.isNaN()) 0f else nv - lastLogV
+                // 诊断（临时）：采样断档（gap>100ms）或值跳变（|Δv|>0.02）都留痕
+                if (gap > 100 || kotlin.math.abs(dV) > 0.02f) {
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "lut.strength_drag",
-                        kv("v" to "%.3f".format(nv), "gapMs" to gap),
+                        kv("v" to "%.3f".format(nv), "gapMs" to gap, "dv" to "%.3f".format(dV)),
                     )
                 }
-                lastDragMs = now
+                lastLogMs = now
+                lastLogV = nv
                 v = nv
                 onCommit(nv)
             },
-            onValueChangeFinished = { onFinished(v) },
-            valueRange = 0f..1.5f,
+            onDragEnd = { onFinished(v) },
             modifier = Modifier
                 .weight(1f)
                 .padding(horizontal = 8.dp),
-            colors = androidx.compose.material3.SliderDefaults.colors(
-                thumbColor = FilmTheme.Cream,
-                activeTrackColor = FilmTheme.Accent,
-                inactiveTrackColor = FilmTheme.ChipBorder,
-            ),
         )
         Text(
             "${(v * 100).roundToInt()}%",
