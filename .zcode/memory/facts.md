@@ -35,8 +35,8 @@ status: active
 
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag（2026-09-30 又违反过一次：一轮打了 6 个，已清理）
-- [2026-09-30] **当前版本：234（`0.10.84-m4`）**，tag `v0.10.79-m4` 为本轮收尾；根目录 `filmkit-0.10.84-m4.apk`
-- [2026-09-30] **版本沿革速查**：183（0.10.31 高光线）→ 184–188（0.10.32–36 C 专项，tag `v0.10.36-m4`）→ 189–221（0.10.37–0.10.69 A/D 专项）→ 222–234（0.10.70–0.10.84 对齐精度/亚像素/性能，见 handoffs/对齐精度亚像素落地与快门异步化）
+- [2026-10-01] **当前版本：242（`0.10.92-m4`）**，本轮未打 tag（性能调试链，未验收）；根目录 `filmkit-0.10.85~0.10.92-m4.apk`
+- [2026-10-01] **版本沿革速查**：183（0.10.31 高光线）→ 184–188（0.10.32–36 C 专项）→ 189–221（0.10.37–0.10.69 A/D 专项）→ 222–234（0.10.70–0.10.84 对齐精度/亚像素/性能）→ **235–242（0.10.85–0.10.92 拍照独立线程 / 连拍 OOM 修复 / 空闲释放 / 让路实验与回退）**
 - [2026-09-29] **Camera2 SENSOR_NOISE_PROFILE 真机形态**：Array<Pair<Double,Double>> = 4 个 (S,O) **标量对**；SDK 签名 `Pair<Double, Double[]>` 与真机不符；`as? DoubleArray` 对装箱数组永败
 - [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
 
@@ -52,6 +52,8 @@ status: active
 - [2026-09-30] **降噪现状**：P0/P4/mismatch 全走 **σ²=A·x+B** 逐像素；强度滑杆 0–2（1.0=真实 σ）；D-1 色度 à trous 5 级（k=2.5/revert=0.20）**已超 PC**；模型优先级：用户导入 > 内置实测 > Camera2 > ISO 估算
 - [2026-09-30] **DFT 合并（A 专项）**：`kFsMfnrFft` compute，按 CFA 平面独立、16×16 平面 tile 半重叠（步长 8 + 修改升余弦窗，窗和恒 1）；**窗函数查表 `sWin`**（0.10.77）；输出 4 张 RGBA16F image2D writeonly，**必须 glTexStorage2D**；compute program **现场创建用完删除**；`mfnr.fft.store_check` 自检 + 失败回落 mismatch；**dftGpu 冷机 500~550ms / 热机 830~870ms**
 
+- [2026-10-01] **拍照侧引擎（v0.10.85）**：`g_renderer_still`（`std::atomic` 指针）+ 独立 `EglCore`/1×1 pbuffer/`FrameRenderer`；`nativeStillStart` 幂等、`nativeStillDestroy` **连 context 一起销毁**（空闲 10s 由 Kotlin 侧触发）；LUT / YUV 矩阵为**进程级快照**、start 时下发；JNI 成片回传统一走 `rgbaToJavaArray`（OOM → 清异常返回 nullptr）；`AndroidManifest` 开 `largeHeap`
+
 ## PhotonCamera 参照事实（/tmp/photoncamera，hinnka 版）
 
 - [2026-09-28] **PC 降噪实现**：Spatial merge 空间域 RBF（`GlesMgcRawSpatialShaders.kt:1654`）+ Sabre 结构张量各向异性核（`GlesMgcRawSabreShaders.kt:139`）+ **FullResolutionDenoise 五级金字塔**（`raw/MgcFullResolutionDenoise.kt`）；噪声模型 = 128-bin 半 bin 居中功率谱；去马赛克噪声传播标定 `DemosaicNoisePropagationCalibrator.kt`
@@ -61,6 +63,8 @@ status: active
 - [2026-09-24] 我们的 DNG 未写 BaselineExposure（vivo DngCreator 不写该 tag）；DNG 无 ForwardMatrix1/2（Characteristics 给全）；`.hcurve`（哈苏，不可复制）= 68B 头 + 65536×uint16 LE
 
 ## 工具与脚本
+
+- [2026-10-01] **本轮新增**：`tools/still-thread-verify.py`（拍照线程验收：按 `settings.still_thread` 切换点分组，输出预览停更中位/最大、每路 burst 中位耗时、CRC 等价性、落盘计数、`render.fps` 帧率曲线）、`tools/still-thread-run.sh`（adb 一键 `install` / `pull`+分析 / `mem`）
 
 - [2026-09-30] **本轮新增**：`tools/align-bench.cpp` + `tools/align-bench-gen.py`（对齐精度离线基准：真 DNG 金字塔 + FFT 相移真值 + 链接真实 Align.cpp）、`tools/p0-subpixel-eval.py`（P0 采样离线评估，与合成真值比误差）、`tools/check-log-json.py`（日志 JSON 合法性守卫，**分析前先跑**）
 - [2026-09-30] `tools/` 既有：validate-shaders.sh、check-diag-fields.py（**出包前必跑**）、check-fft-tile-cover.py、chroma-scale-eval.py（σC 1–32px）、texture-fidelity-eval.py（2/4/8/16px 带通 + 局部对比度）、denoise-strength-eval.py（σY 分层）、ab-100pct.py（同刻 100% 裁剪配准对比）、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py
@@ -74,3 +78,11 @@ status: active
 - [2026-09-30] **PC 对标（同场景同曝光 ISO 1386 vs 1402）**：暗部 σY 1.323 vs 0.586（**差 2.26×**，旧数据 4.7×）、中间调 1.050 vs 0.610；暗部 σC 0.338 vs 0.787（**好 2.3×**）、中间调 0.322 vs 0.935（好 2.9×）；边缘 P99.5 12.11 vs 10.90；纹理保真比 0.92
 - [2026-09-30] **LSC 实测参数（X300 主摄）**：网格 17×13，center=1.000，corner=3.874（BR 3.701）；阻尼后角落 3.179；硬 knee 的斜率突变在**列 1 = 原图 x≈181 = W/17**（交付 JPEG x=105）
 - [2026-09-30] **量化/dither**：成片最平坦块 44.7% 相邻像素相同、|Δ| 中位恰 1.000；TPDF ±1LSB → 35.6%；JPEG q95 吃掉一半 dither 效果（26.9%→31.2%），加大幅度在 q95 下饱和无效；4:2:0 只损失 6–8% 色度细节
+
+## 拍照线程实测数据（2026-10-01）
+
+- [2026-10-01] **连拍崩溃现场**：`Fatal signal 6 (SIGABRT) in tid 28125 (FilmStill)`；OOM 报 `Failed to allocate 50135052 … target footprint 248965720 / growth limit 268435456`（237MB/256MB）；修复后连拍 `burst[still]` 7 张全成功、`queued/saved` 4/4 零丢失
+- [2026-10-01] **Graphics 内存**（`dumpsys meminfo`，逐 2s 采样）：预览基线 392MB；**开独立线程峰值 3011MB、拍完残留 2418MB**；**关独立线程峰值 2556MB、拍完回落 459MB** → 独立线程的代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放后回到 ~400MB）
+- [2026-10-01] **帧率**（`render.fps` = 逐秒实际渲染帧数）：空闲 30~32fps；拍照期间最低 **13~25fps**；`preview_gap` 只在采集期记到过 467ms（阈值 400ms）
+- [2026-10-01] **合成耗时**（热机单张）：`totalMs` 2091~3336ms（`dftGpu` 855~922、`passMs` 711~2021、`alignCpuMs` 185~737）；冷机首次可达 5133ms
+- [2026-10-01] **同帧 A/B 画质等价**：两条路径 CRC32 `3615113902` 完全相同、均值 109.455、`p0w` 19.093、`nzPreMed/nzPostMed` 逐项一致
