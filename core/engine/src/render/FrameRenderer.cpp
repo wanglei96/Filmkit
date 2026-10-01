@@ -6253,7 +6253,12 @@ void FrameRenderer::applyPendingLut() {
 void FrameRenderer::bindLut(GLint loc_tex, GLint loc_on, GLint loc_strength,
                             GLint loc_dmin, GLint loc_dinv, GLint loc_size,
                             float strength) {
-  const float k = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+  // v0.10.95 修复"强度滑杆 100% 以上无效"：上限放开到 1.5（下限 0 保留）。
+  // >1 的语义 = 沿 LUT 色差线性外推（mix(c, lut(c), k) 对 k>1 本来就是外推，
+  // 旧版 clamp 到 1.0 使 100%~150% 整段无变化——UI 允许拉到 150%，滑杆"拉了
+  // 没反应"即此）。溢出由输出 RGBA8 显示域自然截断；与 PhotonCamera 的
+  // >100% 强度语义一致（CameraController.applyLutStrengthPref 同一约定）。
+  const float k = strength < 0.0f ? 0.0f : (strength > 1.5f ? 1.5f : strength);
   const bool on = lut_size_ > 1 && k > 0.0f;
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_3D, lut_tex_);

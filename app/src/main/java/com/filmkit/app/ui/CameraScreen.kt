@@ -344,7 +344,7 @@ fun CameraScreen(
                     lutPending = e    // 导入即选中（走既有加载链）
                 }.onFailure { t ->
                     android.widget.Toast.makeText(
-                        context, "导入失败：${t.message}", android.widget.Toast.LENGTH_SHORT,
+                        context, "导入失败：${t.message?.filter { it.code >= 32 }?.take(60)}", android.widget.Toast.LENGTH_SHORT,
                     ).show()
                 }
             }
@@ -376,7 +376,7 @@ fun CameraScreen(
                     )
                 }.onFailure { t ->
                     android.widget.Toast.makeText(
-                        context, "导出失败：${t.message}", android.widget.Toast.LENGTH_SHORT,
+                        context, "导出失败：${t.message?.filter { it.code >= 32 }?.take(60)}", android.widget.Toast.LENGTH_SHORT,
                     ).show()
                 }
             }

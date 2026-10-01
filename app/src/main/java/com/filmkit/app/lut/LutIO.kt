@@ -53,6 +53,13 @@ object LutIO {
                 bmp.recycle()
             }
         }
+        // UTF-16 BOM（FF FE / FE FF）与 UTF-8 BOM：前者按 UTF-8 强转会解析出乱码行
+        //（Toast 显示乱码的来源之一），显式拒绝并给出可操作的提示
+        if (bytes.size >= 2 && ((bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) ||
+                (bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()))
+        ) {
+            throw IllegalArgumentException("文件编码是 UTF-16，请另存为 UTF-8 后重试")
+        }
         // 白名单：文本入口只认 .cube 结构（TITLE/LUT_*/DOMAIN/数据行），解析失败即拒绝
         val text = bytes.toString(Charsets.UTF_8)
         val lut = CubeLutParser.parse(text, fallbackTitle)

@@ -64,7 +64,7 @@ object CubeLutParser {
                 }
                 line.startsWith("LUT_1D_SIZE") -> {
                     size = line.removePrefix("LUT_1D_SIZE").trim().toIntOrNull()
-                        ?: throw IllegalArgumentException("LUT_1D_SIZE 非法（第 $lineNo 行）：$line")
+                        ?: throw IllegalArgumentException("LUT_1D_SIZE 非法（第 $lineNo 行）—— 文件可能不是 UTF-8/ASCII 文本")
                     require(size in 2..MAX_SIZE) { "LUT_1D_SIZE 超出范围（第 $lineNo 行）：$size" }
                     is1d = true
                     table = FloatArray(size * 3)
@@ -81,7 +81,7 @@ object CubeLutParser {
                 }
                 line.startsWith("LUT_3D_SIZE") -> {
                     size = line.removePrefix("LUT_3D_SIZE").trim().toIntOrNull()
-                        ?: throw IllegalArgumentException("LUT_3D_SIZE 非法（第 $lineNo 行）：$line")
+                        ?: throw IllegalArgumentException("LUT_3D_SIZE 非法（第 $lineNo 行）—— 文件可能不是 UTF-8/ASCII 文本")
                     require(size in 2..MAX_SIZE) { "LUT_3D_SIZE 超出范围（第 $lineNo 行）：$size" }
                     is1d = false
                     acc = FloatArray(size * size * size * 3)
@@ -215,6 +215,9 @@ object CubeLutParser {
      * 正则拆分在加载时是纯浪费（解析只做一次，但要占用首帧时间）。
      *
      * 注意 [body] 必须是**已去掉关键字前缀**的数值段（数据行本身就是纯数值）。
+     *
+     * 消息不带行原文（v0.10.95）：二进制/GBK 文件被强转 UTF-8 后行内容是乱码，
+     * 带原文会让 Toast 直显乱码——定位靠行号已足够。
      */
     private fun parseN(body: String, out: FloatArray, count: Int, lineNo: Int) {
         var i = 0
@@ -224,10 +227,12 @@ object CubeLutParser {
             val st = i
             while (i < body.length && !body[i].isWhitespace()) i++
             if (st == i) {
-                throw IllegalArgumentException("需要 $count 个数值，只找到 $k 个（第 $lineNo 行）：$body")
+                throw IllegalArgumentException(
+                    "需要 $count 个数值，只找到 $k 个（第 $lineNo 行）—— 该行不是数字列",
+                )
             }
             out[k] = body.substring(st, i).toFloatOrNull()
-                ?: throw IllegalArgumentException("数值非法（第 $lineNo 行）：$body")
+                ?: throw IllegalArgumentException("数值非法（第 $lineNo 行）—— 该行不是数字列")
             k++
         }
     }
