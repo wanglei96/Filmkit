@@ -2323,13 +2323,11 @@ private fun RelativeSlider(
  * 引擎），prefs 只在拖动结束写一次；拖动回调带节流诊断日志。
  * v0.10.98：滑杆换 RelativeSlider —— 日志实锤 state 收到 1.051（用户停在 99 附近
  * 重新按住拇指微调时被 M3 的按下 snap 跳走），相对拖动从机制上根除该跳变。
- * 诊断日志加值差条件：|Δv|>0.02 记录（不再只看间隔），验收后移除。
+ * （v0.10.99b 验收通过后移除拖动诊断日志。）
  */
 @Composable
 private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
     var v by remember { mutableFloatStateOf(initial) }
-    var lastLogMs by remember { mutableStateOf(0L) }
-    var lastLogV by remember { mutableStateOf(Float.NaN) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 6.dp),
@@ -2343,18 +2341,6 @@ private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (
         RelativeSlider(
             value = v,
             onValueChange = { nv ->
-                val now = android.os.SystemClock.elapsedRealtime()
-                val gap = now - lastLogMs
-                val dV = if (lastLogV.isNaN()) 0f else nv - lastLogV
-                // 诊断（临时）：采样断档（gap>100ms）或值跳变（|Δv|>0.02）都留痕
-                if (gap > 100 || kotlin.math.abs(dV) > 0.02f) {
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "lut.strength_drag",
-                        kv("v" to "%.3f".format(nv), "gapMs" to gap, "dv" to "%.3f".format(dV)),
-                    )
-                }
-                lastLogMs = now
-                lastLogV = nv
                 v = nv
                 onCommit(nv)
             },
