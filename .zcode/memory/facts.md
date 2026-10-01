@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-09-30 21:50
+updated: 2026-10-01 22:05
 status: active
 ---
 
@@ -35,8 +35,8 @@ status: active
 
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag（2026-09-30 又违反过一次：一轮打了 6 个，已清理）
-- [2026-10-01] **当前版本：242（`0.10.92-m4`）**，本轮未打 tag（性能调试链，未验收）；根目录 `filmkit-0.10.85~0.10.92-m4.apk`
-- [2026-10-01] **版本沿革速查**：183（0.10.31 高光线）→ 184–188（0.10.32–36 C 专项）→ 189–221（0.10.37–0.10.69 A/D 专项）→ 222–234（0.10.70–0.10.84 对齐精度/亚像素/性能）→ **235–242（0.10.85–0.10.92 拍照独立线程 / 连拍 OOM 修复 / 空闲释放 / 让路实验与回退）**
+- [2026-10-01] **当前版本：250（`0.10.99-m4`）**，验收 tag **v0.10.99-m4** 已 push；根目录 `filmkit-0.10.99-m4.apk`
+- [2026-10-01] **版本沿革速查**：183（0.10.31 高光线）→ 184–188（0.10.32–36 C 专项）→ 189–221（0.10.37–0.10.69 A/D 专项）→ 222–234（0.10.70–0.10.84 对齐精度/亚像素/性能）→ 235–242（0.10.85–0.10.92 拍照独立线程/连拍 OOM/空闲释放）→ **243–250（0.10.93–0.10.99 预览降载/单帧迁移/M4 LUT 导入导出/相对滑杆）**
 - [2026-09-29] **Camera2 SENSOR_NOISE_PROFILE 真机形态**：Array<Pair<Double,Double>> = 4 个 (S,O) **标量对**；SDK 签名 `Pair<Double, Double[]>` 与真机不符；`as? DoubleArray` 对装箱数组永败
 - [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
 
@@ -86,3 +86,9 @@ status: active
 - [2026-10-01] **帧率**（`render.fps` = 逐秒实际渲染帧数）：空闲 30~32fps；拍照期间最低 **13~25fps**；`preview_gap` 只在采集期记到过 467ms（阈值 400ms）
 - [2026-10-01] **合成耗时**（热机单张）：`totalMs` 2091~3336ms（`dftGpu` 855~922、`passMs` 711~2021、`alignCpuMs` 185~737）；冷机首次可达 5133ms
 - [2026-10-01] **同帧 A/B 画质等价**：两条路径 CRC32 `3615113902` 完全相同、均值 109.455、`p0w` 19.093、`nzPreMed/nzPostMed` 逐项一致
+
+## LUT 资产互通与预览降载（2026-10-01）
+
+- [2026-10-01] **LUT 库结构**：`app/src/main/java/com/filmkit/app/lut/`（CubeLut 解析 1D/3D/二进制、MAX_SIZE 128；LutIO 嗅探/Hald·Unwrapped/重采样/writeCube/writeHaldPng；LutLibrary 内置 42 + 用户库 files/luts、id 前缀 u_）；日志 lut.import/lut.export/lut.delete/lut.parse
+- [2026-10-01] **预览降载**：`g_preview_scale` 进程级 atomic（FrameRenderer static）；JNI nativeEngineSetPreviewScale；日志 render.preview_scale、preview.frame 加 rs 字段；触发链在 CameraController（快门降 0.5 / 合成完升 1.0，15s 兜底）
+- [2026-10-01] **单帧静拍直通**：nativeEngineSubmitRaw/Still 加 useStill 参数；StillRenderClient.submitRawBuf/submitStillBuf（失败自愈重建重试一次）；render.single_done 日志；bindLut 强度上限 1.5（>1 沿色差外推）

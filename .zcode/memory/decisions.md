@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-09-30 21:50
+updated: 2026-10-01 22:05
 status: active
 ---
 
@@ -102,3 +102,12 @@ status: active
 - [2026-10-01] **largeHeap 作为连拍内存兜底**：MFNR 每张在飞持 4 帧 direct buffer（100MB），而 `ByteBuffer.allocateDirect` 走 `trackExternalAllocation` **计入 ART 的 OOM 额度**；在飞 2 张 200MB + 成片回传 50MB 撞默认 256MB
 - [2026-10-01] **OOM 时「这张失败」优于「进程 abort」**：JNI 回传加 `ExceptionCheck` 防护 + 失败自愈重试一次，仍失败才回退预览线程（用户红线：失败不以丢照片为代价）
 - [2026-10-01] **调度类优化在本平台不再投入**：DFT 分片 / glFlush / 真 sleep / 线程降优先级四种手段实测**全部无效**（Mali 不在 context 间轮转），sleep 还拉长卡顿窗口 → 帧率定性为 GPU 算力·带宽硬约束，改走"用现成开关定位主因，再按主因优化或降预览负载"
+
+## LUT 资产互通与预览降载（10-01）
+
+- [2026-10-01] **LUT 无损口径（对照 PC）**：.cube float 解析不重采样不量化、DOMAIN 原样保留（shader 按 dmin/dinv 归一）、原文件字节存档；PC 的 >65→33 重采样是有损点不学；唯一妥协 = 超引擎上限（Hald L12=144³）三线性重采样到 128³
+- [2026-10-01] **预览降载落点 = 引擎中间纹理**（非 Camera2 流）：帧级切换无需重建 session；16F 无线性过滤 → 输出 pass 渲到小尺寸 RGBA8（OETF 后）再 blitFramebuffer(GL_LINEAR)；成片链零改动
+- [2026-10-01] **单帧 RAW/YUV 迁独立线程用 buffer 语义**（拷贝后 close Image）——回退重放的前提；nativeStillStart 必须补齐 YUV 矩阵快照（曾漏，BT.709 被按 601 解码）
+- [2026-10-01] **LUT 强度滑杆 = 相对拖动**（按下不跳、增量累加）：M3 Slider 按下即 snap，拇指微调必误跳；专业相机 App 标准交互
+- [2026-10-01] **拖动中不写 prefs**：setLutStrength 直通渲染线程写 filmParams[34]，prefs 只在松手写一次；lutStrengthFromPrefs 哨兵防每帧同步拉回直通值
+- [2026-10-01] **用户 LUT 存档原文件**（字节级，导出可取回原样）；id 加 u_ 前缀防与内置冲突

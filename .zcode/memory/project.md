@@ -19,23 +19,24 @@ status: active
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
 - `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
 
-## 进行中（2026-10-01：独立线程落地，转帧率定位）
+## 进行中（2026-10-01：M4 资产互通收线，转 M5）
 
-- [2026-10-01] **拍照期间预览帧率** | 最高 | 现状 = 空闲 30~32fps、拍照期间**最低
-  13~25fps**；四种调度手段（DFT 分片 / glFlush / 真 sleep / 线程降优先级）实测
-  **全部无效且负优化**，已完整回退（引擎 diff 归零）→ 卡顿定性为 **GPU 资源硬约束** |
-  下一步 = 用现成开关做**瓶颈定位**（降噪 0 / bilinear / MFNR 关，各拍一张），
-  再定"降预览负载 / 优化主因 / 接受" | handoffs/拍照独立线程落地与连拍崩溃定案.memo.md
-- [2026-10-01] **渲染链后段 GPU** | 待做 | `passMs` 711~2021ms（RCD + 高光重建 +
-  降噪）是合成耗时大头；动它必须先出画质 A/B（用户红线：画质不降）
-- [2026-10-01] **单帧 RAW / YUV 静拍仍在预览线程** | 待做 | 独立线程开关目前只覆盖
-  MFNR；迁移时 YUV 矩阵也要同步给拍照实例
+- [2026-10-01] **M5 诊断与基准** | 最高 | 下一里程碑：逐 pass GPU 计时、成像会话
+  摘要、一键诊断包、性能基准脚本 + golden image 接 CI（开发计划 §11）
+- [2026-10-01] **渲染链后段 GPU** | 待做（降级）| `passMs` 711~2021ms（RCD + 高光
+  重建 + 降噪）是合成耗时大头；动它必须先出画质 A/B（用户红线：画质不降）
 - [2026-09-30] **DFT 继续挖（冷机 500~550ms）** | 待做（降级）| 先做冷机分段测量
   定位真热点，不凭代码推断
 - [2026-09-29] **MGC-AE 曝光决策 / 弱彩差** | 远期·降级 | 采集侧高光保护；色彩主观类
 
 ## 已完成（近期）
 
+## 已完成（近期）
+
+- [2026-10-01] **M4 无损 LUT 导入导出 + 预览降载收线（v0.10.93–0.10.99，tag v0.10.99-m4）**：
+  实验判读排除降噪、定位 MFNR 链路 → 方案 A（预览中间链 0.5× + blit 升采，单帧
+  RAW/YUV 迁独立线程）；M4 §6.2 .cube 1D/3D + Hald PNG 双向、用户库、分类管理；
+  滑杆跳变根因 = M3 Slider 按下 snap，换相对拖动 | handoffs/M4无损LUT导入导出与预览降载收线.memo.md
 - [2026-10-01] **拍照独立线程落地 + 连拍崩溃定案（v0.10.85–0.10.92）**：独立线程 +
   独立 EGL context（PC 同构），**只启动不销毁**消除 0.10.83 的竞态；同帧 A/B
   **CRC32 逐字节相同**（画质等价）；连拍闪退定案 = Java 堆 OOM 在 JNI 回传处 pending
