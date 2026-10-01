@@ -34,7 +34,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.lazy.LazyRow
@@ -2263,15 +2264,24 @@ private fun RelativeSlider(
             .height(32.dp)
             .onSizeChanged { widthPx = it.width.toFloat() }
             .pointerInput(range) {
+                // v0.10.98b：手写 awaitPointerEvent 循环 —— drag() 原语的事件过滤
+                // 语义不可控（真机 0.10.98a 实测拖不动），每个 move 自己读自己消费，
+                // delta 用 IgnoreConsumed 变体（即便有别的 handler 抢消费也不丢位移）
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     down.consume()  // 按下不改值 —— 相对模式的核心
                     var v = currentValue  // 手势内局部累加（不依赖重组回流）
-                    drag(down.id) { change ->
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || change.changedToUpIgnoreConsumed()) break
+                        val delta = change.positionChangeIgnoreConsumed().x
+                        if (delta != 0f) {
+                            v = (v + delta / widthPx * span)
+                                .coerceIn(range.start, range.endInclusive)
+                            onChange(v)
+                        }
                         change.consume()
-                        v = (v + change.positionChange().x / widthPx * span)
-                            .coerceIn(range.start, range.endInclusive)
-                        onChange(v)
                     }
                     onEnd()
                 }
