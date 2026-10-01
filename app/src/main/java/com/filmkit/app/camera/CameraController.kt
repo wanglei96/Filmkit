@@ -878,7 +878,7 @@ class CameraController(private val context: Context, private val render: RenderC
         tonePref = -1.0  // 换了新数组，强制重写 [28]
         zebraPref = -1.0 // 同上，[30]
         autoTonePref = -1.0 // 同上，[35]
-        lutStrengthPref = -1.0 // 同上，[34]
+        lutStrengthFromPrefs = Float.NaN // 同上，[34]：换预设后强制重读 prefs
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
@@ -888,6 +888,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private var tonePref = -1.0
     private var zebraPref = -1.0
     private var lutStrengthPref = -1.0
+    private var lutStrengthFromPrefs = Float.NaN // 上次从 prefs 读到的强度（变化检测；NaN = 未读）
     private var autoTonePref = -1.0
     // filmic 黑白点（v0.7.6）：哨兵 = 未初始化（用户可配，默认 −7.65/+4.56 EV）
     private var filmicBlackPref = -999.0
@@ -950,14 +951,33 @@ class CameraController(private val context: Context, private val render: RenderC
     /**
      * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量，
      * 1.5 = 150% —— 沿 LUT 色差外推，与 PhotonCamera 的 >100% 强度语义一致）。
-     * 与上述开关同款「偏好覆盖」：UI 只写 prefs，提交前统一回写数组 ——
-     * 预览 / YUV 静拍 / RAW 静拍三条路径共用同一数组，故所见即所得。
+     * v0.10.97：拖动直通（[setLutStrength]）与 prefs 同步双通道并存 ——
+     * [lutStrengthFromPrefs] 记录上次读到的 prefs 值，**只有 prefs 真变了才写数组**：
+     * 拖动中帧回调（本函数每帧被调）不会用 prefs 旧值把直通值拉回去；
+     * 拖动结束写 prefs 后这里幂等同步一次。
      */
     private fun applyLutStrengthPref() {
-        val v = appPrefs.getFloat("lut_strength", 1f).toDouble().coerceIn(0.0, 1.5)
-        if (v != lutStrengthPref) {
-            lutStrengthPref = v
-            filmParams[34] = v
+        val p = appPrefs.getFloat("lut_strength", 1f)
+        if (p != lutStrengthFromPrefs) {
+            lutStrengthFromPrefs = p
+            lutStrengthPref = p.toDouble().coerceIn(0.0, 1.5)
+            filmParams[34] = lutStrengthPref
+        }
+    }
+
+    /**
+     * LUT 强度直通（v0.10.97）：滑杆**拖动中**的实时通道 —— 直接更新 filmParams[34]，
+     * **不写 prefs**。拖动主线程路径只剩 post（非阻塞），SharedPrefs 的 apply 从
+     * 60 次/秒的高频路径移除（QueuedWork 锁竞争在低端机上有已知的主线程抖动）；
+     * prefs 只在拖动结束（onValueChangeFinished）写一次，作为持久化事实源。
+     * lutStrengthPref 同步更新，拖动结束后的 applyLutStrengthPref 幂等。
+     * 必须排队到渲染线程：filmParams 的元素写一直在 render.looper 上，跨线程写
+     * DoubleArray 元素有撕裂风险（数组整体替换才原子）。
+     */
+    fun setLutStrength(v: Float) {
+        render.post {
+            lutStrengthPref = v.toDouble().coerceIn(0.0, 1.5)
+            filmParams[34] = lutStrengthPref
         }
     }
 

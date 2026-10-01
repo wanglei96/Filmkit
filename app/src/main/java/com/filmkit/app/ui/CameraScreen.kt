@@ -1330,8 +1330,11 @@ fun CameraScreen(
                     lutCatOf = lutCatOf + (e.id to c)
                     lutCats = LutLibrary.allCategories(context, prefs)
                 },
-                // 只写 prefs（事实源），CameraController 每帧 applyLutStrengthPref 回写引擎
-                onStrength = { v -> prefs.edit().putFloat("lut_strength", v).apply() },
+                // 拖动中走 controller.setLutStrength 直通（不碰 prefs）；松手写一次 prefs 持久化
+                onStrength = { v -> controller.setLutStrength(v) },
+                onStrengthFinished = { vFinal ->
+                    prefs.edit().putFloat("lut_strength", vFinal).apply()
+                },
                 onPick = { i ->
                     presetIdx = i
                     controller.setFilmParams(CameraPresets.byIndex(i))
@@ -1877,6 +1880,7 @@ private fun LutSheet(
     onMoveCat: (LutLibrary.Entry, String) -> Unit,
     onRenameCat: (String, String) -> Unit,
     onStrength: (Float) -> Unit,
+    onStrengthFinished: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onImport: () -> Unit,
@@ -1960,7 +1964,11 @@ private fun LutSheet(
         //（v0.10.96 修"读数断档 99→103"：此前强度是 LutSheet 参数，每帧全面板重组，
         // 手势丢帧使 onValueChange 采样断档）。
         if (tab == 0 && lutId != null) {
-            StrengthRow(initial = lutStrength, onCommit = onStrength)
+            StrengthRow(
+                initial = lutStrength,
+                onCommit = onStrength,
+                onFinished = onStrengthFinished,
+            )
         }
         // 横向卡片
         if (tab == 0) {
@@ -2222,13 +2230,20 @@ private fun LutSheet(
 
 /**
  * LUT 强度行（v0.10.96 抽出）：拖动 state 留在本 Composable 内部，拖动每帧只重组
- * 这一行。onCommit 每帧回调（写 prefs → CameraController 每帧回写 FilmParams[34] →
- * 预览实时跟随）。[initial] 只在面板打开时读一次 prefs —— 面板期间以内部 state 为准，
- * 避免父层回读打断拖动。
+ * 这一行。[initial] 只在面板打开时读一次 prefs。
+ *
+ * v0.10.97 两处升级（"滑杆读数断档 99→103"第二轮）：
+ *  - 拖动中不再写 SharedPrefs（onCommit 走 controller.setLutStrength 直通引擎），
+ *    prefs 只在 onValueChangeFinished 写一次 —— 60 次/秒的 apply 在 QueuedWork 上
+ *    的锁竞争是主线程抖动的已知来源，也是手势事件合并（读数断档）的头号嫌疑；
+ *  - 拖动回调带节流诊断日志（>100ms 才记一条，gap = 距上次回调的间隔）：真机拖一次
+ *    就能从日志分辨"采样断档"（gap 大）与"值跳变"（gap 正常但 v 差 0.04），
+ *    验收后删除。
  */
 @Composable
-private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit) {
+private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
     var v by remember { mutableFloatStateOf(initial) }
+    var lastDragMs by remember { mutableStateOf(0L) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 6.dp),
@@ -2241,7 +2256,21 @@ private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit) {
         )
         androidx.compose.material3.Slider(
             value = v,
-            onValueChange = { nv -> v = nv; onCommit(nv) },
+            onValueChange = { nv ->
+                val now = android.os.SystemClock.elapsedRealtime()
+                val gap = now - lastDragMs
+                // 诊断（临时）：采样间隔与值序列 —— 验收"读数断档"后移除
+                if (gap > 100) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "lut.strength_drag",
+                        kv("v" to "%.3f".format(nv), "gapMs" to gap),
+                    )
+                }
+                lastDragMs = now
+                v = nv
+                onCommit(nv)
+            },
+            onValueChangeFinished = { onFinished(v) },
             valueRange = 0f..1.5f,
             modifier = Modifier
                 .weight(1f)
