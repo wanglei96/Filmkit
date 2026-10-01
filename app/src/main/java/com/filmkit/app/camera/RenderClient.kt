@@ -201,30 +201,46 @@ class RenderClient {
         handler?.post(r)
     }
 
-    /** 静拍：全分辨率 YUV → 胶片链 → 读回，回调在渲染线程。 */
-    fun submitStill(img: android.media.Image, rotation: Int, film: DoubleArray, onDone: (ByteArray?, Int, Int) -> Unit) {
-        val h = handler
-        if (h == null) {
-            img.close()
+    /**
+     * 预览降载（v0.10.93）：拍照期间把预览链中间渲染缩到 scale×，结束设回 1.0。
+     * 引擎侧是进程级 atomic（下一帧生效），**任意线程直接调用** —— 与渲染队列
+     * 无耦合，拍照线程的合成完成回调里也能安全调用。恢复缺失的兜底见
+     * CameraController 的 previewScaleGuard（15s 强制回升）。
+     */
+    fun setPreviewScale(scale: Float) {
+        EngineBridge.nativeEngineSetPreviewScale(scale)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "engine", "render.preview_scale",
+            kv("scale" to "%.2f".format(scale)),
+        )
+    }
+
+    /**
+     * 静拍 YUV（buffer 语义，v0.10.93 改造）：三平面已由调用方拷出并 close Image
+     * —— buffer 可在拍照线程失败后回退重放（红线：失败不以丢照片为代价），
+     * 与 MFNR 的 direct buffer 语义对齐。
+     * yPlanar = false 时 v 为 null（UV 交错）。回调在渲染线程。
+     */
+    fun submitStillBuf(
+        y: java.nio.ByteBuffer, u: java.nio.ByteBuffer, v: java.nio.ByteBuffer?,
+        w: Int, h: Int, yStride: Int, uvStride: Int, uvPix: Int,
+        rotation: Int, film: DoubleArray, onDone: (ByteArray?, Int, Int) -> Unit,
+    ) {
+        val h0 = handler
+        if (h0 == null) {
             onDone(null, 0, 0)
             return
         }
-        h.post {
+        h0.post {
             // 与 C++ submitStill 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
             val effectiveRot = (rotation + 1) % 4
-            val rotatedW = if (effectiveRot % 2 == 1) img.height else img.width
-            val rotatedH = if (effectiveRot % 2 == 1) img.width else img.height
+            val rotatedW = if (effectiveRot % 2 == 1) h else w
+            val rotatedH = if (effectiveRot % 2 == 1) w else h
             var bytes: ByteArray? = null
             try {
-                val pY = img.planes[0]
-                val pU = img.planes[1]
-                val pV = img.planes[2]
-                val semi = pU.pixelStride >= 2
                 bytes = EngineBridge.nativeEngineSubmitStill(
-                    pY.buffer, pU.buffer, if (semi) null else pV.buffer,
-                    img.width, img.height,
-                    pY.rowStride, pU.rowStride, pU.pixelStride,
-                    rotation, film,
+                    y, u, v, w, h, yStride, uvStride, uvPix, rotation, film,
+                    useStill = false,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -232,7 +248,6 @@ class RenderClient {
                     com.filmkit.app.kv("error" to (t.message ?: t.toString())),
                 )
             }
-            img.close()
             if (bytes == null) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "engine", "render.still_failed", "{}",
@@ -240,10 +255,8 @@ class RenderClient {
             }
             onDone(bytes, rotatedW, rotatedH)
         }.let { posted ->
-            // post 失败（线程正在退出）：必须回调 + close，否则调用方永久等待、
-            // Image 泄漏（v0.10.85 审查 R1）
+            // post 失败（线程正在退出）：必须回调，否则调用方永久等待（v0.10.85 审查 R1）
             if (!posted) {
-                img.close()
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_WARN, "engine", "render.still_dropped", "{}",
                 )
@@ -272,32 +285,36 @@ class RenderClient {
         val ccmStd: Boolean = false,
     )
 
-    /** 静拍 RAW：u16 Bayer → 引擎 demosaic+胶片链 → 读回，回调在渲染线程。
-     *  img 在本函数消费后关闭；DNG 原片须在本调用前写出（依赖 image 与 result）。
+    /** 静拍 RAW（buffer 语义，v0.10.93 改造）：u16 Bayer 已由调用方拷出并 close
+     *  Image（HAL 槽位即释），buffer 可在拍照线程失败后回退重放。
      *  demosaic：0 = bilinear（速度档）1 = RCD 三段管线（质量档）。
-     *  noiseStrength：降噪强度滑杆 0–2（C 专项：0 = 关、1 = 真实 σ、2 = 2×σ；仅 RCD 生效）。 */
-    fun submitRaw(img: android.media.Image, meta: RawFrameMeta, rotation: Int, film: DoubleArray, demosaic: Int, noiseStrength: Float, onDone: (ByteArray?, Int, Int) -> Unit) {
+     *  noiseStrength：降噪强度滑杆 0–2（C 专项：0 = 关、1 = 真实 σ、2 = 2×σ；仅 RCD 生效）。
+     *  回调在渲染线程。 */
+    fun submitRawBuf(
+        buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
+        meta: RawFrameMeta, rotation: Int, film: DoubleArray,
+        demosaic: Int, noiseStrength: Float,
+        onDone: (ByteArray?, Int, Int) -> Unit,
+    ) {
         val h = handler
         if (h == null) {
-            img.close()
             onDone(null, 0, 0)
             return
         }
         h.post {
             // 与 submitStill 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
             val effectiveRot = (rotation + 1) % 4
-            val rotatedW = if (effectiveRot % 2 == 1) img.height else img.width
-            val rotatedH = if (effectiveRot % 2 == 1) img.width else img.height
+            val rotatedW = if (effectiveRot % 2 == 1) height else width
+            val rotatedH = if (effectiveRot % 2 == 1) width else height
             var bytes: ByteArray? = null
             try {
-                val p = img.planes[0]
                 bytes = EngineBridge.nativeEngineSubmitRaw(
-                    p.buffer, img.width, img.height, p.rowStride / 2,
+                    buf, width, height, rowStridePx,
                     meta.cfa, meta.blackPhase, meta.whiteLevel,
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, film,
+                    meta.noiseSigma, film, useStill = false,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -305,7 +322,6 @@ class RenderClient {
                     com.filmkit.app.kv("error" to (t.message ?: t.toString())),
                 )
             }
-            img.close()
             if (bytes == null) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "engine", "render.raw_failed", "{}",
@@ -314,7 +330,6 @@ class RenderClient {
             onDone(bytes, rotatedW, rotatedH)
         }.let { posted ->
             if (!posted) {
-                img.close()
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_WARN, "engine", "render.raw_dropped", "{}",
                 )

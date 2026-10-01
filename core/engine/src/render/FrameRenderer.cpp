@@ -41,6 +41,13 @@ inline std::string jnum(float v, size_t n) {
 float g_pv_mid_ema = 0.0f;   // 预览统计中位的 EMA（0 = 未初始化）
 float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范围 1.70–3.87 的中位）
 
+// 预览降载（v0.10.93）：1.0 = 全分辨率。进程级 atomic —— 写方（Kotlin 的
+// capture 入口/完成回调，任意线程）与读方（渲染线程 submitFrame 每帧开头）
+// 天然解耦：写后下一帧生效，无锁、无 post、无生命周期竞态（g_renderer 的
+// delete 也碰不到它）。拍照结束必须回 1.0，否则预览一直糊（见 CameraController
+// 的 releasePreviewScaleGuard，快门到合成结束全程 0.5）。
+std::atomic<float> g_preview_scale{1.0f};
+
 // M4-7 局部色调映射的低频亮度图尺寸与 knee（都是设备端标定旋钮）。
 // 32×24 在 4080×3072 上等效模糊半径约 128px ≈ 3% 画面宽：再小会退化成全局曲线
 // 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
@@ -3369,6 +3376,7 @@ void FrameRenderer::release() {
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (tex_hist_) glDeleteTextures(1, &tex_hist_);
+  if (tex_out_s_) glDeleteTextures(1, &tex_out_s_);
   if (lut_tex_) glDeleteTextures(1, &lut_tex_);
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
@@ -3378,6 +3386,7 @@ void FrameRenderer::release() {
   if (fbo_mos_) glDeleteFramebuffers(1, &fbo_mos_);
   if (fbo_dn_) glDeleteFramebuffers(1, &fbo_dn_);
   if (fbo_hist_) glDeleteFramebuffers(1, &fbo_hist_);
+  if (fbo_out_s_) glDeleteFramebuffers(1, &fbo_out_s_);
   releaseHrTargets();  // v0.10.15：HR 的 10 张全分辨率纹理
   if (prog_hr_mask_) glDeleteProgram(prog_hr_mask_);
   if (prog_hr_inpaint_) glDeleteProgram(prog_hr_inpaint_);
@@ -3568,12 +3577,57 @@ bool FrameRenderer::ensureTargets(int w, int h) {
   return ok;
 }
 
+// 降档输出的 RGBA8 中间目标：makeTex 固定 NEAREST，这里必须 LINEAR（blit 升采
+// 的平滑性全靠它）。RGBA16F 在 X300 无线性过滤（实测 quirk），RGBA8 有。
+bool FrameRenderer::ensureOutScaleTarget(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  if (w != out_s_w_ || h != out_s_h_) {
+    if (tex_out_s_) {
+      glDeleteTextures(1, &tex_out_s_);
+      glDeleteFramebuffers(1, &fbo_out_s_);
+    }
+    tex_out_s_ = fbo_out_s_ = 0;
+    makeTex(&tex_out_s_, &fbo_out_s_, GL_RGBA8, w, h);
+    glBindTexture(GL_TEXTURE_2D, tex_out_s_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    out_s_w_ = w;
+    out_s_h_ = h;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_out_s_);
+  const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  if (!ok) {
+    Logger::instance().log(
+        LogLevel::kError, "engine", "render.outs_incomplete",
+        "{\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
+  }
+  return ok;
+}
+
+void FrameRenderer::setPreviewScale(float s) {
+  g_preview_scale.store(std::clamp(s, 0.25f, 1.0f), std::memory_order_relaxed);
+}
+
+float FrameRenderer::previewScale() {
+  return g_preview_scale.load(std::memory_order_relaxed);
+}
+
 bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
                                 int dst_w, int dst_h, const FilmParams& p,
                                 bool fill_test) {
   if (dst_w <= 0 || dst_h <= 0) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
-  if (!ensureTargets(dst_w, dst_h)) return false;
+
+  // 预览降载（v0.10.93）：pass1/2/3 与后处理（局部色调映射、直方图统计、
+  // filmic 统计）全按缩放后尺寸跑，成本随像素数下降（0.5 → 1/4）。显示不变：
+  // pass3 渲到低分辨率 RGBA8（OETF 后 display 域，8bit 无截断），再 blit 线性
+  // 升到全窗口 —— 16F 的 NEAREST 放大会出像素块，RGBA8 才有 LINEAR。
+  // scale=1 时走原路径（零改动零回归）；成片链不经此函数。
+  const float s = previewScale();
+  const int rw = std::max(1, static_cast<int>(std::lround(dst_w * s)));
+  const int rh = std::max(1, static_cast<int>(std::lround(dst_h * s)));
+  const bool scaled = rw != dst_w || rh != dst_h;
+  if (!ensureTargets(rw, rh)) return false;
 
   // 吞掉上一帧/诊断残留的 GL 错误，保证诊断只反映本帧问题
   while (glGetError() != GL_NO_ERROR) {
@@ -3583,14 +3637,35 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   const bool diag = frames_.load(std::memory_order_relaxed) == 1;
 
   if (fill_test) {
-    passFill(dst_w, dst_h);
+    passFill(rw, rh);
     if (diag) logPassDiag("pass1_fill", fbo_scene_, true);
   } else {
-    passOES(dst_w, dst_h, st, rot, sx, sy, p);
+    passOES(rw, rh, st, rot, sx, sy, p);
     if (diag) logPassDiag("pass1_oes", fbo_scene_, true);
   }
-  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false);
+  passFilm(rw, rh, p, tex_scene_, /*still=*/false);
   if (diag) logPassDiag("pass2_film", fbo_work_, true);
+
+  if (scaled) {
+    // 降档：pass3 在低分辨率 RGBA8 上完成，blit 升到窗口。blit 建不出/不完整
+    // （罕见）则整帧退回全尺寸重渲 —— 取景正确性优先于省电。
+    if (ensureOutScaleTarget(rw, rh)) {
+      passOutput(rw, rh, p, false, true);  // 渲到 fbo_out_s_（passOutput 不改绑定）
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_out_s_);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+      glBlitFramebuffer(0, 0, rw, rh, 0, 0, dst_w, dst_h,
+                        GL_COLOR_BUFFER_BIT, GL_LINEAR);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      return true;
+    }
+    if (!ensureTargets(dst_w, dst_h)) return false;
+    if (fill_test) {
+      passFill(dst_w, dst_h);
+    } else {
+      passOES(dst_w, dst_h, st, rot, sx, sy, p);
+    }
+    passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false);
+  }
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
   glBindFramebuffer(GL_FRAMEBUFFER, 0);

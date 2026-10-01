@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -300,6 +301,9 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
     g_renderer_still.store(r);
     // 补齐风格层：后建实例默认没有 LUT，不补就是"照片少一层"的静默回归
     applyLutSnapshot(g_renderer_still.load());
+    // YUV 解码矩阵同理（v0.10.93 补齐）：快照在 nativeEngineSetYuvMatrix 里写，
+    // 这里不下发的话 BT.709 视频会被按 BT.601 解码（色偏）。幂等，每次 start 都补。
+    g_renderer_still.load()->setYuvMatrix(g_yuv_matrix.load());
     Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
                            "{\"fresh\":true}");
   } else {
@@ -413,11 +417,13 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
   const int64_t f = g_renderer->frameCount();
   if (f == 1 || f - last_logged >= 120) {
     last_logged = f;
+    char rs[16];
+    std::snprintf(rs, sizeof(rs), "%.2f", FrameRenderer::previewScale());
     Logger::instance().log(
         LogLevel::kInfo, "engine", "preview.frame",
         "{\"frames\":" + std::to_string(f) +
             ",\"dstW\":" + std::to_string(dst_w) +
-            ",\"dstH\":" + std::to_string(dst_h) + "}");
+            ",\"dstH\":" + std::to_string(dst_h) + ",\"rs\":" + rs + "}");
   }
   return JNI_TRUE;
 }
@@ -434,6 +440,16 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetYuvMatrix(JNIEnv* env, jobject,
                                                            jint m) {
   (void)env;
   g_yuv_matrix.store(m);
+}
+
+// 预览降载（v0.10.93）：拍照期间把预览链中间渲染缩到 s×。任意线程可调——
+// 写方是进程级 atomic（FrameRenderer.cpp 的 g_preview_scale），渲染线程每帧
+// submitFrame 开头 load，下一帧生效；不需要排队到渲染线程，也没有与
+// nativeEngineStop 的生命周期竞态。成片链不经 submitFrame，画质不受影响。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSetPreviewScale(JNIEnv*, jobject,
+                                                              jfloat scale) {
+  FrameRenderer::setPreviewScale(scale);
 }
 
 // M4：3D LUT（display 域）。data = RGB 交错（.cube 顺序，红最快），长度 size³×3；
@@ -484,18 +500,39 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetLut(JNIEnv* env, jobject, jint 
 }
 
 // 静拍：全分辨率 YUV → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）
+// use_still（v0.10.93）：走拍照侧实例 —— 单帧路径迁出预览线程，亮光下拍一张
+// 不再把预览渲染线程占住 ~1s（实测单帧 RCD passMs 766ms → 预览 gap 1038ms、
+// fps 掉到 2）。路由语义与 nativeEngineSubmitRawBurst 完全一致。
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
     JNIEnv* env, jobject, jobject y_buf, jobject u_buf, jobject v_buf, jint w,
     jint h, jint y_stride, jint uv_stride, jint uv_pix, jint rotation,
-    jdoubleArray film) {
-  if (!g_renderer) return nullptr;
+    jdoubleArray film, jboolean use_still) {
+  FrameRenderer* r = g_renderer;
+  if (use_still == JNI_TRUE) {
+    if (g_renderer_still.load() == nullptr) {
+      Logger::instance().log(LogLevel::kError, "engine", "engine.still_missing",
+                             "{}");
+      return nullptr;
+    }
+    if (!stillEgl().makeCurrent(g_still_surface)) return nullptr;
+    r = g_renderer_still.load();
+  }
+  if (!r) return nullptr;
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
-  const bool ok = g_renderer->submitStill(
+  const int64_t t0 = nowMs();
+  const bool ok = r->submitStill(
       env->GetDirectBufferAddress(y_buf), env->GetDirectBufferAddress(u_buf),
       v_buf ? env->GetDirectBufferAddress(v_buf) : nullptr, w, h, y_stride,
       uv_stride, uv_pix, rotation, p, &rgba);
+  Logger::instance().log(
+      LogLevel::kInfo, "camera", "render.single_done",
+      "{\"kind\":\"yuv\",\"path\":\"" +
+          std::string(use_still == JNI_TRUE ? "still" : "preview") +
+          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          ",\"ok\":" + (ok ? "true" : "false") +
+          ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
   return rgbaToJavaArray(env, rgba);
 }
@@ -514,8 +551,21 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jfloatArray lsc,
     jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic,
     jfloat noise_strength, jfloatArray noise_model, jfloat noise_sigma,
-    jdoubleArray film) {
-  if (!g_renderer || !raw_buf) return nullptr;
+    jdoubleArray film, jboolean use_still) {
+  // v0.10.93：单帧 RAW 与 MFNR burst 同构的拍照侧实例路由（use_still），单帧
+  // 合成（passMs 610~766ms）不再占住预览渲染线程。调用线程已在 nativeStillStart
+  // makeCurrent，这里再确认一次（幂等）。
+  FrameRenderer* r = g_renderer;
+  if (use_still == JNI_TRUE) {
+    if (g_renderer_still.load() == nullptr) {
+      Logger::instance().log(LogLevel::kError, "engine", "engine.still_missing",
+                             "{}");
+      return nullptr;
+    }
+    if (!stillEgl().makeCurrent(g_still_surface)) return nullptr;
+    r = g_renderer_still.load();
+  }
+  if (!r || !raw_buf) return nullptr;
   float black4[4] = {0, 0, 0, 0};
   if (black_phase) {
     const jsize bn = env->GetArrayLength(black_phase);
@@ -546,11 +596,19 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   }
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
-  const bool ok = g_renderer->submitRaw(
+  const int64_t t0 = nowMs();
+  const bool ok = r->submitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
       lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, &rgba);
+  Logger::instance().log(
+      LogLevel::kInfo, "camera", "render.single_done",
+      "{\"kind\":\"raw\",\"path\":\"" +
+          std::string(use_still == JNI_TRUE ? "still" : "preview") +
+          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          ",\"ok\":" + (ok ? "true" : "false") +
+          ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
   return rgbaToJavaArray(env, rgba);
 }

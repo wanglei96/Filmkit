@@ -43,9 +43,6 @@ object StillRenderClient {
 
     private var handler: Handler? = null
 
-    @Volatile
-    private var ready = false
-
     /** 连续 init 失败计数与熔断（v0.10.85 审查建议）：失败若是显存/驱动这类
      *  持久原因，每张照片都白付一次 init（数百 ms~数秒）反而比原来的卡顿更糟。
      *  连续 3 次即本会话不再尝试，直接走预览线程。 */
@@ -61,7 +58,7 @@ object StillRenderClient {
 
     /** 在拍照线程上执行销毁（与所有 native 调用同一条队列 → 必然排在在飞合成之后）。 */
     private val idleRelease = Runnable {
-        if (!ready) return@Runnable
+        if (!ready_) return@Runnable
         try {
             EngineBridge.nativeStillDestroy()
         } catch (t: Throwable) {
@@ -70,7 +67,7 @@ object StillRenderClient {
                 kv("error" to (t.message ?: t.toString())),
             )
         }
-        ready = false
+        ready_ = false
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "engine", "render.still_idle_release", "{}",
         )
@@ -91,14 +88,14 @@ object StillRenderClient {
      *  "卡一下"总比"拍不了"好。已就绪时零开销直接返回。 */
     fun ensureStarted(): Boolean {
         synchronized(this) {
-            if (ready) return true
+            if (ready_) return true
             if (disabled) return false
             cancelIdleRelease()  // 别让到期释放和本次启动打架（同队列下只是白跑一趟）
             val h = handlerOrStart() ?: return false
             val latch = CountDownLatch(1)
             postStart(h, latch)
             latch.await(5, TimeUnit.SECONDS)
-            return ready
+            return ready_
         }
     }
 
@@ -108,7 +105,7 @@ object StillRenderClient {
      *  init 幂等，重复调用只是多排一次队。 */
     fun startAsync() {
         synchronized(this) {
-            if (ready || disabled) return
+            if (ready_ || disabled) return
             cancelIdleRelease()
             val h = handlerOrStart() ?: return
             postStart(h, null)
@@ -137,7 +134,7 @@ object StillRenderClient {
                 )
                 false
             }
-            ready = ok
+            ready_ = ok
             if (ok) {
                 failStreak = 0
             } else {
@@ -160,6 +157,16 @@ object StillRenderClient {
         }
     }
 
+    /** 是否就绪（v0.10.93 单帧路由用）：调用方（渲染线程上的 tryProcessRaw）只做
+     *  非阻塞判断 —— 不 ready 就直接走预览线程，**绝不**在预览渲染线程上干等
+     *  ensureStarted（那本身就是一次卡顿，0.10.85 的教训）。预热由 capture 入口的
+     *  startAsync 负责，本张没赶上就下一张。 */
+    val ready: Boolean
+        get() = ready_
+
+    @Volatile
+    private var ready_ = false
+
     /** 在拍照线程上跑一次 MFNR 合成。onDone 在**拍照线程**回调（与 RenderClient
      *  同一约定），调用方只做轻量收尾（计数、入队保存）。 */
     fun submitRawBurst(
@@ -180,7 +187,7 @@ object StillRenderClient {
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
-        if (h == null || !ready || frames.size != 4) {
+        if (h == null || !ready_ || frames.size != 4) {
             onDone(null, 0, 0)
             return
         }
@@ -247,6 +254,148 @@ object StillRenderClient {
             if (bytes == null) EngineBridge.nativeFlushLogs()
             onDone(bytes, rotatedW, rotatedH)
             // 合成结束：起一段空闲计时，到期把 ~2GB 中间纹理还给系统
+            scheduleIdleRelease()
+        }
+        if (!posted) onDone(null, 0, 0)
+    }
+
+    /** 在拍照线程上跑一次单帧 RAW 合成（v0.10.93：单帧路径迁出预览线程 ——
+     *  亮光下单帧 RCD passMs 610~766ms 会把预览渲染线程占住，实测预览 gap
+     *  877~1038ms、fps 掉到 2，比暗光 MFNR（独立线程保 20fps+）更糟）。
+     *  失败先自愈重建重试一次（与 submitRawBurst 同构），仍失败由调用方回退
+     *  预览线程重放（buffer 语义：img 已拷出 close，可重复提交）。
+     *  onDone 在**拍照线程**回调。 */
+    fun submitRawBuf(
+        buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
+        meta: RenderClient.RawFrameMeta, rotation: Int, film: DoubleArray,
+        demosaic: Int, noiseStrength: Float,
+        onDone: (ByteArray?, Int, Int) -> Unit,
+    ) {
+        val h = handler
+        if (h == null || !ready_) {
+            onDone(null, 0, 0)
+            return
+        }
+        cancelIdleRelease()
+        val tPost = SystemClock.elapsedRealtime()
+        val posted = h.post {
+            val effectiveRot = (rotation + 1) % 4
+            val rotatedW = if (effectiveRot % 2 == 1) height else width
+            val rotatedH = if (effectiveRot % 2 == 1) width else height
+            val t0 = SystemClock.elapsedRealtime()
+            var bytes: ByteArray? = null
+            try {
+                bytes = EngineBridge.nativeEngineSubmitRaw(
+                    buf, width, height, rowStridePx,
+                    meta.cfa, meta.blackPhase, meta.whiteLevel,
+                    meta.neutral[0], meta.neutral[1], meta.neutral[2],
+                    meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
+                    rotation, demosaic, noiseStrength, meta.noiseModel,
+                    meta.noiseSigma, film, useStill = true,
+                )
+                if (bytes == null) {
+                    // 自愈一次（v0.10.89 同款："空闲释放后重建，首次合成纹理分配
+                    // 失败"）；重建与首次启动同构，实测总是成功
+                    EngineBridge.nativeStillDestroy()
+                    if (EngineBridge.nativeStillStart()) {
+                        bytes = EngineBridge.nativeEngineSubmitRaw(
+                            buf, width, height, rowStridePx,
+                            meta.cfa, meta.blackPhase, meta.whiteLevel,
+                            meta.neutral[0], meta.neutral[1], meta.neutral[2],
+                            meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
+                            rotation, demosaic, noiseStrength, meta.noiseModel,
+                            meta.noiseSigma, film, useStill = true,
+                        )
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
+                            kv("ok" to (bytes != null), "kind" to "raw"),
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.raw_error",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+            }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "render.still_done",
+                kv(
+                    "kind" to "raw",
+                    "ms" to (SystemClock.elapsedRealtime() - t0),
+                    // 排队等待（post → 开始执行）：与 MFNR 同口径
+                    "queuedMs" to (t0 - tPost),
+                    "bytes" to (bytes?.size ?: -1),
+                    "size" to "${rotatedW}x${rotatedH}",
+                ),
+            )
+            // 失败节点立刻落盘：这条日志往往就是崩溃现场的最后一条
+            if (bytes == null) EngineBridge.nativeFlushLogs()
+            onDone(bytes, rotatedW, rotatedH)
+            // 合成结束：起一段空闲计时，到期把 ~2GB 中间纹理还给系统
+            scheduleIdleRelease()
+        }
+        if (!posted) onDone(null, 0, 0)
+    }
+
+    /** 在拍照线程上跑一次单帧 YUV 合成（v0.10.93，与 submitRawBuf 同构）。
+     *  调用前提：YUV 矩阵快照已由 nativeStillStart 下发（v0.10.93 补齐——此前
+     *  只补 LUT，BT.709 会被按 BT.601 解码）。onDone 在**拍照线程**回调。 */
+    fun submitStillBuf(
+        y: java.nio.ByteBuffer, u: java.nio.ByteBuffer, v: java.nio.ByteBuffer?,
+        width: Int, height: Int, yStride: Int, uvStride: Int, uvPix: Int,
+        rotation: Int, film: DoubleArray,
+        onDone: (ByteArray?, Int, Int) -> Unit,
+    ) {
+        val h = handler
+        if (h == null || !ready_) {
+            onDone(null, 0, 0)
+            return
+        }
+        cancelIdleRelease()
+        val tPost = SystemClock.elapsedRealtime()
+        val posted = h.post {
+            val effectiveRot = (rotation + 1) % 4
+            val rotatedW = if (effectiveRot % 2 == 1) height else width
+            val rotatedH = if (effectiveRot % 2 == 1) width else height
+            val t0 = SystemClock.elapsedRealtime()
+            var bytes: ByteArray? = null
+            try {
+                bytes = EngineBridge.nativeEngineSubmitStill(
+                    y, u, v, width, height, yStride, uvStride, uvPix,
+                    rotation, film, useStill = true,
+                )
+                if (bytes == null) {
+                    EngineBridge.nativeStillDestroy()
+                    if (EngineBridge.nativeStillStart()) {
+                        bytes = EngineBridge.nativeEngineSubmitStill(
+                            y, u, v, width, height, yStride, uvStride, uvPix,
+                            rotation, film, useStill = true,
+                        )
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
+                            kv("ok" to (bytes != null), "kind" to "yuv"),
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.still_error",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+            }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "render.still_done",
+                kv(
+                    "kind" to "yuv",
+                    "ms" to (SystemClock.elapsedRealtime() - t0),
+                    "queuedMs" to (t0 - tPost),
+                    "bytes" to (bytes?.size ?: -1),
+                    "size" to "${rotatedW}x${rotatedH}",
+                ),
+            )
+            if (bytes == null) EngineBridge.nativeFlushLogs()
+            onDone(bytes, rotatedW, rotatedH)
             scheduleIdleRelease()
         }
         if (!posted) onDone(null, 0, 0)

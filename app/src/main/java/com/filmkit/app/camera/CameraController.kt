@@ -1199,6 +1199,16 @@ class CameraController(private val context: Context, private val render: RenderC
             return
         }
         capturing = true
+        // 预览降载（v0.10.93 方案 A）：快门即降（0.5×），合成结束回升。实验判读
+        //（2026-10-01 四组开关）：拍照期掉帧主因 = MFNR 链路 GPU 负载 + 预览自身
+        // 争抢份额，降噪已排除。同时预热拍照线程（单帧 RAW/YUV 也迁入独立线程了，
+        // burst 与单帧都需要）。
+        armPreviewScaleGuard()
+        if (context.getSharedPreferences("filmkit", 0)
+                .getBoolean("still_thread", false)
+        ) {
+            StillRenderClient.startAsync()
+        }
         if (shutterSound) {
             shutterSoundPlayer.play(android.media.MediaActionSound.SHUTTER_CLICK)
         }
@@ -1225,12 +1235,6 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
                 // fwrite 缓冲在崩溃时丢内容：拍照入口日志立即落盘（v0.9.1）
                 EngineBridge.nativeFlushLogs()
-                if (trigger && prefs.getBoolean("still_thread", false)) {
-                    // 拍照线程异步预热（v0.10.85）：与 burst 采集（≈0.5s）并行。
-                    // 否则首次拍照时 ensureStarted 会在**预览渲染线程**上干等整段
-                    // 引擎 init（编译全部 shader）—— 那本身就是一次可见卡顿。
-                    StillRenderClient.startAsync()
-                }
                 if (trigger) {
                     startBurst(s, b)
                     return
@@ -1248,11 +1252,38 @@ class CameraController(private val context: Context, private val render: RenderC
         } catch (t: Throwable) {
             capturing = false
             capturePhase = 0
+            releasePreviewScaleGuard()
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "camera", "capture.submit_failed",
                 kv("error" to (t.message ?: t.toString())),
             )
         }
+    }
+
+    // ── 预览降载（v0.10.93 方案 A）──────────────────────────────────────
+    // 快门即 0.5×（像素 1/4，pass1/2/3 全部受益），合成结束立即回升 —— 帧级
+    // 切换、无需重建 session。成片链不经预览路径，画质零影响（用户红线）。
+    // 15s 兜底只防"完成回调永远不来"把预览糊死到重进相机页；正常路径都会先到，
+    // 每次拍照重新武装（连拍时旧兜底被移除，不会中途把新一张升回去）。
+    private val previewScaleCapture = 0.5f
+    private var previewScaleGuard: Runnable? = null
+
+    private fun armPreviewScaleGuard() {
+        render.setPreviewScale(previewScaleCapture)
+        previewScaleGuard?.let { r ->
+            render.looper?.let { lo -> android.os.Handler(lo).removeCallbacks(r) }
+        }
+        val r = Runnable { render.setPreviewScale(1f) }
+        previewScaleGuard = r
+        render.looper?.let { lo -> android.os.Handler(lo).postDelayed(r, 15_000L) }
+    }
+
+    private fun releasePreviewScaleGuard() {
+        previewScaleGuard?.let { r ->
+            render.looper?.let { lo -> android.os.Handler(lo).removeCallbacks(r) }
+        }
+        previewScaleGuard = null
+        render.setPreviewScale(1f)
     }
 
     // ── MFNR burst 采集（v0.9.0 阶段一）─────────────────────────────────
@@ -1411,6 +1442,7 @@ class CameraController(private val context: Context, private val render: RenderC
         releaseBurst()
         capturing = false
         capturePhase = 0
+        releasePreviewScaleGuard()
     }
 
     /** 关闭已收帧并复位桶（超时路径；正常路径由 processRawBurst/RenderClient 收尾） */
@@ -1459,6 +1491,7 @@ class CameraController(private val context: Context, private val render: RenderC
             pendingResult = null
             capturing = false
             capturePhase = 0
+            releasePreviewScaleGuard()  // 退出相机页：预览降载必须复位
             surfaceTexture?.release()
             surfaceTexture = null
             previewSurface?.release()
@@ -1745,15 +1778,73 @@ class CameraController(private val context: Context, private val render: RenderC
 
     private fun rotation(): Int = (sensorOrientation / 90) % 4
 
+    /** 单帧静拍统一收尾（YUV / 单帧 RAW 共用）：解锁 + 预览回升 + 落盘。
+     *  回调可能在预览渲染线程（直拍/回退）或拍照线程（独立线程）上——只做
+     *  轻量操作，与 v0.10.85 以来 "onDone 只收尾" 的约定一致。 */
+    private fun finishStillCapture(bytes: ByteArray?, w: Int, h: Int) {
+        capturing = false
+        capturePhase = 0
+        releasePreviewScaleGuard()
+        if (bytes != null) queueJpegSave(bytes, w, h)
+    }
+
     private fun submitStill(img: Image) {
-        // 静拍与预览共用「方向」设定（用户在界面选定；默认 0）
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
-        render.submitStill(img, orientationStep, filmParams) { bytes, w, h ->
-            capturing = false
-            capturePhase = 0
-            if (bytes != null) queueJpegSave(bytes, w, h)
+        // v0.10.93：三平面先拷出、随即 close（HAL 槽位即释），提交改走 buffer
+        // 语义 —— 拍照线程失败时可回退预览线程重放（img 已 close 不能二次消费）。
+        // YUV 全平面 ≈18MB、拷贝 ~15ms，采集期内可接受。
+        val pY = img.planes[0]
+        val pU = img.planes[1]
+        val pV = img.planes[2]
+        fun copyPlane(p: Image.Plane): java.nio.ByteBuffer {
+            val b = java.nio.ByteBuffer.allocateDirect(p.buffer.capacity())
+            val src = p.buffer.duplicate()
+            src.position(0)
+            b.put(src)
+            b.position(0)
+            return b
+        }
+        val semiPlanar = pU.pixelStride >= 2
+        val y = copyPlane(pY)
+        val u = copyPlane(pU)
+        val v = if (semiPlanar) null else copyPlane(pV)
+        val w = img.width
+        val h = img.height
+        val yStride = pY.rowStride
+        val uvStride = pU.rowStride
+        val uvPix = pU.pixelStride
+        runCatching { img.close() }
+        val film = filmParams
+        val rot = orientationStep
+        // 拍照线程路由（v0.10.93，prefs still_thread）：**非阻塞**判断 ready ——
+        // 这里在渲染线程上（ImageReader 回调），绝不干等 ensureStarted；
+        // 预热在 capture() 入口已 startAsync，本张没赶上就走预览线程（下一张起生效）。
+        val useStill = context.getSharedPreferences("filmkit", 0)
+            .getBoolean("still_thread", false) && StillRenderClient.ready
+        if (useStill) {
+            StillRenderClient.submitStillBuf(
+                y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+            ) { bytes, rw, rh ->
+                if (bytes != null) {
+                    finishStillCapture(bytes, rw, rh)
+                } else {
+                    // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_WARN, "camera", "render.still_fallback",
+                        kv("kind" to "yuv"),
+                    )
+                    EngineBridge.nativeFlushLogs()
+                    render.submitStillBuf(
+                        y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
+                }
+            }
+        } else {
+            render.submitStillBuf(
+                y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh) }
         }
     }
 
@@ -1832,13 +1923,50 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
             }
         }
+        // v0.10.93：Image 先拷成 direct buffer 再 close（HAL 槽位即释），提交走
+        // buffer 语义 —— 拍照线程失败可回退预览线程重放；与 MFNR 的 copyRawAndClose
+        // 同构（25MB、~30ms）。saveDng 在拷贝前（DngCreator 只吃 Image 本体）。
+        val p0 = img.planes[0]
+        val rawBuf = java.nio.ByteBuffer.allocateDirect(p0.buffer.capacity())
+        val rawSrc = p0.buffer.duplicate()
+        rawSrc.position(0)
+        rawBuf.put(rawSrc)
+        rawBuf.position(0)
+        val rawStridePx = p0.rowStride / 2
+        val rawW = img.width
+        val rawH = img.height
+        runCatching { img.close() }
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
-        render.submitRaw(img, meta, orientationStep, filmParams, demosaic, noiseStrength) { bytes, w, h ->
-            capturing = false
-            capturePhase = 0
-            if (bytes != null) queueJpegSave(bytes, w, h)
+        // 拍照线程路由（v0.10.93，prefs still_thread）：非阻塞判断 ready（本函数
+        // 在渲染线程上，绝不干等）；预热在 capture() 入口 startAsync。
+        val useStill = prefs.getBoolean("still_thread", false) && StillRenderClient.ready
+        if (useStill) {
+            StillRenderClient.submitRawBuf(
+                rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
+                demosaic, noiseStrength,
+            ) { bytes, w, h ->
+                if (bytes != null) {
+                    finishStillCapture(bytes, w, h)
+                } else {
+                    // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_WARN, "camera", "render.still_fallback",
+                        kv("kind" to "raw"),
+                    )
+                    EngineBridge.nativeFlushLogs()
+                    render.submitRawBuf(
+                        rawBuf, rawW, rawH, rawStridePx, meta, orientationStep,
+                        filmParams, demosaic, noiseStrength,
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
+                }
+            }
+        } else {
+            render.submitRawBuf(
+                rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
+                demosaic, noiseStrength,
+            ) { bytes, w, h -> finishStillCapture(bytes, w, h) }
         }
     }
 
@@ -1983,6 +2111,9 @@ class CameraController(private val context: Context, private val render: RenderC
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
+            // 合成结束（无论成败）：预览降载回升（v0.10.93）。capturing 已在下面
+            // 提前解锁，这里的恢复点才是"GPU 不再被合成占用"的时刻。
+            releasePreviewScaleGuard()
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。

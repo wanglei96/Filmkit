@@ -89,6 +89,15 @@ class FrameRenderer {
 
   void setOesTexture(GLuint tex) { oes_tex_ = tex; }
 
+  // 预览降载（v0.10.93）：拍照期间把预览链的**中间渲染**缩到 s×（每维），输出
+  // pass 仍上屏全窗口（RGBA8 中间 + glBlitFramebuffer 线性升采，见 submitFrame）。
+  // 进程级 static（.cpp）：预览 / 拍照两个实例共享一个快照，任意线程可调——
+  // 切换是帧级生效（下一帧 submitFrame 按新值建目标），拍照结束设回 1.0 立即复原，
+  // 无需重建 Camera2 session。成片链（submitStill/submitRaw/submitRawBurst）不经过
+  // submitFrame，不受影响（画质红线）。
+  static void setPreviewScale(float s);   // clamp [0.25, 1.0]
+  static float previewScale();
+
   /// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
   void setYuvMatrix(int m) { yuv_matrix_ = m ? 1 : 0; }
 
@@ -293,6 +302,8 @@ class FrameRenderer {
                             const float b[3]);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
+  // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
+  bool ensureOutScaleTarget(int w, int h);
   // 显示域直方图统计（kFsHist 自带 OETF，与公开的 histogram() 同一实现）。
   // stat_ch：统计通道 —— 0 = luma（UI 直方图，用户看的亮度分布）；
   //          1 = max 通道（filmic 自动 EV 的判据：filmic 内部按 max RGB 做归一，
@@ -476,6 +487,12 @@ class FrameRenderer {
   // 预览与成片的局部提亮分布对不上。init 仍建 32×24 作兜底绑定。
   GLuint fbo_local_ = 0, tex_local_ = 0;
   int local_w_ = 0, local_h_ = 0;
+  // v0.10.93 预览降载：降档帧的输出中间目标（RGBA8、渲染分辨率 = 缩放后尺寸）。
+  // pass3（OETF+锐化+LUT+颗粒）整体跑在低分辨率上，blitFramebuffer(GL_LINEAR)
+  // 升到全窗口 —— X300 的 RGBA16F 无线性过滤（NEAREST 放大 = 像素块），必须借
+  // RGBA8（display 域 [0,1]，OETF 后量化无截断）的 LINEAR 能力做平滑放大。
+  GLuint fbo_out_s_ = 0, tex_out_s_ = 0;
+  int out_s_w_ = 0, out_s_h_ = 0;
   std::vector<uint8_t> rgb_stage_;
   // M4 3D LUT（display 域）：RGBA16F 3D 纹理，LINEAR/CLAMP；lut_size_ ≤ 1 = 关闭
   GLuint lut_tex_ = 0;

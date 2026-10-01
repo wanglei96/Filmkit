@@ -73,12 +73,17 @@ object EngineBridge {
         film: DoubleArray, fillTest: Boolean,
     ): Boolean
 
-    /** 静拍：全分辨率 YUV_420_888 → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）。 */
+    /**
+     * 静拍：全分辨率 YUV_420_888 → CPU 转 RGB → 胶片链 → 读回 RGBA（旋转后尺寸）。
+     * useStill = true（v0.10.93）走拍照侧实例（独立线程 + 独立 EGL context）：
+     * 单帧 YUV 合成不再占住预览渲染线程；调用前必须 nativeStillStart 成功。
+     */
     external fun nativeEngineSubmitStill(
         y: ByteBuffer, u: ByteBuffer, v: ByteBuffer?,
         width: Int, height: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
         rotation: Int, film: DoubleArray,
+        useStill: Boolean = false,
     ): ByteArray?
 
     /**
@@ -91,6 +96,9 @@ object EngineBridge {
      *   var(x)=S·x+O，x = [0,1] 归一化 raw 域；null = 无效 → noiseSigma legacy 回退）。
      * noiseSigma：归一化域噪声 σ（legacy 回退；≤0 时引擎内估计）。
      * lsc：镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=图像左上），null = 关闭/无数据（恒等）。
+     * useStill = true（v0.10.93）走拍照侧实例（独立线程 + 独立 EGL context）：
+     *   单帧 RAW 合成（实测 passMs 610~766ms）不再占住预览渲染线程；调用前必须
+     *   nativeStillStart 成功，且必须在拍照线程上调用（与 nativeEngineSubmitRawBurst 同构）。
      */
     external fun nativeEngineSubmitRaw(
         raw: ByteBuffer, width: Int, height: Int, rowStridePx: Int,
@@ -99,6 +107,7 @@ object EngineBridge {
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float, film: DoubleArray,
+        useStill: Boolean = false,
     ): ByteArray?
 
     /**
@@ -137,6 +146,14 @@ object EngineBridge {
 
     /** 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709（须在引擎启动后设置） */
     external fun nativeEngineSetYuvMatrix(m: Int)
+
+    /**
+     * 预览降载（v0.10.93）：拍照期间把预览链的中间渲染缩到 scale×（每维 0.25–1.0），
+     * 输出 pass 在低分辨率 RGBA8 上完成后由 glBlitFramebuffer 线性升采到全窗口。
+     * 帧级生效（下一帧预览即按新比例渲染），成片链不经预览路径、画质不受影响。
+     * 任意线程可调（引擎侧进程级 atomic）；拍照结束必须设回 1.0。
+     */
+    external fun nativeEngineSetPreviewScale(scale: Float)
 
     /**
      * 3D LUT（M4）：display 域 LUT，引擎把它接在输出 OETF 之后（kFsOut/kFsHist，四面体插值）。
