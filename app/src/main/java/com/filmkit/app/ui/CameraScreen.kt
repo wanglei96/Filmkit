@@ -296,16 +296,20 @@ fun CameraScreen(
     // 选中项持久化；解析在 IO 线程（35937 行 ≈ 数十毫秒），纹理随会话重建由 controller 重传。
     var lutId by rememberSaveable { mutableStateOf(prefs.getString("lut_id", null)) }
     var lutPending by remember { mutableStateOf<LutLibrary.Entry?>(null) }
-    // LUT 强度（§6 节点 opacity）：只写 prefs，CameraController 每帧回写 FilmParams[34]
-    var lutStrength by rememberSaveable { mutableFloatStateOf(prefs.getFloat("lut_strength", 1f)) }
+    // LUT 强度（§6 节点 opacity）：**不设 Compose state**（v0.10.96）——强度行抽成
+    // 独立 Composable 后拖动只重组它自己；此前强度是 LutSheet 参数，每帧拖动让整个
+    // 面板（顶行 + 分类行 + 卡片行）跟着重组，手势丢帧 → 滑杆读数断档（99→103）。
+    // 事实源 = prefs，CameraController 每帧回写 FilmParams[34]。
     var lutTab by rememberSaveable { mutableIntStateOf(0) } // 选择页分类：0 = LUT，1 = 预设
-    // M4-3 分类：默认品牌来自资产头部，用户可改归属 / 新建分类（存 prefs，不动资产）
+    // M4-3 分类：默认品牌来自资产头部，用户可改归属 / 重命名 / 新建分类（存 prefs，不动资产）
     var lutCats by remember { mutableStateOf(LutLibrary.allCategories(context, prefs)) }
     var lutCatOf by remember {
         mutableStateOf(LutLibrary.entries(context).associate { it.id to LutLibrary.categoryOf(prefs, it) })
     }
     var lutCustomCats by remember { mutableStateOf(LutLibrary.customCategories(prefs)) }
     var lutFilter by rememberSaveable { mutableStateOf<String?>(null) } // null = 全部
+    // 导入成功后待归类的 LUT（v0.10.96）：弹归类弹窗让用户选/建分类，而不是默认「导入」
+    var lutCategorize by remember { mutableStateOf<LutLibrary.Entry?>(null) }
     // 卡片预览图：启动时后台用固定测试图 × 各 LUT 生成一次并缓存（见 LutPreview），
     // 之后开面板只读缓存 —— 一次性生成而非实时渲染，省电
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
@@ -342,6 +346,7 @@ fun CameraScreen(
                     refreshLutLib()
                     lutFilter = null  // 新 LUT 落在「导入」分类，清筛选保证可见
                     lutPending = e    // 导入即选中（走既有加载链）
+                    lutCategorize = e // 弹归类弹窗：选/建分类，而不是默默落「导入」
                 }.onFailure { t ->
                     android.widget.Toast.makeText(
                         context, "导入失败：${t.message?.filter { it.code >= 32 }?.take(60)}", android.widget.Toast.LENGTH_SHORT,
@@ -1292,17 +1297,26 @@ fun CameraScreen(
                 onTab = { lutTab = it },
                 presetIdx = presetIdx,
                 lutId = lutId,
-                lutStrength = lutStrength,
+                lutStrength = prefs.getFloat("lut_strength", 1f), // 面板打开时的初值（事实源 = prefs）
                 previews = lutPreviews,
                 cats = lutCats,
                 catOf = lutCatOf,
                 filter = lutFilter,
                 onFilter = { lutFilter = it },
                 customCats = lutCustomCats,
+                categorize = lutCategorize,
+                onCategorizeHandled = { lutCategorize = null },
                 onNewCat = { name ->
                     LutLibrary.addCategory(prefs, name)
                     lutCats = LutLibrary.allCategories(context, prefs)
                     lutCustomCats = LutLibrary.customCategories(prefs)
+                },
+                onRenameCat = { old, new ->
+                    if (LutLibrary.renameCategory(prefs, old, new)) {
+                        lutCats = LutLibrary.allCategories(context, prefs)
+                        lutCatOf = LutLibrary.entries(context).associate { it.id to LutLibrary.categoryOf(prefs, it) }
+                        if (lutFilter == old) lutFilter = new
+                    }
                 },
                 onDelCat = { c ->
                     LutLibrary.removeCategory(context, prefs, c)
@@ -1316,10 +1330,8 @@ fun CameraScreen(
                     lutCatOf = lutCatOf + (e.id to c)
                     lutCats = LutLibrary.allCategories(context, prefs)
                 },
-                onStrength = { v ->
-                    lutStrength = v
-                    prefs.edit().putFloat("lut_strength", v).apply()
-                },
+                // 只写 prefs（事实源），CameraController 每帧 applyLutStrengthPref 回写引擎
+                onStrength = { v -> prefs.edit().putFloat("lut_strength", v).apply() },
                 onPick = { i ->
                     presetIdx = i
                     controller.setFilmParams(CameraPresets.byIndex(i))
@@ -1863,19 +1875,28 @@ private fun LutSheet(
     onNewCat: (String) -> Unit,
     onDelCat: (String) -> Unit,
     onMoveCat: (LutLibrary.Entry, String) -> Unit,
+    onRenameCat: (String, String) -> Unit,
     onStrength: (Float) -> Unit,
     onPick: (Int) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onImport: () -> Unit,
     onExport: (LutLibrary.Entry, Boolean) -> Unit,
     onDeleteLut: (LutLibrary.Entry) -> Unit,
+    categorize: LutLibrary.Entry?,
+    onCategorizeHandled: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
     var catNewOpen by remember { mutableStateOf(false) }
+    var catNewTarget by remember { mutableStateOf<LutLibrary.Entry?>(null) } // 新建分类后归入的 LUT
     var catMove by remember { mutableStateOf<LutLibrary.Entry?>(null) }
     var catDel by remember { mutableStateOf<String?>(null) } // 待确认删除的分类名
+    var catEdit by remember { mutableStateOf<String?>(null) } // 待重命名的自定义分类
     var lutDel by remember { mutableStateOf<LutLibrary.Entry?>(null) } // 待确认删除的用户 LUT
+    // 导入成功 → 自动弹归类弹窗（父层置 categorize，处理完回执清掉）
+    LaunchedEffect(categorize) {
+        categorize?.let { catMove = it; onCategorizeHandled() }
+    }
     Column(
         Modifier
             .fillMaxWidth()
@@ -1925,48 +1946,21 @@ private fun LutSheet(
             ) {
                 item { SheetPill("全部", selected = filter == null) { onFilter(null) } }
                 items(cats) { c ->
-                    // 长按自定义分类即删除（内置品牌分类不可删）；删完 LUT 回到默认分类
-                    val del: (() -> Unit)? = if (c in customCats) ({ catDel = c }) else null
-                    SheetPill(c, selected = filter == c, onTap = { onFilter(c) }, onLongTap = del)
+                    // 长按自定义分类弹「重命名 / 删除」（内置品牌分类不可改，长按无动作）
+                    val edit: (() -> Unit)? = if (c in customCats) ({ catEdit = c }) else null
+                    SheetPill(c, selected = filter == c, onTap = { onFilter(c) }, onLongTap = edit)
                 }
                 item { SheetPill("＋", selected = false) { catNewOpen = true } }
                 // 用户 LUT 导入（M4 §6.2）：SAF 选 .cube / Hald PNG，内容嗅探把关
                 item { SheetPill("导入", selected = false) { onImport() } }
             }
         }
-        // 强度（仅 LUT 分类且已选中时）：拖到 0 = 旁路，用于在风格与噪声之间权衡
+        // 强度（仅 LUT 分类且已选中时）：拖到 0 = 旁路，用于在风格与噪声之间权衡。
+        // [StrengthRow] 内部持有拖动 state —— 拖动每帧只重组这一行，不再拖动整个面板
+        //（v0.10.96 修"读数断档 99→103"：此前强度是 LutSheet 参数，每帧全面板重组，
+        // 手势丢帧使 onValueChange 采样断档）。
         if (tab == 0 && lutId != null) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(top = 6.dp),
-            ) {
-                Text(
-                    "强度",
-                    color = FilmTheme.CreamDim,
-                    fontSize = 11.sp,
-                    fontFamily = FilmTheme.Mono,
-                )
-                androidx.compose.material3.Slider(
-                    value = lutStrength,
-                    onValueChange = onStrength,
-                    valueRange = 0f..1.5f,
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 8.dp),
-                    colors = androidx.compose.material3.SliderDefaults.colors(
-                        thumbColor = FilmTheme.Cream,
-                        activeTrackColor = FilmTheme.Accent,
-                        inactiveTrackColor = FilmTheme.ChipBorder,
-                    ),
-                )
-                Text(
-                    "${(lutStrength * 100).roundToInt()}%",
-                    color = FilmTheme.Accent,
-                    fontSize = 12.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
+            StrengthRow(initial = lutStrength, onCommit = onStrength)
         }
         // 横向卡片
         if (tab == 0) {
@@ -2004,7 +1998,15 @@ private fun LutSheet(
             shape = RoundedCornerShape(18.dp),
             confirmButton = {
                 androidx.compose.material3.TextButton(
-                    onClick = { if (name.isNotBlank()) onNewCat(name); catNewOpen = false },
+                    onClick = {
+                        if (name.isNotBlank()) {
+                            onNewCat(name)
+                            // 「新建分类并归入」（导入归类弹窗入口）：建完直接把目标 LUT 归进去
+                            catNewTarget?.let { onMoveCat(it, name.trim()) }
+                        }
+                        catNewTarget = null
+                        catNewOpen = false
+                    },
                 ) { Text("新建", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
             },
             dismissButton = {
@@ -2072,6 +2074,16 @@ private fun LutSheet(
                             }
                         }
                     }
+                    // 新建分类并直接归入（导入归类的第 4 个选项，也是任意卡片的快捷建类）
+                    Text(
+                        "＋ 新建分类并归入",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 14.sp,
+                        fontFamily = FilmTheme.Mono,
+                        modifier = Modifier
+                            .pressScale(onTap = { catNewTarget = e; catNewOpen = true; catMove = null })
+                            .padding(vertical = 10.dp),
+                    )
                     // 用户 LUT（M4 §6.2）：导出 .cube / 导出 Hald PNG / 删除 ——
                     // 内置资产不可删（只读交付），也不需要导出（用户拿得到原版 .cube）
                     if (e.user) {
@@ -2133,6 +2145,53 @@ private fun LutSheet(
             },
         )
     }
+    // 自定义分类重命名（v0.10.96）：长按分类弹此窗，顺带保留删除入口；内置品牌分类不可改
+    catEdit?.let { c ->
+        var newName by remember(c) { mutableStateOf(c) }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { catEdit = null },
+            shape = RoundedCornerShape(18.dp),
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { onRenameCat(c, newName); catEdit = null },
+                ) { Text("重命名", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { catEdit = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("分类「$c」", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Column {
+                    androidx.compose.material3.OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        singleLine = true,
+                        label = { Text("分类名", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Serif) },
+                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = FilmTheme.Cream,
+                            unfocusedTextColor = FilmTheme.Cream,
+                            cursorColor = FilmTheme.Accent,
+                            focusedBorderColor = FilmTheme.Accent,
+                            unfocusedBorderColor = FilmTheme.ChipBorder,
+                            focusedContainerColor = FilmTheme.ChipBg,
+                            unfocusedContainerColor = FilmTheme.ChipBg,
+                        ),
+                    )
+                    Text(
+                        "删除此分类",
+                        color = FilmTheme.Accent,
+                        fontSize = 14.sp,
+                        fontFamily = FilmTheme.Mono,
+                        modifier = Modifier
+                            .pressScale(onTap = { catDel = c; catEdit = null })
+                            .padding(top = 12.dp),
+                    )
+                }
+            },
+        )
+    }
     // 删除分类二次确认：不可逆的动作必须确认（LUT 归属会回默认，但分类本身消失）
     catDel?.let { c ->
         androidx.compose.material3.AlertDialog(
@@ -2157,6 +2216,48 @@ private fun LutSheet(
                     fontFamily = FilmTheme.Serif,
                 )
             },
+        )
+    }
+}
+
+/**
+ * LUT 强度行（v0.10.96 抽出）：拖动 state 留在本 Composable 内部，拖动每帧只重组
+ * 这一行。onCommit 每帧回调（写 prefs → CameraController 每帧回写 FilmParams[34] →
+ * 预览实时跟随）。[initial] 只在面板打开时读一次 prefs —— 面板期间以内部 state 为准，
+ * 避免父层回读打断拖动。
+ */
+@Composable
+private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit) {
+    var v by remember { mutableFloatStateOf(initial) }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(top = 6.dp),
+    ) {
+        Text(
+            "强度",
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            fontFamily = FilmTheme.Mono,
+        )
+        androidx.compose.material3.Slider(
+            value = v,
+            onValueChange = { nv -> v = nv; onCommit(nv) },
+            valueRange = 0f..1.5f,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 8.dp),
+            colors = androidx.compose.material3.SliderDefaults.colors(
+                thumbColor = FilmTheme.Cream,
+                activeTrackColor = FilmTheme.Accent,
+                inactiveTrackColor = FilmTheme.ChipBorder,
+            ),
+        )
+        Text(
+            "${(v * 100).roundToInt()}%",
+            color = FilmTheme.Accent,
+            fontSize = 12.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = FontWeight.SemiBold,
         )
     }
 }

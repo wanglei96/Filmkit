@@ -225,6 +225,25 @@ object LutLibrary {
         prefs.edit().putString(KEY_CATS, (cur + n).joinToString("\n")).apply()
     }
 
+    /**
+     * 重命名用户新建的分类（v0.10.96）：KEY_CATS 清单替换 + 归入旧名的覆盖值一起改
+     * （遍历 prefs 的 lut_cat_* 键，不需要 context/清单）。目标名已存在或旧名不是
+     * 自定义分类时返回 false（内置品牌分类不可改名，与删除同规则）。
+     */
+    fun renameCategory(prefs: SharedPreferences, old: String, new: String): Boolean {
+        val o = old.trim()
+        val n = new.trim()
+        if (o.isEmpty() || n.isEmpty() || n.contains('\n') || o == n) return false
+        val cur = customCategories(prefs)
+        if (o !in cur || n in cur) return false
+        val e = prefs.edit()
+        e.putString(KEY_CATS, cur.map { if (it == o) n else it }.joinToString("\n"))
+        prefs.all.keys.filter { it.startsWith(KEY_CAT_PREFIX) }
+            .forEach { k -> if (prefs.getString(k, null) == o) e.putString(k, n) }
+        e.apply()
+        return true
+    }
+
     /** 删除用户新建的分类：同时把归入它的 LUT 覆盖清掉（回默认分类，LUT 本身不动） */
     fun removeCategory(context: Context, prefs: SharedPreferences, name: String) {
         val e = prefs.edit().putString(KEY_CATS, customCategories(prefs).filter { it != name }.joinToString("\n"))
