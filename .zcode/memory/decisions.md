@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-10-01 22:05
+updated: 2026-10-02 10:05
 status: active
 ---
 
@@ -111,3 +111,10 @@ status: active
 - [2026-10-01] **LUT 强度滑杆 = 相对拖动**（按下不跳、增量累加）：M3 Slider 按下即 snap，拇指微调必误跳；专业相机 App 标准交互
 - [2026-10-01] **拖动中不写 prefs**：setLutStrength 直通渲染线程写 filmParams[34]，prefs 只在松手写一次；lutStrengthFromPrefs 哨兵防每帧同步拉回直通值
 - [2026-10-01] **用户 LUT 存档原文件**（字节级，导出可取回原样）；id 加 u_ 前缀防与内置冲突
+
+## NN 路线与中频归因（10-02）
+
+- [2026-10-02] **跨张 A/B 的混杂控制**：场景混杂 ±40%@4px；判读靠 σ2（场景不敏感）+ 引擎 nzPre/nzPost 交叉验证；**失焦只衰减信号不衰减噪声**是判失焦硬指标
+- [2026-10-02] **中频归因定案**：P0 空间核在合焦布纹上净 4px 损失 ≈0（B vs D）；MFNR 时域融合无损中频（D vs E）；锐化 3×3 只盖 1–3px；强度滑杆不是纹理杠杆（C 组）
+- [2026-10-02] **NN 路线集成形态**：融合后 RAW 域 pass、去马赛克前；GPU delegate 强制创建（CompatibilityList 对 Mali-G1 误拒）；失败回退 CPU（3.65s/12MP 兜底）
+- [2026-10-02] **PMRID 是 spike 代表非天花板**：GPU 裕量 5–10× 可上 AP-BSN/CPR；X300 噪声模型 finetune 是最大质量提升项；超越 FX 需 NN + bracketing 两条腿（后处理无法造回被噪声淹没的信息）

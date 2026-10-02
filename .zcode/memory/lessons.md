@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-10-01 22:05
+updated: 2026-10-02 10:05
 status: active
 ---
 
@@ -108,3 +108,13 @@ status: active
 - [2026-10-01] **暗光下空闲 fps 17–21 是曝光时间封顶**（50ms 曝光 → ≤20fps）：帧率对比必须看 blackEv/场景亮度，暗场 20fps vs 亮场 30+ 是物理不是回归
 - [2026-10-01] **prefs"变化才写"守卫会吃默认值**：哨兵初值恰等于 prefs 默认 → 数组槽恒 0（强度全失效）；改用"上次读到的 prefs 值"做变化检测，直通值不被拉回
 - [2026-10-01] **手势内状态用局部变量累加**：rememberUpdatedState 回流慢一帧，同一手势内连续增量事件必须基于本地累加值
+
+## 对比实验与 NN 移植（10-02）
+
+- [2026-10-02] **AF 锁前景致 ROI 失焦全废**（床单前手指，A 组作废）：判据 = 信号2px（带通−σ）崩半而平坦 σ 正常 + 梯度中位崩；定量前逐张目视 ROI 落点（grid 拼图一次查 15 张）
+- [2026-10-02] **shell 管道吞退出码三犯**（gradle/pip 假成功）：校验必须 `RC=$?` 或 grep BUILD 标志；pip 大包两镜像超时换 uv（断点+重试）
+- [2026-10-02] **TFLite CompatibilityList 对 Mali-G1 误拒**：强制 `GpuDelegate()` 即工作；真不支持由 Interpreter.run 抛错捕获
+- [2026-10-02] **电池温度 API**：无 BATTERY_PROPERTY_TEMPERATURE 常量（javap 实锤），在 ACTION_BATTERY_CHANGED sticky 广播 EXTRA_TEMPERATURE（0.1°C）
+- [2026-10-02] **PMRID 移植四坑**：torch.save 权重用 torch.load(weights_only)；onnx2tf 1.28 不声明依赖（psutil/ai_edge_litert/sng4onnx 手动补）；产物 **NHWC**；网络输入 = 01 域 × 959/256（喂 [0,1] 域错配，2px 爆 10×）
+- [2026-10-02] **numpy shape 解构错位**（c,h,w = (H,W,C)）→ y1 切片越界静默截断（272 案）；转换守卫（CPU interpreter vs onnxruntime 相对误差）拦住走样模型上机
+- [2026-10-02] **Compose Row 不换行**：四个按钮在窄屏把后面的挤出屏幕外——按钮组用 FlowRow

@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-01 13:05
+updated: 2026-10-02 10:05
 status: active
 ---
 
@@ -19,19 +19,23 @@ status: active
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
 - `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
 
-## 进行中（2026-10-01：M4 资产互通收线，转 M5）
+## 进行中（2026-10-02：NN spike 闭环，待集成立项）
 
-- [2026-10-01] **M5 诊断与基准** | 最高 | 下一里程碑：逐 pass GPU 计时、成像会话
-  摘要、一键诊断包、性能基准脚本 + golden image 接 CI（开发计划 §11）
-- [2026-10-01] **渲染链后段 GPU** | 待做（降级）| `passMs` 711~2021ms（RCD + 高光
-  重建 + 降噪）是合成耗时大头；动它必须先出画质 A/B（用户红线：画质不降）
-- [2026-09-30] **DFT 继续挖（冷机 500~550ms）** | 待做（降级）| 先做冷机分段测量
-  定位真热点，不凭代码推断
-- [2026-09-29] **MGC-AE 曝光决策 / 弱彩差** | 远期·降级 | 采集侧高光保护；色彩主观类
+- [2026-10-02] **NN 降噪集成** | 最高 | PMRID pass 接拍照链（融合后 RAW 域、
+  去马赛克前，GPU 0.5s + CPU 回退）；先 100% 原版接入再同帧 A/B
+- [2026-10-02] **X300 噪声模型 finetune PMRID** | 高 | σ²=A·x+B 合成训练对，
+  预期纹理保留率 78–86% 再上一档（超越 PC/FX 的算法层主力）
+- [2026-10-02] **HDR+ bracketing 评估** | 高 | 1×/4×/16× 曝光阶梯实拍（超越
+  FX 的进光杠杆）；hdr-plus-swift 为参考实现
+- [2026-10-01] **M5 诊断与基准** | 待做 | 逐 pass GPU 计时、golden image 接 CI
+- [2026-10-01] **更强 NN 模型评估** | 降级 | GPU 裕量 5–10×,AP-BSN/CPR <2s
 
 ## 已完成（近期）
 
-## 已完成（近期）
+- [2026-10-02] **NN 路线可行性验证闭环（v0.10.100–0.10.101）**：三 APP 对比 +
+  5 组开关 A/B 中频归因（P0 否证/MFNR 保留）→ PMRID→TFLite FP16 → 真机 GPU
+  26ms/tile（7× CPU）、12MP 0.51s 零温升；离线质量对照纹理保留 78–86% 优于
+  P0 交换比 | handoffs/NN降噪spike达标与中频归因定案.memo.md
 
 - [2026-10-01] **M4 无损 LUT 导入导出 + 预览降载收线（v0.10.93–0.10.99，tag v0.10.99-m4）**：
   实验判读排除降噪、定位 MFNR 链路 → 方案 A（预览中间链 0.5× + blit 升采，单帧
