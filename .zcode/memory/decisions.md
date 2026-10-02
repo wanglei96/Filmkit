@@ -118,3 +118,9 @@ status: active
 - [2026-10-02] **中频归因定案**：P0 空间核在合焦布纹上净 4px 损失 ≈0（B vs D）；MFNR 时域融合无损中频（D vs E）；锐化 3×3 只盖 1–3px；强度滑杆不是纹理杠杆（C 组）
 - [2026-10-02] **NN 路线集成形态**：融合后 RAW 域 pass、去马赛克前；GPU delegate 强制创建（CompatibilityList 对 Mali-G1 误拒）；失败回退 CPU（3.65s/12MP 兜底）
 - [2026-10-02] **PMRID 是 spike 代表非天花板**：GPU 裕量 5–10× 可上 AP-BSN/CPR；X300 噪声模型 finetune 是最大质量提升项；超越 FX 需 NN + bracketing 两条腿（后处理无法造回被噪声淹没的信息）
+
+## NN 集成（10-02）
+
+- [2026-10-02] **推理层与范围（用户拍板）**：Java TFLite API + JNI 逐 tile 同步回调（GPU delegate 已真机实测、零构建系统改动；专用 NnInfer 常驻线程避 EGL current 抢占，Interpreter 只建不销毁）；范围 = MFNR + 单帧都接；GPU 创建失败降 CPU、运行失败熔断重建 CPU、推理任何失败**整张回退 P0 原链**（照片优先）
+- [2026-10-02] **NN 开 = P0 空域降噪被替代**（PMRID 原版语义：融合后 Bayer 直接进网络）：P0 走 k=0 直读展开（输入 tex_nn_fused_，与 tex_fused_ 同域）、Ts 变体关；rmsPre(前)/rmsPost(后) 恰构成 NN 前后对照，诊断零改动
+- [2026-10-02] **官方预处理口径定案（对照 MegEngine/PMRID run_benchmark.py 源码）**：inp = img01 × cvt_k × 256，cvt_k = S_anchor/S_iso（方差线性模型 var_dn=K·x+Σ 的 shot 项之比，anchor=1600 恒等；X300 anchor S=4.5e-4 @ISO1600 G 通道引擎常量 kNnAnchorS，clamp[0.25,4]，模型无效按 anchor）；**通道序 = BGGR 空间序语义 ch0=B/Gr/Gb/R**（nnSemTables 按 CFA 映射，与训练数据的 bayer pattern 对齐）；cvt_b（read 项平移）img01 域 ~7e-4 实测可忽略。959/256 只是 anchor 恒等点的中间量，不是固定系数；离线复现恒等 0.997（旧口径 0.41 + 发绿/网格/点阵）

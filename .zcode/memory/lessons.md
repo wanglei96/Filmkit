@@ -16,7 +16,7 @@ status: active
 - [2026-09-20] **engine shader 改动构建/单测全绿仍可能设备端全黑**：shader 是设备运行时编译（v0.5.13 非法 step 重载致黑屏）——铁律：shader 改动必须过 `tools/validate-shaders.sh` 且真机验证后才发版
 - [2026-09-22] **C++ 原始字符串 `R"(...)"` 里出现 `)"` 会提前终止字面量**（GLSL 注释里「0.25(=64/255)」即触发）；Kotlin KDoc 里写 `/*` 会开嵌套注释吞文件。注释内数字后接括号用全角
 - [2026-09-23] **增量打包残留旧 so**（APK 33.7MB vs 28.2MB）——出包前 `rm -rf app/build/outputs/apk`
-- [2026-09-27] **shell 管道吞退出码**：`bash x.sh | tail && ...` 的 `&&` 看到 tail 的退出码——校验类命令必须 `RC=$?` 判真实退出码
+- [2026-09-27] **shell 管道吞退出码**：`bash x.sh | tail && ...` 的 `&&` 看到 tail 的退出码——校验类命令必须 `RC=$?` 判真实退出码（10-02 gradle 假失败又犯，三犯在册）
 - [2026-09-30] **Logger 的 fwrite 缓冲会在崩溃时吞掉关键记录**：0.10.83 崩溃后日志只有 77 行，出事那张照片的记录（含崩溃现场）全丢，只剩一个 DNG。关键路径必须主动 `nativeFlushLogs()`；排障时"日志里没有"不等于"没发生"
 
 ## GL / Mali 驱动（X300 实测）
@@ -115,6 +115,12 @@ status: active
 - [2026-10-02] **shell 管道吞退出码三犯**（gradle/pip 假成功）：校验必须 `RC=$?` 或 grep BUILD 标志；pip 大包两镜像超时换 uv（断点+重试）
 - [2026-10-02] **TFLite CompatibilityList 对 Mali-G1 误拒**：强制 `GpuDelegate()` 即工作；真不支持由 Interpreter.run 抛错捕获
 - [2026-10-02] **电池温度 API**：无 BATTERY_PROPERTY_TEMPERATURE 常量（javap 实锤），在 ACTION_BATTERY_CHANGED sticky 广播 EXTRA_TEMPERATURE（0.1°C）
-- [2026-10-02] **PMRID 移植四坑**：torch.save 权重用 torch.load(weights_only)；onnx2tf 1.28 不声明依赖（psutil/ai_edge_litert/sng4onnx 手动补）；产物 **NHWC**；网络输入 = 01 域 × 959/256（喂 [0,1] 域错配，2px 爆 10×）
+- [2026-10-02] **PMRID 移植四坑**：torch.save 权重用 torch.load(weights_only)；onnx2tf 1.28 不声明依赖（psutil/ai_edge_litert/sng4onnx 手动补）；产物 **NHWC**；~~网络输入 = 01 域 × 959/256~~（该口径 10-02 晚被官方源码推翻，见下条与 decisions）
+- [2026-10-02] **官方口径两处误读的方法论**（发绿+网格+点阵的总根源）：①注释里的常数不是公式——959/256 被当固定 VST，实为官方 KSigma 在 anchor 的中间量，正确口径 inp = img01×cvt_k×256（cvt_k=S_anchor/S_iso）；②bayer2rggb 是纯空间序打包手法，通道语义由**训练数据的 bayer pattern（BGGR）**决定——预处理必须溯源到官方源码，不能只看注释/论文转述
+- [2026-10-02] **去直流指标测不出全局亮度偏移**：带通保留率/去梯度 σ 全部"达标"的离线评估，实际压暗 44%（eval_inputs.npy 均值比 0.563 一直在档案里没人看）——离线验收必须加均值/直方图比对或目视 npy
+- [2026-10-02] **通道语义错位的症状 = 弱通道被拉向强通道**（R/B 抬向 G、成片发绿）：跨通道卷积网络对 packed 通道位置敏感，CFA→packed 映射必须对齐训练口径
+- [2026-10-02] **JNI 回调桥「检查就绪却从不初始化」**：nnBridgeInfer 只查 g_nn.ready、nnBridgeInit 无人调用 → 整轮静默回退；判据 = 应有的首次日志（nn.init）缺失
+- [2026-10-02] **自检失败先算理论误差对号**：往返自检多除一次增益，maxRel 0.7335 与 1−256/959 精确吻合——理论值对上了就是那个 bug；自检第一道闸确实拦住了域错配流入正式链
+- [2026-10-02] **诊断双跑的落盘要走独立分支**：nn_ab 两遍成片被 done 回调又存一遍（三张同名冲突）——独立落盘 + 后缀（_nn）区分，done 传 null 防重复
 - [2026-10-02] **numpy shape 解构错位**（c,h,w = (H,W,C)）→ y1 切片越界静默截断（272 案）；转换守卫（CPU interpreter vs onnxruntime 相对误差）拦住走样模型上机
 - [2026-10-02] **Compose Row 不换行**：四个按钮在窄屏把后面的挤出屏幕外——按钮组用 FlowRow

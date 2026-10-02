@@ -98,5 +98,12 @@ status: active
 
 - [2026-10-02] **NN spike 真机数据（X300, PMRID 512tile FP16, 20 块=12.58MP）**：GPU delegate 单块中位 **26ms**（p90 28）、全图 **0.51s**、**24.86MP/s**、零温升；CPU XNNPACK×4 181ms、3.65s、3.45MP/s、零温升
 - [2026-10-02] **PMRID 离线质量（X300 噪声模型合成 + clean 参照）**：纹理保留率 4px 78%（暗光 ISO640）/86%（白天 ISO3200）、8px 91–97%、平坦 σ −77~80%、2px 增强 1.7–2×；对比锚点（10-01 三 APP 同场景 4px）：PC 2.24 / Filmix 2.19 / 我们 1.47
-- [2026-10-02] **PMRID 移植口径**：输入 = 01 域 × 959/256（VST iso=anchor 恒等）、NHWC [1,512,512,4]、tile 重叠 16、FP16 tflite 2.1MB（守卫相对误差 0.76%）；Filmix 曝光 = ISO166+1/4s（+3.6EV 进光）
-- [2026-10-02] **tools 新增**：`tools/midband-attrib.py`（三图/分组归因：EXIF 聚类 + 配准 + 归一带通 + 分尺度噪声 + CIELAB）、`tools/nn/convert_pmrid.py`（torch→onnx→tf→tflite FP16 + 数值守卫）、`tools/nn/quality_eval.py`（合成噪声 + 分块推理 + 保留率表）
+- [2026-10-02] **PMRID 移植口径（10-02 晚官方口径修订）**：输入 = img01 × cvt_k × 256（cvt_k = 4.5e-4/S_iso_G，clamp[0.25,4]；~~01 域 × 959/256~~ 已推翻）+ **BGGR 空间序语义 ch0=B/Gr/Gb/R**（nnSemTables 按 CFA）；NHWC [1,512,512,4]、tile 512/步进 496/重叠 16、FP16 tflite 2.1MB（守卫 0.76%）；Filmix 曝光 = ISO166+1/4s（+3.6EV 进光）
+- [2026-10-02] **tools 新增**：`tools/midband-attrib.py`（三图/分组归因：EXIF 聚类 + 配准 + 归一带通 + 分尺度噪声 + CIELAB）、`tools/nn/convert_pmrid.py`（torch→onnx→tf→tflite FP16 + 数值守卫）、`tools/nn/quality_eval.py`（合成噪声 + 分块推理 + 保留率表；⚠ 其 959/256 口径注释已被官方源码推翻）
+
+## NN 集成（2026-10-02 晚）
+
+- [2026-10-02] **版本沿革（NN 集成三轮）**：253（0.10.102-nnint，NN pass 全链落地；JNI 桥未初始化全回退）→ 254（0.10.103-nnint2，修桥 init/自检 VST/tile 缓冲/nn_ab 重复落盘 4 bug；真机跑通 gpu 1217ms/12MP、nzPreMed 0.0061→0.0020，但口径错成片发绿+网格+点阵）→ **255（0.10.104-nnint3，官方口径 cvt_k×256 + BGGR 通道语义，离线恒等 0.997，待真机复测）**；验证包均未打 tag
+- [2026-10-02] **NN 集成代码落点**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制+CPU 熔断、inferTile JNI 入口）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、kNnAnchorS=4.5e-4、tex_nn_packed_/tex_nn_out_/tex_nn_fused_）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab（均默认关）；raw.render 新增 nn/nnOk/nnFail/nnDel/nnMs/nnTiles/nnGain
+- [2026-10-02] **NN 诊断与自检**：SpikeUi「NN 链路自检」= pack→unpack 域往返（应恒等，half 容差 maxRel ~1e-3）+ 真推理端到端；出包前 check-diag-fields.py 已登记 nnOk/nnFail/nnMs/nnTiles/nnGain
+- [2026-10-02] **离线验收新增判据**：eval_inputs.npy / NN 输出必须查**均值比**（去直流指标测不出全局亮度偏移，PMRID 曾压暗 44% 而带通指标全"达标"）；同刻 DNG 离线复现脚本口径见 decisions（官方 KSigma + BGGR 语义）
