@@ -42,6 +42,16 @@ object EngineBridge {
      *  variant：0=基线 1=+twiddle 查表 2=+twiddle 查表+寄存器 FFT。 */
     external fun nativeRunFftSpike(width: Int, height: Int, iterations: Int, overlap: Boolean, variant: Int): String?
 
+    /**
+     * NN 链路自检（v0.10.102，SpikeUi 按钮）：**必须在拍照线程上调用**
+     * （经 StillRenderClient 队列，引擎 context current）。
+     * withInfer = false：pack→unpack 域往返恒等（R16F 量化容差内）——
+     * 拦"域错配 2px 能量爆 10×"这类集成事故的第一道闸；
+     * withInfer = true：含真推理（GPU/CPU delegate 端到端 + 输出有限性）。
+     * 返回 JSON 诊断串。
+     */
+    external fun nativeRunNnRoundtrip(withInfer: Boolean): String?
+
     // ── M1 相机引擎（SurfaceTexture + OES 路径）──
     external fun nativeEngineStart(surface: Surface): Boolean
     external fun nativeEngineStop()
@@ -96,6 +106,9 @@ object EngineBridge {
      *   var(x)=S·x+O，x = [0,1] 归一化 raw 域；null = 无效 → noiseSigma legacy 回退）。
      * noiseSigma：归一化域噪声 σ（legacy 回退；≤0 时引擎内估计）。
      * lsc：镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=图像左上），null = 关闭/无数据（恒等）。
+     * nnDn = true（v0.10.102，prefs nn_dn）启用 NN 降噪 pass（PMRID，融合后/RAW
+     *   域、去马赛克前）：成功时 P0 空域降噪被替代（直读展开），推理失败自动
+     *   回退 P0 原链（照片优先）。
      * useStill = true（v0.10.93）走拍照侧实例（独立线程 + 独立 EGL context）：
      *   单帧 RAW 合成（实测 passMs 610~766ms）不再占住预览渲染线程；调用前必须
      *   nativeStillStart 成功，且必须在拍照线程上调用（与 nativeEngineSubmitRawBurst 同构）。
@@ -106,7 +119,8 @@ object EngineBridge {
         neutralR: Float, neutralG: Float, neutralB: Float,
         ccm: FloatArray?, lsc: FloatArray?, lscCols: Int, lscRows: Int,
         rotation: Int, demosaic: Int,
-        noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float, film: DoubleArray,
+        noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
+        nnDn: Boolean, film: DoubleArray,
         useStill: Boolean = false,
     ): ByteArray?
 
@@ -124,6 +138,8 @@ object EngineBridge {
      * 诊断那遍固定 = v0.10.69 基线（1/4 域最细层 + 整数采样），所以一次只改一个
      * 设置（align_l1 或 p0_sub）就是单变量对照。
      * p0Sub = true 时 P0 的时域采样走逐通道网格亚像素双线性（prefs p0_sub）。
+     * nnDn = true（v0.10.102，prefs nn_dn）启用 NN 降噪 pass（PMRID）：融合后
+     *   RAW 域、去马赛克前；成功时 P0 空域降噪被替代，推理失败自动回退 P0 原链。
      * useStill = true（v0.10.85，prefs still_thread）时走**拍照侧实例**（独立线程
      *  + 独立 EGL context），预览线程不再被这条链阻塞；调用前必须
      *  nativeStillStart 成功，且必须在拍照线程上调用。
@@ -137,7 +153,7 @@ object EngineBridge {
         rotation: Int, demosaic: Int,
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
-        alignAb: Boolean, p0Sub: Boolean, film: DoubleArray,
+        alignAb: Boolean, p0Sub: Boolean, nnDn: Boolean, film: DoubleArray,
         useStill: Boolean = false,
     ): ByteArray?
 

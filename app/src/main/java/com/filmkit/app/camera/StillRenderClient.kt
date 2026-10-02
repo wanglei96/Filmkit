@@ -167,6 +167,12 @@ object StillRenderClient {
     @Volatile
     private var ready_ = false
 
+    /** 在拍照线程上跑一段诊断（v0.10.102）：NN 自检这类需要引擎 EGL context 的
+     *  native 入口专用。调用前必须 ensureStarted() 成功；与拍照任务同队列串行。 */
+    fun runDiagnostic(block: () -> Unit) {
+        handler?.post(block)
+    }
+
     /** 在拍照线程上跑一次 MFNR 合成。onDone 在**拍照线程**回调（与 RenderClient
      *  同一约定），调用方只做轻量收尾（计数、入队保存）。 */
     fun submitRawBurst(
@@ -184,6 +190,7 @@ object StillRenderClient {
         alignL1: Boolean,
         alignAb: Boolean,
         p0Sub: Boolean,
+        nnDn: Boolean,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -209,7 +216,7 @@ object StillRenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
-                    film, useStill = true,
+                    nnDn, film, useStill = true,
                 )
                 if (bytes == null) {
                     // 合成失败先自愈再谈回退（v0.10.89）：真机 0.10.88 出现过
@@ -226,7 +233,7 @@ object StillRenderClient {
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
                             meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb,
-                            p0Sub, film, useStill = true,
+                            p0Sub, nnDn, film, useStill = true,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
@@ -268,7 +275,7 @@ object StillRenderClient {
     fun submitRawBuf(
         buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
         meta: RenderClient.RawFrameMeta, rotation: Int, film: DoubleArray,
-        demosaic: Int, noiseStrength: Float,
+        demosaic: Int, noiseStrength: Float, nnDn: Boolean,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -291,7 +298,7 @@ object StillRenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, film, useStill = true,
+                    meta.noiseSigma, nnDn, film, useStill = true,
                 )
                 if (bytes == null) {
                     // 自愈一次（v0.10.89 同款："空闲释放后重建，首次合成纹理分配
@@ -304,7 +311,7 @@ object StillRenderClient {
                             meta.neutral[0], meta.neutral[1], meta.neutral[2],
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
-                            meta.noiseSigma, film, useStill = true,
+                            meta.noiseSigma, nnDn, film, useStill = true,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",

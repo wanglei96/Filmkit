@@ -24,6 +24,11 @@ EXPECT = {
     "cms": ("finishStillChain", ["passChromaMultiScale("]),
     "cmsK": ("finishStillChain", ["passChromaMultiScale("]),
     "p0w": ("finishStillChain", ["passRawDenoiseFused("]),
+    # v0.10.102 NN 降噪 pass：runNnPass 必须在 finishStillChain 内、日志行之前
+    "nnOk": ("finishStillChain", ["runNnPass("]),
+    "nnFail": ("finishStillChain", ["runNnPass("]),
+    "nnMs": ("finishStillChain", ["runNnPass("]),
+    "nnTiles": ("finishStillChain", ["runNnPass("]),
 }
 
 
@@ -67,7 +72,8 @@ def main():
             print(f"OK   {name:<6} 行 {ln} 函数 {fn}（定义 {fn_ln}），前置调用齐备且更早")
     # 顺带查 GPU 程序生命周期 —— 只查白名单里的**本次新增** pass（对全仓历史程序
     # 检查会因合并赋值清零/变量名差异产生大量假阳性，噪音掩盖真问题）。
-    WATCH_PROGS = ["raw_dn_ts", "chroma_down", "chroma_at", "chroma_apply"]
+    WATCH_PROGS = ["raw_dn_ts", "chroma_down", "chroma_at", "chroma_apply",
+                   "nn_pack", "nn_unpack"]
     txt = SRC.read_text()
     for prog in WATCH_PROGS:
         miss = []

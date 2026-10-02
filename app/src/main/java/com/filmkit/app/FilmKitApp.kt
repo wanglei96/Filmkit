@@ -21,6 +21,8 @@ class FilmKitApp : Application() {
     override fun onCreate() {
         super.onCreate()
         EngineBridge.ensureLoaded()
+        // NN 推理引擎（v0.10.102）：注入 application context（JNI 回调栈里拿不到）
+        com.filmkit.app.nn.NnInferEngine.attach(this)
         val dir = (getExternalFilesDir("logs") ?: File(filesDir, "logs")).absolutePath
         File(dir).mkdirs()
         EngineBridge.nativeInitLogger(dir)

@@ -48,6 +48,23 @@ float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范
 // 的 releasePreviewScaleGuard，快门到合成结束全程 0.5）。
 std::atomic<float> g_preview_scale{1.0f};
 
+// NN tile 推理回调（v0.10.102）：进程级单槽，Bridge.cpp 在每次 submit 入口注入。
+// 只在拍照合成调用栈内被调（JNIEnv 契约由 Bridge 维护），无并发风险。
+NnInferFn& nn_infer_slot() {
+  static NnInferFn fn = nullptr;
+  return fn;
+}
+
+NnInfoFn& nn_info_slot() {
+  static NnInfoFn fn = nullptr;
+  return fn;
+}
+
+// ── NN 降噪 pass（v0.10.102）标定常数（quality_eval.py 口径）─────────────
+constexpr int kNnTile = 512;      // PMRID tile 尺寸
+constexpr int kNnOverlap = 16;    // tile 重叠（盲点网络边界伪影的标准对策）
+constexpr float kNnVst = 959.0f / 256.0f;  // VST：iso=anchor 1600 恒等点
+
 // M4-7 局部色调映射的低频亮度图尺寸与 knee（都是设备端标定旋钮）。
 // 32×24 在 4080×3072 上等效模糊半径约 128px ≈ 3% 画面宽：再小会退化成全局曲线
 // 并引入光晕，再大（如直接复用 256×96 的直方图目标）就等于逐像素亮度，提亮量会
@@ -1395,6 +1412,82 @@ void main() {
     float rms = sqrt(acc * (1.0 / 256.0));
     float nz = dn > 0 ? sqrt(dacc / float(dn) * 0.5) : 0.0;
     oColor = vec4(rms, nz, 0.0, 1.0);
+})";
+
+// ── NN 降噪 pass（v0.10.102）：PMRID TFLite 的域桥 shader ─────────────────
+// kFsNnPack：mosaic（R16F fused 域 / R16UI 原始域，uSrc 分支）→ packed Bayer
+// 4ch 半分辨率 RGBA（×VST 959/256）。供 glReadPixels 后 CPU 组 tile 喂推理。
+// 域口径（与 tools/nn/quality_eval.py 逐项对照，喂 [0,1] 会域错配 —— 2px 能量
+// 爆 10× 的教训）：
+//   · packed 通道序 = 2×2 块**空间序** (cy,cx) = (0,0),(0,1),(1,0),(1,1)，与离线
+//     bayer2rggb 的 reshape/transpose 一致；X300 GRBG → ch0=Gr,ch1=R,ch2=B,ch3=Gb。
+//     不假设 RGGB —— 通道值一律经 chanAt 按实际 CFA 相位取。
+//   · fused 域（MFNR 路径）已含 WB：除回 gain 还原 PMRID 训练的无 WB 域；
+//     原始域（单帧路径）直接扣黑阶归一，本来无 WB。
+//   · 输出 = clamp[0,1] × 959/256（官方 Denoiser 口径，iso=anchor 恒等点）。
+const char* kFsNnPack = R"(#version 300 es
+precision highp float;
+precision highp usampler2D;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uFused;   // R16F 融合 mosaic（线性，已扣黑阶+WB）
+uniform highp usampler2D uRaw;    // R16UI 单帧原始 mosaic（未消费时绑 dummy）
+uniform ivec2 uSize;              // mosaic 全尺寸
+uniform int uCfaLut;
+uniform vec4 uBlack;              // 按相位 (0,0)(1,0)(0,1)(1,1)
+uniform float uWhite;
+uniform vec3 uGain;
+uniform int uSrc;                 // 0 = fused 域 / 1 = 原始域
+uniform float uScale;             // 959/256
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+float linFused(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    float v = texelFetch(uFused, p, 0).r;
+    return clamp(v / max(gainAt(chanAt(p)), 1e-4), 0.0, 1.0);
+}
+float linRaw(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    float raw = float(texelFetch(uRaw, p, 0).r);
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    return clamp(max((raw - bl) / max(uWhite - bl, 1.0), 0.0), 0.0, 1.0);
+}
+float linAt(ivec2 p) { return uSrc > 0 ? linRaw(p) : linFused(p); }
+void main() {
+    ivec2 q = ivec2(gl_FragCoord.xy);   // 半分辨率 packed 网格
+    ivec2 p = q * 2;
+    float c0 = linAt(p);                    // (cy0, cx0)
+    float c1 = linAt(p + ivec2(1, 0));      // (cy0, cx1)
+    float c2 = linAt(p + ivec2(0, 1));      // (cy1, cx0)
+    float c3 = linAt(p + ivec2(1, 1));      // (cy1, cx1)
+    oColor = vec4(c0, c1, c2, c3) * uScale;
+})";
+
+// kFsNnUnpack：推理结果（RGBA16F 半分辨率 packed Bayer，[0,1] 无 WB）→ mosaic
+// R16F（线性 + WB 域，与 tex_fused_ 同域 —— 下游 P0 直读展开 / RCD 零改动）。
+// 展开下标 = 同一空间序 (p.y&1)*2+(p.x&1)；R16F attachment 只消费 r 通道。
+const char* kFsNnUnpack = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uPacked;
+uniform ivec2 uSize;
+uniform int uCfaLut;
+uniform vec3 uGain;
+uniform float uInvScale;   // ÷(959/256) = 256/959
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int idx = (p.y & 1) * 2 + (p.x & 1);
+    vec4 t = texelFetch(uPacked, ivec2(p.x >> 1, p.y >> 1), 0);
+    float v = idx == 0 ? t.x : (idx == 1 ? t.y : (idx == 2 ? t.z : t.w));
+    float g = gainAt(chanAt(p));
+    oColor = vec4(v * uInvScale * g, 0.0, 0.0, 1.0);
 })";
 
 // kFsMfnrFft（降噪专项 A，2026-09-29）：HDR+ §5 式 6/7 的 pairwise DFT 逐频
@@ -2891,6 +2984,9 @@ bool FrameRenderer::init() {
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
   const GLuint fs_raw_dn_ts = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFusedTs);
   const GLuint fs_tile_rms = compileShader(GL_FRAGMENT_SHADER, kFsTileRms);
+  // NN 降噪 pass（v0.10.102）：域桥 shader（pack/unpack），纯 fragment 低风险
+  const GLuint fs_nn_pack = compileShader(GL_FRAGMENT_SHADER, kFsNnPack);
+  const GLuint fs_nn_unpack = compileShader(GL_FRAGMENT_SHADER, kFsNnUnpack);
   // 降噪专项 A（v0.10.49）：compute program 一律**拍照时现场创建、用完删除**
   //（spike 模式）—— 实锤:init 创建的 compute program 在该 Mali 驱动上经
   // 预览链大量 program 创建后写入全丢（主内核 + 1-texel 微测试一致失败），
@@ -2914,6 +3010,7 @@ bool FrameRenderer::init() {
       !fs_chroma_apply || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
       !fs_raw_dn_f || !fs_raw_dn_ts || !fs_tile_rms || !fs_hr_mask ||
+      !fs_nn_pack || !fs_nn_unpack ||
       !fs_hr_inp || !fs_hr_blur ||
       !fs_hr_hf || !fs_hr_rin || !fs_hr_step || !fs_hr_norms || !fs_hr_ratios ||
       !fs_hr_restore || !fs_hr_stat)
@@ -2942,6 +3039,8 @@ bool FrameRenderer::init() {
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
   prog_raw_dn_ts_ = linkProgram(vs_plain_, fs_raw_dn_ts);
   prog_tile_rms_ = linkProgram(vs_plain_, fs_tile_rms);
+  prog_nn_pack_ = linkProgram(vs_plain_, fs_nn_pack);
+  prog_nn_unpack_ = linkProgram(vs_plain_, fs_nn_unpack);
   // 相位组求和 pass（fragment;主 compute program 见 passMfnrFft 现场创建）。
   if (fs_mfnr_fft_sum) {
     prog_mfnr_fft_sum_ = linkProgram(vs_plain_, fs_mfnr_fft_sum);
@@ -2982,6 +3081,8 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_raw_dn_f);
   glDeleteShader(fs_raw_dn_ts);
   glDeleteShader(fs_tile_rms);
+  glDeleteShader(fs_nn_pack);
+  glDeleteShader(fs_nn_unpack);
   glDeleteShader(fs_mfnr_fft_sum);
   glDeleteShader(fs_hr_mask);
   glDeleteShader(fs_hr_inp);
@@ -2999,6 +3100,7 @@ bool FrameRenderer::init() {
       !prog_chroma_at_ || !prog_chroma_apply_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
       !prog_mfnr_mis_ || !prog_raw_dn_fused_ || !prog_tile_rms_ ||
+      !prog_nn_pack_ || !prog_nn_unpack_ ||
       !prog_hr_mask_ ||
       !prog_hr_inpaint_ || !prog_hr_blur_ || !prog_hr_hf_ || !prog_hr_rin_ ||
       !prog_hr_step_ || !prog_hr_norms_ || !prog_hr_ratios_ ||
@@ -3115,6 +3217,21 @@ bool FrameRenderer::init() {
   u_tile_rms_.size = glGetUniformLocation(prog_tile_rms_, "uSize");
   u_tile_rms_.noise_a = glGetUniformLocation(prog_tile_rms_, "uNoiseA");
   u_tile_rms_.noise_b = glGetUniformLocation(prog_tile_rms_, "uNoiseB");
+
+  u_nn_pack_.fused = glGetUniformLocation(prog_nn_pack_, "uFused");
+  u_nn_pack_.raw = glGetUniformLocation(prog_nn_pack_, "uRaw");
+  u_nn_pack_.size = glGetUniformLocation(prog_nn_pack_, "uSize");
+  u_nn_pack_.cfalut = glGetUniformLocation(prog_nn_pack_, "uCfaLut");
+  u_nn_pack_.black = glGetUniformLocation(prog_nn_pack_, "uBlack");
+  u_nn_pack_.white = glGetUniformLocation(prog_nn_pack_, "uWhite");
+  u_nn_pack_.gain = glGetUniformLocation(prog_nn_pack_, "uGain");
+  u_nn_pack_.src = glGetUniformLocation(prog_nn_pack_, "uSrc");
+  u_nn_pack_.scale = glGetUniformLocation(prog_nn_pack_, "uScale");
+  u_nn_unpack_.packed = glGetUniformLocation(prog_nn_unpack_, "uPacked");
+  u_nn_unpack_.size = glGetUniformLocation(prog_nn_unpack_, "uSize");
+  u_nn_unpack_.cfalut = glGetUniformLocation(prog_nn_unpack_, "uCfaLut");
+  u_nn_unpack_.gain = glGetUniformLocation(prog_nn_unpack_, "uGain");
+  u_nn_unpack_.iscale = glGetUniformLocation(prog_nn_unpack_, "uInvScale");
 
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
   if (prog_mfnr_fft_sum_) {
@@ -3419,6 +3536,8 @@ void FrameRenderer::release() {
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
   if (prog_raw_dn_ts_) glDeleteProgram(prog_raw_dn_ts_);
   if (prog_tile_rms_) glDeleteProgram(prog_tile_rms_);
+  if (prog_nn_pack_) glDeleteProgram(prog_nn_pack_);
+  if (prog_nn_unpack_) glDeleteProgram(prog_nn_unpack_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
   for (auto& t : tex_fft_out_) {
     if (t) glDeleteTextures(1, &t);
@@ -3455,6 +3574,29 @@ void FrameRenderer::release() {
   if (fbo_pyr4_) glDeleteFramebuffers(1, &fbo_pyr4_);
   if (tex_fused_) glDeleteTextures(1, &tex_fused_);
   if (fbo_fused_) glDeleteFramebuffers(1, &fbo_fused_);
+  // NN pass（v0.10.102）：纹理 + CPU 缓冲一并释放
+  if (tex_nn_packed_) glDeleteTextures(1, &tex_nn_packed_);
+  if (fbo_nn_packed_) glDeleteFramebuffers(1, &fbo_nn_packed_);
+  if (tex_nn_out_) glDeleteTextures(1, &tex_nn_out_);
+  if (tex_nn_fused_) glDeleteTextures(1, &tex_nn_fused_);
+  if (fbo_nn_fused_) glDeleteFramebuffers(1, &fbo_nn_fused_);
+  if (tex_nn_fdummy_) glDeleteTextures(1, &tex_nn_fdummy_);
+  if (tex_nn_rdummy_) glDeleteTextures(1, &tex_nn_rdummy_);
+  tex_nn_packed_ = fbo_nn_packed_ = 0;
+  tex_nn_out_ = 0;
+  tex_nn_fused_ = fbo_nn_fused_ = 0;
+  tex_nn_fdummy_ = 0;
+  tex_nn_rdummy_ = 0;
+  nn_w_ = nn_h_ = 0;
+  nn_packed_.clear();
+  nn_packed_.shrink_to_fit();
+  nn_out_.clear();
+  nn_out_.shrink_to_fit();
+  nn_weight_.clear();
+  nn_weight_.shrink_to_fit();
+  nn_ramp_.clear();
+  nn_ramp_.shrink_to_fit();
+  prog_nn_pack_ = prog_nn_unpack_ = 0;
   if (tex_mis_) glDeleteTextures(1, &tex_mis_);
   if (fbo_mis_) glDeleteFramebuffers(1, &fbo_mis_);
   if (tex_w_) glDeleteTextures(1, &tex_w_);
@@ -3611,6 +3753,14 @@ void FrameRenderer::setPreviewScale(float s) {
 float FrameRenderer::previewScale() {
   return g_preview_scale.load(std::memory_order_relaxed);
 }
+
+void FrameRenderer::setNnInferFn(NnInferFn fn) { nn_infer_slot() = fn; }
+
+NnInferFn FrameRenderer::nnInferFn() { return nn_infer_slot(); }
+
+void FrameRenderer::setNnInfoFn(NnInfoFn fn) { nn_info_slot() = fn; }
+
+NnInfoFn FrameRenderer::nnInfoFn() { return nn_info_slot(); }
 
 bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
                                 int dst_w, int dst_h, const FilmParams& p,
@@ -4250,7 +4400,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               const float* lsc, int lsc_cols, int lsc_rows,
                               int rotation, const FilmParams& p, int demosaic,
                               float noise_strength, const float* noise_model,
-                              float noise_sigma,
+                              float noise_sigma, bool nn_dn,
                               std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
@@ -4313,6 +4463,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.lsc_cols = lsc_cols;
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+  c.nn = nn_dn;
+  // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
+  dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
+  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0;
   finishStillChain(c, t0, out_rgba);
   return true;
 }
@@ -4485,10 +4639,28 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // bilateral 逻辑同款（kFsRawDenoiseFused）。
     // C 专项：关档 = 全零系数（A=B=0，shader 里精确跳过邻域）。
     static const NoiseCoef kNoDn{};
+    // ── NN 降噪 pass（v0.10.102）：融合后/RAW 域、去马赛克前 ────────────────
+    // PMRID（融合后 RAW 域 pass）：成功 → P0 空域降噪被 NN 替代（强度 0 直读
+    // 展开，输入 tex_nn_fused_，与 tex_fused_ 同域）；失败 → 整张自动回退 P0
+    // 原链（照片优先红线，dbg_nn_fail_=1 留痕）。rms_pre 在下方读 tex_fused_
+    //（NN 前域）与 rms_res（NN 后 tex_mos_）—— nzPre/nzPost 恰好构成 NN 的
+    // 前后对照，诊断链零改动。
+    bool nn_ok = false;
+    if (c.nn) {
+      const NnSrc src = c.mfnr_fused ? NnSrc{tex_fused_, 0} : NnSrc{0, 1};
+      nn_ok = runNnPass(c, src, c.gains, c.cfa, c.black_phase, c.white_level);
+      if (nn_ok) dbg_p0s_ = 0;  // NN 替代 P0；9/96 是 P0 原路径的样本数语义
+    }
     if (c.mfnr_fused) {
+      if (nn_ok) {
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
+                            tex_nn_fused_, /*allow_ts=*/false);
+      } else {
       // 同帧 A/B 诊断（v0.10.74）：先用**旧层**位移场跑一遍 P0 + tile RMS
       //（结果不进成片），紧接着跑正常那遍覆盖 tex_mos_。同一帧数据、同一
       // 抖动、同一场景，唯一差异 = 最细对齐层 —— 这是唯一没有混杂的对照。
+      // （NN 生效时跳过：那遍跑的是被替代的 P0，读数与成片链无关。）
       if (c.align_ab && tex_off_ab_[2] != 0) {
         passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
                             c.dn ? c.nc : kNoDn, tex_off_ab_, /*subpixel=*/false);
@@ -4499,9 +4671,19 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       }
       passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
                           c.gains, c.dn ? c.nc : kNoDn, nullptr, c.p0_sub);
+      }
     } else {
-      passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
-                     c.dn ? c.nc : kNoDn);
+      if (nn_ok) {
+        // 单帧 NN：PMRID 输出已落 tex_nn_fused_（fused 域），走同一条
+        // "强度 0 直读展开" 产出 tex_mos_（单帧无 tex_mfnr_，Ts 本就不命中，
+        // allow_ts=false 显式钉死）
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
+                            tex_nn_fused_, /*allow_ts=*/false);
+      } else {
+        passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                       c.dn ? c.nc : kNoDn);
+      }
     }
     // D-2 诊断（v0.10.62）：P0 **之前**也测一次 tile RMS（tex_fused_），与 P0 之后的
     // 同网格结果对比即可读出 P0 的实际降噪量 —— 否则只能靠跨场景成片猜测
@@ -4700,6 +4882,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   if (dbg_ab_ok_) {
     kv += ",\"abP0w\":" + jnum(dbg_ab_p0w_, 6);
     kv += ",\"abNzPostMed\":" + jnum(dbg_ab_nz_post_, 8);
+  }
+  // NN 降噪 pass（v0.10.102）：生效性读数 —— nnOk/nnFail/nnDel/nnMs/nnTiles。
+  // 必须在这里（runNnPass 于本函数内执行完之后、日志发出前）读取。
+  kv += ",\"nn\":" + std::to_string(c.nn ? 1 : 0);
+  if (c.nn) {
+    kv += ",\"nnOk\":" + std::to_string(dbg_nn_ok_);
+    kv += ",\"nnFail\":" + std::to_string(dbg_nn_fail_);
+    kv += ",\"nnDel\":\"" + dbg_nn_del_ + "\"";
+    kv += ",\"nnMs\":" + jnum(dbg_nn_ms_, 6);
+    kv += ",\"nnTiles\":" + std::to_string(dbg_nn_tiles_);
   }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
@@ -5252,13 +5444,16 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
                                         const float black_phase[4],
                                         float white_level, const float gains[3],
                                         const NoiseCoef& nc,
-                                        const GLuint* off_tex, bool subpixel) {
+                                        const GLuint* off_tex, bool subpixel,
+                                        GLuint fused_tex, bool allow_ts) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   // D-2（v0.10.58）：时域 × 空间联合（4 帧各取 3×3 同相位邻域 = 36 独立样本）。
   // 缺任一输入（无位移场/无原始帧）则回落到旧的"融合后 9 样本"路径。
+  // v0.10.102：NN 直读展开时强制 allow_ts=false —— Ts 的时域样本来自未降噪
+  // 原始帧，与 NN 后的参考域不一致，且 P0 已被 NN 替代、再采时域无意义。
   const GLuint* offs = off_tex != nullptr ? off_tex : tex_off_;
-  if (prog_raw_dn_ts_ && offs[2] != 0 && tex_mfnr_[2] != 0) {
+  if (allow_ts && prog_raw_dn_ts_ && offs[2] != 0 && tex_mfnr_[2] != 0) {
     glUseProgram(prog_raw_dn_ts_);
     const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
     for (int i = 0; i < 4; ++i) {
@@ -5305,7 +5500,9 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   }
   glUseProgram(prog_raw_dn_fused_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_fused_);
+  // v0.10.102：NN 直读展开时输入 = tex_nn_fused_（PMRID 输出，与 tex_fused_
+  // 同域同格式 —— 线性 mosaic、已扣黑阶 + WB）
+  glBindTexture(GL_TEXTURE_2D, fused_tex != 0 ? fused_tex : tex_fused_);
   glUniform1i(u_raw_dn_f_.tex, 0);
   glUniform2i(u_raw_dn_f_.size, w, h);
   glUniform1i(u_raw_dn_f_.cfalut, cfaLutOf(cfa));
@@ -5314,6 +5511,427 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
   dbg_p0w_ = -1.f;                                   // 旧路径无 wsum 诊断
   glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// ── NN 降噪 pass（v0.10.102）：PMRID TFLite 接拍照链 ──────────────────────
+
+bool FrameRenderer::ensureNnTargets(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  const int w1 = (w + 1) / 2, h1 = (h + 1) / 2;
+  const bool ready = tex_nn_packed_ && fbo_nn_packed_ && tex_nn_out_ &&
+                     tex_nn_fused_ && fbo_nn_fused_ && tex_nn_fdummy_ &&
+                     tex_nn_rdummy_;
+  if (nn_w_ == w && nn_h_ == h && ready) return true;
+  if (nn_w_ != w || nn_h_ != h) {
+    if (tex_nn_packed_) glDeleteTextures(1, &tex_nn_packed_);
+    if (fbo_nn_packed_) glDeleteFramebuffers(1, &fbo_nn_packed_);
+    if (tex_nn_out_) glDeleteTextures(1, &tex_nn_out_);
+    if (tex_nn_fused_) glDeleteTextures(1, &tex_nn_fused_);
+    if (fbo_nn_fused_) glDeleteFramebuffers(1, &fbo_nn_fused_);
+    tex_nn_packed_ = fbo_nn_packed_ = tex_nn_out_ = 0;
+    tex_nn_fused_ = fbo_nn_fused_ = 0;
+  }
+  if (!tex_nn_fdummy_ || !tex_nn_rdummy_) {
+    // 类型匹配的两个 1×1 兜底（kFsNnPack 的 sampler 分支互斥仍须全绑定：
+    // 整型/浮点 sampler 不可混绑，Mali 预测执行 + 无绑定 = 整帧 1282 丢弃）
+    glGenTextures(1, &tex_nn_fdummy_);
+    glBindTexture(GL_TEXTURE_2D, tex_nn_fdummy_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, 1, 1, 0, GL_RED, GL_HALF_FLOAT,
+                 nullptr);
+    glGenTextures(1, &tex_nn_rdummy_);
+    glBindTexture(GL_TEXTURE_2D, tex_nn_rdummy_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, 1, 1, 0, GL_RED_INTEGER,
+                 GL_UNSIGNED_SHORT, nullptr);
+  }
+  // packed 中转（RGBA16F；与 Java 侧 readback/上传同一格式）
+  makeTex(&tex_nn_packed_, &fbo_nn_packed_, GL_RGBA16F, w1, h1);
+  // 推理输出上传目标（只上传 + 采样，无需 fbo）
+  glGenTextures(1, &tex_nn_out_);
+  glBindTexture(GL_TEXTURE_2D, tex_nn_out_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w1, h1, 0, GL_RGBA, GL_HALF_FLOAT,
+               nullptr);
+  // unpack 输出：R16F mosaic（照 tex_fused_ 手写 —— makeTex 写死 GL_RGBA）
+  glGenTextures(1, &tex_nn_fused_);
+  glBindTexture(GL_TEXTURE_2D, tex_nn_fused_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, w, h, 0, GL_RED, GL_HALF_FLOAT,
+               nullptr);
+  glGenFramebuffers(1, &fbo_nn_fused_);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_nn_fused_);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex_nn_fused_, 0);
+  // CPU 缓冲（随实例常驻；NN 关闭路径不进来）
+  nn_packed_.resize(static_cast<size_t>(w1) * h1 * 4);
+  nn_out_.resize(static_cast<size_t>(w1) * h1 * 4);
+  nn_weight_.resize(static_cast<size_t>(w1) * h1);
+  nn_tile_in_.resize(static_cast<size_t>(kNnTile) * kNnTile * 4);
+  nn_tile_out_.resize(static_cast<size_t>(kNnTile) * kNnTile * 4);
+  if (nn_ramp_.empty()) buildNnRamp();
+  nn_w_ = w;
+  nn_h_ = h;
+  return true;
+}
+
+void FrameRenderer::buildNnRamp() {
+  nn_ramp_.assign(static_cast<size_t>(kNnTile) * kNnTile, 1.0f);
+  for (int i = 0; i < kNnOverlap; ++i) {
+    const float v = static_cast<float>(i) / (kNnOverlap - 1);
+    for (int j = 0; j < kNnTile; ++j) {
+      nn_ramp_[static_cast<size_t>(i) * kNnTile + j] *= v;
+      nn_ramp_[static_cast<size_t>(kNnTile - 1 - i) * kNnTile + j] *= v;
+      nn_ramp_[static_cast<size_t>(j) * kNnTile + i] *= v;
+      nn_ramp_[static_cast<size_t>(j) * kNnTile + (kNnTile - 1 - i)] *= v;
+    }
+  }
+}
+
+bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
+                              const float gains[3], int cfa,
+                              const float black_phase[4], float white_level) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const NnInferFn infer = nn_infer_slot();
+  if (!infer) {
+    Logger::instance().log(LogLevel::kError, "engine", "nn.fail",
+                           "{\"why\":\"no_fn\"}");
+    return false;
+  }
+  if (!ensureNnTargets(c.w, c.h)) {
+    Logger::instance().log(LogLevel::kError, "engine", "nn.fail",
+                           "{\"why\":\"targets\"}");
+    return false;
+  }
+  const int w = c.w, h = c.h;
+  const int w1 = (w + 1) / 2, h1 = (h + 1) / 2;
+  constexpr int kStep = kNnTile - kNnOverlap;
+  const int nx = (w1 + kStep - 1) / kStep;
+  const int ny = (h1 + kStep - 1) / kStep;
+
+  // 1) kFsNnPack：mosaic → packed 4ch 半分辨率（除回 WB、×VST）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_nn_packed_);
+  glViewport(0, 0, w1, h1);
+  glUseProgram(prog_nn_pack_);
+  if (src.src == 0) {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_fused_);
+    glUniform1i(u_nn_pack_.fused, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_nn_rdummy_);
+    glUniform1i(u_nn_pack_.raw, 1);
+  } else {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_nn_fdummy_);
+    glUniform1i(u_nn_pack_.fused, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, raw_tex_);
+    glUniform1i(u_nn_pack_.raw, 1);
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glUniform2i(u_nn_pack_.size, w, h);
+  glUniform1i(u_nn_pack_.cfalut, cfaLutOf(cfa));
+  glUniform4f(u_nn_pack_.black, black_phase[0], black_phase[1], black_phase[2],
+              black_phase[3]);
+  glUniform1f(u_nn_pack_.white, white_level);
+  glUniform3f(u_nn_pack_.gain, gains[0], gains[1], gains[2]);
+  glUniform1i(u_nn_pack_.src, src.src);
+  glUniform1f(u_nn_pack_.scale, kNnVst);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+
+  // 2) 读回 packed（RGBA16F + GL_FLOAT = X300 已验证组合，见 v0.6.48 教训）
+  glReadPixels(0, 0, w1, h1, GL_RGBA, GL_FLOAT, nn_packed_.data());
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  // 3) tile 循环：组块（边缘补零）→ 推理 → ramp 融合。
+  //    组块/融合口径与 tools/nn/quality_eval.py run_pmrid 逐项一致：
+  //    步进 496、pad 补零、ramp = linspace(0,1,16) 四边、out/max(weight,1e-6)。
+  nn_out_.assign(nn_out_.size(), 0.f);
+  nn_weight_.assign(nn_weight_.size(), 0.f);
+  for (int iy = 0; iy < ny; ++iy) {
+    for (int ix = 0; ix < nx; ++ix) {
+      const int x0 = ix * kStep, y0 = iy * kStep;
+      float* tin = nn_tile_in_.data();
+      for (int ty = 0; ty < kNnTile; ++ty) {
+        const int sy = y0 + ty;
+        float* dst = tin + static_cast<size_t>(ty) * kNnTile * 4;
+        if (sy < h1) {
+          const int wrow = std::min(kNnTile, w1 - x0);
+          std::memcpy(dst, nn_packed_.data() + (static_cast<size_t>(sy) * w1 + x0) * 4,
+                      static_cast<size_t>(wrow) * 4 * sizeof(float));
+          if (wrow < kNnTile)
+            std::memset(dst + static_cast<size_t>(wrow) * 4, 0,
+                        static_cast<size_t>(kNnTile - wrow) * 4 * sizeof(float));
+        } else {
+          std::memset(dst, 0, static_cast<size_t>(kNnTile) * 4 * sizeof(float));
+        }
+      }
+      if (!infer(tin, nn_tile_out_.data())) {
+        // 任一 tile 失败 → 整张回退 P0 原链（照片优先红线）；留痕
+        Logger::instance().log(
+            LogLevel::kError, "engine", "nn.fail",
+            std::string("{\"why\":\"infer\",\"tile\":") +
+                std::to_string(iy * nx + ix) + "}");
+        Logger::instance().flush();
+        return false;
+      }
+      const float* tout = nn_tile_out_.data();
+      for (int ty = 0; ty < kNnTile; ++ty) {
+        const int sy = y0 + ty;
+        if (sy >= h1) break;
+        const int wrow = std::min(kNnTile, w1 - x0);
+        for (int tx = 0; tx < wrow; ++tx) {
+          const float rw = nn_ramp_[static_cast<size_t>(ty) * kNnTile + tx];
+          const size_t oi = static_cast<size_t>(sy) * w1 + x0 + tx;
+          float* o = &nn_out_[oi * 4];
+          const float* t = tout + (static_cast<size_t>(ty) * kNnTile + tx) * 4;
+          o[0] += t[0] * rw;
+          o[1] += t[1] * rw;
+          o[2] += t[2] * rw;
+          o[3] += t[3] * rw;
+          nn_weight_[oi] += rw;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < nn_weight_.size(); ++i) {
+    const float wv = std::max(nn_weight_[i], 1e-6f);
+    nn_out_[i * 4 + 0] /= wv;
+    nn_out_[i * 4 + 1] /= wv;
+    nn_out_[i * 4 + 2] /= wv;
+    nn_out_[i * 4 + 3] /= wv;
+  }
+
+  // 4) 上传 + kFsNnUnpack → tex_nn_fused_（线性 mosaic + WB 域，与 tex_fused_ 同域）
+  glBindTexture(GL_TEXTURE_2D, tex_nn_out_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w1, h1, GL_RGBA, GL_FLOAT,
+                  nn_out_.data());
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_nn_fused_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_nn_unpack_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_nn_out_);
+  glUniform1i(u_nn_unpack_.packed, 0);
+  glUniform2i(u_nn_unpack_.size, w, h);
+  glUniform1i(u_nn_unpack_.cfalut, cfaLutOf(cfa));
+  glUniform3f(u_nn_unpack_.gain, gains[0], gains[1], gains[2]);
+  glUniform1f(u_nn_unpack_.iscale, 1.0f / kNnVst);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  dbg_nn_ok_ = 1;
+  dbg_nn_fail_ = 0;
+  dbg_nn_tiles_ = nx * ny;
+  if (nn_info_slot()) {
+    if (const char* d = nn_info_slot()()) dbg_nn_del_ = d;
+  }
+  dbg_nn_ms_ = std::chrono::duration<float, std::milli>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+  return true;
+}
+
+// NN 链路自检（v0.10.102）：合成 fused 域测试图 → pack →（可选真推理）→ unpack
+// → 与输入对比。独立小纹理（512×384），不碰拍照链目标；unpack 输出用 RGBA16F
+//（R16F + GL_FLOAT 读回是 X300 的静默回零组合，见 v0.6.48/0.10.50 教训）。
+std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const int w = 512, h = 384;
+  const int w1 = w / 2, h1 = h / 2;
+  const float gains[3] = {1.6f, 1.0f, 1.9f};
+  const int cfa = 1;  // GRBG（X300 主摄）
+  // 合成输入：渐变 + 8px 细节 + 2px 高频（packed 网格周期），×WB 增益 = fused 域
+  const int cfa_lut = cfaLutOf(cfa);
+  std::vector<float> in(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int k = ((y & 1) << 1) | (x & 1);
+      const int ch = (cfa_lut >> (k << 1)) & 3;
+      float lin = 0.08f + 0.35f * static_cast<float>(x) / w +
+                  0.04f * std::sin(y * 0.7f) + 0.02f * std::sin(x * 0.9f);
+      if (((x / 2 + y / 2) & 7) == 0) lin += 0.03f;  // 4px 周期方块（纹理探针）
+      lin = std::clamp(lin, 0.0f, 1.0f);
+      const float g = ch == 0 ? gains[0] : (ch == 1 ? gains[1] : gains[2]);
+      in[static_cast<size_t>(y) * w + x] = std::min(lin * g, 1.0f);
+    }
+  }
+  std::string json = std::string("{\"ok\":false,\"withInfer\":") +
+                     (with_infer ? "true" : "false") + ",\"w\":" +
+                     std::to_string(w) + ",\"h\":" + std::to_string(h);
+  GLuint tex_in = 0, fbo_in = 0, tex_pk = 0, fbo_pk = 0, tex_out = 0,
+         fbo_out = 0, tex_pkout = 0;
+  auto cleanup = [&]() {
+    if (tex_in) glDeleteTextures(1, &tex_in);
+    if (fbo_in) glDeleteFramebuffers(1, &fbo_in);
+    if (tex_pk) glDeleteTextures(1, &tex_pk);
+    if (fbo_pk) glDeleteFramebuffers(1, &fbo_pk);
+    if (tex_out) glDeleteTextures(1, &tex_out);
+    if (fbo_out) glDeleteFramebuffers(1, &fbo_out);
+    if (tex_pkout) glDeleteTextures(1, &tex_pkout);
+  };
+  bool ok = false;
+  double max_abs = 0, max_rel = 0, mean_abs = 0;
+  bool infer_ok = false;
+  std::string del = "-";
+  do {
+    if (!prog_nn_pack_ || !prog_nn_unpack_) { json += ",\"error\":\"no_prog\""; break; }
+    makeTex(&tex_pk, &fbo_pk, GL_RGBA16F, w1, h1);
+    makeTex(&tex_out, &fbo_out, GL_RGBA16F, w, h);
+    // 推理输出上传目标（只采样，无需 fbo —— fbo 复用会偷换 pack 的 attachment）
+    glGenTextures(1, &tex_pkout);
+    glBindTexture(GL_TEXTURE_2D, tex_pkout);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w1, h1, 0, GL_RGBA, GL_HALF_FLOAT,
+                 nullptr);
+    // R16F 输入（GL_FLOAT 上传到 R16F 合法，见 ES 3.0 表 3.2）
+    glGenTextures(1, &tex_in);
+    glBindTexture(GL_TEXTURE_2D, tex_in);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, w, h, 0, GL_RED, GL_FLOAT,
+                 in.data());
+    // pack（uSrc=0，fused 域）
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_pk);
+    glViewport(0, 0, w1, h1);
+    glUseProgram(prog_nn_pack_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_in);
+    glUniform1i(u_nn_pack_.fused, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_nn_rdummy_);
+    glUniform1i(u_nn_pack_.raw, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform2i(u_nn_pack_.size, w, h);
+    glUniform1i(u_nn_pack_.cfalut, cfa_lut);
+    glUniform4f(u_nn_pack_.black, 0, 0, 0, 0);
+    glUniform1f(u_nn_pack_.white, 1.0f);
+    glUniform3f(u_nn_pack_.gain, gains[0], gains[1], gains[2]);
+    glUniform1i(u_nn_pack_.src, 0);
+    glUniform1f(u_nn_pack_.scale, kNnVst);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    std::vector<float> packed(static_cast<size_t>(w1) * h1 * 4);
+    glReadPixels(0, 0, w1, h1, GL_RGBA, GL_FLOAT, packed.data());
+    std::vector<float> outpk(static_cast<size_t>(w1) * h1 * 4);
+    infer_ok = true;
+    if (with_infer) {
+      const NnInferFn infer = nn_infer_slot();
+      if (!infer || nn_tile_in_.empty()) {
+        infer_ok = false;
+        json += ",\"error\":\"no_fn\"";
+        break;
+      }
+      if (nn_ramp_.empty()) buildNnRamp();
+      // 256×192 ≤ tile：单 tile 无重叠 —— 推理后直接取结果（ramp 融合只在
+      // 多 tile 的重叠带起作用，runNnPass 全口径已覆盖）
+      for (int ty = 0; ty < kNnTile; ++ty) {
+        const int sy = ty;
+        float* dst = nn_tile_in_.data() + static_cast<size_t>(ty) * kNnTile * 4;
+        if (sy < h1) {
+          const int wrow = std::min(kNnTile, w1);
+          std::memcpy(dst, packed.data() + static_cast<size_t>(sy) * w1 * 4,
+                      static_cast<size_t>(wrow) * 4 * sizeof(float));
+          if (wrow < kNnTile)
+            std::memset(dst + static_cast<size_t>(wrow) * 4, 0,
+                        static_cast<size_t>(kNnTile - wrow) * 4 * sizeof(float));
+        } else {
+          std::memset(dst, 0, static_cast<size_t>(kNnTile) * 4 * sizeof(float));
+        }
+      }
+      if (!infer(nn_tile_in_.data(), nn_tile_out_.data())) {
+        infer_ok = false;
+        json += ",\"error\":\"infer_fail\"";
+        break;
+      }
+      if (nn_info_slot()) {
+        if (const char* d = nn_info_slot()()) del = d;
+      }
+      for (int ty = 0; ty < h1; ++ty) {
+        std::memcpy(outpk.data() + static_cast<size_t>(ty) * w1 * 4,
+                    nn_tile_out_.data() +
+                        (static_cast<size_t>(ty) * kNnTile) * 4,
+                    static_cast<size_t>(w1) * 4 * sizeof(float));
+      }
+    } else {
+      // 无推理：直接 ÷VST（模拟网络输出的逆变换段）
+      for (size_t i = 0; i < outpk.size(); ++i) outpk[i] = packed[i] / kNnVst;
+    }
+    // 输出有限性（推理路径）
+    for (float v : outpk) {
+      if (!std::isfinite(v)) {
+        infer_ok = false;
+        json += ",\"error\":\"nonfinite\"";
+        break;
+      }
+    }
+    if (!infer_ok) break;
+    glBindTexture(GL_TEXTURE_2D, tex_pkout);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w1, h1, GL_RGBA, GL_FLOAT,
+                    outpk.data());
+    // unpack（→ RGBA16F，可安全读回）
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_out);
+    glViewport(0, 0, w, h);
+    glUseProgram(prog_nn_unpack_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_pkout);
+    glUniform1i(u_nn_unpack_.packed, 0);
+    glUniform2i(u_nn_unpack_.size, w, h);
+    glUniform1i(u_nn_unpack_.cfalut, cfa_lut);
+    glUniform3f(u_nn_unpack_.gain, gains[0], gains[1], gains[2]);
+    glUniform1f(u_nn_unpack_.iscale, 1.0f / kNnVst);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    std::vector<float> back(static_cast<size_t>(w) * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, back.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // 对比：无推理 = 域往返恒等（R16F 量化容差内）；推理 = 输出合理（有限 + 值域）
+    size_t n = static_cast<size_t>(w) * h;
+    double sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const double got = back[i * 4];
+      const double want = in[i];
+      const double d = std::fabs(got - want);
+      max_abs = std::max(max_abs, d);
+      if (want > 1e-4) max_rel = std::max(max_rel, d / want);
+      sum += d;
+    }
+    mean_abs = sum / n;
+    ok = with_infer ? infer_ok : (max_rel < 5e-3);
+    if (with_infer) {
+      // 降噪输出应仍在物理值域内（÷VST 后 [0,1]×gain 上限 1.9 之外即域错配）
+      double hi = 0;
+      for (float v : outpk) hi = std::max(hi, static_cast<double>(v));
+      ok = infer_ok && hi < 2.5;
+    }
+  } while (false);
+  cleanup();
+  const double total_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+          .count();
+  char tail[256];
+  snprintf(tail, sizeof(tail),
+           ",\"ok\":%s,\"inferOk\":%s,\"delegate\":\"%s\",\"maxAbs\":%.6f,"
+           "\"maxRel\":%.6f,\"meanAbs\":%.6f,\"ms\":%.1f}",
+           ok ? "true" : "false", infer_ok ? "true" : "false", del.c_str(),
+           max_abs, max_rel, mean_abs, total_ms);
+  json += tail;
+  Logger::instance().log(LogLevel::kInfo, "engine", "nn.roundtrip", json);
+  return json;
 }
 
 // ── v0.10.15：darktable filmic 高光重建（HR）纹理与编排 ─────────────────────
@@ -5619,6 +6237,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float noise_sigma,
                                    float ref_noise_scale, bool use_dft,
                                    bool align_l1, bool align_ab, bool p0_sub,
+                                   bool nn_dn,
                                    std::vector<uint8_t>* out_rgba) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -6124,8 +6743,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
+  c.nn = nn_dn;
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
   dbg_ab_p0w_ = 0.f; dbg_ab_nz_post_ = 0.f; dbg_ab_ok_ = false;
+  // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
+  dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
+  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0;
   c.align_ab = align_ab;
   c.p0_sub = p0_sub;
   rms_pre_res = TileRmsResult{};

@@ -13,6 +13,16 @@
 
 namespace filmkit {
 
+// NN tile 推理回调（v0.10.102）：Bridge.cpp 注入（JNI 调 NnInferEngine.inferTile）。
+// in/out 各为 512×512×4ch NHWC float（packed Bayer 空间序）。返回 false = 推理失败
+// （调用方整张回退 P0 原链 —— 照片优先红线）。进程级单槽：预览/拍照实例共用，
+// Bridge 侧保证只在拍照合成调用栈内被调（JNIEnv 契约见 Bridge.cpp 注释）。
+using NnInferFn = bool (*)(const float* in, float* out);
+
+// delegate 信息回调（v0.10.102）：返回 "gpu"/"cpu"（Bridge 侧缓存的静态缓冲），
+// NN pass 成功后取一次记入日志。与 NnInferFn 同槽生命周期。
+using NnInfoFn = const char* (*)();
+
 // ── 噪声模型（C 专项，2026-09-29）────────────────────────────────────
 // 传感器噪声 = read + shot：var_c(x) = S_c·x + O_c，x = 渲染线性域信号
 // （黑阶后 / 白阶归一，[0,1]，与 DNG NoiseProfile 同域），WB 前。
@@ -98,6 +108,19 @@ class FrameRenderer {
   static void setPreviewScale(float s);   // clamp [0.25, 1.0]
   static float previewScale();
 
+  // NN 推理回调注入（v0.10.102，见 NnInferFn 注释）。幂等，Bridge 在每次
+  // submit 入口重设（顺带刷新其 JNIEnv 快照）。
+  static void setNnInferFn(NnInferFn fn);
+  static NnInferFn nnInferFn();
+  static void setNnInfoFn(NnInfoFn fn);
+  static NnInfoFn nnInfoFn();
+
+  // NN 链路自检（SpikeUi 按钮，v0.10.102；Bridge 的 nativeRunNnRoundtrip 调用，
+  // 须在持有引擎 EGL context 的线程）：合成 mosaic 测试图 → pack →（可选真推理）
+  // → unpack → 与输入比对。with_infer=false 验证域往返恒等（R16F 量化容差内）；
+  // =true 验证 delegate+模型端到端可用。返回 JSON 诊断串。
+  std::string runNnRoundtrip(bool with_infer);
+
   /// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
   void setYuvMatrix(int m) { yuv_matrix_ = m ? 1 : 0; }
 
@@ -135,13 +158,16 @@ class FrameRenderer {
   //   noise_sigma —— 归一化域噪声 σ（模型无效时的 legacy 回退；≤0 时引擎内估计）
   //   lsc/lsc_cols/lsc_rows —— 镜头阴影增益网格（RGB 交错，cols×rows，(0,0)=左上；
   //                  nullptr 或尺寸 ≤1 = 恒等，即 LSC 关闭（A/B 对照））
+  //   nn_dn —— v0.10.102：NN 降噪 pass（PMRID，融合后/RAW 域、去马赛克前）。
+  //          true 时 P0 空域降噪被 NN 替代（直读展开）；NN 失败自动回退 P0 原链。
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
                  const float black_phase[4], int white_level,
                  float neutral_r, float neutral_g, float neutral_b,
                  const float* ccm9, const float* lsc, int lsc_cols,
                  int lsc_rows, int rotation, const FilmParams& p, int demosaic,
                  float noise_strength, const float* noise_model,
-                 float noise_sigma, std::vector<uint8_t>* out_rgba);
+                 float noise_sigma, bool nn_dn,
+                 std::vector<uint8_t>* out_rgba);
 
   // RAW 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域
   // tile 对齐（Align.cpp，CPU 金字塔搜索）+ 置信度加权时域均值 → P0 降噪位
@@ -158,7 +184,7 @@ class FrameRenderer {
                       int demosaic, float noise_strength,
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
-                      bool align_ab, bool p0_sub,
+                      bool align_ab, bool p0_sub, bool nn_dn,
                       std::vector<uint8_t>* out_rgba);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
@@ -199,10 +225,14 @@ class FrameRenderer {
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
   // off_tex = nullptr 时用正常位移场 tex_off_；A/B 诊断传 tex_off_ab_。
   // subpixel = true 走逐通道网格亚像素采样（uSub=1，v0.10.75 杠杆 B）。
+  // fused_tex = v0.10.102：P0 输入纹理替换（NN pass 的输出 tex_fused_nn_，
+  //   0 = 默认 tex_fused_）。allow_ts = false 强制跳过 Ts 变体（NN 直读展开时
+  //   时域样本引用的是未降噪的原始帧，与 NN 后的参考域不一致，且无意义）。
   void passRawDenoiseFused(int w, int h, int cfa, const float black_phase[4],
                            float white_level, const float gains[3],
                            const NoiseCoef& nc, const GLuint* off_tex = nullptr,
-                           bool subpixel = false);
+                           bool subpixel = false, GLuint fused_tex = 0,
+                           bool allow_ts = true);
   // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
   // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
   // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
@@ -249,11 +279,29 @@ class FrameRenderer {
     // 唯一干净的对照就是同一帧数据。
     bool align_ab = false;
     bool p0_sub = false;   // P0 亚像素采样（prefs p0_sub，v0.10.75）
+    bool nn = false;       // NN 降噪 pass（prefs nn_dn，v0.10.102；执行结果在 dbg_nn_*）
     std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
   };
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
                         std::vector<uint8_t>* out_rgba);
+  // ── NN 降噪 pass（v0.10.102）：PMRID TFLite ─────────────────────────────
+  // 位置 = 融合后 RAW 域、去马赛克前（finishStillChain 的 P0 之前）。数据流：
+  // kFsNnPack（mosaic→packed 4ch 半分辨率、除回 WB、×VST 959/256）→ readPixels
+  // → CPU 组 tile（512/步进 496/边缘补零，quality_eval.py 口径）→ NnInferFn
+  // 逐 tile 回调 → CPU ramp 融合（16px 线性）→ 上传 → kFsNnUnpack（÷VST、乘回
+  // WB、展开 mosaic）→ tex_fused_nn_。返回 false = 失败（调用方回退 P0 原链，
+  // dbg_nn_fail 置位）。nn_src 由调用方按路径填（见参数说明）。
+  struct NnSrc {
+    GLuint fused_tex = 0;  // fused 域输入（MFNR 路径 = tex_fused_；0 = 单帧 raw_tex_）
+    int src = 0;           // 0 = fused 域（R16F，已扣黑阶+WB）/ 1 = 原始域（R16UI）
+  };
+  bool runNnPass(const ChainCtx& c, const NnSrc& src, const float gains[3],
+                 int cfa, const float black_phase[4], float white_level);
+  bool ensureNnTargets(int w, int h);
+  // 16px 线性 ramp（quality_eval.py 的 linspace(0,1,16) 四边、对边反转），
+  // 首次构建后常驻。ensureNnTargets 与 runNnRoundtrip 共用。
+  void buildNnRamp();
   // WB 增益 / CCM / LSC 纹理准备（两条静拍路径共用）
   struct RawCommon {
     float gains[3] = {1.f, 1.f, 1.f};
@@ -370,7 +418,8 @@ class FrameRenderer {
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
          prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
-         prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0;
+         prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0,
+         prog_nn_pack_ = 0, prog_nn_unpack_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -390,6 +439,21 @@ class FrameRenderer {
   GLuint tex_pyr4_ = 0, fbo_pyr4_ = 0;  // RGBA8，1/16（readback 层）
   int pyr1_w_ = 0, pyr1_h_ = 0;
   GLuint tex_fused_ = 0, fbo_fused_ = 0;  // R16F，融合后线性 mosaic（raw 尺寸）
+  // ── NN 降噪 pass（v0.10.102）纹理与 CPU 缓冲 ────────────────────────────
+  // tex_nn_packed_ = kFsNnPack 输出（(w/2)×(h/2) RGBA16F，packed Bayer ×VST）；
+  // tex_nn_out_ = 推理结果上传目标（同规格）；tex_fused_nn_ = kFsNnUnpack 输出
+  //（w×h R16F，mosaic、线性+WB 域 —— 与 tex_fused_ 同域，下游零改动）。
+  // CPU 缓冲随实例常驻（readback 50MB + 输出 50MB + 权重 12.5MB），NN 关闭时不分配。
+  GLuint tex_nn_packed_ = 0, fbo_nn_packed_ = 0;
+  GLuint tex_nn_out_ = 0;
+  GLuint tex_nn_fused_ = 0, fbo_nn_fused_ = 0;
+  // 1×1 兜底纹理：kFsNnPack 的两个 sampler 分支互斥，但 Mali 铁律 = 所有
+  // sampler 无论分支都必须有**类型匹配**的合法绑定（整型/浮点不可混绑）。
+  GLuint tex_nn_fdummy_ = 0;  // R16F（uFused 未消费时）
+  GLuint tex_nn_rdummy_ = 0;  // R16UI（uRaw 未消费时）
+  int nn_w_ = 0, nn_h_ = 0;
+  std::vector<float> nn_packed_, nn_out_, nn_weight_, nn_ramp_;
+  std::vector<float> nn_tile_in_, nn_tile_out_;  // 512²×4 tile 暂存（与 Java 缓冲间 memcpy）
   GLuint tex_off_[3] = {0, 0, 0};         // RGBA16F 位移场（tiles×tiles）
   GLuint tex_off_ab_[3] = {0, 0, 0};      // 同上，A/B 诊断的第二组（旧层对齐）
   GLuint tex_mis_ = 0, fbo_mis_ = 0;      // RGBA8 mismatch map（4×tiles 网格）
@@ -416,6 +480,14 @@ class FrameRenderer {
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
+  // ── NN 降噪 pass（v0.10.102）诊断（raw.render 的 nnOk/nnDel/nnMs 族）────
+  // 生效性字段照 p0s 的教训：必须由 finishStillChain 在日志组装前读取（runNnPass
+  // 在 finishStillChain 内执行），不能写在调用方。
+  int dbg_nn_ok_ = 0;      // 1 = NN pass 成功（P0 走直读展开）；0 = 未启用
+  int dbg_nn_fail_ = 0;    // 0 = 成功；1 = 推理链失败（已回退 P0 原链）
+  std::string dbg_nn_del_; // "gpu" / "cpu"（来自 NnInferEngine，随 tile 交换）
+  float dbg_nn_ms_ = 0.f;  // NN pass 端到端（pack+读回+推理+ramp+上传+unpack）
+  int dbg_nn_tiles_ = 0;
   // 同帧 A/B 诊断（v0.10.74）：旧层位移场那遍 P0 的读数
   float dbg_ab_p0w_ = 0.f;
   float dbg_ab_nz_post_ = 0.f;
@@ -608,6 +680,14 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
   } u_tile_rms_;
+  // NN pass（v0.10.102）：pack / unpack 两个 fragment 程序的 uniform
+  struct {
+    GLint fused = -1, raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
+          gain = -1, src = -1, scale = -1;
+  } u_nn_pack_;
+  struct {
+    GLint packed = -1, size = -1, cfalut = -1, gain = -1, iscale = -1;
+  } u_nn_unpack_;
   struct {
     // v0.7.9：contrast/shoulder/toe/cross（旧 log 域胶片链）已随链删除；
     // FilmParams 槽位保留解析（契约不移位），引擎不再消费。

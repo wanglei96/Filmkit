@@ -1931,6 +1931,9 @@ class CameraController(private val context: Context, private val render: RenderC
             prefs.getBoolean("noise_reduction", true),
             prefs.getInt("noise_reduction_level", 1),
         )
+        // NN 降噪（v0.10.102，prefs nn_dn 默认关）：PMRID 接拍照链，P0 空域降噪
+        // 被替代；推理失败引擎侧自动回退 P0 原链（照片优先）
+        val nnDn = prefs.getBoolean("nn_dn", false)
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -1965,7 +1968,7 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill) {
             StillRenderClient.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
-                demosaic, noiseStrength,
+                demosaic, noiseStrength, nnDn,
             ) { bytes, w, h ->
                 if (bytes != null) {
                     finishStillCapture(bytes, w, h)
@@ -1978,14 +1981,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, orientationStep,
-                        filmParams, demosaic, noiseStrength,
+                        filmParams, demosaic, noiseStrength, nnDn,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
-                demosaic, noiseStrength,
+                demosaic, noiseStrength, nnDn,
             ) { bytes, w, h -> finishStillCapture(bytes, w, h) }
         }
     }
@@ -2126,6 +2129,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 真机同帧 A/B 实测收益 +43.7%/+46.5%（残余噪声降到基线的 70%），
         // dnMs 未见显著上升，画质验收（DNG 自参照 100% 裁剪）无细节损失。
         val p0Sub = prefs.getBoolean("p0_sub", true)
+        // NN 降噪（v0.10.102，prefs nn_dn 默认关）：PMRID pass（P0 被替代）
+        val nnDn = prefs.getBoolean("nn_dn", false)
         // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
         rendersInFlight.incrementAndGet()
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
@@ -2144,13 +2149,22 @@ class CameraController(private val context: Context, private val render: RenderC
         // 后面，"拍完挪手机画面完全冻住 1~2 秒"。启动失败即回退预览线程。
         val useStill = prefs.getBoolean("still_thread", false) &&
             StillRenderClient.ensureStarted()
+        // NN 同帧 A/B（v0.10.102，prefs nn_ab）：同一帧数据跑两遍（nn off → on），
+        // 两张成片都落盘供离线对比 —— 与 still_ab 同构，唯一干净口径。
+        // 依赖独立线程（第二遍在预览线程）+ nn_dn 开。
+        val nnAb = useStill && nnDn && prefs.getBoolean("nn_ab", false)
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
-                useDft, alignL1, alignAb, p0Sub, done)
+                useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/false, done)
+        } else if (nnAb) {
+            // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
+            // 两张成片都落盘供离线对比（时间戳天然区分）
+            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+                useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/true, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
                 orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub) { bytes, w, h ->
+                useDft, alignL1, alignAb, p0Sub, nnDn) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -2162,13 +2176,13 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBurst(buffers, strides, refW, refH, meta,
                         orientationStep, filmParams, demosaic, noiseStrength,
-                        burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, done)
+                        burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn, done)
                 }
             }
         } else {
             render.submitRawBurst(buffers, strides, refW, refH, meta,
                 orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub, done)
+                useDft, alignL1, alignAb, p0Sub, nnDn, done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -2184,7 +2198,11 @@ class CameraController(private val context: Context, private val render: RenderC
      *  "换执行路径不改画质"（项目口径：跨拍摄的 A/B 会被场景/曝光/手抖污染）。
      *  落盘第一遍（拍照线程）的成片，第二遍只做对照。
      *  代价：多一遍完整合成（第二遍期间预览会卡，这正是要修的那个现象）+
-     *  峰值多一张 RGBA（≈50MB）—— 只在验收时打开。 */
+     *  峰值多一张 RGBA（≈50MB）—— 只在验收时打开。
+     *
+     *  v0.10.102 扩展（varyNn=true，prefs nn_ab）：NN 质量 A/B —— 第一遍 nn off
+     *  （P0 基线）、第二遍 nn on，两张成片**都落盘**（文件名时间戳天然区分），
+     *  日志 render.nn_ab 记两遍摘要。 */
     private fun submitStillAb(
         buffers: List<ByteBuffer>,
         strides: IntArray,
@@ -2197,6 +2215,8 @@ class CameraController(private val context: Context, private val render: RenderC
         alignL1: Boolean,
         alignAb: Boolean,
         p0Sub: Boolean,
+        nnDn: Boolean,
+        varyNn: Boolean,
         done: (ByteArray?, Int, Int) -> Unit,
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
@@ -2205,16 +2225,19 @@ class CameraController(private val context: Context, private val render: RenderC
         val rot = orientationStep
         val film = filmParams
         val rn = burstRefNoiseScale
+        val nn1 = if (varyNn) false else nnDn
+        val nn2 = if (varyNn) true else nnDn
         StillRenderClient.submitRawBurst(buffers, strides, width, height, meta,
             rot, film, demosaic, noiseStrength, rn,
-            useDft, alignL1, alignAb, p0Sub) { b1, w1, h1 ->
+            useDft, alignL1, alignAb, p0Sub, nn1) { b1, w1, h1 ->
             val d1 = if (b1 != null) outDigest(b1, w1, h1) else null
             render.submitRawBurst(buffers, strides, width, height, meta,
                 rot, film, demosaic, noiseStrength, rn,
-                useDft, alignL1, alignAb, p0Sub) { b2, w2, h2 ->
+                useDft, alignL1, alignAb, p0Sub, nn2) { b2, w2, h2 ->
                 val d2 = if (b2 != null) outDigest(b2, w2, h2) else null
                 EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "render.still_ab",
+                    EngineBridge.LEVEL_INFO, "camera",
+                    if (varyNn) "render.nn_ab" else "render.still_ab",
                     kv(
                         "crcStill" to (d1?.crc ?: -1L),
                         "crcPreview" to (d2?.crc ?: -1L),
@@ -2223,13 +2246,21 @@ class CameraController(private val context: Context, private val render: RenderC
                         "meanPreview" to "%.3f".format(d2?.mean ?: -1.0),
                         "sizeStill" to "${w1}x${h1}",
                         "sizePreview" to "${w2}x${h2}",
+                        "nn1" to nn1, "nn2" to nn2,
                         "abMs" to (android.os.SystemClock.elapsedRealtime() - t0),
                     ),
                 )
                 EngineBridge.nativeFlushLogs()
-                // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
-                // 否则"照片已算出却不落盘"（v0.10.85 审查 R1）
-                if (b1 != null) done(b1, w1, h1) else done(b2, w2, h2)
+                if (varyNn) {
+                    // NN A/B：两张成片都落盘（基线在前，NN 在后 —— 时间戳顺序即 A/B 顺序）
+                    if (b1 != null) queueJpegSave(b1, w1, h1)
+                    if (b2 != null) queueJpegSave(b2, w2, h2)
+                    done(b2 ?: b1, w2, h2)
+                } else {
+                    // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
+                    // 否则"照片已算出却不落盘"（v0.10.85 审查 R1）
+                    if (b1 != null) done(b1, w1, h1) else done(b2, w2, h2)
+                }
             }
         }
     }

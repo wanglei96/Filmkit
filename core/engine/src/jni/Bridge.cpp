@@ -92,6 +92,104 @@ std::atomic<int> g_yuv_matrix{0};
 // 串起来，连拍时"第三张按不动"才能归因（v0.10.85 审查 P2）。
 std::atomic<int> g_burst_seq{0};
 
+// ── NN 推理回桥（v0.10.102）：C++ → NnInferEngine.inferTile ─────────────
+// 契约：g_nn.env 在**每次** nativeEngineSubmitRaw/Burst（以及 nativeRunNnRoundtrip）
+// 入口刷新为当前线程的 JNIEnv —— nnBridgeInfer 只会发生在同一条 native 调用栈内
+//（FrameRenderer::runNnPass 的 tile 循环），env 必然有效。jclass 持 global ref，
+// tile 缓冲地址由 NnInferEngine 常驻 direct buffer 提供（getBufs 一次性取回）。
+struct NnBridge {
+  JNIEnv* env = nullptr;
+  jclass cls = nullptr;         // global ref
+  jmethodID m_infer = nullptr;  // ()I
+  jmethodID m_info = nullptr;   // ()Ljava/lang/String;
+  jmethodID m_bufs = nullptr;   // ()[Ljava/nio/ByteBuffer;
+  float* in_addr = nullptr;
+  float* out_addr = nullptr;
+  char del_buf[8] = {0};        // delegateInfo 的 C 字符串缓存
+  bool tried = false;
+  bool ready = false;
+};
+NnBridge g_nn;
+
+void nnBridgeRefreshDelegate(JNIEnv* env);
+
+bool nnBridgeInit(JNIEnv* env) {
+  if (g_nn.ready) return true;
+  if (g_nn.tried) return false;
+  g_nn.tried = true;
+  jclass lc = env->FindClass("com/filmkit/app/nn/NnInferEngine");
+  if (lc == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return false;
+  }
+  g_nn.cls = static_cast<jclass>(env->NewGlobalRef(lc));
+  env->DeleteLocalRef(lc);
+  if (!g_nn.cls) return false;
+  g_nn.m_infer = env->GetStaticMethodID(g_nn.cls, "inferTile", "()I");
+  g_nn.m_info =
+      env->GetStaticMethodID(g_nn.cls, "delegateInfo", "()Ljava/lang/String;");
+  g_nn.m_bufs =
+      env->GetStaticMethodID(g_nn.cls, "getBufs", "()[Ljava/nio/ByteBuffer;");
+  if (!g_nn.m_infer || !g_nn.m_info || !g_nn.m_bufs || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return false;
+  }
+  auto bufs = static_cast<jobjectArray>(
+      env->CallStaticObjectMethod(g_nn.cls, g_nn.m_bufs));
+  if (bufs == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return false;
+  }
+  jobject inb = env->GetObjectArrayElement(bufs, 0);
+  jobject outb = env->GetObjectArrayElement(bufs, 1);
+  g_nn.in_addr =
+      inb ? static_cast<float*>(env->GetDirectBufferAddress(inb)) : nullptr;
+  g_nn.out_addr =
+      outb ? static_cast<float*>(env->GetDirectBufferAddress(outb)) : nullptr;
+  if (inb) env->DeleteLocalRef(inb);
+  if (outb) env->DeleteLocalRef(outb);
+  env->DeleteLocalRef(bufs);
+  g_nn.ready = g_nn.in_addr != nullptr && g_nn.out_addr != nullptr;
+  return g_nn.ready;
+}
+
+// FrameRenderer 的 NnInferFn：拷入 tile → 阻塞推理 → 拷出结果。
+// 失败（Java 侧错误码 / 异常 / 未就绪）返回 false，调用方整张回退 P0 原链。
+bool nnBridgeInfer(const float* in, float* out) {
+  if (!g_nn.env || !g_nn.ready) return false;
+  constexpr size_t kTileBytes = static_cast<size_t>(512) * 512 * 4 * sizeof(float);
+  std::memcpy(g_nn.in_addr, in, kTileBytes);
+  const jint r = g_nn.env->CallStaticIntMethod(g_nn.cls, g_nn.m_infer);
+  if (g_nn.env->ExceptionCheck()) {
+    g_nn.env->ExceptionClear();
+    return false;
+  }
+  if (r != 0) return false;
+  std::memcpy(out, g_nn.out_addr, kTileBytes);
+  // 首次成功后缓存 delegate 串（nnBridgeInfo 的返回值）
+  if (g_nn.del_buf[0] == 0) nnBridgeRefreshDelegate(g_nn.env);
+  return true;
+}
+
+// FrameRenderer 的 NnInfoFn：返回缓存的 delegate 串（"gpu"/"cpu"）。
+const char* nnBridgeInfo() { return g_nn.del_buf; }
+
+void nnBridgeRefreshDelegate(JNIEnv* env) {
+  if (!g_nn.ready || !g_nn.m_info) return;
+  auto s = static_cast<jstring>(
+      env->CallStaticObjectMethod(g_nn.cls, g_nn.m_info));
+  if (s != nullptr && !env->ExceptionCheck()) {
+    const char* p = env->GetStringUTFChars(s, nullptr);
+    if (p) {
+      std::snprintf(g_nn.del_buf, sizeof(g_nn.del_buf), "%s", p);
+      env->ReleaseStringUTFChars(s, p);
+    }
+  } else {
+    env->ExceptionClear();
+  }
+  if (s) env->DeleteLocalRef(s);
+}
+
 int64_t nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -207,6 +305,26 @@ Java_com_filmkit_app_EngineBridge_nativeRunFftSpike(JNIEnv* env, jobject, jint w
   const filmkit::FftSpikeResult r =
       runSpikeFftMerge(w, h, iters, overlap == JNI_TRUE, variant);
   return toJString(env, r.toJson());
+}
+
+// NN 链路自检（v0.10.102，SpikeUi 按钮）：须在**拍照线程**（有引擎 context，
+// StillRenderClient 队列）调用。with_infer=false = pack→unpack 域往返恒等；
+// true = 含真推理（GPU/CPU delegate 端到端 + 输出有限性）。
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_filmkit_app_EngineBridge_nativeRunNnRoundtrip(JNIEnv* env, jobject,
+                                                       jboolean with_infer) {
+  // NN 回桥注入（往返自检的推理路径也要走 NnInferEngine）
+  g_nn.env = env;
+  FrameRenderer::setNnInferFn(&nnBridgeInfer);
+  FrameRenderer::setNnInfoFn(&nnBridgeInfo);
+  // 优先拍照实例（自带 context 的线程上才有意义）；回退预览实例（SpikeUi 走
+  // StillRenderClient 队列时必为前者）
+  FrameRenderer* r = g_renderer_still.load();
+  if (r == nullptr) r = g_renderer;
+  if (r == nullptr) {
+    return toJString(env, "{\"ok\":false,\"error\":\"no_renderer\"}");
+  }
+  return toJString(env, r->runNnRoundtrip(with_infer == JNI_TRUE));
 }
 
 // ── 相机引擎（M1：SurfaceTexture + OES，参照 PhotonCamera 路径）──────
@@ -551,7 +669,11 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jfloatArray lsc,
     jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic,
     jfloat noise_strength, jfloatArray noise_model, jfloat noise_sigma,
-    jdoubleArray film, jboolean use_still) {
+    jdoubleArray film, jboolean use_still, jboolean nn_dn) {
+  // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
+  g_nn.env = env;
+  FrameRenderer::setNnInferFn(&nnBridgeInfer);
+  FrameRenderer::setNnInfoFn(&nnBridgeInfo);
   // v0.10.93：单帧 RAW 与 MFNR burst 同构的拍照侧实例路由（use_still），单帧
   // 合成（passMs 610~766ms）不再占住预览渲染线程。调用线程已在 nativeStillStart
   // makeCurrent，这里再确认一次（幂等）。
@@ -601,7 +723,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
       lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_strength,
-      model_ok ? model6 : nullptr, noise_sigma, &rgba);
+      model_ok ? model6 : nullptr, noise_sigma, nn_dn == JNI_TRUE, &rgba);
   Logger::instance().log(
       LogLevel::kInfo, "camera", "render.single_done",
       "{\"kind\":\"raw\",\"path\":\"" +
@@ -626,8 +748,12 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jfloatArray ccm, jfloatArray lsc, jint lsc_cols, jint lsc_rows,
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
-    jboolean align_ab, jboolean p0_sub, jdoubleArray film,
+    jboolean align_ab, jboolean p0_sub, jboolean nn_dn, jdoubleArray film,
     jboolean use_still) {
+  // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
+  g_nn.env = env;
+  FrameRenderer::setNnInferFn(&nnBridgeInfer);
+  FrameRenderer::setNnInfoFn(&nnBridgeInfo);
   // v0.10.85：use_still = 走拍照侧实例（独立线程 + 独立 context），预览线程不再
   // 被这条 1.6~3.4s 的链阻塞。context 是 per-thread current，调用线程已在
   // nativeStillStart 里 makeCurrent；这里再确认一次（幂等）。
@@ -692,7 +818,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
       lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale,
       use_dft == JNI_TRUE, align_l1 == JNI_TRUE, align_ab == JNI_TRUE,
-      p0_sub == JNI_TRUE, &rgba);
+      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, &rgba);
   // 每次 burst 落一条路径/耗时/结果记录（v0.10.85 审查 P2）：raw.render 不区分实例，
   // 靠这条把"哪条路、第几张、多久、成没成"钉住；失败也必须留痕。
   Logger::instance().log(

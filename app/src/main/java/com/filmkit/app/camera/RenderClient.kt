@@ -293,7 +293,7 @@ class RenderClient {
     fun submitRawBuf(
         buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
         meta: RawFrameMeta, rotation: Int, film: DoubleArray,
-        demosaic: Int, noiseStrength: Float,
+        demosaic: Int, noiseStrength: Float, nnDn: Boolean,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -314,7 +314,7 @@ class RenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, film, useStill = false,
+                    meta.noiseSigma, nnDn, film, useStill = false,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -356,6 +356,7 @@ class RenderClient {
         alignL1: Boolean,
         alignAb: Boolean,
         p0Sub: Boolean,
+        nnDn: Boolean,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -378,7 +379,8 @@ class RenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub, film,
+                    meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
+                    nnDn, film,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

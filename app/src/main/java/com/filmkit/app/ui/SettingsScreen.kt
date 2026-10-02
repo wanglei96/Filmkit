@@ -684,6 +684,43 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // NN 降噪（v0.10.102）：PMRID 接拍照链（融合后 RAW 域、去马赛克前），
+            // 成功时替代 P0 空域降噪；推理失败自动回退原链。默认关（架构改动默认关）。
+            var nnDn by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("nn_dn", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        nnDn = !nnDn
+                        prefs.edit().putBoolean("nn_dn", nnDn).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.nn_dn",
+                            "{\"on\":$nnDn}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("NN 降噪（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "开 = 神经网络降噪（PMRID）替代空域降噪，GPU 约 +0.7s/张；" +
+                            "失败自动回退原链。与拍照独立线程同用效果最佳",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (nnDn) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 同帧 A/B（v0.10.85 诊断）：同一帧数据先走拍照线程、再走预览线程，
             // 比较两遍输出的 CRC32 与采样均值 —— 验证"换路径不改画质"。
             var stillAb by rememberSaveable {
@@ -715,6 +752,43 @@ fun SettingsScreen(
                 }
                 Text(
                     if (stillAb) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // NN 同帧 A/B（v0.10.102，诊断）：同一帧数据跑两遍（NN off → on），
+            // 两张成片都落盘供离线对比 —— 唯一无混杂的 NN 质量口径。
+            var nnAb by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("nn_ab", false))
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        nnAb = !nnAb
+                        prefs.edit().putBoolean("nn_ab", nnAb).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.nn_ab",
+                            "{\"on\":$nnAb}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("NN A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "仅在 NN 降噪与独立线程都打开时生效：每张照片先跑基线再跑 " +
+                            "NN，两张成片都落盘（先基线后 NN）；拍照慢约一倍",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (nnAb) "开" else "关",
                     color = FilmTheme.Accent,
                     fontSize = 13.sp,
                     fontFamily = FilmTheme.Mono,
