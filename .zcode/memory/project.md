@@ -19,20 +19,34 @@ status: active
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
 - `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
 
-## 进行中（2026-10-02 晚：NN 判死，转 HDR+）
+## 进行中（2026-10-02 深夜）
 
-- [2026-10-02] **HDR+ bracketing 评估** | 最高 | 1×/4×/16× 曝光阶梯实拍（超越
-  FX 的进光杠杆）；hdr-plus-swift 为参考实现。**NN 判死后成为算法层主线**
+- [2026-10-02] **超广角畸变校正** | 最高 | 桶形畸变未校正（实测幅度 5.7%，RAW 流 HAL 不做
+  几何校正）；先探测 `DISTORTION_CORRECTION_MODE` + `LENS_DISTORTION`，不行则引擎加 GPU
+  自校正 pass（去马赛克前、逐 CFA 平面采样保相位）。**需拍板**：校正后裁边的视场损失 5~10%
+- [2026-10-02] **帧数档位 4→8** | 高 | SNR ∝ √(N×T)；用户提分档（日间 2-3 / 较暗 4-8 /
+  很暗 8-16）；前提 = 流式对齐累加（否则 8×25MB direct buffer 撞 ART OOM）+ 处理时间降载
+  （当前 4 帧渲染已 4.3s）
+- [2026-10-02] **exp6 真机复验** | 待做 | 主摄应显示 `src:"builtin"`；盘沿 σY 应从 4.48
+  落到 1~2 量级
 - [2026-10-02] **M5 诊断与基准** | 待做 | 逐 pass GPU 计时、golden image 接 CI
 - [2026-10-02] **NN 微调（暂缓）** | 降级 | 管线已建成（PyTorch 移植 / 亚像素对齐 /
   N2N 配对 / 评估全跑通），但需几十个场景数据 —— 4 场景实测全部过拟合。代码与
   开关保留（`nn_dn` 默认关），数据充足可直接捡起
-- [2026-10-01] **更强 NN 模型评估** | 降级 | GPU 裕量 5–10×,AP-BSN/CPR <2s
-- [2026-10-01] **可选：NN 强度滑杆** | 待定 | `out = α·nn + (1−α)·原图`，让真机
-  自己找权衡点（~30 分钟）
 
 ## 已完成（近期）
 
+- [2026-10-02] **曝光决策专项（v0.10.107-exp → exp4，258→261）**：离线定量证明曝光 ×N 的
+  σ 收益 = √N（解析值与物理上限逐位吻合、决策边界 d\*≈2.2px）→ ExposurePlanner + 陀螺仪
+  motion metering + 曝光上限手动档；真机 250ms 档拿到 **ISO167（= Filmix 同款）**，噪声
+  降到基准 1/3.1 | handoffs/曝光决策落地与亮部降噪修正.memo.md
+- [2026-10-02] **亮部降噪失效修正（v0.10.108-exp5，262）**：根因 = 强度档被当 σ 乘子 ⇒
+  `exp(−0.5d²)` 指数塌陷 ⇒ 降噪近似归零且亮部最惨（盘沿 σY 4.48 vs Filmix 1.72/PC 0.92，
+  中间调我们反而最好 1.06）；改为 **σ 恒真值 + 强度<1 走输出 mix**；真机 P90 降 21~29%
+  | docs/denoise-strength-sigma.md
+- [2026-10-02] **三摄 GCam 噪声标定接入（v0.10.108-exp6，263）**：主摄 HPB（100 张实测）/
+  超广 JN1 / 长焦 LYT602 内置为 assets；发现 `BUILT_IN` 原先**无主摄条目**（主摄一直走
+  HAL cam2，其 G 通道比 R/B 低一半）；真机 `src:"builtin"` 验证通过 | 同上
 - [2026-10-02] **NN 集成五轮 + 判死（v0.10.102–0.10.106，253→257）**：NN pass 全链接入
   → 逐层修口径（JNI 桥 / KSigma 量纲 / 训练口径 anchor / MFNR neff 折减 / 通道序）
   → **nnGain 全与公式逐位吻合但观感零改善**（文字梯度 -24%、平坦区斑块状伪影），

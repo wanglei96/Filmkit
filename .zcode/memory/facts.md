@@ -103,18 +103,18 @@ status: active
   - ~~01 域 × 959/256~~（0.10.102）与 ~~cvt_k=S_anchor/S_iso + BGGR 语义~~（0.10.104）均已推翻
 - [2026-10-02] **tools 新增**：`tools/midband-attrib.py`（三图/分组归因：EXIF 聚类 + 配准 + 归一带通 + 分尺度噪声 + CIELAB）、`tools/nn/convert_pmrid.py`（torch→onnx→tf→tflite FP16 + 数值守卫）、`tools/nn/quality_eval.py`（合成噪声 + 分块推理 + 保留率表；⚠ 其 959/256 口径注释已被官方源码推翻）
 
-## NN 集成（2026-10-02 晚）
+## NN 与对齐工具实测（10-02，NN 已判死）
 
-- [2026-10-02] **版本沿革（NN 集成五轮，253→257）**：253（0.10.102-nnint，NN pass 全链落地；JNI 桥未初始化全回退）→ 254（0.10.103-nnint2，修 4 bug 后跑通 gpu 1217ms/12MP，但口径错成片发绿+4×3 网格+16px 点阵）→ 255（0.10.104-nnint3，官方 KSigma 量纲 + BGGR 语义，画面正常但细节全糊+格纹）→ 256（0.10.105-nnint4，anchor 改训练口径 1.0093e-3 并 ×neff，nnGain 181.9→963）→ **257（0.10.106-nnint5，通道序对齐 (R,Gr,Gb,B)，当前包）**；验证包均未打 tag
-- [2026-10-02] **NN 集成代码落点**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制+CPU 熔断、inferTile JNI 入口）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff、tex_nn_packed_/tex_nn_out_/tex_nn_fused_）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab（均默认关）；raw.render 含 nn/nnOk/nnFail/nnDel/nnMs/nnTiles/nnGain
-- [2026-10-02] **NN 诊断与自检**：SpikeUi「NN 链路自检」= pack→unpack 域往返（应恒等，half 容差 maxRel ~1e-3）+ 真推理端到端；出包前 check-diag-fields.py 已登记 nnOk/nnFail/nnMs/nnTiles/nnGain
-- [2026-10-02] **离线验收新增判据**：eval_inputs.npy / NN 输出必须查**均值比**（去直流指标测不出全局亮度偏移，PMRID 曾压暗 44% 而带通指标全"达标"）；同刻 DNG 离线复现脚本口径见 decisions（官方 KSigma + BGGR 语义）
-
-## NN 真机定因与微调实测（2026-10-02 晚）
-
-- [2026-10-02] **nnGain 核对（口径是否生效的硬标志）**：963.5@ISO3903 / 1018.3@ISO3660 / 1072.6@ISO3444，全部与 `1.0093e-3×4/S_G×256` 逐位吻合
-- [2026-10-02] **同帧 A/B（257，ISO3660/neff=4）**：P0 降噪 nzPreMed 0.00589→0.001756（÷3.35）；NN 0.00589→0.000556（**÷10.6，是 P0 的 3.2 倍**）
-- [2026-10-02] **观感定量（成片层）**：瓶标签文字区梯度均值 1.677→1.272（**-24%**）、强边缘(>30)占比 3.76%→2.41%（-36%）；全图 4px 能量反而 +34%（平坦区 0.55×，增量集中在有内容区）；墙面 nn-on 呈**斑块状结构**而 nn-off 是白噪。JPG 5.66MB→4.21MB（-26%）**不等于丢细节** —— 体积差来自噪声形态（白噪难压缩、结构化伪影易压缩）
-- [2026-10-02] **微调四次全失败**：留出集 loss 监督×3 = +12.0/+9.9/+11.7%、Noise2Noise = +5.06%，ret4 全降；M1 MPS 训练 271ms/step、驱动分配 1.1GB；PMRID PyTorch 移植与 onnxruntime 等价 max abs 2.0e-6、参数 1.032M
+- [2026-10-02] **NN 集成代码落点（保留，默认关）**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制 + CPU 熔断、inferTile JNI）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff、tex_nn_*）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab 默认关；raw.render 含 nn/nnOk/nnFail/nnMs/nnTiles/nnGain（check-diag 已登记）
 - [2026-10-02] **对齐工具实测**：位移误差 0.0115px（合成 6 帧）、噪声 ×3.22、异场景剔除 wn 0.304 vs 同场景 0.996；真实手持 8 帧 ×2.16；93 帧/5 场景中 4 个可用（场景 5 位移 103–114px 报废）
-- [2026-10-02] **DNG 噪声模型来源**：tag 51041 NoiseProfile = Camera2 SENSOR_NOISE_PROFILE（与引擎 `nzSrc:"cam2"` 同源），顺序 (R,G,B)、G 取中间项；本批 S_G = 1.291e-3 / 5.576e-4 / 3.677e-4 / 3.395e-4 / 2.105e-4（ISO 4781/1709/892/771/216）；CFAPattern=[[1,0],[2,3]]=GRBG
+- [2026-10-02] **旧噪声模型来源**：DNG tag 51041 = Camera2 SENSOR_NOISE_PROFILE，顺序 (R,G,B)、G 取中间项；本批 S_G = 1.291e-3…2.105e-4（ISO 4781…216）；CFAPattern=[[1,0],[2,3]]=GRBG（**已被下述三摄 GCam 标定取代**）
+
+## 曝光决策与降噪修正实测（10-02 晚）
+
+- [2026-10-02] **离线曝光杠杆**（`tools/exposure-lever-eval.py`，场景 1 ISO4781/38.46ms，clean = 15 帧对齐平均）：解析 σ 收益 1.42/2.00/**2.95×**（N=2/4/8.66）与 √N 逐位吻合；`tex_keep` 仅与帧内模糊 d 有关（2px 0.956 / 4px 0.918 / 8px 0.842）；细节优先口径决策边界 **d\*≈2.2px**；1 mosaic px ≈ 0.017°
+- [2026-10-02] **真机 250ms 档**：`expCap:"250ms" expN:"8.33" altIso:167 altSec:0.2500`（HAL 逐位执行）；nzPreMed 0.005219→0.001688（**1/3.1**）、成片域 0.002104→0.000417（1/5.0）；**ISO167 = Filmix 的 ISO166**
+- [2026-10-02] **三图同场景定量（盘沿亮白 Y≈211–224；Filmix 局部配准 SAD 8.6 / PC SAD 41 不可比）**：σY 我们 **4.48** / Filmix 1.72 / PC 0.92；中间调（茶几 Y≈162）我们 **1.06（三家最好）** / 2.67 / 1.12；碗内壁 lag-1 自相关 0.939 ≈ Filmix 0.938 ⇒ **真实纹理非噪声**
+- [2026-10-02] **σ 修正前后真机指纹**：修正后 `nzPreP90→nzPostP90` = 0.002474→0.001845 / 0.015045→0.010735 / 0.011360→0.009010（**降 21~29%**），修正前只降 4%（0.006035→0.005806）；修复前 `p0A/nzS = 0.099`（σ 仅真值 0.31×）
+- [2026-10-02] **三摄 GCam 标定（`assets/noise_models/`）**：主摄 HPB A=2.72e-7 dg_ref 6400（**100 张实测**：暗场 50 + 亮场 50、相邻帧差法）、超广 JN1 A=3.07e-7 dg_ref 1600（**同传感器借用 NubiaZ50Ultra，非本机实测**）、长焦 LYT602 A=1.05e-6 dg_ref 3200；`BUILT_IN` 原先**无主摄条目**（主摄一直走 HAL cam2，其 G 比 R/B 低一半）；真机 `src:"builtin"` ×3 验证通过
+- [2026-10-02] **超广角桶形畸变**：221313 竖直边拟合直线残差中位 **50.7px**（图宽 887 = **5.7%**）、两侧都偏 = 系统性；代码 `grep DISTORTION|LENS_INTRINSIC` 零结果（RAW 流 HAL 不做几何校正）
+- [2026-10-02] **MFNR 耗时（真机）**：4 帧渲染 `render.burst_done ms ≈ 3.9–4.3s`（align 835 + fuse 1278 + dftGpu 614）、采集 257–313ms；`capture()` 在渲染期**静默吞快门**（"连按两下只出一张"的根因）

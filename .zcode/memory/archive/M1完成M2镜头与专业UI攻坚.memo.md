@@ -2,7 +2,7 @@
 summary: M1完成M2镜头与专业UI攻坚
 created: 2026-09-18 10:20
 updated: 2026-09-18 11:09
-status: absorbed
+status: archived
 ---
 
 # M1完成M2镜头与专业UI攻坚

@@ -2,7 +2,7 @@
 summary: NN集成定因与判死转HDR+
 created: 2026-10-02 15:05
 updated: 2026-10-02 15:05
-status: active
+status: absorbed
 ---
 
 # NN集成定因与判死转HDR+
