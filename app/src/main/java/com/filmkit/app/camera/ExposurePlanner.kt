@@ -23,12 +23,14 @@ object ExposurePlanner {
     /** 1 mosaic px 对应的角度（X300 主摄 4080×3072 / 等效 23mm ⇒ 86.6° / 5107px）。 */
     const val RAD_PER_PX = 0.017 * Math.PI / 180.0
 
-    /** 帧内模糊预算（px）：折中口径 tex_keep ≥ 0.90（findings §4）。
+    /** 帧内模糊预算（px）：**细节优先口径 tex_keep ≥ 0.95**（findings §4）——
+     *  用户 2026-09-28 拍板「细节优先不可动摇，噪声与细节冲突时选细节」，纹理是红线。
      *
-     * 首版取"细节优先"口径 2.2px（tex ≥ 0.95），真机实测（2026-10-02 日志）在
-     * 正常手持下把预算压到 22ms、比预览 AE 的 40ms 还短 ⇒ 长曝光永久不生效。
-     * 4.5px 对应纹理损失 8~10%（d=4px → tex_keep 0.918），换 σ 收益 √N。 */
-    const val MOTION_BUDGET_PX = 4.5
+     *  曾一度放宽到 4.5px（tex ≥ 0.90）以让长曝光生效，属**误读用户意见后替用户做
+     *  质量取舍**（"偏一点没关系"指的是不必严格 A/B，不是画质可妥协），已撤回。
+     *  运动判据改用矢量平均角速度（见 CameraController.gyroMeanRadPerSec）后，
+     *  正常手持（ω≈0.005 rad/s）下 2.2px 预算即允许 ~131ms 曝光，无需牺牲纹理。 */
+    const val MOTION_BUDGET_PX = 2.2
 
     /** 目标曝光时长：Night Sight 手持单帧上限 333ms。 */
     const val TARGET_EXPOSURE_NS = 333_000_000L
@@ -44,6 +46,9 @@ object ExposurePlanner {
         val motionLimitNs: Long,
         /** 输出亮度变化（EV）；设计上 ≈0（亮度守恒） */
         val deltaEv: Double,
+        /** 预估帧内模糊（mosaic px）= 曝光时长 × 角速度 / RAD_PER_PX；
+         *  必须 ≤ motionBudgetPx —— 每次拍照都能核对纹理代价没超预算 */
+        val blurPx: Double,
     )
 
     /**
@@ -65,7 +70,7 @@ object ExposurePlanner {
         motionBudgetPx: Double = MOTION_BUDGET_PX,
     ): Plan {
         if (baseIso <= 0 || baseExposureNs <= 0L || exposureUpperNs <= 0L) {
-            return Plan(baseIso.coerceAtLeast(1), baseExposureNs, 1.0, "invalid", 0L, 0.0)
+            return Plan(baseIso.coerceAtLeast(1), baseExposureNs, 1.0, "invalid", 0L, 0.0, 0.0)
         }
         val nTarget = targetExposureNs.toDouble() / baseExposureNs
         // ① ISO 下限：降 ISO 保持亮度 ⇒ N ≤ baseIso / isoLower
@@ -102,6 +107,12 @@ object ExposurePlanner {
         val iso = Math.round(baseIso / nEff).toInt().coerceAtLeast(if (isoLower > 0) isoLower else 1)
         val nReal = exposureNs.toDouble() / baseExposureNs
         val deltaEv = Math.log(nReal * iso / baseIso) / Math.log(2.0)
+        // 预估帧内模糊（mosaic px）= 曝光秒数 × 角速度 ÷ 每像素角度；必 ≤ motionBudgetPx
+        val blurPx = if (hasMotion) {
+            exposureNs / 1e9 * motionRadPerSec / RAD_PER_PX
+        } else {
+            0.0
+        }
         return Plan(
             iso = iso,
             exposureNs = exposureNs,
@@ -109,6 +120,7 @@ object ExposurePlanner {
             limitedBy = if (nReal <= 1.0001) "none" else why,
             motionLimitNs = motionLimitNs,
             deltaEv = deltaEv,
+            blurPx = blurPx,
         )
     }
 }

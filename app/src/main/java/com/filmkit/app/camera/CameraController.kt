@@ -1562,6 +1562,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 "gyroM" to "%.4f".format(gyroMean),
                 "gyroR" to "%.4f".format(gyroRms),
                 "mtnLim" to "%.3f".format((expPlan?.motionLimitNs ?: 0L) / 1e9f),
+                "blurPx" to "%.2f".format(expPlan?.blurPx ?: 0.0),
                 "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
             ),
         )

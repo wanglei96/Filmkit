@@ -31,7 +31,7 @@ class ExposurePlannerTest {
         assertTrue(p.iso >= 50)
     }
 
-    /** 运动限制：0.5°/s ⇒ 预算 4.5px 只允许 ~153ms（目标 250ms 被运动否决）。 */
+    /** 运动限制：0.5°/s ⇒ 细节优先预算 2.2px 只允许 ~74.8ms（250ms 目标被运动否决）。 */
     @Test
     fun motionBudgetCapsExposureBeforeTarget() {
         val omega = 0.5 * Math.PI / 180.0       // 0.5°/s = 0.00873 rad/s
@@ -41,10 +41,26 @@ class ExposurePlannerTest {
             motionRadPerSec = omega,
         )
         assertEquals("motion", p.limitedBy)
-        assertTrue("motionLimit≈153ms, got ${p.motionLimitNs}", Math.abs(p.motionLimitNs - 153_000_000L) < 2_000_000L)
-        assertTrue("exposure=${p.exposureNs}", p.exposureNs in 151_000_000L..155_000_000L)
-        assertEquals(3.98, p.n, 0.05)
+        assertTrue("motionLimit≈74.8ms, got ${p.motionLimitNs}", Math.abs(p.motionLimitNs - 74_800_000L) < 1_000_000L)
+        assertTrue("exposure=${p.exposureNs}", p.exposureNs in 74_000_000L..75_500_000L)
+        assertEquals(1.94, p.n, 0.02)
         assertEquals(0.0, p.deltaEv, 0.01)
+    }
+
+    /** 正常手持（矢量平均 0.005 rad/s）⇒ 2.2px 预算仍允许 ~131ms（expN≈3.4）。 */
+    @Test
+    fun typicalHandheldStillGetsLongerExposure() {
+        val p = ExposurePlanner.plan(
+            baseIso = baseIso, baseExposureNs = baseSec,
+            isoLower = 50, exposureUpperNs = 1_000_000_000L,
+            motionRadPerSec = 0.005,
+        )
+        assertEquals("motion", p.limitedBy)
+        assertTrue("exposure=${p.exposureNs}", p.exposureNs in 128_000_000L..134_000_000L)
+        assertEquals(3.4, p.n, 0.05)
+        assertEquals(0.0, p.deltaEv, 0.01)
+        // 纹理红线：拉长后的预估帧内模糊必须仍在细节优先预算内
+        assertTrue("blurPx=${p.blurPx} 超预算", p.blurPx <= ExposurePlanner.MOTION_BUDGET_PX + 1e-9)
     }
 
     /** ISO 下限限制：base ISO 400 / 下限 50 ⇒ 最多 8×。 */
