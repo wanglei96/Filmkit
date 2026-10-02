@@ -621,11 +621,11 @@ uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
 // C 专项（2026-09-29）：σ²(x) = A·x + B（逐通道；x = 本 pass 域信号——黑阶后/
-// 白阶归一/WB 后。A = shot·g·k²、B = read·g²·k²，k = 强度档系数）。
-// 来源 Camera2 SENSOR_NOISE_PROFILE（模型）或 legacy σ 等效（见 denoiseParams）。
-// A=B=0 精确表示"关降噪档"（只做线性化+WB）。
+// 白阶归一/WB 后。A = shot·g、B = read·g²；**v0.10.108 起强度 k 不再乘进 σ**
+// （σ 报小 ⇒ d 放大 ⇒ w=exp(−0.5d²) 塌陷 ⇒ 降噪近似失效，且噪声越大的亮部越惨）。
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -664,7 +664,7 @@ void main() {
                 acc += w * c;
                 wsum += w;
             }
-        v = acc / wsum;
+        v = mix(c0, acc / wsum, uMix);   // v0.10.108：强度<1 = 线性混合（各亮度段一致）
     }
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
 })";
@@ -678,9 +678,10 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 // C 专项（2026-09-29）：σ²(y) = A·y + B（luma 权重合并的逐像素模型；系数 =
-// WB 后 raw 域，强度档 k 已折入）。y = 本 pass 输入 luma（CCM 后，已含 LSC 放大）。
+// WB 后 raw 域；**v0.10.108 起强度 k 不再折入 σ**，<1 走 uMix 输出混合）。
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
 // LSC 增益网格（C 专项：增益传播）。shot 项随被放大的信号 y0 自然增长；
 // read 项不随信号，需显式 ×g²（var' = A·g·x + B·g²，见 NoiseModel::afterWb）。
 uniform highp sampler2D uLsc;
@@ -743,7 +744,7 @@ void main() {
             acc += w * cd;
             wsum += w;
         }
-    oColor = vec4(y0 + acc / wsum, 1.0);
+    oColor = vec4(y0 + mix(cd0, acc / wsum, uMix), 1.0);   // v0.10.108：强度<1 线性混合
 })";
 
 // ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
@@ -1271,6 +1272,7 @@ uniform int uCfaLut;
 // C 专项：σ²(x) = A·x + B（同 kFsRawDenoise；融合输入的系数已 ÷neff）
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -1300,7 +1302,7 @@ void main() {
                 acc += w * c;
                 wsum += w;
             }
-        v = acc / wsum;
+        v = mix(c0, acc / wsum, uMix);   // v0.10.108：强度<1 = 线性混合（各亮度段一致）
     }
     oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);
 })";
@@ -1333,6 +1335,7 @@ uniform float uWhite;
 uniform vec3 uGain;
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
 uniform float uSrScale;
 // v0.10.75（D-2 杠杆 B）：0 = 位移 round 到最近偶数（旧行为，保相位但量化
 // 2 mosaic px）；1 = 逐通道网格亚像素双线性（linSubZ，量化降到亚像素）。
@@ -1420,7 +1423,7 @@ void main() {
                 wsum += w;
             }
     }
-    float v = acc / wsum;
+    float v = mix(ref, acc / wsum, uMix);   // v0.10.108：强度<1 线性混合
     // v0.10.61 诊断：alpha = 权重和 wsum（含中心 1.0）。样本数已足够（每帧 24 个
     // 同相位邻域 × 4 帧 = 96），实测收益却远低于 √96 —— 需知**实际采纳了多少**，
     // 故把 wsum 带出（tex_mos_ 的 alpha 无下游消费者），由 host 读回记入日志。
@@ -3257,12 +3260,14 @@ bool FrameRenderer::init() {
   u_raw_dn_.gain = glGetUniformLocation(prog_raw_dn_, "uGain");
   u_raw_dn_.noise_a = glGetUniformLocation(prog_raw_dn_, "uNoiseA");
   u_raw_dn_.noise_b = glGetUniformLocation(prog_raw_dn_, "uNoiseB");
+  u_raw_dn_.mix = glGetUniformLocation(prog_raw_dn_, "uMix");
 
   u_raw_dn_f_.tex = glGetUniformLocation(prog_raw_dn_fused_, "uTex");
   u_raw_dn_f_.size = glGetUniformLocation(prog_raw_dn_fused_, "uSize");
   u_raw_dn_f_.cfalut = glGetUniformLocation(prog_raw_dn_fused_, "uCfaLut");
   u_raw_dn_f_.noise_a = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseA");
   u_raw_dn_f_.noise_b = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseB");
+  u_raw_dn_f_.mix = glGetUniformLocation(prog_raw_dn_fused_, "uMix");
   // D-2（v0.10.58）时域 × 空间联合 P0
   for (int i = 0; i < 4; ++i) {
     u_raw_dn_ts_.raw[i] = glGetUniformLocation(
@@ -3281,6 +3286,7 @@ bool FrameRenderer::init() {
   u_raw_dn_ts_.gain = glGetUniformLocation(prog_raw_dn_ts_, "uGain");
   u_raw_dn_ts_.noise_a = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseA");
   u_raw_dn_ts_.noise_b = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseB");
+  u_raw_dn_ts_.mix = glGetUniformLocation(prog_raw_dn_ts_, "uMix");
   u_raw_dn_ts_.sr_scale = glGetUniformLocation(prog_raw_dn_ts_, "uSrScale");
   u_raw_dn_ts_.sub = glGetUniformLocation(prog_raw_dn_ts_, "uSub");
 
@@ -3408,6 +3414,7 @@ bool FrameRenderer::init() {
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
   u_chroma_dn_.noise_a = glGetUniformLocation(prog_chroma_dn_, "uNoiseA");
   u_chroma_dn_.noise_b = glGetUniformLocation(prog_chroma_dn_, "uNoiseB");
+  u_chroma_dn_.mix = glGetUniformLocation(prog_chroma_dn_, "uMix");
   u_chroma_dn_.lsc = glGetUniformLocation(prog_chroma_dn_, "uLsc");
   u_chroma_dn_.lsc_size = glGetUniformLocation(prog_chroma_dn_, "uLscSize");
   // D 专项（v0.10.53）色度多尺度降噪
@@ -4153,6 +4160,7 @@ void FrameRenderer::passRawDenoise(int w, int h, int cfa,
   glUniform1f(u_raw_dn_.white, white_level);
   glUniform3f(u_raw_dn_.gain, gains[0], gains[1], gains[2]);
   glUniform3f(u_raw_dn_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+  glUniform1f(u_raw_dn_.mix, nc.mix_p0);   // v0.10.108：强度<1 的输出混合
   glUniform3f(u_raw_dn_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -4174,6 +4182,7 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glUniform2i(u_chroma_dn_.lsc_size, lsc_w_, lsc_h_);
   glUniform2i(u_chroma_dn_.size, dst_w, dst_h);
   glUniform3f(u_chroma_dn_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
+  glUniform1f(u_chroma_dn_.mix, nc.mix_p4);   // v0.10.108
   glUniform3f(u_chroma_dn_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
@@ -4650,19 +4659,28 @@ FrameRenderer::RawCommon FrameRenderer::prepareRawCommon(
 void FrameRenderer::denoiseParams(float strength, const NoiseModel& model,
                                   const float gains[3], float noise_sigma,
                                   NoiseCoef* out) {
-  // 强度滑杆（0–2，步长 0.01）：σ 乘子 —— 0 = 关（A=B=0 精确跳过）、1 = 真实 σ、
-  // 2 = 2×σ。P4 保持 1.5× 的比例（色差噪声 ≈ √2·σ_ch 且后续提亮再放大）。
+  // 强度滑杆（0–2，步长 0.01）：**σ 恒为真实噪声**，强度分层承担 ——
+  //   >1：作 σ 乘子（σ 放大 = 权重曲线更宽容 = 更激进的降噪）
+  //   <1：作输出混合 out = mix(orig, denoised, k)（线性、各亮度段一致）
+  // 旧实现把 k² 直接乘进 σ：k=0.45 时 σ 只有真值 0.45×，bilateral 的 d 放大 2.2×、
+  // w=exp(−0.5d²) 指数塌陷 ⇒ 降噪近似失效，且**噪声越大的地方（亮部，散粒 ∝√x）
+  // 越严重** —— 2026-10-02 真机定案（盘沿亮部 σY 4.48 vs Filmix 1.72/PC 0.92）。
+  const float sg_p0 = std::max(1.0f, strength);
+  const float sg_p4 = std::max(1.0f, strength);
+  const float mix_k = std::min(1.0f, std::max(0.0f, strength));
   const float k_p0 = strength;
   const float k_p4 = 1.5f * strength;
   out->k_p0 = k_p0;
   out->k_p4 = k_p4;
+  out->mix_p0 = mix_k;
+  out->mix_p4 = mix_k;
   if (model.valid()) {
     const NoiseModel wb = model.afterWb(gains);  // P0 域（WB 后）
     for (int c = 0; c < 3; ++c) {
-      out->p0a[c] = wb.S[c] * k_p0 * k_p0;
-      out->p0b[c] = wb.O[c] * k_p0 * k_p0;
-      out->p4a[c] = wb.S[c] * k_p4 * k_p4;
-      out->p4b[c] = wb.O[c] * k_p4 * k_p4;
+      out->p0a[c] = wb.S[c] * sg_p0 * sg_p0;
+      out->p0b[c] = wb.O[c] * sg_p0 * sg_p0;
+      out->p4a[c] = wb.S[c] * 2.25f * sg_p4 * sg_p4;   // 1.5² = 色差噪声标定
+      out->p4b[c] = wb.O[c] * 2.25f * sg_p4 * sg_p4;
       // mismatch/tile-RMS：k=1 的真实噪声（与档位无关）
       out->mma[c] = wb.S[c];
       out->mmb[c] = wb.O[c];
@@ -4673,8 +4691,8 @@ void FrameRenderer::denoiseParams(float strength, const NoiseModel& model,
   } else {
     // legacy：旧式等效（σ 回退值按 ISO 估算，见 Kotlin 侧；引擎兜底 0.012）
     const float ns = noise_sigma > 0.0f ? noise_sigma : 0.012f;
-    const float sr_k = k_p0;
-    const float sc_k = k_p4;
+    const float sr_k = sg_p0;
+    const float sc_k = sg_p4;
     for (int c = 0; c < 3; ++c) {
       out->p0a[c] = 4.0f * ns * ns * sr_k * sr_k;
       out->p0b[c] = 0.2f * ns * ns * sr_k * sr_k;
@@ -5558,6 +5576,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform1f(u_raw_dn_ts_.white, white_level);
     glUniform3f(u_raw_dn_ts_.gain, gains[0], gains[1], gains[2]);
     glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+    glUniform1f(u_raw_dn_ts_.mix, nc.mix_p0);   // v0.10.108
     glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
     glUniform1f(u_raw_dn_ts_.sub, subpixel ? 1.f : 0.f);
@@ -5587,6 +5606,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   glUniform2i(u_raw_dn_f_.size, w, h);
   glUniform1i(u_raw_dn_f_.cfalut, cfaLutOf(cfa));
   glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
+  glUniform1f(u_raw_dn_f_.mix, nc.mix_p0);   // v0.10.108：强度<1 的输出混合
   glUniform3f(u_raw_dn_f_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
   dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
   dbg_p0w_ = -1.f;                                   // 旧路径无 wsum 诊断

@@ -64,6 +64,11 @@ struct NoiseCoef {
   // 一致（2026-09-29 真机回归：模型无效时这里曾传全零，m≡1 → neff=1 融合失效）。
   float mma[3] = {0.f, 0.f, 0.f}, mmb[3] = {0.f, 0.f, 0.f};
   float k_p0 = 0.f, k_p4 = 0.f;   // 强度乘子（日志）
+  // v0.10.108 修正：强度 <1 不再缩小 σ。σ 报小 ⇒ bilateral 的 d=(c−c0)/σ 被放大 ⇒
+  // w=exp(−0.5d²) 指数级塌掉 ⇒ 降噪几乎归零（真机实测：降噪 0.45 时盘沿亮部
+  // σY 4.48 = Filmix 2.6×/PC 4.9×，且 nzPostP90≈nzPreP90「最噪的 10% 没被降噪」）。
+  // 现在 σ 恒用真实噪声，强度 <1 由输出混合承担；强度 >1 仍作 σ 乘子（更激进降噪）。
+  float mix_p0 = 1.f, mix_p4 = 1.f;
   float ns_typ = 0.f;             // 中灰典型 σ（WB 后 G 通道，单帧；resFade/日志）
   bool model_src = false;         // true = Camera2 模型，false = legacy σ 回退
 };
@@ -638,16 +643,16 @@ class FrameRenderer {
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
-          noise_a = -1, noise_b = -1;
+          noise_a = -1, noise_b = -1, mix = -1;
   } u_raw_dn_;
   struct {
-    GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1;
+    GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1, mix = -1;
   } u_raw_dn_f_;
   // D-2（v0.10.58）：时域 × 空间联合 P0（4 帧 × 3×3 同相位邻域）
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, fused = -1,
           size = -1, off_tiles = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1;
+          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1, mix = -1;
   } u_raw_dn_ts_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
@@ -667,7 +672,7 @@ class FrameRenderer {
   } u_mfnr_mis_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
-          lsc_size = -1;
+          lsc_size = -1, mix = -1;
   } u_chroma_dn_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
