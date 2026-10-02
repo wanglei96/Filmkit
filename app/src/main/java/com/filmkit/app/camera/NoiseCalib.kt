@@ -112,9 +112,17 @@ object NoiseCalibStore {
      * id 4=15MM）返回**主摄的噪声模型**（三摄 pairs 完全相同），而实测长焦 shot
      * 噪声是主摄 3.56×、超广 2.16×（DNG 差分拟合 + 成片交叉验证）—— 内置实测
      * 标定用于修正该低估；auto 模式下优先于 Camera2（仅当有匹配项时）。
+     *
+     * v0.10.108（2026-10-02）：换成用户提供的 GCam 生态标定（三摄齐全，含主摄）——
+     *   主摄 HPB：100 张实测（暗场 50 + 亮场 50，相邻帧差法），A≈2.72e-7、dg_ref 6400
+     *   超广 JN1：同传感器借用（NubiaZ50Ultra_JN1_2_new），A≈3.07e-7、dg_ref 1600
+     *   长焦 LYT602：A≈1.05e-6（主摄 3.86×）、dg_ref 3200
+     * 主摄此前一直走 HAL 的 `cam2` SENSOR_NOISE_PROFILE，其 G 通道比 R/B 低一半
+     * （物理上不该如此），而这三份是四通道独立拟合、彼此接近 ⇒ 改用内置标定。
      */
     private val BUILT_IN: Map<String, Map<Float, String>> = mapOf(
         "V2509A" to mapOf(
+            23f to "x300_23mm.c",
             70f to "x300_70mm.c",
             15f to "x300_15mm.c",
         ),
