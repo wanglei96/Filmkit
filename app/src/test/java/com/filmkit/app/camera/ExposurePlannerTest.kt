@@ -31,7 +31,7 @@ class ExposurePlannerTest {
         assertTrue(p.iso >= 50)
     }
 
-    /** 运动限制：0.5°/s ⇒ 预算 2.2px 只允许 ~74.8ms。 */
+    /** 运动限制：0.5°/s ⇒ 预算 4.5px 只允许 ~153ms（目标 250ms 被运动否决）。 */
     @Test
     fun motionBudgetCapsExposureBeforeTarget() {
         val omega = 0.5 * Math.PI / 180.0       // 0.5°/s = 0.00873 rad/s
@@ -41,9 +41,9 @@ class ExposurePlannerTest {
             motionRadPerSec = omega,
         )
         assertEquals("motion", p.limitedBy)
-        assertTrue("motionLimit≈74.8ms, got ${p.motionLimitNs}", Math.abs(p.motionLimitNs - 74_800_000L) < 1_000_000L)
-        assertTrue("exposure=${p.exposureNs}", p.exposureNs in 74_000_000L..75_500_000L)
-        assertEquals(1.94, p.n, 0.02)
+        assertTrue("motionLimit≈153ms, got ${p.motionLimitNs}", Math.abs(p.motionLimitNs - 153_000_000L) < 2_000_000L)
+        assertTrue("exposure=${p.exposureNs}", p.exposureNs in 151_000_000L..155_000_000L)
+        assertEquals(3.98, p.n, 0.05)
         assertEquals(0.0, p.deltaEv, 0.01)
     }
 

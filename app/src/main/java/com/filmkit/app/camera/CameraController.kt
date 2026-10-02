@@ -115,7 +115,7 @@ class CameraController(private val context: Context, private val render: RenderC
     // （tex_keep ≥ 0.95）⇒ 帧内模糊预算 2.2 mosaic px，换算即
     //   t_max = budget · RAD_PER_PX / ω     （ω = 采集前 1s 角速度 RMS）
     // 取三轴模长（含 roll，偏保守）；样本不足返回 -1，规划器视为无运动限制。
-    private class GyroSample(val tNs: Long, val mag: Float)
+    private class GyroSample(val tNs: Long, val x: Float, val y: Float, val z: Float)
 
     private val gyroLock = Any()
     private val gyroSamples = ArrayDeque<GyroSample>()
@@ -124,9 +124,8 @@ class CameraController(private val context: Context, private val render: RenderC
         object : android.hardware.SensorEventListener {
             override fun onSensorChanged(event: android.hardware.SensorEvent?) {
                 val v = event?.values ?: return
-                val mag = kotlin.math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
                 synchronized(gyroLock) {
-                    gyroSamples.addLast(GyroSample(event.timestamp, mag))
+                    gyroSamples.addLast(GyroSample(event.timestamp, v[0], v[1], v[2]))
                     val cut = event.timestamp - GYRO_WINDOW_NS
                     while (gyroSamples.isNotEmpty() && gyroSamples.first().tNs < cut) {
                         gyroSamples.removeFirst()
@@ -138,12 +137,41 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
-    /** 最近 GYRO_WINDOW_NS 的角速度 RMS（rad/s）；样本不足返回 -1（= 无运动限制）。 */
+    /** 最近 GYRO_WINDOW_NS 的**矢量平均**角速度模长（rad/s）—— motion metering 判据。
+     *
+     * Night Sight §2.3 用"时间平滑（平均）后的角速度"预测曝光窗口内的转动量：手持的
+     * 高频抖动在窗口内正负抵消，只有**低频漂移**会在曝光窗口内累积成帧内模糊。
+     *
+     * v0.10.107 实测教训：首版用 RMS（保留高频）⇒ 真机 `gyro:0.030 rad/s` 把运动预算
+     * 压到 22ms（`mtnLim:"0.022"`），比预览 AE 的 40ms 还短 ⇒ 长曝光**永久不生效**
+     * （expN 恒 1.00 / expWhy 恒 none），功能等于不存在。 */
+    private fun gyroMeanRadPerSec(): Double {
+        synchronized(gyroLock) {
+            if (gyroSamples.size < 4) return -1.0
+            var sx = 0.0
+            var sy = 0.0
+            var sz = 0.0
+            for (s in gyroSamples) {
+                sx += s.x
+                sy += s.y
+                sz += s.z
+            }
+            val n = gyroSamples.size.toDouble()
+            sx /= n
+            sy /= n
+            sz /= n
+            return kotlin.math.sqrt(sx * sx + sy * sy + sz * sz)
+        }
+    }
+
+    /** 总抖动 RMS（rad/s）—— 仅诊断，不参与决策（含高频，外推会严重高估帧内模糊）。 */
     private fun gyroRmsRadPerSec(): Double {
         synchronized(gyroLock) {
             if (gyroSamples.size < 4) return -1.0
             var acc = 0.0
-            for (s in gyroSamples) acc += s.mag.toDouble() * s.mag
+            for (s in gyroSamples) {
+                acc += (s.x * s.x + s.y * s.y + s.z * s.z).toDouble()
+            }
             return kotlin.math.sqrt(acc / gyroSamples.size)
         }
     }
@@ -1261,7 +1289,16 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun capture() {
         val s = session ?: return
-        if (capturing) return
+        if (capturing) {
+            // v0.10.107：原来这里是**静默 return** —— 真机实测（2026-10-02 日志）
+            // MFNR 渲染 ~4.3s，用户在渲染期按快门"没反应"却无任何记录，表现为
+            // "连按两下只有一张"。记一条便于诊断（与下面的 inFlight 分支对齐）。
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "capture.busy",
+                kv("reason" to "capturing", "phase" to capturePhase),
+            )
+            return
+        }
         if (rendersInFlight.get() >= maxRendersInFlight) {
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_WARN, "camera", "capture.busy",
@@ -1372,9 +1409,6 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var expPlanIso = 0
 
-    /** exp_ab=1 时的交替标志（true = 本次拍照启用规划） */
-    private var expAbToggle = false
-
     /** 4 帧同参 captureBurst（恒曝光）。Image/Result 桶按回调序配对——
      *  burst 的 onCaptureCompleted 与提交顺序一致且同 looper 串行。
      *  v0.10.1 短参考帧：帧 0（参考帧 + DNG 底片）压短快门（min(AE, 15ms)），
@@ -1413,17 +1447,12 @@ class CameraController(private val context: Context, private val render: RenderC
         // 不变式：**曝光 ×N + ISO ÷N ⇒ 输出亮度与高光裁切完全不变，纯赚 SNR**
         // （离线实测收益 = √N，N=8.66 → 2.95×，与物理上限逐位吻合）。
         // 约束三条：ISO 下限 / 快门上限 / 运动预算（细节优先 2.2px，findings §4）。
-        // prefs `exp_plan`：0 关 / 1 开（默认开）；`exp_ab`=1 时**每次拍照交替**
-        // 启用/禁用规划 —— 用户连按两次快门即得同场景 A/B 对（日志 expN 可区分）。
-        val expPrefs = context.getSharedPreferences("filmkit", 0)
-        val expMode = expPrefs.getInt("exp_plan", 1)
-        val expAb = expPrefs.getInt("exp_ab", 0)
-        val expOn = if (expAb >= 1) {
-            expAbToggle = !expAbToggle
-            expAbToggle
-        } else {
-            expMode >= 1
-        }
+        // prefs `exp_plan`：0 关 / 1 开（默认开）。**用设置页开关手动做 A/B**，不做自动
+        // 交替 —— 真机实测（2026-10-02 日志）MFNR 渲染耗时 ~4.3s，快门在渲染期间被
+        // `capturing` 静默吞掉，"连按两次"根本不成立。
+        val expMode = context.getSharedPreferences("filmkit", 0).getInt("exp_plan", 1)
+        val expOn = expMode >= 1
+        val gyroMean = gyroMeanRadPerSec()
         val gyroRms = gyroRmsRadPerSec()
         var expPlan: ExposurePlanner.Plan? = null
         var capIso = liveIso
@@ -1439,7 +1468,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 isoLower = isoRange?.lower ?: 50,
                 exposureUpperNs = secRange?.upper ?: 1_000_000_000L,
                 targetExposureNs = EXP_TARGET_EXPOSURE_NS,
-                motionRadPerSec = gyroRms,
+                motionRadPerSec = gyroMean,
             )
             expPlan = p
             capIso = p.iso
@@ -1530,7 +1559,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 "expN" to "%.2f".format(expPlan?.n ?: 1.0),
                 "expWhy" to (expPlan?.limitedBy ?: "off"),
                 "expDv" to "%.2f".format(expPlan?.deltaEv ?: 0.0),
-                "gyro" to "%.4f".format(gyroRms),
+                "gyroM" to "%.4f".format(gyroMean),
+                "gyroR" to "%.4f".format(gyroRms),
                 "mtnLim" to "%.3f".format((expPlan?.motionLimitNs ?: 0L) / 1e9f),
                 "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
             ),

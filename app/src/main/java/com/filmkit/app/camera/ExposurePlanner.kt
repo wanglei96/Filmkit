@@ -23,8 +23,12 @@ object ExposurePlanner {
     /** 1 mosaic px 对应的角度（X300 主摄 4080×3072 / 等效 23mm ⇒ 86.6° / 5107px）。 */
     const val RAD_PER_PX = 0.017 * Math.PI / 180.0
 
-    /** 帧内模糊预算（px）：细节优先口径 tex_keep ≥ 0.95（findings §4）。 */
-    const val MOTION_BUDGET_PX = 2.2
+    /** 帧内模糊预算（px）：折中口径 tex_keep ≥ 0.90（findings §4）。
+     *
+     * 首版取"细节优先"口径 2.2px（tex ≥ 0.95），真机实测（2026-10-02 日志）在
+     * 正常手持下把预算压到 22ms、比预览 AE 的 40ms 还短 ⇒ 长曝光永久不生效。
+     * 4.5px 对应纹理损失 8~10%（d=4px → tex_keep 0.918），换 σ 收益 √N。 */
+    const val MOTION_BUDGET_PX = 4.5
 
     /** 目标曝光时长：Night Sight 手持单帧上限 333ms。 */
     const val TARGET_EXPOSURE_NS = 333_000_000L

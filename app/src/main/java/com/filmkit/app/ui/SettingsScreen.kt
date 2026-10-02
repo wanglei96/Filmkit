@@ -537,41 +537,6 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            // 曝光 A/B 交替：连按两次快门即得同场景「开/关」对照（日志 expN 区分）
-            var expAbOn by rememberSaveable { mutableStateOf(prefs.getInt("exp_ab", 0)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = if (expAbOn >= 1) 0 else 1
-                        expAbOn = v
-                        prefs.edit().putInt("exp_ab", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.exp_ab",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("曝光 A/B 交替", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "打开后每次拍照交替启用/禁用「长曝光进光」——" +
-                            "连按两次快门即得同场景对照（日志 expN 可区分）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (expAbOn >= 1) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
             // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
             // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
             var mfnrDft by rememberSaveable {
