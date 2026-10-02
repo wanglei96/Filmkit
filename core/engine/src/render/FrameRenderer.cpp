@@ -75,40 +75,45 @@ constexpr float kNnInpScale = 256.0f;
 // 训练噪声量去减 ⇒ 细节全糊 + decoder 块状伪影（255 真机复测：文字糊、边缘格纹）。
 constexpr float kNnAnchorS = 1.0093e-3f;
 
-// 语义序（官方训练口径，BGGR 空间序语义：ch0=B、ch1=Gr、ch2=Gb、ch3=R）的相位
-// 下发与反查表。ph = (y&1)*2 + (x&1)：0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1)。
+// 语义序（官方训练口径）的相位下发与反查表：ch0=R、ch1=Gr（与 R 同行的 G）、
+// ch2=Gb（与 B 同行的 G）、ch3=B —— 官方 run_benchmark.py 对 BGGR 先 bggr2rggb
+// (rot180→RGGB) 再 bayer2rggb 打包，得到的就是这组语义；其 rot180 只是"把 BGGR
+// 摆成 RGGB"的手段，等价于不翻转、直接按语义取相位（逐通道一致，已核对）。
+// v0.10.106：0.10.102–0.105 用的是 (B,Gr,Gb,R)，ch0/ch3 与官方对调 —— 会让网络
+// 对 R 位置与 B 位置给出不同残差（相邻 CFA 相位被不同程度修改），实测 art4 略升。
+// ph = (y&1)*2 + (x&1)：0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1)。
 //   phSem[cfa][ch] = {dx,dy}：通道 ch 的相位偏移（pack 用）
 //   phChMap[cfa][ph]：相位 → packed 通道 idx（unpack 反查）
 void nnSemTables(int cfa, int ph_sem[4][2], int ph_chmap[4]) {
   switch (cfa) {
     case 0:  // RGGB「R G / G B」
-      ph_sem[0][0] = 1; ph_sem[0][1] = 1;  // B =(1,1)
-      ph_sem[1][0] = 1; ph_sem[1][1] = 0;  // Gr=(1,0)
-      ph_sem[2][0] = 0; ph_sem[2][1] = 1;  // Gb=(0,1)
-      ph_sem[3][0] = 0; ph_sem[3][1] = 0;  // R =(0,0)
-      ph_chmap[0] = 3; ph_chmap[1] = 1; ph_chmap[2] = 2; ph_chmap[3] = 0;
+      ph_sem[0][0] = 0; ph_sem[0][1] = 0;  // R =(0,0)
+      ph_sem[1][0] = 1; ph_sem[1][1] = 0;  // Gr=(0,1)
+      ph_sem[2][0] = 0; ph_sem[2][1] = 1;  // Gb=(1,0)
+      ph_sem[3][0] = 1; ph_sem[3][1] = 1;  // B =(1,1)
+      ph_chmap[0] = 0; ph_chmap[1] = 1; ph_chmap[2] = 2; ph_chmap[3] = 3;
       break;
     case 1:  // GRBG「G R / B G」
     default:
-      ph_sem[0][0] = 0; ph_sem[0][1] = 1;  // B =(0,1)
+      ph_sem[0][0] = 1; ph_sem[0][1] = 0;  // R =(0,1)
       ph_sem[1][0] = 0; ph_sem[1][1] = 0;  // Gr=(0,0)
       ph_sem[2][0] = 1; ph_sem[2][1] = 1;  // Gb=(1,1)
-      ph_sem[3][0] = 1; ph_sem[3][1] = 0;  // R =(1,0)
-      ph_chmap[0] = 1; ph_chmap[1] = 3; ph_chmap[2] = 0; ph_chmap[3] = 2;
+      ph_sem[3][0] = 0; ph_sem[3][1] = 1;  // B =(1,0)
+      ph_chmap[0] = 1; ph_chmap[1] = 0; ph_chmap[2] = 3; ph_chmap[3] = 2;
       break;
     case 2:  // GBRG「G B / R G」
-      ph_sem[0][0] = 1; ph_sem[0][1] = 0;  // B =(1,0)
+      ph_sem[0][0] = 0; ph_sem[0][1] = 1;  // R =(1,0)
       ph_sem[1][0] = 1; ph_sem[1][1] = 1;  // Gr=(1,1)
       ph_sem[2][0] = 0; ph_sem[2][1] = 0;  // Gb=(0,0)
-      ph_sem[3][0] = 0; ph_sem[3][1] = 1;  // R =(0,1)
-      ph_chmap[0] = 2; ph_chmap[1] = 0; ph_chmap[2] = 3; ph_chmap[3] = 1;
+      ph_sem[3][0] = 1; ph_sem[3][1] = 0;  // B =(0,1)
+      ph_chmap[0] = 2; ph_chmap[1] = 3; ph_chmap[2] = 0; ph_chmap[3] = 1;
       break;
     case 3:  // BGGR「B G / G R」
-      ph_sem[0][0] = 0; ph_sem[0][1] = 0;  // B =(0,0)
-      ph_sem[1][0] = 0; ph_sem[1][1] = 1;  // Gr=(0,1)
-      ph_sem[2][0] = 1; ph_sem[2][1] = 0;  // Gb=(1,0)
-      ph_sem[3][0] = 1; ph_sem[3][1] = 1;  // R =(1,1)
-      ph_chmap[0] = 0; ph_chmap[1] = 2; ph_chmap[2] = 1; ph_chmap[3] = 3;
+      ph_sem[0][0] = 1; ph_sem[0][1] = 1;  // R =(1,1)
+      ph_sem[1][0] = 0; ph_sem[1][1] = 1;  // Gr=(1,0)
+      ph_sem[2][0] = 1; ph_sem[2][1] = 0;  // Gb=(0,1)
+      ph_sem[3][0] = 0; ph_sem[3][1] = 0;  // B =(0,0)
+      ph_chmap[0] = 3; ph_chmap[1] = 2; ph_chmap[2] = 1; ph_chmap[3] = 0;
       break;
   }
 }
@@ -1472,9 +1477,10 @@ void main() {
 //     网格、点阵、发绿）；0.10.104 修了量纲但 anchor 用本机 S(1600)=4.5e-4、且漏
 //     算 MFNR 的 ÷neff ⇒ 输入噪声只有训练水平的 ~1/9，过度平滑（文字糊 + 块状伪影）。
 //     cvt_b（read 项平移）在 img01 域 ~7e-4，实测并入无影响。
-//   · 通道序（已知偏差，实测影响 <1% 故暂留）：本实现 ch0=B、ch1=Gr、ch2=Gb、
-//     ch3=R；官方为 bggr2rggb(rot180) 后 bayer2rggb ⇒ ch0=R、ch3=B（且打包图
-//     空间翻转）。真机 A/B 时若仍见通道相关伪影，按官方序改 nnSemTables + pack。
+//   · 通道序 = 官方语义 (R,Gr,Gb,B)（v0.10.106 对齐）：官方 bggr2rggb(rot180) +
+//     bayer2rggb 打包的等价形式（rot180 只是"把 BGGR 摆成 RGGB"的手段，逐通道
+//     核对一致）。0.10.102–0.105 用 (B,Gr,Gb,R)，ch0/ch3 与官方对调。打包图的
+//     空间朝向仍不翻转（官方是翻转的）—— 离线实测该项仅值 ~1%，按最小改动暂留。
 //     各通道相位由 uPhX/uPhY 下发（CFA 无关）。
 const char* kFsNnPack = R"(#version 300 es
 precision highp float;
@@ -1489,7 +1495,7 @@ uniform float uWhite;
 uniform vec3 uGain;
 uniform int uSrc;                 // 0 = fused 域 / 1 = 原始域
 uniform float uScale;             // cvt_k × 256（官方 inp_scale）
-uniform ivec4 uPhX;               // 语义序 (B,Gr,Gb,R) 各通道的相位 x 偏移
+uniform ivec4 uPhX;               // 语义序 (R,Gr,Gb,B) 各通道的相位 x 偏移
 uniform ivec4 uPhY;               // 同上，y 偏移
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
@@ -1520,11 +1526,11 @@ void main() {
     float v1 = linAt(p + ivec2(1, 0));
     float v2 = linAt(p + ivec2(0, 1));
     float v3 = linAt(p + ivec2(1, 1));
-    float cB  = pick(v0, v1, v2, v3, uPhX.x, uPhY.x);
+    float cR  = pick(v0, v1, v2, v3, uPhX.x, uPhY.x);
     float cGr = pick(v0, v1, v2, v3, uPhX.y, uPhY.y);
     float cGb = pick(v0, v1, v2, v3, uPhX.z, uPhY.z);
-    float cR  = pick(v0, v1, v2, v3, uPhX.w, uPhY.w);
-    oColor = vec4(cB, cGr, cGb, cR) * uScale;
+    float cB  = pick(v0, v1, v2, v3, uPhX.w, uPhY.w);
+    oColor = vec4(cR, cGr, cGb, cB) * uScale;
 })";
 
 // kFsNnUnpack：推理结果（RGBA16F 半分辨率 packed Bayer，官方语义序）→ mosaic
@@ -5704,7 +5710,7 @@ bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
   }
   const float nn_gain = cvt_k * kNnInpScale;
   dbg_nn_gain_ = nn_gain;
-  // 语义序相位表（官方训练口径 ch0=B、ch1=Gr、ch2=Gb、ch3=R）
+  // 语义序相位表（官方训练口径 ch0=R、ch1=Gr、ch2=Gb、ch3=B）
   int ph_sem[4][2], ph_chmap[4];
   nnSemTables(cfa, ph_sem, ph_chmap);
 
