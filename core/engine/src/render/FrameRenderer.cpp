@@ -60,10 +60,54 @@ NnInfoFn& nn_info_slot() {
   return fn;
 }
 
-// ── NN 降噪 pass（v0.10.102）标定常数（quality_eval.py 口径）─────────────
+// ── NN 降噪 pass（v0.10.102/104）标定常数（对照官方 run_benchmark.py）─────
 constexpr int kNnTile = 512;      // PMRID tile 尺寸
 constexpr int kNnOverlap = 16;    // tile 重叠（盲点网络边界伪影的标准对策）
-constexpr float kNnVst = 959.0f / 256.0f;  // VST：iso=anchor 1600 恒等点
+// 官方 Denoiser：inp = img01 × cvt_k(iso) × inp_scale(256)，cvt_k = K_a/K(iso)
+//（var 线性模型 var_dn = K(iso)·x_dn + Σ(iso) 的 shot 项之比，anchor=1600 恒等）。
+// K(iso) ∝ 传感器 shot 增益 → 用 X300 噪声模型的 S（G 通道，[0,1] 域）之比。
+constexpr float kNnInpScale = 256.0f;
+// X300 ISO1600 的 S（G 通道，[0,1] 域）—— anchor 标定（raw.noise/quality_eval
+// noise_table 同源：ISO≤1600 模拟增益饱和段 S≈4.5e-4 恒定，1600 恰在拐点）。
+constexpr float kNnAnchorS = 4.5e-4f;
+
+// 语义序（官方训练口径，BGGR 空间序语义：ch0=B、ch1=Gr、ch2=Gb、ch3=R）的相位
+// 下发与反查表。ph = (y&1)*2 + (x&1)：0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1)。
+//   phSem[cfa][ch] = {dx,dy}：通道 ch 的相位偏移（pack 用）
+//   phChMap[cfa][ph]：相位 → packed 通道 idx（unpack 反查）
+void nnSemTables(int cfa, int ph_sem[4][2], int ph_chmap[4]) {
+  switch (cfa) {
+    case 0:  // RGGB「R G / G B」
+      ph_sem[0][0] = 1; ph_sem[0][1] = 1;  // B =(1,1)
+      ph_sem[1][0] = 1; ph_sem[1][1] = 0;  // Gr=(1,0)
+      ph_sem[2][0] = 0; ph_sem[2][1] = 1;  // Gb=(0,1)
+      ph_sem[3][0] = 0; ph_sem[3][1] = 0;  // R =(0,0)
+      ph_chmap[0] = 3; ph_chmap[1] = 1; ph_chmap[2] = 2; ph_chmap[3] = 0;
+      break;
+    case 1:  // GRBG「G R / B G」
+    default:
+      ph_sem[0][0] = 0; ph_sem[0][1] = 1;  // B =(0,1)
+      ph_sem[1][0] = 0; ph_sem[1][1] = 0;  // Gr=(0,0)
+      ph_sem[2][0] = 1; ph_sem[2][1] = 1;  // Gb=(1,1)
+      ph_sem[3][0] = 1; ph_sem[3][1] = 0;  // R =(1,0)
+      ph_chmap[0] = 1; ph_chmap[1] = 3; ph_chmap[2] = 0; ph_chmap[3] = 2;
+      break;
+    case 2:  // GBRG「G B / R G」
+      ph_sem[0][0] = 1; ph_sem[0][1] = 0;  // B =(1,0)
+      ph_sem[1][0] = 1; ph_sem[1][1] = 1;  // Gr=(1,1)
+      ph_sem[2][0] = 0; ph_sem[2][1] = 0;  // Gb=(0,0)
+      ph_sem[3][0] = 0; ph_sem[3][1] = 1;  // R =(0,1)
+      ph_chmap[0] = 2; ph_chmap[1] = 0; ph_chmap[2] = 3; ph_chmap[3] = 1;
+      break;
+    case 3:  // BGGR「B G / G R」
+      ph_sem[0][0] = 0; ph_sem[0][1] = 0;  // B =(0,0)
+      ph_sem[1][0] = 0; ph_sem[1][1] = 1;  // Gr=(0,1)
+      ph_sem[2][0] = 1; ph_sem[2][1] = 0;  // Gb=(1,0)
+      ph_sem[3][0] = 1; ph_sem[3][1] = 1;  // R =(1,1)
+      ph_chmap[0] = 0; ph_chmap[1] = 2; ph_chmap[2] = 1; ph_chmap[3] = 3;
+      break;
+  }
+}
 
 // M4-7 局部色调映射的低频亮度图尺寸与 knee（都是设备端标定旋钮）。
 // 32×24 在 4080×3072 上等效模糊半径约 128px ≈ 3% 画面宽：再小会退化成全局曲线
@@ -1414,17 +1458,17 @@ void main() {
     oColor = vec4(rms, nz, 0.0, 1.0);
 })";
 
-// ── NN 降噪 pass（v0.10.102）：PMRID TFLite 的域桥 shader ─────────────────
+// ── NN 降噪 pass（v0.10.102/104）：PMRID TFLite 的域桥 shader ─────────────
 // kFsNnPack：mosaic（R16F fused 域 / R16UI 原始域，uSrc 分支）→ packed Bayer
-// 4ch 半分辨率 RGBA（×VST 959/256）。供 glReadPixels 后 CPU 组 tile 喂推理。
-// 域口径（与 tools/nn/quality_eval.py 逐项对照，喂 [0,1] 会域错配 —— 2px 能量
-// 爆 10× 的教训）：
-//   · packed 通道序 = 2×2 块**空间序** (cy,cx) = (0,0),(0,1),(1,0),(1,1)，与离线
-//     bayer2rggb 的 reshape/transpose 一致；X300 GRBG → ch0=Gr,ch1=R,ch2=B,ch3=Gb。
-//     不假设 RGGB —— 通道值一律经 chanAt 按实际 CFA 相位取。
-//   · fused 域（MFNR 路径）已含 WB：除回 gain 还原 PMRID 训练的无 WB 域；
-//     原始域（单帧路径）直接扣黑阶归一，本来无 WB。
-//   · 输出 = clamp[0,1] × 959/256（官方 Denoiser 口径，iso=anchor 恒等点）。
+// 4ch 半分辨率 RGBA（× uScale）。供 glReadPixels 后 CPU 组 tile 喂推理。
+// 域口径（v0.10.104 对照官方 run_benchmark.py 重定案，离线恒等 0.997）：
+//   · 输入增益 uScale = cvt_k × 256，cvt_k = K(1600)/K(iso) = S_anchor/S_iso
+//     （官方 KSigma：var 线性模型的 shot 项之比；anchor=1600 恒等）。0.10.102
+//     误用 959/256=3.75 —— 比官方小 68 倍，网络输出崩溃（压暗 44%、tile 网格、
+//     点阵、发绿）。cvt_b（read 项平移）在 img01 域 ~7e-4，实测并入无影响。
+//   · 通道序 = 官方训练口径（BGGR 空间序语义）：ch0=B、ch1=Gr、ch2=Gb、ch3=R。
+//     0.10.102 误用本机空间序 —— R/B 语义错位，网络把弱通道拉向 G（发绿）。
+//     各通道相位由 uPhX/uPhY 下发（CFA 无关）。
 const char* kFsNnPack = R"(#version 300 es
 precision highp float;
 precision highp usampler2D;
@@ -1437,7 +1481,9 @@ uniform vec4 uBlack;              // 按相位 (0,0)(1,0)(0,1)(1,1)
 uniform float uWhite;
 uniform vec3 uGain;
 uniform int uSrc;                 // 0 = fused 域 / 1 = 原始域
-uniform float uScale;             // 959/256
+uniform float uScale;             // cvt_k × 256（官方 inp_scale）
+uniform ivec4 uPhX;               // 语义序 (B,Gr,Gb,R) 各通道的相位 x 偏移
+uniform ivec4 uPhY;               // 同上，y 偏移
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -1455,27 +1501,38 @@ float linRaw(ivec2 p) {
     return clamp(max((raw - bl) / max(uWhite - bl, 1.0), 0.0), 0.0, 1.0);
 }
 float linAt(ivec2 p) { return uSrc > 0 ? linRaw(p) : linFused(p); }
+float pick(float v0, float v1, float v2, float v3, int phx, int phy) {
+    // 相位编号：0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1)
+    if (phy == 0) return phx == 0 ? v0 : v1;
+    return phx == 0 ? v2 : v3;
+}
 void main() {
     ivec2 q = ivec2(gl_FragCoord.xy);   // 半分辨率 packed 网格
     ivec2 p = q * 2;
-    float c0 = linAt(p);                    // (cy0, cx0)
-    float c1 = linAt(p + ivec2(1, 0));      // (cy0, cx1)
-    float c2 = linAt(p + ivec2(0, 1));      // (cy1, cx0)
-    float c3 = linAt(p + ivec2(1, 1));      // (cy1, cx1)
-    oColor = vec4(c0, c1, c2, c3) * uScale;
+    float v0 = linAt(p);
+    float v1 = linAt(p + ivec2(1, 0));
+    float v2 = linAt(p + ivec2(0, 1));
+    float v3 = linAt(p + ivec2(1, 1));
+    float cB  = pick(v0, v1, v2, v3, uPhX.x, uPhY.x);
+    float cGr = pick(v0, v1, v2, v3, uPhX.y, uPhY.y);
+    float cGb = pick(v0, v1, v2, v3, uPhX.z, uPhY.z);
+    float cR  = pick(v0, v1, v2, v3, uPhX.w, uPhY.w);
+    oColor = vec4(cB, cGr, cGb, cR) * uScale;
 })";
 
-// kFsNnUnpack：推理结果（RGBA16F 半分辨率 packed Bayer，[0,1] 无 WB）→ mosaic
+// kFsNnUnpack：推理结果（RGBA16F 半分辨率 packed Bayer，官方语义序）→ mosaic
 // R16F（线性 + WB 域，与 tex_fused_ 同域 —— 下游 P0 直读展开 / RCD 零改动）。
-// 展开下标 = 同一空间序 (p.y&1)*2+(p.x&1)；R16F attachment 只消费 r 通道。
+// 通道反查：当前像素相位 → uChMap[相位] = packed 通道 idx；R16F attachment
+// 只消费 r 通道。
 const char* kFsNnUnpack = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uPacked;
 uniform ivec2 uSize;
-uniform int uCfaLut;
 uniform vec3 uGain;
-uniform float uInvScale;   // ÷(959/256) = 256/959
+uniform int uCfaLut;
+uniform float uInvScale;   // ÷(cvt_k × 256)
+uniform ivec4 uChMap;      // 空间序相位 (0,0)(1,0)(0,1)(1,1) → packed 通道 idx
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -1483,9 +1540,10 @@ int chanAt(ivec2 p) {
 float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    int idx = (p.y & 1) * 2 + (p.x & 1);
+    int ph = (p.y & 1) * 2 + (p.x & 1);
+    int ch = ph == 0 ? uChMap.x : (ph == 1 ? uChMap.y : (ph == 2 ? uChMap.z : uChMap.w));
     vec4 t = texelFetch(uPacked, ivec2(p.x >> 1, p.y >> 1), 0);
-    float v = idx == 0 ? t.x : (idx == 1 ? t.y : (idx == 2 ? t.z : t.w));
+    float v = ch == 0 ? t.x : (ch == 1 ? t.y : (ch == 2 ? t.z : t.w));
     float g = gainAt(chanAt(p));
     oColor = vec4(v * uInvScale * g, 0.0, 0.0, 1.0);
 })";
@@ -3227,11 +3285,14 @@ bool FrameRenderer::init() {
   u_nn_pack_.gain = glGetUniformLocation(prog_nn_pack_, "uGain");
   u_nn_pack_.src = glGetUniformLocation(prog_nn_pack_, "uSrc");
   u_nn_pack_.scale = glGetUniformLocation(prog_nn_pack_, "uScale");
+  u_nn_pack_.phx = glGetUniformLocation(prog_nn_pack_, "uPhX");
+  u_nn_pack_.phy = glGetUniformLocation(prog_nn_pack_, "uPhY");
   u_nn_unpack_.packed = glGetUniformLocation(prog_nn_unpack_, "uPacked");
   u_nn_unpack_.size = glGetUniformLocation(prog_nn_unpack_, "uSize");
   u_nn_unpack_.cfalut = glGetUniformLocation(prog_nn_unpack_, "uCfaLut");
   u_nn_unpack_.gain = glGetUniformLocation(prog_nn_unpack_, "uGain");
   u_nn_unpack_.iscale = glGetUniformLocation(prog_nn_unpack_, "uInvScale");
+  u_nn_unpack_.chmap = glGetUniformLocation(prog_nn_unpack_, "uChMap");
 
   // 收口 pass 的采样器单元固定 0（prog 可能为 0 —— 实验路径失败不阻塞）
   if (prog_mfnr_fft_sum_) {
@@ -4466,7 +4527,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.nn = nn_dn;
   // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
   dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
-  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0;
+  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0; dbg_nn_gain_ = 0.f;
   finishStillChain(c, t0, out_rgba);
   return true;
 }
@@ -4897,6 +4958,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"nnDel\":\"" + dbg_nn_del_ + "\"";
     kv += ",\"nnMs\":" + jnum(dbg_nn_ms_, 6);
     kv += ",\"nnTiles\":" + std::to_string(dbg_nn_tiles_);
+    kv += ",\"nnGain\":" + jnum(dbg_nn_gain_, 6);
   }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
@@ -5626,6 +5688,18 @@ bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
   const int nx = (w1 + kStep - 1) / kStep;
   const int ny = (h1 + kStep - 1) / kStep;
 
+  // 官方 KSigma 增益（v0.10.104 重定案）：inp = img01 × cvt_k × 256。
+  // cvt_k = S_anchor/S_iso（G 通道，[0,1] 域）；模型无效按 anchor 处理（cvt_k=1）。
+  float cvt_k = 1.0f;
+  if (c.nm.valid() && c.nm.S[1] > 1e-8f) {
+    cvt_k = std::clamp(kNnAnchorS / c.nm.S[1], 0.25f, 4.0f);
+  }
+  const float nn_gain = cvt_k * kNnInpScale;
+  dbg_nn_gain_ = nn_gain;
+  // 语义序相位表（官方训练口径 ch0=B、ch1=Gr、ch2=Gb、ch3=R）
+  int ph_sem[4][2], ph_chmap[4];
+  nnSemTables(cfa, ph_sem, ph_chmap);
+
   // 1) kFsNnPack：mosaic → packed 4ch 半分辨率（除回 WB、×VST）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_nn_packed_);
   glViewport(0, 0, w1, h1);
@@ -5653,7 +5727,11 @@ bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
   glUniform1f(u_nn_pack_.white, white_level);
   glUniform3f(u_nn_pack_.gain, gains[0], gains[1], gains[2]);
   glUniform1i(u_nn_pack_.src, src.src);
-  glUniform1f(u_nn_pack_.scale, kNnVst);
+  glUniform1f(u_nn_pack_.scale, nn_gain);
+  glUniform4i(u_nn_pack_.phx, ph_sem[0][0], ph_sem[1][0], ph_sem[2][0],
+              ph_sem[3][0]);
+  glUniform4i(u_nn_pack_.phy, ph_sem[0][1], ph_sem[1][1], ph_sem[2][1],
+              ph_sem[3][1]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 
   // 2) 读回 packed（RGBA16F + GL_FLOAT = X300 已验证组合，见 v0.6.48 教训）
@@ -5732,7 +5810,9 @@ bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
   glUniform2i(u_nn_unpack_.size, w, h);
   glUniform1i(u_nn_unpack_.cfalut, cfaLutOf(cfa));
   glUniform3f(u_nn_unpack_.gain, gains[0], gains[1], gains[2]);
-  glUniform1f(u_nn_unpack_.iscale, 1.0f / kNnVst);
+  glUniform1f(u_nn_unpack_.iscale, 1.0f / nn_gain);
+  glUniform4i(u_nn_unpack_.chmap, ph_chmap[0], ph_chmap[1], ph_chmap[2],
+              ph_chmap[3]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -5829,7 +5909,14 @@ std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
     glUniform1f(u_nn_pack_.white, 1.0f);
     glUniform3f(u_nn_pack_.gain, gains[0], gains[1], gains[2]);
     glUniform1i(u_nn_pack_.src, 0);
-    glUniform1f(u_nn_pack_.scale, kNnVst);
+    // 自检与拍照链同一口径（cvt_k×256 + 语义序相位映射）——恒等性检验才有效
+    int ph_sem[4][2], ph_chmap[4];
+    nnSemTables(cfa, ph_sem, ph_chmap);
+    glUniform1f(u_nn_pack_.scale, kNnInpScale);
+    glUniform4i(u_nn_pack_.phx, ph_sem[0][0], ph_sem[1][0], ph_sem[2][0],
+                ph_sem[3][0]);
+    glUniform4i(u_nn_pack_.phy, ph_sem[0][1], ph_sem[1][1], ph_sem[2][1],
+                ph_sem[3][1]);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     std::vector<float> packed(static_cast<size_t>(w1) * h1 * 4);
     glReadPixels(0, 0, w1, h1, GL_RGBA, GL_FLOAT, packed.data());
@@ -5907,7 +5994,9 @@ std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
     glUniform2i(u_nn_unpack_.size, w, h);
     glUniform1i(u_nn_unpack_.cfalut, cfa_lut);
     glUniform3f(u_nn_unpack_.gain, gains[0], gains[1], gains[2]);
-    glUniform1f(u_nn_unpack_.iscale, 1.0f / kNnVst);
+    glUniform1f(u_nn_unpack_.iscale, 1.0f / kNnInpScale);
+    glUniform4i(u_nn_unpack_.chmap, ph_chmap[0], ph_chmap[1], ph_chmap[2],
+                ph_chmap[3]);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     std::vector<float> back(static_cast<size_t>(w) * h * 4);
     glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, back.data());
@@ -6762,7 +6851,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   dbg_ab_p0w_ = 0.f; dbg_ab_nz_post_ = 0.f; dbg_ab_ok_ = false;
   // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
   dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
-  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0;
+  dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0; dbg_nn_gain_ = 0.f;
   c.align_ab = align_ab;
   c.p0_sub = p0_sub;
   rms_pre_res = TileRmsResult{};

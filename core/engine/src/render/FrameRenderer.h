@@ -488,6 +488,7 @@ class FrameRenderer {
   std::string dbg_nn_del_; // "gpu" / "cpu"（来自 NnInferEngine，随 tile 交换）
   float dbg_nn_ms_ = 0.f;  // NN pass 端到端（pack+读回+推理+ramp+上传+unpack）
   int dbg_nn_tiles_ = 0;
+  float dbg_nn_gain_ = 0.f; // 网络输入增益（cvt_k×256，官方 KSigma 口径；日志 nnGain）
   // 同帧 A/B 诊断（v0.10.74）：旧层位移场那遍 P0 的读数
   float dbg_ab_p0w_ = 0.f;
   float dbg_ab_nz_post_ = 0.f;
@@ -680,13 +681,14 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
   } u_tile_rms_;
-  // NN pass（v0.10.102）：pack / unpack 两个 fragment 程序的 uniform
+  // NN pass（v0.10.102/104）：pack / unpack 两个 fragment 程序的 uniform
   struct {
     GLint fused = -1, raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, src = -1, scale = -1;
+          gain = -1, src = -1, scale = -1, phx = -1, phy = -1;
   } u_nn_pack_;
   struct {
-    GLint packed = -1, size = -1, cfalut = -1, gain = -1, iscale = -1;
+    GLint packed = -1, size = -1, cfalut = -1, gain = -1, iscale = -1,
+          chmap = -1;
   } u_nn_unpack_;
   struct {
     // v0.7.9：contrast/shoulder/toe/cross（旧 log 域胶片链）已随链删除；
