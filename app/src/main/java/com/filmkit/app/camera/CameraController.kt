@@ -1450,8 +1450,16 @@ class CameraController(private val context: Context, private val render: RenderC
         // prefs `exp_plan`：0 关 / 1 开（默认开）。**用设置页开关手动做 A/B**，不做自动
         // 交替 —— 真机实测（2026-10-02 日志）MFNR 渲染耗时 ~4.3s，快门在渲染期间被
         // `capturing` 静默吞掉，"连按两次"根本不成立。
-        val expMode = context.getSharedPreferences("filmkit", 0).getInt("exp_plan", 1)
-        val expOn = expMode >= 1
+        // 曝光上限档（prefs `exp_max_ms`）：0=自动（陀螺仪运动预算，细节优先口径）
+        // / 100 / 250 / 500ms = 固定上限，**跳过运动限制**（仍记录 blurPx 供核对）。
+        // 为什么要手动档：Filmix 同机用 ISO166+1/4s（250ms）拍出远超我们的暗部纹理，
+        // 而"陀螺仪角速度 × 时间"模型未计 OIS（实测实际像面位移仅为机身转动的 0.71）
+        // ⇒ 模型过于保守、与实证冲突。实证 > 模型：由用户直接试上限。
+        val expPrefs = context.getSharedPreferences("filmkit", 0)
+        val expOn = expPrefs.getInt("exp_plan", 1) >= 1
+        val expMaxMs = expPrefs.getInt("exp_max_ms", 0)
+        val expTargetNs = if (expMaxMs > 0) expMaxMs * 1_000_000L else EXP_TARGET_EXPOSURE_NS
+        val expBudgetPx = if (expMaxMs > 0) 1e6 else ExposurePlanner.MOTION_BUDGET_PX
         val gyroMean = gyroMeanRadPerSec()
         val gyroRms = gyroRmsRadPerSec()
         var expPlan: ExposurePlanner.Plan? = null
@@ -1467,8 +1475,9 @@ class CameraController(private val context: Context, private val render: RenderC
                 baseExposureNs = liveExposureNs,
                 isoLower = isoRange?.lower ?: 50,
                 exposureUpperNs = secRange?.upper ?: 1_000_000_000L,
-                targetExposureNs = EXP_TARGET_EXPOSURE_NS,
+                targetExposureNs = expTargetNs,
                 motionRadPerSec = gyroMean,
+                motionBudgetPx = expBudgetPx,
             )
             expPlan = p
             capIso = p.iso
@@ -1563,6 +1572,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 "gyroR" to "%.4f".format(gyroRms),
                 "mtnLim" to "%.3f".format((expPlan?.motionLimitNs ?: 0L) / 1e9f),
                 "blurPx" to "%.2f".format(expPlan?.blurPx ?: 0.0),
+                "expCap" to (if (expMaxMs > 0) "${expMaxMs}ms" else "auto"),
                 "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
             ),
         )

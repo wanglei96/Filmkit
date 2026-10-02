@@ -537,6 +537,44 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 曝光上限档：自动（陀螺仪运动预算）/ 固定值（跳过运动限制，仍记录 blurPx）。
+            // Filmix 同机用 ISO166+1/4s 拍出远超我们的暗部纹理，而"陀螺仪 × 时间"模型
+            // 未计 OIS（实测实际像面位移仅机身转动的 0.71）⇒ 实证 > 模型，由用户试上限。
+            var expMaxMs by rememberSaveable { mutableStateOf(prefs.getInt("exp_max_ms", 0)) }
+            val expCapOpts = listOf(0, 100, 250, 500)
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val i = (expCapOpts.indexOf(expMaxMs).coerceAtLeast(0) + 1) % expCapOpts.size
+                        expMaxMs = expCapOpts[i]
+                        prefs.edit().putInt("exp_max_ms", expMaxMs).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.exp_max_ms",
+                            "{\"ms\":$expMaxMs}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("长曝光上限", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "自动 = 按陀螺仪运动预算（纹理代价 <5%）；固定值 = 跳过运动限制，" +
+                            "直接试 Filmix 同款 1/4s（日志 blurPx 仍记录预估帧内模糊）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (expMaxMs == 0) "自动" else "${expMaxMs}ms",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
             // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
             var mfnrDft by rememberSaveable {
