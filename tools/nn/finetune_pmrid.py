@@ -38,6 +38,9 @@ from pmrid_torch import Network, load_official_weights  # noqa: E402
 SEM_ORDER = ["R", "Gr", "Gb", "B"]      # 官方语义通道序（勿改）
 KNN_ANCHOR_S = 1.0093e-3                # 官方训练 anchor shot 系数（img01 域）
 INP_SCALE = 256.0                       # 官方 inp_scale
+# CFA 排列 → rawpy/LibRaw 的 raw_pattern 编码（0=R 1=G 2=B 3=G2）
+CFA_PATTERNS = {"RGGB": [[0, 1], [3, 2]], "GRBG": [[1, 0], [2, 3]],
+                "GBRG": [[1, 2], [0, 3]], "BGGR": [[2, 1], [3, 0]]}
 
 
 # ── DNG 按 patch 读取 ────────────────────────────────────────────────────
@@ -190,6 +193,70 @@ class BurstPairs:
         return self._buf.pop()
 
 
+class PairNpySampler:
+    """从已对齐的 (noisy, clean) npy 对采样 patch（真机手持 burst 的正确入口）。
+
+    为什么不走 BurstPairs：手持连拍帧间有位移（实测同场景两帧缩略相关仅 0.767），
+    直接对原始帧求均值会得到错位的训练对。正确做法是先用
+    tools/nn/multiframe_clean.py 按 CFA 平面做亚像素对齐再平均（位移精度 0.012px），
+    产出同一坐标系下的 noisy/clean，本类只负责按 patch 采样。
+
+    接口与 BurstPairs 对齐（scenes/holdout/_mean_frames/sample），复用同一训练循环。
+    npy 为 img01 域 CFA mosaic，patch 经 phase_blocks 转 4 相位平面。
+    """
+
+    def __init__(self, root, tile, pat, holdout_rows=None, per_visit=8,
+                 s_train=KNN_ANCHOR_S, neff=4.0):
+        root = Path(root)
+        pairs = []
+        for nf in sorted(root.glob("*_noisy.npy")):
+            cf = nf.with_name(nf.name.replace("_noisy.npy", "_clean.npy"))
+            if cf.exists():
+                pairs.append((nf, cf))
+        if not pairs:
+            sys.exit(f"{root} 下没有 *_noisy.npy / *_clean.npy 对")
+        self.tile, self.pat = tile, pat
+        self.scenes, self.holdout, self.cvt = [], {}, {}
+        self.geom = None
+        for nf, cf in pairs:
+            a = np.load(nf, mmap_mode="r")
+            ph, pw = a.shape[0] // 2, a.shape[1] // 2
+            self.scenes.append(([nf], [cf]))
+            self.holdout[nf] = max(tile, min(holdout_rows or tile, ph - tile))
+            self.geom = (ph, pw) if self.geom is None else self.geom
+            # per-scene cvt_k：本批 5 个场景 ISO 216..4781、S_sensor 差 6 倍，
+            # 用单一 --s-sensor 会让多数场景落在错误的输入域（噪声水平不匹配
+            # 正是块状伪影的根因），所以按每个场景自己的 S_G 算。
+            mp = nf.with_name(nf.name.replace("_noisy.npy", "_meta.json"))
+            s = json.loads(mp.read_text()).get("s_g") if mp.exists() else None
+            self.cvt[nf] = (float(np.clip(s_train * neff / s, 0.25, 16.0))
+                            if s else None)
+        self.per_visit = per_visit
+        self._buf = []
+
+    def _mean_frames(self, frames, y0, x0):
+        a = np.load(frames[0], mmap_mode="r")
+        m = np.asarray(a[y0 * 2:(y0 + self.tile) * 2, x0 * 2:(x0 + self.tile) * 2],
+                       dtype=np.float32)
+        return phase_blocks(m, self.pat)
+
+    def _refill(self, rng):
+        nf, cf = self.scenes[int(rng.integers(len(self.scenes)))]
+        ph, pw = self.geom
+        lim = max(self.tile, ph - self.holdout[nf[0]])
+        for _ in range(self.per_visit):
+            y0 = int(rng.integers(0, lim - self.tile + 1))
+            x0 = int(rng.integers(0, pw - self.tile + 1))
+            self._buf.append((self._mean_frames(nf, y0, x0),
+                              self._mean_frames(cf, y0, x0),
+                              self.cvt[nf[0]]))
+
+    def sample(self, rng):
+        if not self._buf:
+            self._refill(rng)
+        return self._buf.pop()
+
+
 def eval_pairs(sampler, is_synth, rng, n, tile, cache):
     """固定留出 patch（每场景底部 holdout 行内取；噪声一次性生成、前后复用）。"""
     out = []
@@ -205,14 +272,22 @@ def eval_pairs(sampler, is_synth, rng, n, tile, cache):
                          for k, v in clean.items()}
                 out.append((noisy, clean))
     else:
+        is_npy = isinstance(sampler, PairNpySampler)
         for nf, cf in sampler.scenes:
-            d = dng(nf[0], cache)
+            if is_npy:
+                ph, pw = sampler.geom
+            else:
+                d = dng(nf[0], cache)
+                ph, pw = d.ph, d.pw
             hold = sampler.holdout[nf[0]]
             for _ in range(n):
-                y0 = int(rng.integers(d.ph - hold, d.ph - tile + 1))
-                x0 = int(rng.integers(0, d.pw - tile + 1))
-                out.append((sampler._mean_frames(nf, y0, x0),
-                            sampler._mean_frames(cf, y0, x0)))
+                y0 = int(rng.integers(ph - hold, ph - tile + 1))
+                x0 = int(rng.integers(0, pw - tile + 1))
+                item = (sampler._mean_frames(nf, y0, x0),
+                        sampler._mean_frames(cf, y0, x0))
+                if is_npy:
+                    item = item + (sampler.cvt.get(nf[0]),)
+                out.append(item)
     return out
 
 
@@ -235,11 +310,13 @@ def metrics(pred01, noisy01, clean01):
 def evaluate(net, pairs, cvt, dev):
     net.eval()
     agg = {}
-    for noisy, clean in pairs:
-        x = torch.from_numpy(to_net(stack_sem(noisy), cvt)[None]).to(dev)
+    for item in pairs:
+        noisy, clean = item[0], item[1]
+        cv = item[2] if len(item) > 2 and item[2] else cvt
+        x = torch.from_numpy(to_net(stack_sem(noisy), cv)[None]).to(dev)
         with torch.no_grad():
             y = net(x).float().cpu().numpy()[0].transpose(1, 2, 0)
-        y01 = np.clip(y / (cvt * INP_SCALE), 0.0, 1.0)
+        y01 = np.clip(y / (cv * INP_SCALE), 0.0, 1.0)
         m = metrics(y01, stack_sem(noisy), stack_sem(clean))
         m["l1"] = float(np.abs(y01 - stack_sem(clean)).mean())  # img01 MAE = loss 口径
         for k, v in m.items():
@@ -291,9 +368,11 @@ def train(net, sampler, args, cvt, dev, steps, lr, log=True):
     for step in range(steps):
         nb, cb = [], []
         for _ in range(args.batch):
-            n, c = sampler.sample(rng)
-            nb.append(to_net(stack_sem(n), cvt))
-            cb.append(to_net(stack_sem(c), cvt))
+            item = sampler.sample(rng)
+            n, c = item[0], item[1]
+            cv = item[2] if len(item) > 2 and item[2] else cvt
+            nb.append(to_net(stack_sem(n), cv))
+            cb.append(to_net(stack_sem(c), cv))
         x = torch.from_numpy(np.stack(nb)).to(dev)
         y = torch.from_numpy(np.stack(cb)).to(dev)
         t0 = time.perf_counter()
@@ -321,6 +400,11 @@ def main():
     ap.add_argument("--dng", nargs="+", default=["test_temp/FILMKIT_20261002-124812.dng"],
                     help="合成模式源 DNG")
     ap.add_argument("--dng-dir", default=None, help="真机 burst 目录（子目录=场景）")
+    ap.add_argument("--pairs-dir", default=None,
+                    help="已对齐的 (noisy,clean) npy 对目录（multiframe_clean 产出，"
+                         "手持连拍必须走这条，见 PairNpySampler docstring）")
+    ap.add_argument("--cfa-pattern", default="GRBG", choices=sorted(CFA_PATTERNS),
+                    help="CFA 排列（X300 主摄 GRBG）")
     ap.add_argument("--noisy-frames", type=int, default=4, help="noisy 平均帧数（=推理 neff）")
     ap.add_argument("--clean-frames", type=int, default=12, help="clean 平均帧数（与 noisy 不重叠）")
     ap.add_argument("--s-sensor", type=float, default=9.635e-4,
@@ -351,7 +435,7 @@ def main():
     args = ap.parse_args()
     args._log_every = 1
 
-    synth = args.synth or args.dng_dir is None
+    synth = args.synth or (args.dng_dir is None and args.pairs_dir is None)
     dev = torch.device(args.device)
     torch.manual_seed(args.seed)
     outdir = Path(args.out)
@@ -361,7 +445,7 @@ def main():
         np.clip(args.s_train * neff / max(args.s_sensor, 1e-12), 0.25, 16.0))
     holdout = args.holdout_rows
 
-    print(f"[模式] {'合成（DNG 近似 clean + 泊松-高斯噪声）' if synth else '真机 burst'}"
+    print(f"[模式] {'合成（DNG 近似 clean + 泊松-高斯噪声）' if synth else ('已对齐 npy 对' if args.pairs_dir else '真机 burst(DNG)')}"
           f"  device={dev}  tile={tile}(packed)")
     print(f"[口径] cvt_k={cvt:.4f} = clamp(S_train·neff/S_sensor) = "
           f"{args.s_train:.4e}·{neff:g}/{args.s_sensor:.4e}；"
@@ -374,6 +458,16 @@ def main():
         print("[warn] 合成模式 clean 用单帧 DNG 近似 ⇒ label 自带单帧噪声（方差是输入的 "
               f"{neff:g}×），loss 最优解偏向\"少降噪/保噪声\"；本模式只验管线，"
               "成品权重必须用真机 burst")
+    elif args.pairs_dir:
+        sampler = PairNpySampler(args.pairs_dir, tile, CFA_PATTERNS[args.cfa_pattern],
+                                 holdout, args.patches_per_visit,
+                                 args.s_train, neff)
+        print(f"[数据] {len(sampler.scenes)} 个已对齐 npy 对（multiframe_clean 产出，"
+              f"CFA={args.cfa_pattern}，帧已在同一坐标系）")
+        for nf, _ in sampler.scenes:
+            cv = sampler.cvt.get(nf[0])
+            print(f"   {nf[0].name}: cvt_k={cv:.3f} (gain {cv * INP_SCALE:.0f})"
+                  if cv else f"   {nf[0].name}: [warn] 无 meta，回退全局 cvt_k")
     else:
         sampler = BurstPairs(args.dng_dir, args.noisy_frames, args.clean_frames, tile,
                              args.dng_cache, holdout, args.patches_per_visit)

@@ -47,9 +47,11 @@ def load_b01(path, crop=0):
         white = float(raw.white_level)
         pat = raw.raw_pattern.tolist()
     h, w = a.shape[0] // 2 * 2, a.shape[1] // 2 * 2
-    a = a[:h, :w]
+    a = a[:h, :w]                                  # 全幅时就是原数组，下面就地改写省内存
     blf = np.repeat(np.repeat(bl, h // 2, 0), w // 2, 1)
-    a = np.clip((a - blf) / max(white - float(np.median(blf)), 1.0), 0.0, 1.0)
+    a -= blf
+    a *= 1.0 / max(white - float(np.median(blf)), 1.0)
+    np.clip(a, 0.0, 1.0, out=a)
     if crop:
         cy, cx = h // 2, w // 2
         a = np.ascontiguousarray(a[cy - crop:cy + crop, cx - crop:cx + crop])
@@ -311,7 +313,8 @@ def run(paths, ref_idx, levels, crop, max_shift, reject_ratio, out, png, noisy_o
         tag = "(参考)" if x["i"] == ref_idx else ""
         print(f"{x['i']:>3} {x['path'].name:<28}"
               f"{x['d'][0]:>+11.3f},{x['d'][1]:>+9.3f}{x['spread']:>10.3f}"
-              f"{x['resid']:>11.5f}{x['wn']:>8.3f}{x['gain']:>7.2f}{x['sharp']:>8.1f} {tag}")
+              f"{x['resid']:>11.5f}{x['wn']:>8.3f}{min(x['gain'], 999.0):>7.2f}"
+              f"{x['sharp']:>8.1f} {tag}")
 
     keep, bad = select_frames(info, ref_idx, reject_ratio, max_shift, min_wn)
     for name, why in bad:
@@ -386,10 +389,11 @@ def interp_c(d):
 def selftest(crop=1024, seed=20261002, levels=4):
     ok = True
     here = Path(__file__).resolve().parent.parent.parent
-    dng = here / "test_temp/FILMKIT_20261002-124812.dng"
-    other = here / "test_temp/FILMKIT_20261002-124611.dng"
-    if not dng.exists():
-        sys.exit(f"找不到样片 {dng}")
+    # 不硬编码文件名：test_temp 下任意两张 DNG（含子目录）都能做自检
+    dngs = sorted(here.glob("test_temp/**/*.dng"))
+    if len(dngs) < 2:
+        sys.exit(f"{here}/test_temp 下需要至少 2 张 DNG 做自检（现有 {len(dngs)} 张）")
+    dng, other = dngs[-1], dngs[0]
 
     base, pat = load_b01(dng, crop)
     pos = plane_pos(pat)
@@ -406,7 +410,8 @@ def selftest(crop=1024, seed=20261002, levels=4):
         frames.append(synth_noise(f, rng))
 
     # ---- ① 位移恢复精度
-    print(f"[1] 位移恢复（{len(frames)} 帧合成，crop={crop}，噪声 A={A_SHOT:g} B={B_READ:g}）")
+    print(f"[1] 位移恢复（{len(frames)} 帧合成，基准 {dng.name}，crop={crop}，"
+          f"噪声 A={A_SHOT:g} B={B_READ:g}）")
     ref_planes = cfa_planes(frames[0], pos)
     ds, resids, gains, wns = [], [], [], []
     for i, f in enumerate(frames):
@@ -458,7 +463,8 @@ def selftest(crop=1024, seed=20261002, levels=4):
     print(f"\n[2] 噪声下降（真值=平滑后的基准，{n} 帧）")
     print(f"  vs 真值残差 σ      单帧原始 {r1:.5f} → clean {rN:.5f}   下降 ×{r1 / rN:.3f}"
           f"（理想 1/N 平均 √{n}={n ** 0.5:.3f}）")
-    print(f"  高频 σ(lag-2 差分)  单帧原始 {s1:.5f} → clean {sN:.5f}   下降 ×{s1 / sN:.3f}")
+    print(f"  高频 σ(lag-2 差分)  单帧原始 {s1:.5f} → clean {sN:.5f}   下降 ×{s1 / sN:.3f}"
+          f"（此口径含场景自身高频 {lag2_sigma(truth):.5f}，非纯噪声，仅作参考）")
     print(f"  说明 实测高于 √{n} 属正常：5 个非参考帧做亚像素双线性重采样时噪声被一并低通\n"
           f"       （各帧方差增益 cᵢ=Σw²={','.join(f'{c:.3f}' for c in cs)}），按\n"
           f"       σ₀·√((1+Σcᵢ)/{n}²) 预测 {pred:.5f}，与实测 {rN:.5f} 吻合；\n"
@@ -466,7 +472,7 @@ def selftest(crop=1024, seed=20261002, levels=4):
     ok &= r1 / rN > n ** 0.5 and abs(rN - pred) / pred < 0.15
 
     # ---- ③ 故障注入：掺一帧别的场景，看是否被剔除
-    print("\n[3] 故障注入：掺入一帧异场景（124611）")
+    print(f"\n[3] 故障注入：掺入一帧异场景（{other.name}）")
     alien, _ = load_b01(other, crop)
     fake = [{"i": i, "path": Path(f"f{i}.dng"), "d": ds[i],
              "resid": resids[i], "gain": gains[i], "wn": wns[i]} for i in range(n)]
@@ -485,7 +491,7 @@ def selftest(crop=1024, seed=20261002, levels=4):
     ok &= hit
 
     # ---- ④ 真实两张样片
-    print("\n[4] 真实样片 124611 vs 124812")
+    print(f"\n[4] 真实样片 {other.name} vs {dng.name}")
     a1, _ = load_b01(other, crop)
     thumbs = []
     for m in (a1, base):
@@ -496,6 +502,9 @@ def selftest(crop=1024, seed=20261002, levels=4):
     x, y = thumbs[0] - thumbs[0].mean(), thumbs[1] - thumbs[1].mean()
     ncc16 = float((x * y).sum() / np.sqrt((x * x).sum() * (y * y).sum()))
     print(f"  /16 缩略图 NCC = {ncc16:.4f}")
+    d16, sp16, r16, g16, wn16, _ = estimate_frame(ref_planes, cfa_planes(a1, pos), levels)
+    print(f"  对齐判据: 白噪性 wn={wn16:.3f}（同场景应 ≈1，<0.8 判为不是同一场景）；"
+          f"残差 {r16:.5f}")
     for lev in (8, 4):
         gs = []
         for m in (a1, base):
