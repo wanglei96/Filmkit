@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+
 package com.filmkit.app.ui
 
 import android.content.Context
@@ -5,6 +7,7 @@ import android.opengl.GLSurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.filmkit.app.EngineBridge
+import kotlinx.coroutines.launch
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import org.json.JSONArray
@@ -151,9 +155,11 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
     var capsJson by remember { mutableStateOf("{}") }
     var spikeJson by remember { mutableStateOf("") }
     var fftResults by remember { mutableStateOf(listOf<String>()) }
+    var nnResults by remember { mutableStateOf(listOf<String>()) }
     var status by remember { mutableStateOf("等待 surface…") }
     var view by remember { mutableStateOf<SpikeGLView?>(null) }
     var auditPath by remember { mutableStateOf<String?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     Column(
         Modifier
@@ -166,7 +172,8 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
         Spacer(Modifier.height(4.dp))
         Text("状态：$status", color = FilmTheme.Cream, style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 按钮用 FlowRow 自动换行:Row 不换行,四个按钮在窄屏会把后面的挤出屏幕外
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = { view?.rerun() },
                 colors = ButtonDefaults.buttonColors(
@@ -181,6 +188,27 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
                     contentColor = FilmTheme.OnAccent,
                 ),
             ) { Text("DFT 合并 spike（4096×3072）") }
+            Button(
+                onClick = {
+                    scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                        for (gpu in listOf(true, false)) {
+                            status = "NN spike（${if (gpu) "GPU" else "CPU×4"}）运行中…"
+                            val json = com.filmkit.app.NnSpike.run(context, gpu, 4)
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_INFO, "app", "spike.nn", json,
+                            )
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                nnResults = nnResults + json
+                                status = "NN spike（${if (gpu) "GPU" else "CPU×4"}）完成"
+                            }
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = FilmTheme.Accent,
+                    contentColor = FilmTheme.OnAccent,
+                ),
+            ) { Text("NN 降噪 spike（GPU+CPU）") }
             Button(
                 onClick = {
                     auditPath = com.filmkit.app.camera.CameraAudit.export(context)
@@ -224,6 +252,10 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
             val density = if (obj.optBoolean("overlap")) "半重叠" else "非重叠"
             Spacer(Modifier.height(8.dp))
             Section("DFT #${i + 1}｜$vn｜$density", flatten(obj))
+        }
+        nnResults.forEachIndexed { i, json ->
+            Spacer(Modifier.height(8.dp))
+            Section("NN #${i + 1}", flatten(JSONObject(json)))
         }
     }
 }

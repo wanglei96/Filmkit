@@ -1063,7 +1063,7 @@ fun SettingsScreen(
                 )
             }
             SettingNavRow("日志", "引擎/采集 JSONL 日志查看与导出") { onOpenLogs() }
-            SettingNavRow("能力 / Spike", "GL 能力与三段链基准") { onOpenSpike() }
+            SettingNavRow("能力 / Spike", "GL 能力 / 三段链 / NN 推理基准") { onOpenSpike() }
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)

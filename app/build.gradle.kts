@@ -84,8 +84,8 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 250
-        versionName = "0.10.99-m4"
+        versionCode = 251
+        versionName = "0.10.100-nnspike"
         // 只打真机用的 arm64：CMake 有时会把 x86_64 也编进 jniLibs（产物不稳定），
         // 那会让 APK 平白多 5.4MB（v0.6.31 实测 33.6MB → 39.2MB）。
         ndk { abiFilters += "arm64-v8a" }
@@ -132,5 +132,9 @@ dependencies {
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+    // NN spike（v0.10.100）：TFLite 独立 runtime（不用 Play Services 版，验证包离线可用）
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
     testImplementation(libs.junit)
 }
