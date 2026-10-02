@@ -67,9 +67,13 @@ constexpr int kNnOverlap = 16;    // tile 重叠（盲点网络边界伪影的�
 //（var 线性模型 var_dn = K(iso)·x_dn + Σ(iso) 的 shot 项之比，anchor=1600 恒等）。
 // K(iso) ∝ 传感器 shot 增益 → 用 X300 噪声模型的 S（G 通道，[0,1] 域）之比。
 constexpr float kNnInpScale = 256.0f;
-// X300 ISO1600 的 S（G 通道，[0,1] 域）—— anchor 标定（raw.noise/quality_eval
-// noise_table 同源：ISO≤1600 模拟增益饱和段 S≈4.5e-4 恒定，1600 恰在拐点）。
-constexpr float kNnAnchorS = 4.5e-4f;
+// anchor = **训练数据的噪声水平**（网络见过的输入分布），不是本机传感器自己的 S。
+// 由官方 run_benchmark.py 的 K_coeff 换算到 img01 域（V=959）：
+//   S_train = K(1600)/V = 0.96793/959 = 1.0093e-3
+// v0.10.104 曾误用 X300 自己的 S(ISO1600)=4.5e-4 当 anchor —— 输入噪声只有训练
+// 水平的 1/2.24；再叠加 MFNR 融合的 ÷neff（输入是 tex_fused_）共差 ~9×，网络按
+// 训练噪声量去减 ⇒ 细节全糊 + decoder 块状伪影（255 真机复测：文字糊、边缘格纹）。
+constexpr float kNnAnchorS = 1.0093e-3f;
 
 // 语义序（官方训练口径，BGGR 空间序语义：ch0=B、ch1=Gr、ch2=Gb、ch3=R）的相位
 // 下发与反查表。ph = (y&1)*2 + (x&1)：0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1)。
@@ -1461,13 +1465,16 @@ void main() {
 // ── NN 降噪 pass（v0.10.102/104）：PMRID TFLite 的域桥 shader ─────────────
 // kFsNnPack：mosaic（R16F fused 域 / R16UI 原始域，uSrc 分支）→ packed Bayer
 // 4ch 半分辨率 RGBA（× uScale）。供 glReadPixels 后 CPU 组 tile 喂推理。
-// 域口径（v0.10.104 对照官方 run_benchmark.py 重定案，离线恒等 0.997）：
-//   · 输入增益 uScale = cvt_k × 256，cvt_k = K(1600)/K(iso) = S_anchor/S_iso
-//     （官方 KSigma：var 线性模型的 shot 项之比；anchor=1600 恒等）。0.10.102
-//     误用 959/256=3.75 —— 比官方小 68 倍，网络输出崩溃（压暗 44%、tile 网格、
-//     点阵、发绿）。cvt_b（read 项平移）在 img01 域 ~7e-4，实测并入无影响。
-//   · 通道序 = 官方训练口径（BGGR 空间序语义）：ch0=B、ch1=Gr、ch2=Gb、ch3=R。
-//     0.10.102 误用本机空间序 —— R/B 语义错位，网络把弱通道拉向 G（发绿）。
+// 域口径（v0.10.105 对照官方 run_benchmark.py 重定案）：
+//   · 输入增益 uScale = cvt_k × 256，cvt_k = S_train/S_input（S_input = 单帧 S/neff，
+//     融合路径方差已折减）。S_train = K(1600)/V = 1.0093e-3（img01 域，见 kNnAnchorS）。
+//     0.10.102 误用 959/256=3.75（比官方小 68 倍，网络输出崩溃：压暗 44%、tile
+//     网格、点阵、发绿）；0.10.104 修了量纲但 anchor 用本机 S(1600)=4.5e-4、且漏
+//     算 MFNR 的 ÷neff ⇒ 输入噪声只有训练水平的 ~1/9，过度平滑（文字糊 + 块状伪影）。
+//     cvt_b（read 项平移）在 img01 域 ~7e-4，实测并入无影响。
+//   · 通道序（已知偏差，实测影响 <1% 故暂留）：本实现 ch0=B、ch1=Gr、ch2=Gb、
+//     ch3=R；官方为 bggr2rggb(rot180) 后 bayer2rggb ⇒ ch0=R、ch3=B（且打包图
+//     空间翻转）。真机 A/B 时若仍见通道相关伪影，按官方序改 nnSemTables + pack。
 //     各通道相位由 uPhX/uPhY 下发（CFA 无关）。
 const char* kFsNnPack = R"(#version 300 es
 precision highp float;
@@ -5688,11 +5695,12 @@ bool FrameRenderer::runNnPass(const ChainCtx& c, const NnSrc& src,
   const int nx = (w1 + kStep - 1) / kStep;
   const int ny = (h1 + kStep - 1) / kStep;
 
-  // 官方 KSigma 增益（v0.10.104 重定案）：inp = img01 × cvt_k × 256。
-  // cvt_k = S_anchor/S_iso（G 通道，[0,1] 域）；模型无效按 anchor 处理（cvt_k=1）。
+  // 官方 KSigma 增益（v0.10.105 重定案）：inp = img01 × cvt_k × 256，
+  // cvt_k = S_train / S_input。S_input = 单帧 S / neff —— 融合路径喂 tex_fused_，
+  // 噪声方差已按 neff 折减（与 P0/P4 系数同口径，见 nc.p0a）；单帧路径 neff=1。
   float cvt_k = 1.0f;
   if (c.nm.valid() && c.nm.S[1] > 1e-8f) {
-    cvt_k = std::clamp(kNnAnchorS / c.nm.S[1], 0.25f, 4.0f);
+    cvt_k = std::clamp(kNnAnchorS * c.neff / c.nm.S[1], 0.25f, 16.0f);
   }
   const float nn_gain = cvt_k * kNnInpScale;
   dbg_nn_gain_ = nn_gain;
@@ -6841,6 +6849,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.nm = model;
   c.ns = ns;
   c.ns_raw = ns_single;
+  c.neff = neff_n;
   c.lsc_ok = rc.lsc_ok;
   c.lsc_cols = lsc_cols;
   c.lsc_rows = lsc_rows;

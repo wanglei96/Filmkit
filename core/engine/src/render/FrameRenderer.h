@@ -274,6 +274,9 @@ class FrameRenderer {
     int lsc_cols = 0, lsc_rows = 0;
     float upload_ms = 0.f;  // t0 → 传参时刻（MFNR 时含上传+对齐+融合）
     bool mfnr_fused = false;
+    // MFNR 等效帧数（噪声方差折减 ÷neff）。NN 输入增益要按**实际输入**的噪声
+    // 标定：融合路径喂的是 tex_fused_（方差已折减），与 P0/P4 系数同口径。
+    float neff = 1.f;
     // 同帧 A/B 诊断（v0.10.74）：同一次 burst 用**旧层**位移场再跑一遍 P0，
     // 与正常那遍比降噪倍数。四轮真机 A/B 全因 ISO/场景/手抖不同而作废，
     // 唯一干净的对照就是同一帧数据。
