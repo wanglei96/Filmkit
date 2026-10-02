@@ -29,6 +29,7 @@ EXPECT = {
     "nnFail": ("finishStillChain", ["runNnPass("]),
     "nnMs": ("finishStillChain", ["runNnPass("]),
     "nnTiles": ("finishStillChain", ["runNnPass("]),
+    "nnGain": ("finishStillChain", ["runNnPass("]),
 }
 
 
