@@ -156,7 +156,10 @@ bool nnBridgeInit(JNIEnv* env) {
 // FrameRenderer 的 NnInferFn：拷入 tile → 阻塞推理 → 拷出结果。
 // 失败（Java 侧错误码 / 异常 / 未就绪）返回 false，调用方整张回退 P0 原链。
 bool nnBridgeInfer(const float* in, float* out) {
-  if (!g_nn.env || !g_nn.ready) return false;
+  // 首次调用时初始化桥（FindClass/getBufs 在拍照线程的调用栈内，env 有效）——
+  // 0.10.102 真机教训：只检查 ready 却从不 init，NN 整轮静默回退
+  if (!g_nn.env) return false;
+  if (!g_nn.ready && !nnBridgeInit(g_nn.env)) return false;
   constexpr size_t kTileBytes = static_cast<size_t>(512) * 512 * 4 * sizeof(float);
   std::memcpy(g_nn.in_addr, in, kTileBytes);
   const jint r = g_nn.env->CallStaticIntMethod(g_nn.cls, g_nn.m_infer);

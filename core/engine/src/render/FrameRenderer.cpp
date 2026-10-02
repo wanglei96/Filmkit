@@ -4649,7 +4649,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     if (c.nn) {
       const NnSrc src = c.mfnr_fused ? NnSrc{tex_fused_, 0} : NnSrc{0, 1};
       nn_ok = runNnPass(c, src, c.gains, c.cfa, c.black_phase, c.white_level);
-      if (nn_ok) dbg_p0s_ = 0;  // NN 替代 P0；9/96 是 P0 原路径的样本数语义
+      if (nn_ok) {
+        dbg_p0s_ = 0;  // NN 替代 P0；9/96 是 P0 原路径的样本数语义
+      } else {
+        // 0.10.102 教训：失败没置位，日志 nnOk=0/nnFail=0 分不清"回退成功"
+        dbg_nn_fail_ = 1;
+      }
     }
     if (c.mfnr_fused) {
       if (nn_ok) {
@@ -5832,7 +5837,13 @@ std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
     infer_ok = true;
     if (with_infer) {
       const NnInferFn infer = nn_infer_slot();
-      if (!infer || nn_tile_in_.empty()) {
+      if (nn_tile_in_.empty()) {
+        // 自检实例可能从未跑过拍照链：tile 暂存按需分配（0.10.102 真机教训：
+        // 新 still 实例直接自检报 no_fn，其实推理回调是好的）
+        nn_tile_in_.resize(static_cast<size_t>(kNnTile) * kNnTile * 4);
+        nn_tile_out_.resize(static_cast<size_t>(kNnTile) * kNnTile * 4);
+      }
+      if (!infer) {
         infer_ok = false;
         json += ",\"error\":\"no_fn\"";
         break;
@@ -5869,8 +5880,10 @@ std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
                     static_cast<size_t>(w1) * 4 * sizeof(float));
       }
     } else {
-      // 无推理：直接 ÷VST（模拟网络输出的逆变换段）
-      for (size_t i = 0; i < outpk.size(); ++i) outpk[i] = packed[i] / kNnVst;
+      // 无推理：packed 本身就是"网络输出"的替身（VST 域）——直接当输出。
+      // 0.10.102 教训：这里多除了一次 VST，往返相对误差恰 = 1−256/959，
+      // 自检当场拦下（maxRel 0.7335 与理论值吻合）。
+      std::memcpy(outpk.data(), packed.data(), outpk.size() * sizeof(float));
     }
     // 输出有限性（推理路径）
     for (float v : outpk) {
@@ -5913,10 +5926,11 @@ std::string FrameRenderer::runNnRoundtrip(bool with_infer) {
     mean_abs = sum / n;
     ok = with_infer ? infer_ok : (max_rel < 5e-3);
     if (with_infer) {
-      // 降噪输出应仍在物理值域内（÷VST 后 [0,1]×gain 上限 1.9 之外即域错配）
+      // 降噪输出应仍在物理值域内：outpk 是 VST 域（网络口径），输入 [0,1]×3.746
+      // → 上限 4.0 之外即域错配（0.10.102 版检查的是 ÷VST 后的值，域不对）
       double hi = 0;
       for (float v : outpk) hi = std::max(hi, static_cast<double>(v));
-      ok = infer_ok && hi < 2.5;
+      ok = infer_ok && hi < 4.0;
     }
   } while (false);
   cleanup();

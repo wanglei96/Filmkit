@@ -2252,10 +2252,12 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
                 EngineBridge.nativeFlushLogs()
                 if (varyNn) {
-                    // NN A/B：两张成片都落盘（基线在前，NN 在后 —— 时间戳顺序即 A/B 顺序）
+                    // NN A/B：两张成片都落盘（基线在前、NN 在后加 _nn 后缀区分）；
+                    // done 传 null 避免外部收尾把 b2 再存一遍（0.10.102 真机实测
+                    // 三张重复：b1 + b2 + done(b2)）
                     if (b1 != null) queueJpegSave(b1, w1, h1)
-                    if (b2 != null) queueJpegSave(b2, w2, h2)
-                    done(b2 ?: b1, w2, h2)
+                    if (b2 != null) queueJpegSave(b2, w2, h2, "_nn")
+                    done(null, 0, 0)
                 } else {
                     // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
                     // 否则"照片已算出却不落盘"（v0.10.85 审查 R1）
@@ -2602,18 +2604,21 @@ class CameraController(private val context: Context, private val render: RenderC
      *  入队 —— 返回后调用方（相机回调 / 渲染回调）立刻可以继续工作。
      *  日志 photo.save_queued 与 photo.saved 的时间差 = 后台实际耗时，用于验证
      *  主线程确实没被编码阻塞。 */
-    private fun queueJpegSave(bytes: ByteArray, w: Int, h: Int) {
+    private fun queueJpegSave(bytes: ByteArray, w: Int, h: Int, extraTag: String = "") {
         val iso = liveIso
         val secNs = liveExposureNs
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
             kv("bytes" to bytes.size),
         )
-        saver.execute { saveJpeg(bytes, w, h, iso, secNs) }
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag) }
     }
 
     /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。 */
-    private fun saveJpeg(rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long) {
+    private fun saveJpeg(
+        rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
+        extraTag: String = "",
+    ) {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
         // 16×16 网格采样平均亮度：诊断「管线输出是否全黑」
@@ -2665,7 +2670,9 @@ class CameraController(private val context: Context, private val render: RenderC
         val lutTag = currentLut?.title
             ?.takeIf { prefs.getBoolean("lut_in_name", true) }
             ?.replace(Regex("[^\\p{L}\\p{N}_-]"), "")
-        val suffix = if (lutTag.isNullOrEmpty()) "" else "_$lutTag"
+        // extraTag = 诊断标签前置（如 nn_ab 第二遍的 "_nn"）——同秒落盘的两张
+        // A/B 成片靠它区分文件名（MediaStore 同名会自动加 (1)，靠后缀更可读）
+        val suffix = extraTag + if (lutTag.isNullOrEmpty()) "" else "_$lutTag"
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$suffix.jpg"
         try {
             var savedUri: android.net.Uri? = null
