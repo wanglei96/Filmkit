@@ -79,6 +79,19 @@ object CameraAudit {
             intJson(ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)),
         )
         o.put("maxSyncLatency", ch.get(CameraCharacteristics.SYNC_MAX_LATENCY) ?: -1)
+        // 几何/畸变能力（v0.10.109-exp7 探测）：定"超广角畸变校正走 HAL 还是引擎 GPU"。
+        // LENS_DISTORTION = HAL 提供的畸变标定系数（有它就不必自拍棋盘格标定）。
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            o.put(
+                "distortionCorrectionModes",
+                intJson(ch.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)),
+            )
+            o.put("lensDistortion", ch.get(CameraCharacteristics.LENS_DISTORTION)?.joinToString(",") ?: "null")
+        }
+        o.put(
+            "lensIntrinsicCalibration",
+            ch.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)?.joinToString(",") ?: "null",
+        )
 
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         o.put(

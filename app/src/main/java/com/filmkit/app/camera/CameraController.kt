@@ -340,6 +340,10 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var oisSupported = false
 
+    /** 畸变校正可用模式（v0.10.109-exp7 探测；null = 本机 HAL 未声明该能力） */
+    @Volatile
+    private var distCorrectionModes: IntArray? = null
+
     @Volatile
     private var focusRect: android.hardware.camera2.params.MeteringRectangle? = null
 
@@ -860,7 +864,7 @@ class CameraController(private val context: Context, private val render: RenderC
         if (manualFocus) rebuildRepeating()
     }
 
-    private fun applyControls(b: CaptureRequest.Builder) {
+    private fun applyControls(b: CaptureRequest.Builder, distort: Boolean = false) {
         b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         // AF：手动对焦 OFF + 屈光度；否则连续对焦
         if (manualFocus && minFocusDiopter > 0f) {
@@ -910,6 +914,19 @@ class CameraController(private val context: Context, private val render: RenderC
             b.set(CaptureRequest.SCALER_CROP_REGION,
                 android.graphics.Rect(r.left + (r.width() - w) / 2, r.top + (r.height() - hgt) / 2,
                     r.left + (r.width() + w) / 2, r.top + (r.height() + hgt) / 2))
+        }
+        // ── 畸变校正探测（v0.10.109-exp7）────────────────────────────────
+        // 只下发给**静拍**请求（distort=true）：若对预览下发而 HAL 只对 YUV 生效，
+        // 会出现"预览被校正、成片(RAW)未校正"的 WYSIWYG 破坏。
+        // HAL 未声明支持则不发（未声明模式下发请求会被拒/忽略）。
+        val dm = distCorrectionModes
+        if (distort && android.os.Build.VERSION.SDK_INT >= 28 && dm != null &&
+            dm.contains(android.hardware.camera2.CameraMetadata.DISTORTION_CORRECTION_MODE_HIGH_QUALITY)
+        ) {
+            b.set(
+                CaptureRequest.DISTORTION_CORRECTION_MODE,
+                android.hardware.camera2.CameraMetadata.DISTORTION_CORRECTION_MODE_HIGH_QUALITY,
+            )
         }
     }
 
@@ -1323,7 +1340,7 @@ class CameraController(private val context: Context, private val render: RenderC
         try {
             val b = camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
-                applyControls(this) // 静拍继承 M 档控制（WB/EV/OIS/变焦/对焦区域）
+                applyControls(this, distort = true) // 静拍继承 M 档控制（WB/EV/OIS/变焦/对焦区域）
             }
             if (rawMode) {
                 // MFNR（v0.9.0）：三档 prefs mfnr（0 关 / 1 自动暗光 / 2 强制），
@@ -1525,7 +1542,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val refReq = if (secRefFinal < capSec && capIso > 0 && secRefFinal > 0) {
             camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
-                applyControls(this)
+                applyControls(this, distort = true)
                 // AE_OFF + 手动传感器参数（与 M 档手动滑杆同一路径，非 AE 补偿通道）
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 set(CaptureRequest.SENSOR_SENSITIVITY, isoRef)
@@ -1545,7 +1562,7 @@ class CameraController(private val context: Context, private val render: RenderC
             expPlanIso = capIso
             camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
-                applyControls(this)
+                applyControls(this, distort = true)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 // 长曝光规划后的 ISO/曝光（未启用时 == 预览收敛值，行为与历史一致）
                 set(CaptureRequest.SENSOR_SENSITIVITY, capIso)
@@ -1715,6 +1732,13 @@ class CameraController(private val context: Context, private val render: RenderC
         ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.let {
             oisSupported = it.contains(1) // 1 = ON
         }
+        // 畸变校正能力（v0.10.109-exp7 探测）：仅当 HAL 声明支持 HIGH_QUALITY 时才下发
+        // 请求（未声明的模式下发会被 HAL 拒绝/忽略，甚至导致请求构建失败）
+        distCorrectionModes = if (android.os.Build.VERSION.SDK_INT >= 28) {
+            ch.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+        } else {
+            null
+        }
         maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         colorFilterArrangement = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         isoRangeUpper = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
@@ -1739,6 +1763,51 @@ class CameraController(private val context: Context, private val render: RenderC
                         "boost" to (if (b != null) "${b.lower}..${b.upper}" else "none"),
                     ),
                 )
+                // 几何/畸变能力探测（v0.10.109-exp7）：一次打开相机即可判定"超广畸变能否
+                // 交给 HAL（RAW 流是否可能被几何校正）"还是必须引擎 GPU 自校正。
+                // AOSP 原文（CaptureRequest#DISTORTION_CORRECTION_MODE，已取证）：
+                //   "The correction only applies to processed outputs such as YUV, Y8,
+                //    JPEG, or DEPTH16; it is **not applied to any RAW output**."
+                //   "This control will be on by default on devices that support this control."
+                // ⇒ ① 我们的 RAW 链**永远拿不到** HAL 校正（探测只为确认，不为指望）；
+                //   ② YUV 链若本机支持，本来就已经在校正（默认 ON）。
+                // distModes 空 = HAL 未声明畸变校正能力；lensDistortion 有值 = HAL 带标定
+                // 系数（可直接喂我们自己的 GPU 反向映射，省掉自拍棋盘格标定）。
+                if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "camera", "camera.geom_caps_id",
+                        com.filmkit.app.kv(
+                            "id" to cid,
+                            "distModes" to (
+                                c.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+                                    ?.joinToString(",") ?: "none"
+                                ),
+                            "lensDistortion" to (
+                                c.get(CameraCharacteristics.LENS_DISTORTION)
+                                    ?.joinToString(",") { "%.5f".format(it) } ?: "none"
+                                ),
+                            "radial" to (
+                                c.get(CameraCharacteristics.LENS_RADIAL_DISTORTION)
+                                    ?.joinToString(",") { "%.5f".format(it) } ?: "none"
+                                ),
+                            "intrinsic" to (
+                                c.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+                                    ?.joinToString(",") { "%.2f".format(it) } ?: "none"
+                                ),
+                            "active" to (
+                                c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                                    ?.let { "${it.width()}x${it.height()}" } ?: "none"
+                                ),
+                            // 校正前有效阵列 vs 有效阵列的差值 = **HAL 几何校正的裁边量**
+                            // （AOSP：校正 OFF 时坐标系用 preCorrectionActiveArray，ON 时用
+                            // activeArray）。两者相同 ⇒ HAL 校正不损失视场。
+                            "preCorr" to (
+                                c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                                    ?.let { "${it.width()}x${it.height()}" } ?: "none"
+                                ),
+                        ),
+                    )
+                }
             }
         } catch (_: Throwable) {
         }
@@ -2214,6 +2283,13 @@ class CameraController(private val context: Context, private val render: RenderC
                 "stSec" to "%.4f".format(
                     (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) / 1e9f,
                 ),
+                // 畸变校正探测（v0.10.109-exp7）：本次静拍 HAL 实际生效的模式
+                // （1=OFF / 2=FAST / 3=HIGH_QUALITY；-1 = 本流未上报）
+                "distCorr" to (if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    result.get(CaptureResult.DISTORTION_CORRECTION_MODE) ?: -1
+                } else {
+                    -1
+                }),
             ),
         )
         // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在
@@ -2270,6 +2346,12 @@ class CameraController(private val context: Context, private val render: RenderC
                 },
                 "ms" to (android.os.SystemClock.elapsedRealtime() - burstStartMs),
                 "lens" to currentLensId,
+                // 畸变校正探测（v0.10.109-exp7）：burst 首帧实际生效的模式
+                "distCorr" to (if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    results.firstOrNull()?.get(CaptureResult.DISTORTION_CORRECTION_MODE) ?: -1
+                } else {
+                    -1
+                }),
             ),
         )
         logRawMeta(ref, refResult, meta)
