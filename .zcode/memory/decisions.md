@@ -112,15 +112,9 @@ status: active
 - [2026-10-01] **拖动中不写 prefs**：setLutStrength 直通渲染线程写 filmParams[34]，prefs 只在松手写一次；lutStrengthFromPrefs 哨兵防每帧同步拉回直通值
 - [2026-10-01] **用户 LUT 存档原文件**（字节级，导出可取回原样）；id 加 u_ 前缀防与内置冲突
 
-## NN 路线与中频归因（10-02）
+## NN 路线与集成（10-02，已判死）
 
-- [2026-10-02] **跨张 A/B 的混杂控制**：场景混杂 ±40%@4px；判读靠 σ2（场景不敏感）+ 引擎 nzPre/nzPost 交叉验证；**失焦只衰减信号不衰减噪声**是判失焦硬指标
-- [2026-10-02] **中频归因定案**：P0 空间核在合焦布纹上净 4px 损失 ≈0（B vs D）；MFNR 时域融合无损中频（D vs E）；锐化 3×3 只盖 1–3px；强度滑杆不是纹理杠杆（C 组）
-- [2026-10-02] **NN 路线集成形态**：融合后 RAW 域 pass、去马赛克前；GPU delegate 强制创建（CompatibilityList 对 Mali-G1 误拒）；失败回退 CPU（3.65s/12MP 兜底）
-- [2026-10-02] **PMRID 是 spike 代表非天花板**：GPU 裕量 5–10× 可上 AP-BSN/CPR；X300 噪声模型 finetune 是最大质量提升项；超越 FX 需 NN + bracketing 两条腿（后处理无法造回被噪声淹没的信息）
+- [2026-10-02] **中频归因与集成形态**：P0 空间核在合焦布纹上净 4px 损失 ≈0；MFNR 融合无损中频；锐化只盖 1–3px；强度滑杆不是纹理杠杆；失焦只衰减信号不衰减噪声。集成 = Java TFLite + JNI 逐 tile 回调 + NnInfer 常驻线程；MFNR+单帧都接；任何失败**整张回退 P0**（照片优先）；NN 开 = P0 空域降噪被替代
+- [2026-10-02] **cvt_k 定案（推翻 0.10.104 的 S_anchor/S_iso + 本机 anchor）**：`inp = img01 × cvt_k × 256`，`cvt_k = S_train·neff/S_input`。S_train = 官方 K(1600)/V = **1.0093e-3**（img01 域，**训练数据的噪声水平**；用本机 S(ISO1600)=4.5e-4 会让输入噪声只剩 1/2.24）；**× neff 必须**（NN 输入是 tex_fused_、方差已 ÷4；P0/P4 早已 ÷neff，唯独 NN pass 漏了）—— 两层合计差 ~9×，是"细节全糊"的根因。通道序 = 官方语义 **(R,Gr,Gb,B)**（bggr2rggb 的 rot180 只是"把 BGGR 摆成 RGGB"的手段，等价于不翻转、按语义取相位）。真机 nnGain 181.9→963/1018/1073 全与公式吻合
+- [2026-10-02] **判死：跨域模型不可直接用 + 微调需数据量 → 转 HDR+**：口径全修对后真机观感仍无改善（文字区强边缘占比 -36%、梯度 -24%、平坦区斑块状伪影而非白噪），**不如 P0**；根因 = PMRID 官方权重在 SIDD 上训练、与 X300 域不匹配。四次微调（监督×3 + Noise2Noise）留出集**全部过拟合**（+12.0/+9.9/+11.7/+5.06%），官方 3 万+ 对 vs 我们 4 场景差 3~4 个数量级。下一步转 HDR+ bracketing（后处理造不出被噪声淹没的信息，FX 的 +3.6EV 属采集端差距）
 
-## NN 集成（10-02）
-
-- [2026-10-02] **推理层与范围（用户拍板）**：Java TFLite API + JNI 逐 tile 同步回调（GPU delegate 已真机实测、零构建系统改动；专用 NnInfer 常驻线程避 EGL current 抢占，Interpreter 只建不销毁）；范围 = MFNR + 单帧都接；GPU 创建失败降 CPU、运行失败熔断重建 CPU、推理任何失败**整张回退 P0 原链**（照片优先）
-- [2026-10-02] **NN 开 = P0 空域降噪被替代**（PMRID 原版语义：融合后 Bayer 直接进网络）：P0 走 k=0 直读展开（输入 tex_nn_fused_，与 tex_fused_ 同域）、Ts 变体关；rmsPre(前)/rmsPost(后) 恰构成 NN 前后对照，诊断零改动
-- [2026-10-02] **官方预处理口径定案（对照 MegEngine/PMRID run_benchmark.py 源码）**：inp = img01 × cvt_k × 256，cvt_k = S_anchor/S_iso（方差线性模型 var_dn=K·x+Σ 的 shot 项之比，anchor=1600 恒等；X300 anchor S=4.5e-4 @ISO1600 G 通道引擎常量 kNnAnchorS，clamp[0.25,4]，模型无效按 anchor）；**通道序 = BGGR 空间序语义 ch0=B/Gr/Gb/R**（nnSemTables 按 CFA 映射，与训练数据的 bayer pattern 对齐）；cvt_b（read 项平移）img01 域 ~7e-4 实测可忽略。959/256 只是 anchor 恒等点的中间量，不是固定系数；离线复现恒等 0.997（旧口径 0.41 + 发绿/网格/点阵）

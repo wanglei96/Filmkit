@@ -19,21 +19,28 @@ status: active
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
 - `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
 
-## 进行中（2026-10-02 晚：NN 集成口径定案，0.10.104 待真机复测）
+## 进行中（2026-10-02 晚：NN 判死，转 HDR+）
 
-- [2026-10-02] **NN 降噪集成** | 最高 | **0.10.104-nnint3 (255) 已修官方口径（KSigma
-  cvt_k×256 + BGGR 通道语义），离线恒等 0.997**：真机复测（发绿/网格应消、
-  nnGain 核对）→ nn_ab 正式 A/B → 验收
-- [2026-10-02] **X300 噪声模型 finetune PMRID** | 高 | σ²=A·x+B 合成训练对，
-  预期纹理保留率 78–86% 再上一档（超越 PC/FX 的算法层主力）；兼治修正口径下
-  极端暗部 R/B 相位仍向 G 收敛的残余
-- [2026-10-02] **HDR+ bracketing 评估** | 高 | 1×/4×/16× 曝光阶梯实拍（超越
-  FX 的进光杠杆）；hdr-plus-swift 为参考实现
-- [2026-10-01] **M5 诊断与基准** | 待做 | 逐 pass GPU 计时、golden image 接 CI
+- [2026-10-02] **HDR+ bracketing 评估** | 最高 | 1×/4×/16× 曝光阶梯实拍（超越
+  FX 的进光杠杆）；hdr-plus-swift 为参考实现。**NN 判死后成为算法层主线**
+- [2026-10-02] **M5 诊断与基准** | 待做 | 逐 pass GPU 计时、golden image 接 CI
+- [2026-10-02] **NN 微调（暂缓）** | 降级 | 管线已建成（PyTorch 移植 / 亚像素对齐 /
+  N2N 配对 / 评估全跑通），但需几十个场景数据 —— 4 场景实测全部过拟合。代码与
+  开关保留（`nn_dn` 默认关），数据充足可直接捡起
 - [2026-10-01] **更强 NN 模型评估** | 降级 | GPU 裕量 5–10×,AP-BSN/CPR <2s
+- [2026-10-01] **可选：NN 强度滑杆** | 待定 | `out = α·nn + (1−α)·原图`，让真机
+  自己找权衡点（~30 分钟）
 
 ## 已完成（近期）
 
+- [2026-10-02] **NN 集成五轮 + 判死（v0.10.102–0.10.106，253→257）**：NN pass 全链接入
+  → 逐层修口径（JNI 桥 / KSigma 量纲 / 训练口径 anchor / MFNR neff 折减 / 通道序）
+  → **nnGain 全与公式逐位吻合但观感零改善**（文字梯度 -24%、平坦区斑块状伪影），
+  不如 P0 → 判定"跨域模型不可直接用" | handoffs/NN集成定因与判死转HDR+.memo.md
+- [2026-10-02] **微调管线建成 + 四次微调全失败**：PyTorch 移植（与 onnxruntime 等价
+  2e-6）、亚像素对齐（0.0115px）、Noise2Noise 配对、评估与 TFLite 导出；四次微调
+  留出集全过拟合（+12.0/+9.9/+11.7/+5.06%），瓶颈 = 数据量（4 场景 vs 官方 3 万+）
+  | handoffs/NN集成定因与判死转HDR+.memo.md
 - [2026-10-02] **NN 集成三轮（v0.10.102–0.10.104，253→255）**：NN pass 全链接入
   （MFNR+单帧、NnInferEngine 常驻推理线程、失败回退 P0 真机验证零丢照片）→
   官方口径两处误读定案（cvt_k×256 增益、BGGR 通道语义）→ 离线复现恒等 0.997；

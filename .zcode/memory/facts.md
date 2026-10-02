@@ -98,12 +98,23 @@ status: active
 
 - [2026-10-02] **NN spike 真机数据（X300, PMRID 512tile FP16, 20 块=12.58MP）**：GPU delegate 单块中位 **26ms**（p90 28）、全图 **0.51s**、**24.86MP/s**、零温升；CPU XNNPACK×4 181ms、3.65s、3.45MP/s、零温升
 - [2026-10-02] **PMRID 离线质量（X300 噪声模型合成 + clean 参照）**：纹理保留率 4px 78%（暗光 ISO640）/86%（白天 ISO3200）、8px 91–97%、平坦 σ −77~80%、2px 增强 1.7–2×；对比锚点（10-01 三 APP 同场景 4px）：PC 2.24 / Filmix 2.19 / 我们 1.47
-- [2026-10-02] **PMRID 移植口径（10-02 晚官方口径修订）**：输入 = img01 × cvt_k × 256（cvt_k = 4.5e-4/S_iso_G，clamp[0.25,4]；~~01 域 × 959/256~~ 已推翻）+ **BGGR 空间序语义 ch0=B/Gr/Gb/R**（nnSemTables 按 CFA）；NHWC [1,512,512,4]、tile 512/步进 496/重叠 16、FP16 tflite 2.1MB（守卫 0.76%）；Filmix 曝光 = ISO166+1/4s（+3.6EV 进光）
+- [2026-10-02] **PMRID 移植口径（10-02 晚经 256/257 两次修订，最终版）**：输入 = img01 × cvt_k × 256，**cvt_k = S_train·neff/S_input**，S_train = 官方 K(1600)/V = **1.0093e-3**（img01 域）、neff = 4、clamp[0.25,16]；**通道序 = 官方语义 ch0=R/ch1=Gr/ch2=Gb/ch3=B**（`nnSemTables` 按 CFA 给相位；打包图空间朝向不翻转）。NHWC [1,512,512,4]、tile 512/步进 496/重叠 16、FP16 tflite 2.1MB（守卫 0.76%）；Filmix 曝光 = ISO166+1/4s（+3.6EV 进光）
+  - 修正沿革：255 用 `S_anchor/S_iso`（X300 S(1600)=4.5e-4）且通道序 (B,Gr,Gb,R)；256 修 anchor 为训练口径并 ×neff；257 修通道序
+  - ~~01 域 × 959/256~~（0.10.102）与 ~~cvt_k=S_anchor/S_iso + BGGR 语义~~（0.10.104）均已推翻
 - [2026-10-02] **tools 新增**：`tools/midband-attrib.py`（三图/分组归因：EXIF 聚类 + 配准 + 归一带通 + 分尺度噪声 + CIELAB）、`tools/nn/convert_pmrid.py`（torch→onnx→tf→tflite FP16 + 数值守卫）、`tools/nn/quality_eval.py`（合成噪声 + 分块推理 + 保留率表；⚠ 其 959/256 口径注释已被官方源码推翻）
 
 ## NN 集成（2026-10-02 晚）
 
-- [2026-10-02] **版本沿革（NN 集成三轮）**：253（0.10.102-nnint，NN pass 全链落地；JNI 桥未初始化全回退）→ 254（0.10.103-nnint2，修桥 init/自检 VST/tile 缓冲/nn_ab 重复落盘 4 bug；真机跑通 gpu 1217ms/12MP、nzPreMed 0.0061→0.0020，但口径错成片发绿+网格+点阵）→ **255（0.10.104-nnint3，官方口径 cvt_k×256 + BGGR 通道语义，离线恒等 0.997，待真机复测）**；验证包均未打 tag
-- [2026-10-02] **NN 集成代码落点**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制+CPU 熔断、inferTile JNI 入口）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、kNnAnchorS=4.5e-4、tex_nn_packed_/tex_nn_out_/tex_nn_fused_）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab（均默认关）；raw.render 新增 nn/nnOk/nnFail/nnDel/nnMs/nnTiles/nnGain
+- [2026-10-02] **版本沿革（NN 集成五轮，253→257）**：253（0.10.102-nnint，NN pass 全链落地；JNI 桥未初始化全回退）→ 254（0.10.103-nnint2，修 4 bug 后跑通 gpu 1217ms/12MP，但口径错成片发绿+4×3 网格+16px 点阵）→ 255（0.10.104-nnint3，官方 KSigma 量纲 + BGGR 语义，画面正常但细节全糊+格纹）→ 256（0.10.105-nnint4，anchor 改训练口径 1.0093e-3 并 ×neff，nnGain 181.9→963）→ **257（0.10.106-nnint5，通道序对齐 (R,Gr,Gb,B)，当前包）**；验证包均未打 tag
+- [2026-10-02] **NN 集成代码落点**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制+CPU 熔断、inferTile JNI 入口）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff、tex_nn_packed_/tex_nn_out_/tex_nn_fused_）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab（均默认关）；raw.render 含 nn/nnOk/nnFail/nnDel/nnMs/nnTiles/nnGain
 - [2026-10-02] **NN 诊断与自检**：SpikeUi「NN 链路自检」= pack→unpack 域往返（应恒等，half 容差 maxRel ~1e-3）+ 真推理端到端；出包前 check-diag-fields.py 已登记 nnOk/nnFail/nnMs/nnTiles/nnGain
 - [2026-10-02] **离线验收新增判据**：eval_inputs.npy / NN 输出必须查**均值比**（去直流指标测不出全局亮度偏移，PMRID 曾压暗 44% 而带通指标全"达标"）；同刻 DNG 离线复现脚本口径见 decisions（官方 KSigma + BGGR 语义）
+
+## NN 真机定因与微调实测（2026-10-02 晚）
+
+- [2026-10-02] **nnGain 核对（口径是否生效的硬标志）**：963.5@ISO3903 / 1018.3@ISO3660 / 1072.6@ISO3444，全部与 `1.0093e-3×4/S_G×256` 逐位吻合
+- [2026-10-02] **同帧 A/B（257，ISO3660/neff=4）**：P0 降噪 nzPreMed 0.00589→0.001756（÷3.35）；NN 0.00589→0.000556（**÷10.6，是 P0 的 3.2 倍**）
+- [2026-10-02] **观感定量（成片层）**：瓶标签文字区梯度均值 1.677→1.272（**-24%**）、强边缘(>30)占比 3.76%→2.41%（-36%）；全图 4px 能量反而 +34%（平坦区 0.55×，增量集中在有内容区）；墙面 nn-on 呈**斑块状结构**而 nn-off 是白噪。JPG 5.66MB→4.21MB（-26%）**不等于丢细节** —— 体积差来自噪声形态（白噪难压缩、结构化伪影易压缩）
+- [2026-10-02] **微调四次全失败**：留出集 loss 监督×3 = +12.0/+9.9/+11.7%、Noise2Noise = +5.06%，ret4 全降；M1 MPS 训练 271ms/step、驱动分配 1.1GB；PMRID PyTorch 移植与 onnxruntime 等价 max abs 2.0e-6、参数 1.032M
+- [2026-10-02] **对齐工具实测**：位移误差 0.0115px（合成 6 帧）、噪声 ×3.22、异场景剔除 wn 0.304 vs 同场景 0.996；真实手持 8 帧 ×2.16；93 帧/5 场景中 4 个可用（场景 5 位移 103–114px 报废）
+- [2026-10-02] **DNG 噪声模型来源**：tag 51041 NoiseProfile = Camera2 SENSOR_NOISE_PROFILE（与引擎 `nzSrc:"cam2"` 同源），顺序 (R,G,B)、G 取中间项；本批 S_G = 1.291e-3 / 5.576e-4 / 3.677e-4 / 3.395e-4 / 2.105e-4（ISO 4781/1709/892/771/216）；CFAPattern=[[1,0],[2,3]]=GRBG
