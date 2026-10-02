@@ -108,6 +108,46 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
+    // ── 曝光决策专项（v0.10.107）：motion metering ─────────────────────
+    // Night Sight §2.3：按运动量决定每帧曝光时长（手持 ≤333ms / 稳定 ≤1s）。
+    // 离线实测（test_temp/exposure_lever/findings.md）：曝光 ×N 的噪声收益 = √N，
+    // 代价是帧内模糊 d 对纹理的衰减（tex_keep 只与 d 有关）；细节优先口径
+    // （tex_keep ≥ 0.95）⇒ 帧内模糊预算 2.2 mosaic px，换算即
+    //   t_max = budget · RAD_PER_PX / ω     （ω = 采集前 1s 角速度 RMS）
+    // 取三轴模长（含 roll，偏保守）；样本不足返回 -1，规划器视为无运动限制。
+    private class GyroSample(val tNs: Long, val mag: Float)
+
+    private val gyroLock = Any()
+    private val gyroSamples = ArrayDeque<GyroSample>()
+
+    private val gyroListener by lazy {
+        object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(event: android.hardware.SensorEvent?) {
+                val v = event?.values ?: return
+                val mag = kotlin.math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+                synchronized(gyroLock) {
+                    gyroSamples.addLast(GyroSample(event.timestamp, mag))
+                    val cut = event.timestamp - GYRO_WINDOW_NS
+                    while (gyroSamples.isNotEmpty() && gyroSamples.first().tNs < cut) {
+                        gyroSamples.removeFirst()
+                    }
+                }
+            }
+
+            override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) = Unit
+        }
+    }
+
+    /** 最近 GYRO_WINDOW_NS 的角速度 RMS（rad/s）；样本不足返回 -1（= 无运动限制）。 */
+    private fun gyroRmsRadPerSec(): Double {
+        synchronized(gyroLock) {
+            if (gyroSamples.size < 4) return -1.0
+            var acc = 0.0
+            for (s in gyroSamples) acc += s.mag.toDouble() * s.mag
+            return kotlin.math.sqrt(acc / gyroSamples.size)
+        }
+    }
+
     /** 设备物理方向监听（v0.6.39 引入 → v0.6.41 对齐 PhotonCamera）。
      *  原实现是 CameraScreen 里读 `winMgr.defaultDisplay.rotation` 快照 + `LaunchedEffect(displayRot)`，
      *  但**设备旋转不会触发 Compose 重组** → displayRot 永远停在初值 → orientationStep 恒为 0。
@@ -625,6 +665,13 @@ class CameraController(private val context: Context, private val render: RenderC
             in 225..314 -> 3 // 右侧朝上 = 设备逆时针 90°
             else -> 0        // 竖（含 ORIENTATION_UNKNOWN 之外的所有残角）
         }
+
+        /** motion metering 的角速度统计窗口（Night Sight：快门按下前 ~1.5s 平滑） */
+        const val GYRO_WINDOW_NS = 1_000_000_000L
+
+        /** 采集端长曝光目标：同机 Filmix 实证 1/4s 可用（ISO166+1/4s 样片）；
+         *  Night Sight 标准手持上限 333ms 待真机确认后再放开 —— 保守起步，照片优先。 */
+        const val EXP_TARGET_EXPOSURE_NS = 250_000_000L
 
         /** MFNR 阶段一固定帧数（融合 shader 固定 4 输入） */
         const val MFNR_FRAMES = 4
@@ -1203,6 +1250,10 @@ class CameraController(private val context: Context, private val render: RenderC
                 sm.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let {
                     sm.registerListener(gravityListener, it, android.hardware.SensorManager.SENSOR_DELAY_UI)
                 }
+                // 曝光决策专项：陀螺仪（motion metering）；缺失时规划器自动退化为无运动限制
+                sm.getDefaultSensor(android.hardware.Sensor.TYPE_GYROSCOPE)?.let {
+                    sm.registerListener(gyroListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME)
+                }
             }
         started = true
         openCamera()
@@ -1315,6 +1366,15 @@ class CameraController(private val context: Context, private val render: RenderC
     private var burstRefNoiseScale = 1.0f
     private val MFNR_REF_MAX_EXPOSURE_NS = 15_000_000L  // 快门锚 15ms（拖影减半）
 
+    // 曝光决策专项护栏：本次 burst 请求的曝光/ISO（供结果回调核对 HAL 是否 clamp）
+    @Volatile
+    private var expPlanSec = 0L
+    @Volatile
+    private var expPlanIso = 0
+
+    /** exp_ab=1 时的交替标志（true = 本次拍照启用规划） */
+    private var expAbToggle = false
+
     /** 4 帧同参 captureBurst（恒曝光）。Image/Result 桶按回调序配对——
      *  burst 的 onCaptureCompleted 与提交顺序一致且同 looper 串行。
      *  v0.10.1 短参考帧：帧 0（参考帧 + DNG 底片）压短快门（min(AE, 15ms)），
@@ -1348,41 +1408,83 @@ class CameraController(private val context: Context, private val render: RenderC
         var isoUpperGate = Int.MAX_VALUE
         curCharacteristics?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             ?.let { isoUpperGate = it.upper }
-        val isoTouchesTop = liveIso >= isoUpperGate        // 触顶 = 暗光
-        val isoHeadroomOk = liveIso * 3 / 2 <= isoUpperGate  // isoRef 不会被 clamp
-        val canShorten = liveIso > 0 && liveExposureNs > 0 &&
+
+        // ── 曝光决策专项（v0.10.107）：长曝光规划 ────────────────────────
+        // 不变式：**曝光 ×N + ISO ÷N ⇒ 输出亮度与高光裁切完全不变，纯赚 SNR**
+        // （离线实测收益 = √N，N=8.66 → 2.95×，与物理上限逐位吻合）。
+        // 约束三条：ISO 下限 / 快门上限 / 运动预算（细节优先 2.2px，findings §4）。
+        // prefs `exp_plan`：0 关 / 1 开（默认开）；`exp_ab`=1 时**每次拍照交替**
+        // 启用/禁用规划 —— 用户连按两次快门即得同场景 A/B 对（日志 expN 可区分）。
+        val expPrefs = context.getSharedPreferences("filmkit", 0)
+        val expMode = expPrefs.getInt("exp_plan", 1)
+        val expAb = expPrefs.getInt("exp_ab", 0)
+        val expOn = if (expAb >= 1) {
+            expAbToggle = !expAbToggle
+            expAbToggle
+        } else {
+            expMode >= 1
+        }
+        val gyroRms = gyroRmsRadPerSec()
+        var expPlan: ExposurePlanner.Plan? = null
+        var capIso = liveIso
+        var capSec = liveExposureNs
+        if (expOn && liveIso > 0 && liveExposureNs > 0) {
+            val secRange = curCharacteristics
+                ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val isoRange = curCharacteristics
+                ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            val p = ExposurePlanner.plan(
+                baseIso = liveIso,
+                baseExposureNs = liveExposureNs,
+                isoLower = isoRange?.lower ?: 50,
+                exposureUpperNs = secRange?.upper ?: 1_000_000_000L,
+                targetExposureNs = EXP_TARGET_EXPOSURE_NS,
+                motionRadPerSec = gyroRms,
+            )
+            expPlan = p
+            capIso = p.iso
+            capSec = p.exposureNs
+        }
+        // 长曝光生效时**取消参考帧压短**：压短的初衷是"参考帧更锐以防拖影"，而长
+        // 曝光下所有帧 SNR 同时提高，压短反而让参考帧噪声变差（对齐/mismatch 判据
+        // 一起退化）；拖影风险已由运动预算统一约束（Night Sight：参考帧取最锐帧）。
+        val longExposureOn = expPlan != null && expPlan.n > 1.0001
+
+        val isoTouchesTop = capIso >= isoUpperGate        // 触顶 = 暗光
+        val isoHeadroomOk = capIso * 3 / 2 <= isoUpperGate  // isoRef 不会被 clamp
+        val canShorten = !longExposureOn && capIso > 0 && capSec > 0 &&
             !isoTouchesTop && isoHeadroomOk
         val secRef = if (!canShorten) {
-            liveExposureNs
+            capSec
         } else {
             minOf(
-                liveExposureNs,
-                maxOf(MFNR_REF_MAX_EXPOSURE_NS, liveExposureNs * 2 / 3),
+                capSec,
+                maxOf(MFNR_REF_MAX_EXPOSURE_NS, capSec * 2 / 3),
             )
         }
         // v0.10.9：**曝光量守恒优先** —— iso 被 clamp（range/模拟上限）后必须反算
         // 快门，否则 ref 欠曝（实测 ISO 2544/30ms → 想要 3816/20ms 但 ISO clamp
         // 到 3200 后仍是 20ms = 曝光量 64000 vs alt 的 76680，ref 系统性欠 0.26EV，
         // 给残差判据引入 18% 的全图亮度差）。
-        var isoRef = if (liveIso > 0 && secRef > 0) {
-            Math.round(liveIso.toDouble() * liveExposureNs / secRef).toInt()
+        var isoRef = if (capIso > 0 && secRef > 0) {
+            Math.round(capIso.toDouble() * capSec / secRef).toInt()
                 .coerceAtMost(isoUpperGate)
         } else {
-            liveIso
+            capIso
         }
         isoRef = isoRef.coerceAtLeast(1)
         // 守恒反算（canShorten 已保证 isoRef 不被 clamp，此处精确守恒）
-        val secRefFinal = if (liveIso > 0 && liveExposureNs > 0 && isoRef > 0) {
-            Math.round(liveIso.toDouble() * liveExposureNs / isoRef)
+        val secRefFinal = if (capIso > 0 && capSec > 0 && isoRef > 0) {
+            Math.round(capIso.toDouble() * capSec / isoRef)
         } else {
             secRef
         }
-        burstRefNoiseScale = if (liveIso > 0 && liveExposureNs > 0 && secRefFinal > 0) {
-            kotlin.math.sqrt(liveExposureNs.toDouble() / secRefFinal).toFloat()
+        burstRefNoiseScale = if (capIso > 0 && capSec > 0 && secRefFinal > 0) {
+            kotlin.math.sqrt(capSec.toDouble() / secRefFinal).toFloat()
         } else {
             1.0f
         }
-        val refReq = if (secRefFinal < liveExposureNs && liveIso > 0 && secRefFinal > 0) {
+        val refReq = if (secRefFinal < capSec && capIso > 0 && secRefFinal > 0) {
             camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
                 applyControls(this)
@@ -1400,13 +1502,16 @@ class CameraController(private val context: Context, private val render: RenderC
         // ref/alt 曝光量不守恒（42.8 vs 47.2）→ 对齐 SAD 残差被亮度差淹没
         // （confMed=0 → 位移场全零 → neff=1.45，MFNR 整体失效）。主摄/15MM 因
         // AE 恰好稳定而侥幸守恒（±0.7%）。
-        val altReq = if (liveIso > 0 && liveExposureNs > 0) {
+        val altReq = if (capIso > 0 && capSec > 0) {
+            expPlanSec = capSec
+            expPlanIso = capIso
             camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(stillReader!!.surface)
                 applyControls(this)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                set(CaptureRequest.SENSOR_SENSITIVITY, liveIso)
-                set(CaptureRequest.SENSOR_EXPOSURE_TIME, liveExposureNs)
+                // 长曝光规划后的 ISO/曝光（未启用时 == 预览收敛值，行为与历史一致）
+                set(CaptureRequest.SENSOR_SENSITIVITY, capIso)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, capSec)
             }.build()
         } else {
             null
@@ -1419,8 +1524,15 @@ class CameraController(private val context: Context, private val render: RenderC
             kv(
                 "frames" to MFNR_FRAMES,
                 "refIso" to isoRef, "refSec" to "%.4f".format(secRefFinal / 1e9f),
-                "altIso" to liveIso, "altSec" to "%.4f".format(liveExposureNs / 1e9f),
+                "altIso" to capIso, "altSec" to "%.4f".format(capSec / 1e9f),
                 "rn" to "%.3f".format(burstRefNoiseScale),
+                // 曝光决策专项：规划结果 + 运动判据（expN=1 表示未启用/未生效）
+                "expN" to "%.2f".format(expPlan?.n ?: 1.0),
+                "expWhy" to (expPlan?.limitedBy ?: "off"),
+                "expDv" to "%.2f".format(expPlan?.deltaEv ?: 0.0),
+                "gyro" to "%.4f".format(gyroRms),
+                "mtnLim" to "%.3f".format((expPlan?.motionLimitNs ?: 0L) / 1e9f),
+                "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
             ),
         )
         EngineBridge.nativeFlushLogs()
@@ -1497,7 +1609,10 @@ class CameraController(private val context: Context, private val render: RenderC
         pendingOpenId = null
         orientationListener.disable()
         (context.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager)
-            ?.unregisterListener(gravityListener)
+            ?.let { sm ->
+                sm.unregisterListener(gravityListener)
+                sm.unregisterListener(gyroListener)
+            }
         render.post {
             try { session?.stopRepeating() } catch (_: Throwable) {}
             camera?.close()
@@ -1880,6 +1995,25 @@ class CameraController(private val context: Context, private val render: RenderC
                 // burst：按回调序入桶（同 looper 串行保证与提交顺序一致）
                 if (burstResultCount < MFNR_FRAMES) {
                     burstResults[burstResultCount++] = result
+                    // 曝光决策专项护栏：记录**实际**曝光/ISO —— 请求被 HAL clamp 时
+                    // 画面会偏暗（ISO 已按规划值下调），必须能从日志一眼发现。
+                    if (burstResultCount == MFNR_FRAMES) {
+                        val secs = burstResults.mapNotNull {
+                            it?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                        }
+                        val isos = burstResults.mapNotNull {
+                            it?.get(CaptureResult.SENSOR_SENSITIVITY)
+                        }
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_actual",
+                            kv(
+                                "secs" to secs.joinToString(",") { "%.4f".format(it / 1e9f) },
+                                "isos" to isos.joinToString(","),
+                                "reqSec" to "%.4f".format(expPlanSec / 1e9f),
+                                "reqIso" to expPlanIso,
+                            ),
+                        )
+                    }
                     tryProcessBurst()
                 }
             } else {

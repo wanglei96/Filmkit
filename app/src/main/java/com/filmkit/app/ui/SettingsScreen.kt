@@ -499,6 +499,79 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 曝光决策专项（v0.10.107）：长曝光进光 —— 曝光 ×N + ISO ÷N（亮度与
+            // 高光裁切不变，纯赚 SNR；离线实测收益 = √N）。上限由陀螺仪 motion
+            // metering 的运动预算 + ISO 下限 + 快门范围共同决定。
+            var expPlanOn by rememberSaveable { mutableStateOf(prefs.getInt("exp_plan", 1)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = if (expPlanOn >= 1) 0 else 1
+                        expPlanOn = v
+                        prefs.edit().putInt("exp_plan", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.exp_plan",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("长曝光进光", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "暗光按陀螺仪运动量拉长曝光（≤250ms）并等比降 ISO：亮度与高光" +
+                            "裁切不变、噪声按 √N 下降（N=6.5 → 2.5×）；" +
+                            "仅 M 档 RAW + 多帧融合触发时生效",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (expPlanOn >= 1) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            // 曝光 A/B 交替：连按两次快门即得同场景「开/关」对照（日志 expN 区分）
+            var expAbOn by rememberSaveable { mutableStateOf(prefs.getInt("exp_ab", 0)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = if (expAbOn >= 1) 0 else 1
+                        expAbOn = v
+                        prefs.edit().putInt("exp_ab", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.exp_ab",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("曝光 A/B 交替", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "打开后每次拍照交替启用/禁用「长曝光进光」——" +
+                            "连按两次快门即得同场景对照（日志 expN 可区分）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (expAbOn >= 1) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
             // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
             var mfnrDft by rememberSaveable {
