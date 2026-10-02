@@ -10,7 +10,8 @@
 set -u
 ROOT="/Users/wl/Downloads/胶片相机"
 DNG="$ROOT/test_temp/dng"
-OUT="$ROOT/test_temp/burst"
+OUT="${OUT_DIR:-$ROOT/test_temp/burst}"
+INTERP="${INTERP:-bilinear}"
 TOOL="$ROOT/tools/nn/multiframe_clean.py"
 mkdir -p "$OUT"
 
@@ -18,6 +19,7 @@ mkdir -p "$OUT"
 python3 - "$DNG" "$OUT" "$TOOL" <<'PY'
 import glob, os, subprocess, sys, datetime
 dng_dir, out_dir, tool = sys.argv[1], sys.argv[2], sys.argv[3]
+interp = os.environ.get("INTERP", "bilinear")
 files = sorted(glob.glob(os.path.join(dng_dir, "*.dng")))
 scenes, cur, prev = [], [], None
 for f in files:
@@ -34,12 +36,13 @@ for k, sc in enumerate(scenes, 1):
     clean_in = [sc[0]] + sc[4:]           # f1 + f5..fN
     n_out = os.path.join(out_dir, f"scene{k:02d}_noisy.npy")
     c_out = os.path.join(out_dir, f"scene{k:02d}_clean.npy")
-    print(f"\n=== 场景{k}: {len(sc)} 帧  noisy←{len(noisy_in)}帧  clean←{len(clean_in)}帧", flush=True)
+    print(f"\n=== 场景{k}: {len(sc)} 帧  noisy←{len(noisy_in)}帧  clean←{len(clean_in)}帧  核={interp}", flush=True)
     for inp, outp, tag in ((noisy_in, n_out, "noisy"), (clean_in, c_out, "clean")):
-        cmd = ["python3", tool, *inp, "--ref", "0", "--max-shift", "200", "--min-wn", "0.6", "--out", outp]
+        cmd = ["python3", tool, *inp, "--ref", "0", "--max-shift", "200", "--min-wn", "0.6",
+               "--interp", interp, "--out", outp]
         r = subprocess.run(cmd, capture_output=True, text=True)
         tail = [l for l in r.stdout.splitlines() if any(s in l for s in
-                ("保留", "剔除", "有效像素", "耗时", "→ clean"))]
+                ("保留", "剔除", "有效像素", "耗时", "→ clean", "重建核"))]
         print(f"  [{tag}] rc={r.returncode} " + " | ".join(tail[-4:]), flush=True)
         if r.returncode != 0:
             print("   STDERR:", r.stderr[-400:], flush=True)

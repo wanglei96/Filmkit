@@ -71,32 +71,42 @@ def main():
     ft.eval()
 
     print(f"{'场景':<9}{'cvt_k':>7}{'输入σ':>8} | "
-          f"{'官方σ':>7}{'微调σ':>7} | {'输入4px':>8}{'官方4px':>8}{'微调4px':>8} | "
-          f"{'官方art4':>9}{'微调art4':>9}")
+          f"{'官方σ':>7}{'微调σ':>7} | {'ret2':>7}{'ret4':>7}{'ret8':>7} | "
+          f"{'官方art4':>9}{'微调art4':>9}   （ret*=相对 clean 的保留率）")
     rows = []
     for nf in sorted(Path(args.pairs_dir).glob("*_noisy.npy")):
         mp = nf.with_name(nf.name.replace("_noisy.npy", "_meta.json"))
-        if not mp.exists():
+        cf = nf.with_name(nf.name.replace("_noisy.npy", "_clean.npy"))
+        if not mp.exists() or not cf.exists():
             continue
         s = json.loads(mp.read_text())["s_g"]
         cvt = float(np.clip(KNN_ANCHOR_S * 4.0 / s, 0.25, 16.0))
         m = np.load(nf, mmap_mode="r")
+        cma = np.load(cf, mmap_mode="r")
         h, w = m.shape
         cy, cx = h // 2, w // 2
         c = args.crop
         mos = np.asarray(m[cy - c:cy + c, cx - c:cx + c], dtype=np.float32)
+        mcs = np.asarray(cma[cy - c:cy + c, cx - c:cx + c], dtype=np.float32)
         pl = phase_blocks(mos, pat)
+        cl = phase_blocks(mcs, pat)
         inp_g = gray(np.stack([pl[k] for k in SEM_ORDER], -1))
+        cl_g = gray(np.stack([cl[k] for k in SEM_ORDER], -1))
         i4 = band_rms(inp_g, 2, 4)
+        ref = {r: max(band_rms(cl_g, *b), 1e-9) for r, b in
+               (("2", (1, 2)), ("4", (2, 4)), ("8", (4, 8)))}
         res = {}
         for name, net in (("off", off), ("ft", ft)):
             o = infer(net, mos, pat, cvt, dev)
             g = gray(o)
-            res[name] = (g, band_rms(g, 2, 4), flat_sigma(g / 255.0) * 255)
+            res[name] = (g, band_rms(g, 2, 4), flat_sigma(g / 255.0) * 255,
+                         {r: band_rms(g, *b) for r, b in
+                          (("2", (1, 2)), ("4", (2, 4)), ("8", (4, 8)))})
         tag = nf.stem.replace("_noisy", "")
         print(f"{tag:<9}{cvt:>7.2f}{flat_sigma(inp_g/255)*255:>8.2f} | "
               f"{res['off'][2]:>7.2f}{res['ft'][2]:>7.2f} | "
-              f"{i4:>8.2f}{res['off'][1]:>8.2f}{res['ft'][1]:>8.2f} | "
+              f"{res['off'][3]['2']/ref['2']:>7.3f}{res['off'][3]['4']/ref['4']:>7.3f}"
+              f"{res['off'][3]['8']/ref['8']:>7.3f} | "
               f"{res['off'][1]/i4:>9.3f}{res['ft'][1]/i4:>9.3f}")
         rows.append((tag, res['off'][1] / i4, res['ft'][1] / i4))
         from PIL import Image

@@ -136,6 +136,78 @@ def warp(p, dy, dx):
     return (top + (bot - top) * wy).astype(np.float32), valid
 
 
+# ------------------------------------------------- 重采样核（--interp 可选项）
+
+def _keys(x, a):
+    """Keys 三次卷积核：a=-0.5 即 Catmull-Rom，a 越负越锐、旁瓣（过冲）越大。"""
+    x = np.abs(np.asarray(x, np.float64))
+    return np.where(x < 1, ((a + 2) * x - (a + 3)) * x * x + 1,
+                    np.where(x < 2, ((a * x - 5 * a) * x + 8 * a) * x - 4 * a, 0.0))
+
+
+def _lanczos(x, n):
+    x = np.asarray(x, np.float64)
+    return np.where(np.abs(x) < n, np.sinc(x) * np.sinc(x / n), 0.0)
+
+
+def kernel_of(name, a=-0.5):
+    """--interp 名 → (核函数, 半径 r)。tap 取 j∈[−r+1, r]，x=j−frac，覆盖 (−r, r]。"""
+    if name == "bilinear":
+        return lambda x: np.maximum(0.0, 1.0 - np.abs(np.asarray(x, np.float64))), 1
+    if name == "bicubic":
+        return lambda x: _keys(x, a), 2
+    if name == "lanczos2":
+        return lambda x: _lanczos(x, 2), 2
+    if name == "lanczos3":
+        return lambda x: _lanczos(x, 3), 3
+    raise ValueError(f"未知插值核 {name}")
+
+
+def warp_k(p, dy, dx, kern):
+    """可分离高阶核重采样 out(y,x)=p(y+dy, x+dx)（kern=--interp；平面域位移）。
+    权重逐点归一化（Lanczos 非严格单位分解，且保证无位移时恒等）；
+    valid 要求全部 tap 在界内 —— 与 warp() 的双线性口径一致，
+    因此 r=1 时本函数与 warp() 数值等价（selftest 有断言）。"""
+    fn, r = kern
+    h, w = p.shape
+
+    def taps(n, d):
+        t = np.arange(n, dtype=np.float64) + float(d)
+        t0 = np.floor(t).astype(np.int32)
+        j = np.arange(-r + 1, r + 1)
+        wj = fn(j[None, :] - (t - t0)[:, None])
+        idx = t0[:, None] + j[None, :]
+        ok = (idx >= 0) & (idx < n)
+        wj = np.where(ok, wj, 0.0)
+        # 越界 tap 权重置 0 后再归一；整窗越界时和为 0 → 保持 0（valid=False，调用方丢弃）
+        wj /= np.maximum(wj.sum(1, keepdims=True), 1e-20)
+        return np.clip(idx, 0, n - 1), wj.astype(np.float32), ok.all(1)
+
+    iy, wy, oky = taps(h, dy)
+    ix, wx, okx = taps(w, dx)
+    out = np.zeros((h, w), np.float32)
+    for k in range(2 * r):                          # 先 y
+        out += wy[:, k:k + 1] * p[iy[:, k]]
+    res = np.zeros((h, w), np.float32)
+    for k in range(2 * r):                          # 再 x
+        res += out[:, ix[:, k]] * wx[None, :, k]
+    return res, (oky[:, None] & okx[None, :])
+
+
+def noise_gain(kern, d):
+    """该核在平面域位移 d 下的噪声方差增益 Σw²（可分离 = gy·gx）。
+    白噪声经重采样后方差乘以它 —— 保高频的核通带更宽，这一项更大。"""
+    fn, r = kern
+    j = np.arange(-r + 1, r + 1)
+    g = []
+    for dd in np.asarray(d, np.float64):
+        f = dd - np.floor(dd)
+        w = fn(j - f)
+        w = w / w.sum()
+        g.append(float((w * w).sum()))
+    return g[0] * g[1]
+
+
 def refine_lk(ref, mov, d, iters=3):
     """Gauss-Newton 细化 d（本层 px），返回 (d, 残差稳健尺度 s)。"""
     d = np.asarray(d, np.float64).copy()
@@ -214,14 +286,16 @@ def estimate_frame(ref_planes, mov_planes, levels):
 
 # ----------------------------------------------------------------- 累加/筛选
 
-def accumulate(acc, wsum, planes, d):
-    """按 mosaic 域位移 d 重采样后累加；d=None 表示原样。"""
+def accumulate(acc, wsum, planes, d, kern=None):
+    """按 mosaic 域位移 d 重采样后累加；d=None 表示原样（参考帧不插值）。
+    kern=None 走双线性 warp()（默认，与历史产物逐位一致），否则走 warp_k()。"""
     for c, pl in enumerate(planes):
         if d is None:
             acc[c] += pl
             wsum[c] += 1.0
         else:
-            v, valid = warp(pl, d[0] / 2.0, d[1] / 2.0)
+            v, valid = (warp(pl, d[0] / 2.0, d[1] / 2.0) if kern is None
+                        else warp_k(pl, d[0] / 2.0, d[1] / 2.0, kern))
             acc[c] += v * valid
             wsum[c] += valid
 
@@ -274,8 +348,11 @@ def save_png(mosaic, path):
 # --------------------------------------------------------------------- 主流程
 
 def run(paths, ref_idx, levels, crop, max_shift, reject_ratio, out, png, noisy_out,
-        min_wn=0.8):
+        min_wn=0.8, interp="bilinear", bicubic_a=-0.5, ref_exclude=False):
     t_all = time.time()
+    # 位移估计固定用双线性（与核解耦，A/B 只变重建这一个变量）；重建走 --interp。
+    kern = None if interp == "bilinear" else kernel_of(interp, bicubic_a)
+    tag_kern = interp if interp != "bicubic" else f"bicubic(a={bicubic_a:g})"
     try:
         ref_m, pat = load_b01(paths[ref_idx], crop)
     except Exception as e:
@@ -283,7 +360,7 @@ def run(paths, ref_idx, levels, crop, max_shift, reject_ratio, out, png, noisy_o
     pos = plane_pos(pat)
     ref_planes = cfa_planes(ref_m, pos)
     print(f"参考帧 {paths[ref_idx].name}  {ref_m.shape[1]}×{ref_m.shape[0]}  "
-          f"CFA={pat}  帧数 {len(paths)}  金字塔 {levels} 级")
+          f"CFA={pat}  帧数 {len(paths)}  金字塔 {levels} 级  重建核 {tag_kern}")
 
     # ---- 第一轮：逐帧估位移（内存只驻留参考帧 + 当前帧）
     info = []
@@ -319,7 +396,9 @@ def run(paths, ref_idx, levels, crop, max_shift, reject_ratio, out, png, noisy_o
     keep, bad = select_frames(info, ref_idx, reject_ratio, max_shift, min_wn)
     for name, why in bad:
         print(f"  ✗ 剔除 {name}: {why}")
-    n_keep = int(keep.sum())
+    # ref_exclude（Noise2Noise 配对用）：参考帧只作对齐基准、不参与平均 ——
+    # 这样 input/target 两组可共享同一参考系（同坐标系）却互不重叠（噪声独立）。
+    n_keep = int(keep.sum()) - (1 if ref_exclude else 0)
     if n_keep < 2:
         sys.exit(f"对齐失败：{len(paths)} 帧中仅 {n_keep} 帧通过（阈值 --reject-ratio "
                  f"{reject_ratio:g} / --max-shift {max_shift:g}）。拒绝产出 clean。")
@@ -334,11 +413,12 @@ def run(paths, ref_idx, levels, crop, max_shift, reject_ratio, out, png, noisy_o
         if not keep[i]:
             continue
         if i == ref_idx:
-            accumulate(acc, wsum, ref_planes, None)
+            if not ref_exclude:
+                accumulate(acc, wsum, ref_planes, None)
             continue
         m, _ = load_b01(p, crop)
         mov = cfa_planes(m, pos)
-        accumulate(acc, wsum, mov, info[i]["d"])
+        accumulate(acc, wsum, mov, info[i]["d"], kern)
         del mov, m
     clean = pack_planes([acc[c] / np.maximum(wsum[c], 1.0) for c in range(4)], pos, ref_m.shape)
     cov = float(wsum.mean() / n_keep)
@@ -389,6 +469,28 @@ def interp_c(d):
 def selftest(crop=1024, seed=20261002, levels=4):
     ok = True
     here = Path(__file__).resolve().parent.parent.parent
+
+    # ---- [0] 重采样核：r=1 必须与历史 warp() 等价；整数相位恒等；权重归一
+    print("[0] 重采样核自检")
+    rp = np.random.default_rng(7).random((64, 64)).astype(np.float32)
+    lin = kernel_of("bilinear")
+    dv, dvv = 0.0, True
+    for f in (0.0, 0.25, 0.5, 0.75, 0.999):
+        a1, v1 = warp(rp, 0.37, f)
+        a2, v2 = warp_k(rp, 0.37, f, lin)
+        dvv &= bool((v1 == v2).all())
+        dv = max(dv, float(np.abs(a1 - a2)[v1].max()))
+    print(f"  warp_k(bilinear) vs warp()：max|Δ|={dv:.2e}  valid 一致={dvv}")
+    ok &= dv < 1e-5 and dvv
+    for name in ("bicubic", "lanczos2", "lanczos3"):
+        kern = kernel_of(name)
+        a, _ = warp_k(rp, 0.0, 0.0, kern)
+        ei = float(np.abs(a - rp).max())
+        c, _ = warp_k(np.full((64, 64), 0.4, np.float32), 0.31, -0.67, kern)
+        ec = float(np.abs(c[8:-8, 8:-8] - 0.4).max())
+        print(f"  {name:<9} 整数相位恒等 max|Δ|={ei:.2e}  常数保持 max|Δ|={ec:.2e}")
+        ok &= ei < 1e-6 and ec < 1e-6
+
     # 不硬编码文件名：test_temp 下任意两张 DNG（含子目录）都能做自检
     dngs = sorted(here.glob("test_temp/**/*.dng"))
     if len(dngs) < 2:
@@ -521,6 +623,212 @@ def selftest(crop=1024, seed=20261002, levels=4):
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------- 插值核 bench
+
+BENCH_KERNS = ["bilinear", "bicubic", "bicubic-0.75", "lanczos2", "lanczos3"]
+
+
+def _phase_shift(p, dy, dx):
+    """FFT 相移（周期边界）：精确亚像素位移 out(y,x)=p(y+dy,x+dx)，自身无核衰减。
+    合成基准帧必须用它 —— 若用某个插值核造基准，那个核的衰减会被当成"真值"。"""
+    h, w = p.shape
+    fy = np.fft.fftfreq(h)[:, None]
+    fx = np.fft.rfftfreq(w)[None, :]
+    P = np.fft.rfft2(p.astype(np.float64))
+    return np.fft.irfft2(P * np.exp(2j * np.pi * (fy * dy + fx * dx)), s=(h, w)).astype(np.float32)
+
+
+def _band(p, lag):
+    """平面域 lag 差分 RMS/√2：峰值在 mosaic 周期 2·lag px（lag=1→4px, lag=2→8px）。"""
+    d = p[:, lag:] - p[:, :-lag]
+    return float(np.std(d) / np.sqrt(2))
+
+
+def _pil_band4(g01):
+    """ret4 口径（同 diag_255b.band_rms）：gray=四平面均值×255 上的 blur2−blur4。"""
+    from PIL import ImageFilter
+    im = Image.fromarray(np.clip(g01 * 255.0, 0, 255).astype(np.uint8))
+    b2 = np.asarray(im.filter(ImageFilter.GaussianBlur(2)), np.float32)
+    b4 = np.asarray(im.filter(ImageFilter.GaussianBlur(4)), np.float32)
+    return float((b2 - b4).std())
+
+
+def _dilate(a, k, mode="max"):
+    op = np.maximum if mode == "max" else np.minimum
+    out = a
+    for dy in range(-k, k + 1):
+        for dx in range(-k, k + 1):
+            if dy or dx:
+                out = op(out, np.roll(np.roll(a, dy, 0), dx, 1))
+    return out
+
+
+def _step_overshoot(kern, size=192, lo=0.2, amp=0.6):
+    """合成理想阶跃、扫亚像素相位 → 最大过冲（占阶跃幅度比例）。振铃的核属性。"""
+    x = np.arange(size)
+    st = np.tile(np.where(x >= size // 2, lo + amp, lo).astype(np.float32), (4, 1))
+    worst = 0.0
+    for f in np.arange(0.05, 1.0, 0.05):
+        out, _ = warp_k(st, 0.0, float(f), kern)
+        worst = max(worst, (float(out.max()) - (lo + amp)) / amp, (lo - float(out.min())) / amp)
+    return worst
+
+
+def _edge_overshoot(kern, p, shifts):
+    """真实纹理上的过冲：输出超出理想相移图 5×5 邻域极值的部分 / 局部对比度，
+    在对比度 >2% 处取 99.9 分位（无振铃核应 ≈0）。"""
+    hi, lo = _dilate(p, 2, "max"), _dilate(p, 2, "min")
+    vals = []
+    for s in shifts:
+        out, valid = warp_k(p, s[0] / 2.0, s[1] / 2.0, kern)
+        true = _phase_shift(p, s[0] / 2.0, s[1] / 2.0)
+        hi, lo = _dilate(true, 2, "max"), _dilate(true, 2, "min")
+        contrast = hi - lo
+        over = np.maximum(out - hi, 0.0) + np.maximum(lo - out, 0.0)
+        inner = np.zeros_like(valid)
+        inner[4:-4, 4:-4] = True
+        sel = valid & inner & (contrast > 0.02)
+        if sel.sum() > 100:
+            vals.append(float(np.percentile(over[sel] / contrast[sel], 99.9)))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def interp_bench(crop=1024, seed=20261003, levels=4, n_frames=6, dng=None):
+    here = Path(__file__).resolve().parent.parent.parent
+    dngs = sorted(here.glob("test_temp/**/*.dng"))
+    if not dngs:
+        sys.exit(f"{here}/test_temp 下没有 DNG，无法做插值 bench")
+    path = Path(dng) if dng else dngs[-1]
+    base, pat = load_b01(path, crop)
+    pos = plane_pos(pat)
+    planes = cfa_planes(base, pos)
+    h, w = planes[0].shape
+    rng = np.random.default_rng(seed)
+    # 位移：第 1 帧固定半像素（最坏相位），其余随机亚像素（mosaic px）
+    shifts = np.vstack([[2.5, -2.5], rng.uniform(-3.5, 3.5, (n_frames - 1, 2))])
+    truth = base                                   # 基准 = 未插值的原图（含其自身噪声，共模）
+    frames = [truth] + [pack_planes([_phase_shift(p, -s[0] / 2, -s[1] / 2)
+                                     for p in planes], pos, base.shape) for s in shifts[1:]]
+
+    def merge(fs, kern):
+        a = np.zeros((4, h, w), np.float32)
+        s = np.zeros((4, h, w), np.float32)
+        for f, d in zip(fs, shifts):
+            accumulate(a, s, cfa_planes(f, pos), d, kern)
+        return pack_planes([a[c] / np.maximum(s[c], 1.0) for c in range(4)], pos, base.shape)
+
+    def merge_ideal(fs):
+        """理想重采样（FFT 相移，无核衰减）平均 —— 用来把"核的损失"从共模噪声里分离出来。"""
+        a = np.zeros((4, h, w), np.float32)
+        for f, d in zip(fs, shifts):
+            for c, pl in enumerate(cfa_planes(f, pos)):
+                a[c] += pl if not d.any() else _phase_shift(pl, d[0] / 2, d[1] / 2)
+        return pack_planes([a[c] / len(shifts) for c in range(4)], pos, base.shape)
+
+    def kern_obj(name):
+        a = -0.75 if name == "bicubic-0.75" else -0.5
+        return kernel_of("bicubic" if name.startswith("bicubic") else name, a)
+
+    sl = (slice(8, -8), slice(8, -8))
+    print(f"插值核 bench：基准 {path.name}  crop={crop}（平面 {w}×{h}）  {len(shifts)} 帧合成"
+          f"  噪声 A={A_SHOT:g} B={B_READ:g}")
+    print("  口径：4px/8px = 平面域 lag-1/lag-2 差分 RMS（峰值对应 mosaic 周期 4/8px）；"
+          "ret4 = PIL blur2−blur4（同 diag_255b.band_rms）；过冲 = 超出理想相移邻域极值/局部对比度")
+
+    def bands(m):
+        pls = [p[sl] for p in cfa_planes(m, pos)]
+        return [float(np.median([_band(p, k) for p in pls])) for k in (1, 2, 4)]
+
+    def r4of(m):
+        return _pil_band4(sum(cfa_planes(m, pos)) / 4.0)
+
+    b_t, r4_t = bands(truth), r4of(truth)
+
+    # ---- [1] 核频率响应（解析）
+    fs = [0.05, 0.125, 0.25, 0.375, 0.5]
+    print(f"\n[1] 频率响应 |H(f)|（f 单位 cycles/plane-px：0.5=平面 Nyquist=mosaic 4px，"
+          f"0.25=mosaic 8px，0.125=mosaic 16px）")
+    print(f"{'核':<14}" + "".join(f"{f'f={f:g}':>9}" for f in fs) + f"{'(相位)':>10}")
+    for name in BENCH_KERNS:
+        kern = kern_obj(name)
+        fn, r = kern
+        j = np.arange(-r + 1, r + 1)
+        row = []
+        for f0 in (0.5, 0.25):
+            wj = fn(j - f0)
+            wj = wj / wj.sum()
+            row.append([abs(np.sum(wj * np.exp(-2j * np.pi * f * j))) for f in fs])
+        print(f"{name:<14}" + "".join(f"{v:>9.3f}" for v in row[0]) + f"{'f0=0.5':>10}")
+        print(f"{'  ↑同核':<14}" + "".join(f"{v:>9.3f}" for v in row[1]) + f"{'f0=0.25':>10}")
+
+    # ---- [2] 无噪声：纯核高频保留（基准 = 未插值原图 + 理想相移平均）
+    ideal = merge_ideal(frames)
+    b_i, r4_i = bands(ideal), r4of(ideal)
+    print(f"\n[2] 无噪声合成（只测核本身）：带通 RMS 保留率。'原图'基准 = 未插值原图"
+          f"（4px={b_t[0]:.5f} 8px={b_t[1]:.5f} 16px={b_t[2]:.5f} ret4={r4_t:.3f}）；"
+          f"'理想'基准 = FFT 相移平均（4px={b_i[0]:.5f} 8px={b_i[1]:.5f}）")
+    print(f"{'核':<14}{'4px/原图':>10}{'8px/原图':>10}{'4px/理想':>10}{'8px/理想':>10}"
+          f"{'ret4':>8}{'阶跃过冲':>10}{'边缘过冲':>10}{'Σw²中位':>10}{'merge s':>10}")
+    rows = {}
+    for name in BENCH_KERNS:
+        kern = kern_obj(name)
+        t0 = time.time()
+        clean0 = merge(frames, kern)
+        dt = time.time() - t0
+        b = bands(clean0)
+        step = _step_overshoot(kern)
+        edge = _edge_overshoot(kern, planes[0], shifts[1:])
+        cg = float(np.median([noise_gain(kern, s / 2.0) for s in shifts[1:]]))
+        rows[name] = dict(b=b, ret4=r4of(clean0) / r4_t, step=step, edge=edge, cg=cg,
+                          dt=dt, clean0=clean0)
+        print(f"{name:<14}{b[0] / b_t[0]:>10.3f}{b[1] / b_t[1]:>10.3f}"
+              f"{b[0] / b_i[0]:>10.3f}{b[1] / b_i[1]:>10.3f}"
+              f"{rows[name]['ret4']:>8.3f}{step * 100:>9.1f}%{edge * 100:>9.1f}%"
+              f"{cg:>10.3f}{dt:>10.2f}")
+
+    # ---- [3] 有噪声：同批帧 + 泊松-高斯噪声 → clean 噪声 σ 与下降倍数
+    rng2 = np.random.default_rng(seed + 1)
+    noisy = [synth_noise(truth, rng2)] + [
+        pack_planes([synth_noise(_phase_shift(p, -s[0] / 2, -s[1] / 2), rng2)
+                     for p in planes], pos, base.shape) for s in shifts[1:]]
+    n = len(shifts)
+    s16 = (slice(16, -16), slice(16, -16))
+    # 差分法口径：带噪 clean − 同一批帧同一核的无噪 clean = 纯噪声项，与场景内容无关，
+    # 也不受"核低通改变带通口径"的影响（8px 带通列仅作参考，跨核不完全可比）。
+    sig1 = float(np.std((noisy[1] - frames[1])[s16]))
+    print(f"\n[3] 加噪合成（同批 {n} 帧，σ²=A·x+B）：clean 的噪声 σ（差分法口径）")
+    print(f"  单帧总噪声 σ₁={sig1:.5f}（差分法实测，理论 √(A·x+B) 随 x 变）")
+    print(f"{'核':<14}{'clean σ':>10}{'下降 ×':>9}{'理论 ×':>9}{'实/理':>8}"
+          f"{'4px':>8}{'8px':>8}{'σ传递':>9}")
+    for name in BENCH_KERNS:
+        kern = kern_obj(name)
+        cn = merge(noisy, kern)
+        sig = float(np.std((cn - rows[name]['clean0'])[s16]))
+        cs = [noise_gain(kern, s / 2.0) for s in shifts[1:]]
+        pred = sig1 * (n ** -2 * (1.0 + sum(cs))) ** 0.5
+        bc = bands(cn)
+        print(f"{name:<14}{sig:>10.5f}{sig1 / sig:>9.3f}{sig1 / pred:>9.3f}"
+              f"{(sig1 / sig) / (sig1 / pred):>8.3f}"
+              f"{bc[0] / b_t[0]:>8.3f}{bc[1] / b_t[1]:>8.3f}"
+              f"{(sum(cs) / len(cs)) ** 0.5:>9.3f}")
+
+    # 纯噪声验证：常数图 + 白噪声重采样后 σ 比应 = √Σw²（核的噪声代价，与图像无关）
+    rng3 = np.random.default_rng(seed + 3)
+    d0 = np.array([1.25, -0.75])
+    flat = np.full((256, 256), 0.3, np.float32)
+    nz = rng3.normal(0, 1, flat.shape).astype(np.float32)
+    print("  纯噪声验证（常数图+白噪声，位移 (1.25,-0.75)）：实测 σ传递 vs 理论 √Σw²")
+    for name in BENCH_KERNS:
+        kern = kern_obj(name)
+        v, _ = warp_k(flat + nz, d0[0], d0[1], kern)
+        got = float(np.std((v - flat)[16:-16, 16:-16]))
+        print(f"    {name:<14}{got:.4f} vs {noise_gain(kern, d0) ** 0.5:.4f}")
+
+    print("\n结论口径：4px/8px 保留率越高越好（1.000 = 与未插值基准同高频），"
+          "阶跃过冲/边缘过冲越低越好（0 = 无振铃），Σw² 越大 = 亚像素插值带进的噪声越多。")
+    return 0
+
+
 # ------------------------------------------------------------------------ CLI
 
 def main():
@@ -539,11 +847,25 @@ def main():
                     help="对齐残差超过同批中位数该倍数即剔除（默认 1.8）")
     ap.add_argument("--min-wn", type=float, default=0.8,
                     help="对齐残差白噪性下限，低于此判为异场景/错位（默认 0.8）")
+    ap.add_argument("--interp", default="bilinear",
+                    choices=["bilinear", "bicubic", "lanczos2", "lanczos3"],
+                    help="重建插值核（默认 bilinear = 历史行为；保高频选 bicubic）")
+    ap.add_argument("--ref-exclude", action="store_true",
+                    help="参考帧只作对齐基准、不参与平均（Noise2Noise 配对用：input/target "
+                         "两组共享同一参考系却互不重叠，噪声独立且同水平）")
+    ap.add_argument("--bicubic-a", type=float, default=-0.5,
+                    help="--interp bicubic 的 Keys 系数 a（默认 -0.5=Catmull-Rom；更负更锐、振铃更大）")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--interp-bench", action="store_true",
+                    help="插值核 bench：频响/过冲/高频保留率/噪声（用真实 DNG 合成基准帧）")
+    ap.add_argument("--bench-dng", default=None, help="bench 用哪张 DNG（默认 test_temp 最后一张）")
     args = ap.parse_args()
 
     if args.selftest:
         sys.exit(selftest(crop=args.crop or 1024, levels=args.levels))
+    if args.interp_bench:
+        sys.exit(interp_bench(crop=args.crop or 1024, levels=args.levels,
+                              dng=args.bench_dng))
 
     paths = []
     for s in args.inputs:
@@ -559,7 +881,8 @@ def main():
         names = [p.name for p in paths]
         ref_idx = names.index(Path(args.ref).name) if Path(args.ref).name in names else 0
     run(paths, ref_idx, args.levels, args.crop, args.max_shift, args.reject_ratio,
-        args.out, args.png, args.noisy_out, args.min_wn)
+        args.out, args.png, args.noisy_out, args.min_wn, args.interp, args.bicubic_a,
+        args.ref_exclude)
 
 
 if __name__ == "__main__":
