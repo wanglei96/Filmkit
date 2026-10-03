@@ -33,6 +33,9 @@ EXPECT = {
     # v0.10.121 HR 白点（threshold = 2^hrWhiteEv × 0.1845）：passFilm 内的 HR 必须在
     # finishStillChain 内、日志行之前跑完，否则字段是上一帧的陈旧值
     "hrWhiteEv": ("finishStillChain", ["passFilm("]),
+    # v0.10.122 opposed chrominance 分子/分通道样本（定位 chroma 偏大 3.4×）
+    "hlSum": ("finishStillChain", ["passHighlightRaw("]),
+    "hlCnt3": ("finishStillChain", ["passHighlightRaw("]),
     "clipB": ("finishStillChain", ["passFilm("]),
     "hrMs": ("finishStillChain", ["passFilm("]),
 }

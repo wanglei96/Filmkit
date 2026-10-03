@@ -95,6 +95,10 @@ struct HlRawResult {
   bool ok = false;
   float chroma[3] = {0.f, 0.f, 0.f};
   float cnt[3] = {0.f, 0.f, 0.f};
+  // v0.10.122 诊断：chrominance 的分子（Σ(实测−对立外推)，host 双精度累加）。
+  // 与 cnt 一起判定"引擎 chroma 比原版公式偏大 3.4×"是样本集合问题还是 refavg
+  // 问题 —— 离线 tools/hl-opposed-check.py 给出同一口径的对照值。
+  double sum[3] = {0.0, 0.0, 0.0};
   int blocks_x = 0, blocks_y = 0;
   float ms = 0.f;
 };
@@ -539,6 +543,8 @@ class FrameRenderer {
   int dbg_hl_ok_ = 0;        // 1 = 执行成功（下游改用 tex_hl_）；0 = 未启用/失败
   float dbg_hl_cnt_ = 0.f;   // 色度统计样本数（G 通道；darktable 的 100 样本闸）
   float dbg_hl_chroma_[3] = {0.f, 0.f, 0.f};  // 色度校正量
+  double dbg_hl_sum_[3] = {0.0, 0.0, 0.0};    // Σ(实测−对立外推)，chroma 的分子
+  float dbg_hl_cnt3_[3] = {0.f, 0.f, 0.f};    // 分通道样本数（原只记 G 通道）
   float dbg_hl_ms_ = 0.f;
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;

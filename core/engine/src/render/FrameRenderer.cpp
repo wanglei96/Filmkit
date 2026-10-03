@@ -4794,6 +4794,7 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   }
   for (int k = 0; k < 3; ++k) {
     r.cnt[k] = static_cast<float>(cnt[k]);
+    r.sum[k] = sum[k];
     r.chroma[k] = (cnt[k] > 100.0) ? static_cast<float>(sum[k] / cnt[k]) : 0.f;
   }
 
@@ -5249,12 +5250,21 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_hl_ok_ = 0;
     dbg_hl_cnt_ = 0.f;
     dbg_hl_ms_ = 0.f;
+    for (int k = 0; k < 3; ++k) {
+      dbg_hl_chroma_[k] = 0.f;
+      dbg_hl_sum_[k] = 0.0;
+      dbg_hl_cnt3_[k] = 0.f;
+    }
     if (p.hr_raw > 0.5f) {
       const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, tex_mos_);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
       dbg_hl_cnt_ = hl.cnt[1];
       dbg_hl_ms_ = hl.ms;
-      for (int k = 0; k < 3; ++k) dbg_hl_chroma_[k] = hl.chroma[k];
+      for (int k = 0; k < 3; ++k) {
+        dbg_hl_chroma_[k] = hl.chroma[k];
+        dbg_hl_sum_[k] = hl.sum[k];
+        dbg_hl_cnt3_[k] = hl.cnt[k];
+      }
       if (hl.ok) hr_src_override_ = tex_hl_;
     }
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
@@ -5428,6 +5438,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // v0.10.121：HR 输入域（曝光前）的白点 EV —— threshold = 2^hrWhiteEv × 0.1845，
   // 与 tools/hr-mask-check.py --white-ev 同一口径（改阈值后靠它核对真机覆盖面对不对）。
   kv += ",\"hrWhiteEv\":" + jnum(hr_white_ev_, 6);
+  // v0.10.122：opposed chrominance 的分通道分子/样本数。chroma = sum/cnt（cnt>100），
+  // 与 tools/hl-opposed-check.py 的 ③ 同口径 —— 用来定位"引擎 chroma 偏大 3.4×"。
+  // 注意 jnum(v,n) 的 n 是**字符数**不是小数位（2026-10-03 教训）：sum 可达 ±5e4
+  kv += ",\"hlSum\":[" + jnum(static_cast<float>(dbg_hl_sum_[0]), 14) + "," +
+        jnum(static_cast<float>(dbg_hl_sum_[1]), 14) + "," +
+        jnum(static_cast<float>(dbg_hl_sum_[2]), 14) + "]";
+  kv += ",\"hlCnt3\":[" + jnum(dbg_hl_cnt3_[0], 12) + "," + jnum(dbg_hl_cnt3_[1], 12) +
+        "," + jnum(dbg_hl_cnt3_[2], 12) + "]";
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
   // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
