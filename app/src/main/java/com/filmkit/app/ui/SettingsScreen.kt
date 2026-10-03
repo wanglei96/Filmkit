@@ -226,41 +226,6 @@ fun SettingsScreen(
                     ),
                 )
             }
-            var autoToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_black_ev", false)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !autoToneOn
-                        autoToneOn = v
-                        prefs.edit().putBoolean("auto_black_ev", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.auto_black_ev",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("自适应影调", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "实验性：黑白点按场景分位自动（darktable autodetect 语义）。" +
-                            "默认关 = 固定 darktable 默认黑白点（−7.65/+4.56EV，与 PC 一致）——" +
-                            "三版真机证实自动端点会把 power 推离设计值，亮度校准请用基准曝光",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (autoToneOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
             // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
             // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
             // "配置项"而不是需要标定的数值。默认 −7.65/+4.56 = darktable 默认值。
@@ -1125,53 +1090,27 @@ fun SettingsScreen(
                     )
                 },
             )
-            // 白点高光感知（v0.10.27）：自适应影调开启时，对数域统计的 P99.9 驱动
-            // filmic 白点上探（≤+1.5EV）+ contrast 参数补偿，治"高光太白压不住"。
-            var whiteHlOn by rememberSaveable { mutableStateOf(prefs.getBoolean("white_hl", true)) }
+            // ── 基础影调（v0.10.112）：一个开关替代此前 4 个互相干扰的白点旋钮 ─────
+            // 标准 = 固定 darktable 出厂默认黑白点（−8/+4 EV 相对中灰，一手出处
+            // docs/research/01-darktable.md），并关掉全部自动机制（场景分位 / 白点上探 /
+            // 下限边距 / 对比补偿）。标准做法（darktable filmic、AgX、ACES）的影调映射
+            // 都是**一套固定参数** —— 场景差异由曝光吸收，不由曲线逐场景变；此前的
+            // "每场景自适应"正是设置爆炸与"修一个坏一个"的根源。
+            var toneStd by rememberSaveable { mutableStateOf(prefs.getInt("tone_mode", 0) == 0) }
             SettingSwitchRow(
-                title = "高光自适应白点",
-                subtitle = "开自适应影调时按场景高光自动扩展 filmic 白点（含对比补偿），治高光平顶泛白；关 = 旧判据 A/B 对照",
-                checked = whiteHlOn,
+                title = "基础影调：标准",
+                subtitle = "标准 = 固定 darktable 默认黑白点（−8/+4EV），一套参数走所有场景；" +
+                    "关 = 自适应（旧行为：场景分位 + 白点上探 + 下限边距，供 A/B）",
+                checked = toneStd,
                 onChecked = { v ->
-                    whiteHlOn = v
-                    prefs.edit().putBoolean("white_hl", v).apply()
+                    toneStd = v
+                    prefs.edit().putInt("tone_mode", if (v) 0 else 1).apply()
                     EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.white_hl",
-                        "{\"on\":$v}",
+                        EngineBridge.LEVEL_INFO, "app", "settings.tone_mode",
+                        "{\"std\":$v}",
                     )
                 },
             )
-            // 白点下限边距（v0.10.111）：治"密集高光点变白斑"。
-            // 旧下限恒钉 RAW 饱和数据白点 2.438EV；场景高光（P99）远低于它时
-            // （釉面/白瓷这类"高光点密集但面积小"的场景），1% 以上的高光全落在
-            // 肩部以下、根本不被压缩 ⇒ 密集高光点一路白上去。边距 >0 时下限改为
-            // min(2.438, P99 + 边距)，白点跟着场景走，中间调对比由 cp 补偿兜住。
-            EvSliderRow(
-                "白点下限边距",
-                "filmic 白点下限改为「场景高光 P99 + 本边距」：高光点密集的场景" +
-                    "（釉面/白瓷）白点会跟着降、高光才被肩部压住；0 = 旧行为" +
-                    "（下限恒钉 RAW 饱和点 2.438EV）",
-                prefs.getFloat("white_floor", 0.4f),
-                0f..1.5f,
-            ) { v ->
-                prefs.edit().putFloat("white_floor", v).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "settings.white_floor", "{\"v\":$v}",
-                )
-            }
-            // 白点上探幅度（v0.10.111）：旧硬编码 +1.5EV，真机每次都满额。
-            EvSliderRow(
-                "白点上探幅度",
-                "filmic 白点由场景最大值上探的上限：越小，密集高光越早被肩部压住" +
-                    "（治白斑）；越大，越能兜住 P99 看不见的近饱和高光（白壶类场景）",
-                prefs.getFloat("white_probe", 0.5f),
-                0f..1.5f,
-            ) { v ->
-                prefs.edit().putFloat("white_probe", v).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "settings.white_probe", "{\"v\":$v}",
-                )
-            }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

@@ -1096,6 +1096,17 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /**
+     * 基础影调模式（v0.10.112）：`tone_mode` 0 = **标准**（固定 darktable 默认黑白点
+     * −8/+4 EV，关掉全部自动机制）；1 = 自适应（旧行为，保留 A/B）。
+     *
+     * 为什么收成一个开关：影调层此前堆了 5 个互相干扰的自动机制（自适应影调 / 高光
+     * 自适应白点 / 白点下限边距 / 白点上探幅度 / contrast 补偿），每一个都是为修某个
+     * 场景加的，结果是"修一个坏一个"且设置爆炸。标准做法（darktable filmic、AgX、
+     * ACES）的影调映射都是**一套固定参数**——场景差异由**曝光**吸收，不由曲线逐场景变。
+     */
+    private fun toneStandard(): Boolean = appPrefs.getInt("tone_mode", 0) == 0
+
+    /**
      * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量，
      * 1.5 = 150% —— 沿 LUT 色差外推，与 PhotonCamera 的 >100% 强度语义一致）。
      * v0.10.97：拖动直通（[setLutStrength]）与 prefs 同步双通道并存 ——
@@ -1155,8 +1166,12 @@ class CameraController(private val context: Context, private val render: RenderC
      * auto_tone 开时黑点由引擎按场景分位自动（[37] 被忽略）。
      */
     private fun applyFilmicRangePrefs() {
-        val b = appPrefs.getFloat("filmic_black_ev", -7.65f).toDouble()
-        val w = appPrefs.getFloat("filmic_white_ev", 4.56f).toDouble()
+        // 标准模式 = darktable filmic 出厂默认（black_point_source −8.0 / white_point_source
+        // +4.0 EV 相对中灰），一手出处见 docs/research/01-darktable.md；自适应模式用
+        // 用户可调值（旧行为）。
+        val std = toneStandard()
+        val b = if (std) -8.0 else appPrefs.getFloat("filmic_black_ev", -7.65f).toDouble()
+        val w = if (std) 4.0 else appPrefs.getFloat("filmic_white_ev", 4.56f).toDouble()
         if (b != filmicBlackPref) {
             filmicBlackPref = b
             filmParams[37] = b
@@ -1183,7 +1198,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // sceneExposureGain 只是 HDR 参考链的坐标增益）。HR 裁剪阈值已与曲线解耦
         // （恒 1.0），黑白点自动降级为可选工具（darktable 的 autodetect 本就是
         // 手动拾取器），亮度校准回归 base_ev 机制。
-        val v = if (appPrefs.getBoolean("auto_black_ev", false)) 1.0 else 0.0
+        val v = if (!toneStandard() && appPrefs.getBoolean("auto_black_ev", false)) 1.0 else 0.0
         if (v != autoTonePref) {
             autoTonePref = v
             filmParams[35] = v
@@ -1250,7 +1265,7 @@ class CameraController(private val context: Context, private val render: RenderC
      * 0 = A/B 通路（v0.10.18 行为：P99 判据、恒 2.438 下限）。
      */
     private fun applyWhiteHlPref() {
-        val v = if (appPrefs.getBoolean("white_hl", true)) WHITE_HL else 0.0
+        val v = if (!toneStandard() && appPrefs.getBoolean("white_hl", true)) WHITE_HL else 0.0
         if (v != whiteHlPref) {
             whiteHlPref = v
             filmParams[42] = v
@@ -1267,7 +1282,8 @@ class CameraController(private val context: Context, private val render: RenderC
      * 中间调对比由引擎已有的 cp 补偿兜住。
      */
     private fun applyWhiteFloorPref() {
-        val v = appPrefs.getFloat("white_floor", 0.4f).toDouble().coerceIn(0.0, 1.5)
+        val v = if (toneStandard()) 0.0
+        else appPrefs.getFloat("white_floor", 0.4f).toDouble().coerceIn(0.0, 1.5)
         if (v != whiteFloorPref) {
             whiteFloorPref = v
             filmParams[43] = v
@@ -1281,7 +1297,8 @@ class CameraController(private val context: Context, private val render: RenderC
      * 降到 0.5 保留"P99 看不见的近饱和高光"上探能力（白壶案）而不再推白整段高光。
      */
     private fun applyWhiteProbePref() {
-        val v = appPrefs.getFloat("white_probe", 0.5f).toDouble().coerceIn(0.0, 1.5)
+        val v = if (toneStandard()) 1.5
+        else appPrefs.getFloat("white_probe", 0.5f).toDouble().coerceIn(0.0, 1.5)
         if (v != whiteProbePref) {
             whiteProbePref = v
             filmParams[44] = v
