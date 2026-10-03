@@ -2292,10 +2292,6 @@ float mosAt(ivec2 p) {
 // 真机 −0.250；亮部 R/G 1.063 → 1.131）。MFNR 路径改用 tex_fused_（融合后、P0 前，
 // 与 tex_mos_ 同域的 R16F 线性 mosaic 单通道）。MFNR 的时间平均不改空间结构，
 // 所以它不引入这个偏差；单帧路径没有该中间纹理，退回 tex_mos_。
-float statAt(ivec2 p) {
-    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
-    return mosAt(p);
-}
 float clipAt(int c) {
     return c == 0 ? uClips.x : (c == 1 ? uClips.y : uClips.z);
 }
@@ -2308,7 +2304,7 @@ void main() {
             ivec2 p = p0 + ivec2(x, y);
             if (p.x < uSize.x && p.y < uSize.y) {
                 int c = chanAt(p);
-                float v = statAt(p);
+                float v = mosAt(p);
                 if (v >= clipAt(c)) mbuff[c] += 1.0;
             }
         }
@@ -2388,10 +2384,6 @@ float mosAt(ivec2 p) {
 // _calc_refavg（segbased.c:186）：3×3 photosite 邻域按通道求均值 → 各开立方 →
 // 目标通道取**另两个通道**立方的均值（opposing）→ linear 时回立方。边界截断与
 // darktable 同式（dymax = min(h-1, row+2)，非 +2 含端）。
-float statAt(ivec2 p) {
-    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
-    return mosAt(p);
-}
 float refavg(ivec2 p) {
     int color = chanAt(p);
     vec3 mean = vec3(0.0), cnt = vec3(0.0);
@@ -2401,7 +2393,7 @@ float refavg(ivec2 p) {
         for (int dx = dxmin; dx < dxmax; ++dx) {
             ivec2 q = ivec2(dx, dy);
             int c = chanAt(q);
-            float v = max(0.0, statAt(q));
+            float v = max(0.0, mosAt(q));
             if (c == 0) { mean.x += v; cnt.x += 1.0; }
             else if (c == 1) { mean.y += v; cnt.y += 1.0; }
             else { mean.z += v; cnt.z += 1.0; }
@@ -2424,7 +2416,7 @@ void main() {
             if (p.x >= uSize.x || p.y >= uSize.y) continue;
             int c = chanAt(p);
             float cl = at3(uClips, c);
-            float v = statAt(p);
+            float v = mosAt(p);
             if (v >= cl || v <= 0.2 * cl) continue;
             ivec2 mb = p / 3;
             if (mb.x >= uMSize.x || mb.y >= uMSize.y) continue;
@@ -2462,10 +2454,6 @@ float mosAt(ivec2 p) {
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
-float statAt(ivec2 p) {
-    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
-    return mosAt(p);
-}
 float refavg(ivec2 p) {
     int color = chanAt(p);
     vec3 mean = vec3(0.0), cnt = vec3(0.0);
@@ -2475,7 +2463,7 @@ float refavg(ivec2 p) {
         for (int dx = dxmin; dx < dxmax; ++dx) {
             ivec2 q = ivec2(dx, dy);
             int c = chanAt(q);
-            float v = max(0.0, statAt(q));
+            float v = max(0.0, mosAt(q));
             if (c == 0) { mean.x += v; cnt.x += 1.0; }
             else if (c == 1) { mean.y += v; cnt.y += 1.0; }
             else { mean.z += v; cnt.z += 1.0; }
@@ -2492,11 +2480,10 @@ float refavg(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     int c = chanAt(p);
-    float v = mosAt(p);      // 基底 = P0 降噪后的值（降噪画质不丢）
-    float vr = statAt(p);    // 判定与 refavg 用未降噪源（darktable 的输入位置）
+    float v = mosAt(p);
     float cl = at3(uClips, c);
     float outv = v;
-    if (vr >= cl) outv = max(v, refavg(p) + at3(uChroma, c));
+    if (v >= cl) outv = max(v, refavg(p) + at3(uChroma, c));
     // 按 CFA 相位写回（与 P0 的输出约定一致）—— 写 .r 会让 G/B 位置归零
     oColor = vec4(c == 0 ? outv : 0.0, c == 1 ? outv : 0.0,
                   c == 2 ? outv : 0.0, 1.0);
@@ -4854,7 +4841,17 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glUniform2i(u_hl_apply_.size, w, h);
   glUniform1i(u_hl_apply_.cfalut, cfalut);
   glUniform3f(u_hl_apply_.clips, clips[0], clips[1], clips[2]);
-  glUniform3f(u_hl_apply_.chroma, r.chroma[0], r.chroma[1], r.chroma[2]);
+  // v0.10.124：**chrominance 补偿置 0**（有数据支撑的偏离原版）。
+  // 原版 chroma 补偿的是"refavg 的系统性偏差"，前提是输入为**单帧未降噪** RAW。
+  // 我们的输入是 MFNR(4 帧) + P0 空间 bilateral 之后：同色 3×3 平滑把饱和像素旁的
+  // G 压低，而 refavg 走 R/B 外推受影响小 ⇒ `v−refavg` 被系统性拉负。离线在 151713
+  // 上复算（R/G = 亮部 G 饱和像素的色偏）：未降噪 −0.047→1.063；平滑后 −0.138→1.131；
+  // 真机 −0.250→1.12；**chroma=0 → R/G 0.996（中性）**。
+  // 安全性：另外三张（客厅红杯/室内×2）chroma_G 仅 +0.015~+0.022，禁用前后 R/G 差
+  // 0.007 —— 即该补偿只在"G 大量饱和"的逆光场景起作用，而那里它是有害的。
+  // r.chroma 仍照常统计并写日志（hlChroma），便于日后换更正确的口径时对照。
+  static const float kHlChromaOff[3] = {0.f, 0.f, 0.f};
+  glUniform3f(u_hl_apply_.chroma, kHlChromaOff[0], kHlChromaOff[1], kHlChromaOff[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 
   while (glGetError() != GL_NO_ERROR) {
@@ -5302,13 +5299,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       dbg_hl_cnt3_[k] = 0.f;
     }
     if (p.hr_raw > 0.5f) {
-      // v0.10.123：统计源取 P0 **之前**的 tex_fused_（darktable 的 highlights 位置）。
-      // 单帧路径没有该中间纹理，退回 tex_mos_（stat_raw=0，行为同 exp19）。
-      const bool hr_stat_raw = c.mfnr_fused && tex_fused_ != 0;
-      const GLuint hr_stat_src = hr_stat_raw ? tex_fused_ : tex_mos_;
-      hr_stat_raw_ = hr_stat_raw ? 1 : 0;
+      // exp21 曾把统计源换成 P0 前的 tex_fused_：真机实测无效反而更红（apply 判定
+      // 一并换源 ⇒ 修复面 47269→63903 样本，chroma 仍偏正 ⇒ 修得更多、更红）。已回退：
+      // 判定与 refavg 一律用 tex_mos_；真正生效的改动是上面的 chroma 置 0。
+      hr_stat_raw_ = 0;
       const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, tex_mos_,
-                                              hr_stat_src, hr_stat_raw_);
+                                              tex_mos_, 0);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
       dbg_hl_cnt_ = hl.cnt[1];
       dbg_hl_ms_ = hl.ms;
