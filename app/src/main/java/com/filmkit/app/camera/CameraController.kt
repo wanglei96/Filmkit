@@ -1104,7 +1104,10 @@ class CameraController(private val context: Context, private val render: RenderC
      * 场景加的，结果是"修一个坏一个"且设置爆炸。标准做法（darktable filmic、AgX、
      * ACES）的影调映射都是**一套固定参数**——场景差异由**曝光**吸收，不由曲线逐场景变。
      */
-    private fun toneStandard(): Boolean = appPrefs.getInt("tone_mode", 0) == 0
+    private fun toneStandard(): Boolean = true   // v0.10.113：标准为唯一行为（无 UI 开关）
+    // 注：原先给过 `tone_mode` 开关，但它与既有的「基准影调」（base_tone，FilmParams[28]）
+    // 名字撞车，设置页出现两个"基础/基准影调"——已撤掉开关，标准模式成为唯一行为；
+    // 自适应分支保留在代码里仅供离线回退，不再暴露给用户。
 
     /**
      * LUT 强度（M4 §6 节点 opacity）：写 FilmParams[34]（0 = 旁路，1 = 全量，

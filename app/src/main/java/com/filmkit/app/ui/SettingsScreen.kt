@@ -1090,27 +1090,6 @@ fun SettingsScreen(
                     )
                 },
             )
-            // ── 基础影调（v0.10.112）：一个开关替代此前 4 个互相干扰的白点旋钮 ─────
-            // 标准 = 固定 darktable 出厂默认黑白点（−8/+4 EV 相对中灰，一手出处
-            // docs/research/01-darktable.md），并关掉全部自动机制（场景分位 / 白点上探 /
-            // 下限边距 / 对比补偿）。标准做法（darktable filmic、AgX、ACES）的影调映射
-            // 都是**一套固定参数** —— 场景差异由曝光吸收，不由曲线逐场景变；此前的
-            // "每场景自适应"正是设置爆炸与"修一个坏一个"的根源。
-            var toneStd by rememberSaveable { mutableStateOf(prefs.getInt("tone_mode", 0) == 0) }
-            SettingSwitchRow(
-                title = "基础影调：标准",
-                subtitle = "标准 = 固定 darktable 默认黑白点（−8/+4EV），一套参数走所有场景；" +
-                    "关 = 自适应（旧行为：场景分位 + 白点上探 + 下限边距，供 A/B）",
-                checked = toneStd,
-                onChecked = { v ->
-                    toneStd = v
-                    prefs.edit().putInt("tone_mode", if (v) 0 else 1).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.tone_mode",
-                        "{\"std\":$v}",
-                    )
-                },
-            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
