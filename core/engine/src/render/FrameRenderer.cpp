@@ -7332,7 +7332,8 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
 // auto_on=false：用 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
 void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
                                   float user_black, float user_white,
-                                  float white_hl, float user_ev) {
+                                  float white_hl, float white_floor,
+                                  float white_probe, float user_ev) {
   constexpr float kGrey = 0.1845f;
   // ── v0.7.6：黑白点由**用户配置**（FilmParams[37]/[38]），PC 的做法 ────────────
   // 默认 −7.65/+4.56 = darktable 默认值 = PhotonCamera 固化值（两边一致，有出处）；
@@ -7383,7 +7384,10 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
     const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
-      w = std::max(w99, std::min(w_max + 0.4f, w99 + 1.5f));
+      // v0.10.111：上探幅度由 white_probe 控制（旧硬编码 1.5）。真机实测该闸每次都
+      // 满额（红杯 w99=1.03 → 白点 2.53），把 1% 以上的高光整段推到肩部以下 ⇒ 白斑。
+      const float probe = (white_probe > 0.0f) ? white_probe : 1.5f;
+      w = std::max(w99, std::min(w_max + 0.4f, w99 + probe));
     } else {
       w = w99;  // v0.10.18 行为（A/B 通路）
     }
@@ -7401,7 +7405,19 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // 于黑点对准渲染域 P0.1（暗部锚定本来就是对的）；dr 因此 +ev（略降 power）。
     // 自检：ev=0 → 与 179 逐位一致；auto=0（固定曲线）不走本分支。
     const float ev_shift = user_ev;
-    w = std::clamp(w, 2.438307f, 4.556152f) + ev_shift;
+    // ── v0.10.111：白点下限的场景自适应（治"密集高光点变白斑"）───────────────
+    // 旧下限恒为 RAW 饱和数据白点 2.438（v0.10.17 为暗光室内防 power 爆炸而钉）。
+    // 但"高光点密集、面积很小"的场景（釉面/白瓷）P99 只有 ~1.0EV，白点被钉在
+    // 2.44~2.53 ⇒ 比场景高光高 1.4~1.5EV ⇒ 1% 以上的高光全落在肩部**以下**、根本
+    // 不被压缩 ⇒ 密集高光点一路白上去（2026-10-03 真机红杯实测）。
+    // 修法：下限改为 min(物理饱和点, w99 + 边距)，边距可配（FilmParams[43]，0 = 旧行为）。
+    // 中间调对比由下方已有的 cp 补偿兜住（当年"power 爆炸"的直接后果就是中间调对比，
+    // 而 cp 正是为此引入）。
+    const float kWhiteSat = 2.438307f;
+    const float w_floor = (white_floor > 0.0f)
+        ? std::min(kWhiteSat, w99 + white_floor)
+        : kWhiteSat;
+    w = std::clamp(w, w_floor, 4.556152f) + ev_shift;
     // ── contrast_param 补偿（darktable contrast 滑杆的自动化用法）────────────
     // 上探拉大 dr → power 派生回落（151748 型场景 4.70→~3.2），中灰以上提亮变少
     // = 用户验收过的"通透感"回退。补偿 = 上探前后 power 比（cp = power_old/new，
@@ -7409,7 +7425,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // power 无关，cp 直接抬对数域斜率，把上探前曲线的中间调梯度找回来；肩部
     // 过渡宽度由 dr 决定不受 cp 影响 —— 高光余量与中间调对比同时保住。
     // 未上探（w == w_old）时 cp 恒 1.0，固定曲线（auto=0）不走此分支恒 1.0。
-    const float w_old = std::clamp(w99, 2.438307f, 4.556152f) + ev_shift;
+    const float w_old = std::clamp(w99, w_floor, 4.556152f) + ev_shift;
     if (w > w_old + 1e-3f) {
       auto derive_power = [&](float wv) {
         const float bl = std::min(b, wv - 0.2f);
@@ -7464,7 +7480,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // auto_tone 开 = **黑点**改由场景分位自动（白点仍用配置值），默认关。
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
-                 p.filmic_white_ev, p.white_hl, p.exposure_ev);
+                 p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,
+                 p.exposure_ev);
   // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────
   // 裁剪阈值恒 = RAW 饱和数据白点 1.0（物理量，与 filmic 白点解耦——0.10.17 的
   // 阈值随 white 自动掉到 0.5 曾把 47% 的块送进重建）。重建结果直接替换 filmic

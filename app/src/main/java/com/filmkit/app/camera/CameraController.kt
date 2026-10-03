@@ -1068,6 +1068,10 @@ class CameraController(private val context: Context, private val render: RenderC
     private val WHITE_HL = 1.0
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
+    // v0.10.111：白点下限边距（FilmParams[43]；0 = 旧行为）
+    private var whiteFloorPref = -1.0
+    // v0.10.111：白点上探幅度上限（FilmParams[44]；旧硬编码 1.5）
+    private var whiteProbePref = -1.0
     // 饱和补偿标定旋钮（v0.10.21）：原生 gamut 色度 min 的低饱和副作用由**风格层**
     // （uSat 分区饱和，FilmParams[20..22]）标定补偿——分层架构对应 darktable 的
     // filmic → color balance、PC 的 filmic → LUT。只作用阴影/中间调，高光不动。
@@ -1139,6 +1143,8 @@ class CameraController(private val context: Context, private val render: RenderC
         applyGamutPref()
         applyHrWaveletPref()
         applyWhiteHlPref()
+        applyWhiteFloorPref()
+        applyWhiteProbePref()
         applySatCompPref()
         applyFilmicRangePrefs()
     }
@@ -1248,6 +1254,37 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != whiteHlPref) {
             whiteHlPref = v
             filmParams[42] = v
+        }
+    }
+
+    /**
+     * 白点下限边距（v0.10.111 标定旋钮）：prefs `white_floor`（EV，0..1.5），写 FilmParams[43]。
+     *
+     * 旧行为（0）= filmic 白点下限恒为 RAW 饱和数据白点 2.438；新行为 = 下限改为
+     * `min(2.438, w99 + 边距)` —— 场景高光远低于饱和点时白点跟着降，高光才进肩部被压缩。
+     * 治的是"密集高光点变白斑"（2026-10-03 真机红杯：w99 仅 1.03EV 而白点 2.53EV，
+     * 比场景高光高 1.5EV ⇒ 1% 以上的高光全落在肩部以下不被压缩）。
+     * 中间调对比由引擎已有的 cp 补偿兜住。
+     */
+    private fun applyWhiteFloorPref() {
+        val v = appPrefs.getFloat("white_floor", 0.4f).toDouble().coerceIn(0.0, 1.5)
+        if (v != whiteFloorPref) {
+            whiteFloorPref = v
+            filmParams[43] = v
+        }
+    }
+
+    /**
+     * 白点上探幅度上限（v0.10.111 标定旋钮）：prefs `white_probe`（EV，0..1.5），
+     * 写 FilmParams[44]。旧硬编码 1.5 —— 真机实测每次都满额（红杯 w99=1.03 → 白点
+     * 2.53，比场景高光高 1.5EV ⇒ 1% 以上的高光全在肩部以下不被压缩 ⇒ 白斑）。
+     * 降到 0.5 保留"P99 看不见的近饱和高光"上探能力（白壶案）而不再推白整段高光。
+     */
+    private fun applyWhiteProbePref() {
+        val v = appPrefs.getFloat("white_probe", 0.5f).toDouble().coerceIn(0.0, 1.5)
+        if (v != whiteProbePref) {
+            whiteProbePref = v
+            filmParams[44] = v
         }
     }
 

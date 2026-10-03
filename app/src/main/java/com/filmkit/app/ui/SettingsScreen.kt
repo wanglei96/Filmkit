@@ -1141,6 +1141,37 @@ fun SettingsScreen(
                     )
                 },
             )
+            // 白点下限边距（v0.10.111）：治"密集高光点变白斑"。
+            // 旧下限恒钉 RAW 饱和数据白点 2.438EV；场景高光（P99）远低于它时
+            // （釉面/白瓷这类"高光点密集但面积小"的场景），1% 以上的高光全落在
+            // 肩部以下、根本不被压缩 ⇒ 密集高光点一路白上去。边距 >0 时下限改为
+            // min(2.438, P99 + 边距)，白点跟着场景走，中间调对比由 cp 补偿兜住。
+            EvSliderRow(
+                "白点下限边距",
+                "filmic 白点下限改为「场景高光 P99 + 本边距」：高光点密集的场景" +
+                    "（釉面/白瓷）白点会跟着降、高光才被肩部压住；0 = 旧行为" +
+                    "（下限恒钉 RAW 饱和点 2.438EV）",
+                prefs.getFloat("white_floor", 0.4f),
+                0f..1.5f,
+            ) { v ->
+                prefs.edit().putFloat("white_floor", v).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.white_floor", "{\"v\":$v}",
+                )
+            }
+            // 白点上探幅度（v0.10.111）：旧硬编码 +1.5EV，真机每次都满额。
+            EvSliderRow(
+                "白点上探幅度",
+                "filmic 白点由场景最大值上探的上限：越小，密集高光越早被肩部压住" +
+                    "（治白斑）；越大，越能兜住 P99 看不见的近饱和高光（白壶类场景）",
+                prefs.getFloat("white_probe", 0.5f),
+                0f..1.5f,
+            ) { v ->
+                prefs.edit().putFloat("white_probe", v).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.white_probe", "{\"v\":$v}",
+                )
+            }
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",

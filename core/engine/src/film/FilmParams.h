@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 43;  // v0.10.27：+[42] white_hl（v0.10.15 +[41] hr_wavelet、v0.10.13 +[40] gamut）
+  static constexpr int kCount = 45;  // v0.10.111：+[43] white_floor（v0.10.27 +[42] white_hl、v0.10.15 +[41] hr_wavelet）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -105,6 +105,17 @@ struct FilmParams {
   // 白点上探（≤+1.5EV、物理钳制不变）+ darktable contrast 参数按 power 前后比
   // 补偿中间调回退。1 = 开（默认）；0 = A/B 通路（v0.10.18 行为）。
   float white_hl = 1.0f;       // 42
+  // 43：filmic 白点下限的场景自适应边距（EV）。0 = 旧行为（下限恒为 RAW 饱和数据
+  // 白点 2.438）；>0 = 下限改为 min(2.438, w99 + 本值) —— 治"场景高光远低于饱和点、
+  // 白点却被物理下限钉高 1.5EV ⇒ 高光全落在肩部以下不被压缩"（2026-10-03 真机：
+  // 红杯釉面密集高光点变白斑，w99 仅 1.03EV 而白点 2.53EV）。
+  float white_floor = 0.0f;    // 43
+  // 44：白点上探幅度上限（EV）。旧硬编码 +1.5 —— 真机实测（2026-10-03）该闸**每次
+  // 都满额**：红杯场景 w99 仅 1.03EV，白点被 wmax（单点最大值）推到 w99+1.5 = 2.53EV，
+  // 比场景高光高 1.5EV ⇒ 1% 以上的高光全落在肩部以下不被压缩 ⇒ 密集高光点变白斑。
+  // 降到 0.5 后白点 = w99+0.5，既保留"P99 看不见的近饱和高光"上探能力（白壶案），
+  // 又不再把整段高光推白。
+  float white_probe = 0.5f;    // 44
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -161,6 +172,8 @@ struct FilmParams {
     if (n > 40) gamut = static_cast<float>(v[40]);
     if (n > 41) hr_wavelet = static_cast<float>(v[41]);
     if (n > 42) white_hl = static_cast<float>(v[42]);
+    if (n > 43) white_floor = static_cast<float>(v[43]);
+    if (n > 44) white_probe = static_cast<float>(v[44]);
   }
 };
 
