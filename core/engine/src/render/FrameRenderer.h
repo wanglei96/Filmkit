@@ -207,6 +207,11 @@ class FrameRenderer {
   // highlightClipBlocks = 成片高光重建命中的块数（64×48 网格），用于离线核对
   // "欠曝是否真的把裁剪压下来"。渲染线程写、camera 侧读，单字读取（决策/诊断用途）。
   float sceneW99() const { return last_w99_; }
+  // v0.10.113：**成片链**最后一次的 P99.9（log2 相对中灰，EV 前）。与 sceneW999()
+  // 的区别是关键的：预览链走 OES（ISP 已 tonemap 的流），与 RAW 归一化域**不是一个
+  // 尺度**（同场景实测预览 2.09 / 成片 2.674，差 0.58EV 且逐次不同）——曝光判据用
+  // 预览值必然既不准也不稳（2026-10-03 真机教训）。判据只认这个成片域的值。
+  float stillW999() const { return last_still_w999_; }
   float sceneW999() const { return last_w999_; }
   float sceneWMax() const { return last_wmax_; }
   int highlightClipBlocks() const { return hr_blocks_; }
@@ -611,6 +616,7 @@ class FrameRenderer {
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。
   // v0.10.28：wmax = 采样 max 判据值（上探主驱动）。
   float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
+  float last_still_w999_ = 0.0f;   // 成片链最后一次的 P99.9（EV 前，RAW 归一化域）
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。

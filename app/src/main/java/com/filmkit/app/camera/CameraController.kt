@@ -208,7 +208,12 @@ class CameraController(private val context: Context, private val render: RenderC
         if (s == null) {
             Double.NaN
         } else {
-            val v = org.json.JSONObject(s).optDouble("w999", Double.NaN)
+            // v0.10.113：只认**成片链**的 P99.9（sw999，RAW 归一化域）。
+            // 原实现读的是 `w999`——那是"最后渲染过的那条链"的值，拍照前基本就是
+            // **预览链**（走 OES / ISP 已 tonemap），与 RAW 域**不是一个尺度**：同场景
+            // 实测预览 2.09 / 成片 2.674，差 0.58EV 且逐次不同 ⇒ 判据既不准也不稳
+            // （2026-10-03 真机教训）。无成片历史（会话第一张）⇒ NaN ⇒ 不欠曝。
+            val v = org.json.JSONObject(s).optDouble("sw999", 0.0)
             if (v.isFinite() && v > 0.0) v else Double.NaN
         }
     } catch (_: Throwable) {
@@ -1606,7 +1611,11 @@ class CameraController(private val context: Context, private val render: RenderC
         // 0.1% 的饱和像素扩成大片裁切（成片 clipB 711/3072 = 23% 的块命中高光裁剪）。
         // 判据必须把**将要施加的提亮**算进去，否则"曝光贴顶 + 后处理提亮"仍会撞白点。
         // prefs `hl_protect`：0 关（A/B 通路）/ 1 开（默认）。
-        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1
+        // v0.10.113：默认**关**（曝光给足）。理由：场景高光（渲染域 3.02）本就超过白点
+        // （2.438）0.58EV，"不欠曝"与"高光不爆"物理上不可兼得；而用户诉求是噪声小
+        // （欠曝让全图光子 -25%~-45% ⇒ 相对噪声上升 ⇒ 红杯那类中高亮表面冒白斑）。
+        // 需要高光保护时可在设置页打开（判据已改用成片域 sw999，比旧版准）。
+        val hlOn = expPrefs.getInt("hl_protect", 0) >= 1
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         val hlCompEv = baseEvPref + (evSteps * evStep).toDouble()
         var expPlan: ExposurePlanner.Plan? = null

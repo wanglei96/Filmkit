@@ -88,7 +88,7 @@ object ExposurePlanner {
         motionRadPerSec: Double = 0.0,
         motionBudgetPx: Double = MOTION_BUDGET_PX,
         sceneHighlightEv: Double = Double.NaN,
-        highlightHeadroomEv: Double = 0.35,
+        highlightHeadroomEv: Double = 0.1,
         exposureCompEv: Double = 0.0,
         whitePointEv: Double = WHITE_POINT_EV,
     ): Plan {

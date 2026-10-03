@@ -7382,6 +7382,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // 噪声尖峰由幅度闸与上限兜底。
     w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+    if (still) last_still_w999_ = w999;   // 成片域专用（曝光判据只认它）
     const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
       // v0.10.111：上探幅度由 white_probe 控制（旧硬编码 1.5）。真机实测该闸每次都
