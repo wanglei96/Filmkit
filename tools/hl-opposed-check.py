@@ -136,6 +136,26 @@ def run(dng, gain=None):
               f"（这些是 refavg 也到顶的点）")
     print(f"  全图改动像素 {int((d != 0).sum())} ({100.0 * (d != 0).mean():.4f}%)")
 
+    # ⑤ 品红溯源：G 通道最先饱和（gain=1），R/B 还有余量 ⇒ 这些像素在 RAW 域就偏品红。
+    #    中性渲染可直接复现（双线性+WB 就能看到亮天空发粉）。这一节量化 opposed 修到哪：
+    #    参考值 = 3×3 邻域的 R/B 线性均值（未裁剪，是可信的真实值）。
+    gsat = clipped & (ch == 1)
+    ng = int(gsat.sum())
+    if ng:
+        mbar = mr ** 3   # 3×3 邻域的线性域通道均值
+        rb = np.stack([mbar[..., 0][gsat], mbar[..., 1][gsat], mbar[..., 2][gsat]], 1)
+        ref_g = refavg[gsat]
+        g_after = np.maximum(val[gsat], ref_g + chroma[1])   # ch==1 ⇒ clips[1]=gain_G=1
+        mag_before = np.minimum(rb[:, 0] - rb[:, 1], rb[:, 2] - rb[:, 1])
+        mag_after = np.minimum(rb[:, 0] - g_after, rb[:, 2] - g_after)
+        print(f"  ⑤ G 饱和 photosite {ng}（占 {100.0 * ng / clipped.size:.3f}%）"
+              f"，邻域线性均值 R {rb[:,0].mean():.3f} / G {rb[:,1].mean():.3f} / B {rb[:,2].mean():.3f}")
+        print(f"      opposed 修后 G: 中位 {np.median(g_after):.3f}（ref 中位 {np.median(ref_g):.3f}"
+              f"，chroma_G {chroma[1]:+.3f}）")
+        print(f"      品红程度 min(R−G,B−G): 修前中位 {np.median(mag_before):+.3f}"
+              f" → 修后中位 {np.median(mag_after):+.3f}")
+        print(f"      修后仍偏品红（>0.05）的占比 {100.0 * (mag_after > 0.05).mean():.1f}%")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
