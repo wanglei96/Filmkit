@@ -2,7 +2,7 @@
 summary: UI收敛与成像专项v0.5.10至v0.5.19
 created: 2026-09-20 10:50
 updated: 2026-09-20 17:10
-status: absorbed
+status: archived
 ---
 
 # UI收敛与成像专项v0.5.10至v0.5.19

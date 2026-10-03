@@ -19,23 +19,34 @@ status: active
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
 - `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
 
-## 进行中（2026-10-03）
+## 进行中（2026-10-03 下午）
 
-- [2026-10-03] **红杯白斑攻坚** | 最高 | 红杯釉面密集白点（显示域 15~56 级、**两帧 IoU=0**）；
-  已排除脉冲尖峰/坏点、锐化过冲、色度噪声、真实纹理四类假设，确认是**亮区噪声**（1~2.3σ）。
-  曝光判据域错位已修（exp12：判据改用**成片域** `sw999`）+ 默认**曝光给足**。
-  **等 exp12 真机复验**：白斑减少 ⇒ 根因是光子不足；没变 ⇒ 查去马赛克在红色高饱和区的色度行为
+- [2026-10-03] **小波高光重建误重建** | 最高 | 杯口反光区色块 = `hr_wavelet`（用户开关实验：
+  关 ⇒ 色块消失但高光出品红，两端都不对）。三个混合权重已排除（= darktable 默认 0.5/1.0/1.0）。
+  待逐行对照 `filmicrgb.c:1278` 的 `reconstruct_highlights`：① `threshold` 语义（我们 1.0 绝对量
+  vs 原版 ±6EV 相对阈值）② mask 生成与 `init_reconstruct` ③ RGB/RATIOS 两轮组合（原版先 RGB、
+  失败才 RATIOS）
+- [2026-10-03] **亮部亮度降噪** | 高 | 根治白点的正道（不改影调）。对标 PC 亮部 σY 差 1.67×；
+  P0 bilateral 在全图只降 21~32%，亮部为何更弱待查（`σ²=A·x+B` 在亮部更大 ⇒ 权重应更大，实测相反）
 - [2026-10-03] **超广畸变自校正** | 高 | HAL 路线已全关（exp7 实测 `distModes:none`、
   `lensDistortion` 为 AOSP 占位值、`preCorr==active`）⇒ 必须引擎 GPU 自校正（去马赛克前、
   逐 CFA 平面反向映射保相位）；**需拍板**：完整校正（视场窄 5~10%）/ 部分校正 / 不校正
-- [2026-10-03] **固定影调观感验收** | 中 | 影调层已收敛为 darktable 默认 −8/+4 一套参数
-  （exp10/11）；亮场 / 暗场 / 光影三场景各一张，确认暗部能沉、高光不闷
+- [2026-10-03] **影调白点默认值拍板** | 中 | `whiteEv` 4.0（darktable 默认、有白点）vs
+  6.x（白点消失、更柔）；属观感基准变更，等用户在不同场景试过后定
+- [2026-10-03] **窗户场景采集曝光只给 12ms** | 中 | 客厅同类场景给到 100ms，窗户只 12~13ms
+  （光子少 8×）；exp12 已改"曝光给足"，需查 `ExposurePlanner` 四条约束为何在强光场景收敛到 12ms
 - [2026-10-02] **M5 诊断与基准** | 待做 | 逐 pass GPU 计时、成像会话摘要、golden image 接 CI
+
 - [2026-10-02] **NN 微调（暂缓）** | 降级 | 管线已建成（PyTorch 移植 / 亚像素对齐 / N2N 配对 /
   评估全跑通），但需几十个场景数据 —— 4 场景实测全部过拟合。代码与开关保留（`nn_dn` 默认关）
 
 ## 已完成（近期）
 
+- [2026-10-03] **对标定位唯一短板 = 亮部降噪（exp16–exp18，273→275）**：同场景对标 PC ⇒ 亮部
+  σY 0.82/0.49（1.67×）、色度反超 1.2~1.8×；白点确认为随机涨落（同机位 IoU 6.8%≈随机 5.4%）
+  且与 dn 无关；噪声模型经 RAW 域实测证实准确（1.04~1.39）；`whiteEv` 6.2 可消白点（代价对比度）；
+  杯口色块由用户开关实验定位到 `hr_wavelet`。期间 exp13 全画面红（mosaic 通道约定 bug）、
+  exp15 RCD 色差回归原版、exp16 修黑白点滑杆失效、exp17 σ 修正发糊已回退
 - [2026-10-03] **超广畸变能力探测（v0.10.109-exp7，263）**：AOSP 一手取证（RAW 永不校正 +
   该控制默认 ON）+ 真机实测 `distModes:none` / `lensDistortion` 占位 / `preCorr==active`
   ⇒ **HAL 路线全关，必须 GPU 自校正** | docs/x300-能力审计.md §4
