@@ -6735,8 +6735,17 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   const float threshold =
       std::max(std::pow(2.0f, white_ev_input_domain) * kGrey, 1.0f);
   const float feather = 16.0f;
+  // ── v0.10.125：inpaint_noise 的 noise_level 置 0（真机"大片色斑"的根因）────
+  // 原版在这步往裁剪区注入**逐通道独立**的噪声：sigma = pix × noise_level / threshold。
+  // 在饱和处 pix ≈ threshold ⇒ sigma ≈ noise_level = 0.2，即**相对信号 20%**；而
+  // darktable 的白点通常远高于数据最大值（本例 2^6.2EV×0.1845 ≈ 9.6 对比数据最大
+  // ≈1.4，曝光前域），同等公式下其相对幅度只有约 7%。逐通道独立 ⇒ 彩色，且在逆光
+  // 窗户这种大片饱和区（mask 权重 ≈1）等于把整片天空换成彩色噪声，小波重建只能部分
+  // 抹平 ⇒ 真机放大的"大片色斑"。
+  // noise_level 在原版是用户可调 0~6 的参数（默认 0.2），置 0 不是删机制而是取边界值：
+  // 裁剪切噪的纹理改由邻域外推提供（LF/HF 来自未裁剪区），平坦高光因此更干净。
+  const float noise_level = 0.0f;
   const float normalize = feather / threshold;
-  const float noise_level = 0.2f;
   // scales（darktable get_scales）：最粗级滤波覆盖最长边的 1/BSPLINE_FSIZE
   const double argument =
       (2.0 * std::max(w, h)) / ((5.0 - 1.0) * 5.0) - 1.0;
@@ -6785,19 +6794,18 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
     return src;
   }
 
-  // ② inpaint_noise（裁剪区注入乘性高斯噪声；写 lf[0] 作为 s=0 的 detail）
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_hr_lf_[0]);
-  glViewport(0, 0, w, h);
-  glUseProgram(prog_hr_inpaint_);
-  bind2(u_hr_inp_tex_, src, u_hr_inp_mask_, tex_hr_mask_);
-  glUniform1f(u_hr_inp_noise_, noise_level);
-  glUniform1f(u_hr_inp_thr_, threshold);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ② inpaint_noise：noise_level = 0 时该 pass 恒等（o = i·(1−w) + w·i = i），
+  // 直接跳过 —— 省一次全分辨率 pass，并把 src 本身当 s=0 的 detail 与重建初值。
+  (void)noise_level;
+  (void)prog_hr_inpaint_;
+  (void)u_hr_inp_noise_;
+  (void)u_hr_inp_thr_;
 
-  // ③ init_reconstruct（recon[0] = max(inpainted×(1−mask), 0)）
+  // ③ init_reconstruct（recon[0] = max(src×(1−mask), 0)）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_hr_recon_[0]);
+  glViewport(0, 0, w, h);
   glUseProgram(prog_hr_rin_);
-  bind2(u_hr_rin_tex_, tex_hr_lf_[0], u_hr_rin_mask_, tex_hr_mask_);
+  bind2(u_hr_rin_tex_, src, u_hr_rin_mask_, tex_hr_mask_);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 
   // ④ à trous 小波（两轮共用：RGB 轮 variant=0 / ratios 轮 variant=1）
@@ -6877,7 +6885,7 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   };
 
   int recon_rd = 0;
-  wavelets(tex_hr_lf_[0], 0, &recon_rd);
+  wavelets(src, 0, &recon_rd);
 
   // ⑤ HQ ratios 轮（darktable high_quality_reconstruction 默认 1 次）
   // norms = max(‖recon‖, NORM_MIN)（R16F）
