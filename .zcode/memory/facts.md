@@ -77,64 +77,44 @@ status: active
 - [2026-09-30] **端到端耗时账**（0.10.80/81，第 2 张，totalMs 1607）：采集 258 + DNG 落盘 144 + 上传与金字塔 37 + **CPU 对齐 345**（3 帧 mfnrAlign 210 + 4 帧 capturePyr 165）+ **DFT 571** + **后段 633**（RCD 335 + 高光重建 245 + 降噪 40）+ 后台编码 332（与前面并行）；快门间隔 0.54s
 - [2026-09-30] **raw.render 诊断字段全集**：`p0s`（96/9）、`p0w`（中心权重和，期望 26.1）、`cms`/`cmsK`、`nzPre`/`nzPost`（同相位 lag-2 差分 std/√2，**去信号**）、`nzPreMed`/`nzPostMed`/`nzPreP90`/`nzPostP90`/`nzN`（全图 48960 tile 统计）、`rmsPre`/`rmsPost`（tile RMS，**信号主导不可作判据**）、`dftUp`/`dftDsp`/`dftRb`/`dftGpu`、`alignMs`/`alignRbMs`/`alignCpuMs`/`alignL1`、`abNzPostMed`/`abP0w`（同帧 A/B 对照遍）、`nzSrc`/`nzS`/`nzO`、`wb`、`w99/w999/wmax/cp`
 - [2026-09-30] **PC 对标（同场景同曝光 ISO 1386 vs 1402）**：暗部 σY 1.323 vs 0.586（**差 2.26×**，旧数据 4.7×）、中间调 1.050 vs 0.610；暗部 σC 0.338 vs 0.787（**好 2.3×**）、中间调 0.322 vs 0.935（好 2.9×）；边缘 P99.5 12.11 vs 10.90；纹理保真比 0.92
-- [2026-09-30] **LSC 实测参数（X300 主摄）**：网格 17×13，center=1.000，corner=3.874（BR 3.701）；阻尼后角落 3.179；硬 knee 的斜率突变在**列 1 = 原图 x≈181 = W/17**（交付 JPEG x=105）
-- [2026-09-30] **量化/dither**：成片最平坦块 44.7% 相邻像素相同、|Δ| 中位恰 1.000；TPDF ±1LSB → 35.6%；JPEG q95 吃掉一半 dither 效果（26.9%→31.2%），加大幅度在 q95 下饱和无效；4:2:0 只损失 6–8% 色度细节
+## 拍照线程与 LUT（2026-10-01，压缩）
 
-## 拍照线程实测数据（2026-10-01）
+- [2026-10-01] **连拍崩溃与显存代价**：OOM 报 `Failed to allocate 50135052 … target footprint 248965720 / growth limit 268435456`（237/256MB）；修后连拍 7 张全成功、queued/saved 4/4 零丢失。显存（`dumpsys meminfo` 逐 2s）：预览基线 392MB、**开独立线程峰值 3011MB / 拍完残留 2418MB**、关线程峰值 2556MB / 回落 459MB ⇒ 独立线程代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放后回 ~400MB）
+- [2026-10-01] **合成耗时与帧率**：热机单张 `totalMs` 2091~3336ms（dftGpu 855~922、passMs 711~2021、alignCpuMs 185~737），冷机首次可达 5133ms；空闲 30~32fps、拍照期最低 13~25fps；**同帧 A/B 画质等价**（两条路径 CRC32 `3615113902` 完全相同）；MFNR 4 帧 `render.burst_done ms ≈ 3.9–4.3s`（align 835 + fuse 1278 + dftGpu 614）、采集 257–313ms，`capture()` 在渲染期**静默吞快门**（"连按两下只出一张"的根因）
+- [2026-10-01] **LUT 库结构**：`app/src/main/java/com/filmkit/app/lut/`（CubeLut 解析 1D/3D/二进制、MAX_SIZE 128；LutIO 嗅探/Hald·Unwrapped/重采样；LutLibrary 内置 42 + 用户库 files/luts、id 前缀 u_）；预览降载走 `g_preview_scale`（进程级 atomic）；单帧静拍直通 `nativeEngineSubmitRaw/Still` + `bindLut` 强度上限 1.5
 
-- [2026-10-01] **连拍崩溃现场**：`Fatal signal 6 (SIGABRT) in tid 28125 (FilmStill)`；OOM 报 `Failed to allocate 50135052 … target footprint 248965720 / growth limit 268435456`（237MB/256MB）；修复后连拍 `burst[still]` 7 张全成功、`queued/saved` 4/4 零丢失
-- [2026-10-01] **Graphics 内存**（`dumpsys meminfo`，逐 2s 采样）：预览基线 392MB；**开独立线程峰值 3011MB、拍完残留 2418MB**；**关独立线程峰值 2556MB、拍完回落 459MB** → 独立线程的代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放后回到 ~400MB）
-- [2026-10-01] **帧率**（`render.fps` = 逐秒实际渲染帧数）：空闲 30~32fps；拍照期间最低 **13~25fps**；`preview_gap` 只在采集期记到过 467ms（阈值 400ms）
-- [2026-10-01] **合成耗时**（热机单张）：`totalMs` 2091~3336ms（`dftGpu` 855~922、`passMs` 711~2021、`alignCpuMs` 185~737）；冷机首次可达 5133ms
-- [2026-10-01] **同帧 A/B 画质等价**：两条路径 CRC32 `3615113902` 完全相同、均值 109.455、`p0w` 19.093、`nzPreMed/nzPostMed` 逐项一致
+## NN 路线与对齐（2026-10-02，NN 已判死）
 
-## LUT 资产互通与预览降载（2026-10-01）
+- [2026-10-02] **spike 达标但集成判死**：真机 GPU **26ms/tile**（7× CPU）、12MP 0.51s 零温升；纹理保留 78–86% 优于 P0 交换比。集成五轮逐层修口径（JNI 桥 / KSigma 量纲 / cvt_k×256 / 通道序 / neff 折减）后 **nnGain 与公式逐位吻合而观感零改善**（文字梯度 −24%、平坦区斑块状伪影而非白噪）⇒ **跨域模型不可直接用**；四次微调（监督×3 + N2N）留出集**全过拟合**（+12.0/+9.9/+11.7/+5.06%），瓶颈 = 数据量（4 场景 vs 官方 3 万+）
+- [2026-10-02] **NN 代码落点（保留、默认关）**：`app/src/main/java/com/filmkit/app/nn/NnInferEngine.kt`（常驻推理线程 + GpuDelegate + CPU 熔断）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff）、`Bridge.cpp`；prefs nn_dn/nn_ab 默认关；raw.render 含 nn/nnOk/nnFail/nnMs/nnTiles/nnGain
+- [2026-10-02] **对齐工具实测**：位移误差 0.0115px（合成 6 帧）、噪声 ×3.22、异场景剔除 wn 0.304 vs 同场景 0.996；真实手持 8 帧 ×2.16；93 帧/5 场景中 4 个可用
 
-- [2026-10-01] **LUT 库结构**：`app/src/main/java/com/filmkit/app/lut/`（CubeLut 解析 1D/3D/二进制、MAX_SIZE 128；LutIO 嗅探/Hald·Unwrapped/重采样/writeCube/writeHaldPng；LutLibrary 内置 42 + 用户库 files/luts、id 前缀 u_）；日志 lut.import/lut.export/lut.delete/lut.parse
-- [2026-10-01] **预览降载**：`g_preview_scale` 进程级 atomic（FrameRenderer static）；JNI nativeEngineSetPreviewScale；日志 render.preview_scale、preview.frame 加 rs 字段；触发链在 CameraController（快门降 0.5 / 合成完升 1.0，15s 兜底）
-- [2026-10-01] **单帧静拍直通**：nativeEngineSubmitRaw/Still 加 useStill 参数；StillRenderClient.submitRawBuf/submitStillBuf（失败自愈重建重试一次）；render.single_done 日志；bindLut 强度上限 1.5（>1 沿色差外推）
+## 曝光决策（10-02 晚，压缩）
 
-## NN 路线实测（2026-10-02）
+- [2026-10-02] **曝光 ×N + ISO ÷N = 亮度与高光裁切不变、纯赚 SNR**：离线解析收益 √N 与物理上限逐位吻合（N=8.66 → 2.95×）；约束三条 = ISO 下限 / 快门上限 / 运动预算；纹理预算维持**细节优先 2.2px**（一度放宽到 4.5px 属误读用户意见替用户做取舍，已撤回）。**真机 250ms 档**：`expCap:"250ms" expN:"8.33" altIso:167 altSec:0.2500`；nzPreMed 0.005219→0.001688（**1/3.1**）、成片域 0.002104→0.000417（1/5.0）；**ISO167 = Filmix 的 ISO166**
+- [2026-10-02] **三图同场景定量**（盘沿亮白 Y≈211–224）：σY 我们 **4.48** / Filmix 1.72 / PC 0.92；中间调（茶几 Y≈162）我们 **1.06（三家最好）**；碗内壁 lag-1 自相关 0.939 ≈ Filmix 0.938 ⇒ **真实纹理非噪声**
+- [2026-10-02] **三摄 GCam 标定（`assets/noise_models/`）**：主摄 HPB A=2.72e-7 dg_ref 6400（100 张实测）、超广 JN1 A=3.07e-7（借用 NubiaZ50Ultra，非本机实测）、长焦 LYT602 A=1.05e-6；`BUILT_IN` 原先**无主摄条目**；真机 `src:"builtin"` ×3 验证通过
 
-- [2026-10-02] **NN spike 真机数据（X300, PMRID 512tile FP16, 20 块=12.58MP）**：GPU delegate 单块中位 **26ms**（p90 28）、全图 **0.51s**、**24.86MP/s**、零温升；CPU XNNPACK×4 181ms、3.65s、3.45MP/s、零温升
-- [2026-10-02] **PMRID 离线质量（X300 噪声模型合成 + clean 参照）**：纹理保留率 4px 78%（暗光 ISO640）/86%（白天 ISO3200）、8px 91–97%、平坦 σ −77~80%、2px 增强 1.7–2×；对比锚点（10-01 三 APP 同场景 4px）：PC 2.24 / Filmix 2.19 / 我们 1.47
-- [2026-10-02] **PMRID 移植口径（10-02 晚经 256/257 两次修订，最终版）**：输入 = img01 × cvt_k × 256，**cvt_k = S_train·neff/S_input**，S_train = 官方 K(1600)/V = **1.0093e-3**（img01 域）、neff = 4、clamp[0.25,16]；**通道序 = 官方语义 ch0=R/ch1=Gr/ch2=Gb/ch3=B**（`nnSemTables` 按 CFA 给相位；打包图空间朝向不翻转）。NHWC [1,512,512,4]、tile 512/步进 496/重叠 16、FP16 tflite 2.1MB（守卫 0.76%）；Filmix 曝光 = ISO166+1/4s（+3.6EV 进光）
-  - 修正沿革：255 用 `S_anchor/S_iso`（X300 S(1600)=4.5e-4）且通道序 (B,Gr,Gb,R)；256 修 anchor 为训练口径并 ×neff；257 修通道序
-  - ~~01 域 × 959/256~~（0.10.102）与 ~~cvt_k=S_anchor/S_iso + BGGR 语义~~（0.10.104）均已推翻
-- [2026-10-02] **tools 新增**：`tools/midband-attrib.py`（三图/分组归因：EXIF 聚类 + 配准 + 归一带通 + 分尺度噪声 + CIELAB）、`tools/nn/convert_pmrid.py`（torch→onnx→tf→tflite FP16 + 数值守卫）、`tools/nn/quality_eval.py`（合成噪声 + 分块推理 + 保留率表；⚠ 其 959/256 口径注释已被官方源码推翻）
+## 畸变、白斑与预览域（10-03，压缩）
 
-## NN 与对齐工具实测（10-02，NN 已判死）
-
-- [2026-10-02] **NN 集成代码落点（保留，默认关）**：`app/.../nn/NnInferEngine.kt`（NnInfer 常驻线程、GpuDelegate 强制 + CPU 熔断、inferTile JNI）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff、tex_nn_*）、`Bridge.cpp`（nnBridgeInfer 首调自初始化、nativeRunNnRoundtrip）；prefs nn_dn/nn_ab 默认关；raw.render 含 nn/nnOk/nnFail/nnMs/nnTiles/nnGain（check-diag 已登记）
-- [2026-10-02] **对齐工具实测**：位移误差 0.0115px（合成 6 帧）、噪声 ×3.22、异场景剔除 wn 0.304 vs 同场景 0.996；真实手持 8 帧 ×2.16；93 帧/5 场景中 4 个可用（场景 5 位移 103–114px 报废）
-- [2026-10-02] **旧噪声模型来源**：DNG tag 51041 = Camera2 SENSOR_NOISE_PROFILE，顺序 (R,G,B)、G 取中间项；本批 S_G = 1.291e-3…2.105e-4（ISO 4781…216）；CFAPattern=[[1,0],[2,3]]=GRBG（**已被下述三摄 GCam 标定取代**）
-
-## 曝光决策与降噪修正实测（10-02 晚）
-
-- [2026-10-02] **离线曝光杠杆**（`tools/exposure-lever-eval.py`，场景 1 ISO4781/38.46ms，clean = 15 帧对齐平均）：解析 σ 收益 1.42/2.00/**2.95×**（N=2/4/8.66）与 √N 逐位吻合；`tex_keep` 仅与帧内模糊 d 有关（2px 0.956 / 4px 0.918 / 8px 0.842）；细节优先口径决策边界 **d\*≈2.2px**；1 mosaic px ≈ 0.017°
-- [2026-10-02] **真机 250ms 档**：`expCap:"250ms" expN:"8.33" altIso:167 altSec:0.2500`（HAL 逐位执行）；nzPreMed 0.005219→0.001688（**1/3.1**）、成片域 0.002104→0.000417（1/5.0）；**ISO167 = Filmix 的 ISO166**
-- [2026-10-02] **三图同场景定量（盘沿亮白 Y≈211–224；Filmix 局部配准 SAD 8.6 / PC SAD 41 不可比）**：σY 我们 **4.48** / Filmix 1.72 / PC 0.92；中间调（茶几 Y≈162）我们 **1.06（三家最好）** / 2.67 / 1.12；碗内壁 lag-1 自相关 0.939 ≈ Filmix 0.938 ⇒ **真实纹理非噪声**
-- [2026-10-02] **σ 修正前后真机指纹**：修正后 `nzPreP90→nzPostP90` = 0.002474→0.001845 / 0.015045→0.010735 / 0.011360→0.009010（**降 21~29%**），修正前只降 4%（0.006035→0.005806）；修复前 `p0A/nzS = 0.099`（σ 仅真值 0.31×）
-- [2026-10-02] **三摄 GCam 标定（`assets/noise_models/`）**：主摄 HPB A=2.72e-7 dg_ref 6400（**100 张实测**：暗场 50 + 亮场 50、相邻帧差法）、超广 JN1 A=3.07e-7 dg_ref 1600（**同传感器借用 NubiaZ50Ultra，非本机实测**）、长焦 LYT602 A=1.05e-6 dg_ref 3200；`BUILT_IN` 原先**无主摄条目**（主摄一直走 HAL cam2，其 G 比 R/B 低一半）；真机 `src:"builtin"` ×3 验证通过
-- [2026-10-02] **超广角桶形畸变**：221313 竖直边拟合直线残差中位 **50.7px**（图宽 887 = **5.7%**）、两侧都偏 = 系统性；代码 `grep DISTORTION|LENS_INTRINSIC` 零结果（RAW 流 HAL 不做几何校正）
-- [2026-10-02] **MFNR 耗时（真机）**：4 帧渲染 `render.burst_done ms ≈ 3.9–4.3s`（align 835 + fuse 1278 + dftGpu 614）、采集 257–313ms；`capture()` 在渲染期**静默吞快门**（"连按两下只出一张"的根因）
-
-## 畸变能力与白斑实测（10-03）
-
-- [2026-10-03] **X300 畸变/几何能力（exp7 真机，4 次会话 × 2 个 cameraId 全一致）**：`DISTORTION_CORRECTION_AVAILABLE_MODES` = **none**（HAL 不支持校正）、`LENS_DISTORTION` = `0.001,0,0,0,0`（AOSP 占位值，非标定）、`LENS_RADIAL_DISTORTION` 空、`PRE_CORRECTION_ACTIVE_ARRAY == ACTIVE_ARRAY`（4080×3072 主摄 / 4080×3060 超广，无裁边区）；`LENS_INTRINSIC_CALIBRATION` fx=fy=**2790.18**（主摄，cx 2040/cy 1536）/ **2414.06**（超广，cx 2040/cy 1530）。AOSP 原文：校正 *"not applied to any RAW output"* 且该控制 *"on by default"* ⇒ 连 YUV 也未校正
-- [2026-10-03] **预览域 vs 成片域（关键域差）**：同场景 `w999`（EV 前 P99.9，log2 相对中灰）预览 **2.09** / 成片 **2.674**（另一组 2.4383 / 2.674）⇒ 差 0.24~0.58EV 且逐次不同；预览走 OES（ISP 已 tonemap），成片是 RAW 归一化域
-- [2026-10-03] **白斑定量（红杯釉面）**：显示域幅度 **15~56 级**；白斑 RGB (211,171,168) vs 周围 (114,65,41)，通道增量 R+66%/G+126%/**B+229%**；**两帧 IoU = 0**（随机）；`d>15` 占比 0.06~0.14%
-- [2026-10-03] **白斑四类假设的排除证据**：① 坏点/脉冲 —— RAW 域两帧异常像素位置重合仅 **0.5%**（随机），且"异常"多为饱和像素（p=1023、邻域 std 216~302）；② 锐化过冲 —— 白斑邻域 d 均值 **+110（无暗环）**；③ 色度噪声 —— σC/σY 仅 **0.23~0.27**；④ 真实纹理 —— 两帧高频相关 **−0.007**、IoU=0
-- [2026-10-03] **RAW 噪声实测（DNG 平坦区，ISO 531）**：信号 <200 段实测/模型 = **0.96~1.06**（模型准）；200~300（R）1.32、300~500（G1）1.14（高信号段样本少，疑场景残留）；高信号段残差大主要来自**饱和/边缘**而非噪声
-- [2026-10-03] **高光保护的代价/收益（真机同场景）**：不欠曝 `clipB` **803**（26% 块）/ 欠曝 0.85EV `clipB` **109**（3.5%）/ 中间态 163（5.3%）；`hlUnder` 0.35~0.85EV 由场景高光与白点差决定
+- [2026-10-03] **X300 畸变/几何能力（exp7 真机，4 次会话 × 2 个 cameraId 全一致）**：`DISTORTION_CORRECTION_AVAILABLE_MODES` = **none**、`LENS_DISTORTION` = `0.001,0,0,0,0`（AOSP 占位）、`LENS_RADIAL_DISTORTION` 空、`PRE_CORRECTION_ACTIVE_ARRAY == ACTIVE_ARRAY`（无裁边区）；`LENS_INTRINSIC_CALIBRATION` fx=fy=**2790.18**（主摄）/ **2414.06**（超广）。AOSP 原文：校正 *"not applied to any RAW output"* 且该控制 *"on by default"* ⇒ 连 YUV 也未校正
+- [2026-10-03] **预览域 vs 成片域**：同场景 `w999`（EV 前 P99.9）预览 **2.09** / 成片 **2.674**（另一组 2.4383/2.674）⇒ 差 0.24~0.58EV 且逐次不同；预览走 OES（ISP 已 tonemap），成片是 RAW 归一化域
+- [2026-10-03] **白斑（红杯釉面）根因 = 亮部亮度噪声**：显示域幅度 15~56 级；两帧 IoU = 0（随机）；四类假设已排除（RAW 域两帧异常位置重合仅 0.5%、锐化邻域 d 均值 +110 无暗环、σC/σY 仅 0.23~0.27、两帧高频相关 −0.007）。RAW 域模型准：DNG 平坦区（ISO 531）信号 <200 段实测/模型 = **0.96~1.06**，高信号段残差来自饱和/边缘而非噪声
 - [2026-10-03] **横拍裁切 bug 指纹**：`photo.crop srcA:1.328 dstA:0.750 out:2304x3072`（横图被裁成竖幅，丢 44%）；触发条件 = 拍照时 `orientationStep` 为横、渲染完成前用户转回竖屏（MFNR 渲染 3~4s）
 
 ## 对标与开关实测（10-03 下午）
 
-- [2026-10-03] **对标 PhotonCamera（同场景、相隔 14 秒，`test_temp/FILMKIT_20261003-143538.jpg` vs `PhotonCamera_20261003_143524.无.jpg`）**：平坦块分亮度层 σY —— 亮部(170+) 我们 **0.82** / PC **0.49**（**1.67×**）；中亮(120-170) 0.66/0.49；中暗(60-120) 0.82/0.66。**差距随亮度单调放大 ⇒ 唯一短板 = 亮部亮度降噪**。色度多尺度 1→32px 我们 **0.98→0.28** / PC 1.17→0.35（**我们全面占优 1.2~1.8×**）
-- [2026-10-03] **降噪强度与白点无关**：dn 0 / 0.45 / 1.0 三档同机位 ⇒ 釉面 d>15 = **0.38% / 0.50% / 0.53%**（反而略升）；`nzPost` 分别降 0% / 21% / 32% ⇒ **亮度噪声最多只压掉 32%**，而白点正是亮度域随机涨落
-- [2026-10-03] **噪声模型在 RAW 域是准的**：CFA 平面独立、中值残差法实测 σ vs 模型 —— R 1.48/1.07 = 1.39、G1 1.48/1.42 = 1.04、G2 1.48/1.20 = 1.23、B 1.48/1.11 = 1.34（同量级）⇒ "降噪模型不准"可排除
-- [2026-10-03] **filmic 白点滑杆的真实效果**：`whiteEv` 4.53 → **6.20**（`settings.filmic_white_ev`）⇒ 红釉白点消失，代价是对比度降低、画面更柔（luma 4.53 档 131 / 6.20 档 131，但 1.57 档达 177 惨白）。机制：白点越远 ⇒ 映射区间越宽 ⇒ 曲线越平 ⇒ 微小起伏被压缩
-- [2026-10-03] **`hr_wavelet` 开关的两端表现（杯口反光区）**：**开** ⇒ 反光区出现色块；**关** ⇒ 色块消失但高光出品红（树枝/绳子紫边）。⇒ 重建实现有偏差，不是开关问题；三个混合权重已核对为 darktable 默认的 0.5/1.0/1.0（`FrameRenderer.cpp:6785-6789`）
-- [2026-10-03] **版本沿革**：263 exp7 → 265 exp8 → 266~268 exp9/10/11 → 269 exp12 → **270 exp13 新增 RAW 域高光重建（全画面红 bug）** → 271 exp14 修通道约定 → 272 exp15 RCD 色差回归原版 → 273 exp16 修黑白点滑杆 → 274 exp17 σ 的 LSC 修正（发糊，已回退） → **275 exp18（= exp16 行为，当前推荐）**
+- [2026-10-03] **对标 PhotonCamera（同场景、相隔 14 秒）**：平坦块分亮度层 σY —— 亮部(170+) 我们 **0.82** / PC **0.49**（**1.67×**）；中亮(120-170) 0.66/0.49；中暗(60-120) 0.82/0.66。**差距随亮度单调放大 ⇒ 唯一短板 = 亮部亮度降噪**。色度多尺度 1→32px 我们 **0.98→0.28** / PC 1.17→0.35（**全面占优 1.2~1.8×**）
+- [2026-10-03] **噪声模型在 RAW 域是准的**：CFA 平面独立、中值残差法实测 σ vs 模型 —— R 1.39、G1 1.04、G2 1.23、B 1.34（同量级）⇒ "降噪模型不准"可排除
+- [2026-10-03] **filmic 白点滑杆的真实效果**：`whiteEv` 4.53 → **6.20** ⇒ 红釉白点消失，代价是对比度降低；机制 = 白点越远、映射区间越宽、曲线越平、微小起伏被压缩
+- [2026-10-03] **降噪强度与白点无关**：dn 0/0.45/1.0 ⇒ 釉面 d>15 = 0.38%/0.50%/0.53%（反而略升）；`nzPost` 分别降 0%/21%/32% ⇒ **亮度噪声最多只压掉 32%**
 
+## 高光重建与品红（10-03 晚，本窗口）
+
+- [2026-10-03] **filmic HR 的 `threshold` 语义**（逐行对照 `filmicrgb.c:3120`）：原版 = **白点** `2^(white_source + reconstruct_threshold) × grey_source`（后者默认 0）；旧实现写死 `1.0`（RAW 饱和点）在 WB 后域系统性偏低——R/B 增益 1.8/1.7 把未饱和像素的欧氏范数抬过 1.0 ⇒ 大面积误重建。改后真机 `clipB` **523~601 → 2**，色块消失
+- [2026-10-03] **`threshold` 的计算式**：`max(2^(ev_white_ − exposure_ev) × 0.1845, 1.0)`；下限 1.0 = `2^2.4383EV × kGrey`（与 `kWhiteSat` 同源）。其余三处（mask 公式/feather、`init_reconstruct`、RGB-RATIOS 组合）与原版核对一致
+- [2026-10-03] **opposed chrominance 的引擎/原版偏差**：同 DNG 同增益下引擎 `hlChroma` G **−0.250** vs 原版公式 **−0.047**（3.7×）；`hlCnt` 接近（47269/48925）而 `hlSum` 差 4 倍 ⇒ **非样本集合、而是输入被 P0 降噪**（同色 3×3 平滑压低饱和旁的 G，而 refavg 走 R/B 外推受影响小）。修复值 = `ref + chroma` ⇒ 该负值把补回的 G 又扣掉
+- [2026-10-03] **品红位置的实测口径**：把全部 `mag≥10` 像素标出 ⇒ **全在逆光悬挂物（衣服/毛巾/树枝/挂绳）边缘**，天空本体几乎没有。该区域成片 **14.74%**、RAW 域（双线性+CCM）**21.14%** ⇒ 整条链只压掉 30%；DNG 该区域真饱和 **12.40%** photosite（R 9.77 / G 13.44 / B 12.95）
+- [2026-10-03] **PC 色度降噪架构（源码实证）**：`RawToYuv` → **`MeasureMoire`**（输入 Y 平面，输出 **1/4 分辨率 3 通道强度图**）→ 该图**替换**送给 `ChromaDenoise` 的强度（`mgc_full_resolution_denoise_jni.cpp:1021-1064`，注释原文 *"replaces only the strength map supplied to ChromaDenoise"*）；`ChromaDenoise` = **四级色度金字塔** + **4 level × 3 通道 × 2 branch** 独立 shot/quadratic/read 表 + 频响参数（`response_offset`/`response_cosine_offset`）。`MeasureMoire` 本体是编译好的 Halide capsule（`mgc_demoire_capsule.bin`），公式不可读
+- [2026-10-03] **inpaint_noise 的相对幅度**：`sigma = pix × noise_level / threshold`；我们 `threshold`=1.0（RAW 饱和点）而 darktable 白点远高于数据最大值（本例 9.6 vs 1.4）⇒ 同等公式下相对幅度约 3 倍、逐通道独立 ⇒ 彩色颗粒。`noise_level` 已置 0
+- [2026-10-03] **版本沿革（本窗口）**：276 exp19（threshold 修正）→ 277 exp20（hlSum/hlCnt3 诊断）→ 278 exp21（统计源换 `tex_fused_`，**有害已回退**）→ 279 exp22（禁 chrominance）→ **280 exp23（关 inpaint 噪声，当前推荐）**
