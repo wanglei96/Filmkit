@@ -35,6 +35,7 @@ EXPECT = {
     "hrWhiteEv": ("finishStillChain", ["passFilm("]),
     # v0.10.122 opposed chrominance 分子/分通道样本（定位 chroma 偏大 3.4×）
     "hlSum": ("finishStillChain", ["passHighlightRaw("]),
+    "hrStatRaw": ("finishStillChain", ["passHighlightRaw("]),
     "hlCnt3": ("finishStillChain", ["passHighlightRaw("]),
     "clipB": ("finishStillChain", ["passFilm("]),
     "hrMs": ("finishStillChain", ["passFilm("]),

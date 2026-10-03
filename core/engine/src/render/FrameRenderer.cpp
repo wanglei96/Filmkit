@@ -2268,6 +2268,8 @@ const char* kFsHlMask = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uMos;
+uniform highp sampler2D uStat;
+uniform int uStatRaw;
 uniform ivec2 uSize;
 uniform int uCfaLut;
 uniform vec3 uClips;
@@ -2284,6 +2286,16 @@ float mosAt(ivec2 p) {
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
+// v0.10.123 统计源：darktable 的 highlights 跑在**降噪之前**，而我们的 P0 会做
+// 空间 bilateral ⇒ 饱和像素旁的 G 被平滑拉低、v−refavg 被系统性拉负 ⇒ chrominance
+// 偏负 ⇒ 修复力度被吃掉（离线同 DNG 实测：未降噪 chroma_G −0.047、P0 后 −0.138、
+// 真机 −0.250；亮部 R/G 1.063 → 1.131）。MFNR 路径改用 tex_fused_（融合后、P0 前，
+// 与 tex_mos_ 同域的 R16F 线性 mosaic 单通道）。MFNR 的时间平均不改空间结构，
+// 所以它不引入这个偏差；单帧路径没有该中间纹理，退回 tex_mos_。
+float statAt(ivec2 p) {
+    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
+    return mosAt(p);
+}
 float clipAt(int c) {
     return c == 0 ? uClips.x : (c == 1 ? uClips.y : uClips.z);
 }
@@ -2296,7 +2308,7 @@ void main() {
             ivec2 p = p0 + ivec2(x, y);
             if (p.x < uSize.x && p.y < uSize.y) {
                 int c = chanAt(p);
-                float v = mosAt(p);
+                float v = statAt(p);
                 if (v >= clipAt(c)) mbuff[c] += 1.0;
             }
         }
@@ -2355,6 +2367,8 @@ precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uMos;
 uniform highp sampler2D uDil;
+uniform highp sampler2D uStat;
+uniform int uStatRaw;
 uniform ivec2 uSize;
 uniform ivec2 uMSize;
 uniform int uCfaLut;
@@ -2374,6 +2388,10 @@ float mosAt(ivec2 p) {
 // _calc_refavg（segbased.c:186）：3×3 photosite 邻域按通道求均值 → 各开立方 →
 // 目标通道取**另两个通道**立方的均值（opposing）→ linear 时回立方。边界截断与
 // darktable 同式（dymax = min(h-1, row+2)，非 +2 含端）。
+float statAt(ivec2 p) {
+    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
+    return mosAt(p);
+}
 float refavg(ivec2 p) {
     int color = chanAt(p);
     vec3 mean = vec3(0.0), cnt = vec3(0.0);
@@ -2383,7 +2401,7 @@ float refavg(ivec2 p) {
         for (int dx = dxmin; dx < dxmax; ++dx) {
             ivec2 q = ivec2(dx, dy);
             int c = chanAt(q);
-            float v = max(0.0, mosAt(q));
+            float v = max(0.0, statAt(q));
             if (c == 0) { mean.x += v; cnt.x += 1.0; }
             else if (c == 1) { mean.y += v; cnt.y += 1.0; }
             else { mean.z += v; cnt.z += 1.0; }
@@ -2406,7 +2424,7 @@ void main() {
             if (p.x >= uSize.x || p.y >= uSize.y) continue;
             int c = chanAt(p);
             float cl = at3(uClips, c);
-            float v = mosAt(p);
+            float v = statAt(p);
             if (v >= cl || v <= 0.2 * cl) continue;
             ivec2 mb = p / 3;
             if (mb.x >= uMSize.x || mb.y >= uMSize.y) continue;
@@ -2431,6 +2449,8 @@ uniform ivec2 uSize;
 uniform int uCfaLut;
 uniform vec3 uClips;
 uniform vec3 uChroma;
+uniform highp sampler2D uStat;
+uniform int uStatRaw;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2442,6 +2462,10 @@ float mosAt(ivec2 p) {
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
+float statAt(ivec2 p) {
+    if (uStatRaw == 1) return texelFetch(uStat, p, 0).r;
+    return mosAt(p);
+}
 float refavg(ivec2 p) {
     int color = chanAt(p);
     vec3 mean = vec3(0.0), cnt = vec3(0.0);
@@ -2451,7 +2475,7 @@ float refavg(ivec2 p) {
         for (int dx = dxmin; dx < dxmax; ++dx) {
             ivec2 q = ivec2(dx, dy);
             int c = chanAt(q);
-            float v = max(0.0, mosAt(q));
+            float v = max(0.0, statAt(q));
             if (c == 0) { mean.x += v; cnt.x += 1.0; }
             else if (c == 1) { mean.y += v; cnt.y += 1.0; }
             else { mean.z += v; cnt.z += 1.0; }
@@ -2468,10 +2492,11 @@ float refavg(ivec2 p) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     int c = chanAt(p);
-    float v = mosAt(p);
+    float v = mosAt(p);      // 基底 = P0 降噪后的值（降噪画质不丢）
+    float vr = statAt(p);    // 判定与 refavg 用未降噪源（darktable 的输入位置）
     float cl = at3(uClips, c);
     float outv = v;
-    if (v >= cl) outv = max(v, refavg(p) + at3(uChroma, c));
+    if (vr >= cl) outv = max(v, refavg(p) + at3(uChroma, c));
     // 按 CFA 相位写回（与 P0 的输出约定一致）—— 写 .r 会让 G/B 位置归零
     oColor = vec4(c == 0 ? outv : 0.0, c == 1 ? outv : 0.0,
                   c == 2 ? outv : 0.0, 1.0);
@@ -3566,12 +3591,16 @@ bool FrameRenderer::init() {
   u_tile_rms_.noise_b = glGetUniformLocation(prog_tile_rms_, "uNoiseB");
   // RAW 域高光重建（darktable highlights）4 个 pass 的 uniform
   u_hl_mask_.mos = glGetUniformLocation(prog_hl_mask_, "uMos");
+  u_hl_mask_.stat = glGetUniformLocation(prog_hl_mask_, "uStat");
+  u_hl_mask_.statraw = glGetUniformLocation(prog_hl_mask_, "uStatRaw");
   u_hl_mask_.size = glGetUniformLocation(prog_hl_mask_, "uSize");
   u_hl_mask_.cfalut = glGetUniformLocation(prog_hl_mask_, "uCfaLut");
   u_hl_mask_.clips = glGetUniformLocation(prog_hl_mask_, "uClips");
   u_hl_dil_.mask = glGetUniformLocation(prog_hl_dil_, "uMask");
   u_hl_dil_.msize = glGetUniformLocation(prog_hl_dil_, "uMSize");
   u_hl_chroma_.mos = glGetUniformLocation(prog_hl_chroma_, "uMos");
+  u_hl_chroma_.stat = glGetUniformLocation(prog_hl_chroma_, "uStat");
+  u_hl_chroma_.statraw = glGetUniformLocation(prog_hl_chroma_, "uStatRaw");
   u_hl_chroma_.dil = glGetUniformLocation(prog_hl_chroma_, "uDil");
   u_hl_chroma_.size = glGetUniformLocation(prog_hl_chroma_, "uSize");
   u_hl_chroma_.msize = glGetUniformLocation(prog_hl_chroma_, "uMSize");
@@ -3579,6 +3608,8 @@ bool FrameRenderer::init() {
   u_hl_chroma_.clips = glGetUniformLocation(prog_hl_chroma_, "uClips");
   u_hl_chroma_.mode = glGetUniformLocation(prog_hl_chroma_, "uMode");
   u_hl_apply_.mos = glGetUniformLocation(prog_hl_apply_, "uMos");
+  u_hl_apply_.stat = glGetUniformLocation(prog_hl_apply_, "uStat");
+  u_hl_apply_.statraw = glGetUniformLocation(prog_hl_apply_, "uStatRaw");
   u_hl_apply_.size = glGetUniformLocation(prog_hl_apply_, "uSize");
   u_hl_apply_.cfalut = glGetUniformLocation(prog_hl_apply_, "uCfaLut");
   u_hl_apply_.clips = glGetUniformLocation(prog_hl_apply_, "uClips");
@@ -4704,7 +4735,8 @@ TileRmsResult FrameRenderer::passTileRms(GLuint src_tex, int w, int h,
 //   ⇒ correction[c] = 1.0（我们只有 as-shot WB，无 late correction 通道）
 // 输出 tex_hl_（scene-referred，不钳到 1），由 hr_src_override_ 转交 RCD 三段。
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
-                                            const float gains[3], GLuint src) {
+                                            const float gains[3], GLuint src,
+                                            GLuint stat_src, int stat_raw) {
   HlRawResult r;
   const int mw = w / 3, mh = h / 3;    // 块网格（darktable: iwidth/3、iheight/3）
   const int tw = w / 16, th = h / 16;  // 归约网格（同 passTileRms 口径）
@@ -4746,6 +4778,11 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_hl_mask_.mos, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, stat_src);
+  glUniform1i(u_hl_mask_.stat, 1);
+  glUniform1i(u_hl_mask_.statraw, stat_raw);
+  glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_hl_mask_.size, w, h);
   glUniform1i(u_hl_mask_.cfalut, cfalut);
   glUniform3f(u_hl_mask_.clips, clips[0], clips[1], clips[2]);
@@ -4775,6 +4812,10 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_hl_dil_);
     glUniform1i(u_hl_chroma_.dil, 1);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, stat_src);
+    glUniform1i(u_hl_chroma_.stat, 2);
+    glUniform1i(u_hl_chroma_.statraw, stat_raw);
     glActiveTexture(GL_TEXTURE0);
     glUniform2i(u_hl_chroma_.size, w, h);
     glUniform2i(u_hl_chroma_.msize, mw, mh);
@@ -4805,6 +4846,11 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_hl_apply_.mos, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, stat_src);
+  glUniform1i(u_hl_apply_.stat, 1);
+  glUniform1i(u_hl_apply_.statraw, stat_raw);
+  glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_hl_apply_.size, w, h);
   glUniform1i(u_hl_apply_.cfalut, cfalut);
   glUniform3f(u_hl_apply_.clips, clips[0], clips[1], clips[2]);
@@ -5256,7 +5302,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       dbg_hl_cnt3_[k] = 0.f;
     }
     if (p.hr_raw > 0.5f) {
-      const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, tex_mos_);
+      // v0.10.123：统计源取 P0 **之前**的 tex_fused_（darktable 的 highlights 位置）。
+      // 单帧路径没有该中间纹理，退回 tex_mos_（stat_raw=0，行为同 exp19）。
+      const bool hr_stat_raw = c.mfnr_fused && tex_fused_ != 0;
+      const GLuint hr_stat_src = hr_stat_raw ? tex_fused_ : tex_mos_;
+      hr_stat_raw_ = hr_stat_raw ? 1 : 0;
+      const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, tex_mos_,
+                                              hr_stat_src, hr_stat_raw_);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
       dbg_hl_cnt_ = hl.cnt[1];
       dbg_hl_ms_ = hl.ms;
@@ -5438,6 +5490,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // v0.10.121：HR 输入域（曝光前）的白点 EV —— threshold = 2^hrWhiteEv × 0.1845，
   // 与 tools/hr-mask-check.py --white-ev 同一口径（改阈值后靠它核对真机覆盖面对不对）。
   kv += ",\"hrWhiteEv\":" + jnum(hr_white_ev_, 6);
+  // v0.10.123：1 = mask/chrominance 取自 P0 之前的 tex_fused_（darktable 位置）
+  kv += ",\"hrStatRaw\":" + std::to_string(hr_stat_raw_);
   // v0.10.122：opposed chrominance 的分通道分子/样本数。chroma = sum/cnt（cnt>100），
   // 与 tools/hl-opposed-check.py 的 ③ 同口径 —— 用来定位"引擎 chroma 偏大 3.4×"。
   // 注意 jnum(v,n) 的 n 是**字符数**不是小数位（2026-10-03 教训）：sum 可达 ±5e4
@@ -7997,6 +8051,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   hr_blocks_ = -1;
   hr_ms_ = 0.0f;
   hr_white_ev_ = 0.0f;
+  hr_stat_raw_ = -1;
   GLuint film_src = src_tex;
   if (still && p.hr_wavelet > 0.5f) {
     // HR 输入域 = 曝光前（kFsFilm 内部才乘 2^exposure_ev）⇒ 白点也要去掉 ev 平移

@@ -392,8 +392,10 @@ class FrameRenderer {
   // 在**去马赛克前**对线性 mosaic（tex_mos_，已扣黑阶 + WB，白点 1.0）恢复被裁剪
   // 通道 —— mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
   // 成功时结果落在 tex_hl_，由 hr_src_override_ 交给 RCD 三段读取。
+  // stat_src/stat_raw（v0.10.123）：mask 与 chrominance 的统计源。darktable 的
+  // highlights 跑在降噪之前，stat_raw=1 时用 tex_fused_（融合后、P0 前，R16F 单通道）。
   HlRawResult passHighlightRaw(int w, int h, int cfa, const float gains[3],
-                               GLuint src);
+                               GLuint src, GLuint stat_src, int stat_raw);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
@@ -624,6 +626,7 @@ class FrameRenderer {
   int hr_blocks_ = -1;
   float hr_ms_ = 0.0f;
   float hr_white_ev_ = 0.0f;
+  int hr_stat_raw_ = -1;   // 1 = mask/chrominance 用了 P0 前的 tex_fused_
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
   // M4-7 局部色调映射的低频亮度图（RGBA8、LINEAR 上采样）。与 tex_hist_
@@ -757,17 +760,18 @@ class FrameRenderer {
   } u_tile_rms_;
   // RAW 域高光重建（darktable highlights）：mask / dilate / chroma / apply
   struct {
-    GLint mos = -1, size = -1, cfalut = -1, clips = -1;
+    GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1;
   } u_hl_mask_;
   struct {
     GLint mask = -1, msize = -1;
   } u_hl_dil_;
   struct {
-    GLint mos = -1, dil = -1, size = -1, msize = -1, cfalut = -1, clips = -1,
-          mode = -1;
+    GLint mos = -1, stat = -1, statraw = -1, dil = -1, size = -1, msize = -1,
+          cfalut = -1, clips = -1, mode = -1;
   } u_hl_chroma_;
   struct {
-    GLint mos = -1, size = -1, cfalut = -1, clips = -1, chroma = -1;
+    GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1,
+          chroma = -1;
   } u_hl_apply_;
   // NN pass（v0.10.102/104）：pack / unpack 两个 fragment 程序的 uniform
   struct {
