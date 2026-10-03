@@ -450,6 +450,18 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile var captureAspect = 0f
         private set
 
+    /**
+     * 拍照瞬间的**方向/画幅快照**（v0.10.110-fix，2026-10-03 真机）。
+     *
+     * 为什么必须快照：MFNR 渲染要 3~4s，用户按完快门常立刻把手机转回竖屏 —— 日志实证
+     * （09:15:58 拍照 step=3 → 09:16:01 step=0 → 09:16:03 `photo.crop srcA:1.328
+     * dstA:0.750`）渲染输出方向正确（4080×3072 横），但保存时读到的 `captureAspect`
+     * 已被姿态变化改成竖版 0.750，于是**横拍成片被裁成 2304×3072 竖幅**（丢 44% 画面）。
+     * 与项目既有教训同型：「参数快照 —— 相隔数秒的两段链路直接读成员会混进第二个变量」。
+     */
+    @Volatile private var stillRot = 0
+    @Volatile private var stillAspect = 0f
+
     fun setCaptureAspect(a: Float) {
         captureAspect = a.coerceIn(0.2f, 5f)
     }
@@ -1345,6 +1357,19 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun capture() {
         val s = session ?: return
+        // 快门瞬间快照方向与画幅（见 stillRot/stillAspect 注释）：渲染/保存链路必须用
+        // 拍照那一刻的姿态，否则用户"拍完就转回竖屏"会把横拍裁成竖幅。
+        stillRot = orientationStep
+        // 画幅比例按**快门瞬间的姿态**定向 —— 不依赖 Compose 的异步更新：CameraScreen 的
+        // `LaunchedEffect(captureAspectValue)` 要等下一次组合才执行，用户横拿后立刻按快门
+        // 会拿到上一姿态的值。Compose 传进来的是"当前姿态"比例，这里只做转置校正
+        // （竖 → <1，横 → >1），两种滞后情形都自愈。
+        val ca = captureAspect
+        stillAspect = when {
+            ca <= 0f -> 0f
+            stillRot % 2 == 0 -> if (ca > 1f) 1f / ca else ca
+            else -> if (ca < 1f) 1f / ca else ca
+        }
         if (capturing) {
             // v0.10.107：原来这里是**静默 return** —— 真机实测（2026-10-02 日志）
             // MFNR 渲染 ~4.3s，用户在渲染期按快门"没反应"却无任何记录，表现为
@@ -2124,7 +2149,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val uvPix = pU.pixelStride
         runCatching { img.close() }
         val film = filmParams
-        val rot = orientationStep
+        val rot = stillRot   // 快门瞬间快照（不是此刻的 orientationStep，见其注释）
         // 拍照线程路由（v0.10.93，prefs still_thread）：**非阻塞**判断 ready ——
         // 这里在渲染线程上（ImageReader 回调），绝不干等 ensureStarted；
         // 预热在 capture() 入口已 startAsync，本张没赶上就走预览线程（下一张起生效）。
@@ -2273,7 +2298,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val useStill = prefs.getBoolean("still_thread", false) && StillRenderClient.ready
         if (useStill) {
             StillRenderClient.submitRawBuf(
-                rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
+                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, filmParams,
                 demosaic, noiseStrength, nnDn,
             ) { bytes, w, h ->
                 if (bytes != null) {
@@ -2286,14 +2311,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     )
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
-                        rawBuf, rawW, rawH, rawStridePx, meta, orientationStep,
+                        rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
                         filmParams, demosaic, noiseStrength, nnDn,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
                 }
             }
         } else {
             render.submitRawBuf(
-                rawBuf, rawW, rawH, rawStridePx, meta, orientationStep, filmParams,
+                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, filmParams,
                 demosaic, noiseStrength, nnDn,
             ) { bytes, w, h -> finishStillCapture(bytes, w, h) }
         }
@@ -2485,7 +2510,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/true, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
-                orientationStep, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
+                stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
@@ -2497,13 +2522,13 @@ class CameraController(private val context: Context, private val render: RenderC
                     )
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBurst(buffers, strides, refW, refH, meta,
-                        orientationStep, filmStill, demosaic, noiseStrength,
+                        stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn, done)
                 }
             }
         } else {
             render.submitRawBurst(buffers, strides, refW, refH, meta,
-                orientationStep, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
+                stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
@@ -2544,7 +2569,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val t0 = android.os.SystemClock.elapsedRealtime()
         // 参数快照：两遍相隔 1.6s+，中间用户可能转手机/改设置 —— 直接读成员会让
         // A/B 混进第二个变量（本项目"跨时刻对比"翻车过多次）
-        val rot = orientationStep
+        val rot = stillRot   // 快门瞬间快照（同上）
         val film = filmParamsForStill()   // v0.10.110：A/B 两遍同样带高光保护补偿
         val rn = burstRefNoiseScale
         val nn1 = if (varyNn) false else nnDn
@@ -2878,7 +2903,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // v0.6.42 修复：此前只按 sensorOrientation 恒写 6，横拍时像素明明是横的、
         // 相册却按"顺时针转 90°"显示 → 方向反了（真机 2026-09-24 复现）。
         creator.setOrientation(
-            when ((sensorOrientation / 90 + orientationStep) % 4) {
+            when ((sensorOrientation / 90 + stillRot) % 4) {   // 快门瞬间快照
                 1 -> 6 // 需顺时针 90°
                 2 -> 3 // 需 180°
                 3 -> 8 // 需逆时针 90°
@@ -2962,16 +2987,20 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         // 成片按画幅居中裁切（与取景窗口一致，WYSIWYG）
         var outBmp = bmp
-        if (captureAspect > 0f) {
+        // 用**快门瞬间**的画幅快照（v0.10.110-fix）：渲染 3~4s 期间用户常把手机转回
+        // 竖屏，读实时 captureAspect 会把横拍裁成竖幅（2026-10-03 真机实证）。
+        val asp = if (stillAspect > 0f) stillAspect else captureAspect
+        if (asp > 0f) {
             val curA = w.toFloat() / h.toFloat()
-            if (Math.abs(curA - captureAspect) > 0.01f) {
-                val cw = if (curA > captureAspect) (h * captureAspect).toInt() else w
-                val ch = if (curA > captureAspect) h else (w / captureAspect).toInt()
+            if (Math.abs(curA - asp) > 0.01f) {
+                val cw = if (curA > asp) (h * asp).toInt() else w
+                val ch = if (curA > asp) h else (w / asp).toInt()
                 outBmp = Bitmap.createBitmap(bmp, (w - cw) / 2, (h - ch) / 2, cw, ch)
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "camera", "photo.crop",
-                    kv("srcA" to "%.3f".format(curA), "dstA" to "%.3f".format(captureAspect),
-                        "out" to "${outBmp.width}x${outBmp.height}"),
+                    kv("srcA" to "%.3f".format(curA), "dstA" to "%.3f".format(asp),
+                        "out" to "${outBmp.width}x${outBmp.height}",
+                        "snap" to (stillAspect > 0f), "rot" to stillRot),
                 )
             }
         }
