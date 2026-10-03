@@ -200,6 +200,17 @@ class FrameRenderer {
   int sceneW() const { return scene_w_; }
   int sceneH() const { return scene_h_; }
 
+  // ── 曝光决策专项 v2：高光保护判据（2026-10-02）────────────────────────────
+  // sceneW99/sceneW999/sceneWMax = 场景高光分位（log2，相对中灰 0.1845），**测于
+  // kFsFilm 链首乘 uExposure 之前**（v0.10.31 已核对统计域）⇒ camera 侧可直接与
+  // "将要施加的提亮 ev"相加，判断提亮后高光是否会撞 RAW 饱和白点（2.4383）。
+  // highlightClipBlocks = 成片高光重建命中的块数（64×48 网格），用于离线核对
+  // "欠曝是否真的把裁剪压下来"。渲染线程写、camera 侧读，单字读取（决策/诊断用途）。
+  float sceneW99() const { return last_w99_; }
+  float sceneW999() const { return last_w999_; }
+  float sceneWMax() const { return last_wmax_; }
+  int highlightClipBlocks() const { return hr_blocks_; }
+
  private:
   bool ensureTargets(int w, int h);
   bool ensureRcdTargets(int w, int h);

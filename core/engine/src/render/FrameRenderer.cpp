@@ -4857,6 +4857,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"gMs\":" + jnum(g_ms, 6);
   }
   if (c.dn) {
+    // v0.10.109：nzSrc 取值改 "ext"/"legacy"（原 "cam2"）—— 原值与 camera 侧
+    // raw.noise 的 src:"builtin" 撞名：同一张照片里两个 nzSrc 语义不同（引擎侧只
+    // 表达"外部下发 vs 引擎回退"），真机曾据此误读模型来源。
     // C 专项（2026-09-29）：噪声模型诊断族 —— nzSrc/nzIso/nzS/nzO = 模型来源与
     // 逐 ISO 系数（WB 前，[0,1] 域）；p0A/p0B/p4A/p4B = 实际下发 shader 的 (A,B)
     // （WB 后、含强度 k²；σ² = A·x + B）；ns/nsHal = 典型 σ（融合后/单帧）；
@@ -4871,7 +4874,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       return "[" + fe(v[0]) + "," + fe(v[1]) + "," + fe(v[2]) + "]";
     };
     kv += std::string(",\"dn\":") + jnum(c.dn_k, 4) +
-          ",\"nzSrc\":\"" + (c.nc.model_src ? "cam2" : "legacy") + "\"" +
+          ",\"nzSrc\":\"" + (c.nc.model_src ? "ext" : "legacy") + "\"" +
           ",\"nzS\":" + fa3(c.nm.S) + ",\"nzO\":" + fa3(c.nm.O) +
           ",\"nzG\":[" + jnum(c.gains[0], 6) + "," +
           jnum(c.gains[1], 6) + "," +

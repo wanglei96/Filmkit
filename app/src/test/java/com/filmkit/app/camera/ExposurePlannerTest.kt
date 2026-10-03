@@ -114,4 +114,55 @@ class ExposurePlannerTest {
         assertEquals("invalid", p.limitedBy)
         assertEquals(1.0, p.n, 1e-9)
     }
+
+    // ── v0.10.110 高光保护（2026-10-02）────────────────────────────────────
+    // 真机口径：预览 w999 = 2.4383（恰为 RAW 饱和数据白点）、base_ev+用户 EV = 0.503、
+    // 成片 clipB 711/3072 = 23% 的块命中高光裁剪 ⇒ 曝光没有余量。
+
+    /** 高光贴顶 + 提亮 ⇒ 欠曝：只缩短曝光时间，ISO 不变（降 ISO 救不回已饱和的高光）。 */
+    @Test
+    fun highlightProtectionUnderexposesWithoutRaisingIso() {
+        val p = ExposurePlanner.plan(
+            baseIso = 984, baseExposureNs = 50_000_000L,
+            isoLower = 50, exposureUpperNs = 1_000_000_000L,
+            targetExposureNs = 100_000_000L,
+            sceneHighlightEv = 2.4383,      // 真机预览 w999
+            highlightHeadroomEv = 0.35,
+            exposureCompEv = 0.503,
+        )
+        assertEquals("highlight", p.limitedBy)
+        assertEquals(984, p.iso)                        // 不抬 ISO
+        assertTrue("应缩短曝光", p.exposureNs < 50_000_000L)
+        // over = 2.4383 + 0.503 − (2.4383 − 0.35) = 0.853 ⇒ n = 2^−0.853 = 0.5535
+        assertEquals(0.5535, p.n, 0.01)
+        assertEquals(-0.853, p.deltaEv, 0.02)
+        assertEquals((50_000_000L * p.n).toLong(), p.exposureNs)
+    }
+
+    /** 高光有余量 ⇒ 高光保护不介入，拉长侧照常工作。 */
+    @Test
+    fun highlightProtectionStaysOutOfTheWayWhenHeadroomExists() {
+        val p = ExposurePlanner.plan(
+            baseIso = 984, baseExposureNs = 50_000_000L,
+            isoLower = 50, exposureUpperNs = 1_000_000_000L,
+            targetExposureNs = 100_000_000L,
+            sceneHighlightEv = 1.20,        // 提亮后 1.70 < 2.4383 − 0.35
+            exposureCompEv = 0.503,
+        )
+        assertEquals("target", p.limitedBy)
+        assertEquals(100_000_000L, p.exposureNs)
+        assertEquals(492, p.iso)                        // 亮度守恒（984 ÷ 2）
+    }
+
+    /** 无统计（NaN）⇒ 不做高光保护（行为与历史逐位一致）。 */
+    @Test
+    fun missingSceneStatsDisableHighlightProtection() {
+        val p = ExposurePlanner.plan(
+            baseIso = 984, baseExposureNs = 50_000_000L,
+            isoLower = 50, exposureUpperNs = 1_000_000_000L,
+            targetExposureNs = 100_000_000L,
+        )
+        assertEquals("target", p.limitedBy)
+        assertEquals(100_000_000L, p.exposureNs)
+    }
 }

@@ -537,6 +537,46 @@ fun SettingsScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            // 高光保护（v0.10.110）：曝光的第一目标是"**刚好不烧高光**"（HDR+ §4 原文
+            // "set this exposure low enough to avoid blowing out highlights"），不是
+            // "画面亮度达标"——亮度是后处理提亮的事，前提是 RAW 里还留着余量。
+            // 真机实锤：预览 w999 = 2.4383 恰为 RAW 饱和数据白点，再乘 2^(base_ev+EV)
+            // 就把 0.1% 的饱和像素扩成大片裁切（成片 clipB 711/3072 = 23% 的块）。
+            var hlProtect by rememberSaveable { mutableStateOf(prefs.getInt("hl_protect", 1)) }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val v = if (hlProtect >= 1) 0 else 1
+                        hlProtect = v
+                        prefs.edit().putInt("hl_protect", v).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.hl_protect",
+                            "{\"on\":$v}",
+                        )
+                    }
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("高光保护", color = FilmTheme.Cream, fontSize = 14.sp)
+                    Text(
+                        "先看高光余量再决定曝光：场景高光（P99.9）加上将要施加的提亮会撞 " +
+                            "RAW 白点时自动欠曝（只缩曝光时间、不抬 ISO），避免高光被压平" +
+                            "成死白、LUT 在死白上染色；代价是暗部光子略少（由多帧补）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                Text(
+                    if (hlProtect >= 1) "开" else "关",
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             // 曝光上限档：自动（陀螺仪运动预算）/ 固定值（跳过运动限制，仍记录 blurPx）。
             // Filmix 同机用 ISO166+1/4s 拍出远超我们的暗部纹理，而"陀螺仪 × 时间"模型
             // 未计 OIS（实测实际像面位移仅机身转动的 0.71）⇒ 实证 > 模型，由用户试上限。

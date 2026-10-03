@@ -854,7 +854,19 @@ Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
   const int64_t frames = g_renderer ? g_renderer->frameCount() : 0;
   const int w = g_renderer ? g_renderer->sceneW() : 0;
   const int h = g_renderer ? g_renderer->sceneH() : 0;
+  // 曝光决策专项 v2（2026-10-02）：带出高光保护判据 —— w99/w999/wmax 是**EV 之前**的
+  // 场景高光分位（log2 相对中灰），camera 侧据此决定静拍是否为了留高光余量而欠曝。
+  // clipB = 成片高光重建命中块数（核对欠曝效果）。std::to_string 不截断，JSON 合法。
+  // 注意：std::to_string(NaN) = "nan" 是**非法 JSON**（本项目被非法 JSON 吞过整行
+  // 日志），故先过 finite 闸 —— 未出帧时这些量本就是 0，语义等价。
+  const auto jf = [](float v) {
+    return std::isfinite(v) ? std::to_string(v) : std::string("0.0");
+  };
   return toJString(env, "{\"frames\":" + std::to_string(frames) +
                             ",\"w\":" + std::to_string(w) +
-                            ",\"h\":" + std::to_string(h) + "}");
+                            ",\"h\":" + std::to_string(h) +
+                            ",\"w99\":" + jf(g_renderer ? g_renderer->sceneW99() : 0.0f) +
+                            ",\"w999\":" + jf(g_renderer ? g_renderer->sceneW999() : 0.0f) +
+                            ",\"wmax\":" + jf(g_renderer ? g_renderer->sceneWMax() : 0.0f) +
+                            ",\"clipB\":" + std::to_string(g_renderer ? g_renderer->highlightClipBlocks() : -1) + "}");
 }

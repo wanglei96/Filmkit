@@ -164,6 +164,26 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 
+    /**
+     * 高光保护补偿（v0.10.110）：本次 burst 的欠曝量（EV，≥0）。
+     *
+     * 曝光欠多少，**提亮就补多少** —— 这是 HDR+ 的完整做法（故意欠曝 → 后处理提亮）：
+     * 中间调与预览保持一致（WYSIWYG），而高光因为少收了光子不再裁切。若只欠曝不补偿，
+     * 成片会整体变暗，那就只是把"高光爆"换成了"画面暗"，不是解。
+     */
+    @Volatile
+    private var burstHlUnderEv = 0.0
+
+    /** 成片用 filmParams：把高光保护的欠曝量加到 EV（[0]）。预览用原始数组（预览曝光
+     *  由 HAL AE 决定、没有欠曝），故两侧中间调一致、成片高光更低。 */
+    private fun filmParamsForStill(): DoubleArray {
+        val u = burstHlUnderEv
+        if (u <= 1e-4) return filmParams
+        val q = filmParams.copyOf()
+        q[0] = filmParams[0] + u
+        return q
+    }
+
     /** 总抖动 RMS（rad/s）—— 仅诊断，不参与决策（含高频，外推会严重高估帧内模糊）。 */
     private fun gyroRmsRadPerSec(): Double {
         synchronized(gyroLock) {
@@ -174,6 +194,25 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             return kotlin.math.sqrt(acc / gyroSamples.size)
         }
+    }
+
+    /**
+     * 场景高光分位（log2 相对中灰 0.1845，**测于提亮之前**）—— 高光保护判据（v0.10.110）。
+     *
+     * 取引擎每帧写入的 `w999`（P99.9）。为什么不用 `wmax`：max 是单点，受坏点与孤立
+     * 点光源影响；P99.9 = 0.1% 像素，正是"高光会不会成片裁切"的量级。返回值 NaN 表示
+     * **无可用统计**（引擎未出帧 / 解析失败）⇒ 规划器不做高光保护，行为与历史一致。
+     */
+    private fun sceneHighlightEv(): Double = try {
+        val s = EngineBridge.nativeEngineGetStats()
+        if (s == null) {
+            Double.NaN
+        } else {
+            val v = org.json.JSONObject(s).optDouble("w999", Double.NaN)
+            if (v.isFinite() && v > 0.0) v else Double.NaN
+        }
+    } catch (_: Throwable) {
+        Double.NaN
     }
 
     /** 设备物理方向监听（v0.6.39 引入 → v0.6.41 对齐 PhotonCamera）。
@@ -1479,6 +1518,15 @@ class CameraController(private val context: Context, private val render: RenderC
         val expBudgetPx = if (expMaxMs > 0) 1e6 else ExposurePlanner.MOTION_BUDGET_PX
         val gyroMean = gyroMeanRadPerSec()
         val gyroRms = gyroRmsRadPerSec()
+        // ── 高光保护（v0.10.110，2026-10-02 用户拍板"从曝光策略上解决"）─────────
+        // 曝光的第一目标是"刚好不烧高光"（HDR+ §4），不是"亮度达标"。真机实锤：
+        // 预览 w999 = 2.4383 恰为 RAW 饱和数据白点，引擎再乘 2^(base_ev+用户EV) 就把
+        // 0.1% 的饱和像素扩成大片裁切（成片 clipB 711/3072 = 23% 的块命中高光裁剪）。
+        // 判据必须把**将要施加的提亮**算进去，否则"曝光贴顶 + 后处理提亮"仍会撞白点。
+        // prefs `hl_protect`：0 关（A/B 通路）/ 1 开（默认）。
+        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1
+        val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
+        val hlCompEv = baseEvPref + (evSteps * evStep).toDouble()
         var expPlan: ExposurePlanner.Plan? = null
         var capIso = liveIso
         var capSec = liveExposureNs
@@ -1495,10 +1543,16 @@ class CameraController(private val context: Context, private val render: RenderC
                 targetExposureNs = expTargetNs,
                 motionRadPerSec = gyroMean,
                 motionBudgetPx = expBudgetPx,
+                // 高光保护：提亮后高光必须留余量（NaN = 无统计 ⇒ 不介入，与历史一致）
+                sceneHighlightEv = hlSceneEv,
+                exposureCompEv = hlCompEv,
             )
             expPlan = p
             capIso = p.iso
             capSec = p.exposureNs
+            // 高光保护欠曝量（EV）：由 processRawBurst 加到成片 EV 上补偿（见
+            // filmParamsForStill）—— 只欠曝不补偿 = 把"高光爆"换成"画面暗"。
+            burstHlUnderEv = if (p.n < 1.0) -p.deltaEv else 0.0
         }
         // 长曝光生效时**取消参考帧压短**：压短的初衷是"参考帧更锐以防拖影"，而长
         // 曝光下所有帧 SNR 同时提高，压短反而让参考帧噪声变差（对齐/mismatch 判据
@@ -1591,6 +1645,14 @@ class CameraController(private val context: Context, private val render: RenderC
                 "blurPx" to "%.2f".format(expPlan?.blurPx ?: 0.0),
                 "expCap" to (if (expMaxMs > 0) "${expMaxMs}ms" else "auto"),
                 "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
+                // 高光保护（v0.10.110）：hlEv = 场景高光分位（提亮之前，log2 相对中灰；
+                // -99 = 无统计/关闭）；hlCmp = 本次将要施加的提亮 EV；限流原因见 expWhy
+                // （"highlight" = 为留高光余量欠曝）
+                "hlOn" to hlOn,
+                "hlEv" to "%.3f".format(if (hlSceneEv.isFinite()) hlSceneEv else -99.0),
+                "hlCmp" to "%.3f".format(hlCompEv),
+                // 实际欠曝量（EV，0 = 未触发）；成片 EV 会加上同一个量做补偿
+                "hlUnder" to "%.3f".format(if (expPlan != null && expPlan.n < 1.0) -expPlan.deltaEv else 0.0),
             ),
         )
         EngineBridge.nativeFlushLogs()
@@ -2410,6 +2472,9 @@ class CameraController(private val context: Context, private val render: RenderC
         // 两张成片都落盘供离线对比 —— 与 still_ab 同构，唯一干净口径。
         // 依赖独立线程（第二遍在预览线程）+ nn_dn 开。
         val nnAb = useStill && nnDn && prefs.getBoolean("nn_ab", false)
+        // 高光保护（v0.10.110）：成片 EV 加上本次欠曝量做补偿（预览用原数组）——
+        // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
+        val filmStill = filmParamsForStill()
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/false, done)
@@ -2420,7 +2485,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/true, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
-                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                orientationStep, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
@@ -2432,13 +2497,13 @@ class CameraController(private val context: Context, private val render: RenderC
                     )
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBurst(buffers, strides, refW, refH, meta,
-                        orientationStep, filmParams, demosaic, noiseStrength,
+                        orientationStep, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn, done)
                 }
             }
         } else {
             render.submitRawBurst(buffers, strides, refW, refH, meta,
-                orientationStep, filmParams, demosaic, noiseStrength, burstRefNoiseScale,
+                orientationStep, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
@@ -2480,7 +2545,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 参数快照：两遍相隔 1.6s+，中间用户可能转手机/改设置 —— 直接读成员会让
         // A/B 混进第二个变量（本项目"跨时刻对比"翻车过多次）
         val rot = orientationStep
-        val film = filmParams
+        val film = filmParamsForStill()   // v0.10.110：A/B 两遍同样带高光保护补偿
         val rn = burstRefNoiseScale
         val nn1 = if (varyNn) false else nnDn
         val nn2 = if (varyNn) true else nnDn
