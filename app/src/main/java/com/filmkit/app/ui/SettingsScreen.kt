@@ -1,18 +1,23 @@
 package com.filmkit.app.ui
 
 import android.content.Context
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -21,6 +26,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -39,7 +45,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -50,8 +59,11 @@ import com.filmkit.app.camera.NoiseCalibStore
 import kotlin.math.roundToInt
 
 /**
- * 设置主页（v0.4.9 二级菜单化）：主页只放导航行与开关，
- * 镜头配置、系统颜色为子页；日志、能力 Spike 在系统区。规范见 docs/开发计划.md「UI 设计规范」。
+ * 设置主页（整理版）：主页只放拍摄高频项、四个抽屉导航行与系统区——
+ * 工程项按域收进抽屉（画质 / 影调与色彩 / 暗光与曝光 / 实验与诊断），
+ * 二级内容不再平铺主页（规范：二级内容一律进子页，不堆主页）。
+ * 删除项：NN 降噪与 NN A/B（路线已判死，读取端默认关）、静拍 YUV BT.709（已定案 601 正确）。
+ * 全部 prefs 键、写入逻辑与日志字段与整理前一致。规范见 docs/开发计划.md「UI 设计规范」。
  */
 @Composable
 fun SettingsScreen(
@@ -67,14 +79,22 @@ fun SettingsScreen(
     var dngEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("dng_enabled", false)) }
     var wheelZoom by rememberSaveable { mutableStateOf(prefs.getBoolean("wheel_zoom", true)) }
     var auditPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var qualityOpen by rememberSaveable { mutableStateOf(false) }
+    var toneOpen by rememberSaveable { mutableStateOf(false) }
+    var lowlightOpen by rememberSaveable { mutableStateOf(false) }
+    var labOpen by rememberSaveable { mutableStateOf(false) }
 
-    Column(
+    Box(
         Modifier
             .fillMaxSize()
-            .background(FilmTheme.Body)
-            .statusBarsPadding(),
+            .background(FilmTheme.Body),
     ) {
         Column(
+            Modifier
+                .fillMaxSize()
+                .statusBarsPadding(),
+        ) {
+            Column(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
@@ -97,1034 +117,23 @@ fun SettingsScreen(
                     )
                 },
             )
+            var jpegQ by rememberSaveable { mutableStateOf(prefs.getInt("jpeg_quality", 100)) }
+            SettingValueRow(
+                title = "成像质量",
+                subtitle = "95 = 标准；100 = 极高（文件体积约为 2–3 倍）",
+                valueText = "$jpegQ",
+                onTap = {
+                    val v = if (jpegQ >= 100) 95 else 100
+                    jpegQ = v
+                    prefs.edit().putInt("jpeg_quality", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.jpeg_quality",
+                        "{\"q\":$v}",
+                    )
+                },
+            )
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
             SettingNavRow("自定义焦段", "最多 3 个，与原生焦段同显于变焦条（总 ≤6）") { onOpenFocals() }
-            var rcdOn by rememberSaveable { mutableStateOf(prefs.getBoolean("demosaic_quality", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !rcdOn
-                        rcdOn = v
-                        prefs.edit().putBoolean("demosaic_quality", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.demosaic_quality",
-                            "{\"rcd\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("RAW 去马赛克", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "RCD 质量 = 方向自适应+色比修正，边缘伪彩少；" +
-                            "快速 = bilinear，最快。仅影响 M 档成片",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (rcdOn) "RCD 质量" else "快速",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            var toneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("base_tone", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !toneOn
-                        toneOn = v
-                        prefs.edit().putBoolean("base_tone", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.base_tone",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("基准影调", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "黑位 + 中间调 S + 高光 rolloff（治发灰）；" +
-                            "关 = 旧行为（恒等，无影调工程）。预览与成片同步",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (toneOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // ── 基准曝光（v0.8.1）：机型 AE 基准差的校准常量 ─────────────────────────
-            // 与 Lightroom/DNG 的 BaselineExposure 同语义。X300 对同场景参照渲染
-            // 净差 +0.57 EV（v0.10.25 同 DNG 双渲染实测标定），默认 +0.7。
-            // 用户 EV 滑杆叠加在其上（[0] = base + user），对齐参照后滑杆可归零。
-            EvSliderRow(
-                "基准曝光",
-                "校正机型自动曝光的基准差：成片整体偏暗拖右、偏亮拖左。" +
-                    "对齐同场景参照后，EV 滑杆归零即可",
-                prefs.getFloat("base_ev", 0.7f),
-                -2f..2f,
-            ) { v ->
-                prefs.edit().putFloat("base_ev", v).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
-                )
-            }
-            // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
-            // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
-            // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
-            // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
-            var satComp by rememberSaveable { mutableStateOf(prefs.getFloat("sat_comp", 0f)) }
-            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("饱和补偿", color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                    Text(
-                        "+%d%%".format((satComp * 100).toInt()),
-                        color = FilmTheme.Accent,
-                        fontSize = 13.sp,
-                        fontFamily = FilmTheme.Mono,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-                Text(
-                    "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。" +
-                        "对照同场景样张调到灰感消失，定值后回传",
-                    color = FilmTheme.CreamDim,
-                    fontSize = 10.sp,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-                androidx.compose.material3.Slider(
-                    value = satComp,
-                    onValueChange = { satComp = it },
-                    onValueChangeFinished = {
-                        val v = (satComp * 100).toInt() / 100f
-                        satComp = v
-                        prefs.edit().putFloat("sat_comp", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.sat_comp",
-                            "{\"v\":$v}",
-                        )
-                    },
-                    valueRange = 0f..0.30f,
-                    colors = androidx.compose.material3.SliderDefaults.colors(
-                        thumbColor = FilmTheme.Cream,
-                        activeTrackColor = FilmTheme.Accent,
-                        inactiveTrackColor = FilmTheme.ChipBorder,
-                    ),
-                )
-            }
-            // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
-            // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
-            // "配置项"而不是需要标定的数值。默认 −8.0/+4.0 = darktable filmic 出厂默认
-            // （= v0.10.113 起标准模式的固定值；v0.10.118 起滑杆恢复生效，默认值不变）。
-            EvSliderRow(
-                "黑点（多暗算黑）",
-                "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
-                prefs.getFloat("filmic_black_ev", -8.0f),
-                -12f..-1f,
-            ) { v ->
-                prefs.edit().putFloat("filmic_black_ev", v).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "settings.filmic_black_ev", "{\"v\":$v}",
-                )
-            }
-            EvSliderRow(
-                "白点（多亮算白）",
-                "拖右 = 白点更远 ⇒ 影调曲线更平、噪声更不明显（真机 6.2 时红釉白点消失），代价是对比降低、画面更柔",
-                prefs.getFloat("filmic_white_ev", 4.0f),
-                1f..8f,
-            ) { v ->
-                prefs.edit().putFloat("filmic_white_ev", v).apply()
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "app", "settings.filmic_white_ev", "{\"v\":$v}",
-                )
-            }
-            var localToneOn by rememberSaveable { mutableStateOf(prefs.getBoolean("local_tone", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !localToneOn
-                        localToneOn = v
-                        prefs.edit().putBoolean("local_tone", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.local_tone",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("局部色调映射", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。" +
-                            "治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (localToneOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // M3 P0 镜头阴影校正（v0.5.43）：HAL 增益网格治暗角 + 角落色偏。
-            // 常开开关，归设置页（快捷面板只放拍摄时会频繁切的项）。
-            var lscOn by rememberSaveable { mutableStateOf(prefs.getBoolean("lsc", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !lscOn
-                        lscOn = v
-                        prefs.edit().putBoolean("lsc", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.lsc",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("镜头阴影校正", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "HAL 增益网格消暗角与角落色偏（RAW 链、CCM 前，17×13 手写双线性）；" +
-                            "关 = 同机位 A/B 对照",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (lscOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // v0.7.9：「色彩外观层」设置项已删除 —— 该层（M3 P1 治"寡淡"）在 filmic 链下
-            // 恒等（v0.7.7 起 look_sat/look_chroma = 1.0，`1+(c-1)*sk` ≡ 1），开关只控制
-            // 一个空操作，还占设置页心智。FilmParams[31..33] 槽位保留（契约不移位）。
-            // M3 P2 DNG 标准色彩链（§3.2-7 / §3.4-4）：用 characteristics 的标定矩阵
-            // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB）自建 camera→sRGB，
-            // 替代 HAL 的 COLOR_CORRECTION_TRANSFORM；关 = 用 HAL 的做同机位 A/B。
-            var stdCcmOn by rememberSaveable { mutableStateOf(prefs.getBoolean("ccm_std", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !stdCcmOn
-                        stdCcmOn = v
-                        prefs.edit().putBoolean("ccm_std", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.ccm_std",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("DNG 标准色彩链", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "用相机标定矩阵自建色彩链（与 Adobe/libraw 完整链同源，标定数据缺失" +
-                            "自动回退）；关 = 用 HAL 矩阵做 A/B",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (stdCcmOn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // RAW 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01）——
-            // 0 = 关、1 = 真实噪声 σ（标准做法）、2 = 2×σ。作用于 P0/P4 的逐像素
-            // 值域 σ（噪声模型 σ²=A·x+B，逐通道）；写入时同步旧 keys 供回退读取。
-            var dnStr by rememberSaveable {
-                mutableStateOf(
-                    CameraController.denoiseStrength(
-                        prefs.contains("noise_reduction_strength"),
-                        prefs.getFloat("noise_reduction_strength", 1f),
-                        prefs.getBoolean("noise_reduction", true),
-                        prefs.getInt("noise_reduction_level", 1),
-                    ),
-                )
-            }
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 6.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("RAW 降噪", color = FilmTheme.Cream, fontSize = 14.sp)
-                        Text(
-                            "RAW 域双边 + 色度平滑，σ 由噪声模型逐像素给出；" +
-                                "0 = 关、1 = 真实 σ、2 = 2×σ。仅 RCD 质量档生效",
-                            color = FilmTheme.CreamDim,
-                            fontSize = 10.sp,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                    Text(
-                        "%.2f".format(dnStr),
-                        color = FilmTheme.Accent,
-                        fontSize = 13.sp,
-                        fontFamily = FilmTheme.Mono,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-                androidx.compose.material3.Slider(
-                    value = dnStr,
-                    onValueChange = { dnStr = it },
-                    onValueChangeFinished = {
-                        prefs.edit()
-                            .putFloat("noise_reduction_strength", dnStr)
-                            .putBoolean("noise_reduction", dnStr > 0f)
-                            .putInt(
-                                "noise_reduction_level",
-                                if (dnStr <= 0f) 0 else if (dnStr <= 1.5f) 1 else 2,
-                            )
-                            .apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.noise_reduction",
-                            "{\"strength\":\"%.2f\"}".format(dnStr),
-                        )
-                    },
-                    valueRange = 0f..2f,
-                    steps = 199,
-                    colors = androidx.compose.material3.SliderDefaults.colors(
-                        thumbColor = FilmTheme.Cream,
-                        activeTrackColor = FilmTheme.Accent,
-                        inactiveTrackColor = FilmTheme.ChipBorder,
-                    ),
-                )
-            }
-            // MFNR 多帧融合（v0.9.0 阶段一）：关 / 自动（暗光触发）/ 开（强制）三档。
-            // 触发判定在 CameraController.mfnrShouldTrigger（与单测同源）。
-            var mfnrMode by rememberSaveable { mutableStateOf(prefs.getInt("mfnr", 1)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = (mfnrMode + 1) % 3
-                        mfnrMode = v
-                        prefs.edit().putInt("mfnr", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.mfnr",
-                            "{\"mode\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("多帧融合", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "暗光连拍 4 帧对齐合成降噪（彩噪 √4 根治）；" +
-                            "仅 M 档 RAW + RCD 质量档生效。「开」= 每次都连拍",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    when (mfnrMode) {
-                        0 -> "关"
-                        1 -> "自动"
-                        else -> "开"
-                    },
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 曝光决策专项（v0.10.107）：长曝光进光 —— 曝光 ×N + ISO ÷N（亮度与
-            // 高光裁切不变，纯赚 SNR；离线实测收益 = √N）。上限由陀螺仪 motion
-            // metering 的运动预算 + ISO 下限 + 快门范围共同决定。
-            var expPlanOn by rememberSaveable { mutableStateOf(prefs.getInt("exp_plan", 1)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = if (expPlanOn >= 1) 0 else 1
-                        expPlanOn = v
-                        prefs.edit().putInt("exp_plan", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.exp_plan",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("长曝光进光", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "暗光按陀螺仪运动量拉长曝光（≤250ms）并等比降 ISO：亮度与高光" +
-                            "裁切不变、噪声按 √N 下降（N=6.5 → 2.5×）；" +
-                            "仅 M 档 RAW + 多帧融合触发时生效",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (expPlanOn >= 1) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 高光保护（v0.10.110）：曝光的第一目标是"**刚好不烧高光**"（HDR+ §4 原文
-            // "set this exposure low enough to avoid blowing out highlights"），不是
-            // "画面亮度达标"——亮度是后处理提亮的事，前提是 RAW 里还留着余量。
-            // 真机实锤：预览 w999 = 2.4383 恰为 RAW 饱和数据白点，再乘 2^(base_ev+EV)
-            // 就把 0.1% 的饱和像素扩成大片裁切（成片 clipB 711/3072 = 23% 的块）。
-            var hlProtect by rememberSaveable { mutableStateOf(prefs.getInt("hl_protect", 1)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = if (hlProtect >= 1) 0 else 1
-                        hlProtect = v
-                        prefs.edit().putInt("hl_protect", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.hl_protect",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("高光保护", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "先看高光余量再决定曝光：场景高光（P99.9）加上将要施加的提亮会撞 " +
-                            "RAW 白点时自动欠曝（只缩曝光时间、不抬 ISO），避免高光被压平" +
-                            "成死白、LUT 在死白上染色；代价是暗部光子略少（由多帧补）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (hlProtect >= 1) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 曝光上限档：自动（陀螺仪运动预算）/ 固定值（跳过运动限制，仍记录 blurPx）。
-            // Filmix 同机用 ISO166+1/4s 拍出远超我们的暗部纹理，而"陀螺仪 × 时间"模型
-            // 未计 OIS（实测实际像面位移仅机身转动的 0.71）⇒ 实证 > 模型，由用户试上限。
-            var expMaxMs by rememberSaveable { mutableStateOf(prefs.getInt("exp_max_ms", 0)) }
-            val expCapOpts = listOf(0, 100, 250, 500)
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val i = (expCapOpts.indexOf(expMaxMs).coerceAtLeast(0) + 1) % expCapOpts.size
-                        expMaxMs = expCapOpts[i]
-                        prefs.edit().putInt("exp_max_ms", expMaxMs).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.exp_max_ms",
-                            "{\"ms\":$expMaxMs}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("长曝光上限", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "自动 = 按陀螺仪运动预算（纹理代价 <5%）；固定值 = 跳过运动限制，" +
-                            "直接试 Filmix 同款 1/4s（日志 blurPx 仍记录预估帧内模糊）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (expMaxMs == 0) "自动" else "${expMaxMs}ms",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
-            // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
-            var mfnrDft by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("mfnr_dft", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        mfnrDft = !mfnrDft
-                        prefs.edit().putBoolean("mfnr_dft", mfnrDft).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.mfnr_dft",
-                            "{\"on\":$mfnrDft}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("频域合并（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "HDR+ 式 DFT 逐频收缩（16×16 tile 半重叠，暗光 σ 更优）；" +
-                            "关 = mismatch 加权融合",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (mfnrDft) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 对齐精度 A/B（D-2 专项，2026-09-30）：最细对齐层 1/2 域（新）vs
-            // 1/4 域（旧）。同一场景切换各拍一张即可对比；日志 alignL1 = 3(新)/0(旧)。
-            var alignL1 by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("align_l1", true))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        alignL1 = !alignL1
-                        prefs.edit().putBoolean("align_l1", alignL1).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.align_l1",
-                            "{\"on\":$alignL1}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("对齐精度（A/B 对比）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "开 = 高精度对齐（新，中光更少错位，拍照慢约 40%）；" +
-                            "关 = 旧版行为。日志 alignL1：3 = 新 / 0 = 旧",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (alignL1) "高精度" else "旧版",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // P0 亚像素采样（D-2 杠杆 B，v0.10.75）：时域样本不再 round 到偶数
-            var p0Sub by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("p0_sub", true))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        p0Sub = !p0Sub
-                        prefs.edit().putBoolean("p0_sub", p0Sub).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.p0_sub",
-                            "{\"on\":$p0Sub}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("P0 亚像素采样", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "开 = 时域样本按亚像素取（更准，GPU 采样成本 ×4）；" +
-                            "关 = 旧版按 2 像素网格取整",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (p0Sub) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 同帧 A/B 诊断（v0.10.74）：同一帧数据再跑一遍旧层对齐 + P0，
-            // 两组降噪倍数写进同一条 raw.render —— 唯一无混杂的 A/B 口径。
-            var alignAb by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("align_ab", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        alignAb = !alignAb
-                        prefs.edit().putBoolean("align_ab", alignAb).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.align_ab",
-                            "{\"on\":$alignAb}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("对齐 A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "开 = 每张照片额外算一遍旧版对齐，日志里同时给出两层的降噪" +
-                            "倍数（abNzPostMed / abP0w）；拍照慢约 0.3 秒",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (alignAb) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 拍照独立渲染线程（v0.10.85）：合成链 1.6~3.4s 原来跑在预览渲染线程上，
-            // 预览的 updateTexImage 全排在它后面 → "拍完挪手机画面完全冻住 1~2 秒"。
-            // 开 = 独立线程 + 独立 EGL context（PhotonCamera 同构）；默认关 = 旧行为。
-            var stillThread by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("still_thread", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        stillThread = !stillThread
-                        prefs.edit().putBoolean("still_thread", stillThread).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.still_thread",
-                            "{\"on\":$stillThread}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("拍照独立渲染线程", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "开 = 多帧合成走独立线程/上下文，拍完预览不再冻住 1~2 秒" +
-                            "（首张多付一次引擎初始化）；关 = 旧行为（拍照期间预览停更）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (stillThread) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // NN 降噪（v0.10.102）：PMRID 接拍照链（融合后 RAW 域、去马赛克前），
-            // 成功时替代 P0 空域降噪；推理失败自动回退原链。默认关（架构改动默认关）。
-            var nnDn by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("nn_dn", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        nnDn = !nnDn
-                        prefs.edit().putBoolean("nn_dn", nnDn).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.nn_dn",
-                            "{\"on\":$nnDn}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("NN 降噪（实验）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "开 = 神经网络降噪（PMRID）替代空域降噪，GPU 约 +0.7s/张；" +
-                            "失败自动回退原链。与拍照独立线程同用效果最佳",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (nnDn) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 同帧 A/B（v0.10.85 诊断）：同一帧数据先走拍照线程、再走预览线程，
-            // 比较两遍输出的 CRC32 与采样均值 —— 验证"换路径不改画质"。
-            var stillAb by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("still_ab", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        stillAb = !stillAb
-                        prefs.edit().putBoolean("still_ab", stillAb).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.still_ab",
-                            "{\"on\":$stillAb}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("独立线程 A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "仅在上面的开关打开时生效：每张照片额外在预览线程算一遍，" +
-                            "日志 render.still_ab 给出两遍的 CRC32/均值；拍照慢约 1.6 秒",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (stillAb) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // NN 同帧 A/B（v0.10.102，诊断）：同一帧数据跑两遍（NN off → on），
-            // 两张成片都落盘供离线对比 —— 唯一无混杂的 NN 质量口径。
-            var nnAb by rememberSaveable {
-                mutableStateOf(prefs.getBoolean("nn_ab", false))
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        nnAb = !nnAb
-                        prefs.edit().putBoolean("nn_ab", nnAb).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.nn_ab",
-                            "{\"on\":$nnAb}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("NN A/B 诊断（同帧对比）", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "仅在 NN 降噪与独立线程都打开时生效：每张照片先跑基线再跑 " +
-                            "NN，两张成片都落盘（先基线后 NN）；拍照慢约一倍",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (nnAb) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            // 噪声模型来源（C 专项，2026-09-29；用户需求：PC 式可导入/可切换）
-            //   自动 = Camera2 SENSOR_NOISE_PROFILE（默认）；或选择导入的 GCam .c
-            //   标定（filesDir/noise_models/，按 ISO 求值）。作用于 P0/P4 降噪与
-            //   MFNR mismatch 的噪声底；选择立即对后续拍照生效。
-            var nmSel by rememberSaveable {
-                mutableStateOf(
-                    prefs.getString("noise_model_src", NoiseCalibStore.AUTO)
-                        ?: NoiseCalibStore.AUTO,
-                )
-            }
-            var nmDialog by remember { mutableStateOf(false) }
-            var nmList by remember { mutableStateOf(NoiseCalibStore.list(context)) }
-            val nmImport = androidx.activity.compose.rememberLauncherForActivityResult(
-                androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
-            ) { uri ->
-                if (uri != null) {
-                    val nm = NoiseCalibStore.importFrom(context, uri, uri.lastPathSegment)
-                    if (nm != null) {
-                        nmSel = nm
-                        prefs.edit().putString("noise_model_src", nm).apply()
-                        nmList = NoiseCalibStore.list(context)
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
-                            "{\"src\":\"$nm\",\"act\":\"import\"}",
-                        )
-                    } else {
-                        android.widget.Toast.makeText(
-                            context, "导入失败：不是有效的 GCam 噪声标定文件（.c）",
-                            android.widget.Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                }
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        nmList = NoiseCalibStore.list(context)
-                        nmDialog = true
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("噪声模型", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "降噪与 MFNR 的噪声底来源：自动 = 相机 HAL 标定；可导入 GCam " +
-                            "标定文件（.c）按 ISO 生效",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (nmSel == NoiseCalibStore.AUTO) "自动" else nmSel.removeSuffix(".c"),
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            if (nmDialog) {
-                androidx.compose.material3.AlertDialog(
-                    onDismissRequest = { nmDialog = false },
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-                    confirmButton = {
-                        androidx.compose.material3.TextButton(onClick = { nmDialog = false }) {
-                            Text("关闭", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
-                        }
-                    },
-                    title = { Text("噪声模型", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
-                    text = {
-                        Column(Modifier.verticalScroll(rememberScrollState())) {
-                            val pick: (String) -> Unit = { id ->
-                                nmSel = id
-                                prefs.edit().putString("noise_model_src", id).apply()
-                                EngineBridge.nativeAppendLog(
-                                    EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
-                                    "{\"src\":\"$id\",\"act\":\"select\"}",
-                                )
-                                nmDialog = false
-                            }
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clickable { pick(NoiseCalibStore.AUTO) }
-                                    .padding(vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    "自动（相机标定）",
-                                    color = FilmTheme.Cream,
-                                    fontSize = 14.sp,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                if (nmSel == NoiseCalibStore.AUTO) {
-                                    Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
-                                }
-                            }
-                            nmList.forEach { cal ->
-                                Row(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .clickable { pick(cal.id) }
-                                        .padding(vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text(
-                                        cal.name,
-                                        color = FilmTheme.Cream,
-                                        fontSize = 14.sp,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    if (nmSel == cal.id) {
-                                        Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
-                                    }
-                                    Text(
-                                        "删除",
-                                        color = FilmTheme.CreamDim,
-                                        fontSize = 11.sp,
-                                        fontFamily = FilmTheme.Mono,
-                                        modifier = Modifier
-                                            .clickable {
-                                                NoiseCalibStore.delete(context, cal.id)
-                                                if (nmSel == cal.id) {
-                                                    nmSel = NoiseCalibStore.AUTO
-                                                    prefs.edit()
-                                                        .putString(
-                                                            "noise_model_src",
-                                                            NoiseCalibStore.AUTO,
-                                                        )
-                                                        .apply()
-                                                }
-                                                nmList = NoiseCalibStore.list(context)
-                                            }
-                                            .padding(start = 12.dp),
-                                    )
-                                }
-                            }
-                            HorizontalDivider(color = FilmTheme.ChipBorder)
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clickable { nmImport.launch(arrayOf("*/*")) }
-                                    .padding(vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    "+ 导入 .c 标定文件",
-                                    color = FilmTheme.Accent,
-                                    fontSize = 14.sp,
-                                    fontFamily = FilmTheme.Mono,
-                                )
-                            }
-                            Text(
-                                "文件为 GCam 噪声标定格式（noise_model_A/B/C/D 四数组）；" +
-                                    "可从相机社区获取或自行标定生成",
-                                color = FilmTheme.CreamDim,
-                                fontSize = 10.sp,
-                                style = MaterialTheme.typography.labelSmall,
-                            )
-                        }
-                    },
-                    containerColor = FilmTheme.Panel,
-                )
-            }
-            // 轻度锐化（v0.9.6）：OETF 前线性显示域 luma USM，补 MFNR 后观感细节。
-            // 关 = A/B 通路（同场景对照归因）。
-            var sharpenOn by rememberSaveable { mutableStateOf(prefs.getBoolean("sharpen", true)) }
-            SettingSwitchRow(
-                title = "轻度锐化",
-                subtitle = "线性显示域 luma USM（OETF 前，暗部噪声不放大），补观感细节；关 = 同场景 A/B 对照",
-                checked = sharpenOn,
-                onChecked = { v ->
-                    sharpenOn = v
-                    prefs.edit().putBoolean("sharpen", v).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.sharpen",
-                        "{\"on\":$v}",
-                    )
-                },
-            )
-            // 色域映射（v0.10.13，v0.10.14 修正）：治色域外/病态像素的越界色
-            // （高光偏色、过饱和过冲）——域内像素零改动。关 = A/B 通路。
-            var gamutOn by rememberSaveable { mutableStateOf(prefs.getBoolean("gamut", true)) }
-            SettingSwitchRow(
-                title = "色域映射",
-                subtitle = "filmic 色彩收尾：sRGB 色域内映射（治高光偏色/过饱和），域内像素不动；关 = 同场景 A/B 对照",
-                checked = gamutOn,
-                onChecked = { v ->
-                    gamutOn = v
-                    prefs.edit().putBoolean("gamut", v).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.gamut",
-                        "{\"on\":$v}",
-                    )
-                },
-            )
-            // 高光重建·小波（v0.10.15）：darktable filmic 原生高光重建（à trous 小波，
-            // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
-            var hrWaveletOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hr_wavelet", true)) }
-            SettingSwitchRow(
-                title = "高光重建·小波",
-                subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；关 = 同场景 A/B 对照",
-                checked = hrWaveletOn,
-                onChecked = { v ->
-                    hrWaveletOn = v
-                    prefs.edit().putBoolean("hr_wavelet", v).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.hr_wavelet",
-                        "{\"on\":$v}",
-                    )
-                },
-            )
-            // RAW 域高光重建（v0.10.115）：darktable highlights 模块 "inpaint opposed"
-            // —— 去马赛克**前**在 3×3 photosite 块上对被裁剪通道做对立外推 + 全图
-            // 色度校正。补"小波"够不到的一环（film 域修不了 RAW 饱和丢掉的通道信息）。
-            var hrRawOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
-            SettingSwitchRow(
-                title = "高光重建·RAW 域",
-                subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
-                checked = hrRawOn,
-                onChecked = { v ->
-                    hrRawOn = v
-                    prefs.edit().putBoolean("hr_raw", v).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.hr_raw",
-                        "{\"on\":$v}",
-                    )
-                },
-            )
-            // RCD 色差段回归原版（v0.10.117）：darktable/RawTherapee 的 RCD 在
-            // 色差段靠**梯度反比加权**实现边缘感知；我们此前额外加的 clamp 会把
-            // 跨边界邻居的色差锁进允许区间 ⇒ 红色扩散进白瓷/过曝区。
-            var rcdCdFixOn by rememberSaveable { mutableStateOf(prefs.getBoolean("rcd_cdfix", true)) }
-            SettingSwitchRow(
-                title = "去马赛克·色差原版",
-                subtitle = "RCD 色差段回归 RawTherapee 原版（梯度三项 + 无限幅），治红白边界与过曝区的彩色块；关 = 复现旧行为 A/B",
-                checked = rcdCdFixOn,
-                onChecked = { v ->
-                    rcdCdFixOn = v
-                    prefs.edit().putBoolean("rcd_cdfix", v).apply()
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.rcd_cdfix",
-                        "{\"on\":$v}",
-                    )
-                },
-            )
             SettingSwitchRow(
                 title = "长按焦段轮盘变焦",
                 subtitle = "长按变焦刻度弹出轮盘（含原生焦段刻度，上限 6 个），上下拖动变焦",
@@ -1138,87 +147,33 @@ fun SettingsScreen(
                     )
                 },
             )
-            var yuv709 by rememberSaveable { mutableStateOf(prefs.getBoolean("yuv_709", false)) }
+            var lutInName by rememberSaveable { mutableStateOf(prefs.getBoolean("lut_in_name", true)) }
             SettingSwitchRow(
-                title = "静拍 YUV 解码 BT.709",
-                subtitle = "2026-09-20 实拍 A/B 定量：两种矩阵暗部 R/G 仅差 0.001，已确认 601 正确；此开关保留供未来机型复查（改动下次进入相机生效）",
-                checked = yuv709,
+                title = "LUT 名写入文件名",
+                subtitle = "成片名追加 _<LUT 名>（如 …_理光正片.jpg）；未选 LUT 时不加",
+                checked = lutInName,
                 onChecked = { v ->
-                    yuv709 = v
-                    prefs.edit().putBoolean("yuv_709", v).apply()
-                    EngineBridge.nativeEngineSetYuvMatrix(if (v) 1 else 0)
+                    lutInName = v
+                    prefs.edit().putBoolean("lut_in_name", v).apply()
                     EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "app", "settings.yuv709",
+                        EngineBridge.LEVEL_INFO, "app", "settings.lut_in_name",
                         "{\"on\":$v}",
                     )
                 },
             )
-            var jpegQ by rememberSaveable { mutableStateOf(prefs.getInt("jpeg_quality", 100)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = if (jpegQ >= 100) 95 else 100
-                        jpegQ = v
-                        prefs.edit().putInt("jpeg_quality", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.jpeg_quality",
-                            "{\"q\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("成像质量", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "95 = 标准；100 = 极高（文件体积约为 2–3 倍）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    "$jpegQ",
-                    color = FilmTheme.Accent,
-                    fontSize = 15.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
 
-            var lutInName by rememberSaveable { mutableStateOf(prefs.getBoolean("lut_in_name", true)) }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        val v = !lutInName
-                        lutInName = v
-                        prefs.edit().putBoolean("lut_in_name", v).apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.lut_in_name",
-                            "{\"on\":$v}",
-                        )
-                    }
-                    .padding(vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("LUT 名写入文件名", color = FilmTheme.Cream, fontSize = 14.sp)
-                    Text(
-                        "成片名追加 _<LUT 名>（如 …_理光正片.jpg）；未选 LUT 时不加",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-                Text(
-                    if (lutInName) "开" else "关",
-                    color = FilmTheme.Accent,
-                    fontSize = 13.sp,
-                    fontFamily = FilmTheme.Mono,
-                    fontWeight = FontWeight.SemiBold,
-                )
+            SectionHeader("成像")
+            SettingNavRow("画质", "去马赛克 · 多帧融合 · 降噪 · 噪声模型 · 镜头校正 · 锐化") {
+                qualityOpen = true
+            }
+            SettingNavRow("影调与色彩", "基准影调 · 曝光基准 · 黑白点 · 色彩链 · 色域 · 高光重建") {
+                toneOpen = true
+            }
+            SettingNavRow("暗光与曝光", "长曝光进光 · 曝光上限 · 高光保护") {
+                lowlightOpen = true
+            }
+            SettingNavRow("实验与诊断", "频域合并 · 对齐精度 · 亚像素 · 独立线程 · A/B 开关") {
+                labOpen = true
             }
 
             Spacer(Modifier.height(12.dp))
@@ -1248,6 +203,693 @@ fun SettingsScreen(
                 fontSize = 11.sp,
                 modifier = Modifier.padding(bottom = 24.dp),
             )
+        }
+        }
+
+        SettingsDrawer(visible = qualityOpen, title = "画质", onDismiss = { qualityOpen = false }) {
+            QualityDrawerContent()
+        }
+        SettingsDrawer(visible = toneOpen, title = "影调与色彩", onDismiss = { toneOpen = false }) {
+            ToneColorDrawerContent()
+        }
+        SettingsDrawer(visible = lowlightOpen, title = "暗光与曝光", onDismiss = { lowlightOpen = false }) {
+            LowLightDrawerContent()
+        }
+        SettingsDrawer(visible = labOpen, title = "实验与诊断", onDismiss = { labOpen = false }) {
+            LabDrawerContent()
+        }
+    }
+}
+
+/** 抽屉内容：画质（去马赛克档 / 多帧融合 / 降噪 / 噪声模型 / LSC / 锐化） */
+@Composable
+private fun QualityDrawerContent() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    var rcdOn by remember { mutableStateOf(prefs.getBoolean("demosaic_quality", true)) }
+    SettingValueRow(
+        title = "RAW 去马赛克",
+        subtitle = "RCD 质量 = 方向自适应+色比修正，边缘伪彩少；快速 = bilinear，最快。仅影响 M 档成片",
+        valueText = if (rcdOn) "RCD 质量" else "快速",
+        onTap = {
+            val v = !rcdOn
+            rcdOn = v
+            prefs.edit().putBoolean("demosaic_quality", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.demosaic_quality",
+                "{\"rcd\":$v}",
+            )
+        },
+    )
+    var mfnrMode by remember { mutableStateOf(prefs.getInt("mfnr", 1)) }
+    SettingValueRow(
+        title = "多帧融合",
+        subtitle = "暗光连拍 4 帧对齐合成降噪（彩噪 √4 根治）；仅 M 档 RAW + RCD 质量档生效。「开」= 每次都连拍",
+        valueText = when (mfnrMode) {
+            0 -> "关"
+            1 -> "自动"
+            else -> "开"
+        },
+        onTap = {
+            val v = (mfnrMode + 1) % 3
+            mfnrMode = v
+            prefs.edit().putInt("mfnr", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.mfnr",
+                "{\"mode\":$v}",
+            )
+        },
+    )
+    // RAW 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01）——
+    // 0 = 关、1 = 真实噪声 σ（标准做法）、2 = 2×σ。作用于 P0/P4 的逐像素
+    // 值域 σ（噪声模型 σ²=A·x+B，逐通道）；写入时同步旧 keys 供回退读取。
+    var dnStr by remember {
+        mutableStateOf(
+            CameraController.denoiseStrength(
+                prefs.contains("noise_reduction_strength"),
+                prefs.getFloat("noise_reduction_strength", 1f),
+                prefs.getBoolean("noise_reduction", true),
+                prefs.getInt("noise_reduction_level", 1),
+            ),
+        )
+    }
+    SliderRow(
+        label = "RAW 降噪",
+        desc = "RAW 域双边 + 色度平滑，σ 由噪声模型逐像素给出；0 = 关、1 = 真实 σ、2 = 2×σ。仅 RCD 质量档生效",
+        initial = dnStr,
+        range = 0f..2f,
+        steps = 199,
+        valueText = { "%.2f".format(it) },
+    ) { v ->
+        dnStr = v
+        prefs.edit()
+            .putFloat("noise_reduction_strength", v)
+            .putBoolean("noise_reduction", v > 0f)
+            .putInt(
+                "noise_reduction_level",
+                if (v <= 0f) 0 else if (v <= 1.5f) 1 else 2,
+            )
+            .apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.noise_reduction",
+            "{\"strength\":\"%.2f\"}".format(v),
+        )
+    }
+    NoiseModelRow()
+
+    var lscOn by remember { mutableStateOf(prefs.getBoolean("lsc", true)) }
+    SettingSwitchRow(
+        title = "镜头阴影校正",
+        subtitle = "HAL 增益网格消暗角与角落色偏（RAW 链、CCM 前，17×13 手写双线性）；关 = 同机位 A/B 对照",
+        checked = lscOn,
+        onChecked = { v ->
+            lscOn = v
+            prefs.edit().putBoolean("lsc", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.lsc",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    var sharpenOn by remember { mutableStateOf(prefs.getBoolean("sharpen", true)) }
+    SettingSwitchRow(
+        title = "轻度锐化",
+        subtitle = "线性显示域 luma USM（OETF 前，暗部噪声不放大），补观感细节；关 = 同场景 A/B 对照",
+        checked = sharpenOn,
+        onChecked = { v ->
+            sharpenOn = v
+            prefs.edit().putBoolean("sharpen", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.sharpen",
+                "{\"on\":$v}",
+            )
+        },
+    )
+}
+
+/** 抽屉内容：影调与色彩（基准影调 / 曝光基准 / 饱和 / 黑白点 / 局部色调 / 色彩链 / 色域 / 高光重建） */
+@Composable
+private fun ToneColorDrawerContent() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    var toneOn by remember { mutableStateOf(prefs.getBoolean("base_tone", true)) }
+    SettingSwitchRow(
+        title = "基准影调",
+        subtitle = "黑位 + 中间调 S + 高光 rolloff（治发灰）；关 = 旧行为（恒等，无影调工程）。预览与成片同步",
+        checked = toneOn,
+        onChecked = { on ->
+            toneOn = on
+            prefs.edit().putBoolean("base_tone", on).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.base_tone",
+                "{\"on\":$on}",
+            )
+        },
+    )
+    // ── 基准曝光（v0.8.1）：机型 AE 基准差的校准常量 ─────────────────────────
+    // 与 Lightroom/DNG 的 BaselineExposure 同语义。X300 对同场景参照渲染
+    // 净差 +0.57 EV（v0.10.25 同 DNG 双渲染实测标定），默认 +0.7。
+    // 用户 EV 滑杆叠加在其上（[0] = base + user），对齐参照后滑杆可归零。
+    SliderRow(
+        label = "基准曝光",
+        desc = "校正机型自动曝光的基准差：成片整体偏暗拖右、偏亮拖左。对齐同场景参照后，EV 滑杆归零即可",
+        initial = prefs.getFloat("base_ev", 0.7f),
+        range = -2f..2f,
+        steps = 0,
+        valueText = { "%+.2f EV".format(it) },
+    ) { v ->
+        prefs.edit().putFloat("base_ev", v).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
+        )
+    }
+    // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
+    // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
+    // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
+    // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
+    SliderRow(
+        label = "饱和补偿",
+        desc = "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。对照同场景样张调到灰感消失，定值后回传",
+        initial = prefs.getFloat("sat_comp", 0f),
+        range = 0f..0.30f,
+        steps = 0,
+        valueText = { "+%d%%".format((it * 100).toInt()) },
+    ) { v ->
+        val snap = (v * 100).toInt() / 100f
+        prefs.edit().putFloat("sat_comp", snap).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.sat_comp", "{\"v\":$snap}",
+        )
+    }
+    // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
+    // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
+    // "配置项"而不是需要标定的数值。默认 −8.0/+4.0 = darktable filmic 出厂默认
+    // （= v0.10.113 起标准模式的固定值；v0.10.118 起滑杆恢复生效，默认值不变）。
+    SliderRow(
+        label = "黑点（多暗算黑）",
+        desc = "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
+        initial = prefs.getFloat("filmic_black_ev", -8.0f),
+        range = -12f..-1f,
+        steps = 0,
+        valueText = { "%+.2f EV".format(it) },
+    ) { v ->
+        prefs.edit().putFloat("filmic_black_ev", v).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.filmic_black_ev", "{\"v\":$v}",
+        )
+    }
+    SliderRow(
+        label = "白点（多亮算白）",
+        desc = "拖右 = 白点更远 ⇒ 影调曲线更平、噪声更不明显（真机 6.2 时红釉白点消失），代价是对比降低、画面更柔",
+        initial = prefs.getFloat("filmic_white_ev", 4.0f),
+        range = 1f..8f,
+        steps = 0,
+        valueText = { "%+.2f EV".format(it) },
+    ) { v ->
+        prefs.edit().putFloat("filmic_white_ev", v).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.filmic_white_ev", "{\"v\":$v}",
+        )
+    }
+    var localToneOn by remember { mutableStateOf(prefs.getBoolean("local_tone", true)) }
+    SettingSwitchRow(
+        title = "局部色调映射",
+        subtitle = "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",
+        checked = localToneOn,
+        onChecked = { on ->
+            localToneOn = on
+            prefs.edit().putBoolean("local_tone", on).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.local_tone",
+                "{\"on\":$on}",
+            )
+        },
+    )
+    // v0.7.9：「色彩外观层」设置项已删除 —— 该层（M3 P1 治"寡淡"）在 filmic 链下
+    // 恒等（v0.7.7 起 look_sat/look_chroma = 1.0，`1+(c-1)*sk` ≡ 1），开关只控制
+    // 一个空操作，还占设置页心智。FilmParams[31..33] 槽位保留（契约不移位）。
+    // M3 P2 DNG 标准色彩链（§3.2-7 / §3.4-4）：用 characteristics 的标定矩阵
+    // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB）自建 camera→sRGB，
+    // 替代 HAL 的 COLOR_CORRECTION_TRANSFORM；关 = 用 HAL 的做同机位 A/B。
+    var stdCcmOn by remember { mutableStateOf(prefs.getBoolean("ccm_std", true)) }
+    SettingSwitchRow(
+        title = "DNG 标准色彩链",
+        subtitle = "用相机标定矩阵自建色彩链（与 Adobe/libraw 完整链同源，标定数据缺失自动回退）；关 = 用 HAL 矩阵做 A/B",
+        checked = stdCcmOn,
+        onChecked = { v ->
+            stdCcmOn = v
+            prefs.edit().putBoolean("ccm_std", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.ccm_std",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    var gamutOn by remember { mutableStateOf(prefs.getBoolean("gamut", true)) }
+    SettingSwitchRow(
+        title = "色域映射",
+        subtitle = "filmic 色彩收尾：sRGB 色域内映射（治高光偏色/过饱和），域内像素不动；关 = 同场景 A/B 对照",
+        checked = gamutOn,
+        onChecked = { v ->
+            gamutOn = v
+            prefs.edit().putBoolean("gamut", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.gamut",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 高光重建·小波（v0.10.15）：darktable filmic 原生高光重建（à trous 小波，
+    // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
+    var hrWaveletOn by remember { mutableStateOf(prefs.getBoolean("hr_wavelet", true)) }
+    SettingSwitchRow(
+        title = "高光重建·小波",
+        subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；关 = 同场景 A/B 对照",
+        checked = hrWaveletOn,
+        onChecked = { v ->
+            hrWaveletOn = v
+            prefs.edit().putBoolean("hr_wavelet", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hr_wavelet",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // RAW 域高光重建（v0.10.115）：darktable highlights 模块 "inpaint opposed"
+    // —— 去马赛克**前**在 3×3 photosite 块上对被裁剪通道做对立外推 + 全图
+    // 色度校正。补"小波"够不到的一环（film 域修不了 RAW 饱和丢掉的通道信息）。
+    var hrRawOn by remember { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
+    SettingSwitchRow(
+        title = "高光重建·RAW 域",
+        subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
+        checked = hrRawOn,
+        onChecked = { v ->
+            hrRawOn = v
+            prefs.edit().putBoolean("hr_raw", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hr_raw",
+                "{\"on\":$v}",
+            )
+        },
+    )
+}
+
+/** 抽屉内容：暗光与曝光（长曝光进光 / 上限 / 高光保护） */
+@Composable
+private fun LowLightDrawerContent() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    // 曝光决策专项（v0.10.107）：长曝光进光 —— 曝光 ×N + ISO ÷N（亮度与
+    // 高光裁切不变，纯赚 SNR；离线实测收益 = √N）。上限由陀螺仪 motion
+    // metering 的运动预算 + ISO 下限 + 快门范围共同决定。
+    var expPlanOn by remember { mutableStateOf(prefs.getInt("exp_plan", 1)) }
+    SettingSwitchRow(
+        title = "长曝光进光",
+        subtitle = "暗光按陀螺仪运动量拉长曝光（≤250ms）并等比降 ISO：亮度与高光裁切不变、噪声按 √N 下降（N=6.5 → 2.5×）；仅 M 档 RAW + 多帧融合触发时生效",
+        checked = expPlanOn >= 1,
+        onChecked = { on ->
+            val v = if (on) 1 else 0
+            expPlanOn = v
+            prefs.edit().putInt("exp_plan", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.exp_plan",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 曝光上限档：自动（陀螺仪运动预算）/ 固定值（跳过运动限制，仍记录 blurPx）。
+    // Filmix 同机用 ISO166+1/4s 拍出远超我们的暗部纹理，而"陀螺仪 × 时间"模型
+    // 未计 OIS（实测实际像面位移仅机身转动的 0.71）⇒ 实证 > 模型，由用户试上限。
+    var expMaxMs by remember { mutableStateOf(prefs.getInt("exp_max_ms", 0)) }
+    val expCapOpts = listOf(0, 100, 250, 500)
+    SettingValueRow(
+        title = "长曝光上限",
+        subtitle = "自动 = 按陀螺仪运动预算（纹理代价 <5%）；固定值 = 跳过运动限制，直接试 Filmix 同款 1/4s（日志 blurPx 仍记录预估帧内模糊）",
+        valueText = if (expMaxMs == 0) "自动" else "${expMaxMs}ms",
+        onTap = {
+            val i = (expCapOpts.indexOf(expMaxMs).coerceAtLeast(0) + 1) % expCapOpts.size
+            expMaxMs = expCapOpts[i]
+            prefs.edit().putInt("exp_max_ms", expMaxMs).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.exp_max_ms",
+                "{\"ms\":$expMaxMs}",
+            )
+        },
+    )
+    // 高光保护（v0.10.110）：曝光的第一目标是"**刚好不烧高光**"（HDR+ §4 原文
+    // "set this exposure low enough to avoid blowing out highlights"），不是
+    // "画面亮度达标"——亮度是后处理提亮的事，前提是 RAW 里还留着余量。
+    var hlProtect by remember { mutableStateOf(prefs.getInt("hl_protect", 1)) }
+    SettingSwitchRow(
+        title = "高光保护",
+        subtitle = "先看高光余量再决定曝光：场景高光（P99.9）加上将要施加的提亮会撞 RAW 白点时自动欠曝（只缩曝光时间、不抬 ISO），避免高光被压平成死白、LUT 在死白上染色；代价是暗部光子略少（由多帧补）",
+        checked = hlProtect >= 1,
+        onChecked = { on ->
+            val v = if (on) 1 else 0
+            hlProtect = v
+            prefs.edit().putInt("hl_protect", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hl_protect",
+                "{\"on\":$v}",
+            )
+        },
+    )
+}
+
+/** 抽屉内容：实验与诊断（A/B 与专项实验开关，日常拍摄不动） */
+@Composable
+private fun LabDrawerContent() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
+    // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。
+    var mfnrDft by remember { mutableStateOf(prefs.getBoolean("mfnr_dft", false)) }
+    SettingSwitchRow(
+        title = "频域合并（实验）",
+        subtitle = "HDR+ 式 DFT 逐频收缩（16×16 tile 半重叠，暗光 σ 更优）；关 = mismatch 加权融合",
+        checked = mfnrDft,
+        onChecked = { v ->
+            mfnrDft = v
+            prefs.edit().putBoolean("mfnr_dft", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.mfnr_dft",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 对齐精度 A/B（D-2 专项，2026-09-30）：最细对齐层 1/2 域（新）vs
+    // 1/4 域（旧）。同一场景切换各拍一张即可对比；日志 alignL1 = 3(新)/0(旧)。
+    var alignL1 by remember { mutableStateOf(prefs.getBoolean("align_l1", true)) }
+    SettingSwitchRow(
+        title = "对齐精度（A/B 对比）",
+        subtitle = "开 = 高精度对齐（新，中光更少错位，拍照慢约 40%）；关 = 旧版行为。日志 alignL1：3 = 新 / 0 = 旧",
+        checked = alignL1,
+        onChecked = { v ->
+            alignL1 = v
+            prefs.edit().putBoolean("align_l1", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.align_l1",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // P0 亚像素采样（D-2 杠杆 B，v0.10.75）：时域样本不再 round 到偶数
+    var p0Sub by remember { mutableStateOf(prefs.getBoolean("p0_sub", true)) }
+    SettingSwitchRow(
+        title = "P0 亚像素采样",
+        subtitle = "开 = 时域样本按亚像素取（更准，GPU 采样成本 ×4）；关 = 旧版按 2 像素网格取整",
+        checked = p0Sub,
+        onChecked = { v ->
+            p0Sub = v
+            prefs.edit().putBoolean("p0_sub", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.p0_sub",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 同帧 A/B 诊断（v0.10.74）：同一帧数据再跑一遍旧层对齐 + P0，
+    // 两组降噪倍数写进同一条 raw.render —— 唯一无混杂的 A/B 口径。
+    var alignAb by remember { mutableStateOf(prefs.getBoolean("align_ab", false)) }
+    SettingSwitchRow(
+        title = "对齐 A/B 诊断（同帧对比）",
+        subtitle = "开 = 每张照片额外算一遍旧版对齐，日志里同时给出两层的降噪倍数（abNzPostMed / abP0w）；拍照慢约 0.3 秒",
+        checked = alignAb,
+        onChecked = { v ->
+            alignAb = v
+            prefs.edit().putBoolean("align_ab", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.align_ab",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // RCD 色差段回归原版（v0.10.117）：darktable/RawTherapee 的 RCD 在
+    // 色差段靠**梯度反比加权**实现边缘感知；我们此前额外加的 clamp 会把
+    // 跨边界邻居的色差锁进允许区间 ⇒ 红色扩散进白瓷/过曝区。
+    var rcdCdFixOn by remember { mutableStateOf(prefs.getBoolean("rcd_cdfix", true)) }
+    SettingSwitchRow(
+        title = "去马赛克·色差原版",
+        subtitle = "RCD 色差段回归 RawTherapee 原版（梯度三项 + 无限幅），治红白边界与过曝区的彩色块；关 = 复现旧行为 A/B",
+        checked = rcdCdFixOn,
+        onChecked = { v ->
+            rcdCdFixOn = v
+            prefs.edit().putBoolean("rcd_cdfix", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.rcd_cdfix",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 拍照独立渲染线程（v0.10.85）：合成链 1.6~3.4s 原来跑在预览渲染线程上，
+    // 预览的 updateTexImage 全排在它后面 → "拍完挪手机画面完全冻住 1~2 秒"。
+    // 开 = 独立线程 + 独立 EGL context（PhotonCamera 同构）；默认关 = 旧行为。
+    var stillThread by remember { mutableStateOf(prefs.getBoolean("still_thread", false)) }
+    SettingSwitchRow(
+        title = "拍照独立渲染线程",
+        subtitle = "开 = 多帧合成走独立线程/上下文，拍完预览不再冻住 1~2 秒（首张多付一次引擎初始化）；关 = 旧行为（拍照期间预览停更）",
+        checked = stillThread,
+        onChecked = { v ->
+            stillThread = v
+            prefs.edit().putBoolean("still_thread", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.still_thread",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 同帧 A/B（v0.10.85 诊断）：同一帧数据先走拍照线程、再走预览线程，
+    // 比较两遍输出的 CRC32 与采样均值 —— 验证"换路径不改画质"。
+    var stillAb by remember { mutableStateOf(prefs.getBoolean("still_ab", false)) }
+    SettingSwitchRow(
+        title = "独立线程 A/B 诊断（同帧对比）",
+        subtitle = "仅在「拍照独立渲染线程」打开时生效：每张照片额外在预览线程算一遍，日志 render.still_ab 给出两遍的 CRC32/均值；拍照慢约 1.6 秒",
+        checked = stillAb,
+        onChecked = { v ->
+            stillAb = v
+            prefs.edit().putBoolean("still_ab", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.still_ab",
+                "{\"on\":$v}",
+            )
+        },
+    )
+}
+
+/** 噪声模型行 + 选择/导入对话框（C 专项，2026-09-29；用户需求：PC 式可导入/可切换） */
+@Composable
+private fun NoiseModelRow() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+    var nmSel by remember {
+        mutableStateOf(
+            prefs.getString("noise_model_src", NoiseCalibStore.AUTO)
+                ?: NoiseCalibStore.AUTO,
+        )
+    }
+    var nmDialog by remember { mutableStateOf(false) }
+    var nmList by remember { mutableStateOf(NoiseCalibStore.list(context)) }
+    val nmImport = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            val nm = NoiseCalibStore.importFrom(context, uri, uri.lastPathSegment)
+            if (nm != null) {
+                nmSel = nm
+                prefs.edit().putString("noise_model_src", nm).apply()
+                nmList = NoiseCalibStore.list(context)
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
+                    "{\"src\":\"$nm\",\"act\":\"import\"}",
+                )
+            } else {
+                android.widget.Toast.makeText(
+                    context, "导入失败：不是有效的 GCam 噪声标定文件（.c）",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+    SettingValueRow(
+        title = "噪声模型",
+        subtitle = "降噪与 MFNR 的噪声底来源：自动 = 相机 HAL 标定；可导入 GCam 标定文件（.c）按 ISO 生效",
+        valueText = if (nmSel == NoiseCalibStore.AUTO) "自动" else nmSel.removeSuffix(".c"),
+        onTap = {
+            nmList = NoiseCalibStore.list(context)
+            nmDialog = true
+        },
+    )
+    if (nmDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { nmDialog = false },
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = { nmDialog = false }) {
+                    Text("关闭", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+            title = { Text("噪声模型", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    val pick: (String) -> Unit = { id ->
+                        nmSel = id
+                        prefs.edit().putString("noise_model_src", id).apply()
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.noise_model",
+                            "{\"src\":\"$id\",\"act\":\"select\"}",
+                        )
+                        nmDialog = false
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { pick(NoiseCalibStore.AUTO) }
+                            .padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "自动（相机标定）",
+                            color = FilmTheme.Cream,
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (nmSel == NoiseCalibStore.AUTO) {
+                            Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
+                        }
+                    }
+                    nmList.forEach { cal ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { pick(cal.id) }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                cal.name,
+                                color = FilmTheme.Cream,
+                                fontSize = 14.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (nmSel == cal.id) {
+                                Text("✓", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
+                            }
+                            Text(
+                                "删除",
+                                color = FilmTheme.CreamDim,
+                                fontSize = 11.sp,
+                                fontFamily = FilmTheme.Mono,
+                                modifier = Modifier
+                                    .clickable {
+                                        NoiseCalibStore.delete(context, cal.id)
+                                        if (nmSel == cal.id) {
+                                            nmSel = NoiseCalibStore.AUTO
+                                            prefs.edit()
+                                                .putString(
+                                                    "noise_model_src",
+                                                    NoiseCalibStore.AUTO,
+                                                )
+                                                .apply()
+                                        }
+                                        nmList = NoiseCalibStore.list(context)
+                                    }
+                                    .padding(start = 12.dp),
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = FilmTheme.ChipBorder)
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { nmImport.launch(arrayOf("*/*")) }
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "+ 导入 .c 标定文件",
+                            color = FilmTheme.Accent,
+                            fontSize = 14.sp,
+                            fontFamily = FilmTheme.Mono,
+                        )
+                    }
+                    Text(
+                        "文件为 GCam 噪声标定格式（noise_model_A/B/C/D 四数组）；" +
+                            "可从相机社区获取或自行标定生成",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            },
+            containerColor = FilmTheme.Panel,
+        )
+    }
+}
+
+/**
+ * 设置抽屉(自绘底部面板):透明拦截层(点画面任意处收起)+ PanelSolid 面板,
+ * 出入场统一走 FilmMotion.panelEnter/panelExit;BackHandler 保证**一次返回直接关闭**
+ * ——此前用 M3 ModalBottomSheet,真机返回要按两次才关(用户 2026-10-03 实测),已弃用。
+ */
+@Composable
+private fun SettingsDrawer(
+    visible: Boolean,
+    title: String,
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    BackHandler(enabled = visible, onBack = onDismiss)
+    AnimatedVisibility(visible = visible, enter = FilmMotion.panelEnter, exit = FilmMotion.panelExit) {
+        val maxH = (LocalConfiguration.current.screenHeightDp * 0.78f).dp
+        Box(Modifier.fillMaxSize()) {
+            // 拦截层先绘制:点画面任意处收起(浮层规则)
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color(0x66000000))
+                    .pointerInput(Unit) { detectTapGestures { onDismiss() } },
+            )
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .heightIn(max = maxH)
+                    .background(FilmTheme.PanelSolid, RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                    .verticalScroll(rememberScrollState())
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {} // 吃掉面板内点击,不透传到拦截层
+                    .padding(horizontal = 20.dp),
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp, bottom = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        Modifier
+                            .size(width = 36.dp, height = 4.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(FilmTheme.ChipBorder),
+                    )
+                }
+                Text(
+                    title,
+                    color = FilmTheme.Cream,
+                    fontSize = 17.sp,
+                    fontFamily = FilmTheme.Serif,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(bottom = 2.dp),
+                )
+                content()
+                Spacer(Modifier.height(28.dp))
+            }
         }
     }
 }
@@ -1378,83 +1020,6 @@ private val AccentSwatches = listOf(
     "银盐灰" to Color(0xFFA8A8A0),
 )
 
-/** 区块标题：强调色等宽小字（全 App 统一） */
-@Composable
-private fun SectionHeader(text: String) {
-    Text(
-        text,
-        color = FilmTheme.Accent,
-        fontSize = 11.sp,
-        fontFamily = FilmTheme.Mono,
-        fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.padding(top = 14.dp, bottom = 6.dp),
-    )
-}
-
-/** 开关行：标题 + 次级说明 + 强调色开关 */
-@Composable
-private fun SettingSwitchRow(
-    title: String,
-    subtitle: String?,
-    checked: Boolean,
-    onChecked: (Boolean) -> Unit,
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
-            if (subtitle != null) {
-                Text(
-                    subtitle,
-                    color = FilmTheme.CreamDim,
-                    fontSize = 10.sp,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
-        }
-        Switch(
-            checked = checked,
-            onCheckedChange = onChecked,
-            colors = SwitchDefaults.colors(
-                checkedTrackColor = FilmTheme.Accent,
-                checkedThumbColor = FilmTheme.Cream,
-                uncheckedTrackColor = FilmTheme.ChipBg,
-                uncheckedThumbColor = FilmTheme.CreamDim,
-                uncheckedBorderColor = FilmTheme.ChipBorder,
-            ),
-        )
-    }
-}
-
-/** 导航行：标题 + 次级说明 + ›（进入子页 / 触发动作） */
-@Composable
-private fun SettingNavRow(title: String, subtitle: String?, onTap: () -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clickable { onTap() }
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
-            if (subtitle != null) {
-                Text(
-                    subtitle,
-                    color = FilmTheme.CreamDim,
-                    fontSize = 10.sp,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
-        }
-        Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
-    }
-}
-
 /** 自定义焦段子页：最多 3 个（20–120mm，步进 5），与原生焦段同显于变焦条（总 ≤6） */
 @Composable
 fun FocalScreen(onBack: () -> Unit = {}) {
@@ -1572,41 +1137,167 @@ fun FocalScreen(onBack: () -> Unit = {}) {
     }
 }
 
+/** 区块标题：强调色等宽小字（全 App 统一） */
+@Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text,
+        color = FilmTheme.Accent,
+        fontSize = 11.sp,
+        fontFamily = FilmTheme.Mono,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(top = 14.dp, bottom = 6.dp),
+    )
+}
+
+/** 开关行：标题 + 次级说明 + 强调色开关（切换带 CONTEXT_CLICK 触感） */
+@Composable
+private fun SettingSwitchRow(
+    title: String,
+    subtitle: String?,
+    checked: Boolean,
+    onChecked: (Boolean) -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = {
+                haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                onChecked(it)
+            },
+            colors = SwitchDefaults.colors(
+                checkedTrackColor = FilmTheme.Accent,
+                checkedThumbColor = FilmTheme.Cream,
+                uncheckedTrackColor = FilmTheme.ChipBg,
+                uncheckedThumbColor = FilmTheme.CreamDim,
+                uncheckedBorderColor = FilmTheme.ChipBorder,
+            ),
+        )
+    }
+}
+
+/** 数值行：标题 + 次级说明 + 强调色等宽值；点按切换/进入（带 CONTEXT_CLICK 触感） */
+@Composable
+private fun SettingValueRow(
+    title: String,
+    subtitle: String?,
+    valueText: String,
+    onTap: () -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable {
+                haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                onTap()
+            }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+        Text(
+            valueText,
+            color = FilmTheme.Accent,
+            fontSize = 13.sp,
+            fontFamily = FilmTheme.Mono,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+/** 导航行：标题 + 次级说明 + ›（进入子页 / 触发动作） */
+@Composable
+private fun SettingNavRow(title: String, subtitle: String?, onTap: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable { onTap() }
+            .padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+        Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
+    }
+}
+
 /**
- * 一行 EV 滑杆（v0.7.6）：用于 filmic 黑白点这类"物理量配置项"。
- * 拖动时只更新本地状态，**松手才提交**（避免每帧写 prefs）。
+ * 一行滑杆：拖动时只更新本地状态，**松手才提交**（避免每帧写 prefs）。
+ * valueText 把当前值渲染成右侧等宽读数（EV / 百分比 / 强度等各域自带格式）。
  */
 @Composable
-private fun EvSliderRow(
+private fun SliderRow(
     label: String,
-    desc: String,
+    desc: String?,
     initial: Float,
     range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    valueText: (Float) -> String,
     onCommit: (Float) -> Unit,
 ) {
-    var v by rememberSaveable { mutableStateOf(initial) }
+    var v by remember { mutableStateOf(initial) }
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, color = FilmTheme.Cream, fontSize = 14.sp, modifier = Modifier.weight(1f))
             Text(
-                "%+.2f EV".format(v),
+                valueText(v),
                 color = FilmTheme.Accent,
                 fontSize = 13.sp,
                 fontFamily = FilmTheme.Mono,
                 fontWeight = FontWeight.SemiBold,
             )
         }
-        Text(
-            desc,
-            color = FilmTheme.CreamDim,
-            fontSize = 10.sp,
-            style = MaterialTheme.typography.labelSmall,
-        )
+        if (desc != null) {
+            Text(
+                desc,
+                color = FilmTheme.CreamDim,
+                fontSize = 10.sp,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
         androidx.compose.material3.Slider(
             value = v,
             onValueChange = { v = it },
             onValueChangeFinished = { onCommit(v) },
             valueRange = range,
+            steps = steps,
             colors = androidx.compose.material3.SliderDefaults.colors(
                 thumbColor = FilmTheme.Cream,
                 activeTrackColor = FilmTheme.Accent,

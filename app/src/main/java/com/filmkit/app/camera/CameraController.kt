@@ -1434,12 +1434,10 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             return
         }
-        // 静拍 YUV 解码矩阵（设置页开关，实拍 A/B 定夺；须在引擎启动后设置）。
+        // 静拍 YUV 解码矩阵（2026-09-20 实拍 A/B 已定案 601 正确，设置入口已删，恒 601）。
         // 防御性包裹：JNI/任何异常不得阻断相机启动（started=false = 全黑+焦段丢失）
         runCatching {
-            EngineBridge.nativeEngineSetYuvMatrix(
-                if (context.getSharedPreferences("filmkit", 0).getBoolean("yuv_709", false)) 1 else 0,
-            )
+            EngineBridge.nativeEngineSetYuvMatrix(0)
         }
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
@@ -2370,9 +2368,9 @@ class CameraController(private val context: Context, private val render: RenderC
             prefs.getBoolean("noise_reduction", true),
             prefs.getInt("noise_reduction_level", 1),
         )
-        // NN 降噪（v0.10.102，prefs nn_dn 默认关）：PMRID 接拍照链，P0 空域降噪
-        // 被替代；推理失败引擎侧自动回退 P0 原链（照片优先）
-        val nnDn = prefs.getBoolean("nn_dn", false)
+        // NN 降噪（v0.10.102）：PMRID 接拍照链 —— NN 路线已判死（2026-10-02，
+        // 跨域模型不可直接用、微调全过拟合），设置入口已删，恒关；代码路径保留
+        val nnDn = false
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -2581,8 +2579,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 真机同帧 A/B 实测收益 +43.7%/+46.5%（残余噪声降到基线的 70%），
         // dnMs 未见显著上升，画质验收（DNG 自参照 100% 裁剪）无细节损失。
         val p0Sub = prefs.getBoolean("p0_sub", true)
-        // NN 降噪（v0.10.102，prefs nn_dn 默认关）：PMRID pass（P0 被替代）
-        val nnDn = prefs.getBoolean("nn_dn", false)
+        // NN 降噪（v0.10.102）：NN 路线已判死（2026-10-02），设置入口已删，恒关
+        val nnDn = false
         // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
         rendersInFlight.incrementAndGet()
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
@@ -2601,10 +2599,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 后面，"拍完挪手机画面完全冻住 1~2 秒"。启动失败即回退预览线程。
         val useStill = prefs.getBoolean("still_thread", false) &&
             StillRenderClient.ensureStarted()
-        // NN 同帧 A/B（v0.10.102，prefs nn_ab）：同一帧数据跑两遍（nn off → on），
-        // 两张成片都落盘供离线对比 —— 与 still_ab 同构，唯一干净口径。
-        // 依赖独立线程（第二遍在预览线程）+ nn_dn 开。
-        val nnAb = useStill && nnDn && prefs.getBoolean("nn_ab", false)
+        // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
+        val nnAb = false
         // 高光保护（v0.10.110）：成片 EV 加上本次欠曝量做补偿（预览用原数组）——
         // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
         val filmStill = filmParamsForStill()
