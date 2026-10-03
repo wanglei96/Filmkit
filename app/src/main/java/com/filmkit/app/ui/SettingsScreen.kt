@@ -228,11 +228,12 @@ fun SettingsScreen(
             }
             // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
             // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
-            // "配置项"而不是需要标定的数值。默认 −7.65/+4.56 = darktable 默认值。
+            // "配置项"而不是需要标定的数值。默认 −8.0/+4.0 = darktable filmic 出厂默认
+            // （= v0.10.113 起标准模式的固定值；v0.10.118 起滑杆恢复生效，默认值不变）。
             EvSliderRow(
                 "黑点（多暗算黑）",
                 "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
-                prefs.getFloat("filmic_black_ev", -7.65f),
+                prefs.getFloat("filmic_black_ev", -8.0f),
                 -12f..-1f,
             ) { v ->
                 prefs.edit().putFloat("filmic_black_ev", v).apply()
@@ -242,8 +243,8 @@ fun SettingsScreen(
             }
             EvSliderRow(
                 "白点（多亮算白）",
-                "比它更亮的压到白；拖右 = 高光更亮、更容易过曝",
-                prefs.getFloat("filmic_white_ev", 4.56f),
+                "拖右 = 白点更远 ⇒ 影调曲线更平、噪声更不明显（真机 6.2 时红釉白点消失），代价是对比降低、画面更柔",
+                prefs.getFloat("filmic_white_ev", 4.0f),
                 1f..8f,
             ) { v ->
                 prefs.edit().putFloat("filmic_white_ev", v).apply()
@@ -1086,6 +1087,40 @@ fun SettingsScreen(
                     prefs.edit().putBoolean("hr_wavelet", v).apply()
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "settings.hr_wavelet",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
+            // RAW 域高光重建（v0.10.115）：darktable highlights 模块 "inpaint opposed"
+            // —— 去马赛克**前**在 3×3 photosite 块上对被裁剪通道做对立外推 + 全图
+            // 色度校正。补"小波"够不到的一环（film 域修不了 RAW 饱和丢掉的通道信息）。
+            var hrRawOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
+            SettingSwitchRow(
+                title = "高光重建·RAW 域",
+                subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
+                checked = hrRawOn,
+                onChecked = { v ->
+                    hrRawOn = v
+                    prefs.edit().putBoolean("hr_raw", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.hr_raw",
+                        "{\"on\":$v}",
+                    )
+                },
+            )
+            // RCD 色差段回归原版（v0.10.117）：darktable/RawTherapee 的 RCD 在
+            // 色差段靠**梯度反比加权**实现边缘感知；我们此前额外加的 clamp 会把
+            // 跨边界邻居的色差锁进允许区间 ⇒ 红色扩散进白瓷/过曝区。
+            var rcdCdFixOn by rememberSaveable { mutableStateOf(prefs.getBoolean("rcd_cdfix", true)) }
+            SettingSwitchRow(
+                title = "去马赛克·色差原版",
+                subtitle = "RCD 色差段回归 RawTherapee 原版（梯度三项 + 无限幅），治红白边界与过曝区的彩色块；关 = 复现旧行为 A/B",
+                checked = rcdCdFixOn,
+                onChecked = { v ->
+                    rcdCdFixOn = v
+                    prefs.edit().putBoolean("rcd_cdfix", v).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.rcd_cdfix",
                         "{\"on\":$v}",
                     )
                 },

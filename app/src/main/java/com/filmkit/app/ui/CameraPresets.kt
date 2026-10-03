@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(45).apply {
+    private fun neutral(): DoubleArray = DoubleArray(47).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -118,6 +118,18 @@ object CameraPresets {
         // 对强光源失明 → 白点恒钉 2.438 下限 → 肩部挤压 → 高光平顶白墙）。
         // 默认开；0 = A/B 通路（v0.10.18 行为）。设置页开关写 prefs("white_hl")。
         this[42] = 1.0
+        // 45 = RAW 域高光重建（v0.10.115，darktable highlights "inpaint opposed"）：
+        // 去马赛克**前**对线性 mosaic 的被裁剪通道做对立通道外推（3×3 photosite）+
+        // 全图色度校正。补 41 号 hr_wavelet 够不到的一环 —— 后者在 film 域修影调，
+        // 恢复不了 RAW 饱和时丢掉的通道信息（2026-10-03 真机：曝光给足使饱和像素
+        // 6×，壶身玻璃反光带留彩色伪影）。默认开；0 = A/B 通路。
+        // 设置页开关写 prefs("hr_raw")。
+        this[45] = 1.0
+        // 46 = RCD 色差段回归 RawTherapee 原版（v0.10.117）：1 = 原版行为
+        //（对角梯度三项 + **无限幅**，边缘感知靠梯度反比加权）；0 = 旧行为
+        //（梯度两项 + clamp 到 4 对角色差范围，实测会把红色扩散进白瓷/过曝区）。
+        // 默认 1；0 = A/B 通路。设置页开关写 prefs("rcd_cdfix")。
+        this[46] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

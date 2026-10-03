@@ -1071,6 +1071,13 @@ class CameraController(private val context: Context, private val render: RenderC
     private val HR_WAVELET = 1.0
     // v0.10.27：白点高光感知（FilmParams[42]，auto_tone 开时生效）
     private val WHITE_HL = 1.0
+    // v0.10.115：RAW 域高光重建（FilmParams[45]，darktable highlights "inpaint
+    // opposed"）。去马赛克前对裁剪通道做对立外推 + 全图色度校正。
+    private val HR_RAW = 1.0
+    // v0.10.117：RCD 色差段回归 RawTherapee 原版（FilmParams[46]）
+    private val RCD_CDFIX = 1.0
+    private var rcdCdFixPref = -1.0
+    private var hrRawPref = -1.0
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
     // v0.10.111：白点下限边距（FilmParams[43]；0 = 旧行为）
@@ -1161,6 +1168,8 @@ class CameraController(private val context: Context, private val render: RenderC
         applySharpenPref()
         applyGamutPref()
         applyHrWaveletPref()
+        applyHrRawPref()
+        applyRcdCdFixPref()
         applyWhiteHlPref()
         applyWhiteFloorPref()
         applyWhiteProbePref()
@@ -1174,12 +1183,13 @@ class CameraController(private val context: Context, private val render: RenderC
      * auto_tone 开时黑点由引擎按场景分位自动（[37] 被忽略）。
      */
     private fun applyFilmicRangePrefs() {
-        // 标准模式 = darktable filmic 出厂默认（black_point_source −8.0 / white_point_source
-        // +4.0 EV 相对中灰），一手出处见 docs/research/01-darktable.md；自适应模式用
-        // 用户可调值（旧行为）。
-        val std = toneStandard()
-        val b = if (std) -8.0 else appPrefs.getFloat("filmic_black_ev", -7.65f).toDouble()
-        val w = if (std) 4.0 else appPrefs.getFloat("filmic_white_ev", 4.56f).toDouble()
+        // v0.10.118 修复：默认 = darktable filmic 出厂默认（black −8.0 / white +4.0 EV
+        // 相对中灰，一手出处 docs/research/01-darktable.md），但**用户滑杆必须能覆盖**。
+        // 旧实现（v0.10.113 起）在标准模式下把两者硬编码成常量，设置页的「白点（多亮
+        // 算白）」滑杆写了 prefs 却永远进不了引擎 —— 2026-10-03 真机 A/B 因此把
+        // "影调层无影响"当成了结论（日志 whiteEv 恒 4.0，与滑杆值无关）。
+        val b = appPrefs.getFloat("filmic_black_ev", -8.0f).toDouble()
+        val w = appPrefs.getFloat("filmic_white_ev", 4.0f).toDouble()
         if (b != filmicBlackPref) {
             filmicBlackPref = b
             filmParams[37] = b
@@ -1263,6 +1273,38 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hrPref) {
             hrPref = v
             filmParams[41] = v
+        }
+    }
+
+    /**
+     * RAW 域高光重建开关（v0.10.115）：写 FilmParams[45]。
+     * darktable highlights 模块 "inpaint opposed"（该模块对 Bayer RAW 的默认模式）：
+     * 去马赛克**前**在 3×3 photosite 块上对被裁剪通道做"对立通道"外推，再用紧邻
+     * 裁剪区的未裁剪像素统计全局色度校正。补 [41] hr_wavelet 够不到的一环 ——
+     * 后者在 film 域修影调，恢复不了 RAW 饱和时丢掉的通道信息。
+     * 0 = 关（A/B 通路，行为同 exp12）。
+     */
+    private fun applyHrRawPref() {
+        val v = if (appPrefs.getBoolean("hr_raw", true)) HR_RAW else 0.0
+        if (v != hrRawPref) {
+            hrRawPref = v
+            filmParams[45] = v
+        }
+    }
+
+    /**
+     * RCD 色差段回归原版开关（v0.10.117）：写 FilmParams[46]。
+     * 1 = RawTherapee RCD 原版行为（对角梯度三项 + **无限幅**，边缘感知靠梯度
+     * 反比加权）；0 = 旧行为（梯度两项 + clamp 到 4 对角色差范围）。
+     * 真机实测根因：clamp 的限幅范围取自**跨边界**的 4 对角邻居 ⇒ 红色扩散进
+     * 白瓷与过曝区（杯口白瓷 Cr +4.3 → 边界 +20~26）。
+     * 0 = A/B 通路（复现旧色块用）。
+     */
+    private fun applyRcdCdFixPref() {
+        val v = if (appPrefs.getBoolean("rcd_cdfix", true)) RCD_CDFIX else 0.0
+        if (v != rcdCdFixPref) {
+            rcdCdFixPref = v
+            filmParams[46] = v
         }
     }
 
