@@ -5425,6 +5425,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"hr\":" + jnum(p.hr_wavelet, 3);
   kv += ",\"hrMs\":" + jnum(hr_ms_, 6);
   kv += ",\"clipB\":" + std::to_string(hr_blocks_);
+  // v0.10.121：HR 输入域（曝光前）的白点 EV —— threshold = 2^hrWhiteEv × 0.1845，
+  // 与 tools/hr-mask-check.py --white-ev 同一口径（改阈值后靠它核对真机覆盖面对不对）。
+  kv += ",\"hrWhiteEv\":" + jnum(hr_white_ev_, 6);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
   // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
@@ -6634,6 +6637,7 @@ bool FrameRenderer::ensureHrTargets(int w, int h) {
 }
 
 GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
+                                              float white_ev_input_domain,
                                               int* out_clipped_blocks,
                                               float* out_ms) {
   if (out_clipped_blocks) *out_clipped_blocks = -1;
@@ -6642,18 +6646,26 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   const auto t0 = std::chrono::steady_clock::now();
 
   // 参数（darktable 默认换算，全部物理量、不可调）：
-  //   threshold = 2^(white_source + 0EV) × grey_source；feather = 2^(12/3) = 16；
-  //   normalize = feather / threshold；noise_level 0.2；
+  //   feather = 2^(12/3) = 16；normalize = feather / threshold；noise_level 0.2；
   //   gamma/gamma_comp = 0.5/0.5（structure_vs_texture 0 的换算 (p/100+1)/2）；
   //   beta/beta_comp 1/0；delta 1；HQ 迭代 1。
-  // v0.10.18：threshold 与 filmic 的 white_source **解耦，恒 = RAW 饱和数据白点
-  // 1.0**（= 2^2.4383EV × 0.1845）。原因：0.10.17 真机——white 自动（P99）在无
-  // 饱和场景掉到 1.44EV → 阈值 0.5 → 比 P99 亮的普通像素全被当"裁剪"送进小波
-  // 重建（clipB=1435/3072 = 47% 的块，灾难）。darktable 语境里 white_source 由
-  // 用户设在数据 max 附近 → 阈值 ≈ 数据白点；自动语境下"裁剪重建"的物理语义 =
-  // RAW 饱和（线性 1.0），恒定阈值是该行为的忠实落地。
+  // ── threshold 语义（2026-10-03 逐行对照 filmicrgb.c:3120 后修正）──────────
+  // 原版：threshold = 2^(white_source + reconstruct_threshold) × grey_source，
+  // reconstruct_threshold 默认 0.0 ⇒ **threshold = 白点**（mask 在范数 = 白点处 w=0.5）。
+  // 旧实现写死 1.0（"RAW 饱和数据白点"）在 WB 后域系统性偏低：R/B 增益 ≈1.8/1.7 把
+  // 大量**未饱和**像素的欧氏范数抬过 1.0 ⇒ 白墙/电视屏这类亮部被注入 20% 相对幅度
+  // 的彩色噪声再做小波外推，正是"反光区色块"。实测闭环：
+  //   ① 真机日志 clipB 523~601 / 3072 块（17~20%）；
+  //   ② hl-opposed-check 在同批 DNG 上量到真 RAW 饱和仅 0.0065%（且只有 G 通道）；
+  //   ③ 离线 tools/hr-mask-check.py（双线性 + 1.41× LSC 标定）复现：threshold=1.0
+  //      覆盖 8.7% 的块且高权重区落在白墙/电视屏；改用白点后降到 1%，而真饱和像素
+  //      的 mask 权重仍 ≈0.94 —— **两端都对**（关掉 hr_wavelet 会丢的就是这 0.94）。
+  // 输入域 = 曝光**前**（kFsFilm 内部才乘 2^ev），故白点取曝光前域值。
+  // 下限 1.0 = 2^2.4383EV × kGrey，与 filmic 的 kWhiteSat 同源（0.10.17 事故：
+  // 阈值随自动白点掉到 0.5 曾把 47% 的块送进重建）。
   constexpr float kGrey = 0.1845f;
-  const float threshold = 1.0f;
+  const float threshold =
+      std::max(std::pow(2.0f, white_ev_input_domain) * kGrey, 1.0f);
   const float feather = 16.0f;
   const float normalize = feather / threshold;
   const float noise_level = 0.2f;
@@ -7966,9 +7978,14 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 失败时返回原纹理。
   hr_blocks_ = -1;
   hr_ms_ = 0.0f;
+  hr_white_ev_ = 0.0f;
   GLuint film_src = src_tex;
   if (still && p.hr_wavelet > 0.5f) {
-    film_src = runHighlightReconstruct(src_tex, w, h, &hr_blocks_, &hr_ms_);
+    // HR 输入域 = 曝光前（kFsFilm 内部才乘 2^exposure_ev）⇒ 白点也要去掉 ev 平移
+    // 才是同一域的量（ev_white_ 是 updateFilmicEV 刚算出的、含 ev_shift 的白点）。
+    const float white_ev_in = ev_white_ - p.exposure_ev;
+    hr_white_ev_ = white_ev_in;
+    film_src = runHighlightReconstruct(src_tex, w, h, white_ev_in, &hr_blocks_, &hr_ms_);
   }
   // 预览域映射的在线标定（v0.8.0）：updateFilmicEV 刚把 last_lin_mid_ 更新为本帧
   // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替

@@ -607,13 +607,17 @@ class FrameRenderer {
   GLint u_hr_restore_ratios_ = -1, u_hr_restore_norms_ = -1;
   GLint u_hr_stat_mask_ = -1, u_hr_stat_size_ = -1, u_hr_stat_out_ = -1;
   // 返回重建后的纹理：未触发/失败/关闭时返回 src（调用方零分支）。
+  // white_ev_input_domain = HR 输入域（曝光前）的白点 EV，暗含 darktable 的
+  // threshold = 2^white_source × grey_source 语义（见实现处注释）。
   GLuint runHighlightReconstruct(GLuint src, int w, int h,
+                                 float white_ev_input_domain,
                                  int* out_clipped_blocks, float* out_ms);
   bool ensureHrTargets(int w, int h);
   void releaseHrTargets();
-  // passFilm 内的 HR 观测（raw.render 的 hr/hrMs/clipB 由 finishStillChain 读取）
+  // passFilm 内的 HR 观测（raw.render 的 hr/hrThr/hrMs/clipB 由 finishStillChain 读取）
   int hr_blocks_ = -1;
   float hr_ms_ = 0.0f;
+  float hr_white_ev_ = 0.0f;
   GLuint fbo_hist_ = 0, tex_hist_ = 0;  // RGBA8 直方图下采样目标（256×96）
   int hist_w_ = 0, hist_h_ = 0;
   // M4-7 局部色调映射的低频亮度图（RGBA8、LINEAR 上采样）。与 tex_hist_

@@ -30,6 +30,11 @@ EXPECT = {
     "nnMs": ("finishStillChain", ["runNnPass("]),
     "nnTiles": ("finishStillChain", ["runNnPass("]),
     "nnGain": ("finishStillChain", ["runNnPass("]),
+    # v0.10.121 HR 白点（threshold = 2^hrWhiteEv × 0.1845）：passFilm 内的 HR 必须在
+    # finishStillChain 内、日志行之前跑完，否则字段是上一帧的陈旧值
+    "hrWhiteEv": ("finishStillChain", ["passFilm("]),
+    "clipB": ("finishStillChain", ["passFilm("]),
+    "hrMs": ("finishStillChain", ["passFilm("]),
 }
 
 
