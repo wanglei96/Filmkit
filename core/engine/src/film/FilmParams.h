@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 45;  // v0.10.111：+[43] white_floor（v0.10.27 +[42] white_hl、v0.10.15 +[41] hr_wavelet）
+  static constexpr int kCount = 47;  // v0.10.117：+[46] rcd_cdfix（v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -116,6 +116,21 @@ struct FilmParams {
   // 降到 0.5 后白点 = w99+0.5，既保留"P99 看不见的近饱和高光"上探能力（白壶案），
   // 又不再把整段高光推白。
   float white_probe = 0.5f;    // 44
+  // 45：RAW 域高光重建（darktable highlights 模块 "inpaint opposed"）。作用在
+  // 去马赛克**前**的线性 mosaic（tex_mos_，已扣黑阶 + WB，白点 1.0）：对被裁剪
+  // 通道用"对立通道"（3×3 photosite 邻域内另两个通道的立方均值）外推 + 全图
+  // 色度校正。补的是 [41] hr_wavelet 够不到的一环 —— 后者在 film 域修影调，
+  // 恢复不了 RAW 饱和时丢掉的通道信息（2026-10-03 真机：曝光给足使饱和像素 6×，
+  // 壶身玻璃反光带留彩色伪影）。默认开；0 = A/B 通路（行为同 exp12）。
+  float hr_raw = 1.0f;         // 45
+  // 46：RCD 色差段回归 RawTherapee 原版（M3-3）。1 = 原版行为（对角梯度三项 +
+  // **无限幅**，边缘感知由梯度反比加权承担）；0 = 旧行为（梯度两项 + clamp 到
+  // 4 对角色差范围）。
+  // 真机实测（2026-10-03）根因：clamp 的限幅范围取自**跨边界**的 4 对角邻居，
+  // 等于把红侧的色差锁进允许区间 ⇒ 红色扩散进白瓷（杯口白瓷深处 Cr +4.3，
+  // 边界被抬到 +20~26），窗户过曝区同样出现大面积色块。默认 1（回归原版）；
+  // 0 = A/B 通路。设置页开关写 prefs("rcd_cdfix")。
+  float rcd_cdfix = 1.0f;      // 46
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -174,6 +189,8 @@ struct FilmParams {
     if (n > 42) white_hl = static_cast<float>(v[42]);
     if (n > 43) white_floor = static_cast<float>(v[43]);
     if (n > 44) white_probe = static_cast<float>(v[44]);
+    if (n > 45) hr_raw = static_cast<float>(v[45]);
+    if (n > 46) rcd_cdfix = static_cast<float>(v[46]);
   }
 };
 

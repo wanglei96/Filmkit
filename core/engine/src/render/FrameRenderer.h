@@ -88,6 +88,17 @@ struct TileRmsResult {
   int nz_n = 0;  // 参与统计的 tile 数（nz > 0 且有限）
 };
 
+// RAW 域高光重建（darktable highlights / "inpaint opposed"）诊断结果。
+// chroma = 全图色度校正量（darktable `chrominance`），cnt = 参与统计的样本数
+// （darktable 的 100 样本闸）。blocks = 有裁剪 photosite 的块数（膨胀前）。
+struct HlRawResult {
+  bool ok = false;
+  float chroma[3] = {0.f, 0.f, 0.f};
+  float cnt[3] = {0.f, 0.f, 0.f};
+  int blocks_x = 0, blocks_y = 0;
+  float ms = 0.f;
+};
+
 // 共享后段渲染器：SurfaceTexture(OES) → 场景线性 → 胶片曲线 → 输出。
 // pass1 采用系统 SurfaceTexture 路径（参照 PhotonCamera）；
 // M2 RAW 路径在此层替换 pass1，pass2/3 复用。
@@ -357,7 +368,8 @@ class FrameRenderer {
                 float white_level, const float gains[3], bool mosaic);
   void passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                      const float black_phase[4], float white_level,
-                     const float gains[3], const float* ccm, bool mosaic);
+                     const float gains[3], const float* ccm, bool mosaic,
+                     float cd_fix);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑。
   // C 专项起值域 σ 由 (A,B) 模型逐像素给出（nc，强度已折入系数）。
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
@@ -372,6 +384,12 @@ class FrameRenderer {
   // a/b = k=1 的 WB 后系数（NoiseCoef::mma/mmb），用于读回诊断 σ。返回诊断供日志。
   TileRmsResult passTileRms(GLuint src_tex, int w, int h, const float a[3],
                             const float b[3]);
+  // RAW 域高光重建（darktable highlights 模块 / "inpaint opposed"，2026-10-03）：
+  // 在**去马赛克前**对线性 mosaic（tex_mos_，已扣黑阶 + WB，白点 1.0）恢复被裁剪
+  // 通道 —— mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
+  // 成功时结果落在 tex_hl_，由 hr_src_override_ 交给 RCD 三段读取。
+  HlRawResult passHighlightRaw(int w, int h, int cfa, const float gains[3],
+                               GLuint src);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
@@ -444,7 +462,10 @@ class FrameRenderer {
          prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0,
-         prog_nn_pack_ = 0, prog_nn_unpack_ = 0;
+         prog_nn_pack_ = 0, prog_nn_unpack_ = 0,
+         // RAW 域高光重建（darktable highlights / inpaint opposed）
+         prog_hl_mask_ = 0, prog_hl_dil_ = 0, prog_hl_chroma_ = 0,
+         prog_hl_apply_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -492,6 +513,17 @@ class FrameRenderer {
   GLuint fbo_g_ = 0, tex_g_ = 0;      // RGBA16F，RCD 全图 G（g 通道有效）
   int rcd_w_ = 0, rcd_h_ = 0;
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
+  // ── RAW 域高光重建（darktable highlights / inpaint opposed）─────────────
+  // tex_hl_mask_ / tex_hl_dil_ = 3×3 photosite 块网格（w/3 × h/3）的裁剪掩码与
+  // 膨胀掩码；tex_hl_sum_/tex_hl_cnt_ = 16×16 归约的 chrominance 累加（MRT 双目标）；
+  // tex_hl_ = 重建后的线性 mosaic（w×h），由 hr_src_override_ 转交 RCD 三段。
+  GLuint tex_hl_mask_ = 0, fbo_hl_mask_ = 0;
+  GLuint tex_hl_dil_ = 0, fbo_hl_dil_ = 0;
+  GLuint tex_hl_sum_ = 0, fbo_hl_sum_ = 0;  // chrominance 归约（两趟累加复用）
+  GLuint tex_hl_ = 0, fbo_hl_ = 0;
+  int hl_w_ = 0, hl_h_ = 0, hl_mw_ = 0, hl_mh_ = 0, hl_tw_ = 0, hl_th_ = 0;
+  // 非 0 时 RCD 三段改读它（= tex_hl_）；0 = 原行为（直读 tex_mos_）。
+  GLuint hr_src_override_ = 0;
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
   // D 专项：半分辨率 à trous 色度降噪缓冲（2× 近似层 ping-pong + 5× 细节层
@@ -502,6 +534,12 @@ class FrameRenderer {
   int ch_w_ = 0, ch_h_ = 0;
   // v0.10.59 诊断：本轮新增算法是否真的执行（0.10.58 起日志无字段，无法验证生效）
   int dbg_p0s_ = 0;      // P0 实际样本数（9 = 旧"融合后"路径，36 = 时域×空间联合）
+  // RAW 域高光重建（darktable highlights）生效性：照 p0s/nnOk 的教训，必须由
+  // finishStillChain 在日志组装前读取。
+  int dbg_hl_ok_ = 0;        // 1 = 执行成功（下游改用 tex_hl_）；0 = 未启用/失败
+  float dbg_hl_cnt_ = 0.f;   // 色度统计样本数（G 通道；darktable 的 100 样本闸）
+  float dbg_hl_chroma_[3] = {0.f, 0.f, 0.f};  // 色度校正量
+  float dbg_hl_ms_ = 0.f;
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
@@ -657,7 +695,7 @@ class FrameRenderer {
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, mos = -1, mosaic = -1,
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, ccm = -1, lsc = -1, lsc_size = -1;
+          gain = -1, ccm = -1, lsc = -1, lsc_size = -1, cd_fix = -1;
   } u_rcd_chroma_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
@@ -707,6 +745,20 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
   } u_tile_rms_;
+  // RAW 域高光重建（darktable highlights）：mask / dilate / chroma / apply
+  struct {
+    GLint mos = -1, size = -1, cfalut = -1, clips = -1;
+  } u_hl_mask_;
+  struct {
+    GLint mask = -1, msize = -1;
+  } u_hl_dil_;
+  struct {
+    GLint mos = -1, dil = -1, size = -1, msize = -1, cfalut = -1, clips = -1,
+          mode = -1;
+  } u_hl_chroma_;
+  struct {
+    GLint mos = -1, size = -1, cfalut = -1, clips = -1, chroma = -1;
+  } u_hl_apply_;
   // NN pass（v0.10.102/104）：pack / unpack 两个 fragment 程序的 uniform
   struct {
     GLint fused = -1, raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
