@@ -98,6 +98,21 @@ INVARIANT_KEYS = frozenset({
 # （1a: 触发 ISO 3223 / 拍摄 3557 → ns 0.0034；1b: 拍摄 2464 → ns 0.0024）。
 # 原先 ns 在 INVARIANT_KEYS 里，会把这种正常的 ISO 差异误报成"跨版本回归"。
 ISO_DEPENDENT_KEYS = frozenset({"ns", "nsHal", "nsSng", "nzS", "nzO", "nzG"})
+# 随"这一次拍摄"变化、与引擎版本**无关**的字段（手持抖动 / 运动量 / 对齐置信度）。
+# dMed/dP90 来自 dx_med_max/dx_p90_max —— 是 **MFNR 帧对齐的亚像素位移**，不是细节指标！
+# 实测同一版本内帧间波动就有 7~12%（第 4a 期验机：A 帧 2.837~3.034，B 帧 2.283~2.559），
+# 跨版本对比无意义。2026-10-04 曾把它误读成"细节指标下降 17.5%"。
+CAPTURE_KEYS = frozenset({
+    # MFNR 对齐/运动（手持抖动）
+    "dMed", "dP90", "mMed", "mP90", "motMed", "confMed", "resFade",
+    # 噪声模型派生的**下发系数**（同一 ISO 族，随 ISO/增益变；见引擎 :6049-6051 注释
+    # "p0A/p0B/p4A/p4B = 实际下发 shader 的 (A,B)"）。实测帧间波动可达数倍。
+    "p0A", "p0B", "p0w", "p4A", "p4B", "nzIso",
+    # 内容统计量（随场景内容/曝光时刻变，非引擎配置）
+    "clipB", "dfCavg", "hlRgG", "hlBgG",
+})
+# ⚠ 往 CAPTURE_KEYS 里加字段的门槛：**实测同一版本内帧间波动就接近或超过阈值的**。
+# 这是"允许变化"不是"忽略"——工具仍打印 Δ 供人查看。别把想回避的回归塞进来。
 NOISE_FLOOR = 1e-9   # 绝对值低于此量级视为浮点噪声
 INV_TOL = 1e-6       # 不变量相对容差 %
 
@@ -171,6 +186,11 @@ def classify(key, values):
         return "time"
     if key in SCENE_KEYS:
         return "scene"
+    # 随拍摄条件（ISO/增益、手持抖动）变化 → 归"允许变化"，不计失败。
+    # 注：ISO_DEPENDENT_KEYS 此前**定义了却未接线**（2026-10-04 发现并修），
+    # 导致 ns/nzS 等仍按 1% 阈值判，换 ISO 拍摄就误报"跨版本回归"。
+    if key in ISO_DEPENDENT_KEYS or key in CAPTURE_KEYS:
+        return "capture"
     if has_str(values) or key in INVARIANT_KEYS:
         return "invariant"
     return "numeric" if flat(values) else "invariant"   # 非数值非字符串 → 按不变量严格比
@@ -305,8 +325,10 @@ def compare(base, cur, event, tol, scene_tol, paint):
         print(paint.green(f"  ✓ 全部在阈值内：{', '.join(num_ok)}"))
 
     # ---- 允许变化 ----
-    print(paint.bold(f"\n── 允许变化 {len(groups['time'])} 项（时间/性能，不计失败）──"))
-    for k in groups["time"]:
+    allowed = groups["time"] + groups["capture"]
+    print(paint.bold(f"\n── 允许变化 {len(allowed)} 项"
+                     f"（时间/性能 + 随拍摄变化[ISO/手持]，不计失败）──"))
+    for k in allowed:
         xa, xb = flat(base["vals"][k]), flat(cur["vals"][k])
         if not xa or not xb:
             print(paint.dim(f"  ~ {k:<14} 缺失：A n={len(xa)} B n={len(xb)}"))
