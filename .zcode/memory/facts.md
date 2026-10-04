@@ -36,9 +36,6 @@ status: active
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag（2026-09-30 又违反过一次：一轮打了 6 个，已清理）
 - [2026-10-01] **当前版本：250（`0.10.99-m4`）**，验收 tag **v0.10.99-m4** 已 push；根目录 `filmkit-0.10.99-m4.apk`
-- [2026-10-02] **NN spike 包沿革**：251（`0.10.100-nnspike`，用户已装，GPU 被 CompatibilityList 拒）→ **252（`0.10.101-nnspike2`，GPU 强制版，功能与已装相同仅版本号修正）**；验证包不打 tag
-- [2026-10-01] **版本沿革速查**：183（0.10.31 高光线）→ 184–188（0.10.32–36 C 专项）→ 189–221（0.10.37–0.10.69 A/D 专项）→ 222–234（0.10.70–0.10.84 对齐精度/亚像素/性能）→ 235–242（0.10.85–0.10.92 拍照独立线程/连拍 OOM/空闲释放）→ **243–250（0.10.93–0.10.99 预览降载/单帧迁移/M4 LUT 导入导出/相对滑杆）**
-- [2026-09-29] **Camera2 SENSOR_NOISE_PROFILE 真机形态**：Array<Pair<Double,Double>> = 4 个 (S,O) **标量对**；SDK 签名 `Pair<Double, Double[]>` 与真机不符；`as? DoubleArray` 对装箱数组永败
 - [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
 
 ## 引擎实现现状
@@ -74,8 +71,6 @@ status: active
 
 ## 本轮实测数据（2026-09-30）
 
-- [2026-09-30] **端到端耗时账**（0.10.80/81，第 2 张，totalMs 1607）：采集 258 + DNG 落盘 144 + 上传与金字塔 37 + **CPU 对齐 345**（3 帧 mfnrAlign 210 + 4 帧 capturePyr 165）+ **DFT 571** + **后段 633**（RCD 335 + 高光重建 245 + 降噪 40）+ 后台编码 332（与前面并行）；快门间隔 0.54s
-- [2026-09-30] **raw.render 诊断字段全集**：`p0s`（96/9）、`p0w`（中心权重和，期望 26.1）、`cms`/`cmsK`、`nzPre`/`nzPost`（同相位 lag-2 差分 std/√2，**去信号**）、`nzPreMed`/`nzPostMed`/`nzPreP90`/`nzPostP90`/`nzN`（全图 48960 tile 统计）、`rmsPre`/`rmsPost`（tile RMS，**信号主导不可作判据**）、`dftUp`/`dftDsp`/`dftRb`/`dftGpu`、`alignMs`/`alignRbMs`/`alignCpuMs`/`alignL1`、`abNzPostMed`/`abP0w`（同帧 A/B 对照遍）、`nzSrc`/`nzS`/`nzO`、`wb`、`w99/w999/wmax/cp`
 - [2026-09-30] **PC 对标（同场景同曝光 ISO 1386 vs 1402）**：暗部 σY 1.323 vs 0.586（**差 2.26×**，旧数据 4.7×）、中间调 1.050 vs 0.610；暗部 σC 0.338 vs 0.787（**好 2.3×**）、中间调 0.322 vs 0.935（好 2.9×）；边缘 P99.5 12.11 vs 10.90；纹理保真比 0.92
 ## 拍照线程与 LUT（2026-10-01，压缩）
 
@@ -118,3 +113,8 @@ status: active
 - [2026-10-03] **PC 色度降噪架构（源码实证）**：`RawToYuv` → **`MeasureMoire`**（输入 Y 平面，输出 **1/4 分辨率 3 通道强度图**）→ 该图**替换**送给 `ChromaDenoise` 的强度（`mgc_full_resolution_denoise_jni.cpp:1021-1064`，注释原文 *"replaces only the strength map supplied to ChromaDenoise"*）；`ChromaDenoise` = **四级色度金字塔** + **4 level × 3 通道 × 2 branch** 独立 shot/quadratic/read 表 + 频响参数（`response_offset`/`response_cosine_offset`）。`MeasureMoire` 本体是编译好的 Halide capsule（`mgc_demoire_capsule.bin`），公式不可读
 - [2026-10-03] **inpaint_noise 的相对幅度**：`sigma = pix × noise_level / threshold`；我们 `threshold`=1.0（RAW 饱和点）而 darktable 白点远高于数据最大值（本例 9.6 vs 1.4）⇒ 同等公式下相对幅度约 3 倍、逐通道独立 ⇒ 彩色颗粒。`noise_level` 已置 0
 - [2026-10-03] **版本沿革（本窗口）**：276 exp19（threshold 修正）→ 277 exp20（hlSum/hlCnt3 诊断）→ 278 exp21（统计源换 `tex_fused_`，**有害已回退**）→ 279 exp22（禁 chrominance）→ **280 exp23（关 inpaint 噪声，当前推荐）**
+
+## 设置页与图标（10-04）
+
+- [2026-10-04] **版本 281–288（0.10.126–133）**：设置页四抽屉整理 / 图标五版迭代 / 验收 tag v0.10.133（2f8bbfc）；图标 = 光圈叶片+居中镜片 **vector 13 path**（`drawable/ic_launcher_fg.xml`）+ legacy 4 密度 PNG + monochrome，资源结构 = PC 同构
+- [2026-10-04] **编辑器调研 docs/research/10 号**（6e94f99）：预设 schema 提案（47 槽不动 + 颗粒强度/尺寸/密度调制、halation 阈值/强度/半径/色相、暗角、趾肩、层间效应）、E1–E5 阶段；基础设施 = CameraPresets 47 槽 + `nativeEngineSubmitStill/Raw` 单帧直通 + 胶卷位占位（CameraScreen:1232）
