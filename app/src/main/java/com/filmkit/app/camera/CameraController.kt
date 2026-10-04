@@ -174,11 +174,13 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var burstHlUnderEv = 0.0
 
-    /** 成片用 filmParams：把高光保护的欠曝量加到 EV（[0]）。预览用原始数组（预览曝光
-     *  由 HAL AE 决定、没有欠曝），故两侧中间调一致、成片高光更低。 */
+    /** 成片用 filmParams：把曝光决策的 EV 增量加到 EV（[0]）。预览用原始数组（预览
+     *  曝光由 HAL AE 决定）。v0.10.135 双向：hl 欠曝（deltaEv<0）→ 正补偿补回亮度；
+     *  曝光给足（deltaEv>0，ISO 下限后纯拉长）→ 负补偿压回亮度——两侧都是
+     *  "成片亮度回到 AE 基准"，欠曝侧救高光裁切、给足侧救暗部 SNR（高光交给影调层）。 */
     private fun filmParamsForStill(): DoubleArray {
         val u = burstHlUnderEv
-        if (u <= 1e-4) return filmParams
+        if (kotlin.math.abs(u) <= 1e-4) return filmParams
         val q = filmParams.copyOf()
         q[0] = filmParams[0] + u
         return q
@@ -1702,7 +1704,9 @@ class CameraController(private val context: Context, private val render: RenderC
             capSec = p.exposureNs
             // 高光保护欠曝量（EV）：由 processRawBurst 加到成片 EV 上补偿（见
             // filmParamsForStill）—— 只欠曝不补偿 = 把"高光爆"换成"画面暗"。
-            burstHlUnderEv = if (p.n < 1.0) -p.deltaEv else 0.0
+            // v0.10.135：统一对称——欠曝（n<1，保险丝）补回、给足拉长（ISO 下限后
+            // 纯拉长）压回；守恒段（ISO ÷N）deltaEv 恒 0 不受影响。
+            burstHlUnderEv = -p.deltaEv
         }
         // 长曝光生效时**取消参考帧压短**：压短的初衷是"参考帧更锐以防拖影"，而长
         // 曝光下所有帧 SNR 同时提高，压短反而让参考帧噪声变差（对齐/mismatch 判据
@@ -1795,14 +1799,15 @@ class CameraController(private val context: Context, private val render: RenderC
                 "blurPx" to "%.2f".format(expPlan?.blurPx ?: 0.0),
                 "expCap" to (if (expMaxMs > 0) "${expMaxMs}ms" else "auto"),
                 "baseIso" to liveIso, "baseSec" to "%.4f".format(liveExposureNs / 1e9f),
-                // 高光保护（v0.10.110）：hlEv = 场景高光分位（提亮之前，log2 相对中灰；
-                // -99 = 无统计/关闭）；hlCmp = 本次将要施加的提亮 EV；限流原因见 expWhy
-                // （"highlight" = 为留高光余量欠曝）
+                // 高光保护（v0.10.110；v0.10.135 起为保险丝）：hlEv = 场景高光分位
+                // （提亮之前，log2 相对中灰；-99 = 无统计/关闭）；hlCmp = 本次将要施加
+                // 的提亮 EV；限流原因见 expWhy（"highlight" = 无给足空间时的高光保险丝）
                 "hlOn" to hlOn,
                 "hlEv" to "%.3f".format(if (hlSceneEv.isFinite()) hlSceneEv else -99.0),
                 "hlCmp" to "%.3f".format(hlCompEv),
-                // 实际欠曝量（EV，0 = 未触发）；成片 EV 会加上同一个量做补偿
-                "hlUnder" to "%.3f".format(if (expPlan != null && expPlan.n < 1.0) -expPlan.deltaEv else 0.0),
+                // 曝光决策 EV 增量的负值（v0.10.135 双向）：欠曝 >0 补回、给足 <0 压回；
+                // 成片 EV 会加上同一个量
+                "hlUnder" to "%.3f".format(-(expPlan?.deltaEv ?: 0.0)),
             ),
         )
         EngineBridge.nativeFlushLogs()

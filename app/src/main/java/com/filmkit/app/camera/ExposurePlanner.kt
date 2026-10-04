@@ -15,18 +15,33 @@ package com.filmkit.app.camera
  * 核心不变式
  * ----------
  * **曝光 ×N + ISO ÷N ⇒ 输出亮度与高光裁切完全不变，纯赚 SNR。**
- * 因此拉长侧的约束只有三个：ISO 下限、快门上限、运动（帧内模糊）预算。
+ * 拉长侧的约束只有三个：ISO 下限、快门上限、运动（帧内模糊）预算。
  * 只做"拉长"；缩短仍交给既有参考帧压短逻辑（缩短直接损失 SNR）。
  *
- * v0.10.110 高光保护（2026-10-02 用户拍板"从曝光策略上解决"）
+ * v0.10.135 曝光给足（2026-10-04 用户拍板方案 A；"先压噪声，高光交给影调层"
+ * 2026-10-03 拍板的完整落地）
+ * --------------------------------------------------------------------------
+ * 上述守恒不变式有一个死角：**ISO 已在下限时 nIso = 1，拉长被锁死**——逆光
+ * 大光比场景（预览 AE 高光优先收敛，如窗景 4.8ms）暗部 SNR 永远上不去。
+ * 2026-10-04 真机实锤（112025 对）：4.8ms×4 帧的低频色度噪声云（P90 3 级）
+ * 在相册放大下呈密集品红斑点；同场景 73.6ms（seq1）无此问题。修法：
+ * ISO 钉在下限后**继续拉快门**（亮度 +N），增量由成片 EV 反补偿压回
+ * （filmParamsForStill 的 -deltaEv 对称扩展）——亮度不变、SNR 净赚 √N、
+ * 高光 RAW 裁切交给影调层黑白点/肩部（seq1 同窗场景已真机验证可行）。
+ * 拉长侧约束 = min(运动预算, 快门上限, 目标 333ms)，**不含 ISO 下限、不含
+ * 高光上限**（拍板：噪声优先）。高光欠曝降级为保险丝：仅当连给足的物理
+ * 上限都不存在（nStretch ≤ 1，基准已 ≥ 给足上限）且高光越界时才缩短。
+ *
+ * v0.10.110 高光保护（2026-10-02 用户拍板"从曝光策略上解决"；v0.10.135 起降级
+ * 为保险丝，历史教训留档）
  * ----------------------------------------------------------
- * 曝光的第一目标是**刚好不烧高光**（HDR+ §4 原文："set this exposure low enough to
- * avoid blowing out highlights"），而不是"画面亮度达标"——亮度是后处理的事，前提是
- * RAW 里还留着余量。真机实锤：预览 `w999 = 2.4383` 恰为 RAW 饱和数据白点，引擎再乘
- * 2^(base_ev+用户EV) 就把 0.1% 的饱和像素扩成大片裁切（成片 `clipB 711/3072` = 23%
- * 的块命中高光裁剪），提亮型 LUT 只是在这片压平的白上染色。
- * 故新增第四项约束：`sceneHighlightEv + exposureCompEv ≤ 白点 − 余量`，越界即**欠曝**
- * （n < 1，只缩短曝光时间、不抬 ISO）。代价（SNR）由多帧补，不由"硬抬"补。
+ * 曝光的第一目标曾是**刚好不烧高光**（HDR+ §4 原文："set this exposure low enough
+ * to avoid blowing out highlights"）。真机实锤：预览 `w999 = 2.4383` 恰为 RAW 饱和
+ * 数据白点，引擎再乘 2^(base_ev+用户EV) 就把 0.1% 的饱和像素扩成大片裁切（成片
+ * `clipB 711/3072` = 23% 的块命中高光裁剪），提亮型 LUT 只是在这片压平的白上染色。
+ * 故曾有第四项约束：`sceneHighlightEv + exposureCompEv ≤ 白点 − 余量`，越界即**欠曝**
+ * （n < 1，只缩短曝光时间、不抬 ISO）。2026-10-03 用户拍板"先压噪声，高光交给
+ * 影调层"后，欠曝与给足在大光比场景正面冲突，按后拍板降级为保险丝（见上）。
  */
 object ExposurePlanner {
 
@@ -96,7 +111,8 @@ object ExposurePlanner {
             return Plan(baseIso.coerceAtLeast(1), baseExposureNs, 1.0, "invalid", 0L, 0.0, 0.0)
         }
         val nTarget = targetExposureNs.toDouble() / baseExposureNs
-        // ① ISO 下限：降 ISO 保持亮度 ⇒ N ≤ baseIso / isoLower
+        // ① ISO 下限：降 ISO 保持亮度 ⇒ N ≤ baseIso / isoLower（只决定 ISO 钉
+        //    下限的位置 = 守恒段与给足段的分界，不再是拉长上限）
         val nIso = if (isoLower > 0) baseIso.toDouble() / isoLower else Double.MAX_VALUE
         // ② 快门上限
         val nShutter = exposureUpperNs.toDouble() / baseExposureNs
@@ -108,13 +124,13 @@ object ExposurePlanner {
             0L                                   // 无陀螺数据：不限制（诊断字段 0 = 未生效）
         }
         val nMotion = if (hasMotion) motionLimitNs.toDouble() / baseExposureNs else Double.MAX_VALUE
-        // ④ 高光保护（v0.10.110）：曝光的目标不是"亮度达标"而是"**刚好不烧高光**"
-        //（HDR+ §4 原文：set this exposure low enough to avoid blowing out highlights）。
-        // 判据 = 提亮之后的场景高光 ≤ 白点 − 余量；越界则**欠曝**（n < 1）。
-        // 为什么必须把 exposureCompEv 算进来：本仓实测（2026-10-02 真机）预览
-        // w999 = 2.4383 恰为 RAW 饱和白点，再乘 2^0.5 就把 0.1% 的饱和像素扩成
-        // 大片裁切（成片 clipB 711/3072 = 23% 块命中裁剪）——LUT 只是在这片压平的
-        // 白上染色。根因是曝光没有余量，不是 LUT。
+        // 给足拉长上限（v0.10.135）：ISO 下限与高光上限**都不在列**——
+        // ① nIso 不封顶：ISO 钉在下限后继续拉（亮度 +N，成片 EV 反补偿）；
+        // ② nHl 不封顶：拉长侧高光裁切交给影调层（2026-10-04 拍板方案 A）。
+        val nStretch = minOf(nMotion, nShutter, nTarget)
+        // ④ 高光越界分位（v0.10.110）：nHl < 1 = 基准下高光将越白点。
+        //    v0.10.135 起只在**无给足空间**（nStretch ≤ 1，基准已 ≥ 给足上限，
+        //    极暗长曝场景）时作为欠曝保险丝；给足可行时高光交给影调层。
         val nHl = if (sceneHighlightEv.isFinite()) {
             val over = sceneHighlightEv + exposureCompEv - (whitePointEv - highlightHeadroomEv)
             if (over > 0.0) Math.pow(2.0, -over) else 1.0
@@ -122,27 +138,10 @@ object ExposurePlanner {
             1.0
         }
 
-        var why = "target"
-        var n = nTarget
-        // 高光保护是**上限**（≤1），不参与"拉长"竞争：只有它要求欠曝（nHl < 1）时才入列。
-        // 否则 nHl = 1.0 会把 target/运动预算的拉长全部截断（v0.10.110 首版 bug：
-        // 无高光统计时所有场景都退化成基准曝光，单测 8 项红）。
-        val limits = mutableListOf(
-            "motion" to nMotion, "iso" to nIso, "shutter" to nShutter,
-        )
-        if (nHl < 1.0) limits.add(0, "highlight" to nHl)
-        for ((k, v) in limits) {
-            if (v < n) {
-                n = v
-                why = k
-            }
-        }
-        // 欠曝侧（高光保护）：**只缩短曝光时间，不抬 ISO** —— 降 ISO 不改变物理满阱，
-        // 救不回已经饱和的高光；少收光子才是唯一有效手段。代价（SNR）由多帧补。
-        // 注意：只有 why == "highlight" 才走这里 —— 运动预算比基准曝光还紧时历史行为是
-        // **不缩短**（nEff = 1.0），那是既有语义，不能被高光保护顺带改掉。
-        if (why == "highlight" && n < 1.0) {
-            val exposureNs = (baseExposureNs * n).toLong().coerceIn(1L, baseExposureNs)
+        // 保险丝：给足没有物理空间（基准已 ≥ motion/shutter/target 全部上限）且
+        // 高光越界 ⇒ 缩短到刚好不烧（v0.10.110 原行为）。给足可行时不走这里。
+        if (nHl < 1.0 && nStretch <= 1.0) {
+            val exposureNs = (baseExposureNs * nHl).toLong().coerceIn(1L, baseExposureNs)
             val nReal = exposureNs.toDouble() / baseExposureNs
             val blurPx = if (hasMotion) exposureNs / 1e9 * motionRadPerSec / RAD_PER_PX else 0.0
             return Plan(
@@ -155,18 +154,31 @@ object ExposurePlanner {
                 blurPx = blurPx,
             )
         }
-        val nEff = n.coerceAtLeast(1.0)
+
+        // 给足链：n = min(运动, 快门, 目标)。why 取最小项（与既有命名一致）。
+        var why = "target"
+        var n = nTarget
+        for ((k, v) in listOf("motion" to nMotion, "shutter" to nShutter)) {
+            if (v < n) {
+                n = v
+                why = k
+            }
+        }
         val upper = maxOf(exposureUpperNs, baseExposureNs)
-        // 受限项直接取该约束的时长，避免浮点截断（1e8/38.46ms×38.46ms ≠ 1e8）
+        // 受限项直接取该约束的时长，避免浮点截断；coerceAtLeast(base)：
+        // 运动预算比基准还紧时不缩短（历史语义，缩短直接损失 SNR）。
         val exposureNs = when {
-            nEff <= 1.0 -> baseExposureNs
+            n <= 1.0 -> baseExposureNs
             why == "shutter" -> upper
             why == "motion" -> minOf(motionLimitNs, upper)
-            why == "target" -> minOf(targetExposureNs, upper)
-            else -> (baseExposureNs * nEff).toLong().coerceIn(baseExposureNs, upper)
-        }
-        val iso = Math.round(baseIso / nEff).toInt().coerceAtLeast(if (isoLower > 0) isoLower else 1)
+            else -> minOf(targetExposureNs, upper)
+        }.coerceIn(baseExposureNs, upper)
+        // ISO：守恒段（n ≤ nIso）按比例降，触到下限后钉死（给足段）。
+        val iso = Math.round(baseIso / n).toInt()
+            .coerceIn(if (isoLower > 0) isoLower else 1, baseIso)
         val nReal = exposureNs.toDouble() / baseExposureNs
+        // 亮度变化：守恒段 = 0；给足段 = log2(n × isoLower / baseIso) > 0，
+        // 由成片 EV 反补偿（CameraController.burstHlUnderEv = -deltaEv）。
         val deltaEv = Math.log(nReal * iso / baseIso) / Math.log(2.0)
         // 预估帧内模糊（mosaic px）= 曝光秒数 × 角速度 ÷ 每像素角度；必 ≤ motionBudgetPx
         val blurPx = if (hasMotion) {
@@ -178,7 +190,11 @@ object ExposurePlanner {
             iso = iso,
             exposureNs = exposureNs,
             n = nReal,
-            limitedBy = if (nReal <= 1.0001) "none" else why,
+            limitedBy = if (nReal <= 1.0001) {
+                if (nHl < 1.0) "highlight" else "none"
+            } else {
+                why
+            },
             motionLimitNs = motionLimitNs,
             deltaEv = deltaEv,
             blurPx = blurPx,
