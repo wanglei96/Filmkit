@@ -63,21 +63,18 @@ class ExposurePlannerTest {
         assertTrue("blurPx=${p.blurPx} 超预算", p.blurPx <= ExposurePlanner.MOTION_BUDGET_PX + 1e-9)
     }
 
-    /** v0.10.135 曝光给足：ISO 下限不再是拉长上限——继续拉到目标，ISO 钉下限，
-     *  亮度增量（deltaEv>0）由成片 EV 反补偿。 */
+    /** ISO 下限限制：base ISO 400 / 下限 50 ⇒ 最多 8×。 */
     @Test
-    fun isoFloorNoLongerCapsStretch() {
+    fun isoFloorCapsExposure() {
         val p = ExposurePlanner.plan(
             baseIso = 400, baseExposureNs = 38_461_538L,
             isoLower = 50, exposureUpperNs = 1_000_000_000L,
             motionRadPerSec = 0.0,
         )
-        assertEquals("target", p.limitedBy)
-        assertEquals(333_000_000L, p.exposureNs)
-        assertEquals(50, p.iso)                          // 钉在下限
-        assertEquals(8.66, p.n, 0.01)
-        // 给足段亮度增量：log2(8.66 × 50 / 400) = log2(1.0825) ≈ +0.115EV（反补偿压回）
-        assertEquals(0.115, p.deltaEv, 0.01)
+        assertEquals("iso", p.limitedBy)
+        assertEquals(8.0, p.n, 0.01)
+        assertEquals(50, p.iso)
+        assertEquals(0.0, p.deltaEv, 0.01)
     }
 
     /** 传感器快门上限限制。 */
@@ -118,43 +115,28 @@ class ExposurePlannerTest {
         assertEquals(1.0, p.n, 1e-9)
     }
 
-    // ── 高光保护：v0.10.135 起降级为保险丝（2026-10-04 拍板方案 A：噪声优先，
-    //    高光交给影调层）。给足可行时高光越界不再欠曝；仅当无给足空间时缩短。
+    // ── v0.10.110 高光保护（2026-10-02）────────────────────────────────────
+    // 真机口径：预览 w999 = 2.4383（恰为 RAW 饱和数据白点）、base_ev+用户 EV = 0.503、
+    // 成片 clipB 711/3072 = 23% 的块命中高光裁剪 ⇒ 曝光没有余量。
 
-    /** 给足可行（nStretch > 1）⇒ 高光越界也让位：照常拉到目标，亮度守恒段不受影响。 */
+    /** 高光贴顶 + 提亮 ⇒ 欠曝：只缩短曝光时间，ISO 不变（降 ISO 救不回已饱和的高光）。 */
     @Test
-    fun highlightYieldsToFullWellWhenStretchPossible() {
+    fun highlightProtectionUnderexposesWithoutRaisingIso() {
         val p = ExposurePlanner.plan(
             baseIso = 984, baseExposureNs = 50_000_000L,
             isoLower = 50, exposureUpperNs = 1_000_000_000L,
             targetExposureNs = 100_000_000L,
-            sceneHighlightEv = 2.4383,      // 真机预览 w999（越界）
-            highlightHeadroomEv = 0.35,
-            exposureCompEv = 0.503,
-        )
-        assertEquals("target", p.limitedBy)             // 给足优先
-        assertEquals(100_000_000L, p.exposureNs)
-        assertEquals(492, p.iso)                        // 守恒段（984 ÷ 2，deltaEv = 0）
-        assertEquals(0.0, p.deltaEv, 0.01)
-    }
-
-    /** 保险丝：给足没有物理空间（基准已 ≥ 目标）且高光越界 ⇒ 欠曝（v0.10.110 原行为）。 */
-    @Test
-    fun highlightFuseWhenNoStretchRoom() {
-        val p = ExposurePlanner.plan(
-            baseIso = 984, baseExposureNs = 500_000_000L,   // 基准 500ms ≥ 目标 333ms
-            isoLower = 50, exposureUpperNs = 1_000_000_000L,
-            targetExposureNs = 333_000_000L,
-            sceneHighlightEv = 2.4383,
+            sceneHighlightEv = 2.4383,      // 真机预览 w999
             highlightHeadroomEv = 0.35,
             exposureCompEv = 0.503,
         )
         assertEquals("highlight", p.limitedBy)
-        assertTrue("应缩短曝光", p.exposureNs < 500_000_000L)
+        assertEquals(984, p.iso)                        // 不抬 ISO
+        assertTrue("应缩短曝光", p.exposureNs < 50_000_000L)
         // over = 2.4383 + 0.503 − (2.4383 − 0.35) = 0.853 ⇒ n = 2^−0.853 = 0.5535
         assertEquals(0.5535, p.n, 0.01)
-        assertEquals((500_000_000L * p.n).toLong(), p.exposureNs)
         assertEquals(-0.853, p.deltaEv, 0.02)
+        assertEquals((50_000_000L * p.n).toLong(), p.exposureNs)
     }
 
     /** 高光有余量 ⇒ 高光保护不介入，拉长侧照常工作。 */
