@@ -494,6 +494,10 @@ uniform float uMosaic;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// ⚠ 第 4a 期后本 pass 内**已不使用** uCcm（CCM 移至独立 pass kFsCcm）。
+// 声明与 CPU 侧下发（passRcdChroma 里的 glUniformMatrix3fv）一并保留以维持零接口
+// 改动：编译器消除后 location = -1，glUniform* 按 GL 规范静默 no-op，行为安全。
+// 清理属独立小项（牵连 shader 声明 / location / 下发 / 函数签名 / 调用点共 5 处）。
 uniform mat3 uCcm;     // sensor→sRGB 行主序
 // M3-3（v0.10.117）：色差段回归 RawTherapee RCD 原版 —— 1 = 原版行为
 //（梯度三项 + 无限幅），0 = 旧行为（梯度两项 + clamp 限幅）。
@@ -617,7 +621,39 @@ void main() {
         b = g + axialFill(p, 2);
     }
     // LSC 在 CCM 前（网格低频，去马赛克前后差异 <1%）
-    vec3 rgb = uCcm * (vec3(r, g, b) * lscAt(p));
+    // ── 第 4a 期（S14）域拆分：本 pass 的输出到此为止 = **D3**（相机 RGB：
+    // LSC 后、CCM 前）。CCM 已拆为独立 pass kFsCcm（读 tex_work_ D3 → 写
+    // tex_scene_ D4），D3→D4 的收口 clamp 随 CCM 一起下移。
+    // 此处**刻意不截断**（保持拆分前语义）：拆分前不存在 D3 clamp，加上它是引入
+    // 一次原本没有的语义（负色差在 CCM 之前就被吃掉）。实测 D3 负分量占比
+    // 0.0000%（包络口径亦然）⇒ 两种写法数值等价；但 D3 是第 4b 期色度滤镜的
+    // 取数域，**提前截断会掩盖该期要观察的负色度过冲**，故原样写出。
+    // 截断只在 D4 收口做（kFsCcm，上限 64 = 拆分前的 kFsRcdChroma 口径）。
+    vec3 rgb = vec3(r, g, b) * lscAt(p);
+    oColor = vec4(rgb, 1.0);
+})";
+
+// ── 第 4a 期（S14）：D3 → D4 独立 CCM pass ─────────────────────────────────
+// 动机：原 kFsRcdChroma 在**一个 pass 内**依次跨 D2→D3（LSC）→D4（CCM）三域，
+// 使色度降噪无法在 D3（相机 RGB：LSC 后、CCM 前）取数（第 4b 期的前提）。
+// 本 pass 是整条链路里唯一的 D3→D4 收口：读 tex_work_（D3，RCD 段输出）→
+// 乘 CCM → 写 tex_scene_（D4，场景线性）。tex_work_ 在 RCD→CCM 区间本是空闲的
+// （它只在 passFilm 被写，:passFilm），借用它承载 D3 **零新增显存**。
+// 几何与 passChromaDenoise 同构：kVertRot + uST 单位阵，frag 用 gl_FragCoord
+// 逐像素定位（输入输出同尺寸同布局，纯逐像素映射）。
+// 代价：D3 多一次 RGBA16F（half）往返；量化误差实测见第 4a 期报告。
+const char* kFsCcm = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;  // D3：相机 RGB（LSC 后、CCM 前）
+uniform ivec2 uSize;
+uniform mat3 uCcm;     // sensor→sRGB 行主序
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    vec3 d3 = texelFetch(uTex, p, 0).rgb;
+    vec3 rgb = uCcm * d3;
+    // D3→D4 域收口（审计 S14）：负值与超白在 CCM 之后一次截断。上限 64 是拆分前
+    // kFsRcdChroma 的 D4 域口径，原样搬来（不重标定、不调参）。
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
@@ -3628,6 +3664,8 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_dir = compileShader(GL_FRAGMENT_SHADER, kFsRcdDir);
   const GLuint fs_rcd_g = compileShader(GL_FRAGMENT_SHADER, kFsRcdG);
   const GLuint fs_rcd_chroma = compileShader(GL_FRAGMENT_SHADER, kFsRcdChroma);
+  // 第 4a 期（S14）：D3→D4 独立 CCM pass
+  const GLuint fs_ccm = compileShader(GL_FRAGMENT_SHADER, kFsCcm);
   const GLuint fs_raw_dn = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoise);
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
   const GLuint fs_chroma_down = compileShader(GL_FRAGMENT_SHADER, kFsChromaDown);
@@ -3676,6 +3714,7 @@ bool FrameRenderer::init() {
   const GLuint fs_hl_refdown = compileShader(GL_FRAGMENT_SHADER, kFsHlRefDown);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
+      !fs_ccm ||
       !fs_raw_dn || !fs_chroma_dn || !fs_chroma_down || !fs_chroma_at ||
       !fs_chroma_apply || !fs_hist || !fs_local ||
       !fs_mfnr_pyr || !fs_mfnr_down || !fs_mfnr_fuse || !fs_mfnr_mis ||
@@ -3698,6 +3737,8 @@ bool FrameRenderer::init() {
   prog_rcd_dir_ = linkProgram(vs_plain_, fs_rcd_dir);
   prog_rcd_g_ = linkProgram(vs_plain_, fs_rcd_g);
   prog_rcd_chroma_ = linkProgram(vs_rot_, fs_rcd_chroma);
+  // 与 passChromaDenoise 同构：kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位
+  prog_ccm_ = linkProgram(vs_rot_, fs_ccm);
   prog_raw_dn_ = linkProgram(vs_plain_, fs_raw_dn);
   prog_chroma_dn_ = linkProgram(vs_rot_, fs_chroma_dn);
   prog_chroma_down_ = linkProgram(vs_rot_, fs_chroma_down);
@@ -3752,6 +3793,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_rcd_dir);
   glDeleteShader(fs_rcd_g);
   glDeleteShader(fs_rcd_chroma);
+  glDeleteShader(fs_ccm);
   glDeleteShader(fs_raw_dn);
   glDeleteShader(fs_chroma_dn);
   glDeleteShader(fs_chroma_down);
@@ -3784,6 +3826,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_hr_stat);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
+      !prog_ccm_ ||
       !prog_raw_dn_ || !prog_chroma_dn_ || !prog_chroma_down_ ||
       !prog_chroma_at_ || !prog_chroma_apply_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
@@ -3868,6 +3911,11 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.lsc = glGetUniformLocation(prog_rcd_chroma_, "uLsc");
   u_rcd_chroma_.lsc_size = glGetUniformLocation(prog_rcd_chroma_, "uLscSize");
   u_rcd_chroma_.cd_fix = glGetUniformLocation(prog_rcd_chroma_, "uCdFix");
+
+  // 第 4a 期（S14）：D3→D4 CCM pass
+  u_ccm_.tex = glGetUniformLocation(prog_ccm_, "uTex");
+  u_ccm_.size = glGetUniformLocation(prog_ccm_, "uSize");
+  u_ccm_.ccm = glGetUniformLocation(prog_ccm_, "uCcm");
 
   u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
   u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
@@ -4122,6 +4170,15 @@ bool FrameRenderer::init() {
     glUseProgram(prog_rcd_chroma_);
     glUniformMatrix4fv(u_rcd_chroma_.st, 1, GL_FALSE, ident);
   }
+  {
+    // 第 4a 期（S14）：kFsCcm 用 kVertRot，uST 默认全 0 必须置单位阵
+    const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const GLint st = glGetUniformLocation(prog_ccm_, "uST");
+    if (st >= 0) {
+      glUseProgram(prog_ccm_);
+      glUniformMatrix4fv(st, 1, GL_FALSE, ident);
+    }
+  }
 
   u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
   u_film_.preview_map = glGetUniformLocation(prog_film_, "uPreviewMap");
@@ -4269,6 +4326,7 @@ void FrameRenderer::release() {
   if (prog_rcd_dir_) glDeleteProgram(prog_rcd_dir_);
   if (prog_rcd_g_) glDeleteProgram(prog_rcd_g_);
   if (prog_rcd_chroma_) glDeleteProgram(prog_rcd_chroma_);
+  if (prog_ccm_) glDeleteProgram(prog_ccm_);
   if (prog_raw_dn_) glDeleteProgram(prog_raw_dn_);
   if (prog_chroma_dn_) glDeleteProgram(prog_chroma_dn_);
   if (prog_chroma_down_) glDeleteProgram(prog_chroma_down_);
@@ -4408,6 +4466,7 @@ void FrameRenderer::release() {
   fbo_scene_ = fbo_work_ = fbo_cap_ = 0;
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
+  prog_ccm_ = 0;
   prog_raw_dn_ = prog_chroma_dn_ = 0;
   prog_chroma_down_ = prog_chroma_at_ = prog_chroma_apply_ = 0;
   prog_hist_ = 0;
@@ -5478,13 +5537,16 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-// RCD P3：色度填充 + CCM → 场景线性（tex_scene_）。输出几何与 passRaw 一致
-// （kVertRot 旋转，uST 已在 init 置单位阵）。
+// RCD P3：色度填充（+ LSC）→ **D3**（相机 RGB：LSC 后、CCM 前，写 tex_work_）。
+// 第 4a 期（S14）域拆分：CCM 已移出本 pass（见 kFsCcm / passCcm），本 pass 只负责
+// D2→D3；输出几何仍与 passRaw 一致（kVertRot 旋转，uST 已在 init 置单位阵）。
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
                                   const float* ccm, bool mosaic, float cd_fix) {
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+  // 第 4a 期：D3 走 tex_work_（fbo_work_）—— RCD→CCM 区间它是空闲的，CCM 消费完
+  // D3 之后 passFilm 才覆盖它；不新增纹理（零新增显存）。
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_rcd_chroma_);
   glActiveTexture(GL_TEXTURE0);
@@ -5522,6 +5584,24 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
+}
+
+// P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_）。
+// 纯逐像素映射：读 tex_work_（D3：相机 RGB，LSC 后、CCM 前）→ 乘 CCM → 写
+// tex_scene_（D4：场景线性）。几何与 passChromaDenoise 同构（kVertRot + uST 单位阵，
+// frag 用 gl_FragCoord 定位），输出尺寸 = 输入尺寸，无旋转/无重采样。
+// 只在 RCD 档（demosaic == 1）调用；双线性档仍由 passRaw 内联 CCM（kFsRaw，本期不动）。
+void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_ccm_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glUniform1i(u_ccm_.tex, 0);
+  glUniform2i(u_ccm_.size, dst_w, dst_h);
+  // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
+  glUniformMatrix3fv(u_ccm_.ccm, 1, GL_TRUE, ccm);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // RAW 静拍端到端：u16 Bayer 上传 → passRaw（黑阶/WB/demosaic/CCM）→
@@ -5767,7 +5847,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const auto t1 = std::chrono::steady_clock::now();
   const int w = c.w, h = c.h, dst_w = c.dst_w, dst_h = c.dst_h;
   const FilmParams& p = *c.p;
-  float dir_ms = 0.0f, g_ms = 0.0f, dn_ms = 0.0f;
+  float dir_ms = 0.0f, g_ms = 0.0f, ccm_ms = 0.0f, dn_ms = 0.0f;
   if (c.rcd) {
     if (!ensureRcdTargets(w, h)) return;
     const auto d0 = std::chrono::steady_clock::now();
@@ -5870,6 +5950,15 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     passRcdChroma(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase,
                   c.white_level, c.gains, c.ccm, true, p.rcd_cdfix);
+    // 第 4a 期（S14）：RCD 档的 D3→D4 收口（tex_work_ D3 → tex_scene_ D4）。
+    // 必须在 P4（读 tex_scene_）之前；双线性档不经此处（passRaw 内联 CCM）。
+    // v0.10.154：本 pass 是 4a 新增的全屏 pass，单独计时入日志（ccmMs）——
+    // 项目铁律要求"性能取舍必须实测"，没有这个字段就无法在真机上评估拆分成本。
+    const auto d3 = std::chrono::steady_clock::now();
+    passCcm(dst_w, dst_h, c.ccm);
+    glFinish();
+    ccm_ms = std::chrono::duration<float, std::milli>(
+                 std::chrono::steady_clock::now() - d3).count();
   } else {
     passRaw(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase, c.white_level,
             c.gains, c.ccm, p);
@@ -5956,8 +6045,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       ",\"hlRef2Hit\":" + jnum(dbg_hl_r2hit_, 6) +
       ",\"hlRefGHit\":" + jnum(dbg_hl_rghit_, 6);
   if (c.rcd) {
+    // ccmMs（v0.10.154，第 4a 期新增）：D3→D4 独立 CCM pass 的实测成本。
+    // 它是本期唯一的运行时开销（新增一次全屏 pass：读 100MB + 写 100MB），
+    // 按铁律须由真机数据决定是否接受；跨版本对比时需同场景同 ISO。
     kv += ",\"dirMs\":" + jnum(dir_ms, 6) +
-          ",\"gMs\":" + jnum(g_ms, 6);
+          ",\"gMs\":" + jnum(g_ms, 6) +
+          ",\"ccmMs\":" + jnum(ccm_ms, 6);
   }
   if (c.dn) {
     // v0.10.109：nzSrc 取值改 "ext"/"legacy"（原 "cam2"）—— 原值与 camera 侧

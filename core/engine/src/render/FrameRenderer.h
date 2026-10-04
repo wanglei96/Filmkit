@@ -363,6 +363,10 @@ class FrameRenderer {
                      const float black_phase[4], float white_level,
                      const float gains[3], const float* ccm, bool mosaic,
                      float cd_fix);
+  // P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_），
+  // 纯逐像素映射（kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位）。
+  // 只在 RCD 档调用（双线性档 passRaw 内联 CCM）。S14 的 clamp 收口在 shader 内。
+  void passCcm(int dst_w, int dst_h, const float* ccm);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑。
   // C 专项起值域 σ 由 (A,B) 模型逐像素给出（nc，强度已折入系数）。
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
@@ -454,7 +458,8 @@ class FrameRenderer {
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
-         prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
+         prog_rcd_chroma_ = 0, prog_ccm_ = 0, prog_raw_dn_ = 0,
+         prog_chroma_dn_ = 0,
          prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0,
@@ -716,6 +721,10 @@ class FrameRenderer {
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
           gain = -1, ccm = -1, lsc = -1, lsc_size = -1, cd_fix = -1;
   } u_rcd_chroma_;
+  // 第 4a 期（S14）：D3→D4 独立 CCM pass 的 uniform 句柄
+  struct {
+    GLint tex = -1, size = -1, ccm = -1;
+  } u_ccm_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
           noise_a = -1, noise_b = -1, mix = -1;
