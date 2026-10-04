@@ -979,23 +979,35 @@ vec3 lscAt(ivec2 p) {
     vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
     return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
 }
+// ── D-1 σ 双路修复（Cb/Cr 分离）────────────────────────────────────────
+// 投影到 (Cb, Cr) 的权重 = 行向量的**平方**：
+//   B−Y = −0.2126R − 0.7152G + 0.9278B ⇒ (0.0452, 0.5115, 0.8608)，Σ = 1.4175
+//   R−Y = +0.7874R − 0.7152G − 0.0722B ⇒ (0.6200, 0.5115, 0.0052)，Σ = 1.1367
+// **两路本不相等**，而旧实现给两路共用同一个 `Σᵢwᵢσᵢ²`（luma 合并恒 = 1.0）——
+// 这是"彩噪偏蓝紫"的算术来源：Cb 路径的 σ 被低估最多，降噪最弱。
+// 与 P4 的区别：P4 在**三维 cd 向量**上取 length（三通道一起），这里是**两条
+// 独立标量路径**，故必须逐路给 σ（P4 的合并口径是另一个问题，见 σ 核实报告）。
+const vec3 WCB2 = vec3(0.0452, 0.5115, 0.8608);
+const vec3 WCR2 = vec3(0.6200, 0.5115, 0.0052);
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy) * 2;
     vec2 acc = vec2(0.0);
-    float sacc = 0.0;
-    float ay = dot(uNoiseA, LUMA);
-    float by = dot(uNoiseB, LUMA);
+    vec2 sacc = vec2(0.0);          // 逐路 (Σσ_Cb, Σσ_Cr)
     for (int i = 0; i < 4; ++i) {
         ivec2 q = clamp(p + ivec2(i & 1, i >> 1), ivec2(0), uSize - 1);
         vec3 c = texelFetch(uTex, q, 0).rgb;
         float y = dot(c, LUMA);
         acc += vec2(c.b - y, c.r - y);
-        float glY = dot(lscAt(q), LUMA);
-        sacc += sqrt(max(ay * y + by * glY * glY, 1e-12));
+        // 逐通道方差 σᵢ² = Aᵢ·cᵢ + Bᵢ·gᵢ²：shot 项随**该通道**信号；read 项不随
+        // 信号但经**该通道**的 LSC 增益放大。旧实现把两者都折成 luma，丢掉了
+        // 通道差异（WB 增益把三通道噪声拉开后，这个差异正是要修的东西）。
+        vec3 gl = lscAt(q);
+        vec3 v = max(uNoiseA * c + uNoiseB * gl * gl, vec3(0.0));
+        sacc += sqrt(max(vec2(dot(v, WCB2), dot(v, WCR2)), vec2(1e-12)));
     }
     oChroma = vec4(acc * 0.25, 0.0, 1.0);
-    // 2×2 box 平均使白噪 σ 减半：σ_half = mean(σ_full)/2
-    oSigma = vec4(sacc * 0.125, 0.0, 0.0, 1.0);
+    // 2×2 box 平均使白噪 σ 减半：σ_half = mean(σ_full)/2（两路同一规则）
+    oSigma = vec4(sacc * 0.125, 0.0, 1.0);
 })";
 
 // ② 每级：a_l = B3_dilated(a_{l-1}, step)；d = a_{l-1} − a_l；收缩 + revert
@@ -1022,8 +1034,10 @@ void main() {
             s += (B3[i] * B3[j]) * texelFetch(uPrev, q, 0).rg;
         }
     vec2 d = a0 - s;
-    float sig = max(texelFetch(uSigma, p, 0).r * uK, 1e-6);
-    vec2 dp = d * (d * d) / (d * d + vec2(sig * sig) + vec2(1e-12));
+    // σ **逐路**（Cb/Cr 的噪声方差本不相等；见 kFsChromaDown 的 WCB2/WCR2）。
+    // 旧实现取 .r 单标量给两路共用 ⇒ Cb 路径欠降噪。
+    vec2 sig = max(texelFetch(uSigma, p, 0).rg * uK, vec2(1e-6));
+    vec2 dp = d * (d * d) / (d * d + sig * sig + vec2(1e-12));
     dp += uRevert * (d - dp);          // detail reconstruction（PC revert factor）
     oNext = vec4(s, 0.0, 1.0);
     oDetail = vec4(dp, 0.0, 1.0);
