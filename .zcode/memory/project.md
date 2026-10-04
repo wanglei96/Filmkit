@@ -17,15 +17,18 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/、log/（JSONL+GPU 计时）、jni/Bridge.cpp
 - `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、**research/（11 份独立调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪专项）**
 - `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
-- `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析日志前先跑）**、**still-thread-verify.py + still-thread-run.sh（拍照线程验收：按开关分组出中位）**、align-bench.cpp + align-bench-gen.py、p0-subpixel-eval.py、ab-100pct.py、chroma-scale-eval.py、texture-fidelity-eval.py、denoise-strength-eval.py、check-fft-tile-cover.py、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py/gen-lut-previews.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py、tuning/
+- `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析前先跑）**、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
-## 进行中（2026-10-03 下午）
+## 进行中（2026-10-04 中午）
 
-- [2026-10-03] **品红 = 逆光边缘伪彩（紫边）** | 最高 | 前几轮测错区域（"天空"2.1% 混入了室内
-  天花板）；把全部 `mag≥10` 像素标出后可见品红**全在逆光悬挂物（衣服/毛巾/树枝/挂绳）边缘**——
-  该区域成片 **14.74%**、RAW 域（双线性+CCM）21.14% ⇒ **整条链只压掉 30%**。PC 做法：`MeasureMoire`
-  在 Y 平面出逐像素强度图 → **替换** ChromaDenoise 的强度；我们的 P4/D-1 是全局参数、无伪彩感知
-  | handoffs/高光重建阈值修正与品红伪彩定位.memo.md
+- [2026-10-04] **品红 = 逆光边缘紫边渐晕（定性修正）** | 最高 | 上窗口"伪彩判据"被真实
+  样片否决（品红处亮度带通 = 全图 14×）；14.74% 基准系 uint8 回绕口径污染，安全口径
+  0.65~0.78%。defringe（RT 同形态）已落地 v0.10.134。真机解剖：用户所见主体 =
+  **>32px 低频色度噪声云**（P90 3 级），根因 = 4.8ms 短曝光；**修正方向待拍板**：
+  有界给足（饱和预算）/ D-1 低频扩展 / 暂缓 | handoffs/紫边defringe落地与曝光给足回滚.memo.md
+- [2026-10-04] **曝光给足事故已回滚** | 高 | 方案 A（ISO 下限后解除封顶拉到 target 333ms、
+  砍 hl 上限）真机 100ms → RAW 饱和 4.2%（R 24.3 万像素）→ HR 品红洪水 + 白点失控，
+  成片与 DNG 全毁 ⇒ 当日 revert。**hl 欠曝保险丝保留**；后继给足必须有饱和预算约束
 - [2026-10-03] **亮部亮度降噪** | 高 | 根治白点的正道（不改影调）。对标 PC 亮部 σY 差 1.67×；
   P0 bilateral 在全图只降 21~32%，亮部为何更弱待查（`σ²=A·x+B` 在亮部更大 ⇒ 权重应更大，实测相反）
 - [2026-10-03] **超广畸变自校正** | 高 | HAL 路线已全关（exp7 实测 `distModes:none`、
@@ -33,8 +36,8 @@ status: active
   逐 CFA 平面反向映射保相位）；**需拍板**：完整校正（视场窄 5~10%）/ 部分校正 / 不校正
 - [2026-10-03] **影调白点默认值拍板** | 中 | `whiteEv` 4.0（darktable 默认、有白点）vs
   6.x（白点消失、更柔）；属观感基准变更，等用户在不同场景试过后定
-- [2026-10-03] **窗户场景采集曝光只给 12ms** | 中 | 客厅同类场景给到 100ms，窗户只 12~13ms
-  （光子少 8×）；exp12 已改"曝光给足"，需查 `ExposurePlanner` 四条约束为何在强光场景收敛到 12ms
+- [2026-10-03] **窗户场景采集曝光只给 12ms** | 已定位 | ISO 50 下限时 `nIso=1` 锁死
+  Planner 拉长（"亮度不变"死角）；给足语义已落地但因无饱和预算翻车回滚（见上），重启需拍板
 - [2026-10-04] **M5 诊断与 NN 微调** | 待做/降级 | M5:逐 pass GPU 计时、golden image CI；NN 微调维持暂缓（管线代码保留 nn_dn 默认关）
 
 
@@ -110,7 +113,8 @@ status: active
   P0 LSC、实时直方图、DNG 标准色彩链；对标 PC 重标定与方向链路（orientationStep =
   设备物理旋转）
 
-## 设置页与图标、编辑器调研（10-04，本窗口）
+## 品红专项、defringe 与曝光事故（10-04，本窗口）
 
-- [2026-10-04] **设置页抽屉化 + 应用图标（v0.10.133，tag 已 push）**：35 项平铺 → 4 抽屉；图标 = 光圈叶片+居中镜片 vector 13 path（G 款）；踩坑 = adaptive 前景 bitmap 被桌面非等比渲染、纯 legacy 垫白托 → **PC 同构完整套（vector fg+color bg+monochrome+legacy 全密度）** 才稳
-- [2026-10-04] **编辑器/预设调研完成**（docs/research/10 号）：编辑器与预设一体做；预设 schema 增量 = 颗粒调制/halation/暗角/趾肩/层间效应；E1–E5 阶段待立项
+- [2026-10-04] **设置页抽屉化 + 应用图标（v0.10.133）**：35 项平铺 → 4 抽屉；图标 = 光圈 vector 13 path（G 款）；adaptive 前景须 vector、纯 legacy 垫白托 → **PC 同构完整套** 才稳；编辑器/预设调研完成（docs/research/10 号，E1–E5 待立项）
+- [2026-10-04] **defringe 落地（v0.10.134，c5133d9）**：4 pass 半分辨率（down+Lab+a 门/检测/均值读回/替换），RT PF_correct_RT 机制复现；离线紫边 ↓63%、红 +1%；prefs `defringe` 默认开、FilmParams[47]、日志 `df`/`dfCavg`
+- [2026-10-04] **曝光给足事故（v0.10.135 → 0.10.136 回滚）**：无饱和预算的给足在逆光窗 = RAW 饱和 4.2% + HR 品红洪水 + 白点失控，成片与 DNG 全毁；revert 后 hl 欠曝降级保险丝；安全口径测量脚本在 /tmp 未沉淀

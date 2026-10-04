@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-02 10:05
+updated: 2026-10-04 12:30
 status: active
 ---
 
@@ -15,7 +15,7 @@ status: active
 - [2026-09-18] 构建链：AGP 8.13.2 / Gradle 8.13 / Kotlin 2.3.21 / Compose BOM 2026.06.01 / NDK 29 / CMake 3.22.1 / minSdk 26 / compileSdk 36；依赖上限锁定（2026.09 版 AndroidX 需 AGP 9.1+/SDK 37）
 - [2026-09-18] 项目路径含中文（Downloads/胶片相机）：AGP externalNativeBuild 丢中文段（CXX1400），已改自定义 CMake Exec 直驱 NDK
 - [2026-09-23] 构建命令（本机已验证）：`JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`（系统默认 Java 8 跑不动 AGP）
-- [2026-09-18] X300：Android 16/OriginOS 6，Mali-G1-Ultra MC12，GL ES 3.2，7 相机（0=逻辑主摄、6=第二逻辑组、2/3/4/5=隐藏物理、1=前置）；主摄 RAW 4080×3072、CFA=GRBG、黑阶 64、白阶 1023、maxISO 3200；**16F 无线性过滤**；实测 1024² 三段 spike 0.3–0.5ms/段
+- [2026-09-18] X300：Android 16/OriginOS 6，Mali-G1-Ultra MC12，GL ES 3.2，7 相机（0=逻辑主摄、1=前置、2-5 隐藏物理、6=第二逻辑组）；主摄 RAW 4080×3072、CFA=GRBG、黑阶 64、白阶 1023、maxISO 3200；16F 无线性过滤
 - [2026-09-29] X300 compute 能力（caps.detected 实测）：`maxComputeSharedMemory 32768`、`maxComputeInvocations 1024`、image units 21、GPU timer 可用；RGBA16F + `GL_FLOAT` readPixels 可用
 - [2026-09-21] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`；手机存储可 Mac 直读：`~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/`
 - [2026-09-18] 设备日志导出：`/storage/emulated/0/Android/data/com.filmkit.app/files/logs`（用户经 vivo 办公套件回传，落点 `~/Downloads/vivo办公套件/`）；审计导出同目录 `files/audit/`
@@ -35,7 +35,7 @@ status: active
 
 - [2026-09-18] 版本管理：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；版本号单一来源（build.gradle + BuildConfig）
 - [2026-09-22] **每轮对话只打一个 tag（验收版）**；中间验证包只出 APK 不打 tag（2026-09-30 又违反过一次：一轮打了 6 个，已清理）
-- [2026-10-01] **当前版本：250（`0.10.99-m4`）**，验收 tag **v0.10.99-m4** 已 push；根目录 `filmkit-0.10.99-m4.apk`
+
 - [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
 
 ## 引擎实现现状
@@ -62,27 +62,23 @@ status: active
 
 ## 工具与脚本
 
-- [2026-10-01] **本轮新增**：`tools/still-thread-verify.py`（拍照线程验收：按 `settings.still_thread` 切换点分组，输出预览停更中位/最大、每路 burst 中位耗时、CRC 等价性、落盘计数、`render.fps` 帧率曲线）、`tools/still-thread-run.sh`（adb 一键 `install` / `pull`+分析 / `mem`）
-
-- [2026-09-30] **本轮新增**：`tools/align-bench.cpp` + `tools/align-bench-gen.py`（对齐精度离线基准：真 DNG 金字塔 + FFT 相移真值 + 链接真实 Align.cpp）、`tools/p0-subpixel-eval.py`（P0 采样离线评估，与合成真值比误差）、`tools/check-log-json.py`（日志 JSON 合法性守卫，**分析前先跑**）
-- [2026-09-30] `tools/` 既有：validate-shaders.sh、check-diag-fields.py（**出包前必跑**）、check-fft-tile-cover.py、chroma-scale-eval.py（σC 1–32px）、texture-fidelity-eval.py（2/4/8/16px 带通 + 局部对比度）、denoise-strength-eval.py（σY 分层）、ab-100pct.py（同刻 100% 裁剪配准对比）、chroma-denoise-eval.py、tone-scan.py、gen-lut-assets.py、dng-color-dump.py、color-metrics.py、ccm-chain-ab.py、check-srgb-oetf.py、check-lsc-mapping.py、lut-audit.py
-- [2026-09-22] 内置 LUT 资产：42 个 `.lut`（uint8、33³、4.3MB）；与 `~/Downloads/LUT/滤镜.cube/` 64³ 逐点一致；显示名/分类在资产头，prefs `lut_cat_*`/`lut_cats` 存覆盖
-- [2026-09-24] `docs/research/` 11 份 + README 索引（00=活入口、01–08 证据附录、**09=频域降噪专项**、90=原始转储勿删）
+- [2026-10-01] `tools/still-thread-verify.py` + `still-thread-run.sh`（拍照线程验收：预览停更/burst 耗时/CRC 等价/落盘计数/帧率曲线）；[2026-09-30] `align-bench.cpp`+`align-bench-gen.py`（对齐离线基准）、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）
+- [2026-09-30] `tools/` 既有：validate-shaders.sh、check-diag-fields.py（**出包前必跑**）、check-fft-tile-cover、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、ab-100pct、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit
+- [2026-09-22] 内置 LUT 资产 42 个 `.lut`（uint8、33³、4.3MB）与 `~/Downloads/LUT/滤镜.cube/` 逐点一致；[2026-09-24] `docs/research/` 11 份 + README（00=活入口、09=频域降噪专项、90=原始转储勿删）
 
 ## 本轮实测数据（2026-09-30）
 
 - [2026-09-30] **PC 对标（同场景同曝光 ISO 1386 vs 1402）**：暗部 σY 1.323 vs 0.586（**差 2.26×**，旧数据 4.7×）、中间调 1.050 vs 0.610；暗部 σC 0.338 vs 0.787（**好 2.3×**）、中间调 0.322 vs 0.935（好 2.9×）；边缘 P99.5 12.11 vs 10.90；纹理保真比 0.92
+
 ## 拍照线程与 LUT（2026-10-01，压缩）
 
-- [2026-10-01] **连拍崩溃与显存代价**：OOM 报 `Failed to allocate 50135052 … target footprint 248965720 / growth limit 268435456`（237/256MB）；修后连拍 7 张全成功、queued/saved 4/4 零丢失。显存（`dumpsys meminfo` 逐 2s）：预览基线 392MB、**开独立线程峰值 3011MB / 拍完残留 2418MB**、关线程峰值 2556MB / 回落 459MB ⇒ 独立线程代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放后回 ~400MB）
-- [2026-10-01] **合成耗时与帧率**：热机单张 `totalMs` 2091~3336ms（dftGpu 855~922、passMs 711~2021、alignCpuMs 185~737），冷机首次可达 5133ms；空闲 30~32fps、拍照期最低 13~25fps；**同帧 A/B 画质等价**（两条路径 CRC32 `3615113902` 完全相同）；MFNR 4 帧 `render.burst_done ms ≈ 3.9–4.3s`（align 835 + fuse 1278 + dftGpu 614）、采集 257–313ms，`capture()` 在渲染期**静默吞快门**（"连按两下只出一张"的根因）
+- [2026-10-01] **连拍显存与耗时**：修后 7 张全成功零丢失；独立线程代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放回 ~400MB）；热机单张 totalMs 2091~3336ms、同帧 A/B CRC32 等价；`capture()` 在渲染期**静默吞快门**（"连按两下只出一张"根因）
 - [2026-10-01] **LUT 库结构**：`app/src/main/java/com/filmkit/app/lut/`（CubeLut 解析 1D/3D/二进制、MAX_SIZE 128；LutIO 嗅探/Hald·Unwrapped/重采样；LutLibrary 内置 42 + 用户库 files/luts、id 前缀 u_）；预览降载走 `g_preview_scale`（进程级 atomic）；单帧静拍直通 `nativeEngineSubmitRaw/Still` + `bindLut` 强度上限 1.5
 
 ## NN 路线与对齐（2026-10-02，NN 已判死）
 
 - [2026-10-02] **spike 达标但集成判死**：真机 GPU **26ms/tile**（7× CPU）、12MP 0.51s 零温升；纹理保留 78–86% 优于 P0 交换比。集成五轮逐层修口径（JNI 桥 / KSigma 量纲 / cvt_k×256 / 通道序 / neff 折减）后 **nnGain 与公式逐位吻合而观感零改善**（文字梯度 −24%、平坦区斑块状伪影而非白噪）⇒ **跨域模型不可直接用**；四次微调（监督×3 + N2N）留出集**全过拟合**（+12.0/+9.9/+11.7/+5.06%），瓶颈 = 数据量（4 场景 vs 官方 3 万+）
 - [2026-10-02] **NN 代码落点（保留、默认关）**：`app/src/main/java/com/filmkit/app/nn/NnInferEngine.kt`（常驻推理线程 + GpuDelegate + CPU 熔断）、`FrameRenderer.{h,cpp}`（kFsNnPack/Unpack、runNnPass、nnSemTables、**kNnAnchorS=1.0093e-3**、cvt_k×neff）、`Bridge.cpp`；prefs nn_dn/nn_ab 默认关；raw.render 含 nn/nnOk/nnFail/nnMs/nnTiles/nnGain
-- [2026-10-02] **对齐工具实测**：位移误差 0.0115px（合成 6 帧）、噪声 ×3.22、异场景剔除 wn 0.304 vs 同场景 0.996；真实手持 8 帧 ×2.16；93 帧/5 场景中 4 个可用
 
 ## 曝光决策（10-02 晚，压缩）
 
@@ -99,10 +95,7 @@ status: active
 
 ## 对标与开关实测（10-03 下午）
 
-- [2026-10-03] **对标 PhotonCamera（同场景、相隔 14 秒）**：平坦块分亮度层 σY —— 亮部(170+) 我们 **0.82** / PC **0.49**（**1.67×**）；中亮(120-170) 0.66/0.49；中暗(60-120) 0.82/0.66。**差距随亮度单调放大 ⇒ 唯一短板 = 亮部亮度降噪**。色度多尺度 1→32px 我们 **0.98→0.28** / PC 1.17→0.35（**全面占优 1.2~1.8×**）
-- [2026-10-03] **噪声模型在 RAW 域是准的**：CFA 平面独立、中值残差法实测 σ vs 模型 —— R 1.39、G1 1.04、G2 1.23、B 1.34（同量级）⇒ "降噪模型不准"可排除
-- [2026-10-03] **filmic 白点滑杆的真实效果**：`whiteEv` 4.53 → **6.20** ⇒ 红釉白点消失，代价是对比度降低；机制 = 白点越远、映射区间越宽、曲线越平、微小起伏被压缩
-- [2026-10-03] **降噪强度与白点无关**：dn 0/0.45/1.0 ⇒ 釉面 d>15 = 0.38%/0.50%/0.53%（反而略升）；`nzPost` 分别降 0%/21%/32% ⇒ **亮度噪声最多只压掉 32%**
+- [2026-10-03] **对标 PhotonCamera（同场景相隔 14s）**：亮部 σY 我们 0.82 / PC 0.49（**1.67×**），差距随亮度单调放大 ⇒ **唯一短板 = 亮部亮度降噪**；色度多尺度 1→32px 全面占优 1.2~1.8×；**噪声模型 RAW 域实测准**（R 1.39/G 1.04/G2 1.23/B 1.34）；`whiteEv` 4.53→6.20 消白点但降对比度；降噪强度与白点无关（nzPost 最多降 32%）
 
 ## 高光重建与品红（10-03 晚，本窗口）
 
@@ -118,3 +111,10 @@ status: active
 
 - [2026-10-04] **版本 281–288（0.10.126–133）**：设置页四抽屉整理 / 图标五版迭代 / 验收 tag v0.10.133（2f8bbfc）；图标 = 光圈叶片+居中镜片 **vector 13 path**（`drawable/ic_launcher_fg.xml`）+ legacy 4 密度 PNG + monochrome，资源结构 = PC 同构
 - [2026-10-04] **编辑器调研 docs/research/10 号**（6e94f99）：预设 schema 提案（47 槽不动 + 颗粒强度/尺寸/密度调制、halation 阈值/强度/半径/色相、暗角、趾肩、层间效应）、E1–E5 阶段；基础设施 = CameraPresets 47 槽 + `nativeEngineSubmitStill/Raw` 单帧直通 + 胶卷位占位（CameraScreen:1232）
+
+## 紫边 defringe 与曝光事故（10-04）
+
+- [2026-10-04] **defringe 落地（v0.10.134，c5133d9）**：4 pass 半分辨率——down+Lab+a 门（kFsDefringeDown）/11×11 检测（kFsDefringeDetect）/16×16 均值读回 chromave（kFsDefringeAvg）/全分辨率替换（kFsDefringeApply）；插桩 P4 后、D-1 前（成片链 only，D-1 加 src_tex 参数）；FilmParams[47] kCount=48、prefs `defringe` 默认开、日志 `df`/`dfCavg`；离线定稿 σ8/窗13/t23 + Lab a 门[15,30]（紫边 ↓63%、红 +1%）
+- [2026-10-04] **真机口径（112025 对，4.8ms 逆光窗）**：1px 色度噪点 10.5%→0.04%（融合+P0/P4/D-1）；用户所见品红主体 = >32px 低频云（P90 3 级、品红绿成对、中亮区集中）；df=1 正常执行、dfCavg 1.22~3.73；defringe 对低频云结构性无效
+- [2026-10-04] **曝光给足事故与回滚**：v0.10.135（511ad73）拉 100ms → RAW 饱和 4.2%、hlCnt 50.8 万、白点 8.5/5.1 失控，成片与 DNG 毁；revert 52870f4 → v0.10.136（3c6da7c，当前推荐包）；ExposurePlanner 语义：守恒段（ISO÷N）+ 给足段（ISO 钉下限纯拉长、deltaEv 反补偿）、hl 欠曝仅 nStretch≤1 保险丝
+- [2026-10-04] 版本沿革：288（0.10.133）→ 289（0.10.134 defringe）→ 290（0.10.135 给足，已回滚）→ 291（0.10.136 当前）；离线脚本 /tmp/magenta_recon、/tmp/df_real 未沉淀
