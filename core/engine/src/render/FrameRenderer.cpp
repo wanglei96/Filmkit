@@ -772,6 +772,145 @@ void main() {
     oColor = vec4(y0 + mix(cd0, acc / wsum, uMix), 1.0);   // v0.10.108：强度<1 线性混合
 })";
 
+// ── 紫边抑制（v0.10.134）：逆光边缘紫边 = 贴着物体轮廓的品红渐晕 ─────────
+// 2026-10-04 样片定量（tools 离线，基准 154402 对）：品红伪影 56~66% 贴边、
+// 平坦区孤立点 2~3%；P4/D-1 的保边判据恰好保护它，整链近零压制；RawTherapee
+// Defringe（PF_correct_RT）的核心机制对症：检测量 = 色度相对**局部模糊基线**
+// 的偏离（高饱和物体内部均匀 → 不命中，天然保红），替换 = 低偏离邻居加权
+// 平均（L 零损失）。三处与原版的差异都有数据支撑：
+// ① 作用域 = 引擎 P4 后的场景线性 RGB → Lab（RT 在其管线 demosaic 后，同位）；
+// ② 色相门 = Lab a∈[15,30] 反向 smoothstep（离线定稿：紫边 ↓63%、红物体
+//    色度 +1%；RT 用可选 hue curve 实现同职，默认全 0 不动作）；
+// ③ 参数：检测模糊 σ8 / 替换窗口 13×13 / 阈值 t23（k=(23/33)²·5=2.43，RT
+//    默认 t13 对自动管线命中 21% = 全图色度大清洗，毁图实锤后重标定）。
+// 实现（半分辨率，紫边为 2-8px 低频结构）：
+//   down（2×2 box + 转 Lab + 门）→ detect（11×11 box 基线 + chroma）→
+//   avg（16×16 网格均值，CPU 读回 chromave）→ apply（命中替换）。
+const char* kFsDefringeDown = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oLab;   // (L, a, b, gate)
+uniform highp sampler2D uTex;         // 全分辨率场景线性 RGB（P4 输出）
+uniform ivec2 uSize;
+const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
+const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
+const vec3 ZW = vec3(0.0193339, 0.1191920, 0.9503041);
+float labf(float t) {
+    return t > 0.008856 ? pow(t, 1.0 / 3.0) : t * 7.787037 + 0.137931;
+}
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy) * 2, ivec2(0), uSize - 1);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        ivec2 q = clamp(p + ivec2(i & 1, i >> 1), ivec2(0), uSize - 1);
+        acc += texelFetch(uTex, q, 0).rgb;
+    }
+    vec3 rgb = acc * 0.25;
+    vec3 xyz = vec3(dot(XW, rgb), dot(YW, rgb), dot(ZW, rgb)) /
+               vec3(0.95047, 1.0, 1.08883);
+    vec3 f = vec3(labf(xyz.r), labf(xyz.g), labf(xyz.b));
+    float L = 116.0 * f.g - 16.0;
+    float a = 500.0 * (f.r - f.g);
+    float b = 200.0 * (f.g - f.b);
+    // 色相门：a 高 = 红/橙（Lab a 与品红紫边重叠但红物体 a 显著更高，离线
+    // 定稿 15/30），门关 = 该像素完全不参与检测与替换。
+    float gate = 1.0 - smoothstep(15.0, 30.0, a);
+    oLab = vec4(L, a, b, gate);
+})";
+
+const char* kFsDefringeDetect = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oDet;   // (a, b, chroma, gate)
+uniform highp sampler2D uSrc;         // 半分辨率 (L,a,b,gate)
+uniform ivec2 uHalf;
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf - 1);
+    vec4 c0 = texelFetch(uSrc, p, 0);
+    vec2 ba = vec2(0.0);
+    for (int dy = -5; dy <= 5; ++dy)
+        for (int dx = -5; dx <= 5; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uHalf - 1);
+            vec4 c = texelFetch(uSrc, q, 0);
+            ba += c.yz;               // (a, b)
+        }
+    ba *= 1.0 / 121.0;
+    float dev = c0.w * ((c0.y - ba.x) * (c0.y - ba.x) +
+                        (c0.z - ba.y) * (c0.z - ba.y));
+    oDet = vec4(c0.y, c0.z, dev, c0.w);
+})";
+
+const char* kFsDefringeAvg = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oAvg;   // (chroma 均值, 0, 0, 1)
+uniform highp sampler2D uSrc;         // 半分辨率 (a,b,chroma,gate)
+uniform ivec2 uHalf;
+void main() {
+    // 16×16 box：CPU 对网格再取均值 = 全图 chromave（边缘 box 略欠权，可忽略）
+    ivec2 p = ivec2(gl_FragCoord.xy) * 16;
+    float acc = 0.0;
+    for (int dy = 0; dy < 16; ++dy)
+        for (int dx = 0; dx < 16; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uHalf - 1);
+            acc += texelFetch(uSrc, q, 0).z;
+        }
+    oAvg = vec4(acc / 256.0, 0.0, 0.0, 1.0);
+})";
+
+const char* kFsDefringeApply = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;  // 线性 RGB（进 D-1 / film）
+uniform highp sampler2D uTex;          // 全分辨率场景线性 RGB
+uniform highp sampler2D uDet;          // 半分辨率 (a,b,chroma,gate)
+uniform ivec2 uHalf;
+uniform float uChromaAvg;              // 全图 chroma 均值（CPU 读回）
+uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
+const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
+const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
+const vec3 ZW = vec3(0.0193339, 0.1191920, 0.9503041);
+const mat3 XYZ2RGB = mat3(3.2404542, -0.9692660, 0.0556434,
+                          -1.5371385, 1.8760108, -0.2040259,
+                          -0.4985314, 0.0415560, 1.0572252);
+float labf(float t) {
+    return t > 0.008856 ? pow(t, 1.0 / 3.0) : t * 7.787037 + 0.137931;
+}
+float labfinv(float t) {
+    return t > 0.206896 ? t * t * t : (t - 0.137931) * 0.128418;
+}
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf * 2 - 1);
+    vec3 lin0 = texelFetch(uTex, p, 0).rgb;
+    vec4 d0 = texelFetch(uDet, clamp(p >> 1, ivec2(0), uHalf - 1), 0);
+    // RT 判定 fringe < threshfactor ⇔ chroma > (t/33)^2·5·chromave
+    if (d0.z <= uThreshK * uChromaAvg) {
+        oColor = vec4(lin0, 1.0);
+        return;
+    }
+    // 命中：13×13 全分辨率窗口（半分辨率 ±3）内低偏离邻居加权平均 a/b。
+    // 权重 = 1/(chroma_i + chromave)：紫边像素自身偏离大、权重低，替换值
+    // 由均匀区（物体内部与背景）主导——色相过渡自然，这是 RT 不做方向
+    // 判定也不毁饱和物体的关键。
+    float wsum = 1e-9, atot = 0.0, btot = 0.0;
+    ivec2 hp = clamp(p >> 1, ivec2(0), uHalf - 1);
+    for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
+            ivec2 q = clamp(hp + ivec2(dx, dy), ivec2(0), uHalf - 1);
+            vec4 c = texelFetch(uDet, q, 0);
+            float w = 1.0 / (c.z + uChromaAvg);
+            atot += w * c.x;
+            btot += w * c.y;
+            wsum += w;
+        }
+    // L 由本像素线性值现算（亮度零损失），只换 a/b
+    float y0 = dot(lin0, LW);
+    float fy = (116.0 * labf(y0) - 16.0 + 16.0) / 116.0;
+    float fx = fy + (atot / wsum) / 500.0;
+    float fz = fy - (btot / wsum) / 200.0;
+    vec3 xyz = vec3(labfinv(fx) * 0.95047, labfinv(fy),
+                    labfinv(fz) * 1.08883);
+    oColor = vec4(clamp(XYZ2RGB * xyz, vec3(0.0), vec3(16.0)), 1.0);
+})";
+
 // ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
 // 对标 PhotonCamera FullResolutionDenoise（多尺度金字塔 + luma/chroma 独立 +
 // detail revert factor）与 darktable wavelet denoise：undecimated à trous 分解
@@ -3326,6 +3465,11 @@ bool FrameRenderer::init() {
   // NN 降噪 pass（v0.10.102）：域桥 shader（pack/unpack），纯 fragment 低风险
   const GLuint fs_nn_pack = compileShader(GL_FRAGMENT_SHADER, kFsNnPack);
   const GLuint fs_nn_unpack = compileShader(GL_FRAGMENT_SHADER, kFsNnUnpack);
+  // 紫边抑制（v0.10.134）：down+Lab / 检测 / 均值 / 替换
+  const GLuint fs_df_down = compileShader(GL_FRAGMENT_SHADER, kFsDefringeDown);
+  const GLuint fs_df_det = compileShader(GL_FRAGMENT_SHADER, kFsDefringeDetect);
+  const GLuint fs_df_avg = compileShader(GL_FRAGMENT_SHADER, kFsDefringeAvg);
+  const GLuint fs_df_apply = compileShader(GL_FRAGMENT_SHADER, kFsDefringeApply);
   // 降噪专项 A（v0.10.49）：compute program 一律**拍照时现场创建、用完删除**
   //（spike 模式）—— 实锤:init 创建的 compute program 在该 Mali 驱动上经
   // 预览链大量 program 创建后写入全丢（主内核 + 1-texel 微测试一致失败），
@@ -3378,6 +3522,13 @@ bool FrameRenderer::init() {
   prog_chroma_down_ = linkProgram(vs_rot_, fs_chroma_down);
   prog_chroma_at_ = linkProgram(vs_rot_, fs_chroma_at);
   prog_chroma_apply_ = linkProgram(vs_rot_, fs_chroma_apply);
+  // 紫边抑制（v0.10.134）：down 用 vs_rot_（需要旋转一致的几何？不需要——
+  // defringe 紧跟 P4，同为全分辨率纹理域，用 vs_plain_ 与 chroma_apply 同构；
+  // vs_rot_ 顶点层带 kVertRot，detect/avg 的 gl_FragCoord 语义随视口，plain 更直白）
+  prog_df_down_ = linkProgram(vs_plain_, fs_df_down);
+  prog_df_det_ = linkProgram(vs_plain_, fs_df_det);
+  prog_df_avg_ = linkProgram(vs_plain_, fs_df_avg);
+  prog_df_apply_ = linkProgram(vs_plain_, fs_df_apply);
   prog_mfnr_pyr_ = linkProgram(vs_plain_, fs_mfnr_pyr);
   prog_mfnr_down_ = linkProgram(vs_plain_, fs_mfnr_down);
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
@@ -3751,6 +3902,19 @@ bool FrameRenderer::init() {
   u_chroma_apply_.lsc_size = glGetUniformLocation(prog_chroma_apply_, "uLscSize");
   u_chroma_apply_.l = glGetUniformLocation(prog_chroma_apply_, "uL");
   u_chroma_apply_.kr = glGetUniformLocation(prog_chroma_apply_, "uKr");
+  // 紫边抑制（v0.10.134）
+  u_df_down_.tex = glGetUniformLocation(prog_df_down_, "uTex");
+  u_df_down_.size = glGetUniformLocation(prog_df_down_, "uSize");
+  u_df_det_.src = glGetUniformLocation(prog_df_det_, "uSrc");
+  u_df_det_.half = glGetUniformLocation(prog_df_det_, "uHalf");
+  u_df_avg_.src = glGetUniformLocation(prog_df_avg_, "uSrc");
+  u_df_avg_.size = glGetUniformLocation(prog_df_avg_, "uHalf");
+  u_df_apply_.tex = glGetUniformLocation(prog_df_apply_, "uTex");
+  u_df_apply_.det = glGetUniformLocation(prog_df_apply_, "uDet");
+  u_df_apply_.size = glGetUniformLocation(prog_df_apply_, "uSize");
+  u_df_apply_.half = glGetUniformLocation(prog_df_apply_, "uHalf");
+  u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
+  u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -3917,6 +4081,10 @@ void FrameRenderer::release() {
   if (prog_chroma_down_) glDeleteProgram(prog_chroma_down_);
   if (prog_chroma_at_) glDeleteProgram(prog_chroma_at_);
   if (prog_chroma_apply_) glDeleteProgram(prog_chroma_apply_);
+  if (prog_df_down_) glDeleteProgram(prog_df_down_);
+  if (prog_df_det_) glDeleteProgram(prog_df_det_);
+  if (prog_df_avg_) glDeleteProgram(prog_df_avg_);
+  if (prog_df_apply_) glDeleteProgram(prog_df_apply_);
   if (prog_mfnr_pyr_) glDeleteProgram(prog_mfnr_pyr_);
   if (prog_mfnr_down_) glDeleteProgram(prog_mfnr_down_);
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
@@ -4546,8 +4714,10 @@ bool FrameRenderer::ensureChromaMst(int w, int h) {
 
 // D 专项：色度多尺度降噪。输入 tex_dn_（P4 已平滑的输出），输出 tex_scene_
 // （= P5 之后 passFilm 的输入）。返回 false = 未执行（调用方回落 tex_dn_）。
+// src_tex（v0.10.134）：输入源可替换——defringe 开启时传 tex_df_（紫边抑制输出），
+// 0 = tex_dn_（原行为）。
 bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
-                                        const NoiseCoef& nc) {
+                                        const NoiseCoef& nc, GLuint src_tex) {
   dbg_cms_ = 0; dbg_cms_k_ = 0.f;
   if (!prog_chroma_down_ || !prog_chroma_at_ || !prog_chroma_apply_) return false;
   if (!ensureChromaMst(dst_w, dst_h)) return false;
@@ -4561,7 +4731,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glViewport(0, 0, hw, hh);
   glUseProgram(prog_chroma_down_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
   glUniform1i(u_chroma_down_.tex, 0);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, lsc_tex_);
@@ -4864,6 +5034,119 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
              .count();
   r.ok = true;
   return r;
+}
+
+// ── 紫边抑制（v0.10.134）────────────────────────────────────────────────
+// 缓冲：tex_df_（全分辨率输出）、tex_df_lab_/tex_df_det_（半分辨率）、
+// tex_df_avg_（1/16 网格 chroma 均值，CPU 读回 chromave）。尺寸缓存键 = w/h。
+bool FrameRenderer::ensureDefringe(int w, int h) {
+  const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+  const int aw = (hw + 15) / 16, ah = (hh + 15) / 16;
+  if (df_w_ == w && df_h_ == h && tex_df_ != 0 && tex_df_lab_ != 0 &&
+      tex_df_det_ != 0 && tex_df_avg_ != 0) {
+    return true;
+  }
+  if (tex_df_) {
+    glDeleteTextures(1, &tex_df_);
+    glDeleteFramebuffers(1, &fbo_df_);
+    tex_df_ = fbo_df_ = 0;
+  }
+  if (tex_df_lab_) {
+    glDeleteTextures(1, &tex_df_lab_);
+    glDeleteFramebuffers(1, &fbo_df_lab_);
+    tex_df_lab_ = fbo_df_lab_ = 0;
+  }
+  if (tex_df_det_) {
+    glDeleteTextures(1, &tex_df_det_);
+    glDeleteFramebuffers(1, &fbo_df_det_);
+    tex_df_det_ = fbo_df_det_ = 0;
+  }
+  if (tex_df_avg_) {
+    glDeleteTextures(1, &tex_df_avg_);
+    glDeleteFramebuffers(1, &fbo_df_avg_);
+    tex_df_avg_ = fbo_df_avg_ = 0;
+  }
+  makeTex(&tex_df_, &fbo_df_, GL_RGBA16F, w, h);
+  makeTex(&tex_df_lab_, &fbo_df_lab_, GL_RGBA16F, hw, hh);
+  makeTex(&tex_df_det_, &fbo_df_det_, GL_RGBA16F, hw, hh);
+  makeTex(&tex_df_avg_, &fbo_df_avg_, GL_RGBA16F, aw, ah);
+  if (tex_df_ == 0 || tex_df_lab_ == 0 || tex_df_det_ == 0 || tex_df_avg_ == 0) {
+    df_w_ = df_h_ = 0;   // 分配失败 → 调用方保持 P4 输出（照片优先红线）
+    return false;
+  }
+  df_w_ = w;
+  df_h_ = h;
+  return true;
+}
+
+// 四段：down+Lab+门 → 检测 → 1/16 均值（读回 chromave）→ 替换。
+// 输入 tex_dn_（P4 输出），输出 tex_df_。任何一步失败返回 false（调用方回落）。
+bool FrameRenderer::passDefringe(int dst_w, int dst_h) {
+  dbg_df_cavg_ = 0.f;
+  if (!prog_df_down_ || !prog_df_det_ || !prog_df_avg_ || !prog_df_apply_) {
+    return false;
+  }
+  if (!ensureDefringe(dst_w, dst_h)) return false;
+  const int hw = (dst_w + 1) / 2, hh = (dst_h + 1) / 2;
+  const int aw = (hw + 15) / 16, ah = (hh + 15) / 16;
+  // ① 2×2 box down + 线性 RGB → Lab + 色相门
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_lab_);
+  glViewport(0, 0, hw, hh);
+  glUseProgram(prog_df_down_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glUniform1i(u_df_down_.tex, 0);
+  glUniform2i(u_df_down_.size, dst_w, dst_h);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ② 11×11 box 局部基线 + chroma（门已乘入）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_det_);
+  glViewport(0, 0, hw, hh);
+  glUseProgram(prog_df_det_);
+  glBindTexture(GL_TEXTURE_2D, tex_df_lab_);
+  glUniform1i(u_df_det_.src, 0);
+  glUniform2i(u_df_det_.half, hw, hh);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ③ chroma 均值网格 + CPU 读回（RGBA16F + GL_FLOAT 组合 X300 已验证）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_avg_);
+  glViewport(0, 0, aw, ah);
+  glUseProgram(prog_df_avg_);
+  glBindTexture(GL_TEXTURE_2D, tex_df_det_);
+  glUniform1i(u_df_avg_.src, 0);
+  glUniform2i(u_df_avg_.size, hw, hh);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  float cavg = 0.f;
+  {
+    std::vector<float> grid(static_cast<size_t>(aw) * ah * 4);
+    glReadPixels(0, 0, aw, ah, GL_RGBA, GL_FLOAT, grid.data());
+    double s = 0.0;
+    for (size_t i = 0; i < grid.size(); i += 4) s += grid[i];
+    cavg = static_cast<float>(s / (aw * ah));
+    if (!(cavg > 0.f)) {   // 读回异常（NaN/全零）→ 放弃本帧（fail-safe）
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      return false;
+    }
+  }
+  dbg_df_cavg_ = cavg;
+  // ④ 命中替换（L 零损失；未命中像素原样直通）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_df_apply_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glUniform1i(u_df_apply_.tex, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_df_det_);
+  glUniform1i(u_df_apply_.det, 1);
+  glUniform2i(u_df_apply_.size, dst_w, dst_h);
+  glUniform2i(u_df_apply_.half, hw, hh);
+  glUniform1f(u_df_apply_.chroma_avg, cavg);
+  glUniform1f(u_df_apply_.thresh_k, 2.43f);   // (23/33)²·5，RT threshold=23
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glActiveTexture(GL_TEXTURE0);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  return true;
 }
 
 // RCD P1：方向场（vh + pq 统计），raw 原始方向全屏
@@ -5330,12 +5613,19 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
             c.gains, c.ccm, p);
   }
   bool mst_ok = false;
+  bool df_ok = false;
   if (c.dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return;
     const auto n0 = std::chrono::steady_clock::now();
     passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc);
+    // 紫边抑制（v0.10.134）：P4 后、D-1 前。逆光边缘品红渐晕 56~66% 贴边
+    // （P4/D-1 保边判据恰好保护它），Lab 域 defringe（RT 同形态）对症。
+    // 失败/关闭回落 tex_dn_（照片优先红线）。成片链 only —— 预览链成本
+    // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
+    df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h) : false;
     // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
-    mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc);
+    mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
+                                  df_ok ? tex_df_ : tex_dn_);
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -5343,9 +5633,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   // v0.10.16：HR 已移入 passFilm（黑白点标定之后、still 才跑）——darktable 的
   // 高光重建与黑白点 autodetect 是配套的（裁剪阈值由 white_source 决定）。
-  // D 专项：P5 成功时结果在 tex_scene_；否则回落 P4 的 tex_dn_
+  // D 专项：P5 成功时结果在 tex_scene_；否则回落 P4 的 tex_dn_（defringe 成功时
+  // 为 tex_df_——紫边抑制输出，与 tex_dn_ 同域同几何）
   passFilm(dst_w, dst_h, p,
-           (c.dn && mst_ok) ? tex_scene_ : (c.dn ? tex_dn_ : tex_scene_),
+           (c.dn && mst_ok) ? tex_scene_
+                            : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_),
            /*still=*/true);
   const auto t2 = std::chrono::steady_clock::now();
 
@@ -5419,7 +5711,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"p4A\":" + fa3(c.nc.p4a) + ",\"p4B\":" + fa3(c.nc.p4b) +
           ",\"ns\":" + jnum(c.ns, 6) +
           ",\"nsHal\":" + jnum(c.ns_raw, 6) +
-          ",\"dnMs\":" + jnum(dn_ms, 6);
+          ",\"dnMs\":" + jnum(dn_ms, 6) +
+          // 紫边抑制（v0.10.134）：ok = 执行与否，cavg = Lab chroma 全图均值
+          //（读回值，评估判定阈值是否跟场景走），hit 需 GPU 计数暂缺
+          ",\"df\":" + std::to_string(df_ok ? 1 : 0) +
+          ",\"dfCavg\":" + jnum(dbg_df_cavg_, 6);
     if (rms_res.ok) {
       kv += ",\"rms\":[" + jnum(rms_res.rms[0], 6) + "," +
             jnum(rms_res.rms[1], 6) + "," +

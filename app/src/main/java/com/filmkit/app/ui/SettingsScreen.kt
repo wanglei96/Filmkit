@@ -326,6 +326,22 @@ private fun QualityDrawerContent() {
             )
         },
     )
+    // 逆光边缘紫边抑制（v0.10.134）：RawTherapee Defringe 同形态。2026-10-04
+    // 样片定量：品红伪影 56~66% 贴着物体轮廓，P4/D-1 的保边判据恰好保护它。
+    var defringeOn by remember { mutableStateOf(prefs.getBoolean("defringe", true)) }
+    SettingSwitchRow(
+        title = "边缘紫边抑制",
+        subtitle = "逆光轮廓品红渐晕（Lab 域 defringe，红物体与亮度不受损）；关 = 同场景 A/B 对照",
+        checked = defringeOn,
+        onChecked = { v ->
+            defringeOn = v
+            prefs.edit().putBoolean("defringe", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.defringe",
+                "{\"on\":$v}",
+            )
+        },
+    )
 }
 
 /** 抽屉内容：影调与色彩（基准影调 / 曝光基准 / 饱和 / 黑白点 / 局部色调 / 色彩链 / 色域 / 高光重建） */

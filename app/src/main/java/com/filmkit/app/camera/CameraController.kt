@@ -1076,7 +1076,10 @@ class CameraController(private val context: Context, private val render: RenderC
     private val HR_RAW = 1.0
     // v0.10.117：RCD 色差段回归 RawTherapee 原版（FilmParams[46]）
     private val RCD_CDFIX = 1.0
+    // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）
+    private val DEFRINGE = 1.0
     private var rcdCdFixPref = -1.0
+    private var defringePref = -1.0
     private var hrRawPref = -1.0
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
@@ -1170,6 +1173,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHrWaveletPref()
         applyHrRawPref()
         applyRcdCdFixPref()
+        applyDefringePref()
         applyWhiteHlPref()
         applyWhiteFloorPref()
         applyWhiteProbePref()
@@ -1305,6 +1309,21 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != rcdCdFixPref) {
             rcdCdFixPref = v
             filmParams[46] = v
+        }
+    }
+
+    /**
+     * 逆光边缘紫边抑制开关（v0.10.134）：写 FilmParams[47]。
+     * RawTherapee Defringe 同形态（Lab 域"色度相对局部基线偏离"检测 + Lab a
+     * 通道色相门 + 低偏离邻居加权替换，L 零损失），作用在 P4 之后、D-1 之前。
+     * 对症 2026-10-04 样片定量：品红伪影 56~66% 贴边，P4/D-1 保边判据恰好
+     * 保护它，整链近零压制。0 = 关（A/B 通路）。
+     */
+    private fun applyDefringePref() {
+        val v = if (appPrefs.getBoolean("defringe", true)) DEFRINGE else 0.0
+        if (v != defringePref) {
+            defringePref = v
+            filmParams[47] = v
         }
     }
 

@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 47;  // v0.10.117：+[46] rcd_cdfix（v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）
+  static constexpr int kCount = 48;  // v0.10.134：+[47] defringe（v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -131,6 +131,15 @@ struct FilmParams {
   // 边界被抬到 +20~26），窗户过曝区同样出现大面积色块。默认 1（回归原版）；
   // 0 = A/B 通路。设置页开关写 prefs("rcd_cdfix")。
   float rcd_cdfix = 1.0f;      // 46
+  // 47：逆光边缘紫边抑制（v0.10.134，RawTherapee Defringe 同形态复现）。
+  // 2026-10-04 样片定量：品红伪影 56~66% 贴着物体轮廓（紫边渐晕），平坦区孤立点
+  // 仅 2~3%——P4/D-1 的保边判据恰好保护它，整链对紫边近零压制。本层在 P4 后
+  // Lab 域做"色度相对局部基线的偏离"检测（RT PF_correct_RT 核心机制）+ Lab a
+  // 通道色相门（红物体 a 高，开门区与红分离）+ 低偏离邻居加权替换（L 零损失）。
+  // 离线定稿：检测模糊 σ8（全分辨率等效）/ 替换窗口 13×13 / 阈值 t23（k=2.43），
+  // 基准样片紫边 ≥10 占比 ↓63%、红物体色度 +1%、σ_HP(R-G) −28%（其中紫边本身
+  // 就是 σ_HP 的主要贡献者之一）。默认开；0 = A/B 通路。prefs("defringe")。
+  float defringe = 1.0f;       // 47
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -191,6 +200,7 @@ struct FilmParams {
     if (n > 44) white_probe = static_cast<float>(v[44]);
     if (n > 45) hr_raw = static_cast<float>(v[45]);
     if (n > 46) rcd_cdfix = static_cast<float>(v[46]);
+    if (n > 47) defringe = static_cast<float>(v[47]);
   }
 };
 

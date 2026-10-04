@@ -236,6 +236,7 @@ class FrameRenderer {
   bool ensureRcdTargets(int w, int h);
   bool ensureDnTarget(int w, int h);
   bool ensureChromaMst(int w, int h);
+  bool ensureDefringe(int w, int h);
   // MFNR 阶段一（v0.9.0）：raw 尺寸的 burst 纹理 / 金字塔 / 融合目标
   bool ensureMfnrTargets(int w, int h);
   // u16 Bayer 上传（submitRaw / submitRawBurst 共用）：rowStride 跳行 + 失败日志
@@ -381,7 +382,13 @@ class FrameRenderer {
                       const NoiseCoef& nc);
   void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc);
   // D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 5 级）
-  bool passChromaMultiScale(int dst_w, int dst_h, const NoiseCoef& nc);
+  bool passChromaMultiScale(int dst_w, int dst_h, const NoiseCoef& nc,
+                            GLuint src_tex = 0);
+  // 逆光边缘紫边抑制（v0.10.134，RawTherapee Defringe 同形态）：P4 后、D-1 前。
+  // 输入 tex_dn_，成功时输出 tex_df_（返回 true）；失败/关闭返回 false（调用方
+  // 沿用 tex_dn_）。Lab 域"色度相对局部基线偏离"检测 + a 通道色相门 + 低偏离
+  // 邻居加权替换，L 通道零损失。
+  bool passDefringe(int dst_w, int dst_h);
   static constexpr int kChromaLevels = 5;
   // C 专项：tile RMS 归约（HDR+ §5 —— 逐 tile RMS 代入噪声模型得 σ，A 的输入
   // 底座）。每像素输出一个 tile 的 RMS（mosaic 信号，线性域）。dst = tiles 网格。
@@ -471,7 +478,10 @@ class FrameRenderer {
          prog_nn_pack_ = 0, prog_nn_unpack_ = 0,
          // RAW 域高光重建（darktable highlights / inpaint opposed）
          prog_hl_mask_ = 0, prog_hl_dil_ = 0, prog_hl_chroma_ = 0,
-         prog_hl_apply_ = 0;
+         prog_hl_apply_ = 0,
+         // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
+         prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
+         prog_df_apply_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -532,6 +542,14 @@ class FrameRenderer {
   GLuint hr_src_override_ = 0;
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
   int dn_w_ = 0, dn_h_ = 0;
+  // 紫边抑制（v0.10.134）：tex_df_ = defringe 输出（替换 tex_dn_ 进 D-1/film）；
+  // 半分辨率 Lab/检测缓冲与 1/16 均值网格（CPU 读回 chromave）。
+  GLuint fbo_df_ = 0, tex_df_ = 0;          // 全分辨率 RGBA16F
+  GLuint fbo_df_lab_ = 0, tex_df_lab_ = 0;  // 半分辨率 (L,a,b,gate)
+  GLuint fbo_df_det_ = 0, tex_df_det_ = 0;  // 半分辨率 (a,b,chroma,gate)
+  GLuint fbo_df_avg_ = 0, tex_df_avg_ = 0;  // 1/16 网格 chroma 均值
+  int df_w_ = 0, df_h_ = 0;                 // 全分辨率尺寸（缓存键）
+  float dbg_df_cavg_ = 0.f;                 // 最近一次 chromave（日志）
   // D 专项：半分辨率 à trous 色度降噪缓冲（2× 近似层 ping-pong + 5× 细节层
   // + 1× σ 图；RGBA16F、1/2 分辨率 ≈ 25MB/张）
   GLuint tex_ch_a_[2] = {0, 0}, fbo_ch_a_[2] = {0, 0};
@@ -743,6 +761,20 @@ class FrameRenderer {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1, mix = -1;
   } u_chroma_dn_;
+  // 紫边抑制（v0.10.134）三个 pass 的 uniform 句柄
+  struct {
+    GLint tex = -1, size = -1;
+  } u_df_down_;
+  struct {
+    GLint src = -1, half = -1;
+  } u_df_det_;
+  struct {
+    GLint src = -1, size = -1;
+  } u_df_avg_;
+  struct {
+    GLint tex = -1, det = -1, size = -1, half = -1, chroma_avg = -1,
+          thresh_k = -1;
+  } u_df_apply_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1;

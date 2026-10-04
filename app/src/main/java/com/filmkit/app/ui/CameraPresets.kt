@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(47).apply {
+    private fun neutral(): DoubleArray = DoubleArray(48).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -130,6 +130,11 @@ object CameraPresets {
         //（梯度两项 + clamp 到 4 对角色差范围，实测会把红色扩散进白瓷/过曝区）。
         // 默认 1；0 = A/B 通路。设置页开关写 prefs("rcd_cdfix")。
         this[46] = 1.0
+        // 47 = 逆光边缘紫边抑制（v0.10.134）：RawTherapee Defringe 同形态
+        //（Lab 域局部基线偏离检测 + a 通道色相门 + 低偏离邻居加权替换，L 零损失）。
+        // 基准样片紫边 ↓63%、红物体色度 +1%。默认 1；0 = A/B 通路。
+        // 设置页开关写 prefs("defringe")。
+        this[47] = 1.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */
