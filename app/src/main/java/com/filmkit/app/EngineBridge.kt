@@ -42,16 +42,6 @@ object EngineBridge {
      *  variant：0=基线 1=+twiddle 查表 2=+twiddle 查表+寄存器 FFT。 */
     external fun nativeRunFftSpike(width: Int, height: Int, iterations: Int, overlap: Boolean, variant: Int): String?
 
-    /**
-     * NN 链路自检（v0.10.102，SpikeUi 按钮）：**必须在拍照线程上调用**
-     * （经 StillRenderClient 队列，引擎 context current）。
-     * withInfer = false：pack→unpack 域往返恒等（R16F 量化容差内）——
-     * 拦"域错配 2px 能量爆 10×"这类集成事故的第一道闸；
-     * withInfer = true：含真推理（GPU/CPU delegate 端到端 + 输出有限性）。
-     * 返回 JSON 诊断串。
-     */
-    external fun nativeRunNnRoundtrip(withInfer: Boolean): String?
-
     // ── M1 相机引擎（SurfaceTexture + OES 路径）──
     external fun nativeEngineStart(surface: Surface): Boolean
     external fun nativeEngineStop()

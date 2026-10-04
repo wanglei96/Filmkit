@@ -32,11 +32,10 @@ struct FilmParams {
   // M3 色彩内核：基准影调强度（0 = 恒等/旧行为，1 = 完整基准 S 曲线）。
   // 默认 1.0 —— 中灰锚定、只补黑位与高光 rolloff，不是风格化。
   float tone_strength = 1.0f;  // 28
-  // M3 高光重建强度（0 = 关）：CCM 前用未饱和通道外推饱和通道，默认 1.0。
-  // ⚠️ v0.10.15 审计定性：这是对 darktable 原生高光处理的**自研简化替代**
-  // （darktable 的 RAW 域对应 = highlights 模块；filmic 内的原生小波重建已由
-  // [41] hr_wavelet 完整实现）。保留待 RAW 域 highlights 模块对齐后移除。
-  float hl_recon = 1.0f;  // 29
+  // [29] 曾为 hl_recon（自研"中性外推"高光重建，CCM 前用未饱和通道外推）：
+  // v0.10.15 审计定性为对 darktable 原生处理的简化替代；RAW 域 highlights
+  // 模块（[45] hr_raw）落地后全仓零引用，已删除。索引 29 留空不复用
+  //（Kotlin 侧 film 数组仍在 29 占位，删除只影响 C++ 解析）。
   // 过曝提示阈值（显示域亮度，0 = 关）：仅预览 passOutput 使用，成片一律 0。
   float zebra_thr = 0.95f;  // 30
   // ── M3 P1 色彩外观层（治"寡淡"）──────────────────────────────────
@@ -94,7 +93,7 @@ struct FilmParams {
   // ── v0.10.15：darktable filmic 高光重建（à trous 小波）───────────────────
   // darktable filmicrgb.c 的原生功能（enable_highlight_reconstruction +
   // mask/inpaint/wavelets 全链，参数 = darktable 默认）；PC 完整移植、我们此前
-  // 用自研"中性外推"（[29] hl_recon，RAW 域）替代并在审核中定为简化。
+  // 用自研"中性外推"（[29]，已删）替代并在审核中定为简化。
   // 本层作用于线性 RGB 域（CCM 后、filmic 前），修复部分通道裁剪高光
   // （灯管/过曝边缘的品红残留即此类）。默认开；0 = A/B 通路。
   float hr_wavelet = 1.0f;     // 41
@@ -181,7 +180,6 @@ struct FilmParams {
     grain_amount = static_cast<float>(v[26]);
     if (n > 27) grain_size = static_cast<float>(v[27]);
     if (n > 28) tone_strength = static_cast<float>(v[28]);
-    if (n > 29) hl_recon = static_cast<float>(v[29]);
     if (n > 30) zebra_thr = static_cast<float>(v[30]);
     if (n > 31) look_strength = static_cast<float>(v[31]);
     if (n > 32) look_sat = static_cast<float>(v[32]);

@@ -167,12 +167,6 @@ object StillRenderClient {
     @Volatile
     private var ready_ = false
 
-    /** 在拍照线程上跑一段诊断（v0.10.102）：NN 自检这类需要引擎 EGL context 的
-     *  native 入口专用。调用前必须 ensureStarted() 成功；与拍照任务同队列串行。 */
-    fun runDiagnostic(block: () -> Unit) {
-        handler?.post(block)
-    }
-
     /** 在拍照线程上跑一次 MFNR 合成。onDone 在**拍照线程**回调（与 RenderClient
      *  同一约定），调用方只做轻量收尾（计数、入队保存）。 */
     fun submitRawBurst(

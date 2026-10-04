@@ -211,43 +211,6 @@ fun SpikeScreen(onBack: () -> Unit = {}) {
             ) { Text("NN 降噪 spike（GPU+CPU）") }
             Button(
                 onClick = {
-                    scope.launch(kotlinx.coroutines.Dispatchers.Default) {
-                        status = "NN 自检：启动拍照线程…"
-                        val results = mutableListOf<String>()
-                        if (!com.filmkit.app.camera.StillRenderClient.ensureStarted()) {
-                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                status = "NN 自检失败：拍照线程启动失败"
-                            }
-                            return@launch
-                        }
-                        status = "NN 自检运行中（域往返 + 真推理）…"
-                        val latch = java.util.concurrent.CountDownLatch(1)
-                        // 须在拍照线程（引擎 EGL context current）上跑 native 入口
-                        com.filmkit.app.camera.StillRenderClient.runDiagnostic {
-                            for (infer in listOf(false, true)) {
-                                val json = EngineBridge.nativeRunNnRoundtrip(infer)
-                                    ?: "{\"ok\":false,\"error\":\"引擎返回空\"}"
-                                EngineBridge.nativeAppendLog(
-                                    EngineBridge.LEVEL_INFO, "app", "spike.nn_roundtrip", json,
-                                )
-                                results += json
-                            }
-                            latch.countDown()
-                        }
-                        latch.await(120, java.util.concurrent.TimeUnit.SECONDS)
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            nnResults = nnResults + results
-                            status = "NN 自检完成（先域往返后真推理）"
-                        }
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = FilmTheme.Accent,
-                    contentColor = FilmTheme.OnAccent,
-                ),
-            ) { Text("NN 链路自检（域往返+推理）") }
-            Button(
-                onClick = {
                     auditPath = com.filmkit.app.camera.CameraAudit.export(context)
                 },
                 colors = ButtonDefaults.buttonColors(

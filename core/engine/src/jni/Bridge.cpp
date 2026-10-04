@@ -93,8 +93,8 @@ std::atomic<int> g_yuv_matrix{0};
 std::atomic<int> g_burst_seq{0};
 
 // ── NN 推理回桥（v0.10.102）：C++ → NnInferEngine.inferTile ─────────────
-// 契约：g_nn.env 在**每次** nativeEngineSubmitRaw/Burst（以及 nativeRunNnRoundtrip）
-// 入口刷新为当前线程的 JNIEnv —— nnBridgeInfer 只会发生在同一条 native 调用栈内
+// 契约：g_nn.env 在**每次** nativeEngineSubmitRaw/Burst 入口刷新为当前线程的
+// JNIEnv —— nnBridgeInfer 只会发生在同一条 native 调用栈内
 //（FrameRenderer::runNnPass 的 tile 循环），env 必然有效。jclass 持 global ref，
 // tile 缓冲地址由 NnInferEngine 常驻 direct buffer 提供（getBufs 一次性取回）。
 struct NnBridge {
@@ -308,26 +308,6 @@ Java_com_filmkit_app_EngineBridge_nativeRunFftSpike(JNIEnv* env, jobject, jint w
   const filmkit::FftSpikeResult r =
       runSpikeFftMerge(w, h, iters, overlap == JNI_TRUE, variant);
   return toJString(env, r.toJson());
-}
-
-// NN 链路自检（v0.10.102，SpikeUi 按钮）：须在**拍照线程**（有引擎 context，
-// StillRenderClient 队列）调用。with_infer=false = pack→unpack 域往返恒等；
-// true = 含真推理（GPU/CPU delegate 端到端 + 输出有限性）。
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_filmkit_app_EngineBridge_nativeRunNnRoundtrip(JNIEnv* env, jobject,
-                                                       jboolean with_infer) {
-  // NN 回桥注入（往返自检的推理路径也要走 NnInferEngine）
-  g_nn.env = env;
-  FrameRenderer::setNnInferFn(&nnBridgeInfer);
-  FrameRenderer::setNnInfoFn(&nnBridgeInfo);
-  // 优先拍照实例（自带 context 的线程上才有意义）；回退预览实例（SpikeUi 走
-  // StillRenderClient 队列时必为前者）
-  FrameRenderer* r = g_renderer_still.load();
-  if (r == nullptr) r = g_renderer;
-  if (r == nullptr) {
-    return toJString(env, "{\"ok\":false,\"error\":\"no_renderer\"}");
-  }
-  return toJString(env, r->runNnRoundtrip(with_infer == JNI_TRUE));
 }
 
 // ── 相机引擎（M1：SurfaceTexture + OES，参照 PhotonCamera 路径）──────

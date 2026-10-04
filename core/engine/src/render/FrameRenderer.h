@@ -73,20 +73,6 @@ struct NoiseCoef {
   bool model_src = false;         // true = Camera2 模型，false = legacy σ 回退
 };
 
-// tile RMS 归约的诊断结果（C 专项；A 的 σ 输入底座）
-struct TileRmsResult {
-  bool ok = false;
-  int tiles_w = 0, tiles_h = 0;
-  float rms[4] = {0, 0, 0, 0};   // 采样 tile 的 RMS（中心/左上/右上/左下）
-  float sigma[4] = {0, 0, 0, 0}; // 代入模型后的 σ（G 通道）
-  float nz[4] = {0, 0, 0, 0};    // 去信号噪声 σ（同相位 lag-2 差分，v0.10.63）
-  // 全网格稳健统计（v0.10.72）：4 点采样只有 2 个 nz 进日志，单张 A/B 的样本
-  // 量不够（2026-09-30 的对齐 A/B 就是被这个卡住的）。现在一次读回整张 tiles
-  // 网格（RGBA16F，≈783KB）在 host 侧算中位/p90 —— 降噪倍数用**全图中位**比
-  // 单点稳得多，也不受"用户这次手抖幅度不同"的局部影响。
-  float nz_med = 0.f, nz_p90 = 0.f, nz_mean = 0.f, rms_med = 0.f;
-  int nz_n = 0;  // 参与统计的 tile 数（nz > 0 且有限）
-};
 
 // RAW 域高光重建（darktable highlights / "inpaint opposed"）诊断结果。
 // chroma = 全图色度校正量（darktable `chrominance`），cnt = 参与统计的样本数
@@ -99,6 +85,15 @@ struct HlRawResult {
   // 与 cnt 一起判定"引擎 chroma 比原版公式偏大 3.4×"是样本集合问题还是 refavg
   // 问题 —— 离线 tools/hl-opposed-check.py 给出同一口径的对照值。
   double sum[3] = {0.0, 0.0, 0.0};
+  // 2026-10-04：全局兜底配对比例（Pass3.5 ref 场按样本占比 w 加权的全图 R/G、B/G）。
+  // 用途 = Pass4 在局部块无有效参考（大面积饱和区）时退到它，否则那片整块漏修。
+  // w_sum = Σw（权重和，用于判定"全图几乎无有效参考"→ 退中性）。
+  float rg_g = 0.f, bg_g = 0.f;      // 池化比（allSat + 普通 G 路径第 3 级兜底用）
+  double w_sum = 0.0;
+  // 2026-10-04 v0.10.139 三级参考诊断：中尺度（1/128 网格）与全图兜底各自的命中
+  // 格数占"32 块局部参考不足的格"的百分比（两者之和 = 100）。真机据此看"天空区
+  // 到底用了哪一级"。口径：按 ref 格（每格 1024 CFA 像素）计，不含插值边界效应。
+  float ref2_hit = 0.f, refg_hit = 0.f;
   int blocks_x = 0, blocks_y = 0;
   float ms = 0.f;
 };
@@ -134,12 +129,6 @@ class FrameRenderer {
   static NnInferFn nnInferFn();
   static void setNnInfoFn(NnInfoFn fn);
   static NnInfoFn nnInfoFn();
-
-  // NN 链路自检（SpikeUi 按钮，v0.10.102；Bridge 的 nativeRunNnRoundtrip 调用，
-  // 须在持有引擎 EGL context 的线程）：合成 mosaic 测试图 → pack →（可选真推理）
-  // → unpack → 与输入比对。with_infer=false 验证域往返恒等（R16F 量化容差内）；
-  // =true 验证 delegate+模型端到端可用。返回 JSON 诊断串。
-  std::string runNnRoundtrip(bool with_infer);
 
   /// 静拍 YUV 解码矩阵：0 = BT.601（默认），1 = BT.709
   void setYuvMatrix(int m) { yuv_matrix_ = m ? 1 : 0; }
@@ -283,11 +272,10 @@ class FrameRenderer {
   bool ensureMfnrFftTargets(int w, int h);
   // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
   // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
-  // out_probe[4] = 收口后 tex_fused_ 的 4 个采样点（黑图归因探针）。
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
-                   float* out_neff, float* out_probe,
+                   float* out_neff,
                    float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
@@ -304,7 +292,6 @@ class FrameRenderer {
     float dn_k = 0.f;  // 降噪强度（日志）
     NoiseCoef nc;         // (A,B) 系数（P0/P4/mismatch，C 专项）
     NoiseModel nm;        // 原始噪声模型（WB 前、单帧；日志 nzS/nzO）
-    TileRmsResult rms;    // tile RMS 归约诊断（P0 后）
     float ns = 0.f;       // 典型 σ（融合折减后；resFade/日志）
     float ns_raw = 0.f;   // 单帧典型 σ（日志 nsHal / nsSng 兼容）
     bool lsc_ok = false;
@@ -340,7 +327,7 @@ class FrameRenderer {
                  int cfa, const float black_phase[4], float white_level);
   bool ensureNnTargets(int w, int h);
   // 16px 线性 ramp（quality_eval.py 的 linspace(0,1,16) 四边、对边反转），
-  // 首次构建后常驻。ensureNnTargets 与 runNnRoundtrip 共用。
+  // 首次构建后常驻（ensureNnTargets 首次调用时构建）。
   void buildNnRamp();
   // WB 增益 / CCM / LSC 纹理准备（两条静拍路径共用）
   struct RawCommon {
@@ -349,8 +336,9 @@ class FrameRenderer {
     bool lsc_ok = false;
     int lsc_w = 1, lsc_h = 1;
   };
-  // wb_r/g/b = FilmParams 的用户 WB 补偿（与预览 OES / YUV 静拍的 uWb 同源）：
-  // RAW 链在 asShotNeutral 增益之上相乘，缺它则手动 WB 只动预览不动 M 档成片。
+  // wb_r/g/b = FilmParams 的用户 WB 补偿**原始值**（G 分量未归一）。RAW 链在本函数
+  // 内换算成 (wb_r/wb_g, 1, wb_b/wb_g)；预览 OES / YUV 静拍的 uWb 走同一换算
+  // （wbCompGNorm）—— 三条链因此同口径（第 2 期 S13）。
   RawCommon prepareRawCommon(float neutral_r, float neutral_g, float neutral_b,
                              float wb_r, float wb_g, float wb_b,
                              const float* ccm9, const float* lsc, int lsc_cols,
@@ -390,11 +378,6 @@ class FrameRenderer {
   // 邻居加权替换，L 通道零损失。
   bool passDefringe(int dst_w, int dst_h);
   static constexpr int kChromaLevels = 5;
-  // C 专项：tile RMS 归约（HDR+ §5 —— 逐 tile RMS 代入噪声模型得 σ，A 的输入
-  // 底座）。每像素输出一个 tile 的 RMS（mosaic 信号，线性域）。dst = tiles 网格。
-  // a/b = k=1 的 WB 后系数（NoiseCoef::mma/mmb），用于读回诊断 σ。返回诊断供日志。
-  TileRmsResult passTileRms(GLuint src_tex, int w, int h, const float a[3],
-                            const float b[3]);
   // RAW 域高光重建（darktable highlights 模块 / "inpaint opposed"，2026-10-03）：
   // 在**去马赛克前**对线性 mosaic（tex_mos_，已扣黑阶 + WB，白点 1.0）恢复被裁剪
   // 通道 —— mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
@@ -474,11 +457,11 @@ class FrameRenderer {
          prog_rcd_chroma_ = 0, prog_raw_dn_ = 0, prog_chroma_dn_ = 0,
          prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
-         prog_hist_ = 0, prog_local_ = 0, prog_tile_rms_ = 0,
+         prog_hist_ = 0, prog_local_ = 0,
          prog_nn_pack_ = 0, prog_nn_unpack_ = 0,
          // RAW 域高光重建（darktable highlights / inpaint opposed）
          prog_hl_mask_ = 0, prog_hl_dil_ = 0, prog_hl_chroma_ = 0,
-         prog_hl_apply_ = 0,
+         prog_hl_apply_ = 0, prog_hl_ref_ = 0, prog_hl_refdown_ = 0,
          // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
          prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
          prog_df_apply_ = 0;
@@ -537,6 +520,8 @@ class FrameRenderer {
   GLuint tex_hl_dil_ = 0, fbo_hl_dil_ = 0;
   GLuint tex_hl_sum_ = 0, fbo_hl_sum_ = 0;  // chrominance 归约（两趟累加复用）
   GLuint tex_hl_ = 0, fbo_hl_ = 0;
+  GLuint tex_hl_ref_ = 0, fbo_hl_ref_ = 0;  // 1/32 网格参考色度场 (rg·w, bg·w, w)
+  GLuint tex_hl_ref2_ = 0, fbo_hl_ref2_ = 0;  // 1/128 中尺度参考场（同上三元组）
   int hl_w_ = 0, hl_h_ = 0, hl_mw_ = 0, hl_mh_ = 0, hl_tw_ = 0, hl_th_ = 0;
   // 非 0 时 RCD 三段改读它（= tex_hl_）；0 = 原行为（直读 tex_mos_）。
   GLuint hr_src_override_ = 0;
@@ -566,6 +551,17 @@ class FrameRenderer {
   double dbg_hl_sum_[3] = {0.0, 0.0, 0.0};    // Σ(实测−对立外推)，chroma 的分子
   float dbg_hl_cnt3_[3] = {0.f, 0.f, 0.f};    // 分通道样本数（原只记 G 通道）
   float dbg_hl_ms_ = 0.f;
+  // 全局兜底比例诊断（2026-10-04）：真机据此核对"全局比例是否接近该场景中性比例"，
+  // 明显跑偏说明 w 加权或配对口径有问题。
+  // v0.10.145：HR mask 阈值的域换算所需 —— 当帧 WB 增益与 CCM（行主序）。
+  // 阈值 = kSaturationNormCalib × |clip(CCM · (0, gain_G, 0))| —— kSaturationNormCalib
+  // 是**满阱范数的标定系数（非白点）**，换 CCM / 换镜头需重标；G 最先饱和，见 .cpp 注释。
+  float hr_gain_[3] = {1.f, 1.f, 1.f};
+  float hr_ccm_[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+  float dbg_hr_thr_ = 0.f;   // 实际下发的 mask threshold（日志 hrThr）
+  float dbg_hl_rgg_ = 0.f, dbg_hl_bgg_ = 0.f;
+  double dbg_hl_refw_ = 0.0;  // Σw（ref 场权重和；理论上限 = 块数）
+  float dbg_hl_r2hit_ = 0.f, dbg_hl_rghit_ = 0.f;  // 三级参考命中占比（%）
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
@@ -578,14 +574,6 @@ class FrameRenderer {
   float dbg_nn_ms_ = 0.f;  // NN pass 端到端（pack+读回+推理+ramp+上传+unpack）
   int dbg_nn_tiles_ = 0;
   float dbg_nn_gain_ = 0.f; // 网络输入增益（cvt_k×256，官方 KSigma 口径；日志 nnGain）
-  // 同帧 A/B 诊断（v0.10.74）：旧层位移场那遍 P0 的读数
-  float dbg_ab_p0w_ = 0.f;
-  float dbg_ab_nz_post_ = 0.f;
-  bool dbg_ab_ok_ = false;
-  TileRmsResult rms_pre_res;   // P0 之前的 tile RMS（诊断）
-  // C 专项：tile RMS 归约（R16F，tiles 网格；A 的 σ 输入底座，见 passTileRms）
-  GLuint fbo_rms_ = 0, tex_rms_ = 0;
-  int rms_w_ = 0, rms_h_ = 0;
   // ── 降噪专项 A：DFT 逐频收缩合并（compute）──────────────────────────
   // overlap-add = R32F scratch（ES 3.1 规范保证 image load+store）× 4 次
   // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
@@ -784,12 +772,9 @@ class FrameRenderer {
   } u_chroma_at_;
   struct {
     GLint tex = -1, coarse = -1, d[5] = {-1, -1, -1, -1, -1}, size = -1,
-          half = -1, noise_a = -1, noise_b = -1, lsc = -1, lsc_size = -1, l = -1,
+          half = -1, noise_a = -1, noise_b = -1, lsc = -1, lsc_size = -1,
           kr = -1;
   } u_chroma_apply_;
-  struct {
-    GLint tex = -1, size = -1, noise_a = -1, noise_b = -1;
-  } u_tile_rms_;
   // RAW 域高光重建（darktable highlights）：mask / dilate / chroma / apply
   struct {
     GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1;
@@ -803,8 +788,15 @@ class FrameRenderer {
   } u_hl_chroma_;
   struct {
     GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1,
-          chroma = -1;
+          chroma = -1, ref = -1, grecon = -1, gcap = -1, refglobal = -1, refsize = -1,
+          ref2 = -1, ref2size = -1;
   } u_hl_apply_;
+  struct {
+    GLint mos = -1, size = -1, cfalut = -1, clips = -1, block = -1;
+  } u_hl_ref_;
+  struct {
+    GLint ref1 = -1, refsize = -1;
+  } u_hl_refdown_;
   // NN pass（v0.10.102/104）：pack / unpack 两个 fragment 程序的 uniform
   struct {
     GLint fused = -1, raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
