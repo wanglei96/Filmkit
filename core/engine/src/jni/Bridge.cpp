@@ -652,7 +652,12 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     jfloat neutral_g, jfloat neutral_b, jfloatArray ccm, jfloatArray lsc,
     jint lsc_cols, jint lsc_rows, jint rotation, jint demosaic,
     jfloat noise_strength, jfloatArray noise_model, jfloat noise_sigma,
-    jdoubleArray film, jboolean use_still, jboolean nn_dn) {
+    // ⚠ 顺序必须与 Kotlin 声明/调用一致（nnDn, film, useStill）——
+    // 曾错写成 (film, use_still, nn_dn)：JNI 按位置解析 ⇒ Kotlin 传的 useStill=true
+    // 落到 nn_dn 上（NN"已判死恒关"却真跑），film 数组落到 use_still（jboolean）、
+    // nnDn=false 落到 film ⇒ FilmParams 解析到垃圾 ⇒ **整帧参数全错、成片全黑**。
+    // 该路径只在"多帧融合=关"时走到，故长期未被发现（2026-10-05 用户实测暴露）。
+    jboolean nn_dn, jdoubleArray film, jboolean use_still) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
