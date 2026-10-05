@@ -4280,6 +4280,7 @@ bool FrameRenderer::init() {
   // 预测执行 `if (uLocalStrength > 0.0)` 分支里的 texture() 会让整帧 draw 报 1282
   // （v0.6.0-m4 全黑同族事故；LSC 关闭档绑 1×1 全 1 网格是同一处理）。
   // 过滤必须 LINEAR：makeTex 默认 NEAREST，会把 32×24 的格子放大成可见方块。
+  // @domain: D5 —— local_tone 的低频亮度图（显示域，RGBA8 8bit）
   makeTex(&tex_local_, &fbo_local_, GL_RGBA8, kLocalW, kLocalH);
   local_w_ = kLocalW;
   local_h_ = kLocalH;
@@ -4555,7 +4556,15 @@ bool FrameRenderer::ensureTargets(int w, int h) {
     }
     tex_scene_ = tex_work_ = 0;
     fbo_scene_ = fbo_work_ = 0;
+    // @domain: D4 —— 主链场景线性（4a 后：CCM 输出 → P4 → D-1 汇聚）
     makeTex(&tex_scene_, &fbo_scene_, GL_RGBA16F, w, h);
+    // D3 = RCD 的去马赛克输出（第 4a 期起，LSC 后 / CCM 前）。
+    // ⚠ 本标签不完整：同一纹理也是 passFilm 的输出目标（显示域 D5）—— 正是 §3.1
+    // 告警的『一帧内先后承载多域的纹理，标签本身会说谎』。4a 已把 RCD(D3) 与
+    // CCM(D4) 拆开，但 passFilm 仍复用 tex_work_ 作输出 ⇒ **这是全链仅剩的一处
+    // 多域复用**，待后续期次拆 per-domain 纹理（成本：+1 张全分辨率 RGBA16F
+    // = 100MB，需用户拍板）。
+    // @domain: D3
     makeTex(&tex_work_, &fbo_work_, GL_RGBA16F, w, h);
     scene_w_ = w;
     scene_h_ = h;
@@ -4584,6 +4593,7 @@ bool FrameRenderer::ensureOutScaleTarget(int w, int h) {
       glDeleteFramebuffers(1, &fbo_out_s_);
     }
     tex_out_s_ = fbo_out_s_ = 0;
+    // @domain: D5 —— 预览降档输出（OETF 后，RGBA8）
     makeTex(&tex_out_s_, &fbo_out_s_, GL_RGBA8, w, h);
     glBindTexture(GL_TEXTURE_2D, tex_out_s_);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -4818,6 +4828,7 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
       glDeleteFramebuffers(1, &fbo_cap_);
     }
     tex_cap_ = fbo_cap_ = 0;
+    // @domain: D5 —— 成片 RGBA8 输出
     makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, dst_w, dst_h);
     cap_w_ = dst_w;
     cap_h_ = dst_h;
@@ -4878,8 +4889,11 @@ bool FrameRenderer::ensureRcdTargets(int w, int h) {
     }
     tex_dir_ = tex_g_ = tex_mos_ = 0;
     fbo_dir_ = fbo_g_ = fbo_mos_ = 0;
+    // @domain: A2 —— RCD 方向场（色差域的判据量）
     makeTex(&tex_dir_, &fbo_dir_, GL_RGBA16F, w, h);
+    // @domain: D2
     makeTex(&tex_g_, &fbo_g_, GL_RGBA16F, w, h);
+    // @domain: D2
     makeTex(&tex_mos_, &fbo_mos_, GL_RGBA16F, w, h);
     rcd_w_ = w;
     rcd_h_ = h;
@@ -4901,6 +4915,7 @@ bool FrameRenderer::ensureDnTarget(int w, int h) {
     glDeleteFramebuffers(1, &fbo_dn_);
   }
   tex_dn_ = fbo_dn_ = 0;
+  // @domain: D4 —— P4 色度降噪输出
   makeTex(&tex_dn_, &fbo_dn_, GL_RGBA16F, w, h);
   dn_w_ = w;
   dn_h_ = h;
@@ -4920,6 +4935,7 @@ bool FrameRenderer::ensureLocalTarget(int w, int h) {
     glDeleteFramebuffers(1, &fbo_local_);
   }
   tex_local_ = fbo_local_ = 0;
+  // @domain: D5 —— local_tone 的低频亮度图（显示域，RGBA8 8bit）
   makeTex(&tex_local_, &fbo_local_, GL_RGBA8, w, h);
   // 过滤必须 LINEAR：makeTex 默认 NEAREST，会把格子放大成可见方块（真机"亮斑"）
   glBindTexture(GL_TEXTURE_2D, tex_local_);
@@ -4932,6 +4948,7 @@ bool FrameRenderer::ensureLocalTarget(int w, int h) {
   // 兜底：退回 1×1（局部提亮退化成全局基准，调用方据返回值决定是否启用）
   glDeleteTextures(1, &tex_local_);
   glDeleteFramebuffers(1, &fbo_local_);
+  // @domain: D5 —— local_tone 的低频亮度图（显示域，RGBA8 8bit）
   makeTex(&tex_local_, &fbo_local_, GL_RGBA8, 1, 1);
   local_w_ = local_h_ = 1;
   return false;
@@ -5004,6 +5021,7 @@ bool FrameRenderer::ensureChromaMst(int w, int h) {
   if (tex_ch_sig_) glDeleteTextures(1, &tex_ch_sig_);
   if (fbo_ch_sig_) glDeleteFramebuffers(1, &fbo_ch_sig_);
   tex_ch_sig_ = fbo_ch_sig_ = 0;
+  // @domain: A2 —— D-1 的 σ 图（色差域的噪声尺度）
   makeTex(&tex_ch_sig_, &fbo_ch_sig_, GL_RGBA16F, hw, hh);
   if (tex_ch_a_[0] == 0 || tex_ch_sig_ == 0 || tex_ch_dp_[kChromaLevels - 1] == 0) {
     ch_w_ = ch_h_ = 0;                       // 分配失败 → 调用方保持 P4 输出
@@ -5151,13 +5169,19 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     tex_hl_sum_ = fbo_hl_sum_ = tex_hl_ = fbo_hl_ = 0;
     tex_hl_ref_ = fbo_hl_ref_ = 0;
     tex_hl_ref2_ = fbo_hl_ref2_ = 0;
+    // @domain: D2 —— 高光重建（S17 判定掩码）——输入域 = 线性 mosaic + WB
     makeTex(&tex_hl_mask_, &fbo_hl_mask_, GL_RGBA16F, mw, mh);
+    // @domain: D2
     makeTex(&tex_hl_dil_, &fbo_hl_dil_, GL_RGBA16F, mw, mh);
+    // @domain: D2
     makeTex(&tex_hl_sum_, &fbo_hl_sum_, GL_RGBA16F, tw, th);
+    // @domain: D2 —— 高光重建输出（替代 tex_mos_ 进入 RCD）
     makeTex(&tex_hl_, &fbo_hl_, GL_RGBA16F, w, h);
     // 参考色度场：1/32 网格（尺寸键 = w/h，随上面的 hl_w_/hl_h_ 一起失效重建）
+    // @domain: D2
     makeTex(&tex_hl_ref_, &fbo_hl_ref_, GL_RGBA16F, rw32, rh32);
     // 中尺度参考场（Pass3.55）：4×4 降采样 ⇒ 每格 128×128 CFA 像素
+    // @domain: D2 —— 高光重建参考场（中尺度）
     makeTex(&tex_hl_ref2_, &fbo_hl_ref2_, GL_RGBA16F, (rw32 + 3) / 4, (rh32 + 3) / 4);
     hl_w_ = w;
     hl_h_ = h;
@@ -5428,9 +5452,13 @@ bool FrameRenderer::ensureDefringe(int w, int h) {
     glDeleteFramebuffers(1, &fbo_df_avg_);
     tex_df_avg_ = fbo_df_avg_ = 0;
   }
+  // @domain: D4 —— defringe 输出（与 tex_dn_ 同域同几何）
   makeTex(&tex_df_, &fbo_df_, GL_RGBA16F, w, h);
+  // @domain: A7
   makeTex(&tex_df_lab_, &fbo_df_lab_, GL_RGBA16F, hw, hh);
+  // @domain: A7
   makeTex(&tex_df_det_, &fbo_df_det_, GL_RGBA16F, hw, hh);
+  // @domain: A7 —— defringe 局部模糊基线（Lab 域）
   makeTex(&tex_df_avg_, &fbo_df_avg_, GL_RGBA16F, aw, ah);
   if (tex_df_ == 0 || tex_df_lab_ == 0 || tex_df_det_ == 0 || tex_df_avg_ == 0) {
     df_w_ = df_h_ = 0;   // 分配失败 → 调用方保持 P4 输出（照片优先红线）
@@ -6033,6 +6061,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       glDeleteFramebuffers(1, &fbo_cap_);
     }
     tex_cap_ = fbo_cap_ = 0;
+    // @domain: D5 —— 成片 RGBA8 输出
     makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, dst_w, dst_h);
     cap_w_ = dst_w;
     cap_h_ = dst_h;
@@ -6297,6 +6326,7 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
     glDeleteTextures(1, &tex_mis_);
     glDeleteFramebuffers(1, &fbo_mis_);
   }
+  // @domain: A8 —— MFNR 对齐的运动/不匹配图（RGBA8）
   makeTex(&tex_mis_, &fbo_mis_, GL_RGBA8, cw, chh);
   // 权重图（RGBA8 **LINEAR**——8bit 纹理硬件双线性可用，Fuse 采样即 32px 平滑过渡；
   // 与 tex_mis_ 同网格）
@@ -6782,6 +6812,7 @@ bool FrameRenderer::ensureNnTargets(int w, int h) {
                  GL_UNSIGNED_SHORT, nullptr);
   }
   // packed 中转（RGBA16F；与 Java 侧 readback/上传同一格式）
+  // @domain: A6 —— PMRID NN 的 pack/unpack 域桥
   makeTex(&tex_nn_packed_, &fbo_nn_packed_, GL_RGBA16F, w1, h1);
   // 推理输出上传目标（只上传 + 采样，无需 fbo）
   glGenTextures(1, &tex_nn_out_);
@@ -7043,8 +7074,11 @@ bool FrameRenderer::ensureHrTargets(int w, int h) {
   };
   makeTex(&tex_hr_lf_[0], &fbo_hr_lf_[0], GL_RGBA16F, w, h);
   makeTex(&tex_hr_lf_[1], &fbo_hr_lf_[1], GL_RGBA16F, w, h);
+  // @domain: D4 —— HR 小波：高频层
   makeTex(&tex_hr_hf_, &fbo_hr_hf_, GL_RGBA16F, w, h);
+  // @domain: D4
   makeTex(&tex_hr_hfrgb_, &fbo_hr_hfrgb_, GL_RGBA16F, w, h);
+  // @domain: D4
   makeTex(&tex_hr_temp_, &fbo_hr_temp_, GL_RGBA16F, w, h);
   makeTex(&tex_hr_recon_[0], &fbo_hr_recon_[0], GL_RGBA16F, w, h);
   makeTex(&tex_hr_recon_[1], &fbo_hr_recon_[1], GL_RGBA16F, w, h);
@@ -7053,6 +7087,7 @@ bool FrameRenderer::ensureHrTargets(int w, int h) {
   // v0.10.17：stat 用 RGBA8（makeTex）——R16F attachment 配 GL_UNSIGNED_BYTE
   // readback 在 ES 3.0 不保证可用（X300 实测静默回零 → clipB 恒 0、HR 永不触发）。
   // mask ∈ [0,1] 的 8bit 量化对"块内 max > 1/17"判据足够。
+  // @domain: A5 —— HR 统计域
   makeTex(&tex_hr_stat_, &fbo_hr_stat_, GL_RGBA8, 64, 48);
   // 任一 FBO 不完整 = 该 pass 被驱动整体丢弃（X300 上 RGBA8+HALF_FLOAT 事故同型）
   bool ok = true;
@@ -8054,6 +8089,7 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
   // UI 直方图共用本 FBO（桶映射按 8bit 值，与 FBO 尺寸无关）。
   const int hw = 512, hh = 288;
   if (tex_hist_ == 0) {
+    // @domain: A5 —— 直方图统计（显示域亮度）
     makeTex(&tex_hist_, &fbo_hist_, GL_RGBA8, hw, hh);
     hist_w_ = hw;
     hist_h_ = hh;
