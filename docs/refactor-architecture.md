@@ -209,6 +209,30 @@ vs 上版 11/32 ⇒ **预览补跑这五项处理无性能代价**；字段集�
 **已知遗留**：`updateFilmicEV(src_tex, still, …)` 的 `still` —— 见下"收尾期"，**它不是死参数**
 （编译验证推翻了这个判断，参数已保留）。
 
+### 事故：JNI 参数顺序错位 —— 关"多帧融合"时成片全黑（2026-10-05，已修 v0.10.159）
+
+**症状**（用户实测）：把「多帧融合」设为关后拍摄，**成片全黑**（`photo.saved avgLuma=0`）。
+
+**根因**：`nativeEngineSubmitRaw` 的 **Kotlin 声明/调用尾部是 `(nnDn, film, useStill)`，
+而 C++ JNI 实现写成 `(film, use_still, nn_dn)`** —— JNI 按位置解析：
+- Kotlin 的 `useStill=true` 落到 `nn_dn` ⇒ **NN 降噪真跑了**（该路线 2026-10-02 已判死、
+  Kotlin 侧恒传 `false`、设置入口已删）。黑帧日志出现 6 个 NN 专属字段
+  （`nnOk`/`nnFail`/`nnGain`/`nnMs`/`nnTiles`/`nnDel`），而正常帧没有
+- `film`（DoubleArray）落到 `use_still`（jboolean）、`nnDn=false` 落到 `film`
+  ⇒ `paramsFromJava` 解析到垃圾 ⇒ **整帧参数全错**（黑帧 `p0A` 比正常大 15 倍、
+  `ev=0.0`、`linMid` 大 10 倍）⇒ 全黑
+
+**引入点**：`27923f7 feat(nn): integrate PMRID denoise pass into still chain (v0.10.102-nnint)`
+—— 加 NN 时 C++ 把 `nn_dn` 追加在**末尾**，Kotlin 加在 `film` **之前**，两侧就此分叉。
+
+**为什么藏了 10+ 个版本**：该入口**只在"多帧融合=关"时走到**；MFNR 开时走
+`nativeEngineSubmitRawBurst`（两侧签名一致、一直正常）⇒ 日常拍摄全走 MFNR，永不触发。
+
+**教训（记入验收纪律）**：**JNI 签名是"按位置"的隐式契约，两侧必须逐字段对齐**。
+本项目的日志字段对拍（`tools/log-ab-diff.py`）能抓到这类问题 —— 黑帧与正常帧的
+**字段集合差异**（多出 6 个 NN 字段）正是第一手证据。**凡"只有某个开关组合才走到"的
+路径，都要专门走一遍。**
+
 ### 收尾期：S21 域标签 + 两项核实（2026-10-05）
 
 **① S21 域标签（完成）**：设计文档说第 1a 期"打标签"，但**实际从未做**（工具基线 27 个
