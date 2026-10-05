@@ -13,7 +13,8 @@
 用法：
     python3 tools/domain-contract-check.py [core/engine/src/render/FrameRenderer.cpp]
 
-约定（第 1 期引入）：在 makeTex 行（或其上方 3 行内）的注释写 `@domain: D2`。
+约定：在 makeTex 行（或其上方 3 行内）的注释写 `@domain: D4`（主链）或 `@domain: A7`
+（辅助域）。编号见 docs/refactor-architecture.md §3.1 的两张表。
 未标注的纹理列为 unlabeled —— 先补标签，再谈运行期断言。
 
 退出码：0 = 无 unlabeled 且无重载嫌疑；1 = 存在其一（提醒补契约）。
@@ -38,7 +39,7 @@ def parse(path):
         name, fbo, fmt, size = m.groups()
         dom = None
         for k in range(i, max(-1, i - 4), -1):          # 本行或上方 3 行找 @domain
-            d = re.search(r'@domain:\s*(D\d+)', src[k])
+            d = re.search(r'@domain:\s*((?:D|A)\d+)', src[k])
             if d:
                 dom = d.group(1)
                 break
@@ -85,7 +86,11 @@ def main():
             print(f'      {n:22s} :{t["line"]:<5} 被 {len(users.get(n,[]))} 个 pass 使用  {t["fmt"]}')
 
     print(f'\n=== 域重载嫌疑（被 >=3 个 pass 绑定的纹理）===')
-    hot = [(n, u) for n, u in users.items() if len(u) >= 3 and n in textures]
+    def is_creator(fn):
+        return fn == 'init' or fn.startswith('ensure') or fn.startswith('submit') \
+            or fn == 'finishStillChain' or fn == 'passHighlightRaw'
+    hot = [(n, [x for x in u if not is_creator(x)]) for n, u in users.items()]
+    hot = [(n, u) for n, u in hot if len(u) >= 3 and n in textures]
     if not hot:
         print('  无')
     for n, u in sorted(hot, key=lambda kv: -len(kv[1])):
