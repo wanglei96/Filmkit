@@ -1,14 +1,21 @@
 #include "FrameRenderer.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <string>
+#include <vector>
 
 #include "../log/GpuTimer.h"
 #include "../log/Logger.h"
 #include "Align.h"
+#include "AmazeDemosaic.h"
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
@@ -657,6 +664,31 @@ void main() {
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
+// ── AMaZE 档（v0.10.172）─────────────────────────────────────────────
+// 算法出处：Emil Martinec 的 AMaZE（2008-2010，Ingo Weyrich 优化版），参考实现
+// RawTherapee `rtengine/amaze_demosaic_RT.cc`。**本项目的 AMaZE 在 CPU 侧跑**
+// （src/render/AmazeDemosaic.cpp：逐段对齐参考实现的标量分支 + tile 并行），
+// 本 pass 只承担"CPU 结果 → 成片几何"的搬运：
+//   CPU AMaZE（源几何、WB 域相机 RGB）→ tex_amaze_（RGB16F）
+//   → 本 pass（kVertRot + uST 单位阵，与 kFsRcdChroma 同款坐标变换）→ tex_work_ D3
+//   → 既有 passCcm → tex_scene_ D4 → 既有胶片链（零改动）
+// 为什么不做 GLSL 多 pass 版：AMaZE 在 tile 内需要 14 张 ts×ts + 12 张半网格中间场
+// （见参考实现的 buffer 清单），GLES 3.0 fragment 版等价于 15+ pass、全图级中间
+// 纹理显存峰值按 12MP 估 ≈1.7GB（RGBA16F），且 Nyquist 判据对半精度敏感。成本表
+// 与备选方案见 /tmp/amaze/REPORT.md「GPU 移植策略与成本」。
+const char* kFsAmazeUp = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uSrc;  // AMaZE 输出（源几何，WB 域相机 RGB）
+uniform ivec2 uSize;           // 源尺寸 (raw_w, raw_h)
+void main() {
+    // 2D 纹理坐标 (0,0) 在左上，vUV0 翻转对齐 OES 习惯（与 kFsRcdChroma 逐字同款）
+    vec2 tuv = vec2(vUV0.x, 1.0 - vUV0.y);
+    ivec2 p = clamp(ivec2(tuv * vec2(uSize)), ivec2(0), uSize - 1);
+    oColor = vec4(texelFetch(uSrc, p, 0).rgb, 1.0);
+})";
+
 // ── M3-2 降噪（v0.5.32 引入 / v0.5.33 两档调参）─────────────────────
 // 量化基线（真机 ISO~1200 平坦区）：亮噪 σ(Y)≈1.5–1.8（达标优），彩噪
 // σ(chroma)≈1.8–2.1（未达优，B-Y 最重）——彩噪是短板。
@@ -743,6 +775,50 @@ uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实�
 // read 项不随信号，需显式 ×g²（var' = A·g·x + B·g²，见 NoiseModel::afterWb）。
 uniform highp sampler2D uLsc;
 uniform ivec2 uLscSize;
+// ── 档 A（v0.10.165）：伪彩感知色度降噪 ─────────────────────────────────────
+// uMoire = 强度（0 = 关，A/B 通路）；uMoireK = 伪彩度量的归一化尺度
+// （"K 倍 σc 量级的色度起伏"给 moire = 0.5）。封顶 = 4·σc（常量；uMoire ≤ 3 时
+// 恒不触发 —— 见 FilmParams[48] 注释）。
+uniform float uMoire;
+uniform float uMoireK;
+// ── 强边缘色度门 v2（v0.10.174）：**逐像素、有界、平坦区严格 0** ────────────
+// PC 原文（esd3d2.glsl:78-82 = esd3d2_steered.glsl:94-98，两版逐字相同）：
+//   chromaDiff *= max(abs(xDelta), abs(yDelta));
+//   float sigZ = max(sigY, min(abs(chromaNoise) * MOIRE, 0.2));
+//   vec4 w2 = (1.0 - d*d/(d*d + sigZ));    ← 色度路，**无独立亮度项**
+// v0.10.173 的错法（真机实测"一片红一片黄一片紫"）：把 PC 的**绝对** cap 0.2
+// 直接当 scEff，并让 wy 的阈值也用它（uCgScope=1）。两个后果都是**全图性**的：
+//   ① 绝对 0.2 与真实噪声 σc（中灰 ≈0.01、暗部 ≈0.005）相比是 20~40×
+//      ⇒ `min(κ·|∇L|, 0.2)` 在 |∇L| ≥ 0.1 处就吃满 ⇒ **73.7% 的像素**被放宽
+//      （真机同源：p4scEff+ = 34~87%）；
+//   ② 门只看 |∇L|、不看色度是否异常 ⇒ 亮部平坦区（sRGB 斜率大，显示域 ∇<10
+//      也对应线性域 |∇L| ≈0.07）同样开门。
+//   ③ D-1 的同一门在 5 级 à trous（step 1..16 半分辨率 = 2..32 px）上是
+//      100% 覆盖 ⇒ 每一级的色度 detail 被整片抹掉 ⇒ 输出色度 ≈ 最粗尺度均值。
+//      **"片"量级的色块只能由这一级产生**（离线：去掉 D-1 的门后 hue15blk
+//      11.90% → 3.20%；只留 D-1 的门则是 12.65%）。
+// v2 的三条修正：
+//   ① **逐像素门**：gate = smoothstep(kCgG0, kCgG1, |∇L|)，平坦区**严格 0**；
+//   ② **有界放宽**：上限 = kCgRel·σc（相对量），不再用绝对 0.2；
+//   ③ **权重换成 PC 的 w2 形式**（不再"放宽 wy 的阈值"）：d² = |c − c0|²（3D
+//      距离，含亮度差），w2 = 1 − d²/(d² + σ)，唯一阈值 σ。这样跨亮度取色由
+//      w2 分支**自己**承担，gauss 路径的 wy 恒用 σc ⇒ **彻底放弃"放宽 wy"**。
+//      w = mix(w_gauss, w2, gate)：gate = 0 ⇒ 逐位等于改动前（含 uCgK = 0）。
+// kCgG0 的依据（可复算）：显示域（sRGB 8-bit）中心差分 ∇ ≤ 10 是本链红线判据
+// "平坦区"的定义；线性域 |∇L| = (∇/255)·d(lin)/d(disp)，而 d(lin)/d(disp) 在
+// disp = 1.0（纯白）取最大 2.46 ⇒ ∇ = 10 对应 |∇L| ≤ 0.0965 < kCgG0 = 0.10
+// ⇒ **∇≤10 的像素在数学上必然 gate = 0**。kCgG1 = 3·kCgG0 与 PC 的
+// convdiff.glsl:34-36 同一个中心差分算子（PC 用 Rec.601 luma，本链统一 Rec.709，
+// 同一梯度上差 < 3%）。
+// ★ 亮度零损失：P4 的输出亮度**恒为** y0（末行 oColor = y0 + 平滑后的色度），
+//   gate 只出现在色度采样权重里 ⇒ 改它不改变输出的亮度通道（线性域逐位）。
+uniform float uCgK;      // κ：门控强度（0 = 关 ⇒ 逐位回到改动前）
+uniform float uCgScope;  // 1 = PC 的 w2 形式（v2 默认）；0 = 字面版（只放大 wc）
+const float kMoireCap = 4.0;
+const float kCgG0 = 0.10;   // 门的下阈（线性域 |∇L|；依据见上，∇≤10 ⇒ gate=0）
+const float kCgG1 = 0.30;   // 门的上阈
+const float kCgRel = 16.0;  // 放宽上限 = 16·σc（相对；旧版绝对 0.2 ≈ 20~40·σc，
+                            //   暗部（σc≈0.005）现在是 0.08 ⇒ 自动收紧）
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 vec3 lscAt(ivec2 p) {
     vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
@@ -754,6 +830,28 @@ vec3 lscAt(ivec2 p) {
     vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
     vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
     return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+// 单个邻居的值域权重累加（P4 原式；档 A 起色度阈值用 scEff = 放大后的 σc）。
+// v0.10.174：亮度项阈值**恒为 sc**（不再接受"放宽后的 sy" —— 同步步放宽 wy 的
+// 路径已删除）；gate > 0 时按 PC 的 w2 形式（1 − d²/(d² + scEff)）逐像素混合。
+void p4Accum(vec3 c, int dx, int dy, float y0, vec3 cd0, float sc, float scEff,
+             float pcGate, inout vec3 acc, inout float wsum) {
+    float y = dot(c, LUMA);
+    vec3 cd = c - y;
+    float wy = (y - y0) / (sc * 1.2);
+    float wc = length(cd - cd0) / scEff;   // ← 档 A 起 = 放大后的 σc
+    float w = exp(-0.5 * (wy * wy + wc * wc)
+                  - 0.5 * float(dx * dx + dy * dy) / 9.68);  // σs=2.2（v0.6.32）
+    if (pcGate > 0.0) {
+        // PC esd3d2.glsl:104-106 的 w2：d = |c − c0|（3D，含亮度差），唯一阈值
+        // scEff，**没有独立的亮度项** ⇒ 跨亮度边缘的邻居在此分支重新获得权重。
+        vec3 dv = c - (cd0 + y0);
+        float d2 = dot(dv, dv);
+        float w2 = 1.0 - d2 / (d2 + scEff);
+        w = w + (w2 - w) * pcGate;
+    }
+    acc += w * cd;
+    wsum += w;
 }
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
@@ -789,22 +887,106 @@ void main() {
     // （2026-10-03 14:30）降噪从 21~32% 猛增到 43~62% ⇒ 画面发糊，而色块**毫无改善**。
     // 结论：σ 不是杯体色块的根因，该修正只有副作用，回退。
     float sc = sqrt(max(ay * y0 + by * glY * glY, 1e-12));
+    // ── 档 A（v0.10.165）：逐像素伪彩强度 → 色度 σc 放大 ────────────────────
+    // PC 依据 esd3d2_steered.glsl:94-98（sigZ = max(sigY, min(chromaNoise·MOIRE,
+    // 0.2))）。四条可搬运规则照抄：① 只增强不减弱 ② 结构门控 ③ 通道差异 ④ 封顶。
+    // 度量 = 「3×3 内色差相对局部基线的偏离 → 取 Cb/Cr 两路极差（彩色性）→ 乘
+    // 结构门 gate = |∇Y|/(|∇Y|+σc)」，归一成 moire ∈ [0,1) 后放大 σc。
+    // **零新增采样**：内圈 3×3 的 8 个邻居在这里取一次（显式变量，不用数组动态
+    // 索引 —— 避免移动 GPU 把它 spill 到 local memory），主循环只补取外圈 40 个
+    // ⇒ texelFetch 次数与改动前同为 48。
+    vec3 cA = texelFetch(uTex, clamp(p + ivec2(-1, -1), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cB = texelFetch(uTex, clamp(p + ivec2( 0, -1), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cC = texelFetch(uTex, clamp(p + ivec2( 1, -1), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cD = texelFetch(uTex, clamp(p + ivec2(-1,  0), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cE = texelFetch(uTex, clamp(p + ivec2( 1,  0), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cF = texelFetch(uTex, clamp(p + ivec2(-1,  1), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cG = texelFetch(uTex, clamp(p + ivec2( 0,  1), ivec2(0), uSize - 1), 0).rgb;
+    vec3 cH = texelFetch(uTex, clamp(p + ivec2( 1,  1), ivec2(0), uSize - 1), 0).rgb;
+    float yB = dot(cB, LUMA), yD = dot(cD, LUMA);
+    float yE = dot(cE, LUMA), yG = dot(cG, LUMA);
+    vec3 cd3 = cd0 + (cA - dot(cA, LUMA)) + (cB - yB) + (cC - dot(cC, LUMA))
+             + (cD - yD) + (cE - yE) + (cF - dot(cF, LUMA))
+             + (cG - yG) + (cH - dot(cH, LUMA));   // 3×3 色差基线（含中心）
+    // 只取 Cb/Cr 两路（G 是 Y 守恒反解的残差，同 D-1 的逐路口径）
+    vec2 dev = abs(cd0.br - (cd3 / 9.0).br);
+    float chromaDev = max(dev.x, dev.y) - min(dev.x, dev.y);   // R3：通道差异
+    float gmag = length(vec2(yE - yD, yG - yB) * 0.5);         // 中心差分（convdiff.glsl:34 同式）
+    float gate = gmag / (gmag + sc);                           // R2：结构门控
+    float m = chromaDev * gate;
+    float moire = m / (m + uMoireK * sc);
+    // R1（只增强：uMoire = 0 ⇒ scEff 逐位 = sc）+ R4（封顶 4·σc）
+    float scEff0 = min(sc * (1.0 + uMoire * moire), kMoireCap * sc);
+    // ── v0.10.174：强边缘色度门 v2（照 PC 的 sigZ 架构，但逐像素 + 有界）────
+    // |∇L| = gmag（上一段的中心差分；与 PC convdiff.glsl:34-35 的
+    // (sum3(x-1) − sum3(x+1))/2 同式，PC 的 sum3 = Rec.601 luma，此处沿用引擎
+    // 全链的 Rec.709 —— 两者在本场景梯度上差 < 3%）。
+    // cgGate = 逐像素门：∇≤10（显示域）的像素在数学上必然为 0（见 kCgG0 注释）。
+    // cgRelax = min(κ·|∇L|, kCgRel·σc)·cgGate ⇒ ① **有界**（旧版绝对 0.2 在暗部
+    // 是 40·σc，现在最多 8·σc）；② **门控**（平坦区 scEff 逐位 = scEff0）。
+    // uCgK = 0 ⇒ cgGate = 0 ⇒ cgRelax = 0 ⇒ scEff 逐位 = scEff0、gate = 0
+    // ⇒ 权重逐位回到改动前（P4 路径的"关闭即逐位"由这两条保证）。
+    float cgGate = (uCgK > 0.0) ? smoothstep(kCgG0, kCgG1, gmag) : 0.0;
+    float cgRelax = min(uCgK * gmag, kCgRel * sc) * cgGate;
+    float scEff = max(scEff0, cgRelax);
+    // 作用域：1 = PC 的 w2 形式（跨亮度取色由 w2 分支承担，v2 默认）；
+    // 0 = 字面版（**只**放大 wc 的阈值，权重仍是 gauss；实测近无效，留作 A/B 反证）。
+    // 注意 pcGate 只在 scope = 1 时非零：字面版不切分支，但 scEff 仍按 cgGate 门控。
+    float pcGate = (uCgScope > 0.5) ? cgGate : 0.0;
     vec3 acc = cd0;
     float wsum = 1.0;
+    p4Accum(cA, -1, -1, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cB,  0, -1, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cC,  1, -1, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cD, -1,  0, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cE,  1,  0, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cF, -1,  1, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cG,  0,  1, y0, cd0, sc, scEff, pcGate, acc, wsum);
+    p4Accum(cH,  1,  1, y0, cd0, sc, scEff, pcGate, acc, wsum);
     for (int dy = -3; dy <= 3; ++dy)
         for (int dx = -3; dx <= 3; ++dx) {
-            if (dx == 0 && dy == 0) continue;
+            if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) continue;  // 内圈已取
             vec3 c = texelFetch(uTex, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0).rgb;
-            float y = dot(c, LUMA);
-            vec3 cd = c - y;
-            float wy = (y - y0) / (sc * 1.2);
-            float wc = length(cd - cd0) / sc;
-            float w = exp(-0.5 * (wy * wy + wc * wc)
-                          - 0.5 * float(dx * dx + dy * dy) / 9.68);  // σs=2.2（v0.6.32）
-            acc += w * cd;
-            wsum += w;
+            p4Accum(c, dx, dy, y0, cd0, sc, scEff, pcGate, acc, wsum);
         }
-    oColor = vec4(y0 + mix(cd0, acc / wsum, uMix), 1.0);   // v0.10.108：强度<1 线性混合
+    // a 通道 = 逐像素诊断量（下游只读 rgb；供 kFsMoireStat 统计）。
+    // v0.10.174：uCgK > 0 时写**门控开度** cgGate（1 = 强边缘吃满门）
+    // ⇒ cgMean/cgCov 直接读作"门控覆盖率"（旧版写的是 cg/scEff = 阈值里的门控
+    // 占比，那个量在 v2 里恒 ≤1 但语义不同）；否则维持档 A 的 moire 语义。
+    // 两者都不开写 1.0 ⇒ 输出与 v0.10.172 逐位一致（含 alpha）。
+    oColor = vec4(y0 + mix(cd0, acc / wsum, uMix),
+                  uCgK > 0.0 ? cgGate : (uMoire > 0.0 ? moire : 1.0));
+})";
+
+// 档 A 诊断（v0.10.165）：伪彩强度图的全局统计（只读 P4 输出的 a 通道 = moire）。
+// 32×32 网格 × 每格 16×16 等距采样（= 262144 样本 ≈ 全图 2%，采样成本 ≈ P4 的
+// 1/2300；每张成片一次）。每格输出 4 个**比例**通道（已 ÷256），CPU 按格覆盖的
+// 像素数加权后得到全图统计：
+//   r = mean(moire)                    → moMean（精确）
+//   g = P(moire>0.25)、b = P(>0.5)、a = P(>0.75)
+//                                      → moCov = b（精确）；moP95 = 在锚点
+//                                        (0,0.25,0.5,0.75,1.0) 上做分段线性 CDF 插值
+// （口径边界：P95 是 4 锚点分段线性近似，段内按均匀分布假设；判读量级足够）。
+const char* kFsMoireStat = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oStat;
+uniform highp sampler2D uSrc;
+uniform ivec2 uSize;
+const int kGrid = 32;
+void main() {
+    ivec2 g = clamp(ivec2(gl_FragCoord.xy), ivec2(0), ivec2(kGrid - 1, kGrid - 1));
+    ivec2 lo = (g * uSize) / kGrid;
+    ivec2 hi = ((g + 1) * uSize + (kGrid - 1)) / kGrid;
+    ivec2 span = max(hi - lo, ivec2(1, 1));
+    vec4 acc = vec4(0.0);
+    for (int j = 0; j < 16; ++j)
+        for (int i = 0; i < 16; ++i) {
+            ivec2 q = clamp(lo + (ivec2(i, j) * span) / 16, ivec2(0), uSize - 1);
+            float m = texelFetch(uSrc, q, 0).a;
+            acc += vec4(m, m > 0.25 ? 1.0 : 0.0, m > 0.5 ? 1.0 : 0.0,
+                        m > 0.75 ? 1.0 : 0.0);
+        }
+    oStat = acc * (1.0 / 256.0);
 })";
 
 // ── 紫边抑制（v0.10.134）：逆光边缘紫边 = 贴着物体轮廓的品红渐晕 ─────────
@@ -899,6 +1081,7 @@ uniform highp sampler2D uDet;          // 半分辨率 (a,b,chroma,gate)
 uniform ivec2 uHalf;
 uniform float uChromaAvg;              // 全图 chroma 均值（CPU 读回）
 uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
+uniform float uDfGate;                 // v0.10.173：判据的梯度自适应强度（0 = 关）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
 const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
 const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
@@ -917,7 +1100,20 @@ void main() {
     vec3 lin0 = texelFetch(uTex, p, 0).rgb;
     vec4 d0 = texelFetch(uDet, clamp(p >> 1, ivec2(0), uHalf - 1), 0);
     // RT 判定 fringe < threshfactor ⇔ chroma > (t/33)^2·5·chromave
-    if (d0.z <= uThreshK * uChromaAvg) {
+    float thr = uThreshK * uChromaAvg;
+    // ── v0.10.173：判据的梯度自适应（uDfGate = 0 ⇒ thr 逐位不变）────────────
+    // 全图均值判据（RT 原式）把"贴着强亮度边缘"的紫边挡在校正区外 —— 它们的
+    // chroma 偏离未必高于全图均值 ×2.43。这里在强边缘处按 |∇L| 放宽阈值，
+    // 使紫边进入替换区。uDfGate 同时是放宽强度（越大越激进，风险见 REPORT）。
+    if (uDfGate > 0.0) {
+        ivec2 mx = uHalf * 2 - 1;
+        float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
+        float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
+        float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
+        float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
+        thr = thr / (1.0 + uDfGate * 0.5 * length(vec2(yR - yL, yD - yU)));
+    }
+    if (d0.z <= thr) {
         oColor = vec4(lin0, 1.0);
         return;
     }
@@ -957,6 +1153,75 @@ void main() {
 //   边缘等效宽度 4.05 vs PC 4.11（细节不退化）
 // 分级职责：P4（kFsChromaDenoise，半径 3）管 1-3px 彩点；本 pass 管 4-32px 色斑。
 // ① 全分辨率 → 半分辨率：Cb/Cr 2×2 box 平均 + 该处噪声 σ（方差平均后 ÷2）
+// ── 横向色差校正（v0.10.170）──────────────────────────────────────────────
+// ① 估计输入：D3（RCD 后 / CCM 前）1/8 box 降采样。梯度尺度 8px ⇒ 可测 ±4px 位移，
+// 覆盖真实横向色差量级；8×8 均值同时把估计噪声压到 1/8。
+const char* kFsCaDown = R"(#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform ivec2 uSize;
+out vec4 fragColor;
+const int kDs = 8;
+void main() {
+  ivec2 o = ivec2(gl_FragCoord.xy);
+  ivec2 base = o * kDs;
+  ivec2 mx = uSize - ivec2(1);
+  vec3 s = vec3(0.0);
+  for (int j = 0; j < kDs; ++j) {
+    for (int i = 0; i < kDs; ++i) {
+      s += texelFetch(uTex, clamp(base + ivec2(i, j), ivec2(0), mx), 0).rgb;
+    }
+  }
+  fragColor = vec4(s * (1.0 / float(kDs * kDs)), 1.0);
+}
+)";
+
+// ② 校正：只重采样 R/B，G 逐位原样（G 是参考通道）。采样点 =
+// p + r̂·clamp(k·r, ±uMaxShift)：k>0 表示该通道相对 G 向外偏移（放大率更大），
+// 需向外取样才能把它拉回与 G 对齐。RGBA16F 在本项目驱动上无线性过滤
+//（makeTex 的 X300 quirk：RGBA16F 只有 NEAREST），故双线性在此手写
+//（4 次 texelFetch + mix）；边缘按纹素中心范围 clamp（等价 CLAMP_TO_EDGE）。
+const char* kFsCaCorr = R"(#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform ivec2 uSize;
+uniform vec2 uCenter;
+uniform float uKR;
+uniform float uKB;
+uniform float uMaxShift;
+out vec4 fragColor;
+vec3 bilerp(ivec2 t0, vec2 f, ivec2 mx) {
+  ivec2 t1 = min(t0 + ivec2(1), mx);
+  vec3 a = texelFetch(uTex, t0, 0).rgb;
+  vec3 b = texelFetch(uTex, ivec2(t1.x, t0.y), 0).rgb;
+  vec3 c = texelFetch(uTex, ivec2(t0.x, t1.y), 0).rgb;
+  vec3 d = texelFetch(uTex, t1, 0).rgb;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec3 c = texelFetch(uTex, ip, 0).rgb;
+  vec2 d = gl_FragCoord.xy - uCenter;
+  float r = length(d);
+  if (r > 1.0) {
+    vec2 rh = d / r;
+    ivec2 mx = uSize - ivec2(1);
+    vec2 lim = vec2(uSize) - vec2(0.5);
+    vec2 pR = clamp(gl_FragCoord.xy + rh * clamp(uKR * r, -uMaxShift, uMaxShift),
+                    vec2(0.5), lim);
+    vec2 pB = clamp(gl_FragCoord.xy + rh * clamp(uKB * r, -uMaxShift, uMaxShift),
+                    vec2(0.5), lim);
+    vec2 qR = pR - vec2(0.5);
+    vec2 qB = pB - vec2(0.5);
+    ivec2 tR = clamp(ivec2(floor(qR)), ivec2(0), mx);
+    ivec2 tB = clamp(ivec2(floor(qB)), ivec2(0), mx);
+    c.r = bilerp(tR, fract(qR), mx).r;
+    c.b = bilerp(tB, fract(qB), mx).b;
+  }
+  fragColor = vec4(c, 1.0);
+}
+)";
+
 const char* kFsChromaDown = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oChroma;
@@ -993,10 +1258,12 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy) * 2;
     vec2 acc = vec2(0.0);
     vec2 sacc = vec2(0.0);          // 逐路 (Σσ_Cb, Σσ_Cr)
+    float yacc = 0.0;               // v0.10.173：2×2 的 Y（梯度门引导，见下）
     for (int i = 0; i < 4; ++i) {
         ivec2 q = clamp(p + ivec2(i & 1, i >> 1), ivec2(0), uSize - 1);
         vec3 c = texelFetch(uTex, q, 0).rgb;
         float y = dot(c, LUMA);
+        yacc += y;
         acc += vec2(c.b - y, c.r - y);
         // 逐通道方差 σᵢ² = Aᵢ·cᵢ + Bᵢ·gᵢ²：shot 项随**该通道**信号；read 项不随
         // 信号但经**该通道**的 LSC 增益放大。旧实现把两者都折成 luma，丢掉了
@@ -1005,7 +1272,9 @@ void main() {
         vec3 v = max(uNoiseA * c + uNoiseB * gl * gl, vec3(0.0));
         sacc += sqrt(max(vec2(dot(v, WCB2), dot(v, WCR2)), vec2(1e-12)));
     }
-    oChroma = vec4(acc * 0.25, 0.0, 1.0);
+    // b 通道 = 半分辨率 Y（v0.10.173）：kFsChromaAtrous 的梯度门需要 |∇L|，而它的
+    // uPrev 只有 Cb/Cr ⇒ 这里顺带把 2×2 的 Y 均值带下去（零新增纹理、零新增采样）。
+    oChroma = vec4(acc * 0.25, yacc * 0.25, 1.0);
     // 2×2 box 平均使白噪 σ 减半：σ_half = mean(σ_full)/2（两路同一规则）
     oSigma = vec4(sacc * 0.125, 0.0, 1.0);
 })";
@@ -1022,10 +1291,15 @@ uniform ivec2 uSize;
 uniform int uStep;
 uniform float uK;
 uniform float uRevert;
+uniform float uCgK;    // v0.10.174：强边缘色度门强度（0 = 关，逐位回到改动前）
+const float kCgG0 = 0.10;   // 门的下阈（半分辨率 Y 的中心差分，与 P4 同一常量）
+const float kCgG1 = 0.30;   // 门的上阈
+const float kCgRel = 16.0;  // 放宽上限 = 16·σ（相对；旧版绝对 0.2 是 100% 覆盖的来源）
 const float B3[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
-    vec2 a0 = texelFetch(uPrev, p, 0).rg;
+    vec4 p0 = texelFetch(uPrev, p, 0);
+    vec2 a0 = p0.rg;
     vec2 s = vec2(0.0);
     for (int i = 0; i < 5; ++i)
         for (int j = 0; j < 5; ++j) {
@@ -1037,9 +1311,33 @@ void main() {
     // σ **逐路**（Cb/Cr 的噪声方差本不相等；见 kFsChromaDown 的 WCB2/WCR2）。
     // 旧实现取 .r 单标量给两路共用 ⇒ Cb 路径欠降噪。
     vec2 sig = max(texelFetch(uSigma, p, 0).rg * uK, vec2(1e-6));
+    // ── v0.10.174：强边缘门 v2（**只在前两级**，且有界 + 逐像素门）──────────
+    // 引导量 = 半分辨率 Y 的中心差分（步长 uStep，等效全分辨率 2·uStep px）。
+    // v0.10.173 在这里用了 PC 的**绝对** cap 0.2 且不限级别 ⇒ 5 级全部 100% 覆盖
+    //（离线实测 d1gate = [100,100,100,100,100]），每一级的 detail 被整片抹掉
+    // ⇒ 输出色度 ≈ 最粗尺度（32 px）的均值 ⇒ **"一片红一片黄一片紫"**。
+    // 离线归因（152207，同一链）：只 D-1 的门 hue15blk = 12.65%（≈ 现状 11.90%），
+    // 只 P4 的门 = 3.20%，全关 = 0%。
+    // v2 的两条修正：
+    //   ① **uStep ≤ 2**：紫边是 1~3 px 的现象，与 step 1/2（= 2/4 px）同尺度；
+    //      大尺度级（step 8/16 → 16/32 px）抹掉的是真实色度结构，不产生紫边收益
+    //      只产生色块（实测：放开全级多降 8% 紫边，flatRG 从 −0.7% 恶化到 −4.6%）。
+    //   ② **有界 + 门控**：放宽量 = min(κ·|∇L|, 16·σ)·smoothstep(kCgG0,kCgG1,|∇L|)
+    //      —— 上限由绝对 0.2 改为相对 16·σ，且平坦区严格 0。
+    // uCgK = 0 时整段不执行（sig 逐位不变）。
+    if (uCgK > 0.0 && uStep <= 2) {
+        ivec2 mx = uSize - 1;
+        float yL = texelFetch(uPrev, clamp(p - ivec2(uStep, 0), ivec2(0), mx), 0).b;
+        float yR = texelFetch(uPrev, clamp(p + ivec2(uStep, 0), ivec2(0), mx), 0).b;
+        float yU = texelFetch(uPrev, clamp(p - ivec2(0, uStep), ivec2(0), mx), 0).b;
+        float yD = texelFetch(uPrev, clamp(p + ivec2(0, uStep), ivec2(0), mx), 0).b;
+        float gmag = 0.5 * length(vec2(yR - yL, yD - yU));
+        float cgGate = smoothstep(kCgG0, kCgG1, gmag);
+        sig = max(sig, min(vec2(uCgK * gmag), kCgRel * sig) * cgGate);
+    }
     vec2 dp = d * (d * d) / (d * d + sig * sig + vec2(1e-12));
     dp += uRevert * (d - dp);          // detail reconstruction（PC revert factor）
-    oNext = vec4(s, 0.0, 1.0);
+    oNext = vec4(s, p0.b, 1.0);        // b = Y 原样传下去（梯度门引导，不参与滤波）
     oDetail = vec4(dp, 0.0, 1.0);
 })";
 
@@ -1118,6 +1416,279 @@ void main() {
     // 参数化，让三通道对称参与滤波，而不是让 G 当残差（设计文档 §3.4 第 10 项）。
     o.g = max((y - 0.2126 * o.r - 0.0722 * o.b) / 0.7152, 0.0);
     oColor = vec4(o, 1.0);
+})";
+
+// ══ PC ESD3D2 完整移植（v0.10.175）：核尺寸 + 尺度结构 + 伪彩强度逻辑 ═══════
+// 一手来源（逐行读，不凭记忆）：
+//   /tmp/pc/app/src/main/assets/shaders/denoise/esd3d2_steered.glsl（PC 默认档）
+//   /tmp/pc/app/src/main/java/.../postpipeline/ESD3D2.java（核尺寸公式 + 两趟编排）
+//   /tmp/pc/app/src/main/assets/shaders/utils/convdiff.glsl（GradBuffer 的算子）
+//   /tmp/pc/app/src/main/assets/shaders/denoise/guidedupsample.glsl（尺度结构收口）
+//   /tmp/pc/app/src/main/java/.../opengl/GLUtils.java:238-280（gaussdown，k 倍）
+// 与我们现状（P4 7×7 双边 + D-1 半分辨率 5 级 à trous）差三件事，本块**全部搬**：
+//   ① **核尺寸**：MSIZE×MSIZE，且**对称折叠**（一个 (i,j) 格同时取 4 个象限点，
+//      四象限共享权重）；MSIZE 由噪声模型按 PC 公式算出（7..21），不是固定 7×7；
+//   ② **尺度结构**：噪声自适应降采样（scale 1..4）→ 低分辨率先降噪（MOIRE=0）
+//      → guided upsample 回全分辨率 → 全分辨率第二趟（MOIRE=1.5）；
+//   ③ **伪彩强度逻辑**：chromaDiff =（2×2 quad 的四点非均匀度均值）×
+//      **convdiff 梯度幅值 max(|Δx|,|Δy|)** ⇒ 取 3 通道**极差** × MOIRE ⇒
+//      **绝对 cap 0.2** ⇒ **只进色度路 sigZ**；亮度路 sigY 恒 = 噪声方差模型
+//      ⇒ 强边缘处色度被整核（≤21px）平均，而亮度逐点保真。
+// 输出 = (色度路归一化到 luma=1) × br，br = mix(中心 luma, 亮度路 luma, LUMA)。
+// ⚠ 机型相关输入（**不照抄数值**）：PC 的 NOISES/NOISEO 来自它自己的
+//   NoiseModeler（方差模型，已按帧数折算）。我们的等价物 = 本链的方差模型
+//   （uSigA/uSigB = A/B 按 PC 的 (0.25,0.5,0.25) 权重合并，含 LSC 传播）。
+// ⚠ 与 PC 的实现差异（非算法删减，逐位等价）：
+//   ① PC 用独立 pass 产出 GradBuffer（RG16F 全分辨率 ≈48MB），本实现把同一
+//      convdiff 算子内联（缓存 5×5 的 sum3 luma = 25 次采样，9 个梯度点全部由
+//      它组合）⇒ 省 1 个全屏 pass + 1 张 RG16F；
+//   ② 主循环上界写常量 10（MSIZE ≤ 21 ⇒ KSIZE ≤ 10）+ break，避免非恒定循环
+//      上界在某些移动驱动上的编译风险（执行格数与动态上界一致）。
+const char* kFsPc3d = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;
+uniform int uK;          // KSIZE = (MSIZE-1)/2（PC 的 #define KSIZE）
+uniform float uKernel;   // KERNELSIZE = 1 + sqrt(σ²/noiseTarget)·noiseToKernel
+uniform float uSigA;     // sigY 斜率（A/B 按 PC 的 (0.25,0.5,0.25) 权重合并）
+uniform float uSigB;     // sigY 截距（read 项，含 LSC 增益²）
+uniform float uMoire;    // MOIRE（PC Tunable；pass1 = 0、pass2 = 1.5）
+uniform float uLuma;     // LUMA（PC Tunable，默认 0.8）
+uniform highp sampler2D uLsc;
+uniform ivec2 uLscSize;
+const vec3 LW3 = vec3(0.25, 0.5, 0.25);        // esd3d2_steered.glsl:64/157 的权重
+const vec3 SUM3 = vec3(0.299, 0.587, 0.114);   // convdiff.glsl:15 的 sum3
+const float kCap = 0.2;                        // esd3d2_steered.glsl:98 的绝对 cap
+const float kSeed = 0.01;                      // esd3d2_steered.glsl:100-101 的 Z/Z2
+float normpdf(float x, float sigma) {
+    return 0.39894 * exp(-0.5 * x * x / (sigma * sigma)) / sigma;
+}
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+void main() {
+    ivec2 mx = uSize - ivec2(1);
+    ivec2 xy = clamp(ivec2(gl_FragCoord.xy), ivec2(0), mx);
+    // ① GradBuffer 的等价物：convdiff.glsl:33-36（TEXSIZE==3）的算子
+    //    g = (sum3(x−1) − sum3(x+1))/2。9 个梯度点需要 5×5 的 sum3 luma（25 个
+    //    唯一坐标），先缓存再组合 ⇒ 采样数与 PC 的「1 次梯度 pass + 9 次读回」同量级。
+    float L25[25];
+    for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i)
+            L25[j * 5 + i] = dot(texelFetch(
+                uTex, clamp(xy + ivec2(i - 2, j - 2), ivec2(0), mx), 0).rgb, SUM3);
+    vec2 g9[9];
+    for (int j = -1; j <= 1; ++j)
+        for (int i = -1; i <= 1; ++i) {
+            float yl = L25[(j + 2) * 5 + (i + 1)];
+            float yr = L25[(j + 2) * 5 + (i + 3)];
+            float yu = L25[(j + 1) * 5 + (i + 2)];
+            float yd = L25[(j + 3) * 5 + (i + 2)];
+            g9[(j + 1) * 3 + (i + 1)] = vec2((yl - yr) * 0.5, (yu - yd) * 0.5);
+        }
+    // ② 2×2 quad 与 chromaDiff 的基准（esd3d2_steered.glsl:59-63）
+    vec3 cin = texelFetch(uTex, xy, 0).rgb;
+    vec3 cinX = texelFetch(uTex, clamp(xy + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 cinY = texelFetch(uTex, clamp(xy + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 cinXY = texelFetch(uTex, clamp(xy + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    vec3 cavg = (cin + cinX + cinY + cinXY) * 0.25;
+    float noisefactor = dot(cin, LW3);
+    // ③ 结构张量（:68-87）：xDelta/yDelta = 3×3 的 length(g) 一阶矩 / 3；
+    //    sxx/sxy/syy → 相干度 coh（平方）与切向单位向量 tng。
+    float xDelta = 0.0;
+    float yDelta = 0.0;
+    float sxx = 0.0;
+    float sxy = 0.0;
+    float syy = 0.0;
+    for (int i = -1; i <= 1; ++i) {
+        for (int j = -1; j <= 1; ++j) {
+            vec2 g = g9[(j + 1) * 3 + (i + 1)];
+            xDelta += float(i) * length(g);
+            yDelta += float(j) * length(g);
+            sxx += g.x * g.x;
+            sxy += g.x * g.y;
+            syy += g.y * g.y;
+        }
+    }
+    float tr = sxx + syy;
+    float dlt = sqrt(max((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy, 0.0));
+    float lam1 = 0.5 * (tr + dlt);
+    float lam2 = max(0.5 * (tr - dlt), 0.0);
+    float coh = (lam1 - lam2) / max(lam1 + lam2, 0.000001);
+    coh *= coh;
+    vec2 tng = vec2(sxy, lam1 - sxx);
+    tng = mix(tng, vec2(1.0, 0.0), step(dot(tng, tng), 0.000000000001));
+    tng /= max(length(tng), 0.000001);
+    xDelta /= 3.0;
+    yDelta /= 3.0;
+    // ④ 双路阈值（:92-98）：sigY = 噪声**方差**；sigZ = max(sigY,
+    //    min(|chromaNoise|·MOIRE, 0.2))，chromaNoise = 3 通道 chromaDiff 的极差，
+    //    chromaDiff 先被 convdiff 梯度幅值缩放（伪彩强度逻辑的核心）。
+    vec3 gl = lscAt(xy);
+    float glY = dot(gl, LW3);
+    float sigY = max(uSigA * noisefactor + uSigB * glY * glY, 0.0000001);
+    vec3 chromaDiff = (abs(cavg - cinX) + abs(cavg - cinY) +
+                       abs(cavg - cinXY) + abs(cavg - cin)) * 0.25;
+    chromaDiff *= max(abs(xDelta), abs(yDelta));
+    float chromaNoise = max(chromaDiff.r, max(chromaDiff.g, chromaDiff.b)) -
+                        min(chromaDiff.r, min(chromaDiff.g, chromaDiff.b));
+    float sigZ = max(sigY, min(abs(chromaNoise) * uMoire, kCap));
+    // ⑤ 自引导参考 gref（:104-117）：3×3 相似度加权均值，权重形状与主滤波同。
+    vec3 gref = vec3(0.0);
+    float gW = 0.0;
+    for (int i = -1; i <= 1; ++i) {
+        for (int j = -1; j <= 1; ++j) {
+            vec3 c = texelFetch(uTex, clamp(xy + ivec2(i, j), ivec2(0), mx), 0).rgb;
+            float dd = length(abs(c - cin));
+            float ww = max(0.0, 1.0 - dd * dd / (dd * dd + sigY));
+            gref += c * ww;
+            gW += ww;
+        }
+    }
+    vec3 cref = gref / max(gW, 0.0001);
+    vec3 final_colour = cin * kSeed;
+    vec3 final_colour2 = cin * kSeed;
+    float Z = kSeed;
+    float Z2 = kSeed;
+    // ⑥ 主循环（:121-152）：对称折叠 —— 一格同时取 4 个象限点，四者共享 f1；
+    //    w（sigY 路）与 w2（sigZ 路）各自做「减去四者最小值再归一化」再乘回。
+    for (int i = 0; i <= 10; ++i) {
+        if (i > uK) { break; }
+        for (int j = 0; j <= 10; ++j) {
+            if (j > uK) { break; }
+            ivec2 pos = ivec2(i, j);
+            vec3 cc0 = texelFetch(uTex, clamp(xy + pos, ivec2(0), mx), 0).rgb;
+            vec3 cc1 = texelFetch(uTex, clamp(xy - pos, ivec2(0), mx), 0).rgb;
+            vec3 cc2 = texelFetch(uTex, clamp(xy + ivec2(i, -j), ivec2(0), mx), 0).rgb;
+            vec3 cc3 = texelFetch(uTex, clamp(xy + ivec2(-i, j), ivec2(0), mx), 0).rgb;
+            vec4 d = vec4(length(abs(cc0 - cref)), length(abs(cc1 - cref)),
+                          length(abs(cc2 - cref)), length(abs(cc3 - cref)));
+            vec4 w = (1.0 - d * d / (d * d + vec4(sigY)));
+            vec4 w2 = (1.0 - d * d / (d * d + vec4(sigZ)));
+            float wm = min(min(min(w[0], w[1]), w[2]), w[3]);
+            vec4 ws = w - wm;
+            ws /= length(ws) + 0.000001;
+            vec4 w2s = w2 - wm;
+            w2s /= length(w2s) + 0.000001;
+            w *= ws;
+            w2 *= w2s;
+            float ut = float(i) * tng.x + float(j) * tng.y;
+            float f1 = mix(normpdf(float(i), uKernel) * normpdf(float(j), uKernel),
+                           normpdf(ut, uKernel), coh);
+            final_colour += f1 * mat4x3(cc0, cc1, cc2, cc3) * w;
+            final_colour2 += f1 * mat4x3(cc0, cc1, cc2, cc3) * w2;
+            Z += dot(vec4(f1), w);
+            Z2 += dot(vec4(f1), w2);
+        }
+    }
+    // ⑦ 输出（:157-164）：色度比 × 亮度。steered 版**没有上钳制**（原文注释：
+    //    scene-referred 的值要活过降噪），照抄。
+    float br = dot(final_colour / Z, LW3);
+    br = mix(dot(cin, LW3), br, uLuma);
+    vec3 resColour = final_colour2 / Z2;
+    resColour /= max(1e-6, dot(resColour, LW3));
+    resColour = max(resColour * br, 0.0);
+    oColor = vec4(resColour, 1.0);
+})";
+
+// PC gaussdown（GLUtils.java:246-280，k 倍）—— 尺度结构的入口。5×5 高斯
+// （σ = blur/stride，stride = max(1, k/2)，blur = k·0.5）+ 采样点 ×k 的抽取。
+const char* kFsPc3dDown = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;
+uniform int uResize;    // k
+uniform int uStride;    // max(1, k/2)
+uniform float uSigma;   // blur / stride
+float normpdf(float x, float sigma) {
+    return 0.39894 * exp(-0.5 * x * x / (sigma * sigma)) / sigma;
+}
+void main() {
+    ivec2 mx = uSize - ivec2(1);
+    ivec2 xy = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1) * uResize;
+    vec3 mask = vec3(0.0);
+    float pdfsize = 0.00001;
+    for (int i = -2; i <= 2; ++i) {
+        for (int j = -2; j <= 2; ++j) {
+            float pdf = normpdf(float(j), uSigma) * normpdf(float(i), uSigma);
+            vec3 inp = texelFetch(uTex, clamp(xy + ivec2(i * uStride, j * uStride),
+                                              ivec2(0), mx), 0).rgb;
+            mask += inp * pdf;
+            pdfsize += pdf;
+        }
+    }
+    oColor = vec4(mask / pdfsize, 1.0);
+})";
+
+// PC guidedupsample（guidedupsample.glsl，逐行同构）—— 尺度结构的收口：
+// 低分辨率去噪结果按**全分辨率引导**做高斯加权最小二乘拟合（导引 = RGB 均值），
+// 再把结果缩放到「输出亮度 = 引导亮度」。
+// ⚠ 与原文的两处工程差异（非算法删减）：
+//   ① uR（= SCALE）由 #define 改成 uniform，上界写常量 4 + continue；
+//   ② 分母加 1e-6 下限（原文 max(outL, 0.25*guideLightness) 在引导亮度 = 0 的
+//      纯黑像素上是 0/0）；输出加 max(·,0) 是引擎契约（下游 filmic 假设非负）。
+const char* kFsPc3dUp = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uLow;
+uniform highp sampler2D uGuideHi;
+uniform ivec2 uLowSize;
+uniform ivec2 uHiSize;
+uniform int uR;
+vec3 fitModel(ivec2 center, float guideLightness) {
+    float R = float(uR);
+    float sigma = 0.4 * R;
+    float sigmaSq2 = 2.0 * sigma * sigma;
+    float momentX = 0.0;
+    float momentX2 = 0.0;
+    float ws = 0.0;
+    vec3 momentY = vec3(0.0);
+    vec3 momentXY = vec3(0.0);
+    ivec2 hiMax = uHiSize - ivec2(1);
+    ivec2 loMax = uLowSize - ivec2(1);
+    for (int i = -4; i <= 4; ++i) {
+        if (i < -uR || i > uR) { continue; }
+        float wi = exp(-float(i * i) / sigmaSq2);
+        for (int j = -4; j <= 4; ++j) {
+            if (j < -uR || j > uR) { continue; }
+            float w = wi * exp(-float(j * j) / sigmaSq2);
+            ivec2 pos = clamp(center + ivec2(i, j), ivec2(0), hiMax);
+            float lightness = dot(texelFetch(uGuideHi, pos, 0).rgb, vec3(1.0 / 3.0));
+            vec3 lowresVal = texelFetch(uLow, clamp(pos / uR, ivec2(0), loMax), 0).rgb;
+            momentX += lightness * w;
+            momentY += lowresVal * w;
+            momentX2 += lightness * lightness * w;
+            momentXY += lowresVal * (lightness * w);
+            ws += w;
+        }
+    }
+    float invWs = 1.0 / ws;
+    float meanX = momentX * invWs;
+    vec3 meanY = momentY * invWs;
+    float varX = momentX2 * invWs - meanX * meanX;
+    vec3 covXY = momentXY * invWs - meanX * meanY;
+    vec3 a = covXY / (max(varX, 0.0) + 3e-04);
+    vec3 b = meanY - a * meanX;
+    return a * guideLightness + b;
+}
+void main() {
+    ivec2 mx = uHiSize - ivec2(1);
+    ivec2 xy = clamp(ivec2(gl_FragCoord.xy), ivec2(0), mx);
+    float guideLightness = dot(texelFetch(uGuideHi, xy, 0).rgb, vec3(1.0 / 3.0));
+    vec3 o = fitModel(xy, guideLightness);
+    float outL = dot(o, vec3(1.0 / 3.0));
+    o *= guideLightness / max(outL, max(0.25 * guideLightness, 1e-6));
+    oColor = vec4(max(o, 0.0), 1.0);
 })";
 
 // ── MFNR 阶段一（v0.9.0）────────────────────────────────────────────
@@ -1459,6 +2030,17 @@ uniform int uCfaLut;
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
 uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
+// ── v0.10.167 值域保护（HR 前置的必备件）────────────────────────────────
+// HR（RAW 域 opposed）的输出是 scene-referred、**不钳到 1**（饱和像素被重建抬到
+// 满阱之上，实测落点 1.0~1.24、G 分支上限 uGCap=2.0），而本 pass 的噪声模型
+// σ²(x) = A·x + B 是在 **[0,1] 域**标定的（x = 扣黑阶/白阶归一/WB 后的线性值）。
+// 若把 >1 的 HR 输出直接喂进 σ 与 d，σ 被线性外推放大 ⇒ 权重窗口变宽 ⇒ 刚被
+// HR 重建出来的饱和边缘又被平滑掉（= "前置了但没效果"的老路）。
+// 保护口径：**权重用钳位值、信号用原值** ——
+//   · σ 与 d 的输入一律 clamp(x, 0, 1)（留在噪声模型的标定域内）；
+//   · 累加进 acc 的仍然是原值 c（不丢 HR 刚补回来的亮度）。
+// uWClamp = 0（默认，非前置路径）时 wAt(x) ≡ x ⇒ 逐位等于改动前的实现。
+uniform float uWClamp;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -1467,14 +2049,17 @@ float fused0(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
     return texelFetch(uTex, p, 0).r;
 }
+// 权重域的取值（uWClamp > 0.5 时钳到 [0,1]），只用于 σ 与 d，不用于信号累加。
+float wAt(float x) { return uWClamp > 0.5 ? clamp(x, 0.0, 1.0) : x; }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float c0 = fused0(p);
+    float w0 = wAt(c0);
     float v = c0;
     int ch = chanAt(p);
     float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
     float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
-    float sr2 = av * c0 + bv;
+    float sr2 = av * w0 + bv;
     if (sr2 > 1e-12) {
         float sr = sqrt(sr2);
         float wsum = 1.0, acc = c0;
@@ -1482,10 +2067,10 @@ void main() {
             for (int dx = -4; dx <= 4; dx += 2) {
                 if (dx == 0 && dy == 0) continue;
                 float c = fused0(p + ivec2(dx, dy));
-                float d = (c - c0) / sr;
+                float d = (wAt(c) - w0) / sr;
                 float w = exp(-0.5 * d * d
                               - 0.5 * float(dx * dx + dy * dy) / 6.48);
-                acc += w * c;
+                acc += w * c;   // 信号用原值（wAt 只进权重）
                 wsum += w;
             }
         v = mix(c0, acc / wsum, uMix);   // v0.10.108：强度<1 = 线性混合（各亮度段一致）
@@ -1513,6 +2098,8 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform highp sampler2D uFused;
+// v0.10.167：HR 前置的值域保护开关（1 = σ 用 clamp(ref,0,1)；见 main 内注释）
+uniform float uWClamp;
 uniform ivec2 uSize;
 uniform ivec2 uOffTiles;
 uniform int uCfaLut;
@@ -1579,7 +2166,12 @@ void main() {
     int ch = chanAt(p);
     float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
     float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
-    float sr = sqrt(max(av * ref + bv, 1e-12)) * uSrScale;
+    // v0.10.167 值域保护：ref 在 HR 前置后是 scene-referred、可 >1（tex_hl_），
+    // 而噪声模型 σ²(x)=A·x+B 标定在 [0,1]。σ 用钳位值（留在标定域），
+    // ref 本身仍以原值参与信号与 d 的分子 —— 与 kFsRawDenoiseFused 同口径。
+    // uWClamp=0 时 rw ≡ ref ⇒ 逐位等于改动前。
+    float rw = uWClamp > 0.5 ? clamp(ref, 0.0, 1.0) : ref;
+    float sr = sqrt(max(av * rw + bv, 1e-12)) * uSrScale;
     float wsum = 1.0, acc = ref;
     vec2 ctr = vec2(p) + 0.5;
     for (int z = 0; z < 4; ++z) {
@@ -2374,11 +2966,16 @@ void main() {
 const char* kFsHlMask = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
-uniform highp sampler2D uMos;
-uniform highp sampler2D uStat;
+uniform highp sampler2D uMos;   // 判定源：本 pass 不读（保留声明，驱动会优化掉）
+uniform highp sampler2D uStat;  // 统计源（v0.10.167 起**真正被读取**）
 uniform int uStatRaw;
+// v0.10.167：1 = 源为单通道 R16F（值在 .r，tex_fused_ 布局），0 = RGBA16F 相位布局。
+uniform int uMono;
 uniform ivec2 uSize;
 uniform int uCfaLut;
+// v0.10.161：uClips = **裁剪判据**（0.987 × 中性白），不是满阱。本域（tex_mos_ =
+// 扣黑阶 + WB 的线性 mosaic）中性白恒等于 1.0（论证见 passHighlightRaw 的
+// kHlClipThr 注释）⇒ 三分量同为 0.987，与 PC `hlVal >= HLCLIP(0.987)` 逐字等价。
 uniform vec3 uClips;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
@@ -2388,8 +2985,17 @@ int chanAt(ivec2 p) {
 // CFA 通道**的槽位里，即 R 位置 = (v,0,0)、G 位置 = (0,v,0)、B 位置 = (0,0,v)。
 // 下游 RCD 三段读 .rgb 后按相位取通道，所以这里必须按相位读、按相位写 ——
 // 一律读 .r / 写 .r 会让 G/B 位置全变 0（2026-10-03 真机 exp13 全画面红的根因）。
-float mosAt(ivec2 p) {
-    vec4 t = texelFetch(uMos, p, 0);
+// v0.10.167 前置：HR 的输入换成 P0 前的 mosaic。MFNR 路径的 tex_fused_ 是 R16F
+// **单通道**（值恒在 .r），与相位布局不同 ⇒ 用 uMono 分支适配（uMono=0 时逐位
+// 等于改动前的 mosAt）。uMono 只描述"源布局"，不改任何判定口径。
+//
+// 统计采样（v0.10.167）：mask 的饱和判定属于**统计口径**，改走 uStat。接线时
+// 调用方仍传 stat_src == src（同一 GLuint、同一读取式）⇒ 与读 uMos 逐位一致
+// （零行为变化）；前置到 P0 之前后二者同指 P0 前的 mosaic。exp21 翻车的结构性
+// 根因正是"统计口径与判定口径共用 src、没有独立旋钮"（见 kFsHlApply 顶部注释）。
+float statAt(ivec2 p) {
+    vec4 t = texelFetch(uStat, p, 0);
+    if (uMono > 0) return t.r;
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
@@ -2411,7 +3017,7 @@ void main() {
             ivec2 p = p0 + ivec2(x, y);
             if (p.x < uSize.x && p.y < uSize.y) {
                 int c = chanAt(p);
-                float v = mosAt(p);
+                float v = statAt(p);   // v0.10.167：统计口径（原 mosAt(uMos)）
                 if (v >= clipAt(c)) mbuff[c] += 1.0;
             }
         }
@@ -2468,13 +3074,17 @@ void main() {
 const char* kFsHlChroma = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
-uniform highp sampler2D uMos;
+uniform highp sampler2D uMos;   // 判定源：本 pass 不读（保留声明，驱动会优化掉）
 uniform highp sampler2D uDil;
-uniform highp sampler2D uStat;
+uniform highp sampler2D uStat;  // 统计源（v0.10.167 起**真正被读取**）
 uniform int uStatRaw;
+// v0.10.167：1 = 源为单通道 R16F（值在 .r），0 = RGBA16F 相位布局。
+uniform int uMono;
 uniform ivec2 uSize;
 uniform ivec2 uMSize;
 uniform int uCfaLut;
+// uClips = 裁剪判据（0.987 × 中性白），非满阱（同 kFsHlMask 的说明）。故下面的
+// 样本窗 `0.2×判据 < v < 判据` 就是 PC opposedaccum.glsl:93 的原式。
 uniform vec3 uClips;
 uniform int uMode;
 int chanAt(ivec2 p) {
@@ -2482,9 +3092,11 @@ int chanAt(ivec2 p) {
     return (uCfaLut >> (k << 1)) & 3;
 }
 float at3(vec3 v, int c) { return c == 0 ? v.x : (c == 1 ? v.y : v.z); }
-// mosaic 按 CFA 相位取通道（理由见 kFsHlMask 的 mosAt 注释）
-float mosAt(ivec2 p) {
-    vec4 t = texelFetch(uMos, p, 0);
+// 统计采样（v0.10.167）：chrominance 是**统计口径**，与 mask 同走 uStat。
+// 接线时 stat_src == src ⇒ 与改动前的 mosAt(uMos) 逐位一致（零行为变化）。
+float statAt(ivec2 p) {
+    vec4 t = texelFetch(uStat, p, 0);
+    if (uMono > 0) return t.r;
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
@@ -2500,7 +3112,7 @@ float refavg(ivec2 p) {
         for (int dx = dxmin; dx < dxmax; ++dx) {
             ivec2 q = ivec2(dx, dy);
             int c = chanAt(q);
-            float v = max(0.0, mosAt(q));
+            float v = max(0.0, statAt(q));
             if (c == 0) { mean.x += v; cnt.x += 1.0; }
             else if (c == 1) { mean.y += v; cnt.y += 1.0; }
             else { mean.z += v; cnt.z += 1.0; }
@@ -2523,7 +3135,7 @@ void main() {
             if (p.x >= uSize.x || p.y >= uSize.y) continue;
             int c = chanAt(p);
             float cl = at3(uClips, c);
-            float v = mosAt(p);
+            float v = statAt(p);
             if (v >= cl || v <= 0.2 * cl) continue;
             ivec2 mb = p / 3;
             if (mb.x >= uMSize.x || mb.y >= uMSize.y) continue;
@@ -2557,14 +3169,20 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uMos;
 uniform ivec2 uSize;
 uniform int uCfaLut;
+// uClips = 裁剪判据（0.987 × 中性白），非满阱（同 kFsHlMask 的说明）。
 uniform vec3 uClips;
 uniform int uBlock;
+// v0.10.167：1 = 源为单通道 R16F（值在 .r），0 = RGBA16F 相位布局。
+// 本 pass 仍读 uMos（判定口径，v0.10.167 未改统计源）—— 前置后 uMos 本身就是
+// P0 前的 mosaic，故参考色度场自然用上未降噪数据（这正是本项要修的那 9.2%）。
+uniform int uMono;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
 }
 float mosAt(ivec2 p) {
     vec4 t = texelFetch(uMos, p, 0);
+    if (uMono > 0) return t.r;
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
@@ -2667,10 +3285,26 @@ void main() {
 const char* kFsHlApply = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
+// ── v0.10.167：本 pass 的**判定口径一个字节都没改** ──────────────────────────
+// 它仍读 uMos（判定源）。v0.10.167 的改动只有两处、都不触碰判据：
+//   ① uMono：源的**布局**适配（1 = R16F 单通道，0 = RGBA16F 相位布局）；
+//   ② 输出布局：由"按 CFA 相位写回"改为**单通道 .r**（oColor.r = outv）。
+//      为什么必须改：前置后本 pass 的输出 tex_hl_ 是 **P0 的输入**，而 P0 的
+//      kFsRawDenoiseFused::fused0() 读 .r（与 tex_fused_ 同约定）。RCD 不再读
+//      tex_hl_（它读 P0 的输出 tex_mos_），故旧的相位布局在本链路没有消费者。
+//      输出布局变了 ≠ 判定口径变了：outv 的每一行计算（判据 0.987、refavg、
+//      三级参考、软门控、allSat 重分配、uGCap）逐字未动。
 uniform highp sampler2D uMos;
 uniform ivec2 uSize;
 uniform int uCfaLut;
-uniform vec3 uClips;
+// v0.10.167：1 = 源为单通道 R16F（值在 .r，tex_fused_ 布局），0 = RGBA16F 相位布局。
+uniform int uMono;
+// uSatClip = **满阱**（本域 = WB 增益 gain[c]，逐通道不同）：只用于下面 allSat
+// 的"三通道都真的顶到传感器上限"判定与 luma 锚点 —— 语义是传感器饱和，不是裁剪判据。
+uniform vec3 uSatClip;
+// uHlClip = **裁剪判据** = 0.987 × 中性白（本域中性白 ≡ 1.0 ⇒ 标量 0.987）。
+// PC 把它作为标量（OpposedGL/opposedaccum 的 u_clip）正是同一域语义的体现。
+uniform float uHlClip;
 uniform vec3 uChroma;
 uniform highp sampler2D uStat;
 uniform int uStatRaw;
@@ -2688,9 +3322,11 @@ int chanAt(ivec2 p) {
     return (uCfaLut >> (k << 1)) & 3;
 }
 float at3(vec3 v, int c) { return c == 0 ? v.x : (c == 1 ? v.y : v.z); }
-// mosaic 按 CFA 相位取通道（理由见 kFsHlMask 的 mosAt 注释）
+// mosaic 按 CFA 相位取通道（理由见 kFsHlMask 的 mosAt 注释）。v0.10.167 加 uMono
+// 分支：uMono=0 时逐位等于改动前的实现。
 float mosAt(ivec2 p) {
     vec4 t = texelFetch(uMos, p, 0);
+    if (uMono > 0) return t.r;
     int c = chanAt(p);
     return c == 0 ? t.r : (c == 1 ? t.g : t.b);
 }
@@ -2803,10 +3439,11 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     int c = chanAt(p);
     float v = mosAt(p);
-    float cl = at3(uClips, c);
     float outv = v;
-    // ① darktable opposed 外推（原逻辑，一行未改）
-    if (v >= cl) outv = max(v, refavg(p) + at3(uChroma, c));
+    // ① darktable opposed 外推：**只抬不压**（PC tofloat.glsl:188 `max(hlVal, ...)`
+    // 逐字口径）。判据 = 裁剪判据（0.987 × 中性白）：[中性白, 满阱) 这段过曝区必须
+    // 纳入，否则被 P0 平滑拉到 1.0 以下的饱和 G 永远进不来。
+    if (v >= uHlClip) outv = max(v, refavg(p) + at3(uChroma, c));
     // ② RAW 域 G 通道色度重建 + 三通道全饱和同步重分配（v0.10.142）
     if (uGRecon > 0.5) {
         vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
@@ -2817,7 +3454,7 @@ void main() {
         float Gv = (c == 1) ? v : neighborOfChan8(p, 1);
         float Bv = (c == 2) ? v : neighborOfChan8(p, 2);
         // 0.99 容差：饱和边界上的相邻 photosite 可能差一两个 LSB 才到顶
-        if (Rv >= uClips.x * 0.99 && Gv >= uClips.y * 0.99 && Bv >= uClips.z * 0.99) {
+        if (Rv >= uSatClip.x * 0.99 && Gv >= uSatClip.y * 0.99 && Bv >= uSatClip.z * 0.99) {
             // 三通道全饱和（台灯真机：占 G 饱和像素的 35.9%）：三个锚点全是裁剪值
             // ⇒ 单通道反推失效（Gest≈1.0 被下界卡住）⇒ 经 WB + CCM 后必然品红
             //（本片实测 CCM 后 R/G 3.505）。
@@ -2834,11 +3471,22 @@ void main() {
             // 1.617 vs 块比值 1.142），而 allSat 用全局池化落点 1.072/0.895（达标）。
             float rg = max(uRefGlobal.x, 1e-3);
             float bg = max(uRefGlobal.y, 1e-3);
-            float lc = 0.2126 * uClips.x + 0.7152 * uClips.y + 0.0722 * uClips.z;
+            float lc = 0.2126 * uSatClip.x + 0.7152 * uSatClip.y + 0.0722 * uSatClip.z;
             float den = 0.2126 * rg + 0.7152 + 0.0722 * bg;
             float sc = lc / max(den, 1e-3);
+            // ⚠ v0.10.161 **故意不改成 max(v, 估计值)**（与任务书 ① 的字面口径的
+            // 唯一偏离，离线数据驱动）：本支的前提是"三个锚点全是裁剪值"，即
+            // 本通道原值 = 满阱 = 不含场景信息。此处"保留原值"保留的是**满阱比例**
+            // （本机 1.898 : 1.0 : 1.643 = WB 增益的伪影），必然偏品红。
+            // 离线逐位仿真（/tmp/hl-fix/verify.py，shot.dng，含真实软门控）：
+            //   高光区(2x2 单元 G≥0.987) R/G：本式 0.959 / max(v,估计) 1.212 /
+            //   libraw 标准链 0.975 ⇒ max 版把高光推离中性 15 倍于本式。
+            // 且"只抬不压"在本支救不了任何东西：本支输出对 G 恒为抬高（sc>1.0，
+            // 除非参考场 rg>2.12 的极端偏红），被压低的是 R/B —— 那正是把满阱伪影
+            // 拉回中性的**有益**动作。故本支保留改写；只抬不压只适用于"原值有信息"
+            // 的路径（分支① 与普通 G 分支，二者已是 max）。
             outv = (c == 0) ? rg * sc : ((c == 1) ? sc : bg * sc);
-        } else if (v >= cl && c == 1) {
+        } else if (v >= uHlClip && c == 1) {
             // 普通 G 重建路径：块比值加权口径（逐位不变，除 half-float 折算舍入）
             vec3 rr = refRatiosW(uv);
             float rg = rr.x;
@@ -2859,13 +3507,18 @@ void main() {
             // 门控量固定用第 1 级占比 rr.z（32 块邻域饱和率），与"最终选了哪一级
             // 参考"无关：它表达的是该像素邻域的空间连续性，不是参考的可信度。
             float satFrac = 1.0 - clamp(rr.z, 0.0, 1.0);
-            outv = mix(v, gest, smoothstep(0.05, 0.30, satFrac));
+            // max 兜底（v0.10.161）：gest 的下界是 v，但 uGCap < v 的退化输入会让
+            // clamp(x, v, uGCap) 返回 uGCap < v ⇒ mix 后低于原值。max 后不可能压低。
+            outv = max(v, mix(v, gest, smoothstep(0.05, 0.30, satFrac)));
             }
         }
     }
-    // 按 CFA 相位写回（与 P0 的输出约定一致）—— 写 .r 会让 G/B 位置归零
-    oColor = vec4(c == 0 ? outv : 0.0, c == 1 ? outv : 0.0,
-                  c == 2 ? outv : 0.0, 1.0);
+    // ── v0.10.167 输出布局：单通道（值恒在 .r）─────────────────────────────
+    // 前置前：按 CFA 相位写回（oColor = 相位槽位），供 RCD 三段读 .rgb 按相位取。
+    // 前置后：本输出是 **P0 的输入**，P0 的 kFsRawDenoiseFused::fused0() 读 .r
+    //   （与 tex_fused_ 同约定）；RCD 改读 P0 的输出 tex_mos_ ⇒ 相位布局无消费者。
+    // ⚠ 变的只是写出布局，outv 的判定/计算公式逐字未动（见本 shader 顶部说明）。
+    oColor = vec4(outv, 0.0, 0.0, 1.0);
 })";
 
 // Pass2：胶片模拟内核 —— v0.7.9 起 = **filmic 专属**。
@@ -3670,7 +4323,432 @@ int cfaLutOf(int cfa) {
   }
 }
 
+// ── 诊断统计（v0.10.166）：GPU 内归约各阶段色度统计量，只读回标量 ──────────
+// 目的（与 v0.10.163 相同）：定位"全图显示域 R−G 偏 +0.0145（≈3.6 个 8bit 级）"
+// **产生在哪一步**。上一版走"把各阶段纹理挂到诊断 FBO 的 READ 附件 → glReadPixels
+// 读浮点图 → 写 PFM"，真机（2026-10-05 12:20 日志）两处失败：
+//   ① `diag.dump_fail reason=readpixels` —— ES 3.0 只保证 GL_RGBA+GL_UNSIGNED_BYTE
+//      的 glReadPixels，浮点图像读回需要扩展（真机没有）；
+//   ② 更严重：dump 失败还破坏了渲染状态 → `photo.saved avgLuma=0`（后续成片全黑）。
+// 本版**彻底删除**该路径（不再有 PFM / 诊断 FBO 挂渲染纹理 / 读图像），改为：
+//   pass A（kFsStatDown）：把阶段纹理按 kStatGridW×kStatGridH 分块，每块自适应取
+//     kStatTap² 个 texel，GPU 内累加 ΣR/ΣG/ΣB、有效计数 n、按显示域亮度分 5 档的
+//     Σ(R−G) 与档内计数 → 4 个 MRT 附件。Σ **用 float32 累加，不归一化到 8bit**
+//     （这正是上一版要 PFM 的原因）；源里的 NaN/Inf 点只丢累加、仍计入总采样数。
+//   pass B（kFsStatPack）：把 4 张归约网格合成 15 个 float32 标量，按 IEEE754 位
+//     模式拆成 4 字节，写进一张 8×2 的 **RGBA8** 纹理（16 槽位）。
+//   读回：glReadPixels(GL_RGBA, GL_UNSIGNED_BYTE) 取 **64 字节** —— 这是 ES 3.0
+//     **保证可用**的组合，也是本项目已在跑的路径（tex_hr_stat_ 的 clipB、
+//     tex_local_ 的局部亮度中位、tex_hist_ 的直方图）。位打包 ⇒ 浮点无损。
+//   最终成片（D5-out-u8）在 CPU 侧按**同一分块口径**统计已读回的 u8 缓冲（零 GL 调用）。
+// 触发：prefs `diag_stats`（**默认开**）→ JNI nativeEngineSetDiagStats → setDiagStats。
+// 关闭时每个统计点唯一开销 = 一次 relaxed atomic load（无分配、无 pass、无 GL 调用）。
+// 硬约束（静态可核对，见 tools/check-diag-stats.py）：
+//   · 不把任何渲染纹理 attach 到诊断 FBO（源纹理只作 sampler 读）；
+//   · 诊断只写自己的 4+1 张纹理，全文件唯一的诊断 glReadPixels 是 8×2 RGBA8；
+//   · 进入/退出成对保存并恢复 FBO 绑定 / viewport / program / 纹理单元与绑定 /
+//     blend / scissor / depth，退出时清空本段产生的 GL 错误；
+//   · 任何一步失败（program 缺失、FBO 不完整、GL 错误、读回全零）⇒ 静默跳过，
+//     只写一条 diag.stats_fail，成片链一像素不改。
+std::atomic<bool> g_diag_stats{true};
+std::string g_diag_params;  // 本帧 kFsFilm 色度开关快照（split/look/sat…）
+bool g_diag_chain = false;  // 仅成片链（finishStillChain）内为 true
+int g_diag_seq = 0;         // 本帧序号（日志配对用）
+
+inline bool diagOn() { return g_diag_stats.load(std::memory_order_relaxed); }
+
+// 归约网格与采样密度：块数 = 12288（块间近似独立 ⇒ 均值的有效样本数 ≈ 块数），
+// 采样点 = 786432 ≈ 全图的 6.3%（4080×3072）。规则网格采样对低频统计量近似无偏，
+// 标准误 ≈ σ/√12288（σ = 跨图 R−G 标准差 ~0.05 ⇒ ~4.5e-4），比要查的 0.0145 小
+// 一个数量级以上；离线基准 tools/diag-stats-ref.py 复算同一口径供对照。
+constexpr int kStatGridW = 128;
+constexpr int kStatGridH = 96;
+constexpr int kStatTap = 8;  // 每块每维采样点数（kStatTap² = 64 点/块）
+constexpr int kStatSamples = kStatGridW * kStatGridH * kStatTap * kStatTap;
+// 位打包输出：16 槽位 × 1 float32 = 8×2 个 RGBA8 像素 = 64 字节读回。
+constexpr int kStatPackW = 8;
+constexpr int kStatPackH = 2;
+// 5 档分层（4 个边界，与离线口径一致）：[0,0.05) [0.05,0.15) [0.15,0.35)
+// [0.35,0.60) [0.60,∞)。判据量 = 显示域亮度 dot(rgb, Rec.709)。
+constexpr int kStatBands = 5;
+
+// pass A：分块采样 + GPU 内累加。Σ 用 float32（附件格式 RGBA32F，不支持时回落
+// RGBA16F —— 见 ensureDiagTargets），**不在 GPU 端做任何 8bit 归一化**。
+const char* kFsStatDown = R"(#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) out vec4 oRGB;    // (ΣR, ΣG, ΣB, n)
+layout(location = 1) out vec4 oBandA;  // (Σ(R−G)|b0, b1, b2, b3)
+layout(location = 2) out vec4 oBandB;  // (n|b0, n|b1, n|b2, n|b3)
+layout(location = 3) out vec4 oBandC;  // (Σ(R−G)|b4, n|b4, 0, 0)
+uniform highp sampler2D uSrc;
+uniform ivec2 uSize;
+const ivec2 kGrid = ivec2(128, 96);
+const int kTap = 8;
+const vec3 kLw = vec3(0.2126, 0.7152, 0.0722);
+void main() {
+    ivec2 g = ivec2(gl_FragCoord.xy);
+    ivec2 lo = (g * uSize) / kGrid;
+    ivec2 hi = ((g + 1) * uSize + kGrid - 1) / kGrid;
+    ivec2 span = max(hi - lo, ivec2(1, 1));
+    vec3 acc = vec3(0.0);
+    float n = 0.0;
+    float rg0 = 0.0, rg1 = 0.0, rg2 = 0.0, rg3 = 0.0, rg4 = 0.0;
+    float c0 = 0.0, c1 = 0.0, c2 = 0.0, c3 = 0.0, c4 = 0.0;
+    for (int j = 0; j < kTap; ++j)
+        for (int i = 0; i < kTap; ++i) {
+            ivec2 q = clamp(lo + (ivec2(i, j) * span) / kTap, ivec2(0), uSize - 1);
+            vec3 c = texelFetch(uSrc, q, 0).rgb;
+            if (any(isnan(c)) || any(isinf(c))) continue;  // 只丢累加，仍计入总采样数
+            acc += c;
+            n += 1.0;
+            float L = dot(c, kLw);
+            float d = c.r - c.g;
+            if (L < 0.05) { rg0 += d; c0 += 1.0; }
+            else if (L < 0.15) { rg1 += d; c1 += 1.0; }
+            else if (L < 0.35) { rg2 += d; c2 += 1.0; }
+            else if (L < 0.60) { rg3 += d; c3 += 1.0; }
+            else { rg4 += d; c4 += 1.0; }
+        }
+    oRGB = vec4(acc, n);
+    oBandA = vec4(rg0, rg1, rg2, rg3);
+    oBandB = vec4(c0, c1, c2, c3);
+    oBandC = vec4(rg4, c4, 0.0, 0.0);
+})";
+
+// pass B：4 张归约网格 → 16 个 float32 标量 → IEEE754 位模式拆成字节写 RGBA8。
+const char* kFsStatPack = R"(#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) out vec4 oPack;
+uniform highp sampler2D uT0;
+uniform highp sampler2D uT1;
+uniform highp sampler2D uT2;
+uniform highp sampler2D uT3;
+const ivec2 kGrid = ivec2(128, 96);
+void main() {
+    int k = int(gl_FragCoord.y) * 8 + int(gl_FragCoord.x);
+    int t = k >> 2;  // 0..3：读哪张归约网格
+    int c = k & 3;   // 0..3：取该网格的哪个通道
+    float v = 0.0;
+    for (int j = 0; j < kGrid.y; ++j)
+        for (int i = 0; i < kGrid.x; ++i) {
+            ivec2 q = ivec2(i, j);
+            vec4 s = texelFetch(uT0, q, 0);
+            if (t == 1) s = texelFetch(uT1, q, 0);
+            else if (t == 2) s = texelFetch(uT2, q, 0);
+            else if (t == 3) s = texelFetch(uT3, q, 0);
+            v += (c == 0) ? s.x : ((c == 1) ? s.y : ((c == 2) ? s.z : s.w));
+        }
+    uint bits = floatBitsToUint(v);
+    oPack = vec4(float(bits & 0xFFu), float((bits >> 8) & 0xFFu),
+                 float((bits >> 16) & 0xFFu), float((bits >> 24) & 0xFFu)) / 255.0;
+})";
+
+// 读回缓冲的槽位布局（与 kFsStatPack 的 k 一一对应）。
+enum {
+  kSlotSumR = 0, kSlotSumG = 1, kSlotSumB = 2, kSlotN = 3,
+  kSlotRgBand = 4,   // 4..8：5 档的 Σ(R−G)
+  kSlotNBand = 9,    // 9..13：5 档的计数
+  kSlotCount = 16,
+};
+
+// IEEE754 位模式还原（与 kFsStatPack 的打包互为逆运算）。
+float statUnpack(const unsigned char* p) {
+  const uint32_t bits = static_cast<uint32_t>(p[0]) |
+                        (static_cast<uint32_t>(p[1]) << 8) |
+                        (static_cast<uint32_t>(p[2]) << 16) |
+                        (static_cast<uint32_t>(p[3]) << 24);
+  float v = 0.0f;
+  std::memcpy(&v, &bits, sizeof(v));
+  return v;
+}
+
+// 一条 diag.stats（成功）或 diag.stats_fail（跳过）。字段与离线基准同口径：
+//   sumR/sumG/sumB = 采样点的 float 累加（**未做任何 8bit 归一化**）；
+//   n = 有效采样点数；samples = 总采样点数（常数）；nan = samples − n（NaN/Inf）；
+//   rgByBand[i] = 该档 Σ(R−G) / 该档计数（档内计数为 0 时记 0）；
+//   nBand[i] = 该档计数；r/g/b = 全图均值；rg = b 与 r 的均值之比对应的 R−G。
+// 开关快照（split/look/sat/mono/tone/gm）由 diagBeginFrame 攒好，逐条带上——
+// 偏红若来自其中某一项，同一帧里可直接对照。
+void diagStatsLog(const char* stage, const float* v, const FilmParams* p,
+                  const char* fail) {
+  std::string kv = "{\"stage\":\"" + std::string(stage) + "\",\"seq\":" +
+                   std::to_string(g_diag_seq);
+  if (fail) {
+    kv += ",\"reason\":\"" + std::string(fail) + "\"}";
+    Logger::instance().log(LogLevel::kWarn, "engine", "diag.stats_fail", kv);
+    return;
+  }
+  const float n = v[kSlotN];
+  const float inv = n > 0.0f ? 1.0f / n : 0.0f;
+  kv += ",\"sumR\":" + jnum(v[kSlotSumR], 9);
+  kv += ",\"sumG\":" + jnum(v[kSlotSumG], 9);
+  kv += ",\"sumB\":" + jnum(v[kSlotSumB], 9);
+  kv += ",\"n\":" + std::to_string(static_cast<long long>(n + 0.5f));
+  kv += ",\"samples\":" + std::to_string(kStatSamples);
+  kv += ",\"nan\":" + std::to_string(static_cast<long long>(
+                          kStatSamples - static_cast<long long>(n + 0.5f)));
+  kv += ",\"r\":" + jnum(v[kSlotSumR] * inv, 9);
+  kv += ",\"g\":" + jnum(v[kSlotSumG] * inv, 9);
+  kv += ",\"b\":" + jnum(v[kSlotSumB] * inv, 9);
+  kv += ",\"rg\":" + jnum((v[kSlotSumR] - v[kSlotSumG]) * inv, 9);
+  kv += ",\"rgByBand\":[";
+  for (int i = 0; i < kStatBands; ++i) {
+    const float c = v[kSlotNBand + i];
+    if (i) kv += ",";
+    kv += jnum(c > 0.0f ? v[kSlotRgBand + i] / c : 0.0f, 9);
+  }
+  kv += "],\"nBand\":[";
+  for (int i = 0; i < kStatBands; ++i) {
+    if (i) kv += ",";
+    kv += std::to_string(static_cast<long long>(v[kSlotNBand + i] + 0.5f));
+  }
+  kv += "]";
+  if (p) {  // 开关快照（由调用方传入，保证是**本帧**的参数）
+    kv += ",\"sat\":[" + jnum(p->sat_shadow, 8) + "," + jnum(p->sat_mid, 8) + "," +
+          jnum(p->sat_high, 8) + "],\"split\":[" + jnum(p->split_warm, 8) + "," +
+          jnum(p->split_cool, 8) + "],\"look\":[" + jnum(p->look_strength, 8) + "," +
+          jnum(p->look_sat, 8) + "," + jnum(p->look_chroma, 8) +
+          "],\"mono\":" + jnum(p->monochrome, 8) +
+          ",\"tone\":" + jnum(p->tone_strength, 8) +
+          ",\"gm\":" + jnum(p->gamut, 8) + ",\"hrW\":" + jnum(p->hr_wavelet, 8);
+  }
+  kv += "}";
+  Logger::instance().log(LogLevel::kInfo, "engine", "diag.stats", kv);
+}
+
+// 成片链入口（finishStillChain 开头）：开表。默认关闭时仅一次 atomic load。
+void diagBeginFrame() {
+  g_diag_chain = false;
+  if (!diagOn()) return;
+  g_diag_chain = true;
+  ++g_diag_seq;
+  g_diag_params.clear();
+}
+
+// 成片链出口：关表（统计逐阶段即时上报，这里只负责把链标志清掉）。
+void diagEndFrame() { g_diag_chain = false; }
+
 }  // namespace
+
+// 诊断统计资源（4 张归约网格 + 1 张位打包输出）的惰性创建。**自带状态保存/恢复**：
+// 调用方在读"进入前状态"之前调用它，绝不能让它留下的 FBO/纹理绑定冒充成片链的状态。
+bool FrameRenderer::ensureDiagTargets() {
+  if (tex_diag_out_ && fbo_diag_out_ && tex_diag_ds_[0] && fbo_diag_ds_) return true;
+  GLint prev_fbo = 0, prev_unit = 0, prev_tex = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+  releaseDiagTargets();
+  // @domain: A5 —— 诊断统计域（Σ 用 float32 累加，绝不降到 8bit）
+  // 首选 RGBA32F（EXT_color_buffer_float；Σ 可能到 1e5 量级且不能丢有效位）；
+  // 真机若不可渲染则回落 RGBA16F（half 在 1e3 量级仍有 ~11bit 有效位，够比值用），
+  // 两者都建不出 ⇒ 调用方静默跳过（diag.stats_fail）。
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const GLenum fmt = attempt == 0 ? GL_RGBA32F : GL_RGBA16F;
+    tex_diag_ds_[3] = 0;
+    glGenTextures(4, tex_diag_ds_);
+    for (int i = 0; i < 4; ++i) {
+      glBindTexture(GL_TEXTURE_2D, tex_diag_ds_[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      // 类型必须与内部格式匹配（X300 实测：RGBA8 + HALF_FLOAT 非法组合静默失败）
+      glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(fmt), kStatGridW, kStatGridH,
+                   0, GL_RGBA, fmt == GL_RGBA32F ? GL_FLOAT : GL_HALF_FLOAT, nullptr);
+    }
+    if (fbo_diag_ds_ == 0) glGenFramebuffers(1, &fbo_diag_ds_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_diag_ds_);
+    for (int i = 0; i < 4; ++i) {
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D,
+                             tex_diag_ds_[i], 0);
+    }
+    const GLenum bufs[4] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                            GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3};
+    glDrawBuffers(4, bufs);
+    const bool ds_ok =
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (!ds_ok) {
+      glDeleteTextures(4, tex_diag_ds_);
+      for (int i = 0; i < 4; ++i) tex_diag_ds_[i] = 0;
+    }
+    while (glGetError() != GL_NO_ERROR) {
+    }  // 探测期的错误不外泄
+    if (ds_ok) {
+      diag_ds_f32_ = attempt == 0;
+      break;
+    }
+  }
+  // 位打包输出：8×2 RGBA8（ES 3.0 保证可渲染；readback 用 GL_RGBA+GL_UNSIGNED_BYTE
+  // = ES 3.0 **唯一保证可用**的组合，也是本项目 tex_hr_stat_/tex_local_ 在跑的路径）。
+  // @domain: A5
+  makeTex(&tex_diag_out_, &fbo_diag_out_, GL_RGBA8, kStatPackW, kStatPackH);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_diag_out_);
+  const GLenum one = GL_COLOR_ATTACHMENT0;
+  glDrawBuffers(1, &one);
+  const bool out_ok =
+      tex_diag_out_ != 0 &&
+      glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  if (!out_ok || !tex_diag_ds_[0]) {
+    releaseDiagTargets();
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
+  glActiveTexture(static_cast<GLenum>(prev_unit));
+  return tex_diag_out_ != 0 && tex_diag_ds_[0] != 0;
+}
+
+void FrameRenderer::releaseDiagTargets() {
+  if (tex_diag_ds_[0]) {
+    glDeleteTextures(4, tex_diag_ds_);
+    for (int i = 0; i < 4; ++i) tex_diag_ds_[i] = 0;
+  }
+  if (fbo_diag_ds_) {
+    glDeleteFramebuffers(1, &fbo_diag_ds_);
+    fbo_diag_ds_ = 0;
+  }
+  if (tex_diag_out_) {
+    glDeleteTextures(1, &tex_diag_out_);
+    tex_diag_out_ = 0;
+  }
+  if (fbo_diag_out_) {
+    glDeleteFramebuffers(1, &fbo_diag_out_);
+    fbo_diag_out_ = 0;
+  }
+}
+
+// 阶段纹理 → GPU 内归约 → 64 字节读回 → 一条 diag.stats。
+// **不得影响成片链**：源纹理只作 sampler 读、只写诊断自有的 4+1 张纹理，
+// 进入/退出成对保存恢复 FBO/viewport/program/纹理单元与绑定/blend/scissor/depth，
+// 任何一步失败只写 diag.stats_fail 并返回。
+void FrameRenderer::diagStatsTex(const char* stage, GLuint tex, int w, int h,
+                                 const FilmParams* p) {
+  if (!diagOn() || !g_diag_chain) return;
+  if (!tex || w <= 0 || h <= 0) return;
+  if (!prog_diag_down_ || !prog_diag_pack_ || !ensureDiagTargets()) {
+    diagStatsLog(stage, nullptr, p, "no_target");
+    return;
+  }
+  GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0}, prev_prog = 0, prev_unit = 0;
+  GLint prev_tex[4] = {0, 0, 0, 0};  // pass B 用 unit 0..3（项目其它 pass 用到 unit≥3），逐个还原
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glGetIntegerv(GL_VIEWPORT, prev_vp);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit);
+  for (int i = 0; i < 4; ++i) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex[i]);
+  }
+  const GLboolean prev_blend = glIsEnabled(GL_BLEND);
+  const GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  const GLboolean prev_depth = glIsEnabled(GL_DEPTH_TEST);
+  // 进入前先读走历史 GL 错误：本段只对自己的错误负责，历史错误不冒充统计失败
+  //（成片链无 glGetError 消费者，丢掉无信息损失；留在这里只为不误判 post_err）。
+  while (glGetError() != GL_NO_ERROR) {
+  }
+
+  glDisable(GL_BLEND);
+  glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_DEPTH_TEST);
+  // pass A：源 → 4 张 kStatGridW×kStatGridH 归约网格（MRT，Σ 全程 float）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_diag_ds_);
+  glViewport(0, 0, kStatGridW, kStatGridH);
+  glUseProgram(prog_diag_down_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glUniform1i(u_diag_down_.src, 0);
+  glUniform2i(u_diag_down_.size, w, h);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // pass B：4 张网格 → 16 个 float32，IEEE754 位模式拆成字节写 RGBA8
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_diag_out_);
+  glViewport(0, 0, kStatPackW, kStatPackH);
+  glUseProgram(prog_diag_pack_);
+  for (int i = 0; i < 4; ++i) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, tex_diag_ds_[i]);
+  }
+  glUniform1i(u_diag_pack_.t0, 0);
+  glUniform1i(u_diag_pack_.t1, 1);
+  glUniform1i(u_diag_pack_.t2, 2);
+  glUniform1i(u_diag_pack_.t3, 3);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glFinish();
+  unsigned char buf[kStatPackW * kStatPackH * 4] = {0};
+  glReadPixels(0, 0, kStatPackW, kStatPackH, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+  GLenum post_err = GL_NO_ERROR;
+  for (GLenum e = glGetError(); e != GL_NO_ERROR; e = glGetError()) post_err = e;
+
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  glUseProgram(static_cast<GLuint>(prev_prog));
+  for (int i = 0; i < 4; ++i) {
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex[i]));
+  }
+  glActiveTexture(static_cast<GLenum>(prev_unit));
+  if (prev_blend) glEnable(GL_BLEND);
+  if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+  if (prev_depth) glEnable(GL_DEPTH_TEST);
+  while (glGetError() != GL_NO_ERROR) {
+  }  // 恢复动作自身的错误也不外泄
+
+  if (post_err != GL_NO_ERROR) {
+    diagStatsLog(stage, nullptr, p, "gl_error");
+    return;
+  }
+  float v[kSlotCount];
+  for (int i = 0; i < kSlotCount; ++i) v[i] = statUnpack(buf + i * 4);
+  // 读回全零 = FBO/读回静默失效（X300 上遇到过同型：attachment 配错格式静默回零）
+  if (!(v[kSlotN] > 0.0f)) {
+    diagStatsLog(stage, nullptr, p, "readback");
+    return;
+  }
+  diagStatsLog(stage, v, p, nullptr);
+}
+
+// 最终成片：引擎内本就是 RGBA8 读回（finishStillChain 的 glReadPixels），
+// 在 CPU 侧按**与 GPU 端逐字相同的分块/采样/分档口径**统计已读回的缓冲，
+// **不产生任何 GL 调用**。值 = u8/255 ⇒ 精度上限 8bit（1 级 = 0.0039）：
+// 它只作"基准/终点"，判据一律用上面的 float 阶段。
+void FrameRenderer::diagStatsU8(const char* stage, const unsigned char* px, int w,
+                                int h, const FilmParams* p) {
+  if (!diagOn() || !g_diag_chain || !px || w <= 0 || h <= 0) return;
+  float v[kSlotCount] = {0};
+  for (int gy = 0; gy < kStatGridH; ++gy) {
+    const int y0 = gy * h / kStatGridH;
+    const int y1 = std::max(((gy + 1) * h + kStatGridH - 1) / kStatGridH, y0 + 1);
+    const int sy = y1 - y0;
+    for (int gx = 0; gx < kStatGridW; ++gx) {
+      const int x0 = gx * w / kStatGridW;
+      const int x1 = std::max(((gx + 1) * w + kStatGridW - 1) / kStatGridW, x0 + 1);
+      const int sx = x1 - x0;
+      for (int j = 0; j < kStatTap; ++j) {
+        const int y = std::min(y0 + j * sy / kStatTap, h - 1);
+        const unsigned char* row = px + static_cast<size_t>(y) * w * 4;
+        for (int i = 0; i < kStatTap; ++i) {
+          const int x = std::min(x0 + i * sx / kStatTap, w - 1);
+          const unsigned char* q = row + static_cast<size_t>(x) * 4;
+          const float r = q[0] / 255.0f, g = q[1] / 255.0f, b = q[2] / 255.0f;
+          v[kSlotSumR] += r;
+          v[kSlotSumG] += g;
+          v[kSlotSumB] += b;
+          v[kSlotN] += 1.0f;
+          const float L = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+          const int band = L < 0.05f ? 0 : (L < 0.15f ? 1 : (L < 0.35f ? 2
+                                                              : (L < 0.60f ? 3 : 4)));
+          v[kSlotRgBand + band] += r - g;
+          v[kSlotNBand + band] += 1.0f;
+        }
+      }
+    }
+  }
+  diagStatsLog(stage, v, p, nullptr);
+}
 
 FrameRenderer::~FrameRenderer() { release(); }
 
@@ -3690,8 +4768,14 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_chroma = compileShader(GL_FRAGMENT_SHADER, kFsRcdChroma);
   // 第 4a 期（S14）：D3→D4 独立 CCM pass
   const GLuint fs_ccm = compileShader(GL_FRAGMENT_SHADER, kFsCcm);
+  const GLuint fs_amaze_up = compileShader(GL_FRAGMENT_SHADER, kFsAmazeUp);
   const GLuint fs_raw_dn = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoise);
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
+  // 档 A（v0.10.165）：伪彩强度图统计（32×32 网格归约，passChromaDenoise 内）
+  const GLuint fs_moire_stat = compileShader(GL_FRAGMENT_SHADER, kFsMoireStat);
+  // 诊断统计（v0.10.166）：GPU 内归约 + 位打包（见 kFsStatDown/kFsStatPack 注释）
+  const GLuint fs_diag_down = compileShader(GL_FRAGMENT_SHADER, kFsStatDown);
+  const GLuint fs_diag_pack = compileShader(GL_FRAGMENT_SHADER, kFsStatPack);
   const GLuint fs_chroma_down = compileShader(GL_FRAGMENT_SHADER, kFsChromaDown);
   const GLuint fs_chroma_at = compileShader(GL_FRAGMENT_SHADER, kFsChromaAtrous);
   const GLuint fs_chroma_apply = compileShader(GL_FRAGMENT_SHADER, kFsChromaApply);
@@ -3710,6 +4794,13 @@ bool FrameRenderer::init() {
   const GLuint fs_df_det = compileShader(GL_FRAGMENT_SHADER, kFsDefringeDetect);
   const GLuint fs_df_avg = compileShader(GL_FRAGMENT_SHADER, kFsDefringeAvg);
   const GLuint fs_df_apply = compileShader(GL_FRAGMENT_SHADER, kFsDefringeApply);
+  // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 径向位移校正
+  const GLuint fs_ca_ds = compileShader(GL_FRAGMENT_SHADER, kFsCaDown);
+  const GLuint fs_ca_corr = compileShader(GL_FRAGMENT_SHADER, kFsCaCorr);
+  // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构（gaussdown / guided upsample）
+  const GLuint fs_pc3d = compileShader(GL_FRAGMENT_SHADER, kFsPc3d);
+  const GLuint fs_pc3d_down = compileShader(GL_FRAGMENT_SHADER, kFsPc3dDown);
+  const GLuint fs_pc3d_up = compileShader(GL_FRAGMENT_SHADER, kFsPc3dUp);
   // 降噪专项 A（v0.10.49）：compute program 一律**拍照时现场创建、用完删除**
   //（spike 模式）—— 实锤:init 创建的 compute program 在该 Mali 驱动上经
   // 预览链大量 program 创建后写入全丢（主内核 + 1-texel 微测试一致失败），
@@ -3738,6 +4829,7 @@ bool FrameRenderer::init() {
   const GLuint fs_hl_refdown = compileShader(GL_FRAGMENT_SHADER, kFsHlRefDown);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
+      !fs_amaze_up ||
       !fs_ccm ||
       !fs_raw_dn || !fs_chroma_dn || !fs_chroma_down || !fs_chroma_at ||
       !fs_chroma_apply || !fs_hist || !fs_local ||
@@ -3763,8 +4855,13 @@ bool FrameRenderer::init() {
   prog_rcd_chroma_ = linkProgram(vs_rot_, fs_rcd_chroma);
   // 与 passChromaDenoise 同构：kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位
   prog_ccm_ = linkProgram(vs_rot_, fs_ccm);
+  prog_amaze_up_ = linkProgram(vs_rot_, fs_amaze_up);
   prog_raw_dn_ = linkProgram(vs_plain_, fs_raw_dn);
   prog_chroma_dn_ = linkProgram(vs_rot_, fs_chroma_dn);
+  prog_moire_stat_ = linkProgram(vs_plain_, fs_moire_stat);
+  // 诊断统计（v0.10.166）：两个 pass 都用 vs_plain_（全屏三角形 + gl_FragCoord 定位）
+  prog_diag_down_ = linkProgram(vs_plain_, fs_diag_down);
+  prog_diag_pack_ = linkProgram(vs_plain_, fs_diag_pack);
   prog_chroma_down_ = linkProgram(vs_rot_, fs_chroma_down);
   prog_chroma_at_ = linkProgram(vs_rot_, fs_chroma_at);
   prog_chroma_apply_ = linkProgram(vs_rot_, fs_chroma_apply);
@@ -3775,6 +4872,23 @@ bool FrameRenderer::init() {
   prog_df_det_ = linkProgram(vs_plain_, fs_df_det);
   prog_df_avg_ = linkProgram(vs_plain_, fs_df_avg);
   prog_df_apply_ = linkProgram(vs_plain_, fs_df_apply);
+  // 横向色差校正（v0.10.170）
+  prog_ca_ds_ = linkProgram(vs_plain_, fs_ca_ds);
+  prog_ca_corr_ = linkProgram(vs_plain_, fs_ca_corr);
+  // PC ESD3D2 完整移植（v0.10.175）：**不进 init 的硬失败判据** —— 本模块默认关
+  //（FilmParams[54] = 0），任何一环缺失都只是"少一条可选路径"，绝不允许它把默认
+  //配置拖成初始化失败（照 fs_mfnr_fft_sum 的处理）；失败时三个 prog 全置 0，
+  //passPc3d 自动返回 false ⇒ 调用方沿用 tex_scene_，与改动前逐位相同。
+  // vs_plain_：kVertRot 与 kVertPlain 的 gl_Position 相同（都铺满视口），fragment
+  // 用 gl_FragCoord + texelFetch 定位 ⇒ 两者等价（与 df/chroma_* 同构）。
+  if (fs_pc3d) prog_pc3d_ = linkProgram(vs_plain_, fs_pc3d);
+  if (fs_pc3d_down) prog_pc3d_down_ = linkProgram(vs_plain_, fs_pc3d_down);
+  if (fs_pc3d_up) prog_pc3d_up_ = linkProgram(vs_plain_, fs_pc3d_up);
+  if (!prog_pc3d_ || !prog_pc3d_down_ || !prog_pc3d_up_) {
+    Logger::instance().log(LogLevel::kError, "engine", "pc3d.compile_fail",
+                           "{\"stage\":\"link\"}");
+    prog_pc3d_ = prog_pc3d_down_ = prog_pc3d_up_ = 0;
+  }
   prog_mfnr_pyr_ = linkProgram(vs_plain_, fs_mfnr_pyr);
   prog_mfnr_down_ = linkProgram(vs_plain_, fs_mfnr_down);
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
@@ -3818,8 +4932,12 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_rcd_g);
   glDeleteShader(fs_rcd_chroma);
   glDeleteShader(fs_ccm);
+  glDeleteShader(fs_amaze_up);
   glDeleteShader(fs_raw_dn);
   glDeleteShader(fs_chroma_dn);
+  glDeleteShader(fs_moire_stat);   // 档 A（v0.10.165）
+  glDeleteShader(fs_diag_down);    // 诊断统计（v0.10.166）
+  glDeleteShader(fs_diag_pack);
   glDeleteShader(fs_chroma_down);
   glDeleteShader(fs_chroma_at);
   glDeleteShader(fs_chroma_apply);
@@ -3848,10 +4966,13 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_hr_ratios);
   glDeleteShader(fs_hr_restore);
   glDeleteShader(fs_hr_stat);
+  glDeleteShader(fs_pc3d);
+  glDeleteShader(fs_pc3d_down);
+  glDeleteShader(fs_pc3d_up);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
-      !prog_ccm_ ||
-      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_chroma_down_ ||
+      !prog_ccm_ || !prog_amaze_up_ ||
+      !prog_raw_dn_ || !prog_chroma_dn_ || !prog_moire_stat_ || !prog_chroma_down_ ||
       !prog_chroma_at_ || !prog_chroma_apply_ || !prog_hist_ || !prog_local_ ||
       !prog_mfnr_pyr_ || !prog_mfnr_down_ || !prog_mfnr_fuse_ ||
       !prog_mfnr_mis_ || !prog_raw_dn_fused_ ||
@@ -3940,6 +5061,17 @@ bool FrameRenderer::init() {
   u_ccm_.tex = glGetUniformLocation(prog_ccm_, "uTex");
   u_ccm_.size = glGetUniformLocation(prog_ccm_, "uSize");
   u_ccm_.ccm = glGetUniformLocation(prog_ccm_, "uCcm");
+  u_amaze_up_.tex = glGetUniformLocation(prog_amaze_up_, "uSrc");
+  u_amaze_up_.size = glGetUniformLocation(prog_amaze_up_, "uSize");
+  u_amaze_up_.st = glGetUniformLocation(prog_amaze_up_, "uST");
+  u_amaze_up_.rot = glGetUniformLocation(prog_amaze_up_, "uRot");
+  u_amaze_up_.scale = glGetUniformLocation(prog_amaze_up_, "uScale");
+  if (u_amaze_up_.st >= 0) {
+    // AMaZE 档用 kVertRot（与 RCD chroma 同款）：uST 默认全 0 必须置单位阵
+    const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    glUseProgram(prog_amaze_up_);
+    glUniformMatrix4fv(u_amaze_up_.st, 1, GL_FALSE, ident);
+  }
 
   u_raw_dn_.tex = glGetUniformLocation(prog_raw_dn_, "uRaw");
   u_raw_dn_.size = glGetUniformLocation(prog_raw_dn_, "uSize");
@@ -3957,6 +5089,7 @@ bool FrameRenderer::init() {
   u_raw_dn_f_.noise_a = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseA");
   u_raw_dn_f_.noise_b = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseB");
   u_raw_dn_f_.mix = glGetUniformLocation(prog_raw_dn_fused_, "uMix");
+  u_raw_dn_f_.wclamp = glGetUniformLocation(prog_raw_dn_fused_, "uWClamp");
   // D-2（v0.10.58）时域 × 空间联合 P0
   for (int i = 0; i < 4; ++i) {
     u_raw_dn_ts_.raw[i] = glGetUniformLocation(
@@ -3976,6 +5109,7 @@ bool FrameRenderer::init() {
   u_raw_dn_ts_.noise_a = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseA");
   u_raw_dn_ts_.noise_b = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseB");
   u_raw_dn_ts_.mix = glGetUniformLocation(prog_raw_dn_ts_, "uMix");
+  u_raw_dn_ts_.wclamp = glGetUniformLocation(prog_raw_dn_ts_, "uWClamp");
   u_raw_dn_ts_.sr_scale = glGetUniformLocation(prog_raw_dn_ts_, "uSrScale");
   u_raw_dn_ts_.sub = glGetUniformLocation(prog_raw_dn_ts_, "uSub");
 
@@ -3983,6 +5117,7 @@ bool FrameRenderer::init() {
   u_hl_mask_.mos = glGetUniformLocation(prog_hl_mask_, "uMos");
   u_hl_mask_.stat = glGetUniformLocation(prog_hl_mask_, "uStat");
   u_hl_mask_.statraw = glGetUniformLocation(prog_hl_mask_, "uStatRaw");
+  u_hl_mask_.mono = glGetUniformLocation(prog_hl_mask_, "uMono");
   u_hl_mask_.size = glGetUniformLocation(prog_hl_mask_, "uSize");
   u_hl_mask_.cfalut = glGetUniformLocation(prog_hl_mask_, "uCfaLut");
   u_hl_mask_.clips = glGetUniformLocation(prog_hl_mask_, "uClips");
@@ -3991,6 +5126,7 @@ bool FrameRenderer::init() {
   u_hl_chroma_.mos = glGetUniformLocation(prog_hl_chroma_, "uMos");
   u_hl_chroma_.stat = glGetUniformLocation(prog_hl_chroma_, "uStat");
   u_hl_chroma_.statraw = glGetUniformLocation(prog_hl_chroma_, "uStatRaw");
+  u_hl_chroma_.mono = glGetUniformLocation(prog_hl_chroma_, "uMono");
   u_hl_chroma_.dil = glGetUniformLocation(prog_hl_chroma_, "uDil");
   u_hl_chroma_.size = glGetUniformLocation(prog_hl_chroma_, "uSize");
   u_hl_chroma_.msize = glGetUniformLocation(prog_hl_chroma_, "uMSize");
@@ -4000,9 +5136,11 @@ bool FrameRenderer::init() {
   u_hl_apply_.mos = glGetUniformLocation(prog_hl_apply_, "uMos");
   u_hl_apply_.stat = glGetUniformLocation(prog_hl_apply_, "uStat");
   u_hl_apply_.statraw = glGetUniformLocation(prog_hl_apply_, "uStatRaw");
+  u_hl_apply_.mono = glGetUniformLocation(prog_hl_apply_, "uMono");
   u_hl_apply_.size = glGetUniformLocation(prog_hl_apply_, "uSize");
   u_hl_apply_.cfalut = glGetUniformLocation(prog_hl_apply_, "uCfaLut");
-  u_hl_apply_.clips = glGetUniformLocation(prog_hl_apply_, "uClips");
+  u_hl_apply_.clips = glGetUniformLocation(prog_hl_apply_, "uSatClip");
+  u_hl_apply_.hlclip = glGetUniformLocation(prog_hl_apply_, "uHlClip");
   u_hl_apply_.chroma = glGetUniformLocation(prog_hl_apply_, "uChroma");
   u_hl_apply_.ref = glGetUniformLocation(prog_hl_apply_, "uRef");
   u_hl_apply_.grecon = glGetUniformLocation(prog_hl_apply_, "uGRecon");
@@ -4014,6 +5152,7 @@ bool FrameRenderer::init() {
   u_hl_ref_.cfalut = glGetUniformLocation(prog_hl_ref_, "uCfaLut");
   u_hl_ref_.clips = glGetUniformLocation(prog_hl_ref_, "uClips");
   u_hl_ref_.block = glGetUniformLocation(prog_hl_ref_, "uBlock");
+  u_hl_ref_.mono = glGetUniformLocation(prog_hl_ref_, "uMono");
   u_hl_refdown_.ref1 = glGetUniformLocation(prog_hl_refdown_, "uRef1");
   u_hl_refdown_.refsize = glGetUniformLocation(prog_hl_refdown_, "uRefSize");
   u_hl_apply_.ref2 = glGetUniformLocation(prog_hl_apply_, "uRef2");
@@ -4141,6 +5280,23 @@ bool FrameRenderer::init() {
   u_chroma_dn_.mix = glGetUniformLocation(prog_chroma_dn_, "uMix");
   u_chroma_dn_.lsc = glGetUniformLocation(prog_chroma_dn_, "uLsc");
   u_chroma_dn_.lsc_size = glGetUniformLocation(prog_chroma_dn_, "uLscSize");
+  // 档 A（v0.10.165）
+  u_chroma_dn_.moire = glGetUniformLocation(prog_chroma_dn_, "uMoire");
+  u_chroma_dn_.moire_k = glGetUniformLocation(prog_chroma_dn_, "uMoireK");
+  // v0.10.173：强边缘色度梯度门
+  u_chroma_dn_.cg_k = glGetUniformLocation(prog_chroma_dn_, "uCgK");
+  u_chroma_dn_.cg_scope = glGetUniformLocation(prog_chroma_dn_, "uCgScope");
+  u_moire_stat_.src = glGetUniformLocation(prog_moire_stat_, "uSrc");
+  u_moire_stat_.size = glGetUniformLocation(prog_moire_stat_, "uSize");
+
+  // 诊断统计（v0.10.166）：**不进 init 的 program 失败判据** —— 统计链路任何一环
+  // 缺失都只是"少一条 diag.stats 日志"，绝不允许它把整个引擎拖成初始化失败。
+  u_diag_down_.src = glGetUniformLocation(prog_diag_down_, "uSrc");
+  u_diag_down_.size = glGetUniformLocation(prog_diag_down_, "uSize");
+  u_diag_pack_.t0 = glGetUniformLocation(prog_diag_pack_, "uT0");
+  u_diag_pack_.t1 = glGetUniformLocation(prog_diag_pack_, "uT1");
+  u_diag_pack_.t2 = glGetUniformLocation(prog_diag_pack_, "uT2");
+  u_diag_pack_.t3 = glGetUniformLocation(prog_diag_pack_, "uT3");
   // D 专项（v0.10.53）色度多尺度降噪
   u_chroma_down_.tex = glGetUniformLocation(prog_chroma_down_, "uTex");
   u_chroma_down_.size = glGetUniformLocation(prog_chroma_down_, "uSize");
@@ -4154,6 +5310,7 @@ bool FrameRenderer::init() {
   u_chroma_at_.step = glGetUniformLocation(prog_chroma_at_, "uStep");
   u_chroma_at_.k = glGetUniformLocation(prog_chroma_at_, "uK");
   u_chroma_at_.revert = glGetUniformLocation(prog_chroma_at_, "uRevert");
+  u_chroma_at_.cg_k = glGetUniformLocation(prog_chroma_at_, "uCgK");
   u_chroma_apply_.tex = glGetUniformLocation(prog_chroma_apply_, "uTex");
   u_chroma_apply_.coarse = glGetUniformLocation(prog_chroma_apply_, "uCoarse");
   for (int i = 0; i < kChromaLevels; ++i) {
@@ -4180,6 +5337,37 @@ bool FrameRenderer::init() {
   u_df_apply_.half = glGetUniformLocation(prog_df_apply_, "uHalf");
   u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
+  u_df_apply_.df_gate = glGetUniformLocation(prog_df_apply_, "uDfGate");
+  // 横向色差校正（v0.10.170）
+  u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
+  u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
+  u_ca_corr_.tex = glGetUniformLocation(prog_ca_corr_, "uTex");
+  u_ca_corr_.size = glGetUniformLocation(prog_ca_corr_, "uSize");
+  u_ca_corr_.center = glGetUniformLocation(prog_ca_corr_, "uCenter");
+  u_ca_corr_.kr = glGetUniformLocation(prog_ca_corr_, "uKR");
+  u_ca_corr_.kb = glGetUniformLocation(prog_ca_corr_, "uKB");
+  u_ca_corr_.maxshift = glGetUniformLocation(prog_ca_corr_, "uMaxShift");
+  // PC ESD3D2 完整移植（v0.10.175）
+  u_pc3d_.tex = glGetUniformLocation(prog_pc3d_, "uTex");
+  u_pc3d_.size = glGetUniformLocation(prog_pc3d_, "uSize");
+  u_pc3d_.k = glGetUniformLocation(prog_pc3d_, "uK");
+  u_pc3d_.kernel = glGetUniformLocation(prog_pc3d_, "uKernel");
+  u_pc3d_.sig_a = glGetUniformLocation(prog_pc3d_, "uSigA");
+  u_pc3d_.sig_b = glGetUniformLocation(prog_pc3d_, "uSigB");
+  u_pc3d_.moire = glGetUniformLocation(prog_pc3d_, "uMoire");
+  u_pc3d_.luma = glGetUniformLocation(prog_pc3d_, "uLuma");
+  u_pc3d_.lsc = glGetUniformLocation(prog_pc3d_, "uLsc");
+  u_pc3d_.lsc_size = glGetUniformLocation(prog_pc3d_, "uLscSize");
+  u_pc3d_down_.tex = glGetUniformLocation(prog_pc3d_down_, "uTex");
+  u_pc3d_down_.size = glGetUniformLocation(prog_pc3d_down_, "uSize");
+  u_pc3d_down_.resize = glGetUniformLocation(prog_pc3d_down_, "uResize");
+  u_pc3d_down_.stride = glGetUniformLocation(prog_pc3d_down_, "uStride");
+  u_pc3d_down_.sigma = glGetUniformLocation(prog_pc3d_down_, "uSigma");
+  u_pc3d_up_.low = glGetUniformLocation(prog_pc3d_up_, "uLow");
+  u_pc3d_up_.guide_hi = glGetUniformLocation(prog_pc3d_up_, "uGuideHi");
+  u_pc3d_up_.low_size = glGetUniformLocation(prog_pc3d_up_, "uLowSize");
+  u_pc3d_up_.hi_size = glGetUniformLocation(prog_pc3d_up_, "uHiSize");
+  u_pc3d_up_.r = glGetUniformLocation(prog_pc3d_up_, "uR");
   {
     // P4 用 kVertRot（uST 默认全 0 必须置单位阵）
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -4319,6 +5507,9 @@ void FrameRenderer::release() {
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
+  if (tex_mo_stat_) glDeleteTextures(1, &tex_mo_stat_);   // 档 A 统计网格
+  if (fbo_mo_stat_) glDeleteFramebuffers(1, &fbo_mo_stat_);
+  releaseDiagTargets();  // v0.10.166：诊断统计的 4+1 张小纹理（~200KB）
   if (tex_hist_) glDeleteTextures(1, &tex_hist_);
   if (tex_out_s_) glDeleteTextures(1, &tex_out_s_);
   if (lut_tex_) glDeleteTextures(1, &lut_tex_);
@@ -4331,6 +5522,11 @@ void FrameRenderer::release() {
   if (fbo_dn_) glDeleteFramebuffers(1, &fbo_dn_);
   if (fbo_hist_) glDeleteFramebuffers(1, &fbo_hist_);
   if (fbo_out_s_) glDeleteFramebuffers(1, &fbo_out_s_);
+  // 横向色差校正（v0.10.170）：全分辨率输出 + 1/8 估计图
+  if (tex_ca_) glDeleteTextures(1, &tex_ca_);
+  if (fbo_ca_) glDeleteFramebuffers(1, &fbo_ca_);
+  if (tex_ca_ds_) glDeleteTextures(1, &tex_ca_ds_);
+  if (fbo_ca_ds_) glDeleteFramebuffers(1, &fbo_ca_ds_);
   releaseHrTargets();  // v0.10.15：HR 的 10 张全分辨率纹理
   if (prog_hr_mask_) glDeleteProgram(prog_hr_mask_);
   if (prog_hr_inpaint_) glDeleteProgram(prog_hr_inpaint_);
@@ -4354,6 +5550,9 @@ void FrameRenderer::release() {
   if (prog_ccm_) glDeleteProgram(prog_ccm_);
   if (prog_raw_dn_) glDeleteProgram(prog_raw_dn_);
   if (prog_chroma_dn_) glDeleteProgram(prog_chroma_dn_);
+  if (prog_moire_stat_) glDeleteProgram(prog_moire_stat_);   // 档 A（v0.10.165）
+  if (prog_diag_down_) glDeleteProgram(prog_diag_down_);     // 诊断统计（v0.10.166）
+  if (prog_diag_pack_) glDeleteProgram(prog_diag_pack_);
   if (prog_chroma_down_) glDeleteProgram(prog_chroma_down_);
   if (prog_chroma_at_) glDeleteProgram(prog_chroma_at_);
   if (prog_chroma_apply_) glDeleteProgram(prog_chroma_apply_);
@@ -4361,6 +5560,8 @@ void FrameRenderer::release() {
   if (prog_df_det_) glDeleteProgram(prog_df_det_);
   if (prog_df_avg_) glDeleteProgram(prog_df_avg_);
   if (prog_df_apply_) glDeleteProgram(prog_df_apply_);
+  if (prog_ca_ds_) glDeleteProgram(prog_ca_ds_);
+  if (prog_ca_corr_) glDeleteProgram(prog_ca_corr_);
   if (prog_mfnr_pyr_) glDeleteProgram(prog_mfnr_pyr_);
   if (prog_mfnr_down_) glDeleteProgram(prog_mfnr_down_);
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
@@ -4486,13 +5687,16 @@ void FrameRenderer::release() {
   rcd_w_ = rcd_h_ = 0;
   tex_mos_ = tex_dn_ = tex_hist_ = 0;
   fbo_mos_ = fbo_dn_ = fbo_hist_ = 0;
+  tex_mo_stat_ = fbo_mo_stat_ = 0;   // 档 A 统计网格
+  releaseDiagTargets();              // v0.10.166：诊断统计纹理/FBO（已自带置 0）
   hist_w_ = hist_h_ = 0;
   tex_scene_ = tex_work_ = tex_cap_ = 0;
   fbo_scene_ = fbo_work_ = fbo_cap_ = 0;
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
   prog_ccm_ = 0;
-  prog_raw_dn_ = prog_chroma_dn_ = 0;
+  prog_raw_dn_ = prog_chroma_dn_ = prog_moire_stat_ = 0;
+  prog_diag_down_ = prog_diag_pack_ = 0;   // 诊断统计（v0.10.166）
   prog_chroma_down_ = prog_chroma_at_ = prog_chroma_apply_ = 0;
   prog_hist_ = 0;
   prog_local_ = 0;
@@ -4618,6 +5822,11 @@ void FrameRenderer::setPreviewScale(float s) {
 float FrameRenderer::previewScale() {
   return g_preview_scale.load(std::memory_order_relaxed);
 }
+
+// 诊断统计开关（v0.10.166，prefs `diag_stats`，**默认开**）：只置一个 atomic，其余
+// 见文件头的 diag 块。任意线程可调；关闭时全链零额外开销（每个统计点一次
+// relaxed atomic load）。
+void FrameRenderer::setDiagStats(bool on) { g_diag_stats.store(on); }
 
 void FrameRenderer::setNnInferFn(NnInferFn fn) { nn_infer_slot() = fn; }
 
@@ -4977,15 +6186,75 @@ void FrameRenderer::passRawDenoise(int w, int h, int cfa,
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+// 档 A（v0.10.165）：伪彩强度图统计网格边长。**必须与 kFsMoireStat 的 kGrid 一致**。
+constexpr int kMoireGrid = 32;
+// 档 A：伪彩度量的归一化尺度（"2σc 量级的色度起伏"给 moire = 0.5）。离线标定见
+// /tmp/stageA/REPORT.md（扫参区间 1–4，取 σC(1) 降幅与色度带通损失的拐点）。
+constexpr float kMoireK = 2.0f;
+// 档 A 统计口径（与 kFsMoireStat 成对，见其注释）：4 锚点分段线性 CDF 估 P95；
+// moSc = 1 + gain·mean（封顶 4·σc 在 gain ≤ 3 时恒不触发 ⇒ 精确）。
+struct MoireStats {
+  float mean = 0.f, p95 = 0.f, cov = 0.f, sc = 1.f;
+};
+MoireStats moireReduce(const float* grid, int w, int h, float gain) {
+  double wsum = 0.0, s_mean = 0.0, s_c25 = 0.0, s_c50 = 0.0, s_c75 = 0.0;
+  for (int gy = 0; gy < kMoireGrid; ++gy) {
+    const int loy = gy * h / kMoireGrid;
+    const int hiy = std::min(((gy + 1) * h + kMoireGrid - 1) / kMoireGrid, h);
+    for (int gx = 0; gx < kMoireGrid; ++gx) {
+      const int lox = gx * w / kMoireGrid;
+      const int hix = std::min(((gx + 1) * w + kMoireGrid - 1) / kMoireGrid, w);
+      // 每格 256 个等距样本代表整格 ⇒ 按格覆盖像素数加权（边缘格面积不同）
+      const double wt = static_cast<double>(std::max(hix - lox, 1)) *
+                        static_cast<double>(std::max(hiy - loy, 1));
+      const float* s = &grid[(static_cast<size_t>(gy) * kMoireGrid + gx) * 4];
+      wsum += wt;
+      s_mean += wt * s[0];
+      s_c25 += wt * s[1];
+      s_c50 += wt * s[2];
+      s_c75 += wt * s[3];
+    }
+  }
+  MoireStats out;
+  if (wsum <= 0.0) return out;
+  const double mean = s_mean / wsum;
+  out.mean = static_cast<float>(mean);
+  out.cov = static_cast<float>(s_c50 / wsum);
+  out.sc = static_cast<float>(1.0 + static_cast<double>(gain) * mean);
+  const double p25 = s_c25 / wsum, p50 = s_c50 / wsum, p75 = s_c75 / wsum;
+  const double xs[5] = {0.0, 0.25, 0.5, 0.75, 1.0};
+  double fs[5] = {0.0, 1.0 - p25, 1.0 - p50, 1.0 - p75, 1.0};
+  for (int i = 1; i < 5; ++i) fs[i] = std::max(fs[i], fs[i - 1]);  // 采样噪声防倒挂
+  double p95 = 1.0;
+  for (int i = 1; i < 5; ++i) {
+    if (0.95 <= fs[i]) {
+      const double t = fs[i] > fs[i - 1] ? (0.95 - fs[i - 1]) / (fs[i] - fs[i - 1]) : 0.0;
+      p95 = xs[i - 1] + t * (xs[i] - xs[i - 1]);
+      break;
+    }
+  }
+  out.p95 = static_cast<float>(p95);
+  return out;
+}
+
 // P4：色度平滑（读 tex_scene_ → tex_dn_）。输出几何与 passRcdChroma 一致
 void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
-                                      const NoiseCoef& nc) {
+                                      const NoiseCoef& nc, float moire,
+                                      float cg_k, float cg_scope,
+                                      GLuint src_tex) {
   (void)rot;  // kVertRot 旋转已在顶点层；frag 用 gl_FragCoord 定位
+  dbg_mo_gain_ = moire > 0.0f ? moire : 0.0f;
+  dbg_mo_mean_ = 0.f; dbg_mo_p95_ = 0.f; dbg_mo_cov_ = 0.f; dbg_mo_sc_ = 1.f;
+  dbg_cg_k_ = cg_k > 0.0f ? cg_k : 0.f;      // v0.10.173（日志字段 cgK）
+  dbg_cg_cap_ = 16.0f;                       // v0.10.174：shader 常量 kCgRel（相对上限 16·σc）
+  dbg_cg_scope_ = cg_scope;
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_chroma_dn_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_scene_);
+  // v0.10.175：src_tex = 0 时读 tex_scene_（原行为，**逐位不变**）；PC3D 开启时
+  // 读 tex_pc3d_（同一域、同一几何，只是多了一层照抄 PC 的降噪）。
+  glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_scene_);
   glUniform1i(u_chroma_dn_.tex, 0);
   // C 专项：LSC 增益网格（传播 read 项 ×g²；关闭态绑 1×1 恒等 → 零分支）
   glActiveTexture(GL_TEXTURE1);
@@ -4996,8 +6265,45 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glUniform3f(u_chroma_dn_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
   glUniform1f(u_chroma_dn_.mix, nc.mix_p4);   // v0.10.108
   glUniform3f(u_chroma_dn_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
+  // 档 A（v0.10.165）：伪彩强度 + 归一化尺度。uMoireK = 2.0 ⇒ "2σc 量级的色度
+  // 起伏"给 moire = 0.5（与 PC 的 MOIRE 不同量纲，不可数值对标）。
+  glUniform1f(u_chroma_dn_.moire, moire > 0.0f ? moire : 0.0f);
+  glUniform1f(u_chroma_dn_.moire_k, kMoireK);
+  // v0.10.173：强边缘色度梯度门（κ、作用域）。cg_k = 0 ⇒ cg = 0 ⇒ scEff/sy 与
+  // 改动前逐位相同，a 通道也回到档 A 的 moire 语义。
+  glUniform1f(u_chroma_dn_.cg_k, cg_k > 0.0f ? cg_k : 0.0f);
+  glUniform1f(u_chroma_dn_.cg_scope, cg_scope);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
+  // 档 A 诊断：强度图统计（仅开启时执行 —— 关闭时零新增成本）。成本 = 32×32
+  // fragment × 256 次 texelFetch（≈ 全图 2% 采样）+ 16KB 读回，每张成片一次。
+  // v0.10.173：cg_k > 0 时 a 通道 = 门控占比，同一读回给 cgMean/cgP95/cgCov。
+  if (moire > 0.0f || cg_k > 0.0f) {
+    if (tex_mo_stat_ == 0) {
+      makeTex(&tex_mo_stat_, &fbo_mo_stat_, GL_RGBA16F, kMoireGrid, kMoireGrid);
+    }
+    if (fbo_mo_stat_ != 0 &&
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo_mo_stat_);
+      glViewport(0, 0, kMoireGrid, kMoireGrid);
+      glUseProgram(prog_moire_stat_);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, tex_dn_);   // P4 输出，a = moire
+      glUniform1i(u_moire_stat_.src, 0);
+      glUniform2i(u_moire_stat_.size, dst_w, dst_h);
+      glDrawArrays(GL_TRIANGLES, 0, 3);
+      std::vector<float> grid(static_cast<size_t>(kMoireGrid) * kMoireGrid * 4, 0.f);
+      glReadPixels(0, 0, kMoireGrid, kMoireGrid, GL_RGBA, GL_FLOAT, grid.data());
+      const MoireStats st = moireReduce(grid.data(), dst_w, dst_h, moire);
+      dbg_mo_mean_ = st.mean;
+      dbg_mo_p95_ = st.p95;
+      dbg_mo_cov_ = st.cov;
+      dbg_mo_sc_ = st.sc;
+      // 恢复 P4 的目标绑定（后续 pass 各自绑 FBO，这里只为不留下意外状态）
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
+      glViewport(0, 0, dst_w, dst_h);
+    }
+  }
 }
 
 // D 专项（v0.10.53）：半分辨率 à trous 色度降噪缓冲（2× 近似层 + 5× 细节层 + σ）
@@ -5036,7 +6342,8 @@ bool FrameRenderer::ensureChromaMst(int w, int h) {
 // src_tex（v0.10.134）：输入源可替换——defringe 开启时传 tex_df_（紫边抑制输出），
 // 0 = tex_dn_（原行为）。
 bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
-                                        const NoiseCoef& nc, GLuint src_tex) {
+                                        const NoiseCoef& nc, GLuint src_tex,
+                                        float cg_k) {
   dbg_cms_ = 0; dbg_cms_k_ = 0.f;
   if (!prog_chroma_down_ || !prog_chroma_at_ || !prog_chroma_apply_) return false;
   if (!ensureChromaMst(dst_w, dst_h)) return false;
@@ -5071,6 +6378,9 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   // （噪声），没看色度纹理，是第五次同类口径事故。
   glUniform1f(u_chroma_at_.k, 2.5f);
   glUniform1f(u_chroma_at_.revert, 0.20f);
+  // v0.10.173：强边缘色度梯度门（逐级作用在收缩阈值 sig 上；引导量 = 半分辨率
+  // Y 的中心差分，由 kFsChromaDown 的 oChroma.b 携带）。cg_k = 0 ⇒ 整段不执行。
+  glUniform1f(u_chroma_at_.cg_k, cg_k > 0.0f ? cg_k : 0.0f);
   dbg_cms_ = 1; dbg_cms_k_ = 2.5f;
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
@@ -5136,14 +6446,34 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
 // 路径正是在 RAW 域（去马赛克前）恢复被裁剪通道，本层补上这一环。
 //
 // 数据域与 darktable 逐项对应（不新造域）：
-//   输入 = tex_mos_（线性 mosaic，已扣黑阶 + WB，白点 1.0）
+//   输入 = 线性 mosaic（已扣黑阶 + WB，白点 1.0）——v0.10.167 前置后由调用方传
+//     P0 **之前**的 mosaic（MFNR = tex_fused_，R16F 单通道；单帧 = kNoDn 展开结
+//     果，RGBA16F 相位布局），布局由 mono_src 描述
 //   ⇒ clips[c] = 1.0 × gain[c]（darktable: d->clip × icoeffs[c]，clip 默认 1.0）
 //   ⇒ correction[c] = 1.0（我们只有 as-shot WB，无 late correction 通道）
-// 输出 tex_hl_（scene-referred，不钳到 1），由 hr_src_override_ 转交 RCD 三段。
+// 输出 tex_hl_（scene-referred，不钳到 1，值恒在 .r），v0.10.167 起交给 **P0**
+// 作为输入（不再由 hr_src_override_ 转交 RCD —— 那时是后置）。
+//
+// ── v0.10.167：为什么前置（PhotonCamera / darktable 的顺序）──────────────────
+// 本函数此前跑在 P0（RAW 域空间 bilateral）**之后**，而 PC/darktable 的 highlights
+// 跑在空间降噪**之前**。同一张真实 DNG 的离线实测：不降噪时参考场 hlRgG = 0.9860，
+// 经 P0 后 hlRgG = 1.0768 —— P0 把高光参考场的 R/G 抬高 9.2%（饱和像素旁的 G 被
+// 同色 bilateral 平滑拉低，而 refavg 走 R/B 外推受影响小，`v − refavg` 被系统性
+// 拉负 ⇒ 修复力度被吃掉）。真机同现象：亮部 R/G 1.063 → 1.131、chroma_G
+// −0.047 → −0.138（真机 −0.250）。⇒ 统计口径必须用 **P0 前**的数据。
+// ⚠ exp21 的教训（本次必须先修的结构性缺陷）：那时 mask/chroma 的输入换成 P0 前的
+// tex_fused_ 时，顺手把 apply 的判定也换了 ⇒ 修复面 47269→63903 样本 ⇒ 修得更多、
+// 画面更红。根因是 uStat 是**死参数**（原始字符串里 texelFetch(uStat 零命中），
+// 统计/mask/apply 全走同一个 uMos ⇒ 改 src 即全改、没有独立旋钮。v0.10.167 先把
+// uStat 接线成真正的统计源（mask/chrominance 走 uStat，apply/ref 走 uMos），再做
+// 前置 —— 统计口径与判定口径从此是两件事。
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
                                             const float gains[3], GLuint src,
-                                            GLuint stat_src, int stat_raw) {
+                                            GLuint stat_src, int stat_raw,
+                                            int mono_src, int grecon) {
   HlRawResult r;
+  // v0.10.169：记录实际下发给 kFsHlApply 的 uGRecon（0/1），进 raw.render 的 hlGRecon。
+  r.grecon = grecon ? 1 : 0;
   const int mw = w / 3, mh = h / 3;    // 块网格（darktable: iwidth/3、iheight/3）
   const int tw = w / 16, th = h / 16;  // 色度统计归约网格（16×16）
   // 参考色度场网格（1/32 photosite 一块）：每通道期望 32²/4 = 256 个样本
@@ -5195,7 +6525,22 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     return r;
 
   const int cfalut = cfaLutOf(cfa);
-  const float clips[3] = {gains[0], gains[1], gains[2]};
+  // ── 域核实（v0.10.161，改判据前必须钉死的一步）────────────────────────
+  // 输入 = tex_mos_（扣黑阶 + WB 的线性 mosaic）。WB 增益 = asShotNeutral 倒数、
+  // G 归一（prepareRawCommon: "WB 增益 = asShotNeutral 的倒数，G 归一"），即
+  //   gain[c] = neutral_g / neutral_c,  neutral = asShotNeutral
+  // 中性白在本域的值 = neutral_c × gain[c] = neutral_g ≡ 1.0（所有通道）——
+  // 与 AWB 的绝对电平无关，是恒等式。满阱（raw 归一 1.0）在本域 = gain[c]。
+  // ⇒ 判据「中性白 × 0.987」在本域就是标量 **0.987**，与 PhotonCamera
+  //   tofloat.glsl:182 `hlVal = raw / whitePoint[c]; if (hlVal >= HLCLIP(0.987))`
+  //   在同一域、逐字等价（hlVal × neutral_g ≡ 本域值；neutral_g 归一为 1）。
+  // 反证旧口径：满阱 = gain[c] = 本机 (1.898, 1.0, 1.643)（真机日志 nzG）。G 的
+  // 满阱恰好 = 中性白 ⇒ [中性白, 满阱) 这段过曝区在 R/B 上极宽、在 G 上为空；
+  // 而饱和区在本域的值就是 (gainR, 1.0, gainB) —— 天然缺 G ⇒ 偏品红。
+  const float kHlClipThr = 0.987f;
+  const float hlclip[3] = {kHlClipThr, kHlClipThr, kHlClipThr};
+  // 满阱（逐通道）：只交给 kFsHlApply 的 allSat 判定（"三通道都顶到传感器上限"）
+  const float sat[3] = {gains[0], gains[1], gains[2]};
 
   // ① 块级 mask：3×3 photosite 一块，块内任一 photosite 达 clips[c] 即置位
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_hl_mask_);
@@ -5208,10 +6553,12 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glBindTexture(GL_TEXTURE_2D, stat_src);
   glUniform1i(u_hl_mask_.stat, 1);
   glUniform1i(u_hl_mask_.statraw, stat_raw);
+  // v0.10.167：统计源的布局（src 与 stat_src 在本前置下同源同布局）
+  glUniform1i(u_hl_mask_.mono, mono_src);
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_hl_mask_.size, w, h);
   glUniform1i(u_hl_mask_.cfalut, cfalut);
-  glUniform3f(u_hl_mask_.clips, clips[0], clips[1], clips[2]);
+  glUniform3f(u_hl_mask_.clips, hlclip[0], hlclip[1], hlclip[2]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 
   // ② 块级膨胀（_mask_dilated 的 3/5/7 块环形模式）
@@ -5242,11 +6589,12 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     glBindTexture(GL_TEXTURE_2D, stat_src);
     glUniform1i(u_hl_chroma_.stat, 2);
     glUniform1i(u_hl_chroma_.statraw, stat_raw);
+    glUniform1i(u_hl_chroma_.mono, mono_src);   // v0.10.167 统计源布局
     glActiveTexture(GL_TEXTURE0);
     glUniform2i(u_hl_chroma_.size, w, h);
     glUniform2i(u_hl_chroma_.msize, mw, mh);
     glUniform1i(u_hl_chroma_.cfalut, cfalut);
-    glUniform3f(u_hl_chroma_.clips, clips[0], clips[1], clips[2]);
+    glUniform3f(u_hl_chroma_.clips, hlclip[0], hlclip[1], hlclip[2]);
     glUniform1i(u_hl_chroma_.mode, mode);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     std::fill(grid.begin(), grid.end(), 0.f);
@@ -5275,8 +6623,9 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     glUniform1i(u_hl_ref_.mos, 0);
     glUniform2i(u_hl_ref_.size, w, h);
     glUniform1i(u_hl_ref_.cfalut, cfalut);
-    glUniform3f(u_hl_ref_.clips, clips[0], clips[1], clips[2]);
+    glUniform3f(u_hl_ref_.clips, hlclip[0], hlclip[1], hlclip[2]);
     glUniform1i(u_hl_ref_.block, 32);
+    glUniform1i(u_hl_ref_.mono, mono_src);   // v0.10.167 判定源布局
     glDrawArrays(GL_TRIANGLES, 0, 3);
   }
 
@@ -5363,6 +6712,7 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_hl_apply_.mos, 0);
+  glUniform1i(u_hl_apply_.mono, mono_src);   // v0.10.167 判定源布局
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, stat_src);
   glUniform1i(u_hl_apply_.stat, 1);
@@ -5370,7 +6720,8 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_hl_apply_.size, w, h);
   glUniform1i(u_hl_apply_.cfalut, cfalut);
-  glUniform3f(u_hl_apply_.clips, clips[0], clips[1], clips[2]);
+  glUniform3f(u_hl_apply_.clips, sat[0], sat[1], sat[2]);          // 满阱（allSat 判定）
+  glUniform1f(u_hl_apply_.hlclip, kHlClipThr);                     // 裁剪判据 0.987
   // v0.10.124：**chrominance 补偿置 0**（有数据支撑的偏离原版）。
   // 原版 chroma 补偿的是"refavg 的系统性偏差"，前提是输入为**单帧未降噪** RAW。
   // 我们的输入是 MFNR(4 帧) + P0 空间 bilateral 之后：同色 3×3 平滑把饱和像素旁的
@@ -5391,7 +6742,15 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glBindTexture(GL_TEXTURE_2D, tex_hl_ref2_);   // 中尺度兜底（三级参考的第 2 级）
   glUniform1i(u_hl_apply_.ref2, 3);
   glActiveTexture(GL_TEXTURE0);
-  glUniform1f(u_hl_apply_.grecon, 1.0f);
+  // uGRecon（v0.10.169，来自 FilmParams[49] hl_grecon）：kFsHlApply 内"自创机制"两支
+  // （G 三级池化比 + allSat 三通道同步改写）的总开关。
+  //   1 = **现有行为逐位不变**（默认值，故本改动不改变默认画质）；
+  //   0 = shader 内 `if (uGRecon > 0.5)` 整段跳过 ⇒ apply 支只剩分支① 的 darktable
+  //       opposed 外推（= PhotonCamera OpposedGL 口径）。
+  // 用途：真机同场景同光线 A/B 判定"过曝边缘品红"是否改善（离线：高光区
+  // B/G 1.0856 → 1.0217、R/G 0.9773 → 1.0051）。风险：allSat 在基准片占 G 饱和像素
+  // 44.15%，台灯类场景可能退化 ⇒ 默认不开。
+  glUniform1f(u_hl_apply_.grecon, grecon ? 1.0f : 0.0f);
   // uGCap = 重建值上界。v0.10.150：1.5 → 2.0。
   // 为什么改：1.5 的隐含假设是"G 最多被低估 50%"，即高光超出 G 满阱不超过 1.5 倍。
   // 这个假设在**逆光大片天空**上成立（该处 G 只需抬 ~1.09），但在"镜面高光/亚像素窄亮线"
@@ -5469,9 +6828,185 @@ bool FrameRenderer::ensureDefringe(int w, int h) {
   return true;
 }
 
+// ── PC ESD3D2 完整移植（v0.10.175）────────────────────────────────────────
+// 下列常数 = PC 的 Tunable 默认值，**照抄不换算**（ESD3D2.java:29-55）：
+//   noiseToKernelSize 24.0 / noiseTarget 1/256 / minSize 7 / maxSize 21
+//   MOIRE 1.5 / LUMA 0.8
+// 尺度结构 = ESD3D2.Run（ESD3D2.java:121-176）：scale 判定 → 低分辨率趟
+// （MOIRE = 0）→ guided upsample → 全分辨率第二趟（MOIRE = 1.5）。
+constexpr float kPc3dNoiseToKernel = 24.0f;
+constexpr float kPc3dNoiseTarget = 1.0f / 256.0f;
+constexpr int kPc3dMinSize = 7;
+constexpr int kPc3dMaxSize = 21;
+constexpr float kPc3dMoire = 1.5f;
+constexpr float kPc3dLuma = 0.8f;
+
+bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
+                             const FilmParams& p) {
+  dbg_pc3d_on_ = 0;
+  dbg_pc3d_m_ = 0;
+  dbg_pc3d_scale_ = 1;
+  dbg_pc3d_k_ = 0.f;
+  if (!prog_pc3d_ || !prog_pc3d_down_ || !prog_pc3d_up_) return false;
+  if (dst_w <= 0 || dst_h <= 0) return false;
+
+  // ① 噪声模型 → sigY 的 (斜率, 截距)。PC 的 NOISES/NOISEO 是**方差模型**；
+  //    权重形状 w = 1 − d²/(d² + sigY) 的两边同为平方量纲 ⇒ 照抄即自洽。
+  //    luma 权重用 PC 的 (0.25,0.5,0.25)（esd3d2_steered.glsl:64）。
+  const float sigA = 0.25f * nc.p4a[0] + 0.5f * nc.p4a[1] + 0.25f * nc.p4a[2];
+  const float sigB = 0.25f * nc.p4b[0] + 0.5f * nc.p4b[1] + 0.25f * nc.p4b[2];
+  // ② 核尺寸（照抄 ESD3D2.java:89-94，逐字）：
+  //      noiseMpy  = max((S+O)/noiseTarget, 1e-7)
+  //      kernelSize = 1 + sqrt(noiseMpy)·noiseToKernelSize
+  //      msize = min(minSize + (int)kernelSize − (int)kernelSize%2, maxSize)
+  const double noiseMpy =
+      std::max(static_cast<double>(sigA + sigB) / kPc3dNoiseTarget, 1e-7);
+  const double kernelSize = 1.0 + std::sqrt(noiseMpy) * kPc3dNoiseToKernel;
+  int msize = std::min(kPc3dMinSize + static_cast<int>(kernelSize) -
+                           static_cast<int>(kernelSize) % 2,
+                       kPc3dMaxSize);
+  // [55] pc3d_msize > 0 = 真机 A/B 强制核尺寸（选项，代价表见 REPORT）；
+  // 0 = 自动（PC 公式）。奇数化 + 夹到 PC 的 [minSize, maxSize] 内。
+  if (p.pc3d_msize > 0.f) {
+    int forced = static_cast<int>(p.pc3d_msize + 0.5f);
+    if (forced % 2 == 0) ++forced;
+    msize = std::min(std::max(forced, kPc3dMinSize), kPc3dMaxSize);
+  }
+  // ③ 尺度（照抄 ESD3D2.java:126-129）：
+  //      N = sqrt(0.5·S + O)；scaleF = clamp(N/noiseTarget, 1, 4)；scale = round(scaleF)
+  const double nSqrt = std::sqrt(0.5 * sigA + sigB);
+  const float scaleF =
+      std::min(std::max(static_cast<float>(nSqrt / kPc3dNoiseTarget), 1.f), 4.f);
+  int scale = static_cast<int>(scaleF + 0.5f);
+  if (scale < 1) scale = 1;
+  if (scale > 4) scale = 4;
+
+  // ④ 缓冲（惰性；[54] = 0 时一个都不建）
+  const int lw = std::max(1, dst_w / scale), lh = std::max(1, dst_h / scale);
+  if (tex_pc3d_ == 0 || pc3d_w_ != dst_w || pc3d_h_ != dst_h) {
+    if (tex_pc3d_) {
+      glDeleteTextures(1, &tex_pc3d_);
+      glDeleteFramebuffers(1, &fbo_pc3d_);
+      glDeleteTextures(1, &tex_pc3d_t1_);
+      glDeleteFramebuffers(1, &fbo_pc3d_t1_);
+    }
+    tex_pc3d_ = fbo_pc3d_ = tex_pc3d_t1_ = fbo_pc3d_t1_ = 0;
+    // @domain: D4 —— PC3D 全分辨率输出（与 tex_scene_ 同域同几何）
+    makeTex(&tex_pc3d_, &fbo_pc3d_, GL_RGBA16F, dst_w, dst_h);
+    makeTex(&tex_pc3d_t1_, &fbo_pc3d_t1_, GL_RGBA16F, dst_w, dst_h);
+    pc3d_w_ = dst_w;
+    pc3d_h_ = dst_h;
+    pc3d_lw_ = pc3d_lh_ = 0;   // 尺度可能变，低分辨率缓冲一并失效
+  }
+  if (scale > 1 && (tex_pc3d_lo_[0] == 0 || pc3d_lw_ != lw || pc3d_lh_ != lh)) {
+    for (int i = 0; i < 2; ++i) {
+      if (tex_pc3d_lo_[i]) {
+        glDeleteTextures(1, &tex_pc3d_lo_[i]);
+        glDeleteFramebuffers(1, &fbo_pc3d_lo_[i]);
+      }
+      tex_pc3d_lo_[i] = fbo_pc3d_lo_[i] = 0;
+      makeTex(&tex_pc3d_lo_[i], &fbo_pc3d_lo_[i], GL_RGBA16F, lw, lh);
+    }
+    pc3d_lw_ = lw;
+    pc3d_lh_ = lh;
+  }
+  if (tex_pc3d_ == 0 || tex_pc3d_t1_ == 0 ||
+      (scale > 1 && (tex_pc3d_lo_[0] == 0 || tex_pc3d_lo_[1] == 0))) {
+    return false;   // 分配失败 → 调用方沿用 tex_scene_（照片优先红线）
+  }
+
+  const GLenum bufs1[1] = {GL_COLOR_ATTACHMENT0};
+  auto runPc3d = [&](GLuint src, GLuint dst_fbo, int w, int h, int ms,
+                     float moire, float sA, float sB) {
+    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+    glDrawBuffers(1, bufs1);
+    glViewport(0, 0, w, h);
+    glUseProgram(prog_pc3d_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, src);
+    glUniform1i(u_pc3d_.tex, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+    glUniform1i(u_pc3d_.lsc, 1);
+    glUniform2i(u_pc3d_.lsc_size, lsc_w_, lsc_h_);
+    glUniform2i(u_pc3d_.size, w, h);
+    glUniform1i(u_pc3d_.k, (ms - 1) / 2);
+    glUniform1f(u_pc3d_.kernel, static_cast<float>(kernelSize));
+    glUniform1f(u_pc3d_.sig_a, sA);
+    glUniform1f(u_pc3d_.sig_b, sB);
+    glUniform1f(u_pc3d_.moire, moire);
+    glUniform1f(u_pc3d_.luma, kPc3dLuma);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE0);
+  };
+
+  // ⑤ 第一趟（ESD3D2.java:135-155）：scale > 1 时在**降采样域**降噪再引导上采样。
+  //    scale == 1 时直接全分辨率（原文同一分支）。
+  float sigA1 = sigA, sigB1 = sigB;
+  if (scale > 1) {
+    // PC：ESD3DRun(..., scaleF * 0.75f) ⇒ shader 内 NoiseS/scale、NoiseO/scale
+    const float sc = std::max(scaleF * 0.75f, 1e-3f);
+    sigA1 = sigA / sc;
+    sigB1 = sigB / sc;
+    const int stride = std::max(1, scale / 2);
+    const float blur = static_cast<float>(scale) * 0.5f;
+    // gaussdown：tex_scene_ → tex_pc3d_lo_[0]
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_pc3d_lo_[0]);
+    glDrawBuffers(1, bufs1);
+    glViewport(0, 0, lw, lh);
+    glUseProgram(prog_pc3d_down_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_scene_);
+    glUniform1i(u_pc3d_down_.tex, 0);
+    glUniform2i(u_pc3d_down_.size, dst_w, dst_h);
+    glUniform1i(u_pc3d_down_.resize, scale);
+    glUniform1i(u_pc3d_down_.stride, stride);
+    glUniform1f(u_pc3d_down_.sigma, blur / static_cast<float>(stride));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE0);
+    // 核尺寸也随缩放后的噪声模型（PC 的 ESD3DRun 重算 MSIZE）
+    const double mp1 =
+        std::max(static_cast<double>(sigA1 + sigB1) / kPc3dNoiseTarget, 1e-7);
+    const double ks1 = 1.0 + std::sqrt(mp1) * kPc3dNoiseToKernel;
+    int ms1 = std::min(kPc3dMinSize + static_cast<int>(ks1) -
+                           static_cast<int>(ks1) % 2,
+                       kPc3dMaxSize);
+    if (p.pc3d_msize > 0.f) ms1 = msize;
+    runPc3d(tex_pc3d_lo_[0], fbo_pc3d_lo_[1], lw, lh, ms1, 0.0f, sigA1, sigB1);
+    // guided upsample：低分辨率结果 + 全分辨率引导 → tex_pc3d_t1_
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_pc3d_t1_);
+    glDrawBuffers(1, bufs1);
+    glViewport(0, 0, dst_w, dst_h);
+    glUseProgram(prog_pc3d_up_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_pc3d_lo_[1]);
+    glUniform1i(u_pc3d_up_.low, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_scene_);
+    glUniform1i(u_pc3d_up_.guide_hi, 1);
+    glUniform2i(u_pc3d_up_.low_size, lw, lh);
+    glUniform2i(u_pc3d_up_.hi_size, dst_w, dst_h);
+    glUniform1i(u_pc3d_up_.r, scale);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE0);
+    dbg_pc3d_scale_ = scale;
+  } else {
+    runPc3d(tex_scene_, fbo_pc3d_t1_, dst_w, dst_h, msize, 0.0f, sigA, sigB);
+  }
+  // ⑥ 第二趟（ESD3D2.java:161-162）：全分辨率 + MOIRE = 1.5（伪彩强度逻辑在这里
+  //    才真正开火；第一趟 MOIRE = 0 ⇒ sigZ = sigY）。
+  runPc3d(tex_pc3d_t1_, fbo_pc3d_, dst_w, dst_h, msize, kPc3dMoire, sigA, sigB);
+
+  dbg_pc3d_on_ = 1;
+  dbg_pc3d_m_ = msize;
+  dbg_pc3d_k_ = static_cast<float>(kernelSize);
+  return true;
+}
+
 // 四段：down+Lab+门 → 检测 → 1/16 均值（读回 chromave）→ 替换。
 // 输入 tex_dn_（P4 输出），输出 tex_df_。任何一步失败返回 false（调用方回落）。
-bool FrameRenderer::passDefringe(int dst_w, int dst_h) {
+bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate) {
+  dbg_df_gate_ = df_gate > 0.f ? df_gate : 0.f;   // v0.10.173（日志字段 dfG）
   dbg_df_cavg_ = 0.f;
   if (!prog_df_down_ || !prog_df_det_ || !prog_df_avg_ || !prog_df_apply_) {
     return false;
@@ -5531,12 +7066,235 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h) {
   glUniform2i(u_df_apply_.half, hw, hh);
   glUniform1f(u_df_apply_.chroma_avg, cavg);
   glUniform1f(u_df_apply_.thresh_k, 2.43f);   // (23/33)²·5，RT threshold=23
+  glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
   }
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   return true;
+}
+
+// 横向色差判据（v0.10.170），单位 = **全分辨率像素**：
+//   kCaMinShift = 角部位移下限 —— 低于半个像素的横向色差在成片上看不出来，
+//     而"看起来像 LCA"的噪声拟合恰好落在这一区间（离线：基准样片 B 通道
+//     原始估计 0.13~0.41px，全是噪声，判定后必须不动作）。
+//   kCaConsist = 内外半区一致性容差 —— 真实 LCA 由**同一个 k** 支配所有半径
+//     （位移 ∝ r），噪声/局部伪影拟合的 k 在内（r<0.6R）与外（≥0.6R）半区互不
+//     相容。这是"零假设下自然拒绝"的判据，不依赖任何经验阈值标定。
+//   kCaMaxShift = 单通道位移上限（1/8 估计图的梯度尺度 8px ⇒ 可测 ±4px）。
+static constexpr float kCaMinShift = 0.5f;
+static constexpr float kCaConsist = 0.5f;
+static constexpr float kCaMaxShift = 4.0f;
+
+// ── 横向色差校正（v0.10.170，lateral chromatic aberration）──────────────────
+// 作用域 = **D3**（RCD 去马赛克后、passCcm 前，相机 RGB）。选择依据：
+//   ① 色差是**纯几何**位移 —— 此域通道尚未被 CCM 混合，改 R/B 不会污染颜色矩阵
+//      的输入；CCM 之后（D4/场景线性）再改会与已混合的通道打架。
+//   ② G 作参考通道**逐位不动**（PhotonCamera 与 darktable 的共同口径：G 采样最密、
+//      信噪比最高，动它会把整幅画面的亮度结构一起带走）。
+//   ③ 位置在 diagStatsTex(D3-camrgb) **之后** ⇒ 该诊断基线的既有语义不变。
+// 估计（无镜头配置文件）：1/8 box 降采样 → readPixels → CPU 一维径向 LK。
+// 估计失败 / 位移低于门限 ⇒ 返回 false ⇒ 调用方仍读 tex_work_（逐位等于改动前）。
+bool FrameRenderer::passCaCorrect(int dst_w, int dst_h, float strength) {
+  dbg_ca_applied_ = 0;
+  dbg_ca_kr_ = dbg_ca_kb_ = 0.f;
+  dbg_ca_shift_r_ = dbg_ca_shift_b_ = 0.f;
+  dbg_ca_ms_ = 0.f;
+  dbg_amaze_ms_ = 0.f;
+  // 判据与上限见文件作用域的 kCaMinShift / kCaConsist / kCaMaxShift。
+  if (!prog_ca_ds_ || !prog_ca_corr_) return false;
+  if (!ensureCaTargets(dst_w, dst_h)) return false;
+  const auto t0 = std::chrono::steady_clock::now();
+  const int dw = ca_ds_w_, dh = ca_ds_h_;
+  // ① 1/8 box 降采样（估计输入；8×8 均值同时压低估计噪声）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ca_ds_);
+  glViewport(0, 0, dw, dh);
+  glUseProgram(prog_ca_ds_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glUniform1i(u_ca_ds_.tex, 0);
+  glUniform2i(u_ca_ds_.size, dst_w, dst_h);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ② CPU 读回（RGBA16F + GL_FLOAT，与 passDefringe 同组合，X300 已验证）
+  std::vector<float> ds(static_cast<size_t>(dw) * dh * 4);
+  glReadPixels(0, 0, dw, dh, GL_RGBA, GL_FLOAT, ds.data());
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  float kr = 0.f, kb = 0.f, kraw_r = 0.f, kraw_b = 0.f;
+  if (!estimateCaRadial(ds.data(), dw, dh, dst_w, dst_h, &kr, &kb, &kraw_r,
+                        &kraw_b)) {
+    return false;
+  }
+  const float rmax = 0.5f * std::sqrt(static_cast<float>(dst_w) * dst_w +
+                                      static_cast<float>(dst_h) * dst_h);
+  const float kr_s = kr * strength, kb_s = kb * strength;
+  const float sr = kr_s * rmax, sb = kb_s * rmax;   // 画面角部的实际位移（px）
+  dbg_ca_kr_ = kr;
+  dbg_ca_kb_ = kb;
+  dbg_ca_kraw_r_ = kraw_r;
+  dbg_ca_kraw_b_ = kraw_b;
+  dbg_ca_shift_r_ = sr;
+  dbg_ca_shift_b_ = sb;
+  // 门限：两个通道都没通过判据 ⇒ 判定本帧无横向色差 ⇒ 整段跳过。
+  // 这是"默认开也安全"的**唯一**依据（对无 LCA 的场景零动作、零副作用）。
+  if (std::fabs(sr) < kCaMinShift && std::fabs(sb) < kCaMinShift) return false;
+  // ③ 全分辨率径向位移校正（只重采样 R/B，G 原样）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ca_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_ca_corr_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glUniform1i(u_ca_corr_.tex, 0);
+  glUniform2i(u_ca_corr_.size, dst_w, dst_h);
+  glUniform2f(u_ca_corr_.center, 0.5f * dst_w, 0.5f * dst_h);
+  glUniform1f(u_ca_corr_.kr, kr_s);
+  glUniform1f(u_ca_corr_.kb, kb_s);
+  glUniform1f(u_ca_corr_.maxshift, kCaMaxShift);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glActiveTexture(GL_TEXTURE0);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  dbg_ca_applied_ = 1;
+  dbg_ca_ms_ = std::chrono::duration<float, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+  return true;
+}
+
+bool FrameRenderer::ensureCaTargets(int w, int h) {
+  const int dw = (w + 7) / 8, dh = (h + 7) / 8;
+  if (ca_w_ == w && ca_h_ == h && tex_ca_ != 0 && tex_ca_ds_ != 0) return true;
+  if (tex_ca_) {
+    glDeleteTextures(1, &tex_ca_);
+    glDeleteFramebuffers(1, &fbo_ca_);
+    tex_ca_ = fbo_ca_ = 0;
+  }
+  if (tex_ca_ds_) {
+    glDeleteTextures(1, &tex_ca_ds_);
+    glDeleteFramebuffers(1, &fbo_ca_ds_);
+    tex_ca_ds_ = fbo_ca_ds_ = 0;
+  }
+  makeTex(&tex_ca_, &fbo_ca_, GL_RGBA16F, w, h);
+  makeTex(&tex_ca_ds_, &fbo_ca_ds_, GL_RGBA16F, dw, dh);
+  ca_w_ = w;
+  ca_h_ = h;
+  ca_ds_w_ = dw;
+  ca_ds_h_ = dh;
+  return tex_ca_ != 0 && tex_ca_ds_ != 0;
+}
+
+// 逐环带一维径向 Lucas-Kanade。把 darktable cacorrect（RAW 域分块位移场 + 二次
+// 曲面拟合）的模型退化成**单一径向系数**：横向色差的位移场沿径向、中心为 0、
+// 随半径单调 ⇒ d = k·r 已是完整模型（这也是它比逐像素估计稳健一个量级的原因：
+// 自由度从 2N 降到 2，噪声无法伪装成位移）。
+// 对 ch ∈ {R,B}：minimize Σ (k·r·(∇G·r̂) − (G−ch))²
+//   ⇒ k = Σ[r·g_r·(G−ch)] / Σ[r²·g_r²]，g_r = ∇G·r̂。
+// ∇G 代替 ∇ch 是 PhotonCamera 与 darktable 的共同口径。It 先做 3×3 高通：
+// LK 只对"梯度相关的分量"敏感，缓变色偏（整块偏紫）不该被读成位移。
+// 只用强梯度像素（能量 ≥ P50）：LCA 只在高对比边缘显现，平坦区只有噪声。
+bool FrameRenderer::estimateCaRadial(const float* ds, int dw, int dh, int full_w,
+                                     int full_h, float* kr, float* kb,
+                                     float* raw_kr, float* raw_kb) {
+  if (!ds || !kr || !kb || !raw_kr || !raw_kb || dw < 16 || dh < 16) return false;
+  const float sx = static_cast<float>(full_w) / static_cast<float>(dw);
+  const float sy = static_cast<float>(full_h) / static_cast<float>(dh);
+  const float cx = 0.5f * static_cast<float>(full_w);
+  const float cy = 0.5f * static_cast<float>(full_h);
+  const int npx = dw * dh;
+  std::vector<float> gx(npx, 0.f), gy(npx, 0.f), dR(npx, 0.f), dB(npx, 0.f),
+      energy(npx, 0.f);
+  // 读回有限性检查（NaN/inf = 读回异常 → 放弃本帧，fail-safe）
+  for (int k = 0; k < npx; ++k) {
+    const float r = ds[k * 4], g = ds[k * 4 + 1], b = ds[k * 4 + 2];
+    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) return false;
+    dR[k] = g - r;   // It_R = G − R
+    dB[k] = g - b;
+  }
+  for (int j = 1; j < dh - 1; ++j) {
+    for (int i = 1; i < dw - 1; ++i) {
+      const int k = j * dw + i;
+      gx[k] = 0.5f * (ds[(k + 1) * 4 + 1] - ds[(k - 1) * 4 + 1]) / sx;
+      gy[k] = 0.5f * (ds[(k + dw) * 4 + 1] - ds[(k - dw) * 4 + 1]) / sy;
+      energy[k] = gx[k] * gx[k] + gy[k] * gy[k];
+    }
+  }
+  // It 的 3×3 box 高通（去掉缓变色偏，只留与梯度同尺度的分量）
+  std::vector<float> dRh(npx, 0.f), dBh(npx, 0.f);
+  for (int j = 1; j < dh - 1; ++j) {
+    for (int i = 1; i < dw - 1; ++i) {
+      const int k = j * dw + i;
+      float sr = 0.f, sb = 0.f;
+      for (int jj = -1; jj <= 1; ++jj) {
+        for (int ii = -1; ii <= 1; ++ii) {
+          const int kk = k + jj * dw + ii;
+          sr += dR[kk];
+          sb += dB[kk];
+        }
+      }
+      dRh[k] = dR[k] - sr * (1.f / 9.f);
+      dBh[k] = dB[k] - sb * (1.f / 9.f);
+    }
+  }
+  // 梯度能量分位数（P50）—— 只用强边缘像素
+  std::vector<float> es(energy);
+  const size_t mid = es.size() / 2;
+  std::nth_element(es.begin(), es.begin() + mid, es.end());
+  const float ethr = es[mid];
+  if (!(ethr > 0.f)) return false;   // 全图无梯度（纯平坦/纯黑）⇒ 不动作
+  // 三组累加：0 = 全体、1 = 内半区（r < 0.6R）、2 = 外半区。
+  // 内/外一致性 = "径向模型成立"的必要条件（见 kCaConsist 的说明）。
+  double numR[3] = {0.0, 0.0, 0.0}, numB[3] = {0.0, 0.0, 0.0},
+         den[3] = {0.0, 0.0, 0.0};
+  long used[3] = {0, 0, 0};
+  const float rmax = 0.5f * std::sqrt(static_cast<float>(full_w) * full_w +
+                                      static_cast<float>(full_h) * full_h);
+  const float rsplit = 0.6f * rmax;
+  for (int j = 1; j < dh - 1; ++j) {
+    for (int i = 1; i < dw - 1; ++i) {
+      const int k = j * dw + i;
+      if (energy[k] < ethr) continue;
+      const float dx = (i + 0.5f) * sx - cx;
+      const float dy = (j + 0.5f) * sy - cy;
+      const float r = std::sqrt(dx * dx + dy * dy);
+      if (r < 1.f) continue;   // 中心位移恒 0，无信息（dt/PC 同样不估计中心）
+      const float gr = (gx[k] * dx + gy[k] * dy) / r;   // ∇G·r̂
+      const float wgt = r * gr;                          // = r·g_r
+      const int half = (r < rsplit) ? 1 : 2;
+      const double wr = static_cast<double>(wgt) * dRh[k];
+      const double wb = static_cast<double>(wgt) * dBh[k];
+      const double w2 = static_cast<double>(wgt) * wgt;
+      numR[0] += wr;
+      numB[0] += wb;
+      den[0] += w2;
+      ++used[0];
+      numR[half] += wr;
+      numB[half] += wb;
+      den[half] += w2;
+      ++used[half];
+    }
+  }
+  if (used[0] < 500 || den[0] <= 1e-9) return false;   // 有效边缘太少 ⇒ 不动作
+  const float kraw[2] = {static_cast<float>(numR[0] / den[0]),
+                         static_cast<float>(numB[0] / den[0])};
+  if (!std::isfinite(kraw[0]) || !std::isfinite(kraw[1])) return false;
+  *raw_kr = kraw[0];
+  *raw_kb = kraw[1];
+  // 通道级判定：① 角部位移够大（kCaMinShift）② 内外半区一致（kCaConsist）。
+  // 任一不满足 ⇒ 该通道不动作（k 记 0），日志里 caKraw 仍保留原始估计供归因。
+  float kacc[2] = {0.f, 0.f};
+  for (int c = 0; c < 2; ++c) {
+    if (std::fabs(kraw[c] * rmax) < kCaMinShift) continue;
+    if (den[1] <= 1e-9 || den[2] <= 1e-9) continue;
+    const float kI = static_cast<float>((c == 0 ? numR[1] : numB[1]) / den[1]);
+    const float kO = static_cast<float>((c == 0 ? numR[2] : numB[2]) / den[2]);
+    if (!std::isfinite(kI) || !std::isfinite(kO)) continue;
+    const float mx = std::max(std::fabs(kI), std::fabs(kO));
+    if (std::fabs(kO - kI) > kCaConsist * mx) continue;   // 非径向 ⇒ 不动作
+    kacc[c] = kraw[c];
+  }
+  *kr = kacc[0];
+  *kb = kacc[1];
+  return true;   // 两通道都为 0 = 判定无横向色差（调用方据门限跳过整段）
 }
 
 // RCD P1：方向场（vh + pq 统计），raw 原始方向全屏
@@ -5647,16 +7405,127 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
 // tex_scene_（D4：场景线性）。几何与 passChromaDenoise 同构（kVertRot + uST 单位阵，
 // frag 用 gl_FragCoord 定位），输出尺寸 = 输入尺寸，无旋转/无重采样。
 // 只在 RCD 档（demosaic == 1）调用；双线性档仍由 passRaw 内联 CCM（kFsRaw，本期不动）。
-void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm) {
+// v0.10.170：src 非 0 时改读它（横向色差校正输出 tex_ca_）；0 = 原行为（tex_work_）。
+void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_ccm_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glBindTexture(GL_TEXTURE_2D, src ? src : tex_work_);
   glUniform1i(u_ccm_.tex, 0);
   glUniform2i(u_ccm_.size, dst_w, dst_h);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
   glUniformMatrix3fv(u_ccm_.ccm, 1, GL_TRUE, ccm);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// ── AMaZE 档（v0.10.172）───────────────────────────────────────────────
+// CPU 侧跑 AMaZE 并把结果搬到 GPU。三段：① u16 RAW → 线性化 + WB（与
+// kFsRaw/kFsRcd 的 s() 逐字同口径）→ ② AmazeDemosaic（多线程 tile 并行）→
+// ③ LSC（WB 域乘，网格双线性同 kFsRaw 的 lscAt 口径）→ 上传 tex_amaze_。
+// ⚠ 未完成项：本路径**不经过 P0（RAW 域 bilateral）/ HR 前置**（那两者是 GPU
+//   pass）；高 ISO 下本档噪点会多于 RCD 档。见 /tmp/amaze/REPORT.md「未完成」。
+bool FrameRenderer::runAmazeCpu(const ChainCtx& c) {
+  const int w = c.w, h = c.h;
+  if (!c.amaze_raw || !c.gains || !c.black_phase || w < 32 || h < 32)
+    return false;
+  // CFA 相位 → 通道（cfaLutOf 的 2bit/相位打包；k=(y&1)*2+(x&1)）
+  const int lut = cfaLutOf(c.cfa);
+  int pattern[4];
+  for (int k = 0; k < 4; ++k) pattern[k] = (lut >> (k << 1)) & 3;
+  const uint16_t* raw = static_cast<const uint16_t*>(c.amaze_raw);
+  const int stride = c.amaze_stride > 0 ? c.amaze_stride : w;
+
+  // ① 线性化 + WB（黑阶按相位、白阶归一、gains 按通道）
+  std::vector<float> cfa(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    const uint16_t* row = raw + static_cast<size_t>(y) * stride;
+    for (int x = 0; x < w; ++x) {
+      const int k = ((y & 1) << 1) | (x & 1);
+      const float bl = c.black_phase[k];
+      const float den = std::max(c.white_level - bl, 1.0f);
+      const float lin = std::max((static_cast<float>(row[x]) - bl) / den, 0.0f);
+      cfa[static_cast<size_t>(y) * w + x] = lin * c.gains[pattern[k]];
+    }
+  }
+  // ② AMaZE（clip_pt = WB 域最大通道满阱；实测 1.0~8.0 对结果无实质影响）
+  std::vector<float> rgb(static_cast<size_t>(w) * h * 3);
+  const float clip_pt = std::max(c.gains[0], std::max(c.gains[1], c.gains[2]));
+  AmazeDemosaic(cfa.data(), w, h, pattern, clip_pt, rgb.data());
+  cfa.clear();
+  cfa.shrink_to_fit();
+  // ③ LSC（网格双线性；无数据 = 恒等）
+  if (c.amaze_lsc && c.lsc_cols > 1 && c.lsc_rows > 1) {
+    const int lw = c.lsc_cols, lh = c.lsc_rows;
+    for (int y = 0; y < h; ++y) {
+      const float gy = ((static_cast<float>(y) + 0.5f) / h) * lh - 0.5f;
+      const int by = static_cast<int>(std::floor(gy));
+      const float ty = gy - by;
+      for (int x = 0; x < w; ++x) {
+        const float gx = ((static_cast<float>(x) + 0.5f) / w) * lw - 0.5f;
+        const int bx = static_cast<int>(std::floor(gx));
+        const float tx = gx - bx;
+        float g[3] = {0.f, 0.f, 0.f};
+        for (int dy = 0; dy <= 1; ++dy) {
+          const int yy = std::min(std::max(by + dy, 0), lh - 1);
+          const float wy = dy ? ty : (1.f - ty);
+          for (int dx = 0; dx <= 1; ++dx) {
+            const int xx = std::min(std::max(bx + dx, 0), lw - 1);
+            const float wx = dx ? tx : (1.f - tx);
+            const float* s = c.amaze_lsc + (static_cast<size_t>(yy) * lw + xx) * 3;
+            const float wgt = wx * wy;
+            g[0] += s[0] * wgt;
+            g[1] += s[1] * wgt;
+            g[2] += s[2] * wgt;
+          }
+        }
+        float* o = rgb.data() + (static_cast<size_t>(y) * w + x) * 3;
+        o[0] *= g[0];
+        o[1] *= g[1];
+        o[2] *= g[2];
+      }
+    }
+  }
+  // ④ 上传（源几何；RGB16F 与 lsc_tex_ 同款用法）
+  if (tex_amaze_ == 0 || amaze_w_ != w || amaze_h_ != h) {
+    if (tex_amaze_) glDeleteTextures(1, &tex_amaze_);
+    glGenTextures(1, &tex_amaze_);
+    glBindTexture(GL_TEXTURE_2D, tex_amaze_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_FLOAT,
+                 nullptr);
+    amaze_w_ = w;
+    amaze_h_ = h;
+  }
+  glBindTexture(GL_TEXTURE_2D, tex_amaze_);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_FLOAT, rgb.data());
+  if (glGetError() != GL_NO_ERROR) {
+    Logger::instance().log(LogLevel::kError, "engine", "amaze.upload_failed",
+                           "{\"w\":" + std::to_string(w) +
+                               ",\"h\":" + std::to_string(h) + "}");
+    return false;
+  }
+  return true;
+}
+
+// tex_amaze_（源几何）→ tex_work_（成片几何 D3）：几何口径与 kFsRcdChroma 逐字
+// 一致（kVertRot + uST 单位阵 + uScale=1 + frag 的 tuv 翻转），保证与 RCD 档
+// 成片方向完全一致。
+void FrameRenderer::passAmazeUp(int dst_w, int dst_h, int rot) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_amaze_up_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_amaze_);
+  if (u_amaze_up_.tex >= 0) glUniform1i(u_amaze_up_.tex, 0);
+  if (u_amaze_up_.size >= 0) glUniform2i(u_amaze_up_.size, amaze_w_, amaze_h_);
+  if (u_amaze_up_.rot >= 0) glUniform1i(u_amaze_up_.rot, rot);
+  if (u_amaze_up_.scale >= 0) glUniform2f(u_amaze_up_.scale, 1.0f, 1.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -5722,6 +7591,13 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
+  // AMaZE 档（demosaic == 2，v0.10.172）：CPU 侧从这份 u16 RAW 直接跑 AMaZE
+  c.amaze = demosaic == 2;
+  if (c.amaze) {
+    c.amaze_raw = raw;
+    c.amaze_stride = row_stride_px;
+    c.amaze_lsc = lsc;
+  }
   c.dn = rcd && noise_strength > 0.f;
   c.dn_k = noise_strength;
   c.nc = nc;
@@ -5904,7 +7780,26 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const int w = c.w, h = c.h, dst_w = c.dst_w, dst_h = c.dst_h;
   const FilmParams& p = *c.p;
   float dir_ms = 0.0f, g_ms = 0.0f, ccm_ms = 0.0f, dn_ms = 0.0f;
-  if (c.rcd) {
+  diagBeginFrame();  // 诊断统计：关时仅一次 atomic load，无 pass / 无 GL 调用
+  if (c.amaze) {
+    // ── AMaZE 档（v0.10.172）──────────────────────────────────────────
+    // CPU AMaZE（源几何）→ tex_amaze_ → passAmazeUp（成片几何 D3 = tex_work_）
+    // → 既有 passCcm（D4）→ 下面的胶片链（零改动）。本档**不走** P0 / HR 前置
+    // （未完成项，见 REPORT.md）；也不进 P4 色度降噪（c.dn = rcd && ...）。
+    const auto a0 = std::chrono::steady_clock::now();
+    if (!runAmazeCpu(c)) {
+      Logger::instance().log(LogLevel::kError, "engine", "amaze.failed", "{}");
+      return;  // 照片优先红线：失败不出图（调用方按 ok=false 处理）
+    }
+    glFinish();
+    dbg_amaze_ms_ = std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() - a0).count();
+    passAmazeUp(dst_w, dst_h, c.effective_rot);
+    diagStatsTex("D3-camrgb", tex_work_, dst_w, dst_h, &p);
+    passCcm(dst_w, dst_h, c.ccm, tex_work_);
+    glFinish();
+    diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
+  } else if (c.rcd) {
     if (!ensureRcdTargets(w, h)) return;
     const auto d0 = std::chrono::steady_clock::now();
     // ── v0.6.34：P0 **无条件执行**（关降噪时 k=0 = 只做线性化+WB，零邻域操作）──
@@ -5918,49 +7813,21 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // bilateral 逻辑同款（kFsRawDenoiseFused）。
     // C 专项：关档 = 全零系数（A=B=0，shader 里精确跳过邻域）。
     static const NoiseCoef kNoDn{};
-    // ── NN 降噪 pass（v0.10.102）：融合后/RAW 域、去马赛克前 ────────────────
-    // PMRID（融合后 RAW 域 pass）：成功 → P0 空域降噪被 NN 替代（强度 0 直读
-    // 展开，输入 tex_nn_fused_，与 tex_fused_ 同域）；失败 → 整张自动回退 P0
-    // 原链（照片优先红线，dbg_nn_fail_=1 留痕）。
-    bool nn_ok = false;
-    if (c.nn) {
-      const NnSrc src = c.mfnr_fused ? NnSrc{tex_fused_, 0} : NnSrc{0, 1};
-      nn_ok = runNnPass(c, src, c.gains, c.cfa, c.black_phase, c.white_level);
-      if (nn_ok) {
-        dbg_p0s_ = 0;  // NN 替代 P0；9/96 是 P0 原路径的样本数语义
-      } else {
-        // 0.10.102 教训：失败没置位，日志 nnOk=0/nnFail=0 分不清"回退成功"
-        dbg_nn_fail_ = 1;
-      }
-    }
-    if (c.mfnr_fused) {
-      if (nn_ok) {
-        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
-                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
-                            tex_nn_fused_, /*allow_ts=*/false);
-      } else {
-      passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
-                          c.gains, c.dn ? c.nc : kNoDn, nullptr, c.p0_sub);
-      }
-    } else {
-      if (nn_ok) {
-        // 单帧 NN：PMRID 输出已落 tex_nn_fused_（fused 域），走同一条
-        // "强度 0 直读展开" 产出 tex_mos_（单帧无 tex_mfnr_，Ts 本就不命中，
-        // allow_ts=false 显式钉死）
-        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
-                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
-                            tex_nn_fused_, /*allow_ts=*/false);
-      } else {
-        passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
-                       c.dn ? c.nc : kNoDn);
-      }
-    }
-    // ── RAW 域高光重建（darktable highlights / "inpaint opposed"，2026-10-03）──
-    // 位置 = P0 之后、去马赛克之前：输入 tex_mos_ 正是 darktable 的输入域（线性
-    // mosaic + WB，白点 1.0）。成功时 RCD 三段改读 tex_hl_（hr_src_override_）；
-    // 失败/关闭时保持原行为（照片优先红线）。只接 RCD 路径 —— 双线性档的
-    // passRaw 直读 u16 raw_tex_ 自己做黑阶/WB/去马赛克，没有 mosaic 域入口。
-    hr_src_override_ = 0;
+
+    // ══ v0.10.167：HR **前置**到 P0 之前 ═══════════════════════════════════
+    // 顺序由 "P0 → HR" 改为 "HR → P0"，对齐 PhotonCamera / darktable（二者的
+    // highlights 都跑在空间降噪之前）。根因（离线同 DNG 逐位实测）：不降噪时
+    // 参考场 hlRgG = 0.9860，经 P0 后 = 1.0768 —— P0 把高光参考场的 R/G 抬高
+    // 9.2%（饱和像素旁的 G 被同色 bilateral 平滑拉低，而 refavg 走 R/B 外推受
+    // 影响小 ⇒ `v − refavg` 被系统性拉负 ⇒ 修复力度被吃掉）。
+    // ⚠ 统计口径与判定口径是**两个独立旋钮**：统计（mask + chrominance）走
+    //   stat_src（uStat），判定（apply + ref 场）走 src（uMos）。exp21 翻车正是
+    //   因为当时两者共用一个 src —— 换统计源时把判定也换了（修复面 47269→63903
+    //   样本、画面更红）。前置后二者同指 P0 前的 mosaic，但代码上已解耦。
+    // ⚠ 值域（第 2 步）：HR 输出是 scene-referred、可 >1，而 P0 的噪声模型
+    //   σ²(x) = A·x+B 标定在 [0,1] ⇒ 前置路径下 P0 用 wclamp=true（权重/σ 用钳位
+    //   值、信号用原值）。量化见 /tmp/hr-pre/REPORT.md。
+    hr_src_override_ = 0;   // 前置后 RCD 读 P0 的输出 tex_mos_（已含 HR 修复）
     dbg_hl_ok_ = 0;
     dbg_hl_cnt_ = 0.f;
     dbg_hl_ms_ = 0.f;
@@ -5969,19 +7836,51 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_hl_refw_ = 0.0;
     dbg_hl_r2hit_ = 0.f;
     dbg_hl_rghit_ = 0.f;
+    dbg_hl_pre_ = 0;
+    dbg_hl_wclamp_ = 0.f;
+    // v0.10.169：无条件写下参数真值（hr_raw 关时 pass 不执行，日志 hlGRecon 仍可读）
+    dbg_hl_grecon_ = p.hl_grecon > 0.5f ? 1 : 0;
+    dbg_hl_stat_src_ = "none";
+    dbg_hl_decide_src_ = "none";
     for (int k = 0; k < 3; ++k) {
       dbg_hl_chroma_[k] = 0.f;
       dbg_hl_sum_[k] = 0.0;
       dbg_hl_cnt3_[k] = 0.f;
     }
-    if (p.hr_raw > 0.5f) {
-      // exp21 曾把统计源换成 P0 前的 tex_fused_：真机实测无效反而更红（apply 判定
-      // 一并换源 ⇒ 修复面 47269→63903 样本，chroma 仍偏正 ⇒ 修得更多、更红）。已回退：
-      // 判定与 refavg 一律用 tex_mos_；真正生效的改动是上面的 chroma 置 0。
+
+    const bool hr_on = p.hr_raw > 0.5f;
+    // ① P0 前的 mosaic（HR 的输入域）
+    //    MFNR：tex_fused_（融合后 R16F 单通道，已扣黑阶+WB）
+    //    单帧：无现成中间纹理 ⇒ 先用 kNoDn 的 P0 做一趟纯线性化+WB 展开（无邻域
+    //          采样），结果落 tex_mos_（相位布局）；真 P0 稍后覆盖 tex_mos_。
+    //          只在 hr_raw 开时才付这一趟 ⇒ 关 HR = 原链路逐位不变（A/B 红线）。
+    GLuint p0_pre = 0;
+    int p0_pre_mono = 0;
+    if (c.mfnr_fused) {
+      p0_pre = tex_fused_;
+      p0_pre_mono = 1;
+    } else if (hr_on) {
+      passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains, kNoDn);
+      p0_pre = tex_mos_;
+      p0_pre_mono = 0;
+    }
+
+    // ② HR（前置）：src == stat_src == P0 前的 mosaic（判定源与统计源各自独立下发）
+    GLuint hr_out = 0;
+    if (hr_on && p0_pre != 0) {
+      dbg_hl_pre_ = 1;
+      dbg_hl_stat_src_ = c.mfnr_fused ? "tex_fused_P0pre" : "tex_mos_P0pre_expand";
+      dbg_hl_decide_src_ = dbg_hl_stat_src_;
+      // stat_raw：本前置把**已展开**的 mosaic 交给统计，故恒 0（uStatRaw 仍是死参数，
+      // 见 REPORT 的"未做/无法判定"一节 —— 接 raw 展开会另开一条数据流）。
       hr_stat_raw_ = 0;
-      const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, tex_mos_,
-                                              tex_mos_, 0);
+      // v0.10.169：G 通道重建开关（FilmParams[49]）→ 下发给 apply pass 的 uGRecon；
+      // 日志 hlGRecon 回读 pass 的 hl.grecon（= 那次 glUniform 的实际值），不另算一份。
+      const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, p0_pre, p0_pre,
+                                              0, p0_pre_mono,
+                                              p.hl_grecon > 0.5f ? 1 : 0);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
+      dbg_hl_grecon_ = hl.grecon;
       dbg_hl_cnt_ = hl.cnt[1];
       dbg_hl_ms_ = hl.ms;
       dbg_hl_rgg_ = hl.rg_g;
@@ -5994,7 +7893,72 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         dbg_hl_sum_[k] = hl.sum[k];
         dbg_hl_cnt3_[k] = hl.cnt[k];
       }
-      if (hl.ok) hr_src_override_ = tex_hl_;
+      if (hl.ok) hr_out = tex_hl_;   // ③ P0 的输入（单通道 .r 布局）
+    }
+
+    // ── NN 降噪 pass（v0.10.102）：融合后/RAW 域、去马赛克前 ────────────────
+    // PMRID（融合后 RAW 域 pass）：成功 → P0 空域降噪被 NN 替代（强度 0 直读
+    // 展开，输入 tex_nn_fused_，与 tex_fused_ 同域）；失败 → 整张自动回退 P0
+    // 原链（照片优先红线，dbg_nn_fail_=1 留痕）。
+    // v0.10.167 前置：NN 的输入换成 HR 输出（tex_hl_ 是单通道 .r，与 tex_fused_
+    // 同读法 ⇒ kFsNnPack 零改动且域等价：linFused(HR 输出) ≡ linRaw(raw)）。
+    // HR 关或失败时保持原输入（tex_fused_ / raw_tex_）。
+    bool nn_ok = false;
+    if (c.nn) {
+      NnSrc nsrc;
+      if (hr_out != 0) {
+        nsrc.fused_tex = hr_out;   // HR 后的 P0 前 mosaic
+        nsrc.src = 0;
+      } else if (c.mfnr_fused) {
+        nsrc.fused_tex = tex_fused_;
+        nsrc.src = 0;
+      } else {
+        nsrc.fused_tex = 0;
+        nsrc.src = 1;              // 单帧原始域（R16UI）
+      }
+      nn_ok = runNnPass(c, nsrc, c.gains, c.cfa, c.black_phase, c.white_level);
+      if (nn_ok) {
+        dbg_p0s_ = 0;  // NN 替代 P0；9/96 是 P0 原路径的样本数语义
+      } else {
+        // 0.10.102 教训：失败没置位，日志 nnOk=0/nnFail=0 分不清"回退成功"
+        dbg_nn_fail_ = 1;
+      }
+    }
+
+    // ── P0（前置后输入 = HR 输出；NN 成功时输入 = NN 输出）──────────────────
+    const GLuint p0_in = nn_ok ? tex_nn_fused_
+                               : (hr_out != 0 ? hr_out
+                                              : (c.mfnr_fused ? 0u : tex_mos_));
+    // 值域保护只在"P0 直接吃 HR 输出"时需要（NN 输出本就落在 [0,1] 训练域）
+    const bool p0_wclamp = (!nn_ok && hr_out != 0);
+    if (c.mfnr_fused) {
+      if (nn_ok) {
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
+                            tex_nn_fused_, /*allow_ts=*/false, /*wclamp=*/false);
+      } else {
+      passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                          c.gains, c.dn ? c.nc : kNoDn, nullptr, c.p0_sub, p0_in,
+                          /*allow_ts=*/true, p0_wclamp);
+      }
+    } else {
+      if (nn_ok) {
+        // 单帧 NN：PMRID 输出已落 tex_nn_fused_（fused 域），走同一条
+        // "强度 0 直读展开" 产出 tex_mos_（单帧无 tex_mfnr_，Ts 本就不命中，
+        // allow_ts=false 显式钉死）
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                            c.gains, kNoDn, nullptr, /*subpixel=*/false,
+                            tex_nn_fused_, /*allow_ts=*/false, /*wclamp=*/false);
+      } else if (hr_on) {
+        // v0.10.167 单帧前置：输入 = ① 的展开结果（或 HR 输出）。kFsRawDenoiseFused
+        // 的 bilateral 与 kFsRawDenoise 逐字相同（都读已展开的值、同一 σ 式与核）。
+        passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                            c.dn ? c.nc : kNoDn, nullptr, /*subpixel=*/false,
+                            p0_in, /*allow_ts=*/false, p0_wclamp);
+      } else {
+        passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                       c.dn ? c.nc : kNoDn);
+      }
     }
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
     glFinish();
@@ -6011,28 +7975,86 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // v0.10.154：本 pass 是 4a 新增的全屏 pass，单独计时入日志（ccmMs）——
     // 项目铁律要求"性能取舍必须实测"，没有这个字段就无法在真机上评估拆分成本。
     const auto d3 = std::chrono::steady_clock::now();
-    passCcm(dst_w, dst_h, c.ccm);
+    // 诊断统计 D3（RCD 去马赛克后 / CCM 前，相机 RGB）。统计耗时不计入 ccmMs。
+    // 放在 passCcm 之前 ⇒ 读到的是 CCM 的输入（tex_work_ 此刻承载 D3）。
+    diagStatsTex("D3-camrgb", tex_work_, dst_w, dst_h, &p);
+    // 横向色差校正（v0.10.170）：D3（去马赛克后 / CCM 前，相机 RGB）→ CCM。
+    // 放在 D3 诊断**之后**：保持该基线的既有语义（统计到的是校正前的相机 RGB）。
+    // caApplied=0（关闭/估计失败/位移低于门限）时 ccm_src 仍是 tex_work_，
+    // 与加本模块之前**逐位相同**。
+    GLuint ccm_src = tex_work_;
+    // 先清零诊断字段：ca_corr 关闭时 passCaCorrect 根本不被调用，若不在调用点
+    // 清零，日志会残留上一帧的值（假"动作"）。
+    dbg_ca_applied_ = 0;
+    dbg_ca_kr_ = dbg_ca_kb_ = 0.f;
+    dbg_ca_kraw_r_ = dbg_ca_kraw_b_ = 0.f;
+    dbg_ca_shift_r_ = dbg_ca_shift_b_ = 0.f;
+    dbg_ca_ms_ = 0.f;
+  dbg_amaze_ms_ = 0.f;
+    if (p.ca_corr > 0.5f) {
+      // 在 pass 外计时：**不动作时也要有成本读数**（估计阶段的 1/8 降采样 +
+      // readPixels 无论判据是否通过都已经付了），否则真机无法评估本模块的开销。
+      glFinish();   // 起点同步：只计本模块的工作，不背前面 pass 的尾巴
+      const auto ca_t0 = std::chrono::steady_clock::now();
+      if (passCaCorrect(dst_w, dst_h, p.ca_corr)) {
+        ccm_src = tex_ca_;
+      }
+      dbg_ca_ms_ = std::chrono::duration<float, std::milli>(
+                       std::chrono::steady_clock::now() - ca_t0).count();
+    }
+    passCcm(dst_w, dst_h, c.ccm, ccm_src);
     glFinish();
     ccm_ms = std::chrono::duration<float, std::milli>(
                  std::chrono::steady_clock::now() - d3).count();
+    // 诊断统计 D4（CCM 后 / P4 前，场景线性）
+    diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
   } else {
     passRaw(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase, c.white_level,
             c.gains, c.ccm, p);
   }
   bool mst_ok = false;
   bool df_ok = false;
+  bool pc3d_ok = false;
+  bool pc3d_replace = false;   // [54] = 1：PC3D 顶替 P4/defringe/D-1（改 passFilm 输入源）
   if (c.dn) {
     if (!ensureDnTarget(dst_w, dst_h)) return;
     const auto n0 = std::chrono::steady_clock::now();
-    passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc);
-    // 紫边抑制（v0.10.134）：P4 后、D-1 前。逆光边缘品红渐晕 56~66% 贴边
-    // （P4/D-1 保边判据恰好保护它），Lab 域 defringe（RT 同形态）对症。
-    // 失败/关闭回落 tex_dn_（照片优先红线）。成片链 only —— 预览链成本
-    // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
-    df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h) : false;
-    // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
-    mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
-                                  df_ok ? tex_df_ : tex_dn_);
+    // ── PC ESD3D2 完整移植（v0.10.175）────────────────────────────────────
+    // [54] = 0（默认）⇒ 整段不执行，tex_scene_ 直通 P4 ⇒ 与改动前**逐位相同**。
+    // [54] = 1（替换档）= 照抄 PC 的**链路地位**：PC 链上 ESD3D2 是去马赛克后唯一
+    //   的降噪 pass（PostPipeline.java:1504），故 PC3D 的输出直接进 film，
+    //   P4/defringe/D-1 三步**旁路**（代码全部保留、[54] 一改即用 —— 铁律：不预删）。
+    // [54] = 2（叠加档）：PC3D → P4 → defringe → D-1 串联。
+    dbg_pc3d_on_ = 0;
+    dbg_pc3d_m_ = 0;
+    dbg_pc3d_scale_ = 1;
+    dbg_pc3d_k_ = 0.f;
+    dbg_pc3d_ms_ = 0.f;
+    GLuint p4_src = 0;
+    if (p.pc3d > 0.5f) {
+      glFinish();   // 起点同步：只计本模块的工作，不背前面 pass 的尾巴
+      const auto pc0 = std::chrono::steady_clock::now();
+      pc3d_ok = passPc3d(dst_w, dst_h, c.nc, p);
+      glFinish();
+      dbg_pc3d_ms_ = std::chrono::duration<float, std::milli>(
+                         std::chrono::steady_clock::now() - pc0).count();
+      if (pc3d_ok) {
+        p4_src = tex_pc3d_;
+        pc3d_replace = (p.pc3d < 1.5f);
+      }
+    }
+    if (!pc3d_replace) {
+      passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
+                        p.chroma_gate, p.cg_scope, p4_src);
+      // 紫边抑制（v0.10.134）：P4 后、D-1 前。逆光边缘品红渐晕 56~66% 贴边
+      // （P4/D-1 保边判据恰好保护它），Lab 域 defringe（RT 同形态）对症。
+      // 失败/关闭回落 tex_dn_（照片优先红线）。成片链 only —— 预览链成本
+      // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
+      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate) : false;
+      // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
+      mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
+                                    df_ok ? tex_df_ : tex_dn_, p.chroma_gate);
+    }
     glFinish();
     dn_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - n0)
@@ -6050,10 +8072,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 第 6 期（S12）：RAW 静拍链的输入本来就是**场景线性域** ⇒ hal_domain = false
   //（不做域比归一）。三条链的域标志至此齐全：预览=true、YUV 静拍=true、RAW 静拍=false。
   passFilm(dst_w, dst_h, p,
-           (c.dn && mst_ok) ? tex_scene_
-                            : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_),
+           pc3d_replace ? tex_pc3d_          // [54] = 1：PC3D 顶替 P4/D-1（照抄 PC 地位）
+                        : ((c.dn && mst_ok) ? tex_scene_
+                            : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_)),
            /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
+  // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
+  // 放在 t2 之后，passMs 不受统计耗时污染。
+  diagStatsTex("FILM-out", tex_work_, dst_w, dst_h, &p);
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
     if (tex_cap_) {
@@ -6071,6 +8097,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   glFinish();
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
+  // 诊断统计 D5（最终成片，基准；引擎内本就是 u8，零 GL 调用的 CPU 侧统计）
+  diagStatsU8("D5-out-u8", out_rgba->data(), dst_w, dst_h, &p);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   const auto t3 = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
@@ -6080,8 +8108,44 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       std::string("{\"uploadMs\":") + jnum(c.upload_ms, 6) +
       ",\"passMs\":" + jnum(ms(t1, t2), 6) +
       ",\"totalMs\":" + jnum(ms(t0, t3), 7) +
+      // ── 强边缘色度门（v0.10.174，FilmParams[51]/[52]/[53]）─────────────────
+      // cgK = 下发的 κ（0 = 关）；cgCap = shader 常量 kCgRel = 16.0（**相对**上限
+      // 16·σc；v0.10.173 这里是绝对 0.2，正是 73.7% 像素被放宽的来源）；
+      // cgScope = 1 = PC 的 w2 权重形式（v2 默认）、0 = 字面版（只放大 wc）；
+      // dfG = 紫边判据自适应强度。
+      // cgK > 0 时 P4 的 a 通道 = **门控开度** smoothstep(0.10, 0.30, |∇L|)
+      // ⇒ cgMean/cgP95/cgCov 直接读作"门控覆盖率"（cgCov = 开度 > 0.5 的面积比；
+      // 真机健康区间：cgMean 应 ≤ 0.15、cgCov ≤ 0.05 —— 离线 4 张样片 cgGate
+      // 覆盖 < 8%；v0.10.173 的旧口径下这个数是 100%）。
+      // ⚠️ cgK > 0 时下面 moMean/moP95/moCov 是**同一组数**（档 A 的强度图观测
+      // 被让位），moSc 此时无意义（档 A 关时恒 1）。
+      ",\"cgK\":" + jnum(dbg_cg_k_, 4) +
+      ",\"cgCap\":" + jnum(dbg_cg_cap_, 4) +
+      ",\"cgScope\":" + jnum(dbg_cg_scope_, 3) +
+      ",\"cgMean\":" + jnum(dbg_cg_k_ > 0.f ? dbg_mo_mean_ : 0.f, 6) +
+      ",\"cgP95\":" + jnum(dbg_cg_k_ > 0.f ? dbg_mo_p95_ : 0.f, 6) +
+      ",\"cgCov\":" + jnum(dbg_cg_k_ > 0.f ? dbg_mo_cov_ : 0.f, 6) +
+      ",\"dfG\":" + jnum(dbg_df_gate_, 4) +
+      // ── PC ESD3D2 完整移植（v0.10.175，FilmParams[54]/[55]）───────────────
+      // pc3dOn = 1 表示本帧真的跑了照抄档且 P4 已改读 tex_pc3d_；
+      // pc3dM  = 本轮实际 MSIZE（PC 公式 + 本机噪声模型，7..21）；
+      // pc3dSc = 尺度结构实际用的降采样倍数（1 = 全分辨率单趟，≥2 = 走
+      //          gaussdown + guided upsample）；
+      // pc3dMs = 本模块（含 glFinish 同步）耗时，与 dnMs 同量级为健康。
+      // 判读：pc3dOn=0 而 [54]>0.5 ⇒ **没生效**（shader 链接失败或纹理分配失败）；
+      //       pc3dSc 恒 1 而噪声模型正常 ⇒ scale 判定与 PC 公式不一致；
+      //       pc3dMs ≫ dnMs ⇒ 成本过高（把 [55] 调小或关 [54] 的信号）。
+      ",\"pc3dOn\":" + std::to_string(dbg_pc3d_on_) +
+      ",\"pc3dM\":" + std::to_string(dbg_pc3d_m_) +
+      ",\"pc3dK\":" + jnum(dbg_pc3d_k_, 6) +
+      ",\"pc3dSc\":" + std::to_string(dbg_pc3d_scale_) +
+      ",\"pc3dMs\":" + jnum(dbg_pc3d_ms_, 7) +
       ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) +
-      ",\"demosaic\":\"" + (c.rcd ? "rcd" : "bilinear") + "\"" +
+      ",\"demosaic\":\"" + (c.amaze ? "amaze" : (c.rcd ? "rcd" : "bilinear")) +
+      "\"" + ",\"dem\":\"" + (c.amaze ? "amaze" : (c.rcd ? "rcd" : "bilinear")) +
+      "\"" + ",\"amazeMs\":" + jnum(dbg_amaze_ms_, 8) +
+      ",\"amazeSrc\":\"" + (c.amaze ? (c.mfnr_fused ? "burst0" : "single") : "-") +
+      "\"" +
       // RAW 域高光重建（darktable highlights / inpaint opposed）：生效性 + 色度
       // 校正量 + 样本数。hlOk=0 而 hr_raw 开 = pass 失败（已回退原行为，照片不受
       // 影响，照片优先红线）；hlCnt < 100 时 darktable 语义 = 色度校正不启用。
@@ -6102,7 +8166,21 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 三级参考命中占比（%，v0.10.139）：在"32 块局部参考不足"的格里，中尺度
       // （hlRef2Hit）与全图兜底（hlRefGHit）各占多少 —— 真机看饱和天空用了哪一级。
       ",\"hlRef2Hit\":" + jnum(dbg_hl_r2hit_, 6) +
-      ",\"hlRefGHit\":" + jnum(dbg_hl_rghit_, 6);
+      ",\"hlRefGHit\":" + jnum(dbg_hl_rghit_, 6) +
+      // ── v0.10.167 HR 前置的生效性字段（照 p0s/nnOk 的教训：改完必须能自证）──
+      // hlPre=1 表示 HR 已前置到 P0 之前（输入 = P0 前的 mosaic、输出是该 P0 的输入）。
+      // hlStatSrc / hlDecideSrc = 统计源（uStat，喂 mask/chrominance）与判定源
+      // （uMos，喂 apply 与参考色度场）**实际绑定的纹理名** —— 真机据此直接回答
+      // "两者是否指向不同纹理"。exp21 翻车的结构性根因就是二者共用一个 src、
+      // 没有独立旋钮（换统计口径时把判定也换了 ⇒ 修复面 47269→63903、画面更红）。
+      // 前置生效时两者同为 P0 前的 mosaic；hlPre=0 的 "P0post" = 未前置/回退。
+      ",\"hlPre\":" + std::to_string(dbg_hl_pre_) +
+      ",\"hlStatSrc\":\"" + dbg_hl_stat_src_ + "\"" +
+      ",\"hlDecideSrc\":\"" + dbg_hl_decide_src_ + "\"" +
+      // hlWClamp = P0 实际收到的 uWClamp（1 = 权重/σ 用钳位值、信号用原值）。
+      // ⚠ 只有 P0 走 kFsRawDenoiseFused / kFsRawDenoiseFusedTs 时才记得到；
+      // 单帧未前置（hr_raw 关）路径不经过它 ⇒ 该字段为 0 是正常的。
+      ",\"hlWClamp\":" + jnum(dbg_hl_wclamp_, 4);
   if (c.rcd) {
     // ccmMs（v0.10.154，第 4a 期新增）：D3→D4 独立 CCM pass 的实测成本。
     // 它是本期唯一的运行时开销（新增一次全屏 pass：读 100MB + 写 100MB），
@@ -6145,7 +8223,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           // 紫边抑制（v0.10.134）：ok = 执行与否，cavg = Lab chroma 全图均值
           //（读回值，评估判定阈值是否跟场景走），hit 需 GPU 计数暂缺
           ",\"df\":" + std::to_string(df_ok ? 1 : 0) +
-          ",\"dfCavg\":" + jnum(dbg_df_cavg_, 6);
+          ",\"dfCavg\":" + jnum(dbg_df_cavg_, 6) +
+           // 档 A（v0.10.165）伪彩感知色度降噪：moGain = 下发强度（0 = 关/A/B 通路），
+           // moMean/moP95 = 伪彩强度图全图均值/P95（P95 为 4 锚点分段线性 CDF 近似），
+           // moCov = moire>0.5 的像素占比，moSc = σc 实际平均放大倍数
+           //（= 1 + moGain·moMean；封顶未触发时精确）。口径见 kFsMoireStat。
+           ",\"moGain\":" + jnum(dbg_mo_gain_, 4) +
+           ",\"moMean\":" + jnum(dbg_mo_mean_, 6) +
+           ",\"moP95\":" + jnum(dbg_mo_p95_, 6) +
+           ",\"moCov\":" + jnum(dbg_mo_cov_, 6) +
+           ",\"moSc\":" + jnum(dbg_mo_sc_, 6);
   }
   kv += ",\"tone\":" + jnum(p.tone_strength, 3);
   kv += ",\"ev\":" + jnum(p.exposure_ev, 5);
@@ -6213,6 +8300,23 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         ",\"hrThr\":" + jnum(dbg_hr_thr_, 7);   // v0.10.145 实际下发的 mask 阈值
   // v0.10.123：1 = mask/chrominance 取自 P0 之前的 tex_fused_（darktable 位置）
   kv += ",\"hrStatRaw\":" + std::to_string(hr_stat_raw_);
+  // v0.10.169：apply 支实际下发的 uGRecon。1 = G 通道重建开（默认 / 现有行为）；
+  // 0 = A/B 关（apply 只留 opposed 外推分支）。hr_raw 关时本 pass 不执行，此处为
+  // 调用点写入的参数真值（不是 pass 回填值），仍然可读。
+  kv += ",\"hlGRecon\":" + std::to_string(dbg_hl_grecon_);
+  // v0.10.170：横向色差校正的估计结果与执行状态（镜头横向色差 / lateral CA）。
+  // caK = **实际采用**的径向系数（位移 = k·r，r 自画面中心；0 = 未通过判据）；
+  // caKraw = 原始估计（未过判据）—— 用来分辨"位移太小"与"内外半区不一致"；
+  // caShiftR/B = 画面角部的实际位移（px，已乘强度并 clamp 到 ±4）；
+  // caApplied = 1 表示真的跑了校正 pass（0 = 关闭 / 估计失败 / 判据未通过
+  // ⇒ 走的是原 tex_work_，逐位等于加本模块之前）。
+  kv += ",\"caK\":[" + jnum(dbg_ca_kr_, 10) + "," + jnum(dbg_ca_kb_, 10) + "]";
+  kv += ",\"caKraw\":[" + jnum(dbg_ca_kraw_r_, 10) + "," +
+        jnum(dbg_ca_kraw_b_, 10) + "]";
+  kv += ",\"caShiftR\":" + jnum(dbg_ca_shift_r_, 9) +
+        ",\"caShiftB\":" + jnum(dbg_ca_shift_b_, 9);
+  kv += ",\"caApplied\":" + std::to_string(dbg_ca_applied_);
+  kv += ",\"caMs\":" + jnum(dbg_ca_ms_, 7);
   // v0.10.122：opposed chrominance 的分通道分子/样本数。chroma = sum/cnt（cnt>100），
   // 与 tools/hl-opposed-check.py 的 ③ 同口径 —— 用来定位"引擎 chroma 偏大 3.4×"。
   // 注意 jnum(v,n) 的 n 是**字符数**不是小数位（2026-10-03 教训）：sum 可达 ±5e4
@@ -6243,6 +8347,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
+  diagEndFrame();  // 诊断统计：逐阶段已即时上报，这里只清链标志
 }
 
 // ── MFNR 阶段一（v0.9.0）：纹理 / 金字塔 / 融合 / burst 端到端 ───────────
@@ -6703,7 +8808,8 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
                                         float white_level, const float gains[3],
                                         const NoiseCoef& nc,
                                         const GLuint* off_tex, bool subpixel,
-                                        GLuint fused_tex, bool allow_ts) {
+                                        GLuint fused_tex, bool allow_ts,
+                                        bool wclamp) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   glViewport(0, 0, w, h);
   // D-2（v0.10.58）：时域 × 空间联合（4 帧各取 3×3 同相位邻域 = 36 独立样本）。
@@ -6725,7 +8831,9 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
       glUniform1i(u_raw_dn_ts_.off[i], 4 + i);
     }
     glActiveTexture(GL_TEXTURE7);
-    glBindTexture(GL_TEXTURE_2D, tex_fused_);
+    // v0.10.167：Ts 的参考域必须与 P0 的输入同域 —— 前置时输入是 HR 输出 tex_hl_
+    // （单通道 .r，与 tex_fused_ 同读法，故 Ts shader 无需改动）。
+    glBindTexture(GL_TEXTURE_2D, fused_tex != 0 ? fused_tex : tex_fused_);
     glUniform1i(u_raw_dn_ts_.fused, 7);
     glActiveTexture(GL_TEXTURE0);
     glUniform2i(u_raw_dn_ts_.size, w, h);
@@ -6737,6 +8845,8 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform3f(u_raw_dn_ts_.gain, gains[0], gains[1], gains[2]);
     glUniform3f(u_raw_dn_ts_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
     glUniform1f(u_raw_dn_ts_.mix, nc.mix_p0);   // v0.10.108
+    glUniform1f(u_raw_dn_ts_.wclamp, wclamp ? 1.f : 0.f);   // v0.10.167 值域保护
+    dbg_hl_wclamp_ = wclamp ? 1.f : 0.f;
     glUniform3f(u_raw_dn_ts_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
     glUniform1f(u_raw_dn_ts_.sub, subpixel ? 1.f : 0.f);
@@ -6768,6 +8878,10 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
   glUniform1f(u_raw_dn_f_.mix, nc.mix_p0);   // v0.10.108：强度<1 的输出混合
   glUniform3f(u_raw_dn_f_.noise_b, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
+  // v0.10.167 值域保护：输入为 RAW 域 HR 的输出（scene-referred、可 >1）时，
+  // 权重/σ 用钳位值、信号用原值（口径与理由见 kFsRawDenoiseFused 的 uWClamp 注释）。
+  glUniform1f(u_raw_dn_f_.wclamp, wclamp ? 1.f : 0.f);
+  dbg_hl_wclamp_ = wclamp ? 1.f : 0.f;   // 生效性自证：真机日志直接可查
   dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
   dbg_p0w_ = -1.f;                                   // 旧路径无 wsum 诊断
   glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -7169,9 +9283,27 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   // G 满阱通道经 CCM 投影后的范数（WB+CCM 域；命名沿用 thr_raw_sat：它是该域的
   // **满阱范数**，不是白点）
   const float thr_raw_sat = static_cast<float>(std::sqrt(acc2));
+  // ── v0.10.168：threshold 的**输入域**换算（真机 130208 帧 + 离线复算实锤）──
+  // 上面这个量是 **WB+CCM 域**的满阱范数下界，而本函数的输入是**场景线性域**
+  //（D4：CCM 之后、kFsFilm 乘 2^exposure_ev 之前；两条 RAW 静拍链都给 D4 或其
+  // 保 Y 下游）。该域中性白仍是 (1,1,1)：tex_mos_ 的中性白 ≡ 1.0（见
+  // passHighlightRaw 的 kHlClipThr 域核实），CCM 行和恒 = 1（DNG ColorMatrix 行和
+  // 实测 1.000，真机 D3→D4 亦保 Y）⇒ CCM·(1,1,1) = (1,1,1)。
+  // 而 kFsHrMask 的判据是**欧氏范数** pixMax = ‖c‖ ⇒ 中性白范数 = √3 = 1.732，
+  // **大于**旧阈值 1.511（= 1.13×1.337）⇒ 未裁剪的正常亮部被判为裁剪：
+  // 中性白 w = 0.835。真机证据：HR-filmsrc（= 本函数输出、filmic 输入）的
+  // Rec.709 加权和比 D4-scene 高 **+2.03%**（68903 → 70299）且三通道同向
+  //（R +4.60% / G +1.29% / B +1.56%）= 改亮度的形态；该段其它算子（P4、
+  // à trous、defringe、D-1）均严格保 Y ⇒ 唯一能动 Y 的就是本函数。
+  // 乘 √3 ⇒ 阈值 2.618 = 该域的**白点范数**，回到 darktable "threshold = 白点、
+  // mask 在白点处 w = 0.5" 的原义；等价口径 = 只有中性像素 Y > 2.617/√3 = 1.511
+  //（比中性白亮 +0.60 EV）才 w > 0.5。真裁剪仍被覆盖：满阱像素
+  // CCM·(gR,gG,gB) 的范数 ≈ 3.20（130208 帧 CCM/WB）⇒ w ≈ 0.92；[中性白, 满阱)
+  // 这段未裁剪区则退出重建。真 RAW 裁剪另由前置 RAW 域 HR 兜底（不在此处）。
+  constexpr float kSceneLinearNorm = 1.7320508f;   // √3 = 场景线性域中性白的欧氏范数
   const float threshold =
       std::max(kSaturationNormCalib * (thr_raw_sat > 1e-6f ? thr_raw_sat : 1.0f),
-               1.0f);
+               1.0f) * kSceneLinearNorm;
   dbg_hr_thr_ = threshold;
   (void)kGrey;
   (void)white_ev_input_domain;   // 保留参数：白点仍写日志（hrWhiteEv）供对照
@@ -7877,6 +10009,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
+  // AMaZE 档（demosaic == 2）：MFNR 的融合结果在 GPU（tex_fused_），CPU 侧拿不到
+  // ⇒ burst 路径用**参考帧 frames[0]** 跑单帧 AMaZE（质量 = 单帧档，日志里
+  // amazeSrc="burst0" 标注）。这是未完成项（见 REPORT.md），不是静默降级。
+  c.amaze = demosaic == 2;
+  if (c.amaze) {
+    c.amaze_raw = frames[0];
+    c.amaze_stride = row_strides_px[0];
+    c.amaze_lsc = lsc;
+  }
   c.dn = rcd && noise_strength > 0.f;
   c.dn_k = noise_strength;
   c.nc = nc;
@@ -8501,6 +10642,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
     hr_white_ev_ = white_ev_in;
     film_src = runHighlightReconstruct(src_tex, w, h, white_ev_in, &hr_blocks_, &hr_ms_);
   }
+  // 诊断统计：filmic 的**实际输入**（HR 重建输出；HR 关闭/失败时 = src_tex）。
+  // 只在成片链内触发（g_diag_chain），预览帧与 YUV 静拍帧不跑统计。
+  diagStatsTex("HR-filmsrc", film_src, w, h, &p);
   // 预览域映射的在线标定（v0.8.0）：updateFilmicEV 刚把 last_lin_mid_ 更新为本帧
   // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替
   // 到达，用 EMA 各记一侧，静拍时对出比值：

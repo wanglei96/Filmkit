@@ -10,19 +10,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 记 M3 优化项。后续按 docs/开发计划.md 扩充 raw/ lut/ color/ io/。
 add_library(filmengine SHARED
         src/jni/Bridge.cpp
+        src/jni/JpegEncoder.cpp
         src/gl/Capabilities.cpp
         src/gl/EglCore.cpp
         src/log/Logger.cpp
         src/log/GpuTimer.cpp
         src/pipeline/Pipeline.cpp
         src/render/Align.cpp
+        src/render/AmazeDemosaic.cpp
         src/render/FrameRenderer.cpp
         src/spike/SpikePass.cpp
         src/spike/SpikeFftMerge.cpp)
 
 target_include_directories(filmengine PRIVATE src)
 
+# jnigraphics：JpegEncoder.cpp 的 AndroidBitmap_lockPixels（成片 4:4:4 直编，零拷贝）
 find_library(log-lib log)
-target_link_libraries(filmengine PRIVATE GLESv3 EGL android ${log-lib})
+find_library(jnigraphics-lib jnigraphics)
+target_link_libraries(filmengine PRIVATE GLESv3 EGL android ${log-lib} ${jnigraphics-lib})
 
 target_compile_options(filmengine PRIVATE -Wall -Wextra -Wno-unused-parameter)

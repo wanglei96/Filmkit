@@ -96,6 +96,9 @@ struct HlRawResult {
   float ref2_hit = 0.f, refg_hit = 0.f;
   int blocks_x = 0, blocks_y = 0;
   float ms = 0.f;
+  // v0.10.169：apply 支实际下发的 uGRecon（0/1），进 raw.render 的 hlGRecon 字段 ——
+  // 真机 A/B 时用它确认"这一张到底是哪一支"。
+  int grecon = 1;
 };
 
 // 共享后段渲染器：SurfaceTexture(OES) → 场景线性 → 胶片曲线 → 输出。
@@ -122,6 +125,15 @@ class FrameRenderer {
   // submitFrame，不受影响（画质红线）。
   static void setPreviewScale(float s);   // clamp [0.25, 1.0]
   static float previewScale();
+
+  // 诊断统计（v0.10.166）：prefs `diag_stats`（**默认开**）= 在成片链的 5 个阶段
+  // （D3-camrgb / D4-scene / HR-filmsrc / FILM-out / D5-out-u8）把色度统计量
+  // **在 GPU 内归约**成 16 个 float32，位打包成 8×2 RGBA8 后用 ES 3.0 唯一保证
+  // 可用的 `GL_RGBA + GL_UNSIGNED_BYTE` 读回 64 字节，逐阶段写一条 `diag.stats`。
+  // 上一版（v0.10.163 `diag_dump`）把渲染纹理挂到诊断 FBO 读浮点图像，真机上
+  // 读回失败且破坏了渲染状态（成片全黑），已彻底删除。
+  // 关闭时全链零额外开销（每个统计点一次 relaxed atomic load）。任意线程可调。
+  static void setDiagStats(bool on);
 
   // NN 推理回调注入（v0.10.102，见 NnInferFn 注释）。幂等，Bridge 在每次
   // submit 入口重设（顺带刷新其 JNIEnv 快照）。
@@ -223,6 +235,8 @@ class FrameRenderer {
  private:
   bool ensureTargets(int w, int h);
   bool ensureRcdTargets(int w, int h);
+  // tex_amaze_（源几何）→ 成片几何 tex_work_（D3）。与 kFsRcdChroma 同一几何口径。
+  void passAmazeUp(int dst_w, int dst_h, int rot);
   bool ensureDnTarget(int w, int h);
   bool ensureChromaMst(int w, int h);
   bool ensureDefringe(int w, int h);
@@ -254,11 +268,13 @@ class FrameRenderer {
   // fused_tex = v0.10.102：P0 输入纹理替换（NN pass 的输出 tex_fused_nn_，
   //   0 = 默认 tex_fused_）。allow_ts = false 强制跳过 Ts 变体（NN 直读展开时
   //   时域样本引用的是未降噪的原始帧，与 NN 后的参考域不一致，且无意义）。
+  // wclamp = v0.10.167：HR 前置的值域保护（输入是 scene-referred、可 >1 的 HR
+  //   输出时置 true —— 权重/σ 用 clamp(x,0,1)，信号仍用原值）。
   void passRawDenoiseFused(int w, int h, int cfa, const float black_phase[4],
                            float white_level, const float gains[3],
                            const NoiseCoef& nc, const GLuint* off_tex = nullptr,
                            bool subpixel = false, GLuint fused_tex = 0,
-                           bool allow_ts = true);
+                           bool allow_ts = true, bool wclamp = false);
   // ── 降噪专项 A（2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频收缩合并 ──────
   // passMfnrFuse 的并联路径（prefs mfnr_dft）：4 帧 Bayer mosaic → 按 CFA 平面
   // 独立合并（R/Gr/Gb/B 各自半分辨率网格上 16×16 tile、半重叠、修改升余弦窗），
@@ -289,6 +305,16 @@ class FrameRenderer {
     const FilmParams* p = nullptr;
     int effective_rot = 0;
     bool rcd = false, dn = false;
+    // AMaZE 档（demosaic == 2，v0.10.172）：CPU 侧跑 AMaZE（AmazeDemosaic.cpp），
+    // 输入 = u16 RAW（amaze_raw / amaze_stride，未降噪）；输出 WB 域相机 RGB →
+    // 上传 tex_amaze_ → passAmazeUp 旋转到成片几何 → 既有 passCcm → 胶片链。
+    // amaze_lsc = 镜头阴影网格（可为 null = 恒等），CPU 侧在 WB 域乘。
+    // ⚠ 未完成项：本档**不经过** P0（RAW 域 bilateral）/ HR 前置 —— 见
+    //   /tmp/amaze/REPORT.md「未完成」，高 ISO 下噪点会多于 RCD 档。
+    bool amaze = false;
+    const void* amaze_raw = nullptr;
+    int amaze_stride = 0;
+    const float* amaze_lsc = nullptr;
     float dn_k = 0.f;  // 降噪强度（日志）
     NoiseCoef nc;         // (A,B) 系数（P0/P4/mismatch，C 专项）
     NoiseModel nm;        // 原始噪声模型（WB 前、单帧；日志 nzS/nzO）
@@ -312,6 +338,10 @@ class FrameRenderer {
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
                         std::vector<uint8_t>* out_rgba);
+  // AMaZE 档（v0.10.172）：CPU 跑 AMaZE（src/render/AmazeDemosaic.cpp，多线程
+  // tile 并行）→ LSC → 上传 tex_amaze_（源几何）。返回 false = 失败（调用方
+  // 必须回退，照片优先红线）。demosaic == 2 才调用。
+  bool runAmazeCpu(const ChainCtx& c);
   // ── NN 降噪 pass（v0.10.102）：PMRID TFLite ─────────────────────────────
   // 位置 = 融合后 RAW 域、去马赛克前（finishStillChain 的 P0 之前）。数据流：
   // kFsNnPack（mosaic→packed 4ch 半分辨率、除回 WB、×VST 959/256）→ readPixels
@@ -366,30 +396,76 @@ class FrameRenderer {
   // P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_），
   // 纯逐像素映射（kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位）。
   // 只在 RCD 档调用（双线性档 passRaw 内联 CCM）。S14 的 clamp 收口在 shader 内。
-  void passCcm(int dst_w, int dst_h, const float* ccm);
+  // v0.10.170：src 可指定输入纹理（横向色差校正输出 tex_ca_）；0/tex_work_ = 原行为。
+  void passCcm(int dst_w, int dst_h, const float* ccm, GLuint src = 0);
+  // 横向色差估计（v0.10.170）：对 1/8 降采样图做逐环带一维径向 Lucas-Kanade
+  //（d·r̂ = k·r 的过原点最小二乘），输出 R/B 的径向系数 kr/kb。只用强梯度像素。
+  // 返回 false = 梯度能量不足（低纹理/读回异常）⇒ 调用方不动作。
+  bool estimateCaRadial(const float* ds, int dw, int dh, int full_w, int full_h,
+                        float* kr, float* kb, float* raw_kr, float* raw_kb);
   // M3-2 降噪：P0 RAW 域同色 bilateral（输出线性 mosaic）；P4 色度平滑。
   // C 专项起值域 σ 由 (A,B) 模型逐像素给出（nc，强度已折入系数）。
   void passRawDenoise(int w, int h, int cfa, const float black_phase[4],
                       float white_level, const float gains[3],
                       const NoiseCoef& nc);
-  void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc);
+  // 档 A（v0.10.165）伪彩感知色度降噪：moire = FilmParams[48]（0 = 关）。>0 时
+  // shader 用逐像素伪彩强度放大 σc，并在 pass 内做一次强度图统计读回（诊断字段）。
+  // v0.10.174：cg_k/cg_scope = 强边缘色度门（FilmParams[51]/[52]），**逐像素门 +
+  // 有界放宽**（v0.10.173 的绝对 cap 0.2 全图生效 ⇒ 真机色渗事故）。cg_k > 0
+  // 时 P4 的 a 通道改输出门控开度 ⇒ 同一统计读回即 cgMean/cgCov（= 门控覆盖率）。
+  void passChromaDenoise(int dst_w, int dst_h, int rot, const NoiseCoef& nc,
+                         float moire, float cg_k, float cg_scope,
+                         GLuint src_tex = 0);
   // D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 5 级）
+  // v0.10.174：cg_k = 同一门，但**只在最细两级**（uStep ≤ 2 = 2/4 px）生效
+  // —— 大尺度级（16/32 px）抹掉的是真实色度结构，是"大片色块"的唯一来源。
   bool passChromaMultiScale(int dst_w, int dst_h, const NoiseCoef& nc,
-                            GLuint src_tex = 0);
+                            GLuint src_tex = 0, float cg_k = 0.f);
   // 逆光边缘紫边抑制（v0.10.134，RawTherapee Defringe 同形态）：P4 后、D-1 前。
   // 输入 tex_dn_，成功时输出 tex_df_（返回 true）；失败/关闭返回 false（调用方
   // 沿用 tex_dn_）。Lab 域"色度相对局部基线偏离"检测 + a 通道色相门 + 低偏离
   // 邻居加权替换，L 通道零损失。
-  bool passDefringe(int dst_w, int dst_h);
+  // v0.10.173：df_gate = 判据的梯度自适应强度（FilmParams[53]，0 = 关 ⇒ 判据
+  // 与 v0.10.172 逐位相同）。>0 时阈值 = uThreshK·uChromaAvg/(1 + df_gate·|∇L|)
+  // ⇒ 强亮度边缘附近的色度偏离更容易进入校正区。
+  bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f);
+  // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
+  // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
+  // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，
+  // 与加本模块之前**逐位相同**）。
+  // 结构完全照抄 PhotonCamera 的 ESD3D2.Run（ESD3D2.java:121-176）：
+  //   ① scale = clamp(round(clamp(sqrt(0.5·S+O)/noiseTarget,1,4)),1,4)
+  //   ② scale > 1：gaussdown(scale) → PC3D(低分辨率, MOIRE=0, 噪声/scaleF·0.75)
+  //                → guidedUpsample(低分辨率结果, 全分辨率原图) → 全分辨率
+  //      scale = 1：PC3D(全分辨率, MOIRE=0)
+  //   ③ 第二趟：PC3D(全分辨率, MOIRE=1.5)
+  // pc3d_msize_override > 0 时强制 MSIZE（真机 A/B 拍板用；0 = 按 PC 公式）。
+  bool passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
+                const FilmParams& p);
+  // 横向色差校正（v0.10.170，镜头侧向色差 / lateral CA）：D3（RCD 去马赛克后、
+  // passCcm 前）的相机 RGB 域。自动估计（无镜头配置文件）+ 径向位移校正，只重采样
+  // R/B，G 逐位不动。返回 true 时 tex_ca_ = 校正输出（调用方把 CCM 源换成它）；
+  // 返回 false = 关闭 / 估计失败 / 位移低于门限（tex_work_ 直通，逐位等于改动前）。
+  bool passCaCorrect(int dst_w, int dst_h, float strength);
+  bool ensureCaTargets(int w, int h);
   static constexpr int kChromaLevels = 5;
   // RAW 域高光重建（darktable highlights 模块 / "inpaint opposed"，2026-10-03）：
-  // 在**去马赛克前**对线性 mosaic（tex_mos_，已扣黑阶 + WB，白点 1.0）恢复被裁剪
-  // 通道 —— mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
-  // 成功时结果落在 tex_hl_，由 hr_src_override_ 交给 RCD 三段读取。
-  // stat_src/stat_raw（v0.10.123）：mask 与 chrominance 的统计源。darktable 的
-  // highlights 跑在降噪之前，stat_raw=1 时用 tex_fused_（融合后、P0 前，R16F 单通道）。
+  // 在**去马赛克前**对线性 mosaic（已扣黑阶 + WB，白点 1.0）恢复被裁剪通道 ——
+  // mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
+  // v0.10.167 起本 pass 被**前置到 P0 之前**执行：输入 = P0 前的 mosaic，输出
+  // tex_hl_（单通道 .r 布局）转交 P0 作为输入；RCD 读 P0 的输出 tex_mos_（含 HR
+  // 修复），故 hr_src_override_ 前置路径下恒为 0。
+  // stat_src/stat_raw（v0.10.123 起）：统计源与判定源的**独立旋钮**。
+  //   v0.10.167 前 uStat 是死参数（三个 hl shader 只声明不读取）⇒ 改 src 即全改
+  //   （exp21 翻车的结构性根因）。现在 mask/chrominance 走 stat_src，apply 走 src。
+  // mono_src（v0.10.167）：源的布局 —— 1 = 单通道 R16F（值在 .r，tex_fused_ 布局），
+  //   0 = RGBA16F 按 CFA 相位写槽位（tex_mos_ 布局）。只影响读取方式，不改判据。
+  // grecon（v0.10.169）：kFsHlApply 内"自创机制"两支（G 三级池化比 + allSat 三通道
+  //   改写）的总开关，来自 FilmParams[49] hl_grecon。1 = 现有行为（默认）；0 = 只留
+  //   分支① 的 darktable opposed 外推（= PhotonCamera OpposedGL 口径），供真机 A/B。
   HlRawResult passHighlightRaw(int w, int h, int cfa, const float gains[3],
-                               GLuint src, GLuint stat_src, int stat_raw);
+                               GLuint src, GLuint stat_src, int stat_raw,
+                               int mono_src = 0, int grecon = 1);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
@@ -459,8 +535,10 @@ class FrameRenderer {
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
-         prog_rcd_chroma_ = 0, prog_ccm_ = 0, prog_raw_dn_ = 0,
+         prog_rcd_chroma_ = 0, prog_ccm_ = 0, prog_amaze_up_ = 0,
+         prog_raw_dn_ = 0,
          prog_chroma_dn_ = 0,
+         prog_moire_stat_ = 0,   // 档 A（v0.10.165）伪彩强度图统计
          prog_raw_dn_ts_ = 0,
          prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0,
@@ -470,7 +548,11 @@ class FrameRenderer {
          prog_hl_apply_ = 0, prog_hl_ref_ = 0, prog_hl_refdown_ = 0,
          // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
          prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
-         prog_df_apply_ = 0;
+         prog_df_apply_ = 0,
+         // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 全分辨率径向位移校正
+         prog_ca_ds_ = 0, prog_ca_corr_ = 0,
+         // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构入口/收口
+         prog_pc3d_ = 0, prog_pc3d_down_ = 0, prog_pc3d_up_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -518,6 +600,10 @@ class FrameRenderer {
   GLuint fbo_g_ = 0, tex_g_ = 0;      // RGBA16F，RCD 全图 G（g 通道有效）
   int rcd_w_ = 0, rcd_h_ = 0;
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
+  // AMaZE 档（v0.10.172）：CPU AMaZE 输出的 WB 域相机 RGB（源几何，RGB16F）。
+  // 只在 demosaic == 2 时创建/上传；RCD/双线性档完全不触碰（零回归面）。
+  GLuint tex_amaze_ = 0;
+  int amaze_w_ = 0, amaze_h_ = 0;
   // ── RAW 域高光重建（darktable highlights / inpaint opposed）─────────────
   // tex_hl_mask_ / tex_hl_dil_ = 3×3 photosite 块网格（w/3 × h/3）的裁剪掩码与
   // 膨胀掩码；tex_hl_sum_/tex_hl_cnt_ = 16×16 归约的 chrominance 累加（MRT 双目标）；
@@ -541,6 +627,57 @@ class FrameRenderer {
   GLuint fbo_df_avg_ = 0, tex_df_avg_ = 0;  // 1/16 网格 chroma 均值
   int df_w_ = 0, df_h_ = 0;                 // 全分辨率尺寸（缓存键）
   float dbg_df_cavg_ = 0.f;                 // 最近一次 chromave（日志）
+  // 横向色差校正（v0.10.170）：tex_ca_ = 校正输出（只在 caApplied=1 时替换
+  // tex_work_ 进 passCcm）；tex_ca_ds_ = 1/8 box 降采样（CPU readback 做估计）。
+  // dbg_ca_*：kr/kb = 估计的径向系数（位移 = k·r）、shiftR/shiftB = 画面角部的
+  // 实际最大位移（px，已乘强度并 clamp）、applied = 是否真的执行了校正 pass。
+  GLuint fbo_ca_ = 0, tex_ca_ = 0;
+  GLuint fbo_ca_ds_ = 0, tex_ca_ds_ = 0;
+  int ca_w_ = 0, ca_h_ = 0, ca_ds_w_ = 0, ca_ds_h_ = 0;
+  float dbg_ca_kr_ = 0.f, dbg_ca_kb_ = 0.f;   // 实际采用的径向系数（0 = 未通过判据）
+  float dbg_ca_kraw_r_ = 0.f, dbg_ca_kraw_b_ = 0.f;  // 原始估计（未过判据，诊断用）
+  float dbg_ca_shift_r_ = 0.f, dbg_ca_shift_b_ = 0.f;
+  int dbg_ca_applied_ = 0;
+  float dbg_ca_ms_ = 0.f;
+  // AMaZE 档（v0.10.172）：CPU AMaZE + 上传耗时（日志 amazeMs；0 = 未走本档）
+  float dbg_amaze_ms_ = 0.f;
+  // 档 A（v0.10.165）伪彩强度图诊断（passChromaDenoise 内 GPU 统计读回）：
+  //   moGain = 下发强度（FilmParams[48]）；moMean = 强度图全图均值；
+  //   moP95  = 强度图的 P95（4 锚点分段线性 CDF 近似，口径见 kFsMoireStat）；
+  //   moCov  = moire > 0.5 的像素占比；moSc = σc 实际平均放大倍数
+  //   （= 1 + moGain·moMean；封顶 4·σc 在 moGain ≤ 3 时恒不触发 ⇒ 精确）。
+  float dbg_mo_gain_ = 0.f, dbg_mo_mean_ = 0.f, dbg_mo_p95_ = 0.f,
+        dbg_mo_cov_ = 0.f, dbg_mo_sc_ = 1.f;
+  // 强边缘色度门（v0.10.174，FilmParams[51]/[52]/[53]）：
+  //   cgK     = 下发的 κ（0 = 关）；cgCap = shader 常量 kCgRel = 16.0（**相对**上限
+  //             16·σc，v0.10.173 这里是绝对 0.2 = 73.7% 像素被放宽的来源）；
+  //   cgScope = 1 = PC 的 w2 权重形式（v2 默认）；0 = 字面版（只放大 wc）。
+  //   cgK > 0 时 P4 的 a 通道改输出**门控开度** smoothstep(0.10, 0.30, |∇L|)
+  //   ⇒ 复用档 A 的统计读回，字段 cgMean/cgP95/cgCov = 门控覆盖率的
+  //   mean/P95/>0.5 占比（此时 moMean 等三个字段是**同一组数**，档 A 的强度图
+  //   观测被让位，见 REPORT）。真机健康区间：cgMean ≤ 0.15、cgCov ≤ 0.05。
+  float dbg_cg_k_ = 0.f, dbg_cg_cap_ = 16.0f, dbg_cg_scope_ = 1.f;
+  float dbg_df_gate_ = 0.f;   // 紫边判据的梯度自适应强度（[53]；0 = 判据未改）
+  // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
+  // 生效性字段（照 p0s/hlOk 的教训：改完必须能自证）：
+  //   pc3dOn  = 1 = 本帧真的跑了 PC3D 且输出已替换 P4 的输入
+  //   pc3dM   = 本轮实际的 MSIZE（PC 公式 + 本机噪声模型算出，7..21）
+  //   pc3dK   = 实际下发的 KERNELSIZE（f1 的高斯 σ）
+  //   pc3dSc  = 尺度结构实际用的降采样倍数（PC ESD3D2.Run 的 scale，1..4；
+  //             1 = 全分辨率单趟、≥2 = 走 gaussdown + guided upsample）
+  //   pc3dMs  = 本模块 GPU+提交耗时（ms）
+  // 健康区间见 FilmParams.h 的 [54] 注释。
+  int dbg_pc3d_on_ = 0, dbg_pc3d_m_ = 0, dbg_pc3d_scale_ = 1;
+  float dbg_pc3d_k_ = 0.f, dbg_pc3d_ms_ = 0.f;
+  // tex_pc3d_ = 本模块的全分辨率输出（只在 pc3dOn = 1 时被 P4 读）；
+  // tex_pc3d_t1_ = pass1（MOIRE = 0）的全分辨率中间；tex_pc3d_lo_ = 低分辨率中间。
+  // 全部 RGBA16F，惰性分配（开关关闭时零显存）。
+  GLuint fbo_pc3d_ = 0, tex_pc3d_ = 0;
+  GLuint fbo_pc3d_t1_ = 0, tex_pc3d_t1_ = 0;
+  GLuint fbo_pc3d_lo_[2] = {0, 0}, tex_pc3d_lo_[2] = {0, 0};
+  int pc3d_w_ = 0, pc3d_h_ = 0, pc3d_lw_ = 0, pc3d_lh_ = 0;
+  // 档 A：强度图统计网格（32×32 RGBA16F，惰性分配；强度 = 0 时零成本不分配）
+  GLuint tex_mo_stat_ = 0, fbo_mo_stat_ = 0;
   // D 专项：半分辨率 à trous 色度降噪缓冲（2× 近似层 ping-pong + 5× 细节层
   // + 1× σ 图；RGBA16F、1/2 分辨率 ≈ 25MB/张）
   GLuint tex_ch_a_[2] = {0, 0}, fbo_ch_a_[2] = {0, 0};
@@ -568,6 +705,15 @@ class FrameRenderer {
   float dbg_hl_rgg_ = 0.f, dbg_hl_bgg_ = 0.f;
   double dbg_hl_refw_ = 0.0;  // Σw（ref 场权重和；理论上限 = 块数）
   float dbg_hl_r2hit_ = 0.f, dbg_hl_rghit_ = 0.f;  // 三级参考命中占比（%）
+  int dbg_hl_grecon_ = 1;  // v0.10.169：apply 支实际下发的 uGRecon（日志 hlGRecon）
+  // ── v0.10.167 HR 前置的生效性字段（照 p0s/hlOk 的教训：改完必须能自证）──
+  // 为什么必须记"统计源/判定源"两个名字：exp21 翻车的结构性根因就是二者共用
+  // 一个 src、没有独立旋钮（改统计口径时把判定口径一起改了 ⇒ 修复面 47269→63903
+  // 样本、画面更红）。这两个字段让真机日志直接回答"它们是否指向不同纹理"。
+  const char* dbg_hl_stat_src_ = "none";    // uStat 实际绑定（统计源）
+  const char* dbg_hl_decide_src_ = "none";  // uMos 实际绑定（判定源）
+  int dbg_hl_pre_ = 0;        // 1 = HR 已前置到 P0 之前；0 = 后置/未启用
+  float dbg_hl_wclamp_ = 0.f;  // 实际下发的 uWClamp（1 = P0 权重域已保护）
   int dbg_cms_ = 0;      // 色度多尺度（D-1）是否执行
   float dbg_cms_k_ = 0.f;
   float dbg_p0w_ = 0.f;   // P0 中心点权重和（诊断）
@@ -648,6 +794,28 @@ class FrameRenderer {
   // 预览与成片的局部提亮分布对不上。init 仍建 32×24 作兜底绑定。
   GLuint fbo_local_ = 0, tex_local_ = 0;
   int local_w_ = 0, local_h_ = 0;
+  // ── 诊断统计（v0.10.166，见 .cpp 的 diag 块注释）────────────────────────
+  // 4 张归约网格（RGBA32F，不可渲染时回落 RGBA16F）+ 1 张位打包输出（RGBA8 8×2）。
+  // 惰性创建、随实例释放：**源纹理只作 sampler 读**，诊断只写这 5 张自己的纹理。
+  GLuint tex_diag_ds_[4] = {0, 0, 0, 0};
+  GLuint fbo_diag_ds_ = 0;
+  GLuint tex_diag_out_ = 0, fbo_diag_out_ = 0;
+  bool diag_ds_f32_ = false;  // 归约网格是否用了 RGBA32F（日志/排错用）
+  GLuint prog_diag_down_ = 0, prog_diag_pack_ = 0;
+  struct {
+    GLint src = -1, size = -1;
+  } u_diag_down_;
+  struct {
+    GLint t0 = -1, t1 = -1, t2 = -1, t3 = -1;
+  } u_diag_pack_;
+  bool ensureDiagTargets();
+  void releaseDiagTargets();
+  // 阶段纹理 → GPU 归约 → 读回标量 → diag.stats。失败只写 diag.stats_fail。
+  // 进入/退出成对保存恢复 FBO/viewport/program/纹理绑定/blend/scissor/depth。
+  void diagStatsTex(const char* stage, GLuint tex, int w, int h, const FilmParams* p);
+  // 最终成片：对已读回的 u8 缓冲做 CPU 侧同口径统计（**零 GL 调用**）。
+  void diagStatsU8(const char* stage, const unsigned char* px, int w, int h,
+                   const FilmParams* p);
   // v0.10.93 预览降载：降档帧的输出中间目标（RGBA8、渲染分辨率 = 缩放后尺寸）。
   // pass3（OETF+锐化+LUT+颗粒）整体跑在低分辨率上，blitFramebuffer(GL_LINEAR)
   // 升到全窗口 —— X300 的 RGBA16F 无线性过滤（NEAREST 放大 = 像素块），必须借
@@ -726,18 +894,27 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, ccm = -1;
   } u_ccm_;
+  // AMaZE 档（v0.10.172）：tex_amaze_（源几何，CPU AMaZE 上传的 WB 域相机 RGB）
+  // → 按成片几何旋转写入 tex_work_（D3）。几何口径与 kFsRcdChroma 逐字一致
+  // （kVertRot + uST 单位阵 + uScale=1，frag 里 tuv=(vUV0.x, 1−vUV0.y)）。
+  struct {
+    GLint tex = -1, size = -1, st = -1, rot = -1, scale = -1;
+  } u_amaze_up_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
           noise_a = -1, noise_b = -1, mix = -1;
   } u_raw_dn_;
   struct {
-    GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1, mix = -1;
+    // v0.10.167：wclamp = uWClamp，HR 前置的值域保护（权重用钳位值、信号用原值）
+    GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1, mix = -1,
+          wclamp = -1;
   } u_raw_dn_f_;
   // D-2（v0.10.58）：时域 × 空间联合 P0（4 帧 × 3×3 同相位邻域）
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, fused = -1,
           size = -1, off_tiles = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1, mix = -1;
+          gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1, mix = -1,
+          wclamp = -1;   // v0.10.167：σ 的值域保护
   } u_raw_dn_ts_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
@@ -757,8 +934,13 @@ class FrameRenderer {
   } u_mfnr_mis_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
-          lsc_size = -1, mix = -1;
+          lsc_size = -1, mix = -1, moire = -1, moire_k = -1, cg_k = -1,
+          cg_scope = -1;
   } u_chroma_dn_;
+  // 档 A：伪彩强度图统计（32×32 网格归约）
+  struct {
+    GLint src = -1, size = -1;
+  } u_moire_stat_;
   // 紫边抑制（v0.10.134）三个 pass 的 uniform 句柄
   struct {
     GLint tex = -1, size = -1;
@@ -771,38 +953,65 @@ class FrameRenderer {
   } u_df_avg_;
   struct {
     GLint tex = -1, det = -1, size = -1, half = -1, chroma_avg = -1,
-          thresh_k = -1;
+          thresh_k = -1, df_gate = -1;
   } u_df_apply_;
+  // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
+  struct {
+    GLint tex = -1, size = -1;
+  } u_ca_ds_;
+  struct {
+    GLint tex = -1, size = -1, center = -1, kr = -1, kb = -1, maxshift = -1;
+  } u_ca_corr_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1;
   } u_chroma_down_;
   struct {
-    GLint prev = -1, sigma = -1, size = -1, step = -1, k = -1, revert = -1;
+    GLint prev = -1, sigma = -1, size = -1, step = -1, k = -1, revert = -1,
+          cg_k = -1;
   } u_chroma_at_;
   struct {
     GLint tex = -1, coarse = -1, d[5] = {-1, -1, -1, -1, -1}, size = -1,
           half = -1, noise_a = -1, noise_b = -1, lsc = -1, lsc_size = -1,
           kr = -1;
   } u_chroma_apply_;
-  // RAW 域高光重建（darktable highlights）：mask / dilate / chroma / apply
+  // PC ESD3D2 完整移植（v0.10.175）：
+  //   u_pc3d_      = 本体（k / kernel / sigA / sigB / moire / luma / lsc）
+  //   u_pc3d_down_ = gaussdown（resize / stride / sigma）
+  //   u_pc3d_up_   = guidedupsample（low / guidehi / lowSize / hiSize / R）
   struct {
-    GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1;
+    GLint tex = -1, size = -1, k = -1, kernel = -1, sig_a = -1, sig_b = -1,
+          moire = -1, luma = -1, lsc = -1, lsc_size = -1;
+  } u_pc3d_;
+  struct {
+    GLint tex = -1, size = -1, resize = -1, stride = -1, sigma = -1;
+  } u_pc3d_down_;
+  struct {
+    GLint low = -1, guide_hi = -1, low_size = -1, hi_size = -1, r = -1;
+  } u_pc3d_up_;
+  // RAW 域高光重建（darktable highlights）：mask / dilate / chroma / apply
+  // mono（v0.10.167）= 源布局开关：1 = 单通道 R16F（值在 .r），0 = RGBA16F 相位布局
+  struct {
+    GLint mos = -1, stat = -1, statraw = -1, mono = -1, size = -1, cfalut = -1,
+          clips = -1;
   } u_hl_mask_;
   struct {
     GLint mask = -1, msize = -1;
   } u_hl_dil_;
   struct {
-    GLint mos = -1, stat = -1, statraw = -1, dil = -1, size = -1, msize = -1,
-          cfalut = -1, clips = -1, mode = -1;
+    GLint mos = -1, stat = -1, statraw = -1, mono = -1, dil = -1, size = -1,
+          msize = -1, cfalut = -1, clips = -1, mode = -1;
   } u_hl_chroma_;
   struct {
-    GLint mos = -1, stat = -1, statraw = -1, size = -1, cfalut = -1, clips = -1,
-          chroma = -1, ref = -1, grecon = -1, gcap = -1, refglobal = -1, refsize = -1,
-          ref2 = -1, ref2size = -1;
+    // clips = uSatClip（满阱，仅 allSat 判定）；hlclip = uHlClip（裁剪判据 0.987，
+    // v0.10.161 —— 与满阱解耦，理由见 passHighlightRaw 的域核实注释）
+    GLint mos = -1, stat = -1, statraw = -1, mono = -1, size = -1, cfalut = -1,
+          clips = -1, hlclip = -1, chroma = -1, ref = -1, grecon = -1, gcap = -1,
+          refglobal = -1, refsize = -1, ref2 = -1, ref2size = -1;
   } u_hl_apply_;
   struct {
-    GLint mos = -1, size = -1, cfalut = -1, clips = -1, block = -1;
+    // v0.10.167：mono = 源布局（本 pass 仍读 uMos；前置后 uMos 即 P0 前的 mosaic）
+    GLint mos = -1, size = -1, cfalut = -1, clips = -1, block = -1, mono = -1;
   } u_hl_ref_;
   struct {
     GLint ref1 = -1, refsize = -1;
