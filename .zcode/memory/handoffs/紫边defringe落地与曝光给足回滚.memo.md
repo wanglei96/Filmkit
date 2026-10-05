@@ -1,8 +1,8 @@
 ---
 summary: 紫边defringe落地与曝光给足回滚
 created: 2026-10-04 12:30
-updated: 2026-10-04 12:30
-status: active
+updated: 2026-10-05 20:30
+status: absorbed
 ---
 
 # 紫边defringe落地与曝光给足回滚

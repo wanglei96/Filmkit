@@ -1,11 +1,13 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-03 16:10
+updated: 2026-10-05 20:30
 status: active
 ---
 
 # 项目状态
+
+<!-- 2026-10-05 d3 整理：全量吸收 37 份快照 + 5 份归档，压缩折行、删除被取代的中间状态。 -->
 
 ## 目标
 
@@ -13,108 +15,37 @@ status: active
 
 ## 结构
 
-- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ **RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）** + CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）
-- `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/、log/（JSONL+GPU 计时）、jni/Bridge.cpp
-- `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、**research/（11 份独立调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪专项）**
-- `app/src/main/assets/luts/`：**42 个内置 .lut（uint8、33³、4.3MB）**，格式 `[size][titleLen][title][catLen][category][data]`；源为 `~/Downloads/LUT/滤镜.cube/` 的 64³ 导出（`tools/gen-lut-assets.py`）
-- `tools/`：validate-shaders.sh、**check-diag-fields.py（出包前必跑）**、**check-log-json.py（分析前先跑）**、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
+- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）+ `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，kCount=56）
+- `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/（SpikeFftMerge）、log/（JSONL+GPU 计时）、jni/Bridge.cpp、`film/FilmParams.h`
+- `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、research/（12 个编号调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪 / 10=ARRI 引擎计划 + 内建编辑器与预设）
+- `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
+- `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
-## 进行中（2026-10-04 中午）
+## 进行中（2026-10-05）
 
-- [2026-10-04] **品红 = 逆光边缘紫边渐晕（定性修正）** | 最高 | 上窗口"伪彩判据"被真实
-  样片否决（品红处亮度带通 = 全图 14×）；14.74% 基准系 uint8 回绕口径污染，安全口径
-  0.65~0.78%。defringe（RT 同形态）已落地 v0.10.134。真机解剖：用户所见主体 =
-  **>32px 低频色度噪声云**（P90 3 级），根因 = 4.8ms 短曝光；**修正方向待拍板**：
-  有界给足（饱和预算）/ D-1 低频扩展 / 暂缓 | handoffs/紫边defringe落地与曝光给足回滚.memo.md
-- [2026-10-04] **曝光给足事故已回滚** | 高 | 方案 A（ISO 下限后解除封顶拉到 target 333ms、
-  砍 hl 上限）真机 100ms → RAW 饱和 4.2%（R 24.3 万像素）→ HR 品红洪水 + 白点失控，
-  成片与 DNG 全毁 ⇒ 当日 revert。**hl 欠曝保险丝保留**；后继给足必须有饱和预算约束
-- [2026-10-03] **亮部亮度降噪** | 高 | 根治白点的正道（不改影调）。对标 PC 亮部 σY 差 1.67×；
-  P0 bilateral 在全图只降 21~32%，亮部为何更弱待查（`σ²=A·x+B` 在亮部更大 ⇒ 权重应更大，实测相反）
-- [2026-10-03] **超广畸变自校正** | 高 | HAL 路线已全关（exp7 实测 `distModes:none`、
-  `lensDistortion` 为 AOSP 占位值、`preCorr==active`）⇒ 必须引擎 GPU 自校正（去马赛克前、
-  逐 CFA 平面反向映射保相位）；**需拍板**：完整校正（视场窄 5~10%）/ 部分校正 / 不校正
-- [2026-10-03] **影调白点默认值拍板** | 中 | `whiteEv` 4.0（darktable 默认、有白点）vs
-  6.x（白点消失、更柔）；属观感基准变更，等用户在不同场景试过后定
-- [2026-10-03] **窗户场景采集曝光只给 12ms** | 已定位 | ISO 50 下限时 `nIso=1` 锁死
-  Planner 拉长（"亮度不变"死角）；给足语义已落地但因无饱和预算翻车回滚（见上），重启需拍板
-- [2026-10-04] **M5 诊断与 NN 微调** | 待做/降级 | M5:逐 pass GPU 计时、golden image CI；NN 微调维持暂缓（管线代码保留 nn_dn 默认关）
+- [2026-10-05] **紫边/边缘伪彩归因闭环** | 待拍板 | 已锁定高频环节（去马赛克伪彩 / 小尺度色度处理）：三个真实缺陷已修（HR 阈值域 / `uStat` 死参数 / 档位 2 硬限）、三条路径已排除（4:4:4 编码 / 去马赛克算法 / 横向色差）；ESD3D2 完整移植 `[54]`（默认关、代码就绪）。**待拍板**：`[54]` 是否默认开、`[51] κ` 是否调低（高饱和彩边去饱和 25~37% 代价）；待定位产生"4px 窄峰"的具体 pass | handoffs/紫边归因闭环与对标基准修正.memo.md
+- [2026-10-05] **对标基准修正与 KPI 更换** | 进行中 | 长期当目标的 3.684（`∇>60` 均值）把 PC 高估 ≈2.2×；正确目标 = 边缘局域超额 1.67 / 剖面 core 1.08；`CameraPresets.kt:183-186` 注释待改；新 KPI（剖面 core / 零假设选择超额）待沉淀 tools | 同上
+- [2026-10-05] **低频色度噪声云（曝光给足事故）** | 待拍板 | 根因 = 4.8ms 短曝光（ISO 下限锁死 Planner 拉长）；方案 A 无饱和预算毁图（RAW 饱和 4.2% + HR 品红洪水）已回滚；**修正方向待拍板**：有界给足（饱和预算）/ D-1 低频扩展 / 暂缓 | 同上
+- [2026-10-03] **亮部亮度降噪** | 挂起 | 对标 PC 唯一成像短板（亮部 σY 1.67×）；P0 bilateral 全图只降 21~32%，亮部为何更弱待查（`σ²=A·x+B` 在亮部更大 ⇒ 权重应更大，实测相反）| handoffs/亮部降噪短板定位与小波重建待修.memo.md
+- [2026-10-03] **超广畸变自校正** | 待拍板 | HAL 路线已全关 ⇒ 必须引擎 GPU 自校正（去马赛克前、逐 CFA 平面反向映射保相位）；**需拍板**：完整校正（视场窄 5~10%）/ 部分校正 / 不校正 | handoffs/超广探测高光保护与白斑攻坚.memo.md
+- [2026-10-04] **内建编辑器与预设** | 待立项 | 调研完成（docs/research/10 号）：编辑器与预设一体做、同一参数源；预设 schema 增量（颗粒调制/halation/暗角/趾肩/层间效应）；E1–E5 待立项，优先级低于成像缺陷 | handoffs/设置页抽屉化与光圈图标落地.memo.md
+- [2026-10-03] **影调 whiteEv 默认值** | 低 | 4.0（darktable 默认、有白点）vs 6.x（白点消失、更柔）等用户多场景试后定
+- [2026-10-01] **M5 诊断与基准** | 低 | 逐 pass GPU 计时、成像会话摘要、一键诊断包、性能基准脚本 + golden image 接 CI | decisions.md「色彩链、管线与 MFNR」
 
+## 里程碑沿革（压缩）
 
-- [2026-10-03] **高光重建收线（exp19–exp23，276→280）**：逐行对照 darktable 找到 `threshold`
-  语义偏差（原版 = 白点 `2^white_source × grey`，我们写死 1.0）⇒ 真机 `clipB` **523~601 → 2**、
-  色块消失；mask / `init_reconstruct` / RGB-RATIOS 组合三处核对为一致。品红侧：opposed 的
-  chrominance 因输入被 P0 降噪而系统性偏大 3.7×（`v−refavg` 被拉负）⇒ 置 0（洋红像素
-  6.21%→0.83%，另三张 DNG 禁用前后差 0.007）；`inpaint_noise` 的彩色噪声相对信号 20%
-  （是 darktable 约 3 倍）⇒ `noise_level` 置 0 并跳过恒等 pass
-- [2026-10-03] **对标定位唯一短板 = 亮部降噪（exp16–exp18，273→275）**：同场景对标 PC ⇒ 亮部
-  σY 0.82/0.49（1.67×）、色度反超 1.2~1.8×；白点确认为随机涨落（同机位 IoU 6.8%≈随机 5.4%）
-  且与 dn 无关；噪声模型经 RAW 域实测证实准确（1.04~1.39）；`whiteEv` 6.2 可消白点（代价对比度）；
-  杯口色块由用户开关实验定位到 `hr_wavelet`。期间 exp13 全画面红（mosaic 通道约定 bug）、
-  exp15 RCD 色差回归原版、exp16 修黑白点滑杆失效、exp17 σ 修正发糊已回退
-- [2026-10-03] **超广畸变能力探测（v0.10.109-exp7，263）**：AOSP 一手取证（RAW 永不校正 +
-  该控制默认 ON）+ 真机实测 `distModes:none` / `lensDistortion` 占位 / `preCorr==active`
-  ⇒ **HAL 路线全关，必须 GPU 自校正** | docs/x300-能力审计.md §4
-- [2026-10-03] **高光保护 + 横拍裁切修复（v0.10.110-exp8，265）**：曝光目标改"刚好不烧高光"
-  （`ExposurePlanner` 第 4 约束，n 可 <1；欠曝量由成片 EV 补偿）真机 `clipB` **890→163**；
-  横拍被裁成竖幅（丢 44% 画面）修复 = 方向/画幅**快门瞬间快照** + 按姿态定向
-- [2026-10-03] **影调层收敛（v0.10.112/113-exp10/11，267/268）**：4 个互相干扰的白点旋钮
-  （自适应影调/高光自适应白点/白点下限边距/白点上探幅度）→ 最终**全部撤掉**，标准模式唯一，
-  固定 darktable 出厂默认 **−8/+4 EV**
-- [2026-10-03] **曝光判据域修正（v0.10.114-exp12，269）**：判据从预览域 `w999` 改为**成片域**
-  `sw999`（实测预览 2.09 vs 成片 2.674，差 0.58EV 且逐次不同）+ 默认**曝光给足**（余量 0.35→0.1）
-- [2026-10-02] **曝光决策专项（v0.10.107-exp → exp4，258→261）**：离线定量证明曝光 ×N 的
-  σ 收益 = √N（解析值与物理上限逐位吻合、决策边界 d\*≈2.2px）→ ExposurePlanner + 陀螺仪
-  motion metering + 曝光上限手动档；真机 250ms 档拿到 **ISO167（= Filmix 同款）**，噪声
-  降到基准 1/3.1 | handoffs/曝光决策落地与亮部降噪修正.memo.md
-- [2026-10-02] **亮部降噪失效修正（v0.10.108-exp5，262）**：根因 = 强度档被当 σ 乘子 ⇒
-  `exp(−0.5d²)` 指数塌陷 ⇒ 降噪近似归零且亮部最惨（盘沿 σY 4.48 vs Filmix 1.72/PC 0.92，
-  中间调我们反而最好 1.06）；改为 **σ 恒真值 + 强度<1 走输出 mix**；真机 P90 降 21~29%
-  | docs/denoise-strength-sigma.md
-- [2026-10-02] **三摄 GCam 噪声标定接入（v0.10.108-exp6，263）**：主摄 HPB（100 张实测）/
-  超广 JN1 / 长焦 LYT602 内置为 assets；发现 `BUILT_IN` 原先**无主摄条目**（主摄一直走
-  HAL cam2，其 G 通道比 R/B 低一半）；真机 `src:"builtin"` 验证通过 | 同上
-- [2026-10-02] **NN 路线全程 + 判死（v0.10.100–0.10.106，253→257）**：spike 达标（真机 GPU
-  26ms/tile、纹理保留 78–86% 优于 P0）→ 集成五轮逐层修口径（JNI 桥 / KSigma / cvt_k×256 /
-  通道序 / neff 折减）→ **nnGain 与公式逐位吻合而观感零改善**（文字梯度 −24%、斑块状伪影）⇒
-  跨域模型不可直接用；四次微调（监督×3 + N2N）留出集**全过拟合**，瓶颈 = 数据量（4 场景 vs
-  官方 3 万+）⇒ 转 HDR+ | handoffs/NN集成定因与判死转HDR+.memo.md
+- [2026-10-05] **v0.10.162–176（本轮，未打 tag）**：小波 HR 阈值域修复（真机 Y 加权和差 +2.03%→+0.03%、clipB 289→60）、`uStat` 接线 + HR 前置到 P0 之前、档位 2 硬限回退 + `hr_wavelet` 默认关（省 ≈752MB 纹理 + ≈103 全分辨率 pass/张）、`uGRecon` 开关、4:4:4 JPEG、AMaZE 去马赛克、强边缘色度门（0.173 全局放宽翻车 → 0.174 逐像素）、ESD3D2 完整移植 + 设置页入口；HEAD `a91c9d6`，最新包 `filmkit-0.10.176.apk`（315）
+- [2026-10-04] **v0.10.126–136**：设置页 35 项平铺 → 4 抽屉 + 光圈 vector 图标（PC 同构完整资源套，验收 tag v0.10.133）；defringe 落地（0.10.134，离线紫边 ↓63%）；曝光给足 0.10.135 真机毁图 → 0.10.136 当日回滚
+- [2026-10-02/03] **曝光决策 + 降噪链 + 影调固定**：离线证明曝光 ×N 收益 = √N（真机 250ms 档 ISO167，噪声降到 1/3.1）；σ 恒真值 + 强度<1 走输出 mix（修"亮部降噪近似归零"）；三摄 GCam 标定接入；NN 路线判死转 HDR+；高光保护（clipB 890→163）；影调白点 4 个互相干扰的旋钮全撤（标准模式唯一、固定 darktable 默认 −8/+4 EV）；曝光判据改用成片域 `sw999`
+- [2026-09-30] **对齐/P0 亚像素 + 性能收口**：最细对齐层 1/4→1/2 域 + 逐通道网格亚像素（同帧降噪 +43.7%/+46.5%，两者协同而非叠加）；A 专项 DFT 合并验收（根因 = imageStore 目标必须 `glTexStorage2D`）+ D-1 色度多尺度超 PC；快门间隔 2.5s→0.54s；拍照独立线程落地（同帧 A/B CRC32 逐字节等价）
+- [2026-09-27/29] **域映射与 MFNR**：EV 单一来源（filmic 前线性域）、预览域映射真 WYSIWYG、管线顺序定稿；MFNR 阶段一（4 帧 Bayer 域对齐 + 等权均值 + 逐通道亚像素）验收、阶段二 robust merge（mismatch + 一致性门控，手部达标）；C 专项噪声模型全链（σ²=A·x+B + 三摄标定，残余噪声 4.4×/2.2× → 1.22×/1.45×）
+- [2026-09-21/24] **基础链奠基**：M2 RAW 端到端 + DngCreator 底片、RCD 三段 fragment 管线（12MP 1969→477ms）、LSC 接去马赛克后 CCM 前、P2 标准色彩链（ColorMatrix/ForwardMatrix 双光源）、M4 LUT 引擎（display 域、OETF 后）+ 无损导入导出、基础引擎三旋钮正交化、真 sRGB OETF、哈苏形 Reinhard 换底 → filmic 原生件接管
+- [2026-09-18/20] **M0–M2 前半**：YUV 全链路（SurfaceTexture+OES 预览、全分辨率静拍）、M 档专业 UI、镜头发现与设置页、手动 WB = HAL 恒 AWB + 引擎侧补偿、变焦画质优先（±3% 迟滞）
 
-- [2026-10-01] **M4 无损 LUT 导入导出 + 预览降载收线（v0.10.93–0.10.99，tag v0.10.99-m4）**：
-  实验判读排除降噪、定位 MFNR 链路 → 方案 A（预览中间链 0.5× + blit 升采，单帧
-  RAW/YUV 迁独立线程）；M4 §6.2 .cube 1D/3D + Hald PNG 双向、用户库、分类管理；
-  滑杆跳变根因 = M3 Slider 按下 snap，换相对拖动 | handoffs/M4无损LUT导入导出与预览降载收线.memo.md
-- [2026-10-01] **拍照独立线程落地 + 连拍崩溃定案（v0.10.85–0.10.92）**：独立线程 +
-  独立 EGL context（PC 同构），**只启动不销毁**消除 0.10.83 的竞态；同帧 A/B
-  **CRC32 逐字节相同**（画质等价）；连拍闪退定案 = Java 堆 OOM 在 JNI 回传处 pending
-  exception → ART abort，`largeHeap` + `ExceptionCheck` 修复后 7 张全成功零丢失；
-  空闲 10s 释放 2GB 中间纹理（须连 context 一起销毁）；让路方案实测无效已回退
-- [2026-09-30] **对齐精度 + P0 亚像素（v0.10.70–0.10.76）**：最细对齐层 1/4→**1/2 域**
-  （HDR+ §4 原版），离线 p50 0.68→0.27px、错位 >1px 的 tile 23%→5%；P0 时域采样改
-  逐通道网格亚像素 → **同帧实测降噪 +43.7%/+46.5%**；两者协同（只换层 +2.5%）
-- [2026-09-30] **日志与 DFT 修复（v0.10.73/0.10.77）**：`jnum()` 修 68 处"截断出非法
-  JSON"；DFT 窗函数查表 → dftGpu 冷机 500~550ms
-- [2026-09-30] **快门与保存异步化（v0.10.80–0.10.82）**：JPEG 编码落盘移后台单线程队列
-  （主线程 8~21ms 撒手）；`capturing` 提前到采集完成（**快门间隔 0.54s**）；在飞上限 2
-- [2026-09-30] **PC 对标（同场景同曝光）**：暗部 σY 差 **2.26×**、色度**好 2.3~2.9×**、
-  边缘高 11%、纹理保真 0.92；PC"快门即撒手" = 各后处理器**各自独立 EGL context**
-- [2026-09-30] **D-2 与 A 专项（v0.10.37–0.10.69）**：D-1 色度 à trous 多尺度超 PC；
-  时域×空间联合 P0（96 样本）；TPDF dither；LSC 软 knee；DFT 合并（CFA 平面独立、
-  16×16 半重叠 + 升余弦窗，根因 = imageStore 目标必须 `glTexStorage2D`）
-- [2026-09-29] **C 专项收线 = 噪声模型全链与多摄标定（v0.10.36-m4）**：逐像素
-  σ²=A·x+B、强度滑杆 0–2、可导入标定（GCam .c）、三摄内置标定；同刻三镜头残余噪声
-  4.4×/2.2× → **1.22×/1.45×**
-- [2026-09-28/29] **影调与色度主线**：EV = filmic 前线性域、OETF 真 sRGB 三处同步、
-  filmic 原生件 + 小波 HR + gamut 五步；base_ev +0.7；M 档 WB 断链修复（raw 域 gains）；
-  白点探针治"整张白"
-- [2026-09-27] **MFNR 阶段一 + 域映射曝光链（v0.7.8–v0.9.5-m4）**：4 帧 Bayer 域 tile
-  对齐 + 每通道网格亚像素双线性融合（σ 比 0.442-0.451 ≈ √4）；预览直通退役（真 WYSIWYG）
-- [2026-09-21/24] **M2/M3 收线**：RAW 端到端 + DngCreator 底片、RCD 三段 fragment 管线、
-  P0 LSC、实时直方图、DNG 标准色彩链；对标 PC 重标定与方向链路（orientationStep =
-  设备物理旋转）
+## 品红/紫边与曝光（10-04 → 10-05）
 
-## 品红专项、defringe 与曝光事故（10-04，本窗口）
-
-- [2026-10-04] **设置页抽屉化 + 应用图标（v0.10.133）**：35 项平铺 → 4 抽屉；图标 = 光圈 vector 13 path（G 款）；adaptive 前景须 vector、纯 legacy 垫白托 → **PC 同构完整套** 才稳；编辑器/预设调研完成（docs/research/10 号，E1–E5 待立项）
-- [2026-10-04] **defringe 落地（v0.10.134，c5133d9）**：4 pass 半分辨率（down+Lab+a 门/检测/均值读回/替换），RT PF_correct_RT 机制复现；离线紫边 ↓63%、红 +1%；prefs `defringe` 默认开、FilmParams[47]、日志 `df`/`dfCavg`
-- [2026-10-04] **曝光给足事故（v0.10.135 → 0.10.136 回滚）**：无饱和预算的给足在逆光窗 = RAW 饱和 4.2% + HR 品红洪水 + 白点失控，成片与 DNG 全毁；revert 后 hl 欠曝降级保险丝；安全口径测量脚本在 /tmp 未沉淀
+- [2026-10-04] **定性修正**：品红 = 逆光边缘紫边渐晕（上窗口"色度高、亮度平坦"判据被真实样片否决：品红处亮度带通 = 全图 14×）；14.74% 基准系 uint8 回绕口径污染，紫边安全口径 0.65~0.78%
+- [2026-10-04] **defringe 落地（v0.10.134，c5133d9）**：4 pass 半分辨率（down+Lab a 门 / 11×11 检测 / 16×16 均值读回 chromave / 全分辨率替换），RT `PF_correct_RT` 机制复现（GPL 不抄码）；prefs `defringe` 默认开、FilmParams[47]、日志 `df`/`dfCavg`；对 >32px 低频云结构性无效
+- [2026-10-05] **真机剖面**：我们 = 窄峰（FWHM 4px）、PC = 宽缓斜坡（20+px、无峰）⇒ 高频窄峰与 >32px 低频云是两件事；1px 色度噪点 10.5%→0.04%（融合+P0/P4/D-1 有效）
+- [2026-10-05] **口径自证**：复现 PC 的 3.68413/0.44607%；零假设检验证明 3.684 里只有 +1.668 与边缘有关；`∇>60` 均值同地点相隔 7 秒可差 25.8× ⇒ 禁作跨图 KPI
+- [2026-10-04] **曝光给足事故**：无饱和预算的给足（target 333ms + 砍 hl 上限）在逆光窗 = RAW 饱和 4.2%（R 24.3 万像素）+ HR 品红洪水 + 白点失控（hrWhiteEv 8.52 / pHi 5.1），成片与 DNG 高光永久丢失；修正方向待拍板
