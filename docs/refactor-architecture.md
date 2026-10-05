@@ -282,6 +282,27 @@ Restore / Stat），**重建在 ratios（归一化色相 `c/|c|`）域做**，�
 ⇒ `hr_wavelet` 是**主要贡献者但非全部**：修好它之后预计仍有约 +0.008 的残留（libraw 同场景为 +0.0004），
 **不得声称"一次修完"**，需按剩余量另立专项。
 
+### 诊断方案返工：图像 dump → GPU 内统计（2026-10-05）
+
+**v0.10.163 的图像 dump 方案真机失败**：把渲染纹理临时挂到诊断 FBO，再用 `glReadPixels`
+以 `GL_FLOAT`/`GL_HALF_FLOAT` 读回浮点图像并写 PFM。真机实测：
+```
+diag.dump_fail {'stage':'D4-scene','reason':'readpixels'}
+diag.dump_fail {'stage':'HR-filmsrc','reason':'readpixels'}
+photo.saved    {'avgLuma': 0}          ← 失败还破坏了渲染状态，后续成片全黑
+```
+两条教训：① **ES 3.0 只保证 `GL_RGBA`+`GL_UNSIGNED_BYTE` 的 readback**，浮点格式需扩展；
+② **诊断代码绝不能改动渲染状态** —— "临时挂 FBO + 读图像"这类做法一旦失败会连累成片。
+
+**v0.10.166 改为 GPU 内统计**：只把各阶段的色度统计量（`ΣR/ΣG/ΣB`、按亮度分层的 R−G）
+归约到 **8×2 小纹理**，用 **`GL_RGBA`+`GL_UNSIGNED_BYTE`** 读回（唯一保证可用的组合），
+**不挂渲染纹理、不读图像、不落盘**；并把上面两条硬约束**固化成可执行检查**
+`tools/check-diag-stats.py`（不存在"把渲染纹理挂 FBO"、唯一 readback 必须是 8×2 的 8bit、
+不存在任何落盘路径），任一不满足即非零退出。当前核对输出：
+`5 个阶段调用点、8 项状态保存/恢复、无挂 FBO、无图像读回、无落盘` ✅
+
+**方法论**：诊断功能也要有"不得影响产品路径"的**可执行证明**，而不是靠承诺。
+
 ### PhotonCamera 对照研究（2026-10-05）—— 用户要求"抄 PC"的落地依据
 
 **四条硬事实**（源码证据见 `/tmp/pc-chroma/DESIGN.md`，715 行）：
