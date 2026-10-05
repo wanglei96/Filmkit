@@ -236,10 +236,84 @@ Restore / Stat），**重建在 ratios（归一化色相 `c/|c|`）域做**，�
 把大量未饱和像素纳入重建 ⇒「反光区色块」；当时改成白点（现 `hrThr≈1.51`）。
 **本次待查：改成白点之后还有什么在把红带进画面。**（已派两个子代理：原版逐行对照审计 + 数值仿真量化）
 
+**子代理诊断结论（原版逐行对照，对标 darktable master `d531574` 的 `src/iop/filmicrgb.c`）**：
+
+**根因 = 两处叠加，且它就是抗紫边能力的同一枚硬币另一面**：
+1. **直接原因 — `threshold` 语义被替换**（`:7172–7179`）：我们用 `max(1.13×‖CCM·(0,gain_G,0)‖,1.0) ≈ 1.506`
+   （RAW 满阱范数），而原版是 `powf(2, white_source + reconstruct_threshold) × grey_source`
+   （本场景 ≈ **8.3**）。门限从 pixMax>5.06 降到 >1.13 ⇒ **未饱和亮部的 alpha 从 ~7e-4 抬到 ~1.0（9–115×）**。
+   ⚠ 并且 `:7177 (void)white_ev_input_domain;` **把原版公式要的 `white_source` 直接丢弃了**
+   （调用点 `:8500` 已算好 `white_ev_in`；`kGrey=0.1845` 就在 `:7156` 未用）。
+2. **根本原因 — ratios 轮的"替换目标"是邻域色度**：alpha≈1 时像素自身色度被完全丢弃，
+   输出 = `LF(ratios) × norms`，逆光室内的 LF 偏暖 ⇒ **大片红**。
+
+**同一批像素的两个极端（数值自洽）**：
+- 裁剪区**自身** ratio：WB 后 (0.674,0.375,0.637) → **CCM 后（HR 的真实工作域 D4）(0.708,0.236,0.666)**
+  ⇒ **R≈B ≫ G = 品红**（= 关掉 HR 后用户看到的粉紫）
+- 替换成 `LF(ratios)` 后：输出 R/G=1.144、B/G=0.803 ⇒ **橙红**（= 开着 HR 时的大片红）
+
+**逐行对照结论**：`kFsHrBlur/HF/ReconInit/ReconStep/Norms/Ratios/Restore` 与原版**逐行一致**（无偏离）；
+`kFsHrStat` 是块级近似（只影响"做不做"、不改重建值）；原版**不存在** `DT_HR_*` 标志，
+护栏只有 mask sigmoid + `clipped>9` + `init_reconstruct` 的 `(1-mask)`，**两条我们都有，没漏护栏**，
+只是判据参数被换了物理量。**restore 往返在 alpha=0 时严格恒等**（c≥0 时 max/clamp 均空操作）⇒ 排除。
+
+> ⚠️ **【已作废 2026-10-05】** 以下"锚定中性"方向已实施后又**被回退**：
+> 真机实测它对全图 R−G **无影响**（`hlRgG` 从 1.0768 修到 0.9913，全图 R−G 纹丝不动），
+> 且其硬限带来 **+29% 梯度**副作用。该模块（`hr_wavelet`）现**默认关闭**，
+> 后续按 PhotonCamera 路子以"伪彩感知色度降噪"替代。**以下内容仅存历史，勿据此实施。**
+
+**修复方向（历史记录·已作废）**：**判据不动、只把 ratios 轮的"替换目标"锚定到中性**
+（`residual = mix(lf.rgb, vec3(1/√3), k)`），原版依据 = 原版 **PASS1** 的 `beta_comp` 机制注释原文
+"force the reconstruction to be **achromatic** … help with gamut issues or **magenta highlights**"，
+而 **PASS2 里 `beta`/`beta_comp` 是未使用的 dead parameter** ⇒ 是"接上原版自己遗漏的接线"，非自创算法。
+
+**审核发现的两个实现陷阱（实施时必须避开）**：
+1. **`uBetaComp` 是两个 variant 共享的**（`:2287–2290` 的 RGB 轮 + 候选的 ratios 轮），
+   `:7317` 现给它 0.0。**直接改它会让 RGB 轮也混入灰度** ⇒ 必须**新增独立 uniform**。
+2. A 的 ratio 数值用的是 **WB 后域**，而 **HR 实际工作在 D4（CCM 后）** ⇒ 标定要按 D4 域做
+   （品红更强：G 分量 0.375 → 0.236）。
+
+**验收判据（双向，单向改善不算"打破权衡"）**：粉紫指标（R≈B>G）与红指标（R>G>B 且 B/G≪1）
+**必须同时下降**；真机验收线 **|R/G−1| ≤ 0.05 且 |B/G−1| ≤ 0.05**；日志 `hr`+`clipB` 同步确认**判据未动**
+（证明抗紫边能力未被牺牲、而非被关掉）。
+
 **量化基线（修复验收用）**：关掉 `hr_wavelet` 前后的成片统计（不同光线，只看趋势）——
 全图 `R−G` **+0.0195 → +0.0084（−57%）**、中间调 **+0.0367 → +0.0164（−55%）**、亮部 `R−G` +0.0099 → −0.0188。
 ⇒ `hr_wavelet` 是**主要贡献者但非全部**：修好它之后预计仍有约 +0.008 的残留（libraw 同场景为 +0.0004），
 **不得声称"一次修完"**，需按剩余量另立专项。
+
+### PhotonCamera 对照研究（2026-10-05）—— 用户要求"抄 PC"的落地依据
+
+**四条硬事实**（源码证据见 `/tmp/pc-chroma/DESIGN.md`，715 行）：
+
+1. **`ChromaDenoise` / `MeasureMoire` / `mgc_*` 不在 PhotonCamera 仓库里** —— 全仓 grep 只命中
+   `SmartNR.java` 的一个变量名，Gradle 无 mgc 依赖，公网亦检索不到 `mgc_full_resolution_denoise_jni.cpp`。
+   ⇒ 记忆库 2026-10-03 那条"PC 用 `MeasureMoire` 逐像素伪彩强度图驱动色度降噪"**来自另一份源码树（MGC）**，
+   本机不可得 ⇒ **其算法本体属"无法判定"，不得据此实施**（措辞限定为"已完成检索范围内未命中"）。
+2. **PC 主线现役的同职实现是 `ESD3D2`**，`assets/shaders/denoise/esd3d2_steered.glsl`，**可读且可搬**：
+   `chromaDiff`（2×2 内色度非均匀度）→ `*= max(|xΔ|,|yΔ|)`（梯度门）→ `chromaNoise`（三通道极差）
+   → **`sigZ = max(sigY, min(chromaNoise·MOIRE, 0.2))`**，`MOIRE` = Tunable 默认 **1.5**；
+   **亮度走 `σ=sigY`、色度走 `σ=sigZ`（两套权重解耦）**，运行在**去马赛克后、色调链前**的 scene-referred 线性域。
+   第二原型 `SmartNR/noisedetection44.glsl:47-51`（⚠ 该节点**未接入管线**，其强度图消费是半接线死代码，勿误引）。
+3. **我们的 `stat_src`/`stat_raw` 是死参数** —— `uStat` 在三个 hl shader 里只声明，`texelFetch(uStat` **全文件 0 命中**，
+   统计/判定/apply 全走同一个 `uMos = src`。**这就是 exp21「顺手把 apply 的判定也换了」翻车的结构性根因：
+   当时根本没有独立旋钮，改 `src` 即全改。** ⇒ 档 C 的第一步必须是"**先给 `uStat` 接线**（零行为变化）"。
+4. **档 A/B 不解决全图低频偏红**（`R−G ≈ +0.0145`）—— 它们的验收线是"局部伪彩/品红残留 + 色度纹理保留"。
+   **止损规则（写死）**：若离线复算显示对全图 R−G 无可测影响，即停止在此线投入、转查低频色偏通路（诊断 dump 专项）。
+
+**三档方案与实施顺序**：
+**① C-步骤0**（`uStat` 接线，**零行为变化**，可用 dump 逐位验证）→ **② A1**（P4 伪彩感知：复用现有 7×7 循环的
+3×3 子集、**零新增采样**，核心唯一改动行 ≈ `:806` 的 σ 替换 `wc = …/sc → /scEff`，四条规则 =
+只增强不减弱 / 结构门控 / 通道差异 / 封顶 `4·sc`）→ ③ C-步骤1（换 `stat_src` 为 P0 前纹理）→
+④ A2（D-1 `kFsChromaDown` 注入，门控偏粗）→ ⑤ B1（`uK` 标量 → 5 级表）→ ⑥ C-步骤2（HR 真前置，**风险最高**）。
+
+**档 B 不是"补齐缺失"**：我们的 **5 级 à trous 离线数据已优于 PC**，**不建议**改成 4 级（级数变动会让全部定稿失效）。
+**GPU 无做不到项**：三档都在现有 pass 内，零新增全屏 pass/纹理，档 A 额外采样 = 0。
+
+**验收工具**（设计已指定，含新增）：`chroma-denoise-eval.py`（noise ↓≥10% 且 edge 不降）、
+`chroma-scale-eval.py`（σC(1)/σC(2)↓，**σC(8..32) 不升 = 红线**）、`texture-fidelity-eval.py`/`midband-attrib.py`
+（色度带通降 ≤3%）、**新增 `moire-strength-eval.py`**（按显示域 Y 分层统计 `moire`，是"红紫分层"的直接判据）。
+**真机新增字段**：档 A `moGain/moMean/moP95/moCov/moSc`；档 B `cmsK[5]`；档 C `hlStatSrc/hlDecideSrc/hlFixPx/hlP0OR/hlP0W`。
 
 ### 事故：JNI 参数顺序错位 —— 关"多帧融合"时成片全黑（2026-10-05，已修 v0.10.159）
 
