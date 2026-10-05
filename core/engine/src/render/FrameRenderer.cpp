@@ -2899,7 +2899,7 @@ uniform float uLookChroma; // 色度 S 曲线端点增益
 // 开时预览按 HAL 域统计自标定（各自自洽，与成片近似）。
 // 注：旧的"直通"理由（baseTone S 曲线压死 HAL 暗部 59×）已随旧链删除而消失；
 // filmic 吃线性输入 + 域映射后不再有压死问题。
-uniform float uPreviewMap;
+uniform float uHalDomainMap;
 uniform float uDomainRatio;
 // ── M4-7 局部色调映射 ────────────────────────────────────────────────
 // 低频亮度图（32×24、显示域 luma、硬件 LINEAR 上采样）+ 强度 + knee。
@@ -3206,19 +3206,18 @@ void main() {
     // 验证（−0.3EV）：后置乘性只整体平移亮度（黑位/对比不动，红杯 rel 0.65→0.76 仍灰），
     // 形状必须由曲线内的曝光决定。
     vec3 mapped = max(lin, vec3(0.0)) * uExposure;
-    // 预览域映射（v0.8.0，取代直通）：先除以在线估计的 HAL/RAW 域比，映射回 RAW
-    // 等效域，再走与成片完全相同的 filmic 链 —— 真 WYSIWYG。
-    // filmicTone 输出 pow(clamp(spline), power) ∈ [0,1]，数学有界 —— 预览不再可能爆白。
-    if (uPreviewMap > 0.5) {
-        vec3 evMapped = mapped / uDomainRatio;
-        vec3 toned = filmicTone(evMapped);
-        // 预览与成片同链（WYSIWYG）：gamut mapping 同样生效
-        oColor = vec4(uGamut > 0.5 ? gamutMapV5(evMapped, toned) : toned, 1.0);
-        return;
-    }
+    // ── 第 6 期（S11 / S12）：域映射**只影响输入域，不再短路后续链**──────────
+    // HAL 显示域输入（预览链、YUV 静拍链）先除以在线估计的 HAL/RAW 域比，映射回
+    // RAW 等效域；RAW 静拍链本来就是场景线性域，不动。
+    // 旧写法（≤0.10.156）在这里直接 `return` —— 跳过 local_tone/sat/split/look/mono，
+    // 而紧邻的注释却写着"预览与成片同链（真 WYSIWYG）"，**注释与代码矛盾**；
+    // 同时 `uToneK = 0` 时预览无条件跑 filmic、成片却整段跳过，是第二处 WYSIWYG 破绽。
+    // 另：本 uniform 原名 uPreviewMap，但它的真实语义是"输入是 HAL 显示域"——
+    // 被当成"是否预览"用，正是 YUV 静拍链（HAL 域）被误当场景线性域的根因（S12）。
+    // 现更名为 uHalDomainMap，与"是否静拍"完全解耦。
+    vec3 out3 = (uHalDomainMap > 0.5) ? mapped / uDomainRatio : mapped;
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
     // filmic 直接吃线性场景输入 —— blackEv/whiteEv 的标定域与渲染域首次严格一致。
-    vec3 out3 = mapped;
     // M4-7 局部色调映射：按**局部相对画面基准**的暗度补光 —— 比基准暗得越多补得越多，
     // 到 uLocalKnee 以上（含所有亮区/高光）归零。刻意放在 baseTone **之前**：这里还是
     // 线性域，S 曲线对暗部的弹性约 2（离线实测 +60% 线性 → 显示域 +45~55%），同样的
@@ -4206,7 +4205,7 @@ bool FrameRenderer::init() {
   }
 
   u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
-  u_film_.preview_map = glGetUniformLocation(prog_film_, "uPreviewMap");
+  u_film_.hal_domain = glGetUniformLocation(prog_film_, "uHalDomainMap");
   u_film_.domain_ratio = glGetUniformLocation(prog_film_, "uDomainRatio");
   u_film_.sat = glGetUniformLocation(prog_film_, "uSat");
   u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
@@ -4649,7 +4648,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     passOES(rw, rh, st, rot, sx, sy, p);
     if (diag) logPassDiag("pass1_oes", fbo_scene_, true);
   }
-  passFilm(rw, rh, p, tex_scene_, /*still=*/false);
+  passFilm(rw, rh, p, tex_scene_, /*still=*/false, /*hal_domain=*/true);
   if (diag) logPassDiag("pass2_film", fbo_work_, true);
 
   if (scaled) {
@@ -4670,7 +4669,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     } else {
       passOES(dst_w, dst_h, st, rot, sx, sy, p);
     }
-    passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false);
+    passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false, /*hal_domain=*/true);
   }
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
@@ -4686,7 +4685,9 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
 // RAW 成片链在 prepareRawCommon 里以 (wb_r/wb_g, 1, wb_b/wb_g) 乘在 asShotNeutral
 // 之上；而 OES 预览 / YUV 静拍此前把原始 (wb_r, wb_g, wb_b) 直接乘进 pass1 的线性值
 // ——**没有除 wb_g**。wb_g ≠ 1 时这两条链的整体亮度会被 wb_g 缩放（RAW 成片不会），
-// 静拍 `uPreviewMap = 0` 又没有任何域比/亮度归一兜底 ⇒ 成片亮度随 WB 的 G 分量漂移。
+// 静拍侧当时也**不做域比归一**（域标志被 `still` 兼任）⇒ 亮度随 WB 的 G 分量漂移。
+// 【第 6 期已修】域标志独立为 `hal_domain`：YUV 静拍链与预览链同走域比归一
+//（uHalDomainMap），且域比的在线标定也只认 RAW 静拍帧（详见 passFilm 内注释）。
 // 逐通道防呆与 prepareRawCommon 完全同口径：该通道 WB 补偿非法（≤0）时取 1（不动）。
 static void wbCompGNorm(const FilmParams& p, float out[3]) {
   const bool ok_g = p.wb_g > 1e-6f;
@@ -4807,7 +4808,9 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   }
 
   passStill(dst_w, dst_h, effective_rot, p);
-  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/true);
+  // 第 6 期（S12）：YUV 静拍链的输入同样是 HAL 显示域 ⇒ 必须走域比归一。
+  // 旧写法传 still=true 使它拿到 hal_domain=0，被当作场景线性域（亮度随 AWB 漂移）。
+  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/true, /*hal_domain=*/true);
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
     if (tex_cap_) {
@@ -6016,10 +6019,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // threshold 是实际范数的 2.9 倍、命中率 0%）。CCM 为行主序（sensor→sRGB）。
   for (int i = 0; i < 3; ++i) hr_gain_[i] = c.gains[i];
   for (int i = 0; i < 9; ++i) hr_ccm_[i] = c.ccm[i];
+  // 第 6 期（S12）：RAW 静拍链的输入本来就是**场景线性域** ⇒ hal_domain = false
+  //（不做域比归一）。三条链的域标志至此齐全：预览=true、YUV 静拍=true、RAW 静拍=false。
   passFilm(dst_w, dst_h, p,
            (c.dn && mst_ok) ? tex_scene_
                             : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_),
-           /*still=*/true);
+           /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
 
   if (cap_w_ != dst_w || cap_h_ != dst_h) {
@@ -8434,7 +8439,7 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 }
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
-                             bool still) {
+                             bool still, bool hal_domain) {
   // filmic 的自动 EV 标定（v0.7.3）：**刻意放在 passFilm 内** —— 预览 / YUV 静拍 /
   // RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 开关语义（v0.7.6）：黑白点来自用户配置（FilmParams[37]/[38]，默认 −7.65/+4.56）；
@@ -8464,9 +8469,14 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 统计中位 —— 预览帧 = HAL OES 域，静拍帧 = RAW/YUV 链域。同一场景两类帧交替
   // 到达，用 EMA 各记一侧，静拍时对出比值：
   //   ratio = 预览中位 / RAW 中位（v0.6.48 实测范围 1.70–3.87，EMA 平滑 AE/构图抖动）
-  // 预览除以它回到 RAW 等效域（shader 的 uPreviewMap 分支），filmic 曲线因此与
+  // 预览除以它回到 RAW 等效域（shader 的 uHalDomainMap 分支），filmic 曲线因此与
   // 成片共用（WYSIWYG）。首拍前 ratio 用初值 2.0（实测范围中位）兜底。
-  if (still) {
+  // ── 第 6 期（S12，完整修复）──────────────────────────────────────────
+  // 判据从 `still` 改为 `!hal_domain`：域比是"HAL 域 / RAW 域"之比，**只有 RAW 静拍帧**
+  // 才在 RAW 域。YUV 静拍帧同为 HAL 域，若参与标定会把比值拉向 1，污染的是**预览**的
+  // 域映射（影响面比 S12 原文写的"静拍亮度漂移"更大）。`still` 在此处本就是错用的
+  // 语义 —— 它在 HR 小波（:8457）与日志节流（:8558）处的含义才是"是否静拍"。
+  if (!hal_domain) {
     if (g_pv_mid_ema > 1e-4f && last_lin_mid_ > 1e-6f) {
       const float r = std::clamp(g_pv_mid_ema / last_lin_mid_, 1.2f, 4.5f);
       g_domain_ratio = g_domain_ratio * 0.7f + r * 0.3f;
@@ -8527,7 +8537,9 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // v0.10.13：darktable v5 gamut mapping 开关（1 = 标准，0 = A/B 关）
   glUniform1f(u_film_.gamut, p.gamut);
   // 预览域映射（v0.8.0）：预览先 /uDomainRatio 回 RAW 等效域再走 filmic；静拍=1。
-  glUniform1f(u_film_.preview_map, still ? 0.0f : 1.0f);
+  // 第 6 期（S12）：域标志**独立于 still** —— YUV 静拍链的输入也是 HAL 显示域，
+  // 旧写法用 `still` 兼任域标志，把它当场景线性域送进 filmic。
+  glUniform1f(u_film_.hal_domain, hal_domain ? 1.0f : 0.0f);
   glUniform1f(u_film_.domain_ratio, g_domain_ratio);
   // 用户 EV 滑杆 = 显示亮度补偿（v0.7.8 影调链之后乘；预览在域映射后同乘）
   glUniform1f(u_film_.exposure, std::exp2(p.exposure_ev));

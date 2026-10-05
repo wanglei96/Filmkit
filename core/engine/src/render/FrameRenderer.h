@@ -447,7 +447,8 @@ class FrameRenderer {
   void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
                       float user_white, float white_hl, float white_floor,
                       float white_probe, float user_ev);
-  void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still);
+  void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
+                bool hal_domain);
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
   void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
@@ -821,7 +822,7 @@ class FrameRenderer {
     GLint tex = -1, sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
           look_sat = -1, look_chroma = -1, local = -1,
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
-          local_size = -1, preview_map = -1, domain_ratio = -1,
+          local_size = -1, hal_domain = -1, domain_ratio = -1,
           // ── filmic（v0.7.3，darktable v3 spline）────────────────────────────
           // 三段四次多项式 y = M1 + x·(M2 + x·(M3 + x·(M4 + x·M5)))，下标
           // [0]=toe [1]=shoulder [2]=中间线性段。系数由 CPU 侧 computeFilmicSpline 求解。
