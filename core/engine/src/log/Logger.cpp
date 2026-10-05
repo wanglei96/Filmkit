@@ -83,6 +83,13 @@ const char* Logger::levelName(LogLevel level) {
   return "info";
 }
 
+// 日志目录（init 设定；空 = 目录不可写/仅内存模式）。
+// v0.10.163：诊断 dump 复用同一目录（<dir>/diag），不再另开一套路径下发通道。
+std::string Logger::dir() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return dir_;
+}
+
 bool Logger::init(const std::string& dir) {
   std::lock_guard<std::mutex> lk(mu_);
   dir_ = dir;

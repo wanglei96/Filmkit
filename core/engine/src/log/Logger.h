@@ -25,6 +25,10 @@ class Logger {
   std::string recentLines(int max_lines) const;
   bool flush();
 
+  // 日志目录（init 设定；空 = 目录不可写/仅内存模式）。
+  // v0.10.163：诊断 dump 复用同一目录（<dir>/diag）。
+  std::string dir() const;
+
   size_t droppedCount() const;
 
   static const char* levelName(LogLevel level);

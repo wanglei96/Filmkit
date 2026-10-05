@@ -553,6 +553,17 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetPreviewScale(JNIEnv*, jobject,
   FrameRenderer::setPreviewScale(scale);
 }
 
+// 诊断统计开关（v0.10.166）：prefs `diag_stats`（**默认开**）= 成片链 5 个阶段
+// （D3-camrgb/D4-scene/HR-filmsrc/FILM-out/D5-out-u8）的色度统计量在 **GPU 内归约**
+// 后只读回 64 字节，逐阶段写一条 `diag.stats`。上一版的图像 dump（挂 FBO 读浮点图
+// → PFM）真机读回失败且破坏渲染状态（成片全黑），已整体删除。
+// 只置一个进程级 atomic；关闭时全链零额外开销。任意线程可调。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSetDiagStats(JNIEnv*, jobject,
+                                                           jboolean on) {
+  FrameRenderer::setDiagStats(on == JNI_TRUE);
+}
+
 // M4：3D LUT（display 域）。data = RGB 交错（.cube 顺序，红最快），长度 size³×3；
 // size ≤ 1 或 data 为空 = 关闭。任意线程可调（引擎内部暂存，渲染线程上传纹理）。
 // v0.10.85：同时写入进程级快照并下发到预览 / 拍照两个实例 —— 拍照侧实例可能
