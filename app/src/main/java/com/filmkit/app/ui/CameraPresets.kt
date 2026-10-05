@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(48).apply {
+    private fun neutral(): DoubleArray = DoubleArray(56).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -110,8 +110,10 @@ object CameraPresets {
         // 41 = darktable filmic 高光重建（v0.10.15）：à trous 小波重建部分通道
         // 裁剪的高光（治过曝边缘品红残留），线性 RGB 域、filmic 前。原生算法
         // 完整实现（mask/inpaint/小波/RGB+ratios 两轮），参数 = darktable 默认。
-        // 默认开；0 = A/B 通路。设置页开关写 prefs("hr_wavelet")。
-        this[41] = 1.0
+        // 默认**关**（v0.10.162：PC 路子无此模块，本模块与 [45] hr_raw 职责重复）；
+        // 1 = 开。设置页开关写 prefs("hr_wavelet")，CameraController.applyHrWaveletPref
+        // 是决定下发值的那一层（它总能覆盖这里的预设值）。
+        this[41] = 0.0
         // 42 = 白点高光感知（v0.10.27，auto_tone 开时生效）：对数域场景统计 +
         // P99.9 驱动白点上探（≤+1.5EV、物理钳制不变）+ darktable contrast 参数
         // 按 power 前后比补偿中间调回退。治"高光太白压不住"（统计 clamp 使 P99
@@ -135,6 +137,57 @@ object CameraPresets {
         // 基准样片紫边 ↓63%、红物体色度 +1%。默认 1；0 = A/B 通路。
         // 设置页开关写 prefs("defringe")。
         this[47] = 1.0
+        // 48 = 伪彩感知色度降噪强度（档 A，v0.10.165）：0 = 关（A/B 通路），
+        // >0 = σc 放大倍率（scEff = sc·(1 + moire·[48])，封顶 4·sc）。
+        // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 51，数组越界会直接崩。
+        this[48] = 2.0
+        // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
+        // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
+        // 只留分支① 的 darktable opposed 外推 = PhotonCamera OpposedGL 口径）。
+        // 用途：真机同帧 A/B 判"过曝边缘品红"（离线高光区 B/G 1.0856→1.0217）。
+        // **默认必须 1.0**（不改变默认画质）；设置页开关写 prefs("hl_grecon")，
+        // CameraController.applyHlGReconPref 是决定下发值的那一层。
+        this[49] = 1.0
+        // 50 = 镜头横向色差校正（v0.10.170）：0 = 关（A/B 通路，不跑任何 pass）；
+        // >0 = 开关 + 估计位移的强度倍率。作用在 D3（RCD 去马赛克后 / CCM 前）
+        // 相机 RGB 域，只重采样 R/B、G 不动；自动估计（1/8 降采样 + 径向 LK），
+        // 角部位移 < 0.25px 判定无横向色差 ⇒ 整段跳过（零副作用）。
+        // ⚠️ 默认 1.0 的实测依据与局限（对 2026-10-05 逆光基准样片**不动作**）
+        // 见 /tmp/cacorr/REPORT.md；设置页开关写 prefs("ca_corr")。
+        this[50] = 1.0
+        // 51..53 = 强边缘色度门 v2（v0.10.174）：
+        // PC `esd3d2.glsl:78-82` = `chromaDiff *= max(|Δx|,|Δy|)` +
+        // `sigZ = max(sigY, min(chromaNoise·MOIRE, 0.2))`，且色度权重 w2 = 1−d²/(d²+σ)
+        // 只由 sigZ 决定（无独立亮度项）⇒ 强边缘处跨边缘把伪彩抹平，亮度另走 sigY 路。
+        // v0.10.173 把 PC 的**绝对** cap 0.2 全图生效（73.7% 像素被放宽）+ D-1 五级
+        // 100% 覆盖 ⇒ 真机"一片红一片黄一片紫"。v2 改为：**逐像素门**
+        // smoothstep(0.10, 0.30, |∇L|)（∇≤10 显示域必然为 0）+ **相对上限 16·σc** +
+        // **D-1 只在最细两级**（uStep ≤ 2）。
+        // [51] = κ（0 = 关 ⇒ P4/D-1 逐位回到 v0.10.172）；κ=2 沿用 PC 的 0.2 标定。
+        // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
+        // [53] = 紫边判据梯度自适应（默认 0 关）。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 54，数组越界会直接崩。
+        // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
+        this[51] = 2.0
+        this[52] = 1.0
+        this[53] = 0.0
+        // 54/55 = PC ESD3D2 完整移植（v0.10.175）：核尺寸 + 尺度结构 + 伪彩强度逻辑
+        // 全部照抄 PC（`esd3d2_steered.glsl` + `ESD3D2.java` + `convdiff.glsl` +
+        // `guidedupsample.glsl` + `GLUtils.gaussdown`）。
+        // [54] = 0 = **关（默认）**，tex_scene_ 直通 P4（与 v0.10.174 逐位相同）；
+        //        1 = **替换档**（照抄 PC 的链路地位：PC3D 输出直接进 film，
+        //            P4/defringe/D-1 旁路，代码全保留）；2 = 叠加档（PC3D → 现有链）。
+        // [55] = 0 = 核尺寸自动（PC 公式 min(7+(int)ks−(int)ks%2, 21)，本机 ⇒ 11）；
+        //        >0 = 强制 MSIZE（奇数 7..21），真机拍板"代价 vs 收益"用。
+        // ⚠️ 默认关的依据（离线四组数据，/tmp/pc3d/REPORT.md）：收益随核尺寸/MOIRE
+        // 单调下降但**达不到 PC 的 3.68**；且离线域（成片反推线性）的 sigZ 诊断显示
+        // PC 的绝对 cap 0.2 **从未触发**（sigZ60 0.007~0.012、吃满率 0.0%）
+        // ⇒ 离线低估了 PC 的伪彩强度，**证据不足以证明真机更优 ⇒ 默认关**。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
+        // 真机 A/B：prefs("pc3d") / prefs("pc3d_msize")。
+        this[54] = 0.0
+        this[55] = 0.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

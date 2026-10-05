@@ -162,9 +162,33 @@ object EngineBridge {
     external fun nativeEngineSetPreviewScale(scale: Float)
 
     /**
+     * 诊断统计（v0.10.166）：true = 成片链 5 个阶段（D3-camrgb / D4-scene /
+     * HR-filmsrc / FILM-out / D5-out-u8）的色度统计量在 **GPU 内归约**成 16 个
+     * float32，位打包后只读回 64 字节，逐阶段写一条 `diag.stats` 日志事件
+     * （含 sumR/sumG/sumB/n/nan/rgByBand 与 split/look/sat/mono/tone/gm 快照）。
+     * 由 prefs `diag_stats`（**默认开**）控制；改 prefs 后重进相机界面生效。
+     * 关闭时全链零额外开销（每个统计点一次 atomic load）。
+     * 上一版 `diag_dump`（读回浮点图像落 PFM）真机读回失败且破坏渲染状态，已删除。
+     */
+    external fun nativeEngineSetDiagStats(on: Boolean)
+
+    /**
      * 3D LUT（M4）：display 域 LUT，引擎把它接在输出 OETF 之后（kFsOut/kFsHist，四面体插值）。
      * data = RGB 交错、顺序与 .cube 一致（红最快），长度 size³×3；size ≤ 1 或 data = null = 关闭。
      * 可在任意线程调用（引擎内暂存，渲染线程上传纹理）；强度走 FilmParams[34]。
      */
     external fun nativeEngineSetLut(size: Int, data: FloatArray?, domainMin: FloatArray, domainMax: FloatArray)
+
+    /**
+     * 成片 JPEG 4:4:4 编码（v0.10.171）。bitmap 必须是 ARGB_8888 软件位图；
+     * quality < 91 会被钳到 91（编码器在 ≤90 时退回 4:2:0，本函数承诺 4:4:4）。
+     * 返回编码后的 JPEG 字节流；**null = 编码失败，调用方必须回退 Bitmap.compress**
+     * （丢成片比退到 4:2:0 严重得多）。任意线程可调（只读 Bitmap 像素）。
+     *
+     * 动机：Bitmap.compress 无采样因子参数，Android 上恒为 4:2:0；4:2:0 的色度下采样
+     * 会在强亮度边缘两侧互相串色 ⇒ 中性边缘的紫/绿镶边。离线对照实验（同一渲染源，
+     * 仅改编码）在中性强边缘处测得编码引入的色度误差 p99 4:4:4 1.36 vs 4:2:0 9.77、
+     * max 1.94 vs 49.17；真实成片侧证：同机同表的 PhotonCamera 成片为 4:4:4。
+     */
+    external fun nativeEncodeJpeg444(bitmap: android.graphics.Bitmap, quality: Int): ByteArray?
 }

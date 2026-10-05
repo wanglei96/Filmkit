@@ -1078,8 +1078,36 @@ class CameraController(private val context: Context, private val render: RenderC
     private val RCD_CDFIX = 1.0
     // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）
     private val DEFRINGE = 1.0
+    // v0.10.169：高光重建·G 通道重建（FilmParams[49]）。1 = 开 = 现有行为
+    // （kFsHlApply 的 apply 支含自创的 G 三级池化比 + allSat 三通道改写）；
+    // 0 = 关（apply 只留分支① 的 darktable opposed 外推 = PhotonCamera 口径）。
+    private val HL_GRECON = 1.0
+    // v0.10.170：镜头横向色差校正（FilmParams[50]）。作用在 D3（RCD 去马赛克后 /
+    // CCM 前）相机 RGB 域：自动估计（1/8 降采样 + 径向 Lucas-Kanade）+ 径向位移
+    // 重采样 R/B（G 逐位不动）。判据：角部位移 ≥ 0.5px 且内外半区拟合一致，
+    // 否则该通道不动作；两通道都不动作 ⇒ 整段跳过（走原 tex_work_）。
+    private val CA_CORR = 1.0
+    // v0.10.173：强边缘色度梯度门（FilmParams[51]，照抄 PhotonCamera 的 sigZ 架构）。
+    // PC 依据 = esd3d2.glsl:78-82（chromaDiff *= max(|Δx|,|Δy|) 与
+    // sigZ = max(sigY, min(chromaNoise·MOIRE, 0.2))，色度权重只由 sigZ 定）。
+    // κ=2 的标定与离线实测见 core/engine/src/film/FilmParams.h 的 [51] 注释。
+    // 0 = 关（A/B 通路 ⇒ P4/D-1 逐位回到 v0.10.172）。
+    private val CHROMA_GATE = 2.0
+    // v0.10.176：PC ESD3D2 结构开关（FilmParams[54] / [55]，prefs `pc3d` /
+    // `pc3d_msize`）—— 引擎侧 v0.10.175 已完整实现，但此前**没有设置页入口 ⇒
+    // 用户无法打开**；本版只补 UI + 下发通路，不动引擎。
+    // [54]：0 = 关（默认 ⇒ 与 v0.10.174 逐位相同）/ 1 = 替换档（旁路 P4/D-1）/
+    //       2 = 叠加档（叠在现有色度降噪之上）。
+    // [55]：0 = 自动（照抄 PC 公式）/ 7 / 11 / 15 / 21 = 强制核尺寸（奇数）。
+    // 代价与离线数据见 FilmParams.h 的 [54]/[55] 注释；真机判据 = 日志字段
+    // pc3dOn / pc3dM / pc3dK / pc3dSc / pc3dMs。
+    private var pc3dPref = -1.0
+    private var pc3dMsizePref = -1.0
+    private var chromaGatePref = -1.0
     private var rcdCdFixPref = -1.0
     private var defringePref = -1.0
+    private var caCorrPref = -1.0
+    private var hlGreconPref = -1.0
     private var hrRawPref = -1.0
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
@@ -1174,6 +1202,10 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHrRawPref()
         applyRcdCdFixPref()
         applyDefringePref()
+        applyHlGReconPref()
+        applyCaCorrPref()
+        applyChromaGatePref()
+        applyPc3dPref()
         applyWhiteHlPref()
         applyWhiteFloorPref()
         applyWhiteProbePref()
@@ -1271,9 +1303,15 @@ class CameraController(private val context: Context, private val render: RenderC
      * à trous 小波重建部分通道裁剪的高光（线性 RGB 域、filmic 前），原生算法
      * 完整实现（mask/inpaint/小波/RGB+ratios 两轮），参数 = darktable 默认。
      * 0 = 关（A/B 通路）。
+     * ── v0.10.162：默认值 true → **false（默认关）**────────────────────────
+     * 本层是"下发给引擎的值"的**唯一决定层**（`hrPref` 初值 −1.0 ⇒ 首次调用必
+     * 写入），所以默认关只需改这里；prefs 里已显式存过的值不受影响（老用户不变）。
+     * 依据：PC（对标对象）没有小波高光重建这一模块，它的高光处理只有 OpposedGL
+     * 一套（我们的 [45] hr_raw），本模块与之职责重复 ⇒ 按 PC 路子本该退场，
+     * 先默认关、不删链（保留开关供 A/B 复核）。回退细节见 settings 侧同款注释。
      */
     private fun applyHrWaveletPref() {
-        val v = if (appPrefs.getBoolean("hr_wavelet", true)) HR_WAVELET else 0.0
+        val v = if (appPrefs.getBoolean("hr_wavelet", false)) HR_WAVELET else 0.0
         if (v != hrPref) {
             hrPref = v
             filmParams[41] = v
@@ -1324,6 +1362,91 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != defringePref) {
             defringePref = v
             filmParams[47] = v
+        }
+    }
+
+    /**
+     * 高光重建·G 通道重建开关（v0.10.169）：写 FilmParams[49]。
+     * kFsHlApply（RAW 域高光重建的 apply 支）里"自创机制"两支的总开关 ——
+     * ① 普通 G 的三级池化比重建（`else if (v >= uHlClip && c == 1)`）；
+     * ② allSat 三通道同步改写。与 PhotonCamera 的 OpposedGL 逐行对照后，这两支
+     * 贡献了"过曝边缘品红"B/G 偏差的 71%（离线逐位仿真：G 池化比 +0.0384、
+     * allSat 改写 +0.0255；被强制 0 的 chroma 反向抵消 −0.0218）。
+     * 0 = 关 ⇒ shader 内 `if (uGRecon > 0.5)` 整段跳过，apply 支只剩分支① 的
+     * opposed 外推（= PhotonCamera OpposedGL 口径；离线高光区 B/G 1.0856 → 1.0217、
+     * R/G 0.9773 → 1.0051）。
+     * ⚠ 默认 1.0（**不改变默认画质**）：allSat 在基准片占 G 饱和像素 44.15%，
+     * 台灯类场景可能退化 ⇒ 仅供真机同帧 A/B，改默认前必须真机数据说话。
+     */
+    private fun applyHlGReconPref() {
+        val v = if (appPrefs.getBoolean("hl_grecon", true)) HL_GRECON else 0.0
+        if (v != hlGreconPref) {
+            hlGreconPref = v
+            filmParams[49] = v
+        }
+    }
+
+    /**
+     * 镜头横向色差校正开关（v0.10.170）：写 FilmParams[50]。
+     * 作用在 D3（RCD 去马赛克后、passCcm 之前）的相机 RGB 域 —— 色差是纯几何
+     * 位移，此域通道尚未被 CCM 混合；只重采样 R/B，G 逐位不动（G 为参考通道）。
+     * 自动估计（无镜头配置文件）：1/8 box 降采样 → readPixels → CPU 逐环带一维
+     * 径向 Lucas-Kanade，解 d·r̂ = k·r 的过原点最小二乘。
+     * 0 = 关（A/B 通路，不跑任何 pass）。日志字段 caK / caShiftR / caShiftB /
+     * caApplied 给出实际估计与是否动作。
+     * ⚠ 默认 1.0 的依据：双重判据（角部位移 ≥ 0.5px **且** 内外半区拟合一致）
+     * 保证对**无横向色差**的场景零动作；对 2026-10-05 逆光基准样片实测原始估计
+     * 仅 0.13/0.41px 且内外半区不相容 ⇒ 判据全部否决、模块不动作
+     * （详见 /tmp/cacorr/REPORT.md）。
+     */
+    private fun applyCaCorrPref() {
+        val v = if (appPrefs.getBoolean("ca_corr", true)) CA_CORR else 0.0
+        if (v != caCorrPref) {
+            caCorrPref = v
+            filmParams[50] = v
+        }
+    }
+
+    /**
+     * 强边缘色度门开关（v0.10.174）：prefs `chroma_gate`（默认开）写 FilmParams[51]。
+     * 关（false）⇒ [51]=0 ⇒ P4/D-1 的门整段不执行，输出逐位回到 v0.10.172。
+     * 真机 A/B 判据：同场景开/关各一张，比 diag.stats 的强边缘紫边与日志字段
+     * cgK/cgCap/cgScope/cgMean/cgP95/cgCov（**门控覆盖率**：健康区间 cgMean ≤ 0.15、
+     * cgCov ≤ 0.05；v0.10.173 的旧口径下这两个数是 100%）。若真机仍见色块，
+     * 关掉本开关即逐位回退（已验证），无需改代码。
+     */
+    private fun applyChromaGatePref() {
+        val v = if (appPrefs.getBoolean("chroma_gate", true)) CHROMA_GATE else 0.0
+        if (v != chromaGatePref) {
+            chromaGatePref = v
+            filmParams[51] = v
+        }
+    }
+
+    /**
+     * PC 降噪结构（ESD3D2，v0.10.175 引擎 / v0.10.176 设置页入口）：prefs `pc3d`
+     * （0 关 / 1 替换档 / 2 叠加档）写 FilmParams[54]，prefs `pc3d_msize`
+     * （0 自动 / 7 / 11 / 15 / 21）写 FilmParams[55]。
+     * ⚠ 默认两者都是 0 = **关 + 自动** ⇒ 与 v0.10.174 逐位相同，不改变默认画质；
+     * 本通路存在的唯一目的是真机同场景 A/B。改默认前必须真机数据说话。
+     * 越界兜底：`pc3d` 不在 0..2、`pc3d_msize` 不是 0 或 7..21 的奇数 ⇒ 归 0
+     * （防手改 prefs / 旧值把非法核尺寸喂给引擎）。
+     * 真机判据：日志 pc3dOn=1 且 pc3dM∈[7,21]、pc3dSc=1..4 ⇒ 生效；pc3dOn=0 而
+     * [54]>0.5 ⇒ shader 编译/链接或纹理分配失败（pc3d.compile_fail）；
+     * pc3dMs 与 dnMs 同量级 ⇒ 成本正常，pc3dMs ≫ dnMs ⇒ 过强（把核尺寸调小）。
+     */
+    private fun applyPc3dPref() {
+        val v = appPrefs.getInt("pc3d", 0).let { if (it in 0..2) it else 0 }.toDouble()
+        if (v != pc3dPref) {
+            pc3dPref = v
+            filmParams[54] = v
+        }
+        val m = appPrefs.getInt("pc3d_msize", 0)
+            .let { if (it == 0 || (it in 7..21 && it % 2 == 1)) it else 0 }
+            .toDouble()
+        if (m != pc3dMsizePref) {
+            pc3dMsizePref = m
+            filmParams[55] = m
         }
     }
 
@@ -1458,6 +1581,15 @@ class CameraController(private val context: Context, private val render: RenderC
         runCatching {
             EngineBridge.nativeEngineSetYuvMatrix(0)
         }
+        // 诊断统计（v0.10.166）：prefs `diag_stats`（**默认开**）= 成片链各阶段的色度
+        // 统计量在 GPU 内归约后只读回 64 字节，逐阶段写一条 diag.stats 日志事件
+        //（sumR/sumG/sumB/n/nan/rgByBand + 开关快照），用于定位"全图显示域偏红"
+        // 产生在哪一步。每次进相机界面读一次 ⇒ 改 prefs 后重进相机界面生效。
+        runCatching {
+            EngineBridge.nativeEngineSetDiagStats(
+                context.getSharedPreferences("filmkit", 0).getBoolean("diag_stats", true),
+            )
+        }
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
         orientationListener.enable() // 设备方向 → orientationStep（成片旋转 + 对焦区域映射）
@@ -1532,7 +1664,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 // 触发时 4 帧同参 captureBurst（HDR+：恒曝光使对齐鲁棒）。
                 val prefs = context.getSharedPreferences("filmkit", 0)
                 val mode = prefs.getInt("mfnr", 1)
-                val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+                val demosaic = prefs.getInt("demosaic_algo", -1)
+            .let { if (it in 0..2) it else if (prefs.getBoolean("demosaic_quality", true)) 1 else 0 }
                 val trigger = mfnrShouldTrigger(
                     mode, rawMode, demosaic == 1, liveIso, liveExposureNs,
                 )
@@ -2378,7 +2511,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val prefs = context.getSharedPreferences("filmkit", 0)
         val dngOn = prefs.getBoolean("dng_enabled", false)
         // 去马赛克质量档：1 = RCD 三段管线（默认，M3-1）；0 = bilinear 速度档
-        val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+        val demosaic = prefs.getInt("demosaic_algo", -1)
+            .let { if (it in 0..2) it else if (prefs.getBoolean("demosaic_quality", true)) 1 else 0 }
         // 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、
         // 2 = 2×σ；仅 RCD 生效）。旧三档 key 自动迁移（见 denoiseStrength）。
         val noiseStrength = denoiseStrength(
@@ -2535,7 +2669,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val ch = curCharacteristics
         val prefs = context.getSharedPreferences("filmkit", 0)
         val dngOn = prefs.getBoolean("dng_enabled", false)
-        val demosaic = if (prefs.getBoolean("demosaic_quality", true)) 1 else 0
+        val demosaic = prefs.getInt("demosaic_algo", -1)
+            .let { if (it in 0..2) it else if (prefs.getBoolean("demosaic_quality", true)) 1 else 0 }
         // 降噪强度（C 专项：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、2 = 2×σ）
         val noiseStrength = denoiseStrength(
             prefs.contains("noise_reduction_strength"),
@@ -3139,6 +3274,31 @@ class CameraController(private val context: Context, private val render: RenderC
         // 这是用户报的"边缘色带"的最后一环：降噪抹平噪声 → 8bit 量化台阶
         // → dither 打散 → JPEG q95 又把 dither 滤掉。
         val jpegQ = prefs.getInt("jpeg_quality", 100)
+        // ── 成片 JPEG 色度采样（v0.10.171）─────────────────────────────────
+        // 默认 **4:4:4**。Bitmap.compress 无采样因子参数、Android 上恒 4:2:0，
+        // 而 4:2:0 的色度下采样会把强亮度边缘两侧的色度互相平均 ⇒ 中性边缘（窗框/
+        // 晾衣杆/枝条 vs 过曝天空）出现紫/绿镶边。离线对照（同一渲染源、只改编码，
+        // 12.5MP RAW → DCB 去马赛克 → filmic → 8bit）在中性强亮度边缘 11.6 万像素上
+        // 实测编码引入的色度误差：4:4:4 p99 1.36 / max 1.94，4:2:0 p99 9.77 /
+        // max 49.17（ΔC 相对无损 PNG）⇒ 边缘串色误差的 ~86–96% 由 4:2:0 贡献。
+        // 侧证：同机同量化表的 PhotonCamera 成片 SOF0 为 4:4:4（FilmKit 为 4:2:0）。
+        // 依据与体积/耗时实测见 /tmp/jpeg444/REPORT.md；false = 旧行为（4:2:0）。
+        val jpeg444 = prefs.getBoolean("jpeg_444", true)
+        // 编码一次（下面两个落盘分支只差写入目标）；native 失败返回 null ⇒ 回退
+        // Bitmap.compress（宁可退到 4:2:0，不可丢成片）。
+        val encT0 = System.nanoTime()
+        // runCatching 兜住 UnsatisfiedLinkError（老 .so 被缓存等极端情形）：任何失败都退
+        // 回 Bitmap.compress，绝不让编码环节把成片整张丢掉。
+        val jpegBytes: ByteArray? =
+            if (jpeg444) runCatching {
+                EngineBridge.nativeEncodeJpeg444(outBmp, jpegQ)
+            }.getOrNull() else null
+        val encMs = (System.nanoTime() - encT0) / 1_000_000
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.encode",
+            kv("chroma" to (if (jpegBytes != null) "444" else "420"),
+                "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0)),
+        )
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
         // 未选 LUT 时无后缀。只保留字母/数字/下划线/连字符（中文名照常保留），避免非法路径字符。
         val lutTag = currentLut?.title
@@ -3148,6 +3308,11 @@ class CameraController(private val context: Context, private val render: RenderC
         // A/B 成片靠它区分文件名（MediaStore 同名会自动加 (1)，靠后缀更可读）
         val suffix = extraTag + if (lutTag.isNullOrEmpty()) "" else "_$lutTag"
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$suffix.jpg"
+        // 4:4:4 走 native 字节流，4:2:0 / native 失败走 Bitmap.compress
+        val writeJpeg: (java.io.OutputStream) -> Unit = { os ->
+            if (jpegBytes != null) os.write(jpegBytes)
+            else outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, os)
+        }
         try {
             var savedUri: android.net.Uri? = null
             var savedFile: File? = null
@@ -3163,7 +3328,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     ?.let { uri ->
                         lastPhotoUri = uri
                         context.contentResolver.openOutputStream(uri)?.use {
-                            outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, it)
+                            writeJpeg(it)
                         }
                         cv.clear()
                         cv.put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -3174,7 +3339,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
                 dir.mkdirs()
                 File(dir, name).outputStream().use {
-                    outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, it)
+                    writeJpeg(it)
                 }
                 savedFile = File(dir, name)
             }

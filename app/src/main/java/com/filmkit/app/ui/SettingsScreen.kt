@@ -132,6 +132,20 @@ fun SettingsScreen(
                     )
                 },
             )
+            var jpeg444 by rememberSaveable { mutableStateOf(prefs.getBoolean("jpeg_444", true)) }
+            SettingSwitchRow(
+                title = "成片 4:4:4 色度",
+                subtitle = "开 = 色度不降采样（默认；治强亮度边缘的紫/绿镶边，体积约 1.9×）；关 = 4:2:0 旧行为",
+                checked = jpeg444,
+                onChecked = { on ->
+                    jpeg444 = on
+                    prefs.edit().putBoolean("jpeg_444", on).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.jpeg_444",
+                        "{\"on\":$on}",
+                    )
+                },
+            )
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
             SettingNavRow("自定义焦段", "最多 3 个，与原生焦段同显于变焦条（总 ≤6）") { onOpenFocals() }
             SettingSwitchRow(
@@ -227,18 +241,39 @@ private fun QualityDrawerContent() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
 
-    var rcdOn by remember { mutableStateOf(prefs.getBoolean("demosaic_quality", true)) }
+    // v0.10.172：RCD / Amaze 二选一（用户明确要求），并保留既有"快速 = bilinear"档。
+    // 取值：0 = 快速(bilinear) / 1 = RCD 质量（默认）/ 2 = Amaze。
+    // 读旧 prefs（demosaic_quality 布尔）做迁移：未写过新键时按旧值推断。
+    var demosaicMode by remember {
+        mutableStateOf(
+            prefs.getInt("demosaic_algo", -1)
+                .let { if (it in 0..2) it else if (prefs.getBoolean("demosaic_quality", true)) 1 else 0 },
+        )
+    }
     SettingValueRow(
         title = "RAW 去马赛克",
-        subtitle = "RCD 质量 = 方向自适应+色比修正，边缘伪彩少；快速 = bilinear，最快。仅影响 M 档成片",
-        valueText = if (rcdOn) "RCD 质量" else "快速",
+        subtitle = "RCD 质量 = 方向自适应+色比修正（默认，快）；Amaze = AMaZE（Martinec 2010，CPU 实现，纹理/细节取向，单张约 +0.3~1s，且当前不接 RAW 域降噪 ⇒ 高 ISO 噪声更大）；快速 = bilinear。仅影响 M 档成片",
+        valueText = when (demosaicMode) {
+            0 -> "快速"
+            2 -> "Amaze"
+            else -> "RCD 质量"
+        },
         onTap = {
-            val v = !rcdOn
-            rcdOn = v
-            prefs.edit().putBoolean("demosaic_quality", v).apply()
+            val v = when (demosaicMode) {
+                1 -> 2
+                2 -> 0
+                else -> 1
+            }
+            demosaicMode = v
+            prefs.edit().putInt("demosaic_algo", v).apply()
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "app", "settings.demosaic_quality",
-                "{\"rcd\":$v}",
+                "{\"algo\":$v,\"dem\":\"" +
+                    when (v) {
+                        0 -> "bilinear"
+                        2 -> "amaze"
+                        else -> "rcd"
+                    } + "\"}",
             )
         },
     )
@@ -339,6 +374,85 @@ private fun QualityDrawerContent() {
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "app", "settings.defringe",
                 "{\"on\":$v}",
+            )
+        },
+    )
+    // 镜头横向色差校正（v0.10.170）：D3（去马赛克后 / CCM 前）相机 RGB 域的
+    // 自动估计（1/8 降采样 + 径向 LK）+ 径向位移校正（只动 R/B，G 不变）。
+    // 见 CameraController.applyCaCorrPref 与 /tmp/cacorr/REPORT.md。
+    var caCorrOn by remember { mutableStateOf(prefs.getBoolean("ca_corr", true)) }
+    SettingSwitchRow(
+        title = "镜头色差校正",
+        subtitle = "横向色差（离轴紫/青边）自动估计 + 径向位移校正；无位移时不动作；关 = A/B 对照",
+        checked = caCorrOn,
+        onChecked = { v ->
+            caCorrOn = v
+            prefs.edit().putBoolean("ca_corr", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.ca_corr",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 强边缘色度门 v2（v0.10.174）：治"暗室逆光拍窗外"这类强亮度对比边缘上的紫/绿
+    // 镶边。关 = A/B 对照（FilmParams[51]=0 ⇒ P4/D-1 的门整段不执行，输出逐位回到
+    // v0.10.172）。v0.10.173 的旧形态在真机上"一片红一片黄一片紫"（绝对 cap 0.2
+    // 全图生效 + D-1 五级 100% 覆盖），v2 改为逐像素门（∇≤10 必然为 0）+ 相对上限
+    // 16·σc + D-1 只在最细两级。若仍见色块，关掉本开关即逐位回退。
+    // 见 CameraController.applyChromaGatePref 与 /tmp/chromagate2/REPORT.md。
+    var chromaGateOn by remember { mutableStateOf(prefs.getBoolean("chroma_gate", true)) }
+    SettingSwitchRow(
+        title = "强边缘色度门",
+        subtitle = "只在强亮度对比边缘（∇L 门控）的色度路上抑制紫/绿镶边，平坦区逐位不动；关 = A/B 对照",
+        checked = chromaGateOn,
+        onChecked = { v ->
+            chromaGateOn = v
+            prefs.edit().putBoolean("chroma_gate", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.chroma_gate",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // PC 降噪结构（ESD3D2）v0.10.176：引擎 v0.10.175 已把 [54]/[55] 完整移植，
+    // 但**此前没有任何设置页入口 ⇒ 用户无法打开它**（用户反馈"[54] 设为 2 在哪"）。
+    // 本版只补 UI + 下发通路（CameraController.applyPc3dPref），不动引擎。
+    // 0 = 关（默认）⇒ FilmParams[54]=0 ⇒ 与 v0.10.174 逐位相同；1 = 替换档
+    // （旁路 P4/D-1）；2 = 叠加档（叠在现有色度降噪之上）。核尺寸 `pc3d_msize`。
+    // 离线数据见 /tmp/pc3d/REPORT.md，默认值保持不变。
+    var pc3dMode by remember { mutableStateOf(prefs.getInt("pc3d", 0).coerceIn(0, 2)) }
+    SettingValueRow(
+        title = "色度降噪·多尺度",
+        subtitle = "两趟降采样结构（核 11、尺度 2）作用于色度降噪：低分辨率趟先做亮度/色度分离降噪，再引导上采样回全分辨率做第二趟。离线实测强边缘紫边 −12.6%（叠加档）/ −20.6%（核 21），但离参考实现的 3.68 仍差 2.3× —— 本层解决的是判据量级问题。代价：采样 2.3×、额外显存约 240MB。叠加档 = 在现有色度降噪之上叠加（离线色渗判据全绿）；替换档 = 旁路现有色度降噪（离线在重紫边样片上不稳）。默认关，仅供真机同场景 A/B",
+        valueText = when (pc3dMode) {
+            1 -> "替换档"
+            2 -> "叠加档"
+            else -> "关"
+        },
+        onTap = {
+            val v = (pc3dMode + 1) % 3
+            pc3dMode = v
+            prefs.edit().putInt("pc3d", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.pc3d",
+                "{\"pc3d\":$v}",
+            )
+        },
+    )
+    var pc3dMsize by remember { mutableStateOf(prefs.getInt("pc3d_msize", 0)) }
+    SettingValueRow(
+        title = "色度降噪核尺寸",
+        subtitle = "仅多尺度降噪非「关」时生效。自动 = 按画面尺寸自适应（本机 ⇒ 11）；核越大强边缘紫边越少，但采样与显存按核面积涨（21 约 3.6×）",
+        valueText = if (pc3dMsize == 0) "自动" else pc3dMsize.toString(),
+        onTap = {
+            // 与 CameraController.applyPc3dPref 的允许集合一致（0 = 自动 / 奇数 7..21）
+            val msizes = intArrayOf(0, 7, 11, 15, 21)
+            val v = msizes[(msizes.indexOf(pc3dMsize).coerceAtLeast(0) + 1) % msizes.size]
+            pc3dMsize = v
+            prefs.edit().putInt("pc3d_msize", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.pc3d_msize",
+                "{\"msize\":$v}",
             )
         },
     )
@@ -479,10 +593,12 @@ private fun ToneColorDrawerContent() {
     )
     // 高光重建·小波（v0.10.15）：darktable filmic 原生高光重建（à trous 小波，
     // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
-    var hrWaveletOn by remember { mutableStateOf(prefs.getBoolean("hr_wavelet", true)) }
+    // v0.10.162：默认关（与 CameraController.applyHrWaveletPref 的 prefs 默认值
+    // 必须一致，否则 UI 显示"开"而引擎实际"关"）。
+    var hrWaveletOn by remember { mutableStateOf(prefs.getBoolean("hr_wavelet", false)) }
     SettingSwitchRow(
         title = "高光重建·小波",
-        subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；关 = 同场景 A/B 对照",
+        subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；默认关（v0.10.162，与 RAW 域高光重建职责重叠）；开 = A/B 对照",
         checked = hrWaveletOn,
         onChecked = { v ->
             hrWaveletOn = v
@@ -506,6 +622,24 @@ private fun ToneColorDrawerContent() {
             prefs.edit().putBoolean("hr_raw", v).apply()
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "app", "settings.hr_raw",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 高光重建·G 通道重建（v0.10.169）：RAW 域高光重建 apply 支里**自创机制**两支
+    // （普通 G 的三级池化比 + allSat 三通道同步改写）的总开关。默认开 = 现有行为；
+    // 关 = apply 只留分支① 的 darktable opposed 外推（= PhotonCamera OpposedGL 口径）。
+    // 仅供真机同光线同场景 A/B：日志 raw.render.hlGRecon 应显示 1 / 0。
+    var hlGReconOn by remember { mutableStateOf(prefs.getBoolean("hl_grecon", true)) }
+    SettingSwitchRow(
+        title = "高光重建·G 通道重建",
+        subtitle = "开 = 当前默认（含自创的 G 池化比，过曝边缘品红较多）；关 = 更接近标准 opposed 口径，离线实测高光区 B/G 从 1.086 降到 1.022，但台灯类场景可能退化，请同场景 A/B",
+        checked = hlGReconOn,
+        onChecked = { v ->
+            hlGReconOn = v
+            prefs.edit().putBoolean("hl_grecon", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hl_grecon",
                 "{\"on\":$v}",
             )
         },
