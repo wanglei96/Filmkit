@@ -310,7 +310,7 @@ class FrameRenderer {
     // 上传 tex_amaze_ → passAmazeUp 旋转到成片几何 → 既有 passCcm → 胶片链。
     // amaze_lsc = 镜头阴影网格（可为 null = 恒等），CPU 侧在 WB 域乘。
     // ⚠ 未完成项：本档**不经过** P0（RAW 域 bilateral）/ HR 前置 —— 见
-    //   /tmp/amaze/REPORT.md「未完成」，高 ISO 下噪点会多于 RCD 档。
+    //   docs/reports/amaze-REPORT.md「未完成」，高 ISO 下噪点会多于 RCD 档。
     bool amaze = false;
     const void* amaze_raw = nullptr;
     int amaze_stride = 0;

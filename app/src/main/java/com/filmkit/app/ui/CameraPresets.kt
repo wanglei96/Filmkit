@@ -140,7 +140,7 @@ object CameraPresets {
         // 48 = 伪彩感知色度降噪强度（档 A，v0.10.165）：0 = 关（A/B 通路），
         // >0 = σc 放大倍率（scEff = sc·(1 + moire·[48])，封顶 4·sc）。
         // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 51，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
         this[48] = 2.0
         // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
         // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
@@ -154,7 +154,7 @@ object CameraPresets {
         // 相机 RGB 域，只重采样 R/B、G 不动；自动估计（1/8 降采样 + 径向 LK），
         // 角部位移 < 0.25px 判定无横向色差 ⇒ 整段跳过（零副作用）。
         // ⚠️ 默认 1.0 的实测依据与局限（对 2026-10-05 逆光基准样片**不动作**）
-        // 见 /tmp/cacorr/REPORT.md；设置页开关写 prefs("ca_corr")。
+        // 见 docs/reports/cacorr-REPORT.md；设置页开关写 prefs("ca_corr")。
         this[50] = 1.0
         // 51..53 = 强边缘色度门 v2（v0.10.174）：
         // PC `esd3d2.glsl:78-82` = `chromaDiff *= max(|Δx|,|Δy|)` +
@@ -167,7 +167,7 @@ object CameraPresets {
         // [51] = κ（0 = 关 ⇒ P4/D-1 逐位回到 v0.10.172）；κ=2 沿用 PC 的 0.2 标定。
         // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
         // [53] = 紫边判据梯度自适应（默认 0 关）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 54，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
         // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
         this[51] = 2.0
         this[52] = 1.0
@@ -175,18 +175,19 @@ object CameraPresets {
         // 54/55 = PC ESD3D2 完整移植（v0.10.175）：核尺寸 + 尺度结构 + 伪彩强度逻辑
         // 全部照抄 PC（`esd3d2_steered.glsl` + `ESD3D2.java` + `convdiff.glsl` +
         // `guidedupsample.glsl` + `GLUtils.gaussdown`）。
-        // [54] = 0 = **关（默认）**，tex_scene_ 直通 P4（与 v0.10.174 逐位相同）；
+        // [54] = 0 = 关，tex_scene_ 直通 P4（与 v0.10.174 逐位相同）；
         //        1 = **替换档**（照抄 PC 的链路地位：PC3D 输出直接进 film，
-        //            P4/defringe/D-1 旁路，代码全保留）；2 = 叠加档（PC3D → 现有链）。
+        //            P4/defringe/D-1 旁路，代码全保留）；2 = **叠加档（默认）**
+        //            （PC3D → 现有链）。
         // [55] = 0 = 核尺寸自动（PC 公式 min(7+(int)ks−(int)ks%2, 21)，本机 ⇒ 11）；
         //        >0 = 强制 MSIZE（奇数 7..21），真机拍板"代价 vs 收益"用。
-        // ⚠️ 默认关的依据（离线四组数据，/tmp/pc3d/REPORT.md）：收益随核尺寸/MOIRE
-        // 单调下降但**达不到 PC 的 3.68**；且离线域（成片反推线性）的 sigZ 诊断显示
-        // PC 的绝对 cap 0.2 **从未触发**（sigZ60 0.007~0.012、吃满率 0.0%）
-        // ⇒ 离线低估了 PC 的伪彩强度，**证据不足以证明真机更优 ⇒ 默认关**。
+        // ⚠️ 默认值依据（v0.10.177 从"关"改为"叠加档"）：2026-10-05 新 KPI 重估
+        // （docs/reports/pc3d-reval-REPORT.md）：叠加档 core ×0.676 四片全改善、色渗全绿
+        // ⇒ 默认开，**待真机 pc3dMs/画质验证后定稿**；旧"默认关"依据（∇>60 旧口径，
+        // docs/reports/pc3d-REPORT.md + "PC 的 3.68" 旧基准）已被推翻。
         // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
         // 真机 A/B：prefs("pc3d") / prefs("pc3d_msize")。
-        this[54] = 0.0
+        this[54] = 2.0
         this[55] = 0.0
     }
 

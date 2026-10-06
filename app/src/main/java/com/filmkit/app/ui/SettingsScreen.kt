@@ -379,7 +379,7 @@ private fun QualityDrawerContent() {
     )
     // 镜头横向色差校正（v0.10.170）：D3（去马赛克后 / CCM 前）相机 RGB 域的
     // 自动估计（1/8 降采样 + 径向 LK）+ 径向位移校正（只动 R/B，G 不变）。
-    // 见 CameraController.applyCaCorrPref 与 /tmp/cacorr/REPORT.md。
+    // 见 CameraController.applyCaCorrPref 与 docs/reports/cacorr-REPORT.md。
     var caCorrOn by remember { mutableStateOf(prefs.getBoolean("ca_corr", true)) }
     SettingSwitchRow(
         title = "镜头色差校正",
@@ -394,36 +394,50 @@ private fun QualityDrawerContent() {
             )
         },
     )
-    // 强边缘色度门 v2（v0.10.174）：治"暗室逆光拍窗外"这类强亮度对比边缘上的紫/绿
-    // 镶边。关 = A/B 对照（FilmParams[51]=0 ⇒ P4/D-1 的门整段不执行，输出逐位回到
-    // v0.10.172）。v0.10.173 的旧形态在真机上"一片红一片黄一片紫"（绝对 cap 0.2
-    // 全图生效 + D-1 五级 100% 覆盖），v2 改为逐像素门（∇≤10 必然为 0）+ 相对上限
-    // 16·σc + D-1 只在最细两级。若仍见色块，关掉本开关即逐位回退。
-    // 见 CameraController.applyChromaGatePref 与 /tmp/chromagate2/REPORT.md。
-    var chromaGateOn by remember { mutableStateOf(prefs.getBoolean("chroma_gate", true)) }
-    SettingSwitchRow(
-        title = "强边缘色度门",
-        subtitle = "只在强亮度对比边缘（∇L 门控）的色度路上抑制紫/绿镶边，平坦区逐位不动；关 = A/B 对照",
-        checked = chromaGateOn,
-        onChecked = { v ->
-            chromaGateOn = v
-            prefs.edit().putBoolean("chroma_gate", v).apply()
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.chroma_gate",
-                "{\"on\":$v}",
-            )
-        },
-    )
+    // 强边缘色度门 κ（v0.10.174 开关 → v0.10.177 可调滑杆）：治"暗室逆光拍窗外"
+    // 这类强亮度对比边缘上的紫/绿镶边。κ 直写 FilmParams[51]，0 = 关 = A/B 对照
+    // （P4/D-1 的门整段不执行，输出逐位回 v0.10.172），2 = PC 标定默认。κ 最优值
+    // 未定（评估方向可能调低，代价 = 高饱和彩边去饱和 25~37%），真机拖动观察定值。
+    // v0.10.173 的旧形态在真机上"一片红一片黄一片紫"（绝对 cap 0.2 全图生效 +
+    // D-1 五级 100% 覆盖），v2 改为逐像素门（∇≤10 必然为 0）+ 相对上限 16·σc +
+    // D-1 只在最细两级。若仍见色块，拖回 0（关）即逐位回退。
+    // prefs bool→float 迁移见 CameraController.chromaGatePrefValue。
+    // 见 CameraController.applyChromaGatePref 与 docs/reports/chromagate2-REPORT.md。
+    var chromaGateK by remember {
+        mutableStateOf(CameraController.chromaGatePrefValue(prefs.all["chroma_gate"]))
+    }
+    SliderRow(
+        label = "强边缘色度门",
+        desc = "只在强亮度对比边缘（∇L 门控）的色度路上抑制紫/绿镶边，平坦区逐位不动。κ 越大强边缘处色度平滑越强；代价 = 高饱和彩边去饱和（κ=2 时 25~37%）。0 = 关 = 同场景 A/B 对照（逐位回退）",
+        initial = chromaGateK,
+        range = 0f..2f,
+        steps = 19, // 0..2、步长 0.1（与 RAW 降噪同用法：steps = 中间刻度数）
+        valueText = { if (it <= 0.05f) "关" else "%.1f".format(it) },
+    ) { raw ->
+        val v = (raw * 10).roundToInt() / 10f  // 对齐 0.1 步进（滑杆量化有浮点误差）
+        chromaGateK = v
+        prefs.edit().putFloat("chroma_gate", v).apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.chroma_gate",
+            "{\"k\":\"%.1f\"}".format(v),
+        )
+    }
     // PC 降噪结构（ESD3D2）v0.10.176：引擎 v0.10.175 已把 [54]/[55] 完整移植，
     // 但**此前没有任何设置页入口 ⇒ 用户无法打开它**（用户反馈"[54] 设为 2 在哪"）。
     // 本版只补 UI + 下发通路（CameraController.applyPc3dPref），不动引擎。
-    // 0 = 关（默认）⇒ FilmParams[54]=0 ⇒ 与 v0.10.174 逐位相同；1 = 替换档
-    // （旁路 P4/D-1）；2 = 叠加档（叠在现有色度降噪之上）。核尺寸 `pc3d_msize`。
-    // 离线数据见 /tmp/pc3d/REPORT.md，默认值保持不变。
-    var pc3dMode by remember { mutableStateOf(prefs.getInt("pc3d", 0).coerceIn(0, 2)) }
+    // v0.10.177：默认从"关"改为"叠加档"（与 CameraPresets.neutral() 同步）——
+    // 2026-10-05 新 KPI 重估（docs/reports/pc3d-reval-REPORT.md）：叠加档 core ×0.676
+    // 四片全改善、色渗全绿 ⇒ 默认开，**待真机 pc3dMs/画质验证后定稿**；旧"默认关"
+    // 依据（∇>60 旧口径）已被推翻。0 = 关 ⇒ FilmParams[54]=0 ⇒ 与 v0.10.174
+    // 逐位相同；1 = 替换档（旁路 P4/D-1）；2 = 叠加档（叠在现有色度降噪之上）。
+    // 核尺寸 `pc3d_msize`。
+    // 初始态 fallback = 2（叠加档）：与 CameraPresets.neutral() 的 [54]、
+    // CameraController.applyPc3dPref 的 getInt fallback 三方一致 —— 无记录的
+    // 升级用户显示与实际一致（叠加档），不会出现"显示关、实际开"的状态误导。
+    var pc3dMode by remember { mutableStateOf(prefs.getInt("pc3d", 2).coerceIn(0, 2)) }
     SettingValueRow(
         title = "色度降噪·多尺度",
-        subtitle = "两趟降采样结构（核 11、尺度 2）作用于色度降噪：低分辨率趟先做亮度/色度分离降噪，再引导上采样回全分辨率做第二趟。离线实测强边缘紫边 −12.6%（叠加档）/ −20.6%（核 21），但离参考实现的 3.68 仍差 2.3× —— 本层解决的是判据量级问题。代价：采样 2.3×、额外显存约 240MB。叠加档 = 在现有色度降噪之上叠加（离线色渗判据全绿）；替换档 = 旁路现有色度降噪（离线在重紫边样片上不稳）。默认关，仅供真机同场景 A/B",
+        subtitle = "两趟降采样结构（核 11、尺度 2）作用于色度降噪：低分辨率趟先做亮度/色度分离降噪，再引导上采样回全分辨率做第二趟。离线重估（2026-10-05 新 KPI）：紫边主指标（剖面 core）四片全改善（×0.676）、色渗判据全绿，待真机验证。代价：采样 2.3×、额外显存约 240MB。叠加档 = 在现有色度降噪之上叠加；替换档 = 旁路现有色度降噪（新 KPI 下色渗指标在警戒侧，留作真机 A/B）。默认叠加档，待真机 pc3dMs/画质验证后定稿",
         valueText = when (pc3dMode) {
             1 -> "替换档"
             2 -> "叠加档"

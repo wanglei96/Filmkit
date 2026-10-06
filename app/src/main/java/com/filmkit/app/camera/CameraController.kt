@@ -832,6 +832,21 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             return OutDigest(c.value, if (n > 0) sum.toDouble() / n else -1.0)
         }
+
+        /**
+         * 强边缘色度门 κ 的 prefs 兼容读取（v0.10.174 是 bool 开关 `chroma_gate`：
+         * true→2.0 / false→0.0；v0.10.177 迁为 float 0..2、步进 0.1、默认 2.0，
+         * 0 = 关）。SharedPreferences 的 getFloat 读到 Boolean 存储会抛
+         * ClassCastException，故**所有读取端必须走本函数**：用 prefs.all 做类型
+         * 分派（不触发类型转换），首次从设置页写入即为 float（同 key 覆盖类型）。
+         * κ 的 shader 语义不变（[51]>0 的行为照旧）；κ 最优值未定（评估方向可能
+         * 调低），由真机拖动观察定值。纯函数供单测。
+         */
+        fun chromaGatePrefValue(raw: Any?): Float = when (raw) {
+            is Boolean -> if (raw) 2f else 0f
+            is Number -> raw.toFloat().coerceIn(0f, 2f)
+            else -> 2f
+        }
     }
 
     private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
@@ -1087,17 +1102,12 @@ class CameraController(private val context: Context, private val render: RenderC
     // 重采样 R/B（G 逐位不动）。判据：角部位移 ≥ 0.5px 且内外半区拟合一致，
     // 否则该通道不动作；两通道都不动作 ⇒ 整段跳过（走原 tex_work_）。
     private val CA_CORR = 1.0
-    // v0.10.173：强边缘色度梯度门（FilmParams[51]，照抄 PhotonCamera 的 sigZ 架构）。
-    // PC 依据 = esd3d2.glsl:78-82（chromaDiff *= max(|Δx|,|Δy|) 与
-    // sigZ = max(sigY, min(chromaNoise·MOIRE, 0.2))，色度权重只由 sigZ 定）。
-    // κ=2 的标定与离线实测见 core/engine/src/film/FilmParams.h 的 [51] 注释。
-    // 0 = 关（A/B 通路 ⇒ P4/D-1 逐位回到 v0.10.172）。
-    private val CHROMA_GATE = 2.0
     // v0.10.176：PC ESD3D2 结构开关（FilmParams[54] / [55]，prefs `pc3d` /
     // `pc3d_msize`）—— 引擎侧 v0.10.175 已完整实现，但此前**没有设置页入口 ⇒
     // 用户无法打开**；本版只补 UI + 下发通路，不动引擎。
-    // [54]：0 = 关（默认 ⇒ 与 v0.10.174 逐位相同）/ 1 = 替换档（旁路 P4/D-1）/
-    //       2 = 叠加档（叠在现有色度降噪之上）。
+    // [54]：0 = 关（⇒ 与 v0.10.174 逐位相同）/ 1 = 替换档（旁路 P4/D-1）/
+    //       2 = 叠加档（**默认**，v0.10.177：2026-10-05 新 KPI 重估 ⇒ 叠在
+    //       现有色度降噪之上）。
     // [55]：0 = 自动（照抄 PC 公式）/ 7 / 11 / 15 / 21 = 强制核尺寸（奇数）。
     // 代价与离线数据见 FilmParams.h 的 [54]/[55] 注释；真机判据 = 日志字段
     // pc3dOn / pc3dM / pc3dK / pc3dSc / pc3dMs。
@@ -1397,7 +1407,7 @@ class CameraController(private val context: Context, private val render: RenderC
      * ⚠ 默认 1.0 的依据：双重判据（角部位移 ≥ 0.5px **且** 内外半区拟合一致）
      * 保证对**无横向色差**的场景零动作；对 2026-10-05 逆光基准样片实测原始估计
      * 仅 0.13/0.41px 且内外半区不相容 ⇒ 判据全部否决、模块不动作
-     * （详见 /tmp/cacorr/REPORT.md）。
+     * （详见 docs/reports/cacorr-REPORT.md）。
      */
     private fun applyCaCorrPref() {
         val v = if (appPrefs.getBoolean("ca_corr", true)) CA_CORR else 0.0
@@ -1408,15 +1418,19 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /**
-     * 强边缘色度门开关（v0.10.174）：prefs `chroma_gate`（默认开）写 FilmParams[51]。
-     * 关（false）⇒ [51]=0 ⇒ P4/D-1 的门整段不执行，输出逐位回到 v0.10.172。
-     * 真机 A/B 判据：同场景开/关各一张，比 diag.stats 的强边缘紫边与日志字段
+     * 强边缘色度门 κ（v0.10.174 开关 → v0.10.177 可调滑杆）：prefs `chroma_gate`
+     * （float 0..2、步进 0.1、默认 2.0；旧 bool true→2.0 / false→0.0 兼容见
+     * [chromaGatePrefValue]）直写 FilmParams[51]，夹取 0..2。
+     * 0 = 关 ⇒ P4/D-1 的门整段不执行，输出逐位回到 v0.10.172；κ=2 沿用 PC 的
+     * 0.2 标定。κ 越大强边缘处色度平滑越强；代价 = 高饱和彩边去饱和（κ=2 时
+     * 25~37%）。κ 最优值未定（评估方向可能调低），由真机拖动观察定值后再固化。
+     * 真机 A/B 判据：同场景各 κ 一张，比 diag.stats 的强边缘紫边与日志字段
      * cgK/cgCap/cgScope/cgMean/cgP95/cgCov（**门控覆盖率**：健康区间 cgMean ≤ 0.15、
-     * cgCov ≤ 0.05；v0.10.173 的旧口径下这两个数是 100%）。若真机仍见色块，
-     * 关掉本开关即逐位回退（已验证），无需改代码。
+     * cgCov ≤ 0.05；v0.10.173 的旧口径下这两个数是 100%）。cgK 本就回读 [51]
+     * 实际值，κ 任意值下语义不变。若真机仍见色块，拖回 0（关）即逐位回退（已验证）。
      */
     private fun applyChromaGatePref() {
-        val v = if (appPrefs.getBoolean("chroma_gate", true)) CHROMA_GATE else 0.0
+        val v = chromaGatePrefValue(appPrefs.all["chroma_gate"]).toDouble().coerceIn(0.0, 2.0)
         if (v != chromaGatePref) {
             chromaGatePref = v
             filmParams[51] = v
@@ -1427,16 +1441,21 @@ class CameraController(private val context: Context, private val render: RenderC
      * PC 降噪结构（ESD3D2，v0.10.175 引擎 / v0.10.176 设置页入口）：prefs `pc3d`
      * （0 关 / 1 替换档 / 2 叠加档）写 FilmParams[54]，prefs `pc3d_msize`
      * （0 自动 / 7 / 11 / 15 / 21）写 FilmParams[55]。
-     * ⚠ 默认两者都是 0 = **关 + 自动** ⇒ 与 v0.10.174 逐位相同，不改变默认画质；
-     * 本通路存在的唯一目的是真机同场景 A/B。改默认前必须真机数据说话。
+     * ⚠ 默认 [54] = 2 = **叠加档**（v0.10.177 改，2026-10-05 新 KPI 重估
+     * docs/reports/pc3d-reval-REPORT.md，待真机 pc3dMs/画质验证后定稿）、[55] = 0 =
+     * 自动；[54] = 0 时与 v0.10.174 逐位相同。
+     * ⚠ getInt 的 fallback 默认必须与 CameraPresets.neutral() 的 [54] 同步
+     * （都 = 2）：prefs 无记录的升级用户落叠加档，"默认开"才不落空；
+     * 已写 prefs 的用户保持其显式选择（含显式选"关"）。
      * 越界兜底：`pc3d` 不在 0..2、`pc3d_msize` 不是 0 或 7..21 的奇数 ⇒ 归 0
-     * （防手改 prefs / 旧值把非法核尺寸喂给引擎）。
+     * （防手改 prefs / 旧值把非法核尺寸喂给引擎；显式写入的非法值走安全侧 = 关，
+     * 与"无记录用默认"是两回事）。
      * 真机判据：日志 pc3dOn=1 且 pc3dM∈[7,21]、pc3dSc=1..4 ⇒ 生效；pc3dOn=0 而
      * [54]>0.5 ⇒ shader 编译/链接或纹理分配失败（pc3d.compile_fail）；
      * pc3dMs 与 dnMs 同量级 ⇒ 成本正常，pc3dMs ≫ dnMs ⇒ 过强（把核尺寸调小）。
      */
     private fun applyPc3dPref() {
-        val v = appPrefs.getInt("pc3d", 0).let { if (it in 0..2) it else 0 }.toDouble()
+        val v = appPrefs.getInt("pc3d", 2).let { if (it in 0..2) it else 0 }.toDouble()
         if (v != pc3dPref) {
             pc3dPref = v
             filmParams[54] = v
@@ -3282,7 +3301,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 实测编码引入的色度误差：4:4:4 p99 1.36 / max 1.94，4:2:0 p99 9.77 /
         // max 49.17（ΔC 相对无损 PNG）⇒ 边缘串色误差的 ~86–96% 由 4:2:0 贡献。
         // 侧证：同机同量化表的 PhotonCamera 成片 SOF0 为 4:4:4（FilmKit 为 4:2:0）。
-        // 依据与体积/耗时实测见 /tmp/jpeg444/REPORT.md；false = 旧行为（4:2:0）。
+        // 依据与体积/耗时实测见 docs/reports/jpeg444-REPORT.md；false = 旧行为（4:2:0）。
         val jpeg444 = prefs.getBoolean("jpeg_444", true)
         // 编码一次（下面两个落盘分支只差写入目标）；native 失败返回 null ⇒ 回退
         // Bitmap.compress（宁可退到 4:2:0，不可丢成片）。

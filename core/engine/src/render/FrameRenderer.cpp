@@ -675,7 +675,7 @@ void main() {
 // 为什么不做 GLSL 多 pass 版：AMaZE 在 tile 内需要 14 张 ts×ts + 12 张半网格中间场
 // （见参考实现的 buffer 清单），GLES 3.0 fragment 版等价于 15+ pass、全图级中间
 // 纹理显存峰值按 12MP 估 ≈1.7GB（RGBA16F），且 Nyquist 判据对半精度敏感。成本表
-// 与备选方案见 /tmp/amaze/REPORT.md「GPU 移植策略与成本」。
+// 与备选方案见 docs/reports/amaze-REPORT.md「GPU 移植策略与成本」。
 const char* kFsAmazeUp = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
@@ -4875,10 +4875,11 @@ bool FrameRenderer::init() {
   // 横向色差校正（v0.10.170）
   prog_ca_ds_ = linkProgram(vs_plain_, fs_ca_ds);
   prog_ca_corr_ = linkProgram(vs_plain_, fs_ca_corr);
-  // PC ESD3D2 完整移植（v0.10.175）：**不进 init 的硬失败判据** —— 本模块默认关
-  //（FilmParams[54] = 0），任何一环缺失都只是"少一条可选路径"，绝不允许它把默认
-  //配置拖成初始化失败（照 fs_mfnr_fft_sum 的处理）；失败时三个 prog 全置 0，
-  //passPc3d 自动返回 false ⇒ 调用方沿用 tex_scene_，与改动前逐位相同。
+  // PC ESD3D2 完整移植（v0.10.175）：**不进 init 的硬失败判据** —— v0.10.177 起
+  //默认 [54] = 2（叠加档，docs/reports/pc3d-reval-REPORT.md），但任何一环缺失仍只是
+  //"少一条可选路径"，绝不允许它把默认配置拖成初始化失败（照 fs_mfnr_fft_sum 的
+  //处理）；失败时三个 prog 全置 0，passPc3d 自动返回 false ⇒ 调用方沿用
+  //tex_scene_（等价于 [54] = 0 的链路）。
   // vs_plain_：kVertRot 与 kVertPlain 的 gl_Position 相同（都铺满视口），fragment
   // 用 gl_FragCoord + texelFetch 定位 ⇒ 两者等价（与 df/chroma_* 同构）。
   if (fs_pc3d) prog_pc3d_ = linkProgram(vs_plain_, fs_pc3d);
@@ -7424,7 +7425,7 @@ void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) 
 // kFsRaw/kFsRcd 的 s() 逐字同口径）→ ② AmazeDemosaic（多线程 tile 并行）→
 // ③ LSC（WB 域乘，网格双线性同 kFsRaw 的 lscAt 口径）→ 上传 tex_amaze_。
 // ⚠ 未完成项：本路径**不经过 P0（RAW 域 bilateral）/ HR 前置**（那两者是 GPU
-//   pass）；高 ISO 下本档噪点会多于 RCD 档。见 /tmp/amaze/REPORT.md「未完成」。
+//   pass）；高 ISO 下本档噪点会多于 RCD 档。见 docs/reports/amaze-REPORT.md「未完成」。
 bool FrameRenderer::runAmazeCpu(const ChainCtx& c) {
   const int w = c.w, h = c.h;
   if (!c.amaze_raw || !c.gains || !c.black_phase || w < 32 || h < 32)
@@ -8020,11 +8021,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     if (!ensureDnTarget(dst_w, dst_h)) return;
     const auto n0 = std::chrono::steady_clock::now();
     // ── PC ESD3D2 完整移植（v0.10.175）────────────────────────────────────
-    // [54] = 0（默认）⇒ 整段不执行，tex_scene_ 直通 P4 ⇒ 与改动前**逐位相同**。
+    // [54] = 0（关）⇒ 整段不执行，tex_scene_ 直通 P4 ⇒ 与 v0.10.174 **逐位相同**。
     // [54] = 1（替换档）= 照抄 PC 的**链路地位**：PC 链上 ESD3D2 是去马赛克后唯一
     //   的降噪 pass（PostPipeline.java:1504），故 PC3D 的输出直接进 film，
     //   P4/defringe/D-1 三步**旁路**（代码全部保留、[54] 一改即用 —— 铁律：不预删）。
-    // [54] = 2（叠加档）：PC3D → P4 → defringe → D-1 串联。
+    // [54] = 2（叠加档，**v0.10.177 默认**，docs/reports/pc3d-reval-REPORT.md）：
+    //   PC3D → P4 → defringe → D-1 串联。
     dbg_pc3d_on_ = 0;
     dbg_pc3d_m_ = 0;
     dbg_pc3d_scale_ = 1;
