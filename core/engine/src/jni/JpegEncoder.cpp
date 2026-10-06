@@ -5,7 +5,7 @@
 // 公开 API 无任何参数可改；`YuvImage.compressToJpeg` 同样固定 4:2:0；NDK 亦不提供 libjpeg
 // （NDK 29 的 sysroot 中无 jpeglib.h / libjpeg.so，已实测）。4:2:0 的色度下采样会把强亮度
 // 边缘两侧的色度平均串到另一侧 ⇒ 中性边缘出现紫/绿镶边（离线对照实验归因见
-// /tmp/jpeg444/REPORT.md：中性强边缘处编码引入的色度误差 p99 由 4:4:4 的 1.36 升到
+// docs/reports/jpeg444-REPORT.md：中性强边缘处编码引入的色度误差 p99 由 4:4:4 的 1.36 升到
 // 4:2:0 的 9.77、max 由 1.94 升到 49.17）。
 //
 // 实现选择：stb_image_write（v1.16，单头文件 1724 行，MIT / Public Domain 双许可）。

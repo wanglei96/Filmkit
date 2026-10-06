@@ -1,0 +1,43 @@
+[auto-msize 复核] sigA+sigB(AY/BY 模型) = 8.5691e-05 → kernelSize = 4.55 → MSIZE = 11 (PC 公式)
+
+=== FILMKIT_20261005-164623.jpg ===
+  1024x1360 (ds=3)
+  base_chain done [3.4s]
+  pc3d M=11 done [9.1s]
+  m11_overlay chain done [3.3s]
+    FILMKIT_20261005-164623__input KPI1v=  6.433 frac= 0.598%  excess= +4.677  core=  +2.36 peak@-1 FWHM=6px  flatSig= 4.937  [3.6s]
+    FILMKIT_20261005-164623__m0_base KPI1v=  8.067 frac= 0.616%  excess= +5.338  core=  +1.30 peak@-4 FWHM=10px  flatSig= 9.006  [3.4s]
+    FILMKIT_20261005-164623__m11_replace KPI1v=  5.665 frac= 0.612%  excess= +4.000  core=  +1.94 peak@-1 FWHM=6px  flatSig= 4.890  [3.2s]
+    FILMKIT_20261005-164623__m11_overlay KPI1v=  7.430 frac= 0.628%  excess= +4.695  core=  +0.66 peak@-4 FWHM=11px  flatSig= 8.992  [3.3s]
+
+=== FILMKIT_20261005-164631.jpg ===
+  1024x1360 (ds=3)
+  base_chain done [3.4s]
+  pc3d M=11 done [8.9s]
+  m11_overlay chain done [3.2s]
+    FILMKIT_20261005-164631__input KPI1v=  5.695 frac= 0.622%  excess= +4.004  core=  +2.14 peak@-1 FWHM=7px  flatSig= 4.920  [3.3s]
+    FILMKIT_20261005-164631__m0_base KPI1v=  7.446 frac= 0.644%  excess= +4.639  core=  +0.96 peak@-4 FWHM=11px  flatSig= 9.062  [3.3s]
+    FILMKIT_20261005-164631__m11_replace KPI1v=  4.956 frac= 0.638%  excess= +3.333  core=  +1.76 peak@-1 FWHM=9px  flatSig= 4.880  [3.2s]
+    FILMKIT_20261005-164631__m11_overlay KPI1v=  6.954 frac= 0.659%  excess= +4.135  core=  +0.44 peak@-4 FWHM=11px  flatSig= 9.037  [3.4s]
+
+=== FILMKIT_20261005-152207.jpg ===
+  1024x1360 (ds=3)
+  base_chain done [3.4s]
+  pc3d M=11 done [8.9s]
+  m11_overlay chain done [3.1s]
+    FILMKIT_20261005-152207__input KPI1v=  9.515 frac= 0.614%  excess= +7.799  core=  +4.23 peak@-1 FWHM=4px  flatSig= 5.327  [3.3s]
+    FILMKIT_20261005-152207__m0_base KPI1v=  8.291 frac= 0.639%  excess= +5.550  core=  +1.84 peak@-3 FWHM=9px  flatSig= 9.704  [3.2s]
+    FILMKIT_20261005-152207__m11_replace KPI1v=  7.048 frac= 0.629%  excess= +5.444  core=  +2.91 peak@-1 FWHM=4px  flatSig= 5.222  [3.1s]
+    FILMKIT_20261005-152207__m11_overlay KPI1v=  7.150 frac= 0.648%  excess= +4.419  core=  +1.34 peak@-3 FWHM=10px  flatSig= 9.677  [3.4s]
+
+=== FILMKIT_20261005-161533.jpg ===
+  1024x1360 (ds=3)
+  base_chain done [3.3s]
+  pc3d M=11 done [9.2s]
+  m11_overlay chain done [3.2s]
+    FILMKIT_20261005-161533__input KPI1v=  4.985 frac= 0.664%  excess= +3.282  core=  -0.47 peak@-4 FWHM=5px  flatSig= 5.054  [3.4s]
+    FILMKIT_20261005-161533__m0_base KPI1v=  6.944 frac= 0.675%  excess= +4.807  core=  -1.13 peak@-6 FWHM=10px  flatSig= 7.415  [3.3s]
+    FILMKIT_20261005-161533__m11_replace KPI1v=  5.194 frac= 0.680%  excess= +3.559  core=  -0.07 peak@-1 FWHM=5px  flatSig= 4.958  [3.1s]
+    FILMKIT_20261005-161533__m11_overlay KPI1v=  6.832 frac= 0.690%  excess= +4.656  core=  -1.14 peak@-5 FWHM=10px  flatSig= 7.416  [3.4s]
+
+wrote /tmp/pc3d-reval/reval.json

@@ -7,7 +7,7 @@
 //
 // 本实现的分工：**CPU 侧**（本文件）做完整的 AMaZE；GPU 侧只接"Amaze 输出
 // → 旋转到成片几何 → CCM"（kFsAmazeUp / passCcm）。选择 CPU 而非 GLSL 的
-// 依据见 /tmp/amaze/REPORT.md「移植策略」：AMaZE 在 tile 内需要 14 张
+// 依据见 docs/reports/amaze-REPORT.md「移植策略」：AMaZE 在 tile 内需要 14 张
 // ts×ts 中间场 + 12 张半网格场，GLES 3.0 fragment 版相当于 15+ 个 pass、
 // 全图级中间纹理显存峰值 ~1.7GB(12MP)，而 CPU 版与参考实现逐段同构、无
 // 纹理格式/精度折损。代价是耗时（真机实测见报告），按项目铁律由用户拍板。
