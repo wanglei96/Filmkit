@@ -2,7 +2,7 @@
 summary: M4内置LUT引擎落地与tag规则收紧
 created: 2026-09-22 10:15
 updated: 2026-09-22 10:15
-status: absorbed
+status: archived
 ---
 
 # M4内置LUT引擎落地与tag规则收紧

@@ -28,7 +28,7 @@ status: active
 - [2026-09-18] 引擎 so `libfilmengine.so`，JNI 入口 `com.filmkit.app.EngineBridge`；源码 `core/engine/src/`（jni/Bridge.cpp、render/FrameRenderer.cpp、render/Align.{h,cpp}、spike/SpikeFftMerge.cpp、film/FilmParams.h）
 - [2026-09-20] shader 校验 `tools/validate-shaders.sh`（提取 FrameRenderer.cpp 的 `R"(...)"` 交 glslang，ES 3.1；本地二进制 `tools/bin/glslang`，gitignore）；**发版前必跑**
 - [2026-09-18] 版本约定：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；**每轮对话只打一个 tag**（中间验证包只出 APK 不打 tag）；版本号单一来源（build.gradle + BuildConfig）
-- [2026-10-05] **版本现状**：本轮改动跨 v0.10.162–176（快照记"10 个交付包"）；仓库现存 `filmkit-0.10.163`–`0.10.176`（含 `0.10.164-diag`），**0.10.162 无对应 APK 包**；最新 `filmkit-0.10.176.apk`（versionCode 315），HEAD `a91c9d6`；**验收 tag 最新仍为 v0.10.133**（本轮未打 tag）；`app/src/main/java/com/filmkit/app/ui/CameraPresets.kt` 是 FilmParams 槽位唯一来源
+- [2026-10-06] **版本现状**：`filmkit-0.10.177.apk`（versionCode 316：`[54]`=2 默认叠加档、`[51]` κ 滑杆 0..2 步进 0.1、chroma_gate prefs bool→float 兼容读取）；**成片文件名变小写 `filmkit_*`**；提交 c5f1475（[54]/[51] 实现）+ a503d7e（docs,tools 存档），已 push；**验收 tag 最新仍为 v0.10.133**（未打 tag）；`app/src/main/java/com/filmkit/app/ui/CameraPresets.kt` 是 FilmParams 槽位唯一来源
 
 ## 引擎实现现状
 
@@ -42,7 +42,7 @@ status: active
 - [2026-09-30] **降噪现状**：P0/P4/mismatch 全走 **σ²=A·x+B** 逐像素；强度滑杆 0–2（1.0 = 真实 σ；<1 走输出 mix）；D-1 色度 à trous 5 级（k=2.5、revert 0.20）**已超 PC**；模型优先级 = 用户导入 > 内置实测 > Camera2 > ISO 估算
 - [2026-09-30] **DFT 合并（A 专项）**：`kFsMfnrFft` compute，按 CFA 平面独立、16×16 平面 tile 半重叠（步长 8 + 修改升余弦窗，窗和恒 1）；窗函数查表 `sWin`；输出 4 张 RGBA16F image2D writeonly，**目标必须 `glTexStorage2D`**；compute program 现场创建用完删除；`mfnr.fft.store_check` 自检 + 失败回落 mismatch；dftGpu 冷机 500~550ms / 热机 830~870ms
 - [2026-10-01] **拍照侧引擎（v0.10.85）**：`g_renderer_still`（`std::atomic` 指针）+ 独立 `EglCore`/1×1 pbuffer/`FrameRenderer`；`nativeStillStart` 幂等、`nativeStillDestroy` **连 context 一起销毁**（空闲 10s 由 Kotlin 侧触发）；LUT / YUV 矩阵为**进程级快照**、start 时下发；JNI 成片回传统一走 `rgbaToJavaArray`（OOM → 清异常返回 nullptr）；`AndroidManifest` 开 `largeHeap`
-- [2026-10-05] **紫边/高频链现状**：`hr_wavelet` 默认关（模块保留可 A/B；曾占 ≈752MB 纹理 + ≈103 全分辨率 pass/张，且 `w=(w>0.9)?w*w:0` 是 +29% 梯度的来源已移除）；HR 前置到 P0 之前、统计用 `uStat`（原 `uStat` 是死参数，与 `uMos` 同源 = 历史 exp21"改 src 即全改"的结构性根因）；defringe 4 pass 半分辨率（`[47]` 默认开）；强边缘色度门逐像素（`[51]`/`[52]`）；ESD3D2 移植 `[54]` 默认关（核尺寸由噪声模型算、两趟 + 引导上采样）
+- [2026-10-06] **紫边/高频链现状**：`hr_wavelet` 默认关（模块保留可 A/B；曾占 ≈752MB 纹理 + ≈103 全分辨率 pass/张，`w=(w>0.9)?w*w:0` 梯度源已移除）；HR 前置到 P0 之前、统计用 `uStat`；defringe 4 pass 半分辨率（`[47]` 默认开）；强边缘色度门逐像素（`[51]` κ 滑杆 / `[52]`）；ESD3D2 `[54]` **默认叠加档**（v0.10.177，真机去留待组合轮）；`[55]` 自动核真机 = **9**（噪声模型 builtin ext 通路，非离线假设 11）
 
 - [2026-10-05] **紫边相关 shader 落点**：`core/engine/src/render/FrameRenderer.cpp`——`kFsChromaDenoise`（P4 色度）/ `kFsPc3d`（ESD3D2 移植）/ `kFsHrMask`（小波 HR mask）/ `passHighlightRaw` + `runHighlightReconstruct`（RAW 域高光重建）/ `kFsDefringe*`（defringe 4 pass）；槽位常量与默认值在 `film/FilmParams.h` + `ui/CameraPresets.kt`
 
@@ -61,7 +61,7 @@ status: active
 - [2026-10-01] `tools/still-thread-verify.py` + `still-thread-run.sh`（拍照线程验收：预览停更/burst 耗时/CRC 等价/落盘计数/帧率曲线）；`align-bench.cpp`+`align-bench-gen.py`（对齐离线基准）、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**，六点核对 compile/link/zero/uniforms/use/delete）
 - [2026-09-30] 其余 `tools/`：validate-shaders.sh、check-fft-tile-cover、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、ab-100pct、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 - [2026-09-22] 内置 LUT 资产 42 个 `.lut`（uint8、33³、4.3MB）与 `~/Downloads/LUT/滤镜.cube/` 逐点一致；`docs/research/` = 12 个编号调研（00 活入口 / 01–08 冻结证据附录 / 09 频域降噪 / 10 ARRI 引擎计划 + 内建编辑器与预设）+ filmulator 专题 + README + `90-工作流原始转储`（勿删，含独有内容）
-- [2026-10-05] **紫边审计报告** `/tmp/pcfix/REPORT.md`（578 行：口径自证 + 四维消融 + 零假设 + 剖面）；前序 `/tmp/amaze`、`/tmp/chromagate{,2}`、`/tmp/pc3d`、`/tmp/jpeg444`、`/tmp/pc-full`、`/tmp/darkrg`；**均在 /tmp，重启即失、未沉淀 tools**
+- [2026-10-06] **审计报告已存档 `docs/reports/`**（pcfix / pc3d / pc3d-reval / amaze / jpeg444 / chromagate2 / cacorr / phase-sigma 共 8 份+配套数据，代码内 27 处 /tmp 引用已改写；/tmp 原件已删，与 test_temp 旧场景合计释放 ≈9GB；PC 源码保留 `/tmp/pc`、`/tmp/photoncamera`）；**本轮评估报告未沉淀（重启即失）**：`/tmp/ab-1006`、`/tmp/ab-1006b`、`/tmp/ab-s4`；新工具 `tools/purple-fringe-kpi.py`、方案 `docs/紫边窄峰真机AB方案.md`
 
 ## 对标数据与测量口径（10-03 → 10-05）
 
@@ -73,6 +73,7 @@ status: active
 - [2026-10-05] **色度门实测**：0.173 全局放宽 `wy` ⇒ 真机"一片红一片黄一片紫"；0.174 改逐像素门控（门覆盖率 73.7%→1.6%）后色渗判据全绿
 - [2026-10-05] **HR 阈值域修复实测**：真机 Y 加权和之差 **+2.03% → +0.03%**、clipB **289→60**；`uGRecon` 关闭后高光区 B/G **1.087→1.025**
 - [2026-10-05] **测量证据两则**：rawpy 的 `black_level_per_channel` 是取整值（DNG 真值 `[63.99,64.01,64.01,64.01]`，相位极差 ≤0.03 ADU）⇒ "R 相位黑电平 63 致暗部偏红"假设被推翻；旧诊断照片是二次传输重编码副本（1777×2360 ≠ 原生 3072×4080、DQT 非标准表）⇒ **用户截图不能作证据，必须取相册原图**
+- [2026-10-06] **真机三轮基线（1777 尺度，新 KPI；跨场景不可混用，每场景以同场景 PC 为基准）**：台灯逆光（主场景）PC 超额 ≈0、叠加 +2.84、关闭 +2.34、替换 +4.24（替换暗区独有紫向 +2.80）；红笔亮场景六组：基线 +1.89、κ0 +1.15、defringe 关 +0.80（绿边/红渗反升 = 交换）、锐化关 **+0.12≈PC**、多尺度关 +0.87；**色散 = 成片域 dRG +0.9~1.0px 而 RAW 域三通道对齐 ⇒ 管线产生（非光学非 [51]）**；台灯窗框品红窄峰 +10@3px（135918，关锐化不消失）
 
 ## 相机能力与标定（仍有效）
 
