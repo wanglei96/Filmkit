@@ -995,7 +995,7 @@ class FrameRenderer {
   } u_df_avg_;
   struct {
     GLint tex = -1, det = -1, size = -1, half = -1, chroma_avg = -1,
-          thresh_k = -1, df_gate = -1;
+          thresh_k = -1, df_gate = -1, base_chroma_max = -1;
   } u_df_apply_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {

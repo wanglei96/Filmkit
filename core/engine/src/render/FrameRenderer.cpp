@@ -1309,7 +1309,13 @@ void main() {
     ba *= 1.0 / 121.0;
     float dev = c0.w * ((c0.y - ba.x) * (c0.y - ba.x) +
                         (c0.z - ba.y) * (c0.z - ba.y));
+    // v0.10.190 空间判据：邻域**基线本身**的色度强度。
+    // 紫边 = 窄带（11×11 基线覆盖两侧中性区 ⇒ 基线色度低）；
+    // 紫色物体 = 大块（基线也是紫的 ⇒ 基线色度高）。apply 用它排除后者。
+    float base_chroma = sqrt(ba.x * ba.x + ba.y * ba.y);
     oDet = vec4(c0.y, c0.z, dev, c0.w);
+    // 第 4 分量改存 base_chroma（原来存 gate，但 gate 已乘进 dev；apply 不再单独用 gate）
+    oDet.w = base_chroma;
 })";
 
 const char* kFsDefringeAvg = R"(#version 300 es
@@ -1338,6 +1344,7 @@ uniform ivec2 uHalf;
 uniform float uChromaAvg;              // 全图 chroma 均值（CPU 读回）
 uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
 uniform float uDfGate;                 // v0.10.173：判据的梯度自适应强度（0 = 关）
+uniform float uBaseChromaMax;          // v0.10.190：邻域基线色度上限（超过=大片色块，不改写）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
 const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
 const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
@@ -1369,7 +1376,13 @@ void main() {
         float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
         thr = thr / (1.0 + uDfGate * 0.5 * length(vec2(yR - yL, yD - yU)));
     }
-    if (d0.z <= thr) {
+    // v0.10.190：空间判据（零误伤核心）——
+    //   d0.z = dev（本像素相对邻域基线的色度偏离）⇒ 命中 = 有"偏离"（边缘特征）
+    //   d0.w = 邻域基线色度强度 ⇒ 基线低 = 周围是中性区（真紫边）；基线高 = 大片紫（物体）
+    // 两个条件同时满足才替换：既是"偏离基线的窄带"，又"周围本来是中性"。
+    // 紫色物体内部：偏离小（邻域都是紫的）⇒ 不命中；紫色物体边缘：基线高 ⇒ 不命中。
+    // ⇒ 对大面积紫色物体**零改写**。
+    if (d0.z <= thr || d0.w > uBaseChromaMax) {
         oColor = vec4(lin0, 1.0);
         return;
     }
@@ -5676,6 +5689,7 @@ bool FrameRenderer::init() {
   u_df_apply_.half = glGetUniformLocation(prog_df_apply_, "uHalf");
   u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
+  u_df_apply_.base_chroma_max = glGetUniformLocation(prog_df_apply_, "uBaseChromaMax");
   u_df_apply_.df_gate = glGetUniformLocation(prog_df_apply_, "uDfGate");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
@@ -7441,6 +7455,8 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   // 会把正常色度也去饱和；2.43 时命中 19.2% 且紫线（dev≈117）仍远超阈值。
   glUniform1f(u_df_apply_.thresh_k, 2.43f);   // (23/33)²·5，RT threshold=23
   glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
+  // v0.10.190：邻域基线色度上限。紫边基线（两侧中性）实测 < 3；紫色物体基线 > 8。
+  glUniform1f(u_df_apply_.base_chroma_max, 6.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
