@@ -28,12 +28,12 @@ status: active
 - [2026-09-18] 引擎 so `libfilmengine.so`，JNI 入口 `com.filmkit.app.EngineBridge`；源码 `core/engine/src/`（jni/Bridge.cpp、render/FrameRenderer.cpp、render/Align.{h,cpp}、spike/SpikeFftMerge.cpp、film/FilmParams.h）
 - [2026-09-20] shader 校验 `tools/validate-shaders.sh`（提取 FrameRenderer.cpp 的 `R"(...)"` 交 glslang，ES 3.1；本地二进制 `tools/bin/glslang`，gitignore）；**发版前必跑**
 - [2026-09-18] 版本约定：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；**每轮对话只打一个 tag**（中间验证包只出 APK 不打 tag）；版本号单一来源（build.gradle + BuildConfig）
-- [2026-10-06] **版本现状**：`filmkit-0.10.177.apk`（versionCode 316：`[54]`=2 默认叠加档、`[51]` κ 滑杆 0..2 步进 0.1、chroma_gate prefs bool→float 兼容读取）；**成片文件名变小写 `filmkit_*`**；提交 c5f1475（[54]/[51] 实现）+ a503d7e（docs,tools 存档），已 push；**验收 tag 最新仍为 v0.10.133**（未打 tag）；`app/src/main/java/com/filmkit/app/ui/CameraPresets.kt` 是 FilmParams 槽位唯一来源
+- [2026-10-07] **版本现状**：`filmkit-0.10.181.apk`（versionCode 320：`[54]`=1 **替换档默认**、`[56]` rcd_g_orig / `[57]` hl_rb_recon / `[58]` rcd_p3_split 三实验开关默认 0、3a/3b 填充值 per-channel 满阱钳）；**成片文件名小写 `filmkit_*`**；提交 2a67c42（feat）+ c7fef2d（docs: research/11 号）已 push；**验收 tag 最新仍为 v0.10.133**（未打 tag）；`app/src/main/java/com/filmkit/app/ui/CameraPresets.kt` 是 FilmParams 槽位唯一来源
 
 ## 引擎实现现状
 
 - [2026-09-27] **管线顺序（定稿）**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化 → OETF → 3D LUT → 颗粒 → JPEG；硬约束 LUT 必须在 OETF 后
-- [2026-10-05] **FilmParams 契约 kCount=56**（`film/FilmParams.h:14`，v0.10.175 起；旧记忆的 36/43/48 均已过时）：[0] exposure_ev、[1..3] wb、[29] 空槽不复用、[31..34] 外观层/LUT 强度、[35] auto_tone（默认关）、[45] hr_raw、[47] defringe、[48] moire、[49] hl_grecon、[50] ca_corr、[51] chroma_gate=2.0、[52] cg_scope=1.0、[53] df_gate=0.0、[54] pc3d=0（默认关）、[55] pc3d_msize=0（自动 ⇒ 核 11）；**按实际长度读取（下限 26）**；⚠️ `CameraPresets.kt:170` 注释仍写 kCount=54，下发数组必须按 56（越界直接崩）
+- [2026-10-07] **FilmParams 契约 kCount=59**（`film/FilmParams.h:14`，v0.10.180 起；旧记忆的 36/43/48/56 均已过时）：[0] exposure_ev、[1..3] wb、[29] 空槽不复用、[31..34] 外观层/LUT 强度、[35] auto_tone（默认关）、[45] hr_raw、[46] rcd_cdfix=1、[47] defringe、[48] moire、[49] hl_grecon、[50] ca_corr、[51] chroma_gate=2.0、[52] cg_scope=1.0、[53] df_gate=0.0、[54] **pc3d=1（替换档默认，v0.10.181）**、[55] pc3d_msize=0（自动）、[56] rcd_g_orig=0、[57] hl_rb_recon=0、[58] rcd_p3_split=0；**按实际长度读取（下限 26）**；⚠️ 下发数组必须按 59（越界直接崩）
 - [2026-09-29] **影调链**：filmic 原生件（darktable v5 固定参数，base_ev 默认 +0.7）；黑白点自动三版证伪后默认关；`updateFilmicEV` 的 white 判据 = max 驱动探针 + 整体 +ev（渲染域对齐）；statistics 512×288、P99/P99.9/P100
 - [2026-09-29] **gamut mapping v5**（min+相锁+Y clamp+desaturate(0)+Yrg+clip chroma）；**输出 OETF 真 sRGB**（`kFsOut`/`kFsHist`/`measureSceneStats` 三处同步）；原生小波高光重建；锐化 = 线性显示域 luma USM（kFsOut 内）
 - [2026-09-27] **MFNR 采集**：maxImages 4 + 帧 1-3 拷贝即 close（maxImages 5+4 全程持有致 HAL 预配 125MB 闪退）；prefs `mfnr` 三档（0 关 / 1 自动暗光 ISO≥600 或 ≥25ms / 2 强制）
@@ -42,7 +42,7 @@ status: active
 - [2026-09-30] **降噪现状**：P0/P4/mismatch 全走 **σ²=A·x+B** 逐像素；强度滑杆 0–2（1.0 = 真实 σ；<1 走输出 mix）；D-1 色度 à trous 5 级（k=2.5、revert 0.20）**已超 PC**；模型优先级 = 用户导入 > 内置实测 > Camera2 > ISO 估算
 - [2026-09-30] **DFT 合并（A 专项）**：`kFsMfnrFft` compute，按 CFA 平面独立、16×16 平面 tile 半重叠（步长 8 + 修改升余弦窗，窗和恒 1）；窗函数查表 `sWin`；输出 4 张 RGBA16F image2D writeonly，**目标必须 `glTexStorage2D`**；compute program 现场创建用完删除；`mfnr.fft.store_check` 自检 + 失败回落 mismatch；dftGpu 冷机 500~550ms / 热机 830~870ms
 - [2026-10-01] **拍照侧引擎（v0.10.85）**：`g_renderer_still`（`std::atomic` 指针）+ 独立 `EglCore`/1×1 pbuffer/`FrameRenderer`；`nativeStillStart` 幂等、`nativeStillDestroy` **连 context 一起销毁**（空闲 10s 由 Kotlin 侧触发）；LUT / YUV 矩阵为**进程级快照**、start 时下发；JNI 成片回传统一走 `rgbaToJavaArray`（OOM → 清异常返回 nullptr）；`AndroidManifest` 开 `largeHeap`
-- [2026-10-06] **紫边/高频链现状**：`hr_wavelet` 默认关（模块保留可 A/B；曾占 ≈752MB 纹理 + ≈103 全分辨率 pass/张，`w=(w>0.9)?w*w:0` 梯度源已移除）；HR 前置到 P0 之前、统计用 `uStat`；defringe 4 pass 半分辨率（`[47]` 默认开）；强边缘色度门逐像素（`[51]` κ 滑杆 / `[52]`）；ESD3D2 `[54]` **默认叠加档**（v0.10.177，真机去留待组合轮）；`[55]` 自动核真机 = **9**（噪声模型 builtin ext 通路，非离线假设 11）
+- [2026-10-07] **紫边/高频链现状**：`hr_wavelet` 默认关（模块保留可 A/B；曾占 ≈752MB 纹理 + ≈103 全分辨率 pass/张）；HR 前置到 P0 之前、统计用 `uStat`；defringe 4 pass 半分辨率（`[47]` 默认开，**替换档下被旁路**）；强边缘色度门逐像素（`[51]` κ 滑杆，替换档下同被旁路）；ESD3D2 `[54]` **默认替换档**（v0.10.181，旁路 P4/defringe/D-1）；`[55]` 自动核真机 = **9**（builtin ext 噪声通路）；`[56]`/`[57]`/`[58]` 实验开关默认 0（判定依据见 decisions.md 10-07 条）；P3 拆双 pass 的 3a 输出纹理 = `tex_rcd_a_`（+100MB RGBA16F），性能 rcdAMs+rcdBs 实测 15~61ms
 
 - [2026-10-05] **紫边相关 shader 落点**：`core/engine/src/render/FrameRenderer.cpp`——`kFsChromaDenoise`（P4 色度）/ `kFsPc3d`（ESD3D2 移植）/ `kFsHrMask`（小波 HR mask）/ `passHighlightRaw` + `runHighlightReconstruct`（RAW 域高光重建）/ `kFsDefringe*`（defringe 4 pass）；槽位常量与默认值在 `film/FilmParams.h` + `ui/CameraPresets.kt`
 
@@ -73,6 +73,7 @@ status: active
 - [2026-10-05] **色度门实测**：0.173 全局放宽 `wy` ⇒ 真机"一片红一片黄一片紫"；0.174 改逐像素门控（门覆盖率 73.7%→1.6%）后色渗判据全绿
 - [2026-10-05] **HR 阈值域修复实测**：真机 Y 加权和之差 **+2.03% → +0.03%**、clipB **289→60**；`uGRecon` 关闭后高光区 B/G **1.087→1.025**
 - [2026-10-05] **测量证据两则**：rawpy 的 `black_level_per_channel` 是取整值（DNG 真值 `[63.99,64.01,64.01,64.01]`，相位极差 ≤0.03 ADU）⇒ "R 相位黑电平 63 致暗部偏红"假设被推翻；旧诊断照片是二次传输重编码副本（1777×2360 ≠ 原生 3072×4080、DQT 非标准表）⇒ **用户截图不能作证据，必须取相册原图**
+- [2026-10-07] **品红带机理闭环（docs/research/11 号 §6-8）**：成片白区左边缘 = B 通道 ~8px 缓爬 vs G ~2px 陡跳的错位带（品红）；RAW 域 G/B 形状重合（光学干净，单帧多列平均剖面）；单帧 ≈ 4 帧（融合赦免）；dn=0 更重（P0 缓解者，p0A_B/p0A_G ≈ 1.46 抹缓 B 边缘为次嫌疑）；**B 缓 G 陡错位 = RCD 类算法固有**（全无 LIM 公平直译：原版 = 我们 = [56] 两模式 = +86~88 WB 域，LIM(0,1) 在 WB 域削顶曾伪造"原版 43.8"）；[57] 判定离线复现：品红带满阱率 R 18.7%/G 32.1%/B 24.4%、目标态 0.1%、allSat 18.6%
 - [2026-10-06] **真机三轮基线（1777 尺度，新 KPI；跨场景不可混用，每场景以同场景 PC 为基准）**：台灯逆光（主场景）PC 超额 ≈0、叠加 +2.84、关闭 +2.34、替换 +4.24（替换暗区独有紫向 +2.80）；红笔亮场景六组：基线 +1.89、κ0 +1.15、defringe 关 +0.80（绿边/红渗反升 = 交换）、锐化关 **+0.12≈PC**、多尺度关 +0.87；**色散 = 成片域 dRG +0.9~1.0px 而 RAW 域三通道对齐 ⇒ 管线产生（非光学非 [51]）**；台灯窗框品红窄峰 +10@3px（135918，关锐化不消失）
 
 ## 相机能力与标定（仍有效）
