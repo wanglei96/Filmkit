@@ -1,0 +1,15 @@
+ROI (250, 515), 输入范围 [-0.002, 2.070]
+
+=== A. 原版 RCD 直译 ===
+  恒等检查 G@G=True R@R=True B@B=True
+  输出范围 [-0.002, 2.070]
+Traceback (most recent call last):
+  File "/Users/wl/Downloads/胶片相机/docs/reports/rcd-linecompare/rcd_ab.py", line 558, in <module>
+    main()
+  File "/Users/wl/Downloads/胶片相机/docs/reports/rcd-linecompare/rcd_ab.py", line 510, in main
+    m_ref = measure(ref, 'REF 原版 RCD')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wl/Downloads/胶片相机/docs/reports/rcd-linecompare/rcd_ab.py", line 365, in measure
+    seg_full = rgb[:, MEAS_Y0 - Y0:MEAS_Y1 - Y0, cols][:, ::-1, :]   # 暗->亮
+               ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+IndexError: index 516 is out of bounds for axis 2 with size 515

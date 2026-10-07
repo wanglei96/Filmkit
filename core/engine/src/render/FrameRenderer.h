@@ -442,7 +442,8 @@ class FrameRenderer {
   // v0.10.173：df_gate = 判据的梯度自适应强度（FilmParams[53]，0 = 关 ⇒ 判据
   // 与 v0.10.172 逐位相同）。>0 时阈值 = uThreshK·uChromaAvg/(1 + df_gate·|∇L|)
   // ⇒ 强亮度边缘附近的色度偏离更容易进入校正区。
-  bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f);
+  // src: 输入纹理（默认 tex_dn_ = P4 输出；替换档 [54]=1 时传 tex_pc3d_）
+  bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f, GLuint src = 0);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
   // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
   // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，

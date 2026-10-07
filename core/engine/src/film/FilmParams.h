@@ -234,7 +234,11 @@ struct FilmParams {
   //        —— 低风险替代方案（只作用于已判定的紫边像素），**默认关**，待真机拍板。
   float chroma_gate = 2.0f;    // 51 κ（0 = 关）
   float cg_scope = 1.0f;       // 52 1 = PC 的 w2 权重形式；0 = 只放大 wc（字面版）
-  float df_gate = 0.0f;        // 53 紫边判据梯度自适应（0 = 关）
+  // v0.10.182：默认 0 → 8。为什么：淡紫线（窗帘边缘 1~3px 窄带）在半分辨率
+  // 检测器里 dev ≈ 14，而基础阈值 thr = 2.43·chromaAvg ≈ 62 ⇒ 永不命中
+  // （离线引擎 shader 实测）。df_gate 正是为此设计：thr = 2.43·chromaAvg/(1+g·|∇L|)，
+  // 高梯度处阈值下降，平坦区几乎不变（保护平坦区色度）。
+  float df_gate = 8.0f;        // 53 紫边判据梯度自适应（0 = 关；v0.10.182 默认 8）
   // ── 54/55：PC ESD3D2 完整移植（v0.10.175）──────────────────────────────
   // 一手来源（逐行读）：PC `denoise/esd3d2_steered.glsl`（PC 默认档）+
   // `postpipeline/ESD3D2.java`（核尺寸公式 + 两趟编排）+ `utils/convdiff.glsl`

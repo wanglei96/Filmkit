@@ -1368,8 +1368,14 @@ void main() {
     // L 由本像素线性值现算（亮度零损失），只换 a/b
     float y0 = dot(lin0, LW);
     float fy = (116.0 * labf(y0) - 16.0 + 16.0) / 116.0;
-    float fx = fy + (atot / wsum) / 500.0;
-    float fz = fy - (btot / wsum) / 200.0;
+    // v0.10.183 保护：替换 a/b **只许降不许升**（朝中性收缩，上限 = 本像素原值）。
+    // 为什么：原实现直接取邻域加权均值，离线实测替换后 B-G>40 的像素从 604 涨到
+    // 1833 —— 色度被推给邻居（加权均值可能高于本像素）。紫边抑制只需要去饱和，
+    // 不需要反向增饱和；限住上限即可保留"降到中性"的能力。
+    float a_new = abs(atot / wsum) < abs(d0.x) ? (atot / wsum) : d0.x;
+    float b_new = abs(btot / wsum) < abs(d0.y) ? (btot / wsum) : d0.y;
+    float fx = fy + a_new / 500.0;
+    float fz = fy - b_new / 200.0;
     vec3 xyz = vec3(labfinv(fx) * 0.95047, labfinv(fy),
                     labfinv(fz) * 1.08883);
     oColor = vec4(clamp(XYZ2RGB * xyz, vec3(0.0), vec3(16.0)), 1.0);
@@ -7332,13 +7338,14 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
 
 // 四段：down+Lab+门 → 检测 → 1/16 均值（读回 chromave）→ 替换。
 // 输入 tex_dn_（P4 输出），输出 tex_df_。任何一步失败返回 false（调用方回落）。
-bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate) {
+bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src) {
   dbg_df_gate_ = df_gate > 0.f ? df_gate : 0.f;   // v0.10.173（日志字段 dfG）
   dbg_df_cavg_ = 0.f;
   if (!prog_df_down_ || !prog_df_det_ || !prog_df_avg_ || !prog_df_apply_) {
     return false;
   }
   if (!ensureDefringe(dst_w, dst_h)) return false;
+  const GLuint df_src_ = (src != 0) ? src : tex_dn_;   // 替换档传 tex_pc3d_
   const int hw = (dst_w + 1) / 2, hh = (dst_h + 1) / 2;
   const int aw = (hw + 15) / 16, ah = (hh + 15) / 16;
   // ① 2×2 box down + 线性 RGB → Lab + 色相门
@@ -7346,7 +7353,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate) {
   glViewport(0, 0, hw, hh);
   glUseProgram(prog_df_down_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glBindTexture(GL_TEXTURE_2D, df_src_);
   glUniform1i(u_df_down_.tex, 0);
   glUniform2i(u_df_down_.size, dst_w, dst_h);
   glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -7384,7 +7391,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate) {
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_df_apply_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_dn_);
+  glBindTexture(GL_TEXTURE_2D, df_src_);
   glUniform1i(u_df_apply_.tex, 0);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, tex_df_det_);
@@ -7392,7 +7399,10 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate) {
   glUniform2i(u_df_apply_.size, dst_w, dst_h);
   glUniform2i(u_df_apply_.half, hw, hh);
   glUniform1f(u_df_apply_.chroma_avg, cavg);
-  glUniform1f(u_df_apply_.thresh_k, 2.43f);   // (23/33)²·5，RT threshold=23
+  // v0.10.183：2.43 → 1.0。为什么：2.43 是 RT threshold=23 的等效值，为「宽紫边」
+  // 定标；1~3px 窄线在 2×2 降采样后被稀释（dev 只剩 1/3~1/2），按 2.43 判据大面积
+  // 漏检（离线实测：紫线像素集合只降 27%）。降到 1.0 让窄线进入替换区。
+  glUniform1f(u_df_apply_.thresh_k, 1.0f);   // v0.10.183：原 2.43（RT t23）
   glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
@@ -8476,7 +8486,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         pc3d_replace = (p.pc3d < 1.5f);
       }
     }
-    if (!pc3d_replace) {
+    if (pc3d_replace) {
+      // v0.10.182（用户拍板方案 A）：替换档 [54]=1 下**保留 defringe**。
+      // 为什么：替换档照抄 PC 链路地位（ESD3D2 后直进 film）会旁路 defringe，
+      // 而 defringe（Lab a 色相门 + 局部基线偏离检测 + 邻居加权替换）正是为
+      // "逆光边缘品红窄带"设计的模块；替换档是色度平滑，对 1~3px 窄线效果有限
+      // ⇒ 真机留下淡紫线（2026-10-07 样片：PC 无、我们 B-G 峰 +104）。
+      // 输入 = tex_pc3d_（PC3D 输出，D4 场景线性，与 tex_dn_ 同域同几何）。
+      // P4/D-1 仍然旁路（保持替换档的观感基调，只补回窄带紫边抑制）。
+      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, tex_pc3d_) : false;
+    } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
                         p.chroma_gate, p.cg_scope, p4_src);
       // 紫边抑制（v0.10.134）：P4 后、D-1 前。逆光边缘品红渐晕 56~66% 贴边
@@ -8505,7 +8524,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 第 6 期（S12）：RAW 静拍链的输入本来就是**场景线性域** ⇒ hal_domain = false
   //（不做域比归一）。三条链的域标志至此齐全：预览=true、YUV 静拍=true、RAW 静拍=false。
   passFilm(dst_w, dst_h, p,
-           pc3d_replace ? tex_pc3d_          // [54] = 1：PC3D 顶替 P4/D-1（照抄 PC 地位）
+           pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
                         : ((c.dn && mst_ok) ? tex_scene_
                             : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_)),
            /*still=*/true, /*hal_domain=*/false);
