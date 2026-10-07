@@ -809,6 +809,63 @@ private fun LabDrawerContent() {
             )
         },
     )
+    // RCD P2/G 位回归原版（v0.10.178）：与上面的色差段同型 —— P2 的 G 估计
+    // 限幅到四邻实测 G 范围、G 位轴向填充混 ±3 远对并限幅，都是原版没有的
+    // 结构；限幅范围取自跨边界邻居，候选解释亮暗交界暗侧品红窄峰。
+    // 默认关 = 旧行为逐位不变；开 = A/B 通路（真机数据说话后再定默认）。
+    var rcdGOrigOn by remember { mutableStateOf(prefs.getBoolean("rcd_g_orig", false)) }
+    SettingSwitchRow(
+        title = "去马赛克·G 段原版",
+        subtitle = "RCD 绿色段与 G 位色度填充回归原版（无限幅、无 ±3 远对混合）；针对亮暗交界暗侧品红窄峰的 A/B；关 = 旧行为",
+        checked = rcdGOrigOn,
+        onChecked = { v ->
+            rcdGOrigOn = v
+            prefs.edit().putBoolean("rcd_g_orig", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.rcd_g_orig",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 高光重建·R/B 反推（v0.10.179）：亮暗交界 clip 过渡带的品红窄带 —— 过渡带
+    // photosite 本通道（R/B）满阱、其余通道未满，allSat 与普通 G 反推都够不着，
+    // 满阱比例（WB 增益伪影）经 CCM 后成 4~6px 品红窄带。开 = 按参考比反推替换
+    // （替换语义）；关 = 旧行为逐位不变。默认关 = 旧行为；开 = A/B 通路
+    //（真机数据说话后再定默认）。
+    var hlRbReconOn by remember { mutableStateOf(prefs.getBoolean("hl_rb_recon", false)) }
+    SettingSwitchRow(
+        title = "高光重建·R/B 反推",
+        subtitle = "亮暗交界品红窄带修复 A/B（clip 过渡带 R/B 满阱时按参考比反推替换）；开 = 启用，关 = 旧行为",
+        checked = hlRbReconOn,
+        onChecked = { v ->
+            hlRbReconOn = v
+            prefs.edit().putBoolean("hl_rb_recon", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hl_rb_recon",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    // 去马赛克·G 位双 pass（v0.10.180）：与上面同族但根因不同 —— 单 pass 的
+    // P3 里 G 位轴向填充并行读不到本 pass 内对角段刚填好的对侧色，轴向估计
+    // 只剩同轴 ±1 实测信息，把原版就有的 B 缓 G 陡错位放大 2 倍（品红峰
+    // +43.8 → +85.6 WB 域）。开 = 拆 3a/3b 双 pass 恢复原版四正邻双轴估计；
+    // 关 = 旧行为逐位不变。默认关 = 旧行为；开 = A/B 通路（真机数据说话
+    // 后再定默认）。
+    var rcdP3SplitOn by remember { mutableStateOf(prefs.getBoolean("rcd_p3_split", false)) }
+    SettingSwitchRow(
+        title = "去马赛克·G 位双 pass",
+        subtitle = "RCD 色度段拆双 pass 对齐原版四邻估计，针对亮暗交界品红窄带（拍照约慢 0.2 秒）；关 = 旧行为",
+        checked = rcdP3SplitOn,
+        onChecked = { v ->
+            rcdP3SplitOn = v
+            prefs.edit().putBoolean("rcd_p3_split", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.rcd_p3_split",
+                "{\"on\":$v}",
+            )
+        },
+    )
     // 拍照独立渲染线程（v0.10.85）：合成链 1.6~3.4s 原来跑在预览渲染线程上，
     // 预览的 updateTexImage 全排在它后面 → "拍完挪手机画面完全冻住 1~2 秒"。
     // 开 = 独立线程 + 独立 EGL context（PhotonCamera 同构）；默认关 = 旧行为。

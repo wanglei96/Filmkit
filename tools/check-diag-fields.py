@@ -37,6 +37,13 @@ EXPECT = {
     "hlSum": ("finishStillChain", ["passHighlightRaw("]),
     "hrStatRaw": ("finishStillChain", ["passHighlightRaw("]),
     "hlCnt3": ("finishStillChain", ["passHighlightRaw("]),
+    # v0.10.179：uRbRecon（FilmParams[57]）实际下发值，与 hlGRecon 同口径
+    "hlRb": ("finishStillChain", ["passHighlightRaw("]),
+    # v0.10.180：P3 拆双 pass（FilmParams[58]）的生效性与分 pass 成本；
+    # 3a/3b 都必须在 finishStillChain 内、日志行之前执行
+    "rcdSplit": ("finishStillChain", ["passRcdChromaA(", "passRcdChromaB("]),
+    "rcdAMs": ("finishStillChain", ["passRcdChromaA("]),
+    "rcdBMs": ("finishStillChain", ["passRcdChromaB("]),
     "clipB": ("finishStillChain", ["passFilm("]),
     "hrMs": ("finishStillChain", ["passFilm("]),
 }

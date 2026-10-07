@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 56;  // v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）
+  static constexpr int kCount = 59;  // v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -266,11 +266,55 @@ struct FilmParams {
   //   pc3dMs 与 dnMs 同量级 ⇒ 成本正常；pc3dMs ≫ dnMs ⇒ 过强（核尺寸调小的信号）。
   //   cg* 字段（v0.10.174 的 P4 门）在 [54] 开启后**语义不变**（仍在 P4 内），
   //   健康区间照旧：cgMean ≤ 0.15、cgCov ≤ 0.05。
-  float pc3d = 2.0f;           // 54 0 = 关；1 = 替换档；2 = **叠加档（默认）**，
-                               //    2026-10-05 新 KPI 重估 docs/reports/pc3d-reval-REPORT.md；
+  float pc3d = 1.0f;           // 54 0 = 关；1 = **替换档（默认，v0.10.181 转正，
+                               //    用户真机拍板 2026-10-07：紫边细、红笔不色散）**；
+                               //    2 = 叠加档（2026-10-05 新 KPI 重估
+                               //    docs/reports/pc3d-reval-REPORT.md）；
                                //    运行时默认值以 Kotlin 下发为准（CameraPresets.neutral()
-                               //    同步改 2.0），此处仅为未收到下发时的 C++ 兜底值
+                               //    同步改 1.0），此处仅为未收到下发时的 C++ 兜底值
   float pc3d_msize = 0.0f;     // 55 0 = 自动（PC 公式）；>0 = 强制核尺寸（奇数 7..21）
+
+  // 56：RCD P2(G@RB)/G 位色度段回归原版（v0.10.178）。1 = 原版行为：
+  // P2 的 G 估计**不做**四邻实测范围限幅（参考实现 STEP 3 只有 LIM 0..1），
+  // G 位的 R/B 填充按参考实现 STEP 4.3（只用 ±1 近对 + 三项梯度反比加权、
+  // 无 ±3 远对混合、无限幅）；0 = 旧行为（v0.5.28/30 实现期产物：P2 clamp 到
+  // 四邻 G 范围 + G 位"近对 0.75/±3 均值 0.25 固定混合 + clamp"）。
+  // 动机（2026-10-06 原版逐行对照）：与 [46] 同型的"clamp 限幅范围取自跨边界
+  // 邻居"结构在 P2/G 位仍然存在 —— 亮暗交界暗侧把插值 G 钳向 R/B 位四邻的
+  // 暗侧 G 范围（⇒ R−G/B−G 增大 ⇒ 品红窄峰，宽度 = 邻域半径 ≈ 3px）、亮侧
+  // 对称地产生绿向；候选解释台灯逆光 B 类品红窄峰（+10@3px）。v0.10.117 只
+  // 回归了对角段（chromaDiag），P2/axialFill 漏网。⚠ 默认 0 = **旧行为逐位
+  // 不变**（clamp 当年是为压伪彩加的，正面/负面作用都未单独实测过）；1 = A/B
+  // 通路，改默认前必须真机数据说话。prefs("rcd_g_orig")。
+  float rcd_g_orig = 0.0f;     // 56
+
+  // 57：clip 过渡带 R/B 满阱比例反推（v0.10.179，kFsHlApply 内新支）。
+  // 1 = 启用：allSat（三通道全饱和）与普通 G 反推（c==1）都够不着的 clip
+  //     过渡带 photosite —— 本通道（R/B）已满阱、其余通道未满 —— 按**三级
+  //     参考比**由 G 与对侧通道反推**替换**（不做 max、不做软门控；与 allSat
+  //     分支 v0.10.161 哲学同源：满阱原值 = WB 增益伪影、不含场景信息）。
+  //     动机 = 2026-10-06 台灯样张 RAW 域定案的 clip 过渡带品红窄带
+  //     （docs/research/11 号 §6）：亮窗大面积 clip 后 WB 后 clip 场 =
+  //     (gainR 2.027, G 1.0, gainB 1.443) 的强品红底色，过渡带 R/B 满阱比例
+  //     原样保留经 CCM 后成 4~6px 品红窄带。
+  // 0 = 旧行为**逐位不变**（shader 内该支判据不满足 ⇒ 不执行任何新计算
+  //     路径，默认）；1 = A/B 通路，改默认前必须真机数据说话。
+  // prefs("hl_rb_recon")。
+  float hl_rb_recon = 0.0f;    // 57
+
+  // 58：RCD P3 拆双 pass（v0.10.180）。1 = 色度段拆成 3a（R/B 位对角填充
+  //     = 原版 STEP 4.2，输出中间纹理 tex_rcd_a_）→ 3b（G 位轴向填充，交叉轴
+  //     ±1 从 3a 读已填充的对侧色），恢复原版 STEP 4.3 的**四正邻双轴**色度
+  //     估计（v0.10.181 起 3a/3b 填充值钳到 per-channel 满阱 = 原版 LIM(0,1)
+  //     的域正确翻译；直译对照更正：早期"原版 43.8 vs 我们 85.6 的 2× 放大"
+  //     是直译 LIM(0,1) 在 WB 域削顶的假象，全无 LIM 口径下两者 ≈ +87 无差异
+  //     —— docs/research/11 号 §8/§9）。真机 A/B（2026-10-07，pc3d 替换档）：
+  //     品红带峰 43.4 vs 40.6 持平；灯盘高光区无钳时 +31%（70.3 vs 53.5），
+  //     v0.10.181 加钳后应回平。代价 = 多一次全分辨率 RGBA16F 往返
+  //     （实测 rcdAMs+rcdBs 仅 15~61ms，可忽略）。
+  // 0 = 旧行为**逐位不变**（旧 shader/调用路径零改动，默认存档）；1 = A/B 通路。
+  // prefs("rcd_p3_split")。
+  float rcd_p3_split = 0.0f;   // 58
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -341,6 +385,12 @@ struct FilmParams {
     // v0.10.175：PC ESD3D2 完整移植（[54] 开关 / [55] 强制核尺寸）
     if (n > 54) pc3d = static_cast<float>(v[54]);
     if (n > 55) pc3d_msize = static_cast<float>(v[55]);
+    // v0.10.178：RCD P2/G 位色度段回归原版（[56]）
+    if (n > 56) rcd_g_orig = static_cast<float>(v[56]);
+    // v0.10.179：clip 过渡带 R/B 满阱比例反推（[57]）
+    if (n > 57) hl_rb_recon = static_cast<float>(v[57]);
+    // v0.10.180：RCD P3 拆双 pass（[58]）
+    if (n > 58) rcd_p3_split = static_cast<float>(v[58]);
   }
 };
 

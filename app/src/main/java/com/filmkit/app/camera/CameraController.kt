@@ -1091,12 +1091,27 @@ class CameraController(private val context: Context, private val render: RenderC
     private val HR_RAW = 1.0
     // v0.10.117：RCD 色差段回归 RawTherapee 原版（FilmParams[46]）
     private val RCD_CDFIX = 1.0
+    // v0.10.178：RCD P2(G@RB)/G 位色度段回归原版（FilmParams[56]）。1 = 原版
+    //（P2 无四邻 G 范围限幅；G 位轴向填充 ±1 近对 + 三项梯度反比、无限幅）；
+    // 0 = 旧行为（v0.5.28/30 的 clamp/0.75·0.25 混合）。默认 0 = 旧行为逐位不变。
+    private val RCD_G_ORIG = 1.0
     // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）
     private val DEFRINGE = 1.0
     // v0.10.169：高光重建·G 通道重建（FilmParams[49]）。1 = 开 = 现有行为
     // （kFsHlApply 的 apply 支含自创的 G 三级池化比 + allSat 三通道改写）；
     // 0 = 关（apply 只留分支① 的 darktable opposed 外推 = PhotonCamera 口径）。
     private val HL_GRECON = 1.0
+    // v0.10.179：高光重建·R/B 满阱反推（FilmParams[57]）。1 = 启用 kFsHlApply 内
+    // 新支 —— clip 过渡带"本通道（R/B）满阱、其余未满"的 photosite（allSat 与
+    // 普通 G 反推都够不着）按三级参考比反推替换（替换语义，与 allSat 分支哲学
+    // 同源）；治亮暗交界 CCM 后的品红窄带。0 = 旧行为逐位不变（默认）。
+    private val HL_RB_RECON = 1.0
+    // v0.10.180：RCD P3 拆双 pass（FilmParams[58]）。1 = 色度段拆 3a（对角填充）
+    // → 3b（G 位轴向填充，交叉轴 ±1 读 3a 已填充色），恢复原版 STEP 4.3 四正邻
+    // 双轴估计 —— 单 pass 版并行读不到对角段结果 ⇒ B 缓 G 陡错位放大 2×
+    //（品红峰 +43.8 → +85.6 WB 域，docs/research/11 号 §8）。
+    // 0 = 旧行为逐位不变（默认）。
+    private val RCD_P3_SPLIT = 1.0
     // v0.10.170：镜头横向色差校正（FilmParams[50]）。作用在 D3（RCD 去马赛克后 /
     // CCM 前）相机 RGB 域：自动估计（1/8 降采样 + 径向 Lucas-Kanade）+ 径向位移
     // 重采样 R/B（G 逐位不动）。判据：角部位移 ≥ 0.5px 且内外半区拟合一致，
@@ -1115,9 +1130,12 @@ class CameraController(private val context: Context, private val render: RenderC
     private var pc3dMsizePref = -1.0
     private var chromaGatePref = -1.0
     private var rcdCdFixPref = -1.0
+    private var rcdGOrigPref = -1.0
     private var defringePref = -1.0
     private var caCorrPref = -1.0
     private var hlGreconPref = -1.0
+    private var hlRbReconPref = -1.0
+    private var rcdP3SplitPref = -1.0
     private var hrRawPref = -1.0
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
@@ -1211,6 +1229,9 @@ class CameraController(private val context: Context, private val render: RenderC
         applyHrWaveletPref()
         applyHrRawPref()
         applyRcdCdFixPref()
+        applyRcdGOrigPref()
+        applyHlRbReconPref()
+        applyRcdP3SplitPref()
         applyDefringePref()
         applyHlGReconPref()
         applyCaCorrPref()
@@ -1357,6 +1378,61 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != rcdCdFixPref) {
             rcdCdFixPref = v
             filmParams[46] = v
+        }
+    }
+
+    /**
+     * RCD P2(G@RB)/G 位色度段回归原版开关（v0.10.178）：写 FilmParams[56]。
+     * 1 = 原版行为（P2 不做四邻 G 范围限幅；G 位轴向填充只用 ±1 近对 +
+     * 三项梯度反比、无 ±3 远对混合、无限幅）；0 = 旧行为（v0.5.28/30 的
+     * clamp/0.75·0.25 固定混合）。
+     * 动机（2026-10-06 原版逐行对照）：与 [46] 同型的"clamp 限幅范围取自
+     * 跨边界邻居"结构在 P2/G 位仍存在，候选解释台灯逆光暗侧品红窄峰
+     * （+10@3px，宽度 = 邻域半径吻合）。默认 0 = 旧行为逐位不变，1 = A/B
+     * 通路；改默认前必须真机数据说话。
+     */
+    private fun applyRcdGOrigPref() {
+        val v = if (appPrefs.getBoolean("rcd_g_orig", false)) RCD_G_ORIG else 0.0
+        if (v != rcdGOrigPref) {
+            rcdGOrigPref = v
+            filmParams[56] = v
+        }
+    }
+
+    /**
+     * 高光重建·R/B 满阱反推开关（v0.10.179）：写 FilmParams[57]。
+     * kFsHlApply（RAW 域高光重建的 apply 支）里新增支的总开关：clip 过渡带
+     * "本通道（R/B）满阱、其余通道未满"的 photosite —— allSat 三判据够不着、
+     * 普通 G 反推只管 c==1、分支① 的 max 只抬不压 ⇒ 满阱比例（WB 增益伪影）
+     * 原样保留，经 CCM 后成 4~6px 品红窄带（2026-10-06 台灯样张 RAW 域定案，
+     * docs/research/11 号 §6）。开 = 按三级参考比由 G 与对侧通道反推**替换**
+     * （直接替换，不做 max/软门控，与 allSat 分支 v0.10.161 哲学同源：满阱
+     * 原值不含场景信息）；关 = 旧行为逐位不变（默认）。
+     * 改默认前必须真机数据说话。prefs("hl_rb_recon")。
+     */
+    private fun applyHlRbReconPref() {
+        val v = if (appPrefs.getBoolean("hl_rb_recon", false)) HL_RB_RECON else 0.0
+        if (v != hlRbReconPref) {
+            hlRbReconPref = v
+            filmParams[57] = v
+        }
+    }
+
+    /**
+     * RCD P3 拆双 pass 开关（v0.10.180）：写 FilmParams[58]。
+     * 1 = 色度段拆 3a（R/B 位对角填充 = 原版 STEP 4.2）→ 3b（G 位轴向填充，
+     * 交叉轴 ±1 从 3a 读已填充的对侧色），恢复原版 STEP 4.3 的四正邻双轴
+     * 估计 —— 单 pass 版并行读不到本 pass 内对角段结果 ⇒ 原版就有的 B 缓 G
+     * 陡错位（品红峰 +43.8 WB 域）被放大 2 倍（+85.6），治亮暗交界品红窄带
+     *（docs/research/11 号 §8）。拍照约慢 0.2 秒（日志 rcdAMs/rcdBMs）。
+     * 0 = 旧行为逐位不变（默认）；1 = A/B 通路，改默认前必须真机数据说话。
+     * prefs("rcd_p3_split")。
+     */
+    private fun applyRcdP3SplitPref() {
+        val v = if (appPrefs.getBoolean("rcd_p3_split", false)) RCD_P3_SPLIT else 0.0
+        if (v != rcdP3SplitPref) {
+            rcdP3SplitPref = v
+            filmParams[58] = v
         }
     }
 

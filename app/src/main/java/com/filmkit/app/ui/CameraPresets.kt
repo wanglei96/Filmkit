@@ -21,7 +21,7 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(56).apply {
+    private fun neutral(): DoubleArray = DoubleArray(59).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵
@@ -140,7 +140,7 @@ object CameraPresets {
         // 48 = 伪彩感知色度降噪强度（档 A，v0.10.165）：0 = 关（A/B 通路），
         // >0 = σc 放大倍率（scEff = sc·(1 + moire·[48])，封顶 4·sc）。
         // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
         this[48] = 2.0
         // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
         // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
@@ -167,7 +167,7 @@ object CameraPresets {
         // [51] = κ（0 = 关 ⇒ P4/D-1 逐位回到 v0.10.172）；κ=2 沿用 PC 的 0.2 标定。
         // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
         // [53] = 紫边判据梯度自适应（默认 0 关）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
         // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
         this[51] = 2.0
         this[52] = 1.0
@@ -176,19 +176,48 @@ object CameraPresets {
         // 全部照抄 PC（`esd3d2_steered.glsl` + `ESD3D2.java` + `convdiff.glsl` +
         // `guidedupsample.glsl` + `GLUtils.gaussdown`）。
         // [54] = 0 = 关，tex_scene_ 直通 P4（与 v0.10.174 逐位相同）；
-        //        1 = **替换档**（照抄 PC 的链路地位：PC3D 输出直接进 film，
-        //            P4/defringe/D-1 旁路，代码全保留）；2 = **叠加档（默认）**
-        //            （PC3D → 现有链）。
+        //        1 = **替换档（默认，v0.10.181 转正）**（照抄 PC 的链路地位：
+        //            PC3D 输出直接进 film，P4/defringe/D-1 旁路，代码全保留）；
+        //        2 = 叠加档（PC3D → 现有链）。
         // [55] = 0 = 核尺寸自动（PC 公式 min(7+(int)ks−(int)ks%2, 21)，本机 ⇒ 11）；
         //        >0 = 强制 MSIZE（奇数 7..21），真机拍板"代价 vs 收益"用。
-        // ⚠️ 默认值依据（v0.10.177 从"关"改为"叠加档"）：2026-10-05 新 KPI 重估
-        // （docs/reports/pc3d-reval-REPORT.md）：叠加档 core ×0.676 四片全改善、色渗全绿
-        // ⇒ 默认开，**待真机 pc3dMs/画质验证后定稿**；旧"默认关"依据（∇>60 旧口径，
-        // docs/reports/pc3d-REPORT.md + "PC 的 3.68" 旧基准）已被推翻。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 56，数组越界会直接崩。
+        // ⚠️ 默认值沿革：v0.10.177 从"关"改"叠加档"（2026-10-05 新 KPI 重估，
+        // docs/reports/pc3d-reval-REPORT.md）；v0.10.181 从"叠加档"改**替换档** ——
+        // 用户真机拍板（2026-10-07，台灯逆光 + 红笔场景）："替换档紫边变细、
+        // 且红笔不色散"，成片观感以用户为准；替换档旁路 P4/defringe/D-1 的
+        // 色渗风险由 ESD3D2 自带逐像素门覆盖（pc3dK 诊断字段观察）。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
         // 真机 A/B：prefs("pc3d") / prefs("pc3d_msize")。
-        this[54] = 2.0
+        this[54] = 1.0
         this[55] = 0.0
+        // 56 = RCD P2(G@RB)/G 位色度段回归原版（v0.10.178）：1 = 原版行为
+        //（P2 不做四邻 G 范围限幅；G 位轴向填充只用 ±1 近对 + 三项梯度反比、
+        // 无 ±3 远对混合、无限幅）；0 = 旧行为（v0.5.28/30 的 clamp/混合结构）。
+        // 动机：2026-10-06 原版逐行对照发现与 [46] 同型的"clamp 锁跨边界邻居"
+        // 结构在 P2/G 位仍存在（[46] 只回归了对角段），候选解释台灯逆光暗侧
+        // 品红窄峰（+10@3px，宽度 = 邻域半径吻合）。⚠ 默认 0 = 旧行为逐位不变
+        //（clamp 正/负作用均未单独实测）；1 = A/B 通路，改默认前真机数据说话。
+        // 设置页开关写 prefs("rcd_g_orig")。
+        this[56] = 0.0
+        // 57 = 高光重建·R/B 满阱反推（v0.10.179）：1 = 启用 kFsHlApply 内新支 ——
+        // clip 过渡带"本通道（R/B）满阱、其余未满"的 photosite（allSat 三判据与
+        // 普通 G 反推都够不着）按三级参考比由 G 与对侧通道反推**替换**（与 allSat
+        // 分支 v0.10.161 哲学同源：满阱原值 = WB 增益伪影）；治亮暗交界经 CCM 后
+        // 的 4~6px 品红窄带（2026-10-06 台灯样张 RAW 域定案，docs/research/11 §6）。
+        // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // 设置页开关写 prefs("hl_rb_recon")。
+        this[57] = 0.0
+        // 58 = RCD P3 拆双 pass（v0.10.180）：1 = 色度段拆成 3a（R/B 位对角
+        // 填充 = 原版 STEP 4.2，输出中间纹理 tex_rcd_a_）→ 3b（G 位轴向填充，
+        // 交叉轴 ±1 从 3a 读已填充的对侧色），恢复原版 STEP 4.3 的四正邻双轴
+        // 估计 —— 单 pass 版并行读不到本 pass 内对角段结果 ⇒ 原版就有的 B 缓
+        // G 陡错位（品红峰 +43.8 WB 域）被放大 2 倍（+85.6），治亮暗交界品红
+        // 窄带（docs/research/11 号 §8）。拍照约慢 0.2 秒（日志 rcdAMs/rcdBMs）。
+        // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // 设置页开关写 prefs("rcd_p3_split")。
+        this[58] = 0.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

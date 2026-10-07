@@ -99,6 +99,8 @@ struct HlRawResult {
   // v0.10.169：apply 支实际下发的 uGRecon（0/1），进 raw.render 的 hlGRecon 字段 ——
   // 真机 A/B 时用它确认"这一张到底是哪一支"。
   int grecon = 1;
+  // v0.10.179：apply 支实际下发的 uRbRecon（0/1），进 raw.render 的 hlRb 字段。
+  int rbrecon = 0;
 };
 
 // 共享后段渲染器：SurfaceTexture(OES) → 场景线性 → 胶片曲线 → 输出。
@@ -388,11 +390,23 @@ class FrameRenderer {
   void passRcdDir(int w, int h, int cfa, const float black_phase[4],
                   float white_level, const float gains[3], bool mosaic);
   void passRcdG(int w, int h, int cfa, const float black_phase[4],
-                float white_level, const float gains[3], bool mosaic);
+                float white_level, const float gains[3], bool mosaic,
+                float g_orig);
   void passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                      const float black_phase[4], float white_level,
                      const float gains[3], const float* ccm, bool mosaic,
-                     float cd_fix);
+                     float cd_fix, float g_orig);
+  // P3 拆双 pass（v0.10.180，FilmParams[58] rcd_p3_split，仅 =1 时调用）：
+  // 3a 对角段填充（= 原版 STEP 4.2）→ tex_rcd_a_（源几何，WB 域 RGB 无 LSC）；
+  // 3b G 位轴向填充（= 原版 STEP 4.3，交叉轴 ±1 从 tex_rcd_a_ 读已填充色，
+  // 恢复四正邻双轴估计）→ 乘 LSC 写 tex_work_（D3，与旧 P3 输出域一致）。
+  // 机理：单 pass 版并行读不到本 pass 内对角段结果 ⇒ B 缓 G 陡错位放大 2×
+  //（品红峰 +43.8 → +85.6 WB 域，docs/research/11 号 §8）。
+  void passRcdChromaA(int w, int h, int cfa, const float black_phase[4],
+                      float white_level, const float gains[3], bool mosaic,
+                      float cd_fix);
+  void passRcdChromaB(int dst_w, int dst_h, int rot, int cfa,
+                      const float gains[3]);
   // P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_），
   // 纯逐像素映射（kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位）。
   // 只在 RCD 档调用（双线性档 passRaw 内联 CCM）。S14 的 clamp 收口在 shader 内。
@@ -463,9 +477,12 @@ class FrameRenderer {
   // grecon（v0.10.169）：kFsHlApply 内"自创机制"两支（G 三级池化比 + allSat 三通道
   //   改写）的总开关，来自 FilmParams[49] hl_grecon。1 = 现有行为（默认）；0 = 只留
   //   分支① 的 darktable opposed 外推（= PhotonCamera OpposedGL 口径），供真机 A/B。
+  // rbrecon（v0.10.179）：clip 过渡带 R/B 满阱比例反推支的总开关，来自 FilmParams[57]
+  //   hl_rb_recon。1 = 启用（替换语义，见 kFsHlApply 新分支注释）；0 = 默认，旧行为
+  //   逐位不变。
   HlRawResult passHighlightRaw(int w, int h, int cfa, const float gains[3],
                                GLuint src, GLuint stat_src, int stat_raw,
-                               int mono_src = 0, int grecon = 1);
+                               int mono_src = 0, int grecon = 1, int rbrecon = 0);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
@@ -535,7 +552,10 @@ class FrameRenderer {
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
-         prog_rcd_chroma_ = 0, prog_ccm_ = 0, prog_amaze_up_ = 0,
+         prog_rcd_chroma_ = 0,
+         // P3 拆双 pass（v0.10.180）：3a 对角填充 / 3b G 位轴向
+         prog_rcd_chroma_a_ = 0, prog_rcd_chroma_b_ = 0,
+         prog_ccm_ = 0, prog_amaze_up_ = 0,
          prog_raw_dn_ = 0,
          prog_chroma_dn_ = 0,
          prog_moire_stat_ = 0,   // 档 A（v0.10.165）伪彩强度图统计
@@ -599,6 +619,9 @@ class FrameRenderer {
   GLuint fbo_dir_ = 0, tex_dir_ = 0;  // RGBA16F，RCD 方向场（vh + pq 统计）
   GLuint fbo_g_ = 0, tex_g_ = 0;      // RGBA16F，RCD 全图 G（g 通道有效）
   int rcd_w_ = 0, rcd_h_ = 0;
+  // P3 拆双 pass（v0.10.180）的 3a 中间场：源几何 RGBA16F，WB 域 RGB
+  //（对角段已填、无 LSC）；3b 的交叉轴取数源。仅 [58]=1 时被写/读。
+  GLuint fbo_rcd_a_ = 0, tex_rcd_a_ = 0;
   GLuint fbo_mos_ = 0, tex_mos_ = 0;  // RGBA16F，P0 降噪后线性 mosaic
   // AMaZE 档（v0.10.172）：CPU AMaZE 输出的 WB 域相机 RGB（源几何，RGB16F）。
   // 只在 demosaic == 2 时创建/上传；RCD/双线性档完全不触碰（零回归面）。
@@ -639,6 +662,11 @@ class FrameRenderer {
   float dbg_ca_shift_r_ = 0.f, dbg_ca_shift_b_ = 0.f;
   int dbg_ca_applied_ = 0;
   float dbg_ca_ms_ = 0.f;
+  // P3 拆双 pass（v0.10.180，[58]）生效性与分 pass 成本（照 p0s/hlOk 的教训：
+  // 改完必须能自证）。rcdSplit = 1 = 本帧真的走了 3a→3b；rcdAMs/rcdBMs =
+  // 两个 pass 各自耗时（含 glFinish 同步，ms）。日志字段 rcdSplit/rcdAMs/rcdBMs。
+  int dbg_rcd_split_ = 0;
+  float dbg_rcd_a_ms_ = 0.f, dbg_rcd_b_ms_ = 0.f;
   // AMaZE 档（v0.10.172）：CPU AMaZE + 上传耗时（日志 amazeMs；0 = 未走本档）
   float dbg_amaze_ms_ = 0.f;
   // 档 A（v0.10.165）伪彩强度图诊断（passChromaDenoise 内 GPU 统计读回）：
@@ -706,6 +734,7 @@ class FrameRenderer {
   double dbg_hl_refw_ = 0.0;  // Σw（ref 场权重和；理论上限 = 块数）
   float dbg_hl_r2hit_ = 0.f, dbg_hl_rghit_ = 0.f;  // 三级参考命中占比（%）
   int dbg_hl_grecon_ = 1;  // v0.10.169：apply 支实际下发的 uGRecon（日志 hlGRecon）
+  int dbg_hl_rbrecon_ = 0;  // v0.10.179：apply 支实际下发的 uRbRecon（日志 hlRb）
   // ── v0.10.167 HR 前置的生效性字段（照 p0s/hlOk 的教训：改完必须能自证）──
   // 为什么必须记"统计源/判定源"两个名字：exp21 翻车的结构性根因就是二者共用
   // 一个 src、没有独立旋钮（改统计口径时把判定口径一起改了 ⇒ 修复面 47269→63903
@@ -883,13 +912,25 @@ class FrameRenderer {
   } u_rcd_dir_;
   struct {
     GLint tex = -1, mos = -1, mosaic = -1, dir = -1, size = -1, cfalut = -1,
-          black = -1, white = -1, gain = -1;
+          black = -1, white = -1, gain = -1, gorig = -1;
   } u_rcd_g_;
   struct {
     GLint st = -1, rot = -1, scale = -1, tex = -1, mos = -1, mosaic = -1,
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
-          gain = -1, ccm = -1, lsc = -1, lsc_size = -1, cd_fix = -1;
+          gain = -1, ccm = -1, lsc = -1, lsc_size = -1, cd_fix = -1,
+          gorig = -1;
   } u_rcd_chroma_;
+  // P3 拆双 pass（v0.10.180，[58] rcd_p3_split）：3a（vs_plain_ 源几何直写）
+  // 与 3b（kVertRot 成片几何，与 kFsRcdChroma 同款坐标变换）的 uniform 句柄
+  struct {
+    GLint tex = -1, mos = -1, mosaic = -1, dir = -1, g = -1, size = -1,
+          cfalut = -1, black = -1, white = -1, gain = -1, cd_fix = -1,
+          satclip = -1;
+  } u_rcd_chroma_a_;
+  struct {
+    GLint st = -1, rot = -1, scale = -1, rcd_a = -1, dir = -1, g = -1,
+          size = -1, cfalut = -1, lsc = -1, lsc_size = -1, satclip = -1;
+  } u_rcd_chroma_b_;
   // 第 4a 期（S14）：D3→D4 独立 CCM pass 的 uniform 句柄
   struct {
     GLint tex = -1, size = -1, ccm = -1;
@@ -1007,7 +1048,7 @@ class FrameRenderer {
     // v0.10.161 —— 与满阱解耦，理由见 passHighlightRaw 的域核实注释）
     GLint mos = -1, stat = -1, statraw = -1, mono = -1, size = -1, cfalut = -1,
           clips = -1, hlclip = -1, chroma = -1, ref = -1, grecon = -1, gcap = -1,
-          refglobal = -1, refsize = -1, ref2 = -1, ref2size = -1;
+          rbrecon = -1, refglobal = -1, refsize = -1, ref2 = -1, ref2size = -1;
   } u_hl_apply_;
   struct {
     // v0.10.167：mono = 源布局（本 pass 仍读 uMos；前置后 uMos 即 P0 前的 mosaic）

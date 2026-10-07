@@ -421,6 +421,7 @@ uniform float uMosaic;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+uniform float uGOrig;  // [56]：1 = 原版（不做四邻 G 范围限幅）；0 = 旧行为
 const float EPS = 1e-6;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
@@ -474,10 +475,13 @@ void main() {
         float eW = cW * 2.0 * l0 / (l0 + lpfAt(p + ivec2(-1, 0)) + EPS);
         float hEst = (gw * eE + ge * eW) / (ge + gw);
         g = mix(vEst, hEst, dirMix(p, 0));
-        // 伪彩抑制：限幅到四邻实测 G 范围
-        float lo = min(min(cN, cS), min(cE, cW));
-        float hi = max(max(cN, cS), max(cE, cW));
-        g = clamp(g, lo, hi);
+        // 伪彩抑制：限幅到四邻实测 G 范围（参考实现 STEP 3 无此限幅，只有
+        // LIM 0..1 —— D4 收口钳制承担）。[56]=1 时不执行。
+        if (uGOrig < 0.5) {
+            float lo = min(min(cN, cS), min(cE, cW));
+            float hi = max(max(cN, cS), max(cE, cW));
+            g = clamp(g, lo, hi);
+        }
     }
     oColor = vec4(0.0, g, 0.0, 1.0);
 })";
@@ -513,6 +517,7 @@ uniform mat3 uCcm;     // sensor→sRGB 行主序
 // 边界被抬到 +20~26，偏红 16~22 级）。原版靠梯度反比加权天然边缘感知
 //（跨边界邻居梯度大 ⇒ 权重小），本来不需要限幅。
 uniform float uCdFix;
+uniform float uGOrig;  // [56]：1 = G 位轴向填充走原版 STEP 4.3 同轴口径；0 = 旧行为
 const float EPS = 1e-6;
 // ── 高光重建（M3 §3.2 阶段 4）——v0.10.20 移除 ──────────────────────
 // 自研"中性外推"（2026-09-28 审计定性为 darktable 原生高光处理的简化替代），
@@ -596,11 +601,22 @@ float chromaDiag(ivec2 p) {
 // 轴向色差填充（G 位置专用）：Bayer 中 G 位的 R/B 都在四正邻（±1），
 // 哪个轴是 R 由 G 的两种相位决定（水平邻 R 或垂直邻 R），按 chanAt 实测
 // 分派；同轴 ±3 为第二对。近对反梯度加权为主、远对弱混合，限幅防过冲。
+// uGOrig=1（原版 STEP 4.3 同轴口径）：只用 ±1 近对，梯度三项（同轴隔 2 的 G 差
+//   + 近对色差 + 同色隔 2 位距差）反比交叉加权，**无 ±3 远对混合、无限幅**。
+//   与参考实现的已知差异：原版还把交叉轴 ±1（对角段 STEP 4.2 已填充的对侧色）
+//   纳入梯度/估计 —— 我们 P3 单 pass 并行无中间纹理读不到，信息面窄一档。
+// uGOrig=0（旧）：近对 0.75 + ±3 均值 0.25 固定混合，clamp 到 ±1/±3 色差范围。
 float axialFill(ivec2 p, int c) {
     ivec2 d = chanAt(p + ivec2(1, 0)) == c ? ivec2(1, 0) : ivec2(0, 1);
     float c1 = s(p + d), c2 = s(p - d);
-    float c3 = s(p + 3 * d), c4 = s(p - 3 * d);
     float d1 = c1 - gAt(p + d), d2 = c2 - gAt(p - d);
+    if (uGOrig > 0.5) {
+        float c3 = s(p + 3 * d), c4 = s(p - 3 * d);
+        float gN = EPS + abs(gAt(p) - gAt(p - 2 * d)) + abs(c2 - c1) + abs(c2 - c4);
+        float gS = EPS + abs(gAt(p) - gAt(p + 2 * d)) + abs(c1 - c2) + abs(c1 - c3);
+        return (gN * d1 + gS * d2) / (gN + gS);
+    }
+    float c3 = s(p + 3 * d), c4 = s(p - 3 * d);
     float d3 = c3 - gAt(p + 3 * d), d4 = c4 - gAt(p - 3 * d);
     float g1 = abs(c1 - c2) + EPS;
     float g2 = abs(c3 - c4) + EPS;
@@ -638,6 +654,223 @@ void main() {
     // 截断只在 D4 收口做（kFsCcm，上限 64 = 拆分前的 kFsRcdChroma 口径）。
     vec3 rgb = vec3(r, g, b) * lscAt(p);
     oColor = vec4(rgb, 1.0);
+})";
+
+// ── P3 拆双 pass（v0.10.180，FilmParams[58] rcd_p3_split）──────────────────
+// 机理（docs/research/11 号 §8）：单 pass 的 kFsRcdChroma 里 G 位轴向填充与
+// R/B 位对角填充**并行执行**，读不到本 pass 内对角段刚填好的对侧色 —— 原版
+// STEP 4.3 的 G 位色度估计是**四正邻双轴**（同轴 ±1 实测 + 交叉轴 ±1 的
+// STEP 4.2 已填充色），信息面窄一档 ⇒ 原版就有的 B 缓 G 陡错位（品红峰
+// +43.8 WB 域）被放大 2 倍（+85.6）。拆成 3a/3b 后 3b 从中间纹理读 3a 填充
+// 色，恢复原版四邻估计（Python 直译对照：品红峰回落 +44）。
+// 3a：对角段填充（= 原版 STEP 4.2）。R 位补 B、B 位补 R（chromaDiag 原样，
+// uCdFix 语义不变）；G 位 R/B 占位（轴向填充在 3b）。**不乘 LSC**（中间域 =
+// WB 域相机 RGB 无 LSC，LSC 挪到 3b 出口）；刻意不截断（D3 域口径，收口在
+// kFsCcm）。输出 tex_rcd_a_（源几何 RGBA16F），仅 [58]=1 时执行。
+// 几何：vs_plain_ + gl_FragCoord 直写（与 kFsRcdDir/kFsRcdG 同构），保证
+// tex_rcd_a_ 与 tex_g_/tex_dir_ 同一源几何坐标语义，3b 的 texelFetch 直接对齐。
+const char* kFsRcdChromaA = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp usampler2D uRaw;
+uniform highp sampler2D uDir;
+uniform highp sampler2D uG;
+uniform ivec2 uSize;
+uniform int uCfaLut;
+uniform highp sampler2D uMos;
+uniform float uMosaic;
+uniform vec4 uBlack;
+uniform float uWhite;
+uniform vec3 uGain;
+uniform float uCdFix;
+uniform vec3 uSatClip;  // 满阱 = WB 增益 gain[c]：对角填充值的 per-channel 上界
+const float EPS = 1e-6;
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
+float s(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    if (uMosaic > 0.5) {
+        vec3 m = texelFetch(uMos, p, 0).rgb;
+        int c = chanAt(p);
+        return c == 0 ? m.r : (c == 1 ? m.g : m.b);
+    }
+    float v = float(texelFetch(uRaw, p, 0).r);
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+float gAt(ivec2 p) {
+    return texelFetch(uG, clamp(p, ivec2(0), uSize - 1), 0).g;
+}
+float dirFetch(ivec2 p, int ch) {
+    return texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0)[ch];
+}
+// 十字 5-tap 均值：方向场低通（与 kFsRcdChroma 逐字同款）
+float dir5(ivec2 p, int ch) {
+    float v = dirFetch(p, ch)
+            + dirFetch(p + ivec2(0, -1), ch) + dirFetch(p + ivec2(0, 1), ch)
+            + dirFetch(p + ivec2(1, 0), ch) + dirFetch(p + ivec2(-1, 0), ch);
+    return v / 5.0;
+}
+// 对角色差填充：与 kFsRcdChroma 的 chromaDiag 逐字同款（uCdFix 语义不变）
+float chromaDiag(ivec2 p) {
+    float g0 = gAt(p);
+    ivec2 nw = p + ivec2(-1, -1), se = p + ivec2(1, 1);
+    ivec2 ne = p + ivec2(1, -1), sw = p + ivec2(-1, 1);
+    float cnw = s(nw), cse = s(se), cne = s(ne), csw = s(sw);
+    float gnw, gse, gne, gsw;
+    if (uCdFix > 0.5) {
+        gnw = abs(cnw - cse) + abs(cnw - s(p + ivec2(-3, -3)))
+            + abs(g0 - gAt(p + ivec2(-2, -2))) + EPS;
+        gse = abs(cse - cnw) + abs(cse - s(p + ivec2(3, 3)))
+            + abs(g0 - gAt(p + ivec2(2, 2))) + EPS;
+        gne = abs(cne - csw) + abs(cne - s(p + ivec2(3, -3)))
+            + abs(g0 - gAt(p + ivec2(2, -2))) + EPS;
+        gsw = abs(csw - cne) + abs(csw - s(p + ivec2(-3, 3)))
+            + abs(g0 - gAt(p + ivec2(-2, 2))) + EPS;
+    } else {
+        gnw = abs(cnw - cse) + abs(g0 - gAt(p + ivec2(-3, -3))) + EPS;
+        gse = abs(cse - cnw) + abs(g0 - gAt(p + ivec2(3, 3))) + EPS;
+        gne = abs(cne - csw) + abs(g0 - gAt(p + ivec2(3, -3))) + EPS;
+        gsw = abs(csw - cne) + abs(g0 - gAt(p + ivec2(-3, 3))) + EPS;
+    }
+    float pEst = (gnw * (cse - gAt(se)) + gse * (cnw - gAt(nw))) / (gnw + gse);
+    float qEst = (gne * (csw - gAt(sw)) + gsw * (cne - gAt(ne))) / (gne + gsw);
+    float d = mix(pEst, qEst, dir5(p, 1));
+    if (uCdFix > 0.5) return d;  // 原版：无限幅
+    float lo = min(min(cnw - gAt(nw), cse - gAt(se)), min(cne - gAt(ne), csw - gAt(sw)));
+    float hi = max(max(cnw - gAt(nw), cse - gAt(se)), max(cne - gAt(ne), csw - gAt(sw)));
+    return clamp(d, lo, hi);
+}
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    int ch = chanAt(p);
+    float g = gAt(p);
+    float r, b;
+    if (ch == 0) {
+        r = s(p);
+        b = clamp(g + chromaDiag(p), 0.0, uSatClip.z);
+    } else if (ch == 2) {
+        b = s(p);
+        r = clamp(g + chromaDiag(p), 0.0, uSatClip.x);
+    } else {
+        r = g;  // G 位占位：轴向填充在 3b —— 本 pass 并行执行时对角段结果
+        b = g;  // 还没落盘，占位值不会被任何下游读取（3b 的 G 位重算）
+    }
+    // 中间域 = WB 域相机 RGB **无 LSC**（LSC 挪到 3b 出口，与旧 P3 输出域一致）。
+    // 填充值钳到 per-channel 满阱（uSatClip[c]）——原版 STEP4.2 输出的 LIM(0,1)
+    // 在其归一化域（0..满阱）的域正确翻译；本体实测值不钳（原版同款）。
+    // 真机依据（2026-10-07 灯盘 A/B）：[58] 双 pass 无钳时高光区品红 +31%
+    //（70.3 vs 53.5，docs/research/11 号 §9）。
+    oColor = vec4(r, g, b, 1.0);
+})";
+
+// 3b：G 位轴向填充（= 原版 STEP 4.3 逐行）。读 3a 的 tex_rcd_a_ 取交叉轴
+// 已填充色 → 四正邻双轴估计；R/B 位直通 3a。输出乘 LSC → D3（写 tex_work_，
+// 与旧 kFsRcdChroma 的输出域完全一致）。仅 [58]=1 时执行。
+const char* kFsRcdChromaB = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uRcdA;  // 3a 输出：WB 域 RGB（对角段已填，无 LSC）
+uniform highp sampler2D uDir;   // P1 方向场（vh=[0]，pq=[1]）
+uniform highp sampler2D uG;     // P2 全图 G
+uniform highp sampler2D uLsc;   // LSC 增益网格（RGB，与 kFsRaw 同源）
+uniform ivec2 uLscSize;
+uniform ivec2 uSize;
+uniform int uCfaLut;
+uniform vec3 uSatClip;  // 满阱 = WB 增益 gain[c]：轴向填充值的 per-channel 上界
+const float EPS = 1e-6;
+int chanAt(ivec2 p) {
+    int k = ((p.y & 1) << 1) | (p.x & 1);
+    return (uCfaLut >> (k << 1)) & 3;
+}
+float at3(vec3 v, int c) { return c == 0 ? v.x : (c == 1 ? v.y : v.z); }
+float gAt(ivec2 p) {
+    return texelFetch(uG, clamp(p, ivec2(0), uSize - 1), 0).g;
+}
+float dirFetch(ivec2 p, int ch) {
+    return texelFetch(uDir, clamp(p, ivec2(0), uSize - 1), 0)[ch];
+}
+// 3a 取值（源几何 texelFetch，与 gAt/dirFetch 同一 clamp 口径）
+vec3 aAt(ivec2 p) {
+    return texelFetch(uRcdA, clamp(p, ivec2(0), uSize - 1), 0).rgb;
+}
+// 镜头阴影增益（LSC）：与 kFsRaw/kFsRcdChroma 同款手写 4-tap 双线性
+vec3 lscAt(ivec2 p) {
+    vec2 g = ((vec2(p) + 0.5) / vec2(uSize)) * vec2(uLscSize) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 t = g - vec2(b);
+    ivec2 mx = uLscSize - 1;
+    vec3 c00 = texelFetch(uLsc, clamp(b, ivec2(0), mx), 0).rgb;
+    vec3 c10 = texelFetch(uLsc, clamp(b + ivec2(1, 0), ivec2(0), mx), 0).rgb;
+    vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
+    vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+// 原版 STEP 4.3 逐行（单通道 c ∈ {0(R), 2(B)}；RawTherapee rcd_demosaicing.c
+// 173-206 行的公开数学，GLSL 自写）。四方向梯度（同轴隔 2 的 G 差 + 近对色差
+// + 同色隔 2 位距差）+ 四正邻色差 Est + V/H 双轴梯度反比交叉加权。
+// ⚠ 拆双 pass 的根因：单 pass 版并行读不到本 pass 内对角段填充 ⇒ 轴向估计只剩
+// 同轴 ±1 实测信息，而原版把交叉轴 ±1 的 STEP 4.2 已填充色也纳入四邻估计 ——
+// 缺这一半 ⇒ B 缓 G 陡错位放大 2×（品红峰 +43.8 → +85.6，docs/research/11 §8）。
+// 本函数对**全部四正邻**读 3a 的 c 通道：Bayer G 位的四正邻 = 2R+2B 相位，
+// 同色轴 = 实测值（3a 直通）、交叉轴 = 3a 对角填充，与原版 rgb[·][c] 的取值
+// 逐一同构（G(·) 读 P2 的 tex_g_，±2 保持 G 相位）。
+float axialC(ivec2 p, int c, float disc) {
+    float g0 = gAt(p);
+    ivec2 pn = p + ivec2(0, -1), ps = p + ivec2(0, 1);
+    ivec2 pw = p + ivec2(-1, 0), pe = p + ivec2(1, 0);
+    float cn = aAt(pn)[c], cs = aAt(ps)[c];
+    float cw = aAt(pw)[c], ce = aAt(pe)[c];
+    // Cardinal gradients：N_Grad = eps + |G(p)−G(p−2dy)| + |C(p−dy)−C(p+dy)|
+    //                     + |C(p−dy)−C(p−3dy)|（S/W/E 同构换轴）
+    float ng = EPS + abs(g0 - gAt(p + ivec2(0, -2)))
+             + abs(cn - cs) + abs(cn - aAt(p + ivec2(0, -3))[c]);
+    float sg = EPS + abs(g0 - gAt(p + ivec2(0, 2)))
+             + abs(cs - cn) + abs(cs - aAt(p + ivec2(0, 3))[c]);
+    float wg = EPS + abs(g0 - gAt(p + ivec2(-2, 0)))
+             + abs(cw - ce) + abs(cw - aAt(p + ivec2(-3, 0))[c]);
+    float eg = EPS + abs(g0 - gAt(p + ivec2(2, 0)))
+             + abs(ce - cw) + abs(ce - aAt(p + ivec2(3, 0))[c]);
+    // Cardinal colour differences（邻居 G = P2 的 G@RB 填充，tex_g_ 已有）
+    float nEst = cn - gAt(pn);
+    float sEst = cs - gAt(ps);
+    float wEst = cw - gAt(pw);
+    float eEst = ce - gAt(pe);
+    // V/H 双轴估计（N·S / E·W 梯度反比交叉加权）
+    float vEst = (ng * sEst + sg * nEst) / (ng + sg);
+    float hEst = (eg * wEst + wg * eEst) / (eg + wg);
+    // R@G / B@G 填充值钳到 per-channel 满阱 —— 原版 STEP4.3 输出 LIM(0,1) 在其
+    // 归一化域（0..满阱）的域正确翻译（⚠ 不是 [46] 当时去掉的"四邻范围 clamp"，
+    // 那是跨边界锁定；这里是绝对界）。真机依据（2026-10-07 灯盘 A/B）：无钳时
+    // 高光区品红 +31%（70.3 vs 53.5，docs/research/11 号 §9）。
+    return clamp(g0 + (1.0 - disc) * vEst + disc * hEst, 0.0, at3(uSatClip, c));
+}
+void main() {
+    // 2D 纹理坐标 (0,0) 在左上，vUV0 翻转对齐 OES 习惯（与 kFsRcdChroma 逐字同款）
+    vec2 tuv = vec2(vUV0.x, 1.0 - vUV0.y);
+    ivec2 p = clamp(ivec2(tuv * vec2(uSize)), ivec2(0), uSize - 1);
+    int ch = chanAt(p);
+    vec3 rgb;
+    if (ch == 1) {
+        // 细化 VH 判别（与原版 4.2 的 PQ 细化同款）：中心 vh 与 0.25×四对角
+        // 均值，取离 0.5 更远者（更确定）。每像素算一次，c 两轮共用。
+        float vhc = dirFetch(p, 0);
+        float vhn = 0.25 * (dirFetch(p + ivec2(-1, -1), 0)
+                          + dirFetch(p + ivec2(1, -1), 0)
+                          + dirFetch(p + ivec2(-1, 1), 0)
+                          + dirFetch(p + ivec2(1, 1), 0));
+        float disc = abs(0.5 - vhc) < abs(0.5 - vhn) ? vhn : vhc;
+        rgb = vec3(axialC(p, 0, disc), gAt(p), axialC(p, 2, disc));
+    } else {
+        // R/B 位：直通 3a（实测 + 对角填充 = 原版 STEP 4.2 的结果）
+        rgb = aAt(p);
+    }
+    // LSC 在 CCM 前（与旧 P3 输出域完全一致：D3 = 相机 RGB，CCM 已拆独立 pass）
+    oColor = vec4(rgb * lscAt(p), 1.0);
 })";
 
 // ── 第 4a 期（S14）：D3 → D4 独立 CCM pass ─────────────────────────────────
@@ -3317,6 +3550,11 @@ uniform vec2 uRefGlobal;
 // 不再参与着色（驱动会优化掉，CPU 侧下发是安全 no-op）：声明已于第 1b 期删除，本注仅记录旧口径值）
 uniform float uGRecon;
 uniform float uGCap;
+// v0.10.179：clip 过渡带 R/B 满阱比例反推（FilmParams[57] hl_rb_recon）。
+// 1 = 启用 allSat 三判据够不着的"本通道（R/B）满阱、其余通道未满"photosite 的
+//     参考比反推替换（见 main() 内新分支注释）；0 = 该支不进（默认，旧行为逐位
+//     不变 —— 新分支不触发时不执行任何新计算路径）。
+uniform float uRbRecon;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -3486,6 +3724,30 @@ void main() {
             // 拉回中性的**有益**动作。故本支保留改写；只抬不压只适用于"原值有信息"
             // 的路径（分支① 与普通 G 分支，二者已是 max）。
             outv = (c == 0) ? rg * sc : ((c == 1) ? sc : bg * sc);
+        } else if (uRbRecon > 0.5 && (c == 0 || c == 2)
+                   && v >= at3(uSatClip, c) * 0.99
+                   && Gv > 0.0
+                   && ((c == 0 && Bv > 0.0) || (c == 2 && Rv > 0.0))) {
+            // v0.10.179：clip 过渡带的"部分满阱"品红窄带（2026-10-06 台灯样张 RAW
+            // 域定案，docs/research/11 号 §6）。机理：本通道（R/B）已顶满阱、其余
+            // 通道未满的 photosite —— allSat 三判据够不着（G 未满）、普通 G 分支
+            // 只管 c==1、分支① 的 max 只抬不压 ⇒ 满阱比例（WB 增益 gainR 2.027 /
+            // gainB 1.443 的伪影）原样保留，经 CCM 后成 4~6px 品红窄带。
+            // 处置与 allSat 分支（v0.10.161）哲学同源：本支前提 = 本通道原值是
+            // 满阱下界、不含场景信息，"保留原值"保留的是 WB 增益的满阱比例 ⇒
+            // 直接按参考比反推替换（与普通 G 分支 gest = 0.5*(Rv4/rg + Bv4/bg)
+            // 严格对称，复用上面 allSat 判定已取好的 8 邻域值 Rv/Gv/Bv），不做
+            // max、不做软门控；darktable opposed 的"只抬不压" max 语义只适用于
+            // 原值有信息的路径（分支① 与普通 G 分支，二者已是 max）。
+            // ⚠ 判据用**满阱 uSatClip**（0.99 容差同 allSat）而不是裁剪判据
+            // uHlClip=0.987：[0.987, 满阱) 是未 clip 的过曝值、有真实场景信息，
+            // 归分支① 的 max 语义管，本支绝不能碰。
+            vec3 rr = refRatiosW(uv);
+            float rg = rr.x;
+            float bg = rr.y;
+            float est = (c == 0) ? 0.5 * (Gv + Bv / bg) * rg   // R 位：G + 对侧 B
+                                 : 0.5 * (Gv + Rv / rg) * bg;  // B 位：G + 对侧 R
+            outv = est;
         } else if (v >= uHlClip && c == 1) {
             // 普通 G 重建路径：块比值加权口径（逐位不变，除 half-float 折算舍入）
             vec3 rr = refRatiosW(uv);
@@ -4766,6 +5028,9 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_dir = compileShader(GL_FRAGMENT_SHADER, kFsRcdDir);
   const GLuint fs_rcd_g = compileShader(GL_FRAGMENT_SHADER, kFsRcdG);
   const GLuint fs_rcd_chroma = compileShader(GL_FRAGMENT_SHADER, kFsRcdChroma);
+  // P3 拆双 pass（v0.10.180，[58] rcd_p3_split）：3a 对角填充 / 3b G 位轴向
+  const GLuint fs_rcd_chroma_a = compileShader(GL_FRAGMENT_SHADER, kFsRcdChromaA);
+  const GLuint fs_rcd_chroma_b = compileShader(GL_FRAGMENT_SHADER, kFsRcdChromaB);
   // 第 4a 期（S14）：D3→D4 独立 CCM pass
   const GLuint fs_ccm = compileShader(GL_FRAGMENT_SHADER, kFsCcm);
   const GLuint fs_amaze_up = compileShader(GL_FRAGMENT_SHADER, kFsAmazeUp);
@@ -4829,6 +5094,7 @@ bool FrameRenderer::init() {
   const GLuint fs_hl_refdown = compileShader(GL_FRAGMENT_SHADER, kFsHlRefDown);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
+      !fs_rcd_chroma_a || !fs_rcd_chroma_b ||
       !fs_amaze_up ||
       !fs_ccm ||
       !fs_raw_dn || !fs_chroma_dn || !fs_chroma_down || !fs_chroma_at ||
@@ -4853,6 +5119,10 @@ bool FrameRenderer::init() {
   prog_rcd_dir_ = linkProgram(vs_plain_, fs_rcd_dir);
   prog_rcd_g_ = linkProgram(vs_plain_, fs_rcd_g);
   prog_rcd_chroma_ = linkProgram(vs_rot_, fs_rcd_chroma);
+  // 3a 用 vs_plain_（源几何直写，与 kFsRcdDir/kFsRcdG 同构）；3b 用 kVertRot
+  // （成片几何输出，与 kFsRcdChroma 同款坐标变换）
+  prog_rcd_chroma_a_ = linkProgram(vs_plain_, fs_rcd_chroma_a);
+  prog_rcd_chroma_b_ = linkProgram(vs_rot_, fs_rcd_chroma_b);
   // 与 passChromaDenoise 同构：kVertRot + uST 单位阵，frag 用 gl_FragCoord 定位
   prog_ccm_ = linkProgram(vs_rot_, fs_ccm);
   prog_amaze_up_ = linkProgram(vs_rot_, fs_amaze_up);
@@ -5039,6 +5309,7 @@ bool FrameRenderer::init() {
   u_rcd_g_.black = glGetUniformLocation(prog_rcd_g_, "uBlack");
   u_rcd_g_.white = glGetUniformLocation(prog_rcd_g_, "uWhite");
   u_rcd_g_.gain = glGetUniformLocation(prog_rcd_g_, "uGain");
+  u_rcd_g_.gorig = glGetUniformLocation(prog_rcd_g_, "uGOrig");
 
   u_rcd_chroma_.st = glGetUniformLocation(prog_rcd_chroma_, "uST");
   u_rcd_chroma_.rot = glGetUniformLocation(prog_rcd_chroma_, "uRot");
@@ -5057,6 +5328,31 @@ bool FrameRenderer::init() {
   u_rcd_chroma_.lsc = glGetUniformLocation(prog_rcd_chroma_, "uLsc");
   u_rcd_chroma_.lsc_size = glGetUniformLocation(prog_rcd_chroma_, "uLscSize");
   u_rcd_chroma_.cd_fix = glGetUniformLocation(prog_rcd_chroma_, "uCdFix");
+  u_rcd_chroma_.gorig = glGetUniformLocation(prog_rcd_chroma_, "uGOrig");
+  // P3 拆双 pass（v0.10.180，[58]）的 uniform 句柄
+  u_rcd_chroma_a_.tex = glGetUniformLocation(prog_rcd_chroma_a_, "uRaw");
+  u_rcd_chroma_a_.mos = glGetUniformLocation(prog_rcd_chroma_a_, "uMos");
+  u_rcd_chroma_a_.mosaic = glGetUniformLocation(prog_rcd_chroma_a_, "uMosaic");
+  u_rcd_chroma_a_.dir = glGetUniformLocation(prog_rcd_chroma_a_, "uDir");
+  u_rcd_chroma_a_.g = glGetUniformLocation(prog_rcd_chroma_a_, "uG");
+  u_rcd_chroma_a_.size = glGetUniformLocation(prog_rcd_chroma_a_, "uSize");
+  u_rcd_chroma_a_.cfalut = glGetUniformLocation(prog_rcd_chroma_a_, "uCfaLut");
+  u_rcd_chroma_a_.black = glGetUniformLocation(prog_rcd_chroma_a_, "uBlack");
+  u_rcd_chroma_a_.white = glGetUniformLocation(prog_rcd_chroma_a_, "uWhite");
+  u_rcd_chroma_a_.gain = glGetUniformLocation(prog_rcd_chroma_a_, "uGain");
+  u_rcd_chroma_a_.cd_fix = glGetUniformLocation(prog_rcd_chroma_a_, "uCdFix");
+  u_rcd_chroma_a_.satclip = glGetUniformLocation(prog_rcd_chroma_a_, "uSatClip");
+  u_rcd_chroma_b_.st = glGetUniformLocation(prog_rcd_chroma_b_, "uST");
+  u_rcd_chroma_b_.rot = glGetUniformLocation(prog_rcd_chroma_b_, "uRot");
+  u_rcd_chroma_b_.scale = glGetUniformLocation(prog_rcd_chroma_b_, "uScale");
+  u_rcd_chroma_b_.rcd_a = glGetUniformLocation(prog_rcd_chroma_b_, "uRcdA");
+  u_rcd_chroma_b_.dir = glGetUniformLocation(prog_rcd_chroma_b_, "uDir");
+  u_rcd_chroma_b_.g = glGetUniformLocation(prog_rcd_chroma_b_, "uG");
+  u_rcd_chroma_b_.size = glGetUniformLocation(prog_rcd_chroma_b_, "uSize");
+  u_rcd_chroma_b_.cfalut = glGetUniformLocation(prog_rcd_chroma_b_, "uCfaLut");
+  u_rcd_chroma_b_.lsc = glGetUniformLocation(prog_rcd_chroma_b_, "uLsc");
+  u_rcd_chroma_b_.lsc_size = glGetUniformLocation(prog_rcd_chroma_b_, "uLscSize");
+  u_rcd_chroma_b_.satclip = glGetUniformLocation(prog_rcd_chroma_b_, "uSatClip");
 
   // 第 4a 期（S14）：D3→D4 CCM pass
   u_ccm_.tex = glGetUniformLocation(prog_ccm_, "uTex");
@@ -5146,6 +5442,7 @@ bool FrameRenderer::init() {
   u_hl_apply_.ref = glGetUniformLocation(prog_hl_apply_, "uRef");
   u_hl_apply_.grecon = glGetUniformLocation(prog_hl_apply_, "uGRecon");
   u_hl_apply_.gcap = glGetUniformLocation(prog_hl_apply_, "uGCap");
+  u_hl_apply_.rbrecon = glGetUniformLocation(prog_hl_apply_, "uRbRecon");
   u_hl_apply_.refglobal = glGetUniformLocation(prog_hl_apply_, "uRefGlobal");
   u_hl_apply_.refsize = glGetUniformLocation(prog_hl_apply_, "uRefSize");
   u_hl_ref_.mos = glGetUniformLocation(prog_hl_ref_, "uMos");
@@ -5384,6 +5681,14 @@ bool FrameRenderer::init() {
     glUniformMatrix4fv(u_rcd_chroma_.st, 1, GL_FALSE, ident);
   }
   {
+    // P3 拆双 pass 的 3b 用 kVertRot，uST 默认全 0 必须置单位阵（v0.10.180）
+    const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    if (u_rcd_chroma_b_.st >= 0) {
+      glUseProgram(prog_rcd_chroma_b_);
+      glUniformMatrix4fv(u_rcd_chroma_b_.st, 1, GL_FALSE, ident);
+    }
+  }
+  {
     // 第 4a 期（S14）：kFsCcm 用 kVertRot，uST 默认全 0 必须置单位阵
     const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     const GLint st = glGetUniformLocation(prog_ccm_, "uST");
@@ -5507,6 +5812,7 @@ void FrameRenderer::release() {
   if (tex_dir_) glDeleteTextures(1, &tex_dir_);
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
+  if (tex_rcd_a_) glDeleteTextures(1, &tex_rcd_a_);  // P3 拆双 pass 中间场
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (tex_mo_stat_) glDeleteTextures(1, &tex_mo_stat_);   // 档 A 统计网格
   if (fbo_mo_stat_) glDeleteFramebuffers(1, &fbo_mo_stat_);
@@ -5520,6 +5826,7 @@ void FrameRenderer::release() {
   if (fbo_dir_) glDeleteFramebuffers(1, &fbo_dir_);
   if (fbo_g_) glDeleteFramebuffers(1, &fbo_g_);
   if (fbo_mos_) glDeleteFramebuffers(1, &fbo_mos_);
+  if (fbo_rcd_a_) glDeleteFramebuffers(1, &fbo_rcd_a_);  // P3 拆双 pass 中间场
   if (fbo_dn_) glDeleteFramebuffers(1, &fbo_dn_);
   if (fbo_hist_) glDeleteFramebuffers(1, &fbo_hist_);
   if (fbo_out_s_) glDeleteFramebuffers(1, &fbo_out_s_);
@@ -5548,6 +5855,8 @@ void FrameRenderer::release() {
   if (prog_rcd_dir_) glDeleteProgram(prog_rcd_dir_);
   if (prog_rcd_g_) glDeleteProgram(prog_rcd_g_);
   if (prog_rcd_chroma_) glDeleteProgram(prog_rcd_chroma_);
+  if (prog_rcd_chroma_a_) glDeleteProgram(prog_rcd_chroma_a_);  // P3 拆双 pass
+  if (prog_rcd_chroma_b_) glDeleteProgram(prog_rcd_chroma_b_);
   if (prog_ccm_) glDeleteProgram(prog_ccm_);
   if (prog_raw_dn_) glDeleteProgram(prog_raw_dn_);
   if (prog_chroma_dn_) glDeleteProgram(prog_chroma_dn_);
@@ -6096,15 +6405,20 @@ bool FrameRenderer::ensureRcdTargets(int w, int h) {
       glDeleteFramebuffers(1, &fbo_g_);
       glDeleteTextures(1, &tex_mos_);
       glDeleteFramebuffers(1, &fbo_mos_);
+      glDeleteTextures(1, &tex_rcd_a_);
+      glDeleteFramebuffers(1, &fbo_rcd_a_);
     }
-    tex_dir_ = tex_g_ = tex_mos_ = 0;
-    fbo_dir_ = fbo_g_ = fbo_mos_ = 0;
+    tex_dir_ = tex_g_ = tex_mos_ = tex_rcd_a_ = 0;
+    fbo_dir_ = fbo_g_ = fbo_mos_ = fbo_rcd_a_ = 0;
     // @domain: A2 —— RCD 方向场（色差域的判据量）
     makeTex(&tex_dir_, &fbo_dir_, GL_RGBA16F, w, h);
     // @domain: D2
     makeTex(&tex_g_, &fbo_g_, GL_RGBA16F, w, h);
     // @domain: D2
     makeTex(&tex_mos_, &fbo_mos_, GL_RGBA16F, w, h);
+    // @domain: D2 —— P3 拆双 pass（v0.10.180）的 3a 中间场：WB 域 RGB（对角段
+    // 已填、无 LSC），3b 的交叉轴取数源。源几何（与 tex_g_ 同尺寸同坐标语义）。
+    makeTex(&tex_rcd_a_, &fbo_rcd_a_, GL_RGBA16F, w, h);
     rcd_w_ = w;
     rcd_h_ = h;
   }
@@ -6114,7 +6428,9 @@ bool FrameRenderer::ensureRcdTargets(int w, int h) {
   const bool ok2 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mos_);
   const bool ok3 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-  return ok1 && ok2 && ok3;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_rcd_a_);
+  const bool ok4 = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  return ok1 && ok2 && ok3 && ok4;
 }
 
 // 降噪输出目标：tex_dn_（旋转后 dst 尺寸，P4 输出，胶片链输入）
@@ -6471,10 +6787,13 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
                                             const float gains[3], GLuint src,
                                             GLuint stat_src, int stat_raw,
-                                            int mono_src, int grecon) {
+                                            int mono_src, int grecon,
+                                            int rbrecon) {
   HlRawResult r;
   // v0.10.169：记录实际下发给 kFsHlApply 的 uGRecon（0/1），进 raw.render 的 hlGRecon。
   r.grecon = grecon ? 1 : 0;
+  // v0.10.179：同上，uRbRecon（clip 过渡带 R/B 满阱比例反推）→ hlRb。
+  r.rbrecon = rbrecon ? 1 : 0;
   const int mw = w / 3, mh = h / 3;    // 块网格（darktable: iwidth/3、iheight/3）
   const int tw = w / 16, th = h / 16;  // 色度统计归约网格（16×16）
   // 参考色度场网格（1/32 photosite 一块）：每通道期望 32²/4 = 256 个样本
@@ -6752,6 +7071,13 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   // B/G 1.0856 → 1.0217、R/G 0.9773 → 1.0051）。风险：allSat 在基准片占 G 饱和像素
   // 44.15%，台灯类场景可能退化 ⇒ 默认不开。
   glUniform1f(u_hl_apply_.grecon, grecon ? 1.0f : 0.0f);
+  // uRbRecon（v0.10.179，来自 FilmParams[57] hl_rb_recon）：clip 过渡带 R/B
+  // 满阱比例反推支的总开关。
+  //   1 = 启用（替换语义：本通道满阱、其余未满的 photosite 按三级参考比由
+  //       G 与对侧通道反推替换，治 CCM 后 4~6px 品红窄带）；
+  //   0 = **默认**，shader 内该支判据不满足 ⇒ 旧行为逐位不变。
+  // 日志 hlRb 回读 pass 的 hl.rbrecon（= 那次 glUniform 的实际值）。
+  glUniform1f(u_hl_apply_.rbrecon, rbrecon ? 1.0f : 0.0f);
   // uGCap = 重建值上界。v0.10.150：1.5 → 2.0。
   // 为什么改：1.5 的隐含假设是"G 最多被低估 50%"，即高光超出 G 满阱不超过 1.5 倍。
   // 这个假设在**逆光大片天空**上成立（该处 G 只需抬 ~1.09），但在"镜面高光/亚像素窄亮线"
@@ -7327,7 +7653,7 @@ void FrameRenderer::passRcdDir(int w, int h, int cfa,
 // RCD P2：G@RB（比值修正 + 方向混合 + 限幅），输出全图 G 到 tex_g_
 void FrameRenderer::passRcdG(int w, int h, int cfa,
                              const float black_phase[4], float white_level,
-                             const float gains[3], bool mosaic) {
+                             const float gains[3], bool mosaic, float g_orig) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_g_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_rcd_g_);
@@ -7349,6 +7675,7 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(u_rcd_g_.white, white_level);
   glUniform3f(u_rcd_g_.gain, gains[0], gains[1], gains[2]);
+  if (u_rcd_g_.gorig >= 0) glUniform1f(u_rcd_g_.gorig, g_orig);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -7358,7 +7685,8 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
 void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
                                   const float black_phase[4],
                                   float white_level, const float gains[3],
-                                  const float* ccm, bool mosaic, float cd_fix) {
+                                  const float* ccm, bool mosaic, float cd_fix,
+                                  float g_orig) {
   // 第 4a 期：D3 走 tex_work_（fbo_work_）—— RCD→CCM 区间它是空闲的，CCM 消费完
   // D3 之后 passFilm 才覆盖它；不新增纹理（零新增显存）。
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
@@ -7374,6 +7702,7 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   if (u_rcd_chroma_.mosaic >= 0)
     glUniform1f(u_rcd_chroma_.mosaic, mosaic ? 1.0f : 0.0f);
   if (u_rcd_chroma_.cd_fix >= 0) glUniform1f(u_rcd_chroma_.cd_fix, cd_fix);
+  if (u_rcd_chroma_.gorig >= 0) glUniform1f(u_rcd_chroma_.gorig, g_orig);
   glActiveTexture(GL_TEXTURE2);
   glBindTexture(GL_TEXTURE_2D, tex_dir_);
   glActiveTexture(GL_TEXTURE3);
@@ -7399,6 +7728,78 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
+}
+
+// P3 拆双 pass（v0.10.180，[58] rcd_p3_split）。
+// 3a：对角段填充（= 原版 STEP 4.2）→ tex_rcd_a_（源几何，WB 域 RGB 无 LSC）。
+// 输入与 passRcdChroma 相同（raw/mos/dir/g），仅 G 位是占位值（3b 重算）。
+// 几何与 passRcdDir/passRcdG 同构：vs_plain_ + gl_FragCoord 源几何直写。
+void FrameRenderer::passRcdChromaA(int w, int h, int cfa,
+                                   const float black_phase[4],
+                                   float white_level, const float gains[3],
+                                   bool mosaic, float cd_fix) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_rcd_a_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_rcd_chroma_a_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, raw_tex_);
+  if (u_rcd_chroma_a_.mos >= 0) {
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, hr_src_override_ ? hr_src_override_ : tex_mos_);
+    glUniform1i(u_rcd_chroma_a_.mos, 1);
+  }
+  if (u_rcd_chroma_a_.mosaic >= 0)
+    glUniform1f(u_rcd_chroma_a_.mosaic, mosaic ? 1.0f : 0.0f);
+  if (u_rcd_chroma_a_.cd_fix >= 0) glUniform1f(u_rcd_chroma_a_.cd_fix, cd_fix);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  glActiveTexture(GL_TEXTURE3);
+  glBindTexture(GL_TEXTURE_2D, tex_g_);
+  glUniform1i(u_rcd_chroma_a_.tex, 0);
+  glUniform1i(u_rcd_chroma_a_.dir, 2);
+  glUniform1i(u_rcd_chroma_a_.g, 3);
+  glUniform2i(u_rcd_chroma_a_.size, raw_w_, raw_h_);
+  glUniform1i(u_rcd_chroma_a_.cfalut, cfaLutOf(cfa));
+  glUniform4f(u_rcd_chroma_a_.black, black_phase[0], black_phase[1],
+              black_phase[2], black_phase[3]);
+  glUniform1f(u_rcd_chroma_a_.white, white_level);
+  glUniform3f(u_rcd_chroma_a_.gain, gains[0], gains[1], gains[2]);
+  if (u_rcd_chroma_a_.satclip >= 0)
+    glUniform3f(u_rcd_chroma_a_.satclip, gains[0], gains[1], gains[2]);
+  glActiveTexture(GL_TEXTURE0);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// 3b：G 位轴向填充（= 原版 STEP 4.3，交叉轴从 3a 的 tex_rcd_a_ 读已填充色）
+// → 乘 LSC 写 tex_work_（成片几何 D3）。几何与 kFsRcdChroma 逐字同款
+//（kVertRot + uST 单位阵（init 置）+ uScale=1 + frag 的 tuv 翻转）。
+void FrameRenderer::passRcdChromaB(int dst_w, int dst_h, int rot, int cfa,
+                                   const float gains[3]) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_rcd_chroma_b_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_rcd_a_);
+  glUniform1i(u_rcd_chroma_b_.rcd_a, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_dir_);
+  glUniform1i(u_rcd_chroma_b_.dir, 1);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_g_);
+  glUniform1i(u_rcd_chroma_b_.g, 2);
+  glUniform2i(u_rcd_chroma_b_.size, raw_w_, raw_h_);
+  glUniform1i(u_rcd_chroma_b_.rot, rot);
+  glUniform2f(u_rcd_chroma_b_.scale, 1.0f, 1.0f);
+  glUniform1i(u_rcd_chroma_b_.cfalut, cfaLutOf(cfa));
+  // LSC 增益纹理（单元 3；0/1/2 已被 rcd_a/dir/g 占用）
+  glActiveTexture(GL_TEXTURE3);
+  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(u_rcd_chroma_b_.lsc, 3);
+  glUniform2i(u_rcd_chroma_b_.lsc_size, lsc_w_, lsc_h_);
+  if (u_rcd_chroma_b_.satclip >= 0)
+    glUniform3f(u_rcd_chroma_b_.satclip, gains[0], gains[1], gains[2]);
+  glActiveTexture(GL_TEXTURE0);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_）。
@@ -7841,6 +8242,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_hl_wclamp_ = 0.f;
     // v0.10.169：无条件写下参数真值（hr_raw 关时 pass 不执行，日志 hlGRecon 仍可读）
     dbg_hl_grecon_ = p.hl_grecon > 0.5f ? 1 : 0;
+    // v0.10.179：同上，uRbRecon（FilmParams[57]）→ 日志 hlRb
+    dbg_hl_rbrecon_ = p.hl_rb_recon > 0.5f ? 1 : 0;
     dbg_hl_stat_src_ = "none";
     dbg_hl_decide_src_ = "none";
     for (int k = 0; k < 3; ++k) {
@@ -7879,9 +8282,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 日志 hlGRecon 回读 pass 的 hl.grecon（= 那次 glUniform 的实际值），不另算一份。
       const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, p0_pre, p0_pre,
                                               0, p0_pre_mono,
-                                              p.hl_grecon > 0.5f ? 1 : 0);
+                                              p.hl_grecon > 0.5f ? 1 : 0,
+                                              p.hl_rb_recon > 0.5f ? 1 : 0);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
       dbg_hl_grecon_ = hl.grecon;
+      dbg_hl_rbrecon_ = hl.rbrecon;
       dbg_hl_cnt_ = hl.cnt[1];
       dbg_hl_ms_ = hl.ms;
       dbg_hl_rgg_ = hl.rg_g;
@@ -7964,13 +8369,39 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
-    passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
+    passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
+             p.rcd_g_orig);
     glFinish();
     const auto d2 = std::chrono::steady_clock::now();
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
-    passRcdChroma(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase,
-                  c.white_level, c.gains, c.ccm, true, p.rcd_cdfix);
+    // ── P3 色度段（v0.10.180 加 [58] 拆双 pass A/B 路径）───────────────────
+    // rcdSplit=1：3a 对角段填充（tex_rcd_a_）→ 3b G 位轴向填充（交叉轴 ±1 读
+    // 3a 的 STEP4.2 已填充色，恢复原版四正邻双轴估计）——单 pass 版并行读不到
+    // 本 pass 内对角段结果 ⇒ 原版就有的 B 缓 G 陡错位（品红峰 +43.8 WB 域）被
+    // 放大 2×（+85.6），docs/research/11 号 §8。3a/3b 分别计时（rcdAMs/rcdBMs，
+    // 铁律：性能取舍必须实测）；3b 含 glFinish 同步，与 ccmMs 同口径。
+    // rcdSplit=0：旧单 pass，逐位不变。
+    dbg_rcd_split_ = 0;
+    dbg_rcd_a_ms_ = dbg_rcd_b_ms_ = 0.f;
+    if (p.rcd_p3_split > 0.5f) {
+      passRcdChromaA(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
+                     p.rcd_cdfix);
+      glFinish();
+      const auto d2a = std::chrono::steady_clock::now();
+      passRcdChromaB(dst_w, dst_h, c.effective_rot, c.cfa, c.gains);
+      glFinish();
+      const auto d2b = std::chrono::steady_clock::now();
+      dbg_rcd_a_ms_ =
+          std::chrono::duration<float, std::milli>(d2a - d2).count();
+      dbg_rcd_b_ms_ =
+          std::chrono::duration<float, std::milli>(d2b - d2a).count();
+      dbg_rcd_split_ = 1;
+    } else {
+      passRcdChroma(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase,
+                    c.white_level, c.gains, c.ccm, true, p.rcd_cdfix,
+                    p.rcd_g_orig);
+    }
     // 第 4a 期（S14）：RCD 档的 D3→D4 收口（tex_work_ D3 → tex_scene_ D4）。
     // 必须在 P4（读 tex_scene_）之前；双线性档不经此处（passRaw 内联 CCM）。
     // v0.10.154：本 pass 是 4a 新增的全屏 pass，单独计时入日志（ccmMs）——
@@ -8187,9 +8618,15 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // ccmMs（v0.10.154，第 4a 期新增）：D3→D4 独立 CCM pass 的实测成本。
     // 它是本期唯一的运行时开销（新增一次全屏 pass：读 100MB + 写 100MB），
     // 按铁律须由真机数据决定是否接受；跨版本对比时需同场景同 ISO。
+    // rcdSplit/rcdAMs/rcdBMs（v0.10.180，[58]）：P3 拆双 pass 的生效性与
+    // 分 pass 成本 —— rcdSplit=0 而 [58]>0.5 ⇒ 未生效；rcdAMs+rcdBMs 对比
+    // 旧单 pass 成本（多一次全分辨率 RGBA16F 往返）。
     kv += ",\"dirMs\":" + jnum(dir_ms, 6) +
           ",\"gMs\":" + jnum(g_ms, 6) +
           ",\"ccmMs\":" + jnum(ccm_ms, 6);
+    kv += ",\"rcdSplit\":" + std::to_string(dbg_rcd_split_);
+    kv += ",\"rcdAMs\":" + jnum(dbg_rcd_a_ms_, 7);
+    kv += ",\"rcdBMs\":" + jnum(dbg_rcd_b_ms_, 7);
   }
   if (c.dn) {
     // v0.10.109：nzSrc 取值改 "ext"/"legacy"（原 "cam2"）—— 原值与 camera 侧
@@ -8306,6 +8743,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 0 = A/B 关（apply 只留 opposed 外推分支）。hr_raw 关时本 pass 不执行，此处为
   // 调用点写入的参数真值（不是 pass 回填值），仍然可读。
   kv += ",\"hlGRecon\":" + std::to_string(dbg_hl_grecon_);
+  // v0.10.179：apply 支实际下发的 uRbRecon。1 = clip 过渡带 R/B 满阱比例反推开；
+  // 0 = 默认旧行为。hr_raw 关时 pass 不执行，此处为调用点写入的参数真值。
+  kv += ",\"hlRb\":" + std::to_string(dbg_hl_rbrecon_);
   // v0.10.170：横向色差校正的估计结果与执行状态（镜头横向色差 / lateral CA）。
   // caK = **实际采用**的径向系数（位移 = k·r，r 自画面中心；0 = 未通过判据）；
   // caKraw = 原始估计（未过判据）—— 用来分辨"位移太小"与"内外半区不一致"；
