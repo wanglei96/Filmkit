@@ -166,12 +166,13 @@ object CameraPresets {
         // **D-1 只在最细两级**（uStep ≤ 2）。
         // [51] = κ（0 = 关 ⇒ P4/D-1 逐位回到 v0.10.172）；κ=2 沿用 PC 的 0.2 标定。
         // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
-        // [53] = 紫边判据梯度自适应（默认 0 关）。
+        // [53] = 紫边判据梯度自适应（v0.10.185：默认 0 → 8）。0 = 关；
+        //        8 = 高梯度处把替换阈值 thr 放宽 1/(1+8·|∇L|)，让 1~3px 窄紫线进替换区。
         // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
         // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
         this[51] = 2.0
         this[52] = 1.0
-        this[53] = 0.0
+        this[53] = 8.0
         // 54/55 = PC ESD3D2 完整移植（v0.10.175）：核尺寸 + 尺度结构 + 伪彩强度逻辑
         // 全部照抄 PC（`esd3d2_steered.glsl` + `ESD3D2.java` + `convdiff.glsl` +
         // `guidedupsample.glsl` + `GLUtils.gaussdown`）。
