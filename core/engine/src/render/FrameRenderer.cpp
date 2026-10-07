@@ -1351,6 +1351,7 @@ uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
 uniform float uDfGate;                 // v0.10.173：判据的梯度自适应强度（0 = 关）
 uniform float uBaseChromaMax;          // v0.10.190：邻域基线色度上限（超过=大片色块，不改写）
 uniform float uThreshAbs;              // v0.10.191：绝对色度阈值（uThreshK=0 时启用）
+uniform float uGradMin;                // v0.10.192：亮度梯度下限（只打窄紫边，不动平坦大片色度）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
 const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
 const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
@@ -1391,7 +1392,16 @@ void main() {
     // ⇒ 对大面积紫色物体**零改写**。
     // v0.10.191：命中 = 绝对色度 > 阈值（thr 现在作用于 |(a,b)|）。
     // 空间判据 uBaseChromaMax 保留（排除「邻域本身就是大片紫」的物体内部）。
-    if (d0.z <= thr || d0.w > uBaseChromaMax) {
+    // v0.10.192：加**梯度判据** —— 只在强亮度边缘命中。
+    // 为什么：实测 B-G>40 的像素里 13729 个在平坦区（大片紫/紫色物体）、
+    // 仅 2340 个在边缘（真紫边）。紫线峰 B-G=111 处 |∇L|≈80。
+    // 加 |∇L| > uGradMin 后，平坦区大片紫完全不动 ⇒ 真正零误伤。
+    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
+    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
+    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
+    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
+    float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
+    if (d0.z <= thr || d0.w > uBaseChromaMax || gL < uGradMin) {
         oColor = vec4(lin0, 1.0);
         return;
     }
@@ -5696,6 +5706,7 @@ bool FrameRenderer::init() {
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
   u_df_apply_.base_chroma_max = glGetUniformLocation(prog_df_apply_, "uBaseChromaMax");
   u_df_apply_.thresh_abs = glGetUniformLocation(prog_df_apply_, "uThreshAbs");
+  u_df_apply_.grad_min = glGetUniformLocation(prog_df_apply_, "uGradMin");
   u_df_apply_.df_gate = glGetUniformLocation(prog_df_apply_, "uDfGate");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
@@ -7466,6 +7477,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   glUniform1f(u_df_apply_.thresh_k, 0.0f);   // 0 = 关闭 chromaAvg 倍率
   glUniform1f(u_df_apply_.thresh_abs, 5.0f); // 绝对色度阈值
   glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
+  glUniform1f(u_df_apply_.grad_min, 50.0f);  // 梯度下限（紫线峰处 |∇L|≈80）
   // v0.10.191：邻域基线色度上限 6 → 25。为什么：实测紫边像素的 base_chroma
   // 分布很散（P50 3.4 但 P75 13.7 / P90 48.8），上限 6 只放过 55% 的紫边
   // ⇒ 190 真机紫线回流。25 放过约 85%，同时仍排除「邻域整体是大片紫」的区域。
