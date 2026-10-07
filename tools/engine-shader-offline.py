@@ -69,8 +69,10 @@ class GL:
         glfw.make_context_current(self.win)
         self.ctx = moderngl.create_context()
         self.w, self.h = w, h
+        self._fbos = {}
         self.fbo = self.ctx.framebuffer(
             color_attachments=[self.ctx.texture((w, h), 4, dtype='f2')])
+        self._fbos[(w, h)] = self.fbo
         # 全屏三角形顶点着色器：gl_FragCoord.xy 直接对应像素中心 (x+0.5, y+0.5)
         # 全屏三角形 + 插值出 vUV0（0..1，左下原点，与 GL 纹理坐标一致）
         self.vs_src = '''#version 330 core
@@ -83,11 +85,17 @@ void main() {
 '''
 
 
-    def run(self, fs_src, uniforms, textures):
-        """执行一个 fragment shader。textures: {uniform名: moderngl.Texture}"""
+    def run(self, fs_src, uniforms, textures, size=None):
+        """执行一个 fragment shader。textures: {uniform名: moderngl.Texture}
+        size=(w,h) 时用该尺寸的 framebuffer（同 context，可复用纹理）。"""
+        tw, th = size if size else (self.w, self.h)
+        if (tw, th) not in self._fbos:
+            self._fbos[(tw, th)] = self.ctx.framebuffer(
+                color_attachments=[self.ctx.texture((tw, th), 4, dtype='f2')])
+        fbo = self._fbos[(tw, th)]
         prog = self.ctx.program(self.vs_src, to_core(fs_src))
-        self.fbo.use()
-        self.ctx.viewport = (0, 0, self.w, self.h)
+        fbo.use()
+        self.ctx.viewport = (0, 0, tw, th)
         for i, (name, tex) in enumerate(textures.items()):
             tex.use(i)
             if name in prog:
@@ -99,8 +107,8 @@ void main() {
         vao.render(moderngl.TRIANGLES, vertices=3)
         vao.release()
         prog.release()
-        data = self.fbo.read(components=4, dtype='f2')
-        arr = np.frombuffer(data, dtype='float16').reshape(self.h, self.w, 4)
+        data = fbo.read(components=4, dtype='f2')
+        arr = np.frombuffer(data, dtype='float16').reshape(th, tw, 4)
         return arr.astype(np.float32)     # 保留 4 通道（纹理是 RGBA16F）
 
     def close(self):
@@ -113,6 +121,8 @@ def main():
     ap.add_argument('--roi', default='1800,2100,600,1000', help='Y0,Y1,X0,X1（sensor 域）')
     ap.add_argument('--out', default='/tmp/chain')
     ap.add_argument('--p3-split', type=int, default=1, help='1 = [58] G 位双 pass')
+    ap.add_argument('--defringe', type=int, default=0, help='1 = 跑 defringe 三段并统计线性域量纲')
+    ap.add_argument('--ccm', default='1.627,-0.561,-0.066,-0.139,1.347,-0.208,0.009,-0.564,1.554')
     ap.add_argument('--pc3d', type=int, default=0, help='1 = 执行 kFsPc3d（需 LSC，暂用恒等）')
     args = ap.parse_args()
 
@@ -210,16 +220,66 @@ def main():
     np.save(os.path.join(args.out, 'rcd_d3.npy'), d3)
 
     # ── CCM：D3 → D4
-    CCM = np.array([[1.626, -0.559, -0.067],
-                    [-0.139, 1.345, -0.206],
-                    [0.009, -0.568, 1.559]], dtype=np.float32)
+    CCM = np.array([float(v) for v in args.ccm.split(',')], dtype=np.float32).reshape(3, 3)
     tex_d3 = gl.ctx.texture((w, h), 4, dtype='f2'); tex_d3.write(d3.astype(np.float16).tobytes())
     tex_d3.filter = (moderngl.NEAREST, moderngl.NEAREST)
     # moderngl 的 mat3 按**列主序**读入 → 传转置
     d4 = gl.run(sh['kFsCcm'], {'uSize': (w, h), 'uCcm': tuple(CCM.T.ravel().tolist())},
                 {'uTex': tex_d3})
+    tex_d4 = gl.ctx.texture((w, h), 4, dtype='f2'); tex_d4.write(d4.astype(np.float16).tobytes())
+    tex_d4.filter = (moderngl.NEAREST, moderngl.NEAREST)
     np.save(os.path.join(args.out, 'ccm_d4.npy'), d4)
     steps['ccm'] = 'kFsCcm'
+
+    # ── v0.10.194：defringe 三段在线性域真跑（定阈值的唯一可靠途径）──────────
+    if args.defringe:
+        dw, dh = w, h
+        hw, hh = (dw + 1) // 2, (dh + 1) // 2
+        # ① down：全分辨率 → 半分辨率 (L, br, b, gate)
+        lab = gl.run(sh['kFsDefringeDown'], {'uSize': (dw, dh)}, {'uTex': tex_d4}, size=(hw, hh))
+        np.save(os.path.join(args.out, 'df_lab.npy'), lab)
+        tex_lab = gl.ctx.texture((hw, hh), 4, dtype='f2')
+        tex_lab.write(lab.astype(np.float16).tobytes())
+        tex_lab.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        # ② detect：11×11 base_std(B-R)
+        det = gl.run(sh['kFsDefringeDetect'], {'uHalf': (hw, hh)}, {'uSrc': tex_lab}, size=(hw, hh))
+        np.save(os.path.join(args.out, 'df_det.npy'), det)
+        # ③ avg：16×16 网格 → 全图 |B-R| 均值（= uChromaAvg）
+        aw, ah = (hw + 15) // 16, (hh + 15) // 16
+        tex_det_h = gl.ctx.texture((hw, hh), 4, dtype='f2')
+        tex_det_h.write(det.astype(np.float16).tobytes())
+        tex_det_h.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        avg = gl.run(sh['kFsDefringeAvg'], {'uHalf': (hw, hh)}, {'uSrc': tex_det_h}, size=(aw, ah))
+        cavg = float(avg[..., 0].mean())
+        steps['defringe'] = {'chromaAvg(linear |B-R| mean)': cavg}
+        print(f'uChromaAvg（线性域 |B-R| 全图均值）= {cavg:.6f}')
+        # ④ 线性域统计：紫线像素的三个物理量分布
+        d4a = d4[..., :3]
+        br_full = d4a[..., 2] - d4a[..., 0]
+        # 邻域 std（半分辨率，与 shader 同口径用 det.w）
+        det_w = np.repeat(np.repeat(det[..., 3], 2, axis=0), 2, axis=1)[:dh, :dw]
+        # gL：与 apply shader 同式（中心差分，未除 2，×255）
+        lum = 0.2126 * d4a[..., 0] + 0.7152 * d4a[..., 1] + 0.0722 * d4a[..., 2]
+        gx = np.zeros_like(lum); gy = np.zeros_like(lum)
+        gx[:, 1:-1] = lum[:, 2:] - lum[:, :-2]
+        gy[1:-1, :] = lum[2:, :] - lum[:-2, :]
+        gL = np.sqrt(gx * gx + gy * gy) * 255.0
+        # 紫线候选：|br| 高 + 亮度梯度高
+        cand = (np.abs(br_full) > 1.5 * cavg) & (gL > 5)
+        ys, xs2 = np.where(cand)
+        stats = {'cavg': cavg, 'n_cand': int(len(ys))}
+        if len(ys):
+            abr = np.abs(br_full[ys, xs2]); astd = det_w[ys, xs2]; agl = gL[ys, xs2]
+            for nm, arr in (('|br|', abr), ('base_std', astd), ('gL', agl)):
+                stats[nm] = {'P10': float(np.percentile(arr, 10)),
+                             'P50': float(np.percentile(arr, 50)),
+                             'P90': float(np.percentile(arr, 90))}
+                stats[nm + '_x_cavg'] = {'P10': float(np.percentile(arr, 10) / cavg),
+                                          'P50': float(np.percentile(arr, 50) / cavg),
+                                          'P90': float(np.percentile(arr, 90) / cavg)}
+        steps['defringe_stats'] = stats
+        print('紫线候选统计:', json.dumps(stats, indent=2)[:1200])
+        d4 = d4  # noqa
 
     gl.close()
     json.dump({'steps': steps, 'roi': [Y0, Y1, X0, X1], 'dng': os.path.basename(args.dng),

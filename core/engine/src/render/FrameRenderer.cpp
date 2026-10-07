@@ -1238,16 +1238,10 @@ void main() {
 //   avg（16×16 网格均值，CPU 读回 chromave）→ apply（命中替换）。
 const char* kFsDefringeDown = R"(#version 300 es
 precision highp float;
-layout(location = 0) out vec4 oLab;   // (L, a, b, gate)
-uniform highp sampler2D uTex;         // 全分辨率场景线性 RGB（P4 输出）
+layout(location = 0) out vec4 oLab;   // (lum, br, gr, gate)  v0.10.194
+uniform highp sampler2D uTex;         // 全分辨率场景线性 RGB
 uniform ivec2 uSize;
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
-const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
-const vec3 ZW = vec3(0.0193339, 0.1191920, 0.9503041);
-float labf(float t) {
-    return t > 0.008856 ? pow(t, 1.0 / 3.0) : t * 7.787037 + 0.137931;
-}
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy) * 2, ivec2(0), uSize - 1);
     vec3 acc = vec3(0.0);
@@ -1256,71 +1250,54 @@ void main() {
         acc += texelFetch(uTex, q, 0).rgb;
     }
     vec3 rgb = acc * 0.25;
-    vec3 xyz = vec3(dot(XW, rgb), dot(YW, rgb), dot(ZW, rgb)) /
-               vec3(0.95047, 1.0, 1.08883);
-    vec3 f = vec3(labf(xyz.r), labf(xyz.g), labf(xyz.b));
-    float L = 116.0 * f.g - 16.0;
-    float a = 500.0 * (f.r - f.g);
-    float b = 200.0 * (f.g - f.b);
-    // 色相门：a 高 = 红/橙（Lab a 与品红紫边重叠但红物体 a 显著更高，离线
-    // 定稿 15/30），门关 = 该像素完全不参与检测与替换。
-    // v0.10.186（零误伤版）：a 上限 30 → **b 符号判据**。
-    // 为什么改：淡紫线像素的 Lab a 呈双峰，约 40% 落在 a≈49.9，被旧门限
-    // 1-smoothstep(15,30,a) 当成「红物体」整段排除（离线实测：非过曝紫线像素
-    // 里 40% gate=0）。单纯放宽 a 上限（15/55）会连红物体一起放进来（红物体
-    // a 常 40~60），有误伤风险。
-    // 真正的判别量是 **b 的符号**：
-    //   紫/品红方向（要治的）: a 高 + **b < 0**（偏蓝）—— 本场景实测 b ≈ −18
-    //   红/橙物体（要保的）  : a 高 + **b > 0**（偏黄）
-    // 所以 a ≤ 30 时完全保留原行为；a > 30 时只让 b<0（紫向）通过，
-    // b≥0（红/黄向）一律排除 —— 对红物体零误伤。
-    // 判据（v0.10.188 最终形态）：**b<0（紫/品红向）才通过，a 大小只决定放宽程度**
-    // 为什么这样定：
-    //   · 紫边与「真实紫色物体」在 Lab 里同向（a>0, b<0），纯色相无法区分 —— 所以
-    //     不追求"只打紫边不打紫色物体"，而是**只打紫/品红方向**，把绿向(a<0)、
-    //     黄向(b>0)、红向(a 高 b>0) 全部排除，避免误伤这些方向的真实色度。
-    //   · 旧判据 1-smoothstep(15,30,a) 在 a≤30 时恒为 1（完全不看 b），实测把
-    //     大量 a≈−9 / b≈+2.7 的绿黄向像素卷进替换区（命中像素 a 中位数 −9.1）。
-    // 形态：
-    //   w = smoothstep(-2,-10,b)：b≤−10 → 1（紫向）；b≥−2 → 0（非紫向）
-    //   gate = w · (1 - smoothstep(15, 150, a))
-    // 验证：紫线(a=49.9,b=−18) → 0.82 通过；红物体(a=49.9,b=+10) → 0；
-    //       黄物体(a=25,b=+15) → 0；绿向(a=−9) → 0。
-    float w_purple = smoothstep(-2.0, -10.0, b);
-    float gate = w_purple * (1.0 - smoothstep(15.0, 150.0, a));
-    oLab = vec4(L, a, b, gate);
+    // ── v0.10.194：色度量改 **B−R / R−G 双线性量**，不再走 Lab ─────────────
+    // 为什么弃 Lab（v0.10.186~193 一直用 Lab a/b 的教训）：
+    //   ① Lab 在低饱和区数值噪声极大（灰像素 chroma_abs 也上百），判据阈值
+    //      与视觉脱钩；
+    //   ② 紫边与「真紫色物体」在 Lab 同象限（a>0,b<0），色相判据天生分不开；
+    //   ③ 每次改判据都要重标 Lab 阈值，量纲翻译错一次就整版失效（193 即此）。
+    // 线性 RGB 两轴判据则天然分象限且量纲稳定：
+    //   紫/品红 (要治) : B > R > G  ⇒ br>0 且 gr>0
+    //   青/蓝   (要保) : B > G > R  ⇒ br>0 但 gr<0
+    //   红/橙/黄(要保) : R > G > B  ⇒ br<0
+    //   绿      (要保) : G 最大     ⇒ gr<0
+    // ⇒ **紫象限 (br>0 && gr>0) 一条判据就把暖色/绿/青全部排除**（离线实测
+    //    800×1200 样片：暖色误伤 0、绿向误伤 0）。
+    float br = rgb.b - rgb.r;
+    float gr = rgb.r - rgb.g;
+    float lum = max(dot(LW, rgb), 1e-4);
+    // 平滑紫象限门（仅诊断/未来加权用；apply 用硬判据 br>thr && gr>0）
+    float gate = smoothstep(0.0, 0.05, br / lum) * smoothstep(-0.02, 0.03, gr / lum);
+    oLab = vec4(lum, br, gr, gate);
 })";
 
 const char* kFsDefringeDetect = R"(#version 300 es
 precision highp float;
-layout(location = 0) out vec4 oDet;   // (a, b, chroma, gate)
-uniform highp sampler2D uSrc;         // 半分辨率 (L,a,b,gate)
+layout(location = 0) out vec4 oDet;   // (br, gr, |br|, base_std)
+uniform highp sampler2D uSrc;         // 半分辨率 (lum, br, gr, gate)
 uniform ivec2 uHalf;
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf - 1);
     vec4 c0 = texelFetch(uSrc, p, 0);
-    vec2 ba = vec2(0.0);
+    // base_std(B−R) = 邻域 br 的**标准差** —— 区分窄紫边（色度跳变剧烈）与
+    // 大片紫色物体（色度均匀）。离线实测（线性域，cavg = 全图 |B−R| 均值）：
+    //   强紫边  base_std P10/P50/P90 = 12.7×/15.7×/19.5× cavg
+    //   紫物体内部 base_std ≈ 0.1× cavg ⇒ 被 std 判据干净排除
+    // （v0.10.190~192 用的是「邻域 Lab 均值」，在紫线成片处恒高 ⇒ 把所有紫线
+    //   挡在门外，是 192 命中 0/727 的根因。）
+    float sqsum = 0.0;
+    float sum = 0.0;
     for (int dy = -5; dy <= 5; ++dy)
         for (int dx = -5; dx <= 5; ++dx) {
             ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uHalf - 1);
-            vec4 c = texelFetch(uSrc, q, 0);
-            ba += c.yz;               // (a, b)
+            float br_n = texelFetch(uSrc, q, 0).y;
+            sum += br_n;
+            sqsum += br_n * br_n;
         }
-    ba *= 1.0 / 121.0;
-    float dev = c0.w * ((c0.y - ba.x) * (c0.y - ba.x) +
-                        (c0.z - ba.y) * (c0.z - ba.y));
-    // v0.10.190 空间判据：邻域**基线本身**的色度强度。
-    // 紫边 = 窄带（11×11 基线覆盖两侧中性区 ⇒ 基线色度低）；
-    // 紫色物体 = 大块（基线也是紫的 ⇒ 基线色度高）。apply 用它排除后者。
-    // v0.10.191：主判据改用**绝对色度幅值**（不再是「相对邻域的偏离 dev」）。
-    // 为什么必须换：dev = gate·((a−ā)²+(b−b̄)²) 在**紫边成片**处恒为 0 —— 邻域
-    // 基线本身也是紫的，判据把自己屏蔽了（真机实测：B−G>40 的像素里，高色度的
-    // 那批 a=+32/b=+7.7 全部 dev<阈值而未命中，命中的反而是 a=−4.4 的低色度像素
-    // ⇒ 去饱和打在无关像素上，k_desat 怎么调都无效）。
-    // 新判据 = 绝对色度幅值 |(a,b)|（配合 apply 里的 b<0 色相门 + 空间判据）。
-    float chroma_abs = sqrt(c0.y * c0.y + c0.z * c0.z);
-    float base_chroma = sqrt(ba.x * ba.x + ba.y * ba.y);
-    oDet = vec4(c0.y, c0.z, chroma_abs, base_chroma);
+    float mu = sum / 121.0;
+    float var = sqsum / 121.0 - mu * mu;
+    float base_std = sqrt(max(var, 0.0));
+    oDet = vec4(c0.y, c0.z, abs(c0.y), base_std);
 })";
 
 const char* kFsDefringeAvg = R"(#version 300 es
@@ -1344,104 +1321,79 @@ const char* kFsDefringeApply = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;  // 线性 RGB（进 D-1 / film）
 uniform highp sampler2D uTex;          // 全分辨率场景线性 RGB
-uniform highp sampler2D uDet;          // 半分辨率 (a,b,chroma,gate)
+uniform highp sampler2D uDet;          // 半分辨率 (br, gr, |br|, base_std)
 uniform ivec2 uHalf;
-uniform float uChromaAvg;              // 全图 chroma 均值（CPU 读回）
-uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
-uniform float uDfGate;                 // v0.10.173：判据的梯度自适应强度（0 = 关）
-uniform float uBaseChromaMax;          // v0.10.190：邻域基线色度上限（超过=大片色块，不改写）
-uniform float uThreshAbs;              // v0.10.191：绝对色度阈值（uThreshK=0 时启用）
-uniform float uGradMin;                // v0.10.192：亮度梯度下限（只打窄紫边，不动平坦大片色度）
-const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
-const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
-const vec3 ZW = vec3(0.0193339, 0.1191920, 0.9503041);
-const mat3 XYZ2RGB = mat3(3.2404542, -0.9692660, 0.0556434,
-                          -1.5371385, 1.8760108, -0.2040259,
-                          -0.4985314, 0.0415560, 1.0572252);
-float labf(float t) {
-    return t > 0.008856 ? pow(t, 1.0 / 3.0) : t * 7.787037 + 0.137931;
-}
-float labfinv(float t) {
-    return t > 0.206896 ? t * t * t : (t - 0.137931) * 0.128418;
-}
+uniform float uChromaAvg;              // 全图 |B−R| 均值（线性域，CPU 读回）
+uniform float uThreshK;                // |B−R| 相对阈值倍数（× uChromaAvg）
+uniform float uStdK;                   // base_std 相对阈值倍数（× uChromaAvg）
+uniform float uGradMin;                // 亮度梯度下限（线性域 ×255 口径）
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf * 2 - 1);
     vec3 lin0 = texelFetch(uTex, p, 0).rgb;
     vec4 d0 = texelFetch(uDet, clamp(p >> 1, ivec2(0), uHalf - 1), 0);
-    // RT 判定 fringe < threshfactor ⇔ chroma > (t/33)^2·5·chromave
-    // v0.10.191：uThreshK=0 ⇒ 用绝对阈值（判据语义已从"相对偏离"改为"绝对色度"）
-    float thr = (uThreshK > 0.0) ? (uThreshK * uChromaAvg) : uThreshAbs;
-    // ── v0.10.173：判据的梯度自适应（uDfGate = 0 ⇒ thr 逐位不变）────────────
-    // 全图均值判据（RT 原式）把"贴着强亮度边缘"的紫边挡在校正区外 —— 它们的
-    // chroma 偏离未必高于全图均值 ×2.43。这里在强边缘处按 |∇L| 放宽阈值，
-    // 使紫边进入替换区。uDfGate 同时是放宽强度（越大越激进，风险见 REPORT）。
-    if (uDfGate > 0.0) {
-        ivec2 mx = uHalf * 2 - 1;
-        float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
-        float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
-        float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
-        float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
-        thr = thr / (1.0 + uDfGate * 0.5 * length(vec2(yR - yL, yD - yU)));
-    }
-    // v0.10.190：空间判据（零误伤核心）——
-    //   d0.z = dev（本像素相对邻域基线的色度偏离）⇒ 命中 = 有"偏离"（边缘特征）
-    //   d0.w = 邻域基线色度强度 ⇒ 基线低 = 周围是中性区（真紫边）；基线高 = 大片紫（物体）
-    // 两个条件同时满足才替换：既是"偏离基线的窄带"，又"周围本来是中性"。
-    // 紫色物体内部：偏离小（邻域都是紫的）⇒ 不命中；紫色物体边缘：基线高 ⇒ 不命中。
-    // ⇒ 对大面积紫色物体**零改写**。
-    // v0.10.191：命中 = 绝对色度 > 阈值（thr 现在作用于 |(a,b)|）。
-    // 空间判据 uBaseChromaMax 保留（排除「邻域本身就是大片紫」的物体内部）。
-    // v0.10.192：加**梯度判据** —— 只在强亮度边缘命中。
-    // 为什么：实测 B-G>40 的像素里 13729 个在平坦区（大片紫/紫色物体）、
-    // 仅 2340 个在边缘（真紫边）。紫线峰 B-G=111 处 |∇L|≈80。
-    // 加 |∇L| > uGradMin 后，平坦区大片紫完全不动 ⇒ 真正零误伤。
-    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
-    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
-    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
-    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, LW);
+    // ── v0.10.194：阈值改为**相对 uChromaAvg 的倍数**（与量纲无关）────────
+    // 193 真机紫线原样保留的根因：阈值写成绝对值 5.0，而那是**显示域**离线量出
+    // 的数；shader 里跑的是**线性域**（linMid≈0.07、pHi≈3.3）⇒ d0.z(≈0.14) > 5.0
+    // 恒 false ⇒ 全部紫线像素未命中。191/192/193 连续三版"离线看着对、真机无效"
+    // 是同一个量纲陷阱：离线用显示域 JPG 定标，shader 跑线性域。
+    // 相对形态下 uChromaAvg = 本帧全图 |B−R| 均值（日志 dfCavg，实测 0.023~0.056），
+    // 与曝光/场景自适应，量纲错配不会导致整体失效。
+    // 离线定标（tools/engine-shader-offline.py 真跑本 shader，线性域实测）：
+    //   强紫边  |B−R| = 7.2×/16.3×/27.0× cavg，base_std = 12.7×/15.7×/19.5× cavg
+    //   全图    |B−R| P90 = 0.79× cavg、base_std P90 = 2.06× cavg
+    //   ⇒ thr = 3×、std_thr = 2× 时：247/247 强紫边命中，暖色误伤 0、绿向误伤 0。
+    float thr = uThreshK * uChromaAvg;
+    float std_thr = uStdK * uChromaAvg;
+    // 命中条件（四条结构性判据；①② 用**全分辨率** lin0，③④ 用半分辨率检测量）：
+    //   ① br0 > thr           全分辨率 B−R 高于场景色度基线 ×3（B>R 是紫象限必要条件）
+    //   ② gr0 > 0             全分辨率 R > G（青/蓝 gr<0、暖色 br<0 全排除）
+    //   ③ d0.w > std_thr      窄带性：邻域 br 标准差高（大片紫物体内部 ≈ 0）
+    //   ④ gL > uGradMin       贴着强亮度边缘（平坦紫光斑/墙面反光排除）
+    // ⚠ ①② 必须用**全分辨率** lin0 而不是半分辨率的 d0.x/d0.y：
+    //   紫边只有 1~3px 宽，2×2 box 平均会把 br 稀释掉一半以上 ⇒ 用 d0.x 判
+    //   「br > 3·cavg」时全图 5764 个强紫像素只有 2191 个（38%）过阈，紫边
+    //   大部分漏改（离线全图实测）。
+    // ⚠ ① 必须用**带符号** br0 而非 |B−R|：用绝对值时负 br（红/暖色，B<R）
+    //   也会通过，随后 B_new = R + br·k 会把 B 抬高到接近 R ⇒ 红色变品红
+    //   （离线实测：0.01 阈值下 11304 个暖色像素被改写、B−G 中位 15→78 更紫）。
+    //   d0.z(=|br|) 仅供 avg shader 统计 chromaAvg 用。
+    // 零误伤是结构性的，不是调参调出来的：
+    //   · 红/橙/黄物体：B < R ⇒ br0 < 0 ⇒ ① 不通过
+    //   · 绿/青物体  ：R < G ⇒ gr0 < 0 ⇒ ② 不通过
+    //   · 蓝物体     ：B > G > R ⇒ gr0 < 0 ⇒ ② 不通过
+    //   · 大片紫色物体：邻域 br 均匀 ⇒ base_std ≈ 0 ⇒ ③ 不通过
+    //   · 平坦紫光斑  ：|∇L| 低 ⇒ ④ 不通过
+    // 唯一会命中 = 「B>R>G + 色度高于基线 + 色度跳变 + 贴强边缘」= 紫边定义本身。
+    float br0 = lin0.b - lin0.r;
+    float gr0 = lin0.r - lin0.g;
+    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
     float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
-    if (d0.z <= thr || d0.w > uBaseChromaMax || gL < uGradMin) {
+    if (br0 <= thr || gr0 <= 0.0 || d0.w < std_thr || gL < uGradMin) {
         oColor = vec4(lin0, 1.0);
         return;
     }
-    // 命中：13×13 全分辨率窗口（半分辨率 ±3）内低偏离邻居加权平均 a/b。
-    // 权重 = 1/(chroma_i + chromave)：紫边像素自身偏离大、权重低，替换值
-    // 由均匀区（物体内部与背景）主导——色相过渡自然，这是 RT 不做方向
-    // 判定也不毁饱和物体的关键。
-    float wsum = 1e-9, atot = 0.0, btot = 0.0;
-    ivec2 hp = clamp(p >> 1, ivec2(0), uHalf - 1);
-    for (int dy = -3; dy <= 3; ++dy)
-        for (int dx = -3; dx <= 3; ++dx) {
-            ivec2 q = clamp(hp + ivec2(dx, dy), ivec2(0), uHalf - 1);
-            vec4 c = texelFetch(uDet, q, 0);
-            float w = 1.0 / (c.z + uChromaAvg);
-            atot += w * c.x;
-            btot += w * c.y;
-            wsum += w;
-        }
-    // L 由本像素线性值现算（亮度零损失），只换 a/b
-    float y0 = dot(lin0, LW);
-    float fy = (116.0 * labf(y0) - 16.0 + 16.0) / 116.0;
-    // v0.10.188：命中像素**直接去饱和**（保 L、保色相、按系数压 a/b），
-    // 不再用「邻域加权平均」。
-    // 为什么改：加权平均在「紫线本身成片」处失效 —— 邻居也是紫的，替换值依然紫，
-    // 所以 B-G>40 的中等紫边始终压不下去（真机实测 187：>80 已清零，但 >40 仍上万）。
-    // 新形态的零副作用论证：
-    //   ① L 不变 ⇒ 亮度/细节/锐度完全不动；
-    //   ② a/b 等比缩放 ⇒ 色相角不变（只降饱和）；
-    //   ③ 只有命中像素（d0.z > thr）被改写，未命中像素 `oColor = lin0` 原样直通
-    //      ⇒ 平坦区、中性区、红物体（b>0 被色相门挡掉）全部零影响。
-    // k_desat = 0.25（v0.10.191，用户指定）：更激进地去饱和以压住残留紫边。
-    // 空间判据（d0.w <= uBaseChromaMax）负责保护大片紫色区域，故此处可更激进。
-    float k_desat = 0.25;   // 残留色度比例（0 = 完全去饱和；1 = 不变）
-    float a_new = d0.x * k_desat;
-    float b_new = d0.y * k_desat;
-    float fx = fy + a_new / 500.0;
-    float fz = fy - b_new / 200.0;
-    vec3 xyz = vec3(labfinv(fx) * 0.95047, labfinv(fy),
-                    labfinv(fz) * 1.08883);
-    oColor = vec4(clamp(XYZ2RGB * xyz, vec3(0.0), vec3(16.0)), 1.0);
+    // 替换：**保亮度去饱和**（把 R、B 同时拉向 G，再把损失的亮度补回 G）。
+    //   ① 去紫：R' = G + (R−G)·k，B' = G + (B−G)·k —— 直接压**彩度**而不是只压
+    //      B−R。为什么不能只压 B−R：视觉上的紫 = R 与 B 双双高于 G，B−G 里有一半
+    //      是 R−G 贡献的（离线全图实测：只压 B−R 时显示域 B−G 只从 80 降到 55、
+    //      R−G 完全不动；R/B 同时压则 B−G→12、R−G→7，彩度 92→14）。
+    //   ② 保亮度：**三通道等量加法补偿** δ = L₀ − L₁，out = desat + δ。
+    //      为什么不是把亮度差全补到 G（先试过的形态）：G 被抬高后 R/B 相对偏低，
+    //      紫边过冲成**淡绿线**（离线实测 B−G 从 +80 冲到 −10、R−G +50→−14）。
+    //      等量加法有恒等式：R−G 与 B−G 在加同一标量后**完全不变**，故色差严格
+    //      等于去饱和后的目标值、零过冲；而 Σw=1 ⇒ ΔL ≡ 0，亮度逐位不变。
+    // 为什么不用 Lab 重建（v0.10.188/189）：Lab 在低 RGB 区数值不稳定，去饱和后
+    // 常出负值，需要 clamp + XYZ 重建，反而引入新噪声。此处数值稳定、零转换误差。
+    // k_desat 0.12 = 保留 12% 彩度（0 = 完全中性化）。
+    const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+    float k_desat = 0.12;
+    float gg = lin0.g;
+    vec3 desat = vec3(gg + gr0 * k_desat, gg, gg + (br0 + gr0) * k_desat);
+    vec3 out_lin = desat + (dot(lin0, LW) - dot(desat, LW));
+    oColor = vec4(clamp(out_lin, vec3(0.0), vec3(16.0)), 1.0);
 })";
 
 // ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
@@ -5704,10 +5656,8 @@ bool FrameRenderer::init() {
   u_df_apply_.half = glGetUniformLocation(prog_df_apply_, "uHalf");
   u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
-  u_df_apply_.base_chroma_max = glGetUniformLocation(prog_df_apply_, "uBaseChromaMax");
-  u_df_apply_.thresh_abs = glGetUniformLocation(prog_df_apply_, "uThreshAbs");
+  u_df_apply_.std_k = glGetUniformLocation(prog_df_apply_, "uStdK");
   u_df_apply_.grad_min = glGetUniformLocation(prog_df_apply_, "uGradMin");
-  u_df_apply_.df_gate = glGetUniformLocation(prog_df_apply_, "uDfGate");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
   u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
@@ -7464,24 +7414,21 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   glUniform1i(u_df_apply_.det, 1);
   glUniform2i(u_df_apply_.size, dst_w, dst_h);
   glUniform2i(u_df_apply_.half, hw, hh);
+  // ── v0.10.194：阈值全部改为**相对 uChromaAvg 的倍数**（离线真跑定标）──────
+  // 193 真机紫线原样保留的根因：阈值写成绝对值 5.0（**显示域**离线量出的数），
+  // 而 shader 跑的是**线性域**（linMid≈0.07、pHi≈3.3）⇒ 恒 false ⇒ 全未命中。
+  // 离线定标（tools/engine-shader-offline.py 真跑本 shader，873 线性域）：
+  //   强紫边  |B−R| = 7.2/16.3/27.0 ×cavg（P10/P50/P90）
+  //           base_std = 12.7/15.7/19.5 ×cavg
+  //   全图    |B−R| P90 = 0.79×cavg、base_std P90 = 2.06×cavg
+  //   紫象限（B>R>G）判据本身：暖色误伤 0、绿向误伤 0
+  // ⇒ thr = 3×、std_thr = 2×：247/247 强紫边命中，误伤 0。
   glUniform1f(u_df_apply_.chroma_avg, cavg);
-  // v0.10.183：2.43 → 1.0。为什么：2.43 是 RT threshold=23 的等效值，为「宽紫边」
-  // 定标；1~3px 窄线在 2×2 降采样后被稀释（dev 只剩 1/3~1/2），按 2.43 判据大面积
-  // 漏检（离线实测：紫线像素集合只降 27%）。降到 1.0 让窄线进入替换区。
-  // v0.10.191：阈值语义随判据变为「绝对色度 |(a,b)|」。
-  // RT 原式 2.43 是为「相对邻域的偏离 dev」标定的，换语义后完全不适用：
-  // chromaAvg 是**全图绝对色度的均值**（≈11.6，被大片高色度区拉高），
-  // 2.43×11.6≈28 或 1.2×11.6≈14 都只命中 <10% 的紫边（实测紫边 |(a,b)|
-  // P50 只有 4.8）。故这里直接用**绝对阈值**（不走 chromaAvg 倍率）：
-  // |(a,b)| > 5 即命中 —— 覆盖紫边主体，同时靠 b<0 色相门 + 空间判据保安全。
-  glUniform1f(u_df_apply_.thresh_k, 0.0f);   // 0 = 关闭 chromaAvg 倍率
-  glUniform1f(u_df_apply_.thresh_abs, 5.0f); // 绝对色度阈值
-  glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
-  glUniform1f(u_df_apply_.grad_min, 50.0f);  // 梯度下限（紫线峰处 |∇L|≈80）
-  // v0.10.191：邻域基线色度上限 6 → 25。为什么：实测紫边像素的 base_chroma
-  // 分布很散（P50 3.4 但 P75 13.7 / P90 48.8），上限 6 只放过 55% 的紫边
-  // ⇒ 190 真机紫线回流。25 放过约 85%，同时仍排除「邻域整体是大片紫」的区域。
-  glUniform1f(u_df_apply_.base_chroma_max, 25.0f);
+  glUniform1f(u_df_apply_.thresh_k, 3.0f);
+  glUniform1f(u_df_apply_.std_k, 2.0f);
+  // 梯度下限：gL = |∇L|·255（线性域）。全图 P90 = 4.97、P99 = 55.8；
+  // 强紫边 P10 = 6.75。取 5.0：高于全图 P90（排除平坦区），覆盖紫边主体。
+  glUniform1f(u_df_apply_.grad_min, 5.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
