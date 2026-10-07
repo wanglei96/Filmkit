@@ -1312,10 +1312,15 @@ void main() {
     // v0.10.190 空间判据：邻域**基线本身**的色度强度。
     // 紫边 = 窄带（11×11 基线覆盖两侧中性区 ⇒ 基线色度低）；
     // 紫色物体 = 大块（基线也是紫的 ⇒ 基线色度高）。apply 用它排除后者。
+    // v0.10.191：主判据改用**绝对色度幅值**（不再是「相对邻域的偏离 dev」）。
+    // 为什么必须换：dev = gate·((a−ā)²+(b−b̄)²) 在**紫边成片**处恒为 0 —— 邻域
+    // 基线本身也是紫的，判据把自己屏蔽了（真机实测：B−G>40 的像素里，高色度的
+    // 那批 a=+32/b=+7.7 全部 dev<阈值而未命中，命中的反而是 a=−4.4 的低色度像素
+    // ⇒ 去饱和打在无关像素上，k_desat 怎么调都无效）。
+    // 新判据 = 绝对色度幅值 |(a,b)|（配合 apply 里的 b<0 色相门 + 空间判据）。
+    float chroma_abs = sqrt(c0.y * c0.y + c0.z * c0.z);
     float base_chroma = sqrt(ba.x * ba.x + ba.y * ba.y);
-    oDet = vec4(c0.y, c0.z, dev, c0.w);
-    // 第 4 分量改存 base_chroma（原来存 gate，但 gate 已乘进 dev；apply 不再单独用 gate）
-    oDet.w = base_chroma;
+    oDet = vec4(c0.y, c0.z, chroma_abs, base_chroma);
 })";
 
 const char* kFsDefringeAvg = R"(#version 300 es
@@ -1345,6 +1350,7 @@ uniform float uChromaAvg;              // 全图 chroma 均值（CPU 读回）
 uniform float uThreshK;                // (t/33)^2 * 5 = 2.43（t23）
 uniform float uDfGate;                 // v0.10.173：判据的梯度自适应强度（0 = 关）
 uniform float uBaseChromaMax;          // v0.10.190：邻域基线色度上限（超过=大片色块，不改写）
+uniform float uThreshAbs;              // v0.10.191：绝对色度阈值（uThreshK=0 时启用）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
 const vec3 XW = vec3(0.4124564, 0.3575761, 0.1804375);
 const vec3 YW = vec3(0.2126729, 0.7151522, 0.0721750);
@@ -1363,7 +1369,8 @@ void main() {
     vec3 lin0 = texelFetch(uTex, p, 0).rgb;
     vec4 d0 = texelFetch(uDet, clamp(p >> 1, ivec2(0), uHalf - 1), 0);
     // RT 判定 fringe < threshfactor ⇔ chroma > (t/33)^2·5·chromave
-    float thr = uThreshK * uChromaAvg;
+    // v0.10.191：uThreshK=0 ⇒ 用绝对阈值（判据语义已从"相对偏离"改为"绝对色度"）
+    float thr = (uThreshK > 0.0) ? (uThreshK * uChromaAvg) : uThreshAbs;
     // ── v0.10.173：判据的梯度自适应（uDfGate = 0 ⇒ thr 逐位不变）────────────
     // 全图均值判据（RT 原式）把"贴着强亮度边缘"的紫边挡在校正区外 —— 它们的
     // chroma 偏离未必高于全图均值 ×2.43。这里在强边缘处按 |∇L| 放宽阈值，
@@ -1382,6 +1389,8 @@ void main() {
     // 两个条件同时满足才替换：既是"偏离基线的窄带"，又"周围本来是中性"。
     // 紫色物体内部：偏离小（邻域都是紫的）⇒ 不命中；紫色物体边缘：基线高 ⇒ 不命中。
     // ⇒ 对大面积紫色物体**零改写**。
+    // v0.10.191：命中 = 绝对色度 > 阈值（thr 现在作用于 |(a,b)|）。
+    // 空间判据 uBaseChromaMax 保留（排除「邻域本身就是大片紫」的物体内部）。
     if (d0.z <= thr || d0.w > uBaseChromaMax) {
         oColor = vec4(lin0, 1.0);
         return;
@@ -1413,13 +1422,9 @@ void main() {
     //   ② a/b 等比缩放 ⇒ 色相角不变（只降饱和）；
     //   ③ 只有命中像素（d0.z > thr）被改写，未命中像素 `oColor = lin0` 原样直通
     //      ⇒ 平坦区、中性区、红物体（b>0 被色相门挡掉）全部零影响。
-    // k_desat 的取舍（离线标定，用户 16:15 配对 DNG，引擎 shader 真执行）：
-    //   k=0.20 → B-G>40 从 9089 降到 1505（压得最狠）
-    //   k=0.35 → 降到 5589（保留更多原始色度）
-    // 取 0.35：本判据只打「紫/品红方向」(b<0)，而**真实紫色物体**也在这一侧 ——
-    // k 越小，紫色物体被去饱和越狠。0.35 = 紫边压得住（>60 降 82%）同时把
-    // 紫色物体的色度损失限制在 65% 以内。
-    float k_desat = 0.35;   // 残留色度比例（0 = 完全去饱和；1 = 不变）
+    // k_desat = 0.25（v0.10.191，用户指定）：更激进地去饱和以压住残留紫边。
+    // 空间判据（d0.w <= uBaseChromaMax）负责保护大片紫色区域，故此处可更激进。
+    float k_desat = 0.25;   // 残留色度比例（0 = 完全去饱和；1 = 不变）
     float a_new = d0.x * k_desat;
     float b_new = d0.y * k_desat;
     float fx = fy + a_new / 500.0;
@@ -5690,6 +5695,7 @@ bool FrameRenderer::init() {
   u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
   u_df_apply_.base_chroma_max = glGetUniformLocation(prog_df_apply_, "uBaseChromaMax");
+  u_df_apply_.thresh_abs = glGetUniformLocation(prog_df_apply_, "uThreshAbs");
   u_df_apply_.df_gate = glGetUniformLocation(prog_df_apply_, "uDfGate");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
@@ -7451,12 +7457,19 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   // v0.10.183：2.43 → 1.0。为什么：2.43 是 RT threshold=23 的等效值，为「宽紫边」
   // 定标；1~3px 窄线在 2×2 降采样后被稀释（dev 只剩 1/3~1/2），按 2.43 判据大面积
   // 漏检（离线实测：紫线像素集合只降 27%）。降到 1.0 让窄线进入替换区。
-  // v0.10.188：阈值收回 RT 原式 2.43。为什么：1.0 时命中率 26.5%（离线实测），
-  // 会把正常色度也去饱和；2.43 时命中 19.2% 且紫线（dev≈117）仍远超阈值。
-  glUniform1f(u_df_apply_.thresh_k, 2.43f);   // (23/33)²·5，RT threshold=23
+  // v0.10.191：阈值语义随判据变为「绝对色度 |(a,b)|」。
+  // RT 原式 2.43 是为「相对邻域的偏离 dev」标定的，换语义后完全不适用：
+  // chromaAvg 是**全图绝对色度的均值**（≈11.6，被大片高色度区拉高），
+  // 2.43×11.6≈28 或 1.2×11.6≈14 都只命中 <10% 的紫边（实测紫边 |(a,b)|
+  // P50 只有 4.8）。故这里直接用**绝对阈值**（不走 chromaAvg 倍率）：
+  // |(a,b)| > 5 即命中 —— 覆盖紫边主体，同时靠 b<0 色相门 + 空间判据保安全。
+  glUniform1f(u_df_apply_.thresh_k, 0.0f);   // 0 = 关闭 chromaAvg 倍率
+  glUniform1f(u_df_apply_.thresh_abs, 5.0f); // 绝对色度阈值
   glUniform1f(u_df_apply_.df_gate, df_gate > 0.f ? df_gate : 0.f);   // v0.10.173
-  // v0.10.190：邻域基线色度上限。紫边基线（两侧中性）实测 < 3；紫色物体基线 > 8。
-  glUniform1f(u_df_apply_.base_chroma_max, 6.0f);
+  // v0.10.191：邻域基线色度上限 6 → 25。为什么：实测紫边像素的 base_chroma
+  // 分布很散（P50 3.4 但 P75 13.7 / P90 48.8），上限 6 只放过 55% 的紫边
+  // ⇒ 190 真机紫线回流。25 放过约 85%，同时仍排除「邻域整体是大片紫」的区域。
+  glUniform1f(u_df_apply_.base_chroma_max, 25.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
