@@ -1432,8 +1432,13 @@ uniform float uGradLo;
 uniform float uGradHi;
 uniform float uSideK;       // 两侧色度必须 < 中心 × 该系数
 uniform float uChromaMin;   // 相对亮度的色度下限（低于此值视为中性，不动）
+uniform float uPeakK;       // 中心色度必须 > 该系数 × 两侧最大色度（"局部色度峰"）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-// ── 边缘伪彩抑制 v0.10.205：**前置到 PC3D 之前 + 窄带尺度 [3,6]** ──────────
+// ── 边缘伪彩抑制 v0.10.206：**前置到 PC3D 之前 + 尺度 [3,6,12]** ───────────
+// v0.10.205 用 [3,6] 两尺度后真机仍有紫线（用户 15:09 样片）：剖面实测该紫线
+// **宽 6~8px**（x=931~937 连续 B−R=+14~+39，y 方向延伸很长），±3/±6 的探测点
+// 总有一侧落在带内（x=936 B−R=+30）⇒ 判据不成立 ⇒ color_smooth 漏检 ⇒ PC3D
+// 再把它摊开 ⇒ defringe 面对宽带也治不了。**加回 12 尺度**覆盖 6~12px 的带。
 // v0.10.205 的关键改动：本 pass 的输入从"PC3D 输出"改成 **PC3D 之前的 D4**。
 // 原因：PC3D 的色度平滑会把 1~3px 伪彩**摊成 12~90px 宽带**（真机 112643 剖面
 // 实测），一旦摊开，任何尺度的探测点都落在带内 ⇒ 判据恒不成立（203 的 ±3px
@@ -1470,21 +1475,43 @@ void main() {
     vec2 nd = grad / length(grad);
     ivec2 o3 = ivec2(round(nd * 3.0));
     ivec2 o6 = ivec2(round(nd * 6.0));
+    ivec2 o12 = ivec2(round(nd * 12.0));
     vec3 a3 = texelFetch(uTex, clamp(p + o3, ivec2(0), mx), 0).rgb;
     vec3 b3 = texelFetch(uTex, clamp(p - o3, ivec2(0), mx), 0).rgb;
     vec3 a6 = texelFetch(uTex, clamp(p + o6, ivec2(0), mx), 0).rgb;
     vec3 b6 = texelFetch(uTex, clamp(p - o6, ivec2(0), mx), 0).rgb;
+    vec3 a12 = texelFetch(uTex, clamp(p + o12, ivec2(0), mx), 0).rgb;
+    vec3 b12 = texelFetch(uTex, clamp(p - o12, ivec2(0), mx), 0).rgb;
     float c3a = abs(a3.r - a3.g) + abs(a3.b - a3.g);
     float c3b = abs(b3.r - b3.g) + abs(b3.b - b3.g);
     float c6a = abs(a6.r - a6.g) + abs(a6.b - a6.g);
     float c6b = abs(b6.r - b6.g) + abs(b6.b - b6.g);
-    float lim = uSideK * ch0;
-    if (max(c3a, c3b) >= lim && max(c6a, c6b) >= lim) {
-        oColor = vec4(c0.rgb, 1.0);   // 所有尺度两侧都有色度 ⇒ 真实色度区域
+    float c12a = abs(a12.r - a12.g) + abs(a12.b - a12.g);
+    float c12b = abs(b12.r - b12.g) + abs(b12.b - b12.g);
+    // ── v0.10.206：判据改为"**局部色度峰**" ─────────────────────────────────
+    // 原判据要求"两侧色度都 < sideK×中心"。真机实测（150917 成片 y=340 剖面）
+    // 该紫线峰值 ch0=41 而**右侧背景本身就有色度 30** ⇒ 原判据永远不成立 ⇒
+    // 漏检（这正是 205 前置后紫线仍在的原因）。
+    // 新判据 = 中心是**局部色度峰**：ch0 > peakK × max(两侧)，且至少一侧显著低
+    //（min(两侧) < sideK × ch0）—— 前者排除"色度渐变区"，后者排除"真实色度
+    // 边缘"（真实边缘两侧都有色度、中心不是峰）。
+    // 实测（成片，尺度 [3,6,12]）：peakK=1.05/sideK=0.5 → 色度总量 **−1.25%**
+    //（204 的宽带判据是 −6%）、紫向边缘覆盖 23.1%、蓝向 16.6%。
+    float mx_side = max(max(c3a, c3b), max(max(c6a, c6b), max(c12a, c12b)));
+    float mn_side = min(min(c3a, c3b), min(min(c6a, c6b), min(c12a, c12b)));
+    // 判据 A：两侧**都**中性（窄带伪彩的经典形态）
+    bool side_ok = (max(c3a, c3b) < uSideK * ch0) && (max(c6a, c6b) < uSideK * ch0)
+                && (max(c12a, c12b) < uSideK * ch0);
+    // 判据 B：**局部色度峰**（中心显著高于两侧最大值，且至少一侧低）
+    bool peak_ok = (ch0 > uPeakK * mx_side) && (mn_side < uSideK * ch0);
+    if (!(side_ok || peak_ok)) {
+        oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    float r_t = 0.25 * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g));
-    float b_t = 0.25 * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g));
+    float r_t = (1.0 / 6.0) * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g)
+                             + (a12.r - a12.g) + (b12.r - b12.g));
+    float b_t = (1.0 / 6.0) * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g)
+                             + (a12.b - a12.g) + (b12.b - b12.g));
     vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
     if (c_med >= ch0) { oColor = vec4(c0.rgb, 1.0); return; }
@@ -5766,6 +5793,7 @@ bool FrameRenderer::init() {
   u_cs_.grad_hi = glGetUniformLocation(prog_cs_, "uGradHi");
   u_cs_.side_k = glGetUniformLocation(prog_cs_, "uSideK");
   u_cs_.chroma_min = glGetUniformLocation(prog_cs_, "uChromaMin");
+  u_cs_.peak_k = glGetUniformLocation(prog_cs_, "uPeakK");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
   u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
@@ -7312,7 +7340,8 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
     //   尺度 [3,6,12,18] 覆盖 PC3D 摊开后的 12~90px 宽色带；
     //   sideK 0.7（0.35 时带内仅 1/11 命中，0.7 时 6/11；全图蓝边覆盖 16.8%→43.1%）；
     //   uChromaMin=0.12 相对亮度下限（等价显示域 色度/亮度 ≈ 12%，低于此视为中性不动）。
-    glUniform1f(u_cs_.side_k, 0.35f);   // v0.10.205：伪彩已回到窄带 ⇒ 判据收紧回 0.35
+    glUniform1f(u_cs_.side_k, 0.5f);    // min(两侧) < 0.5×中心（排除真实色度边缘）
+    glUniform1f(u_cs_.peak_k, 1.05f);    // 中心 > 1.05×max(两侧)（"局部色度峰"，实测最优）
     glUniform1f(u_cs_.chroma_min, 0.12f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     in = last ? tex_cs_ : tex_cs_tmp_;
