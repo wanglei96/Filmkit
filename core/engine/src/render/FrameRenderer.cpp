@@ -1514,15 +1514,14 @@ void main() {
     // 206 判据命中却"还是明显"的原因）。改用最中性探测点的色差作目标值 ⇒
     // 色度降到 ~0。判据已保证 min(两侧) < 0.5×ch0，故最中性点必然比中心
     // 中性得多，不会把远处真实色度搬进来。
-    vec3 tgt = a3;
-    float tc = c3a;
-    if (c3b < tc) { tgt = b3; tc = c3b; }
-    if (c6a < tc) { tgt = a6; tc = c6a; }
-    if (c6b < tc) { tgt = b6; tc = c6b; }
-    if (c12a < tc) { tgt = a12; tc = c12a; }
-    if (c12b < tc) { tgt = b12; tc = c12b; }
-    float r_t = tgt.r - tgt.g;
-    float b_t = tgt.b - tgt.g;
+    // ── v0.10.209：替换策略改回**去饱和**（不再搬"最中性探测点"的色度）──────
+    // v0.10.207 用最中性点的色差作目标值，在"该点落在有色背景上"时会把背景色
+    // **搬进**被处理像素（真机实测把中性灰染成蓝色）。去饱和只压本像素自己的
+    // 色度（保色相、保亮度），**不引入任何外来色度** ⇒ 结构性安全。
+    // 保留 15% 色度（k_desat=0.15）：完全归零会在色度渐变区留下可见的"灰线"。
+    const float k_desat = 0.15;
+    float r_t = (c0.r - c0.g) * k_desat;
+    float b_t = (c0.b - c0.g) * k_desat;
     vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
     if (c_med >= ch0) { oColor = vec4(c0.rgb, 1.0); return; }
@@ -8777,16 +8776,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // v0.10.196：色差域中值（darktable color_smoothing）—— 在 defringe 之前。
       // 顺序理由：中值是"无偏"的（不判色相，治任意色向的 1~3px 色差异常），
       // 先用它把窄带伪彩压掉，defringe 再处理剩下的紫/品红定向部分。
-      // v0.10.208：**PC3D 之后再跑一次** color_smooth（治 PC3D 自身产生的色度
-      // 过冲；真机实测 D4 域无过冲而成片有 ⇒ 过冲产生于 PC3D）。
-      // df_src 优先级：后置结果 > PC3D 输出 > 前置结果 > D4 原图。
+      // v0.10.209：**回退 v0.10.208 的"后置再跑一次"** —— 真机实测该改动有害：
+      // 它把**中性/暗部像素染成蓝色**（例：(386,812) 由 RGB(79,73,73) 变成
+      // (132,151,181)；(286,866) 由中性灰 (147,151,152) 变成 (138,147,186)），
+      // 全图过冲像素数反而从 932 升到 1209。根因 = 后置的替换值取"最中性探测点"
+      // 的色差，而该点落在**蓝色背景**上时就把蓝色**搬进了中性区**。
+      // df_src 优先级：PC3D 输出 > 前置结果 > D4 原图。
       GLuint df_src = pc3d_ok ? tex_pc3d_ : (cs_ok ? tex_cs_ : tex_scene_);
-      bool cs2_ok = false;
-      if (p.color_smooth > 0.5f && pc3d_ok && passColorSmooth(dst_w, dst_h, tex_pc3d_, true)) {
-        cs2_ok = true;
-      }
-      if (cs2_ok) df_src = tex_cs_tmp_;
-      dbg_cs_on_ = (cs_ok ? 1 : 0) + (cs2_ok ? 2 : 0);
+      dbg_cs_on_ = cs_ok ? 1 : 0;
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
     } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
