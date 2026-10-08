@@ -25,7 +25,8 @@ import kotlin.math.min
  */
 
 /**
- * 编辑器参数数组（集成点 I-3）：以 [CameraPresets.standard]（78 槽，ADR-1 单一参数源）
+ * 编辑器参数数组（集成点 I-3）：以 [CameraPresets.standard]（长度 = `CameraPresets.COUNT`，
+ * ADR-1 单一参数源）
  * 为底，把参数快照里**存在且有限**的槽位覆盖上去。
  *
  * 为什么不是"直接返回快照数组"：
@@ -45,6 +46,61 @@ internal fun editorParams(raw: DoubleArray?): DoubleArray {
     }
     return base
 }
+
+/**
+ * 打开编辑器时的参数起点（E2-1，架构师 2026-10-08 拍板）：**画面必须与原片完全一致**。
+ *
+ * 成片在拍摄时已经把 LUT 烘焙进去了，若编辑器再把快照里的同一个 LUT + 强度套一遍，
+ * 用户第一眼看到的是"照片莫名其妙变浓了"。所以这里在 [editorParams] 之上把 **[34]
+ * 强制置 0** —— 引擎侧 `bindLut` 见 `lut_strength = 0` ⇒ `uLutOn = 0` ⇒ LUT 整段旁路
+ *（E1-3 离线验收：输出与输入 max|Δ| = 1 LSB，仅 dither）。
+ *
+ * 快照里的 LUT 选择与强度**不丢**：调用方把它另存为 UI 状态（"原片风格：xxx · 85%"），
+ * 配一个「套用」把当初的值原样下发。
+ */
+internal fun editorOpenParams(snap: StillSnapshot?): DoubleArray =
+    editorParams(snap?.params).also { it[34] = 0.0 }
+
+/**
+ * 暗角参数的 UI ↔ 槽位映射（E2-1）。**纯逻辑、无 Android 依赖** ⇒ JVM 单测直接覆盖往返。
+ *
+ * 槽位语义（E4-2 已实现并离线验收，见 `core/engine/src/film/FilmParams.h`）：
+ *  - [66] strength ∈ [−1, 0]：**负值才是暗角**，越负越暗；0 = 关（shader 整段跳过）
+ *  - [67] radius   ∈ [0, 200]：falloff 起点（%），darktable `scale` 默认 80
+ *  - [68] feather  ∈ [0, 200]：过渡宽度（%），darktable `falloff_scale` 默认 50
+ *
+ * UI 约定（"用户不该看到负数"，同时与 LUT 强度行的百分比读数一致）：
+ *  - 强度滑杆 = **0%..100%**，槽位 `[66] = −ui/100`（0% = 关、100% = 最强）
+ *  - 半径/羽化滑杆 = **0%..200%**，槽位 = `ui * 100`（80% 就是 80）
+ *
+ * 这里的 ui 单位 = 显示读数 / 100（[com.filmkit.app.ui.StrengthRow] 的 `v`：显示恒为
+ * `v * 100%`），所以强度 ui ∈ 0..1、半径/羽化 ui ∈ 0..2。
+ */
+
+/** UI 暗角强度（0..1 = 显示 0..100%）→ 槽位 [66]（−1..0）。 */
+internal fun vigStrengthSlot(ui: Float): Double = -ui.coerceIn(0f, 1f).toDouble()
+
+/**
+ * 槽位 [66]（−1..0）→ UI 强度（0..1）。
+ * **正值一律当"关"**：本 UI 永不产生正值（正 = 提亮四角，不是暗角），
+ * 出现在快照里只可能是手改 prefs 的坏数据 —— 不能把"提亮"画成滑杆上的一段。
+ */
+internal fun vigStrengthUi(slot: Double): Float =
+    if (!slot.isFinite() || slot > 0.0) 0f else (-slot).coerceIn(0.0, 1.0).toFloat()
+
+/** UI 暗角半径（0..2 = 显示 0..200%）→ 槽位 [67]（0..200）。 */
+internal fun vigRadiusSlot(ui: Float): Double = ui.coerceIn(0f, 2f).toDouble() * 100.0
+
+/** 槽位 [67] → UI 半径（0..2）。坏数据/越界回落到 darktable 默认 80% 对应的 0.8。 */
+internal fun vigRadiusUi(slot: Double): Float =
+    if (!slot.isFinite()) 0.8f else (slot / 100.0).coerceIn(0.0, 2.0).toFloat()
+
+/** UI 暗角羽化（0..2 = 显示 0..200%）→ 槽位 [68]（0..200）。 */
+internal fun vigFeatherSlot(ui: Float): Double = ui.coerceIn(0f, 2f).toDouble() * 100.0
+
+/** 槽位 [68] → UI 羽化（0..2）。坏数据/越界回落到 darktable 默认 50% 对应的 0.5。 */
+internal fun vigFeatherUi(slot: Double): Float =
+    if (!slot.isFinite()) 0.5f else (slot / 100.0).coerceIn(0.0, 2.0).toFloat()
 
 /** 另存文件名：`FILMKIT_20261008-213000_edit.jpg`（同拍摄链路的命名规则，`_edit` 区分原片） */
 internal fun editorExportName(timeMs: Long): String =

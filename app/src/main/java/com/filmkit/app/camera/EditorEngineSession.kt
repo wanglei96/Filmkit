@@ -34,9 +34,11 @@ import java.util.concurrent.atomic.AtomicReference
  * onDispose 里的 [RenderClient.stop] 是同步 join 的，本会话 [close] 同样同步 join ——
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
- * **参数**：调用方传进来的 `film` 是 78 槽 FilmParams 的**副本**（主线程可能同时在改
- * 滑杆值，不能共享同一数组）。引擎侧只读 [34] lut_strength / [26] grain_amount /
- * [27] grain_size，其余槽位不影响输出（E4-1 契约）。
+ * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 只读
+ * [26] grain_amount / [27] grain_size / [34] lut_strength / [66][67][68] 暗角三条，
+ * 其余槽位不影响输出（ADR §5.1 I-2，白名单由 `tools/check-style-passthrough.py`
+ * 第 ④ 项精确匹配守着）。
  */
 internal class EditorEngineSession {
 

@@ -15,7 +15,7 @@ class CameraPresetsTest {
 
     @Test
     fun lengthMatchesContract() {
-        assertEquals(78, CameraPresets.COUNT)
+        assertEquals(88, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
     }
 
@@ -40,5 +40,18 @@ class CameraPresetsTest {
         assertEquals(50.0, p[68], 0.0)
         // [69..77] 层间效应增益 = 1.0（恒等；0 在这里是"全黑"，是 X300 那类事故的同型坑）
         for (i in 69..77) assertEquals("slot[$i]", 1.0, p[i], 0.0)
+        // [78..87] E2-2：清晰度必须为 0（= 整段跳过）；局部调整（E2-6 才实现）的
+        // 默认值也必须是"无效果"组合 —— 尤其 [87] local_sat = 1.0（0 = 全去饱和）、
+        // [80][81] = 0.5（中心）、[86] = 0（无曝光变化）。
+        assertEquals(0.0, p[78], 0.0)
+        assertEquals(0.0, p[79], 0.0)   // local_type = 关
+        assertEquals(0.5, p[80], 0.0)
+        assertEquals(0.5, p[81], 0.0)
+        assertEquals(0.35, p[82], 0.0)
+        assertEquals(0.5, p[83], 0.0)
+        assertEquals(0.0, p[84], 0.0)
+        assertEquals(0.25, p[85], 0.0)
+        assertEquals(0.0, p[86], 0.0)
+        assertEquals(1.0, p[87], 0.0)
     }
 }

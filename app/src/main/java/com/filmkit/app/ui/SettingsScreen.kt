@@ -1377,9 +1377,14 @@ fun FocalScreen(onBack: () -> Unit = {}) {
     }
 }
 
-/** 区块标题：强调色等宽小字（全 App 统一） */
+/**
+ * 区块标题：强调色等宽小字（全 App 统一）。
+ *
+ * internal 而非 private：编辑器参数面板（E2-1）的分组标题复用同一形态 ——
+ * 两处各写一份，字号/颜色迟早漂移。
+ */
 @Composable
-private fun SectionHeader(text: String) {
+internal fun SectionHeader(text: String) {
     Text(
         text,
         color = FilmTheme.Accent,

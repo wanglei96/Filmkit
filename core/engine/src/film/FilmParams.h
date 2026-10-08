@@ -17,7 +17,11 @@ struct FilmParams {
   // 层间效应）。**本卡只扩契约、不改 shader**（功能由 E4-2…E4-6 各自实现）⇒
   // 新槽位当前零引用，默认值一律取"无效果"值，成片与改动前逐位一致。
   // 沿革：v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
-  static constexpr int kCount = 78;
+  // v0.11.1（E2-2）：78 → 88，+[78] clarity（编辑器基础调整的清晰度）+
+  // [79..87] 局部调整（local_*，E2-6 才实现）。与 E4-1 同模式：**契约扩展与功能
+  // 实现分离** —— 本卡只为 [79..87] 占位（shader 零引用），E2-6 不再改契约。
+  // [78] 本卡实现（`kFsStyle` 内），默认 0 = 整段跳过。
+  static constexpr int kCount = 88;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -390,6 +394,26 @@ struct FilmParams {
   float interlayer_mid[3] = {1.0f, 1.0f, 1.0f};     // 72..74 中间调 R/G/B 增益
   float interlayer_high[3] = {1.0f, 1.0f, 1.0f};    // 75..77 高光 R/G/B 增益
 
+  // ── v0.11.1（E2-2）：编辑器基础调整 + 局部调整占位 [78..87] ───────────────
+  // 语义与域约定见 docs/reports/editor-ADR.md 的 ADR-7 订正 v2 与 §5.7 槽位表。
+  // ⚠️ 这些槽位**只被编辑器链路 `kFsStyle` 读取**（拍照链路 `kFsOut` 不读它们）：
+  // 编辑器链路的输入是已成片的 sRGB JPEG，与拍照链路的 RAW 域语义不同源。
+  // [78] 清晰度（display 域中半径 USM 的强度，0..1）：**0 = 整段跳过**（默认）。
+  //      不复用 [39] sharpen —— 那个是拍照链路的 OETF **前**、小半径轻度锐化，
+  //      语义不同，复用会让两条链路打架（ADR §E2-2 末段）。
+  float clarity = 0.0f;        // 78
+  // [79..87] 局部调整（径向 / 线性 mask + 局部曝光/饱和度）：**E2-6 才实现**，
+  // 本卡只占位（`kFsStyle` 零引用）⇒ 对输出无任何影响。取值见 §5.7 槽位表。
+  float local_type = 0.0f;     // 79 0 = 关，1 = 径向，2 = 线性
+  float local_center_x = 0.5f; // 80 归一化中心 x
+  float local_center_y = 0.5f; // 81 归一化中心 y
+  float local_radius = 0.35f;  // 82 径向半径（相对长边）
+  float local_feather = 0.5f;  // 83 羽化宽度（相对半径）
+  float local_angle = 0.0f;    // 84 线性方向（弧度）
+  float local_width = 0.25f;   // 85 线性半宽
+  float local_ev = 0.0f;       // 86 局部曝光（EV，负 = 压暗）
+  float local_sat = 1.0f;      // 87 局部饱和度（1.0 = 恒等）
+
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
     // 缺失的新参数保持默认 —— 契约长度不一致时"整包静默全丢"比越界更危险。
@@ -487,6 +511,20 @@ struct FilmParams {
     if (n > 77) {
       for (int i = 0; i < 3; ++i) interlayer_high[i] = static_cast<float>(v[75 + i]);
     }
+    // v0.11.1（E2-2）：[78] 清晰度 + [79..87] 局部调整占位（逐槽位判长度，与上同风格）。
+    // 防呆：[87] local_sat 的 0 在 mix 语义下 = 完全去饱和（不是"无效果"）⇒ 保持
+    // 结构体默认 1.0 —— 但契约数组里 0 是合法下发值（用户就是要全去饱和），故不在此
+    // 特判，由下发侧保证初值（CameraPresets.neutral() 显式写 1.0）。
+    if (n > 78) clarity = static_cast<float>(v[78]);
+    if (n > 79) local_type = static_cast<float>(v[79]);
+    if (n > 80) local_center_x = static_cast<float>(v[80]);
+    if (n > 81) local_center_y = static_cast<float>(v[81]);
+    if (n > 82) local_radius = static_cast<float>(v[82]);
+    if (n > 83) local_feather = static_cast<float>(v[83]);
+    if (n > 84) local_angle = static_cast<float>(v[84]);
+    if (n > 85) local_width = static_cast<float>(v[85]);
+    if (n > 86) local_ev = static_cast<float>(v[86]);
+    if (n > 87) local_sat = static_cast<float>(v[87]);
   }
 };
 

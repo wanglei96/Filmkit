@@ -2340,16 +2340,27 @@ private fun RelativeSlider(
  * v0.10.98：滑杆换 RelativeSlider —— 日志实锤 state 收到 1.051（用户停在 99 附近
  * 重新按住拇指微调时被 M3 的按下 snap 跳走），相对拖动从机制上根除该跳变。
  * （v0.10.99b 验收通过后移除拖动诊断日志。）
+ *
+ * [label] / [range] 是 E2-1（编辑器暗角滑杆）加的可选参数，**默认值就是拍摄页现行为**
+ *（"强度" / 0..1.5 = 显示 0..150%），所以拍摄页调用点一个字符都不用改。编辑器复用同一行
+ * 组件而不是另写一套 —— 两套滑杆的相对拖动手感（无按下跳变）必然走样。
+ * 注意 [range] 只是量程：显示值恒为 `v * 100%`，v = 1.0 即 "100%"。
  */
 @Composable
-internal fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
+internal fun StrengthRow(
+    initial: Float,
+    onCommit: (Float) -> Unit,
+    onFinished: (Float) -> Unit,
+    label: String = "强度",
+    range: ClosedFloatingPointRange<Float> = 0f..1.5f,
+) {
     var v by remember { mutableFloatStateOf(initial) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 6.dp),
     ) {
         Text(
-            "强度",
+            label,
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
             fontFamily = FilmTheme.Mono,
@@ -2361,6 +2372,7 @@ internal fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: 
                 onCommit(nv)
             },
             onDragEnd = { onFinished(v) },
+            range = range,
             modifier = Modifier
                 .weight(1f)
                 .padding(horizontal = 8.dp),

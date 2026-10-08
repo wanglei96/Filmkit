@@ -16,13 +16,16 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,7 +44,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -52,21 +54,30 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.EditorEngineSession
 import com.filmkit.app.camera.OverwriteResult
 import com.filmkit.app.camera.StillSnapshot
 import com.filmkit.app.camera.StillSnapshotStore
 import com.filmkit.app.camera.editorExportName
-import com.filmkit.app.camera.editorParams
+import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.saveEditorCopy
+import com.filmkit.app.camera.vigFeatherSlot
+import com.filmkit.app.camera.vigFeatherUi
+import com.filmkit.app.camera.vigRadiusSlot
+import com.filmkit.app.camera.vigRadiusUi
+import com.filmkit.app.camera.vigStrengthSlot
+import com.filmkit.app.camera.vigStrengthUi
+import com.filmkit.app.kv
 import com.filmkit.app.lut.LutLibrary
 import com.filmkit.app.lut.LutPreview
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -85,6 +96,13 @@ import kotlinx.coroutines.withContext
  *
  * 参数起点（集成点 I-3）：打开时读该片的参数快照（`StillSnapshotStore`）；没有快照
  * 时回退 [CameraPresets.standard] 并在界面上明确提示"已用标准基线"（ADR-4）。
+ * **打开时的画面 = 原片本身**（E2-1 架构师拍板）：LUT 强度初值强制 0（旁路），
+ * 快照里的 LUT 与强度改为"原片风格"只读展示 + 一键套用，见 [editorOpenParams]。
+ *
+ * 参数面板（E2-1）：底部操作区上方的**可折叠区**（不是覆盖式浮层）—— 展开时预览区
+ * 自动让位，画面完整可见。暗角最明显的地方是四角，浮层挡住底边两点等于让用户盲调。
+ * 分组按"完整编辑器"预留（见 [EditorParamGroup]），但**只渲染引擎已实现并验收的组**
+ *（ADR-12：不许假滑杆）。本轮 = 色彩（LUT）+ 暗角（[66][67][68]）。
  *
  * ⚠ 编辑器**不写任何拍摄用的 prefs**（`lut_id` / `lut_strength`）：这里的 LUT 选择
  * 只对本次编辑会话有效，退出即丢 —— 否则用户在编辑器里试个滤镜，回到相机页拍照
@@ -133,13 +151,18 @@ fun EditorScreen(
     var source by remember { mutableStateOf<EditorSource?>(null) }
     // 当前显示的位图：先显示解码图，首次渲染完成后替换为引擎输出
     var shown by remember { mutableStateOf<Bitmap?>(null) }
-    // 参数数组（78 槽，编辑器只改得动 [34]；其余槽位原样带着 —— 引擎侧只读
-    // [26][27][34]，其余槽位改了也不影响输出，E4-1 契约）
+    // 参数数组（长度 = CameraPresets.COUNT，编辑器只改得动 [34][66][67][68]；其余槽位原样带着
+    // —— 引擎侧只读
+    // [26][27][34][60][61][66][67][68]，其余槽位改了也不影响输出，ADR §5.1 I-2 契约）
     var params by remember { mutableStateOf<DoubleArray?>(null) }
     var lutId by remember { mutableStateOf<String?>(null) }   // 本会话的 LUT（不持久化）
-    var lutK by remember { mutableFloatStateOf(1f) }          // = params[34]
+    var lutK by remember { mutableFloatStateOf(0f) }          // = params[34]；初值 0 = 与原片一致
+    // 快照里的"原片风格"（只读展示 + 一键套用）：不随滑杆变化，故与 lutId/lutK 分开存
+    var snapLutId by remember { mutableStateOf<String?>(null) }
+    var snapLutK by remember { mutableFloatStateOf(0f) }
     var hasSnapshot by remember { mutableStateOf(false) }
-    var lutOpen by remember { mutableStateOf(false) }
+    var panelOpen by remember { mutableStateOf(false) }
+    var showOriginal by remember { mutableStateOf(false) }     // 按住预览 = 看输入原图
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     var exporting by remember { mutableStateOf(false) }
     var confirmOverwrite by remember { mutableStateOf(false) }
@@ -165,12 +188,16 @@ fun EditorScreen(
         }
     }
 
-    /** 选 LUT（null = 关闭）。解析在 IO 线程，上传与重渲染在渲染线程。 */
-    fun pickLut(entry: LutLibrary.Entry?) {
+    /**
+     * 下发 LUT 资产（null = 关闭）与强度，然后重渲染。两个入口共用：手动选卡片、
+     * 「套用原片风格」。解析在 IO 线程（读 .cube 字节），上传与重渲染在渲染线程。
+     */
+    fun applyLut(entry: LutLibrary.Entry?, k: Float) {
         val film = params ?: return
         if (entry == null) {
             lutId = null
-            film[34] = 0.0
+            lutK = 0f
+            film[34] = 0.0                    // 关闭 = 强度 0（引擎 uLutOn = 0 整段旁路）
             engine.setLut(null)
             rerender()
             return
@@ -182,10 +209,66 @@ fun EditorScreen(
                 return@launch
             }
             lutId = entry.id
-            film[34] = lutK.toDouble()
+            lutK = k
+            film[34] = k.toDouble()
             engine.setLut(lut)
             rerender()
         }
+    }
+
+    /**
+     * 选卡片。强度沿用当前值；**当前是 0（编辑器初值）时给到 1.0 = 100%** ——
+     * 否则用户"选了 LUT 却什么都没发生"（ADR-12 的假滑杆精神：不许让操作看起来无效）。
+     */
+    fun pickLut(entry: LutLibrary.Entry?) {
+        if (entry == null) {
+            applyLut(null, 0f)
+            return
+        }
+        applyLut(entry, if (lutK > 0f) lutK else 1f)
+    }
+
+    /**
+     * 一键套用原片风格：把快照里的 LUT + 强度原样下发（等价于手动把强度拖到那个值）。
+     * 资产在打开编辑器时已上传过，但用户可能已切到别的 LUT/关闭 ⇒ 这里重新走一遍
+     * [applyLut]（重复上传一次 3D 纹理，代价是一次 IO + 一次纹理上传，换"任何状态下都正确"）。
+     */
+    fun applySnapshotStyle() {
+        val id = snapLutId ?: return
+        if (lutId == id && lutK == snapLutK) return   // 已经一致：不重复上传/渲染
+        val entry = LutLibrary.byId(context, id)
+        if (entry == null) {
+            status = "原片用的 LUT 已不在库中"
+            return
+        }
+        applyLut(entry, snapLutK)
+    }
+
+    // ── 暗角三条滑杆（E2-1）：只改同一份 params 的 [66][67][68] ⇒ 预览与导出天然一致 ──
+    // 拖动中每帧调 rerender()：EditorEngineSession.requestPreview 自己就是 latest-wins
+    // 合并（同时最多 1 个在跑 + 1 个待跑），**不再叠加任何时间节流**。
+    fun setVigStrength(ui: Float) {
+        params?.let { it[66] = vigStrengthSlot(ui) }
+        rerender()
+    }
+
+    fun setVigRadius(ui: Float) {
+        params?.let { it[67] = vigRadiusSlot(ui) }
+        rerender()
+    }
+
+    fun setVigFeather(ui: Float) {
+        params?.let { it[68] = vigFeatherSlot(ui) }
+        rerender()
+    }
+
+    /** 拖动结束记一条诊断：真机日志才能核对"暗角参数确实下发进了引擎"（ADR §5.4 T-2） */
+    fun logVignette() {
+        val film = params ?: return
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "editor.vignette",
+            kv("strength" to film[66], "radius" to film[67], "feather" to film[68]),
+        )
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -311,23 +394,37 @@ fun EditorScreen(
                 shown = src.bitmap
                 phase = EditorPhase.Ready
                 status = "正在渲染…"
-                // 参数起点 + 初始化引擎 + 恢复 LUT，全在 IO 线程做完再回主线程
+                // 参数起点 + 初始化引擎 + 上传 LUT 资产，全在 IO 线程做完再回主线程
                 val init = withContext(Dispatchers.IO) {
-                    // I-3：快照存在 ⇒ 用这张片子当初的参数与 LUT；不存在 ⇒ 标准基线（ADR-4）
+                    // I-3：快照存在 ⇒ 用这张片子当初的参数；不存在 ⇒ 标准基线（ADR-4）
                     val snap = StillSnapshotStore.load(context, src.name)
-                    val film = editorParams(snap?.params)
-                    val entry = snap?.lutId?.takeIf { it.isNotEmpty() }
-                        ?.let { id -> LutLibrary.byId(context, id) }
+                    // ★ 打开编辑器 = 原片本身：[34] 强制 0（引擎侧 LUT 整段旁路）。
+                    // 快照里的 LUT 与强度不丢 —— 另存为"原片风格"，由面板给一键套用
+                    //（E2-1 架构师拍板，理由见 editorOpenParams 的 KDoc）。
+                    val film = editorOpenParams(snap)
+                    val snapId = snap?.lutId?.takeIf { it.isNotEmpty() }
+                    val entry = snapId?.let { id -> LutLibrary.byId(context, id) }
                     val lut = entry?.let { LutLibrary.load(context, it) }
                     val started = engine.start()
-                    // 引擎的 LUT 是进程级状态，可能残留着拍摄时的那一套：按快照决定去留
+                    // 引擎的 LUT 是进程级状态，可能残留着拍摄时的那一套：按快照决定去留。
+                    // 资产先传上去（此时强度是 0，仍不生效）⇒ 点「套用原片风格」只需改 [34]。
                     engine.setLut(lut)
-                    EditorInit(film, snap != null, lut, entry?.id, started)
+                    EditorInit(
+                        film = film,
+                        hasSnapshot = snap != null,
+                        // 资产加载失败时不算"选中"：否则 UI 显示选中、引擎里却没有这个 LUT
+                        lutId = if (lut != null) entry.id else null,
+                        snapLutId = snapId,
+                        snapLutK = (snap?.lutK ?: 0.0).toFloat(),
+                        engineStarted = started,
+                    )
                 }
                 params = init.film
                 hasSnapshot = init.hasSnapshot
                 lutId = init.lutId
-                if (init.lut != null) lutK = init.film[34].toFloat()
+                snapLutId = init.snapLutId
+                snapLutK = init.snapLutK
+                lutK = init.film[34].toFloat()   // 恒 0（打开时与原片逐像素一致）
                 if (!init.engineStarted) {
                     status = "引擎不可用，显示原图"
                     return@LaunchedEffect
@@ -375,17 +472,76 @@ fun EditorScreen(
                     }
                     EditorPhase.Ready -> {
                         val bmp = shown
+                        val orig = source?.bitmap
                         if (bmp != null) {
-                            val image = remember(bmp) { bmp.asImageBitmap() }
-                            Image(
-                                bitmap = image,
-                                contentDescription = "成片预览",
-                                contentScale = ContentScale.Fit,
-                                modifier = Modifier.fillMaxSize(),
-                            )
+                            // 按住画面 = 看输入原图（before/after）。用 onPress + tryAwaitRelease
+                            // 而非 detectTapGestures(onLongPress)：按下即见、松手即回，不必等长按
+                            // 延时；预览区没有别的手势（pressScale 是给按钮的），不会冲突。
+                            val image = remember(bmp, orig, showOriginal) {
+                                (if (showOriginal && orig != null) orig else bmp).asImageBitmap()
+                            }
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Image(
+                                    bitmap = image,
+                                    contentDescription = if (showOriginal) "原图" else "成片预览",
+                                    contentScale = ContentScale.Fit,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .pointerInput(bmp) {
+                                            detectTapGestures(onPress = {
+                                                showOriginal = true
+                                                tryAwaitRelease()
+                                                showOriginal = false
+                                            })
+                                        },
+                                )
+                                // 提示只在参数面板展开时给：用户正在调参时才需要 before/after
+                                if (panelOpen && !showOriginal) {
+                                    Text(
+                                        "按住画面看原图",
+                                        color = FilmTheme.CreamDim,
+                                        fontSize = 10.sp,
+                                        modifier = Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .padding(bottom = 6.dp),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
+            }
+
+            // ── 参数面板（E2-1）：嵌在预览与操作区之间，**不是覆盖式浮层** ——
+            // 展开时预览区（上面的 weight(1f)）自动让位，画面完整可见。暗角最明显的地方
+            // 是四角，用底部浮层挡住底边两点等于让用户盲调（这是不沿用 LutSheet 形态的原因）。
+            AnimatedVisibility(
+                visible = panelOpen,
+                enter = FilmMotion.panelEnter,
+                exit = FilmMotion.panelExit,
+            ) {
+                EditorParamsPanel(
+                    lutId = lutId,
+                    lutK = lutK,
+                    previews = lutPreviews,
+                    snapLutId = snapLutId,
+                    snapLutK = snapLutK,
+                    vigStrength = params?.let { vigStrengthUi(it[66]) } ?: 0f,
+                    vigRadius = params?.let { vigRadiusUi(it[67]) } ?: 0.8f,
+                    vigFeather = params?.let { vigFeatherUi(it[68]) } ?: 0.5f,
+                    onLutStrength = { v ->
+                        lutK = v
+                        params?.let { it[34] = v.toDouble() }
+                        rerender()
+                    },
+                    onPickLut = { e -> pickLut(e) },
+                    onApplySnapshot = { applySnapshotStyle() },
+                    onVigStrength = { v -> setVigStrength(v) },
+                    onVigRadius = { v -> setVigRadius(v) },
+                    onVigFeather = { v -> setVigFeather(v) },
+                    onVigFinished = { logVignette() },
+                    onClose = { panelOpen = false },
+                )
             }
 
             // ── 底部：读数 + 参数来源提示 + 操作按钮 ──
@@ -407,7 +563,12 @@ fun EditorScreen(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = editorHint(status, hasSnapshot, lutId != null),
+                    text = editorHint(
+                        status = status,
+                        hasSnapshot = hasSnapshot,
+                        lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
+                        lutK = lutK,
+                    ),
                     color = FilmTheme.CreamDim,
                     fontSize = 11.sp,
                 )
@@ -417,19 +578,15 @@ fun EditorScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     OutlinedButton(
-                        onClick = { lutOpen = !lutOpen },
+                        onClick = { panelOpen = !panelOpen },
                         enabled = !exporting && phase == EditorPhase.Ready,
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = if (lutOpen) FilmTheme.Accent else FilmTheme.Cream,
+                            contentColor = if (panelOpen) FilmTheme.Accent else FilmTheme.Cream,
                             disabledContentColor = FilmTheme.CreamDim,
                         ),
                     ) {
-                        Text(
-                            lutId?.let { id -> "LUT · ${LutLibrary.byId(context, id)?.label ?: id}" }
-                                ?: "LUT",
-                            fontFamily = FilmTheme.Mono, fontSize = 12.sp, maxLines = 1,
-                        )
+                        Text("参数", fontFamily = FilmTheme.Mono, fontSize = 12.sp)
                     }
                     Button(
                         onClick = { exportNow(false) },
@@ -467,37 +624,6 @@ fun EditorScreen(
             }
         }
 
-        // ── LUT 面板（底部弹出，复用拍摄页的卡片/强度滑杆形态）──
-        // 用弹出面板而不是整页跳转：拖强度时必须能同时看到画面变化。
-        if (lutOpen) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .pointerInput(Unit) { detectTapGestures { lutOpen = false } },
-            )
-        }
-        AnimatedVisibility(
-            visible = lutOpen,
-            enter = FilmMotion.panelEnter,
-            exit = FilmMotion.panelExit,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth(),
-        ) {
-            EditorLutPanel(
-                lutId = lutId,
-                lutK = lutK,
-                previews = lutPreviews,
-                onStrength = { v ->
-                    lutK = v
-                    params?.let { it[34] = v.toDouble() }
-                    rerender()
-                },
-                onPick = { e -> pickLut(e) },
-                onClose = { lutOpen = false },
-            )
-        }
-
         if (confirmOverwrite) {
             AlertDialog(
                 onDismissRequest = { confirmOverwrite = false },
@@ -526,8 +652,8 @@ fun EditorScreen(
     }
 
     // 面板首次打开时才生成 LUT 卡片预览（复用拍摄页的一次性缓存，见 LutPreview）
-    LaunchedEffect(lutOpen) {
-        if (!lutOpen || lutPreviews.isNotEmpty()) return@LaunchedEffect
+    LaunchedEffect(panelOpen) {
+        if (!panelOpen || lutPreviews.isNotEmpty()) return@LaunchedEffect
         lutPreviews = withContext(Dispatchers.IO) {
             LutLibrary.entries(context).mapNotNull { e ->
                 LutLibrary.load(context, e)?.let { lut ->
@@ -538,50 +664,100 @@ fun EditorScreen(
     }
 }
 
-/** 底部提示文案（ADR-2 的素材分级 + ADR-4 的无快照提示，必须显式说给用户） */
-private fun editorHint(status: String, hasSnapshot: Boolean, hasLut: Boolean): String = when {
+/**
+ * 底部提示文案（ADR-4 的无快照提示 + 当前 LUT 状态）。
+ *
+ * E2-1 起语义变了：打开编辑器时 LUT 强度是 0（画面 = 原片），所以这里描述的是
+ * **当前状态**，不再解释"叠加在原片已有的风格之上"那种别扭的语义。
+ */
+private fun editorHint(status: String, hasSnapshot: Boolean, lutLabel: String?, lutK: Float): String = when {
     status.isNotEmpty() -> status
     !hasSnapshot -> "这张没有参数记录，已用标准基线"
-    hasLut -> "已按拍摄参数还原 · LUT 会叠加在原片已有的风格之上（拖到 0% 即关闭）"
-    else -> "成片编辑 · 仅后段风格化（LUT / 颗粒 / 暗角），不改曝光与白平衡"
+    lutLabel == null -> "当前：无 LUT（与原片一致）"
+    lutK <= 0f -> "当前：$lutLabel · 0%（与原片一致）"
+    else -> "当前：$lutLabel · ${(lutK * 100).roundToInt()}%（叠加在原片之上）"
 }
 
 /** LaunchedEffect 里初始化结果的打包（避免在协程里零散赋值） */
 private class EditorInit(
     val film: DoubleArray,
     val hasSnapshot: Boolean,
-    val lut: com.filmkit.app.lut.CubeLut?,
     val lutId: String?,
+    /** 快照里**原片**用的 LUT id（≠ [lutId]：用户可能已改选或关闭；null = 原片没记 LUT） */
+    val snapLutId: String?,
+    val snapLutK: Float,
     val engineStarted: Boolean,
 )
 
-/** LUT 选择面板：强度 + 横向卡片（形态与拍摄页 LutSheet 的 LUT 页一致） */
+/**
+ * 参数面板的分组（E2-1）。架构师 2026-10-08 拍板：**按"完整编辑器"预留分组**，
+ * 但只渲染 [implemented] = true 的组。
+ *
+ * [implemented] 的含义是"引擎已实现且已验收"（ADR-12 硬约束：**不许假滑杆**）——
+ * 用户滑了没反应比没有滑杆更糟。历史事故：[4] contrast、[11..19] cross 曾是 shader
+ * 零引用的死参数，照调研文档直接做 UI 的结果就是一排滑了没反应的滑杆。
+ *
+ * 加新组 = 加一个枚举项 + 在 [EditorParamsPanel] 的 when 里加一个分支（数据驱动列表，
+ * 组多到一屏放不下时靠面板自身的纵向滚动兜住，不需要改结构）。
+ */
+private enum class EditorParamGroup(val title: String, val implemented: Boolean) {
+    // TODO(E2-2 基础调整)：曝光 / 白平衡 / 对比度 / 饱和度 / 清晰度。E2-2 正在扩契约
+    //  （`FilmParams.h` 的 [78] clarity 等）并在 `kFsStyle` 内实现 —— 等它的滑杆落地后
+    //  把本项置 true、在 [EditorParamsPanel] 里加分支。曝光与 WB 要走"真 sRGB 解码 →
+    //  线性域增益 → 真 sRGB 编码"的往返，对比度/饱和度/清晰度是显示域操作。
+    BASIC("基础", false),
+    COLOR("色彩", true),
+    VIGNETTE("暗角", true),
+    // TODO(E4-3 颗粒)：[26] 强度 / [27] ISO / [60] 密度偏置 / [61] 枢轴。E4-3 验收后置 true。
+    GRAIN("颗粒", false),
+    // TODO(E4-5 光晕)：[62] 强度 / [63] 阈值 / [64] 半径 / [65] 暖度。E4-5 验收后置 true。
+    HALATION("光晕", false),
+    // 注：E4-4 趾肩（[5..10] latitude）在架构师给的 5 组里没有归口（它是影调/风格层参数）——
+    // 等 E4-4 验收后再决定进"基础"还是单开一组，本轮不猜。
+}
+
+/**
+ * 参数面板（E2-1）：**可折叠区**，嵌在预览区与底部操作区之间（不是覆盖式浮层，
+ * 见调用点注释：浮层会挡住画面底部两角，正好是看暗角的位置）。
+ *
+ * 高度 = 内容自适应、上限屏高 45% + 纵向滚动：组变多也不会把预览区挤没。
+ * 分组标题复用设置页的 [SectionHeader]（全 App 统一形态）。
+ */
 @Composable
-private fun EditorLutPanel(
+private fun EditorParamsPanel(
     lutId: String?,
     lutK: Float,
     previews: Map<String, Bitmap>,
-    onStrength: (Float) -> Unit,
-    onPick: (LutLibrary.Entry?) -> Unit,
+    snapLutId: String?,
+    snapLutK: Float,
+    vigStrength: Float,
+    vigRadius: Float,
+    vigFeather: Float,
+    onLutStrength: (Float) -> Unit,
+    onPickLut: (LutLibrary.Entry?) -> Unit,
+    onApplySnapshot: () -> Unit,
+    onVigStrength: (Float) -> Unit,
+    onVigRadius: (Float) -> Unit,
+    onVigFeather: (Float) -> Unit,
+    onVigFinished: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
-            .background(FilmTheme.Panel)
-            .navigationBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
+            .background(FilmTheme.PanelSolid)
+            .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.45f).dp)
+            .verticalScroll(rememberScrollState())
+            .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id } ?: "无 LUT",
+                "参数",
                 color = FilmTheme.Cream,
-                fontSize = 20.sp,
+                fontSize = 17.sp,
                 fontFamily = FilmTheme.Serif,
                 fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
                 modifier = Modifier.weight(1f),
             )
             Text(
@@ -594,26 +770,159 @@ private fun EditorLutPanel(
                     .padding(6.dp),
             )
         }
-        // 强度只对已选中的 LUT 有意义；拖到 0 = 旁路（引擎侧 [34]=0）
-        if (lutId != null) {
-            StrengthRow(initial = lutK, onCommit = onStrength, onFinished = {})
+        // 只渲染引擎已实现并验收的组（ADR-12）；未实现的组连标题都不给 —— 空标题会让
+        // 用户以为"面板坏了"，而底部那行"下一版支持"已经把预期讲清楚了。
+        EditorParamGroup.entries.filter { it.implemented }.forEach { g ->
+            SectionHeader(g.title)
+            when (g) {
+                EditorParamGroup.COLOR -> EditorColorGroup(
+                    lutId = lutId,
+                    lutK = lutK,
+                    previews = previews,
+                    snapLutId = snapLutId,
+                    snapLutK = snapLutK,
+                    onStrength = onLutStrength,
+                    onPick = onPickLut,
+                    onApplySnapshot = onApplySnapshot,
+                )
+                EditorParamGroup.VIGNETTE -> EditorVignetteGroup(
+                    strength = vigStrength,
+                    radius = vigRadius,
+                    feather = vigFeather,
+                    onStrength = onVigStrength,
+                    onRadius = onVigRadius,
+                    onFeather = onVigFeather,
+                    onFinished = onVigFinished,
+                )
+                // 未实现的组在上面已过滤掉；这里仅为 when 的穷尽性兜底
+                else -> Unit
+            }
         }
-        LazyRow(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.padding(top = 10.dp),
-        ) {
-            item {
-                LutCard(label = "无", selected = lutId == null, preview = null) { onPick(null) }
-            }
-            items(LutLibrary.entries(context)) { e ->
-                LutCard(
-                    label = e.label,
-                    selected = lutId == e.id,
-                    preview = previews[e.id],
-                ) { onPick(e) }
-            }
+        Text(
+            "基础（曝光 / 白平衡 / 对比度…）下一版支持",
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 14.dp),
+        )
+    }
+}
+
+/**
+ * 色彩组：LUT 选择 + 强度 + **原片风格**（参数快照记录的 LUT 与强度，只读）与一键套用。
+ *
+ * 为什么必须显示"原片风格"：打开编辑器时 [34] 被强制 0（画面 = 原片），若不给用户一个
+ * 入口把当初的风格套回来，快照里的 LUT 信息就等于白存了。
+ */
+@Composable
+private fun EditorColorGroup(
+    lutId: String?,
+    lutK: Float,
+    previews: Map<String, Bitmap>,
+    snapLutId: String?,
+    snapLutK: Float,
+    onStrength: (Float) -> Unit,
+    onPick: (LutLibrary.Entry?) -> Unit,
+    onApplySnapshot: () -> Unit,
+) {
+    val context = LocalContext.current
+    // 快照里的 LUT 可能已被用户从 LUT 库删掉（byId = null）：如实说明"已不在库中"，
+    // 并且**不给**套用按钮（点了注定失败的操作比没有按钮更糟）
+    val snapEntry = snapLutId?.let { LutLibrary.byId(context, it) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            when {
+                snapLutId == null -> "原片未使用 LUT"
+                snapEntry == null -> "原片风格：$snapLutId（已不在库中）"
+                // 强度 0 = 当初就没叠加（编辑器导出的新片会落在这一档）：说"未叠加"比说 "0%" 清楚
+                snapLutK <= 0f -> "原片风格：${snapEntry.label}（未叠加）"
+                else -> "原片风格：${snapEntry.label} · ${(snapLutK * 100).roundToInt()}%"
+            },
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (snapEntry != null) {
+            Text(
+                "套用",
+                color = FilmTheme.Accent,
+                fontSize = 12.sp,
+                fontFamily = FilmTheme.Mono,
+                modifier = Modifier
+                    .pressScale(onTap = onApplySnapshot)
+                    .padding(6.dp),
+            )
         }
     }
+    // 强度只对已选中的 LUT 有意义；0% = 与原片一致（引擎侧 [34] = 0 整段旁路）
+    if (lutId != null) {
+        StrengthRow(initial = lutK, onCommit = onStrength, onFinished = {})
+    }
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.padding(top = 6.dp),
+    ) {
+        item {
+            LutCard(label = "无", selected = lutId == null, preview = null) { onPick(null) }
+        }
+        items(LutLibrary.entries(context)) { e ->
+            LutCard(
+                label = e.label,
+                selected = lutId == e.id,
+                preview = previews[e.id],
+            ) { onPick(e) }
+        }
+    }
+}
+
+/**
+ * 暗角组（E2-1 本轮核心）：强度 [66] / 半径 [67] / 羽化 [68]。
+ *
+ * 三条滑杆的初值都来自同一份 `params`（即参数快照 → `editorParams` 的结果，
+ * 无快照时 = `CameraPresets.standard()` 的 0 / 80 / 50），映射见 `EditorExport.kt`
+ * 里的 `vigStrengthUi/Slot` 等函数。
+ *
+ * 量程与读数：强度 0..100%（0 = 关，引擎侧 [66] = 0 整段跳过）；半径/羽化 0..200%
+ *（darktable `scale` / `falloff_scale` 本身就是百分比语义，默认 80 / 50）。
+ */
+@Composable
+private fun EditorVignetteGroup(
+    strength: Float,
+    radius: Float,
+    feather: Float,
+    onStrength: (Float) -> Unit,
+    onRadius: (Float) -> Unit,
+    onFeather: (Float) -> Unit,
+    onFinished: () -> Unit,
+) {
+    Text(
+        "强度 0% = 关闭 · 半径越大暗角越靠外 · 羽化越大过渡越柔",
+        color = FilmTheme.CreamDim,
+        fontSize = 11.sp,
+        modifier = Modifier.padding(top = 2.dp),
+    )
+    StrengthRow(
+        initial = strength,
+        onCommit = onStrength,
+        onFinished = { onFinished() },
+        label = "强度",
+        range = 0f..1f,
+    )
+    StrengthRow(
+        initial = radius,
+        onCommit = onRadius,
+        onFinished = { onFinished() },
+        label = "半径",
+        range = 0f..2f,
+    )
+    StrengthRow(
+        initial = feather,
+        onCommit = onFeather,
+        onFinished = { onFinished() },
+        label = "羽化",
+        range = 0f..2f,
+    )
 }
 
 /** 编辑器页面状态：三态显式建模，避免"位图与错误同时非空"这类非法组合 */

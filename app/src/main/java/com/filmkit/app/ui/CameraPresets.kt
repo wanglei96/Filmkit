@@ -14,11 +14,11 @@ object CameraPresets {
 
     val names = listOf("标准")
 
-    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E4-1 起 78）。
+    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E2-2 起 88）。
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 78
+    const val COUNT = 88
 
     fun byIndex(i: Int): DoubleArray = standard()
 
@@ -268,6 +268,21 @@ object CameraPresets {
         put3(this, 69, 1.0, 1.0, 1.0)  // 层间效应·暗部 R/G/B 增益：1.0 = 恒等（无效果）
         put3(this, 72, 1.0, 1.0, 1.0)  // 层间效应·中间调：1.0 = 恒等
         put3(this, 75, 1.0, 1.0, 1.0)  // 层间效应·高光：1.0 = 恒等
+        // ── E2-2（v0.11.1）：编辑器基础调整 + 局部调整占位 [78..87] ──────────
+        // 与 [60..77] 同一纪律：本卡只为它们定默认值，**每一个都必须是"无效果"值**，
+        // 现有编辑器输出才逐位不变（见 ADR-7 订正 v2 的"默认零回归"）。
+        // 注意 [87] 不能靠"未设置 = 0"：mix 语义下 0 = 完全去饱和（不是无效果）。
+        this[78] = 0.0    // 清晰度：**0 = 整段跳过**（编辑器链路的 display 域 USM）
+        // [79..87] 局部调整（E2-6 才实现，本卡仅占位 ⇒ 引擎零引用、对输出无影响）
+        this[79] = 0.0    // local_type：0 = 关（1 = 径向 / 2 = 线性）
+        this[80] = 0.5    // local_center_x
+        this[81] = 0.5    // local_center_y
+        this[82] = 0.35   // local_radius
+        this[83] = 0.5    // local_feather
+        this[84] = 0.0    // local_angle
+        this[85] = 0.25   // local_width
+        this[86] = 0.0    // local_ev（0 = 无曝光变化）
+        this[87] = 1.0    // local_sat（1.0 = 恒等，不是 0）
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */
