@@ -87,6 +87,26 @@ object EngineBridge {
     ): ByteArray?
 
     /**
+     * 编辑器通路（E1-3，2026-10-08）：已保存的成片 JPEG（RGBA8，**显示域 sRGB，
+     * 已过 OETF**，顶行在前）→ 只重跑 OETF 之后的三段（3D LUT → 颗粒 → TPDF dither）
+     * → 读回 RGBA8（同尺寸、同尺寸行序）。
+     *
+     * 域约定（ADR-7）：链路内**不得**插入 OETF/EOTF；也**不得**复用
+     * [nativeEngineSubmitStill] —— 后者会对已成片的图再跑一遍 filmic（双重影调映射，
+     * 画面显著变暗变灰，可行性报告 R1）。
+     *
+     * rgba = Bitmap 的 RGBA_8888 像素（`copyPixelsToBuffer` 的 ByteBuffer，direct）；
+     * film = 同一份 60 槽 FilmParams（ADR-1 单一参数源），本通路只读
+     * [26] grain_amount / [27] grain_size / [34] lut_strength，其余槽位一律不影响输出。
+     * 颗粒种子由引擎固定 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
+     * 必须在**有 current EGL context 的渲染线程**上调用（同 [nativeEngineSubmitST]）；
+     * 失败（null）时引擎侧已记 `render.style` 日志（styleOk/styleOn 可定位）。
+     */
+    external fun nativeEngineSubmitDisplay(
+        rgba: ByteBuffer, width: Int, height: Int, film: DoubleArray,
+    ): ByteArray?
+
+    /**
      * 静拍 RAW（M2-3）：u16 Bayer → 黑阶扣除 → 白阶归一 → WB（asShotNeutral 倒数）
      * → demosaic → CCM → 胶片链 → 读回 RGBA（旋转后尺寸）。
      * blackPhase 按相位 (0,0)(1,0)(0,1)(1,1)；ccm 为 sensor→sRGB 行主序 3×3（null=单位阵）。

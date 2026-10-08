@@ -14,6 +14,12 @@ object CameraPresets {
 
     val names = listOf("标准")
 
+    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E4-1 起 78）。
+     *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
+     *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
+     *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
+    const val COUNT = 78
+
     fun byIndex(i: Int): DoubleArray = standard()
 
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
@@ -25,15 +31,32 @@ object CameraPresets {
     // v0.10.196 教训：加 [59] color_smooth 时只改了 C++ 的 kCount（59→60），
     // 这里仍是 59 ⇒ CameraController 写 filmParams[59] 直接
     // ArrayIndexOutOfBoundsException ⇒ **装包后应用启动即崩**（真机 2026-10-08）。
-    // 以后加参数槽位：**两处一起改**（本行 + kCount）。
-    private fun neutral(): DoubleArray = DoubleArray(60).apply {
+    // 以后加参数槽位：**四处一起改**（本行 + kCount + fromDoubles 防呆
+    // + setFilmParams 长度兜底）。
+    private fun neutral(): DoubleArray = DoubleArray(COUNT).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
+        // [5..10] E4-1 起语义 = **filmic latitude**（per-channel 0..1），不再是
+        // "软肩/toe 强度（0 = 关）"。⚠️ 必须显式写 **0.01**：latitude 语义下
+        // `0` = 过渡区紧贴中灰 = **极端 S 曲线**（不是"无效果"）。0.01 = darktable
+        // 默认，也正是引擎当前的实际行为（`FrameRenderer.h` 的 computeFilmicSpline
+        // 声明 `latitude = 0.01f`，`FrameRenderer.cpp:11555` 调用只传 3 个实参 ⇒
+        // 恒取该默认）。shader 当前零引用（E4-4 才接线）⇒ 此处改动不影响成片。
+        put3(this, 5, 0.01, 0.01, 0.01)  // shoulder(latitude) R/G/B
+        put3(this, 8, 0.01, 0.01, 0.01)  // toe(latitude) R/G/B
         // 染料串扰 = 单位阵
         put3(this, 11, 1.0, 0.0, 0.0)
         put3(this, 14, 0.0, 1.0, 0.0)
         put3(this, 17, 0.0, 0.0, 1.0)
         put3(this, 20, 1.0, 1.0, 1.0)     // 分区饱和度
+        // [26][27] 颗粒（E4-1 起语义 = darktable grain 的 `strength` / `scale`=ISO）。
+        // ⚠️ ADR-10 硬约束：[26] **必须保持 0.0 = 整段旁路** —— 给非零会让所有用户
+        // 现有拍摄立刻带上颗粒（成片外观回归）。颗粒只由预设/编辑器显式开启。
+        // [27] = 400：新语义（越大越粗，20..6400）下的标定起点（≈9px，见设计文档
+        // §3.1.4）；amount = 0 时不可达，但显式下发修掉了"`neutral()` 未设置 vs
+        // C++ 兜底"的不一致（勘察 R9 / ADR-5）。
+        this[26] = 0.0
+        this[27] = 400.0
         // 28 = 基准影调强度：1.0 = 开（黑位 + 中灰锚定 S + 高光 rolloff，
         // 非风格化；治"发灰"）。0 = 恒等/旧行为。
         this[28] = 1.0
@@ -145,7 +168,7 @@ object CameraPresets {
         // 48 = 伪彩感知色度降噪强度（档 A，v0.10.165）：0 = 关（A/B 通路），
         // >0 = σc 放大倍率（scEff = sc·(1 + moire·[48])，封顶 4·sc）。
         // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
         this[48] = 2.0
         // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
         // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
@@ -173,7 +196,7 @@ object CameraPresets {
         // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
         // [53] = 紫边判据梯度自适应（v0.10.185：默认 0 → 8）。0 = 关；
         //        8 = 高梯度处把替换阈值 thr 放宽 1/(1+8·|∇L|)，让 1~3px 窄紫线进替换区。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
         // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
         this[51] = 2.0
         this[52] = 1.0
@@ -192,7 +215,7 @@ object CameraPresets {
         // 用户真机拍板（2026-10-07，台灯逆光 + 红笔场景）："替换档紫边变细、
         // 且红笔不色散"，成片观感以用户为准；替换档旁路 P4/defringe/D-1 的
         // 色渗风险由 ESD3D2 自带逐像素门覆盖（pc3dK 诊断字段观察）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
         // 真机 A/B：prefs("pc3d") / prefs("pc3d_msize")。
         this[54] = 1.0
         this[55] = 0.0
@@ -211,7 +234,7 @@ object CameraPresets {
         // 分支 v0.10.161 哲学同源：满阱原值 = WB 增益伪影）；治亮暗交界经 CCM 后
         // 的 4~6px 品红窄带（2026-10-06 台灯样张 RAW 域定案，docs/research/11 §6）。
         // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
         // 设置页开关写 prefs("hl_rb_recon")。
         this[57] = 0.0
         // 58 = RCD P3 拆双 pass（v0.10.180）：1 = 色度段拆成 3a（R/B 位对角
@@ -221,9 +244,30 @@ object CameraPresets {
         // G 陡错位（品红峰 +43.8 WB 域）被放大 2 倍（+85.6），治亮暗交界品红
         // 窄带（docs/research/11 号 §8）。拍照约慢 0.2 秒（日志 rcdAMs/rcdBMs）。
         // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 59，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
         // 设置页开关写 prefs("rcd_p3_split")。
         this[58] = 0.0
+        // ── E4-1（v0.11.0）：胶片特有参数 [60..77] 的默认值 ──────────────────
+        // 本卡只扩契约、不改 shader（功能在 E4-2…E4-6），所以下面每一个都必须是
+        // "**无效果**"值，成片才与改动前逐位一致。不能靠"未设置 = 0"：其中
+        // [60][63][64][65][67][68] 与层间增益的默认值都不是 0（0 在层间增益语义下
+        // 是"全黑"，是 X300 那类事故的同型坑）⇒ 全部显式写。
+        this[60] = 100.0  // 颗粒相纸响应 midtones_bias（%）：100 = darktable 默认；
+                          // [26] amount = 0（颗粒整段旁路）时不可达
+        this[61] = 0.0    // 颗粒密度调制枢轴：0 = darktable 原版逐位不变（同上不可达）
+        this[62] = 0.0    // halation 强度：**0 = 整链旁路**（默认，无效果）
+        this[63] = 0.80   // halation 阈值（显示域 sRGB 0..1，ADR-9 统一口径）：
+                          // 0.80 = 设计默认；[62] = 0 时不可达
+        this[64] = 0.45   // halation 半径（0..1 归一）：设计默认；[62] = 0 时不可达
+        this[65] = 0.40   // halation 暖度（0..1）：设计默认；[62] = 0 时不可达
+        this[66] = 0.0    // 暗角强度（−1..0）：**0 = 关**（默认，kFsOut 内整段跳过）
+        this[67] = 80.0   // 暗角 falloff 起点（%）：80 = darktable `scale` 默认；
+                          // [66] = 0 时不可达
+        this[68] = 50.0   // 暗角 falloff 宽度（%）：50 = darktable `falloff_scale`
+                          // 默认；[66] = 0 时不可达
+        put3(this, 69, 1.0, 1.0, 1.0)  // 层间效应·暗部 R/G/B 增益：1.0 = 恒等（无效果）
+        put3(this, 72, 1.0, 1.0, 1.0)  // 层间效应·中间调：1.0 = 恒等
+        put3(this, 75, 1.0, 1.0, 1.0)  // 层间效应·高光：1.0 = 恒等
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

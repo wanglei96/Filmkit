@@ -46,6 +46,14 @@ EXPECT = {
     "rcdBMs": ("finishStillChain", ["passRcdChromaB("]),
     "clipB": ("finishStillChain", ["passFilm("]),
     "hrMs": ("finishStillChain", ["passFilm("]),
+    # E1-3 编辑器通路（2026-10-08）：诊断三件套（styleOk = shader 链接成功 /
+    # styleOn = 本帧真的执行）+ 下发参数值（lutK/grain/grainSz）。passStyle 必须在
+    # submitDisplay 内、日志字段行之前跑完，否则 styleOn 是"没执行却报执行"。
+    "styleOk": ("submitDisplay", ["passStyle("]),
+    "styleOn": ("submitDisplay", ["passStyle("]),
+    "lutK": ("submitDisplay", ["passStyle("]),
+    "grain": ("submitDisplay", ["passStyle("]),
+    "grainSz": ("submitDisplay", ["passStyle("]),
 }
 
 

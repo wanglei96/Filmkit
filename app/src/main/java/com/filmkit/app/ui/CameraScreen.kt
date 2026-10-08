@@ -160,6 +160,8 @@ import kotlin.math.sqrt
 @Composable
 fun CameraScreen(
     onOpenSettings: () -> Unit = {},
+    /** 胶卷位点击：带最近成片的 URI 进内建编辑器（E1-1） */
+    onOpenEditor: (android.net.Uri) -> Unit = {},
     onRegisterVolume: ((() -> Unit)?) -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -290,7 +292,16 @@ fun CameraScreen(
             }
         }
     }
-    var photoUri by remember { mutableStateOf<android.net.Uri?>(null) } // 最近成片
+    // 最近成片（E1-5 / ADR 缺口 G-1）：**初值从 prefs 读回**。controller.lastPhotoUri 虽然
+    // 也有 prefs 回落值，但要等下面 400ms 轮询才刷上来 —— 冷启动首帧胶卷位仍是灰的、编辑器
+    // 入口点不开。用 remember（非 rememberSaveable）：prefs 本身就是持久层，Activity/进程重建
+    // 后重读一次即可拿回同一个值，再叠一层 saveable 是多余的。
+    // prefs 里的 URI 可能已失效（照片被删/迁移）：不在这里做存在性校验 —— 校验要么阻塞 UI
+    // 线程，要么得回写 prefs 与 controller 的持久化状态打架（本卡不动 controller）。失效时
+    // 缩略图加载失败 → 显示占位符，点进编辑器有"图片已失效"失败态，不会崩也不白屏。
+    var photoUri by remember {
+        mutableStateOf(prefs.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) })
+    }
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
     fun doCapture() {
@@ -1246,7 +1257,10 @@ fun CameraScreen(
                     .size(44.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(FilmTheme.ChipBg)
-                    .alpha(if (t == null) 0.5f else 1f),
+                    .alpha(if (t == null) 0.5f else 1f)
+                    // 胶卷位点进内建编辑器（E1-1）：有最近成片才可点 —— 灰态（alpha 0.5）
+                    // 的语义就是"还没有成片"，此时点击不该有任何反应
+                    .clickable(enabled = photoUri != null) { photoUri?.let(onOpenEditor) },
                 contentAlignment = Alignment.Center,
             ) {
                 if (t != null) {

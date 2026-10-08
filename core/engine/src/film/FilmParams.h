@@ -7,19 +7,36 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  // v0.6.34 起实际为 37 项（[35] auto_tone + [36] local_tone）。
-  // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
-  // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
-  // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 60;  // v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
+  // 契约**四处**必须同步（ADR-1 铁律；漏一处 = 启动崩溃）：
+  //   ① 本常量；② Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(N)`；
+  //   ③ `fromDoubles` 的 `if (n > idx)` 解析防呆；④ 下发点
+  //   `CameraController.setFilmParams` 的长度兜底。
+  // v0.10.196 真实事故：只改了本常量（59→60），Kotlin 侧仍是 59 ⇒ 下发点写
+  // `filmParams[59]` 越界 ⇒ **装包后应用启动即崩**。改这里必须四处一起改。
+  // v0.11.0（E4-1）：60 → 78，+[60..77] 胶片特有参数（颗粒调制 / halation / 暗角 /
+  // 层间效应）。**本卡只扩契约、不改 shader**（功能由 E4-2…E4-6 各自实现）⇒
+  // 新槽位当前零引用，默认值一律取"无效果"值，成片与改动前逐位一致。
+  // 沿革：v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
+  static constexpr int kCount = 78;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
   float wb_g = 1.0f;          // 2
   float wb_b = 1.0f;          // 3
   float contrast = 1.0f;      // 4  log 域对比系数
-  float shoulder[3] = {0.0f, 0.0f, 0.0f};  // 5..7 高光软肩强度（per-channel）
-  float toe[3] = {0.0f, 0.0f, 0.0f};       // 8..10 阴影 toe 强度
+  // ── [5..10] v0.11.0（E4-1）**语义重定义**：旧"高光软肩/阴影 toe 强度 0..1
+  //（0 = 关）"→ 新 **filmic `latitude`（0..1）**，per-channel 拆分（R/G/B 三层
+  // 乳剂的 toe/shoulder 过渡位置不同 = 高光/阴影色偏的机制之一）。槽位形状与位置
+  // 不动（契约不移位），shader 侧当前仍零引用（旧 log 域链 v0.7.9 已删，E4-4 才接线）。
+  // ⚠️ **默认值必须是 0.01，不是 0** —— latitude 语义下 `0` 表示 toe/shoulder 过渡区
+  // **紧贴中灰**（`toe_log = grey_log`），是**极端 S 曲线**，不是"无效果"！
+  // `0.01` = darktable 默认，也正是引擎当前的实际行为：`FrameRenderer.h` 的
+  // `computeFilmicSpline(..., float latitude = 0.01f)` 声明默认 0.01，而
+  // `FrameRenderer.cpp:11555` 的调用只传 3 个实参 ⇒ 恒取该默认值。
+  // ⚠️ E4-4 接线时必须处理旧数组（旧快照/预设里 [5..10] 存的是旧语义的 0）：
+  // 那个 0 在新语义下是极端曲线，不能直接透传。
+  float shoulder[3] = {0.01f, 0.01f, 0.01f};  // 5..7 shoulder = latitude R/G/B
+  float toe[3] = {0.01f, 0.01f, 0.01f};       // 8..10 toe = latitude R/G/B
   float cross[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // 11..19 log 域染料串扰
   float sat_shadow = 1.0f;    // 20
   float sat_mid = 1.0f;       // 21
@@ -27,8 +44,17 @@ struct FilmParams {
   float split_warm = 0.0f;    // 23 阴影偏暖
   float split_cool = 0.0f;    // 24 高光偏冷
   float monochrome = 0.0f;    // 25
+  // [26][27] v0.11.0（E4-1）**语义重定义**（shader 侧由 E4-3 对齐 darktable grain.c）：
+  //   [26] `grain_amount` = darktable `strength`（0..100 → 进相纸 LUT 时 ×0.15）。
+  //        ⚠️ **默认必须保持 0.0 = 整段旁路**（ADR-10 硬约束）：给非零会让所有用户
+  //        现有拍摄立刻带上颗粒 = 成片外观回归。颗粒只由预设/编辑器显式开启。
+  //   [27] `grain_size` = darktable `scale` = **ISO（20..6400，越大颗粒越粗）**，
+  //        旧语义是倒置的（越大越细）且无范围夹取。默认 400 = 手机画幅下的标定
+  //        起点（400 ≈ 9px；1600 的 12.5px 过大，见设计文档 §3.1.4）。
+  //        amount = 0 时不可达（无效果），显式给 400 是为了修掉"`neutral()` 未设置
+  //        vs 本处兜底 1.0"的漂移（勘察 R9 / ADR-5）——两处默认值必须一致。
   float grain_amount = 0.0f;  // 26
-  float grain_size = 1.0f;    // 27
+  float grain_size = 400.0f;  // 27
   // M3 色彩内核：基准影调强度（0 = 恒等/旧行为，1 = 完整基准 S 曲线）。
   // 默认 1.0 —— 中灰锚定、只补黑位与高光 rolloff，不是风格化。
   float tone_strength = 1.0f;  // 28
@@ -324,6 +350,46 @@ struct FilmParams {
   // prefs("rcd_p3_split")。
   float rcd_p3_split = 0.0f;   // 58
 
+  // ── v0.11.0（E4-1）：胶片特有参数 [60..77]（契约扩展，**shader 当前零引用**）──
+  // 本卡只定契约与默认值，功能由 E4-2…E4-6 各自实现（禁止在本卡接线）。
+  // 默认值一律取"**无效果**"值 ⇒ 成片与改动前逐位一致：
+  //   · halation / 暗角 = 强度 0 ⇒ 整段旁路（其余参数不可达，但显式给设计默认值，
+  //     使预设 schema 与 UI 有确定起点）；
+  //   · 层间效应 = 增益 1.0 ⇒ 恒等（乘 1）；
+  //   · 颗粒调制 [60][61] 在 [26] amount = 0（整段旁路）时不可达。
+  // 逐项语义/算法/取值范围见 docs/reports/editor-E4-film-params-DESIGN.md §2.3 与 §3。
+  // [60] 颗粒密度调制的相纸响应 `midtones_bias`（%，0..100）：控制调制曲线两端
+  //      falloff 的强度（0 = 平坦无衰减，100 = darktable 默认）。默认 100 = 原版。
+  float grain_midtone_bias = 100.0f;  // 60
+  // [61] 密度调制曲线的亮度枢轴（0..1）：0 = darktable 原版逐位不变；
+  //      >0 把调制峰值移向暗部（调研要求"负片暗部颗粒重"的承载维度）。
+  //      默认 0 = 不改变参考实现行为（A/B 通路纪律）。
+  float grain_pivot = 0.0f;    // 61
+  // [62..65] halation（光晕，E4-6）。落在 kFsFilm 后 / kFsOut 前（线性显示域）：
+  //   [62] 强度 0..1：**0 = 整链旁路**（默认，无效果）；>0 = 叠加量。
+  //   [63] 高光触发阈值（**显示域 sRGB 编码值 0..1**，ADR-9 统一口径）：
+  //        0.80 = 设计默认（拍照链路内部转线性域比较）。[62] = 0 时不可达。
+  //   [64] 光晕半径（0..1 归一）：0.45 = 设计默认。[62] = 0 时不可达。
+  //   [65] 暖度/色相（0..1，红橙程度）：0.40 = 设计默认。[62] = 0 时不可达。
+  float halation_strength = 0.0f;   // 62
+  float halation_threshold = 0.80f; // 63
+  float halation_radius = 0.45f;    // 64
+  float halation_warmth = 0.40f;    // 65
+  // [66..68] 暗角（vignette，E4-2）。kFsOut 内、OETF 后 / LUT 前，sRGB 显示域乘法：
+  //   [66] 强度（−1..0，负 = 乘法衰减）：**0 = 关**（默认，整段跳过 ⇒ 零成本）。
+  //   [67] falloff 起点（%，0..200）：80 = darktable `scale` 默认；[66] = 0 时不可达。
+  //   [68] falloff 宽度（%，0..200）：50 = darktable `falloff_scale` 默认；同上不可达。
+  float vignette_strength = 0.0f;  // 66
+  float vignette_radius = 80.0f;   // 67
+  float vignette_feather = 50.0f;  // 68
+  // [69..77] 层间效应（interlayer，E4-5）：kFsFilm 内、分区饱和之前的**乘法通道增益**，
+  // 按亮度分三区（暗部/中间调/高光）× 三通道。**1.0 = 恒等**（默认，无效果）；
+  // 与 [20..22] 分区饱和的区别：后者只能沿"向 luma 收敛"一条轴移动，无法表达
+  // "阴影 R 抬 / B 压"这类通道间不对称（= 三层乳剂 DIR 耦合的物理量）。
+  float interlayer_shadow[3] = {1.0f, 1.0f, 1.0f};  // 69..71 暗部 R/G/B 增益
+  float interlayer_mid[3] = {1.0f, 1.0f, 1.0f};     // 72..74 中间调 R/G/B 增益
+  float interlayer_high[3] = {1.0f, 1.0f, 1.0f};    // 75..77 高光 R/G/B 增益
+
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
     // 缺失的新参数保持默认 —— 契约长度不一致时"整包静默全丢"比越界更危险。
@@ -400,6 +466,27 @@ struct FilmParams {
     if (n > 59) color_smooth = static_cast<float>(v[59]);
     // v0.10.180：RCD P3 拆双 pass（[58]）
     if (n > 58) rcd_p3_split = static_cast<float>(v[58]);
+    // v0.11.0（E4-1）：胶片特有参数 [60..77]。逐槽位判长度（短数组时缺的参数
+    // 保持结构体默认值 = "无效果"值），与上面各段同风格。
+    if (n > 60) grain_midtone_bias = static_cast<float>(v[60]);
+    if (n > 61) grain_pivot = static_cast<float>(v[61]);
+    if (n > 62) halation_strength = static_cast<float>(v[62]);
+    if (n > 63) halation_threshold = static_cast<float>(v[63]);
+    if (n > 64) halation_radius = static_cast<float>(v[64]);
+    if (n > 65) halation_warmth = static_cast<float>(v[65]);
+    if (n > 66) vignette_strength = static_cast<float>(v[66]);
+    if (n > 67) vignette_radius = static_cast<float>(v[67]);
+    if (n > 68) vignette_feather = static_cast<float>(v[68]);
+    // 层间效应三区：先整体判长度再读三连（`n > 末索引` 已保证 v[首..末] 全部可读）
+    if (n > 71) {
+      for (int i = 0; i < 3; ++i) interlayer_shadow[i] = static_cast<float>(v[69 + i]);
+    }
+    if (n > 74) {
+      for (int i = 0; i < 3; ++i) interlayer_mid[i] = static_cast<float>(v[72 + i]);
+    }
+    if (n > 77) {
+      for (int i = 0; i < 3; ++i) interlayer_high[i] = static_cast<float>(v[75 + i]);
+    }
   }
 };
 

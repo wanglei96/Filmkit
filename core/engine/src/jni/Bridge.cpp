@@ -649,6 +649,34 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
   return rgbaToJavaArray(env, rgba);
 }
 
+// 编辑器通路（E1-3，2026-10-08）：已保存的成片 JPEG（RGBA8，**显示域 sRGB，已过
+// OETF**，顶行在前）→ 只重跑 OETF 之后的三段（3D LUT → 颗粒 → TPDF dither）→ RGBA8。
+// ⚠ 绝不路由到 nativeEngineSubmitStill：后者在 pass1 后调 passFilm ⇒ 对已成片的图
+//   再跑一遍 filmic + 域比归一（双重影调映射，画面显著变暗变灰，可行性报告 R1）。
+// 走预览侧实例 g_renderer（与 nativeEngineSubmitST/Histogram 同实例）；必须在
+// **有 current EGL context 的渲染线程**上调用。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitDisplay(JNIEnv* env, jobject,
+                                                            jobject rgba_buf,
+                                                            jint w, jint h,
+                                                            jdoubleArray film) {
+  FrameRenderer* r = g_renderer;
+  if (!r) return nullptr;
+  const FilmParams p = paramsFromJava(env, film);
+  std::vector<uint8_t> rgba;
+  const int64_t t0 = nowMs();
+  const bool ok = r->submitDisplay(env->GetDirectBufferAddress(rgba_buf), w, h, p,
+                                   &rgba);
+  // 耗时/成败由调用侧记一条；生效性与下发参数值由引擎侧 render.style 记（诊断三件套）
+  Logger::instance().log(
+      LogLevel::kInfo, "camera", "render.display_done",
+      "{\"kind\":\"rgba8\",\"ms\":" + std::to_string(nowMs() - t0) +
+          ",\"ok\":" + (ok ? "true" : "false") +
+          ",\"bytes\":" + std::to_string(rgba.size()) + "}");
+  if (!ok) return nullptr;
+  return rgbaToJavaArray(env, rgba);
+}
+
 // 静拍 RAW（M2-3）：u16 Bayer → 黑阶/WB/demosaic/CCM（GPU）→ 胶片链 → RGBA
 // demosaic：0=bilinear（速度档）1=RCD 三段管线（质量档，M3-1）
 // noise_strength：降噪强度 0-2（C 专项滑杆：0=关 1=真实 σ 2=2×σ，仅 RCD 生效）

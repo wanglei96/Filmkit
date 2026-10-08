@@ -1,5 +1,6 @@
 package com.filmkit.app
 
+import android.net.Uri
 import android.os.Bundle
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
@@ -14,6 +15,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import com.filmkit.app.ui.AccentColorScreen
 import com.filmkit.app.ui.CameraScreen
+import com.filmkit.app.ui.EditorScreen
 import com.filmkit.app.ui.FilmTheme
 import com.filmkit.app.ui.LensConfigScreen
 import com.filmkit.app.ui.LogScreen
@@ -55,10 +57,14 @@ class MainActivity : ComponentActivity() {
 /**
  * 全局导航（无全局 Tab）：相机为主屏；设置/镜头配置/系统颜色/日志/能力 Spike 为子页，
  * 左上角返回按钮逐级回退，系统 Back 键同路。子页归属：设置页各分类。
+ * 编辑器（E1-1）是从相机页胶卷位进入的全屏页，返回直接回相机页（不进设置）。
  */
 @Composable
 private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     var screen by rememberSaveable { mutableStateOf("camera") }
+    // 编辑器当前打开的成片。Uri 是 Parcelable，rememberSaveable 能跨进程重建保住；
+    // 万一恢复后 URI 已失效，EditorScreen 自己会显示"图片已失效"，不会白屏。
+    var editorUri by rememberSaveable { mutableStateOf<Uri?>(null) }
 
     BackHandler(enabled = screen != "camera") {
         screen = if (screen in setOf("logs", "spike", "lens", "accent", "focals")) {
@@ -82,8 +88,17 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         "focals" -> com.filmkit.app.ui.FocalScreen(onBack = { screen = "settings" })
         "logs" -> LogScreen(onBack = { screen = "settings" })
         "spike" -> SpikeScreen(onBack = { screen = "settings" })
+        // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
+        "editor" -> EditorScreen(
+            uri = editorUri,
+            onBack = { screen = "camera" },
+        )
         else -> CameraScreen(
             onOpenSettings = { screen = "settings" },
+            onOpenEditor = { uri ->
+                editorUri = uri
+                screen = "editor"
+            },
             onRegisterVolume = onRegisterVolume,
         )
     }

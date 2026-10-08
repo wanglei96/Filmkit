@@ -4570,6 +4570,100 @@ void main() {
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 })";
 
+// ── E1-3 编辑器渲染通路（2026-10-08）────────────────────────────────────────
+// 输入 = **已经过 OETF 的成片**（JPEG 解出的 RGBA8，显示域 sRGB 0..255）。只重跑
+// kFsOut 的 `srgbEncode` **之后**的三段：3D LUT → 颗粒 → TPDF dither。
+// ⚠ ADR-7 硬约束：本 shader 内**任何地方都不得插入 OETF/EOTF 转换**。输入已是 sRGB
+//   编码值（上传为归一化纹理 ⇒ 0..1），输出直接写 RGBA8；插 OETF = 二次编码
+//   ⇒ 颜色发灰变暗（ADR 里点名的"最容易犯的错"）。
+// ⚠ 绝不复用 submitStill 的 passFilm：那会对已成片的图**再跑一遍 filmic 链**并做
+//   错误的域比归一 ⇒ 双重影调映射（画面显著变暗变灰，可行性报告 R1）。
+// 与 kFsOut 的差异（刻意的，勿"对齐"）：
+//   ① 无 highlightRolloff / sharpenLuma / srgbEncode —— 已烘焙进输入，重跑 = 二次处理；
+//   ② 无 uFlipY —— 本 shader 直接采样上传的 Bitmap 数据：上传数据第 0 行（Bitmap
+//      **顶行**）落在纹理 t=0，屏幕底行（vUV0.y=0）就取 t=0 ⇒ glReadPixels 第 0 行
+//      （= 屏幕底行）= 图像顶行 ⇒ 与 Bitmap 行序**恒等（净零翻转）**。
+//      成片链需要 uFlipY 不是因为 GL 读回行序，而是因为 kFsStill **自己**预翻转了
+//      一次（`vec2 uv = vec2(vUV0.x, 1.0 - vUV0.y);`），kFsOut 那一次是把它抵消掉；
+//      编辑器不经 kFsStill ⇒ 这里再翻一次才会把图**上下颠倒**。
+//      （离线验收 tools/check-style-passthrough.py 的 ①/⑤ 真跑本 shader 证明。）
+//   ③ 无 uZebra —— 过曝提示绝不进成片；
+//   ④ 颗粒种子 = uSeed（外部固定）而非帧计数 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现
+//      （报告 R3：帧计数种子会让同一张图两次导出的颗粒图案不同，A/B 对比失真）。
+// lutTetra/lutApply/hash/dhash/vnoise 逐字拷自 kFsOut —— 显示域 LUT 的语义必须与
+// 成片一致（ADR-7 表格：LUT 资产本就是 display 域、OETF 后）。
+const char* kFsStyle = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform float uSeed;        // 颗粒种子（外部固定 ⇒ 可复现；不随帧计数变化）
+uniform float uGrainAmount;
+uniform float uGrainSize;
+// ── M4 3D LUT（display 域）——与 kFsOut 同款，四面体插值
+uniform highp sampler3D uLut;
+uniform float uLutOn;
+uniform float uLutStrength;
+uniform vec3 uLutDomainMin;
+uniform vec3 uLutDomainInv;
+uniform float uLutSize;
+vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
+              vec3 c101, vec3 c011, vec3 c111) {
+    if (f.x >= f.y) {
+        if (f.y >= f.z) return (1.0 - f.x) * c000 + (f.x - f.y) * c100 + (f.y - f.z) * c110 + f.z * c111;
+        if (f.x >= f.z) return (1.0 - f.x) * c000 + (f.x - f.z) * c100 + (f.z - f.y) * c101 + f.y * c111;
+        return (1.0 - f.z) * c000 + (f.z - f.x) * c001 + (f.x - f.y) * c101 + f.y * c111;
+    }
+    if (f.z >= f.y) return (1.0 - f.z) * c000 + (f.z - f.y) * c001 + (f.y - f.x) * c011 + f.x * c111;
+    if (f.z >= f.x) return (1.0 - f.y) * c000 + (f.y - f.z) * c010 + (f.z - f.x) * c011 + f.x * c111;
+    return (1.0 - f.y) * c000 + (f.y - f.x) * c010 + (f.x - f.z) * c110 + f.z * c111;
+}
+vec3 lutApply(vec3 c) {
+    vec3 t = clamp((c - uLutDomainMin) * uLutDomainInv, 0.0, 1.0) * (uLutSize - 1.0);
+    vec3 i0 = floor(t);
+    vec3 f = t - i0;
+    ivec3 i = ivec3(i0);
+    ivec3 mx = ivec3(int(uLutSize) - 1);
+    vec3 c000 = texelFetch(uLut, clamp(i, ivec3(0), mx), 0).rgb;
+    vec3 c100 = texelFetch(uLut, clamp(i + ivec3(1, 0, 0), ivec3(0), mx), 0).rgb;
+    vec3 c010 = texelFetch(uLut, clamp(i + ivec3(0, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c001 = texelFetch(uLut, clamp(i + ivec3(0, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c110 = texelFetch(uLut, clamp(i + ivec3(1, 1, 0), ivec3(0), mx), 0).rgb;
+    vec3 c101 = texelFetch(uLut, clamp(i + ivec3(1, 0, 1), ivec3(0), mx), 0).rgb;
+    vec3 c011 = texelFetch(uLut, clamp(i + ivec3(0, 1, 1), ivec3(0), mx), 0).rgb;
+    vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
+    return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
+}
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// dither 专用 hash（无 sin 版，见 kFsOut 的注释：sin 版在大坐标下有规律图案）
+float dhash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(i), b = hash(i + vec2(1, 0));
+    float c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+void main() {
+    // 显示域直取：不 decode、不 encode（ADR-7）
+    vec3 c = texture(uTex, vUV0).rgb;
+    // M4：display 域 3D LUT（与 kFsOut 4547 同式；强度 0 ⇒ uLutOn=0 ⇒ 逐像素恒等）
+    if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
+    if (uGrainAmount > 0.0) {
+        vec2 gp = gl_FragCoord.xy * 6.0 / max(uGrainSize, 0.25) + uSeed;
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        float w = 4.0 * l * (1.0 - l);
+        c += (vnoise(gp) - 0.5) * uGrainAmount * w;
+    }
+    // TPDF dither ±1LSB（与 kFsOut 4559 同式；RGBA8 量化前）
+    c += (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / 255.0;
+    oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+})";
+
 // 实时直方图采样（M3）：胶片输出下采样到 256×96 RGBA8，OETF 与 kFsOut 一致
 // —— 直方图必须是"显示域、用户实际看到"的分布。每次读回 24KB（UI 侧节流）。
 // M4：与 kFsOut 同样走 LUT，否则选了 LUT 之后直方图/斑马纹会与画面不符。
@@ -5175,6 +5269,10 @@ bool FrameRenderer::init() {
   const GLuint fs_still = compileShader(GL_FRAGMENT_SHADER, kFsStill);
   const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, kFsFilm);
   const GLuint fs_out = compileShader(GL_FRAGMENT_SHADER, kFsOut);
+  // E1-3 编辑器通路（kFsStyle）：显示域输入 → LUT/颗粒/dither。**进硬失败检查**
+  // —— 历史事故：漏加进下面的检查列表，shader 编译失败连"引擎起不来"都不会发生，
+  // 只在真机上表现为"新 pass 没效果"（ADR §6.2）。
+  const GLuint fs_style = compileShader(GL_FRAGMENT_SHADER, kFsStyle);
   const GLuint fs_hist = compileShader(GL_FRAGMENT_SHADER, kFsHist);
   const GLuint fs_local = compileShader(GL_FRAGMENT_SHADER, kFsLocal);
   const GLuint fs_fill = compileShader(GL_FRAGMENT_SHADER, kFsFillTest);
@@ -5248,6 +5346,7 @@ bool FrameRenderer::init() {
   const GLuint fs_hl_ref = compileShader(GL_FRAGMENT_SHADER, kFsHlRefChroma);
   const GLuint fs_hl_refdown = compileShader(GL_FRAGMENT_SHADER, kFsHlRefDown);
   if (!vs_rot_ || !vs_plain_ || !fs_oes || !fs_still || !fs_film || !fs_out ||
+      !fs_style ||
       !fs_fill || !fs_raw || !fs_rcd_dir || !fs_rcd_g || !fs_rcd_chroma ||
       !fs_rcd_chroma_a || !fs_rcd_chroma_b ||
       !fs_amaze_up ||
@@ -5267,6 +5366,8 @@ bool FrameRenderer::init() {
   prog_still_ = linkProgram(vs_rot_, fs_still);
   prog_film_ = linkProgram(vs_plain_, fs_film);
   prog_out_ = linkProgram(vs_plain_, fs_out);
+  // E1-3 编辑器通路：kFsStyle 与 kFsOut 同几何（vs_plain_，无旋转/无 ST）
+  prog_style_ = linkProgram(vs_plain_, fs_style);
   prog_hist_ = linkProgram(vs_plain_, fs_hist);
   prog_local_ = linkProgram(vs_plain_, fs_local);
   prog_fill_ = linkProgram(vs_rot_, fs_fill);
@@ -5351,6 +5452,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_still);
   glDeleteShader(fs_film);
   glDeleteShader(fs_out);
+  glDeleteShader(fs_style);
   glDeleteShader(fs_hist);
   glDeleteShader(fs_local);
   glDeleteShader(fs_fill);
@@ -5396,7 +5498,8 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_pc3d);
   glDeleteShader(fs_pc3d_down);
   glDeleteShader(fs_pc3d_up);
-  if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_fill_ ||
+  if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_style_ ||
+      !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
       !prog_ccm_ || !prog_amaze_up_ ||
       !prog_raw_dn_ || !prog_chroma_dn_ || !prog_moire_stat_ || !prog_chroma_down_ ||
@@ -5913,6 +6016,18 @@ bool FrameRenderer::init() {
   u_out_.lut_dmin = glGetUniformLocation(prog_out_, "uLutDomainMin");
   u_out_.lut_dinv = glGetUniformLocation(prog_out_, "uLutDomainInv");
   u_out_.lut_size = glGetUniformLocation(prog_out_, "uLutSize");
+
+  // E1-3 编辑器通路（kFsStyle）
+  u_style_.tex = glGetUniformLocation(prog_style_, "uTex");
+  u_style_.seed = glGetUniformLocation(prog_style_, "uSeed");
+  u_style_.grain_amount = glGetUniformLocation(prog_style_, "uGrainAmount");
+  u_style_.grain_size = glGetUniformLocation(prog_style_, "uGrainSize");
+  u_style_.lut = glGetUniformLocation(prog_style_, "uLut");
+  u_style_.lut_on = glGetUniformLocation(prog_style_, "uLutOn");
+  u_style_.lut_strength = glGetUniformLocation(prog_style_, "uLutStrength");
+  u_style_.lut_dmin = glGetUniformLocation(prog_style_, "uLutDomainMin");
+  u_style_.lut_dinv = glGetUniformLocation(prog_style_, "uLutDomainInv");
+  u_style_.lut_size = glGetUniformLocation(prog_style_, "uLutSize");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -6028,6 +6143,7 @@ void FrameRenderer::release() {
   if (prog_still_) glDeleteProgram(prog_still_);
   if (prog_film_) glDeleteProgram(prog_film_);
   if (prog_out_) glDeleteProgram(prog_out_);
+  if (prog_style_) glDeleteProgram(prog_style_);  // E1-3 编辑器通路
   if (prog_fill_) glDeleteProgram(prog_fill_);
   if (prog_raw_) glDeleteProgram(prog_raw_);
   if (prog_rcd_dir_) glDeleteProgram(prog_rcd_dir_);
@@ -6536,6 +6652,91 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   return true;
+}
+
+// ── E1-3 编辑器渲染通路（2026-10-08）────────────────────────────────────────
+// 已保存的成片（RGBA8，**显示域 sRGB，已过 OETF**）→ 只重跑 OETF 之后的三段
+// （3D LUT → 颗粒 → TPDF dither）→ RGBA8 读回。见 kFsStyle 的域约定注释。
+// ⚠ 绝不调 passFilm/passStill（submitStill 那条路会对成片再跑一遍 filmic + 域比
+//   归一 ⇒ 双重影调映射，画面显著变暗变灰 —— 可行性报告 R1，本卡头号风险）；
+//   也绝不插 OETF/EOTF（ADR-7）。
+// 输入行序 = Bitmap 顶行在前：上传后顶行在纹理 t=0，屏幕底行取 t=0 ⇒ glReadPixels
+// 第 0 行（屏幕底行）= 图像顶行 ⇒ 与 Bitmap 行序恒等，**不翻转**（kFsStyle 无 uFlipY）。
+// ⚠ 别照抄 kFsOut 的 uFlipY：那一次翻转是抵消 kFsStill 自己的预翻转（见 kFsStyle 注释
+//   的 ②），本通路不经 kFsStill，加了反而上下颠倒。
+// 只依赖 still_tex_ + fbo_cap_：**不调 ensureTargets** —— 那条路会分配两张全分辨率
+// RGBA16F（4080×3072 ≈ 400MB），而本 pass 一个中间纹理都不需要（报告 U7 内存红线）。
+bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
+                                  const FilmParams& p,
+                                  std::vector<uint8_t>* out_rgba) {
+  const bool prog_ok = prog_style_ != 0;
+  bool ran = false;
+  if (prog_ok && rgba8 != nullptr && out_rgba != nullptr && w > 0 && h > 0) {
+    // 输入纹理：复用 still_tex_ 的上传路径（RGB8；RGBA8 上传时 alpha 丢弃，像素值不变）
+    if (still_w_ != w || still_h_ != h) {
+      if (still_tex_) glDeleteTextures(1, &still_tex_);
+      still_tex_ = 0;
+      glGenTextures(1, &still_tex_);
+      glBindTexture(GL_TEXTURE_2D, still_tex_);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE,
+                   nullptr);
+      still_w_ = w;
+      still_h_ = h;
+    }
+    glBindTexture(GL_TEXTURE_2D, still_tex_);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
+                    rgba8);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+    // 输出目标：显示域 RGBA8（与成片同格式；dither 在 8bit 量化前生效）
+    if (cap_w_ != w || cap_h_ != h) {
+      if (tex_cap_) {
+        glDeleteTextures(1, &tex_cap_);
+        glDeleteFramebuffers(1, &fbo_cap_);
+      }
+      tex_cap_ = fbo_cap_ = 0;
+      // @domain: D5 —— 编辑器输出（OETF 后显示域，LUT/颗粒/dither 之后）
+      makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, w, h);
+      cap_w_ = w;
+      cap_h_ = h;
+    }
+    // FBO 不完整时 draw 被驱动静默丢弃（X300 实测：RGBA8 + HALF_FLOAT 非法组合
+    // ⇒ 输出全黑且 glErr=0），必须显式查一次
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      passStyle(w, h, p);
+      logPassDiag("style", fbo_cap_, false);
+      out_rgba->resize(static_cast<size_t>(w) * h * 4);
+      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      ran = true;
+    } else {
+      Logger::instance().log(
+          LogLevel::kError, "engine", "render.fbo_incomplete",
+          "{\"stage\":\"style\",\"w\":" + std::to_string(w) +
+              ",\"h\":" + std::to_string(h) + "}");
+    }
+  }
+  // 诊断三件套（ADR §6.2）：shader 是否链接成功 / 本帧是否真的执行 / 下发参数值。
+  // 一行发全（字段写在同一出口 ⇒ tools/check-diag-fields.py 能核对"字段—函数—前置调用"；
+  // 历史事故：字段写进别的函数 ⇒ 真机日志缺项，整轮 A/B 白跑）。
+  std::string kv = std::string("{\"styleOk\":") + (prog_ok ? "true" : "false");
+  kv += ",\"styleOn\":";
+  kv += ran ? "true" : "false";
+  kv += ",\"lutK\":" + std::to_string(p.lut_strength);
+  kv += ",\"grain\":" + std::to_string(p.grain_amount);
+  kv += ",\"grainSz\":" + std::to_string(p.grain_size);
+  kv += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
+  Logger::instance().log(ran ? LogLevel::kInfo : LogLevel::kError, "engine",
+                         "render.style", kv);
+  return ran;
 }
 
 // RAW 静拍 pass1：整型纹理 texelFetch + shader 内 demosaic（见 kFsRaw 注释）
@@ -11522,6 +11723,28 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
             ",\"localRef\":" + jnum(local_ref, 5) +
             ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}");
   }
+}
+
+// E1-3 编辑器通路：显示域输入（still_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
+// 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
+// 颗粒种子固定为 0 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
+void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_style_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, still_tex_);
+  glUniform1i(u_style_.tex, 0);
+  glUniform1f(u_style_.seed, 0.0f);
+  glUniform1f(u_style_.grain_amount, p.grain_amount);
+  glUniform1f(u_style_.grain_size, p.grain_size);
+  // 与 passOutput 同款：先落 pending LUT，再 bindLut 下发（关闭态也绑定纹理 + 下发
+  // 全部 uniform —— 提前 return 会让 sampler3D 指向未绑定单元，Mali 预测执行采样
+  // ⇒ draw 报 1282、整帧全黑，见 bindLut 注释）
+  applyPendingLut();
+  bindLut(u_style_.lut, u_style_.lut_on, u_style_.lut_strength, u_style_.lut_dmin,
+          u_style_.lut_dinv, u_style_.lut_size, p.lut_strength);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,

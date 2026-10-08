@@ -184,6 +184,22 @@ class CameraController(private val context: Context, private val render: RenderC
         return q
     }
 
+    /**
+     * 成片参数快照（E1-2 / ADR-4）：[film] 必须是**真正下发给引擎的那份数组**
+     *（调用点就在下发语句旁边），这里立刻 `copyOf()` 冻结 —— 后台落盘线程执行时用户
+     * 可能已经改了参数，晚读一秒就是另一张片子的参数。
+     *
+     * lut id 取 prefs `lut_id`（`LutLibrary` 的 id 命名空间，编辑器靠它反查资产）；
+     * 引擎没收到 LUT 纹理（[currentLut] == null，如资产解析失败）时记空串 —— 快照必须
+     * 描述"这张片子实际用了什么"，不能记一个没生效的 id。强度直接用下发数组的 [34]，
+     * 不另立来源（applyLutStrengthPref 就是写这一槽）。
+     */
+    private fun snapshotOf(film: DoubleArray): StillSnapshot = StillSnapshot(
+        params = film.copyOf(),
+        lutId = if (currentLut != null) appPrefs.getString("lut_id", "").orEmpty() else "",
+        lutK = if (film.size > 34) film[34] else 1.0,
+    )
+
     /** 总抖动 RMS（rad/s）—— 仅诊断，不参与决策（含高频，外推会严重高估帧内模糊）。 */
     private fun gyroRmsRadPerSec(): Double {
         synchronized(gyroLock) {
@@ -495,10 +511,25 @@ class CameraController(private val context: Context, private val render: RenderC
     var maxZoom = 1f
         private set
 
-    /** 最近一张成片的 MediaStore URI（胶卷位缩略图用）；API<29 分支不记录 */
+    /**
+     * 最近一张成片的 MediaStore URI（胶卷位缩略图用）；API<29 分支不记录。
+     *
+     * E1-2 补丁（勘察报告 D9）：**同时持久化到 prefs** —— 纯内存 var 冷启动即丢，
+     * 胶卷位退化成占位符 ⇒ 编辑器入口点不开。冷启动没有内存值时回落到 prefs 里那条；
+     * 失效 URI（照片被删/迁移）由消费侧的失败态兜住，这里不做存在性校验（避免阻塞 IO）。
+     */
     @Volatile
     var lastPhotoUri: android.net.Uri? = null
+        get() = field ?: restoredPhotoUri
         private set
+
+    /** 冷启动回落值：prefs 里最后一张成片的 URI。用 lazy 是因为 [appPrefs] 声明在
+     *  本属性**之后**（构造期读会踩未初始化）；首次访问发生在 UI 轮询里，只读一次。 */
+    private val restoredPhotoUri: android.net.Uri? by lazy {
+        appPrefs.getString("last_photo_uri", null)?.let {
+            runCatching { android.net.Uri.parse(it) }.getOrNull()
+        }
+    }
 
     /** 等效 EV 范围与步进（UI 滑杆用） */
     fun evInfo(): Triple<Float, Float, Float> =
@@ -1031,6 +1062,18 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     fun setFilmParams(p: DoubleArray) {
+        // E4-1 长度兜底（契约第四处，ADR-1）：短于 kCount 的数组**拒绝并记日志**，
+        // 不抛异常 —— 本函数由预设切换（CameraScreen）直接调用，抛异常 = 相机页崩溃；
+        // 保持旧参数只是"这次预设没生效"，可恢复（用户红线：失败不以丢照片为代价）。
+        // 历史事故（v0.10.196）：kCount 与 neutral() 长度不同步时，越界写就发生在
+        // 本函数下方那些 applyXxxPref() 的 filmParams[i] 裸写里，且崩在启动路径上。
+        if (p.size < CameraPresets.COUNT) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "film_params.short",
+                kv("got" to p.size, "want" to CameraPresets.COUNT),
+            )
+            return
+        }
         filmParams = p
         // [0] = 基准曝光 + 用户 EV：预设基线里是 0，换数组后必须回填，否则初始化序列
         // 会把曝光静默清零（v0.7.8 教训）。applyBaseEvPref 先把 prefs 的基准值灌进
@@ -2490,12 +2533,14 @@ class CameraController(private val context: Context, private val render: RenderC
 
     /** 单帧静拍统一收尾（YUV / 单帧 RAW 共用）：解锁 + 预览回升 + 落盘。
      *  回调可能在预览渲染线程（直拍/回退）或拍照线程（独立线程）上——只做
-     *  轻量操作，与 v0.10.85 以来 "onDone 只收尾" 的约定一致。 */
-    private fun finishStillCapture(bytes: ByteArray?, w: Int, h: Int) {
+     *  轻量操作，与 v0.10.85 以来 "onDone 只收尾" 的约定一致。
+     *  [snap] 由下发点（submitStill / tryProcessRaw）冻结后传入：本函数在回调线程上，
+     *  不能再去读成员 filmParams（E1-2）。 */
+    private fun finishStillCapture(bytes: ByteArray?, w: Int, h: Int, snap: StillSnapshot) {
         capturing = false
         capturePhase = 0
         releasePreviewScaleGuard()
-        if (bytes != null) queueJpegSave(bytes, w, h)
+        if (bytes != null) queueJpegSave(bytes, w, h, snap)
     }
 
     private fun submitStill(img: Image) {
@@ -2527,6 +2572,9 @@ class CameraController(private val context: Context, private val render: RenderC
         val uvPix = pU.pixelStride
         runCatching { img.close() }
         val film = filmParams
+        // E1-2：单帧路径下发的就是 filmParams（高光保护补偿是 burst 专属），快照同源；
+        // 本函数在渲染线程（ImageReader 回调）上，与 filmParams 的写同线程，无竞态
+        val snap = snapshotOf(film)
         val rot = stillRot   // 快门瞬间快照（不是此刻的 orientationStep，见其注释）
         // 拍照线程路由（v0.10.93，prefs still_thread）：**非阻塞**判断 ready ——
         // 这里在渲染线程上（ImageReader 回调），绝不干等 ensureStarted；
@@ -2538,7 +2586,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
             ) { bytes, rw, rh ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, rw, rh)
+                    finishStillCapture(bytes, rw, rh, snap)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -2548,13 +2596,13 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitStillBuf(
                         y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
                 }
             }
         } else {
             render.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
-            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh) }
+            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap) }
         }
     }
 
@@ -2672,6 +2720,9 @@ class CameraController(private val context: Context, private val render: RenderC
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
+        // E1-2：快照必须在三个 applyXxxPref 之后取（它们会覆盖 filmParams 的槽位，
+        // 这才是真正下发的值）；本函数在渲染线程上，与 filmParams 的写同线程，无竞态
+        val snap = snapshotOf(filmParams)
         // 拍照线程路由（v0.10.93，prefs still_thread）：非阻塞判断 ready（本函数
         // 在渲染线程上，绝不干等）；预热在 capture() 入口 startAsync。
         val useStill = prefs.getBoolean("still_thread", false) && StillRenderClient.ready
@@ -2681,7 +2732,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 demosaic, noiseStrength, nnDn,
             ) { bytes, w, h ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, w, h)
+                    finishStillCapture(bytes, w, h, snap)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -2692,14 +2743,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
                         filmParams, demosaic, noiseStrength, nnDn,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2) }
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, filmParams,
                 demosaic, noiseStrength, nnDn,
-            ) { bytes, w, h -> finishStillCapture(bytes, w, h) }
+            ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap) }
         }
     }
 
@@ -2857,6 +2908,16 @@ class CameraController(private val context: Context, private val render: RenderC
         val nnDn = false
         // 先占在飞名额再解锁，避免"解锁瞬间用户又按一次"导致计数漏加
         rendersInFlight.incrementAndGet()
+        // 高光保护（v0.10.110）：成片 EV 加上本次欠曝量做补偿（预览用原数组）——
+        // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
+        // ⚠ 定义在 done **之前**是 E1-2 的要求：下面的快照与下发必须是同一份数组。
+        val filmStill = filmParamsForStill()
+        // 成片参数快照（E1-2 / ADR-4）：在此处取 —— 紧邻下发点；snapshotOf 内 copyOf()
+        // 冻结（filmParamsForStill 在无欠曝补偿时返回的正是活跃数组 filmParams 本身，
+        // 后台落盘线程执行时用户可能已改参数，不冻结就是假快照）。
+        // 例外：A/B 诊断分支（still_ab 默认关）下发的是 submitStillAb 内部用同一函数
+        // 算出的 film，那里另有一份同源快照。
+        val snap = snapshotOf(filmStill)
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
@@ -2866,7 +2927,7 @@ class CameraController(private val context: Context, private val render: RenderC
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
-            if (bytes != null) queueJpegSave(bytes, w, h)
+            if (bytes != null) queueJpegSave(bytes, w, h, snap)
         }
         // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
         // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
@@ -2875,9 +2936,6 @@ class CameraController(private val context: Context, private val render: RenderC
             StillRenderClient.ensureStarted()
         // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
         val nnAb = false
-        // 高光保护（v0.10.110）：成片 EV 加上本次欠曝量做补偿（预览用原数组）——
-        // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
-        val filmStill = filmParamsForStill()
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/false, done)
@@ -2949,6 +3007,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // A/B 混进第二个变量（本项目"跨时刻对比"翻车过多次）
         val rot = stillRot   // 快门瞬间快照（同上）
         val film = filmParamsForStill()   // v0.10.110：A/B 两遍同样带高光保护补偿
+        // E1-2：快照 = 本函数下发的这份数组（两遍共用），同样在提交前冻结
+        val snap = snapshotOf(film)
         val rn = burstRefNoiseScale
         val nn1 = if (varyNn) false else nnDn
         val nn2 = if (varyNn) true else nnDn
@@ -2980,8 +3040,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     // NN A/B：两张成片都落盘（基线在前、NN 在后加 _nn 后缀区分）；
                     // done 传 null 避免外部收尾把 b2 再存一遍（0.10.102 真机实测
                     // 三张重复：b1 + b2 + done(b2)）
-                    if (b1 != null) queueJpegSave(b1, w1, h1)
-                    if (b2 != null) queueJpegSave(b2, w2, h2, "_nn")
+                    if (b1 != null) queueJpegSave(b1, w1, h1, snap)
+                    if (b2 != null) queueJpegSave(b2, w2, h2, snap, "_nn")
                     done(null, 0, 0)
                 } else {
                     // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
@@ -3329,20 +3389,23 @@ class CameraController(private val context: Context, private val render: RenderC
      *  入队 —— 返回后调用方（相机回调 / 渲染回调）立刻可以继续工作。
      *  日志 photo.save_queued 与 photo.saved 的时间差 = 后台实际耗时，用于验证
      *  主线程确实没被编码阻塞。 */
-    private fun queueJpegSave(bytes: ByteArray, w: Int, h: Int, extraTag: String = "") {
+    private fun queueJpegSave(
+        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, extraTag: String = "",
+    ) {
         val iso = liveIso
         val secNs = liveExposureNs
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
             kv("bytes" to bytes.size),
         )
-        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag) }
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap) }
     }
 
-    /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。 */
+    /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。
+     *  [snap] 同理：下发点冻结的参数快照（E1-2），落盘成功后写进 prefs。 */
     private fun saveJpeg(
         rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
-        extraTag: String = "",
+        extraTag: String = "", snap: StillSnapshot,
     ) {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
@@ -3447,6 +3510,16 @@ class CameraController(private val context: Context, private val render: RenderC
                     .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                     ?.let { uri ->
                         lastPhotoUri = uri
+                        // E1-2 补丁：URI 持久化（冷启动胶卷位/编辑器入口用，见 lastPhotoUri
+                        // 注释）。写 prefs 失败只记日志 —— 不能影响照片落盘（用户红线）。
+                        runCatching {
+                            appPrefs.edit().putString("last_photo_uri", uri.toString()).apply()
+                        }.onFailure {
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_WARN, "camera", "photo.uri_persist_failed",
+                                kv("error" to (it.message ?: it.toString())),
+                            )
+                        }
                         context.contentResolver.openOutputStream(uri)?.use {
                             writeJpeg(it)
                         }
@@ -3472,6 +3545,15 @@ class CameraController(private val context: Context, private val render: RenderC
                     "avgLuma" to (sum / n.coerceAtLeast(1)),
                     "iso" to iso, "sec" to "%.4f".format(secNs / 1e9f),
                 ),
+            )
+            // 成片参数快照（E1-2 / ADR-4）：**落盘成功后**才写，键 = MediaStore 的真实
+            // DISPLAY_NAME（同名时系统会自动加 "(1)"，落盘时反查一次才与编辑器日后查到的
+            // 键一致）；API<29 的 File 分支没有 URI，用本地 name。写失败只记日志
+            //（save 内部吞异常），绝不影响照片 —— 用户红线。
+            StillSnapshotStore.save(
+                context,
+                savedUri?.let { StillSnapshotStore.fileNameOf(context, it) } ?: name,
+                snap.copy(timeMs = now.time),
             )
         } catch (t: Throwable) {
             EngineBridge.nativeAppendLog(

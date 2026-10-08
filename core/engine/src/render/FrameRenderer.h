@@ -167,6 +167,16 @@ class FrameRenderer {
                    int y_stride, int uv_stride, int uv_pix, int rotation,
                    const FilmParams& p, std::vector<uint8_t>* out_rgba);
 
+  // 编辑器通路（E1-3，2026-10-08）：**已经过 OETF 的成片**（RGBA8，显示域 sRGB，
+  // 顶行在前）→ 只重跑 OETF 之后的三段（3D LUT → 颗粒 → TPDF dither）→ RGBA8 读回。
+  // 域约定（ADR-7）：内部**不插任何 OETF/EOTF**；**绝不复用 submitStill** ——
+  // 那条路会对成片再跑一遍 filmic ⇒ 双重影调映射（画面变暗变灰，报告 R1）。
+  // 只读 p 的 grain_amount[26]/grain_size[27]/lut_strength[34]，其余槽位一律不影响
+  // 输出（ADR §5.1 的 I-2：同一输入 + 只改无关槽位 ⇒ 输出逐像素一致）。
+  // 必须在该实例的渲染线程（有 current context）上调用。
+  bool submitDisplay(const void* rgba8, int w, int h, const FilmParams& p,
+                     std::vector<uint8_t>* out_rgba);
+
   // RAW 静拍（M2-3）：u16 Bayer（R16UI 整型纹理 + texelFetch）→ 黑阶扣除
   // → 白阶归一 → WB（asShotNeutral）→ demosaic（CFA 相位）→ CCM
   // → 场景线性，汇流 pass2/3 胶片链 → RGBA8 读回。
@@ -560,6 +570,8 @@ class FrameRenderer {
   void passFilm(int w, int h, const FilmParams& p);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
   void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
+  // E1-3 编辑器通路：显示域输入 → LUT/颗粒/dither → fbo_cap_（RGBA8）
+  void passStyle(int w, int h, const FilmParams& p);
   void passFill(int dst_w, int dst_h);
 
   static void makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w, int h);
@@ -589,6 +601,9 @@ class FrameRenderer {
          prog_ca_ds_ = 0, prog_ca_corr_ = 0,
          // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构入口/收口
          prog_pc3d_ = 0, prog_pc3d_down_ = 0, prog_pc3d_up_ = 0;
+  // E1-3 编辑器通路（2026-10-08）：成片 JPEG 显示域 → LUT/颗粒/dither
+  // （与 kFsOut 同段；kFsOut 一个字节未动 ⇒ 成片路径零回归）
+  GLuint prog_style_ = 0;
   GLuint vs_rot_ = 0, vs_plain_ = 0;
 
   GLuint oes_tex_ = 0;
@@ -1116,6 +1131,12 @@ class FrameRenderer {
           flip_y = -1, zebra = -1, sharpen = -1, lut = -1, lut_on = -1,
           lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1;
   } u_out_;
+  // kFsStyle（E1-3 编辑器通路）
+  struct {
+    GLint tex = -1, seed = -1, grain_amount = -1, grain_size = -1, lut = -1,
+          lut_on = -1, lut_strength = -1, lut_dmin = -1, lut_dinv = -1,
+          lut_size = -1;
+  } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
           lut_dinv = -1, lut_size = -1, stat_ch = -1, stat_mode = -1;
