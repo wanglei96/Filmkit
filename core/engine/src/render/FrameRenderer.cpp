@@ -1508,10 +1508,21 @@ void main() {
         oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    float r_t = (1.0 / 6.0) * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g)
-                             + (a12.r - a12.g) + (b12.r - b12.g));
-    float b_t = (1.0 / 6.0) * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g)
-                             + (a12.b - a12.g) + (b12.b - b12.g));
+    // ── v0.10.207：替换值改为"**最中性的那个探测点**"（不再是 6 点平均）──────
+    // 真机实测（152300 成片）紫边峰值 ch=47 而两侧是 **33 / 0**（一侧带色、
+    // 一侧中性）⇒ 6 点平均 = 16.5，**色度只降到 1/3，肉眼仍见彩边**（这正是
+    // 206 判据命中却"还是明显"的原因）。改用最中性探测点的色差作目标值 ⇒
+    // 色度降到 ~0。判据已保证 min(两侧) < 0.5×ch0，故最中性点必然比中心
+    // 中性得多，不会把远处真实色度搬进来。
+    vec3 tgt = a3;
+    float tc = c3a;
+    if (c3b < tc) { tgt = b3; tc = c3b; }
+    if (c6a < tc) { tgt = a6; tc = c6a; }
+    if (c6b < tc) { tgt = b6; tc = c6b; }
+    if (c12a < tc) { tgt = a12; tc = c12a; }
+    if (c12b < tc) { tgt = b12; tc = c12b; }
+    float r_t = tgt.r - tgt.g;
+    float b_t = tgt.b - tgt.g;
     vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
     if (c_med >= ch0) { oColor = vec4(c0.rgb, 1.0); return; }
