@@ -1325,7 +1325,10 @@ uniform highp sampler2D uDet;          // 半分辨率 (br, gr, |br|, base_std)
 uniform ivec2 uHalf;
 uniform float uChromaAvg;              // 全图 |B−R| 均值（线性域，CPU 读回）
 uniform float uThreshK;                // |B−R| 相对阈值倍数（× uChromaAvg）
+uniform float uThreshMin;              // |B−R| 绝对下限（防 cavg 极小的暗场景过检）
+uniform float uThreshMax;              // |B−R| 绝对上限（防 cavg 异常大时阈值失效）
 uniform float uStdK;                   // base_std 相对阈值倍数（× uChromaAvg）
+uniform float uStdMax;                 // base_std 绝对上限
 uniform float uGradMin;                // 亮度梯度下限（线性域 ×255 口径）
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf * 2 - 1);
@@ -1336,14 +1339,27 @@ void main() {
     // 的数；shader 里跑的是**线性域**（linMid≈0.07、pHi≈3.3）⇒ d0.z(≈0.14) > 5.0
     // 恒 false ⇒ 全部紫线像素未命中。191/192/193 连续三版"离线看着对、真机无效"
     // 是同一个量纲陷阱：离线用显示域 JPG 定标，shader 跑线性域。
-    // 相对形态下 uChromaAvg = 本帧全图 |B−R| 均值（日志 dfCavg，实测 0.023~0.056），
-    // 与曝光/场景自适应，量纲错配不会导致整体失效。
-    // 离线定标（tools/engine-shader-offline.py 真跑本 shader，线性域实测）：
-    //   强紫边  |B−R| = 7.2×/16.3×/27.0× cavg，base_std = 12.7×/15.7×/19.5× cavg
-    //   全图    |B−R| P90 = 0.79× cavg、base_std P90 = 2.06× cavg
-    //   ⇒ thr = 3×、std_thr = 2× 时：247/247 强紫边命中，暖色误伤 0、绿向误伤 0。
-    float thr = uThreshK * uChromaAvg;
-    float std_thr = uStdK * uChromaAvg;
+    // ── v0.10.195：阈值再降（3.0 → 0.8），修 194 真机残留 ────────────────────
+    // 194 真机三张样片（10-08 084712/084719/084732）紫边仍在的根因：
+    //   **真机 cavg 比离线大 1.4~2.3×**（真机 0.035/0.0453/0.0651 vs 离线
+    //   0.0244/0.0281/0.0286 —— 差异来自 PC3D 等真机独有环节），而判据是
+    //   `br > 3×cavg` ⇒ 真机阈值被同比抬高 ⇒ 可见紫边（br/cavg ≈ 2.1 真机口径）
+    //   整段落在阈值下方。用真机 cavg 复算覆盖率：thr=3× 只有 27~53%，
+    //   thr=0.8× 有 78~97%（三张样片）。
+    // 为什么可以直接降而不用怕误伤：判据②（B>R>G 紫象限）是**结构性**的 ——
+    //   暖色 B<R、绿/青/蓝 R<G，与阈值无关；离线全图复算 thr=0.6~3.0 全区间
+    //   暖色误伤 0 / 绿青误伤 0。
+    // uThreshMin 绝对下限：防 cavg 极小的暗场景把噪声当紫边（0.012 线性域
+    //   ≈ 显示域 3~5，低于任何可见紫边）。
+    // uStdK 2.0 → 1.2：std 阈值同样以 cavg 为基准，真机 cavg 偏大会误挡；
+    //   紫边像素 std/cavg 真机口径仍有 4.7，1.2 有充足余量。
+    // 上下限都要（v0.10.195）：下限防暗场景 cavg 极小把噪声当紫边；上限防
+    // cavg 异常大（真机实测有一张 dfCavg=0.1717，是常规值 0.03~0.065 的 3~5 倍）
+    // 把阈值抬到紫边之上 —— 那种帧会让整个判据静默失效。
+    // 上限取值依据：紫边像素 |B−R| 绝对值实测 0.09~0.11（线性域），
+    // thr 上限 0.06 保证任何帧都不会把真实紫边挡在外面。
+    float thr = clamp(uThreshK * uChromaAvg, uThreshMin, uThreshMax);
+    float std_thr = min(uStdK * uChromaAvg, uStdMax);
     // 命中条件（四条结构性判据；①② 用**全分辨率** lin0，③④ 用半分辨率检测量）：
     //   ① br0 > thr           全分辨率 B−R 高于场景色度基线 ×3（B>R 是紫象限必要条件）
     //   ② gr0 > 0             全分辨率 R > G（青/蓝 gr<0、暖色 br<0 全排除）
@@ -5656,6 +5672,9 @@ bool FrameRenderer::init() {
   u_df_apply_.half = glGetUniformLocation(prog_df_apply_, "uHalf");
   u_df_apply_.chroma_avg = glGetUniformLocation(prog_df_apply_, "uChromaAvg");
   u_df_apply_.thresh_k = glGetUniformLocation(prog_df_apply_, "uThreshK");
+  u_df_apply_.thresh_min = glGetUniformLocation(prog_df_apply_, "uThreshMin");
+  u_df_apply_.thresh_max = glGetUniformLocation(prog_df_apply_, "uThreshMax");
+  u_df_apply_.std_max = glGetUniformLocation(prog_df_apply_, "uStdMax");
   u_df_apply_.std_k = glGetUniformLocation(prog_df_apply_, "uStdK");
   u_df_apply_.grad_min = glGetUniformLocation(prog_df_apply_, "uGradMin");
   // 横向色差校正（v0.10.170）
@@ -7424,8 +7443,11 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   //   紫象限（B>R>G）判据本身：暖色误伤 0、绿向误伤 0
   // ⇒ thr = 3×、std_thr = 2×：247/247 强紫边命中，误伤 0。
   glUniform1f(u_df_apply_.chroma_avg, cavg);
-  glUniform1f(u_df_apply_.thresh_k, 3.0f);
-  glUniform1f(u_df_apply_.std_k, 2.0f);
+  glUniform1f(u_df_apply_.thresh_k, 0.8f);     // v0.10.195: 3.0 → 0.8（真机 cavg 偏大）
+  glUniform1f(u_df_apply_.thresh_min, 0.012f); // 绝对下限（暗场景防过检）
+  glUniform1f(u_df_apply_.thresh_max, 0.06f);  // 绝对上限（防 cavg 异常大失效）
+  glUniform1f(u_df_apply_.std_k, 1.2f);        // v0.10.195: 2.0 → 1.2
+  glUniform1f(u_df_apply_.std_max, 0.10f);     // std 绝对上限（紫边 std 实测 ≈0.21）
   // 梯度下限：gL = |∇L|·255（线性域）。全图 P90 = 4.97、P99 = 55.8；
   // 强紫边 P10 = 6.75。取 5.0：高于全图 P90（排除平坦区），覆盖紫边主体。
   glUniform1f(u_df_apply_.grad_min, 5.0f);
