@@ -1473,10 +1473,12 @@ fun CameraScreen(
 /**
  * 按压缩放 + 波纹点击（规范：自绘可点元素一律用本修饰符，保证「按下有反应」）。
  * 仅供 @Composable 上下文使用。
+ *
+ * internal 而非 private：编辑器（E1-4）复用同一套按压反馈 —— 两处各写一份，手感必然走样。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Modifier.pressScale(
+internal fun Modifier.pressScale(
     pressedScale: Float = 0.92f,
     onTap: () -> Unit,
     onLongTap: (() -> Unit)? = null,
@@ -2340,7 +2342,7 @@ private fun RelativeSlider(
  * （v0.10.99b 验收通过后移除拖动诊断日志。）
  */
 @Composable
-private fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
+internal fun StrengthRow(initial: Float, onCommit: (Float) -> Unit, onFinished: (Float) -> Unit) {
     var v by remember { mutableFloatStateOf(initial) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -2402,9 +2404,14 @@ private fun SheetPill(
     }
 }
 
-/** 选择卡片：LUT 显示「固定测试图 × 该 LUT」的预览图（一次性生成并缓存，见 LutPreview）；无图时显示名称 */
+/**
+ * 选择卡片：LUT 显示「固定测试图 × 该 LUT」的预览图（一次性生成并缓存，见 LutPreview）；
+ * 无图时显示名称。
+ *
+ * internal 而非 private：编辑器（E1-4）复用同一张卡片 —— 选中态/尺寸两处各写一份必然不一致。
+ */
 @Composable
-private fun LutCard(
+internal fun LutCard(
     label: String,
     selected: Boolean,
     preview: Bitmap?,
