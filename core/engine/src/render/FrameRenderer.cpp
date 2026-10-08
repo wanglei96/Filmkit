@@ -5980,6 +5980,11 @@ void FrameRenderer::release() {
     glDeleteFramebuffers(1, &fbo_cs_);
     tex_cs_ = fbo_cs_ = 0;
   }
+  if (tex_cs_tmp_) {
+    glDeleteTextures(1, &tex_cs_tmp_);
+    glDeleteFramebuffers(1, &fbo_cs_tmp_);
+    tex_cs_tmp_ = fbo_cs_tmp_ = 0;
+  }
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (tex_mo_stat_) glDeleteTextures(1, &tex_mo_stat_);   // 档 A 统计网格
   if (fbo_mo_stat_) glDeleteFramebuffers(1, &fbo_mo_stat_);
@@ -7280,15 +7285,21 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
 // tex_df_avg_（1/16 网格 chroma 均值，CPU 读回 chromave）。尺寸缓存键 = w/h。
 // 色差域中值滤波的资源（v0.10.196）：单个全分辨率 RGBA16F。
 bool FrameRenderer::ensureColorSmooth(int w, int h) {
-  if (cs_w_ == w && cs_h_ == h && tex_cs_ != 0) return true;
+  if (cs_w_ == w && cs_h_ == h && tex_cs_ != 0 && tex_cs_tmp_ != 0) return true;
   if (tex_cs_) {
     glDeleteTextures(1, &tex_cs_);
     glDeleteFramebuffers(1, &fbo_cs_);
     tex_cs_ = fbo_cs_ = 0;
   }
-  // @domain: D4 —— 与 tex_dn_/tex_pc3d_ 同域同几何
+  if (tex_cs_tmp_) {
+    glDeleteTextures(1, &tex_cs_tmp_);
+    glDeleteFramebuffers(1, &fbo_cs_tmp_);
+    tex_cs_tmp_ = fbo_cs_tmp_ = 0;
+  }
+  // @domain: D4 —— 与 tex_dn_/tex_pc3d_ 同域同几何（两张用于 ping-pong 多 pass）
   makeTex(&tex_cs_, &fbo_cs_, GL_RGBA16F, w, h);
-  if (tex_cs_ == 0) {
+  makeTex(&tex_cs_tmp_, &fbo_cs_tmp_, GL_RGBA16F, w, h);
+  if (tex_cs_ == 0 || tex_cs_tmp_ == 0) {
     cs_w_ = cs_h_ = 0;
     return false;
   }
@@ -7303,21 +7314,32 @@ bool FrameRenderer::ensureColorSmooth(int w, int h) {
 bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
   if (!prog_cs_ || src == 0) return false;
   if (!ensureColorSmooth(dst_w, dst_h)) return false;
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_cs_);
-  glViewport(0, 0, dst_w, dst_h);
-  glUseProgram(prog_cs_);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, src);
-  glUniform1i(u_cs_.tex, 0);
-  glUniform2i(u_cs_.size, dst_w, dst_h);
+  // 多 pass ping-pong（v0.10.199）：darktable 的 color_smoothing 支持 1~5 次迭代，
+  // 每多一次等效扩大中值的有效窗口。离线实测（095957 真机 D4，过饱和边缘基准
+  // 10334 个）：1 pass → 505（95% 消除）、**2 pass → 240（98%）**、3 pass → 207
+  // （98%，边际递减）；代价 色度总量 −8.7% → −13.1% → −15.8%，线性域 ΔL max
+  // 0.267 → 0.494 → 0.711（均 <0.3%）。取 2 pass（收益/代价拐点）。
+  const int kPasses = 2;
+  GLuint in = src;
+  for (int i = 0; i < kPasses; ++i) {
+    const bool last = (i == kPasses - 1);
+    glBindFramebuffer(GL_FRAMEBUFFER, last ? fbo_cs_ : fbo_cs_tmp_);
+    glViewport(0, 0, dst_w, dst_h);
+    glUseProgram(prog_cs_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, in);
+    glUniform1i(u_cs_.tex, 0);
+    glUniform2i(u_cs_.size, dst_w, dst_h);
   // 梯度门：gL = |∇L|·255（线性域）。伪彩只在强边缘 ⇒ 门设在 3~10
   // （低于 3 视为平坦区不动；10 以上全量中值）。
   // 离线定标（090738/090727/084716 三张真机 D4）：gL∈[6,16] 与 [3,10] 的
   // 伪彩压制量**逐项相同**（紫向 P50 45→10.6 / 蓝向 19.5→10.6），但改写像素
   // 从 7.3% 降到 4.1% ⇒ 取更紧的门（同样效果、更少改动）。
-  glUniform1f(u_cs_.grad_lo, 6.0f);
-  glUniform1f(u_cs_.grad_hi, 16.0f);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+    glUniform1f(u_cs_.grad_lo, 6.0f);
+    glUniform1f(u_cs_.grad_hi, 16.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    in = last ? tex_cs_ : tex_cs_tmp_;
+  }
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
   }

@@ -660,7 +660,8 @@ class FrameRenderer {
   int dbg_cs_on_ = -1;                      // v0.10.198：本帧该 pass 是否真的跑了
   float dbg_cs_k_ = -1.f;                   // v0.10.198：下发的 FilmParams[59] 实际值
   // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
-  GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F
+  GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F（最终输出）
+  GLuint fbo_cs_tmp_ = 0, tex_cs_tmp_ = 0;  // ping-pong 中间缓冲（多 pass）
   int cs_w_ = 0, cs_h_ = 0;                 // 全分辨率尺寸（缓存键）
   float dbg_df_cavg_ = 0.f;                 // 最近一次 chromave（日志）
   // 横向色差校正（v0.10.170）：tex_ca_ = 校正输出（只在 caApplied=1 时替换
