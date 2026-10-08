@@ -21,7 +21,12 @@ object CameraPresets {
     }
 
     /** 中性基线：所有参数处于"无效果"的正确默认值。 */
-    private fun neutral(): DoubleArray = DoubleArray(59).apply {
+    // ⚠ 长度必须与 C++ `core/engine/src/film/FilmParams.h::kCount` **逐位一致**。
+    // v0.10.196 教训：加 [59] color_smooth 时只改了 C++ 的 kCount（59→60），
+    // 这里仍是 59 ⇒ CameraController 写 filmParams[59] 直接
+    // ArrayIndexOutOfBoundsException ⇒ **装包后应用启动即崩**（真机 2026-10-08）。
+    // 以后加参数槽位：**两处一起改**（本行 + kCount）。
+    private fun neutral(): DoubleArray = DoubleArray(60).apply {
         put3(this, 1, 1.0, 1.0, 1.0)     // 白平衡增益
         this[4] = 1.0                     // 对比度
         // 染料串扰 = 单位阵

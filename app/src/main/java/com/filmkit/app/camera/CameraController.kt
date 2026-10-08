@@ -1428,7 +1428,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val v = if (appPrefs.getBoolean("color_smooth", true)) COLOR_SMOOTH else 0.0
         if (v != colorSmoothPref) {
             colorSmoothPref = v
-            filmParams[59] = v
+            // 长度保护（v0.10.196 事故复盘）：v0.10.196 首发时 CameraPresets.neutral()
+            // 仍是 DoubleArray(59)，这里直接越界 ⇒ 应用启动即崩。数组长度与
+            // FilmParams::kCount 必须同步；此处再兜一层，任何不匹配都不崩。
+            if (filmParams.size > 59) filmParams[59] = v
         }
     }
 
