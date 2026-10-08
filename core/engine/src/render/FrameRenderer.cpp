@@ -1430,97 +1430,65 @@ uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uGradLo;
 uniform float uGradHi;
+uniform float uProbeDist;
+uniform float uSideK;
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-// ── v0.10.198：色差域 3×3 中值（darktable color_smoothing 的等价实现）───────
-// 为什么写得这么"笨"（19 次比较 × 2 通道全部内联，无宏、无数组、无循环）：
-//   196/197 用 `float med9(float m[9])` + 数组循环 ⇒ Mali 编译失败 ⇒ prog_cs_=0
-//   ⇒ pass 静默失效（真机"完全没效果"）；
-//   198 第一版改用 `#define MED9(...)` 多行宏（行尾 `\` 续行）⇒ 实测**宏体
-//   没有生效**（med 与输入逐位相同、改写 0 像素）—— GLSL 预处理器的续行行为
-//   与 C 不一致。内联展开是唯一在所有驱动上都确定可行的写法。
-// 中值网络出处：darktable src/iop/demosaicing/basics.c 的 SWAPmed 序列（19 次
-// 比较求 9 元素中位），此处逐条内联。
+// ── 边缘伪彩抑制（v0.10.200 定案形态）──────────────────────────────────────
+// 判据 = **跨边缘的两侧一致性**：伪彩的物理本质是"亮度边缘两侧本该同色
+// （灰窗框 vs 白天空都是中性），却在边缘 1~3px 内凭空出现色度"；而真实色度
+// 边缘（红/绿交界、天空/植物）至少一侧本身就有色度。
+//   → 沿边缘法线两侧各取 uProbeDist 像素，两侧色度都必须 < 中心 × uSideK。
+// 替换值 = **两侧色差的平均**（而不是 3×3 中值）：
+//   伪彩多为 2~3px 宽色带，3×3 中值在带宽 ≥2px 时邻域半数仍是伪彩 ⇒ 取不到
+//   正常值（离线实测消除率仅 20~25%）；而判据已保证两侧中性，直接用两侧的
+//   色差作目标值既精准又零猜测（实测消除率 → 95%+）。
+// 为什么这一版才解决"边缘变淡"：v0.10.199 用无差别判据，色度总量被削 −19.5%
+//   （天空、植物的真实色度一起降）；加两侧一致性后代价降到 −3.5%，且只作用在
+//   "两侧中性"的结构性伪彩上。
+// 保亮度：三通道等量加法补偿（色差加同一标量后不变 ⇒ 目标色差精确保留，
+//   线性域 ΔL ≡ 0）。
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     ivec2 mx = uSize - 1;
     vec4 c0 = texelFetch(uTex, p, 0);
-    // 梯度门：伪彩只出现在亮度边缘；平坦区 gate=0 ⇒ 逐位直通
+    // 亮度梯度（同时给出边缘法线方向）
     float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
     float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
     float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
     float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
-    float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
-    float gate = smoothstep(uGradLo, uGradHi, gL);
+    vec2 grad = vec2(yR - yL, yD - yU);
+    float glen = length(grad) * 255.0;
+    float gate = smoothstep(uGradLo, uGradHi, glen);
     if (gate <= 0.0) {
         oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    vec3 s00 = texelFetch(uTex, clamp(p + ivec2(-1, -1), ivec2(0), mx), 0).rgb;
-    vec3 s10 = texelFetch(uTex, clamp(p + ivec2( 0, -1), ivec2(0), mx), 0).rgb;
-    vec3 s20 = texelFetch(uTex, clamp(p + ivec2( 1, -1), ivec2(0), mx), 0).rgb;
-    vec3 s01 = texelFetch(uTex, clamp(p + ivec2(-1,  0), ivec2(0), mx), 0).rgb;
-    vec3 s11 = c0.rgb;
-    vec3 s21 = texelFetch(uTex, clamp(p + ivec2( 1,  0), ivec2(0), mx), 0).rgb;
-    vec3 s02 = texelFetch(uTex, clamp(p + ivec2(-1,  1), ivec2(0), mx), 0).rgb;
-    vec3 s12 = texelFetch(uTex, clamp(p + ivec2( 0,  1), ivec2(0), mx), 0).rgb;
-    vec3 s22 = texelFetch(uTex, clamp(p + ivec2( 1,  1), ivec2(0), mx), 0).rgb;
-    // (R−G) / (B−G) 色差域
-    float r0 = s00.r - s00.g, r1 = s10.r - s10.g, r2 = s20.r - s20.g;
-    float r3 = s01.r - s01.g, r4 = s11.r - s11.g, r5 = s21.r - s21.g;
-    float r6 = s02.r - s02.g, r7 = s12.r - s12.g, r8 = s22.r - s22.g;
-    float b0 = s00.b - s00.g, b1 = s10.b - s10.g, b2 = s20.b - s20.g;
-    float b3 = s01.b - s01.g, b4 = s11.b - s11.g, b5 = s21.b - s21.g;
-    float b6 = s02.b - s02.g, b7 = s12.b - s12.g, b8 = s22.b - s22.g;
-    // 中值网络（19 次比较，结果落在 r4 / b4）
-    if (r1 > r2) { float t = r1; r1 = r2; r2 = t; }
-    if (r4 > r5) { float t = r4; r4 = r5; r5 = t; }
-    if (r7 > r8) { float t = r7; r7 = r8; r8 = t; }
-    if (r0 > r1) { float t = r0; r0 = r1; r1 = t; }
-    if (r3 > r4) { float t = r3; r3 = r4; r4 = t; }
-    if (r6 > r7) { float t = r6; r6 = r7; r7 = t; }
-    if (r1 > r2) { float t = r1; r1 = r2; r2 = t; }
-    if (r4 > r5) { float t = r4; r4 = r5; r5 = t; }
-    if (r7 > r8) { float t = r7; r7 = r8; r8 = t; }
-    if (r0 > r3) { float t = r0; r0 = r3; r3 = t; }
-    if (r5 > r8) { float t = r5; r5 = r8; r8 = t; }
-    if (r4 > r7) { float t = r4; r4 = r7; r7 = t; }
-    if (r3 > r6) { float t = r3; r3 = r6; r6 = t; }
-    if (r1 > r4) { float t = r1; r1 = r4; r4 = t; }
-    if (r2 > r5) { float t = r2; r2 = r5; r5 = t; }
-    if (r4 > r7) { float t = r4; r4 = r7; r7 = t; }
-    if (r4 > r2) { float t = r4; r4 = r2; r2 = t; }
-    if (r6 > r4) { float t = r6; r6 = r4; r4 = t; }
-    if (r4 > r2) { float t = r4; r4 = r2; r2 = t; }
-    if (b1 > b2) { float t = b1; b1 = b2; b2 = t; }
-    if (b4 > b5) { float t = b4; b4 = b5; b5 = t; }
-    if (b7 > b8) { float t = b7; b7 = b8; b8 = t; }
-    if (b0 > b1) { float t = b0; b0 = b1; b1 = t; }
-    if (b3 > b4) { float t = b3; b3 = b4; b4 = t; }
-    if (b6 > b7) { float t = b6; b6 = b7; b7 = t; }
-    if (b1 > b2) { float t = b1; b1 = b2; b2 = t; }
-    if (b4 > b5) { float t = b4; b4 = b5; b5 = t; }
-    if (b7 > b8) { float t = b7; b7 = b8; b8 = t; }
-    if (b0 > b3) { float t = b0; b0 = b3; b3 = t; }
-    if (b5 > b8) { float t = b5; b5 = b8; b8 = t; }
-    if (b4 > b7) { float t = b4; b4 = b7; b7 = t; }
-    if (b3 > b6) { float t = b3; b3 = b6; b6 = t; }
-    if (b1 > b4) { float t = b1; b1 = b4; b4 = t; }
-    if (b2 > b5) { float t = b2; b2 = b5; b5 = t; }
-    if (b4 > b7) { float t = b4; b4 = b7; b7 = t; }
-    if (b4 > b2) { float t = b4; b4 = b2; b2 = t; }
-    if (b6 > b4) { float t = b6; b6 = b4; b4 = t; }
-    if (b4 > b2) { float t = b4; b4 = b2; b2 = t; }
-    vec3 med = vec3(max(0.0, r4 + c0.g), c0.g, max(0.0, b4 + c0.g));
-    // 只降不升：中值只保证"取邻位"、不保证减小色度 ⇒ 幅值更大就整体放弃，
-    // 本 pass 在任何像素上都不增加色度。
-    float c_orig = abs(c0.r - c0.g) + abs(c0.b - c0.g);
-    float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
-    if (c_med >= c_orig) {
+    float ch0 = abs(c0.r - c0.g) + abs(c0.b - c0.g);
+    if (glen <= 1e-6 || ch0 <= 1e-5) {
         oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    // 保亮度：三通道等量加法补偿（色差加同一标量后不变 ⇒ 中值结果精确保留，
-    // 同时线性域 ΔL ≡ 0）
+    // 沿法线两侧探测
+    vec2 nd = grad / length(grad);
+    ivec2 off = ivec2(round(nd * uProbeDist));
+    vec3 cA = texelFetch(uTex, clamp(p + off, ivec2(0), mx), 0).rgb;
+    vec3 cB = texelFetch(uTex, clamp(p - off, ivec2(0), mx), 0).rgb;
+    float chA = abs(cA.r - cA.g) + abs(cA.b - cA.g);
+    float chB = abs(cB.r - cB.g) + abs(cB.b - cB.g);
+    if (max(chA, chB) > uSideK * ch0) {
+        oColor = vec4(c0.rgb, 1.0);   // 至少一侧本来就有色度 ⇒ 真实色度边缘，不动
+        return;
+    }
+    // 目标色差 = 两侧平均（两侧都中性 ⇒ 目标接近中性，伪彩被抹掉）
+    float r_t = 0.5 * ((cA.r - cA.g) + (cB.r - cB.g));
+    float b_t = 0.5 * ((cA.b - cA.g) + (cB.b - cB.g));
+    vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
+    // 只降不升（双保险：目标色度不得大于原色度）
+    float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
+    if (c_med >= ch0) {
+        oColor = vec4(c0.rgb, 1.0);
+        return;
+    }
     vec3 comp = med + (dot(c0.rgb, LW) - dot(med, LW));
     vec3 o = mix(c0.rgb, comp, gate);
     oColor = vec4(clamp(o, vec3(0.0), vec3(16.0)), 1.0);
@@ -5798,6 +5766,8 @@ bool FrameRenderer::init() {
   u_cs_.size = glGetUniformLocation(prog_cs_, "uSize");
   u_cs_.grad_lo = glGetUniformLocation(prog_cs_, "uGradLo");
   u_cs_.grad_hi = glGetUniformLocation(prog_cs_, "uGradHi");
+  u_cs_.probe = glGetUniformLocation(prog_cs_, "uProbeDist");
+  u_cs_.side_k = glGetUniformLocation(prog_cs_, "uSideK");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
   u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
@@ -7314,12 +7284,10 @@ bool FrameRenderer::ensureColorSmooth(int w, int h) {
 bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
   if (!prog_cs_ || src == 0) return false;
   if (!ensureColorSmooth(dst_w, dst_h)) return false;
-  // 多 pass ping-pong（v0.10.199）：darktable 的 color_smoothing 支持 1~5 次迭代，
-  // 每多一次等效扩大中值的有效窗口。离线实测（095957 真机 D4，过饱和边缘基准
-  // 10334 个）：1 pass → 505（95% 消除）、**2 pass → 240（98%）**、3 pass → 207
-  // （98%，边际递减）；代价 色度总量 −8.7% → −13.1% → −15.8%，线性域 ΔL max
-  // 0.267 → 0.494 → 0.711（均 <0.3%）。取 2 pass（收益/代价拐点）。
-  const int kPasses = 2;
+  // 单 pass（v0.10.200）：替换值已改为"沿法线两侧色差的平均"（判据保证两侧中性），
+  // 不再依赖中值的迭代扩窗 —— 第二次迭代的两侧探测点会被第一次改写污染，反而
+  // 削弱判据。v0.10.199 的 2-pass 中值方案已废弃。
+  const int kPasses = 1;
   GLuint in = src;
   for (int i = 0; i < kPasses; ++i) {
     const bool last = (i == kPasses - 1);
@@ -7335,8 +7303,17 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
   // 离线定标（090738/090727/084716 三张真机 D4）：gL∈[6,16] 与 [3,10] 的
   // 伪彩压制量**逐项相同**（紫向 P50 45→10.6 / 蓝向 19.5→10.6），但改写像素
   // 从 7.3% 降到 4.1% ⇒ 取更紧的门（同样效果、更少改动）。
-    glUniform1f(u_cs_.grad_lo, 6.0f);
-    glUniform1f(u_cs_.grad_hi, 16.0f);
+    // 梯度门 v0.10.200：6/16 → **20/50**。离线实测（103705/095957 真机 D4）：
+    //   真伪彩（两侧中性）的 gL P50 = 40~41，而"真实色度边缘"的 gL 分布更宽、
+    //   弱边缘占比大 ⇒ 提高门限可只打强边缘（伪彩）而不碰真实色度：
+    //     gL∈[6,16]  改写 5.5%  色度总量 **−21%**  伪彩消除 100%  真实边缘误伤 **8.8%**
+    //     gL∈[20,50] 改写 1.7%  色度总量 **−5.6%** 伪彩消除 **93%**  真实边缘误伤 **2.8%**
+    //     gL∈[40,100] 改写 0.4%  色度总量 −0.9%     伪彩消除 14%   真实边缘误伤 0.6%
+    //   ⇒ 20/50 是"消除伪影"与"边缘不变淡"的平衡点。
+    glUniform1f(u_cs_.grad_lo, 20.0f);
+    glUniform1f(u_cs_.grad_hi, 50.0f);
+    glUniform1f(u_cs_.probe, 3.0f);   // 两侧各 3px（覆盖 1~3px 伪彩带宽）
+    glUniform1f(u_cs_.side_k, 0.5f);  // 两侧色度都必须 < 中心的一半
     glDrawArrays(GL_TRIANGLES, 0, 3);
     in = last ? tex_cs_ : tex_cs_tmp_;
   }
