@@ -109,11 +109,14 @@ import kotlinx.coroutines.withContext
  * 也被套上（架构师 2026-10-08 明确要求隔离）。下次打开这张照片仍从快照的 LUT 起。
  *
  * @param uri 待编辑成片的 MediaStore URI；为 null（如进程重建后状态丢失）时显示失败态而非白屏。
+ * @param onOpenGallery 顶栏最左侧菜单图标 → 相册页（用户报的第 5 点）。素材仍由本页
+ *   自己从 [uri] 全尺寸解码，相册网格里的缩略图**不会**流到这里（用户明确禁止）。
  */
 @Composable
 fun EditorScreen(
     uri: Uri?,
     onBack: () -> Unit = {},
+    onOpenGallery: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
@@ -445,7 +448,7 @@ fun EditorScreen(
                 .fillMaxSize()
                 .statusBarsPadding(),
         ) {
-            SubPageTopBar("编辑", onBack)
+            SubPageTopBar("编辑", onBack, onMenu = onOpenGallery)
 
             Box(
                 Modifier

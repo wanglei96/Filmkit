@@ -54,6 +54,24 @@ EXPECT = {
     "lutK": ("submitDisplay", ["passStyle("]),
     "grain": ("submitDisplay", ["passStyle("]),
     "grainSz": ("submitDisplay", ["passStyle("]),
+    # E1-5（2026-10-08 P0「真机编辑器打开全黑」）：render.style_diag 一次定位。
+    # 字段行统一发在 passStyle **之后**（否则"没执行却报执行"），并要求
+    # glReadPixels 也已在字段行之前 —— 输出统计才是本帧的真实读回值。
+    "inMean": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "inP0": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "texNew": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "texIfmt": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "texW": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "texH": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "eTex": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "eSub": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "fbStatus": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "eFbo": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "capIfmt": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "ePass": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "eRead": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "outMean": ("submitDisplay", ["passStyle(", "glReadPixels("]),
+    "outP0": ("submitDisplay", ["passStyle(", "glReadPixels("]),
 }
 
 

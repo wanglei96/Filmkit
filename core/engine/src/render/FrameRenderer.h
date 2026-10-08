@@ -610,6 +610,12 @@ class FrameRenderer {
   int yuv_matrix_ = 0;
   GLuint still_tex_ = 0;  // RGB8，静拍 CPU 转换后上传
   int still_w_ = 0, still_h_ = 0;
+  // E1-5（2026-10-08 P0 全黑定位）：编辑器输入纹理。**独立于 still_tex_** ——
+  // 编辑器上传的是 RGBA8，内部格式必须同为 RGBA8（RGB8 内部格式 + RGBA 上传是
+  // 「内部/外部格式不匹配」，规范允许但部分驱动会拒绝或写入未定义内容）。
+  // 与 submitStill 分离 ⇒ YUV 拍照链路的 still_tex_ 记账/格式逐位不变。
+  GLuint edit_tex_ = 0;  // RGBA8，编辑器成片上传（submitDisplay 专用）
+  int edit_w_ = 0, edit_h_ = 0;
   GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
   int raw_w_ = 0, raw_h_ = 0;
   // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────

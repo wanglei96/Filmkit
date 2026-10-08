@@ -160,8 +160,11 @@ import kotlin.math.sqrt
 @Composable
 fun CameraScreen(
     onOpenSettings: () -> Unit = {},
-    /** 胶卷位点击：带最近成片的 URI 进内建编辑器（E1-1） */
-    onOpenEditor: (android.net.Uri) -> Unit = {},
+    /**
+     * 胶卷位点击 → 相册页（相册里点缩略图才进编辑器）。
+     * **恒可点**：没拍过照时也要能进相册看设备里的照片（用户报的第 6 点）。
+     */
+    onOpenGallery: () -> Unit = {},
     onRegisterVolume: ((() -> Unit)?) -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -1258,9 +1261,11 @@ fun CameraScreen(
                     .clip(RoundedCornerShape(10.dp))
                     .background(FilmTheme.ChipBg)
                     .alpha(if (t == null) 0.5f else 1f)
-                    // 胶卷位点进内建编辑器（E1-1）：有最近成片才可点 —— 灰态（alpha 0.5）
-                    // 的语义就是"还没有成片"，此时点击不该有任何反应
-                    .clickable(enabled = photoUri != null) { photoUri?.let(onOpenEditor) },
+                    // 胶卷位**恒可点** → 相册页（用户报的第 6 点）：此前是
+                    // clickable(enabled = photoUri != null)，装包后没拍过照的用户点它
+                    // 毫无反应。灰态（alpha 0.5）继续表示"还没有成片"，但点击一律进相册
+                    //（传统相册入口），不再直接进编辑器。
+                    .clickable { onOpenGallery() },
                 contentAlignment = Alignment.Center,
             ) {
                 if (t != null) {
@@ -2564,13 +2569,32 @@ private fun RowScope.QuickTile(label: String, on: Boolean, onTap: () -> Unit) {
     }
 }
 
-/** 子页顶栏：左上返回 + 标题（设置 / 日志 / 能力 Spike / 镜头配置 / 系统颜色 共用） */
+/**
+ * 子页顶栏：左上返回 + 标题（设置 / 日志 / 能力 Spike / 镜头配置 / 系统颜色 共用）。
+ * [onMenu] 非空时在最左侧再加一个菜单图标（编辑器页用它进相册，用户报的第 5 点）；
+ * 默认 null ⇒ 其余子页的布局与点击区一字未变。
+ */
 @Composable
-fun SubPageTopBar(title: String, onBack: () -> Unit) {
+fun SubPageTopBar(title: String, onBack: () -> Unit, onMenu: (() -> Unit)? = null) {
     Row(
         Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (onMenu != null) {
+            Box(
+                Modifier
+                    .size(44.dp)
+                    .clickable { onMenu() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Filled.Menu,
+                    contentDescription = "相册",
+                    tint = FilmTheme.Cream,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
         Box(
             Modifier
                 .size(44.dp)

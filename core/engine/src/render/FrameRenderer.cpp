@@ -6327,9 +6327,12 @@ void FrameRenderer::release() {
   if (vs_rot_) glDeleteShader(vs_rot_);
   if (vs_plain_) glDeleteShader(vs_plain_);
   if (still_tex_) glDeleteTextures(1, &still_tex_);
+  if (edit_tex_) glDeleteTextures(1, &edit_tex_);  // E1-5 编辑器输入纹理
   if (raw_tex_) glDeleteTextures(1, &raw_tex_);
   if (lsc_tex_) glDeleteTextures(1, &lsc_tex_);
   still_tex_ = 0;
+  edit_tex_ = 0;
+  edit_w_ = edit_h_ = 0;
   raw_tex_ = 0;
   lsc_tex_ = 0;
   lsc_w_ = lsc_h_ = 0;
@@ -6721,27 +6724,68 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
                                   std::vector<uint8_t>* out_rgba) {
   const bool prog_ok = prog_style_ != 0;
   bool ran = false;
+  // ── E1-5（2026-10-08 P0「真机编辑器打开全黑」）诊断 ──────────────────────
+  // 真机机会宝贵 ⇒ 一次运行必须能定位到**哪一环**断：
+  //   输入就黑            ⇒ Kotlin 上传侧（Bitmap→direct buffer）
+  //   输入非黑、读回黑    ⇒ 本函数内的纹理 / FBO / draw / 读回
+  // 采样统计（≤4096 点，成本可忽略）：判"是不是全黑"不需要精确均值。
+  // ⚠ 字段在此声明，**日志统一发在 passStyle 之后**：tools/check-diag-fields.py
+  //   要求字段行晚于本函数内的 passStyle 调用，否则"没执行却报执行"。
+  int in_mean = -1, in_p0 = -1, out_mean = -1, out_p0 = -1;
+  int tex_new = 0, tex_ifmt = 0, cap_ifmt = 0, tex_w = -1, tex_h = -1;
+  GLenum e_tex = 0, e_sub = 0, e_fbo = 0, e_pass = 0, e_read = 0;
+  GLenum fb_status = 0;
+  if (rgba8 != nullptr && w > 0 && h > 0 && out_rgba != nullptr) {
+    const auto* px = static_cast<const uint8_t*>(rgba8);
+    const size_t n = static_cast<size_t>(w) * h;
+    const size_t step = n > 4096 ? n / 4096 : 1;
+    int64_t sum = 0;
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i += step) {
+      sum += px[i * 4];  // R 通道采样（全黑 ⇒ 0）
+      ++cnt;
+    }
+    in_mean = cnt ? static_cast<int>(sum / static_cast<int64_t>(cnt)) : -1;
+    in_p0 = px[0];
+  }
   if (prog_ok && rgba8 != nullptr && out_rgba != nullptr && w > 0 && h > 0) {
-    // 输入纹理：复用 still_tex_ 的上传路径（RGB8；RGBA8 上传时 alpha 丢弃，像素值不变）
-    if (still_w_ != w || still_h_ != h) {
-      if (still_tex_) glDeleteTextures(1, &still_tex_);
-      still_tex_ = 0;
-      glGenTextures(1, &still_tex_);
-      glBindTexture(GL_TEXTURE_2D, still_tex_);
+    while (glGetError() != GL_NO_ERROR) {
+    }  // 入口清队列：下面各步的错误码才能归属本函数
+    // 输入纹理：**编辑器自己的 RGBA8 纹理**（E1-5 修复，原复用 still_tex_）。
+    // 两条理由：
+    //  ① 内部格式必须与上传格式一致（RGBA8 ← GL_RGBA/GL_UNSIGNED_BYTE）。旧写法
+    //     GL_RGB8 + GL_RGBA 上传是"内部/外部格式不匹配"：规范允许（alpha 丢弃），
+    //     但部分驱动拒绝或写入未定义内容 ⇒ 采样恒 0 ⇒ 全黑。
+    //  ② still_tex_ 与 submitStill（YUV 拍照）共享 ⇒ 编辑器不碰它，拍照链路
+    //     （含 still_w_/still_h_ 记账与 RGB8 格式）逐位不变。
+    if (edit_w_ != w || edit_h_ != h) {
+      if (edit_tex_) glDeleteTextures(1, &edit_tex_);
+      edit_tex_ = 0;
+      glGenTextures(1, &edit_tex_);
+      glBindTexture(GL_TEXTURE_2D, edit_tex_);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE,
-                   nullptr);
-      still_w_ = w;
-      still_h_ = h;
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                   GL_UNSIGNED_BYTE, nullptr);
+      edit_w_ = w;
+      edit_h_ = h;
+      tex_new = 1;
     }
-    glBindTexture(GL_TEXTURE_2D, still_tex_);
+    e_tex = glGetError();  // 纹理创建（glTexImage2D）后
+    glBindTexture(GL_TEXTURE_2D, edit_tex_);
+    // 实际内部格式/尺寸：① 的直接判据（若拿到 GL_RGB8/0x8051 就是格式不匹配；
+    // 尺寸 ≠ w/h ⇒ 纹理记账错位，采样会整幅偏移到纹理外 → clamp 到边缘）
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT,
+                             &tex_ifmt);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
                     rgba8);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    e_sub = glGetError();  // 上传后（① 的直接判据：非 0 ⇒ 驱动拒绝了这次上传）
 
     // 输出目标：显示域 RGBA8（与成片同格式；dither 在 8bit 量化前生效）
     if (cap_w_ != w || cap_h_ != h) {
@@ -6758,13 +6802,39 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
     // FBO 不完整时 draw 被驱动静默丢弃（X300 实测：RGBA8 + HALF_FLOAT 非法组合
     // ⇒ 输出全黑且 glErr=0），必须显式查一次
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+    fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    e_fbo = glGetError();
+    // 输出目标的实际内部格式（FBO 参数；tex_cap_ 由 makeTex 建，与本 FBO 同生共死）
+    glBindTexture(GL_TEXTURE_2D, tex_cap_);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT,
+                             &cap_ifmt);
+    glBindTexture(GL_TEXTURE_2D, edit_tex_);  // 恢复（passStyle 里还会再绑一次）
+    if (fb_status == GL_FRAMEBUFFER_COMPLETE) {
       while (glGetError() != GL_NO_ERROR) {
       }
       passStyle(w, h, p);
+      // ⚠ 必须在 logPassDiag 之前取：它内部会消费掉错误码
+      e_pass = glGetError();
       logPassDiag("style", fbo_cap_, false);
       out_rgba->resize(static_cast<size_t>(w) * h * 4);
       glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
+      e_read = glGetError();
+      // 输出统计：readback 失败时 resize 的零填充会让输出看起来"全黑" ⇒ 与
+      // "draw 真的产出黑"必须靠 eRead / ePass 与 logPassDiag 的 (0,0) 像素交叉判读
+      // （outP0 与 render.diag 的 r 同位置：glReadPixels 第 0 行第 0 列）。
+      {
+        const auto* op = out_rgba->data();
+        const size_t on = static_cast<size_t>(w) * h;
+        const size_t ostep = on > 4096 ? on / 4096 : 1;
+        int64_t osum = 0;
+        size_t ocnt = 0;
+        for (size_t i = 0; i < on; i += ostep) {
+          osum += op[i * 4];
+          ++ocnt;
+        }
+        out_mean = ocnt ? static_cast<int>(osum / static_cast<int64_t>(ocnt)) : -1;
+        out_p0 = op[0];
+      }
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       ran = true;
     } else {
@@ -6774,6 +6844,34 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
               ",\"h\":" + std::to_string(h) + "}");
     }
   }
+  // ── E1-5（2026-10-08 P0「真机编辑器打开全黑」）一次定位诊断 ────────────────
+  // 判读表（用户跑一次真机即可定位）：
+  //   inMean/inP0 ≈ 0        ⇒ 输入就是黑的：问题在 Kotlin 上传侧（Bitmap→buffer）
+  //   eTex/eSub != 0         ⇒ 纹理创建/上传被驱动拒绝（内部格式不匹配 → 见 texIfmt）
+  //   texIfmt = 0x8051(32849)⇒ 拿到的是 GL_RGB8，而上传是 RGBA（① 复现）
+  //   fbStatus != 0x8CD5     ⇒ FBO 不完整 ⇒ draw 被整帧丢弃（输出保持未初始化）
+  //   ePass != 0             ⇒ draw 本身报错（uniform/采样器问题）
+  //   eRead != 0             ⇒ glReadPixels 失败
+  //   inMean 正常 + outMean≈0 + ePass=eRead=0 ⇒ 只有 render.diag 的 (0,0) 像素能区分
+  //                            "draw 产出黑"与"读回黑"（两者同位置，逐字节可比）
+  std::string kv_diag = std::string("{\"inMean\":") + std::to_string(in_mean);
+  kv_diag += ",\"inP0\":" + std::to_string(in_p0);
+  kv_diag += ",\"texNew\":" + std::to_string(tex_new);
+  kv_diag += ",\"texIfmt\":" + std::to_string(tex_ifmt);
+  kv_diag += ",\"texW\":" + std::to_string(tex_w);
+  kv_diag += ",\"texH\":" + std::to_string(tex_h);
+  kv_diag += ",\"eTex\":" + std::to_string(e_tex);
+  kv_diag += ",\"eSub\":" + std::to_string(e_sub);
+  kv_diag += ",\"fbStatus\":" + std::to_string(fb_status);
+  kv_diag += ",\"eFbo\":" + std::to_string(e_fbo);
+  kv_diag += ",\"capIfmt\":" + std::to_string(cap_ifmt);
+  kv_diag += ",\"ePass\":" + std::to_string(e_pass);
+  kv_diag += ",\"eRead\":" + std::to_string(e_read);
+  kv_diag += ",\"outMean\":" + std::to_string(out_mean);
+  kv_diag += ",\"outP0\":" + std::to_string(out_p0);
+  kv_diag += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
+  Logger::instance().log(LogLevel::kInfo, "engine", "render.style_diag", kv_diag);
+
   // 诊断三件套（ADR §6.2）：shader 是否链接成功 / 本帧是否真的执行 / 下发参数值。
   // 一行发全（字段写在同一出口 ⇒ tools/check-diag-fields.py 能核对"字段—函数—前置调用"；
   // 历史事故：字段写进别的函数 ⇒ 真机日志缺项，整轮 A/B 白跑）。
@@ -11775,7 +11873,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   }
 }
 
-// E1-3 编辑器通路：显示域输入（still_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
+// E1-3 编辑器通路：显示域输入（edit_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
 // 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
 // 颗粒种子固定为 0 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
 void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
@@ -11783,7 +11881,7 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   glViewport(0, 0, w, h);
   glUseProgram(prog_style_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, still_tex_);
+  glBindTexture(GL_TEXTURE_2D, edit_tex_);  // E1-5：编辑器自己的 RGBA8 输入纹理
   glUniform1i(u_style_.tex, 0);
   glUniform1f(u_style_.seed, 0.0f);
   glUniform1f(u_style_.grain_amount, p.grain_amount);
