@@ -7318,9 +7318,11 @@ bool FrameRenderer::ensureColorSmooth(int w, int h) {
 // 色差域 3×3 中值（v0.10.196，darktable color_smoothing 移植）。
 // src = 任意 D4 域纹理（替换档传 tex_pc3d_，普通档传 tex_dn_）；
 // 成功时结果在 tex_cs_，调用方改读它。失败返回 false（调用方回落 src，照片优先）。
-bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
+bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tmp) {
   if (!prog_cs_ || src == 0) return false;
   if (!ensureColorSmooth(dst_w, dst_h)) return false;
+  const GLuint cs_out_tex = to_tmp ? tex_cs_tmp_ : tex_cs_;
+  const GLuint cs_out_fbo = to_tmp ? fbo_cs_tmp_ : fbo_cs_;
   // 单 pass（v0.10.200）：替换值已改为"沿法线两侧色差的平均"（判据保证两侧中性），
   // 不再依赖中值的迭代扩窗 —— 第二次迭代的两侧探测点会被第一次改写污染，反而
   // 削弱判据。v0.10.199 的 2-pass 中值方案已废弃。
@@ -7328,7 +7330,7 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
   GLuint in = src;
   for (int i = 0; i < kPasses; ++i) {
     const bool last = (i == kPasses - 1);
-    glBindFramebuffer(GL_FRAMEBUFFER, last ? fbo_cs_ : fbo_cs_tmp_);
+    glBindFramebuffer(GL_FRAMEBUFFER, last ? cs_out_fbo : (to_tmp ? fbo_cs_ : fbo_cs_tmp_));
     glViewport(0, 0, dst_w, dst_h);
     glUseProgram(prog_cs_);
     glActiveTexture(GL_TEXTURE0);
@@ -7355,7 +7357,7 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
     glUniform1f(u_cs_.peak_k, 1.05f);    // 中心 > 1.05×max(两侧)（"局部色度峰"，实测最优）
     glUniform1f(u_cs_.chroma_min, 0.12f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    in = last ? tex_cs_ : tex_cs_tmp_;
+    in = last ? cs_out_tex : (to_tmp ? tex_cs_ : tex_cs_tmp_);
   }
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
@@ -8775,9 +8777,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // v0.10.196：色差域中值（darktable color_smoothing）—— 在 defringe 之前。
       // 顺序理由：中值是"无偏"的（不判色相，治任意色向的 1~3px 色差异常），
       // 先用它把窄带伪彩压掉，defringe 再处理剩下的紫/品红定向部分。
-      // v0.10.205：color_smooth 已前置（见上），此处不再重复执行；
-      // df_src 优先级：PC3D 输出 > color_smooth 输出 > D4 原图。
+      // v0.10.208：**PC3D 之后再跑一次** color_smooth（治 PC3D 自身产生的色度
+      // 过冲；真机实测 D4 域无过冲而成片有 ⇒ 过冲产生于 PC3D）。
+      // df_src 优先级：后置结果 > PC3D 输出 > 前置结果 > D4 原图。
       GLuint df_src = pc3d_ok ? tex_pc3d_ : (cs_ok ? tex_cs_ : tex_scene_);
+      bool cs2_ok = false;
+      if (p.color_smooth > 0.5f && pc3d_ok && passColorSmooth(dst_w, dst_h, tex_pc3d_, true)) {
+        cs2_ok = true;
+      }
+      if (cs2_ok) df_src = tex_cs_tmp_;
+      dbg_cs_on_ = (cs_ok ? 1 : 0) + (cs2_ok ? 2 : 0);
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
     } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,

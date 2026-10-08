@@ -448,7 +448,11 @@ class FrameRenderer {
   bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f, GLuint src = 0);
   // 色差域 3×3 中值（darktable color_smoothing）：输入任意 D4 域纹理，
   // 输出 tex_cs_。失败返回 false（调用方回落 src）。
-  bool passColorSmooth(int dst_w, int dst_h, GLuint src);
+  // to_tmp（v0.10.208）：输出目标 —— false = tex_cs_（PC3D **之前**的前置调用）；
+  // true = tex_cs_tmp_（PC3D **之后**的后置调用）。两次调用是必要的：前置治
+  // RCD 产生的窄带伪彩，后置治 **PC3D 自身产生**的色度过冲（真机实测：D4 域
+  // 该位置 ch 平缓无过冲，而成片有 52 vs 两侧 10/29 的过冲 ⇒ 过冲产生于 PC3D）。
+  bool passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tmp = false);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
   // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
   // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，
