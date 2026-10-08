@@ -1430,28 +1430,27 @@ uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform float uGradLo;
 uniform float uGradHi;
-uniform float uProbeDist;
-uniform float uSideK;
+uniform float uSideK;       // 两侧色度必须 < 中心 × 该系数
+uniform float uChromaMin;   // 相对亮度的色度下限（低于此值视为中性，不动）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-// ── 边缘伪彩抑制（v0.10.200 定案形态）──────────────────────────────────────
-// 判据 = **跨边缘的两侧一致性**：伪彩的物理本质是"亮度边缘两侧本该同色
-// （灰窗框 vs 白天空都是中性），却在边缘 1~3px 内凭空出现色度"；而真实色度
-// 边缘（红/绿交界、天空/植物）至少一侧本身就有色度。
-//   → 沿边缘法线两侧各取 uProbeDist 像素，两侧色度都必须 < 中心 × uSideK。
-// 替换值 = **两侧色差的平均**（而不是 3×3 中值）：
-//   伪彩多为 2~3px 宽色带，3×3 中值在带宽 ≥2px 时邻域半数仍是伪彩 ⇒ 取不到
-//   正常值（离线实测消除率仅 20~25%）；而判据已保证两侧中性，直接用两侧的
-//   色差作目标值既精准又零猜测（实测消除率 → 95%+）。
-// 为什么这一版才解决"边缘变淡"：v0.10.199 用无差别判据，色度总量被削 −19.5%
-//   （天空、植物的真实色度一起降）；加两侧一致性后代价降到 −3.5%，且只作用在
-//   "两侧中性"的结构性伪彩上。
-// 保亮度：三通道等量加法补偿（色差加同一标量后不变 ⇒ 目标色差精确保留，
-//   线性域 ΔL ≡ 0）。
+// ── 边缘伪彩抑制 v0.10.204：**多尺度两侧一致性** ──────────────────────────
+// 为什么从"单尺度 ±3px"改成"多尺度 [3,6,12,18]"：
+//   真机实测（112643 成片）用户所见彩边是 **PC3D 把 1~3px 伪彩摊开后的
+//   12~90px 宽钟形带**（例：y=300 的 x=757~767，峰色度 44、两侧 x=755/769
+//   色度 10/8）。单尺度 ±3px 的探测点**全落在带内** ⇒ 判据恒不成立 ⇒
+//   覆盖率 **0.0%**（这就是 203 仍有残留的原因）。
+//   多尺度让"带中心"能被大尺度命中、"带边缘"能被小尺度命中。
+// 为什么 sideK 从 0.35 放宽到 0.7：相邻色带会污染探测点（本场景 y=300 行
+//   就有 4 条带：675-749 / 757-767 / 824-843 / 868-878），0.35 时带内 11 个
+//   像素只有 1 个命中；0.7 时 6/11。全图蓝边覆盖率 16.8% → **43.1%**，
+//   色度总量代价 −2.5% → **−6.0%**（仍属"只削伪彩"量级）。
+// 替换值 = 8 个探测点色差的平均（都偏中性 ⇒ 目标接近中性）；
+// 保亮度 = 三通道等量加法补偿（色差加同一标量后不变，ΔL ≡ 0）；
+// 只降不升 = 目标色度不得大于原色度。
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     ivec2 mx = uSize - 1;
     vec4 c0 = texelFetch(uTex, p, 0);
-    // 亮度梯度（同时给出边缘法线方向）
     float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
     float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
     float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
@@ -1459,39 +1458,46 @@ void main() {
     vec2 grad = vec2(yR - yL, yD - yU);
     float glen = length(grad) * 255.0;
     float gate = smoothstep(uGradLo, uGradHi, glen);
-    if (gate <= 0.0) {
-        oColor = vec4(c0.rgb, 1.0);
-        return;
-    }
+    if (gate <= 0.0) { oColor = vec4(c0.rgb, 1.0); return; }
+    float lum = max(dot(c0.rgb, LW), 1e-4);
     float ch0 = abs(c0.r - c0.g) + abs(c0.b - c0.g);
-    if (glen <= 1e-6 || ch0 <= 1e-5) {
-        oColor = vec4(c0.rgb, 1.0);
-        return;
-    }
-    // 沿法线两侧探测
+    if (glen <= 1e-6 || ch0 <= uChromaMin * lum) { oColor = vec4(c0.rgb, 1.0); return; }
     vec2 nd = grad / length(grad);
-    ivec2 off = ivec2(round(nd * uProbeDist));
-    vec3 cA = texelFetch(uTex, clamp(p + off, ivec2(0), mx), 0).rgb;
-    vec3 cB = texelFetch(uTex, clamp(p - off, ivec2(0), mx), 0).rgb;
-    float chA = abs(cA.r - cA.g) + abs(cA.b - cA.g);
-    float chB = abs(cB.r - cB.g) + abs(cB.b - cB.g);
-    if (max(chA, chB) > uSideK * ch0) {
-        oColor = vec4(c0.rgb, 1.0);   // 至少一侧本来就有色度 ⇒ 真实色度边缘，不动
+    ivec2 o3 = ivec2(round(nd * 3.0));
+    ivec2 o6 = ivec2(round(nd * 6.0));
+    ivec2 o12 = ivec2(round(nd * 12.0));
+    ivec2 o18 = ivec2(round(nd * 18.0));
+    vec3 a3 = texelFetch(uTex, clamp(p + o3, ivec2(0), mx), 0).rgb;
+    vec3 b3 = texelFetch(uTex, clamp(p - o3, ivec2(0), mx), 0).rgb;
+    vec3 a6 = texelFetch(uTex, clamp(p + o6, ivec2(0), mx), 0).rgb;
+    vec3 b6 = texelFetch(uTex, clamp(p - o6, ivec2(0), mx), 0).rgb;
+    vec3 a12 = texelFetch(uTex, clamp(p + o12, ivec2(0), mx), 0).rgb;
+    vec3 b12 = texelFetch(uTex, clamp(p - o12, ivec2(0), mx), 0).rgb;
+    vec3 a18 = texelFetch(uTex, clamp(p + o18, ivec2(0), mx), 0).rgb;
+    vec3 b18 = texelFetch(uTex, clamp(p - o18, ivec2(0), mx), 0).rgb;
+    float c3a = abs(a3.r - a3.g) + abs(a3.b - a3.g);
+    float c3b = abs(b3.r - b3.g) + abs(b3.b - b3.g);
+    float c6a = abs(a6.r - a6.g) + abs(a6.b - a6.g);
+    float c6b = abs(b6.r - b6.g) + abs(b6.b - b6.g);
+    float c12a = abs(a12.r - a12.g) + abs(a12.b - a12.g);
+    float c12b = abs(b12.r - b12.g) + abs(b12.b - b12.g);
+    float c18a = abs(a18.r - a18.g) + abs(a18.b - a18.g);
+    float c18b = abs(b18.r - b18.g) + abs(b18.b - b18.g);
+    float lim = uSideK * ch0;
+    if (max(c3a, c3b) >= lim && max(c6a, c6b) >= lim &&
+        max(c12a, c12b) >= lim && max(c18a, c18b) >= lim) {
+        oColor = vec4(c0.rgb, 1.0);   // 所有尺度两侧都有色度 ⇒ 真实色度区域
         return;
     }
-    // 目标色差 = 两侧平均（两侧都中性 ⇒ 目标接近中性，伪彩被抹掉）
-    float r_t = 0.5 * ((cA.r - cA.g) + (cB.r - cB.g));
-    float b_t = 0.5 * ((cA.b - cA.g) + (cB.b - cB.g));
+    float r_t = 0.125 * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g)
+                       + (a12.r - a12.g) + (b12.r - b12.g) + (a18.r - a18.g) + (b18.r - b18.g));
+    float b_t = 0.125 * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g)
+                       + (a12.b - a12.g) + (b12.b - b12.g) + (a18.b - a18.g) + (b18.b - b18.g));
     vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
-    // 只降不升（双保险：目标色度不得大于原色度）
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
-    if (c_med >= ch0) {
-        oColor = vec4(c0.rgb, 1.0);
-        return;
-    }
+    if (c_med >= ch0) { oColor = vec4(c0.rgb, 1.0); return; }
     vec3 comp = med + (dot(c0.rgb, LW) - dot(med, LW));
-    vec3 o = mix(c0.rgb, comp, gate);
-    oColor = vec4(clamp(o, vec3(0.0), vec3(16.0)), 1.0);
+    oColor = vec4(clamp(mix(c0.rgb, comp, gate), vec3(0.0), vec3(16.0)), 1.0);
 })";
 
 // ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
@@ -5766,8 +5772,8 @@ bool FrameRenderer::init() {
   u_cs_.size = glGetUniformLocation(prog_cs_, "uSize");
   u_cs_.grad_lo = glGetUniformLocation(prog_cs_, "uGradLo");
   u_cs_.grad_hi = glGetUniformLocation(prog_cs_, "uGradHi");
-  u_cs_.probe = glGetUniformLocation(prog_cs_, "uProbeDist");
   u_cs_.side_k = glGetUniformLocation(prog_cs_, "uSideK");
+  u_cs_.chroma_min = glGetUniformLocation(prog_cs_, "uChromaMin");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
   u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
@@ -7310,15 +7316,12 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
     // 覆盖紫边与蓝绿伪彩，同时靠"两侧一致性判据"避免 199 那种"边缘变淡"。
     glUniform1f(u_cs_.grad_lo, 6.0f);
     glUniform1f(u_cs_.grad_hi, 16.0f);
-    // 两侧探测参数（v0.10.203 扫描定案，四张真机 D4 均值）：
-    //   sideK=0.35 probe=3.0 → 色度总量 −15.0%、真伪彩消除 98.9%、真实边缘误伤 **0.00%**
-    //   sideK=0.35 probe=4.0 → 色度总量 −5.5%、 消除仅 2.8%、  误伤 **13.0%**
-    //   sideK=0.35 probe=5.0 → 色度总量 −14.4%、消除 63.9%、  误伤 **20.1%**
-    //   ⇒ **probe 必须 = 3**：探测点再远就会落进真实色度区，既漏检伪彩（判据以为
-    //     "两侧有色"）又误伤真实边缘（细色带两侧恰好中性）。sideK 在 0.25~0.5
-    //     区间对结果几乎无影响（消除率 98.6/98.9/99.9%），取 0.35 居中。
-    glUniform1f(u_cs_.probe, 3.0f);
-    glUniform1f(u_cs_.side_k, 0.35f);
+    // v0.10.204 多尺度两侧一致性（见 shader 头注释的实测依据）：
+    //   尺度 [3,6,12,18] 覆盖 PC3D 摊开后的 12~90px 宽色带；
+    //   sideK 0.7（0.35 时带内仅 1/11 命中，0.7 时 6/11；全图蓝边覆盖 16.8%→43.1%）；
+    //   uChromaMin=0.12 相对亮度下限（等价显示域 色度/亮度 ≈ 12%，低于此视为中性不动）。
+    glUniform1f(u_cs_.side_k, 0.7f);
+    glUniform1f(u_cs_.chroma_min, 0.12f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     in = last ? tex_cs_ : tex_cs_tmp_;
   }
