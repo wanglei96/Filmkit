@@ -1013,7 +1013,7 @@ class FrameRenderer {
   } u_df_apply_;
   // 色差域中值滤波（v0.10.196）
   struct {
-    GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1, probe = -1, side_k = -1;
+    GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1;
   } u_cs_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {
