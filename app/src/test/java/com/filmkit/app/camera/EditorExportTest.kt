@@ -25,17 +25,24 @@ class EditorExportTest {
 
     @Test
     fun snapshotSlotsWinAndMissingSlotsKeepBaseline() {
-        // 契约升级（60 → 78 这类）前落盘的老快照：只有前 60 槽。缺的槽位必须补
-        // **基线值**，不能补 0 —— [5..10] latitude 语义下 0 = 极端 S 曲线（不是"无效果"），
-        // [26] 颗粒 0 是 ADR-10 的回归红线。
-        val old = DoubleArray(60) { 1.0 }
+        // 契约升级（60 → 78 这类）前落盘的老快照：只有前 60 槽。
+        // 语义 = 快照里**存在**的槽位一律优先，**缺的**槽位补基线值 ——
+        // 不能补 0：[5..10] 在 latitude 语义下 0 = 极端 S 曲线（不是"无效果"）。
+        val old = DoubleArray(60)
+        old[1] = 1.0
+        old[2] = 1.0
+        old[3] = 1.0
+        old[27] = 1.0 // 老语义的 grain_size（此时 [26]=0，颗粒关，值本身不生效）
         old[34] = 0.5 // 当初的 LUT 强度
         val p = editorParams(old)
         assertEquals(CameraPresets.COUNT, p.size)
         assertEquals("快照里的强度必须保留", 0.5, p[34], 0.0)
-        assertEquals("颗粒必须仍是关", CameraPresets.standard()[26], p[26], 0.0)
-        assertEquals("颗粒尺寸取基线", CameraPresets.standard()[27], p[27], 0.0)
-        assertEquals("latitude 取基线 0.01 而不是 0", CameraPresets.standard()[5], p[5], 0.0)
+        assertEquals("快照里的颗粒开关保留（0 = 关，ADR-10 红线）", 0.0, p[26], 0.0)
+        // [60..77] 是新槽位（老快照里不存在）⇒ 必须是基线值
+        val base = CameraPresets.standard()
+        for (i in 60 until CameraPresets.COUNT) {
+            assertEquals("slot[$i] 缺省必须取基线", base[i], p[i], 0.0)
+        }
     }
 
     @Test
