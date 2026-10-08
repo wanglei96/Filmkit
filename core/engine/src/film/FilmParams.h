@@ -11,7 +11,7 @@ struct FilmParams {
   // 此常量当前无引用者，但正因它停在 36，记忆库 facts 曾按它记成 "kCount = 36"，
   // 与 Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(42)` 保持一致（v0.10.15 起）；
   // 数组越界会直接崩，改这里必须同步改那边。
-  static constexpr int kCount = 59;  // v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
+  static constexpr int kCount = 60;  // v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -305,6 +305,10 @@ struct FilmParams {
   //     路径，默认）；1 = A/B 通路，改默认前必须真机数据说话。
   // prefs("hl_rb_recon")。
   float hl_rb_recon = 0.0f;    // 57
+  // [59] color_smooth（v0.10.196）：色差域 3×3 中值滤波（darktable color_smoothing
+  // 逐行移植）。>0.5 = 启用。这是"任意色相窄带伪彩"的通解 —— defringe 只治紫/品红
+  // （色相门），本 pass 不判色相，靠中值的保边性替换 1~3px 色差异常。
+  float color_smooth = 0.0f;   // 59
 
   // 58：RCD P3 拆双 pass（v0.10.180）。1 = 色度段拆成 3a（R/B 位对角填充
   //     = 原版 STEP 4.2，输出中间纹理 tex_rcd_a_）→ 3b（G 位轴向填充，交叉轴
@@ -393,6 +397,7 @@ struct FilmParams {
     if (n > 56) rcd_g_orig = static_cast<float>(v[56]);
     // v0.10.179：clip 过渡带 R/B 满阱比例反推（[57]）
     if (n > 57) hl_rb_recon = static_cast<float>(v[57]);
+    if (n > 59) color_smooth = static_cast<float>(v[59]);
     // v0.10.180：RCD P3 拆双 pass（[58]）
     if (n > 58) rcd_p3_split = static_cast<float>(v[58]);
   }

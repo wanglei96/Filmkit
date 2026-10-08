@@ -1106,6 +1106,9 @@ class CameraController(private val context: Context, private val render: RenderC
     // 普通 G 反推都够不着）按三级参考比反推替换（替换语义，与 allSat 分支哲学
     // 同源）；治亮暗交界 CCM 后的品红窄带。0 = 旧行为逐位不变（默认）。
     private val HL_RB_RECON = 1.0
+    // v0.10.196：色差域 3×3 中值滤波（darktable color_smoothing 移植）的启用值，
+    // 写 FilmParams[59]。1 = 开（默认），0 = 关（旧行为逐位不变）。
+    private val COLOR_SMOOTH = 1.0
     // v0.10.180：RCD P3 拆双 pass（FilmParams[58]）。1 = 色度段拆 3a（对角填充）
     // → 3b（G 位轴向填充，交叉轴 ±1 读 3a 已填充色），恢复原版 STEP 4.3 四正邻
     // 双轴估计 —— 单 pass 版并行读不到对角段结果 ⇒ B 缓 G 陡错位放大 2×
@@ -1135,6 +1138,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private var caCorrPref = -1.0
     private var hlGreconPref = -1.0
     private var hlRbReconPref = -1.0
+    private var colorSmoothPref = -1.0
     private var rcdP3SplitPref = -1.0
     private var hrRawPref = -1.0
     private var hrPref = -1.0
@@ -1231,6 +1235,7 @@ class CameraController(private val context: Context, private val render: RenderC
         applyRcdCdFixPref()
         applyRcdGOrigPref()
         applyHlRbReconPref()
+        applyColorSmoothPref()
         applyRcdP3SplitPref()
         applyDefringePref()
         applyHlGReconPref()
@@ -1410,6 +1415,23 @@ class CameraController(private val context: Context, private val render: RenderC
      * 原值不含场景信息）；关 = 旧行为逐位不变（默认）。
      * 改默认前必须真机数据说话。prefs("hl_rb_recon")。
      */
+    /**
+     * 色差域中值滤波开关（v0.10.196）：写 FilmParams[59]。
+     * 移植 darktable `demosaic` 模块的 color_smoothing（src/iop/demosaicing/basics.c）：
+     * 在 (R−G)/(B−G) 色差域做 3×3 中值，G 不变。它是**唯一不依赖色相判据**的边缘
+     * 伪彩解法 —— defringe 只治紫/品红（色相门 + 去饱和），蓝/青/绿向的窄带伪彩
+     * 一直漏网（2026-10-08 真机实测：边缘蓝向强色度 23729 个像素，195 一个没动）。
+     * 中值对阶跃保边，所以真实色度边界不受影响；代价是 1px 尺度的色度细节会被
+     * 抹掉（darktable 因此默认关）。我们默认开（1 次），prefs("color_smooth")。
+     */
+    private fun applyColorSmoothPref() {
+        val v = if (appPrefs.getBoolean("color_smooth", true)) COLOR_SMOOTH else 0.0
+        if (v != colorSmoothPref) {
+            colorSmoothPref = v
+            filmParams[59] = v
+        }
+    }
+
     private fun applyHlRbReconPref() {
         val v = if (appPrefs.getBoolean("hl_rb_recon", false)) HL_RB_RECON else 0.0
         if (v != hlRbReconPref) {

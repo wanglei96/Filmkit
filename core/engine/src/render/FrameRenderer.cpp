@@ -1412,6 +1412,84 @@ void main() {
     oColor = vec4(clamp(out_lin, vec3(0.0), vec3(16.0)), 1.0);
 })";
 
+// ── 色差域中值滤波（v0.10.196）：darktable color_smoothing 逐行移植 ──────────
+// 出处：darktable `src/iop/demosaicing/basics.c` :: color_smoothing()
+// 语义：在 (R−G) 与 (B−G) **色差域**做 3×3 中值滤波，G 逐位不变，R/B = 中值 + G。
+// 为什么它是"所有色向伪彩"的通解（而 defringe 只能治紫）：
+//   中值滤波**不依赖任何色相判据** —— 紫/蓝/青/绿伪彩只要在色差域表现为
+//   "1~3px 的窄带异常"，3×3 中值就会用邻域的主导色差替换它；而中值对阶跃
+//   是**保边**的（不像均值/高斯那样把边缘糊开），所以真实的色度边界不受影响。
+//   darktable 把它作为 demosaic 模块的可选后处理（0~5 次迭代），默认关
+//   （代价是 1px 尺度的真实色度细节会被抹掉）；我们默认 1 次。
+// 与 defringe 的分工：defringe 治"已知色相（紫/品红）的窄带"（色相门 + 去饱和），
+//   本 pass 治"任意色相的窄带"（含蓝/青/绿向）。串联 = 色相定向 + 无偏中值。
+const char* kFsColorSmooth = R"(#version 300 es
+precision highp float;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform ivec2 uSize;
+uniform float uGradLo;   // 梯度门下沿（gL 单位，见 apply 注释）
+uniform float uGradHi;   // 梯度门上沿（门在这两点之间平滑开启）
+const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+// 9 元素中值：选择排序取中位（36 次比较；darktable 用 19 次比较的最优网络，
+// 此处选可读写法 —— GPU 上这点差异被 9 次 texelFetch 完全掩盖）。
+float med9(float m[9]) {
+    for (int i = 0; i < 5; ++i) {
+        for (int j = i + 1; j < 9; ++j) {
+            if (m[j] < m[i]) { float t = m[i]; m[i] = m[j]; m[j] = t; }
+        }
+    }
+    return m[4];
+}
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    vec4 c0 = texelFetch(uTex, p, 0);
+    // ── 梯度门（v0.10.196 修正）：伪彩只出现在亮度边缘 ─────────────────────
+    // 无门版实测（090738/090727 真机 D4）：改写 **75.6% / 61.7%** 的像素、
+    // 亮度 max 变化 **51/255** —— 中值会在**每个**像素上微调色差，全图性改动
+    // 违反"其余颜色不伤"。加梯度门后平坦区 gate=0 ⇒ 逐位直通（early return）。
+    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uSize - 1), 0).rgb, LW);
+    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uSize - 1), 0).rgb, LW);
+    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uSize - 1), 0).rgb, LW);
+    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uSize - 1), 0).rgb, LW);
+    float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
+    float gate = smoothstep(uGradLo, uGradHi, gL);
+    if (gate <= 0.0) {
+        oColor = vec4(c0.rgb, 1.0);
+        return;
+    }
+    // ── 色差域 3×3 中值（darktable color_smoothing 主体）─────────────────
+    float dr[9];
+    float db[9];
+    int k = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1);
+            vec4 c = texelFetch(uTex, q, 0);
+            dr[k] = c.r - c.g;
+            db[k] = c.b - c.g;
+            ++k;
+        }
+    }
+    vec3 med = vec3(max(0.0, med9(dr) + c0.g), c0.g, max(0.0, med9(db) + c0.g));
+    // ── 只降不升保护（v0.10.196）─────────────────────────────────────────
+    // 中值只保证"取邻域中位"，**不保证减小色度** —— 邻域色差分布偏斜时中值可能
+    // 比原值更极端。离线实测：无此保护时边缘 |B−G|>15 的像素数反而从 98071
+    // 涨到 125222（把伪彩推给邻居）。这里以 |R−G|+|B−G| 为色度幅值，中值结果
+    // 更大就整体放弃替换 ⇒ 本 pass **在任何像素上都不会增加色度**。
+    float c_orig = abs(c0.r - c0.g) + abs(c0.b - c0.g);
+    float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
+    if (c_med >= c_orig) {
+        oColor = vec4(c0.rgb, 1.0);
+        return;
+    }
+    // 保亮度：三通道等量加法补偿（色差 R−G/B−G 在加同一标量后**完全不变**，
+    // 故中值结果被精确保留，同时线性域 ΔL ≡ 0）。
+    vec3 comp = med + (dot(c0.rgb, LW) - dot(med, LW));
+    vec3 o = mix(c0.rgb, comp, gate);
+    oColor = vec4(clamp(o, vec3(0.0), vec3(16.0)), 1.0);
+})";
+
 // ── D 专项（v0.10.53）：色度多尺度降噪（半分辨率 à trous 小波）────────────
 // 对标 PhotonCamera FullResolutionDenoise（多尺度金字塔 + luma/chroma 独立 +
 // detail revert factor）与 darktable wavelet denoise：undecimated à trous 分解
@@ -5096,6 +5174,7 @@ bool FrameRenderer::init() {
   const GLuint fs_df_det = compileShader(GL_FRAGMENT_SHADER, kFsDefringeDetect);
   const GLuint fs_df_avg = compileShader(GL_FRAGMENT_SHADER, kFsDefringeAvg);
   const GLuint fs_df_apply = compileShader(GL_FRAGMENT_SHADER, kFsDefringeApply);
+  const GLuint fs_cs = compileShader(GL_FRAGMENT_SHADER, kFsColorSmooth);
   // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 径向位移校正
   const GLuint fs_ca_ds = compileShader(GL_FRAGMENT_SHADER, kFsCaDown);
   const GLuint fs_ca_corr = compileShader(GL_FRAGMENT_SHADER, kFsCaCorr);
@@ -5179,6 +5258,7 @@ bool FrameRenderer::init() {
   prog_df_det_ = linkProgram(vs_plain_, fs_df_det);
   prog_df_avg_ = linkProgram(vs_plain_, fs_df_avg);
   prog_df_apply_ = linkProgram(vs_plain_, fs_df_apply);
+  prog_cs_ = linkProgram(vs_plain_, fs_cs);
   // 横向色差校正（v0.10.170）
   prog_ca_ds_ = linkProgram(vs_plain_, fs_ca_ds);
   prog_ca_corr_ = linkProgram(vs_plain_, fs_ca_corr);
@@ -5677,6 +5757,11 @@ bool FrameRenderer::init() {
   u_df_apply_.std_max = glGetUniformLocation(prog_df_apply_, "uStdMax");
   u_df_apply_.std_k = glGetUniformLocation(prog_df_apply_, "uStdK");
   u_df_apply_.grad_min = glGetUniformLocation(prog_df_apply_, "uGradMin");
+  // 色差域中值滤波（v0.10.196）
+  u_cs_.tex = glGetUniformLocation(prog_cs_, "uTex");
+  u_cs_.size = glGetUniformLocation(prog_cs_, "uSize");
+  u_cs_.grad_lo = glGetUniformLocation(prog_cs_, "uGradLo");
+  u_cs_.grad_hi = glGetUniformLocation(prog_cs_, "uGradHi");
   // 横向色差校正（v0.10.170）
   u_ca_ds_.tex = glGetUniformLocation(prog_ca_ds_, "uTex");
   u_ca_ds_.size = glGetUniformLocation(prog_ca_ds_, "uSize");
@@ -5854,6 +5939,11 @@ void FrameRenderer::release() {
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
   if (tex_rcd_a_) glDeleteTextures(1, &tex_rcd_a_);  // P3 拆双 pass 中间场
+  if (tex_cs_) {
+    glDeleteTextures(1, &tex_cs_);
+    glDeleteFramebuffers(1, &fbo_cs_);
+    tex_cs_ = fbo_cs_ = 0;
+  }
   if (tex_dn_) glDeleteTextures(1, &tex_dn_);
   if (tex_mo_stat_) glDeleteTextures(1, &tex_mo_stat_);   // 档 A 统计网格
   if (fbo_mo_stat_) glDeleteFramebuffers(1, &fbo_mo_stat_);
@@ -7152,6 +7242,53 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
 // ── 紫边抑制（v0.10.134）────────────────────────────────────────────────
 // 缓冲：tex_df_（全分辨率输出）、tex_df_lab_/tex_df_det_（半分辨率）、
 // tex_df_avg_（1/16 网格 chroma 均值，CPU 读回 chromave）。尺寸缓存键 = w/h。
+// 色差域中值滤波的资源（v0.10.196）：单个全分辨率 RGBA16F。
+bool FrameRenderer::ensureColorSmooth(int w, int h) {
+  if (cs_w_ == w && cs_h_ == h && tex_cs_ != 0) return true;
+  if (tex_cs_) {
+    glDeleteTextures(1, &tex_cs_);
+    glDeleteFramebuffers(1, &fbo_cs_);
+    tex_cs_ = fbo_cs_ = 0;
+  }
+  // @domain: D4 —— 与 tex_dn_/tex_pc3d_ 同域同几何
+  makeTex(&tex_cs_, &fbo_cs_, GL_RGBA16F, w, h);
+  if (tex_cs_ == 0) {
+    cs_w_ = cs_h_ = 0;
+    return false;
+  }
+  cs_w_ = w;
+  cs_h_ = h;
+  return true;
+}
+
+// 色差域 3×3 中值（v0.10.196，darktable color_smoothing 移植）。
+// src = 任意 D4 域纹理（替换档传 tex_pc3d_，普通档传 tex_dn_）；
+// 成功时结果在 tex_cs_，调用方改读它。失败返回 false（调用方回落 src，照片优先）。
+bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
+  if (!prog_cs_ || src == 0) return false;
+  if (!ensureColorSmooth(dst_w, dst_h)) return false;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_cs_);
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_cs_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src);
+  glUniform1i(u_cs_.tex, 0);
+  glUniform2i(u_cs_.size, dst_w, dst_h);
+  // 梯度门：gL = |∇L|·255（线性域）。伪彩只在强边缘 ⇒ 门设在 3~10
+  // （低于 3 视为平坦区不动；10 以上全量中值）。
+  // 离线定标（090738/090727/084716 三张真机 D4）：gL∈[6,16] 与 [3,10] 的
+  // 伪彩压制量**逐项相同**（紫向 P50 45→10.6 / 蓝向 19.5→10.6），但改写像素
+  // 从 7.3% 降到 4.1% ⇒ 取更紧的门（同样效果、更少改动）。
+  glUniform1f(u_cs_.grad_lo, 6.0f);
+  glUniform1f(u_cs_.grad_hi, 16.0f);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glActiveTexture(GL_TEXTURE0);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  return true;
+}
+
 bool FrameRenderer::ensureDefringe(int w, int h) {
   const int hw = (w + 1) / 2, hh = (h + 1) / 2;
   const int aw = (hw + 15) / 16, ah = (hh + 15) / 16;
@@ -8541,7 +8678,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // ⇒ 真机留下淡紫线（2026-10-07 样片：PC 无、我们 B-G 峰 +104）。
       // 输入 = tex_pc3d_（PC3D 输出，D4 场景线性，与 tex_dn_ 同域同几何）。
       // P4/D-1 仍然旁路（保持替换档的观感基调，只补回窄带紫边抑制）。
-      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, tex_pc3d_) : false;
+      // v0.10.196：色差域中值（darktable color_smoothing）—— 在 defringe 之前。
+      // 顺序理由：中值是"无偏"的（不判色相，治任意色向的 1~3px 色差异常），
+      // 先用它把窄带伪彩压掉，defringe 再处理剩下的紫/品红定向部分。
+      GLuint df_src = tex_pc3d_;
+      if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
+        df_src = tex_cs_;
+      }
+      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
     } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
                         p.chroma_gate, p.cg_scope, p4_src);
@@ -8549,7 +8693,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // （P4/D-1 保边判据恰好保护它），Lab 域 defringe（RT 同形态）对症。
       // 失败/关闭回落 tex_dn_（照片优先红线）。成片链 only —— 预览链成本
       // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
-      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate) : false;
+      // v0.10.196：色差域中值（同替换档，输入为 P4 输出 tex_dn_）
+      GLuint df_src = tex_dn_;
+      if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
+        df_src = tex_cs_;
+      }
+      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
       // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
       mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
                                     df_ok ? tex_df_ : tex_dn_, p.chroma_gate);

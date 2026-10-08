@@ -242,6 +242,8 @@ class FrameRenderer {
   bool ensureDnTarget(int w, int h);
   bool ensureChromaMst(int w, int h);
   bool ensureDefringe(int w, int h);
+  // 色差域中值滤波（v0.10.196）：对标 darktable color_smoothing
+  bool ensureColorSmooth(int w, int h);
   // MFNR 阶段一（v0.9.0）：raw 尺寸的 burst 纹理 / 金字塔 / 融合目标
   bool ensureMfnrTargets(int w, int h);
   // u16 Bayer 上传（submitRaw / submitRawBurst 共用）：rowStride 跳行 + 失败日志
@@ -444,6 +446,9 @@ class FrameRenderer {
   // ⇒ 强亮度边缘附近的色度偏离更容易进入校正区。
   // src: 输入纹理（默认 tex_dn_ = P4 输出；替换档 [54]=1 时传 tex_pc3d_）
   bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f, GLuint src = 0);
+  // 色差域 3×3 中值（darktable color_smoothing）：输入任意 D4 域纹理，
+  // 输出 tex_cs_。失败返回 false（调用方回落 src）。
+  bool passColorSmooth(int dst_w, int dst_h, GLuint src);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
   // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
   // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，
@@ -570,6 +575,7 @@ class FrameRenderer {
          // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
          prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
          prog_df_apply_ = 0,
+         prog_cs_ = 0,
          // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 全分辨率径向位移校正
          prog_ca_ds_ = 0, prog_ca_corr_ = 0,
          // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构入口/收口
@@ -650,6 +656,9 @@ class FrameRenderer {
   GLuint fbo_df_det_ = 0, tex_df_det_ = 0;  // 半分辨率 (a,b,chroma,gate)
   GLuint fbo_df_avg_ = 0, tex_df_avg_ = 0;  // 1/16 网格 chroma 均值
   int df_w_ = 0, df_h_ = 0;                 // 全分辨率尺寸（缓存键）
+  // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
+  GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F
+  int cs_w_ = 0, cs_h_ = 0;                 // 全分辨率尺寸（缓存键）
   float dbg_df_cavg_ = 0.f;                 // 最近一次 chromave（日志）
   // 横向色差校正（v0.10.170）：tex_ca_ = 校正输出（只在 caApplied=1 时替换
   // tex_work_ 进 passCcm）；tex_ca_ds_ = 1/8 box 降采样（CPU readback 做估计）。
@@ -998,6 +1007,10 @@ class FrameRenderer {
           chroma_avg = -1, thresh_k = -1, thresh_min = -1, thresh_max = -1,
           std_k = -1, std_max = -1, grad_min = -1;
   } u_df_apply_;
+  // 色差域中值滤波（v0.10.196）
+  struct {
+    GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1;
+  } u_cs_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {
     GLint tex = -1, size = -1;
