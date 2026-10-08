@@ -1129,13 +1129,18 @@ class FrameRenderer {
   struct {
     GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
           flip_y = -1, zebra = -1, sharpen = -1, lut = -1, lut_on = -1,
-          lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1;
+          lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1,
+          // E4-2 暗角（vignette）：与 u_style_ 同名同义 —— 两条链路共用一段
+          // 逐字相同的 shader 逻辑（ADR-9）
+          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1;
   } u_out_;
   // kFsStyle（E1-3 编辑器通路）
   struct {
     GLint tex = -1, seed = -1, grain_amount = -1, grain_size = -1, lut = -1,
           lut_on = -1, lut_strength = -1, lut_dmin = -1, lut_dinv = -1,
-          lut_size = -1;
+          lut_size = -1,
+          // E4-2 暗角（vignette）：见 u_out_
+          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

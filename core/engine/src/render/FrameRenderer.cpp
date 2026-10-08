@@ -4413,6 +4413,13 @@ uniform float uLutStrength;  // 0..1 混合强度
 uniform vec3 uLutDomainMin;  // .cube DOMAIN_MIN
 uniform vec3 uLutDomainInv;  // 1/(DOMAIN_MAX - DOMAIN_MIN)
 uniform float uLutSize;      // 3D 边长 N
+// ── E4-2 暗角（vignette；darktable vignette.c 正圆模型，sRGB 显示域乘法）────
+// 域常数在 CPU 侧算好（shader 内不做 W/H 除法）：pv 尺度 = (W,H)/max(W,H)。
+// [66] ≥ 0（默认 0）⇒ uVigBrightness = 0 ⇒ 整段跳过（A/B 开关 = [66]，零成本）。
+uniform vec2 uVigScaleXY;
+uniform float uVigDscale;
+uniform float uVigFscale;
+uniform float uVigBrightness;
 vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
               vec3 c101, vec3 c011, vec3 c111) {
     if (f.x >= f.y) {
@@ -4543,6 +4550,19 @@ void main() {
     c = highlightRolloff(c);
     if (uSharpen > 0.0) sharpenLuma(c, uv);
     c = srgbEncode(c);
+    // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
+    // 域 = sRGB 显示域、乘法（ADR-7/ADR-9）：落在 LUT 之前 —— 与 darktable 的
+    // 声明域（non-linear, RGB, display-referred）一致，且放 LUT 前可避免不同
+    // LUT 把同一暗角渐变的形状改掉。
+    // uv 用 vUV0（未 flip 的采样坐标）：暗角径向对称 ⇒ 与 flip 后**逐位等价**，
+    // 同时让拍照/编辑器两条链路的这段代码**逐字相同**（E4-2 验收项）。
+    if (uVigBrightness < 0.0) {
+        vec2 pv = uVigScaleXY * abs(2.0 * vUV0 - 1.0);
+        float cplen = length(pv);                  // shape=1：exp1=2, exp2=1/2
+        float vw = clamp((cplen - uVigDscale) / uVigFscale, 0.0, 1.0);
+        vw = 0.5 - 0.5 * cos(3.14159265 * vw);     // 余弦平滑（darktable 同式）
+        c *= (1.0 + vw * uVigBrightness);
+    }
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     if (uGrainAmount > 0.0) {
@@ -4607,6 +4627,13 @@ uniform float uLutStrength;
 uniform vec3 uLutDomainMin;
 uniform vec3 uLutDomainInv;
 uniform float uLutSize;
+// ── E4-2 暗角（vignette；darktable vignette.c 正圆模型，sRGB 显示域乘法）────
+// 域常数在 CPU 侧算好（shader 内不做 W/H 除法）：pv 尺度 = (W,H)/max(W,H)。
+// [66] ≥ 0（默认 0）⇒ uVigBrightness = 0 ⇒ 整段跳过（A/B 开关 = [66]，零成本）。
+uniform vec2 uVigScaleXY;
+uniform float uVigDscale;
+uniform float uVigFscale;
+uniform float uVigBrightness;
 vec3 lutTetra(vec3 f, vec3 c000, vec3 c100, vec3 c010, vec3 c001, vec3 c110,
               vec3 c101, vec3 c011, vec3 c111) {
     if (f.x >= f.y) {
@@ -4651,6 +4678,19 @@ float vnoise(vec2 p) {
 void main() {
     // 显示域直取：不 decode、不 encode（ADR-7）
     vec3 c = texture(uTex, vUV0).rgb;
+    // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
+    // 域 = sRGB 显示域、乘法（ADR-7/ADR-9）：落在 LUT 之前 —— 与 darktable 的
+    // 声明域（non-linear, RGB, display-referred）一致，且放 LUT 前可避免不同
+    // LUT 把同一暗角渐变的形状改掉。
+    // uv 用 vUV0（未 flip 的采样坐标）：暗角径向对称 ⇒ 与 flip 后**逐位等价**，
+    // 同时让拍照/编辑器两条链路的这段代码**逐字相同**（E4-2 验收项）。
+    if (uVigBrightness < 0.0) {
+        vec2 pv = uVigScaleXY * abs(2.0 * vUV0 - 1.0);
+        float cplen = length(pv);                  // shape=1：exp1=2, exp2=1/2
+        float vw = clamp((cplen - uVigDscale) / uVigFscale, 0.0, 1.0);
+        vw = 0.5 - 0.5 * cos(3.14159265 * vw);     // 余弦平滑（darktable 同式）
+        c *= (1.0 + vw * uVigBrightness);
+    }
     // M4：display 域 3D LUT（与 kFsOut 4547 同式；强度 0 ⇒ uLutOn=0 ⇒ 逐像素恒等）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     if (uGrainAmount > 0.0) {
@@ -6016,6 +6056,11 @@ bool FrameRenderer::init() {
   u_out_.lut_dmin = glGetUniformLocation(prog_out_, "uLutDomainMin");
   u_out_.lut_dinv = glGetUniformLocation(prog_out_, "uLutDomainInv");
   u_out_.lut_size = glGetUniformLocation(prog_out_, "uLutSize");
+  // E4-2 暗角（vignette）
+  u_out_.vig_scale = glGetUniformLocation(prog_out_, "uVigScaleXY");
+  u_out_.vig_dscale = glGetUniformLocation(prog_out_, "uVigDscale");
+  u_out_.vig_fscale = glGetUniformLocation(prog_out_, "uVigFscale");
+  u_out_.vig_brightness = glGetUniformLocation(prog_out_, "uVigBrightness");
 
   // E1-3 编辑器通路（kFsStyle）
   u_style_.tex = glGetUniformLocation(prog_style_, "uTex");
@@ -6028,6 +6073,11 @@ bool FrameRenderer::init() {
   u_style_.lut_dmin = glGetUniformLocation(prog_style_, "uLutDomainMin");
   u_style_.lut_dinv = glGetUniformLocation(prog_style_, "uLutDomainInv");
   u_style_.lut_size = glGetUniformLocation(prog_style_, "uLutSize");
+  // E4-2 暗角（vignette）
+  u_style_.vig_scale = glGetUniformLocation(prog_style_, "uVigScaleXY");
+  u_style_.vig_dscale = glGetUniformLocation(prog_style_, "uVigDscale");
+  u_style_.vig_fscale = glGetUniformLocation(prog_style_, "uVigFscale");
+  u_style_.vig_brightness = glGetUniformLocation(prog_style_, "uVigBrightness");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -11738,6 +11788,19 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   glUniform1f(u_style_.seed, 0.0f);
   glUniform1f(u_style_.grain_amount, p.grain_amount);
   glUniform1f(u_style_.grain_size, p.grain_size);
+  // E4-2 暗角（vignette）：域常数在 CPU 侧算好（shader 内不做 W/H 除法）。
+  // pv 尺度 = (W,H)/max(W,H)；fscale 的 100/min(W,H) 下限 = darktable 同款抗锯齿
+  // 保护（feather=0 ⇒ 不产生硬边）。[66] ≥ 0 ⇒ uVigBrightness = 0 ⇒ shader 整段跳过。
+  const float vig_max = static_cast<float>(std::max(w, h));
+  const float vig_min = static_cast<float>(std::min(w, h));
+  glUniform2f(u_style_.vig_scale, static_cast<float>(w) / vig_max,
+              static_cast<float>(h) / vig_max);
+  glUniform1f(u_style_.vig_dscale,
+              std::clamp(p.vignette_radius, 0.0f, 200.0f) / 100.0f);
+  glUniform1f(u_style_.vig_fscale,
+              std::max(p.vignette_feather, 100.0f / vig_min) / 100.0f);
+  glUniform1f(u_style_.vig_brightness,
+              std::clamp(p.vignette_strength, -1.0f, 0.0f));
   // 与 passOutput 同款：先落 pending LUT，再 bindLut 下发（关闭态也绑定纹理 + 下发
   // 全部 uniform —— 提前 return 会让 sampler3D 指向未绑定单元，Mali 预测执行采样
   // ⇒ draw 报 1282、整帧全黑，见 bindLut 注释）
@@ -11766,6 +11829,19 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);
   // v0.9.6 轻度锐化（luma USM，滚降后 OETF 前；0 = 关 = A/B 通路）
   glUniform1f(u_out_.sharpen, p.sharpen);
+  // E4-2 暗角（vignette）：域常数在 CPU 侧算好（shader 内不做 W/H 除法）。
+  // pv 尺度 = (W,H)/max(W,H)；fscale 的 100/min(W,H) 下限 = darktable 同款抗锯齿
+  // 保护（feather=0 ⇒ 不产生硬边）。[66] ≥ 0 ⇒ uVigBrightness = 0 ⇒ shader 整段跳过。
+  const float vig_max = static_cast<float>(std::max(w, h));
+  const float vig_min = static_cast<float>(std::min(w, h));
+  glUniform2f(u_out_.vig_scale, static_cast<float>(w) / vig_max,
+              static_cast<float>(h) / vig_max);
+  glUniform1f(u_out_.vig_dscale,
+              std::clamp(p.vignette_radius, 0.0f, 200.0f) / 100.0f);
+  glUniform1f(u_out_.vig_fscale,
+              std::max(p.vignette_feather, 100.0f / vig_min) / 100.0f);
+  glUniform1f(u_out_.vig_brightness,
+              std::clamp(p.vignette_strength, -1.0f, 0.0f));
   // M4：display 域 LUT（同一 pass 内，不额外增加 pass；斑马纹判定排在 LUT 之后，
   // 与用户实际看到的画面一致）
   applyPendingLut();

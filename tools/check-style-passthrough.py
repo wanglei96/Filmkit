@@ -17,6 +17,17 @@
      为什么单列：kFsOut 有 uFlipY（抵消 kFsStill 自己的预翻转），照抄过来会让编辑器
      输出上下颠倒 —— 这一项就是那个错误的哨兵。
 
+  ⑥ E4-2 暗角默认关（[66]=0）：uVigBrightness=0 ⇒ shader 整段跳过 ⇒ 输出与输入逐位
+      一致。**含 [67]/[68] 取极端值的组合**（证明门控只由 [66] 决定，与半径/羽化无关）。
+  ⑦ E4-2 暗角开启：中心区域（cplen < dscale）**逐位不变**、角落显著变暗（给出 LSB
+      变化量）、沿半径**单调不减**（衰减从中心到角落不回头）。
+  ⑧ E4-2 边界：feather=0（fscale 取下限 100/min(W,H)，不得 NaN/不得硬边振铃）、
+      strength=-1（乘法系数 ≥ 0 ⇒ 不出现负值）。
+      ⚠ ⑥⑦⑧ 只覆盖 `kFsStyle`：`kFsOut` 无离线执行器 ⇒ 拍照链路的暗角靠"与
+      kFsStyle 逐字相同 + 真机"保证（两段一致性由本脚本 ⑨ 项做纯文本比对）。
+  ⑨ E4-2 一致性：kFsOut / kFsStyle 的暗角段（shader 逻辑 + uniform 声明 + CPU 侧
+      下发）逐字相同 ⇒ 上一条"逐字相同"不靠人工目视维持。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
@@ -72,33 +83,114 @@ def quant(out_f, shape):
     return np.clip(np.rint(out_f[..., :3].reshape(shape) * 255.0), 0, 255)
 
 
+def vig_uniforms(w, h, strength, radius, feather):
+    """E4-2 暗角：**与 FrameRenderer::passOutput/passStyle 同式**的 CPU 侧域常数。
+
+    这里刻意重算一遍而不是写死数字 —— ⑥⑦⑧ 同时把 CPU 侧的下发公式也纳入验收。
+    """
+    vmax, vmin = float(max(w, h)), float(min(w, h))
+    return {
+        'uVigScaleXY': (w / vmax, h / vmax),
+        'uVigDscale': min(max(radius, 0.0), 200.0) / 100.0,
+        'uVigFscale': max(feather, 100.0 / vmin) / 100.0,
+        'uVigBrightness': min(max(strength, -1.0), 0.0),
+    }
+
+
+def grey_input(w, h, v=180):
+    """纯灰输入：暗角是确定性径向增益，纯灰 ⇒ 剖面可逐点核对（dither 只 ±1 LSB）。"""
+    return np.full((h, w, 3), v, np.uint8)
+
+
+def cplen_map(w, h):
+    """每像素的 darktable 归一化半径（CPU 侧同式）—— 用于"中心区域"掩码。
+
+    uv = 像素中心。暗角径向对称 ⇒ 行序（GL 底行在前）对 cplen 无影响。
+    """
+    y, x = np.mgrid[0:h, 0:w]
+    u = (x + 0.5) / w
+    v = (y + 0.5) / h
+    vmax = float(max(w, h))
+    return np.hypot(w / vmax * np.abs(2.0 * u - 1.0),
+                    h / vmax * np.abs(2.0 * v - 1.0))
+
+
 def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
-              grain, seed=0.0):
+              grain, seed=0.0, vig=(0.0, 80.0, 50.0)):
     h, w = inp.shape[:2]
     # 归一化 RGB 纹理 ≈ 真机 still_tex_（GL_RGB8：上传 8bit，采样得 v/255）；
     # float16 存 v/255 的量化误差 ≤ 0.13 LSB，不影响 ±1 LSB 判定
     tex = gl.ctx.texture((w, h), 3, dtype='f2')
     tex.write((inp.astype(np.float32) / np.float32(255.0)).astype(np.float16).tobytes())
     tex.filter = (eso.moderngl.LINEAR, eso.moderngl.LINEAR)
-    out = gl.run(sh['kFsStyle'], {
+    uni = {
         'uSeed': seed, 'uGrainAmount': grain, 'uGrainSize': 1.0,
         'uLutOn': lut_on, 'uLutStrength': lut_strength,
         'uLutDomainMin': (0.0, 0.0, 0.0), 'uLutDomainInv': (1.0, 1.0, 1.0),
         'uLutSize': float(lut_size),
-    }, {'uTex': tex, 'uLut': lut_tex})
+    }
+    uni.update(vig_uniforms(w, h, *vig))
+    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex})
     tex.release()
     return out
 
 
 def check_pass_style_slots():
-    """passStyle 只允许读 [26] grain_amount / [27] grain_size / [34] lut_strength。"""
+    """passStyle 的槽位**白名单**（精确匹配，不是子集）：只允许读这几项。
+
+    ⚠ 这是"显式声明"式约束：**每新增一个编辑器链路支持的参数，必须同步加进 want**
+    （E4-2 暗角 = 加 [66][67][68]）；否则 passStyle 读到别处的槽位却没人发现 ——
+    ADR §5.1 的 I-2 要防的正是"数组里有值就莫名生效"。
+    """
     src = pathlib.Path(FR).read_text(encoding='utf-8')
     m = re.search(r'void FrameRenderer::passStyle\(.*?\n\}', src, re.S)
     if not m:
         return False, set(), 'passStyle 函数体未找到'
     refs = set(re.findall(r'\bp\.(\w+)', m.group(0)))
-    want = {'grain_amount', 'grain_size', 'lut_strength'}
+    want = {'grain_amount', 'grain_size', 'lut_strength',
+            'vignette_strength', 'vignette_radius', 'vignette_feather'}
     return refs == want, refs, ''
+
+
+def shader_src(src, name):
+    """从 FrameRenderer.cpp 抽出某个 shader 的 GLSL 源码。"""
+    m = re.search(r'const char\* ' + name + r' = R"\((.*?)\)";', src, re.S)
+    return m.group(1) if m else ''
+
+
+def slice_from(text, start, end):
+    i = text.index(start)
+    return text[i: text.index(end, i) + len(end)]
+
+
+def check_vignette_parity():
+    """E4-2 ⑨：两条链路的暗角实现必须**逐字相同**（shader 段 / uniform 声明 / CPU 下发）。
+
+    差异应为**零**：本实现两处都用 `vUV0`（径向对称 ⇒ 与 kFsOut 里 flip 后的 uv 等价），
+    所以连"uv 变量来源"这一点差异都不存在。
+    """
+    src = pathlib.Path(FR).read_text(encoding='utf-8')
+    sh_start = '// ── E4-2 暗角（vignette，darktable'
+    un_start = '// ── E4-2 暗角（vignette；darktable'
+    sh_end = 'c *= (1.0 + vw * uVigBrightness);\n    }'
+    un_end = 'uniform float uVigBrightness;'
+    pairs = [
+        ('shader 暗角段',
+         slice_from(shader_src(src, 'kFsOut'), sh_start, sh_end),
+         slice_from(shader_src(src, 'kFsStyle'), sh_start, sh_end)),
+        ('uniform 声明',
+         slice_from(shader_src(src, 'kFsOut'), un_start, un_end),
+         slice_from(shader_src(src, 'kFsStyle'), un_start, un_end)),
+    ]
+    # CPU 侧下发段：仅 u_out_ / u_style_ 前缀不同 ⇒ 归一后逐字比对
+    cpu = []
+    for fn in ('passOutput', 'passStyle'):
+        body = re.search(r'void FrameRenderer::' + fn + r'\(.*?\n\}', src, re.S).group(0)
+        seg = slice_from(body, '// E4-2 暗角（vignette）：域常数在 CPU 侧算好',
+                         'std::clamp(p.vignette_strength, -1.0f, 0.0f));')
+        cpu.append(seg.replace('u_out_', 'u_xxx_').replace('u_style_', 'u_xxx_'))
+    pairs.append(('CPU 下发段', cpu[0], cpu[1]))
+    return [name for name, a, b in pairs if a != b]
 
 
 def main():
@@ -178,6 +270,85 @@ def main():
           f'末行 = {q5[-1].mean():.0f}')
     if top_m < 250.0 or bot_m > 5.0:
         fails.append('⑤ 行序')
+
+    # ⑥ E4-2 暗角默认关：[66]=0 ⇒ uVigBrightness=0 ⇒ shader 整段跳过。
+    # 三种组合一起跑，证明门控**只由 [66] 决定**（与 [67]/[68] 无关，[66]>0 也被 clamp 到 0）。
+    worst6, bad6 = 0.0, 0
+    for vig in ((0.0, 80.0, 50.0), (0.0, 200.0, 0.0), (0.5, 120.0, 10.0)):
+        o6 = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                       grain=0.0, vig=vig)
+        d6 = np.abs(quant(o6, inp.shape) - inp.astype(np.float64))
+        worst6 = max(worst6, float(d6.max()))
+        bad6 += int((d6 > 1).sum())
+    print(f'⑥ 暗角默认关（[66]=0；另两种组合 [67]/[68] 极端 + [66]=+0.5）：'
+          f'max|Δ| = {worst6:.0f} LSB, >1LSB 像素 = {bad6}')
+    if bad6:
+        fails.append('⑥ 暗角默认关')
+
+    # ⑦ 暗角开启（纯灰 180 ⇒ 剖面可逐点核对）：中心逐位不变 / 角落显著变暗 / 沿半径单调
+    g180 = grey_input(n, n, 180)
+    o7 = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                   grain=0.0, vig=(-0.8, 80.0, 50.0))
+    q7 = quant(o7, g180.shape)[..., 0]
+    cl = cplen_map(n, n)
+    dscale, fscale = 0.8, 0.5                       # [67]=80 / [68]=50 的期望值
+    centre = cl <= dscale - 0.3                     # 留 0.3 余量：确定在 falloff 起点内
+    corner = np.zeros_like(q7, bool)
+    corner[:4, :4] = corner[:4, -4:] = corner[-4:, :4] = corner[-4:, -4:] = True
+    dc = float(np.abs(q7[centre] - 180.0).max())
+    c_cen, c_cor = float(q7[centre].mean()), float(q7[corner].mean())
+    prof = [float(q7[(cl >= a) & (cl < b)].mean())
+            for a, b in ((0.0, 0.4), (0.4, 0.8), (0.8, 1.0), (1.0, 1.2), (1.2, 1.45))
+            if ((cl >= a) & (cl < b)).any()]
+    dprof = np.diff(prof)
+    diag = q7.astype(np.float64)[np.arange(n // 2, n), np.arange(n // 2, n)]
+    ddiag = np.diff(diag)
+    print(f'⑦ 暗角开启（[66]=-0.8 [67]=80 [68]=50，输入 180 灰）：'
+          f'中心区（cplen≤{dscale - 0.3:.1f}，{int(centre.sum())}px）max|Δ| = {dc:.0f} LSB, '
+          f'中心均值 = {c_cen:.1f}, 角落均值 = {c_cor:.1f}（Δ = {180 - c_cor:.1f} LSB，'
+          f'理论 180×(1-0.8) = 36.0）')
+    print(f'   沿半径分桶均值（cplen 0→0.4/0.4→0.8/0.8→1.0/1.0→1.2/1.2→1.45）：'
+          f'{" / ".join(f"{v:.1f}" for v in prof)}；分桶回升次数 = '
+          f'{int((dprof > 1.0).sum())}, 对角线逐点回升次数 = {int((ddiag > 1.0).sum())}')
+    if dc > 1.0 or c_cor > 180.0 * 0.4 or (dprof > 1.0).any() or (ddiag > 1.0).any():
+        fails.append('⑦ 暗角开启')
+
+    # ⑧ 边界：feather=0（fscale 取到下限 100/min(W,H)，不得 NaN/不得振铃）
+    #          strength=-1（falloff = 1-weight ∈ [0,1] ⇒ 不得出现负值）
+    o8a = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                    grain=0.0, vig=(-0.6, 80.0, 0.0))
+    q8a = quant(o8a, g180.shape)[..., 0]
+    f8 = np.isfinite(o8a).all()
+    diag8 = q8a.astype(np.float64)[np.arange(n // 2, n), np.arange(n // 2, n)]
+    jump = float(np.abs(np.diff(diag8)).max())
+    o8b = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                    grain=0.0, vig=(-1.0, 80.0, 50.0))
+    q8b = quant(o8b, g180.shape)[..., 0]
+    # 过渡宽度（解析，单位 = 像素）：fscale ÷ (每像素的 cplen 步长 2/max(W,H))。
+    # 下限 100/min(W,H) 的语义 = "过渡不窄于 min 边的 1%" ⇒ 在 max/min 的常见画幅上
+    # 只有 0.5~1.3 px —— 即 darktable 同款保护防的是**亚像素跳变（混叠）**，不是让
+    # 渐变变宽；8bit 上这一步台阶是本征行为。判据取"无过冲"而非"无台阶"。
+    span_px = (max(0.0, 100.0 / n) / 100.0) / (2.0 / float(n))
+    over8 = 180.0 * 0.6 + 1.0
+    print(f'⑧ 边界：feather=0 ⇒ fscale = max(0, 100/{n})/100 = {max(0.0, 100.0 / n) / 100.0:.4f}'
+          f'（下限生效，非 0）, 过渡宽度（解析）= {span_px:.2f} px, 输出 finite = {bool(f8)}, '
+          f'min = {q8a.min():.0f}, 中心区 max|Δ| = '
+          f'{float(np.abs(q8a[centre] - 180.0).max()):.0f} LSB, 角落均值 = {float(q8a[corner].mean()):.1f}')
+    print(f'   对角线最大相邻跳变 = {jump:.0f} LSB（理论全幅度 180×0.6 = 108；'
+          f'过冲上限 {over8:.0f} ⇒ {"无振铃" if jump <= over8 else "有过冲"}）')
+    print(f'   strength=-1 ⇒ falloff = 1-weight ∈ [0,1]：输出 min = {q8b.min():.0f}（不得为负）, '
+          f'角落均值 = {float(q8b[corner].mean()):.1f}（应 ≈0）, finite = {bool(np.isfinite(o8b).all())}')
+    if (not f8) or q8a.min() < 0 or float(np.abs(q8a[centre] - 180.0).max()) > 1.0 \
+            or float(q8a[corner].mean()) > 180.0 * 0.5 or (np.diff(diag8) > 1.0).any() \
+            or jump > over8 or span_px < 0.4 \
+            or q8b.min() < 0 or float(q8b[corner].mean()) > 1.0:
+        fails.append('⑧ 边界')
+
+    # ⑨ 两处暗角代码逐字一致（shader 段 / uniform 声明 / CPU 下发段）
+    diff9 = check_vignette_parity()
+    print(f'⑨ kFsOut 与 kFsStyle 的暗角实现逐字比对：差异段 = {diff9 or "无（0 处）"}')
+    if diff9:
+        fails.append('⑨ 两处一致性')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')
