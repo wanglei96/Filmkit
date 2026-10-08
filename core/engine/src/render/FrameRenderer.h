@@ -460,8 +460,13 @@ class FrameRenderer {
   //      scale = 1：PC3D(全分辨率, MOIRE=0)
   //   ③ 第二趟：PC3D(全分辨率, MOIRE=1.5)
   // pc3d_msize_override > 0 时强制 MSIZE（真机 A/B 拍板用；0 = 按 PC 公式）。
+  // in_src（v0.10.205）：输入源覆盖 —— 0 = tex_scene_（原行为，逐位不变）；
+  // 非 0 = 用该纹理（color_smooth 前置后的 tex_cs_）。**为什么需要**：PC3D 的
+  // 色度平滑会把 1~3px 伪彩摊成 12~90px 宽带（真机实测），一旦摊开，任何
+  // "两侧一致性"判据的探测点都落在带内 ⇒ 失效。把 color_smooth 提到 PC3D
+  // **之前**，伪彩仍是窄带，判据才成立。
   bool passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
-                const FilmParams& p);
+                const FilmParams& p, GLuint in_src = 0);
   // 横向色差校正（v0.10.170，镜头侧向色差 / lateral CA）：D3（RCD 去马赛克后、
   // passCcm 前）的相机 RGB 域。自动估计（无镜头配置文件）+ 径向位移校正，只重采样
   // R/B，G 逐位不动。返回 true 时 tex_ca_ = 校正输出（调用方把 CCM 源换成它）；

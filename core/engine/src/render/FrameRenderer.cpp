@@ -1433,8 +1433,13 @@ uniform float uGradHi;
 uniform float uSideK;       // 两侧色度必须 < 中心 × 该系数
 uniform float uChromaMin;   // 相对亮度的色度下限（低于此值视为中性，不动）
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-// ── 边缘伪彩抑制 v0.10.204：**多尺度两侧一致性** ──────────────────────────
-// 为什么从"单尺度 ±3px"改成"多尺度 [3,6,12,18]"：
+// ── 边缘伪彩抑制 v0.10.205：**前置到 PC3D 之前 + 窄带尺度 [3,6]** ──────────
+// v0.10.205 的关键改动：本 pass 的输入从"PC3D 输出"改成 **PC3D 之前的 D4**。
+// 原因：PC3D 的色度平滑会把 1~3px 伪彩**摊成 12~90px 宽带**（真机 112643 剖面
+// 实测），一旦摊开，任何尺度的探测点都落在带内 ⇒ 判据恒不成立（203 的 ±3px
+// 覆盖率实测 **0.0%**，204 的多尺度也只到 43%）。前置后伪彩仍是窄带，只需
+// ±3/±6 两个小尺度即可命中，且探测点必然落在带外 ⇒ 代价远小于宽带处理。
+// （以下为 v0.10.204 的多尺度记录，保留作依据）
 //   真机实测（112643 成片）用户所见彩边是 **PC3D 把 1~3px 伪彩摊开后的
 //   12~90px 宽钟形带**（例：y=300 的 x=757~767，峰色度 44、两侧 x=755/769
 //   色度 10/8）。单尺度 ±3px 的探测点**全落在带内** ⇒ 判据恒不成立 ⇒
@@ -1465,34 +1470,21 @@ void main() {
     vec2 nd = grad / length(grad);
     ivec2 o3 = ivec2(round(nd * 3.0));
     ivec2 o6 = ivec2(round(nd * 6.0));
-    ivec2 o12 = ivec2(round(nd * 12.0));
-    ivec2 o18 = ivec2(round(nd * 18.0));
     vec3 a3 = texelFetch(uTex, clamp(p + o3, ivec2(0), mx), 0).rgb;
     vec3 b3 = texelFetch(uTex, clamp(p - o3, ivec2(0), mx), 0).rgb;
     vec3 a6 = texelFetch(uTex, clamp(p + o6, ivec2(0), mx), 0).rgb;
     vec3 b6 = texelFetch(uTex, clamp(p - o6, ivec2(0), mx), 0).rgb;
-    vec3 a12 = texelFetch(uTex, clamp(p + o12, ivec2(0), mx), 0).rgb;
-    vec3 b12 = texelFetch(uTex, clamp(p - o12, ivec2(0), mx), 0).rgb;
-    vec3 a18 = texelFetch(uTex, clamp(p + o18, ivec2(0), mx), 0).rgb;
-    vec3 b18 = texelFetch(uTex, clamp(p - o18, ivec2(0), mx), 0).rgb;
     float c3a = abs(a3.r - a3.g) + abs(a3.b - a3.g);
     float c3b = abs(b3.r - b3.g) + abs(b3.b - b3.g);
     float c6a = abs(a6.r - a6.g) + abs(a6.b - a6.g);
     float c6b = abs(b6.r - b6.g) + abs(b6.b - b6.g);
-    float c12a = abs(a12.r - a12.g) + abs(a12.b - a12.g);
-    float c12b = abs(b12.r - b12.g) + abs(b12.b - b12.g);
-    float c18a = abs(a18.r - a18.g) + abs(a18.b - a18.g);
-    float c18b = abs(b18.r - b18.g) + abs(b18.b - b18.g);
     float lim = uSideK * ch0;
-    if (max(c3a, c3b) >= lim && max(c6a, c6b) >= lim &&
-        max(c12a, c12b) >= lim && max(c18a, c18b) >= lim) {
+    if (max(c3a, c3b) >= lim && max(c6a, c6b) >= lim) {
         oColor = vec4(c0.rgb, 1.0);   // 所有尺度两侧都有色度 ⇒ 真实色度区域
         return;
     }
-    float r_t = 0.125 * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g)
-                       + (a12.r - a12.g) + (b12.r - b12.g) + (a18.r - a18.g) + (b18.r - b18.g));
-    float b_t = 0.125 * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g)
-                       + (a12.b - a12.g) + (b12.b - b12.g) + (a18.b - a18.g) + (b18.b - b18.g));
+    float r_t = 0.25 * ((a3.r - a3.g) + (b3.r - b3.g) + (a6.r - a6.g) + (b6.r - b6.g));
+    float b_t = 0.25 * ((a3.b - a3.g) + (b3.b - b3.g) + (a6.b - a6.g) + (b6.b - b6.g));
     vec3 med = vec3(max(0.0, r_t + c0.g), c0.g, max(0.0, b_t + c0.g));
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
     if (c_med >= ch0) { oColor = vec4(c0.rgb, 1.0); return; }
@@ -7320,7 +7312,7 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src) {
     //   尺度 [3,6,12,18] 覆盖 PC3D 摊开后的 12~90px 宽色带；
     //   sideK 0.7（0.35 时带内仅 1/11 命中，0.7 时 6/11；全图蓝边覆盖 16.8%→43.1%）；
     //   uChromaMin=0.12 相对亮度下限（等价显示域 色度/亮度 ≈ 12%，低于此视为中性不动）。
-    glUniform1f(u_cs_.side_k, 0.7f);
+    glUniform1f(u_cs_.side_k, 0.35f);   // v0.10.205：伪彩已回到窄带 ⇒ 判据收紧回 0.35
     glUniform1f(u_cs_.chroma_min, 0.12f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     in = last ? tex_cs_ : tex_cs_tmp_;
@@ -7390,7 +7382,9 @@ constexpr float kPc3dMoire = 1.5f;
 constexpr float kPc3dLuma = 0.8f;
 
 bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
-                             const FilmParams& p) {
+                             const FilmParams& p, GLuint in_src) {
+  // v0.10.205：输入源（0 = tex_scene_，逐位等于改动前）
+  const GLuint pc_src = (in_src != 0) ? in_src : tex_scene_;
   dbg_pc3d_on_ = 0;
   dbg_pc3d_m_ = 0;
   dbg_pc3d_scale_ = 1;
@@ -7504,7 +7498,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glViewport(0, 0, lw, lh);
     glUseProgram(prog_pc3d_down_);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_scene_);
+    glBindTexture(GL_TEXTURE_2D, pc_src);
     glUniform1i(u_pc3d_down_.tex, 0);
     glUniform2i(u_pc3d_down_.size, dst_w, dst_h);
     glUniform1i(u_pc3d_down_.resize, scale);
@@ -7530,7 +7524,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glBindTexture(GL_TEXTURE_2D, tex_pc3d_lo_[1]);
     glUniform1i(u_pc3d_up_.low, 0);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_scene_);
+    glBindTexture(GL_TEXTURE_2D, pc_src);
     glUniform1i(u_pc3d_up_.guide_hi, 1);
     glUniform2i(u_pc3d_up_.low_size, lw, lh);
     glUniform2i(u_pc3d_up_.hi_size, dst_w, dst_h);
@@ -7539,7 +7533,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glActiveTexture(GL_TEXTURE0);
     dbg_pc3d_scale_ = scale;
   } else {
-    runPc3d(tex_scene_, fbo_pc3d_t1_, dst_w, dst_h, msize, 0.0f, sigA, sigB);
+    runPc3d(pc_src, fbo_pc3d_t1_, dst_w, dst_h, msize, 0.0f, sigA, sigB);
   }
   // ⑥ 第二趟（ESD3D2.java:161-162）：全分辨率 + MOIRE = 1.5（伪彩强度逻辑在这里
   //    才真正开火；第一趟 MOIRE = 0 ⇒ sigZ = sigY）。
@@ -8702,10 +8696,26 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_pc3d_k_ = 0.f;
     dbg_pc3d_ms_ = 0.f;
     GLuint p4_src = 0;
+    // ── v0.10.205：色差域中值**前置到 PC3D 之前** ──────────────────────────
+    // 真机实测（112643 成片剖面）：用户所见彩边是 PC3D 把 1~3px 伪彩**摊开**
+    // 后的 12~90px 宽钟形带 ⇒ 任何"两侧一致性"判据的探测点都落在带内 ⇒
+    // 覆盖率 0.0%（203/204 两版都卡在这里）。前置后伪彩仍是窄带，判据成立，
+    // 且探测尺度只需 ±3/±6 ⇒ 代价远小于宽带处理。
+    // 输入 = tex_scene_（D4，CCM 后场景线性），与 PC3D 同域同几何。
+    bool cs_ok = false;
+    if (p.color_smooth > 0.5f) {
+      dbg_cs_k_ = p.color_smooth;
+      dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;
+      dbg_cs_on_ = 0;
+      if (passColorSmooth(dst_w, dst_h, tex_scene_)) {
+        cs_ok = true;
+        dbg_cs_on_ = 1;
+      }
+    }
     if (p.pc3d > 0.5f) {
       glFinish();   // 起点同步：只计本模块的工作，不背前面 pass 的尾巴
       const auto pc0 = std::chrono::steady_clock::now();
-      pc3d_ok = passPc3d(dst_w, dst_h, c.nc, p);
+      pc3d_ok = passPc3d(dst_w, dst_h, c.nc, p, cs_ok ? tex_cs_ : 0);
       glFinish();
       dbg_pc3d_ms_ = std::chrono::duration<float, std::milli>(
                          std::chrono::steady_clock::now() - pc0).count();
@@ -8725,15 +8735,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // v0.10.196：色差域中值（darktable color_smoothing）—— 在 defringe 之前。
       // 顺序理由：中值是"无偏"的（不判色相，治任意色向的 1~3px 色差异常），
       // 先用它把窄带伪彩压掉，defringe 再处理剩下的紫/品红定向部分。
-      GLuint df_src = tex_pc3d_;
-      // v0.10.198 诊断（无条件记录）：区分三种失效 —— 参数没下发 / shader 没链接 / pass 没跑
-      dbg_cs_k_ = p.color_smooth;
-      dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;
-      dbg_cs_on_ = 0;
-      if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
-        df_src = tex_cs_;
-        dbg_cs_on_ = 1;
-      }
+      // v0.10.205：color_smooth 已前置（见上），此处不再重复执行；
+      // df_src 优先级：PC3D 输出 > color_smooth 输出 > D4 原图。
+      GLuint df_src = pc3d_ok ? tex_pc3d_ : (cs_ok ? tex_cs_ : tex_scene_);
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
     } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
@@ -8743,14 +8747,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 失败/关闭回落 tex_dn_（照片优先红线）。成片链 only —— 预览链成本
       // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
       // v0.10.196：色差域中值（同替换档，输入为 P4 输出 tex_dn_）
+      // v0.10.205：color_smooth 已前置（PC3D 之前）；叠加档下 P4 已吃它的输出
+      // （p4_src = tex_pc3d_，而 PC3D 读 tex_cs_）⇒ 此处不重复。
       GLuint df_src = tex_dn_;
-      dbg_cs_k_ = p.color_smooth;
-      dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;
-      dbg_cs_on_ = 0;
-      if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
-        df_src = tex_cs_;
-        dbg_cs_on_ = 1;
-      }
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
       // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
       mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
