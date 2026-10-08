@@ -656,6 +656,9 @@ class FrameRenderer {
   GLuint fbo_df_det_ = 0, tex_df_det_ = 0;  // 半分辨率 (a,b,chroma,gate)
   GLuint fbo_df_avg_ = 0, tex_df_avg_ = 0;  // 1/16 网格 chroma 均值
   int df_w_ = 0, df_h_ = 0;                 // 全分辨率尺寸（缓存键）
+  int dbg_cs_ok_ = -1;                      // v0.10.198：色差中值 shader 是否链接成功
+  int dbg_cs_on_ = -1;                      // v0.10.198：本帧该 pass 是否真的跑了
+  float dbg_cs_k_ = -1.f;                   // v0.10.198：下发的 FilmParams[59] 实际值
   // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
   GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F
   int cs_w_ = 0, cs_h_ = 0;                 // 全分辨率尺寸（缓存键）

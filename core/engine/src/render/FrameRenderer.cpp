@@ -1428,63 +1428,99 @@ precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
-uniform float uGradLo;   // 梯度门下沿（gL 单位，见 apply 注释）
-uniform float uGradHi;   // 梯度门上沿（门在这两点之间平滑开启）
+uniform float uGradLo;
+uniform float uGradHi;
 const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
-// 9 元素中值：选择排序取中位（36 次比较；darktable 用 19 次比较的最优网络，
-// 此处选可读写法 —— GPU 上这点差异被 9 次 texelFetch 完全掩盖）。
-float med9(float m[9]) {
-    for (int i = 0; i < 5; ++i) {
-        for (int j = i + 1; j < 9; ++j) {
-            if (m[j] < m[i]) { float t = m[i]; m[i] = m[j]; m[j] = t; }
-        }
-    }
-    return m[4];
-}
+// ── v0.10.198：色差域 3×3 中值（darktable color_smoothing 的等价实现）───────
+// 为什么写得这么"笨"（19 次比较 × 2 通道全部内联，无宏、无数组、无循环）：
+//   196/197 用 `float med9(float m[9])` + 数组循环 ⇒ Mali 编译失败 ⇒ prog_cs_=0
+//   ⇒ pass 静默失效（真机"完全没效果"）；
+//   198 第一版改用 `#define MED9(...)` 多行宏（行尾 `\` 续行）⇒ 实测**宏体
+//   没有生效**（med 与输入逐位相同、改写 0 像素）—— GLSL 预处理器的续行行为
+//   与 C 不一致。内联展开是唯一在所有驱动上都确定可行的写法。
+// 中值网络出处：darktable src/iop/demosaicing/basics.c 的 SWAPmed 序列（19 次
+// 比较求 9 元素中位），此处逐条内联。
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    ivec2 mx = uSize - 1;
     vec4 c0 = texelFetch(uTex, p, 0);
-    // ── 梯度门（v0.10.196 修正）：伪彩只出现在亮度边缘 ─────────────────────
-    // 无门版实测（090738/090727 真机 D4）：改写 **75.6% / 61.7%** 的像素、
-    // 亮度 max 变化 **51/255** —— 中值会在**每个**像素上微调色差，全图性改动
-    // 违反"其余颜色不伤"。加梯度门后平坦区 gate=0 ⇒ 逐位直通（early return）。
-    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uSize - 1), 0).rgb, LW);
-    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uSize - 1), 0).rgb, LW);
-    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uSize - 1), 0).rgb, LW);
-    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uSize - 1), 0).rgb, LW);
+    // 梯度门：伪彩只出现在亮度边缘；平坦区 gate=0 ⇒ 逐位直通
+    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
+    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), mx), 0).rgb, LW);
+    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
+    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), mx), 0).rgb, LW);
     float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
     float gate = smoothstep(uGradLo, uGradHi, gL);
     if (gate <= 0.0) {
         oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    // ── 色差域 3×3 中值（darktable color_smoothing 主体）─────────────────
-    float dr[9];
-    float db[9];
-    int k = 0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1);
-            vec4 c = texelFetch(uTex, q, 0);
-            dr[k] = c.r - c.g;
-            db[k] = c.b - c.g;
-            ++k;
-        }
-    }
-    vec3 med = vec3(max(0.0, med9(dr) + c0.g), c0.g, max(0.0, med9(db) + c0.g));
-    // ── 只降不升保护（v0.10.196）─────────────────────────────────────────
-    // 中值只保证"取邻域中位"，**不保证减小色度** —— 邻域色差分布偏斜时中值可能
-    // 比原值更极端。离线实测：无此保护时边缘 |B−G|>15 的像素数反而从 98071
-    // 涨到 125222（把伪彩推给邻居）。这里以 |R−G|+|B−G| 为色度幅值，中值结果
-    // 更大就整体放弃替换 ⇒ 本 pass **在任何像素上都不会增加色度**。
+    vec3 s00 = texelFetch(uTex, clamp(p + ivec2(-1, -1), ivec2(0), mx), 0).rgb;
+    vec3 s10 = texelFetch(uTex, clamp(p + ivec2( 0, -1), ivec2(0), mx), 0).rgb;
+    vec3 s20 = texelFetch(uTex, clamp(p + ivec2( 1, -1), ivec2(0), mx), 0).rgb;
+    vec3 s01 = texelFetch(uTex, clamp(p + ivec2(-1,  0), ivec2(0), mx), 0).rgb;
+    vec3 s11 = c0.rgb;
+    vec3 s21 = texelFetch(uTex, clamp(p + ivec2( 1,  0), ivec2(0), mx), 0).rgb;
+    vec3 s02 = texelFetch(uTex, clamp(p + ivec2(-1,  1), ivec2(0), mx), 0).rgb;
+    vec3 s12 = texelFetch(uTex, clamp(p + ivec2( 0,  1), ivec2(0), mx), 0).rgb;
+    vec3 s22 = texelFetch(uTex, clamp(p + ivec2( 1,  1), ivec2(0), mx), 0).rgb;
+    // (R−G) / (B−G) 色差域
+    float r0 = s00.r - s00.g, r1 = s10.r - s10.g, r2 = s20.r - s20.g;
+    float r3 = s01.r - s01.g, r4 = s11.r - s11.g, r5 = s21.r - s21.g;
+    float r6 = s02.r - s02.g, r7 = s12.r - s12.g, r8 = s22.r - s22.g;
+    float b0 = s00.b - s00.g, b1 = s10.b - s10.g, b2 = s20.b - s20.g;
+    float b3 = s01.b - s01.g, b4 = s11.b - s11.g, b5 = s21.b - s21.g;
+    float b6 = s02.b - s02.g, b7 = s12.b - s12.g, b8 = s22.b - s22.g;
+    // 中值网络（19 次比较，结果落在 r4 / b4）
+    if (r1 > r2) { float t = r1; r1 = r2; r2 = t; }
+    if (r4 > r5) { float t = r4; r4 = r5; r5 = t; }
+    if (r7 > r8) { float t = r7; r7 = r8; r8 = t; }
+    if (r0 > r1) { float t = r0; r0 = r1; r1 = t; }
+    if (r3 > r4) { float t = r3; r3 = r4; r4 = t; }
+    if (r6 > r7) { float t = r6; r6 = r7; r7 = t; }
+    if (r1 > r2) { float t = r1; r1 = r2; r2 = t; }
+    if (r4 > r5) { float t = r4; r4 = r5; r5 = t; }
+    if (r7 > r8) { float t = r7; r7 = r8; r8 = t; }
+    if (r0 > r3) { float t = r0; r0 = r3; r3 = t; }
+    if (r5 > r8) { float t = r5; r5 = r8; r8 = t; }
+    if (r4 > r7) { float t = r4; r4 = r7; r7 = t; }
+    if (r3 > r6) { float t = r3; r3 = r6; r6 = t; }
+    if (r1 > r4) { float t = r1; r1 = r4; r4 = t; }
+    if (r2 > r5) { float t = r2; r2 = r5; r5 = t; }
+    if (r4 > r7) { float t = r4; r4 = r7; r7 = t; }
+    if (r4 > r2) { float t = r4; r4 = r2; r2 = t; }
+    if (r6 > r4) { float t = r6; r6 = r4; r4 = t; }
+    if (r4 > r2) { float t = r4; r4 = r2; r2 = t; }
+    if (b1 > b2) { float t = b1; b1 = b2; b2 = t; }
+    if (b4 > b5) { float t = b4; b4 = b5; b5 = t; }
+    if (b7 > b8) { float t = b7; b7 = b8; b8 = t; }
+    if (b0 > b1) { float t = b0; b0 = b1; b1 = t; }
+    if (b3 > b4) { float t = b3; b3 = b4; b4 = t; }
+    if (b6 > b7) { float t = b6; b6 = b7; b7 = t; }
+    if (b1 > b2) { float t = b1; b1 = b2; b2 = t; }
+    if (b4 > b5) { float t = b4; b4 = b5; b5 = t; }
+    if (b7 > b8) { float t = b7; b7 = b8; b8 = t; }
+    if (b0 > b3) { float t = b0; b0 = b3; b3 = t; }
+    if (b5 > b8) { float t = b5; b5 = b8; b8 = t; }
+    if (b4 > b7) { float t = b4; b4 = b7; b7 = t; }
+    if (b3 > b6) { float t = b3; b3 = b6; b6 = t; }
+    if (b1 > b4) { float t = b1; b1 = b4; b4 = t; }
+    if (b2 > b5) { float t = b2; b2 = b5; b5 = t; }
+    if (b4 > b7) { float t = b4; b4 = b7; b7 = t; }
+    if (b4 > b2) { float t = b4; b4 = b2; b2 = t; }
+    if (b6 > b4) { float t = b6; b6 = b4; b4 = t; }
+    if (b4 > b2) { float t = b4; b4 = b2; b2 = t; }
+    vec3 med = vec3(max(0.0, r4 + c0.g), c0.g, max(0.0, b4 + c0.g));
+    // 只降不升：中值只保证"取邻位"、不保证减小色度 ⇒ 幅值更大就整体放弃，
+    // 本 pass 在任何像素上都不增加色度。
     float c_orig = abs(c0.r - c0.g) + abs(c0.b - c0.g);
     float c_med = abs(med.r - c0.g) + abs(med.b - c0.g);
     if (c_med >= c_orig) {
         oColor = vec4(c0.rgb, 1.0);
         return;
     }
-    // 保亮度：三通道等量加法补偿（色差 R−G/B−G 在加同一标量后**完全不变**，
-    // 故中值结果被精确保留，同时线性域 ΔL ≡ 0）。
+    // 保亮度：三通道等量加法补偿（色差加同一标量后不变 ⇒ 中值结果精确保留，
+    // 同时线性域 ΔL ≡ 0）
     vec3 comp = med + (dot(c0.rgb, LW) - dot(med, LW));
     vec3 o = mix(c0.rgb, comp, gate);
     oColor = vec4(clamp(o, vec3(0.0), vec3(16.0)), 1.0);
@@ -7558,6 +7594,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
     }
   }
   dbg_df_cavg_ = cavg;
+  dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;   // v0.10.198 诊断：shader 是否链接成功
   // ④ 命中替换（L 零损失；未命中像素原样直通）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_);
   glViewport(0, 0, dst_w, dst_h);
@@ -8682,8 +8719,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 顺序理由：中值是"无偏"的（不判色相，治任意色向的 1~3px 色差异常），
       // 先用它把窄带伪彩压掉，defringe 再处理剩下的紫/品红定向部分。
       GLuint df_src = tex_pc3d_;
+      // v0.10.198 诊断（无条件记录）：区分三种失效 —— 参数没下发 / shader 没链接 / pass 没跑
+      dbg_cs_k_ = p.color_smooth;
+      dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;
+      dbg_cs_on_ = 0;
       if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
         df_src = tex_cs_;
+        dbg_cs_on_ = 1;
       }
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
     } else {
@@ -8695,8 +8737,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 待真机评估后再接（3 pass 半分辨率 ≈ P4 的 1/3）。
       // v0.10.196：色差域中值（同替换档，输入为 P4 输出 tex_dn_）
       GLuint df_src = tex_dn_;
+      dbg_cs_k_ = p.color_smooth;
+      dbg_cs_ok_ = (prog_cs_ != 0) ? 1 : 0;
+      dbg_cs_on_ = 0;
       if (p.color_smooth > 0.5f && passColorSmooth(dst_w, dst_h, df_src)) {
         df_src = tex_cs_;
+        dbg_cs_on_ = 1;
       }
       df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
       // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
@@ -8878,6 +8924,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           //（读回值，评估判定阈值是否跟场景走），hit 需 GPU 计数暂缺
           ",\"df\":" + std::to_string(df_ok ? 1 : 0) +
           ",\"dfCavg\":" + jnum(dbg_df_cavg_, 6) +
+          // v0.10.198 色差中值滤波诊断：csK = 下发的 FilmParams[59]；csOk = shader 是否
+          // 链接成功（0 ⇒ prog_cs_=0、pass 静默失效 = 196/197 "完全没效果"的根因）；
+          // csOn = 本帧 pass 是否真的执行。
+          ",\"csK\":" + jnum(dbg_cs_k_, 3) +
+          ",\"csOk\":" + std::to_string(dbg_cs_ok_) +
+          ",\"csOn\":" + std::to_string(dbg_cs_on_) +
            // 档 A（v0.10.165）伪彩感知色度降噪：moGain = 下发强度（0 = 关/A/B 通路），
            // moMean/moP95 = 伪彩强度图全图均值/P95（P95 为 4 锚点分段线性 CDF 近似），
            // moCov = moire>0.5 的像素占比，moSc = σc 实际平均放大倍数
