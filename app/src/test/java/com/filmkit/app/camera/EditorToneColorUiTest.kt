@@ -3,6 +3,7 @@ package com.filmkit.app.camera
 import com.filmkit.app.ui.CameraPresets
 import kotlin.math.roundToInt
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -286,28 +287,75 @@ class EditorToneColorUiTest {
         p[26] = 0.3    // 颗粒（同上）
         p[34] = 0.9    // LUT 强度（同上）
 
-        // 「调整」组重置：E2-14 起含高光 / 阴影 / 白色色阶 / 黑色色阶
+        // 「调整」组重置：E2-14 起含影调分区四条，E2-15 起**再纳色温/色调**
+        //（用户反馈："色温…应该是调整里面"—— 界面分组变了，重置范围必须跟着走，
+        //  否则"调整组里有色温滑杆、重置本组却不动它" = 假重置）
         resetBasicParams(p)
+        assertEquals(0.0, p[88], 1e-9)
+        assertEquals(0.0, p[89], 1e-9)
         assertEquals(0.0, p[90], 1e-9)
         assertEquals(0.0, p[91], 1e-9)
         assertEquals(0.0, p[92], 1e-9)
         assertEquals(0.0, p[93], 1e-9)
-        // 色彩组三条与别的组一个都不动
-        assertEquals(tempSlot(4000f), p[88], 1e-9)
-        assertEquals(0.3, p[89], 1e-9)
+        // 色彩组（褪色）与别的组一个都不动
         assertEquals(0.6, p[94], 1e-9)
         assertEquals(-0.5, p[66], 1e-9)
         assertEquals(0.3, p[26], 1e-9)
         assertEquals(0.9, p[34], 1e-9)
 
-        // 「色彩」组重置（引擎参数部分）：色温 / 色调 / 褪色回恒等
+        // 「色彩」组重置：E2-15 起**只剩褪色**回恒等（色温/色调已归调整组）
+        p[88] = tempSlot(4000f); p[89] = 0.3
         p[90] = 0.8   // 再设一次：确认 resetColorParams 不碰影调分区
         resetColorParams(p)
-        assertEquals(0.0, p[88], 1e-9)
-        assertEquals(0.0, p[89], 1e-9)
         assertEquals(0.0, p[94], 1e-9)
+        assertEquals("色温不属于色彩组 ⇒ 不动", tempSlot(4000f), p[88], 1e-9)
+        assertEquals("色调不属于色彩组 ⇒ 不动", 0.3, p[89], 1e-9)
         assertEquals(0.8, p[90], 1e-9)
         assertEquals(-0.5, p[66], 1e-9)
-        assertEquals(0.9, p[34], 1e-9)
+        assertEquals("LUT 强度不由重置清（素材选择保留）", 0.9, p[34], 1e-9)
+    }
+
+    // ── E2-15：LUT 强度量程统一到 0..1.5（用户："LUT强度应该统一可调至150"）────────
+
+    @Test
+    fun lutStrengthRangeIsZeroTo150LikeTheCameraPage() {
+        // 量程端点：0..1.5（与拍照页 LUT 强度滑杆同一口径 —— RelativeSlider 默认 0f..1.5f）
+        assertEquals(0f, LUT_STRENGTH_UI_RANGE.start, 0f)
+        assertEquals(1.5f, LUT_STRENGTH_UI_RANGE.endInclusive, 0f)
+        // 读数：整数 0..150（`150` 是端点，不是被 clamp 成 `100`）
+        assertEquals("0", formatZero150(0f))
+        assertEquals("85", formatZero150(0.85f))
+        assertEquals("100", formatZero150(1f))
+        assertEquals("150", formatZero150(1.5f))
+        // 越界 / 坏数据：夹到端点、回落 0（读数绝不出现 `NaN` 或越界值）
+        assertEquals("150", formatZero150(1.8f))
+        assertEquals("0", formatZero150(-0.5f))
+        assertEquals("0", formatZero150(Float.NaN))
+        assertEquals("0", formatZero150(Float.NEGATIVE_INFINITY))
+        // 基准 0 = 关，落在量程最左端 ⇒ 不画中点标记（端点本身就是标记）
+        assertNull(pivotFraction(LUT_STRENGTH_UI_RANGE, 0f))
+        // 与 formatZero100 的区别只在**上限**：1.0 以内两条口径完全一致（同一套整数读数语言）
+        for (i in 0..100) {
+            val ui = i / 100f
+            assertEquals("$i 处两条读数口径不一致", formatZero100(ui), formatZero150(ui))
+        }
+    }
+
+    @Test
+    fun discardConfirmFollowsTheSameRuleAsExportPassthrough() {
+        // 「取消」二次确认的判据 = E2-9 的 paramsUnchanged（用户："如果改过参数，弹一句…"）
+        val open = editorOpenParams(null)
+        assertFalse("刚打开 ⇒ 无修改 ⇒ 直接退出，不弹窗", discardNeedsConfirm(open.copyOf(), open))
+        val changed = open.copyOf().also { it[0] = expSlot(0.5f) }
+        assertTrue("改过曝光 ⇒ 要弹确认", discardNeedsConfirm(changed, open))
+        val changedBack = open.copyOf().also {
+            it[0] = expSlot(0.5f)
+            it[0] = expSlot(0f)   // 改了又改回原值
+        }
+        assertFalse("值比较（不是「碰过滑杆」）：改回原值 ⇒ 不弹", discardNeedsConfirm(changedBack, open))
+        // 状态未就绪（首帧前点取消）：没有可丢的修改 ⇒ 不挡退路
+        assertFalse(discardNeedsConfirm(null, open))
+        assertFalse(discardNeedsConfirm(open, null))
+        assertFalse(discardNeedsConfirm(null, null))
     }
 }

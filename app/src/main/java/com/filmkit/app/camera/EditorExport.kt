@@ -451,11 +451,28 @@ internal fun formatOffset100(ui: Float, pivot: Float = 1f): String {
 }
 
 /**
- * 0..100 整数读数（清晰度 / 暗角强度 / LUT 强度 / 局部半径·羽化·宽度）：UI 0..1 × 100。
+ * 0..100 整数读数（清晰度 / 暗角强度 / 局部半径·羽化·宽度）：UI 0..1 × 100。
  * 这是"清晰度"的口径（研究 §3.3.3 的目标显示就是 `0..100` 无符号整数）。
  */
 internal fun formatZero100(ui: Float): String =
     if (ui.isFinite()) (ui * 100f).roundToInt().coerceIn(0, 100).toString() else "0"
+
+/**
+ * LUT 强度 UI 量程（E2-15 用户反馈："LUT强度应该统一可调至150"）：0..1.5。
+ *
+ * 为什么能超过 1：引擎侧是 `c = mix(c, lutApply(c), uLutStrength)` —— `t > 1` 是**外推**
+ *（把 LUT 定义的变换推过头），数学上天然成立；且**拍照页早就在用这个量程**
+ *（`RelativeSlider` 的默认 `range = 0f..1.5f`，拍照页 LUT 强度滑杆走的就是它）⇒
+ * 编辑器只是**统一**到既有生产口径，不是新开一条通路。读数整数 0..150，见 [formatZero150]。
+ */
+internal val LUT_STRENGTH_UI_RANGE = 0f..1.5f
+
+/**
+ * 0..150 整数读数（LUT 强度）：UI 0..1.5 × 100 —— 与 [formatZero100] 同一口径，
+ * 只是量程上限不同（150% 档位）。超出量程的坏数据夹到 150，不显示 `200` 这种越界读数。
+ */
+internal fun formatZero150(ui: Float): String =
+    if (ui.isFinite()) (ui * 100f).roundToInt().coerceIn(0, 150).toString() else "0"
 
 /** 0..200 整数读数（暗角半径 / 羽化）：UI 0..2 × 100 —— darktable 的 `scale` 本身就是 0..200 语义。 */
 internal fun formatZero200(ui: Float): String =
@@ -482,9 +499,15 @@ internal fun pivotFraction(range: ClosedFloatingPointRange<Float>, pivot: Float)
 }
 
 /**
- * 「调整」组重置（E2-3；E2-14 扩了范围）：本组全部参数回**恒等值** —— 曝光 0 / WB 1,1,1 /
- * 对比度 1 / 饱和度 1,1,1 / 清晰度 0 / 高光·阴影·白·黑色阶 0。只动这 11 个槽位，其余槽位
- * （快照继承来的风格参数、色温/色调/褪色/暗角/LUT）原样保留。
+ * 「调整」组重置（E2-3；E2-14 扩影调分区；E2-15 再纳色温/色调）：本组全部参数回**恒等值** ——
+ * 曝光 0 / 色温 [88] 0（= 6500K）/ 色调 [89] 0 / WB 1,1,1 / 对比度 1 / 饱和度 1,1,1 /
+ * 清晰度 0 / 高光·阴影·白·黑色阶 0。只动这 13 个槽位，其余槽位（快照继承来的风格参数、
+ * 褪色/暗角/LUT）原样保留。
+ *
+ * 色温/色调为什么在**这里**（E2-15 用户反馈："色温方向正确，放的位置不对，怎么放 lut 里了
+ * 应该是调整里面"）：它们是白平衡的两条，与 [1..3] 通道增益同属"基础调整"；界面把它们放进
+ * 「调整」组之后，重置入口也必须跟着走 —— 否则用户看到"调整组里有色温滑杆、重置本组却不动它"
+ *（= 假重置，与 ADR-12 的假滑杆同一类问题）。
  */
 internal fun resetBasicParams(p: DoubleArray) {
     p[0] = 0.0
@@ -494,6 +517,8 @@ internal fun resetBasicParams(p: DoubleArray) {
     p[4] = 1.0
     writeSaturation(p, 1f)
     p[78] = 0.0
+    p[88] = 0.0
+    p[89] = 0.0
     p[90] = 0.0
     p[91] = 0.0
     p[92] = 0.0
@@ -501,15 +526,29 @@ internal fun resetBasicParams(p: DoubleArray) {
 }
 
 /**
- * 「色彩」组的**引擎参数**重置（E2-14）：色温 [88] / 色调 [89] / 褪色 [94] 回恒等值。
+ * 「色彩」组的**引擎参数**重置（E2-14；E2-15 缩到只剩褪色 [94]）：褪色回恒等 0。
  *
- * LUT 不在这里 —— 清 [34] 与卸载纹理是 `applyLut(null, 0f)` 的职责（两者在
- * `EditorScreen.resetColor` 里合并成**一次**渲染，避免画面白闪一下）。
+ * 色温 [88] / 色调 [89] 已随 E2-15 归入「调整」组（见 [resetBasicParams]）；
+ * LUT **不在这里、也不在 UI 的重置里** —— LUT 是用户选的"风格素材"，重置参数不该丢掉素材
+ * 选择本身（E2-15 用户确认："这个你判断的对，不应该清"）。强度归 0 由 UI 侧写 [34] 完成。
  */
 internal fun resetColorParams(p: DoubleArray) {
-    p[88] = 0.0
-    p[89] = 0.0
     p[94] = 0.0
+}
+
+/**
+ * 「取消」是否需要二次确认（E2-15 用户反馈："如果改过参数，弹一句『放弃本次修改？』→ 确认才退出"）。
+ *
+ * **判据直接复用 [paramsUnchanged]**（E2-9 / ADR-13 的同一份逻辑）：当前参数 vs **打开编辑器时**
+ * 的基准（`editorOpenParams` 的副本）。不另写一套比较 —— 两套比较必然出现"导出认为无修改、
+ * 取消却弹窗"这种自相矛盾。
+ *
+ * 任一侧为 null（首帧就绪前点取消 / 状态丢失）⇒ **不弹窗直接退出**：此时没有任何可丢的修改，
+ * 弹窗只会挡住用户的退路。
+ */
+internal fun discardNeedsConfirm(current: DoubleArray?, baseline: DoubleArray?): Boolean {
+    if (current == null || baseline == null) return false
+    return !paramsUnchanged(current, baseline)
 }
 
 /**

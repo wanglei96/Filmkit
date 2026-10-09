@@ -4,12 +4,14 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +42,7 @@ import androidx.compose.material.icons.outlined.Brightness7
 import androidx.compose.material.icons.outlined.CenterFocusStrong
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.Compare
 import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.DarkMode
@@ -88,6 +91,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -108,6 +112,7 @@ import com.filmkit.app.camera.LOCAL_FEATHER_UI_RANGE
 import com.filmkit.app.camera.LOCAL_RADIUS_UI_RANGE
 import com.filmkit.app.camera.LOCAL_SAT_UI_RANGE
 import com.filmkit.app.camera.LOCAL_WIDTH_UI_RANGE
+import com.filmkit.app.camera.LUT_STRENGTH_UI_RANGE
 import com.filmkit.app.camera.LocalMode
 import com.filmkit.app.camera.LocalOutline
 import com.filmkit.app.camera.OverwriteResult
@@ -124,6 +129,7 @@ import com.filmkit.app.camera.claritySlot
 import com.filmkit.app.camera.clarityUi
 import com.filmkit.app.camera.contrastSlot
 import com.filmkit.app.camera.contrastUi
+import com.filmkit.app.camera.discardNeedsConfirm
 import com.filmkit.app.camera.editorExportName
 import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
@@ -136,6 +142,7 @@ import com.filmkit.app.camera.formatEv
 import com.filmkit.app.camera.formatKelvin
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
+import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.imageFitRect
 import com.filmkit.app.camera.linearOutline
@@ -221,13 +228,24 @@ import kotlinx.coroutines.withContext
  * 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航（调整 / 色彩 / 暗角 /
  * 局部；预设·裁剪置灰留位）。
  *
+ * E2-15（用户真机反馈，本页四处修正）：
+ *  ① **面板可收起**：顶部/底部把手（下拉收起·上拉展开·点击切换）+ **返回键分层**（展开时
+ *     系统返回先收起面板，已收起才退出编辑器）。收起后面板整段不组合 ⇒ 预览区吃满全屏。
+ *     状态机是纯逻辑（[EditorPanelState]），JVM 单测覆盖。
+ *  ② **色温/色调移入「调整」组**（用户："怎么放 lut 里了应该是调整里面"），褪色留在「色彩」
+ *     组；色彩组的 LUT 与参数**拆成两行**（LUT 42 个，同行会把参数埋掉）。
+ *  ③ **「查看原图」按钮**（用户："给个按钮"）：预览区右下角圆形按钮 = 持续对比，与按住偷看
+ *     并存（两个来源独立，[OriginalViewState]）；局部模式下隐藏（不跟拖动定位抢事件）。
+ *  ④ **「取消」二次确认**：有修改才弹「放弃本次修改？」—— 判据复用 E2-9 的 `paramsUnchanged`
+ *     （[discardNeedsConfirm]），与导出直通同一份逻辑。
+ *
  * 与 E2-1/E2-3/E2-7 那版（可折叠区 + 纵向堆 7~19 条"标签｜细滑杆｜百分比"三段式表单行）的
  * 区别就是 ADR-14 的三条关键修正：**满宽滑杆 + 标签在上方**、**中点标记**、**读数用物理量**
  *（曝光 `+1.0 EV` 而不是 `100%`）。**只渲染引擎已实现并验收的参数**（ADR-12：不许假滑杆），
  * 参数清单与槽位映射见文件末尾的参数表（[EditorParam]）。
  *
  * 面板仍**不是覆盖式浮层**（嵌在预览与底栏之间）：暗角最明显的地方是四角，浮层挡住底边
- * 两点等于让用户盲调 —— 这是 E1-4 起的设计约束，本卡不改。
+ * 两点等于让用户盲调 —— 这是 E1-4 起的设计约束，本卡不改（收起是"整段不渲染"，不是浮层化）。
  *
  * ⚠ 编辑器**不写任何拍摄用的 prefs**（`lut_id` / `lut_strength`）：这里的 LUT 选择
  * 只对本次编辑会话有效，退出即丢 —— 否则用户在编辑器里试个滤镜，回到相机页拍照
@@ -245,6 +263,8 @@ fun EditorScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 把手的拖动阈值是 dp，判定在纯逻辑里按 px 比较（[EditorPanelState.afterDrag]）
+    val density = LocalDensity.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
     // 滑杆 → 渲染闸门（E2-8）：拖动中只更新参数与读数，松手才渲染一次
     val gate = remember { SliderRenderGate() }
@@ -293,7 +313,16 @@ fun EditorScreen(
     //（各组「重置」/ 单参数重置 / 套用原片风格），都要 ++ 让滑杆子树重建一次 —— 否则画面
     // 变了、滑杆读数还停在原处，等于把 ADR-12 的假滑杆反过来演一遍（读数与状态不符）。
     var panelRefresh by remember { mutableIntStateOf(0) }
-    var showOriginal by remember { mutableStateOf(false) }     // 按住预览 = 看输入原图
+    // ── E2-15 面板收起/展开 + 原图对比（用户真机反馈）────────────────────────
+    // 面板：唯一数据源 = 不可变状态（转换全是纯函数，见文件末尾 [EditorPanelState]）。
+    // 收起后面板整段不组合 ⇒ 预览区（weight 1f）自动吃满剩余空间。
+    var panel by remember { mutableStateOf(EditorPanelState()) }
+    // 原图对比：**按钮锁定 + 按住偷看**两个来源（[OriginalViewState]）—— 长按偷看保留，
+    // 按钮提供"持续对比"（用户反馈："查看原图给个按钮"）。
+    var origView by remember { mutableStateOf(OriginalViewState()) }
+    val showOriginal = origView.showing
+    // 「取消」的二次确认（E2-15）：有修改才弹（判据 = E2-9 的 paramsUnchanged，见 [discardNeedsConfirm]）
+    var confirmDiscard by remember { mutableStateOf(false) }
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     var exporting by remember { mutableStateOf(false) }
     var confirmOverwrite by remember { mutableStateOf(false) }
@@ -486,7 +515,7 @@ fun EditorScreen(
         rerender()
     }
 
-    /** 「调整」组重置（E2-3）：五类参数回恒等值 —— 离散操作，直接渲染一次（不经过 gate） */
+    /** 「调整」组重置（E2-3）：本组参数回恒等值 —— 离散操作，直接渲染一次（不经过 gate） */
     fun resetBasic() {
         params?.let { resetBasicParams(it) }
         panelRefresh++
@@ -505,15 +534,21 @@ fun EditorScreen(
     }
 
     /**
-     * 「色彩」组重置（E2-14 扩了范围）：三条引擎参数（色温/色调/褪色）回恒等值 + LUT 关闭
-     * （[34] = 0、卸载纹理）。
+     * 「色彩」组重置（E2-15 改）：褪色 [94] 回恒等值 + LUT **强度归 0**，但
+     * **保留 LUT 选择与纹理**。
      *
-     * 两件事合成**一次**渲染（[applyLut] 自带 `rerender()`）：分两次会让画面白闪一下，也白跑
-     * 一次全分辨率渲染。
+     * 为什么不卸载 LUT（用户确认："这个你判断的对，不应该清"）：LUT 是用户挑的**风格素材**，
+     * 重置参数不该把素材本身丢掉 —— 旧实现走 `applyLut(null, 0f)` 会连 `lutId` 一起清空，
+     * 用户点一下「重置本组」就丢了刚选好的风格，还得重新翻 42 个卡片。
+     * 强度归 0 同样让画面回到原片（引擎侧 `uLutOn = 0` 整段旁路），但素材还在、强度滑杆还在。
+     *
+     * 色温/色调已随 E2-15 归入「调整」组（见 [resetBasic]）⇒ 本组只剩褪色一条引擎参数。
      */
     fun resetColor() {
-        params?.let { resetColorParams(it) }
-        applyLut(null, 0f)
+        params?.let { resetColorParams(it) }   // 褪色 [94] → 0
+        params?.let { it[34] = 0.0 }           // LUT 强度 → 0（**不动** lutId / 引擎纹理）
+        panelRefresh++
+        rerender()
     }
 
     // ── 局部调整（E2-7）────────────────────────────────────────────────────
@@ -569,6 +604,24 @@ fun EditorScreen(
             EditorTab.VIGNETTE -> resetVignette()
             EditorTab.LOCAL -> resetLocal()
         }
+    }
+
+    /**
+     * 面板把手拖动落定（E2-15）：累计位移超过阈值才切换 —— 判定是纯函数
+     * [EditorPanelState.afterDrag]（JVM 单测覆盖），这里只做 dp→px 与状态落地。
+     */
+    fun onHandleDrag(dy: Float) {
+        val threshold = with(density) { EditorPanelState.DRAG_THRESHOLD_DP.dp.toPx() }
+        EditorPanelState.afterDrag(panel, dy, threshold)?.let { panel = it }
+    }
+
+    /**
+     * 「取消」（E2-15 用户反馈："如果改过参数，弹一句『放弃本次修改？』→ 确认才退出"）：
+     * 无修改直接退出（不打扰），有修改先弹确认 —— 判据是 E2-9 的 [discardNeedsConfirm]
+     * （= `paramsUnchanged` 的包装），与导出直通判据**同一份逻辑**。
+     */
+    fun onCancel() {
+        if (discardNeedsConfirm(params, openParams)) confirmDiscard = true else onBack()
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -785,6 +838,14 @@ fun EditorScreen(
         }
     }
 
+    // ★ E2-15 返回键**分层**（用户反馈："系统返回手势要可以收起编辑面板。目前编辑面板打开所有
+    // 照片点开默认展开收不起来！"）：面板展开时本 handler 启用 ⇒ 系统返回先**收起面板**（消费掉，
+    // 不退编辑器）；面板已收起时本 handler 不启用 ⇒ 返回事件落到宿主（MainActivity 的 Nav
+    // BackHandler）才退出编辑器。一次返回绝不会"面板还开着就直接退出"。
+    BackHandler(enabled = panel.expanded) {
+        panel = EditorPanelState.onBack(panel) ?: panel
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -801,7 +862,7 @@ fun EditorScreen(
             EditorTopBar(
                 enabled = !exporting && phase == EditorPhase.Ready,
                 exporting = exporting,
-                onCancel = onBack,
+                onCancel = { onCancel() },
                 onGallery = onOpenGallery,
                 onOverwrite = { confirmOverwrite = true },
                 onDone = { exportNow(false) },
@@ -893,9 +954,11 @@ fun EditorScreen(
                                                 // 局部模式下按下 = 开始拖动定位（拖动分支负责
                                                 // 渲染），不能再抢着显示原图
                                                 if (dragMode) return@detectTapGestures
-                                                showOriginal = true
+                                                // E2-15：按住 = 瞬时偷看（pressed），松手只解除这一路 ——
+                                                // 按钮的锁定态（locked）不受影响（[OriginalViewState]）
+                                                origView = origView.press(true)
                                                 tryAwaitRelease()
-                                                showOriginal = false
+                                                origView = origView.press(false)
                                             })
                                         },
                                 )
@@ -925,20 +988,34 @@ fun EditorScreen(
                                 }
                                 // 提示：**右上角**（研究 §3.5 —— 底部容易被手指遮）+ PC 式 1px 黑阴影
                                 //（ADR-14 抄的 `BoldTextWithShadow`：文字叠在预览图上的可读性技巧）。
-                                // 面板常驻（E2-10）⇒ 不再按 panelOpen 显隐，直接常显。
-                                if (!showOriginal) {
-                                    Text(
-                                        if (dragMode) {
-                                            if (localDragging) "拖动定位中…松手生效" else "拖动画面移动局部区域"
-                                        } else {
-                                            "按住画面看原图"
-                                        },
-                                        color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
-                                        fontSize = 11.sp,
-                                        style = TextStyle(shadow = TextShadow),
+                                // E2-15：看原图时也保留提示（文案切换）—— 按钮的选中态 + 文案双保险，
+                                // 用户任何时候都知道自己看的是哪张。
+                                Text(
+                                    when {
+                                        showOriginal && origView.locked -> "原图（点右下角按钮看效果）"
+                                        showOriginal -> "原图（松手返回效果）"
+                                        dragMode && localDragging -> "拖动定位中…松手生效"
+                                        dragMode -> "拖动画面移动局部区域"
+                                        else -> "按住画面看原图"
+                                    },
+                                    color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
+                                    fontSize = 11.sp,
+                                    style = TextStyle(shadow = TextShadow),
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(top = 8.dp, end = 12.dp),
+                                )
+                                // ★ E2-15 原图对比按钮（用户反馈："查看原图给个按钮"）：右下角圆形按钮，
+                                // **点一下切换持续对比**（长按偷看保留，两者并存）。
+                                // 局部模式下**隐藏**：拖动定位要用整个预览区（含右下角），按钮会抢走那
+                                // 一片的按下事件 ⇒ 用户在那儿拖不动（父代理已提示这个冲突）。
+                                if (!dragMode) {
+                                    OriginalToggleButton(
+                                        on = origView.locked,
+                                        onTap = { origView = origView.toggleLocked() },
                                         modifier = Modifier
-                                            .align(Alignment.TopEnd)
-                                            .padding(top = 8.dp, end = 12.dp),
+                                            .align(Alignment.BottomEnd)
+                                            .padding(end = 14.dp, bottom = 14.dp),
                                     )
                                 }
                             }
@@ -947,37 +1024,49 @@ fun EditorScreen(
                 }
             }
 
-            // ③④⑤⑥ 参数区（E2-10）：**常驻**（不再是可折叠区）—— 参数名 / 单滑杆 /
-            // 参数图标行 / 底部导航，四层顺序照 ADR-14 的 Filmix 结构。
-            // 仍嵌在预览与底栏之间、**不是覆盖式浮层**：暗角最明显的地方是四角，浮层挡住
-            // 底边两点等于让用户盲调（E1-4 起的设计约束，本卡不改）。
-            EditorPanel(
-                group = tab,
-                onGroup = { tab = it },
-                params = params,
-                refreshTick = panelRefresh,
-                status = status,
-                baseHint = editorHint(
-                    status = "",
-                    hasSnapshot = hasSnapshot,
-                    lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
-                    lutK = lutK,
-                ),
-                lutId = lutId,
-                previews = lutPreviews,
-                snapLutId = snapLutId,
-                snapLutK = snapLutK,
-                onPickLut = { e -> pickLut(e) },
-                onApplySnapshot = { applySnapshotStyle() },
-                localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF,
-                localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f),
-                localOn = params?.let { localActive(it) } ?: false,
-                onLocalMode = { m -> setLocalType(m) },
-                onCommit = { p, v -> commit(p, v) },
-                onFinished = { onSliderRelease() },
-                onResetParam = { p -> resetParam(p) },
-                onResetGroup = { g -> resetGroup(g) },
-            )
+            // ③④⑤⑥ 参数区（E2-10）：参数名 / 单滑杆 / 参数图标行 / 底部导航，四层顺序照
+            // ADR-14 的 Filmix 结构。仍嵌在预览与底栏之间、**不是覆盖式浮层**：暗角最明显的
+            // 地方是四角，浮层挡住底边两点等于让用户盲调（E1-4 起的设计约束，本卡不改）。
+            //
+            // ★ E2-15 可收起（用户反馈："系统返回手势要可以收起编辑面板…收不起来"）：收起后
+            // 整段不组合 ⇒ 上面的预览区（weight 1f）自动吃满剩余空间；底部只留一条把手，
+            // 上拉/点击即可恢复（展开恢复原状态：tab / 选中参数 / 滑杆读数都在 remember 里）。
+            if (panel.expanded) {
+                EditorPanel(
+                    group = tab,
+                    onGroup = { tab = it },
+                    params = params,
+                    refreshTick = panelRefresh,
+                    status = status,
+                    baseHint = editorHint(
+                        status = "",
+                        hasSnapshot = hasSnapshot,
+                        lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
+                        lutK = lutK,
+                    ),
+                    lutId = lutId,
+                    previews = lutPreviews,
+                    snapLutId = snapLutId,
+                    snapLutK = snapLutK,
+                    onPickLut = { e -> pickLut(e) },
+                    onApplySnapshot = { applySnapshotStyle() },
+                    localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF,
+                    localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f),
+                    localOn = params?.let { localActive(it) } ?: false,
+                    onLocalMode = { m -> setLocalType(m) },
+                    onCommit = { p, v -> commit(p, v) },
+                    onFinished = { onSliderRelease() },
+                    onResetParam = { p -> resetParam(p) },
+                    onResetGroup = { g -> resetGroup(g) },
+                    onHandleDrag = { dy -> onHandleDrag(dy) },
+                    onTogglePanel = { panel = panel.toggled() },
+                )
+            } else {
+                CollapsedPanelBar(
+                    onDragEnd = { dy -> onHandleDrag(dy) },
+                    onTogglePanel = { panel = panel.toggled() },
+                )
+            }
         }
 
         if (confirmOverwrite) {
@@ -1001,6 +1090,35 @@ fun EditorScreen(
                 dismissButton = {
                     TextButton(onClick = { confirmOverwrite = false }) {
                         Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                    }
+                },
+            )
+        }
+
+        // ★ E2-15 「取消」的二次确认（用户反馈："如果改过参数，弹一句『放弃本次修改？』→ 确认才退出"）：
+        // 只有 [discardNeedsConfirm] 为真（= 参数与打开时不同）才会走到这里；无修改时「取消」
+        // 直接退出，不弹窗打扰。退出后回哪一页由路由层决定（E2-13 查看页），本页只管"放弃 + 退出"。
+        if (confirmDiscard) {
+            AlertDialog(
+                onDismissRequest = { confirmDiscard = false },
+                shape = RoundedCornerShape(18.dp),
+                title = { Text("放弃本次修改？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+                text = {
+                    Text(
+                        "当前的调整还没有保存，退出后不会保留。",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 13.sp,
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmDiscard = false
+                        onBack()
+                    }) { Text("放弃", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmDiscard = false }) {
+                        Text("继续编辑", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
                     }
                 },
             )
@@ -1111,7 +1229,7 @@ private fun editorHint(status: String, hasSnapshot: Boolean, lutLabel: String?, 
     !hasSnapshot -> "这张没有参数记录，已用标准基线"
     lutLabel == null -> "当前：无 LUT（与原片一致）"
     lutK <= 0f -> "当前：$lutLabel · 强度 0（与原片一致）"
-    else -> "当前：$lutLabel · 强度 ${formatZero100(lutK)}（叠加在原片之上）"
+    else -> "当前：$lutLabel · 强度 ${formatZero150(lutK)}（叠加在原片之上）"
 }
 
 /** LaunchedEffect 里初始化结果的打包（避免在协程里零散赋值） */
@@ -1189,21 +1307,36 @@ private class EditorParam(
 )
 
 /**
- * 「调整」组（E2-3 的「基础」组改名，参数一个没少；E2-14 加影调分区四条）：曝光 [0] /
- * 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] / 清晰度 [78] /
- * 高光 [90] / 阴影 [91] / 白色色阶 [92] / 黑色色阶 [93]。槽位语义与恒等值见
- * `EditorExport.kt` 的映射段。
+ * 「调整」组（E2-3 的「基础」组改名；E2-14 加影调分区四条；E2-15 纳色温/色调）：
+ * 曝光 [0] / 色温 [88] / 色调 [89] / 对比度 [4] / 高光 [90] / 阴影 [91] /
+ * 白色色阶 [92] / 黑色色阶 [93] / 饱和度 [20..22] / 清晰度 [78] / 红 [1] / 绿 [2] / 蓝 [3]。
+ * 槽位语义与恒等值见 `EditorExport.kt` 的映射段。
+ *
+ * **排序理由（E2-15，用户要求"按逻辑排但要说明理由"）**——按用户调色的**实际决策顺序**：
+ *  1. **曝光**：先定整体明暗 —— 后面所有参数（尤其影调分区与饱和度）的观感都建立在它之上；
+ *  2. **色温 → 色调**：白平衡两条紧跟曝光。它们决定"这张照片的色偏"，而色偏会污染后面
+ *     每一个关于颜色的判断（饱和度、清晰度看起来"发灰/发黄"常常只是白平衡没对）；
+ *     两条**必须相邻**（同一套白平衡的两轴，分开找不着）；
+ *  3. **对比度**：全局反差 —— 白平衡定色之后才谈得上"反差合不合适"；
+ *  4. **高光 → 阴影 → 白色色阶 → 黑色色阶**：四个影调分区按**从亮部到暗部**（Lightroom
+ *     Basic 面板的既有顺序，用户肌肉记忆最省）；都在对比度之后，因为它们是"对比度不够
+ *     精细"时的分区微调；
+ *  5. **饱和度**：全局色彩强度 —— 影调定完再谈色彩浓度（影调变了，饱和的观感也变）；
+ *  6. **清晰度**：局部质感（中频），放在全局色彩之后 —— 它是"最后一道质感调味"；
+ *  7. **红 / 绿 / 蓝**：手动通道增益放最后。它们是白平衡的"手动挡"，与色温/色调功能重叠，
+ *     属于进阶微调 —— 放前面会诱导用户用三条增益去调色偏（比色温/色调难用得多）。
  *
  * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
  *  - **曝光** `+1.0 EV`（物理量，不再是 `100%`）；中点 = `0.0 EV`
+ *  - **色温** `5000K`（**物理量 K，不是 mired**）；中点 = `6500K`
+ *  - **色调** `+12`（±100，正 = 品红）；中点 = `0`
  *  - **红/绿/蓝** `+12`（相对增益 ±100）；中点 = `0`（= 增益 1.00 不变）
  *  - **对比度 / 饱和度** `+12`（±100）；中点 = `0`（= 1.00 不变）
  *  - **清晰度** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记（端点本身就是标记）
  *  - **高光 / 阴影 / 白色色阶 / 黑色色阶** `+50`（±100，正 = 该分区提亮）；中点 = `0`
  *
- * 白平衡为什么仍是 R/G/B 三条（而不是色温/色调两条）：三条增益与三个槽位是**双射**，往返精确、
- * 单测能守住；色温/色调是 2 自由度映射到 3 个增益，逆映射不唯一（E2-3 已论证）—— ADR-14
- * 裁决 1 用新槽位 `[88] temp_mired` / `[89] tint` 解决，属 E2-11，本卡不动。
+ * ⚠️ 色温滑杆的值**直接就是 K**（右移 = K 大 = 画面变暖）—— 槽位 [88] 存的是 mired 偏移，
+ * 方向相反，换算在 `EditorExport.kt` 的 `tempSlot` / `tempUi` 里（见那里的方向约定）。
  */
 private val AdjustParams: List<EditorParam> = listOf(
     EditorParam(
@@ -1213,26 +1346,22 @@ private val AdjustParams: List<EditorParam> = listOf(
         read = { expUi(it[0]) },
         write = { p, v -> p[0] = expSlot(v) },
     ),
+    // ── E2-15：色温 / 色调从「色彩」组**移进来**（用户反馈："色温方向正确，放的位置不对，
+    // 怎么放 lut 里了应该是调整里面"）。它们是白平衡的两条，与 [1..3] 通道增益同属基础调整；
+    // 两条**必须在一起**（分开会让用户找不到另一半）。
     EditorParam(
-        key = "wbR", label = "红", letter = "R",
-        range = WB_GAIN_UI_RANGE, pivot = 1f,
-        format = { formatOffset100(it, 1f) },
-        read = { wbGainUi(it[1]) },
-        write = { p, v -> p[1] = wbGainSlot(v) },
+        key = "temp", label = "色温", icon = Icons.Outlined.Thermostat,
+        range = TEMP_UI_RANGE, pivot = TEMP_UI_PIVOT,
+        format = { formatKelvin(it) },
+        read = { tempUi(it[88]) },
+        write = { p, v -> p[88] = tempSlot(v) },
     ),
     EditorParam(
-        key = "wbG", label = "绿", letter = "G",
-        range = WB_GAIN_UI_RANGE, pivot = 1f,
-        format = { formatOffset100(it, 1f) },
-        read = { wbGainUi(it[2]) },
-        write = { p, v -> p[2] = wbGainSlot(v) },
-    ),
-    EditorParam(
-        key = "wbB", label = "蓝", letter = "B",
-        range = WB_GAIN_UI_RANGE, pivot = 1f,
-        format = { formatOffset100(it, 1f) },
-        read = { wbGainUi(it[3]) },
-        write = { p, v -> p[3] = wbGainSlot(v) },
+        key = "tint", label = "色调", icon = Icons.Outlined.InvertColors,
+        range = TINT_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { tintUi(it[89]) },
+        write = { p, v -> p[89] = tintSlot(v) },
     ),
     EditorParam(
         key = "contrast", label = "对比度", icon = Icons.Outlined.Contrast,
@@ -1240,21 +1369,6 @@ private val AdjustParams: List<EditorParam> = listOf(
         format = { formatOffset100(it, 1f) },
         read = { contrastUi(it[4]) },
         write = { p, v -> p[4] = contrastSlot(v) },
-    ),
-    EditorParam(
-        key = "sat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
-        range = SAT_UI_RANGE, pivot = 1f,
-        format = { formatOffset100(it, 1f) },
-        // 一个滑杆同写 [20][21][22] 三槽（ADR §5.6④ 的硬约束，见 writeSaturation 的 KDoc）
-        read = { satUi(it[21]) },
-        write = { p, v -> writeSaturation(p, v) },
-    ),
-    EditorParam(
-        key = "clarity", label = "清晰度", icon = Icons.Outlined.Details,
-        range = CLARITY_UI_RANGE, pivot = 0f,
-        format = { formatZero100(it) },
-        read = { clarityUi(it[78]) },
-        write = { p, v -> p[78] = claritySlot(v) },
     ),
     // ── E2-14：影调分区四条（[90..93]，引擎 `kFsStyle` 的 `uToneOn` 段）────────────
     // 量程 −1..+1 直通槽位，恒等 0；读数 = ±100 整数（`+50` / `0` / `-50`），中点 0。
@@ -1287,38 +1401,58 @@ private val AdjustParams: List<EditorParam> = listOf(
         read = { toneUi(it[93]) },
         write = { p, v -> p[93] = toneSlot(v) },
     ),
+    // 全局色彩强度 → 质感 → 手动通道增益（顺序理由见 [AdjustParams] 的 KDoc）
+    EditorParam(
+        key = "sat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
+        range = SAT_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        // 一个滑杆同写 [20][21][22] 三槽（ADR §5.6④ 的硬约束，见 writeSaturation 的 KDoc）
+        read = { satUi(it[21]) },
+        write = { p, v -> writeSaturation(p, v) },
+    ),
+    EditorParam(
+        key = "clarity", label = "清晰度", icon = Icons.Outlined.Details,
+        range = CLARITY_UI_RANGE, pivot = 0f,
+        format = { formatZero100(it) },
+        read = { clarityUi(it[78]) },
+        write = { p, v -> p[78] = claritySlot(v) },
+    ),
+    EditorParam(
+        key = "wbR", label = "红", letter = "R",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[1]) },
+        write = { p, v -> p[1] = wbGainSlot(v) },
+    ),
+    EditorParam(
+        key = "wbG", label = "绿", letter = "G",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[2]) },
+        write = { p, v -> p[2] = wbGainSlot(v) },
+    ),
+    EditorParam(
+        key = "wbB", label = "蓝", letter = "B",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[3]) },
+        write = { p, v -> p[3] = wbGainSlot(v) },
+    ),
 )
 
 /**
- * 「色彩」组的**引擎参数**（E2-14）：色温 [88] / 色调 [89] / 褪色 [94]。
+ * 「色彩」组的**引擎参数**（E2-14；E2-15 只剩褪色 [94]）：褪色。
  *
- * **不依赖 LUT**（引擎侧这三条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时它们照样可调 —— 这也是
+ * **不依赖 LUT**（引擎侧这条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时它照样可调 —— 这也是
  * 本组从"未选 LUT 就空表"变成常驻的原因。LUT 强度 [34] 是单独一条（[LutStrengthParam]），
  * 选了 LUT 才进表。
  *
- * 读数口径：
- *  - **色温** `5000K`（**物理量 K，不是 mired**）；中点 = `6500K`
- *  - **色调** `+12`（±100，正 = 品红）；中点 = `0`
- *  - **褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记
+ * 色温 [88] / 色调 [89] 已随 E2-15 移入「调整」组（用户反馈见 [AdjustParams] 的 KDoc）；
+ * **褪色留在这里** —— 它是风格化参数（抬黑场、做"褪色胶片感"），不是基础调整。
  *
- * ⚠️ 色温滑杆的值**直接就是 K**（右移 = K 大 = 画面变暖）—— 槽位 [88] 存的是 mired 偏移，
- * 方向相反，换算在 `EditorExport.kt` 的 `tempSlot` / `tempUi` 里（见那里的方向约定）。
+ * 读数口径：**褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记。
  */
 private val ColorParams: List<EditorParam> = listOf(
-    EditorParam(
-        key = "temp", label = "色温", icon = Icons.Outlined.Thermostat,
-        range = TEMP_UI_RANGE, pivot = TEMP_UI_PIVOT,
-        format = { formatKelvin(it) },
-        read = { tempUi(it[88]) },
-        write = { p, v -> p[88] = tempSlot(v) },
-    ),
-    EditorParam(
-        key = "tint", label = "色调", icon = Icons.Outlined.InvertColors,
-        range = TINT_UI_RANGE, pivot = ZERO_UI_PIVOT,
-        format = { formatOffset100(it, ZERO_UI_PIVOT) },
-        read = { tintUi(it[89]) },
-        write = { p, v -> p[89] = tintSlot(v) },
-    ),
     EditorParam(
         key = "fade", label = "褪色", icon = Icons.Outlined.Gradient,
         range = FADE_UI_RANGE, pivot = ZERO_UI_PIVOT,
@@ -1330,14 +1464,17 @@ private val ColorParams: List<EditorParam> = listOf(
 
 /**
  * LUT 强度 [34]（E2-1）：**只有选了 LUT 才有意义** ⇒ 未选时整条不进参数表（ADR-12：不给假滑杆）。
- * 强度读数 `85`（0..100 整数）；基准 0 = 关 ⇒ 不画中点标记。
+ *
+ * 量程 **0..1.5**（E2-15 用户反馈："LUT强度应该统一可调至150"）：与拍照页的 LUT 强度滑杆
+ * 同一量程（`RelativeSlider` 默认就是 `0f..1.5f`）。读数 `150`（整数 0..150，[formatZero150]）；
+ * 基准 0 = 关 ⇒ 不画中点标记。
  */
 private val LutStrengthParam = EditorParam(
     key = "lutK", label = "强度", icon = Icons.Outlined.PhotoFilter,
-    range = 0f..1f, pivot = 0f,
-    format = { formatZero100(it) },
-    read = { p -> if (p[34].isFinite()) p[34].toFloat().coerceIn(0f, 1f) else 0f },
-    write = { p, v -> p[34] = v.coerceIn(0f, 1f).toDouble() },
+    range = LUT_STRENGTH_UI_RANGE, pivot = 0f,
+    format = { formatZero150(it) },
+    read = { p -> if (p[34].isFinite()) p[34].toFloat().coerceIn(0f, 1.5f) else 0f },
+    write = { p, v -> p[34] = v.coerceIn(0f, 1.5f).toDouble() },
 )
 
 /**
@@ -1566,11 +1703,14 @@ private fun EditorTopBar(
 }
 
 /**
- * ③④⑤⑥ 参数区（E2-10）：常驻面板，四层顺序照 ADR-14。
+ * ③④⑤⑥ 参数区（E2-10）：四层顺序照 ADR-14。
  *
  * 选中参数是**派生**的（`list.firstOrNull { key == selKey } ?: list.first()`）：换组 / 换局部
  * 模式后原选中项可能不在新表里，自动回落到第一项 —— 不需要 `LaunchedEffect` 去"修"选中项，
  * 那种写法本身就是状态不同步的来源。
+ *
+ * E2-15：顶部多一条**拖拽把手**（[PanelHandle]）—— 用户不必依赖系统返回手势就能收起面板
+ *（用户反馈："目前编辑面板打开所有照片点开默认展开收不起来"）。
  */
 @Composable
 private fun EditorPanel(
@@ -1596,11 +1736,16 @@ private fun EditorPanel(
     onFinished: () -> Unit,
     onResetParam: (EditorParam) -> Unit,
     onResetGroup: (EditorTab) -> Unit,
+    /** 把手拖动落定（累计位移，px）：判定在 [EditorPanelState.afterDrag] */
+    onHandleDrag: (Float) -> Unit,
+    /** 把手点击 = 收起面板 */
+    onTogglePanel: () -> Unit,
 ) {
     val context = LocalContext.current
     val list = when (group) {
         EditorTab.ADJUST -> AdjustParams
-        // 色彩组（E2-14）：三条引擎参数（色温/色调/褪色）常驻 + LUT 强度（选了 LUT 才有）
+        // 色彩组（E2-15）：褪色（[ColorParams]）+ LUT 强度（选了 LUT 才有）。
+        // 色温/色调已移入「调整」组 —— 它们是白平衡的两条，不属于"风格素材"这一类。
         EditorTab.COLOR -> if (lutId != null) ColorParams + LutStrengthParam else ColorParams
         EditorTab.VIGNETTE -> VignetteParams
         EditorTab.LOCAL -> localParams(localMode)
@@ -1618,8 +1763,13 @@ private fun EditorPanel(
             .fillMaxWidth()
             .background(FilmTheme.PanelSolid)
             .navigationBarsPadding()
-            .padding(top = 6.dp, bottom = 4.dp),
+            .padding(bottom = 4.dp),
     ) {
+        // ★ E2-15 拖拽把手：下拉收起 / 点击收起（展开态的把手在面板**顶部**）
+        PanelHandle(
+            onDragEnd = onHandleDrag,
+            onToggle = onTogglePanel,
+        )
         // 提示行（status / 快照缺失 / 当前 LUT / 局部说明）：11sp 居中 + 1px 黑阴影
         Text(
             hint,
@@ -1665,9 +1815,11 @@ private fun EditorPanel(
             }
         }
         Spacer(Modifier.height(6.dp))
-        // ⑤ 参数图标行：色彩组 = LUT 圆形按钮 + 本组三条引擎参数（**同一行**横向滚动，E2-14）
+        // ⑤ 参数图标行。色彩组**拆成两行**（E2-15）：LUT 一行（42 个素材，横滚很深）+
+        // 本组参数一行（褪色 / 强度）。挤在同一行时，参数被埋在几十张 LUT 卡片之后 ——
+        // 用户横滚半天找不到「褪色」，等于参数不存在（ADR 记的"LUT 与参数挤一行"问题）。
         if (group == EditorTab.COLOR) {
-            ColorIconRow(
+            LutIconRow(
                 lutId = lutId,
                 previews = previews,
                 onPick = { e ->
@@ -1676,10 +1828,9 @@ private fun EditorPanel(
                     // 选「无」时强度条不在表里，选中项自动回落到第一条
                     if (e != null) selKey = LutStrengthParam.key
                 },
-                list = list,
-                selectedKey = current?.key,
-                onSelect = { selKey = it.key },
             )
+            Spacer(Modifier.height(10.dp))
+            ParamIconRow(list, current?.key) { selKey = it.key }
         } else {
             ParamIconRow(list, current?.key) { selKey = it.key }
         }
@@ -1838,7 +1989,7 @@ private fun SnapshotStyleRow(
                 snapEntry == null -> "原片风格：$snapLutId（已不在库中）"
                 // 强度 0 = 当初就没叠加（编辑器导出的新片会落在这一档）：说"未叠加"比 "0" 清楚
                 snapLutK <= 0f -> "原片风格：${snapEntry.label}（未叠加）"
-                else -> "原片风格：${snapEntry.label} · 强度 ${formatZero100(snapLutK)}"
+                else -> "原片风格：${snapEntry.label} · 强度 ${formatZero150(snapLutK)}"
             },
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
@@ -1884,21 +2035,18 @@ private fun ParamIconRow(
 }
 
 /**
- * 色彩组的图标行（E2-1 的 LUT 圆形按钮 + E2-14 的本组引擎参数，**同一个横向滚动行**）：
- * 先是「无」+ 各 LUT（有预览图时显示圆形缩略图），再是色温 / 色调 / 褪色（选了 LUT 时
- * 末尾还有「强度」）。
+ * 色彩组的 **LUT 图标行**（E2-1 的 LUT 圆形按钮；E2-15 从"与参数同行"拆出来独立一行）：
+ * 「无」+ 各 LUT（有预览图时显示圆形缩略图）。
  *
- * 为什么合成一行而不是两行：ADR-14 的层⑤ 就是"一屏一行参数图标"，两行会把滑杆挤下去；
- * 且 LUT 与色温同属"改颜色"的操作，用户在同一行里横向找是自然的。
+ * 为什么拆行（E2-15 用户反馈的连带修正）：LUT 有 42 个，横滚很深 —— 参数挤在同一行时
+ * 用户要滑过几十张卡片才看得到「褪色」，等于参数不存在。拆开后 LUT 一行、参数一行，
+ * 两者都一眼可见；代价只是面板高一点点（本组参数少，两行加起来仍矮于其他组的滑杆区）。
  */
 @Composable
-private fun ColorIconRow(
+private fun LutIconRow(
     lutId: String?,
     previews: Map<String, Bitmap>,
     onPick: (LutLibrary.Entry?) -> Unit,
-    list: List<EditorParam>,
-    selectedKey: String?,
-    onSelect: (EditorParam) -> Unit,
 ) {
     val context = LocalContext.current
     LazyRow(
@@ -1915,14 +2063,6 @@ private fun ColorIconRow(
                 selected = lutId == e.id,
                 bitmap = previews[e.id],
             ) { onPick(e) }
-        }
-        items(list, key = { it.key }) { p ->
-            ParamChip(
-                label = p.label,
-                selected = p.key == selectedKey,
-                icon = p.icon,
-                letter = p.letter,
-            ) { onSelect(p) }
         }
     }
 }
@@ -2055,6 +2195,99 @@ private fun EditorTabBar(selected: EditorTab, onSelect: (EditorTab) -> Unit) {
 }
 
 /**
+ * ★ E2-15 面板拖拽把手（用户反馈："目前编辑面板打开所有照片点开默认展开收不起来"）：
+ * 一条小横条，**下拉收起 / 上拉展开**，**点击也能切换**（不是所有用户都想到去拖它）。
+ *
+ * 为什么不做成"点击预览区切换"：预览区在局部调整模式下已被拖动定位占用，再叠一个
+ * "点击 = 收起"就会跟定位抢事件（父代理已明确排除该方案）。把手的触摸区只有 26dp 高、
+ * 且贴在面板/屏幕边缘，谁也不抢。
+ *
+ * 手势：两个独立 pointerInput（tap 与 vertical drag 互不干扰）；拖动位移在组件内累计，
+ * **松手才判定**（阈值判定是纯函数 [EditorPanelState.afterDrag]，JVM 单测覆盖）。
+ */
+@Composable
+private fun PanelHandle(
+    onDragEnd: (Float) -> Unit,
+    onToggle: () -> Unit,
+) {
+    var accum by remember { mutableFloatStateOf(0f) }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(26.dp)
+            .pointerInput(Unit) { detectTapGestures { onToggle() } }
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
+                    onDragStart = { accum = 0f },
+                    onDragEnd = {
+                        onDragEnd(accum)
+                        accum = 0f
+                    },
+                    onDragCancel = { accum = 0f },
+                    onVerticalDrag = { change, dy ->
+                        change.consume()
+                        accum += dy
+                    },
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        // 把手本体：44×4dp 圆角小横条（一眼看出"这里可以拖"）
+        Box(
+            Modifier
+                .width(44.dp)
+                .height(4.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(FilmTheme.CreamDim.copy(alpha = 0.6f)),
+        )
+    }
+}
+
+/**
+ * ★ E2-15 收起态底栏：只剩把手 + 一行提示（上拉 / 点击展开）。面板整段不组合 ⇒
+ * 预览区（weight 1f）自动吃满剩余空间 —— "收起后预览区扩展到全屏"这条由此**结构性**成立。
+ */
+@Composable
+private fun CollapsedPanelBar(onDragEnd: (Float) -> Unit, onTogglePanel: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(FilmTheme.PanelSolid)
+            .navigationBarsPadding()
+            .padding(bottom = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        PanelHandle(onDragEnd = onDragEnd, onToggle = onTogglePanel)
+        Text("上拉或点击展开参数面板", color = FilmTheme.CreamDim, fontSize = 10.sp)
+    }
+}
+
+/**
+ * ★ E2-15 「查看原图」按钮（用户反馈："查看原图给个按钮"；形态照 Filmix 预览区右下角的
+ * 圆形对比按钮）：**点一下切换持续对比**，长按偷看**同时保留**（两者并存，互不干扰 ——
+ * 见 [OriginalViewState] 的两个来源）。选中态 = 黄底 + 深色图标，一眼看出当前看的是哪张。
+ */
+@Composable
+private fun OriginalToggleButton(on: Boolean, onTap: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .size(44.dp)
+            .clip(CircleShape)
+            .background(if (on) FilmTheme.Accent else FilmTheme.ChipBg.copy(alpha = 0.85f))
+            .border(1.dp, if (on) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape)
+            .pressScale(pressedScale = 0.9f, onTap = onTap),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Outlined.Compare,
+            contentDescription = if (on) "查看效果图" else "查看原图",
+            tint = if (on) FilmTheme.OnAccent else FilmTheme.Cream,
+            modifier = Modifier.size(22.dp),
+        )
+    }
+}
+
+/**
  * 滑杆 → 渲染的触发闸门（E2-8，用户 2026-10-08 拍板："可以拖完松手再渲染，不用实时渲染"）。
  *
  * 纯逻辑、不依赖 Android ⇒ JVM 单测能守住本卡最容易错的一条：**松手必须渲染**
@@ -2086,6 +2319,70 @@ internal class SliderRenderGate {
         ticks = 0
         return n
     }
+}
+
+/**
+ * 面板收起/展开的**纯逻辑状态机**（E2-15，用户真机反馈："系统返回手势要可以收起编辑面板。
+ * 目前编辑面板打开所有照片点开默认展开收不起来！"）。
+ *
+ * 为什么抽成不可变状态 + 纯函数：这三条规格错了用户一眼就能看见，但真机验证要装包点半天 ——
+ * 抽出来 JVM 单测直接钉住（与 [SliderRenderGate] 同一套路）：
+ *  1. **返回键分层**：展开 ⇒ 先收起面板（消费返回）；已收起 ⇒ 交宿主退出编辑器
+ *     （[onBack] 返回 null = 不消费）。一次返回绝不会"面板还开着就直接退出"。
+ *  2. **把手拖动**：累计位移超过阈值才切换（[afterDrag]）—— 轻微抖动不该收起面板。
+ *  3. **点击把手**：显式切换（[toggled]）—— 用户反馈明确要求"不要只依赖返回手势"。
+ *
+ * 不可变 + `copy`：Compose 侧只需一个 `mutableStateOf`（单一数据源，不存在两份状态不同步）。
+ */
+internal data class EditorPanelState(val expanded: Boolean = true) {
+    /** 点击把手：收起 ⇄ 展开 */
+    fun toggled(): EditorPanelState = copy(expanded = !expanded)
+
+    companion object {
+        /** 把手拖动阈值（dp）：小于它视为抖动/误触。24dp ≈ 手指按下时的自然抖动上限。 */
+        const val DRAG_THRESHOLD_DP = 24f
+
+        /**
+         * 返回键分层：**展开 ⇒ 收起面板并消费返回**（返回新状态）；**已收起 ⇒ 返回 null
+         * = 不消费**，事件继续往上传给宿主（退出编辑器）。
+         */
+        fun onBack(s: EditorPanelState): EditorPanelState? =
+            if (s.expanded) s.copy(expanded = false) else null
+
+        /**
+         * 把手拖动落定（[dy] = 本次手势的累计位移，px；向下为正）：超过阈值才切换 ——
+         * **下拉收起 / 上拉展开**；未达阈值或坏数据返回 null（保持原状态）。
+         */
+        fun afterDrag(s: EditorPanelState, dy: Float, thresholdPx: Float): EditorPanelState? {
+            if (!dy.isFinite() || !thresholdPx.isFinite() || thresholdPx <= 0f) return null
+            return when {
+                dy >= thresholdPx -> s.copy(expanded = false)   // 下拉 = 收起
+                dy <= -thresholdPx -> s.copy(expanded = true)   // 上拉 = 展开
+                else -> null
+            }
+        }
+    }
+}
+
+/**
+ * 「查看原图」的状态（E2-15，用户反馈："查看原图给个按钮"）：两个**独立**来源合成一个显示判据。
+ *
+ *  - [locked]：右下角按钮点出来的**持续对比**（再点一下回效果图）
+ *  - [pressed]：按住预览的**瞬时偷看**（松手即回）
+ *
+ * 为什么要两个字段而不是一个 Boolean：一个 Boolean 时"按住看原图"松手会把按钮的锁定态
+ * 一起清掉（用户点开按钮锁定、随手长按一下再松手 ⇒ 原图莫名消失）。[showing] 是唯一的显示
+ * 判据（`locked || pressed`），[press] 只动按下那一路、[toggleLocked] 只动锁定那一路。
+ */
+internal data class OriginalViewState(val locked: Boolean = false, val pressed: Boolean = false) {
+    /** 是否显示输入原图（两个来源取或） */
+    val showing: Boolean get() = locked || pressed
+
+    /** 按钮点击：锁定态取反（不影响正在按住的偷看） */
+    fun toggleLocked(): OriginalViewState = copy(locked = !locked)
+
+    /** 按住预览（[v] = true 按下 / false 松手）：只动瞬时那一路 */
+    fun press(v: Boolean): OriginalViewState = copy(pressed = v)
 }
 
 /**
