@@ -283,6 +283,303 @@ internal fun resetBasicParams(p: DoubleArray) {
     p[78] = 0.0
 }
 
+/**
+ * 局部调整的 UI ↔ 槽位映射 + **预览坐标换算**（E2-7）。与上面两组同一范式：纯逻辑、
+ * 无 Android / Compose 依赖 ⇒ JVM 单测直接覆盖往返、letterbox 偏移与边界夹紧。
+ *
+ * 槽位语义（E2-6 已实现并独立验收，见 ADR「E2-7 必读的槽位与语义」表）：
+ *  - [79] local_type  0 = 关 / 1 = 径向 / 2 = 线性
+ *  - [80][81] 中心（归一化图像坐标，**顶行 = 0**）
+ *  - [82] 半径（UV，**正圆语义**：x 方向 = 相对图像宽，y 方向 = 相对图像高）
+ *  - [83] 羽化（相对半径）、[84] 线性法线角（弧度）、[85] 线性半宽（UV）
+ *  - [86] 局部曝光 EV（恒等 **0**）、[87] 局部饱和度（恒等 **1**）
+ *
+ * 为什么坐标换算必须是纯函数：**轮廓绘制与拖动定位必须共用同一套换算** —— 两处各写一份，
+ * 一旦有偏差，用户看到的是"拖了没对准"（轮廓中心与真实 mask 中心不重合）。放在这里也
+ * 让 letterbox 偏移、边界夹紧这些最容易错的地方能被单测逐条钉住。
+ */
+
+/** 局部调整模式（UI 枚举 = [79] 的三个取值）。 */
+internal object LocalMode {
+    const val OFF = 0
+    const val RADIAL = 1
+    const val LINEAR = 2
+}
+
+/** UI 模式（0/1/2）→ 槽位 [79]。越界/坏数据回落到 0 = 关。 */
+internal fun localTypeSlot(ui: Int): Double =
+    if (ui == LocalMode.RADIAL || ui == LocalMode.LINEAR) ui.toDouble() else 0.0
+
+/**
+ * 槽位 [79] → UI 模式。**只有 [0.5, 2.5) 才认**：快照里 2.7 / −1 / NaN 这类坏数据一律当"关"，
+ * 否则会显示一个引擎侧根本不存在的模式（引擎判据是 `>= 1.5` = 线性、`[0.5,1.5)` = 径向）。
+ */
+internal fun localTypeUi(slot: Double): Int = when {
+    !slot.isFinite() -> LocalMode.OFF
+    slot >= 0.5 && slot < 1.5 -> LocalMode.RADIAL
+    slot >= 1.5 && slot < 2.5 -> LocalMode.LINEAR
+    else -> LocalMode.OFF
+}
+
+/** 槽位 → 模式名（诊断日志用；UI 文案见 EditorScreen）。 */
+internal fun localTypeName(slot: Double): String = when (localTypeUi(slot)) {
+    LocalMode.RADIAL -> "radial"
+    LocalMode.LINEAR -> "linear"
+    else -> "off"
+}
+
+/** 归一化中心（0..1，顶行 = 0）→ 槽位 [80]/[81]。坏数据（NaN/Inf）回落到画面中心。 */
+internal fun localCenterSlot(uiX: Float, uiY: Float): Pair<Double, Double> =
+    (if (uiX.isFinite()) uiX.coerceIn(0f, 1f).toDouble() else 0.5) to
+        (if (uiY.isFinite()) uiY.coerceIn(0f, 1f).toDouble() else 0.5)
+
+/** 槽位 [80]/[81] → 归一化中心（0..1）。坏数据/越界回落到 0.5（= 画面中心）。 */
+internal fun localCenterUi(slotX: Double, slotY: Double): Pair<Float, Float> =
+    (if (slotX.isFinite()) slotX.coerceIn(0.0, 1.0).toFloat() else 0.5f) to
+        (if (slotY.isFinite()) slotY.coerceIn(0.0, 1.0).toFloat() else 0.5f)
+
+/** 半径 UI 量程（**UV 单位 = 图像宽/高的比例**，恒等/默认 0.35；见 [radialOutline] 的正圆语义）。 */
+internal val LOCAL_RADIUS_UI_RANGE = 0f..1f
+
+/** 羽化 UI 量程：0 = 极窄过渡（引擎侧 `max(_,1e-3)` 兜底），1 = 与半径等宽。 */
+internal val LOCAL_FEATHER_UI_RANGE = 0f..1f
+
+/** 角度 UI 量程：显示 0%..100% = 0..π 弧度（法线方向；π 与 0 是同一条轴，不必到 2π）。 */
+internal val LOCAL_ANGLE_UI_RANGE = 0f..1f
+
+/** 线性半宽 UI 量程（UV 单位，默认 0.25）。 */
+internal val LOCAL_WIDTH_UI_RANGE = 0f..1f
+
+/** 局部曝光 UI 量程：显示 −100%..+100% = ±3 EV（0% = 不变，与全局曝光同一口径）。 */
+internal val LOCAL_EV_UI_RANGE = -1f..1f
+
+/** 局部饱和度 UI 量程：显示 0%..200%（100% = 不变）。 */
+internal val LOCAL_SAT_UI_RANGE = 0f..2f
+
+/** UI 半径（0..1，相对图像宽）→ 槽位 [82]。 */
+internal fun localRadiusSlot(ui: Float): Double =
+    ui.coerceIn(LOCAL_RADIUS_UI_RANGE.start, LOCAL_RADIUS_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [82] → UI 半径（0..1）。坏数据回落到默认 0.35（= `CameraPresets` 的占位值）。 */
+internal fun localRadiusUi(slot: Double): Float =
+    if (!slot.isFinite()) 0.35f else {
+        slot.coerceIn(LOCAL_RADIUS_UI_RANGE.start.toDouble(), LOCAL_RADIUS_UI_RANGE.endInclusive.toDouble())
+            .toFloat()
+    }
+
+/** UI 羽化（0..1）→ 槽位 [83]。 */
+internal fun localFeatherSlot(ui: Float): Double =
+    ui.coerceIn(LOCAL_FEATHER_UI_RANGE.start, LOCAL_FEATHER_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [83] → UI 羽化（0..1）。坏数据回落到 0.5。 */
+internal fun localFeatherUi(slot: Double): Float =
+    if (!slot.isFinite()) 0.5f else {
+        slot.coerceIn(LOCAL_FEATHER_UI_RANGE.start.toDouble(), LOCAL_FEATHER_UI_RANGE.endInclusive.toDouble())
+            .toFloat()
+    }
+
+/** UI 角度（0..1 = 显示 0..100%）→ 槽位 [84]（0..π 弧度）。 */
+internal fun localAngleSlot(ui: Float): Double =
+    ui.coerceIn(LOCAL_ANGLE_UI_RANGE.start, LOCAL_ANGLE_UI_RANGE.endInclusive).toDouble() * Math.PI
+
+/** 槽位 [84]（弧度）→ UI 角度（0..1）。坏数据回落到 0（= 条带竖直）。 */
+internal fun localAngleUi(slot: Double): Float =
+    if (!slot.isFinite()) 0f else {
+        (slot / Math.PI)
+            .coerceIn(LOCAL_ANGLE_UI_RANGE.start.toDouble(), LOCAL_ANGLE_UI_RANGE.endInclusive.toDouble())
+            .toFloat()
+    }
+
+/** UI 线性半宽（0..1）→ 槽位 [85]。 */
+internal fun localWidthSlot(ui: Float): Double =
+    ui.coerceIn(LOCAL_WIDTH_UI_RANGE.start, LOCAL_WIDTH_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [85] → UI 线性半宽（0..1）。坏数据回落到 0.25。 */
+internal fun localWidthUi(slot: Double): Float =
+    if (!slot.isFinite()) 0.25f else {
+        slot.coerceIn(LOCAL_WIDTH_UI_RANGE.start.toDouble(), LOCAL_WIDTH_UI_RANGE.endInclusive.toDouble())
+            .toFloat()
+    }
+
+/** UI 局部曝光（−1..1 = 显示 ±100%）→ 槽位 [86]（−3..+3 EV，与全局曝光同一换算）。 */
+internal fun localEvSlot(ui: Float): Double = expSlot(ui)
+
+/** 槽位 [86] → UI 局部曝光（−1..1）。坏数据回落到恒等 0。 */
+internal fun localEvUi(slot: Double): Float = expUi(slot)
+
+/** UI 局部饱和度（0..2 = 显示 0%..200%）→ 槽位 [87]。 */
+internal fun localSatSlot(ui: Float): Double =
+    ui.coerceIn(LOCAL_SAT_UI_RANGE.start, LOCAL_SAT_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [87] → UI 局部饱和度（0..2）。坏数据回落到恒等 1.0（= 100%）。 */
+internal fun localSatUi(slot: Double): Float =
+    if (!slot.isFinite()) 1f else {
+        slot.coerceIn(LOCAL_SAT_UI_RANGE.start.toDouble(), LOCAL_SAT_UI_RANGE.endInclusive.toDouble())
+            .toFloat()
+    }
+
+/**
+ * 局部调整是否**生效**（= 引擎侧 `uLocalOn` 的判据，ADR 交互规格第 6 条）：
+ * `[79] ≥ 0.5`（选了类型）**且**（`[86] ≠ 0` 或 `[87] ≠ 1`）（调过强度）。
+ *
+ * UI 用它给出"选了类型但没调强度 ⇒ 画面不会变"的提示 —— 与引擎同一判据，两处不会打架。
+ */
+internal fun localActive(p: DoubleArray): Boolean =
+    localTypeUi(p[79]) != LocalMode.OFF && (p[86] != 0.0 || p[87] != 1.0)
+
+/**
+ * 「局部」组重置：中心回画面正中、半径/羽化/角度/宽度回默认，**模式与强度不动**。
+ *
+ * 为什么不把 [79]/[86]/[87] 也清零：用户点的是"把这块区域挪回正中/恢复默认大小"，不是
+ * "关掉局部调整" —— 强度清零会让画面**突然变回去**（用户会以为重置把编辑弄丢了）。
+ * 关掉局部调整的入口是模式选「关」。
+ */
+internal fun resetLocalGeometry(p: DoubleArray) {
+    p[80] = 0.5
+    p[81] = 0.5
+    p[82] = 0.35
+    p[83] = 0.5
+    p[84] = 0.0
+    p[85] = 0.25
+}
+
+/**
+ * 预览显示盒内的**图像矩形**（Fit 缩放后的位置与尺寸，像素）—— letterbox 黑边的唯一来源。
+ *
+ * 预览用 `ContentScale.Fit`：等比缩放到**装得下**（`scale = min(boxW/imgW, boxH/imgH)`），
+ * 剩余空间均分成左右/上下黑边。屏幕坐标 → 图像归一化坐标必须**先减这个偏移、再除以
+ * 显示尺寸**，否则用户在竖拍图上拖动会偏（黑边越宽偏得越多）。
+ */
+internal data class ImageFitRect(val left: Float, val top: Float, val width: Float, val height: Float)
+
+/** [ImageFitRect] 的纯计算（Fit 语义 + 非方形画幅 + 尺寸退化保护）。 */
+internal fun imageFitRect(
+    boxW: Float,
+    boxH: Float,
+    imgW: Int,
+    imgH: Int,
+): ImageFitRect {
+    if (boxW <= 0f || boxH <= 0f || imgW <= 0 || imgH <= 0) {
+        return ImageFitRect(0f, 0f, maxOf(boxW, 0f), maxOf(boxH, 0f))
+    }
+    val scale = minOf(boxW / imgW, boxH / imgH)
+    val w = imgW * scale
+    val h = imgH * scale
+    return ImageFitRect((boxW - w) * 0.5f, (boxH - h) * 0.5f, w, h)
+}
+
+/**
+ * 屏幕坐标（预览盒内，px）→ **归一化图像坐标**（0..1，**顶行 = 0**，与槽位 [80]/[81] 同口径）。
+ * 结果夹紧到 0..1：拖到黑边上（letterbox 区域）不能让中心跑出画面（引擎的 mask 会整块消失，
+ * 用户以为"拖没了"）。
+ */
+internal fun localCenterFromScreen(
+    xPx: Float,
+    yPx: Float,
+    rect: ImageFitRect,
+): Pair<Float, Float> {
+    if (rect.width <= 0f || rect.height <= 0f) return 0.5f to 0.5f
+    val u = ((xPx - rect.left) / rect.width).coerceIn(0f, 1f)
+    val v = ((yPx - rect.top) / rect.height).coerceIn(0f, 1f)
+    return u to v
+}
+
+/** [localCenterFromScreen] 的逆：归一化图像坐标 → 屏幕坐标（轮廓绘制用**同一套**换算）。 */
+internal fun localCenterToScreen(
+    u: Float,
+    v: Float,
+    rect: ImageFitRect,
+): Pair<Float, Float> =
+    (rect.left + u.coerceIn(0f, 1f) * rect.width) to
+        (rect.top + v.coerceIn(0f, 1f) * rect.height)
+
+/**
+ * 辅助轮廓的几何（屏幕 px，`0` 号点 = 中心）。**轮廓只画在预览上，绝不进导出** ——
+ * 导出走的是引擎输出位图，这里的东西是 Compose 叠加层（结构性保证，不是"记得别画"）。
+ *
+ * 两种模式共用同一个类：径向 = [rx]/[ry]（椭圆半轴，正圆修正后 rx = ry×W/H）；
+ * 线性 = 条带的两条边线（[lineDx]/[lineDy] 为**单位**方向，边线长 2×[half]）。
+ */
+internal data class LocalOutline(
+    val cx: Float,
+    val cy: Float,
+    val rx: Float,
+    val ry: Float,
+    val feather: Float,
+    val linear: Boolean,
+    val lineDx: Float,
+    val lineDy: Float,
+    val half: Float,
+)
+
+/**
+ * 径向轮廓：**正圆语义**（E2-7 裁决 1）—— 半径以**图像宽度**为单位（x 方向 = [LOCAL_RADIUS_UI_RANGE]），
+ * 像素空间的半轴是 `rx = r×W`（水平）、`ry = r×W×W/H`（垂直）⇒ 屏幕上是一个**正圆**
+ *（`ImageFitRect` 是等比缩放，画出来仍正圆；竖拍 3:4 不再变椭圆）。
+ *
+ * 与 shader 的对应（同一套换算的两种表述）：引擎下发 `uLocalRadius = (r, r×W/H)`，
+ * 于是 `length((u−cu)/r, (v−cv)/(r×W/H))` 在像素空间等距 —— 也就是这里的 `rx/ry`。
+ * **注意 ry 是"乘 W/H"而不是"H/W"**：像素坐标 P = (u×W, v×H) ⇒ 要 `d = |P|/R` 需
+ * `rx×W = ry×H = R`。写反了轮廓会与真实 mask 不重合（E2-7 实测踩过：垂直半径大 2.25 倍）。
+ *
+ * @param radiusUi 槽位 [82]（UV，相对图像宽）
+ * @param featherUi 槽位 [83]（相对半径）
+ * @param aspect 图像**高/宽**（像素，= H/W）—— 正圆修正的唯一输入
+ */
+internal fun radialOutline(
+    centerU: Float,
+    centerV: Float,
+    radiusUi: Float,
+    featherUi: Float,
+    rect: ImageFitRect,
+    aspect: Float,
+): LocalOutline {
+    val (cx, cy) = localCenterToScreen(centerU, centerV, rect)
+    val r = radiusUi.coerceIn(0f, 1f)
+    // rx 直接用显示宽（= 图像宽的等比缩放）⇒ 不必再乘 scale；ry 由**像素**宽高比换算，
+    // 这样"正圆"这件事与显示尺寸无关（转屏/换机型都不会变成椭圆）
+    val rx = r * rect.width
+    val ry = if (aspect.isFinite() && aspect > 0f) rx / aspect else rx
+    return LocalOutline(
+        cx = cx, cy = cy, rx = rx, ry = ry,
+        feather = featherUi.coerceIn(0f, 1f),
+        linear = false, lineDx = 0f, lineDy = 0f, half = 0f,
+    )
+}
+
+/**
+ * 线性轮廓：条带的两条边线。`dir = (cos a, sin a)` 是**法线**（[84] 的语义，ADR 表：
+ * 0 ⇒ 条带竖直）⇒ 边线方向与之垂直 = `(−sin a, cos a)`，两条边线分别在中心沿法线
+ * 偏移 ±half（像素）= ±`width×W`。
+ *
+ * 与 shader 的对应：`d = |dot(p, dir)| / (width×W)`（像素空间），边线在 `d = 1`
+ * （= 硬边位置）；羽化带再向外 `feather` 倍，轮廓用第二条虚线示意。
+ *
+ * @param widthUi 槽位 [85]（UV，相对图像宽）
+ * @param angleSlot 槽位 [84]（弧度，条带法线方向）
+ */
+internal fun linearOutline(
+    centerU: Float,
+    centerV: Float,
+    widthUi: Float,
+    angleSlot: Double,
+    featherUi: Float,
+    rect: ImageFitRect,
+): LocalOutline {
+    val (cx, cy) = localCenterToScreen(centerU, centerV, rect)
+    val a = if (angleSlot.isFinite()) angleSlot else 0.0
+    val half = widthUi.coerceIn(0f, 1f) * rect.width
+    // 屏幕方向 = 图像方向（Fit 是等比缩放 ⇒ 角度不变）；像素宽高比在**归一化空间**里
+    // 才会改变角度，而这里已经换算到像素/屏幕空间了，所以直接用 (cos a, sin a)
+    val ndx = kotlin.math.cos(a).toFloat()
+    val ndy = kotlin.math.sin(a).toFloat()
+    return LocalOutline(
+        cx = cx, cy = cy, rx = 0f, ry = 0f,
+        feather = featherUi.coerceIn(0f, 1f),
+        linear = true, lineDx = -ndy, lineDy = ndx, half = half,
+    )
+}
+
 /** 另存文件名：`FILMKIT_20261008-213000_edit.jpg`（同拍摄链路的命名规则，`_edit` 区分原片） */
 internal fun editorExportName(timeMs: Long): String =
     "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(timeMs))}_edit.jpg"

@@ -4684,7 +4684,8 @@ uniform vec2 uClarStep;    // 清晰度环半径（UV 单位）= r_px/(W,H)
 uniform float uLocalOn;      // 门控（CPU 侧算）：type>0 且 (ev≠0 或 sat≠1)
 uniform float uLocalType;    // [79] 0 = 关，1 = 径向，2 = 线性
 uniform vec2 uLocalCenter;   // [80][81] 归一化中心（vUV0 坐标系，见 localMask）
-uniform float uLocalRadius;  // [82] 径向半径（UV 单位）
+uniform vec2 uLocalRadius;   // [82] 径向半径 (rx, ry)：rx = r（相对图像宽）、ry = r×W/H
+                             //（CPU 侧拆开，使 d = length(p/r) 在**像素空间**等距 = 正圆）
 uniform float uLocalFeather; // [83] 羽化宽度（相对半径/半宽）
 uniform float uLocalAngle;   // [84] 线性 mask 的法线方向（弧度）
 uniform float uLocalWidth;   // [85] 线性半宽（UV 单位）
@@ -4755,8 +4756,11 @@ float chainLuma(float x, float mm) {
 // uv 用 vUV0（与主采样同一坐标系：本 shader 无 flip ⇒ vUV0.y 与 Bitmap 行序同向，
 // E2-7 的 UI 坐标可直接用"图像顶行 = 0"的归一化坐标）。
 // 返回值：mask 内（d ≤ 1）= 1 → 羽化带（1 < d < 1+feather）平滑降到 0 → 外部 = 0。
-// 径向：d = |uv − center| / radius（UV 单位 ⇒ 非方形画幅下是**椭圆**，见 ADR §5.7
-// 的公式原文；[82] 注释里的"相对长边"是后续卡可选的等圆修正，本卡照公式实现）。
+// 径向：d = length(p / r)，r = (rx, ry) 由 CPU 侧按**像素宽高比**拆开
+//（rx = [82]、ry = [82]×W/H）⇒ 像素空间等距 = **正圆**（E2-7 裁决 1；竖拍 3:4 不再变椭圆）。
+// 推导：像素坐标 P = (u×W, v×H) ⇒ d² = (u/rx)² + (v/ry)² = (Pu/(rx·W))² + (Pv/(ry·H))²，
+// 要让它 = (|P|/R)² 需 rx·W = ry·H = R ⇒ ry = rx·W/H（**不是** rx·H/W —— 反了就是椭圆）。
+// 旧写法 `length(p / max(uLocalRadius, 1e-3))` 是 UV 空间的椭圆 —— 见 ADR §5.7 的公式原文。
 // 线性：dir = (cos a, sin a) 是**条带法线方向** ⇒ d = |dot(p, dir)| / width 是到
 // "过 center、垂直于 dir 的直线"的距离（即条带长轴垂直于 dir）。
 // ⚠ GLSL 三禁：本函数无数组参数、无循环、无多行宏（ADR §6.1）。
@@ -4765,7 +4769,7 @@ float localMask(vec2 uv) {
     vec2 p = uv - uLocalCenter;
     float d;
     if (uLocalType < 1.5) {
-        d = length(p / max(uLocalRadius, 1e-3));
+        d = length(p / max(uLocalRadius, vec2(1e-3)));
     } else {
         vec2 dir = vec2(cos(uLocalAngle), sin(uLocalAngle));
         d = abs(dot(p, dir)) / max(uLocalWidth, 1e-3);
@@ -12124,7 +12128,14 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   glUniform1f(u_style_.local_on, local_on ? 1.0f : 0.0f);
   glUniform1f(u_style_.local_type, p.local_type);
   glUniform2f(u_style_.local_center, p.local_center_x, p.local_center_y);
-  glUniform1f(u_style_.local_radius, p.local_radius);
+  // E2-7 正圆修正：radius 拆成 (rx, ry) —— rx = [82]（相对图像宽），ry = [82]×W/H
+  //（相对图像高）。与暗角 uVigScaleXY = (W,H)/max 同款"域常数在 CPU 侧算好"：
+  // shader 内不做 W/H 除法。效果 = `length(p/r)` 在像素空间等距 ⇒ 非方形画幅下是正圆
+  //（推导见 kFsStyle 的 uLocalRadius 声明：rx·W = ry·H = R ⇒ ry = rx·W/H）。
+  const float local_aspect =
+      (h > 0) ? static_cast<float>(w) / static_cast<float>(h) : 1.0f;
+  glUniform2f(u_style_.local_radius, p.local_radius,
+              p.local_radius * local_aspect);
   glUniform1f(u_style_.local_feather, p.local_feather);
   glUniform1f(u_style_.local_angle, p.local_angle);
   glUniform1f(u_style_.local_width, p.local_width);

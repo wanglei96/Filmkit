@@ -2350,6 +2350,10 @@ private fun RelativeSlider(
  *（"强度" / 0..1.5 = 显示 0..150%），所以拍摄页调用点一个字符都不用改。编辑器复用同一行
  * 组件而不是另写一套 —— 两套滑杆的相对拖动手感（无按下跳变）必然走样。
  * 注意 [range] 只是量程：显示值恒为 `v * 100%`，v = 1.0 即 "100%"。
+ *
+ * [format] 是 E2-7（局部调整「角度」滑杆）加的可选读数格式化，**默认值就是百分比**
+ *（拍摄页与其余全部调用点一个字符都不用改）。角度用百分比没有意义（"方向 50%"读不出
+ * 是横还是竖），所以那一行传 `v -> "90°"`。量程与槽位换算仍由调用方的纯函数负责。
  */
 @Composable
 internal fun StrengthRow(
@@ -2358,6 +2362,7 @@ internal fun StrengthRow(
     onFinished: (Float) -> Unit,
     label: String = "强度",
     range: ClosedFloatingPointRange<Float> = 0f..1.5f,
+    format: (Float) -> String = { v -> "${(v * 100).roundToInt()}%" },
 ) {
     var v by remember { mutableFloatStateOf(initial) }
     Row(
@@ -2383,7 +2388,7 @@ internal fun StrengthRow(
                 .padding(horizontal = 8.dp),
         )
         Text(
-            "${(v * 100).roundToInt()}%",
+            format(v),
             color = FilmTheme.Accent,
             fontSize = 12.sp,
             fontFamily = FilmTheme.Mono,
@@ -2392,9 +2397,13 @@ internal fun StrengthRow(
     }
 }
 
-/** 分类 pill（LUT / 预设）：选中 = 琥珀描边 + 琥珀字 */
+/**
+ * 分类 pill（LUT / 预设）：选中 = 琥珀描边 + 琥珀字。
+ * v0.11.4（E2-7）：private → internal —— 编辑器「局部」组的模式选择（关/径向/线性）复用
+ * 同一形态，不另写一套（两个页面的 pill 观感必须一致）。
+ */
 @Composable
-private fun SheetPill(
+internal fun SheetPill(
     label: String,
     selected: Boolean,
     onLongTap: (() -> Unit)? = null,

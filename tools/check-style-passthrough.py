@@ -49,6 +49,11 @@
      f) **只有一次往返**的结构性哨兵：kFsStyle 内 `srgbDecode(` 恰好 3 处
         （定义 / chainLuma / 主路径）—— 局部曝光若另起一次往返会立刻变 4。
 
+  E2-7（局部调整 UI）新增：
+  ⑬h **正圆修正**（非方形画幅）：径向半径在 CPU 侧拆成 `(rx, ry) = (r, r×H/W)`
+     ⇒ mask 的**像素**半径水平与垂直相等。⑬b/⑬c 跑方形画幅 ⇒ 拆分前后数值相同，
+     测不出这个 bug；本项用 2:3 竖幅，旧椭圆写法会差 1/3（解析对照也按同式拆开）。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
@@ -145,12 +150,18 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
 
     门控在 CPU 侧算 ⇒ 默认恒等（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0、
     local_type=0）时 shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时验收 CPU 侧
-    的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on）。
+    的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on，以及 E2-7
+    的 radius 拆分）。
     """
     radial = 0.5 <= local_type < 1.5
     linear = local_type >= 1.5
     ev_on = local_ev != 0.0
     sat_on = local_sat != 1.0
+    # E2-7 正圆修正（passStyle 同式）：rx = [82]（相对图像宽）、ry = [82]×W/H
+    #（相对图像高）⇒ shader 内 `length(p/r)` 在**像素空间**等距。
+    # ⚠ 这项必须与 C++ 侧逐字同式：⑬b/⑬c 的解析对照就是靠它把"椭圆 bug"照出来的
+    #（E2-6 的 ⑬b/⑬c 是方形画幅 ⇒ 拆分前后数值相同，测不出差异；⑬h 用非方形画幅补上）。
+    aspect = (float(w) / float(h)) if h > 0 else 1.0
     return {
         'uEv': float(ev),
         'uWbGain': tuple(float(v) for v in wb),
@@ -167,7 +178,7 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         'uLocalOn': 1.0 if ((radial or linear) and (ev_on or sat_on)) else 0.0,
         'uLocalType': float(local_type),
         'uLocalCenter': tuple(float(v) for v in local_center),
-        'uLocalRadius': float(local_radius),
+        'uLocalRadius': (float(local_radius), float(local_radius) * aspect),
         'uLocalFeather': float(local_feather),
         'uLocalAngle': float(local_angle),
         'uLocalWidth': float(local_width),
@@ -194,7 +205,9 @@ def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
     }
     uni.update(vig_uniforms(w, h, *vig))
     uni.update(style_uniforms(w, h, **(adj or {})))
-    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex})
+    # size=(w, h) 必传：不传则用执行器初始化时的方形 FBO ⇒ **非方形画幅会被静默裁成
+    # 正方形**（⑬h 正圆修正就靠非方形画幅，这里不传等于把判据变成空转）。
+    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex}, size=(w, h))
     tex.release()
     return out
 
@@ -220,6 +233,10 @@ def smoothstep_np(e0, e1, x):
 def local_mask_np(w, h, type_, center, radius, feather, angle, width):
     """E2-6 局部 mask 的 **ADR §5.7 公式直译**（含 [82]/[83]/[85] 的 1e-3 下限）。
 
+    E2-7 正圆修正：径向的除数是 CPU 侧拆开的 `(rx, ry) = (r, r×W/H)`
+    —— 与 `passStyle` / `style_uniforms` **同式**，这样 `length(p/r)` 在像素空间等距
+    （旧写法 `hypot(px, py)/r` 是 UV 空间的椭圆）。
+
     像素中心约定与 shader 的 vUV0 一致：像素 (row=y, col=x) ⇒ uv = ((x+.5)/w, (y+.5)/h)
     —— 本 shader 无 flip（kFsStyle 注释 ②），所以 numpy 行序与 GL 读回行序同向。
     """
@@ -227,7 +244,8 @@ def local_mask_np(w, h, type_, center, radius, feather, angle, width):
     px = (x + 0.5) / w - center[0]
     py = (y + 0.5) / h - center[1]
     if type_ < 1.5:
-        d = np.hypot(px, py) / max(radius, 1e-3)
+        aspect = (float(w) / float(h)) if h > 0 else 1.0
+        d = np.hypot(px / max(radius, 1e-3), py / max(radius * aspect, 1e-3))
     else:
         d = np.abs(px * np.cos(angle) + py * np.sin(angle)) / max(width, 1e-3)
     return 1.0 - smoothstep_np(1.0, 1.0 + max(feather, 1e-3), d)
@@ -377,6 +395,9 @@ def main():
     ap.add_argument('--size', type=int, default=96, help='测试图边长')
     args = ap.parse_args()
     n = args.size
+    # ⑬h 正圆修正用的**非方形**画幅（2:3 竖幅 ≈ 竖拍 3:4 的同类场景）：
+    # 方形画幅下"UV 空间椭圆"与"像素空间正圆"数值完全相同 ⇒ 必须换画幅才测得出来。
+    n2w, n2h = n, (n * 3) // 2
 
     eso = load_eso()
     sh = eso.extract_shaders()
@@ -754,6 +775,69 @@ def main():
           f'max|Δ| = {d13g2:.1f} LSB（判据均 ≤3）')
     if d13g > 3.0 or d13g2 > 3.0:
         fails.append('⑬g 全局+局部合并')
+
+    # ⑬h **正圆修正**（E2-7 裁决 1，非方形画幅）：⑬b/⑬c 跑的是方形画幅 ⇒ 拆分前后数值
+    #     完全相同，**测不出**这个 bug。这里用 64×96 的竖幅：判据是"mask 的像素半径在
+    #     水平与垂直方向相等"—— 旧写法（UV 空间椭圆）在 2:3 画幅下垂直半径会小 1/3，
+    #     这一项会直接失败。同时给出"与解析期望 max|Δ|"（解析侧已按同式拆开）。
+    gh13 = grey_input(n2w, n2h, 180)
+    # [82] 取 0.20（不是 ⑬b 的 0.30）：判据要求**半强度点（d = 1+feather/2）落在画内**，
+    # 竖幅的 y 方向最大只能到 d = 0.5/(r×H/W) ⇒ r < 0.25。取 0.20 ⇒ d_max = 1.875
+    #（内边界 1.0 与外边界 1.5 都在画内，两个方向都能量到同一个 d）。
+    r13h = 0.20
+    o13h = run_style(gl, eso, sh, gh13, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(local_type=1.0, local_center=(0.5, 0.5),
+                              local_radius=r13h, local_feather=f13,
+                              local_ev=-1.5))
+    m13h = local_mask_np(n2w, n2h, 1, (0.5, 0.5), r13h, f13, 0.0, 0.25)
+    q13h = quant(o13h, gh13.shape)[..., 0]
+    e13h = local_expect(gh13, m13h, ev_l=-1.5)[..., 0]
+    d13h = float(np.abs(q13h - e13h).max())
+    # 实测像素半径：从中心沿水平/垂直方向找 **mask 半强度点（d = 1 + feather/2）** 的
+    # 穿越位置。判据 = 两个方向的像素半径相等（正圆）。旧写法（UV 空间椭圆）在 2:3
+    # 画幅下垂直半径会小 1/3，这一项会直接失败。
+    c13y, c13x = n2h // 2, n2w // 2
+    row13h = q13h[c13y, c13x:].astype(np.float64)
+    col13h = q13h[c13y:, c13x].astype(np.float64)
+    # 半强度亮度：mask 内（m = 1）与 mask 外（m = 0）的中点。两者都取**解析值**：
+    #  - m = 1 ⇒ 输入 180 经 sRGB 解码 × 2^−1.5 再编码（= 112，不是 180/2^1.5 = 63.6 ——
+    #    显示域亮度必须走 sRGB 曲线，直接按线性比例算会把基准压低 30 LSB，
+    #    于是"第一个像素就跌破基准"⇒ 实测半径恒 0）；
+    #  - m = 0 ⇒ 180（⑬b 已验证 mask 外 ≤1 LSB）。
+    inside13 = float(srgb_encode_np(srgb_decode_np(np.array(180.0 / 255.0)) * 2.0 ** -1.5) * 255.0)
+    half13 = 0.5 * (inside13 + 180.0)
+
+    def half_cross(prof, half_val):
+        """沿剖面（从中心向外）找**第一次升过**半强度的位置。
+
+        剖面形状：mask 内 = 暗（局部压暗）、向外单调**变亮**到输入值。所以穿越点 =
+        第一个 ≥ 半强度的采样点（半径按此计）。两个坑都踩过：
+         - `argmin(|prof − half|)` 会在**剖面末端**取到最小值（外侧恒为 180 > 半强度）
+           ⇒ 量到的是画幅边界；
+         - `nonzero(prof < half)` 会命中**剖面开头**（mask 内本来就比半强度暗）⇒ 恒 0。
+        """
+        idx = np.nonzero(prof >= half_val)[0]
+        return float(idx[0]) if len(idx) else float(len(prof) - 1)
+
+    prx13 = half_cross(row13h, half13)
+    pry13 = half_cross(col13h, half13)
+    # 解析侧的同口径半径（像素）：**正圆** ⇒ 两个方向的半强度半径都等于
+    # mid × r × **宽**（半强度在 d = 1 + feather/2；而 d 的像素尺度 = r × 宽，
+    # 与方向无关 —— 这正是"像素空间等距"的定义）。
+    # 旧写法（UV 空间椭圆）在 2:3 画幅下垂直半径会**大** H/W = 1.5 倍：ry_px = mid × r × H
+    #（实测 36px vs 正圆的 24px —— 已用"改回椭圆"的负对照验证过本项确实会失败）。
+    mid13 = 1.0 + 0.5 * f13
+    prx_expect = mid13 * r13h * n2w
+    pry_expect = mid13 * r13h * n2w
+    pry_ellipse = mid13 * r13h * n2h
+    print(f'⑬h 正圆修正（{n2w}×{n2h} 竖幅，[82]={r13h} [83]={f13}）：与解析期望 '
+          f'max|Δ| = {d13h:.1f} LSB（判据 ≤3）；实测半强度像素半径 水平 = {prx13:.0f}px / '
+          f'垂直 = {pry13:.0f}px（正圆 ⇒ 都应为 {prx_expect:.0f}px；'
+          f'旧椭圆写法垂直会是 {pry_ellipse:.0f}px）')
+    if (d13h > 3.0 or abs(prx13 - pry13) > 2.0
+            or abs(prx13 - prx_expect) > 2.0 or abs(pry13 - pry_expect) > 2.0):
+        fails.append('⑬h 正圆修正')
 
     # ⑬f 结构性证明：**没有第二次 decode/encode**。kFsStyle 内 `srgbDecode(` 只应有
     #     3 处：函数定义 + chainLuma 的标量往返 + main 主路径往返。局部曝光若被写成

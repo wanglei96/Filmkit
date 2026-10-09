@@ -5,8 +5,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,6 +21,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
@@ -46,13 +49,21 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
@@ -60,6 +71,15 @@ import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
+import com.filmkit.app.camera.ImageFitRect
+import com.filmkit.app.camera.LOCAL_ANGLE_UI_RANGE
+import com.filmkit.app.camera.LOCAL_EV_UI_RANGE
+import com.filmkit.app.camera.LOCAL_FEATHER_UI_RANGE
+import com.filmkit.app.camera.LOCAL_RADIUS_UI_RANGE
+import com.filmkit.app.camera.LOCAL_SAT_UI_RANGE
+import com.filmkit.app.camera.LOCAL_WIDTH_UI_RANGE
+import com.filmkit.app.camera.LocalMode
+import com.filmkit.app.camera.LocalOutline
 import com.filmkit.app.camera.OverwriteResult
 import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
@@ -74,10 +94,33 @@ import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
+import com.filmkit.app.camera.imageFitRect
+import com.filmkit.app.camera.linearOutline
+import com.filmkit.app.camera.localActive
+import com.filmkit.app.camera.localAngleSlot
+import com.filmkit.app.camera.localAngleUi
+import com.filmkit.app.camera.localCenterFromScreen
+import com.filmkit.app.camera.localCenterSlot
+import com.filmkit.app.camera.localCenterUi
+import com.filmkit.app.camera.localEvSlot
+import com.filmkit.app.camera.localEvUi
+import com.filmkit.app.camera.localFeatherSlot
+import com.filmkit.app.camera.localFeatherUi
+import com.filmkit.app.camera.localRadiusSlot
+import com.filmkit.app.camera.localRadiusUi
+import com.filmkit.app.camera.localSatSlot
+import com.filmkit.app.camera.localSatUi
+import com.filmkit.app.camera.localTypeName
+import com.filmkit.app.camera.localTypeSlot
+import com.filmkit.app.camera.localTypeUi
+import com.filmkit.app.camera.localWidthSlot
+import com.filmkit.app.camera.localWidthUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
+import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
+import com.filmkit.app.camera.resetLocalGeometry
 import com.filmkit.app.camera.saveEditorCopy
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.vigFeatherSlot
@@ -195,17 +238,26 @@ fun EditorScreen(
     var status by remember { mutableStateOf("") }
     // 导出期间被挡下的预览请求（导出独占引擎，见 rerender / finish）
     var pendingRender by remember { mutableStateOf(false) }
+    // ── E2-7 局部调整 ──────────────────────────────────────────────────────
+    // 预览区尺寸（Fit 换算要用）与"正在拖动定位"标志（拖动中只画轮廓、松手才渲染）
+    var previewSize by remember { mutableStateOf(IntSize.Zero) }
+    var localDragging by remember { mutableStateOf(false) }
 
     /**
      * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 基础五类 / 暗角三条 / LUT 强度
-     * 全在这一条里）。
+     * / **E2-7 局部调整** 全在这一条里）。
      *
      * 为什么不拆成几个函数各记各的：本项目踩过"字段写进别的函数 ⇒ 真机日志缺项"的坑
      *（ADR §5.4 T-2）—— 一条日志里字段齐全，真机一次运行就能核对全部规格。
      *
      * `dragging` 恒 false 是**回归哨兵**：E2-8 的规格是"拖动中不渲染"，真机日志里若出现
      * dragging=true，说明有人把渲染又接回了 onValueChange。`dragTicks` = 本次渲染之前
-     * 拖动中收到的值变更次数（拖动 60 次只产生 1 条渲染日志 = 规格成立）。
+     * 拖动中收到的值变更次数（拖动 60 次只产生 1 条渲染日志 = 规格成立）—— E2-7 的
+     * 拖动定位走同一个 gate，所以这条哨兵同时守住"拖动定位中不渲染"。
+     *
+     * E2-7 字段：`locType`（off/radial/linear）+ 中心/半径/羽化/角度/宽度/ev/sat —— 与
+     * 引擎侧 `kFsStyle` 的 `locType`/`locEv`/`locSat` 同口径，真机可一眼核对"UI 拖到哪、
+     * 引擎收到哪"。
      */
     fun logRender(w: Int, h: Int, ms: Long, ticks: Int, ok: Boolean, dragging: Boolean = false) {
         val film = params ?: return
@@ -218,6 +270,10 @@ fun EditorScreen(
                 "contrast" to film[4], "sat" to film[21], "clarity" to film[78],
                 "strength" to film[66], "radius" to film[67], "feather" to film[68],
                 "lut" to film[34],
+                "locType" to localTypeName(film[79]), "locCx" to film[80], "locCy" to film[81],
+                "locR" to film[82], "locF" to film[83], "locA" to film[84],
+                "locW" to film[85], "locEv" to film[86], "locSat" to film[87],
+                "locOn" to localActive(film),
             ),
         )
     }
@@ -421,6 +477,76 @@ fun EditorScreen(
      */
     fun resetVignette() {
         params?.let { it[66] = vigStrengthSlot(0f) }
+        panelRefresh++
+        rerender()
+    }
+
+    // ── 局部调整（E2-7）────────────────────────────────────────────────────
+    // 与上面两组同一范式：滑杆拖动中只写槽位 + gate.onValueChange()，松手统一走
+    // [onSliderRelease] 渲染一次。**模式选择与拖动定位**是离散操作 ⇒ 直接 rerender()
+    //（拖动定位走 gate + onSliderRelease，见预览区的手势）。
+
+    /**
+     * 选模式（关 / 径向 / 线性）⇒ 写 [79]。离散操作 ⇒ 直接渲染一次。
+     *
+     * 注意 **A/B 语义**（ADR 交互规格第 6 条）：引擎侧 `uLocalOn = type>0 && (ev≠0 ||
+     * sat≠1)`，所以"选了类型但没调强度"时画面**不变**（正确行为，不是 bug）——面板上
+     * 用 [localActive] 给出提示文案，不让用户以为滑杆坏了。
+     */
+    fun setLocalType(mode: Int) {
+        params?.let { it[79] = localTypeSlot(mode) }
+        localDragging = false
+        panelRefresh++
+        rerender()
+    }
+
+    /**
+     * 拖动定位（预览上）：写 [80][81]（归一化图像坐标，顶行 = 0）。
+     * **只写槽位、不渲染**（走 gate）—— 拖动中画面不动、只有 Compose 画的轮廓跟着走，
+     * 松手由 [onSliderRelease] 渲染一次（与 E2-8 滑杆同一闸门，`dragTicks` 日志可证）。
+     */
+    fun dragLocalCenter(u: Float, v: Float) {
+        params?.let { p ->
+            val (x, y) = localCenterSlot(u, v)
+            p[80] = x
+            p[81] = y
+        }
+        gate.onValueChange()
+    }
+
+    fun setLocalRadius(ui: Float) {
+        params?.let { it[82] = localRadiusSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setLocalFeather(ui: Float) {
+        params?.let { it[83] = localFeatherSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setLocalAngle(ui: Float) {
+        params?.let { it[84] = localAngleSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setLocalWidth(ui: Float) {
+        params?.let { it[85] = localWidthSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setLocalEv(ui: Float) {
+        params?.let { it[86] = localEvSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setLocalSat(ui: Float) {
+        params?.let { it[87] = localSatSlot(ui) }
+        gate.onValueChange()
+    }
+
+    /** 「局部」组重置：几何回默认（中心/半径/羽化/角度/宽度），模式与强度不动（见纯函数 KDoc） */
+    fun resetLocal() {
+        params?.let { resetLocalGeometry(it) }
         panelRefresh++
         rerender()
     }
@@ -687,26 +813,96 @@ fun EditorScreen(
                             val image = remember(bmp, orig, showOriginal) {
                                 (if (showOriginal && orig != null) orig else bmp).asImageBitmap()
                             }
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            // E2-7：局部模式下的拖动定位。坐标换算（含 letterbox 黑边）与轮廓
+                            // 绘制**共用** EditorExport.kt 里的同一套纯函数 —— 两处各写一份，
+                            // 一旦有偏差用户看到的就是"拖了没对准"。
+                            val localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF
+                            val dragMode = localMode != LocalMode.OFF
+                            val srcSize = source?.let { it.w to it.h }
+                            val rect = remember(previewSize, srcSize) {
+                                val (sw, sh) = srcSize ?: (1 to 1)
+                                imageFitRect(
+                                    previewSize.width.toFloat(), previewSize.height.toFloat(), sw, sh,
+                                )
+                            }
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .onSizeChanged { previewSize = it }
+                                    .pointerInput(dragMode) {
+                                        if (dragMode) {
+                                            detectDragGestures(
+                                                onDragStart = { localDragging = true },
+                                                onDragEnd = {
+                                                    localDragging = false
+                                                    onSliderRelease()
+                                                },
+                                                // 取消（手势被抢）也要收尾：否则轮廓一直停在
+                                                // "正在拖动"的高亮态
+                                                onDragCancel = { localDragging = false },
+                                                onDrag = { change, _ ->
+                                                    change.consume()
+                                                    val (u, v) = localCenterFromScreen(
+                                                        change.position.x, change.position.y, rect,
+                                                    )
+                                                    dragLocalCenter(u, v)
+                                                },
+                                            )
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
                                 Image(
                                     bitmap = image,
                                     contentDescription = if (showOriginal) "原图" else "成片预览",
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .pointerInput(bmp) {
+                                        .pointerInput(bmp, dragMode) {
                                             detectTapGestures(onPress = {
+                                                // 局部模式下按下 = 开始拖动定位（拖动分支负责
+                                                // 渲染），不能再抢着显示原图
+                                                if (dragMode) return@detectTapGestures
                                                 showOriginal = true
                                                 tryAwaitRelease()
                                                 showOriginal = false
                                             })
                                         },
                                 )
+                                // ★ 辅助轮廓（E2-7）：**Compose 叠加层**，与 Image 同尺寸的
+                                // 兄弟节点 —— 导出走的是引擎输出位图，这里的东西**结构上
+                                // 不可能**进导出（不是"记得别画进去"）。拖动中只画它、不渲染
+                                //（零引擎开销、实时反馈），松手才 rerender。
+                                val film = params
+                                if (dragMode && film != null) {
+                                    // H/W（不是 W/H）：正圆修正要求 ry = rx×W/H（见 radialOutline 的 KDoc）
+                                    val aspect = source?.let { it.h.toFloat() / it.w } ?: 1f
+                                    val (cu, cv) = localCenterUi(film[80], film[81])
+                                    val outline = if (localMode == LocalMode.RADIAL) {
+                                        radialOutline(
+                                            cu, cv, localRadiusUi(film[82]),
+                                            localFeatherUi(film[83]), rect, aspect,
+                                        )
+                                    } else {
+                                        linearOutline(
+                                            cu, cv, localWidthUi(film[85]), film[84],
+                                            localFeatherUi(film[83]), rect,
+                                        )
+                                    }
+                                    Canvas(Modifier.fillMaxSize()) {
+                                        drawLocalOutline(outline, FilmTheme.Accent, localDragging)
+                                    }
+                                }
                                 // 提示只在参数面板展开时给：用户正在调参时才需要 before/after
+                                // 与定位说明（收起面板后画面留给用户看）
                                 if (panelOpen && !showOriginal) {
                                     Text(
-                                        "按住画面看原图",
-                                        color = FilmTheme.CreamDim,
+                                        if (dragMode) {
+                                            if (localDragging) "拖动定位中…松手生效" else "拖动画面移动局部区域"
+                                        } else {
+                                            "按住画面看原图"
+                                        },
+                                        color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
                                         fontSize = 10.sp,
                                         modifier = Modifier
                                             .align(Alignment.BottomCenter)
@@ -756,9 +952,20 @@ fun EditorScreen(
                     onVigRadius = { v -> setVigRadius(v) },
                     onVigFeather = { v -> setVigFeather(v) },
                     onVigFinished = { onSliderRelease() },
+                    // 局部调整（E2-7）：模式是离散操作（setLocalType 自己渲染），
+                    // 六条滑杆与其它组同款（拖动中只写槽位，松手渲染一次）
+                    onLocalMode = { m -> setLocalType(m) },
+                    onLocalRadius = { v -> setLocalRadius(v) },
+                    onLocalFeather = { v -> setLocalFeather(v) },
+                    onLocalAngle = { v -> setLocalAngle(v) },
+                    onLocalWidth = { v -> setLocalWidth(v) },
+                    onLocalEv = { v -> setLocalEv(v) },
+                    onLocalSat = { v -> setLocalSat(v) },
+                    onLocalFinished = { onSliderRelease() },
                     onResetBasic = { resetBasic() },
                     onResetColor = { applyLut(null, 0f) },
                     onResetVignette = { resetVignette() },
+                    onResetLocal = { resetLocal() },
                     onClose = { panelOpen = false },
                 )
             }
@@ -901,6 +1108,68 @@ fun EditorScreen(
 }
 
 /**
+ * 画局部调整的辅助轮廓（E2-7）。**纯预览叠加层**：导出走引擎输出位图，本函数只被
+ * 预览区的 Canvas 调用 ⇒ "轮廓不进导出"是结构性保证，不靠约定。
+ *
+ * 几何全部来自 [com.filmkit.app.camera.LocalOutline]（纯函数算好的屏幕像素坐标，与
+ * 坐标换算共用同一套换算）⇒ 轮廓中心与引擎 mask 中心重合。
+ *
+ * 画法：
+ *  - **径向**：实线椭圆（正圆修正后 rx/ry 由像素宽高比决定 ⇒ 屏幕上是正圆）+
+ *    羽化带外圈虚线（`d = 1+feather`，只在 feather > 0 时画）
+ *  - **线性**：两条实线边线（`d = ±1`，垂直于法线 [84]）+ 两侧羽化外沿虚线（`d = ±(1+feather)`）
+ *  - 拖动中加粗并提亮（用户能看出"正在定位"）
+ */
+private fun DrawScope.drawLocalOutline(outline: LocalOutline, color: Color, dragging: Boolean) {
+    val alpha = if (dragging) 1f else 0.7f
+    val main = color.copy(alpha = alpha)
+    val dash = color.copy(alpha = alpha * 0.55f)
+    val w = (if (dragging) 3f else 2f) * density
+    val c = Offset(outline.cx, outline.cy)
+    if (!outline.linear) {
+        drawOval(
+            color = main,
+            topLeft = Offset(outline.cx - outline.rx, outline.cy - outline.ry),
+            size = Size(outline.rx * 2f, outline.ry * 2f),
+            style = Stroke(width = w),
+        )
+        if (outline.feather > 0f) {
+            val k = 1f + outline.feather
+            drawOval(
+                color = dash,
+                topLeft = Offset(outline.cx - outline.rx * k, outline.cy - outline.ry * k),
+                size = Size(outline.rx * 2f * k, outline.ry * 2f * k),
+                style = Stroke(width = w * 0.7f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f * density, 8f * density))),
+            )
+        }
+        return
+    }
+    // 线性：边线方向 = (−sin a, cos a)（由纯函数给出），两条线沿**法线**偏移 ±half
+    val nx = -outline.lineDy
+    val ny = outline.lineDx
+    val ext = 4000f // 足够覆盖任何屏幕（超出部分由 Canvas 裁剪）
+    listOf(1f, -1f).forEach { sgn ->
+        val off = sgn * outline.half
+        drawLine(
+            color = main,
+            start = Offset(c.x + nx * off - outline.lineDx * ext, c.y + ny * off - outline.lineDy * ext),
+            end = Offset(c.x + nx * off + outline.lineDx * ext, c.y + ny * off + outline.lineDy * ext),
+            strokeWidth = w,
+        )
+        if (outline.feather > 0f) {
+            val off2 = sgn * outline.half * (1f + outline.feather)
+            drawLine(
+                color = dash,
+                start = Offset(c.x + nx * off2 - outline.lineDx * ext, c.y + ny * off2 - outline.lineDy * ext),
+                end = Offset(c.x + nx * off2 + outline.lineDx * ext, c.y + ny * off2 + outline.lineDy * ext),
+                strokeWidth = w * 0.7f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f * density, 8f * density)),
+            )
+        }
+    }
+}
+
+/**
  * 底部提示文案（ADR-4 的无快照提示 + 当前 LUT 状态）。
  *
  * E2-1 起语义变了：打开编辑器时 LUT 强度是 0（画面 = 原片），所以这里描述的是
@@ -942,6 +1211,10 @@ private enum class EditorParamGroup(val title: String, val implemented: Boolean)
     BASIC("基础", true),
     COLOR("色彩", true),
     VIGNETTE("暗角", true),
+    // E2-7 接入：模式 [79] / 中心 [80][81]（预览上拖动）/ 半径 [82] / 羽化 [83] /
+    // 角度 [84] / 宽度 [85] / 局部曝光 [86] / 局部饱和度 [87]。引擎侧 E2-6 已实现并
+    // 独立验收（ADR §5.7）；本卡只做"让用户点得到"。
+    LOCAL("局部", true),
     // TODO(E4-3 颗粒)：[26] 强度 / [27] ISO / [60] 密度偏置 / [61] 枢轴。E4-3 验收后置 true。
     GRAIN("颗粒", false),
     // TODO(E4-5 光晕)：[62] 强度 / [63] 阈值 / [64] 半径 / [65] 暖度。E4-5 验收后置 true。
@@ -986,9 +1259,20 @@ private fun EditorParamsPanel(
     onVigRadius: (Float) -> Unit,
     onVigFeather: (Float) -> Unit,
     onVigFinished: () -> Unit,
+    // ── 局部调整（E2-7）：onLocalMode = 选模式（离散，直接渲染）；onLocalXxx = 拖动中；
+    //    onLocalFinished = 松手（渲染一次）。中心由预览区拖动写，这里只显示读数 ──
+    onLocalMode: (Int) -> Unit,
+    onLocalRadius: (Float) -> Unit,
+    onLocalFeather: (Float) -> Unit,
+    onLocalAngle: (Float) -> Unit,
+    onLocalWidth: (Float) -> Unit,
+    onLocalEv: (Float) -> Unit,
+    onLocalSat: (Float) -> Unit,
+    onLocalFinished: () -> Unit,
     onResetBasic: () -> Unit,
     onResetColor: () -> Unit,
     onResetVignette: () -> Unit,
+    onResetLocal: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -1004,6 +1288,16 @@ private fun EditorParamsPanel(
     val vigStrength = params?.let { vigStrengthUi(it[66]) } ?: 0f
     val vigRadius = params?.let { vigRadiusUi(it[67]) } ?: 0.8f
     val vigFeather = params?.let { vigFeatherUi(it[68]) } ?: 0.5f
+    // 局部调整（E2-7）：模式与六条滑杆的初值（槽位 → UI 纯函数）
+    val localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF
+    val localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f)
+    val localRadius = params?.let { localRadiusUi(it[82]) } ?: 0.35f
+    val localFeather = params?.let { localFeatherUi(it[83]) } ?: 0.5f
+    val localAngle = params?.let { localAngleUi(it[84]) } ?: 0f
+    val localWidth = params?.let { localWidthUi(it[85]) } ?: 0.25f
+    val localEv = params?.let { localEvUi(it[86]) } ?: 0f
+    val localSat = params?.let { localSatUi(it[87]) } ?: 1f
+    val localOn = params?.let { localActive(it) } ?: false
     Column(
         Modifier
             .fillMaxWidth()
@@ -1082,12 +1376,33 @@ private fun EditorParamsPanel(
                     onFinished = onVigFinished,
                     onReset = onResetVignette,
                 )
+                EditorParamGroup.LOCAL -> EditorLocalGroup(
+                    refreshTick = refreshTick,
+                    mode = localMode,
+                    center = localCenter,
+                    radius = localRadius,
+                    feather = localFeather,
+                    angle = localAngle,
+                    width = localWidth,
+                    ev = localEv,
+                    sat = localSat,
+                    active = localOn,
+                    onMode = onLocalMode,
+                    onRadius = onLocalRadius,
+                    onFeather = onLocalFeather,
+                    onAngle = onLocalAngle,
+                    onWidth = onLocalWidth,
+                    onEv = onLocalEv,
+                    onSat = onLocalSat,
+                    onFinished = onLocalFinished,
+                    onReset = onResetLocal,
+                )
                 // 未实现的组在上面已过滤掉；这里仅为 when 的穷尽性兜底
                 else -> Unit
             }
         }
         Text(
-            "颗粒 / 光晕 / 局部调整在后续版本支持 · 已裁切的高光与丢失的细节找不回来",
+            "颗粒 / 光晕在后续版本支持 · 已裁切的高光与丢失的细节找不回来",
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
             modifier = Modifier.padding(top = 14.dp),
@@ -1351,6 +1666,131 @@ private fun EditorVignetteGroup(
             onFinished = { onFinished() },
             label = "羽化",
             range = 0f..2f,
+        )
+    }
+}
+
+/**
+ * 局部调整组（E2-7 本卡核心）：**模式选择 + 预览上拖动定位 + 六条滑杆**。
+ *
+ * 为什么中心没有滑杆：让用户用滑杆输归一化坐标不现实（ADR 交互规格第 2 条）—— 定位在
+ * 预览图上拖动完成（本组只显示"中心 x%,y%"读数），轮廓由预览区的 Canvas 画（与拖动共用
+ * 同一套坐标换算，见 `EditorExport.kt` 的 `localCenterFromScreen` / `radialOutline`）。
+ *
+ * 滑杆与引擎槽位的对应（槽位语义见 `EditorExport.kt` 的局部映射段）：
+ *  - **半径** [82] 0..100% = UV（相对图像宽）；正圆语义 ⇒ 屏幕上永远是正圆
+ *  - **羽化** [83] 0..100%（相对半径）：0 = 极窄过渡
+ *  - **角度** [84] 显示 0..180°（条带**法线**：0° = 条带竖直、90° = 条带水平）
+ *  - **宽度** [85] 0..100% = 线性半宽（UV，相对图像宽）
+ *  - **曝光** [86] ±100% = ±3 EV（与全局曝光同一口径，0% = 不变）
+ *  - **饱和度** [87] 0..200%（100% = 不变；0% = 局部完全去饱和，**不是"关"**）
+ *
+ * **A/B 语义**（ADR 交互规格第 6 条）：只有 [86] ≠ 0 或 [87] ≠ 1 时画面才变。所以
+ * "选了径向但没调强度"时预览**不会变**（引擎侧 `uLocalOn` 判据）—— 这行提示就是
+ * 为了不让用户以为坏了（[active] 与引擎同一判据，纯函数 [localActive]）。
+ *
+ * E2-8 闸门：六条滑杆拖动中只写槽位与读数，松手（[onFinished]）才渲染一次。
+ */
+@Composable
+private fun EditorLocalGroup(
+    /** 面板重建计数：换模式 / 重置后让滑杆读数归位 */
+    refreshTick: Int,
+    mode: Int,
+    center: Pair<Float, Float>,
+    radius: Float,
+    feather: Float,
+    angle: Float,
+    width: Float,
+    ev: Float,
+    sat: Float,
+    /** 是否真的会改变画面（[localActive]）= 选了模式**且**调过强度 */
+    active: Boolean,
+    onMode: (Int) -> Unit,
+    onRadius: (Float) -> Unit,
+    onFeather: (Float) -> Unit,
+    onAngle: (Float) -> Unit,
+    onWidth: (Float) -> Unit,
+    onEv: (Float) -> Unit,
+    onSat: (Float) -> Unit,
+    onFinished: () -> Unit,
+    onReset: () -> Unit,
+) {
+    GroupReset(onReset)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(top = 2.dp),
+    ) {
+        listOf(
+            LocalMode.OFF to "关",
+            LocalMode.RADIAL to "径向",
+            LocalMode.LINEAR to "线性",
+        ).forEach { (m, label) ->
+            SheetPill(label = label, selected = mode == m) { onMode(m) }
+        }
+    }
+    Text(
+        when {
+            mode == LocalMode.OFF -> "选「径向」或「线性」后，在预览上拖动定位"
+            !active -> "已选模式：调「曝光」或「饱和度」后画面才会变化（当前未调强度）"
+            mode == LocalMode.RADIAL ->
+                "预览上拖动移动中心（当前 ${(center.first * 100).roundToInt()}%, " +
+                    "${(center.second * 100).roundToInt()}%）· 半径 100% = 图像宽度"
+            else ->
+                "预览上拖动移动轴线（当前 ${(center.first * 100).roundToInt()}%, " +
+                    "${(center.second * 100).roundToInt()}%）· 角度 0° = 条带竖直"
+        },
+        color = if (mode != LocalMode.OFF && !active) FilmTheme.Accent else FilmTheme.CreamDim,
+        fontSize = 11.sp,
+        modifier = Modifier.padding(top = 2.dp),
+    )
+    // key(refreshTick)：换模式 / 重置后重建滑杆区 ⇒ 读数从槽位重读（否则画面回默认、
+    // 滑杆还停在原处）
+    key(refreshTick) {
+        StrengthRow(
+            initial = radius,
+            onCommit = onRadius,
+            onFinished = { onFinished() },
+            label = "半径",
+            range = LOCAL_RADIUS_UI_RANGE,
+        )
+        StrengthRow(
+            initial = feather,
+            onCommit = onFeather,
+            onFinished = { onFinished() },
+            label = "羽化",
+            range = LOCAL_FEATHER_UI_RANGE,
+        )
+        StrengthRow(
+            initial = angle,
+            onCommit = onAngle,
+            onFinished = { onFinished() },
+            label = "角度",
+            range = LOCAL_ANGLE_UI_RANGE,
+            // 角度读数用**度数**（0..180°）：百分比在"方向"上没有意义（ADR-12 的
+            // 读数必须与语义一致）。0° = 条带竖直、90° = 条带水平。
+            format = { v -> "${(v * 180f).roundToInt()}°" },
+        )
+        StrengthRow(
+            initial = width,
+            onCommit = onWidth,
+            onFinished = { onFinished() },
+            label = "宽度",
+            range = LOCAL_WIDTH_UI_RANGE,
+        )
+        StrengthRow(
+            initial = ev,
+            onCommit = onEv,
+            onFinished = { onFinished() },
+            label = "曝光",
+            range = LOCAL_EV_UI_RANGE,
+        )
+        StrengthRow(
+            initial = sat,
+            onCommit = onSat,
+            onFinished = { onFinished() },
+            label = "饱和度",
+            range = LOCAL_SAT_UI_RANGE,
         )
     }
 }
