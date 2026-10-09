@@ -12,7 +12,9 @@ import java.io.File
  *  ② 组合语义（**先水平镜像、再顺时针旋转**）与 EXIF 定义的 8 个规范线性变换逐个对上
  *     —— 只测表值会漏掉"5/7 的旋转角写反"这类错，矩阵 golden 才抓得住；
  *  ③ [sampleSizeFor] 的采样率（2 的幂 + 不小于目标）；
- *  ④ **真实 DNG 离线实测**：文件里的 Orientation=6、存储 4080×3072，转正后 3072×4080，
+ *  ④ [fitSizeFor] 的 Fit 尺寸（E2-22）—— 横/竖/全景/正方/高受限 + 退化输入 + **"直接传容器尺寸
+ *     会让三种画幅全部退回全分辨率"这条陷阱的对照回归**；
+ *  ⑤ **真实 DNG 离线实测**：文件里的 Orientation=6、存储 4080×3072，转正后 3072×4080，
  *     与同场景成片 JPEG（Orientation=1、3072×4080）同朝向。`test_temp/` 被 gitignore，
  *     文件不在时整段跳过（CI 不红）。
  */
@@ -134,7 +136,125 @@ class ImageDecodeTest {
         }
     }
 
-    // ------------------------------------------- ④ 真实文件离线实测（缺失则跳过）
+    // ── ④ Fit 尺寸（E2-22：查看页按显示尺寸解码，必须先 Fit 再算采样率）──────
+
+    /** 真机口径的容器：vivo X300 量级 1260×2800（调研报告 §2.2 用的那组数字） */
+    private val viewW = 1260
+    private val viewH = 2800
+
+    @Test
+    fun fitSizeShrinksEachAspectToFitTheViewport() {
+        // 横 / 竖 / 全景 / 正方：至少一维铺满，另一维按比例
+        assertEquals("横：宽铺满", 1260 to 945, fitSizeFor(4000, 3000, viewW, viewH))
+        assertEquals("竖：宽铺满", 1260 to 1680, fitSizeFor(3000, 4000, viewW, viewH))
+        assertEquals("全景：宽铺满（158 = ⌈157.5⌉）", 1260 to 158, fitSizeFor(8000, 1000, viewW, viewH))
+        assertEquals("正方", 1260 to 1260, fitSizeFor(3000, 3000, viewW, viewH))
+        assertEquals("高受限的竖长条：高铺满", 700 to 2800, fitSizeFor(1000, 4000, viewW, viewH))
+    }
+
+    @Test
+    fun fitSizeNeverExceedsViewportAndKeepsAspect() {
+        // 不变式（任意画幅都成立）：两维都不超过容器（"完整放进"）+ 至少一维铺满 + 宽高比不走样
+        val aspects = listOf(
+            4000 to 3000, 3000 to 4000, 8000 to 1000, 3000 to 3000, 1000 to 4000,
+            4080 to 3072, 8000 to 500, 1 to 1, 13 to 7,
+        )
+        for ((w, h) in aspects) {
+            val (fw, fh) = fitSizeFor(w, h, viewW, viewH)
+            assertTrue("$w×$h → $fw×$fh 超出容器", fw <= viewW && fh <= viewH)
+            assertTrue("$w×$h → $fw×$fh 没有铺满任一维", fw == viewW || fh == viewH)
+            val want = w.toDouble() / h
+            val got = fw.toDouble() / fh
+            // 相对误差（不是绝对差）：8000×500 这种 16:1 的画幅取整 1px 就差 0.3%，绝对差判据会误报
+            assertTrue("$w×$h 宽高比走样：$want vs $got", Math.abs(want - got) / want < 0.01)
+        }
+    }
+
+    @Test
+    fun fitSizeOfImageSmallerThanViewportIsUpscaledNotClamped() {
+        // 原图比容器小 ⇒ 返回**放大后**的目标尺寸：不是要放大解码，而是让 sampleSizeFor 如实返回 1
+        // （BitmapFactory 自己也不会放大）。若在这里夹回原尺寸，逻辑上没差，但语义会含糊。
+        assertEquals(1260 to 1260, fitSizeFor(100, 100, viewW, viewH))
+        assertEquals(1, sampleSizeFor(100, 100, 1260, 1260))
+    }
+
+    @Test
+    fun fitSizeDegenerateInputsReturnZero() {
+        // 容器未测量 / 尺寸读不到 / 负数 ⇒ (0,0)：调用侧据此走兜底，**不许拿 0 去解码**
+        assertEquals(0 to 0, fitSizeFor(4000, 3000, 0, 2800))
+        assertEquals(0 to 0, fitSizeFor(4000, 3000, 1260, 0))
+        assertEquals(0 to 0, fitSizeFor(0, 3000, viewW, viewH))
+        assertEquals(0 to 0, fitSizeFor(4000, 0, viewW, viewH))
+        assertEquals(0 to 0, fitSizeFor(-1, 3000, viewW, viewH))
+        assertEquals(0 to 0, fitSizeFor(4000, -1, viewW, viewH))
+        assertEquals(0 to 0, fitSizeFor(4000, 3000, -1, viewH))
+        assertEquals(0 to 0, fitSizeFor(4000, 3000, viewW, Int.MIN_VALUE))
+    }
+
+    /**
+     * **本卡的核心回归**（调研 §7 的陷阱表）：直接拿容器尺寸当目标会让 [sampleSizeFor] 卡在
+     * sample=1（全分辨率 48MB）—— 横 / 竖 / 全景**三种画幅全部失效**。必须走 [fitSizeFor] 再传。
+     */
+    @Test
+    fun samplingByFitSizeDowngradesAllThreeAspects() {
+        // 原尺寸 → 期望 sampleSize → 期望解码尺寸（= 原尺寸 / sample，两维各除）
+        val cases = listOf(
+            Triple(4000 to 3000, 2, 2000 to 1500), // 横
+            Triple(3000 to 4000, 2, 1500 to 2000), // 竖
+            Triple(8000 to 1000, 4, 2000 to 250),  // 全景
+        )
+        for ((src, wantSample, wantDecoded) in cases) {
+            val (w, h) = src
+            val (fw, fh) = fitSizeFor(w, h, viewW, viewH)
+            val s = sampleSizeFor(w, h, fw, fh)
+            assertEquals("$w×$h：Fit $fw×$fh 的采样率", wantSample, s)
+            assertEquals("$w×$h 的解码尺寸", wantDecoded, (w / s) to (h / s))
+            // 对照：传容器尺寸（错误做法）⇒ 三种画幅**全部**退回全分辨率，这就是陷阱本身
+            assertEquals(
+                "$w×$h 直接传容器尺寸应卡在 sample=1（陷阱）",
+                1,
+                sampleSizeFor(w, h, viewW, viewH),
+            )
+            // 降档后像素量必须真的少（至少 1/4，即 sample ≥ 2；横竖两档恰好是 1/4）
+            assertTrue("$w×$h 降档无效", (w / s).toLong() * (h / s) * 4 <= w.toLong() * h)
+        }
+    }
+
+    @Test
+    fun fitSizeOnTheHalfBoundaryStaysDowngradable() {
+        // 临界点：容器正好是原图的一半 ⇒ Fit 尺寸 = 2000×1500，sample=2 仍然成立。
+        // **这里差 1px 就会让 sampleSizeFor 掉回 1（全分辨率 48MB）** —— 用整数交叉相乘 + 向上
+        // 取整（而不是浮点比值）就是为了钉死这条边界：浮点会算出 2000.0000001 之类。
+        assertEquals(2000 to 1500, fitSizeFor(4000, 3000, 2000, 1500))
+        assertEquals(2, sampleSizeFor(4000, 3000, 2000, 1500))
+        // 容器比一半小 1px：Fit 尺寸 1999×1500，仍是 sample=2
+        assertEquals(1999 to 1500, fitSizeFor(4000, 3000, 1999, 1500))
+        assertEquals(2, sampleSizeFor(4000, 3000, 1999, 1500))
+    }
+
+    /**
+     * 三种画幅的**采样台账**（跑的是真实函数，数字直接进 stdout，交付报告引用这一份）：
+     * 原尺寸 → Fit 尺寸 → sampleSize → 解码像素数 → ARGB_8888 字节数。
+     *
+     * 真机耗时与内存峰值**不在这里**（JVM 测不了），本表只钉"要解多少像素"—— 那是解码量与
+     * 内存的直接决定因素。
+     */
+    @Test
+    fun fitSamplingLedger() {
+        for ((w, h) in listOf(4000 to 3000, 3000 to 4000, 8000 to 1000)) {
+            val (fw, fh) = fitSizeFor(w, h, viewW, viewH)
+            val s = sampleSizeFor(w, h, fw, fh)
+            val fullMb = w.toLong() * h * 4 / 1_000_000
+            val fitMb = (w / s).toLong() * (h / s) * 4 / 1_000_000
+            println(
+                "${w}×$h → Fit $fw×$fh → sample=$s → 解码 ${w / s}×${h / s}" +
+                    "（全分辨率 ${fullMb}MB → Fit 档 ${fitMb}MB，ARGB_8888）",
+            )
+            assertTrue("Fit 档必须比全分辨率省内存（$w×$h）", fitMb < fullMb)
+        }
+    }
+
+    // ------------------------------------------- ⑤ 真实文件离线实测（缺失则跳过）
 
     @Test
     fun realDngOrientationRotatesToPortraitLikeTheStill() {

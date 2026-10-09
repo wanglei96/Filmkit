@@ -50,6 +50,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -93,6 +94,20 @@ internal const val MIN_ZOOM = 1f
 
 /** 缩放上限：12MP 原图在 1080p 屏上 Fit ≈0.27×，5× 已是 1:1 像素的 1.35 倍，再多只剩糊 */
 internal const val MAX_ZOOM = 5f
+
+/**
+ * 放大到这一档就补解一张 `viewSize × 2` 的位图（E2-22）。**两档足够**：12MP 的 4000px 长边
+ * 在 2× 档就已经落到 sample=1（全分辨率），再往上没有更多像素可解。必须落在
+ * `(MIN_ZOOM, MAX_ZOOM]` 区间内，否则升档永远不触发（或一放大就到顶）。
+ */
+internal const val ZOOM_HIRES = 2f
+
+/** 预览占位边长（px）：与 PC 的 `PREVIEW_SIDE = 360` 同口径 —— 先上屏一张小图消灭等待感 */
+private const val PREVIEW_SIDE = 360
+
+/** 相邻页预览缓存：3 张（≈0.5–0.75MB/张），PC `previewCache(3)` 的等价物 */
+private const val PREVIEW_CACHE_COUNT = 3
+private const val PREVIEW_CACHE_BYTES = 4L * 1024 * 1024
 
 /**
  * 手势仲裁结果（本卡最容易出错的地方，故用枚举把仲裁表钉死）：
@@ -151,13 +166,17 @@ internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else inde
  * （取消 / 系统返回）回到本页 —— 用户 2026-10-09 明确要求"取消后应该回到照片查看页"。
  *
  * 五层结构照 ADR-15 截图：① 顶栏（返回 ｜ **日期 + 时间**居中两行 ｜ 收藏心形）
- * ② 照片区（**纯黑底 + 全分辨率原图**，用户 2026-10-08："点开看原图"）
+ * ② 照片区（**纯黑底 + 原图**，用户 2026-10-08："点开看原图"）
  * ③ 底部操作栏（编辑 / 胶片 / 分享 / 信息 / 删除）。
  *
  * **E2-20 新增**（用户 2026-10-10）：② 换成 `HorizontalPager` ⇒ 左右滑动切换图片；
  * 双指捏合/展开缩放（下限 = Fit，见 [MIN_ZOOM]）、放大后单指拖动平移。
  *
- * 素材分级（与相册页同一约定）：本页**自己全尺寸解码**，网格缩略图不会流到这里。
+ * **E2-22 优化**（用户报"切图慢"，ADR-18 方案 B）：不再解全分辨率（12MP ≈48MB），改为
+ * ① 按**显示尺寸**解码（[decodeFit]，Fit 档 ≈3MP ≈12MB）；② 360px 预览先上屏（[PREVIEW_SIDE]）；
+ * ③ 相邻页只解预览（`beyondViewportPageCount = 1`）；④ 放大到 [ZOOM_HIRES] 补解一档。
+ *
+ * 素材分级（与相册页同一约定）：本页**自己解码原图**（按显示尺寸，不是网格缩略图那一档）。
  * 权限沿用相册页那套（未授权时相册只列本应用照片），本页不新增权限流程。
  *
  * @param uris 可左右滑动的照片列表（**相册网格的扁平顺序**，URI 字符串）；空列表显示失败态。
@@ -181,8 +200,8 @@ fun PhotoViewScreen(
     val pageCount = uris.size
     val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
 
-    // **只有"停稳"的那一页解全分辨率**（settledPage：滚动动画结束后才更新）。12MP 一张 ≈48MB，
-    // 滑动过程中 Pager 会组合相邻页，若按 currentPage 解码就会同时压两三张在内存里。
+    // **只有"停稳"的那一页解大图**（settledPage：滚动动画结束后才更新）。E2-22 起按显示尺寸解
+    // （12MP 只解 ≈3MP ≈12MB），但滑动过程中 Pager 仍会组合相邻页，按 currentPage 解码就会同时压两三张。
     val page = pagerState.settledPage
     // remember 必须**无条件**调用（放在 getOrNull 的 let 里会随 null 与否改变 slot 结构 ⇒
     // 组合期报错），所以先取值再 remember 它
@@ -190,6 +209,11 @@ fun PhotoViewScreen(
     val currentUri = remember(currentKey) { currentKey?.let { Uri.parse(it) } }
 
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
+    // bitmap 对应的**是哪张图、哪个档位**（0 = 360px 预览，1 = Fit，2 = 放大档）。
+    // 用来区分"切页要重解"与"同页升档只需补解更高档"：缩回 Fit 时 shownTier=2 ≥ 目标 1 ⇒ 不重解
+    // （高清留着更好，降回去反而更糊）。
+    var shownUri by remember { mutableStateOf<String?>(null) }
+    var shownTier by remember { mutableStateOf(0) }
     var meta by remember { mutableStateOf(PhotoMeta()) }
     var error by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
@@ -206,6 +230,16 @@ fun PhotoViewScreen(
     // 是否放大态（决定 Pager 还能不能滚）。用 derivedStateOf：捏合时 zoom 每帧都在变，
     // 直接读 float 会让整页每帧重组；这里只有**跨越 1× 那一下**才通知重组。
     val zoomed by remember { derivedStateOf { zoom.floatValue > MIN_ZOOM } }
+    // 是否到了"补解一档"的放大程度（同理只在跨阈值那一下通知，捏合过程不重启解码）
+    val hiRes by remember { derivedStateOf { zoom.floatValue >= ZOOM_HIRES } }
+    // 相邻页预载的 360px 预览（PC `previewCache(3)` 的等价物）：滑过去的那一瞬间就有内容。
+    // 只丢引用不 recycle（可能正被画在屏幕上，见 ThumbCache.clear 的 KDoc）。
+    val previews = remember {
+        ThumbCache<String, Bitmap>(PREVIEW_CACHE_BYTES, PREVIEW_CACHE_COUNT) { it.byteCount }
+    }
+    DisposableEffect(Unit) {
+        onDispose { previews.clear() }
+    }
 
     val key = currentUri?.toString()
     val favorite = key != null && key in favorites
@@ -248,11 +282,13 @@ fun PhotoViewScreen(
         }
     }
 
-    // 切页：**缩放/平移复位**（新图从 Fit 开始）+ 元数据先到（顶栏立刻更新）+ 全分辨率按需解码
+    // ── 切页：**缩放/平移复位**（新图从 Fit 开始）+ 元数据先到（顶栏立刻更新）────────
+    // 与解码协程分开：解码的 key 含 hiRes/viewSize，放大或窗口尺寸变化时它会重启 ——
+    // 复位/元数据**不能**跟着重启（放大一下就把用户的缩放弹回 Fit 是灾难）。
     LaunchedEffect(page, uris) {
         zoom.floatValue = MIN_ZOOM
         pan.value = Offset.Zero
-        bitmap = null
+        bitmap = null // 上一张的像素内容不对，必须丢（不留作占位）
         error = ""
         status = "" // 上一张的提示（分享失败等）不跟着跨图
         val u = uris.getOrNull(page)
@@ -260,12 +296,54 @@ fun PhotoViewScreen(
             error = "照片已失效"
             return@LaunchedEffect
         }
-        val parsed = Uri.parse(u)
         // 元数据（MediaStore + EXIF）几十毫秒就回来，先更新顶栏，别让日期停在上一张
-        meta = withContext(Dispatchers.IO) { queryMeta(context, parsed) }
-        val b = withContext(Dispatchers.IO) { decodeOriented(context, parsed, 0, 0) }
-        bitmap = b
-        if (b == null) error = "照片已失效或无法读取"
+        meta = withContext(Dispatchers.IO) { queryMeta(context, Uri.parse(u)) }
+    }
+
+    // ── 解码（E2-22 两段式 + 两档）────────────────────────────────────────
+    // ① 360px 预览先上屏（命中相邻页预载就零成本）→ ② 按显示尺寸解目标档（Fit / viewSize×2）。
+    // 目标档解码期间**旧位图一直占位**，解完才替换 —— 全程没有"转圈等大图"。
+    LaunchedEffect(page, uris, hiRes, viewSize) {
+        val u = uris.getOrNull(page) ?: return@LaunchedEffect
+        val vw = viewSize.width
+        val vh = viewSize.height
+        // 容器还没测量（首帧 onSizeChanged 之前）⇒ 算不出 Fit 尺寸。viewSize 是 key，测量完会重启；
+        // 这里直接返回，好过拿 0 去解码（那会退化成全分辨率 48MB）。
+        if (vw <= 0 || vh <= 0) return@LaunchedEffect
+        val target = if (hiRes) 2 else 1
+        // 已经有"不差于目标档"的位图（同页缩回 Fit / 无关重组）⇒ 什么都不做
+        if (shownUri == u && shownTier >= target && bitmap != null) return@LaunchedEffect
+
+        val parsed = Uri.parse(u)
+        if (shownUri != u) {
+            // 切页：相邻页预载过这张就直接上屏（零解码），否则下面补一张
+            bitmap = previews.get(u)
+            shownUri = u
+            shownTier = 0
+        }
+        if (bitmap == null) {
+            val preview = withContext(Dispatchers.IO) {
+                decodeFit(context, parsed, PREVIEW_SIDE, PREVIEW_SIDE)
+            }
+            if (preview != null) {
+                bitmap = preview
+                previews.put(u, preview)
+            }
+        }
+        // 目标档：Fit（12MP ⇒ 2000×1500 ≈12MB）或放大档（viewSize×2；12MP 上这档等价全分辨率）
+        val b = withContext(Dispatchers.IO) {
+            decodeFit(context, parsed, vw * target, vh * target)
+        }
+        if (b != null) {
+            bitmap = b
+            shownTier = target
+        } else if (bitmap == null) {
+            error = "照片已失效或无法读取"
+        } else {
+            // 预览在、目标档没解出来（decodeOriented 内部已按 OOM 降档重试过一次，仍失败）。
+            // 如实说一句，别让用户以为"这图就是这么糊" —— 不静默。
+            status = "大图解码失败，当前是低清预览"
+        }
     }
 
     // 当前是哪张要回写路由层：从查看页进编辑器、退出回查看页时必须回到**同一张**（E2-20）。
@@ -344,6 +422,9 @@ fun PhotoViewScreen(
             } else {
                 HorizontalPager(
                     state = pagerState,
+                    // 相邻页也组合出来（只解 360px 预览占位，见下）—— 滑过去时不是空白，
+                    // 这是 PC `preloadPreviews` 的等价物（E2-22）
+                    beyondViewportPageCount = 1,
                     // 放大态关掉 Pager 的滚动（仲裁表第二行）；手势层自己也会消费放大态的事件，
                     // 这里是第二道保险 —— 两道都失效才会出现"放大后拖动把图切走"。
                     userScrollEnabled = !zoomed,
@@ -395,12 +476,18 @@ fun PhotoViewScreen(
                             },
                         contentAlignment = Alignment.Center,
                     ) {
-                        // 只有停稳的那页有像素：滑动过程中露出的相邻页是空的（按需解码的代价，
-                        // 换来的是任何时刻内存里最多一张 12MP 原图）
-                        val b = if (p == page) bitmap else null
+                        // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 只解 360px 预览当占位
+                        // （不占全尺寸内存）。滑动时必然是 Fit 态（放大态 Pager 被禁用），
+                        // 所以下面那份 graphicsLayer 对相邻页等于无变换。
+                        val neighbor = if (p == page) {
+                            null
+                        } else {
+                            uris.getOrNull(p)?.let { rememberPreview(previews, it, context) }
+                        }
+                        val b = if (p == page) bitmap else neighbor
                         when {
-                            p != page -> Unit
-                            error.isNotEmpty() -> Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
+                            p == page && error.isNotEmpty() ->
+                                Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
                             b != null -> Image(
                                 bitmap = b.asImageBitmap(),
                                 contentDescription = "照片",
@@ -416,7 +503,10 @@ fun PhotoViewScreen(
                                         translationY = pan.value.y
                                     },
                             )
-                            else -> CircularProgressIndicator(color = FilmTheme.Accent)
+                            p == page -> CircularProgressIndicator(color = FilmTheme.Accent)
+                            // 相邻页预览还没解出来：保持黑底（滑动动画里几乎看不见），
+                            // 不值得为它显示错误文案
+                            else -> Unit
                         }
                     }
                 }
@@ -534,6 +624,28 @@ private fun clampPan(pan: Offset, scale: Float, view: IntSize, bitmap: Bitmap?):
         clampAxis(pan.x, view.width.toFloat(), w * scale),
         clampAxis(pan.y, view.height.toFloat(), h * scale),
     )
+}
+
+/**
+ * 相邻页的 360px 预览（E2-22）：命中 [cache] 直接返回，否则后台解一张（解完刷新并回填缓存）。
+ *
+ * **只在 `p != page` 时调用** —— 当前页由主解码负责，同一张图解两次纯属浪费。失败返回 null，
+ * 调用方保持黑底（相邻页不值得显示错误文案）。方向转正沿用 [decodeFit]（8 值含镜像）。
+ */
+@Composable
+private fun rememberPreview(cache: ThumbCache<String, Bitmap>, uri: String, context: Context): Bitmap? {
+    var bmp by remember(uri) { mutableStateOf(cache.get(uri)) }
+    LaunchedEffect(uri) {
+        if (bmp != null) return@LaunchedEffect
+        val b = withContext(Dispatchers.IO) {
+            decodeFit(context, Uri.parse(uri), PREVIEW_SIDE, PREVIEW_SIDE)
+        }
+        if (b != null) {
+            cache.put(uri, b)
+            bmp = b
+        }
+    }
+    return bmp
 }
 
 /** 底栏一项：图标 + 文字（[dimmed] = 可见但明确不可用，如未开工的「胶片」） */

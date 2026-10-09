@@ -26,22 +26,24 @@ import androidx.exifinterface.media.ExifInterface
  *
  * @param reqW 目标宽（px）；`<= 0` 表示不采样（原尺寸解码，照片查看页用）
  * @param reqH 目标高（px）；`<= 0` 同上
+ * @param knownSize 已知的原图尺寸（宽 to 高）—— 调用方刚读过就传进来，省一次流打开（E2-22）；
+ *   默认 null 自己读。只用于算采样率，**不校验**。
  */
-internal fun decodeOriented(context: Context, uri: Uri, reqW: Int, reqH: Int): Bitmap? {
+internal fun decodeOriented(
+    context: Context,
+    uri: Uri,
+    reqW: Int,
+    reqH: Int,
+    knownSize: Pair<Int, Int>? = null,
+): Bitmap? {
     val resolver = context.contentResolver
 
     // 尺寸预读只为算采样率（不分配像素）。读不到也继续试：按原尺寸解一次，失败由下面兜底。
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    val sized = try {
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        bounds.outWidth > 0 && bounds.outHeight > 0
-    } catch (_: Throwable) {
-        false
-    }
+    val src = knownSize ?: readBounds(resolver, uri)
 
     val (rotation, flip) = exifOrientationTransform(readOrientation(resolver, uri))
     // 第一趟按目标算出的采样率；OOM 后降一档（×2 = 长边减半）重试一次
-    var sample = if (sized) sampleSizeFor(bounds.outWidth, bounds.outHeight, reqW, reqH) else 1
+    var sample = if (src != null) sampleSizeFor(src.first, src.second, reqW, reqH) else 1
     repeat(2) {
         var bmp: Bitmap? = null
         try {
@@ -60,6 +62,37 @@ internal fun decodeOriented(context: Context, uri: Uri, reqW: Int, reqH: Int): B
         }
     }
     return null
+}
+
+/** 读原图尺寸（IO 线程，只解析文件头不分配像素）。读不到 / 不是位图 / 格式不支持 ⇒ null。 */
+private fun readBounds(resolver: ContentResolver, uri: Uri): Pair<Int, Int>? {
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    return try {
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        if (options.outWidth > 0 && options.outHeight > 0) options.outWidth to options.outHeight else null
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+/**
+ * 查看页用：按**"完整放进 maxW×maxH"后的显示尺寸**解码（E2-22，照 PC「按显示尺寸解码」的做法）。
+ *
+ * 与 [decodeOriented] 的唯一区别是**先把原图 Fit 进容器再算采样率** —— 直接把容器尺寸当目标传进去
+ * 会让 [sampleSizeFor] 卡在 sample=1（全分辨率 48MB），原因见 [fitSizeFor] 的 KDoc。
+ * 方向转正（8 值含镜像）/ OOM 降档 / 失败返回 null 全部沿用 [decodeOriented]，**不退化**。
+ *
+ * 读不到原尺寸（非标准位图，如 DNG）或容器未测量（`maxW/maxH <= 0`）⇒ 退回全分辨率
+ * （= 改动前的行为），不假装能按显示尺寸解。
+ *
+ * @param maxW 容器宽（px）；调用方传**显示区域的像素尺寸**（如 Compose 的 `viewSize`）
+ * @param maxH 容器高（px）
+ */
+internal fun decodeFit(context: Context, uri: Uri, maxW: Int, maxH: Int): Bitmap? {
+    val src = readBounds(context.contentResolver, uri)
+    val (w, h) = if (src == null) 0 to 0 else fitSizeFor(src.first, src.second, maxW, maxH)
+    if (w <= 0 || h <= 0) return decodeOriented(context, uri, 0, 0)
+    return decodeOriented(context, uri, w, h, src)
 }
 
 /**
@@ -106,6 +139,36 @@ internal fun sampleSizeFor(srcW: Int, srcH: Int, reqW: Int, reqH: Int): Int {
     while (srcW / (s * 2) >= reqW && srcH / (s * 2) >= reqH) s *= 2
     return s
 }
+
+/**
+ * 目标尺寸 = 原图**完整放进 `maxW×maxH`** 后的尺寸（与 Compose `ContentScale.Fit` 同口径），纯函数。
+ *
+ * **为什么必须单独算这一步**（E2-22 的核心陷阱，调研用脚本按真实判据验证过）：[sampleSizeFor]
+ * 要求**两个维度同时满足**才降档，把容器尺寸直接当目标传进去会**完全失效** ——
+ * 竖图 3000×4000 传 `(1260, 2800)` 时 `4000/2 = 2000 < 2800` ⇒ 返回 sample=1（全分辨率 48MB）。
+ * 先 Fit 成 1260×1680 再当目标 ⇒ sample=2 ⇒ 1500×2000（3MP）。三种画幅（横/竖/全景）同理。
+ *
+ * 实现用 **Long 交叉相乘**判"宽受限还是高受限"、整数向上取整算另一维：浮点比值会在临界点偏 1px，
+ * 而 [sampleSizeFor] 的降档判据是"源/2 ≥ 目标"这种**整数悬崖** —— 1px 就能把 sample 从 2 打回 1。
+ *
+ * 原图比容器小 ⇒ 返回**放大后**的目标尺寸（100×100 进 1260×2800 ⇒ 1260×1260）：不是要放大解码，
+ * 而是让 [sampleSizeFor] 如实返回 1（解原尺寸，BitmapFactory 也不会放大）。
+ *
+ * 任一维度非正（容器未测量 / 尺寸读不到）⇒ `(0, 0)`，调用侧据此走兜底，**不要拿 0 去解码**。
+ */
+internal fun fitSizeFor(srcW: Int, srcH: Int, maxW: Int, maxH: Int): Pair<Int, Int> {
+    if (srcW <= 0 || srcH <= 0 || maxW <= 0 || maxH <= 0) return 0 to 0
+    // 宽受限（maxW/srcW <= maxH/srcH，交叉相乘避免除法误差）⇒ 宽铺满；否则高铺满
+    return if (maxW.toLong() * srcH <= maxH.toLong() * srcW) {
+        maxW to ceilDiv(srcH.toLong() * maxW, srcW.toLong())
+    } else {
+        ceilDiv(srcW.toLong() * maxH, srcH.toLong()) to maxH
+    }
+}
+
+/** 正整数向上取整除法（`a`、`b` 都 > 0；结果夹进 Int 值域，病态输入不给负数） */
+private fun ceilDiv(a: Long, b: Long): Int =
+    ((a + b - 1) / b).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
 
 /** 读 EXIF 方向（IO 线程）。读不到 / 格式不支持 / 流打不开一律返回 [ExifInterface.ORIENTATION_UNDEFINED]。 */
 private fun readOrientation(resolver: ContentResolver, uri: Uri): Int = try {

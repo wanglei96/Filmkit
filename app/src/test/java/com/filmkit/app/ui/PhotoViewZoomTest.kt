@@ -1,6 +1,7 @@
 package com.filmkit.app.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -48,6 +49,16 @@ class PhotoViewZoomTest {
         assertEquals(2f, clampZoom(2f, 0f), eps)
         assertEquals(2f, clampZoom(2f, -1f), eps)
         assertEquals(2f, clampZoom(2f, Float.POSITIVE_INFINITY), eps)
+    }
+
+    @Test
+    fun hiResTierIsReachableInsideTheZoomRange() {
+        // E2-22 的"放大补解码"挂在 zoom ≥ ZOOM_HIRES 上，这个阈值必须落在 (MIN_ZOOM, MAX_ZOOM]：
+        //  ≤ MIN_ZOOM ⇒ 一进页就按放大档解码（白解，还多占 4× 内存）；
+        //  > MAX_ZOOM ⇒ 永远触发不了，5× 放大照样是糊的（④ 整个白做）。
+        assertEquals(2f, ZOOM_HIRES, eps)
+        assertTrue("ZOOM_HIRES=$ZOOM_HIRES 必须 > MIN_ZOOM=$MIN_ZOOM", ZOOM_HIRES > MIN_ZOOM)
+        assertTrue("ZOOM_HIRES=$ZOOM_HIRES 必须 <= MAX_ZOOM=$MAX_ZOOM", ZOOM_HIRES <= MAX_ZOOM)
     }
 
     // ── ② 平移夹紧（放大后单指拖动不能拖出画面）──────────────────────────
