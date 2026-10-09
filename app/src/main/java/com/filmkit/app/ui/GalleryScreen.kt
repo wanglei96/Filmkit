@@ -76,7 +76,7 @@ private const val GRID_COLUMNS = 3
  * 查看页这一层，本页因此只负责"挑图"，不再直接把 URI 交给编辑器。
  *
  * 素材分级（用户明确要求，不可混）：**缩略图只喂网格**；查看页与编辑器各自去
- * `ContentResolver` 全尺寸解码原图（[PhotoViewScreen.loadPhotoView] / EditorScreen.loadPreview）。
+ * `ContentResolver` 全尺寸解码原图（PhotoViewScreen / EditorScreen.loadPreview）。
  *
  * 权限与降级：API 33+ 请求 READ_MEDIA_IMAGES、更早请求 READ_EXTERNAL_STORAGE。
  * 拿到 ⇒ 查整个 MediaStore（"所有照片"）；被拒 ⇒ **降级为本 App 的
@@ -86,8 +86,11 @@ private const val GRID_COLUMNS = 3
 @Composable
 fun GalleryScreen(
     onBack: () -> Unit = {},
-    /** 点缩略图：带该图的 MediaStore URI 进**查看页**（查看页自己解码原图，不用这里的缩略图） */
-    onOpenPhoto: (Uri) -> Unit = {},
+    /**
+     * 点缩略图：带**整个扁平列表 + 点中的索引**进查看页（E2-20 左右滑动切图要用），
+     * 查看页自己解码原图，不用这里的缩略图。
+     */
+    onOpenPhoto: (List<String>, Int) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -126,6 +129,9 @@ fun GalleryScreen(
     val days = remember(photos) {
         photos?.let { groupByDay(it) }.orEmpty()
     }
+    // 网格是**按天分组**画的，查看页的 Pager 却是一条扁平列表（E2-20）⇒ 这里把分组后的顺序
+    // 摊平一次，点第 N 格就传扁平索引 N：两侧口径必须完全一致，否则点开的是另一张。
+    val flatUris = remember(days) { days.flatMap { it.photos }.map { it.uri } }
     // 网格项 ≈ 屏宽/3；按密度换算像素，作为自解码的目标边长（采样率由 decodeOriented 算）
     val thumbPx = with(density) {
         (configuration.screenWidthDp.dp / GRID_COLUMNS).roundToPx().coerceIn(160, 512)
@@ -203,7 +209,11 @@ fun GalleryScreen(
                             uri = uri,
                             px = thumbPx,
                             cache = thumbs,
-                            onClick = { onOpenPhoto(uri) },
+                            onClick = {
+                                // 索引在**扁平列表**里取（与查看页的 Pager 同一口径）
+                                val i = flatUris.indexOf(photo.uri)
+                                if (i >= 0) onOpenPhoto(flatUris, i)
+                            },
                         )
                     }
                 }

@@ -9,6 +9,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -71,6 +72,9 @@ class MainActivity : ComponentActivity() {
  * 编辑器退出（取消 / 系统返回）**回到查看页**而不是掉回相册网格 —— 用户 2026-10-09 明确
  * 要求。实现方式就在这一层：编辑器记下 [editorFrom]（"viewer"），退出时回那一页；
  * EditorScreen 一行未动（另一张卡 E2-15 正在改它）。
+ *
+ * E2-20：查看页可左右滑动切换（[viewerUris] + [viewerIndex] 也留在这一层）——
+ * 滑到第 7 张再进编辑器，退出时回的仍是**第 7 张**（查看页重建时 initialPage = viewerIndex）。
  * 返回键的分层归属统一由纯函数 [backTarget] 决定（单测见 PhotoViewerModelTest）。
  */
 @Composable
@@ -82,8 +86,12 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     // 来源页：编辑器与相册各自记住"从哪进来的"，返回时回到那一页（见上面的 KDoc）
     var editorFrom by rememberSaveable { mutableStateOf("camera") }
     var galleryFrom by rememberSaveable { mutableStateOf("camera") }
-    // 查看页当前那张照片（同 editorUri 的持久化理由）
-    var viewerUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    // 查看页的照片列表 + 当前索引（E2-20 左右滑动切图）。列表存 URI **字符串**：ArrayList<String>
+    // 是 Bundle 能存的可序列化类型，跨进程重建不丢（与 editorUri 用 Parcelable 同理）。
+    // **索引必须和列表一起留在这一层**：从查看页进编辑器再退出时，查看页是重新组合的
+    // （initialPage = 这个索引），不带索引就会回到第一张 —— 本卡最容易漏的一条。
+    var viewerUris by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var viewerIndex by rememberSaveable { mutableIntStateOf(0) }
 
     BackHandler(enabled = screen != "camera") {
         screen = backTarget(screen, editorFrom, galleryFrom)
@@ -103,18 +111,22 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         "focals" -> com.filmkit.app.ui.FocalScreen(onBack = { screen = "settings" })
         "logs" -> LogScreen(onBack = { screen = "settings" })
         "spike" -> SpikeScreen(onBack = { screen = "settings" })
-        // 相册：点缩略图进**查看页**（E2-13）—— 不再直接进编辑器
+        // 相册：点缩略图进**查看页**（E2-13）—— 不再直接进编辑器。E2-20 起带上整条扁平
+        // 列表 + 点中的索引，查看页据此左右滑动切换。
         "gallery" -> GalleryScreen(
             onBack = { screen = backTarget("gallery", editorFrom, galleryFrom) },
-            onOpenPhoto = { uri ->
-                viewerUri = uri
+            onOpenPhoto = { uris, index ->
+                viewerUris = uris
+                viewerIndex = index
                 screen = "viewer"
             },
         )
-        // 查看页：全屏原图 + 底栏五项。点「编辑」才进编辑器，并记下"从查看页来的"；
-        // 删除成功后回相册（那张已经不存在，留在查看页只会看到失效图）。
+        // 查看页：全屏原图 + 左右滑动切图 + 双指缩放 + 底栏五项。点「编辑」才进编辑器，并记下
+        // "从查看页来的"；删除成功后回相册（那张已经不存在，留在查看页只会看到失效图）。
         "viewer" -> PhotoViewScreen(
-            uri = viewerUri,
+            uris = viewerUris,
+            index = viewerIndex,
+            onIndexChange = { viewerIndex = it }, // 滑到新的一张 ⇒ 路由层跟着走（编辑器回同一张）
             onBack = { screen = backTarget("viewer", editorFrom, galleryFrom) },
             onEdit = { uri ->
                 editorUri = uri

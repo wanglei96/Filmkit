@@ -14,6 +14,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +31,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -45,18 +51,27 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
@@ -69,6 +84,68 @@ private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
 /** 「胶片」项的实话：E3 预设管理未开工，不假装能进（ADR-12） */
 private const val FILM_PRESET_LATER = "胶片预设将在后续版本提供"
 
+// ── 缩放 / 平移 / 手势仲裁的纯逻辑（E2-20；JVM 单测见 PhotoViewZoomTest）────────
+// 与 PhotoViewerModel.kt 同规矩：**不 import 任何 android.\***。这里算错全是静默事故
+// （图能被拖出画面外、能缩到比 Fit 还小、Fit 下横滑切不了图），所以必须能在 JVM 里真跑。
+
+/** 缩放下限 = **Fit（原片默认展示大小）**：用户 2026-10-10 明确要求"最小为原片默认展示大小" */
+internal const val MIN_ZOOM = 1f
+
+/** 缩放上限：12MP 原图在 1080p 屏上 Fit ≈0.27×，5× 已是 1:1 像素的 1.35 倍，再多只剩糊 */
+internal const val MAX_ZOOM = 5f
+
+/**
+ * 手势仲裁结果（本卡最容易出错的地方，故用枚举把仲裁表钉死）：
+ *
+ * | 状态 | 单指 | 双指 |
+ * |---|---|---|
+ * | Fit（[MIN_ZOOM]） | [Swipe] ⇒ **不消费事件**，交给 Pager 切换图片 | [Zoom] |
+ * | 放大（> [MIN_ZOOM]） | [Pan] ⇒ 平移，**消费事件**（Pager 收不到 ⇒ 不切图） | [Zoom] |
+ *
+ * 关键在 Fit 下的单指：手势层必须**一个事件都不消费**，否则 Pager 的滚动永远拿不到横滑，
+ * 左右切图整个失效（这是把 `detectTransformGestures` 直接挂上去最经典的翻车点：它单指
+ * 超过 touchSlop 就 consume）。
+ */
+internal enum class ViewerGesture { Zoom, Pan, Swipe }
+
+internal fun viewerGesture(pressedPointers: Int, zoomed: Boolean): ViewerGesture = when {
+    pressedPointers >= 2 -> ViewerGesture.Zoom
+    // 手指全抬起（pressed = 0，最后一个 UP 事件）⇒ 什么都不做：不消费、不改平移量
+    pressedPointers <= 0 -> ViewerGesture.Swipe
+    zoomed -> ViewerGesture.Pan
+    else -> ViewerGesture.Swipe
+}
+
+/** 乘性缩放 + 夹紧到 [MIN_ZOOM]..[MAX_ZOOM]；非法 factor（NaN / 0 / 负）保持原值不跳变 */
+internal fun clampZoom(current: Float, factor: Float): Float {
+    val next = if (factor.isFinite() && factor > 0f) current * factor else current
+    return next.coerceIn(MIN_ZOOM, MAX_ZOOM)
+}
+
+/**
+ * `ContentScale.Fit` 之后图片在容器里的显示尺寸（像素）。图片尺寸未知（还没解码 / 解不开）
+ * 时退化成容器尺寸 —— 此时缩放平移本来也不该动。
+ */
+internal fun fitDisplaySize(imgW: Int, imgH: Int, viewW: Float, viewH: Float): Pair<Float, Float> {
+    if (imgW <= 0 || imgH <= 0 || viewW <= 0f || viewH <= 0f) return viewW to viewH
+    val s = minOf(viewW / imgW, viewH / imgH)
+    return imgW * s to imgH * s
+}
+
+/**
+ * 单轴平移夹紧（居中坐标系：0 = 居中，正 = 向右/向下）。内容比视口大多少，才允许移多少。
+ * 内容不超过视口 ⇒ 上限 0 ⇒ **Fit 尺寸下平移量必然归零**（不需要额外写一条"缩回 Fit 时
+ * 归零"的分支，夹紧规则本身就保证了）。
+ */
+internal fun clampAxis(offset: Float, view: Float, content: Float): Float {
+    if (!offset.isFinite()) return 0f
+    val max = ((content - view) / 2f).coerceAtLeast(0f)
+    return offset.coerceIn(-max, max)
+}
+
+/** 索引边界（列表为空 / 越界都收敛到 0：Pager 不接受越界页，路由层也不能拿到越界索引） */
+internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else index.coerceIn(0, size - 1)
+
 /**
  * 照片查看页（ADR-15，E2-13）：**网格点开先到这一页**，点「编辑」才进编辑器；编辑器退出
  * （取消 / 系统返回）回到本页 —— 用户 2026-10-09 明确要求"取消后应该回到照片查看页"。
@@ -77,33 +154,60 @@ private const val FILM_PRESET_LATER = "胶片预设将在后续版本提供"
  * ② 照片区（**纯黑底 + 全分辨率原图**，用户 2026-10-08："点开看原图"）
  * ③ 底部操作栏（编辑 / 胶片 / 分享 / 信息 / 删除）。
  *
+ * **E2-20 新增**（用户 2026-10-10）：② 换成 `HorizontalPager` ⇒ 左右滑动切换图片；
+ * 双指捏合/展开缩放（下限 = Fit，见 [MIN_ZOOM]）、放大后单指拖动平移。
+ *
  * 素材分级（与相册页同一约定）：本页**自己全尺寸解码**，网格缩略图不会流到这里。
  * 权限沿用相册页那套（未授权时相册只列本应用照片），本页不新增权限流程。
  *
- * @param uri 照片的 MediaStore URI；null（进程重建后状态丢失）显示失败态而非白屏。
- * @param onEdit 点「编辑」→ 交给编辑器（路由层记录"从查看页进来的"，退出时回本页）。
+ * @param uris 可左右滑动的照片列表（**相册网格的扁平顺序**，URI 字符串）；空列表显示失败态。
+ * @param index 初始第几张（相册点第 N 张就从第 N 张开始）。
+ * @param onIndexChange 滑动切到新的一张时回调 —— 路由层必须跟着更新，否则"从查看页进编辑器、
+ *   退出回查看页"会回到**上一张**（见 MainActivity 的 viewerIndex）。
+ * @param onEdit 点「编辑」→ 交给编辑器（路由层记录"从查看页进来的"+当前索引，退出时回本页同一张）。
  * @param onDeleted 删除成功 → 回相册（那张已不存在，留在本页只会看到失效图）。
  */
 @Composable
 fun PhotoViewScreen(
-    uri: Uri?,
+    uris: List<String>,
+    index: Int = 0,
+    onIndexChange: (Int) -> Unit = {},
     onBack: () -> Unit = {},
     onEdit: (Uri) -> Unit = {},
     onDeleted: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
-    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
-    var meta by remember(uri) { mutableStateOf(PhotoMeta()) }
-    var error by remember(uri) { mutableStateOf("") }
-    var status by remember(uri) { mutableStateOf("") }
+    val pageCount = uris.size
+    val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
+
+    // **只有"停稳"的那一页解全分辨率**（settledPage：滚动动画结束后才更新）。12MP 一张 ≈48MB，
+    // 滑动过程中 Pager 会组合相邻页，若按 currentPage 解码就会同时压两三张在内存里。
+    val page = pagerState.settledPage
+    // remember 必须**无条件**调用（放在 getOrNull 的 let 里会随 null 与否改变 slot 结构 ⇒
+    // 组合期报错），所以先取值再 remember 它
+    val currentKey = uris.getOrNull(page)
+    val currentUri = remember(currentKey) { currentKey?.let { Uri.parse(it) } }
+
+    var bitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var meta by remember { mutableStateOf(PhotoMeta()) }
+    var error by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("") }
     var showInfo by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     // 收藏的唯一数据源是这份 state；prefs 只负责持久化（见 KDoc 的"没有统一收藏 API"）
     var favorites by remember {
         mutableStateOf(favoritesFrom(prefs.getString(FAVORITES_KEY, null)))
     }
-    val key = uri?.toString()
+    // 缩放 / 平移：state 对象本身被手势协程捕获（读 .value 永远是最新值，不需要 rememberUpdatedState）
+    val zoom = remember { mutableFloatStateOf(MIN_ZOOM) }
+    val pan = remember { mutableStateOf(Offset.Zero) }
+    var viewSize by remember { mutableStateOf(IntSize.Zero) }
+    // 是否放大态（决定 Pager 还能不能滚）。用 derivedStateOf：捏合时 zoom 每帧都在变，
+    // 直接读 float 会让整页每帧重组；这里只有**跨越 1× 那一下**才通知重组。
+    val zoomed by remember { derivedStateOf { zoom.floatValue > MIN_ZOOM } }
+
+    val key = currentUri?.toString()
     val favorite = key != null && key in favorites
 
     // 系统删除确认弹窗（API 30+）的返回：OK = 已删除；其余（用户取消 / 系统拒绝）如实说一句
@@ -120,7 +224,7 @@ fun PhotoViewScreen(
      * 不许静默（删没删掉用户必须知道）。
      */
     fun deletePhoto() {
-        val u = uri ?: return
+        val u = currentUri ?: return
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
                 val req = MediaStore.createDeleteRequest(context.contentResolver, listOf(u))
@@ -144,15 +248,30 @@ fun PhotoViewScreen(
         }
     }
 
-    LaunchedEffect(uri) {
-        if (uri == null) {
+    // 切页：**缩放/平移复位**（新图从 Fit 开始）+ 元数据先到（顶栏立刻更新）+ 全分辨率按需解码
+    LaunchedEffect(page, uris) {
+        zoom.floatValue = MIN_ZOOM
+        pan.value = Offset.Zero
+        bitmap = null
+        error = ""
+        status = "" // 上一张的提示（分享失败等）不跟着跨图
+        val u = uris.getOrNull(page)
+        if (u == null) {
             error = "照片已失效"
             return@LaunchedEffect
         }
-        val loaded = withContext(Dispatchers.IO) { loadPhotoView(context, uri) }
-        bitmap = loaded.bitmap
-        meta = loaded.meta
-        error = loaded.error
+        val parsed = Uri.parse(u)
+        // 元数据（MediaStore + EXIF）几十毫秒就回来，先更新顶栏，别让日期停在上一张
+        meta = withContext(Dispatchers.IO) { queryMeta(context, parsed) }
+        val b = withContext(Dispatchers.IO) { decodeOriented(context, parsed, 0, 0) }
+        bitmap = b
+        if (b == null) error = "照片已失效或无法读取"
+    }
+
+    // 当前是哪张要回写路由层：从查看页进编辑器、退出回查看页时必须回到**同一张**（E2-20）。
+    // 用 settledPage（与解码同一页）而不是 currentPage：滑到一半又滑回去不算换页。
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.settledPage }.collect { onIndexChange(it) }
     }
 
     Column(
@@ -212,18 +331,95 @@ fun PhotoViewScreen(
             }
         }
 
-        // ── ② 照片区：全分辨率原图（纯黑底上下留黑）────────────────────────
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            val b = bitmap
-            when {
-                error.isNotEmpty() -> Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
-                b != null -> Image(
-                    bitmap = b.asImageBitmap(),
-                    contentDescription = "照片",
-                    contentScale = ContentScale.Fit,
+        // ── ② 照片区：HorizontalPager（左右滑动切图）+ 双指缩放 / 放大后单指平移 ──
+        Box(
+            Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .onSizeChanged { viewSize = it }, // 平移夹紧要用容器尺寸
+            contentAlignment = Alignment.Center,
+        ) {
+            if (pageCount == 0) {
+                Text("照片已失效", color = FilmTheme.CreamDim, fontSize = 13.sp)
+            } else {
+                HorizontalPager(
+                    state = pagerState,
+                    // 放大态关掉 Pager 的滚动（仲裁表第二行）；手势层自己也会消费放大态的事件，
+                    // 这里是第二道保险 —— 两道都失效才会出现"放大后拖动把图切走"。
+                    userScrollEnabled = !zoomed,
                     modifier = Modifier.fillMaxSize(),
-                )
-                else -> CircularProgressIndicator(color = FilmTheme.Accent)
+                ) { p ->
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(p) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val pressed = event.changes.count { it.pressed }
+                                        when (
+                                            viewerGesture(pressed, zoomed)
+                                        ) {
+                                            // 双指：缩放（顺带支持双指拖动平移）
+                                            ViewerGesture.Zoom -> {
+                                                zoom.floatValue =
+                                                    clampZoom(zoom.floatValue, event.calculateZoom())
+                                                pan.value = clampPan(
+                                                    pan.value + event.calculatePan(),
+                                                    zoom.floatValue,
+                                                    viewSize,
+                                                    bitmap,
+                                                )
+                                                event.changes.forEach {
+                                                    if (it.positionChanged()) it.consume()
+                                                }
+                                            }
+                                            // 放大态单指：平移，消费掉 ⇒ Pager 收不到 ⇒ 不切图
+                                            ViewerGesture.Pan -> {
+                                                pan.value = clampPan(
+                                                    pan.value + event.calculatePan(),
+                                                    zoom.floatValue,
+                                                    viewSize,
+                                                    bitmap,
+                                                )
+                                                event.changes.forEach {
+                                                    if (it.positionChanged()) it.consume()
+                                                }
+                                            }
+                                            // Fit 单指：**一个事件都不消费**，横滑留给 Pager 切图
+                                            ViewerGesture.Swipe -> Unit
+                                        }
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        // 只有停稳的那页有像素：滑动过程中露出的相邻页是空的（按需解码的代价，
+                        // 换来的是任何时刻内存里最多一张 12MP 原图）
+                        val b = if (p == page) bitmap else null
+                        when {
+                            p != page -> Unit
+                            error.isNotEmpty() -> Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
+                            b != null -> Image(
+                                bitmap = b.asImageBitmap(),
+                                contentDescription = "照片",
+                                contentScale = ContentScale.Fit,
+                                // graphicsLayer 的 block 在绘制阶段读 state ⇒ 手势只触发重绘，
+                                // 不触发重组（每帧拖动都重组整页会很卡）
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer {
+                                        scaleX = zoom.floatValue
+                                        scaleY = zoom.floatValue
+                                        translationX = pan.value.x
+                                        translationY = pan.value.y
+                                    },
+                            )
+                            else -> CircularProgressIndicator(color = FilmTheme.Accent)
+                        }
+                    }
+                }
             }
         }
 
@@ -246,14 +442,14 @@ fun PhotoViewScreen(
                 .fillMaxWidth()
                 .padding(top = 6.dp, bottom = 10.dp),
         ) {
-            val enabled = uri != null
-            BottomAction(Icons.Filled.Edit, "编辑", enabled) { uri?.let(onEdit) }
+            val enabled = currentUri != null
+            BottomAction(Icons.Filled.Edit, "编辑", enabled) { currentUri?.let(onEdit) }
             // 胶片（E3 预设管理未开工）：**置灰 + 一句实话**，不做假入口（ADR-12）
             BottomAction(Icons.Filled.PhotoFilter, "胶片", enabled, dimmed = true) {
                 status = FILM_PRESET_LATER
             }
             BottomAction(Icons.Filled.Share, "分享", enabled) {
-                uri?.let { sharePhoto(context, it)?.let { msg -> status = msg } }
+                currentUri?.let { sharePhoto(context, it)?.let { msg -> status = msg } }
             }
             BottomAction(Icons.Filled.Info, "信息", enabled) { showInfo = true }
             BottomAction(
@@ -327,6 +523,19 @@ fun PhotoViewScreen(
     }
 }
 
+/**
+ * 平移量的夹紧（Compose 侧包装，核心数学是纯函数 [clampAxis] / [fitDisplaySize]）。
+ * 图片尺寸未知 ⇒ 归零（还没解码时拖动没有意义）。
+ */
+private fun clampPan(pan: Offset, scale: Float, view: IntSize, bitmap: Bitmap?): Offset {
+    if (bitmap == null || view.width <= 0 || view.height <= 0) return Offset.Zero
+    val (w, h) = fitDisplaySize(bitmap.width, bitmap.height, view.width.toFloat(), view.height.toFloat())
+    return Offset(
+        clampAxis(pan.x, view.width.toFloat(), w * scale),
+        clampAxis(pan.y, view.height.toFloat(), h * scale),
+    )
+}
+
 /** 底栏一项：图标 + 文字（[dimmed] = 可见但明确不可用，如未开工的「胶片」） */
 @Composable
 private fun RowScope.BottomAction(
@@ -370,22 +579,13 @@ private fun sharePhoto(context: Context, uri: Uri): String? {
     }
 }
 
-private data class LoadedPhoto(val bitmap: Bitmap?, val meta: PhotoMeta, val error: String)
-
-/** 读原图 + 元数据（IO 线程）。解不出来给失败态，不抛。 */
-private fun loadPhotoView(context: Context, uri: Uri): LoadedPhoto {
-    val meta = queryMeta(context, uri)
-    // **全分辨率解码**（用户 2026-10-08："点开看原图"；与编辑器 loadPreview 同口径）：
-    // reqW/reqH = 0 ⇒ 不采样。方向由 [decodeOriented] 统一转正（E2-18a：DNG 写的是真实
-    // sensor 方向，BitmapFactory 自己不读 EXIF，不转正就会横竖颠倒）。
-    val bmp = decodeOriented(context, uri, 0, 0)
-    return LoadedPhoto(bmp, meta, if (bmp == null) "照片已失效或无法读取" else "")
-}
-
 /**
  * MediaStore 元数据 + EXIF（IO 线程，全部 best-effort：单列缺失/单次查询失败只丢那一项）。
  * 路径优先 `_data`（API 29 起 deprecated 但仍是用户能看懂的绝对路径），取不到退回
  * `relative_path` + 文件名。
+ *
+ * 解码**不在**这里：查看页按需分两步（元数据先到、全分辨率后到），见 PhotoViewScreen 的
+ * LaunchedEffect（E2-20）。
  */
 private fun queryMeta(context: Context, uri: Uri): PhotoMeta {
     var takenMs = 0L
