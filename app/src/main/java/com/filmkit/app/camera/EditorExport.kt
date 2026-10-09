@@ -16,6 +16,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.min
 
 /**
@@ -60,6 +61,52 @@ internal fun editorParams(raw: DoubleArray?): DoubleArray {
  */
 internal fun editorOpenParams(snap: StillSnapshot?): DoubleArray =
     editorParams(snap?.params).also { it[34] = 0.0 }
+
+/**
+ * 「无修改」比较容差（E2-9 / ADR-13）。取 **1e-4** 的依据 —— 两侧余量都要够：
+ *
+ *  - **必须盖住 Float → Double 的精度损失**（判"无修改"的一侧）：槽位量级最大的是暗角
+ *    半径/羽化（`ui * 100`，上限 200），而 UI 滑杆的值是 Float（24 位尾数），Float 在 2.0
+ *    附近的 ulp ≈ 2.4e-7 ⇒ 换算到槽位 ≈ 2.4e-5（实测 `vigRadiusSlot(0.8f)` 与 80.0 差
+ *    1.19e-6）。1e-4 是它的 4 倍，够。
+ *  - **必须远小于真实修改的最小步长**（判"有修改"的一侧）：滑杆是相对拖动
+ *    （`delta / widthPx * span`），手指移 1px 在 300px 宽、span = 2 的滑杆上 ⇒ 槽位变化
+ *    ≈ 6.7e-3，是 1e-4 的 67 倍。
+ *  ⇒ 两端各有 1 个数量级以上的余量，不存在"漏判修改"或"误判修改"的窗口。
+ */
+internal const val PARAM_EPS = 1e-4
+
+/**
+ * 「无修改」判据（E2-9 / ADR-13）：[current] 与**打开编辑器时**的基准 [baseline] 逐槽相同
+ * ⇒ 导出可直通原片字节（不渲染、不编码）。
+ *
+ * 三条设计约束：
+ *  1. **基准是"打开时的参数"**（[editorOpenParams] 的返回值副本），不是快照原文 ——
+ *     该函数已把 `[34] lut_strength` 强制置 0（E2-1 拍板"打开即与原片一致"），拿快照
+ *     原文比会把"打开时那一次必然的 LUT 归零"误判成用户修改。
+ *  2. **值比较，不是"是否碰过滑杆"**：用户改了又改回原值 ⇒ 画面与原片一致 ⇒ 该直通。
+ *  3. **不用 `==`**（E2-3 踩过的浮点坑：`0.01f.toDouble()` = 0.009999999776…）：容差见
+ *     [PARAM_EPS]。
+ *
+ * **非有限值（NaN/Inf）一律判"有修改"**：基准来自 [editorParams]（已过滤坏数据）⇒ 恒有限，
+ * 所以出现非有限值只可能是 current 侧被写坏。此时宁可多渲染一次（安全），也不能拿它比出
+ * "无修改"而把用户的修改丢掉 —— 直通是"输出原片字节"，误判的代价是**丢修改**。
+ *
+ * @return true = 逐槽相同（含容差）⇒ 可直通原片字节
+ */
+internal fun paramsUnchanged(
+    current: DoubleArray,
+    baseline: DoubleArray,
+    eps: Double = PARAM_EPS,
+): Boolean {
+    if (current.size != baseline.size) return false
+    for (i in current.indices) {
+        val a = current[i]
+        val b = baseline[i]
+        if (!a.isFinite() || !b.isFinite() || abs(a - b) > eps) return false
+    }
+    return true
+}
 
 /**
  * 暗角参数的 UI ↔ 槽位映射（E2-1）。**纯逻辑、无 Android 依赖** ⇒ JVM 单测直接覆盖往返。
@@ -261,8 +308,15 @@ internal fun encodeEditorJpeg(bmp: Bitmap, quality: Int): ByteArray? {
  *
  * 与原片完全无关：新建条目 + `IS_PENDING` 写完再放开可见（写一半被系统杀进程也不会
  * 在相册里留下半张图）。失败只记日志并返回 null —— 用户的原片不受任何影响。
+ *
+ * [rewriteExif] = false（E2-9 直通路径）：**一个字节都不动**。此时 [jpeg] 就是原片字节，
+ * 拍摄参数（ISO/机型/光圈/拍摄时间）本来就在里面 —— 再走一遍 [writeEditorExif] 反而会
+ * 把拍摄时间改成"导出时间"、把方向硬写成 1，比原样保留更差。渲染路径仍必须重写：
+ * 像素变了、方向在渲染端已转正，旧 EXIF 不再描述这张图。
  */
-internal fun saveEditorCopy(context: Context, jpeg: ByteArray, name: String, timeMs: Long): Uri? {
+internal fun saveEditorCopy(
+    context: Context, jpeg: ByteArray, name: String, timeMs: Long, rewriteExif: Boolean = true,
+): Uri? {
     var inserted: Uri? = null
     try {
         if (Build.VERSION.SDK_INT >= 29) {
@@ -286,7 +340,7 @@ internal fun saveEditorCopy(context: Context, jpeg: ByteArray, name: String, tim
             f.outputStream().use { it.write(jpeg) }
             inserted = Uri.fromFile(f)
         }
-        writeEditorExif(context, inserted, timeMs, null)
+        if (rewriteExif) writeEditorExif(context, inserted, timeMs, null)
         return inserted
     } catch (t: Throwable) {
         EngineBridge.nativeAppendLog(

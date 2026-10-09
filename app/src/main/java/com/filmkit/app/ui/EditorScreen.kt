@@ -75,6 +75,7 @@ import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
+import com.filmkit.app.camera.paramsUnchanged
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
 import com.filmkit.app.camera.saveEditorCopy
@@ -172,6 +173,9 @@ fun EditorScreen(
     // LUT 强度 [34] 与暗角 [66][67][68]；其余槽位原样带着（快照继承 → 导出时整体存回快照，
     // 所以"没碰过的风格参数"不会因为进了一次编辑器就丢）
     var params by remember { mutableStateOf<DoubleArray?>(null) }
+    // 打开编辑器时的参数基准（E2-9 / ADR-13）：`params` 的**副本**，导出时逐槽比一次值
+    //（同一个数组对象会被滑杆原地改写 ⇒ 必须 copy）。"无修改"⇒ 导出直通原片字节。
+    var openParams by remember { mutableStateOf<DoubleArray?>(null) }
     var lutId by remember { mutableStateOf<String?>(null) }   // 本会话的 LUT（不持久化）
     var lutK by remember { mutableFloatStateOf(0f) }          // = params[34]；初值 0 = 与原片一致
     // 快照里的"原片风格"（只读展示 + 一键套用）：不随滑杆变化，故与 lutId/lutK 分开存
@@ -215,6 +219,18 @@ fun EditorScreen(
                 "strength" to film[66], "radius" to film[67], "feather" to film[68],
                 "lut" to film[34],
             ),
+        )
+    }
+
+    /**
+     * 导出诊断（**单一出口**，E2-9）：`dirty` = 是否走了"有修改"的渲染路径、写出字节数、
+     * 耗时。`dirty=false` 时 `bytes` = 原片字节数、`ms` = 一次读 + 一次写（无渲染无编码）。
+     * 落盘失败另有 `photo.edit_save_failed` / `photo.edit_overwrite_failed`，不在这里重复。
+     */
+    fun logExport(dirty: Boolean, bytes: Int, ms: Long, overwrite: Boolean) {
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "editor.export",
+            kv("dirty" to dirty, "bytes" to bytes, "ms" to ms, "overwrite" to overwrite),
         )
     }
 
@@ -420,7 +436,10 @@ fun EditorScreen(
         }
     }
 
-    /** 编码 + 落盘（导出线程）。任何失败都必须让用户能分辨"原片有没有被动过"。 */
+    /**
+     * 编码 + 落盘（导出线程）。**只服务"有修改"路径**（无修改走 [exportNow] 的直通分支，
+     * 不渲染不编码）。任何失败都必须让用户能分辨"原片有没有被动过"。
+     */
     fun saveResult(
         out: Bitmap,
         outName: String,
@@ -435,6 +454,7 @@ fun EditorScreen(
             finish("编码失败，未做任何改动")
             return
         }
+        logExport(dirty = true, bytes = jpeg.size, ms = System.currentTimeMillis() - now, overwrite = overwrite)
         if (overwrite) {
             val res = overwriteOriginalPhoto(context, target, jpeg, origBytes)
             when (res) {
@@ -472,12 +492,62 @@ fun EditorScreen(
     /**
      * 导出（ADR-3）：[overwrite] = false 另存新片（默认，原片不动）；
      * true = 覆盖原片（必须先渲染+编码成功，见 [overwriteOriginalPhoto] 的安全顺序）。
+     *
+     * **E2-9 分流**（ADR-13 真机实测归因）：参数与打开编辑器时**逐槽相同** ⇒ 画面就是原片
+     * 本身，**直接复制原片字节**（不渲染、不编码）。重渲染一次的代价实测是：JPEG 二次编码
+     * （体积增长的 55.16%）+ 多叠一层 dither（43.40%）+ 一次全分辨率渲染（百毫秒）+ 峰值内存
+     * 240MiB —— 全是白付的（"细节更好"是平坦区噪声被读成质感的错觉，强纹理区仅 +0.016）。
      */
     fun exportNow(overwrite: Boolean) {
         val src = source ?: return
         val snapshot = params?.copyOf() ?: return
         val target = uri
         if (exporting || target == null) return
+
+        // ★ 直通判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值，
+        // 已把 [34] 强制置 0），不是快照原文；值比较 + 容差 ⇒ "改了又改回原值"也算无修改。
+        // openParams 为 null（理论上只在首帧就绪前，此时导出按钮不可点）⇒ 保守走渲染。
+        val dirty = openParams?.let { !paramsUnchanged(snapshot, it) } ?: true
+
+        if (!dirty) {
+            if (overwrite) {
+                // 覆盖 = 把原片字节写回原片本身：白写一遍（还平添写坏的风险），直接说清楚
+                logExport(dirty = false, bytes = 0, ms = 0, overwrite = true)
+                status = "没有修改，无需覆盖"
+                return
+            }
+            exporting = true
+            status = "正在保存原片…"
+            val now = System.currentTimeMillis()
+            val outName = editorExportName(now)
+            exportExec.execute {
+                val bytes = readImageBytes(context, target)
+                if (bytes == null || bytes.isEmpty()) {
+                    finish("原图读取失败，未做任何改动")
+                    return@execute
+                }
+                // rewriteExif = false：直通的意义就是**字节原样**，EXIF 里的拍摄参数与拍摄
+                // 时间天然完整；重写反而会把拍摄时间改成现在、方向硬写成 1（比原样更差）
+                val saved = saveEditorCopy(context, bytes, outName, now, rewriteExif = false)
+                logExport(
+                    dirty = false, bytes = bytes.size,
+                    ms = System.currentTimeMillis() - now, overwrite = false,
+                )
+                if (saved == null) {
+                    finish("保存失败，原片未改动")
+                } else {
+                    // 与渲染路径同一口径：新片也留一份参数快照（下次编辑它时起点一致）
+                    StillSnapshotStore.save(
+                        context,
+                        StillSnapshotStore.fileNameOf(context, saved) ?: outName,
+                        StillSnapshot(snapshot, lutId.orEmpty(), lutK.toDouble(), now),
+                    )
+                    finish("已另存为 $outName")
+                }
+            }
+            return
+        }
+
         exporting = true
         status = "正在生成全分辨率成片…"
         val now = System.currentTimeMillis()
@@ -485,30 +555,12 @@ fun EditorScreen(
         exportExec.execute {
             // ① 覆盖要用的原片字节：读**一次**，既作回滚备份又作 EXIF 来源
             val origBytes = if (overwrite) readImageBytes(context, target) else null
-            // ② 全分辨率解码（E2-8 起预览也是全分辨率，但这里仍**独立**解一份：导出期间
-            //    两条链路的位图生命周期必须解耦）。⚠ 峰值内存 = 预览 buffer + 预览输出 +
-            //    这份解码位图 + 导出 buffer + 导出输出 ≈ 5×48MiB ≈ 240MiB —— 12MP 设备上
-            //    已接近堆上限；后续卡若改成复用 src.buffer（预览与导出同分辨率同像素），
-            //    可直接省掉两份 48MiB
-            val full = decodeFull(context, target)
-            if (full == null) {
-                finish("原图解码失败，未做任何改动")
-                return@execute
-            }
-            val w = full.width
-            val h = full.height
-            // ③ 像素拷进 direct buffer 后立刻 recycle 输入位图：50MB 越早还回越好
-            val buf = try {
-                ByteBuffer.allocateDirect(w * h * 4).also { full.copyPixelsToBuffer(it) }
-            } catch (t: Throwable) {
-                full.recycle()
-                finish("图片过大，无法生成")
-                return@execute
-            }
-            full.recycle()
-            buf.rewind()
-            // ④ 渲染（渲染线程）→ 主线程回调 → 回导出线程编码落盘
-            engine.requestFull(buf, w, h, snapshot) { out ->
+            // ② ★ E2-9 内存：**复用预览的常驻 buffer**（`src.buffer`）。E2-8 起预览与导出
+            //    同分辨率、同像素 —— 它就是这张图的全分辨率 RGBA，再独立解一份纯属浪费。
+            //    省掉"独立解码位图 + 导出 direct buffer"两份 ≈ 2×47.8MiB（12MP），导出峰值
+            //    从 ≈239MiB 降到 ≈143MiB。⚠ 复用后**绝不回收** src.buffer：它是编辑器的
+            //    常驻输入（预览 / "按住看原图"都读它），回收 = 后续预览读到野内存。
+            engine.requestFull(src.buffer, src.w, src.h, snapshot) { out ->
                 if (out == null) {
                     finish("渲染失败，未做任何改动")
                     return@requestFull
@@ -569,6 +621,9 @@ fun EditorScreen(
                     )
                 }
                 params = init.film
+                // E2-9：导出直通的比较基准 = **打开时**的参数（`params` 会被滑杆原地改写
+                // ⇒ 必须留一份副本，且必须是 editorOpenParams 的结果，不是快照原文）
+                openParams = init.film.copyOf()
                 hasSnapshot = init.hasSnapshot
                 lutId = init.lutId
                 snapLutId = init.snapLutId
@@ -1470,14 +1525,7 @@ private fun loadPreview(context: Context, uri: Uri?): LoadResult {
     return LoadResult.Err("图片过大，无法加载")
 }
 
-/** 全分辨率解码（导出用，IO 线程）。失败/OOM 一律返回 null，由调用方提示且不动原片。 */
-private fun decodeFull(context: Context, uri: Uri): Bitmap? = try {
-    context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
-} catch (t: Throwable) {
-    null
-}
-
-/** 读整份原片字节（覆盖时既作回滚备份、又作 EXIF 来源，只读一次） */
+/** 读整份原片字节（覆盖时既作回滚备份、又作 EXIF 来源；E2-9 直通另存也走它，只读一次） */
 private fun readImageBytes(context: Context, uri: Uri): ByteArray? = try {
     context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
 } catch (t: Throwable) {

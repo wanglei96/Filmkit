@@ -3,6 +3,7 @@ package com.filmkit.app.camera
 import com.filmkit.app.ui.CameraPresets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -75,5 +76,126 @@ class EditorExportTest {
         assertTrue(name.endsWith("_edit.jpg"))
         // 不同秒必须给出不同名字（同秒重名由 MediaStore 自动加 (1)，与拍摄链路一致）
         assertNotEquals(editorExportName(1_760_000_000_000L), editorExportName(1_760_000_001_000L))
+    }
+
+    // ── E2-9：「无修改」判据（ADR-13 ⇒ 直通原片字节） ────────────────────────────────
+
+    /** 基准 = **打开编辑器时**的参数（`editorOpenParams` 的返回值），快照里带一个非 0 的 LUT 强度 */
+    private fun openBaseline(): DoubleArray = editorOpenParams(
+        StillSnapshot(CameraPresets.standard(), "kodak_portra", 0.85, 0L),
+    )
+
+    @Test
+    fun identicalParamsAreUnchanged() {
+        val base = openBaseline()
+        assertTrue(paramsUnchanged(base.copyOf(), base))
+    }
+
+    @Test
+    fun anySingleSlotChangeIsDirty() {
+        // 88 个槽位逐个改一次：漏判任何一槽 = 用户的修改被直通丢掉（ADR-13 里最严重的错法）
+        val base = openBaseline()
+        for (i in base.indices) {
+            val cur = base.copyOf()
+            cur[i] = base[i] + 0.5   // 对所有槽位量级（最大 200）都远超容差
+            assertFalse("slot[$i] 改了必须算有修改", paramsUnchanged(cur, base))
+        }
+    }
+
+    @Test
+    fun sliderRoundTripBackToOriginalIsUnchanged() {
+        // ★ 核心场景 + E2-3 浮点坑的实证：滑杆是 Float、槽位是 Double。
+        // 用户把暗角半径拖走再拖回 0.8（= 80%）：vigRadiusSlot(0.8f) = 80.0000011920929，
+        // 与快照来的 80.0 **不相等** ⇒ 用 `==` 比较会误判成"有修改"（白渲染 + 白编码一次）。
+        val base = openBaseline()
+        assertEquals(80.0, base[67], 0.0)
+        val cur = base.copyOf()
+        cur[67] = vigRadiusSlot(0.8f)
+        assertNotEquals("前提：Float 往返确实不精确相等", base[67], cur[67])
+        assertTrue("改了又改回原值 ⇒ 无修改", paramsUnchanged(cur, base))
+
+        // 全链路"改走再改回"：基础五类 + 暗角三条 + LUT 强度，全部经 UI 映射函数往返
+        val back = base.copyOf()
+        back[0] = expSlot(0f)
+        back[1] = wbGainSlot(1f)
+        back[2] = wbGainSlot(1f)
+        back[3] = wbGainSlot(1f)
+        back[4] = contrastSlot(1f)
+        writeSaturation(back, 1f)
+        back[78] = claritySlot(0f)
+        back[66] = vigStrengthSlot(0f)
+        back[67] = vigRadiusSlot(vigRadiusUi(base[67]))
+        back[68] = vigFeatherSlot(vigFeatherUi(base[68]))
+        back[34] = 0.0
+        assertTrue(paramsUnchanged(back, base))
+    }
+
+    @Test
+    fun lutStrengthBackToZeroIsUnchanged() {
+        // 试了一下 LUT 又拖回 0（= 关，引擎 uLutOn = 0 整段旁路）⇒ 画面回到原片 ⇒ 该直通
+        val base = openBaseline()
+        val cur = base.copyOf()
+        cur[34] = 1.0
+        assertFalse(paramsUnchanged(cur, base))
+        cur[34] = 0f.toDouble()
+        assertTrue(paramsUnchanged(cur, base))
+    }
+
+    @Test
+    fun epsilonCoversFloatNoiseButNotRealEdits() {
+        val base = openBaseline()
+        val inside = base.copyOf()
+        inside[0] = base[0] + PARAM_EPS / 2
+        assertTrue("容差内的浮点噪声 ⇒ 无修改", paramsUnchanged(inside, base))
+
+        val outside = base.copyOf()
+        outside[0] = base[0] + PARAM_EPS * 2
+        assertFalse("超出容差 ⇒ 有修改", paramsUnchanged(outside, base))
+
+        // 真实修改的最小步长（手指移 1px ≈ 6.7e-3 槽位）必须判成"有修改"
+        val onePixel = base.copyOf()
+        onePixel[67] = base[67] + 6.7e-3
+        assertFalse(paramsUnchanged(onePixel, base))
+    }
+
+    @Test
+    fun nonFiniteParamsAreAlwaysDirty() {
+        // 坏数据（NaN/Inf）一律算"有修改"：宁可多渲染一次（安全），也不能比出"无修改"
+        // 而把用户的修改丢掉。基准侧同理（防御性）。
+        val base = openBaseline()
+        for (bad in listOf(Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+            val cur = base.copyOf()
+            cur[0] = bad
+            assertFalse("current 有 $bad ⇒ 有修改", paramsUnchanged(cur, base))
+            val badBase = base.copyOf()
+            badBase[0] = bad
+            assertFalse("baseline 有 $bad ⇒ 有修改", paramsUnchanged(base.copyOf(), badBase))
+        }
+    }
+
+    @Test
+    fun sizeMismatchIsDirty() {
+        val base = openBaseline()
+        assertFalse(paramsUnchanged(DoubleArray(base.size - 1), base))
+        assertFalse(paramsUnchanged(DoubleArray(base.size + 1), base))
+    }
+
+    @Test
+    fun baselineIsOpenParamsNotSnapshotRaw() {
+        // ★ 判据的语义护栏：基准必须是 [editorOpenParams] 的返回值（[34] 已强制 0），
+        // **不是快照原文**。快照里 [34] = 1.0（standard 默认）/ lutK = 0.85，打开编辑器时
+        // 被强制归零（E2-1"打开即与原片一致"）—— 若拿快照原文当基准，这一次**必然的归零**
+        // 会被误判成用户修改 ⇒ 直通永远失效（本卡白做）。
+        val snap = StillSnapshot(CameraPresets.standard(), "kodak_portra", 0.85, 0L)
+        val raw = editorParams(snap.params)
+        val base = editorOpenParams(snap)
+        assertEquals(0.0, base[34], 0.0)
+        assertTrue("打开后立刻导出 ⇒ 无修改（直通）", paramsUnchanged(base.copyOf(), base))
+        assertFalse("拿快照原文当基准是错的", paramsUnchanged(base.copyOf(), raw))
+
+        // 用户点「套用原片风格」（[34] = 快照强度）⇒ 真的改了 ⇒ 必须走渲染
+        val applied = base.copyOf()
+        applied[34] = 0.85
+        assertFalse(paramsUnchanged(applied, base))
     }
 }
