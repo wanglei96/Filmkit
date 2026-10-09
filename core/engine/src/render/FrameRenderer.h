@@ -1150,7 +1150,12 @@ class FrameRenderer {
           // E2-2 基础调整（ADR §5.6）：ev/wb = 线性域往返段；contrast/sat/
           // clarity = 显示域段。门控 *_on 由 CPU 侧算（默认恒等 ⇒ 整段跳过）。
           ev = -1, wb_gain = -1, exp_wb_on = -1, contrast = -1, contrast_on = -1,
-          sat = -1, sat_on = -1, clarity = -1, clar_step = -1;
+          sat = -1, sat_on = -1, clarity = -1, clar_step = -1,
+          // E2-6 局部调整（ADR §5.7）：mask 程序化生成（纯算术，无纹理/无 pass）。
+          // 首版只支持**一个**局部调整（GLSL 三禁 ⇒ 多组参数无法安全表达）。
+          local_on = -1, local_type = -1, local_center = -1, local_radius = -1,
+          local_feather = -1, local_angle = -1, local_width = -1, local_ev = -1,
+          local_ev_on = -1, local_sat = -1, local_sat_on = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

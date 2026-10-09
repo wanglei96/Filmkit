@@ -4676,6 +4676,22 @@ uniform float uSat;        // [21] 饱和度（显示域绕 luma；1 = 恒等）
 uniform float uSatOn;
 uniform float uClarity;    // [78] 清晰度（显示域局部对比；0 = 关）
 uniform vec2 uClarStep;    // 清晰度环半径（UV 单位）= r_px/(W,H)
+// ── E2-6 局部调整（ADR §5.7）：mask **程序化生成**（纯算术，零纹理、零额外 pass）
+// 首版**只支持一个局部调整**（径向或线性二选一）：Mali 上"数组作函数参数"与
+// "循环内动态索引"都是**静默失败**（ADR §6.1）⇒ 多组参数无法安全表达。
+// 多组的扩展路径（展开 N 份 / N×1 RGBA16F 参数纹理）见 ADR §5.7，等首版真机
+// 跑通、测过开销之后再定（铁律：先跑通一版，用数据决定）。
+uniform float uLocalOn;      // 门控（CPU 侧算）：type>0 且 (ev≠0 或 sat≠1)
+uniform float uLocalType;    // [79] 0 = 关，1 = 径向，2 = 线性
+uniform vec2 uLocalCenter;   // [80][81] 归一化中心（vUV0 坐标系，见 localMask）
+uniform float uLocalRadius;  // [82] 径向半径（UV 单位）
+uniform float uLocalFeather; // [83] 羽化宽度（相对半径/半宽）
+uniform float uLocalAngle;   // [84] 线性 mask 的法线方向（弧度）
+uniform float uLocalWidth;   // [85] 线性半宽（UV 单位）
+uniform float uLocalEv;      // [86] 局部曝光（EV；负 = 压暗）
+uniform float uLocalEvOn;    // 门控：local_ev ≠ 0（只有它非 0 时才需要往返）
+uniform float uLocalSat;     // [87] 局部饱和度（1 = 恒等）
+uniform float uLocalSatOn;   // 门控：local_sat ≠ 1
 // 与 kFsOut:4540 的 srgbEncode **严格互逆**（IEC 61966-2-1：线性 0.0031308 ↔
 // 编码 0.04045，系数 12.92 / 1.055 / 2.4 / 0.055）。
 // **禁止 pow(2.2) 近似**：暗部往返误差可达 9/255（项目实测，见 kFsOut 4530 注释）。
@@ -4722,13 +4738,39 @@ float blurLuma16(vec2 uv) {
 // ⇒ 标量 luma 上用 luma(WB 增益) 近似（一阶正确；二阶误差只影响清晰度的斜率标定，
 // 不会像"不提升"那样把清晰度变成整体提亮）。饱和度**不改 luma**
 //（mix(vec3(l), c, s) 的 luma 恒 = l）⇒ 不参与；对比度是 luma 域线性拉伸 ⇒ 参与。
-float chainLuma(float x) {
-    if (uExpWbOn > 0.5) {
-        float g = exp2(uEv) * dot(uWbGain, vec3(0.299, 0.587, 0.114));
+// E2-6：局部曝光参与（mm = 中心像素的 mask）—— 不做这一项的话，"局部提亮 +
+// 清晰度"会把清晰度变成局部整体提亮（与 E2-2 的 luma 提升同一类事故）。
+// ⚠ 已知近似：16 个 tap 共用中心的 mm（逐 tap 算 mask = 16 次额外 mask 求值）；
+//   羽化带内 mask 逐像素变化 ⇒ 该带内的清晰度标定有轻微误差。
+float chainLuma(float x, float mm) {
+    if (uExpWbOn > 0.5 || (uLocalEvOn > 0.5 && mm > 0.0)) {
+        float g = exp2(uEv + uLocalEv * mm) *
+                  dot(uWbGain, vec3(0.299, 0.587, 0.114));
         x = srgbEncode(srgbDecode(vec3(x)) * g).r;
     }
     if (uContrastOn > 0.5) x = clamp((x - 0.5) * uContrast + 0.5, 0.0, 1.0);
     return x;
+}
+// ── E2-6 局部 mask（ADR §5.7）：纯算术，无采样、无额外 pass、无额外显存 ────────
+// uv 用 vUV0（与主采样同一坐标系：本 shader 无 flip ⇒ vUV0.y 与 Bitmap 行序同向，
+// E2-7 的 UI 坐标可直接用"图像顶行 = 0"的归一化坐标）。
+// 返回值：mask 内（d ≤ 1）= 1 → 羽化带（1 < d < 1+feather）平滑降到 0 → 外部 = 0。
+// 径向：d = |uv − center| / radius（UV 单位 ⇒ 非方形画幅下是**椭圆**，见 ADR §5.7
+// 的公式原文；[82] 注释里的"相对长边"是后续卡可选的等圆修正，本卡照公式实现）。
+// 线性：dir = (cos a, sin a) 是**条带法线方向** ⇒ d = |dot(p, dir)| / width 是到
+// "过 center、垂直于 dir 的直线"的距离（即条带长轴垂直于 dir）。
+// ⚠ GLSL 三禁：本函数无数组参数、无循环、无多行宏（ADR §6.1）。
+float localMask(vec2 uv) {
+    if (uLocalType < 0.5) return 0.0;
+    vec2 p = uv - uLocalCenter;
+    float d;
+    if (uLocalType < 1.5) {
+        d = length(p / max(uLocalRadius, 1e-3));
+    } else {
+        vec2 dir = vec2(cos(uLocalAngle), sin(uLocalAngle));
+        d = abs(dot(p, dir)) / max(uLocalWidth, 1e-3);
+    }
+    return 1.0 - smoothstep(1.0, 1.0 + max(uLocalFeather, 1e-3), d);
 }
 // dither 专用 hash（无 sin 版，见 kFsOut 的注释：sin 版在大坐标下有规律图案）
 float dhash(vec2 p) {
@@ -4746,22 +4788,36 @@ float vnoise(vec2 p) {
 void main() {
     // 显示域直取：不 decode、不 encode（ADR-7）
     vec3 c = texture(uTex, vUV0).rgb;
-    // ── E2-2 ① 线性往返段（曝光 × WB **合并成一次**往返，ADR §5.6②）────────
+    // ── E2-6 局部 mask（纯算术）────────────────────────────────────────────
+    // uLocalOn 由 CPU 侧算（type>0 且 ev≠0 或 sat≠1）⇒ 默认（[79]=0）时 m 恒 0，
+    // 下面的局部段与门控全部短路 ⇒ 输出逐位不变（零回归 / A/B 开关 = [79]）。
+    float m = 0.0;
+    if (uLocalOn > 0.5) m = localMask(vUV0);
+    // ── E2-2 ① + E2-6 线性往返段（曝光 × WB × **局部曝光合并成一次**往返）──
     // 为什么合并：两者都是线性域乘性操作；两次往返 = 两次量化误差 + 双倍开销。
     // 门控 uExpWbOn（CPU 侧算）⇒ 默认恒等时整段跳过，输出逐位不变（零回归）。
+    // E2-6：局部曝光按 mask 加权后与全局**相加**（totalEv = uEv + uLocalEv × m）
+    // ⇒ 全局与局部在**线性域一次完成**，绝不出现第二次 decode/encode（ADR-7）。
+    // m = 0 的像素在只有局部开启时也跳过往返 ⇒ 区域外逐位不变。
     // 必须用真 sRGB 分段曲线（srgbDecode/srgbEncode）：pow(2.2) 近似的暗部往返
     // 误差实测可达 9/255 —— 这是"画面发灰"的独立来源之一。
-    if (uExpWbOn > 0.5) {
+    if (uExpWbOn > 0.5 || (uLocalEvOn > 0.5 && m > 0.0)) {
         vec3 lin = srgbDecode(c);
-        lin *= exp2(uEv) * uWbGain;
+        lin *= exp2(uEv + uLocalEv * m) * uWbGain;
         c = srgbEncode(lin);
     }
     // ── E2-2 ② 对比度（显示域绕中灰 0.5 线性拉伸；1 = 恒等）────────────────
     if (uContrastOn > 0.5) c = clamp((c - 0.5) * uContrast + 0.5, 0.0, 1.0);
-    // ── E2-2 ③ 饱和度（显示域绕 luma 插值；1 = 恒等）──────────────────────
-    if (uSatOn > 0.5) {
+    // ── E2-2 ③ + E2-6 饱和度（显示域绕 luma 插值；1 = 恒等）────────────────
+    // 局部饱和度**合并进同一次 mix**：有效饱和度按 mask 在"全局值 ↔ 局部值"之间
+    // 插值（mask 内 = 局部值，mask 外 = 全局值，边界随羽化平滑过渡）。
+    // 数学上与 ADR §5.7 的 `mix(c, mix(vec3(l), c, uLocalSat), m)` 在**全局饱和度
+    // 恒等时严格等价**；全局也开时本式语义更连贯（有效饱和度插值，而非两次叠加）。
+    if (uSatOn > 0.5 || (uLocalSatOn > 0.5 && m > 0.0)) {
+        float s = uSat;
+        if (uLocalSatOn > 0.5) s = uSat + (uLocalSat - uSat) * m;
         float l = dot(c, vec3(0.299, 0.587, 0.114));
-        c = mix(vec3(l), c, uSat);
+        c = mix(vec3(l), c, s);
     }
     // ── E2-2 ④ 清晰度（显示域局部对比；0 = 关）────────────────────────────
     // 形式 = **加性 luma USM**（照 ADR §5.6 的 `c += (c - blur) * uClarity`）：
@@ -4770,9 +4826,11 @@ void main() {
     //   的 sharpenLuma）；本段实际差值 |d| 通常 ≤ 数 LSB ⇒ 色度偏移可忽略。
     //   若要"零色度污染"，把本段换成 sharpenLuma 的乘性形式即可（一行改动）。
     // 差值限幅 ±0.25 拦高反差边缘过冲（标定旋钮）。
+    // E2-6：blur 基准的域提升带上中心像素的 mask 值（邻域内 mask 近似不变 ⇒ 一阶
+    // 正确；羽化带内 mask 逐像素变化 ⇒ 该带有轻微标定误差，属已知近似）。
     if (uClarity > 0.0) {
         float l0 = dot(c, vec3(0.299, 0.587, 0.114));
-        float lb = chainLuma(blurLuma16(vUV0));
+        float lb = chainLuma(blurLuma16(vUV0), m);
         c += clamp(l0 - lb, -0.25, 0.25) * uClarity;
     }
     // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
@@ -6185,6 +6243,18 @@ bool FrameRenderer::init() {
   u_style_.sat_on = glGetUniformLocation(prog_style_, "uSatOn");
   u_style_.clarity = glGetUniformLocation(prog_style_, "uClarity");
   u_style_.clar_step = glGetUniformLocation(prog_style_, "uClarStep");
+  // E2-6 局部调整（ADR §5.7）：mask 程序化生成（纯算术，无纹理/无额外 pass）
+  u_style_.local_on = glGetUniformLocation(prog_style_, "uLocalOn");
+  u_style_.local_type = glGetUniformLocation(prog_style_, "uLocalType");
+  u_style_.local_center = glGetUniformLocation(prog_style_, "uLocalCenter");
+  u_style_.local_radius = glGetUniformLocation(prog_style_, "uLocalRadius");
+  u_style_.local_feather = glGetUniformLocation(prog_style_, "uLocalFeather");
+  u_style_.local_angle = glGetUniformLocation(prog_style_, "uLocalAngle");
+  u_style_.local_width = glGetUniformLocation(prog_style_, "uLocalWidth");
+  u_style_.local_ev = glGetUniformLocation(prog_style_, "uLocalEv");
+  u_style_.local_ev_on = glGetUniformLocation(prog_style_, "uLocalEvOn");
+  u_style_.local_sat = glGetUniformLocation(prog_style_, "uLocalSat");
+  u_style_.local_sat_on = glGetUniformLocation(prog_style_, "uLocalSatOn");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -7000,6 +7070,20 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
   kv += ",\"ct\":" + jnum(p.contrast, 5);
   kv += ",\"sat\":" + jnum(p.sat_mid, 5);
   kv += ",\"clr\":" + jnum(p.clarity, 5);
+  // E2-6 局部调整：下发值全部进**同一个出口**（历史事故：字段写进别的函数 ⇒
+  // 真机日志缺项、整轮 A/B 白跑）。locOn 与 passStyle 内的门控同式重算。
+  kv += ",\"locOn\":";
+  kv += ((p.local_type >= 0.5f) && (p.local_ev != 0.0f || p.local_sat != 1.0f))
+            ? "true" : "false";
+  kv += ",\"locType\":" + jnum(p.local_type, 3);
+  kv += ",\"locEv\":" + jnum(p.local_ev, 5);
+  kv += ",\"locSat\":" + jnum(p.local_sat, 5);
+  kv += ",\"locC\":[" + jnum(p.local_center_x, 5) + "," +
+        jnum(p.local_center_y, 5) + "]";
+  kv += ",\"locR\":" + jnum(p.local_radius, 5);
+  kv += ",\"locF\":" + jnum(p.local_feather, 5);
+  kv += ",\"locA\":" + jnum(p.local_angle, 5);
+  kv += ",\"locW\":" + jnum(p.local_width, 5);
   kv += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
   Logger::instance().log(ran ? LogLevel::kInfo : LogLevel::kError, "engine",
                          "render.style", kv);
@@ -12026,6 +12110,28 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
       std::max(1.0f, 0.005f * static_cast<float>(std::min(w, h)));
   glUniform2f(u_style_.clar_step, clar_px / static_cast<float>(w),
               clar_px / static_cast<float>(h));
+  // ── E2-6 局部调整（ADR §5.7）────────────────────────────────────────────
+  // 门控一律在 CPU 侧算（与上面五个门控同款）：[79]=0（默认）或 ev/sat 都恒等时
+  // uLocalOn=0 ⇒ shader 内 mask 恒 0 ⇒ 整段无副作用（A/B 开关 = [79]）。
+  // local_ev_on / local_sat_on 分开下发：只有局部曝光非 0 时才需要那次往返
+  //（局部饱和度是显示域操作，不该为它付一次 decode/encode 的量化代价）。
+  const bool local_radial = p.local_type >= 0.5f && p.local_type < 1.5f;
+  const bool local_linear = p.local_type >= 1.5f;
+  const bool local_ev_on = p.local_ev != 0.0f;
+  const bool local_sat_on = p.local_sat != 1.0f;
+  const bool local_on =
+      (local_radial || local_linear) && (local_ev_on || local_sat_on);
+  glUniform1f(u_style_.local_on, local_on ? 1.0f : 0.0f);
+  glUniform1f(u_style_.local_type, p.local_type);
+  glUniform2f(u_style_.local_center, p.local_center_x, p.local_center_y);
+  glUniform1f(u_style_.local_radius, p.local_radius);
+  glUniform1f(u_style_.local_feather, p.local_feather);
+  glUniform1f(u_style_.local_angle, p.local_angle);
+  glUniform1f(u_style_.local_width, p.local_width);
+  glUniform1f(u_style_.local_ev, p.local_ev);
+  glUniform1f(u_style_.local_ev_on, local_ev_on ? 1.0f : 0.0f);
+  glUniform1f(u_style_.local_sat, p.local_sat);
+  glUniform1f(u_style_.local_sat_on, local_sat_on ? 1.0f : 0.0f);
   // E4-2 暗角（vignette）：域常数在 CPU 侧算好（shader 内不做 W/H 除法）。
   // pv 尺度 = (W,H)/max(W,H)；fscale 的 100/min(W,H) 下限 = darktable 同款抗锯齿
   // 保护（feather=0 ⇒ 不产生硬边）。[66] ≥ 0 ⇒ uVigBrightness = 0 ⇒ shader 整段跳过。

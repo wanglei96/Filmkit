@@ -38,6 +38,17 @@
   ⑫ 显示域三项真生效（不是死代码）+ 平坦区无副作用：contrast=1.5 显著改图；
       sat=0 ⇒ 输出逐像素 R=G=B；clarity=0.5 ⇒ 噪声/边缘图变化，纯灰图逐位不变。
 
+  E2-6（局部调整引擎）新增：
+  ⑬ 局部调整（mask 程序化生成，ADR §5.7）：
+     a) 关闭零回归：[79]=0 ⇒ 其余 9 个 local 参数取极端值也只剩 dither（门控只由 [79] 定）；
+     b) 径向 mask **真生效且与 ADR 公式一致**：与 numpy 直译的解析期望 max|Δ| ≤ 3 LSB；
+        mask 外（d ≥ 1+feather）只剩 dither（≤1 LSB）⇒ 局部曝光段对 m=0 的像素整体跳过；
+     c) **边界平滑（无硬边）**：沿半径剖面逐点相邻跳变 ≤ 解析跳变 + 3 LSB、不回升；
+     d) 线性 mask 的 [84] 方向真生效（angle=0 ⇒ 条带竖直；π/2 ⇒ 水平；条带外只剩 dither）；
+     e) 局部饱和度 [87] 真生效（=0 ⇒ 中心区真灰度、mask 外只剩 dither、与解析期望一致）；
+     f) **只有一次往返**的结构性哨兵：kFsStyle 内 `srgbDecode(` 恰好 3 处
+        （定义 / chainLuma / 主路径）—— 局部曝光若另起一次往返会立刻变 4。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
@@ -126,12 +137,20 @@ def cplen_map(w, h):
 
 
 def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
-                   clarity=0.0):
-    """E2-2 基础调整的 CPU 侧下发值（**与 FrameRenderer::passStyle 同式**，含门控）。
+                   clarity=0.0, local_type=0.0, local_center=(0.5, 0.5),
+                   local_radius=0.35, local_feather=0.5, local_angle=0.0,
+                   local_width=0.25, local_ev=0.0, local_sat=1.0):
+    """E2-2 基础调整 + E2-6 局部调整的 CPU 侧下发值（**与 FrameRenderer::passStyle
+    同式**，含门控）。
 
-    门控在 CPU 侧算 ⇒ 默认恒等（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0）时
-    shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时验收 CPU 侧的下发公式。
+    门控在 CPU 侧算 ⇒ 默认恒等（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0、
+    local_type=0）时 shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时验收 CPU 侧
+    的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on）。
     """
+    radial = 0.5 <= local_type < 1.5
+    linear = local_type >= 1.5
+    ev_on = local_ev != 0.0
+    sat_on = local_sat != 1.0
     return {
         'uEv': float(ev),
         'uWbGain': tuple(float(v) for v in wb),
@@ -144,6 +163,18 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         # 环半径 = max(1px, 0.5% × min(W,H))，转成 UV 步长（passStyle 同式）
         'uClarStep': (max(1.0, 0.005 * min(w, h)) / w,
                       max(1.0, 0.005 * min(w, h)) / h),
+        # E2-6 局部调整（passStyle 同式）
+        'uLocalOn': 1.0 if ((radial or linear) and (ev_on or sat_on)) else 0.0,
+        'uLocalType': float(local_type),
+        'uLocalCenter': tuple(float(v) for v in local_center),
+        'uLocalRadius': float(local_radius),
+        'uLocalFeather': float(local_feather),
+        'uLocalAngle': float(local_angle),
+        'uLocalWidth': float(local_width),
+        'uLocalEv': float(local_ev),
+        'uLocalEvOn': 1.0 if ev_on else 0.0,
+        'uLocalSat': float(local_sat),
+        'uLocalSatOn': 1.0 if sat_on else 0.0,
     }
 
 
@@ -178,6 +209,45 @@ def srgb_encode_np(x):
     """真 sRGB OETF —— 与 kFsOut/kFsStyle 的 srgbEncode 同式。"""
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.0031308, 12.92 * x, 1.055 * x ** (1.0 / 2.4) - 0.055)
+
+
+def smoothstep_np(e0, e1, x):
+    """GLSL smoothstep 的 numpy 直译（含 e0 == e1 的退化保护，同 shader 的 max）。"""
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def local_mask_np(w, h, type_, center, radius, feather, angle, width):
+    """E2-6 局部 mask 的 **ADR §5.7 公式直译**（含 [82]/[83]/[85] 的 1e-3 下限）。
+
+    像素中心约定与 shader 的 vUV0 一致：像素 (row=y, col=x) ⇒ uv = ((x+.5)/w, (y+.5)/h)
+    —— 本 shader 无 flip（kFsStyle 注释 ②），所以 numpy 行序与 GL 读回行序同向。
+    """
+    y, x = np.mgrid[0:h, 0:w]
+    px = (x + 0.5) / w - center[0]
+    py = (y + 0.5) / h - center[1]
+    if type_ < 1.5:
+        d = np.hypot(px, py) / max(radius, 1e-3)
+    else:
+        d = np.abs(px * np.cos(angle) + py * np.sin(angle)) / max(width, 1e-3)
+    return 1.0 - smoothstep_np(1.0, 1.0 + max(feather, 1e-3), d)
+
+
+def local_expect(inp, mask, ev_g=0.0, ev_l=0.0, sat_g=1.0, sat_l=1.0):
+    """E2-6 的解析期望（kFsStyle 主流程同序）：一次往返（全局+局部曝光合并）→ 饱和度。
+
+    局部曝光 = 线性域 `exp2(ev_g + ev_l × mask)`；局部饱和度 = 有效饱和度按 mask
+    在全局与局部之间插值（与 shader 的 `s = uSat + (uLocalSat − uSat) × m` 同式）。
+    """
+    x = inp.astype(np.float64) / 255.0
+    lin = srgb_decode_np(x) * (2.0 ** (ev_g + ev_l * mask))[..., None]
+    out = srgb_encode_np(lin)
+    if sat_g != 1.0 or sat_l != 1.0:
+        s = (sat_g + (sat_l - sat_g) * mask)[..., None]
+        l = (out @ np.array([0.299, 0.587, 0.114]))[..., None]
+        out = l + (out - l) * s
+    # 与 shader 末尾的 `oColor = vec4(clamp(c, 0.0, 1.0), 1.0)` 同口径
+    return np.clip(out, 0.0, 1.0) * 255.0
 
 
 def code_ladder(w, h):
@@ -252,7 +322,12 @@ def check_pass_style_slots():
             # 饱和度[21] / 清晰度[78]（显示域）。饱和度读 [21]（UI 一个滑杆同写
             # [20..22]，ADR §5.6④ 的伪代码是单值 uSat）。
             'exposure_ev', 'wb_r', 'wb_g', 'wb_b', 'contrast', 'sat_mid',
-            'clarity'}
+            'clarity',
+            # E2-6 局部调整：type[79] / center[80][81] / radius[82] / feather[83]
+            # / angle[84] / width[85] / ev[86] / sat[87]。
+            'local_type', 'local_center_x', 'local_center_y', 'local_radius',
+            'local_feather', 'local_angle', 'local_width', 'local_ev',
+            'local_sat'}
     return refs == want, refs, ''
 
 
@@ -527,6 +602,167 @@ def main():
           f'纯灰图 max|Δ| = {d12f.max():.0f} LSB（平坦区无副作用）')
     if ch12c < 30.0 or d_rg > 1.0 or d_gb > 1.0 or ch12k < 5.0 or d12f.max() > 1.0:
         fails.append('⑫ 显示域三项')
+
+    # ⑬ E2-6 局部调整（本卡门禁）：mask 真生效 + **边界平滑（无硬边）** + 关闭零回归
+    #    + 线性方向真生效 + 局部饱和度真生效 + **只有一次往返**的结构性证明。
+    #    判据 = numpy 直译 ADR §5.7 的 mask 公式做**解析对照**（不是"看起来变暗了"）。
+    # ⑬a 关闭零回归：[79]=0（默认）⇒ mask 恒 0 ⇒ 其余 9 个 local 参数取极端值也无效
+    o13a = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(local_type=0.0, local_center=(0.1, 0.9),
+                              local_radius=0.05, local_feather=0.0,
+                              local_angle=1.0, local_width=0.02,
+                              local_ev=3.0, local_sat=0.0))
+    d13a = np.abs(quant(o13a, inp.shape) - inp.astype(np.float64))
+    bad13a = int((d13a > 1).sum())
+    print(f'⑬a 局部调整关闭（[79]=0；其余 9 个 local 参数取极端值）：'
+          f'max|Δ| = {d13a.max():.0f} LSB, >1LSB 像素 = {bad13a}/{d13a.size}')
+    if bad13a:
+        fails.append('⑬a 局部关闭零回归')
+
+    # ⑬b 径向 mask 真生效 + 解析对照（纯灰 180 ⇒ 剖面可逐点核对；ev=-1.5 压暗）
+    r13, f13, cx13 = 0.30, 0.50, (0.5, 0.5)
+    m13 = local_mask_np(n, n, 1, cx13, r13, f13, 0.0, 0.25)
+    o13b = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(local_type=1.0, local_center=cx13,
+                              local_radius=r13, local_feather=f13,
+                              local_ev=-1.5))
+    q13b = quant(o13b, g180.shape)[..., 0]
+    exp13b = local_expect(g180, m13, ev_l=-1.5)[..., 0]
+    d13b = np.abs(q13b - exp13b)
+    inside, outside = m13 > 0.999, m13 < 1e-9
+    d13b_out = float(np.abs(q13b[outside] - 180.0).max())
+    print(f'⑬b 径向 mask（[82]={r13} [83]={f13} [86]=-1.5，输入 180 灰）：'
+          f'与解析期望 max|Δ| = {d13b.max():.1f} LSB（判据 ≤3 = dither±1 + 量化余量）；'
+          f'中心区（{int(inside.sum())}px）均值 = {q13b[inside].mean():.1f}'
+          f'（解析 {exp13b[inside].mean():.1f}，输入 180）；'
+          f'mask 外（{int(outside.sum())}px）max|Δ| = {d13b_out:.0f} LSB'
+          f'（应 ≤1 = 只剩 dither，证明局部段对 m=0 的像素整体跳过）')
+
+    # ⑬c 边界平滑（无硬边）：沿过中心的水平剖面，逐点相邻跳变 ≤ 解析跳变 + dither。
+    #     方向：负 EV ⇒ 中心最暗、向外单调**变亮** ⇒ 异常是"向外回落"（< −2 LSB）。
+    row13 = n // 2
+    prof13 = q13b[row13, n // 2:].astype(np.float64)
+    eprof13 = exp13b[row13, n // 2:]
+    jump13, ejump13 = np.abs(np.diff(prof13)), np.abs(np.diff(eprof13))
+    drop13 = int((np.diff(prof13) < -2.0).sum())
+    # 分桶均值（压掉 dither）沿半径单调不回落 —— 与 ⑦ 同款口径
+    rmap13 = np.hypot((np.mgrid[0:n, 0:n][1] + 0.5) / n - cx13[0],
+                      (np.mgrid[0:n, 0:n][0] + 0.5) / n - cx13[1]) / r13
+    buckets13 = [float(q13b[(rmap13 >= a) & (rmap13 < b)].mean())
+                 for a, b in ((0.0, 0.5), (0.5, 1.0), (1.0, 1.25), (1.25, 1.5),
+                              (1.5, 2.5)) if ((rmap13 >= a) & (rmap13 < b)).any()]
+    print(f'⑬c 边界平滑（同一径向剖面，中心→右边缘）：实测最大相邻跳变 = '
+          f'{jump13.max():.1f} LSB, 解析期望 = {ejump13.max():.1f} LSB'
+          f'（判据 ≤ 解析 + 3 = dither 余量 ⇒ 无硬边）；向外回落（< −2 LSB）次数 = '
+          f'{drop13}；沿半径分桶均值（d/r = 0→0.5/0.5→1/1→1.25/1.25→1.5/1.5→2.5）：'
+          f'{" / ".join(f"{v:.1f}" for v in buckets13)}')
+    if (d13b.max() > 3.0 or d13b_out > 1.0
+            or jump13.max() > ejump13.max() + 3.0 or drop13 > 0
+            or any(np.diff(buckets13) < -0.5)):
+        fails.append('⑬b/c 径向 mask')
+
+    # ⑬c2 端点边界：[83]=0（ADR 允许的端点 ⇒ shader 内 max(_,1e-3) 下限生效）与
+    #      [82]=0（半径 0 ⇒ 除中心像素外 mask 恒 0）—— 不得 NaN / 不得负值 /
+    #      解析对照仍成立（ADR §6.5：边界必须实测，不靠"应该没问题"）。
+    edge13 = []
+    for lbl, rad, fea in (('[83]=0（硬边端点）', 0.30, 0.0),
+                          ('[82]=0（半径 0）', 0.0, 0.5)):
+        oe = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                       grain=0.0,
+                       adj=dict(local_type=1.0, local_center=(0.5, 0.5),
+                                local_radius=rad, local_feather=fea,
+                                local_ev=-2.0))
+        qe = quant(oe, g180.shape)[..., 0]
+        ee = local_expect(g180, local_mask_np(n, n, 1, (0.5, 0.5), rad, fea, 0.0,
+                                              0.25), ev_l=-2.0)[..., 0]
+        de = float(np.abs(qe - ee).max())
+        fin = bool(np.isfinite(oe).all())
+        edge13.append(fin and qe.min() >= 0.0 and de <= 3.0)
+        print(f'⑬c2 端点边界 {lbl}：finite = {fin}, min = {qe.min():.0f}'
+              f'（不得为负）, 与解析期望 max|Δ| = {de:.1f} LSB（判据 ≤3）')
+    if not all(edge13):
+        fails.append('⑬c2 端点边界')
+
+    # ⑬d 线性 mask：dir 是**条带法线** ⇒ angle=0 时条带竖直（左右边缘不变、中心列变），
+    #     angle=π/2 时条带水平（上下边缘不变、中心行变）—— 证明 [84] 真的生效
+    ok13d = []
+    for ang, name, edge, mid in ((0.0, 'angle=0（条带竖直）', np.s_[:, :n // 8],
+                                  np.s_[:, n // 2]),
+                                 (np.pi / 2, 'angle=π/2（条带水平）', np.s_[:n // 8, :],
+                                  np.s_[n // 2, :])):
+        o13d = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                         grain=0.0,
+                         adj=dict(local_type=2.0, local_center=(0.5, 0.5),
+                                  local_width=0.25, local_feather=0.5,
+                                  local_angle=ang, local_ev=-1.5))
+        q13d = quant(o13d, g180.shape)[..., 0]
+        m13d = local_mask_np(n, n, 2, (0.5, 0.5), 0.3, 0.5, ang, 0.25)
+        e13d = local_expect(g180, m13d, ev_l=-1.5)[..., 0]
+        de = float(np.abs(q13d - e13d).max())
+        d_edge = float(np.abs(q13d[edge] - 180.0).max())
+        d_mid = float(np.abs(q13d[mid] - 180.0).max())
+        ok13d.append(de <= 3.0 and d_edge <= 1.0 and d_mid > 20.0)
+        print(f'⑬d 线性 mask {name}：与解析期望 max|Δ| = {de:.1f} LSB；'
+              f'条带外边缘区 max|Δ| = {d_edge:.0f} LSB（应 ≤1 = 只剩 dither）；'
+              f'中心列/行 max|Δ| = {d_mid:.1f} LSB（应显著 > 20）')
+    if not all(ok13d):
+        fails.append('⑬d 线性 mask')
+
+    # ⑬e 局部饱和度（显示域，按 mask 混合；[87]=0 ⇒ 局部完全去饱和）
+    m13e = local_mask_np(n, n, 1, (0.5, 0.5), 0.30, 0.5, 0.0, 0.25)
+    o13e = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(local_type=1.0, local_center=(0.5, 0.5),
+                              local_radius=0.30, local_feather=0.5, local_sat=0.0))
+    q13e = quant(o13e, inp.shape)
+    in13e, out13e = m13e > 0.999, m13e < 1e-9
+    rg13 = float(np.abs(q13e[..., 0] - q13e[..., 1])[in13e].max())
+    gb13 = float(np.abs(q13e[..., 1] - q13e[..., 2])[in13e].max())
+    d13e_out = float(np.abs(q13e[out13e] - inp.astype(np.float64)[out13e]).max())
+    e13e = local_expect(inp, m13e, sat_l=0.0)
+    d13e = float(np.abs(q13e - e13e).max())
+    print(f'⑬e 局部饱和度（[87]=0，径向）：中心区 max|R−G| = {rg13:.0f}, '
+          f'max|G−B| = {gb13:.0f}（应为 ≤1 ⇒ 局部真灰度）；mask 外 max|Δ| = '
+          f'{d13e_out:.0f} LSB（应 ≤1 = 只剩 dither）；与解析期望 max|Δ| = '
+          f'{d13e:.1f} LSB')
+    if rg13 > 1.0 or gb13 > 1.0 or d13e_out > 1.0 or d13e > 3.0:
+        fails.append('⑬e 局部饱和度')
+
+    # ⑬g 全局与局部**合并**（不是覆盖、也不是两次往返）：全局 ev=+0.5 与局部 ev=−1.0
+    #     同时非零 ⇒ 解析期望 = exp2(0.5 − 1.0×mask)。若实现成"局部覆盖全局"或
+    #     "全局/局部各做一次往返"，解析对照会偏离。饱和度同理（全局 1.5 + 局部 0
+    #     ⇒ 有效饱和度按 mask 在 1.5 与 0 之间插值）。
+    o13g = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(ev=0.5, local_type=1.0, local_center=(0.5, 0.5),
+                              local_radius=0.30, local_feather=0.5,
+                              local_ev=-1.0))
+    q13g = quant(o13g, g180.shape)[..., 0]
+    e13g = local_expect(g180, m13, ev_g=0.5, ev_l=-1.0)[..., 0]
+    d13g = float(np.abs(q13g - e13g).max())
+    o13g2 = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                      grain=0.0,
+                      adj=dict(sat=1.5, local_type=1.0, local_center=(0.5, 0.5),
+                               local_radius=0.30, local_feather=0.5,
+                               local_sat=0.0))
+    d13g2 = float(np.abs(quant(o13g2, inp.shape)
+                         - local_expect(inp, m13, sat_g=1.5, sat_l=0.0)).max())
+    print(f'⑬g 全局+局部合并：ev 全局 +0.5 与局部 −1.0 同开 ⇒ 与解析期望（一次往返、'
+          f'指数相加）max|Δ| = {d13g:.1f} LSB；饱和度全局 1.5 + 局部 0 ⇒ '
+          f'max|Δ| = {d13g2:.1f} LSB（判据均 ≤3）')
+    if d13g > 3.0 or d13g2 > 3.0:
+        fails.append('⑬g 全局+局部合并')
+
+    # ⑬f 结构性证明：**没有第二次 decode/encode**。kFsStyle 内 `srgbDecode(` 只应有
+    #     3 处：函数定义 + chainLuma 的标量往返 + main 主路径往返。局部曝光若被写成
+    #     独立的第二次往返，这里会立刻变 4 ⇒ 这就是 ADR-7「一次往返」的哨兵。
+    n_dec = shader_src(src_txt, 'kFsStyle').count('srgbDecode(')
+    print(f'⑬f kFsStyle 内 srgbDecode( 出现次数 = {n_dec}'
+          f'（应为 3 = 定义 1 + chainLuma 1 + 主路径 1 ⇒ 全局与局部曝光共用同一次往返）')
+    if n_dec != 3:
+        fails.append('⑬f 单次往返')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')
