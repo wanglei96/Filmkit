@@ -247,8 +247,8 @@ import kotlinx.coroutines.withContext
  *  ① **面板可收起**：顶部/底部把手（下拉收起·上拉展开·点击切换）+ **返回键分层**（展开时
  *     系统返回先收起面板，已收起才退出编辑器）。收起后面板整段不组合 ⇒ 预览区吃满全屏。
  *     状态机是纯逻辑（[EditorPanelState]），JVM 单测覆盖。
- *  ② **色温/色调移入「调整」组**（用户："怎么放 lut 里了应该是调整里面"），褪色留在「色彩」
- *     组；色彩组的 LUT 与参数**拆成两行**（LUT 42 个，同行会把参数埋掉）。
+ *  ② **色温/色调移入「调整」组**（用户："怎么放 lut 里了应该是调整里面"），褪色留在「滤镜」
+ *     组；滤镜组的 LUT 与参数**拆成两行**（LUT 42 个，同行会把参数埋掉）。
  *  ③ **「查看原图」按钮**（用户："给个按钮"）：预览区右下角圆形按钮，**按住看原图 / 松手恢复**
  *     （E2-17 改成 press-and-hold，见下）；局部模式下隐藏（不跟拖动定位抢事件）。
  *  ④ **「取消」二次确认**：有修改才弹「放弃本次修改？」—— 判据复用 E2-9 的 `paramsUnchanged`
@@ -336,7 +336,7 @@ fun EditorScreen(
     var snapLutId by remember { mutableStateOf<String?>(null) }
     var snapLutK by remember { mutableFloatStateOf(0f) }
     var hasSnapshot by remember { mutableStateOf(false) }
-    // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 色彩 / 暗角 / 局部。面板常驻
+    // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 滤镜 / 暗角 / 局部。面板常驻
     //（不再是可折叠区），所以这里取代了 E2-1 的 `panelOpen`。
     var tab by remember { mutableStateOf(EditorTab.ADJUST) }
     // 面板"重建计数"（E2-3）：滑杆的读数 state 只在首次组合时读初值（组件内部 remember，
@@ -570,7 +570,7 @@ fun EditorScreen(
     }
 
     /**
-     * 「色彩」组重置（E2-15 改）：褪色 [94] 回恒等值 + LUT **强度归 0**，但
+     * 「滤镜」组重置（E2-15 改）：褪色 [94] 回恒等值 + LUT **强度归 0**，但
      * **保留 LUT 选择与纹理**。
      *
      * 为什么不卸载 LUT（用户确认："这个你判断的对，不应该清"）：LUT 是用户挑的**风格素材**，
@@ -1020,23 +1020,24 @@ fun EditorScreen(
                                 }
                                 // 提示：**右上角**（研究 §3.5 —— 底部容易被手指遮）+ PC 式 1px 黑阴影
                                 //（ADR-14 抄的 `BoldTextWithShadow`：文字叠在预览图上的可读性技巧）。
-                                // E2-17：看原图时也保留提示（文案切换）—— 按钮的按下态 + 文案双保险，
-                                // 用户任何时候都知道自己看的是哪张；未按时的文案指向**按钮**
-                                //（预览区已不看原图，文案再写"按住画面"就是骗人）。
-                                Text(
-                                    when {
-                                        showOriginal -> "原图（松手返回效果）"
-                                        dragMode && localDragging -> "拖动定位中…松手生效"
-                                        dragMode -> "拖动画面移动局部区域"
-                                        else -> "按住右下角按钮看原图"
-                                    },
-                                    color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
-                                    fontSize = 11.sp,
-                                    style = TextStyle(shadow = TextShadow),
-                                    modifier = Modifier
-                                        .align(Alignment.TopEnd)
-                                        .padding(top = 8.dp, end = 12.dp),
-                                )
+                                // ★ E2-19（用户真机反馈："我觉得不需要界面给按住查看原图的文字提示，
+                                // 正常人都会用"）：看原图的两条文案（未按的"按住右下角按钮看原图"与
+                                // 按住中的"原图（松手返回效果）"）**一并删除** —— 按钮自身的按下态
+                                //（黄底 + 深色图标 + 0.88 缩放）已经足够说明，文字只是噪音。
+                                // ⚠ 按钮本身与 press-and-hold 行为**一个字都没动**（见 [OriginalPressButton]）。
+                                // ⚠ 只保留**局部拖动**的提示：它讲的是"画面可以拖"（删了用户不知道能拖），
+                                // 与看原图无关。
+                                if (dragMode) {
+                                    Text(
+                                        if (localDragging) "拖动定位中…松手生效" else "拖动画面移动局部区域",
+                                        color = if (localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
+                                        fontSize = 11.sp,
+                                        style = TextStyle(shadow = TextShadow),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(top = 8.dp, end = 12.dp),
+                                    )
+                                }
                                 // ★ E2-15 原图按钮（用户："查看原图给个按钮"）→ E2-17 改成**按住看**
                                 //（用户："按住按钮 = 看原图；松手 = 恢复效果图"，明确否掉点一下切换）。
                                 // 局部模式下**隐藏**：拖动定位要用整个预览区（含右下角），按钮会抢走那
@@ -1136,13 +1137,33 @@ fun EditorScreen(
         }
 
         if (confirmOverwrite) {
+            // ★ E2-19：源图是 DNG（非 JPEG）**且有修改** ⇒ 这次覆盖会把 RAW 数据永久换掉，
+            // 同一个确认框换成警告文案（不再多弹一个框：一次操作只打扰一次）。
+            // 判据 = [overwriteNeedsRawWarning]（与「能不能直通」共用 E2-18b 的 isJpegSource
+            // 口径）；"有修改"复用 [discardNeedsConfirm]（= paramsUnchanged 的包装，与
+            // exportNow 的直通判据同一份逻辑）。
+            // 无修改时 rawLoss 恒 false ⇒ 这里仍是原来的「覆盖原片？」—— 但那种情况 exportNow
+            // 会直接拒绝（"没有修改，无需覆盖"），用户确认后也不会写一个字节。
+            val rawLoss = overwriteNeedsRawWarning(
+                paramsUnchanged = !discardNeedsConfirm(params, openParams),
+                jpegSource = source?.jpegSource ?: false,
+            )
             AlertDialog(
                 onDismissRequest = { confirmOverwrite = false },
                 shape = RoundedCornerShape(18.dp),
-                title = { Text("覆盖原片？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+                title = {
+                    Text(
+                        if (rawLoss) "覆盖会丢失 RAW 数据" else "覆盖原片？",
+                        color = FilmTheme.Cream, fontFamily = FilmTheme.Serif,
+                    )
+                },
                 text = {
                     Text(
-                        "会用当前编辑结果替换这张原片，原图无法恢复。\n想保留原片请改用「完成」（另存为新片）。",
+                        if (rawLoss) {
+                            "覆盖会丢失 RAW 数据且无法恢复。\n建议改用「完成」（另存为新片）。"
+                        } else {
+                            "会用当前编辑结果替换这张原片，原图无法恢复。\n想保留原片请改用「完成」（另存为新片）。"
+                        },
                         color = FilmTheme.CreamDim,
                         fontSize = 13.sp,
                     )
@@ -1151,9 +1172,15 @@ fun EditorScreen(
                     TextButton(onClick = {
                         confirmOverwrite = false
                         exportNow(true)
-                    }) { Text("覆盖", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
+                    }) {
+                        Text(
+                            if (rawLoss) "仍要覆盖" else "覆盖",
+                            color = FilmTheme.Accent, fontFamily = FilmTheme.Mono,
+                        )
+                    }
                 },
                 dismissButton = {
+                    // 取消 = 什么都不做：只关掉这个框（参数、原片、快照全不动）
                     TextButton(onClick = { confirmOverwrite = false }) {
                         Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
                     }
@@ -1208,7 +1235,7 @@ fun EditorScreen(
         }
     }
 
-    // LUT 卡片预览按需生成（一次性缓存，见 LutPreview）：切到「色彩」组时才做 ——
+    // LUT 卡片预览按需生成（一次性缓存，见 LutPreview）：切到「滤镜」组时才做 ——
     // 面板常驻后不再有"展开面板"这个时机，用 tab 代替（其余组不生成，进编辑器更快）。
     LaunchedEffect(tab) {
         if (tab != EditorTab.COLOR || lutPreviews.isNotEmpty()) return@LaunchedEffect
@@ -1317,7 +1344,7 @@ private class EditorInit(
 //   ③ 参数名：居中大字（当前选中参数）+ 1px 黑阴影 —— [ParamNameRow]
 //   ④ 单滑杆：**一屏只出当前选中参数的那一条**，满宽 + 密集刻度 + 中点标记 + 物理量读数 —— [EditorSlider]
 //   ⑤ 参数图标行：横向滚动圆形按钮（未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄描边 + 黄图标）—— [ParamIconRow]
-//   ⑥ 底部导航：调整 / 色彩 / 暗角 / 局部（预设 / 裁剪**置灰留位**）—— [EditorTabBar]
+//   ⑥ 底部导航：调整 / 滤镜 / 暗角 / 局部（预设 / 裁剪**置灰留位**）—— [EditorTabBar]
 //
 // 三条关键修正（"专业感"的真正来源，ADR-14「我们的差距」头三条）：
 //   1. **满宽滑杆 + 标签在上方**（不再是"标签｜细滑杆｜百分比"的三段式表单行）
@@ -1340,10 +1367,14 @@ private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
 /**
  * 底部导航的功能大类（E2-10）。**只有引擎已实现并验收的组才进枚举**（ADR-12：不许假控件）。
  * 预设（E3 预设管理）/ 裁剪（E2-12）在 [EditorTabBar] 里置灰留位，不进枚举、不可点。
+ *
+ * ★ E2-19：第二组的**显示名**从「色彩」改为「滤镜」（用户真机反馈："色彩名称改为滤镜"，
+ * 与 Filmix 底栏命名一致）。**只改这一处字符串**：枚举名 `COLOR`、组内参数（LUT 选择 +
+ * LUT 强度 + 褪色）与任何逻辑都没动。
  */
 private enum class EditorTab(val label: String, val icon: ImageVector) {
     ADJUST("调整", Icons.Outlined.Tune),
-    COLOR("色彩", Icons.Outlined.Palette),
+    COLOR("滤镜", Icons.Outlined.Palette),
     VIGNETTE("暗角", Icons.Outlined.Vignette),
     LOCAL("局部", Icons.Outlined.CenterFocusStrong),
 }
@@ -1412,7 +1443,7 @@ private val AdjustParams: List<EditorParam> = listOf(
         read = { expUi(it[0]) },
         write = { p, v -> p[0] = expSlot(v) },
     ),
-    // ── E2-15：色温 / 色调从「色彩」组**移进来**（用户反馈："色温方向正确，放的位置不对，
+    // ── E2-15：色温 / 色调从「滤镜」组**移进来**（用户反馈："色温方向正确，放的位置不对，
     // 怎么放 lut 里了应该是调整里面"）。它们是白平衡的两条，与 [1..3] 通道增益同属基础调整；
     // 两条**必须在一起**（分开会让用户找不到另一半）。
     EditorParam(
@@ -1507,7 +1538,7 @@ private val AdjustParams: List<EditorParam> = listOf(
 )
 
 /**
- * 「色彩」组的**引擎参数**（E2-14；E2-15 只剩褪色 [94]）：褪色。
+ * 「滤镜」组的**引擎参数**（E2-14；E2-15 只剩褪色 [94]）：褪色。
  *
  * **不依赖 LUT**（引擎侧这条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时它照样可调 —— 这也是
  * 本组从"未选 LUT 就空表"变成常驻的原因。LUT 强度 [34] 是单独一条（[LutStrengthParam]），
@@ -1810,7 +1841,7 @@ private fun EditorPanel(
     val context = LocalContext.current
     val list = when (group) {
         EditorTab.ADJUST -> AdjustParams
-        // 色彩组（E2-15）：褪色（[ColorParams]）+ LUT 强度（选了 LUT 才有）。
+        // 滤镜组（E2-15）：褪色（[ColorParams]）+ LUT 强度（选了 LUT 才有）。
         // 色温/色调已移入「调整」组 —— 它们是白平衡的两条，不属于"风格素材"这一类。
         EditorTab.COLOR -> if (lutId != null) ColorParams + LutStrengthParam else ColorParams
         EditorTab.VIGNETTE -> VignetteParams
@@ -1849,7 +1880,7 @@ private fun EditorPanel(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 2.dp),
         )
-        // 色彩组专属：原片风格（只读）+ 一键套用 —— E2-1 的功能，一个都没丢
+        // 滤镜组专属：原片风格（只读）+ 一键套用 —— E2-1 的功能，一个都没丢
         if (group == EditorTab.COLOR) {
             SnapshotStyleRow(context, snapLutId, snapLutK, onApplySnapshot)
         }
@@ -1865,7 +1896,7 @@ private fun EditorPanel(
                 EditorSlider(current, film, onCommit, onFinished)
             }
         } else {
-            // 无参数可调：参数还没加载完（E2-14 起色彩组常驻三条引擎参数，不再有"未选 LUT
+            // 无参数可调：参数还没加载完（E2-14 起滤镜组常驻三条引擎参数，不再有"未选 LUT
             // 就空表"这一档）—— 给一句明确说明，**不给假滑杆**（ADR-12）
             Box(
                 Modifier
@@ -1881,7 +1912,7 @@ private fun EditorPanel(
             }
         }
         Spacer(Modifier.height(6.dp))
-        // ⑤ 参数图标行。色彩组**拆成两行**（E2-15）：LUT 一行（42 个素材，横滚很深）+
+        // ⑤ 参数图标行。滤镜组**拆成两行**（E2-15）：LUT 一行（42 个素材，横滚很深）+
         // 本组参数一行（褪色 / 强度）。挤在同一行时，参数被埋在几十张 LUT 卡片之后 ——
         // 用户横滚半天找不到「褪色」，等于参数不存在（ADR 记的"LUT 与参数挤一行"问题）。
         if (group == EditorTab.COLOR) {
@@ -2101,7 +2132,7 @@ private fun ParamIconRow(
 }
 
 /**
- * 色彩组的 **LUT 图标行**（E2-1 的 LUT 圆形按钮；E2-15 从"与参数同行"拆出来独立一行）：
+ * 滤镜组的 **LUT 图标行**（E2-1 的 LUT 圆形按钮；E2-15 从"与参数同行"拆出来独立一行）：
  * 「无」+ 各 LUT（有预览图时显示圆形缩略图）。
  *
  * 为什么拆行（E2-15 用户反馈的连带修正）：LUT 有 42 个，横滚很深 —— 参数挤在同一行时
@@ -2195,7 +2226,7 @@ private fun ParamChip(
 }
 
 /**
- * ⑥ 底部导航（ADR-14 层⑥）：调整 / 色彩 / 暗角 / 局部，**选中 = 黄色圆角矩形底 + 深色图标与文字**。
+ * ⑥ 底部导航（ADR-14 层⑥）：调整 / 滤镜 / 暗角 / 局部，**选中 = 黄色圆角矩形底 + 深色图标与文字**。
  *
  * 选中态用「强调色实底 + [FilmTheme.OnAccent] 前景」而不是"黄底 + 黄字"：黄底黄字的对比度
  * 约 1.4:1（WCAG 远不达标），实底 + 深字是 6.8:1。同一个"黄色圆角矩形底"的语言，可读性优先。
@@ -2475,6 +2506,27 @@ internal data class OriginalViewState(val pressed: Boolean = false) {
     /** 按住（[v] = true 按下 / false 松手，**含手势被取消的松手**）：唯一的状态迁移 */
     fun press(v: Boolean): OriginalViewState = copy(pressed = v)
 }
+
+/**
+ * 覆盖前是否必须弹「RAW 数据丢失」警告（E2-19，用户真机反馈："DNG 覆盖时给个警告"）。
+ *
+ * 场景：源图是 DNG（非 JPEG）、用户改了参数后点「覆盖原片」—— 覆盖写回的是**渲染出的
+ * JPEG**，DNG 里的 RAW 数据就此永久消失（不可恢复）。这一枪必须先亮明后果再让用户按。
+ *
+ * 两条判据缺一不可（与 [passthroughAllowed] 是同一对输入的**反向**用法）：
+ *  - [paramsUnchanged] = true（没改过）⇒ **根本不会覆盖**：`exportNow` 直接拒绝
+ *    （"没有修改，无需覆盖"，一个字节都不写）⇒ 不该弹警告 —— 弹了是虚惊一场，
+ *    还挡不住任何数据损失；
+ *  - [jpegSource] = true（源图本来就是 JPEG）⇒ 覆盖的代价只是"再一次有损重编码"，
+ *    不是"RAW 永久丢失"级别 ⇒ 走既有的「覆盖原片？」确认框即可，不必多吓一次。
+ *
+ * 源图格式判据**复用 E2-18b 的 [isJpegSource]**（不另写一套判断）：两处口径同源，
+ * 才不会出现"直通说这不是 JPEG、警告却说它是 JPEG"的自相矛盾。
+ *
+ * 纯逻辑、无 Android 依赖 ⇒ JVM 单测直接钉住三种组合（见 `EditorOverwriteWarnTest`）。
+ */
+internal fun overwriteNeedsRawWarning(paramsUnchanged: Boolean, jpegSource: Boolean): Boolean =
+    !paramsUnchanged && !jpegSource
 
 /**
  * 面板出入场时长（E2-17，ms）。为什么是 240：
