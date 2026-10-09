@@ -1150,6 +1150,7 @@ fun EditorScreen(
                         ),
                         lutId = lutId,
                         previews = lutPreviews,
+                        hasSnapshot = hasSnapshot,
                         snapLutId = snapLutId,
                         snapLutK = snapLutK,
                         onPickLut = { e -> pickLut(e) },
@@ -1876,6 +1877,8 @@ private fun EditorPanel(
     baseHint: String,
     lutId: String?,
     previews: Map<String, Bitmap>,
+    /** 有参数快照 ⇒ 显示「套用参数」按钮（E2-23：不再以"快照里有 LUT"为条件） */
+    hasSnapshot: Boolean,
     snapLutId: String?,
     snapLutK: Float,
     onPickLut: (LutLibrary.Entry?) -> Unit,
@@ -1937,7 +1940,7 @@ private fun EditorPanel(
         )
         // 滤镜组专属：原片风格（只读）+ 一键套用 —— E2-1 的功能，一个都没丢
         if (group == EditorTab.COLOR) {
-            SnapshotStyleRow(context, snapLutId, snapLutK, onApplySnapshot)
+            SnapshotStyleRow(context, hasSnapshot, snapLutId, snapLutK, onApplySnapshot)
         }
         // 局部组专属：一行**范围说明**（E2-21）+ 模式选择（关 / 径向 / 线性）
         if (group == EditorTab.LOCAL) {
@@ -2130,16 +2133,21 @@ private fun LocalModeRow(mode: Int, onMode: (Int) -> Unit) {
 /**
  * 「原片风格」只读展示 + 一键套用（E2-1 的功能，形态随面板重做而变、语义不变）：
  * 打开编辑器时 [34] 被强制 0（画面 = 原片），不给这个入口，快照里的 LUT 就等于白存了。
+ *
+ * E2-23：按钮可见性从"快照里有 LUT 资产"放宽到 **"有快照"** —— E2-21 起「套用」下发的是
+ * **参数 + LUT**，标准基线拍的原片（没记 LUT）同样有整套参数可套；按 LUT 决定可见性会让这类
+ * 照片的"套用参数"**根本不可达**。无快照仍不给按钮（提示行已说明"已用标准基线"）。
+ * 快照里的 LUT 若已被用户从库中删掉，按钮也保留：参数仍能套用，点下去会明确提示 LUT 那部分
+ * 失败（`applySnapshotStyle` 的 `entry == null` 分支）——"点了注定失败"的前提已不成立。
  */
 @Composable
 private fun SnapshotStyleRow(
     context: Context,
+    hasSnapshot: Boolean,
     snapLutId: String?,
     snapLutK: Float,
     onApply: () -> Unit,
 ) {
-    // 快照里的 LUT 可能已被用户从库中删掉（byId = null）：如实说明，并且**不给**套用按钮
-    //（点了注定失败的操作比没有按钮更糟）
     val snapEntry = snapLutId?.let { LutLibrary.byId(context, it) }
     Row(
         Modifier
@@ -2161,9 +2169,11 @@ private fun SnapshotStyleRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (snapEntry != null) {
+        if (hasSnapshot) {
             Text(
-                "套用",
+                // E2-23 文案：E2-21 起这个按钮下发的是**参数 + LUT**（不只是风格素材），而左侧
+                // 在"原片未使用 LUT"时只说到了 LUT —— "套用"会指向不明，故写明"参数"。
+                "套用参数",
                 color = FilmTheme.Accent,
                 fontSize = 12.sp,
                 fontFamily = FilmTheme.Mono,

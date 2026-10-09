@@ -35,10 +35,25 @@ import java.util.concurrent.atomic.AtomicReference
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
  * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
- *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 只读
- * [26] grain_amount / [27] grain_size / [34] lut_strength / [66][67][68] 暗角三条，
- * 其余槽位不影响输出（ADR §5.1 I-2，白名单由 `tools/check-style-passthrough.py`
- * 第 ④ 项精确匹配守着）。
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 29 个槽位**，
+ * 其余槽位不影响输出（ADR §5.1 I-2；白名单由 `tools/check-style-passthrough.py` 第 ④ 项
+ * 精确匹配守着，本清单与它逐项对齐，由 `EditorStyleWhitelistTest` 钉住三方一致）：
+ *
+ * ```
+ * [0] exposure_ev        [1] wb_r  [2] wb_g  [3] wb_b      [4] contrast     [21] sat_mid
+ * [26] grain_amount      [27] grain_size                   [34] lut_strength
+ * [66] vignette_strength [67] vignette_radius  [68] vignette_feather
+ * [78] clarity
+ * [79] local_type  [80] local_center_x  [81] local_center_y  [82] local_radius
+ * [83] local_feather  [84] local_angle  [85] local_width  [86] local_ev  [87] local_sat
+ * [88] temp_mired  [89] tint  [90] highlights  [91] shadows  [92] whites  [93] blacks
+ * [94] fade
+ * ```
+ *
+ * ⚠️ 本清单曾长期停在 E2-11 之前的旧版（"只读 [26]/[27]/[34]/[66..68]"）—— E2-21 的
+ * "打开编辑器把成片已烘焙的参数**二次应用**"bug 的认知根源就是它：照旧注释判断，会以为
+ * [0]/[1..3]/[4]/[78]/[88..94] 这些槽位"无所谓"，于是从快照恢复它们看着无害。**改这段前先跑
+ * 脚本第 ④ 项，不要手抄**（`[95]` reserved 确实零引用，所以不在清单里）。
  */
 internal class EditorEngineSession {
 
