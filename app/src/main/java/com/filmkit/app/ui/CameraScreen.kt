@@ -551,11 +551,10 @@ fun CameraScreen(
     LaunchedEffect(photoUri) {
         val uri = photoUri ?: return@LaunchedEffect
         val bmp = withContext(Dispatchers.IO) {
-            try {
-                context.contentResolver.loadThumbnail(uri, android.util.Size(128, 128), null)
-            } catch (_: Throwable) {
-                null
-            }
+            // E2-18b：平台 loadThumbnail 对 DNG 的 EXIF 方向不可靠（与 E2-18a 相册网格
+            // 同款根因），改走统一的 decodeOriented 按方向转正。请求 128px，采样率由
+            // sampleSizeFor 算（结果不小于目标，宁多解一点不糊）。
+            decodeOriented(context, uri, 128, 128)
         }
         thumb = bmp?.asImageBitmap()
     }

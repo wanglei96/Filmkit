@@ -6,7 +6,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
+import java.io.File
 
 /**
  * E1-4 编辑器纯逻辑护栏：参数起点映射（集成点 I-3）与导出命名（ADR-3）。
@@ -197,5 +199,97 @@ class EditorExportTest {
         val applied = base.copyOf()
         applied[34] = 0.85
         assertFalse(paramsUnchanged(applied, base))
+    }
+
+    // ── E2-18b：直通只对 JPEG 源图合法（架构师发现的 E2-9 连带 bug）──────────────
+
+    /**
+     * 真实文件头字节（前 3~12 字节）—— 不是编的，是各自格式的规范起始：
+     *  - JPEG：`FF D8 FF`（SOI + 下一个 marker 前缀），第三字节按 APPn 不同而不同；
+     *  - DNG：TIFF 头 `II*\0`（小端）/ `MM\0*`（大端），DNG 就是 TIFF 容器；
+     *  - HEIC：`ftyp` box（第 4 字节起），前 4 字节是大端长度。
+     */
+    private val jpegHead = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE1.toByte())
+    private val dngHeadLe = byteArrayOf(0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00)
+    private val dngHeadBe = byteArrayOf(0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08)
+    private val heicHead = byteArrayOf(
+        0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63,
+    )
+
+    @Test
+    fun jpegMagicIsRecognizedAndNonJpegIsNot() {
+        assertTrue("JPEG 头必须认出来", isJpegSource(jpegHead))
+        // 白名单：非 JPEG 一律 false（DNG 两种字节序 + HEIC + 空/过短/读不到）
+        assertFalse("DNG（小端 TIFF 头）", isJpegSource(dngHeadLe))
+        assertFalse("DNG（大端 TIFF 头）", isJpegSource(dngHeadBe))
+        assertFalse("HEIC", isJpegSource(heicHead))
+        assertFalse("null（流打不开）", isJpegSource(null))
+        assertFalse("空数组", isJpegSource(ByteArray(0)))
+        assertFalse("只有 2 字节", isJpegSource(byteArrayOf(0xFF.toByte(), 0xD8.toByte())))
+        assertFalse("FF D8 后不是 FF", isJpegSource(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x00)))
+    }
+
+    @Test
+    fun jpegSourceWithoutEditsIsAllowedToPassthrough() {
+        // ★ 用户报的 bug 的另一半：JPEG 源图 + 参数没动 ⇒ 必须仍然直通（E2-9 的收益不能丢）
+        assertTrue(passthroughAllowed(paramsUnchanged = true, jpegSource = true))
+    }
+
+    @Test
+    fun dngSourceIsNeverAllowedToPassthrough() {
+        // ★ 架构师发现的连带 bug：DNG 字节被当成"无修改 ⇒ 复制原片"存成 .jpg
+        //（MediaStore MIME 也写 image/jpeg）⇒ 内容与扩展名不符。参数**一个都没动**也不行。
+        assertFalse(passthroughAllowed(paramsUnchanged = true, jpegSource = false))
+        // 有修改时两条判据都拦（任一为 false 即不直通）
+        assertFalse(passthroughAllowed(paramsUnchanged = false, jpegSource = true))
+        assertFalse(passthroughAllowed(paramsUnchanged = false, jpegSource = false))
+    }
+
+    @Test
+    fun dngSourceEndToEndFallsIntoRenderPath() {
+        // 串起两条判据的实际组合（exportNow 里的调用形态）：DNG 源图打开后立刻导出
+        val base = openBaseline()
+        val unchanged = paramsUnchanged(base.copyOf(), base)
+        assertTrue("参数确实没动", unchanged)
+        assertFalse(
+            "DNG 源图没改参数也必须走渲染（dirty = true）",
+            passthroughAllowed(unchanged, isJpegSource(dngHeadLe)),
+        )
+        assertTrue(
+            "JPEG 源图没改参数才直通",
+            passthroughAllowed(unchanged, isJpegSource(jpegHead)),
+        )
+    }
+
+    @Test
+    fun realFilesConfirmTheMagicNumberVerdict() {
+        // 交叉验证：不只信上面硬编码的字节，用**真机拍的文件**再看一遍魔数。
+        // test_temp/ 被 gitignore，文件不在时跳过（CI 不红）—— 与 ImageDecodeTest 同一口径。
+        val dng = File("../test_temp/FILMKIT_20261009-090803.dng")
+        val jpg = File("../test_temp/FILMKIT_20261009-090810.jpg")
+        assumeTrue("test_temp 不在（已 gitignore），跳过真实文件实测", dng.isFile && jpg.isFile)
+
+        val dngHead = head4(dng)
+        val jpgHead = head4(jpg)
+        // DNG 就是 TIFF 容器：小端头 `II*\0` = 49 49 2A 00
+        assertArrayEquals(byteArrayOf(0x49, 0x49, 0x2A, 0x00), dngHead)
+        // JPEG：SOI + 下一个 marker 前缀 = FF D8 FF（第 4 字节是 marker 种类，随 APPn 而变）
+        assertArrayEquals(
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()), jpgHead.copyOf(3),
+        )
+        assertFalse("真机 DNG 必须判为非 JPEG（否则它会被直通存成 .jpg）", isJpegSource(dngHead))
+        assertTrue("成片 JPEG 必须判为 JPEG（直通收益不能丢）", isJpegSource(jpgHead))
+    }
+
+    /** 读文件前 4 字节（不把 25MB 的 DNG 拉进内存） */
+    private fun head4(f: File): ByteArray = f.inputStream().use { ins ->
+        val b = ByteArray(4)
+        var off = 0
+        while (off < 4) {
+            val r = ins.read(b, off, 4 - off)
+            if (r <= 0) break
+            off += r
+        }
+        b
     }
 }

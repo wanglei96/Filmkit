@@ -110,6 +110,46 @@ internal fun paramsUnchanged(
 }
 
 /**
+ * 源图是否是 JPEG（E2-18b）：**文件头魔数 `FF D8 FF`**（SOI + 下一个 marker 的前缀），
+ * 只看前 3 字节 ⇒ 调用方读头部即可，不必把整张图读进内存。
+ *
+ * 为什么必须判这个（架构师发现的 E2-9 连带 bug）：直通路径 = **复制原片字节**，
+ * 而落盘时文件名固定 `.jpg`、MediaStore MIME 固定 `image/jpeg`（见 [saveEditorCopy]）
+ * ⇒ 源图若是 DNG，存出来的就是"扩展名说 JPEG、内容是 DNG"的四不像，相册/系统解码器
+ * 按 JPEG 解会失败或显示异常。
+ *
+ * **白名单，不是黑名单**：只认"是 JPEG"，其余一律不放行 —— DNG 之外还有 HEIC / PNG /
+ * WebP / 未来新格式，黑名单漏一个就是同一个 bug 再来一次。判错的代价也是安全方向：
+ * 误判成"非 JPEG"只是多渲染一次（像素正确），误判成"JPEG"才是内容与扩展名不符。
+ *
+ * 不用 MIME 兜底：`ContentResolver.getType` 对 DNG 不可靠（不少设备报 `image/jpeg`
+ * 或干脆不报），而魔数读不到时 [passthroughAllowed] 会判 false 走渲染 —— 白名单下
+ * "读不到"与"不是 JPEG"同义，正是想要的失败方向。
+ *
+ * 常见非 JPEG 源图的头部（供对照，本函数不依赖它们）：
+ *  - **DNG / TIFF**：`II*\0`（49 49 2A 00，小端）或 `MM\0*`（4D 4D 00 2A，大端）
+ *  - **HEIC**：`....ftypheic`（第 4~12 字节）
+ *
+ * @param head 文件头部字节（≥3 字节即可）；null / 过短 ⇒ false
+ */
+internal fun isJpegSource(head: ByteArray?): Boolean =
+    head != null && head.size >= 3 &&
+        head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte() && head[2] == 0xFF.toByte()
+
+/**
+ * 「复制原片字节」的完整判据（E2-9 参数判据 + E2-18b 源图格式判据）。
+ *
+ * 两条缺一不可，理由各是一条真金白银的 bug：
+ *  - [paramsUnchanged] = false（有修改）⇒ 直通会把用户的修改丢掉（E2-9 的红线）；
+ *  - [jpegSource] = false（源图不是 JPEG）⇒ 直通会把 DNG 字节存成 `.jpg`（E2-18b）。
+ *
+ * 抽成纯函数而不是在调用处内联 `&&`：这是**两条各自出过 bug 的规则的唯一真相**，
+ * JVM 单测要能直接钉住"JPEG 才直通、DNG 不直通"，而不是靠读 Compose 代码确认。
+ */
+internal fun passthroughAllowed(paramsUnchanged: Boolean, jpegSource: Boolean): Boolean =
+    paramsUnchanged && jpegSource
+
+/**
  * 暗角参数的 UI ↔ 槽位映射（E2-1）。**纯逻辑、无 Android 依赖** ⇒ JVM 单测直接覆盖往返。
  *
  * 槽位语义（E4-2 已实现并离线验收，见 `core/engine/src/film/FilmParams.h`）：

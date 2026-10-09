@@ -1,5 +1,6 @@
 package com.filmkit.app.ui
 
+import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -157,6 +158,7 @@ import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.imageFitRect
+import com.filmkit.app.camera.isJpegSource
 import com.filmkit.app.camera.linearOutline
 import com.filmkit.app.camera.localActive
 import com.filmkit.app.camera.localAngleSlot
@@ -179,6 +181,7 @@ import com.filmkit.app.camera.localWidthSlot
 import com.filmkit.app.camera.localWidthUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
+import com.filmkit.app.camera.passthroughAllowed
 import com.filmkit.app.camera.pivotFraction
 import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
@@ -399,8 +402,12 @@ fun EditorScreen(
     }
 
     /**
-     * 导出诊断（**单一出口**，E2-9）：`dirty` = 是否走了"有修改"的渲染路径、写出字节数、
-     * 耗时。`dirty=false` 时 `bytes` = 原片字节数、`ms` = 一次读 + 一次写（无渲染无编码）。
+     * 导出诊断（**单一出口**，E2-9）：`dirty` = 是否走了**渲染 + 编码**路径（写出字节数、
+     * 耗时）。`dirty=false` 时 `bytes` = 原片字节数、`ms` = 一次读 + 一次写（无渲染无编码）。
+     *
+     * E2-18b 起 `dirty` 的语义仍是"**有没有渲染**"（不是"用户有没有改参数"）：源图不是 JPEG
+     * （DNG 等）时，即使参数一个都没动也必须渲染 + 编码 ⇒ 这一趟记 `dirty=true`，日志里
+     * "参数没动却渲染了"是可解释的（见 [passthroughAllowed]）。
      * 落盘失败另有 `photo.edit_save_failed` / `photo.edit_overwrite_failed`，不在这里重复。
      */
     fun logExport(dirty: Boolean, bytes: Int, ms: Long, overwrite: Boolean) {
@@ -725,6 +732,9 @@ fun EditorScreen(
      * 本身，**直接复制原片字节**（不渲染、不编码）。重渲染一次的代价实测是：JPEG 二次编码
      * （体积增长的 55.16%）+ 多叠一层 dither（43.40%）+ 一次全分辨率渲染（百毫秒）+ 峰值内存
      * 240MiB —— 全是白付的（"细节更好"是平坦区噪声被读成质感的错觉，强纹理区仅 +0.016）。
+     *
+     * **E2-18b 收口**：直通是"复制原片字节"，所以还要求**源图是 JPEG** —— DNG 源图即使
+     * 参数没动，也必须渲染 + 编码（否则 DNG 字节会被存成 `.jpg`，见 [passthroughAllowed]）。
      */
     fun exportNow(overwrite: Boolean) {
         val src = source ?: return
@@ -732,18 +742,24 @@ fun EditorScreen(
         val target = uri
         if (exporting || target == null) return
 
-        // ★ 直通判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值，
+        // ★ 参数判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值，
         // 已把 [34] 强制置 0），不是快照原文；值比较 + 容差 ⇒ "改了又改回原值"也算无修改。
         // openParams 为 null（理论上只在首帧就绪前，此时导出按钮不可点）⇒ 保守走渲染。
-        val dirty = openParams?.let { !paramsUnchanged(snapshot, it) } ?: true
+        val unchanged = openParams?.let { paramsUnchanged(snapshot, it) } ?: false
 
-        if (!dirty) {
-            if (overwrite) {
-                // 覆盖 = 把原片字节写回原片本身：白写一遍（还平添写坏的风险），直接说清楚
-                logExport(dirty = false, bytes = 0, ms = 0, overwrite = true)
-                status = "没有修改，无需覆盖"
-                return
-            }
+        // 覆盖 = 把原片字节写回原片本身：白写一遍（还平添写坏的风险），直接说清楚。
+        // ⚠ 这条**只看参数**、与源图格式无关：它一个字节都不写。若把"非 JPEG 源图"也算成
+        // 有修改而放它过去，一张没动过的 DNG 会被渲染成 JPEG 覆盖回去（原片被换掉）= 数据损坏。
+        if (unchanged && overwrite) {
+            logExport(dirty = false, bytes = 0, ms = 0, overwrite = true)
+            status = "没有修改，无需覆盖"
+            return
+        }
+
+        // ★ E2-18b：另存直通 = 复制原片字节，**只有 JPEG 源图合法**（落盘固定 `.jpg` +
+        // MIME image/jpeg，见 saveEditorCopy）。DNG（及其他非 JPEG）源图一律落到下面的
+        // 渲染 + 编码路径 —— 真出一张 JPEG，内容与扩展名才对得上。
+        if (passthroughAllowed(unchanged, src.jpegSource)) {
             exporting = true
             status = "正在保存原片…"
             val now = System.currentTimeMillis()
@@ -2498,8 +2514,11 @@ private sealed interface EditorPhase {
  * 内存账（12MP = 4080×3072，见 [previewResidentMb]）：buffer ≈50MB + 输出位图 ≈50MB
  * ⇒ 常驻 ≈96MB；首帧渲染那一刻再多一张解码位图（≈150MB 峰值，之后回落）。
  *
- * [srcW]/[srcH] 是**原图**尺寸（底部读数用）；[w]/[h] 是实际解码尺寸 —— 正常两者相等，
- * 只有解码 OOM 降档后 w/h 才小于原图（宁可糊也不崩）。
+ * [srcW]/[srcH] 是**原图**尺寸的读数（**已按 EXIF 方向转正**，E2-18b，见 [orientedReadout]）；
+ * [w]/[h] 是实际解码尺寸 —— 正常两者相等，只有解码 OOM 降档后 w/h 才小于原图（宁可糊也不崩）。
+ *
+ * [jpegSource] 是**直通路径的通行证**（E2-18b）：只有 JPEG 源图允许"复制原片字节"另存，
+ * 判据见 [passthroughAllowed]。
  */
 private class EditorSource(
     /** 渲染输入：解码像素的 direct 副本（RGBA_8888 的内存布局即 R,G,B,A，与引擎约定同序） */
@@ -2509,6 +2528,8 @@ private class EditorSource(
     val name: String,
     val srcW: Int,
     val srcH: Int,
+    /** 源图是 JPEG（文件头魔数判定，见 [isJpegSource]）⇒ 参数无修改时可直通复制字节 */
+    val jpegSource: Boolean,
 ) {
     /** 解码位图：首帧画面（也是渲染失败 / 引擎不可用时的兜底画面） */
     var decoded: Bitmap? = null
@@ -2554,10 +2575,48 @@ private sealed interface LoadResult {
 }
 
 /**
+ * 底部尺寸读数（E2-18b）：把**转正前**的原图尺寸 [rawW]×[rawH] 换算成**转正后**的读数。
+ *
+ * 为什么必须换：[decodeOriented] 出来的像素已按 EXIF 转正（90°/270° 时宽高互换），而
+ * `inJustDecodeBounds` 读到的 [rawW]/[rawH] 是转正**前**的存储尺寸 —— 直接拿它显示，
+ * 竖画面会配一个"4080×3072"的横读数（E2-18a 交接时点名的坑）。
+ *
+ * 判据是"**横竖方向**与解码结果是否一致"（不是比具体数值）：不一致 ⇒ 转过 90°/270° ⇒ 交换。
+ * 用方向而不是数值，是因为解码 OOM 降档后尺寸是原图的 1/2、1/4（`inSampleSize` 是整数，
+ * 不会把横变竖）—— 比数值会把"降过档"误判成"转过向"。正方形（w == h）交换也无差别。
+ */
+internal fun orientedReadout(decodedW: Int, decodedH: Int, rawW: Int, rawH: Int): Pair<Int, Int> =
+    if ((decodedW > decodedH) != (rawW > rawH)) rawH to rawW else rawW to rawH
+
+/**
+ * 读源图前 3 字节（判格式的魔数用，E2-18b）。只读 3 字节：不把整张图拉进内存。
+ * 读不到 / 打不开返回 null —— 调用方按"不是 JPEG"处理（白名单的失败方向，见 [isJpegSource]）。
+ */
+private fun readMagic(resolver: ContentResolver, uri: Uri): ByteArray? = try {
+    resolver.openInputStream(uri)?.use { ins ->
+        val buf = ByteArray(3)
+        var off = 0
+        while (off < 3) {
+            val r = ins.read(buf, off, 3 - off)
+            if (r <= 0) break
+            off += r
+        }
+        buf.copyOf(off)
+    }
+} catch (_: Throwable) {
+    null
+}
+
+/**
  * 读图（IO 线程）：**全分辨率解码**（E2-8 用户 2026-10-08 拍板：预览与导出同分辨率，
  * 见文件头 KDoc）。不再按屏幕尺寸降采样，只保留 OOM 兜底 —— 解不出来（超大图 / 低内存
  * 设备）就**降一档重试一次**（inSampleSize ×2 = 长边减半，宁可糊也不崩），仍失败才报错。
  * 尺寸预读（inJustDecodeBounds）只为拿**原图**尺寸做底部读数。
+ *
+ * **E2-18b 起解码走 [decodeOriented]**（E2-18a 的统一入口）：DNG 写的是 sensor 方向，
+ * 不按 EXIF 转正就会与成片朝向不一致（用户真机反馈）。`reqW/reqH` 传**原图尺寸** ⇒
+ * 采样率恒为 1（全分辨率口径不变）；**解码**的 OOM 由 [decodeOriented] 内部降一档重试，
+ * 外层 `repeat(2)` 守的是它之后那两步（`allocateDirect` + `copyPixelsToBuffer`，同样会 OOM）。
  *
  * 解码位图同时是首帧画面（[EditorSource.decoded]），首次渲染成功后由 rerender 回收 ——
  * 首帧总得显示点什么，这张并不额外抬高常驻峰值。
@@ -2572,35 +2631,39 @@ private fun loadPreview(context: Context, uri: Uri?): LoadResult {
     } catch (_: Throwable) {
         return LoadResult.Err("图片已失效或无法读取")
     }
-    val srcW = bounds.outWidth
-    val srcH = bounds.outHeight
-    if (srcW <= 0 || srcH <= 0) return LoadResult.Err("图片已失效或无法读取")
+    val rawW = bounds.outWidth
+    val rawH = bounds.outHeight
+    if (rawW <= 0 || rawH <= 0) return LoadResult.Err("图片已失效或无法读取")
 
     // 文件名一律走 StillSnapshotStore.fileNameOf（ADR 集成点 I-1）：参数快照的键就是它，
     // 两处各写一份实现，一旦行为不一致，编辑器查到的键就不是落盘时那个（静默取不到快照）。
     // 查不到时的兜底保留原样（URI 末段 → "成片"）。
     val name = StillSnapshotStore.fileNameOf(context, uri) ?: uri.lastPathSegment ?: "成片"
-    // 第一趟原尺寸（1），OOM 后降一档（2 = 长边减半）重试一次
-    var sample = 1
+    // 源图格式（E2-18b）：直通只对 JPEG 合法，判据是文件头魔数（不靠 MIME，见 isJpegSource）
+    val jpegSource = isJpegSource(readMagic(resolver, uri))
+    // 第一趟原尺寸，OOM 后降一档（长边减半）重试一次
+    var reqW = rawW
+    var reqH = rawH
     repeat(2) {
         var bmp: Bitmap? = null
         try {
-            val options = BitmapFactory.Options().apply { inSampleSize = sample }
-            bmp = resolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, options)
-            } ?: return LoadResult.Err("图片已失效或无法读取")
+            bmp = decodeOriented(context, uri, reqW, reqH)
+                ?: return LoadResult.Err("图片已失效或无法读取")
             val w = bmp.width
             val h = bmp.height
             val bytes = ByteBuffer.allocateDirect(w * h * 4)
             bmp.copyPixelsToBuffer(bytes)
             bytes.rewind()
+            // ★ 读数跟着转正（E2-18b）：画面已是转正后的 w×h，读数不能还是转正前的存储尺寸
+            val (srcW, srcH) = orientedReadout(w, h, rawW, rawH)
             return LoadResult.Ok(
-                EditorSource(bytes, w, h, name, srcW, srcH).also { it.decoded = bmp },
+                EditorSource(bytes, w, h, name, srcW, srcH, jpegSource).also { it.decoded = bmp },
             )
         } catch (_: OutOfMemoryError) {
             // 降档前先把这一份还回去，否则重试时两份同时在（全分辨率下每份 50MB）
             bmp?.recycle()
-            sample *= 2
+            reqW /= 2
+            reqH /= 2
         } catch (_: Throwable) {
             bmp?.recycle()
             return LoadResult.Err("图片已失效或无法读取")
