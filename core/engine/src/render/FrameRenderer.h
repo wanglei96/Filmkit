@@ -174,7 +174,20 @@ class FrameRenderer {
   // 只读 p 的 grain_amount[26]/grain_size[27]/lut_strength[34]，其余槽位一律不影响
   // 输出（ADR §5.1 的 I-2：同一输入 + 只改无关槽位 ⇒ 输出逐像素一致）。
   // 必须在该实例的渲染线程（有 current context）上调用。
-  bool submitDisplay(const void* rgba8, int w, int h, const FilmParams& p,
+  //
+  // ── E2-12 裁剪 + 90° 步进旋转（ADR-16；几何变换，**不进 FilmParams**）──────
+  //   out_w/out_h —— **输出**尺寸（≠ w/h 时即裁剪改变宽高比；Kotlin 侧按裁剪矩形
+  //                  的像素尺寸 + 旋转交换算好传入）。w/h 始终 = 输入位图尺寸。
+  //   crop_uv[4]  —— {x0, y0, cw, ch}，**原图**归一化 UV 子矩形（原点 = 左上，
+  //                  y 与 Bitmap 行序同向 = 与 UI 裁剪框同向）。nullptr = 全幅
+  //                  （零回归：不裁剪 + rot=0 ⇒ 输出与输入 max|Δ| ≤ 1 LSB）。
+  //   crop_rot    —— 顺时针 90° 步进（0..3），作用于**裁剪后**的画面。
+  // 裁剪在**引擎输入侧**做（shader 内 UV 变换）：后续处理（暗角 / 局部调整 /
+  // LUT / 颗粒）一律继续用 vUV0（= 裁剪后的归一化坐标）⇒ 暗角自动相对裁剪后
+  // 画面居中、局部调整中心自动落在用户拖的位置。**若改为最后裁输出位图，
+  // 暗角会跑到画面外、局部调整中心会偏**（ADR-16 的核心裁决）。
+  bool submitDisplay(const void* rgba8, int w, int h, int out_w, int out_h,
+                     const float crop_uv[4], int crop_rot, const FilmParams& p,
                      std::vector<uint8_t>* out_rgba);
 
   // RAW 静拍（M2-3）：u16 Bayer（R16UI 整型纹理 + texelFetch）→ 黑阶扣除
@@ -571,7 +584,10 @@ class FrameRenderer {
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
   void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
   // E1-3 编辑器通路：显示域输入 → LUT/颗粒/dither → fbo_cap_（RGBA8）
-  void passStyle(int w, int h, const FilmParams& p);
+  // E2-12：w/h = **输出**尺寸（裁剪后）；crop_uv/crop_rot 见 submitDisplay 注释
+  // （nullptr = 全幅 + rot=0 ⇒ 与改动前逐位一致）。
+  void passStyle(int w, int h, const float crop_uv[4], int crop_rot,
+                 const FilmParams& p);
   void passFill(int dst_w, int dst_h);
 
   static void makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w, int h);
@@ -1161,7 +1177,10 @@ class FrameRenderer {
           // `uWbGain`（ADR-14 裁决 1：同属线性域增益 ⇒ 复用已有的成对往返，
           // 零额外 GPU 成本；也因此 chainLuma 的域提升自动带上它们，无需改动）。
           highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
-          tone_on = -1;
+          tone_on = -1,
+          // E2-12 裁剪 + 90° 步进旋转（ADR-16）：输出坐标 → 原图 UV 的仿射映射
+          //（origin + o×size，再按 rot 置换轴）。不裁剪 = (0,0)/(1,1)/0 ⇒ 恒等。
+          crop_origin = -1, crop_size = -1, crop_rot = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

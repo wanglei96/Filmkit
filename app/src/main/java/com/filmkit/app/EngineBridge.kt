@@ -101,9 +101,17 @@ object EngineBridge {
      * 颗粒种子由引擎固定 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
      * 必须在**有 current EGL context 的渲染线程**上调用（同 [nativeEngineSubmitST]）；
      * 失败（null）时引擎侧已记 `render.style` 日志（styleOk/styleOn 可定位）。
+     *
+     * E2-12 裁剪（ADR-16；几何变换，**不进 FilmParams**）：
+     * outWidth/outHeight = **输出**尺寸（不裁剪时 == width/height）；
+     * cropUv = float[4] {x0, y0, cw, ch}，**原图**归一化 UV 子矩形（原点左上、
+     * y 与 Bitmap 行序同向），**null = 全幅**；cropRot = 顺时针 90° 步进（0..3）。
+     * ⚠ 参数顺序必须与 JNI（Bridge.cpp）**逐位一致**（JNI 按位置解析）。
      */
     external fun nativeEngineSubmitDisplay(
-        rgba: ByteBuffer, width: Int, height: Int, film: DoubleArray,
+        rgba: ByteBuffer, width: Int, height: Int,
+        outWidth: Int, outHeight: Int, cropUv: FloatArray?, cropRot: Int,
+        film: DoubleArray,
     ): ByteArray?
 
     /**

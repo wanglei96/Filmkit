@@ -655,23 +655,41 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
 //   再跑一遍 filmic + 域比归一（双重影调映射，画面显著变暗变灰，可行性报告 R1）。
 // 走预览侧实例 g_renderer（与 nativeEngineSubmitST/Histogram 同实例）；必须在
 // **有 current EGL context 的渲染线程**上调用。
+//
+// E2-12 裁剪（ADR-16；几何变换，**不进 FilmParams**）：
+//   out_w/out_h —— **输出**尺寸（Kotlin 侧按裁剪矩形的像素尺寸 + 旋转交换算好；
+//                  不裁剪时 == w/h）。w/h 始终 = 输入位图尺寸。
+//   crop_uv     —— 长度 ≥4 的 float[] {x0, y0, cw, ch}（**原图**归一化 UV 子矩形，
+//                  原点左上、y 与 Bitmap 行序同向）；nullptr / 长度不足 = 全幅。
+//   crop_rot    —— 顺时针 90° 步进（0..3），作用于裁剪后的画面。
+// ⚠ 参数顺序必须与 Kotlin 声明/调用**逐位一致**（JNI 按位置解析；见下面
+//   nativeEngineSubmitRaw 的注释：曾因顺序错位导致整帧参数全错、成片全黑）。
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_filmkit_app_EngineBridge_nativeEngineSubmitDisplay(JNIEnv* env, jobject,
-                                                            jobject rgba_buf,
-                                                            jint w, jint h,
-                                                            jdoubleArray film) {
+Java_com_filmkit_app_EngineBridge_nativeEngineSubmitDisplay(
+    JNIEnv* env, jobject, jobject rgba_buf, jint w, jint h, jint out_w,
+    jint out_h, jfloatArray crop_uv, jint crop_rot, jdoubleArray film) {
   FrameRenderer* r = g_renderer;
   if (!r) return nullptr;
   const FilmParams p = paramsFromJava(env, film);
+  float crop[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  const float* crop_p = nullptr;  // nullptr = 全幅（引擎内 origin=(0,0) size=(1,1)）
+  if (crop_uv != nullptr && env->GetArrayLength(crop_uv) >= 4) {
+    env->GetFloatArrayRegion(crop_uv, 0, 4, crop);
+    crop_p = crop;
+  }
   std::vector<uint8_t> rgba;
   const int64_t t0 = nowMs();
-  const bool ok = r->submitDisplay(env->GetDirectBufferAddress(rgba_buf), w, h, p,
-                                   &rgba);
+  const bool ok = r->submitDisplay(env->GetDirectBufferAddress(rgba_buf), w, h,
+                                   out_w, out_h, crop_p, crop_rot, p, &rgba);
   // 耗时/成败由调用侧记一条；生效性与下发参数值由引擎侧 render.style 记（诊断三件套）
   Logger::instance().log(
       LogLevel::kInfo, "camera", "render.display_done",
       "{\"kind\":\"rgba8\",\"ms\":" + std::to_string(nowMs() - t0) +
           ",\"ok\":" + (ok ? "true" : "false") +
+          ",\"inW\":" + std::to_string(w) + ",\"inH\":" + std::to_string(h) +
+          ",\"outW\":" + std::to_string(out_w) +
+          ",\"outH\":" + std::to_string(out_h) +
+          ",\"cropRot\":" + std::to_string(crop_rot) +
           ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
   return rgbaToJavaArray(env, rgba);

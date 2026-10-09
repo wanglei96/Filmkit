@@ -611,7 +611,16 @@ internal fun resetColorParams(p: DoubleArray) {
  * 任一侧为 null（首帧就绪前点取消 / 状态丢失）⇒ **不弹窗直接退出**：此时没有任何可丢的修改，
  * 弹窗只会挡住用户的退路。
  */
-internal fun discardNeedsConfirm(current: DoubleArray?, baseline: DoubleArray?): Boolean {
+internal fun discardNeedsConfirm(
+    current: DoubleArray?,
+    baseline: DoubleArray?,
+    /** E2-12：裁剪是否非全幅（裁剪**不在** FilmParams 里，见 [CropSpec] 的 KDoc） */
+    cropDirty: Boolean = false,
+): Boolean {
+    // ⚠ E2-12：裁剪是几何变换、不进 FilmParams ⇒ `paramsUnchanged` 看不见它。**必须**
+    // 在这里显式并进来，否则"只裁了图、没动参数"会被判成"无修改"：取消不弹确认、
+    // 导出还会走直通（把原片字节原样复制出去，裁剪被静默丢弃）。
+    if (cropDirty) return true
     if (current == null || baseline == null) return false
     return !paramsUnchanged(current, baseline)
 }
@@ -911,6 +920,259 @@ internal fun linearOutline(
         feather = featherUi.coerceIn(0f, 1f),
         linear = true, lineDx = -ndy, lineDy = ndx, half = half,
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E2-12 裁剪（ADR-16）：**几何变换**，与色彩参数无关 ⇒ 不进 FilmParams，走
+// submitDisplay 的独立参数通道（[CropSpec]）。交互坐标 = **旋转后画面**的归一化坐标
+// （用户看到的就是旋转后的画面，框在其中拖），提交前换算成"**原图** UV 子矩形 + rot"。
+// 全部纯函数 ⇒ JVM 单测覆盖（CropGeometryTest）。
+//
+// 为什么不直接在原图坐标里框：rot≠0 时用户看到的画面已经转了 90°，在原图坐标里拖动
+// 会出现"往右拖、框往上走"。这里让交互坐标跟着用户看到的画面走，只在提交那一刻做
+// 一次 90° 置换换算（[cropSpecOf]）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 裁剪比例锁定（工具栏那一行）。[ratio] 返回目标**像素**宽高比（宽/高），null = 不锁。
+ * 「原图」= 当前（旋转后）画面的比例 ⇒ 选它即"整幅不裁"。
+ */
+internal enum class CropAspect(val label: String) {
+    FREE("自由"),
+    SQUARE("1:1"),
+    R4_3("4:3"),
+    R3_4("3:4"),
+    R16_9("16:9"),
+    ORIGINAL("原图"),
+    ;
+
+    fun ratio(viewW: Int, viewH: Int): Float? = when (this) {
+        FREE -> null
+        SQUARE -> 1f
+        R4_3 -> 4f / 3f
+        R3_4 -> 3f / 4f
+        R16_9 -> 16f / 9f
+        ORIGINAL -> if (viewH > 0) viewW.toFloat() / viewH else 1f
+    }
+}
+
+/** 裁剪框（**旋转后画面**的归一化坐标：l/t = 左上角，w/h = 宽高，全 ∈ [0,1]）。 */
+internal data class CropView(
+    val l: Float = 0f,
+    val t: Float = 0f,
+    val w: Float = 1f,
+    val h: Float = 1f,
+    /** 顺时针 90° 步进（0..3）；旋转**画面**而框不动（用户看到图转了、框还在原处） */
+    val rot: Int = 0,
+) {
+    val r: Float get() = l + w
+    val b: Float get() = t + h
+
+    companion object {
+        /** 全幅（不裁剪、不旋转） */
+        val FULL = CropView()
+    }
+}
+
+/** 裁剪框的 8 个手柄（4 角 + 4 边） */
+internal enum class CropHandle { TL, T, TR, R, BR, B, BL, L }
+
+/** 旋转后画面的像素尺寸（rot 奇数 ⇒ 宽高交换）—— 比例锁定与最小尺寸的换算基准。 */
+internal fun cropViewSize(srcW: Int, srcH: Int, rot: Int): Pair<Int, Int> =
+    if (rot % 2 == 1) srcH to srcW else srcW to srcH
+
+/** 拖动移动：dx/dy = 屏幕位移 ÷ 画面显示尺寸（归一化）。夹紧在画面内（不越界）。 */
+internal fun cropViewMove(v: CropView, dx: Float, dy: Float): CropView {
+    val maxL = (1f - v.w).coerceAtLeast(0f)
+    val maxT = (1f - v.h).coerceAtLeast(0f)
+    return v.copy(l = (v.l + dx).coerceIn(0f, maxL), t = (v.t + dy).coerceIn(0f, maxT))
+}
+
+/**
+ * 以 (ax, ay) 为锚、按比例 k（w = k·h）放一个 w0 宽的框，并整体缩放到画面内。
+ * [growX]/[growY]：框相对锚点的生长方向（+1 = 右/下，−1 = 左/上，0 = 居中）。
+ */
+private fun cropAnchored(ax: Float, ay: Float, w0: Float, k: Float, growX: Int, growY: Int): CropView {
+    var w = w0.coerceAtLeast(1e-4f)
+    var h = w / k
+    val availW = when (growX) {
+        1 -> 1f - ax
+        -1 -> ax
+        else -> 2f * minOf(ax, 1f - ax)
+    }
+    val availH = when (growY) {
+        1 -> 1f - ay
+        -1 -> ay
+        else -> 2f * minOf(ay, 1f - ay)
+    }
+    val scale = minOf(1f, availW / w, availH / h)
+    w = (w * scale).coerceIn(0f, 1f)
+    h = (w / k).coerceIn(0f, 1f)
+    val l = when (growX) {
+        1 -> ax
+        -1 -> ax - w
+        else -> ax - w / 2f
+    }
+    val t = when (growY) {
+        1 -> ay
+        -1 -> ay - h
+        else -> ay - h / 2f
+    }
+    return CropView(l.coerceIn(0f, (1f - w).coerceAtLeast(0f)),
+        t.coerceIn(0f, (1f - h).coerceAtLeast(0f)), w, h)
+}
+
+/**
+ * 缩放手柄（拖动角/边）。[dx]/[dy] = 屏幕位移 ÷ 画面显示尺寸。
+ *
+ * 比例锁定时：角手柄以**对角**为锚、按位移较大的轴主导；边手柄以**对边**为锚、
+ * 另一个方向**居中生长**（这是主流修图 App 的手感）。[minPx] = 最小边长（像素）。
+ */
+internal fun cropViewScale(
+    v: CropView,
+    handle: CropHandle,
+    dx: Float,
+    dy: Float,
+    aspect: Float?,
+    viewW: Int,
+    viewH: Int,
+    minPx: Float = 32f,
+): CropView {
+    val minW = (minPx / maxOf(viewW, 1)).coerceAtMost(1f)
+    val minH = (minPx / maxOf(viewH, 1)).coerceAtMost(1f)
+    val left = handle == CropHandle.TL || handle == CropHandle.L || handle == CropHandle.BL
+    val right = handle == CropHandle.TR || handle == CropHandle.R || handle == CropHandle.BR
+    val top = handle == CropHandle.TL || handle == CropHandle.T || handle == CropHandle.TR
+    val bottom = handle == CropHandle.BL || handle == CropHandle.B || handle == CropHandle.BR
+    var l = v.l
+    var t = v.t
+    var r = v.r
+    var b = v.b
+    if (left) l = (l + dx).coerceIn(0f, r - minW)
+    if (right) r = (r + dx).coerceIn(l + minW, 1f)
+    if (top) t = (t + dy).coerceIn(0f, b - minH)
+    if (bottom) b = (b + dy).coerceIn(t + minH, 1f)
+    if (aspect == null) return CropView(l, t, r - l, b - t, v.rot)
+
+    // 归一化空间里的目标宽高比：像素比 = (w·viewW)/(h·viewH) ⇒ w/h = ratio·viewH/viewW
+    val k = aspect * maxOf(viewH, 1).toFloat() / maxOf(viewW, 1).toFloat()
+    if ((left || right) && (top || bottom)) {
+        val anchorX = if (left) r else l
+        val anchorY = if (top) b else t
+        val w0 = if (abs(dx) * viewW >= abs(dy) * viewH) (r - l) else (b - t) * k
+        return cropAnchored(anchorX, anchorY, maxOf(w0, minW), k,
+            if (left) -1 else 1, if (top) -1 else 1).copy(rot = v.rot)
+    }
+    if (left || right) {
+        return cropAnchored((l + r) / 2f, (t + b) / 2f, maxOf(r - l, minW), k, 0, 0)
+            .copy(rot = v.rot)
+    }
+    return cropAnchored((l + r) / 2f, (t + b) / 2f, maxOf((b - t) * k, minW), k, 0, 0)
+        .copy(rot = v.rot)
+}
+
+/** 切换比例锁定：保持中心，按新比例重排当前框（放不下则整体缩小）。 */
+internal fun cropViewWithAspect(v: CropView, aspect: Float?, viewW: Int, viewH: Int): CropView {
+    if (aspect == null) return v
+    val k = aspect * maxOf(viewH, 1).toFloat() / maxOf(viewW, 1).toFloat()
+    var w = v.w.coerceIn(1e-4f, 1f)
+    var h = w / k
+    if (h > 1f) {
+        h = 1f
+        w = h * k
+    }
+    w = w.coerceAtMost(1f)
+    val cx = (v.l + v.r) / 2f
+    val cy = (v.t + v.b) / 2f
+    return CropView(
+        (cx - w / 2f).coerceIn(0f, (1f - w).coerceAtLeast(0f)),
+        (cy - h / 2f).coerceIn(0f, (1f - h).coerceAtLeast(0f)),
+        w, h, v.rot,
+    )
+}
+
+/** 旋转 90°：只改 [CropView.rot]，框不动（画面转、框不转）。 */
+internal fun cropViewRotate(v: CropView): CropView = v.copy(rot = (v.rot + 1) % 4)
+
+/**
+ * 裁剪框（旋转后画面归一化）→ 引擎入参 [CropSpec]（**原图** UV 子矩形 + rot）。
+ *
+ * 推导：输出坐标 o → 原图 UV 的映射是 `origin + R(o)·size`，其中 R 是 kFsStyle 的
+ * `cropUV` 用的那个 90° 置换。R 作用在矩形上仍是矩形 ⇒ 只需换算四个边界。
+ */
+internal fun cropSpecOf(v: CropView, srcW: Int, srcH: Int): CropSpec {
+    val l = v.l.coerceIn(0f, 1f)
+    val t = v.t.coerceIn(0f, 1f)
+    val w = v.w.coerceIn(0f, 1f - l)
+    val h = v.h.coerceIn(0f, 1f - t)
+    return when (((v.rot % 4) + 4) % 4) {
+        1 -> CropSpec(t, 1f - l - w, h, w, 1)
+        2 -> CropSpec(1f - l - w, 1f - t - h, w, h, 2)
+        3 -> CropSpec(1f - t - h, l, h, w, 3)
+        else -> CropSpec(l, t, w, h, 0)
+    }
+}
+
+/** [cropSpecOf] 的逆：已确认的裁剪 → 再次进入裁剪模式时的初始草稿框。 */
+internal fun cropViewOf(spec: CropSpec): CropView = when (((spec.rot % 4) + 4) % 4) {
+    1 -> CropView(1f - spec.y0 - spec.ch, spec.x0, spec.ch, spec.cw, 1)
+    2 -> CropView(1f - spec.x0 - spec.cw, 1f - spec.y0 - spec.ch, spec.cw, spec.ch, 2)
+    3 -> CropView(spec.y0, 1f - spec.x0 - spec.cw, spec.ch, spec.cw, 3)
+    else -> CropView(spec.x0, spec.y0, spec.cw, spec.ch, 0)
+}
+
+/** 裁剪框在屏幕上的矩形（[fit] = **旋转后画面**的 Fit 显示矩形，见 [imageFitRect]）。 */
+internal fun cropScreenRect(v: CropView, fit: ImageFitRect): ImageFitRect = ImageFitRect(
+    fit.left + v.l * fit.width,
+    fit.top + v.t * fit.height,
+    v.w * fit.width,
+    v.h * fit.height,
+)
+
+/** 8 个手柄的屏幕坐标（顺序与 [CropHandle] 一致；框太小时手柄会重叠，属可接受）。 */
+internal fun cropHandlePoints(v: CropView, fit: ImageFitRect): List<Pair<Float, Float>> {
+    val s = cropScreenRect(v, fit)
+    val cx = s.left + s.width / 2f
+    val cy = s.top + s.height / 2f
+    val r = s.left + s.width
+    val b = s.top + s.height
+    return listOf(
+        s.left to s.top, cx to s.top, r to s.top,
+        r to cy,
+        r to b, cx to b, s.left to b,
+        s.left to cy,
+    )
+}
+
+/**
+ * 命中测试：触摸点落在哪个手柄上（距离 ≤ [touchPx]，取最近的一个）。
+ * null = 不在任何手柄上（调用方按"框内拖动 / 框外忽略"处理）。
+ */
+internal fun cropHitHandle(
+    v: CropView,
+    fit: ImageFitRect,
+    x: Float,
+    y: Float,
+    touchPx: Float,
+): CropHandle? {
+    val pts = cropHandlePoints(v, fit)
+    var best: CropHandle? = null
+    var bestD = touchPx * touchPx
+    CropHandle.entries.forEachIndexed { i, h ->
+        val (px, py) = pts[i]
+        val d = (px - x) * (px - x) + (py - y) * (py - y)
+        if (d <= bestD) {
+            bestD = d
+            best = h
+        }
+    }
+    return best
+}
+
+/** 触摸点是否在裁剪框内（框内拖动 = 移动整个框） */
+internal fun cropInside(v: CropView, fit: ImageFitRect, x: Float, y: Float): Boolean {
+    val s = cropScreenRect(v, fit)
+    return x >= s.left && x <= s.left + s.width && y >= s.top && y <= s.top + s.height
 }
 
 /** 另存文件名：`FILMKIT_20261008-213000_edit.jpg`（同拍摄链路的命名规则，`_edit` 区分原片） */

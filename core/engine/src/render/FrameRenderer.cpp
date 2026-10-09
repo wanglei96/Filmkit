@@ -4688,6 +4688,25 @@ uniform highp sampler2D uTex;
 uniform float uSeed;        // 颗粒种子（外部固定 ⇒ 可复现；不随帧计数变化）
 uniform float uGrainAmount;
 uniform float uGrainSize;
+// ── E2-12 裁剪 + 90° 步进旋转（ADR-16）：**引擎输入侧的 UV 子矩形** ──────────
+// 所有对 uTex 的采样都经 cropUV() 映射；**后续处理（暗角 / 局部调整 / LUT /
+// 颗粒）一律继续用 vUV0**（= 裁剪后的归一化坐标，仍覆盖 [0,1]）⇒ 暗角自动
+// 相对裁剪后画面居中、局部调整中心自动落在用户拖的位置。
+// ⚠ 这就是"裁剪必须在引擎输入侧做"的原因：若改为最后裁输出位图，暗角会跑到
+//   画面外、局部调整中心会偏（ADR-14 裁决 3 / ADR-16）。
+// 不裁剪 + rot=0 ⇒ origin=(0,0)、size=(1,1) ⇒ `0.0 + o × 1.0` 逐位恒等（零回归）。
+uniform vec2 uCropOrigin;   // 裁剪矩形原点（原图归一化 UV；y 与 Bitmap 行序同向）
+uniform vec2 uCropSize;     // 裁剪矩形尺寸（原图归一化 UV）
+uniform float uCropRot;     // 顺时针 90° 步进（0..3），作用于裁剪后的画面
+// 输出坐标 o（= vUV0，裁剪后归一化）→ 原图 UV。旋转 = 逆映射：rot=1 时
+// 源左上 → 输出右上 ⇒ o=(0,0) 取源 (0,1)（左列底端）。四路都是纯仿射
+//（无循环 / 无数组 / 无宏 ⇒ 符合 GLSL 三禁，ADR §6.1）。
+vec2 cropUV(vec2 o) {
+    if (uCropRot > 2.5) return uCropOrigin + vec2(1.0 - o.y, o.x) * uCropSize;
+    if (uCropRot > 1.5) return uCropOrigin + vec2(1.0 - o.x, 1.0 - o.y) * uCropSize;
+    if (uCropRot > 0.5) return uCropOrigin + vec2(o.y, 1.0 - o.x) * uCropSize;
+    return uCropOrigin + o * uCropSize;
+}
 // ── M4 3D LUT（display 域）——与 kFsOut 同款，四面体插值
 uniform highp sampler3D uLut;
 uniform float uLutOn;
@@ -4790,27 +4809,31 @@ vec3 srgbEncode(vec3 c) {
 // GLSL ES 无数组初始化器，且"循环内动态索引"在 Mali 上**静默失败**（ADR §6.1）
 // ⇒ 不写循环、不用数组、不把数组当函数参数。对称环 ⇒ 平坦区与一阶梯度区的
 // 环均值 = 中心值（清晰度在无细节处无副作用）。
+// E2-12：uv 是**裁剪后**坐标（与 vUV0 同系），环偏移 uClarStep 也按输出尺寸标定
+// ⇒ 每个 tap 先 `uv + 偏移` 再经 cropUV 映射到原图。**必须逐 tap 映射**（不能只在
+// 中心映射一次）：旋转下"裁剪坐标 → 原图 UV"会置换轴，只映射中心会让 16 个 tap
+// 采到错误的方位（旋转 90° 后清晰度环变成沿对角线）。
 float blurLuma16(vec2 uv) {
     vec2 d1 = uClarStep;
     vec2 d2 = uClarStep * 2.0;
     vec3 w = vec3(0.299, 0.587, 0.114);
     float lb = 0.0;
-    lb += dot(texture(uTex, uv + vec2( d1.x, 0.0)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d1.x, 0.0)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(0.0,  d1.y)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(0.0, -d1.y)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2( d1.x,  d1.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d1.x,  d1.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2( d1.x, -d1.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d1.x, -d1.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2( d2.x, 0.0)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d2.x, 0.0)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(0.0,  d2.y)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(0.0, -d2.y)).rgb, w);
-    lb += dot(texture(uTex, uv + vec2( d2.x,  d2.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d2.x,  d2.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2( d2.x, -d2.y) * 0.70710678).rgb, w);
-    lb += dot(texture(uTex, uv + vec2(-d2.x, -d2.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d1.x, 0.0))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d1.x, 0.0))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(0.0,  d1.y))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(0.0, -d1.y))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d1.x,  d1.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d1.x,  d1.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d1.x, -d1.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d1.x, -d1.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d2.x, 0.0))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d2.x, 0.0))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(0.0,  d2.y))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(0.0, -d2.y))).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d2.x,  d2.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d2.x,  d2.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2( d2.x, -d2.y) * 0.70710678)).rgb, w);
+    lb += dot(texture(uTex, cropUV(uv + vec2(-d2.x, -d2.y) * 0.70710678)).rgb, w);
     return lb * 0.0625;
 }
 // 把 blur 基准（未调整的显示域 luma）提升到与中心 c 同域：曝光/WB 是逐通道乘性
@@ -4869,7 +4892,7 @@ float vnoise(vec2 p) {
 }
 void main() {
     // 显示域直取：不 decode、不 encode（ADR-7）
-    vec3 c = texture(uTex, vUV0).rgb;
+    vec3 c = texture(uTex, cropUV(vUV0)).rgb;
     // ── E2-6 局部 mask（纯算术）────────────────────────────────────────────
     // uLocalOn 由 CPU 侧算（type>0 且 ev≠0 或 sat≠1）⇒ 默认（[79]=0）时 m 恒 0，
     // 下面的局部段与门控全部短路 ⇒ 输出逐位不变（零回归 / A/B 开关 = [79]）。
@@ -6328,6 +6351,10 @@ bool FrameRenderer::init() {
   u_style_.seed = glGetUniformLocation(prog_style_, "uSeed");
   u_style_.grain_amount = glGetUniformLocation(prog_style_, "uGrainAmount");
   u_style_.grain_size = glGetUniformLocation(prog_style_, "uGrainSize");
+  // E2-12 裁剪 + 90° 步进旋转（ADR-16）
+  u_style_.crop_origin = glGetUniformLocation(prog_style_, "uCropOrigin");
+  u_style_.crop_size = glGetUniformLocation(prog_style_, "uCropSize");
+  u_style_.crop_rot = glGetUniformLocation(prog_style_, "uCropRot");
   u_style_.lut = glGetUniformLocation(prog_style_, "uLut");
   u_style_.lut_on = glGetUniformLocation(prog_style_, "uLutOn");
   u_style_.lut_strength = glGetUniformLocation(prog_style_, "uLutStrength");
@@ -7009,11 +7036,18 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
 //   的 ②），本通路不经 kFsStill，加了反而上下颠倒。
 // 只依赖 still_tex_ + fbo_cap_：**不调 ensureTargets** —— 那条路会分配两张全分辨率
 // RGBA16F（4080×3072 ≈ 400MB），而本 pass 一个中间纹理都不需要（报告 U7 内存红线）。
-bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
-                                  const FilmParams& p,
+bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
+                                  int out_h, const float crop_uv[4],
+                                  int crop_rot, const FilmParams& p,
                                   std::vector<uint8_t>* out_rgba) {
   const bool prog_ok = prog_style_ != 0;
   bool ran = false;
+  // E2-12：输出尺寸缺省（≤0）⇒ 与输入同尺寸（不裁剪）。w/h 始终 = 输入位图尺寸，
+  // out_w/out_h = 输出尺寸（裁剪改变宽高比时二者不同，由 Kotlin 侧算好）。
+  if (out_w <= 0 || out_h <= 0) {
+    out_w = w;
+    out_h = h;
+  }
   // ── E1-5（2026-10-08 P0「真机编辑器打开全黑」）诊断 ──────────────────────
   // 真机机会宝贵 ⇒ 一次运行必须能定位到**哪一环**断：
   //   输入就黑            ⇒ Kotlin 上传侧（Bitmap→direct buffer）
@@ -7025,7 +7059,8 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
   int tex_new = 0, tex_ifmt = 0, cap_ifmt = 0, tex_w = -1, tex_h = -1;
   GLenum e_tex = 0, e_sub = 0, e_fbo = 0, e_pass = 0, e_read = 0;
   GLenum fb_status = 0;
-  if (rgba8 != nullptr && w > 0 && h > 0 && out_rgba != nullptr) {
+  if (rgba8 != nullptr && w > 0 && h > 0 && out_w > 0 && out_h > 0 &&
+      out_rgba != nullptr) {
     const auto* px = static_cast<const uint8_t*>(rgba8);
     const size_t n = static_cast<size_t>(w) * h;
     const size_t step = n > 4096 ? n / 4096 : 1;
@@ -7038,7 +7073,8 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
     in_mean = cnt ? static_cast<int>(sum / static_cast<int64_t>(cnt)) : -1;
     in_p0 = px[0];
   }
-  if (prog_ok && rgba8 != nullptr && out_rgba != nullptr && w > 0 && h > 0) {
+  if (prog_ok && rgba8 != nullptr && out_rgba != nullptr && w > 0 && h > 0 &&
+      out_w > 0 && out_h > 0) {
     while (glGetError() != GL_NO_ERROR) {
     }  // 入口清队列：下面各步的错误码才能归属本函数
     // 输入纹理：**编辑器自己的 RGBA8 纹理**（E1-5 修复，原复用 still_tex_）。
@@ -7078,16 +7114,17 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
     e_sub = glGetError();  // 上传后（① 的直接判据：非 0 ⇒ 驱动拒绝了这次上传）
 
     // 输出目标：显示域 RGBA8（与成片同格式；dither 在 8bit 量化前生效）
-    if (cap_w_ != w || cap_h_ != h) {
+    // E2-12：**输出**尺寸（裁剪后）—— 与输入纹理尺寸解耦；不裁剪时两者相同。
+    if (cap_w_ != out_w || cap_h_ != out_h) {
       if (tex_cap_) {
         glDeleteTextures(1, &tex_cap_);
         glDeleteFramebuffers(1, &fbo_cap_);
       }
       tex_cap_ = fbo_cap_ = 0;
       // @domain: D5 —— 编辑器输出（OETF 后显示域，LUT/颗粒/dither 之后）
-      makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, w, h);
-      cap_w_ = w;
-      cap_h_ = h;
+      makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, out_w, out_h);
+      cap_w_ = out_w;
+      cap_h_ = out_h;
     }
     // FBO 不完整时 draw 被驱动静默丢弃（X300 实测：RGBA8 + HALF_FLOAT 非法组合
     // ⇒ 输出全黑且 glErr=0），必须显式查一次
@@ -7102,19 +7139,20 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
     if (fb_status == GL_FRAMEBUFFER_COMPLETE) {
       while (glGetError() != GL_NO_ERROR) {
       }
-      passStyle(w, h, p);
+      passStyle(out_w, out_h, crop_uv, crop_rot, p);
       // ⚠ 必须在 logPassDiag 之前取：它内部会消费掉错误码
       e_pass = glGetError();
       logPassDiag("style", fbo_cap_, false);
-      out_rgba->resize(static_cast<size_t>(w) * h * 4);
-      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
+      out_rgba->resize(static_cast<size_t>(out_w) * out_h * 4);
+      glReadPixels(0, 0, out_w, out_h, GL_RGBA, GL_UNSIGNED_BYTE,
+                   out_rgba->data());
       e_read = glGetError();
       // 输出统计：readback 失败时 resize 的零填充会让输出看起来"全黑" ⇒ 与
       // "draw 真的产出黑"必须靠 eRead / ePass 与 logPassDiag 的 (0,0) 像素交叉判读
       // （outP0 与 render.diag 的 r 同位置：glReadPixels 第 0 行第 0 列）。
       {
         const auto* op = out_rgba->data();
-        const size_t on = static_cast<size_t>(w) * h;
+        const size_t on = static_cast<size_t>(out_w) * out_h;
         const size_t ostep = on > 4096 ? on / 4096 : 1;
         int64_t osum = 0;
         size_t ocnt = 0;
@@ -7131,7 +7169,9 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
       Logger::instance().log(
           LogLevel::kError, "engine", "render.fbo_incomplete",
           "{\"stage\":\"style\",\"w\":" + std::to_string(w) +
-              ",\"h\":" + std::to_string(h) + "}");
+              ",\"h\":" + std::to_string(h) +
+              ",\"outW\":" + std::to_string(out_w) +
+              ",\"outH\":" + std::to_string(out_h) + "}");
     }
   }
   // ── E1-5（2026-10-08 P0「真机编辑器打开全黑」）一次定位诊断 ────────────────
@@ -7159,7 +7199,17 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
   kv_diag += ",\"eRead\":" + std::to_string(e_read);
   kv_diag += ",\"outMean\":" + std::to_string(out_mean);
   kv_diag += ",\"outP0\":" + std::to_string(out_p0);
-  kv_diag += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
+  kv_diag += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h);
+  // E2-12：输出尺寸 + 裁剪矩形 + 旋转（真机核对"裁剪是否真的进了引擎"）
+  kv_diag += ",\"outW\":" + std::to_string(out_w) + ",\"outH\":" +
+             std::to_string(out_h);
+  kv_diag += ",\"cropRot\":" + std::to_string(crop_rot);
+  kv_diag += ",\"crop\":[";
+  for (int ci = 0; ci < 4; ++ci) {
+    kv_diag += jnum(crop_uv ? crop_uv[ci] : (ci < 2 ? 0.0f : 1.0f), 5);
+    kv_diag += ci < 3 ? "," : "]";
+  }
+  kv_diag += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "render.style_diag", kv_diag);
 
   // 诊断三件套（ADR §6.2）：shader 是否链接成功 / 本帧是否真的执行 / 下发参数值。
@@ -12214,7 +12264,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
 // E1-3 编辑器通路：显示域输入（edit_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
 // 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
 // 颗粒种子固定为 0 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
-void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
+void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
+                              int crop_rot, const FilmParams& p) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_style_);
@@ -12224,6 +12275,19 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   glUniform1f(u_style_.seed, 0.0f);
   glUniform1f(u_style_.grain_amount, p.grain_amount);
   glUniform1f(u_style_.grain_size, p.grain_size);
+  // ── E2-12 裁剪 + 90° 步进旋转（ADR-16；几何变换，不占 FilmParams 槽位）──────
+  // nullptr = 全幅：origin=(0,0)、size=(1,1)、rot=0 ⇒ shader 内 cropUV 恒等
+  //（`0.0 + o × 1.0` 在 IEEE 下逐位精确）⇒ 不裁剪时输出与改动前逐位一致（零回归）。
+  // ⚠ 本函数的 w/h 是**输出**尺寸（裁剪后）：暗角尺度 uVigScaleXY 与清晰度环半径
+  //   uClarStep 都由它标定 ⇒ 裁剪后暗角自动相对裁剪后画面居中、清晰度环仍是
+  //   "输出图像短边的 0.5%"（这正是"裁剪在引擎输入侧做"的收益，ADR-16）。
+  const float crop_x0 = crop_uv ? crop_uv[0] : 0.0f;
+  const float crop_y0 = crop_uv ? crop_uv[1] : 0.0f;
+  const float crop_cw = crop_uv ? crop_uv[2] : 1.0f;
+  const float crop_ch = crop_uv ? crop_uv[3] : 1.0f;
+  glUniform2f(u_style_.crop_origin, crop_x0, crop_y0);
+  glUniform2f(u_style_.crop_size, crop_cw, crop_ch);
+  glUniform1f(u_style_.crop_rot, static_cast<float>(crop_rot));
   // ── E2-2 基础调整（ADR §5.6；域约定见 kFsStyle 注释）─────────────────────
   // 门控一律在 CPU 侧算 ⇒ 默认（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0）
   // 时 shader 内**整段跳过**，输出逐位不变（零回归 / A/B 开关 = 这五个默认值）。

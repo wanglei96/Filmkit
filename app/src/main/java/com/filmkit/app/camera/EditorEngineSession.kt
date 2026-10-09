@@ -77,6 +77,7 @@ internal class EditorEngineSession {
         val w: Int,
         val h: Int,
         val film: DoubleArray,
+        val crop: CropSpec,
         val onDone: (Bitmap?) -> Unit,
     )
 
@@ -159,9 +160,10 @@ internal class EditorEngineSession {
      * [onDone] 在**主线程**回调（null = 渲染失败/被关闭丢弃）。
      */
     fun requestPreview(
-        rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray, onDone: (Bitmap?) -> Unit,
+        rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray,
+        crop: CropSpec = CropSpec.FULL, onDone: (Bitmap?) -> Unit,
     ) {
-        pending.set(Request(rgba, w, h, film, onDone))
+        pending.set(Request(rgba, w, h, film, crop, onDone))
         schedule()
     }
 
@@ -173,14 +175,15 @@ internal class EditorEngineSession {
      * [onDone] 在**主线程**回调（null = 渲染失败）。
      */
     fun requestFull(
-        rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray, onDone: (Bitmap?) -> Unit,
+        rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray,
+        crop: CropSpec = CropSpec.FULL, onDone: (Bitmap?) -> Unit,
     ) {
         if (!started) {
             postMain { onDone(null) }
             return
         }
         render.post {
-            val out = submit(rgba, w, h, film)
+            val out = submit(rgba, w, h, film, crop)
             postMain { onDone(out) }
         }
     }
@@ -218,7 +221,7 @@ internal class EditorEngineSession {
     private fun drain() {
         while (true) {
             val r = pending.getAndSet(null) ?: break
-            val out = submit(r.rgba, r.w, r.h, r.film)
+            val out = submit(r.rgba, r.w, r.h, r.film, r.crop)
             postMain { r.onDone(out) }
         }
         scheduled.set(false)
@@ -228,9 +231,16 @@ internal class EditorEngineSession {
     }
 
     /** 渲染线程：一次提交 + 读回转 Bitmap（失败返回 null，引擎侧已记 render.style） */
-    private fun submit(rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray): Bitmap? {
+    private fun submit(
+        rgba: ByteBuffer, w: Int, h: Int, film: DoubleArray, crop: CropSpec,
+    ): Bitmap? {
+        // E2-12：裁剪只改**输出**尺寸（输入纹理仍是整幅位图）；不裁剪时 == (w, h)
+        val (outW, outH) = crop.outputSize(w, h)
         val bytes = try {
-            EngineBridge.nativeEngineSubmitDisplay(rgba, w, h, film)
+            EngineBridge.nativeEngineSubmitDisplay(
+                rgba, w, h, outW, outH, crop.uvOrNull(), crop.rot,
+                film,
+            )
         } catch (t: Throwable) {
             // UnsatisfiedLinkError / 引擎内部异常都算失败：宁可显示原图，不许崩
             EngineBridge.nativeAppendLog(
@@ -239,11 +249,11 @@ internal class EditorEngineSession {
             )
             null
         } ?: return null
-        if (bytes.size < w * h * 4) return null
+        if (bytes.size < outW * outH * 4) return null
         return try {
             // 输出是显示域 RGBA8（顶行在前，与输入同序）—— 直接按 ARGB_8888 的内存
             // 布局（R,G,B,A）灌进去，不做任何翻转/转换（ADR-7：不插 OETF/EOTF）
-            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888).apply {
                 copyPixelsFromBuffer(ByteBuffer.wrap(bytes))
             }
         } catch (t: Throwable) {
@@ -251,7 +261,7 @@ internal class EditorEngineSession {
             // 原图、导出不动原片（调用方各自处理）
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "engine", "editor.bitmap_failed",
-                kv("error" to (t.message ?: t.toString()), "w" to w, "h" to h),
+                kv("error" to (t.message ?: t.toString()), "w" to outW, "h" to outH),
             )
             null
         }
@@ -264,5 +274,47 @@ internal class EditorEngineSession {
     private companion object {
         /** EGL window surface 的载体尺寸（不 swap ⇒ 不产生像素分配，尺寸无关紧要） */
         const val WIN_SIZE = 64
+    }
+}
+
+/**
+ * E2-12 裁剪参数（ADR-16）：**几何变换**，与色彩参数无关 ⇒ **不进 `FilmParams`**
+ * 契约（避免为几何量再扩一次契约），走 [EditorEngineSession] 的独立参数通道。
+ *
+ * [x0]/[y0]/[cw]/[ch] = **原图**归一化 UV 子矩形（原点左上、y 与 Bitmap 行序同向
+ * = 与 UI 裁剪框同向）；[rot] = 顺时针 90° 步进（0..3），作用于**裁剪后**的画面。
+ *
+ * ⚠ 与直通（E2-9 `paramsUnchanged`）的交互：直通比的是 **FilmParams 数组** ⇒ 裁剪
+ * 不在比较范围内。**调用方必须显式把"非全幅裁剪"当作"有修改"**（`!isFull`），否则
+ * 裁了图却走直通 = 导出原片字节（裁剪被静默丢弃）。见 EditorScreen 的 `dirty` 推导。
+ */
+internal data class CropSpec(
+    val x0: Float = 0f,
+    val y0: Float = 0f,
+    val cw: Float = 1f,
+    val ch: Float = 1f,
+    val rot: Int = 0,
+) {
+    /** 全幅（不裁剪 + 不旋转）⇒ 引擎走恒等 UV 变换（输出与输入 max|Δ| ≤ 1 LSB） */
+    val isFull: Boolean
+        get() = rot == 0 && x0 == 0f && y0 == 0f && cw == 1f && ch == 1f
+
+    /**
+     * 输出尺寸（ADR-16）：按裁剪矩形的**像素**尺寸算，旋转奇数步则交换宽高。
+     * 4080×3072 裁中间 50% ⇒ 2040×1536；再转 90° ⇒ 1536×2040。
+     */
+    fun outputSize(srcW: Int, srcH: Int): Pair<Int, Int> {
+        val pw = Math.round(cw * srcW).coerceIn(1, maxOf(srcW, 1))
+        val ph = Math.round(ch * srcH).coerceIn(1, maxOf(srcH, 1))
+        return if (rot % 2 == 1) ph to pw else pw to ph
+    }
+
+    /** JNI 入参：全幅传 null（引擎侧 nullptr = origin(0,0) / size(1,1) / rot 0） */
+    fun uvOrNull(): FloatArray? =
+        if (isFull) null else floatArrayOf(x0, y0, cw, ch)
+
+    companion object {
+        /** 不裁剪（默认）：零回归路径 */
+        val FULL = CropSpec()
     }
 }

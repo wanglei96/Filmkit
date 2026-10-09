@@ -66,6 +66,19 @@
   ⑭f 色温与 [1..3] 是**相乘**（同属线性域增益、并入同一次往返）而不是覆盖；含
      "覆盖 WB"的区分度对照。
 
+  E2-12（裁剪 + 90° 步进旋转，ADR-16）新增：
+  ⑮a 不裁剪零回归：crop=(0,0,1,1) + rot=0 ⇒ 输出与输入 max|Δ| ≤ 1 LSB。与 ① 同口径，
+     但**显式列出裁剪参数的默认值** —— E2-12 之后 shader 里多了一次 `origin + o×size`
+     的乘加，① 不再覆盖"裁剪是否真的恒等"。
+  ⑮b **裁剪后暗角仍相对画面居中**（ADR-16 的头号验收项）：纯灰输入 + 暗角，裁中间 50%
+     ⇒ 衰减只由**输出**坐标（vUV0）与**输出**尺寸决定，与解析式逐点相符。含区分度
+     对照：若暗角误按"源图坐标 + 源图尺寸"算（= 最后裁输出位图的写法），裁剪后画面的
+     角落会落在源图中心附近 ⇒ 衰减几乎为 0，差异 100+ LSB。
+  ⑮c 90° 步进旋转：4 个方向的画面朝向正确（源左上 → rot=1 时输出**右上**）+ 输出尺寸
+     按旋转交换（非方形画幅）。
+  ⑮d 裁剪后局部调整中心仍在**用户拖的位置**：非对称裁剪 + 局部中心 (0.5,0.5) ⇒ 输出
+     画面中心仍是最暗点（引擎里 localMask 用 vUV0 = 裁剪后坐标）。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
@@ -134,6 +147,27 @@ def vig_uniforms(w, h, strength, radius, feather):
         'uVigFscale': max(feather, 100.0 / vmin) / 100.0,
         'uVigBrightness': min(max(strength, -1.0), 0.0),
     }
+
+
+def vig_falloff_np(w, h, strength, radius, feather, uv0=(0.0, 0.0), uv1=(1.0, 1.0)):
+    """kFsStyle 暗角段的 numpy 直译（与 [vig_uniforms] 同式）。
+
+    w/h = **输出**尺寸（uVigScaleXY 的基准）；uv0/uv1 = 该像素在**源图**里的归一化范围
+    （默认全幅 = 不裁剪）。E2-12 的 ⑮b 用它做两件事：
+      · 正确实现 ⇒ uv 就是输出坐标（vUV0 覆盖 [0,1]）⇒ 裁剪后暗角仍相对画面居中；
+      · 区分度对照 ⇒ 传源图子矩形（"先全幅渲染、最后裁输出位图"的模型）⇒ 数值显著不同。
+    """
+    y, x = np.mgrid[0:h, 0:w]
+    u = uv0[0] + (x + 0.5) / w * (uv1[0] - uv0[0])
+    v = uv0[1] + (y + 0.5) / h * (uv1[1] - uv0[1])
+    vmax, vmin = float(max(w, h)), float(min(w, h))
+    cplen = np.hypot((w / vmax) * np.abs(2.0 * u - 1.0),
+                     (h / vmax) * np.abs(2.0 * v - 1.0))
+    dscale = min(max(radius, 0.0), 200.0) / 100.0
+    fscale = max(feather, 100.0 / vmin) / 100.0
+    vw = np.clip((cplen - dscale) / fscale, 0.0, 1.0)
+    vw = 0.5 - 0.5 * np.cos(np.pi * vw)
+    return 1.0 + vw * min(max(strength, -1.0), 0.0)
 
 
 def grey_input(w, h, v=180):
@@ -229,7 +263,8 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
                    local_radius=0.35, local_feather=0.5, local_angle=0.0,
                    local_width=0.25, local_ev=0.0, local_sat=1.0,
                    temp_mired=0.0, tint=0.0, highlights=0.0, shadows=0.0,
-                   whites=0.0, blacks=0.0, fade=0.0):
+                   whites=0.0, blacks=0.0, fade=0.0,
+                   crop=(0.0, 0.0, 1.0, 1.0), crop_rot=0):
     """E2-2 基础调整 + E2-6 局部调整的 CPU 侧下发值（**与 FrameRenderer::passStyle
     同式**，含门控）。
 
@@ -237,6 +272,10 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
     local_type=0、[88..94]=0）时 shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时
     验收 CPU 侧的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on；
     E2-7 的 radius 拆分；E2-11 的色温/色调并入 uWbGain + 影调分区门控）。
+
+    ⚠ w/h 是**输出**尺寸（E2-12 起 passStyle 的入参 = 裁剪后的尺寸）：uClarStep 与
+    uLocalRadius 的正圆拆分都由它标定 —— 这正是"裁剪后暗角/局部仍正确"的一半原因
+    （另一半是 shader 内一律用 vUV0 当坐标基准）。
     """
     radial = 0.5 <= local_type < 1.5
     linear = local_type >= 1.5
@@ -284,12 +323,29 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         'uBlacks': float(blacks),
         'uFade': float(fade),
         'uToneOn': 1.0 if tone_on else 0.0,
+        # E2-12 裁剪 + 90° 步进旋转（passStyle 同式）：nullptr/全幅 ⇒ (0,0)/(1,1)/0
+        # ⇒ shader 内 cropUV 逐位恒等（`0.0 + o × 1.0`）。
+        'uCropOrigin': (float(crop[0]), float(crop[1])),
+        'uCropSize': (float(crop[2]), float(crop[3])),
+        'uCropRot': float(crop_rot),
     }
 
 
+def crop_out_size(w, h, crop, crop_rot):
+    """E2-12 输出尺寸：裁剪矩形的**像素**尺寸 + 旋转交换（与 Kotlin 的
+    `CropSpec.outputSize` 同式；4080×3072 裁中间 50% ⇒ 2040×1536，再转 90° ⇒ 1536×2040）。"""
+    pw = max(1, int(round(crop[2] * w)))
+    ph = max(1, int(round(crop[3] * h)))
+    return (ph, pw) if crop_rot % 2 == 1 else (pw, ph)
+
+
 def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
-              grain, seed=0.0, vig=(0.0, 80.0, 50.0), adj=None):
+              grain, seed=0.0, vig=(0.0, 80.0, 50.0), adj=None,
+              crop=(0.0, 0.0, 1.0, 1.0), crop_rot=0):
     h, w = inp.shape[:2]
+    # E2-12：输出尺寸 = 裁剪矩形（+ 旋转交换）。暗角尺度、清晰度环半径、局部半径拆分
+    # 全部按**输出**尺寸下发 —— 与 FrameRenderer::passStyle 的 w/h 语义一致。
+    out_w, out_h = crop_out_size(w, h, crop, crop_rot)
     # 归一化 RGB 纹理 ≈ 真机 still_tex_（GL_RGB8：上传 8bit，采样得 v/255）；
     # float16 存 v/255 的量化误差 ≤ 0.13 LSB，不影响 ±1 LSB 判定
     tex = gl.ctx.texture((w, h), 3, dtype='f2')
@@ -301,11 +357,13 @@ def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
         'uLutDomainMin': (0.0, 0.0, 0.0), 'uLutDomainInv': (1.0, 1.0, 1.0),
         'uLutSize': float(lut_size),
     }
-    uni.update(vig_uniforms(w, h, *vig))
-    uni.update(style_uniforms(w, h, **(adj or {})))
-    # size=(w, h) 必传：不传则用执行器初始化时的方形 FBO ⇒ **非方形画幅会被静默裁成
-    # 正方形**（⑬h 正圆修正就靠非方形画幅，这里不传等于把判据变成空转）。
-    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex}, size=(w, h))
+    uni.update(vig_uniforms(out_w, out_h, *vig))
+    uni.update(style_uniforms(out_w, out_h, **(adj or {}),
+                              crop=crop, crop_rot=crop_rot))
+    # size=(out_w, out_h) 必传：不传则用执行器初始化时的方形 FBO ⇒ **非方形画幅会被静默
+    # 裁成正方形**（⑬h 正圆修正就靠非方形画幅，这里不传等于把判据变成空转）。
+    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex},
+                 size=(out_w, out_h))
     tex.release()
     return out
 
@@ -1063,6 +1121,107 @@ def main():
           f'max|Δ| = {d_cov:.1f} LSB（须 >3）')
     if d14f > 3.0 or d_cov <= 3.0:
         fails.append('⑭f 色温×WB 相乘')
+
+    # ── E2-12 裁剪 + 90° 步进旋转（ADR-16）──────────────────────────────────
+    full = (0.0, 0.0, 1.0, 1.0)
+
+    # ⑮a 不裁剪（默认全幅）零回归：crop=(0,0,1,1) + rot=0 ⇒ 输出与输入 max|Δ| ≤ 1 LSB。
+    o15a = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, crop=full, crop_rot=0)
+    d15a = np.abs(quant(o15a, inp.shape) - inp.astype(np.float64))
+    print(f'⑮a 不裁剪零回归（crop=(0,0,1,1) rot=0，LUT/颗粒关）：max|Δ| = '
+          f'{d15a.max():.0f} LSB, >1LSB 像素 = {(d15a > 1).sum()}/{d15a.size}'
+          f'（判据 ≤1）')
+    if d15a.max() > 1.0:
+        fails.append('⑮a 不裁剪零回归')
+
+    # ⑮b 裁剪后暗角仍相对画面居中（ADR-16 头号验收项）
+    vig15 = (-0.8, 80.0, 50.0)
+    crop15 = (0.25, 0.25, 0.5, 0.5)
+    cw15, ch15 = crop_out_size(n, n, crop15, 0)
+    g15 = grey_input(n, n)
+    o15b = run_style(gl, eso, sh, g15, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, vig=vig15, crop=crop15, crop_rot=0)
+    q15b = quant(o15b, (ch15, cw15, 3))
+    want15b = 180.0 * vig_falloff_np(cw15, ch15, *vig15)
+    d15b = float(np.abs(q15b[..., 0] - want15b).max())
+    # 区分度对照：暗角若按"源图坐标 + 源图尺寸"算（最后裁输出位图）
+    wrong15b = 180.0 * vig_falloff_np(cw15, ch15, *vig15,
+                                      uv0=(crop15[0], crop15[1]),
+                                      uv1=(crop15[0] + crop15[2], crop15[1] + crop15[3]))
+    d15b_wrong = float(np.abs(q15b[..., 0] - wrong15b).max())
+    # 中心-角落的衰减幅度（人可读的证据）
+    cen15 = float(q15b[ch15 // 2, cw15 // 2, 0])
+    cor15 = float(q15b[0, 0, 0])
+    print(f'⑮b 裁剪后暗角居中（裁中间 50% ⇒ 输出 {cw15}×{ch15}，纯灰 180 + 暗角 '
+          f'[66]=-0.8 [67]=80 [68]=50）：与**按输出坐标/输出尺寸**的解析式 max|Δ| = '
+          f'{d15b:.0f} LSB（判据 ≤3）；区分度对照（若按源图坐标算 = 最后裁输出位图）'
+          f'max|Δ| = {d15b_wrong:.0f} LSB（须 >3）')
+    print(f'   裁剪后画面：中心 = {cen15:.0f}（无衰减 ⇒ 应 ≈180）、角落 = {cor15:.0f}'
+          f'（满衰减 ⇒ 应 ≈{180 * 0.2:.0f}）⇒ 暗角仍相对**裁剪后**画面居中')
+    if d15b > 3.0 or d15b_wrong <= 3.0:
+        fails.append('⑮b 裁剪后暗角居中')
+
+    # ⑮c 90° 步进旋转：画面朝向 + 输出尺寸交换（非方形画幅 n2w×n2h）
+    #     四象限图：只有**源图左上**是 255，其余 100 ⇒ 每个 rot 下最亮象限的位置唯一。
+    quad = np.full((n2h, n2w, 3), 100, np.uint8)
+    quad[:n2h // 2, :n2w // 2] = 255
+    ok15c = True
+    # rot=0 ⇒ 左上；1 ⇒ 右上；2 ⇒ 右下；3 ⇒ 左下（顺时针）
+    want_quad = {0: (0, 0), 1: (0, 1), 2: (1, 1), 3: (1, 0)}
+    for rot in (0, 1, 2, 3):
+        o = run_style(gl, eso, sh, quad, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                      grain=0.0, crop=full, crop_rot=rot)
+        ow, oh = crop_out_size(n2w, n2h, full, rot)
+        q = quant(o, (oh, ow, 3))
+        # 四象限均值 → 最亮象限（行, 列）
+        qs = np.array([[q[:oh // 2, :ow // 2, 0].mean(), q[:oh // 2, ow // 2:, 0].mean()],
+                       [q[oh // 2:, :ow // 2, 0].mean(), q[oh // 2:, ow // 2:, 0].mean()]])
+        got = tuple(int(v) for v in np.unravel_index(int(qs.argmax()), qs.shape))
+        exp = want_quad[rot]
+        size_ok = (ow, oh) == ((n2h, n2w) if rot % 2 == 1 else (n2w, n2h))
+        ok15c = ok15c and (got == exp) and size_ok
+        print(f'⑮c 旋转 {rot * 90}°：输出尺寸 = {ow}×{oh}'
+              f'（{"交换 ✓" if size_ok else "错 ✗"}），源左上亮块落在'
+              f'{"左上/右上/右下/左下"[rot * 3:rot * 3 + 3]}'
+              f'（实测 {got} / 期望 {exp} {"✓" if got == exp else "✗"}）')
+    if not ok15c:
+        fails.append('⑮c 90° 旋转方向/尺寸')
+
+    # ⑮d 裁剪后局部调整中心仍在**用户拖的位置**（非对称裁剪 ⇒ 才测得出来）
+    crop15d = (0.10, 0.10, 0.50, 0.50)
+    dw15, dh15 = crop_out_size(n, n, crop15d, 0)
+    o15d = run_style(gl, eso, sh, g15, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, crop=crop15d, crop_rot=0,
+                     adj=dict(local_type=1.0, local_center=(0.5, 0.5),
+                              local_radius=0.25, local_feather=0.3, local_ev=-1.5))
+    q15d = quant(o15d, (dh15, dw15, 3))[..., 0]
+    # 判据 1：画面中心（vUV0=(0.5,0.5)）的压暗量与解析期望逐点相符
+    mask15 = local_mask_np(dw15, dh15, 1.0, (0.5, 0.5), 0.25, 0.3, 0.0, 0.25)
+    want15d = local_expect(g15[:dh15, :dw15], mask15, ev_l=-1.5)
+    d15d = float(np.abs(q15d - want15d[..., 0]).max())
+    # 判据 2：最暗点必须落在 mask 内（半径 0.25×48 = 12px，dither ±1 ⇒ 圆内多点并列最暗，
+    #        所以只要求"在半径内"，不要求恰好是中心像素）
+    cen = (int(q15d.argmin()) // dw15, int(q15d.argmin()) % dw15)
+    rad_px = 0.25 * dw15
+    near = math.hypot(cen[0] - dh15 / 2.0, cen[1] - dw15 / 2.0) <= rad_px + 1.0
+    cen_val = float(q15d[dh15 // 2, dw15 // 2])
+    # 区分度对照：局部中心若被当成**源图坐标**解释（中心会跑到输出的 (0.8,0.8) 处）
+    yy, xx = np.mgrid[0:dh15, 0:dw15]
+    su = crop15d[0] + (xx + 0.5) / dw15 * crop15d[2]
+    sv = crop15d[1] + (yy + 0.5) / dh15 * crop15d[3]
+    d_wrong = np.hypot((su - 0.5) / 0.25, (sv - 0.5) / 0.25)
+    mask_wrong = 1.0 - smoothstep_np(1.0, 1.3, d_wrong)
+    want_wrong = local_expect(g15[:dh15, :dw15], mask_wrong, ev_l=-1.5)
+    d15d_wrong = float(np.abs(q15d - want_wrong[..., 0]).max())
+    print(f'⑮d 裁剪后局部中心（非对称裁剪 (0.10,0.10,0.50,0.50) ⇒ 输出 {dw15}×{dh15}，'
+          f'局部中心 (0.5,0.5) 径向 ev=-1.5）：与解析期望 max|Δ| = {d15d:.0f} LSB'
+          f'（判据 ≤3）；中心实测 {cen_val:.0f}（期望 '
+          f'{float(want15d[dh15 // 2, dw15 // 2, 0]):.0f}）；最暗点 = {cen}'
+          f'（mask 半径 {rad_px:.0f}px 内 {"✓" if near else "✗"}）；'
+          f'区分度对照（局部中心若按**源图坐标**解释）max|Δ| = {d15d_wrong:.0f} LSB（须 >3）')
+    if d15d > 3.0 or not near or d15d_wrong <= 3.0:
+        fails.append('⑮d 裁剪后局部中心')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')

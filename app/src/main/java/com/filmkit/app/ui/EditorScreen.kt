@@ -116,6 +116,10 @@ import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
+import com.filmkit.app.camera.CropAspect
+import com.filmkit.app.camera.CropHandle
+import com.filmkit.app.camera.CropSpec
+import com.filmkit.app.camera.CropView
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
 import com.filmkit.app.camera.FADE_UI_RANGE
@@ -144,6 +148,17 @@ import com.filmkit.app.camera.claritySlot
 import com.filmkit.app.camera.clarityUi
 import com.filmkit.app.camera.contrastSlot
 import com.filmkit.app.camera.contrastUi
+import com.filmkit.app.camera.cropHandlePoints
+import com.filmkit.app.camera.cropHitHandle
+import com.filmkit.app.camera.cropInside
+import com.filmkit.app.camera.cropScreenRect
+import com.filmkit.app.camera.cropSpecOf
+import com.filmkit.app.camera.cropViewMove
+import com.filmkit.app.camera.cropViewOf
+import com.filmkit.app.camera.cropViewRotate
+import com.filmkit.app.camera.cropViewScale
+import com.filmkit.app.camera.cropViewSize
+import com.filmkit.app.camera.cropViewWithAspect
 import com.filmkit.app.camera.discardNeedsConfirm
 import com.filmkit.app.camera.editorExportName
 import com.filmkit.app.camera.editorOpenParams
@@ -375,6 +390,19 @@ fun EditorScreen(
     // 预览区尺寸（Fit 换算要用）与"正在拖动定位"标志（拖动中只画轮廓、松手才渲染）
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
     var localDragging by remember { mutableStateOf(false) }
+    // ── E2-12 裁剪（ADR-16）：几何变换，**不进 FilmParams** ──────────────────
+    // `crop` = 已确认生效的裁剪（引擎入参）；`cropDraft` = 裁剪模式下的草稿框（未确认）；
+    // `cropMode` = 是否在裁剪模式（预览区显示框与遮罩、参数区换成裁剪工具栏）。
+    // ⚠ 直通（E2-9 `paramsUnchanged`）比的是 **FilmParams 数组** ⇒ 裁剪**不在**比较范围
+    //   内 ⇒ 凡"有没有修改"的判据都必须显式带上 `!crop.isFull`（见 exportNow /
+    //   requestCancel / 覆盖警告），否则**裁了图却走直通 = 导出原片字节，裁剪被静默丢弃**。
+    // 草稿独立于 cropMode 保存：点别的 tab 退出裁剪模式时草稿留着，再进来不用重拖；
+    // 「取消」才把它复位成 `crop`。
+    var crop by remember { mutableStateOf(CropSpec.FULL) }
+    var cropMode by remember { mutableStateOf(false) }
+    var cropDraft by remember { mutableStateOf(CropView.FULL) }
+    var cropAspect by remember { mutableStateOf(CropAspect.FREE) }
+    var cropHandle by remember { mutableStateOf<CropHandle?>(null) }
 
     /**
      * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 基础五类 / 暗角三条 / LUT 强度
@@ -391,14 +419,21 @@ fun EditorScreen(
      * E2-7 字段：`locType`（off/radial/linear）+ 中心/半径/羽化/角度/宽度/ev/sat —— 与
      * 引擎侧 `kFsStyle` 的 `locType`/`locEv`/`locSat` 同口径，真机可一眼核对"UI 拖到哪、
      * 引擎收到哪"。
+     *
+     * E2-12 字段：`crop`（原图 UV 子矩形 "x0,y0,cw,ch"）/ `cropRot` / `outW`/`outH`（**输出**
+     * 尺寸）—— 与引擎侧 `render.style_diag` 的 `crop`/`cropRot`/`outW`/`outH` 同口径，
+     * 真机可一眼核对"框拖到哪、引擎收到哪、输出多大"。
      */
     fun logRender(w: Int, h: Int, ms: Long, ticks: Int, ok: Boolean, dragging: Boolean = false) {
         val film = params ?: return
+        val (outW, outH) = crop.outputSize(w, h)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "editor.render",
             kv(
                 "w" to w, "h" to h, "ms" to ms, "dragging" to dragging,
                 "dragTicks" to ticks, "ok" to ok, "memMb" to previewResidentMb(w, h),
+                "crop" to "${crop.x0},${crop.y0},${crop.cw},${crop.ch}",
+                "cropRot" to crop.rot, "outW" to outW, "outH" to outH,
                 "ev" to film[0], "wbR" to film[1], "wbG" to film[2], "wbB" to film[3],
                 "contrast" to film[4], "sat" to film[21], "clarity" to film[78],
                 "strength" to film[66], "radius" to film[67], "feather" to film[68],
@@ -458,7 +493,7 @@ fun EditorScreen(
         pendingRender = false
         val ticks = gate.takeTicks()
         val t0 = System.currentTimeMillis()
-        engine.requestPreview(src.buffer, src.w, src.h, film.copyOf()) { out ->
+        engine.requestPreview(src.buffer, src.w, src.h, film.copyOf(), crop) { out ->
             logRender(src.w, src.h, System.currentTimeMillis() - t0, ticks, out != null)
             if (out != null) {
                 val old = shown
@@ -467,9 +502,16 @@ fun EditorScreen(
                 // 引用先断（Image 改用输出图），内存延迟一帧再还。
                 // 连同上一张输出一起回收 —— 全分辨率下每张都是 50MB，一张都不能攒
                 //（distinct = 同一张只回收一次，Bitmap 没有重写 equals ⇒ 就是同一性去重）
-                origBmp = null
-                (listOfNotNull(old) + src.takeDisplayBitmaps()).distinct()
-                    .forEach { recycleLater(it) }
+                //
+                // ⚠ E2-12：裁剪模式下预览的底图**就是**输入位图（裁剪框画在它上面）⇒
+                // 这一轮绝不能回收它，否则 Image 会去画一张已 recycle 的 Bitmap（直接崩）。
+                if (cropMode) {
+                    listOfNotNull(old).distinct().forEach { recycleLater(it) }
+                } else {
+                    origBmp = null
+                    (listOfNotNull(old) + src.takeDisplayBitmaps()).distinct()
+                        .forEach { recycleLater(it) }
+                }
                 status = ""
             } else {
                 status = "渲染失败，显示原图"
@@ -693,7 +735,11 @@ fun EditorScreen(
      * （= `paramsUnchanged` 的包装），与导出直通判据**同一份逻辑**。
      */
     fun onCancel() {
-        if (discardNeedsConfirm(params, openParams)) confirmDiscard = true else onBack()
+        if (discardNeedsConfirm(params, openParams, cropDirty = !crop.isFull)) {
+            confirmDiscard = true
+        } else {
+            onBack()
+        }
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -781,7 +827,13 @@ fun EditorScreen(
         // ★ 参数判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值：
         // E2-21 起是全恒等基线），不是快照原文；值比较 + 容差 ⇒ "改了又改回原值"也算无修改。
         // openParams 为 null（理论上只在首帧就绪前，此时导出按钮不可点）⇒ 保守走渲染。
-        val unchanged = openParams?.let { paramsUnchanged(snapshot, it) } ?: false
+        //
+        // ★ E2-12（本卡的关键接线）：`paramsUnchanged` 比的是 **FilmParams 数组** ⇒
+        // **裁剪不在它的比较范围内**。裁剪是几何变换、走 submitDisplay 的独立通道
+        //（ADR-16），所以这里必须显式把它并进"有没有修改"：裁剪非全幅 ⇒ 强制走渲染 +
+        // 编码路径。否则用户裁完图点「完成」，直通会把**原片字节原样复制**出去 ——
+        // 裁剪被静默丢弃（而且直通只对 JPEG 生效，DNG 那一路本来就走渲染）。
+        val unchanged = (openParams?.let { paramsUnchanged(snapshot, it) } ?: false) && crop.isFull
 
         // 覆盖 = 把原片字节写回原片本身：白写一遍（还平添写坏的风险），直接说清楚。
         // ⚠ 这条**只看参数**、与源图格式无关：它一个字节都不写。若把"非 JPEG 源图"也算成
@@ -840,7 +892,7 @@ fun EditorScreen(
             //    省掉"独立解码位图 + 导出 direct buffer"两份 ≈ 2×47.8MiB（12MP），导出峰值
             //    从 ≈239MiB 降到 ≈143MiB。⚠ 复用后**绝不回收** src.buffer：它是编辑器的
             //    常驻输入（预览 / "按住看原图"都读它），回收 = 后续预览读到野内存。
-            engine.requestFull(src.buffer, src.w, src.h, snapshot) { out ->
+            engine.requestFull(src.buffer, src.w, src.h, snapshot, crop) { out ->
                 if (out == null) {
                     finish("渲染失败，未做任何改动")
                     return@requestFull
@@ -977,10 +1029,15 @@ fun EditorScreen(
                     }
                     EditorPhase.Ready -> {
                         val bmp = shown
-                        // 看原图：显示输入像素 —— 由 LaunchedEffect(showOriginal) 在 IO
+                        // 看原图：显示输入像素 —— 由 LaunchedEffect(showOriginal, cropMode) 在 IO
                         // 线程从常驻 buffer 重建（见 EditorSource.displayBitmap），主线程零成本；
                         // 还没就绪时退回显示成片，绝不白屏
                         val orig = if (showOriginal) origBmp else null
+                        // ★ E2-12：裁剪模式的底图是**原始输入位图**（未裁剪、未旋转）——
+                        // 裁剪的语义是"相对原图"（引擎的 crop_uv 就是原图 UV 子矩形）。
+                        // 拿已裁剪的画面当底图 = 让用户在"裁剪结果上再裁剪"，语义混乱。
+                        val cropSrc = if (cropMode) origBmp else null
+                        val cropReady = cropMode && cropSrc != null
                         if (bmp != null) {
                             // E2-17：预览区**不再注册任何手势** —— 长按画面看原图已按用户要求
                             // 移除（"也不用长按图片查看原图"）。显示哪张只由右下角按钮的按住态
@@ -988,16 +1045,30 @@ fun EditorScreen(
                             val image = remember(bmp, orig, showOriginal) {
                                 (if (showOriginal && orig != null) orig else bmp).asImageBitmap()
                             }
+                            val cropImage = remember(cropSrc) { cropSrc?.asImageBitmap() }
                             // E2-7：局部模式下的拖动定位。坐标换算（含 letterbox 黑边）与轮廓
                             // 绘制**共用** EditorExport.kt 里的同一套纯函数 —— 两处各写一份，
                             // 一旦有偏差用户看到的就是"拖了没对准"。
                             val localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF
-                            val dragMode = localMode != LocalMode.OFF
-                            val srcSize = source?.let { it.w to it.h }
-                            val rect = remember(previewSize, srcSize) {
-                                val (sw, sh) = srcSize ?: (1 to 1)
+                            // 裁剪模式下局部拖动让位：两种手势都要吃整个预览区
+                            val dragMode = localMode != LocalMode.OFF && !cropMode
+                            // ★ E2-12：局部调整的坐标基准 = **引擎输出**（裁剪后）的画面 ——
+                            // 引擎里 localMask 用的是 vUV0（裁剪后的归一化坐标），所以 letterbox
+                            // 换算 rect 与正圆 aspect 都必须按输出尺寸算，否则裁剪后拖局部中心会偏
+                            //（这正是 ADR-16 说的"局部调整中心自动落在用户拖的位置"）。
+                            val outSize = source?.let { crop.outputSize(it.w, it.h) }
+                            val rect = remember(previewSize, outSize) {
+                                val (sw, sh) = outSize ?: (1 to 1)
                                 imageFitRect(
                                     previewSize.width.toFloat(), previewSize.height.toFloat(), sw, sh,
+                                )
+                            }
+                            // 裁剪框的屏幕几何：基准 = **旋转后**画面（rot 奇数 ⇒ 宽高交换）
+                            val cropSize = source?.let { cropViewSize(it.w, it.h, cropDraft.rot) }
+                            val cropFit = remember(previewSize, cropSize) {
+                                val (vw, vh) = cropSize ?: (1 to 1)
+                                imageFitRect(
+                                    previewSize.width.toFloat(), previewSize.height.toFloat(), vw, vh,
                                 )
                             }
                             Box(
@@ -1024,15 +1095,123 @@ fun EditorScreen(
                                                 },
                                             )
                                         }
+                                    }
+                                    // ★ E2-12 裁剪手势：拖框内 = 移动整框，拖 8 个手柄 = 缩放。
+                                    // 拖动中**只更新框、不渲染**（与 E2-8 的滑杆闸门同一精神：
+                                    // 零引擎开销 + 实时反馈），点「确认」才渲染一次。
+                                    .pointerInput(cropMode, cropDraft.rot, cropFit) {
+                                        if (!cropMode) return@pointerInput
+                                        val touch = 24.dp.toPx()
+                                        var grabbed = false
+                                        detectDragGestures(
+                                            onDragStart = { pos ->
+                                                cropHandle = cropHitHandle(
+                                                    cropDraft, cropFit, pos.x, pos.y, touch,
+                                                )
+                                                grabbed = cropHandle != null || cropInside(
+                                                    cropDraft, cropFit, pos.x, pos.y,
+                                                )
+                                            },
+                                            onDragEnd = { cropHandle = null },
+                                            onDragCancel = { cropHandle = null },
+                                            onDrag = { change, delta ->
+                                                change.consume()
+                                                if (!grabbed || cropFit.width <= 0f ||
+                                                    cropFit.height <= 0f
+                                                ) {
+                                                    return@detectDragGestures
+                                                }
+                                                val (vw, vh) = cropSize ?: (1 to 1)
+                                                val dx = delta.x / cropFit.width
+                                                val dy = delta.y / cropFit.height
+                                                val h = cropHandle
+                                                cropDraft = if (h == null) {
+                                                    cropViewMove(cropDraft, dx, dy)
+                                                } else {
+                                                    cropViewScale(
+                                                        cropDraft, h, dx, dy,
+                                                        cropAspect.ratio(vw, vh), vw, vh,
+                                                    )
+                                                }
+                                            },
+                                        )
                                     },
                                 contentAlignment = Alignment.Center,
                             ) {
-                                Image(
-                                    bitmap = image,
-                                    contentDescription = if (showOriginal) "原图" else "成片预览",
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier.fillMaxSize(),
-                                )
+                                if (cropReady && cropImage != null) {
+                                    // 旋转显示：位图按草稿 rot 旋转 90° 步进（图形层旋转，不重
+                                    // 解码）。显示尺寸 = **旋转前**尺寸，使旋转后的视觉矩形正好
+                                    // 等于 cropFit（旋转后画面的 Fit 矩形），两者同心同大小。
+                                    val odd = cropDraft.rot % 2 == 1
+                                    val dispW = if (odd) cropFit.height else cropFit.width
+                                    val dispH = if (odd) cropFit.width else cropFit.height
+                                    Image(
+                                        bitmap = cropImage,
+                                        contentDescription = "裁剪预览",
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier
+                                            .size(
+                                                with(density) { dispW.toDp() },
+                                                with(density) { dispH.toDp() },
+                                            )
+                                            .graphicsLayer(rotationZ = 90f * cropDraft.rot),
+                                    )
+                                    // ★ 裁剪框 + 遮罩：**Compose 叠加层** —— 导出走引擎输出位图，
+                                    // 这里的东西**结构上不可能**进导出（与 E2-7 局部轮廓同款保证，
+                                    // 不是"记得别画进去"）。
+                                    Canvas(Modifier.fillMaxSize()) {
+                                        if (cropFit.width <= 0f || cropFit.height <= 0f) {
+                                            return@Canvas
+                                        }
+                                        val s = cropScreenRect(cropDraft, cropFit)
+                                        // 框外压暗（整幅预览区，含 letterbox 黑边）
+                                        val mask = Color.Black.copy(alpha = 0.62f)
+                                        drawRect(mask, Offset(0f, 0f), Size(size.width, s.top))
+                                        drawRect(
+                                            mask, Offset(0f, s.top + s.height),
+                                            Size(size.width, size.height - s.top - s.height),
+                                        )
+                                        drawRect(mask, Offset(0f, s.top), Size(s.left, s.height))
+                                        drawRect(
+                                            mask, Offset(s.left + s.width, s.top),
+                                            Size(size.width - s.left - s.width, s.height),
+                                        )
+                                        // 三分线（构图辅助）
+                                        val thin = Color.White.copy(alpha = 0.35f)
+                                        for (k in 1..2) {
+                                            val gx = s.left + s.width * k / 3f
+                                            val gy = s.top + s.height * k / 3f
+                                            drawLine(
+                                                thin, Offset(gx, s.top),
+                                                Offset(gx, s.top + s.height), 1f,
+                                            )
+                                            drawLine(
+                                                thin, Offset(s.left, gy),
+                                                Offset(s.left + s.width, gy), 1f,
+                                            )
+                                        }
+                                        drawRect(
+                                            FilmTheme.Accent, Offset(s.left, s.top),
+                                            Size(s.width, s.height), style = Stroke(2f),
+                                        )
+                                        // 8 个手柄（4 角 + 4 边）
+                                        cropHandlePoints(cropDraft, cropFit).forEach { (hx, hy) ->
+                                            val tl = Offset(hx - 9f, hy - 9f)
+                                            drawRect(Color.White, tl, Size(18f, 18f))
+                                            drawRect(
+                                                FilmTheme.Accent, tl, Size(18f, 18f),
+                                                style = Stroke(2f),
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    Image(
+                                        bitmap = image,
+                                        contentDescription = if (showOriginal) "原图" else "成片预览",
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
+                                }
                                 // ★ 辅助轮廓（E2-7）：**Compose 叠加层**，与 Image 同尺寸的
                                 // 兄弟节点 —— 导出走的是引擎输出位图，这里的东西**结构上
                                 // 不可能**进导出（不是"记得别画进去"）。拖动中只画它、不渲染
@@ -1040,7 +1219,9 @@ fun EditorScreen(
                                 val film = params
                                 if (dragMode && film != null) {
                                     // H/W（不是 W/H）：正圆修正要求 ry = rx×W/H（见 radialOutline 的 KDoc）
-                                    val aspect = source?.let { it.h.toFloat() / it.w } ?: 1f
+                                    val aspect = outSize?.let { (ow, oh) ->
+                                        if (ow > 0) oh.toFloat() / ow else 1f
+                                    } ?: 1f
                                     val (cu, cv) = localCenterUi(film[80], film[81])
                                     val outline = if (localMode == LocalMode.RADIAL) {
                                         radialOutline(
@@ -1077,11 +1258,23 @@ fun EditorScreen(
                                             .padding(top = 8.dp, end = 12.dp),
                                     )
                                 }
+                                if (cropMode) {
+                                    Text(
+                                        "拖动画面移动裁剪框 · 拖角/边缩放",
+                                        color = FilmTheme.CreamDim,
+                                        fontSize = 11.sp,
+                                        style = TextStyle(shadow = TextShadow),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(top = 8.dp, end = 12.dp),
+                                    )
+                                }
                                 // ★ E2-15 原图按钮（用户："查看原图给个按钮"）→ E2-17 改成**按住看**
                                 //（用户："按住按钮 = 看原图；松手 = 恢复效果图"，明确否掉点一下切换）。
                                 // 局部模式下**隐藏**：拖动定位要用整个预览区（含右下角），按钮会抢走那
                                 // 一片的按下事件 ⇒ 用户在那儿拖不动（父代理已提示这个冲突）。
-                                if (!dragMode) {
+                                // E2-12：裁剪模式下同样隐藏（"看原图"与裁剪底图是同一张，没有意义）。
+                                if (!dragMode && !cropMode) {
                                     OriginalPressButton(
                                         pressed = origView.pressed,
                                         onPress = { v -> origView = origView.press(v) },
@@ -1116,6 +1309,36 @@ fun EditorScreen(
             //
             // ⚠ 动画期间**不触发渲染**：这里只做布局与组合，渲染调用点仍是打开首帧 / 滑杆松手 /
             // 离散操作（见 [rerender] 的 KDoc）；面板子树里没有任何 `rerender()`。
+            // ★ E2-12 裁剪模式：参数面板整段让位给**裁剪工具栏**（互斥的两块，不叠在
+            // 预览上 —— 与 E1-4 起"面板不遮挡预览"的约束一致）。
+            if (cropMode) {
+                CropToolBar(
+                    aspect = cropAspect,
+                    dirty = cropDraft != cropViewOf(crop),
+                    onAspect = { a ->
+                        cropAspect = a
+                        source?.let { src ->
+                            val (vw, vh) = cropViewSize(src.w, src.h, cropDraft.rot)
+                            cropDraft = cropViewWithAspect(cropDraft, a.ratio(vw, vh), vw, vh)
+                        }
+                    },
+                    onRotate = { cropDraft = cropViewRotate(cropDraft) },
+                    // 取消 = 草稿复位成**已确认**的裁剪（画面回到进入裁剪模式前的样子）
+                    onCancel = {
+                        cropDraft = cropViewOf(crop)
+                        cropAspect = CropAspect.FREE
+                        cropMode = false
+                    },
+                    // 确认 = 草稿写入 crop（引擎入参）并渲染一次。
+                    // ⚠ 先退裁剪模式再 rerender：rerender 的回收分支按 cropMode 决定要不要
+                    //   回收输入位图（裁剪模式下它是裁剪框的底图，不能回收）。
+                    onConfirm = {
+                        source?.let { src -> crop = cropSpecOf(cropDraft, src.w, src.h) }
+                        cropMode = false
+                        rerender()
+                    },
+                )
+            } else {
             AnimatedContent(
                 targetState = panel.expanded,
                 transitionSpec = {
@@ -1166,6 +1389,12 @@ fun EditorScreen(
                         onResetGroup = { g -> resetGroup(g) },
                         onHandleDrag = { dy -> onHandleDrag(dy) },
                         onTogglePanel = { panel = panel.toggled() },
+                        onCrop = {
+                            // 进入裁剪模式：草稿 = 已确认的裁剪（再次进入时框还在原处）
+                            cropDraft = cropViewOf(crop)
+                            cropAspect = CropAspect.FREE
+                            cropMode = true
+                        },
                     )
                 } else {
                     CollapsedPanelBar(
@@ -1173,6 +1402,7 @@ fun EditorScreen(
                         onTogglePanel = { panel = panel.toggled() },
                     )
                 }
+            }
             }
         }
 
@@ -1185,7 +1415,9 @@ fun EditorScreen(
             // 无修改时 rawLoss 恒 false ⇒ 这里仍是原来的「覆盖原片？」—— 但那种情况 exportNow
             // 会直接拒绝（"没有修改，无需覆盖"），用户确认后也不会写一个字节。
             val rawLoss = overwriteNeedsRawWarning(
-                paramsUnchanged = !discardNeedsConfirm(params, openParams),
+                paramsUnchanged = !discardNeedsConfirm(
+                    params, openParams, cropDirty = !crop.isFull,
+                ),
                 jpegSource = source?.jpegSource ?: false,
             )
             AlertDialog(
@@ -1263,10 +1495,12 @@ fun EditorScreen(
     // 常驻（全分辨率下每个 50MB 都要算清楚）。
     // key 只用 showOriginal：把 source 也放进 key 会在解码完成的瞬间误触发一次回收，
     // 而那一刻 shown 正指向那张解码位图（首帧还没渲染回来）。
-    LaunchedEffect(showOriginal) {
+    LaunchedEffect(showOriginal, cropMode) {
         val src = source ?: return@LaunchedEffect
-        if (showOriginal) {
-            origBmp = withContext(Dispatchers.IO) { src.displayBitmap() }
+        // E2-12：裁剪模式的底图也是这张输入位图（见预览区 cropSrc）⇒ 两个入口共用同一份
+        // 重建缓存，退出时一并还回。
+        if (showOriginal || cropMode) {
+            if (origBmp == null) origBmp = withContext(Dispatchers.IO) { src.displayBitmap() }
         } else {
             origBmp = null
             // 只还回"按需重建"的那张：它从不作为 shown 显示，回收是安全的。
@@ -1896,6 +2130,8 @@ private fun EditorPanel(
     onHandleDrag: (Float) -> Unit,
     /** 把手点击 = 收起面板 */
     onTogglePanel: () -> Unit,
+    /** E2-12：底栏「裁剪」项（进入裁剪模式） */
+    onCrop: () -> Unit,
 ) {
     val context = LocalContext.current
     val list = when (group) {
@@ -2005,7 +2241,7 @@ private fun EditorPanel(
         }
         Spacer(Modifier.height(8.dp))
         // ⑥ 底部导航
-        EditorTabBar(group, onGroup)
+        EditorTabBar(group, onGroup, onCrop)
     }
 }
 
@@ -2435,11 +2671,135 @@ private fun ParamChip(
  * 选中态用「强调色实底 + [FilmTheme.OnAccent] 前景」而不是"黄底 + 黄字"：黄底黄字的对比度
  * 约 1.4:1（WCAG 远不达标），实底 + 深字是 6.8:1。同一个"黄色圆角矩形底"的语言，可读性优先。
  *
- * 「预设」「裁剪」**置灰留位、不注册点击**：预设（E3 预设管理）与裁剪（E2-12）都还没实现 ——
- * ADR-12 不许假控件，所以它们只占位、点不动，颜色用 30% 奶油白（一眼看出是禁用态）。
+ * ★ E2-12：「裁剪」项**已激活**（可点，进裁剪模式时高亮 —— 由 `cropActive` 传入）。
+ * 「预设」仍**置灰留位、不注册点击**：E3 预设管理还没实现 —— ADR-12 不许假控件，
+ * 所以它只占位、点不动，颜色用 30% 奶油白（一眼看出是禁用态）。
+ */
+/**
+ * ★ E2-12 裁剪工具栏（ADR-16）：裁剪模式下**取代参数面板**（两块互斥，不叠在预览上 ——
+ * 与 E1-4 起"面板不遮挡预览"的约束一致）。
+ *
+ * 这里只放**离散动作**：比例锁定 / 旋转 90° / 取消 / 确认。拖动框与缩放在预览区完成
+ *（见预览区的裁剪手势）—— 拖动中只更新框、不渲染，点「确认」才渲染一次（与 E2-8 的
+ * 滑杆闸门同一精神：零引擎开销 + 实时反馈）。
+ *
+ * 比例锁定：选中后**立即**按该比例重排当前框（[cropViewWithAspect]），后续拖动按比例联动
+ *（[cropViewScale]）；「原图」= 当前画面比例 ⇒ 等价于"整幅不裁"。
  */
 @Composable
-private fun EditorTabBar(selected: EditorTab, onSelect: (EditorTab) -> Unit) {
+private fun CropToolBar(
+    aspect: CropAspect,
+    /** 草稿与已确认状态不同 ⇒ 提示行与「确认」按钮高亮（与 E2-9 的"有修改"同一精神） */
+    dirty: Boolean,
+    onAspect: (CropAspect) -> Unit,
+    onRotate: () -> Unit,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(FilmTheme.PanelSolid)
+            .navigationBarsPadding()
+            .padding(bottom = 6.dp),
+    ) {
+        Text(
+            if (dirty) "裁剪已修改 · 点「确认」生效" else "拖动画面移动裁剪框 · 拖角/边缩放",
+            color = if (dirty) FilmTheme.Accent else FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            style = TextStyle(shadow = TextShadow),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        LazyRow(
+            Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(CropAspect.entries) { a ->
+                val on = a == aspect
+                Text(
+                    a.label,
+                    color = if (on) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (on) FilmTheme.Accent else Color.Transparent)
+                        .border(
+                            1.dp,
+                            if (on) FilmTheme.Accent else FilmTheme.CreamDim.copy(alpha = 0.35f),
+                            RoundedCornerShape(10.dp),
+                        )
+                        .pressScale(pressedScale = 0.94f, onTap = { onAspect(a) })
+                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // 旋转 90°（顺时针步进，4 个方向循环）：只转**画面**，框不动
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .border(
+                        1.dp, FilmTheme.CreamDim.copy(alpha = 0.35f), RoundedCornerShape(10.dp),
+                    )
+                    .pressScale(pressedScale = 0.94f, onTap = onRotate)
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Outlined.RotateRight,
+                    contentDescription = "旋转 90°",
+                    tint = FilmTheme.Cream,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("旋转 90°", color = FilmTheme.Cream, fontSize = 12.sp, maxLines = 1)
+            }
+            Spacer(Modifier.weight(1f))
+            Text(
+                "取消",
+                color = FilmTheme.CreamDim,
+                fontSize = 13.sp,
+                fontFamily = FilmTheme.Mono,
+                modifier = Modifier
+                    .pressScale(onTap = onCancel)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "确认",
+                color = FilmTheme.OnAccent,
+                fontSize = 13.sp,
+                fontFamily = FilmTheme.Mono,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(FilmTheme.Accent)
+                    .pressScale(pressedScale = 0.94f, onTap = onConfirm)
+                    .padding(horizontal = 18.dp, vertical = 8.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun EditorTabBar(
+    selected: EditorTab,
+    onSelect: (EditorTab) -> Unit,
+    onCrop: () -> Unit,
+    cropActive: Boolean = false,
+) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -2472,25 +2832,44 @@ private fun EditorTabBar(selected: EditorTab, onSelect: (EditorTab) -> Unit) {
                 )
             }
         }
-        listOf(
-            Icons.Outlined.Collections to "预设",
-            Icons.Outlined.Crop to "裁剪",
-        ).forEach { (ic, label) ->
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(vertical = 6.dp),
-            ) {
-                Icon(
-                    ic,
-                    contentDescription = "$label（暂未开放）",
-                    tint = DisabledInk,
-                    modifier = Modifier.size(22.dp),
-                )
-                Spacer(Modifier.height(2.dp))
-                Text(label, color = DisabledInk, fontSize = 10.sp, maxLines = 1)
-            }
+        // 预设（E3）：置灰留位、不可点
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .weight(1f)
+                .padding(vertical = 6.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Collections,
+                contentDescription = "预设（暂未开放）",
+                tint = DisabledInk,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.height(2.dp))
+            Text("预设", color = DisabledInk, fontSize = 10.sp, maxLines = 1)
+        }
+        // ★ E2-12 裁剪：可点（进裁剪模式），裁剪模式下高亮（与其余四组同一套选中态）
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (cropActive) FilmTheme.Accent else Color.Transparent)
+                .pressScale(pressedScale = 0.94f, onTap = onCrop)
+                .padding(vertical = 6.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Crop,
+                contentDescription = "裁剪",
+                tint = if (cropActive) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "裁剪",
+                color = if (cropActive) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                fontSize = 10.sp, maxLines = 1,
+            )
         }
     }
 }
