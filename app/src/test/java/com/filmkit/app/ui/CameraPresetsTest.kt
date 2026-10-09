@@ -15,8 +15,17 @@ class CameraPresetsTest {
 
     @Test
     fun lengthMatchesContract() {
-        assertEquals(88, CameraPresets.COUNT)
+        // E2-11：88 → 96（一次扩 8 槽，ADR-14 裁决 2）。此断言是 v0.10.196 启动崩溃的哨兵。
+        assertEquals(96, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
+    }
+
+    @Test
+    fun e2_11SlotsHoldNoEffectDefaults() {
+        // E2-11 护栏：新增的 8 个槽位在 neutral() 里必须全是恒等值 ——
+        // 任一非 0 都会让"编辑器无修改导出"悄悄改图（ADR-14 硬约束 2）。
+        val p = CameraPresets.standard()
+        for (i in 88..95) assertEquals("slot[$i]", 0.0, p[i], 0.0)
     }
 
     @Test

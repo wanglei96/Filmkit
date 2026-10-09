@@ -21,7 +21,10 @@ struct FilmParams {
   // [79..87] 局部调整（local_*，E2-6 才实现）。与 E4-1 同模式：**契约扩展与功能
   // 实现分离** —— 本卡只为 [79..87] 占位（shader 零引用），E2-6 不再改契约。
   // [78] 本卡实现（`kFsStyle` 内），默认 0 = 整段跳过。
-  static constexpr int kCount = 88;
+  // v0.11.4（E2-11）：88 → 96，+[88..95]（色温/色调 + 影调分区 + 褪色 + 预留）。
+  // 一次到位（ADR-14 裁决 2）：契约变更次数越少，"漏改一处 = 启动即崩"的暴露面越小。
+  // [88..94] 由本卡在 `kFsStyle` 内实现，[95] 仅预留（shader 零引用）。
+  static constexpr int kCount = 96;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -414,6 +417,27 @@ struct FilmParams {
   float local_ev = 0.0f;       // 86 局部曝光（EV，负 = 压暗）
   float local_sat = 1.0f;      // 87 局部饱和度（1.0 = 恒等）
 
+  // ── v0.11.4（E2-11）：色温/色调 + 影调分区 + 褪色 [88..95] ────────────────
+  // 语义与域约定见 docs/reports/editor-ADR.md 的 ADR-14 裁决 1/2 与 ADR-7 订正 v2。
+  // ⚠️ 与 [78..87] 同一纪律：**只被编辑器链路 `kFsStyle` 读取**，拍照链路 `kFsOut`
+  // 零引用（拍照链路零回归是铁律）。
+  // [88][89] 色温/色调：**相对量**（不是绝对 K）。temp_mired 是相对原片白点的
+  // mired 偏移（0 = 不改），tint 是绿↔品红轴偏移（0 = 不改）。引擎侧在 CPU 上
+  // 转成 RGB 增益后**与 [1..3] 相乘**（同属线性域增益）⇒ 并入已有的成对往返，
+  // 零额外 GPU 成本（ADR-14 裁决 1）。
+  float temp_mired = 0.0f;     // 88 色温偏移（mired；目标白点 = 6500K 的 mired + 本值）
+                               //    正 ⇒ 目标 K 更低（更暖的**光源假设**）⇒ **画面变冷**；
+                               //    UI 建议直接以 K_target = 1e6/(153.846 + 本值) 作滑杆值
+  float tint = 0.0f;           // 89 色调偏移（正 = 品红，负 = 绿）
+  // [90..93] 影调分区（display 域 luma 分区增益，与 [4] contrast / [78] clarity
+  // 同域同段）：0 = 该分区不动。区间 ±1 为建议滑杆范围（见交付报告槽位表）。
+  float highlights = 0.0f;     // 90 高光提亮/压暗
+  float shadows = 0.0f;        // 91 阴影提亮/压暗
+  float whites = 0.0f;         // 92 白色色阶
+  float blacks = 0.0f;         // 93 黑色色阶
+  float fade = 0.0f;           // 94 褪色（抬起黑场，0 = 关）
+  float reserved_95 = 0.0f;    // 95 预留（恒等；`kFsStyle` 零引用，契约占位）
+
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
     // 缺失的新参数保持默认 —— 契约长度不一致时"整包静默全丢"比越界更危险。
@@ -525,6 +549,17 @@ struct FilmParams {
     if (n > 85) local_width = static_cast<float>(v[85]);
     if (n > 86) local_ev = static_cast<float>(v[86]);
     if (n > 87) local_sat = static_cast<float>(v[87]);
+    // v0.11.4（E2-11）：[88..95]。逐槽位判长度（与上同风格）；缺槽时保持结构体默认值
+    // = "无效果"值。⚠️ 本段**每一项的默认值都必须是恒等值**（全部 0）—— 契约数组短于
+    // 96 时（旧快照/旧预设）不读这些槽 ⇒ 行为与改动前逐位一致。
+    if (n > 88) temp_mired = static_cast<float>(v[88]);
+    if (n > 89) tint = static_cast<float>(v[89]);
+    if (n > 90) highlights = static_cast<float>(v[90]);
+    if (n > 91) shadows = static_cast<float>(v[91]);
+    if (n > 92) whites = static_cast<float>(v[92]);
+    if (n > 93) blacks = static_cast<float>(v[93]);
+    if (n > 94) fade = static_cast<float>(v[94]);
+    if (n > 95) reserved_95 = static_cast<float>(v[95]);  // 预留：读到即存，无消费者
   }
 };
 

@@ -1155,7 +1155,13 @@ class FrameRenderer {
           // 首版只支持**一个**局部调整（GLSL 三禁 ⇒ 多组参数无法安全表达）。
           local_on = -1, local_type = -1, local_center = -1, local_radius = -1,
           local_feather = -1, local_angle = -1, local_width = -1, local_ev = -1,
-          local_ev_on = -1, local_sat = -1, local_sat_on = -1;
+          local_ev_on = -1, local_sat = -1, local_sat_on = -1,
+          // E2-11 影调分区 + 褪色（display 域）：[90..93] 四项色阶 + [94] 褪色。
+          // ⚠️ 色温/色调 [88][89] **没有** uniform —— CPU 侧折算成 RGB 增益后并入
+          // `uWbGain`（ADR-14 裁决 1：同属线性域增益 ⇒ 复用已有的成对往返，
+          // 零额外 GPU 成本；也因此 chainLuma 的域提升自动带上它们，无需改动）。
+          highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
+          tone_on = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

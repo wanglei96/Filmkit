@@ -40,6 +40,74 @@ inline std::string jnum(float v, size_t n) {
   return s.empty() ? std::string("0") : s;
 }
 
+// E2-11：编辑器链路的色温/色调 → 线性 RGB 增益（模型与依据见下面两个函数的注释）。
+namespace {
+// ── E2-11 色温/色调 → 线性 RGB 增益（CPU 侧每帧一次；shader 侧零成本）──────────
+// 模型 = **Tanner Helland 黑体近似**（tannerhelland.com/4435 "Convert Temperature to
+// RGB"），与拍照链路的 `CameraController.wbGains()` **逐行同式**（唯一差异：分母加
+// `max(rn,1e-3)` 防除零，该分支在 1500..12000K 内不可达）。
+// 依据（为什么不用 DNG / darktable 的 CIE 轨迹 + Bradford 色适应）：
+//   ① **同一 App 只能有一套"色温"语义** —— 编辑器与拍照链路同模型，用户在两处拨
+//      同一档看到的暖冷才一致；换更精确的模型反而让两条链路打架。
+//   ② 它是**仓库里已有**的实现（`CameraController.kt:648`，含反向扫描 `kFromGains`），
+//      逐行对照即可核对；CIE CMF 表 / Robertson 表 / 色适应矩阵常量在离线环境无法
+//      核对（写了就是幻觉源）。
+//   ③ 纯分段解析式 ⇒ 验证脚本能用 numpy 精确复算（判据 ≤3 LSB 可达）。
+// 已知瑕疵（如实记录）：t≤66 与 t>66 两段在 **6600K 处 G 通道不连续**（255 → 251.3，
+//   ≈1.5%）。滑杆跨过该温度会有一级台阶，见交付报告 §3 的范围建议与升级路径。
+// 语义：返回"把色温 kelvin 的光源还原为中性"的增益（G 归一，与拍照链路同向）。
+void wbGainFromKelvin(float kelvin, float g[3]) {
+  const float t = std::clamp(kelvin, 1500.0f, 12000.0f) / 100.0f;
+  float r, gg, b;
+  if (t <= 66.0f) {
+    r = 255.0f;
+    gg = 99.4708025861f * std::log(t) - 161.1195681661f;
+  } else {
+    r = 329.698727446f * std::pow(t - 60.0f, -0.1332047592f);
+    gg = 288.1221695283f * std::pow(t - 60.0f, -0.0755148492f);
+  }
+  if (t >= 66.0f) {
+    b = 255.0f;
+  } else if (t <= 19.0f) {
+    b = 0.0f;
+  } else {
+    b = 138.5177312231f * std::log(t - 10.0f) - 305.0447927307f;
+  }
+  const float rn = std::clamp(r, 0.0f, 255.0f);
+  const float gn = std::clamp(gg, 0.0f, 255.0f);
+  const float bn = std::max(std::clamp(b, 0.0f, 255.0f), 1.0f);
+  g[0] = std::clamp(gn / std::max(rn, 1e-3f), 0.3f, 3.0f);
+  g[1] = 1.0f;
+  g[2] = std::clamp(gn / bn, 0.3f, 3.0f);
+}
+
+// [88] temp_mired / [89] tint → 相对参考白点（6500K ≈ D65）的 RGB 增益。
+// **参考点差分**是零回归的关键：[88]=[89]=0 时分子分母是同一次调用、同一输入 ⇒
+// 比值逐位 = 1.0f ⇒ 与 [1..3] 相乘后仍是原值 ⇒ 输出逐位不变（硬约束 2）。
+// 方向：mired 是**目标白点的 mired 偏移**（mired_target = 1e6/6500 + Δmired、
+// K_target = 1e6/mired_target）⇒ Δmired > 0 = 目标色温更低（更暖的光源）⇒ 按
+// "把该白点适应到中性"计算 ⇒ **画面变冷**。与 Lightroom/ACR 的 K 读数同向
+//（K 小 = 冷）⇒ UI 直接显示 K_target 即可（ADR-14 要求物理量读数）。
+void tempTintGain(float mired, float tint, float g[3]) {
+  const float k_ref = 6500.0f;
+  const float m_ref = 1e6f / k_ref;
+  const float k_target = 1e6f / std::max(m_ref + mired, 1.0f);
+  float gt[3], gr[3];
+  wbGainFromKelvin(k_target, gt);
+  wbGainFromKelvin(k_ref, gr);
+  g[0] = gt[0] / gr[0];
+  g[1] = 1.0f;
+  g[2] = gt[2] / gr[2];
+  // tint（绿 ↔ 品红）：RGB 增益空间沿该轴的线性近似（正 = 品红 = 压 G、抬 R/B）。
+  // R/B 各取一半 ⇒ 色度往品红走而**亮度近似守恒**（加权和 = 1 − 0.38·tint）；残留
+  // 偏差是有意保留的：Lightroom 的 tint 同样轻微改亮度，不额外补偿（少一层猜测）。
+  const float t = std::clamp(tint, -1.0f, 1.0f);
+  g[0] *= (1.0f + 0.5f * t);
+  g[1] *= (1.0f - t);
+  g[2] *= (1.0f + 0.5f * t);
+}
+}  // namespace
+
 // 预览域映射的在线标定状态（v0.8.2 提为**进程级**）：nativeEngineStart 每次
 // new FrameRenderer，放在成员里会随 engine stop/start 归零 —— 真机日志实测
 // ratio 长期钉在初值 2.0 不收敛。进程存活期间跨实例保持；App 冷启动回落
@@ -4693,6 +4761,16 @@ uniform float uLocalEv;      // [86] 局部曝光（EV；负 = 压暗）
 uniform float uLocalEvOn;    // 门控：local_ev ≠ 0（只有它非 0 时才需要往返）
 uniform float uLocalSat;     // [87] 局部饱和度（1 = 恒等）
 uniform float uLocalSatOn;   // 门控：local_sat ≠ 1
+// ── E2-11 影调分区 + 褪色（display 域；与 [4] contrast / [78] clarity 同域）──────
+// 权重曲线（l = display 域 luma，s = 1−l）：高光 l²、阴影 s²（宽范围，覆盖中灰两侧），
+// 白 l³、黑 s³（端部集中 = "白点/黑点"的窄作用域）。全是多项式 ⇒ 端点与一阶都连续，
+// 分区之间**无硬边**（这是"影调分区"与"曲线分段"的关键区别）。
+uniform float uHighlights;   // [90] 高光提亮/压暗（0 = 不动）
+uniform float uShadows;      // [91] 阴影提亮/压暗（0 = 不动）
+uniform float uWhites;       // [92] 白色色阶（0 = 不动）
+uniform float uBlacks;       // [93] 黑色色阶（0 = 不动）
+uniform float uFade;         // [94] 褪色（抬起黑场；0 = 关）
+uniform float uToneOn;       // 门控（CPU 侧算）：[90..93] 任一非 0
 // 与 kFsOut:4540 的 srgbEncode **严格互逆**（IEC 61966-2-1：线性 0.0031308 ↔
 // 编码 0.04045，系数 12.92 / 1.055 / 2.4 / 0.055）。
 // **禁止 pow(2.2) 近似**：暗部往返误差可达 9/255（项目实测，见 kFsOut 4530 注释）。
@@ -4836,6 +4914,30 @@ void main() {
         float l0 = dot(c, vec3(0.299, 0.587, 0.114));
         float lb = chainLuma(blurLuma16(vUV0), m);
         c += clamp(l0 - lb, -0.25, 0.25) * uClarity;
+    }
+    // ── E2-11 影调分区（display 域 luma 分区**乘性**增益；全 0 = 整段跳过）──────
+    // 为什么在清晰度**之后**：chainLuma 只需把 blur 基准提升过"往返 + 对比度"
+    //（清晰度在影调分区之前执行）⇒ 本段不进入 chainLuma，E2-2 的域提升公式不用扩，
+    // 少一处"新段忘记同步 ⇒ 清晰度变成整体提亮"的事故面。影调分区是逐像素乘性、
+    // 与清晰度的加性差值互不干扰（乘积可交换），观感差异在移动端不可辨。
+    // 为什么**乘性**（不是加性 `c += a·w`）：乘性保持色度比（加性抬亮会把暗部灰化、
+    // 拉低饱和度 —— 与 clarity 段注释里那条同型）；且"色阶增益"的物理直觉就是乘法。
+    // 端点行为：highlights=+1 ⇒ 纯白处 ×2（clamp 到 1）；blacks=-1 ⇒ 纯黑处 ×0。
+    if (uToneOn > 0.5) {
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        float s = 1.0 - l;
+        float g = 1.0 + uHighlights * l * l + uShadows * s * s +
+                  uWhites * l * l * l + uBlacks * s * s * s;
+        c *= max(g, 0.0);
+    }
+    // ── E2-11 褪色（胶片褪色感 = 抬起黑场，白点保持 1）──────────────────────
+    // c' = lift + c×(1−lift)：c=0 ⇒ lift（黑场抬起）、c=1 ⇒ 1（白点不动）。
+    // lift = uFade × 0.25（标定旋钮）：fade=1 ⇒ 黑场抬到 64/255（明显灰雾），
+    // fade=0.2 ⇒ 13/255（轻微）。与 [93] blacks 的区别：blacks 是**乘性**（保色度），
+    // fade 是**加性抬黑**（发灰 = 褪色感本身），两者互补不重复。
+    if (uFade > 0.0) {
+        float lift = uFade * 0.25;
+        c = lift + c * (1.0 - lift);
     }
     // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
     // 域 = sRGB 显示域、乘法（ADR-7/ADR-9）：落在 LUT 之前 —— 与 darktable 的
@@ -6259,6 +6361,13 @@ bool FrameRenderer::init() {
   u_style_.local_ev_on = glGetUniformLocation(prog_style_, "uLocalEvOn");
   u_style_.local_sat = glGetUniformLocation(prog_style_, "uLocalSat");
   u_style_.local_sat_on = glGetUniformLocation(prog_style_, "uLocalSatOn");
+  // E2-11 影调分区 + 褪色（色温/色调无独立 uniform：并入 uWbGain）
+  u_style_.highlights = glGetUniformLocation(prog_style_, "uHighlights");
+  u_style_.shadows = glGetUniformLocation(prog_style_, "uShadows");
+  u_style_.whites = glGetUniformLocation(prog_style_, "uWhites");
+  u_style_.blacks = glGetUniformLocation(prog_style_, "uBlacks");
+  u_style_.fade = glGetUniformLocation(prog_style_, "uFade");
+  u_style_.tone_on = glGetUniformLocation(prog_style_, "uToneOn");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -7074,6 +7183,27 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
   kv += ",\"ct\":" + jnum(p.contrast, 5);
   kv += ",\"sat\":" + jnum(p.sat_mid, 5);
   kv += ",\"clr\":" + jnum(p.clarity, 5);
+  // E2-11：色温/色调 + 影调分区 + 褪色，同样进**同一个出口**。ttOn/toneOn 与
+  // passStyle 内的门控同式重算；wbTot = 含 [88][89] 折算后的**实际**下发增益
+  //（真机核对"色温滑杆是否真的进了引擎"靠它，而不是靠 [1..3] 的裸值）。
+  {
+    float tt[3] = {1.0f, 1.0f, 1.0f};
+    if (p.temp_mired != 0.0f || p.tint != 0.0f) tempTintGain(p.temp_mired, p.tint, tt);
+    kv += ",\"ttOn\":";
+    kv += (p.temp_mired != 0.0f || p.tint != 0.0f) ? "true" : "false";
+    kv += ",\"tMired\":" + jnum(p.temp_mired, 4);
+    kv += ",\"tint\":" + jnum(p.tint, 4);
+    kv += ",\"wbTot\":[" + jnum(p.wb_r * tt[0], 5) + "," +
+          jnum(p.wb_g * tt[1], 5) + "," + jnum(p.wb_b * tt[2], 5) + "]";
+    kv += ",\"toneOn\":";
+    kv += (p.highlights != 0.0f || p.shadows != 0.0f || p.whites != 0.0f ||
+           p.blacks != 0.0f) ? "true" : "false";
+    kv += ",\"hl\":" + jnum(p.highlights, 4);
+    kv += ",\"sh\":" + jnum(p.shadows, 4);
+    kv += ",\"wh\":" + jnum(p.whites, 4);
+    kv += ",\"blk\":" + jnum(p.blacks, 4);
+    kv += ",\"fade\":" + jnum(p.fade, 4);
+  }
   // E2-6 局部调整：下发值全部进**同一个出口**（历史事故：字段写进别的函数 ⇒
   // 真机日志缺项、整轮 A/B 白跑）。locOn 与 passStyle 内的门控同式重算。
   kv += ",\"locOn\":";
@@ -12080,6 +12210,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   }
 }
 
+
 // E1-3 编辑器通路：显示域输入（edit_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
 // 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
 // 颗粒种子固定为 0 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
@@ -12096,10 +12227,21 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   // ── E2-2 基础调整（ADR §5.6；域约定见 kFsStyle 注释）─────────────────────
   // 门控一律在 CPU 侧算 ⇒ 默认（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0）
   // 时 shader 内**整段跳过**，输出逐位不变（零回归 / A/B 开关 = 这五个默认值）。
-  const bool exp_wb_on = p.exposure_ev != 0.0f || p.wb_r != 1.0f ||
-                         p.wb_g != 1.0f || p.wb_b != 1.0f;
+  // ── E2-11 色温/色调：CPU 侧折算成增益后**并入 [1..3]**（ADR-14 裁决 1）──────
+  // 与 [1..3] 同属线性域增益 ⇒ 同一个乘性操作 ⇒ 复用已有的成对往返（零额外 GPU
+  // 成本、零额外量化误差），且 chainLuma 的 `dot(uWbGain, luma)` 域提升**自动**带上
+  // 它们（这也是"不另起一段"的收益：少一处忘记同步 ⇒ 清晰度变成整体偏色的坑）。
+  // 恒等性：[88]=[89]=0 时 tt_gain 恒 (1,1,1)（参考点差分，逐位）⇒ 门控与下发增益
+  // 都与改动前完全一致 ⇒ 零回归。
+  float tt_gain[3] = {1.0f, 1.0f, 1.0f};
+  const bool temp_tint_on = p.temp_mired != 0.0f || p.tint != 0.0f;
+  if (temp_tint_on) tempTintGain(p.temp_mired, p.tint, tt_gain);
+  const float wb_tot[3] = {p.wb_r * tt_gain[0], p.wb_g * tt_gain[1],
+                           p.wb_b * tt_gain[2]};
+  const bool exp_wb_on = p.exposure_ev != 0.0f || wb_tot[0] != 1.0f ||
+                         wb_tot[1] != 1.0f || wb_tot[2] != 1.0f;
   glUniform1f(u_style_.ev, p.exposure_ev);
-  glUniform3f(u_style_.wb_gain, p.wb_r, p.wb_g, p.wb_b);
+  glUniform3f(u_style_.wb_gain, wb_tot[0], wb_tot[1], wb_tot[2]);
   glUniform1f(u_style_.exp_wb_on, exp_wb_on ? 1.0f : 0.0f);
   glUniform1f(u_style_.contrast, p.contrast);
   glUniform1f(u_style_.contrast_on, p.contrast != 1.0f ? 1.0f : 0.0f);
@@ -12114,6 +12256,17 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
       std::max(1.0f, 0.005f * static_cast<float>(std::min(w, h)));
   glUniform2f(u_style_.clar_step, clar_px / static_cast<float>(w),
               clar_px / static_cast<float>(h));
+  // ── E2-11 影调分区 + 褪色（display 域；门控在 CPU 侧算）────────────────────
+  // uToneOn = 四项色阶任一非 0；[94] fade 由 shader 内 `uFade > 0.0` 自行门控
+  //（它是一条独立公式，不需要与四项色阶共用门控）。默认全 0 ⇒ 两段都整段跳过。
+  const bool tone_on = p.highlights != 0.0f || p.shadows != 0.0f ||
+                       p.whites != 0.0f || p.blacks != 0.0f;
+  glUniform1f(u_style_.tone_on, tone_on ? 1.0f : 0.0f);
+  glUniform1f(u_style_.highlights, p.highlights);
+  glUniform1f(u_style_.shadows, p.shadows);
+  glUniform1f(u_style_.whites, p.whites);
+  glUniform1f(u_style_.blacks, p.blacks);
+  glUniform1f(u_style_.fade, p.fade);
   // ── E2-6 局部调整（ADR §5.7）────────────────────────────────────────────
   // 门控一律在 CPU 侧算（与上面五个门控同款）：[79]=0（默认）或 ev/sat 都恒等时
   // uLocalOn=0 ⇒ shader 内 mask 恒 0 ⇒ 整段无副作用（A/B 开关 = [79]）。

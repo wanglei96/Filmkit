@@ -14,11 +14,11 @@ object CameraPresets {
 
     val names = listOf("标准")
 
-    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E2-2 起 88）。
+    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E2-11 起 96）。
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 88
+    const val COUNT = 96
 
     fun byIndex(i: Int): DoubleArray = standard()
 
@@ -283,6 +283,21 @@ object CameraPresets {
         this[85] = 0.25   // local_width
         this[86] = 0.0    // local_ev（0 = 无曝光变化）
         this[87] = 1.0    // local_sat（1.0 = 恒等，不是 0）
+        // ── E2-11（v0.11.4）：色温/色调 + 影调分区 + 褪色 [88..95] ────────────
+        // 与 [60..77]/[78..87] 同一纪律：**每一个都必须是"无效果"值**，编辑器输出
+        // 才逐位不变（ADR-14 的"新参数为恒等值时 max|Δ| ≤ 1 LSB"硬约束）。
+        // 本组全部以 **0 = 恒等**（色温/色调是**相对偏移**，不是绝对 K）—— 因此可以
+        // 依赖 DoubleArray 的零初值，但仍显式写出：契约的默认值是给下一张 UI 卡看的。
+        this[88] = 0.0    // temp_mired：目标白点的 mired 偏移（0 = 不改）。⚠️ 方向：
+                          //   正 ⇒ 目标 K 更低（更暖的光源假设）⇒ **画面变冷**。
+                          //   UI 滑杆建议用 K_target = 1e6/(153.846 + 本值) 作值 ⇒ 右移变暖
+        this[89] = 0.0    // tint：绿↔品红（正 = 品红）；0 = 不改
+        this[90] = 0.0    // highlights：高光提亮/压暗
+        this[91] = 0.0    // shadows：阴影提亮/压暗
+        this[92] = 0.0    // whites：白色色阶
+        this[93] = 0.0    // blacks：黑色色阶
+        this[94] = 0.0    // fade：褪色（抬起黑场）；0 = 关
+        this[95] = 0.0    // 预留（恒等；引擎零引用）
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

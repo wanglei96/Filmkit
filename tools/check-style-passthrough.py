@@ -54,11 +54,24 @@
      ⇒ mask 的**像素**半径水平与垂直相等。⑬b/⑬c 跑方形画幅 ⇒ 拆分前后数值相同，
      测不出这个 bug；本项用 2:3 竖幅，旧椭圆写法会差 1/3（解析对照也按同式拆开）。
 
+  E2-11（色温/色调 + 影调分区 + 褪色）新增：
+  ⑭a 默认零回归：[88..94] 全为恒等值（0）⇒ 输出与输入 max|Δ| ≤ 1 LSB（只剩 dither）。
+  ⑭b 色温 [88] ±50 mired ⇒ 与解析期望（Tanner Helland 黑体近似 + 参考点差分）≤3 LSB，
+     且方向正确（正 mired ⇒ 画面变冷）；含方向取反的区分度对照。
+  ⑭c 色调 [89] ±0.5 ⇒ 同上（正 = 品红 ⇒ G 增益 < 1）。
+  ⑭d 影调分区 [90..93]：高光 l²、阴影 s²、白 l³、黑 s³（乘性 luma 权重）四项各一项 +
+     四项同开，全部与解析期望 ≤3 LSB，并给出"最大变化发生在哪一档 luma"（分区性证据）。
+  ⑭e 褪色 [94]：抬黑场 `lift + c×(1−lift)`，lift = fade×0.25 ⇒ 黑场抬到 32/255、
+     白点保持 255，解析对照 ≤3 LSB。
+  ⑭f 色温与 [1..3] 是**相乘**（同属线性域增益、并入同一次往返）而不是覆盖；含
+     "覆盖 WB"的区分度对照。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
 import argparse
 import importlib.util
+import math
 import os
 import pathlib
 import re
@@ -141,22 +154,100 @@ def cplen_map(w, h):
                     h / vmax * np.abs(2.0 * v - 1.0))
 
 
+def wb_gain_from_kelvin(kelvin):
+    """E2-11：`FrameRenderer.cpp::wbGainFromKelvin` 的直译（Tanner Helland 黑体近似）。
+
+    与 Kotlin `CameraController.wbGains()` 同式（拍照链路同模型）；唯一差异是 C++ 侧
+    分母多了 `max(rn, 1e-3)` 防除零（1500..12000K 内不可达，此处照样保留以逐行对齐）。
+    返回"把该色温的光源还原为中性"的增益（G 归一）。
+    """
+    t = min(max(kelvin, 1500.0), 12000.0) / 100.0
+    if t <= 66.0:
+        r = 255.0
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+    else:
+        r = 329.698727446 * (t - 60.0) ** -0.1332047592
+        g = 288.1221695283 * (t - 60.0) ** -0.0755148492
+    if t >= 66.0:
+        b = 255.0
+    elif t <= 19.0:
+        b = 0.0
+    else:
+        b = 138.5177312231 * math.log(t - 10.0) - 305.0447927307
+    rn = min(max(r, 0.0), 255.0)
+    gn = min(max(g, 0.0), 255.0)
+    bn = max(min(max(b, 0.0), 255.0), 1.0)
+    return (min(max(gn / max(rn, 1e-3), 0.3), 3.0), 1.0,
+            min(max(gn / bn, 0.3), 3.0))
+
+
+def temp_tint_gain(mired, tint):
+    """E2-11：`FrameRenderer.cpp::tempTintGain` 的直译（[88] mired / [89] tint）。
+
+    参考点（6500K ≈ D65）**差分** ⇒ mired=0 且 tint=0 时严格 (1,1,1)（零回归的根据）。
+    方向：mired 是目标白点的 mired 偏移 ⇒ 正 = 目标色温更低（更暖的光源）⇒ 画面变冷。
+    """
+    k_ref = 6500.0
+    m_ref = 1e6 / k_ref
+    k_t = 1e6 / max(m_ref + mired, 1.0)
+    gt, gr = wb_gain_from_kelvin(k_t), wb_gain_from_kelvin(k_ref)
+    t = min(max(tint, -1.0), 1.0)
+    return (gt[0] / gr[0] * (1.0 + 0.5 * t), 1.0 * (1.0 - t),
+            gt[2] / gr[2] * (1.0 + 0.5 * t))
+
+
+def tone_expect(inp, *, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0,
+                highlights=0.0, shadows=0.0, whites=0.0, blacks=0.0, fade=0.0):
+    """E2-11 的解析期望（`kFsStyle` 主流程同序）：往返 → 对比度 → 影调分区 → 褪色。
+
+    ⚠️ 传进来的 `wb` 必须是**含色温/色调折算后的总增益**（= passStyle 的 `wb_tot`），
+    因为引擎把 [88][89] 并进了同一次往返 —— 本函数的入参口径必须与下发口径一致。
+    影调分区 = 乘性 luma 权重（高光 l²、阴影 s²、白 l³、黑 s³，s = 1−l）；褪色 =
+    加性抬黑 `lift + c×(1−lift)`，lift = fade×0.25。饱和度/清晰度不在本函数内
+    （它们各自有单测项，混进来会让"哪一段错了"无法归因）。
+    """
+    x = inp.astype(np.float64) / 255.0
+    if ev != 0.0 or tuple(wb) != (1.0, 1.0, 1.0):
+        lin = srgb_decode_np(x) * (2.0 ** ev) * np.array(wb)[None, None, :]
+        x = srgb_encode_np(lin)
+    if contrast != 1.0:
+        x = np.clip((x - 0.5) * contrast + 0.5, 0.0, 1.0)
+    if highlights or shadows or whites or blacks:
+        l = x @ np.array([0.299, 0.587, 0.114])
+        s = 1.0 - l
+        g = (1.0 + highlights * l * l + shadows * s * s
+             + whites * l * l * l + blacks * s * s * s)
+        x = x * np.maximum(g, 0.0)[..., None]
+    if fade > 0.0:
+        lift = fade * 0.25
+        x = lift + x * (1.0 - lift)
+    return np.clip(x, 0.0, 1.0) * 255.0
+
+
 def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
                    clarity=0.0, local_type=0.0, local_center=(0.5, 0.5),
                    local_radius=0.35, local_feather=0.5, local_angle=0.0,
-                   local_width=0.25, local_ev=0.0, local_sat=1.0):
+                   local_width=0.25, local_ev=0.0, local_sat=1.0,
+                   temp_mired=0.0, tint=0.0, highlights=0.0, shadows=0.0,
+                   whites=0.0, blacks=0.0, fade=0.0):
     """E2-2 基础调整 + E2-6 局部调整的 CPU 侧下发值（**与 FrameRenderer::passStyle
     同式**，含门控）。
 
     门控在 CPU 侧算 ⇒ 默认恒等（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0、
-    local_type=0）时 shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时验收 CPU 侧
-    的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on，以及 E2-7
-    的 radius 拆分）。
+    local_type=0、[88..94]=0）时 shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时
+    验收 CPU 侧的下发公式（E2-6 的三个门控：local_on / local_ev_on / local_sat_on；
+    E2-7 的 radius 拆分；E2-11 的色温/色调并入 uWbGain + 影调分区门控）。
     """
     radial = 0.5 <= local_type < 1.5
     linear = local_type >= 1.5
     ev_on = local_ev != 0.0
     sat_on = local_sat != 1.0
+    # E2-11：色温/色调折算成增益后**并入 [1..3]**（passStyle 同式）⇒ 门控只看 wb_tot。
+    tt = (temp_tint_gain(temp_mired, tint)
+          if (temp_mired != 0.0 or tint != 0.0) else (1.0, 1.0, 1.0))
+    wb_tot = tuple(float(wb[i]) * tt[i] for i in range(3))
+    tone_on = (highlights != 0.0 or shadows != 0.0 or whites != 0.0
+               or blacks != 0.0)
     # E2-7 正圆修正（passStyle 同式）：rx = [82]（相对图像宽）、ry = [82]×W/H
     #（相对图像高）⇒ shader 内 `length(p/r)` 在**像素空间**等距。
     # ⚠ 这项必须与 C++ 侧逐字同式：⑬b/⑬c 的解析对照就是靠它把"椭圆 bug"照出来的
@@ -164,8 +255,8 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
     aspect = (float(w) / float(h)) if h > 0 else 1.0
     return {
         'uEv': float(ev),
-        'uWbGain': tuple(float(v) for v in wb),
-        'uExpWbOn': 1.0 if (ev != 0.0 or tuple(wb) != (1.0, 1.0, 1.0)) else 0.0,
+        'uWbGain': wb_tot,
+        'uExpWbOn': 1.0 if (ev != 0.0 or wb_tot != (1.0, 1.0, 1.0)) else 0.0,
         'uContrast': float(contrast),
         'uContrastOn': 1.0 if contrast != 1.0 else 0.0,
         'uSat': float(sat),
@@ -186,6 +277,13 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         'uLocalEvOn': 1.0 if ev_on else 0.0,
         'uLocalSat': float(local_sat),
         'uLocalSatOn': 1.0 if sat_on else 0.0,
+        # E2-11 影调分区 + 褪色（passStyle 同式；fade 由 shader 内 uFade>0 自行门控）
+        'uHighlights': float(highlights),
+        'uShadows': float(shadows),
+        'uWhites': float(whites),
+        'uBlacks': float(blacks),
+        'uFade': float(fade),
+        'uToneOn': 1.0 if tone_on else 0.0,
     }
 
 
@@ -345,7 +443,12 @@ def check_pass_style_slots():
             # / angle[84] / width[85] / ev[86] / sat[87]。
             'local_type', 'local_center_x', 'local_center_y', 'local_radius',
             'local_feather', 'local_angle', 'local_width', 'local_ev',
-            'local_sat'}
+            'local_sat',
+            # E2-11：色温[88] / 色调[89]（CPU 侧折成增益并入 uWbGain）+ 影调分区
+            # [90..93] + 褪色[94]。⚠️ [95] reserved **不在**白名单 —— 它确实零引用，
+            # 这正是本项要守的（"每新增一个编辑器链路支持的参数必须显式加进来"）。
+            'temp_mired', 'tint', 'highlights', 'shadows', 'whites', 'blacks',
+            'fade'}
     return refs == want, refs, ''
 
 
@@ -847,6 +950,119 @@ def main():
           f'（应为 3 = 定义 1 + chainLuma 1 + 主路径 1 ⇒ 全局与局部曝光共用同一次往返）')
     if n_dec != 3:
         fails.append('⑬f 单次往返')
+
+    # ══ E2-11（色温/色调 + 影调分区 + 褪色）═════════════════════════════════════
+    # 判据一律 = 与 numpy 解析期望（本文件顶部 temp_tint_gain / tone_expect，与 C++ /
+    # shader 逐行同式）的 max|Δ| ≤ 3 LSB（dither ±1 + 量化余量）。
+    # ⚠ `code_ladder` 返回的是 **0..1 的 float**（⑪ 直接喂 `run_fn` 用）；而
+    # `run_style` / `tone_expect` 的输入口径是 **uint8 0..255** ⇒ 必须转回来，否则
+    # 整图接近全黑、⑭d/⑭e 的"作用域"判据全变 0 = 空转（实测踩过一次）。
+    lad14 = np.clip(np.rint(code_ladder(n, n) * 255.0), 0, 255).astype(np.uint8)
+    vals14 = lad14[0, :, 0].astype(np.float64)      # 每列的编码值（0..255 循环）
+    i_blk, i_wht = int(np.argmin(vals14)), int(np.argmax(vals14))
+
+    # ⑭a 默认零回归：8 个新槽位全为恒等值 ⇒ 输出与输入 ≤1 LSB（只剩 dither）。
+    #     与 ①/⑩ 同口径，但**显式列出 [88..94]** —— E2-11 之后 ① 不再覆盖"新参数是否
+    #     真的恒等"（ADR-14 硬约束 2 的哨兵）。
+    o14a = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0,
+                     adj=dict(temp_mired=0.0, tint=0.0, highlights=0.0, shadows=0.0,
+                              whites=0.0, blacks=0.0, fade=0.0))
+    d14a = np.abs(quant(o14a, inp.shape) - inp.astype(np.float64))
+    bad14a = int((d14a > 1).sum())
+    print(f'⑭a E2-11 默认零回归（[88..94] 全 0）：max|Δ| = {d14a.max():.0f} LSB, '
+          f'>1LSB 像素 = {bad14a}/{d14a.size}, 零差占比 = {(d14a == 0).mean() * 100:.1f}%')
+    if bad14a:
+        fails.append('⑭a E2-11 零回归')
+
+    # ⑭b 色温 [88]：±50 mired ⇒ 与解析期望对照 + **方向判据**（正 mired = 目标色温更低
+    #     = 更暖的光源 ⇒ 画面变冷 ⇒ B/R 增益比 > 1）。末项是区分度对照：把方向写反
+    #     （增益取倒数）后与实测的偏离必须 > 3 LSB，否则"方向判据"是空转。
+    ok14b, d_rev = [], 0.0
+    for mired in (50.0, -50.0):
+        o = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                      grain=0.0, adj=dict(temp_mired=mired))
+        q = quant(o, inp.shape)
+        wb_tot = temp_tint_gain(mired, 0.0)
+        d = float(np.abs(q - tone_expect(inp, wb=wb_tot)).max())
+        br = wb_tot[2] / wb_tot[0]
+        ok14b.append(d <= 3.0 and (br > 1.0 if mired > 0 else br < 1.0))
+        print(f'⑭b 色温 [88]={mired:+.0f} mired ⇒ 折算增益 = ({wb_tot[0]:.4f}, 1, '
+              f'{wb_tot[2]:.4f})，B/R = {br:.4f}（判据：正 mired ⇒ >1 = 偏冷 / '
+              f'负 mired ⇒ <1 = 偏暖）；与解析期望 max|Δ| = {d:.1f} LSB（判据 ≤3）')
+        if mired > 0:
+            d_rev = float(np.abs(q - tone_expect(
+                inp, wb=tuple(1.0 / v for v in wb_tot))).max())
+    print(f'   区分度对照（方向取反的期望）：max|Δ| = {d_rev:.1f} LSB（须 >3 ⇒ 判据有效）')
+    if not all(ok14b) or d_rev <= 3.0:
+        fails.append('⑭b 色温')
+
+    # ⑭c 色调 [89]：±0.5 ⇒ 与解析期望对照 + 方向判据（正 = 品红 ⇒ G 增益 < 1）
+    ok14c = []
+    for tint in (0.5, -0.5):
+        o = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                      grain=0.0, adj=dict(tint=tint))
+        g = temp_tint_gain(0.0, tint)
+        d = float(np.abs(quant(o, inp.shape) - tone_expect(inp, wb=g)).max())
+        ok14c.append(d <= 3.0 and (g[1] < 1.0 if tint > 0 else g[1] > 1.0))
+        print(f'⑭c 色调 [89]={tint:+.1f} ⇒ 折算增益 = ({g[0]:.4f}, {g[1]:.4f}, '
+              f'{g[2]:.4f})（G {"<" if g[1] < 1 else ">"} 1 = '
+              f'{"品红" if tint > 0 else "绿"}）；与解析期望 max|Δ| = {d:.1f} LSB（判据 ≤3）')
+    if not all(ok14c):
+        fails.append('⑭c 色调')
+
+    # ⑭d 影调分区 [90..93]：四项各一项 + 四项同开，全部与解析期望对照；并给出**作用域**
+    #     数字（最大变化发生在哪一档 luma）—— "分区"必须真的分区，不是整体提亮。
+    ok14d = []
+    for name, adj in (('高光 [90]=+0.5', dict(highlights=0.5)),
+                      ('阴影 [91]=+0.5', dict(shadows=0.5)),
+                      ('白 [92]=−0.5', dict(whites=-0.5)),
+                      ('黑 [93]=−0.5', dict(blacks=-0.5)),
+                      ('四项同开', dict(highlights=0.5, shadows=0.5, whites=-0.5,
+                                    blacks=-0.5))):
+        o = run_style(gl, eso, sh, lad14, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                      grain=0.0, adj=adj)
+        e = tone_expect(lad14, **adj)
+        d = float(np.abs(quant(o, lad14.shape) - e).max())
+        cd = np.abs(e - lad14.astype(np.float64)).mean(axis=(0, 2))   # 每列的平均变化
+        j = int(cd.argmax())
+        ok14d.append(d <= 3.0 and cd.max() > 5.0)
+        print(f'⑭d 影调分区 {name}：与解析期望 max|Δ| = {d:.1f} LSB（判据 ≤3）；'
+              f'最大变化 {cd.max():.1f} LSB 发生在 luma = {vals14[j]:.0f}/255，'
+              f'两端（luma 0 / 255）变化 = {cd[i_blk]:.1f} / {cd[i_wht]:.1f} LSB')
+    if not all(ok14d):
+        fails.append('⑭d 影调分区')
+
+    # ⑭e 褪色 [94]：fade=0.5 ⇒ 黑场抬到 0.125（≈32/255）、白点保持 255；解析对照 ≤3。
+    o14e = run_style(gl, eso, sh, lad14, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(fade=0.5))
+    q14e = quant(o14e, lad14.shape)
+    e14e = tone_expect(lad14, fade=0.5)
+    d14e = float(np.abs(q14e - e14e).max())
+    blk_got = float(q14e[:, i_blk, 0].mean())
+    wht_got = float(q14e[:, i_wht, 0].mean())
+    print(f'⑭e 褪色 [94]=0.5（抬黑场）：与解析期望 max|Δ| = {d14e:.1f} LSB（判据 ≤3）；'
+          f'luma 0 列实测 = {blk_got:.1f}（期望 {0.5 * 0.25 * 255:.1f}）, '
+          f'luma 255 列实测 = {wht_got:.1f}（期望 255 ⇒ 白点不动）')
+    if d14e > 3.0 or abs(blk_got - 31.9) > 2.0 or abs(wht_got - 255.0) > 2.0:
+        fails.append('⑭e 褪色')
+
+    # ⑭f 色温与 [1..3] 是**相乘**（同属线性域增益），不是覆盖：wb=(1.2,1,0.9) +
+    #     [88]=+50 ⇒ 期望 = wb × tt。末项是区分度对照：若实现成"色温覆盖 WB"会差多少。
+    wb14 = (1.2, 1.0, 0.9)
+    o14f = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(wb=wb14, temp_mired=50.0))
+    q14f = quant(o14f, inp.shape)
+    tt14 = temp_tint_gain(50.0, 0.0)
+    wb_tot14 = tuple(wb14[i] * tt14[i] for i in range(3))
+    d14f = float(np.abs(q14f - tone_expect(inp, wb=wb_tot14)).max())
+    d_cov = float(np.abs(q14f - tone_expect(inp, wb=tt14)).max())
+    print(f'⑭f 色温 × WB 相乘（wb=(1.2,1,0.9) + [88]=+50）：总增益 = '
+          f'({wb_tot14[0]:.4f}, {wb_tot14[1]:.4f}, {wb_tot14[2]:.4f}），与解析期望 '
+          f'max|Δ| = {d14f:.1f} LSB（判据 ≤3）；区分度对照（若为"覆盖 WB"）'
+          f'max|Δ| = {d_cov:.1f} LSB（须 >3）')
+    if d14f > 3.0 or d_cov <= 3.0:
+        fails.append('⑭f 色温×WB 相乘')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')
