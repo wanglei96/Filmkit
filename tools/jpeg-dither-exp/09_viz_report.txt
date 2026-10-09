@@ -1,0 +1,6 @@
+最平坦块: std=0.669 @ (1200,960)
+最纹理块: std=71.911 @ (1920,1440)
+wrote tools/jpeg-dither-exp/viz_flat.png
+wrote tools/jpeg-dither-exp/viz_tex.png
+  平坦块 @(1200,960) luma std=0.67: 局部5x5std 原片=0.6030 导出=1.0127 (Δ=+0.4097); mean|Δ|=0.3399
+  纹理块 @(1920,1440) luma std=71.91: 局部5x5std 原片=2.9809 导出=3.2801 (Δ=+0.2992); mean|Δ|=0.4008

@@ -1,0 +1,48 @@
+/Users/wl/Downloads/胶片相机/tools/jpeg-dither-exp/diff_analysis.py:142: RuntimeWarning: invalid value encountered in scalar divide
+  print(f"    B/A = {[round(float(b/a),4) for a,b in zip(qA,qB)]}")
+/Users/wl/Downloads/胶片相机/tools/jpeg-dither-exp/diff_analysis.py:144: RuntimeWarning: invalid value encountered in scalar divide
+  "ratio": [float(b / a) for a, b in zip(qA, qB)]}
+== 解码 ==
+A (4080, 3072, 3) uint8 B (4080, 3072, 3) uint8
+
+== 第 2 项 逐像素差异 (A=原片, B=导出) ==
+  样本数        = 37,601,280
+  |Δ|=0         = 63.1854%  (23,758,516)
+  |Δ|=1         = 33.6621%  (12,657,367)
+  |Δ|=2         = 2.9913%  (1,124,761)
+  |Δ|>=3        = 0.1613%  (60,636)
+  max|Δ|        = 5
+  mean|Δ|       = 0.40132
+  RMS(Δ)        = 0.68633 LSB
+  |Δ| 0..10 计数 = [23758516, 12657367, 1124761, 59189, 1446, 1, 0, 0, 0, 0, 0]
+  Δ=-8..8 计数   = [0, 0, 0, 1, 733, 29184, 556159, 6317604, 23758516, 6339763, 568602, 30005, 713, 0, 0, 0, 0]
+
+== 第 3 项 高频能量 (luma) ==
+  原片   3x3 拉普拉斯方差 = 30.171   mean|lap| = 3.1807
+  导出   3x3 拉普拉斯方差 = 45.486   mean|lap| = 4.5437
+  比值 (导出/原片) 方差 = 1.5076   mean|lap| = 1.4285
+    R: A=35.16 B=50.99 B/A=1.4501
+    G: A=30.56 B=45.42 B/A=1.4866
+    B: A=32.90 B=48.33 B/A=1.4692
+
+== 第 5 项 细节真伪 ==
+  水平相邻 luma 完全相同占比: 原片 37.551%  导出 25.056%  (差 -12.495 pp)
+    R: A=34.700% B=23.813% (-10.886 pp)
+    G: A=37.379% B=25.327% (-12.052 pp)
+    B: A=36.274% B=24.723% (-11.550 pp)
+  暗部 luma<64 占比: 原片 18.3702%  导出 18.3842%
+  暗部像素数: A=2,302,476 B=2,304,234  交并: 2,290,577  仅A=11,899 仅B=13,657
+  暗部 luma 0..15 计数 A=[26, 601, 4364, 8451, 9709, 9116, 7548, 6112, 4647, 3851, 3352, 2966, 2901, 3151, 3514, 4294]
+  暗部 luma 0..15 计数 B=[337, 1360, 4224, 7473, 9090, 8692, 7601, 6412, 4880, 4040, 3449, 3128, 3015, 3229, 3758, 4331]
+  全图 luma mean: A=143.6198 B=143.6042 (Δ=-0.0156)
+  全图 luma std : A=58.8743 B=58.8678 (Δ=-0.0065)
+  5x5 局部 std 分位数 [10, 25, 50, 75, 90, 99]:
+    A = [0.0, 0.0, 0.0, 14.817, 26.107, 46.926]
+    B = [0.0, 0.0, 0.0, 15.023, 26.107, 46.926]
+    B/A = [nan, nan, nan, 1.0139, 1.0, 1.0]
+  平坦区(cA<1) 占比 52.20%  纹理区(cA>8) 占比 38.75%
+Traceback (most recent call last):
+  File "/Users/wl/Downloads/胶片相机/tools/jpeg-dither-exp/diff_analysis.py", line 151, in <module>
+    dd = ad[1:-1, 1:-1][m]
+         ~~~~~~~~~~~~~~^^^
+IndexError: boolean index did not match indexed array along axis 0; size of axis is 4078 but size of corresponding boolean axis is 4076

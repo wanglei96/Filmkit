@@ -1,0 +1,77 @@
+==============================================================================
+FILE: test_temp/FILMKIT_20261009-090810.jpg
+  size_bytes          = 5,617,678
+  scan(entropy)bytes  = 5,616,697
+  header_bytes        = 981
+  SOF                 = SOF0  precision=8bit  3072x4080  ncomp=3
+  components          = id=1 H=1 V=1 Tq=0 | id=2 H=1 V=1 Tq=1 | id=3 H=1 V=1 Tq=1
+  sampling ratio      = 1x1 -> per-comp H:V = 1:1, 1:1, 1:1
+  CHROMA VERDICT      = 4:4:4 (no subsampling)
+  DQT id=0 prec=0 first16 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+      all-ones? True   min=1 max=1 distinct=1
+      table = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  DQT id=1 prec=0 first16 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+      all-ones? True   min=1 max=1 distinct=1
+      table = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  EXIF len            = 362 bytes
+  APP segments        = APP1(len=370), 0xE0(len=16)
+  segment histogram   = {'0xE1': 1, '0xE0': 1, 'DQT': 1, 'SOF0': 1, 'DHT': 1, 'SOS': 1}
+  DHT count           = 1
+  EXIF tags:
+    ImageWidth (tag=256) type=4 n=1 = [3072]
+    Model (tag=272) type=2 n=7 = ivo
+    ImageLength (tag=257) type=4 n=1 = [4080]
+    Make (tag=271) type=2 n=5 = 6:10:
+    ExifIFDPointer (tag=34665) type=4 n=1 = [130]
+    ExifIFD:0 (tag=ExifIFD:0) type=232 n=2751660035 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=0 n=2450128901 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=252 n=2191130629 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=260 n=2284257283 = None
+    ExifIFD:893 (tag=ExifIFD:893) type=0 n=2751791107 = None
+    ExifIFD:24 (tag=ExifIFD:24) type=0 n=2449997828 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=0 n=2191327237 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=268 n=0 = None
+    ExifIFD:14897 (tag=ExifIFD:14897) type=12346 n=809050160 = None
+    ExifIFD:14897 (tag=ExifIFD:14897) type=12288 n=6 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=100 n=10000 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=10000 n=262416 = None
+    ExifIFD:7 (tag=ExifIFD:7) type=0 n=21627151 = None
+    ExifIFD:5 (tag=ExifIFD:5) type=0 n=22085906 = None
+    GPSLatitudeRef (tag=ExifIFD:1) type=1 n=306 = None
+    ExifIFD:20 (tag=ExifIFD:20) type=0 n=22413312 = None
+    ExifIFD:13616 (tag=ExifIFD:13616) type=14657 n=7760246 = None
+    ExifIFD:12854 (tag=ExifIFD:12854) type=14897 n=809119801 = None
+    Orientation (tag=274) type=3 n=1 = [1]
+    DateTime (tag=306) type=2 n=20 = 09 09:08:10
+==============================================================================
+FILE: test_temp/FILMKIT_20261009-090827_edit.jpg
+  size_bytes          = 7,507,423
+  scan(entropy)bytes  = 7,506,610
+  header_bytes        = 813
+  SOF                 = SOF0  precision=8bit  3072x4080  ncomp=3
+  components          = id=1 H=1 V=1 Tq=0 | id=2 H=1 V=1 Tq=1 | id=3 H=1 V=1 Tq=1
+  sampling ratio      = 1x1 -> per-comp H:V = 1:1, 1:1, 1:1
+  CHROMA VERDICT      = 4:4:4 (no subsampling)
+  DQT id=0 prec=0 first16 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+      all-ones? True   min=1 max=1 distinct=1
+      table = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  DQT id=1 prec=0 first16 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+      all-ones? True   min=1 max=1 distinct=1
+      table = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  EXIF len            = 194 bytes
+  APP segments        = APP1(len=202), 0xE0(len=16)
+  segment histogram   = {'0xE1': 1, '0xE0': 1, 'DQT': 1, 'SOF0': 1, 'DHT': 1, 'SOS': 1}
+  DHT count           = 1
+  EXIF tags:
+    ImageWidth (tag=256) type=4 n=1 = [3072]
+    ImageLength (tag=257) type=4 n=1 = [4080]
+    ExifIFDPointer (tag=34665) type=4 n=1 = [94]
+    ExifIFD:0 (tag=ExifIFD:0) type=124 n=2449997828 = None
+    ExifIFD:0 (tag=ExifIFD:0) type=0 n=0 = None
+    ExifIFD:14897 (tag=ExifIFD:14897) type=12346 n=809050160 = None
+    ExifIFD:14898 (tag=ExifIFD:14898) type=14080 n=131346 = None
+    GPSLatitudeRef (tag=ExifIFD:1) type=1 n=306 = None
+    ExifIFD:20 (tag=ExifIFD:20) type=0 n=11403264 = None
+    ExifIFD:12854 (tag=ExifIFD:12854) type=14897 n=809119801 = None
+    Orientation (tag=274) type=3 n=1 = [1]
+    DateTime (tag=306) type=2 n=20 = 09 09:08:27

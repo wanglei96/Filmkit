@@ -1,0 +1,23 @@
+== 区域选择：原始信号平坦区 ==
+  平坦区(cA<1) 占比 = 72.03%  (9,028,079 px)
+  x=A-localmean: std=13.8588  平坦区内 std=11.5472
+
+== corr( A 的 dither 残差 x , δ_hypothesis )  —— 平坦区内 ==
+  corr(x, δ_H2 (row+0.5, 编辑器实测坐标)           ) = +0.02906
+  corr(x, δ_H1 (H-row-0.5, GL左下原点)          ) = +0.00006
+  corr(x, δ_H3 (双翻转)                        ) = +0.00007
+
+== 阳性对照：corr( out_C - A , δ_H2 ) ==
+  corr(out_C-A, δ_H2) = +0.00033   ← 已知必定相干，给出相关系数上界
+
+== 实际导出：corr( BR - A , δ_H2 ) ==
+  corr(BR-A, δ_H2) = +0.52913
+
+== 关键判据：δ_H2 分档 vs 实际 (BR-A) 与 (out_C-A) ==
+  δ<-0.5       n=1,128,835  mean(BR-A)=-0.8293  mean(out_C-A)=-0.0042  理论 round(δ)=-1
+  -0.5..-0.25  n=1,408,129  mean(BR-A)=-0.0887  mean(out_C-A)=-0.0035  理论 round(δ)=-0
+  -0.25..0.25  n=3,954,691  mean(BR-A)=+0.0211  mean(out_C-A)=-0.0032  理论 round(δ)=+0
+  0.25..0.5    n=1,410,915  mean(BR-A)=+0.0133  mean(out_C-A)=-0.0031  理论 round(δ)=+0
+  δ>+0.5       n=1,125,509  mean(BR-A)=+0.8233  mean(out_C-A)=-0.0033  理论 round(δ)=+1
+
+已写出 tools/jpeg-dither-exp/07_coherence.json

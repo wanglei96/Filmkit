@@ -28,6 +28,16 @@
   ⑨ E4-2 一致性：kFsOut / kFsStyle 的暗角段（shader 逻辑 + uniform 声明 + CPU 侧
       下发）逐字相同 ⇒ 上一条"逐字相同"不靠人工目视维持。
 
+  E2-2（基础调整引擎）新增：
+  ⑩ 往返无损（本卡技术风险点）：ev=0 / WB=(1,1,1) / contrast=1 / sat=1 / clarity=0
+      ⇒ 输出与输入 max|Δ| ≤ 1 LSB（只剩 TPDF dither）。与 ① 同口径，但**显式列出
+      五个新参数的默认值** —— E2-2 之后 ① 不再覆盖"新参数是否真的恒等"。
+  ⑪ **真 sRGB 曲线**的证据（对照 numpy 解析解）：ev=+1 ⇒ shader 输出必须匹配
+      **真 sRGB 分段曲线**的期望值（≤2 LSB），且与 **pow(2.2) 近似**的期望值在暗部
+      显著不同（>3 LSB）。这一项就是"暗部往返误差 9/255"事故的哨兵。
+  ⑫ 显示域三项真生效（不是死代码）+ 平坦区无副作用：contrast=1.5 显著改图；
+      sat=0 ⇒ 输出逐像素 R=G=B；clarity=0.5 ⇒ 噪声/边缘图变化，纯灰图逐位不变。
+
 用法：python3 tools/check-style-passthrough.py [--size 96]
 依赖：moderngl + glfw（与 tools/engine-shader-offline.py 相同）
 """
@@ -115,8 +125,30 @@ def cplen_map(w, h):
                     h / vmax * np.abs(2.0 * v - 1.0))
 
 
+def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
+                   clarity=0.0):
+    """E2-2 基础调整的 CPU 侧下发值（**与 FrameRenderer::passStyle 同式**，含门控）。
+
+    门控在 CPU 侧算 ⇒ 默认恒等（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0）时
+    shader 内整段跳过。这里刻意重算一遍 ⇒ 本脚本同时验收 CPU 侧的下发公式。
+    """
+    return {
+        'uEv': float(ev),
+        'uWbGain': tuple(float(v) for v in wb),
+        'uExpWbOn': 1.0 if (ev != 0.0 or tuple(wb) != (1.0, 1.0, 1.0)) else 0.0,
+        'uContrast': float(contrast),
+        'uContrastOn': 1.0 if contrast != 1.0 else 0.0,
+        'uSat': float(sat),
+        'uSatOn': 1.0 if sat != 1.0 else 0.0,
+        'uClarity': float(clarity),
+        # 环半径 = max(1px, 0.5% × min(W,H))，转成 UV 步长（passStyle 同式）
+        'uClarStep': (max(1.0, 0.005 * min(w, h)) / w,
+                      max(1.0, 0.005 * min(w, h)) / h),
+    }
+
+
 def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
-              grain, seed=0.0, vig=(0.0, 80.0, 50.0)):
+              grain, seed=0.0, vig=(0.0, 80.0, 50.0), adj=None):
     h, w = inp.shape[:2]
     # 归一化 RGB 纹理 ≈ 真机 still_tex_（GL_RGB8：上传 8bit，采样得 v/255）；
     # float16 存 v/255 的量化误差 ≤ 0.13 LSB，不影响 ±1 LSB 判定
@@ -130,17 +162,84 @@ def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
         'uLutSize': float(lut_size),
     }
     uni.update(vig_uniforms(w, h, *vig))
+    uni.update(style_uniforms(w, h, **(adj or {})))
     out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex})
     tex.release()
     return out
+
+
+def srgb_decode_np(x):
+    """真 sRGB EOTF（IEC 61966-2-1）—— 与 kFsStyle 的 srgbDecode 同式。"""
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def srgb_encode_np(x):
+    """真 sRGB OETF —— 与 kFsOut/kFsStyle 的 srgbEncode 同式。"""
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, 12.92 * x, 1.055 * x ** (1.0 / 2.4) - 0.055)
+
+
+def code_ladder(w, h):
+    """编码域阶梯（0..255，密集覆盖 sRGB 线性段边界 0.04045 ≈ 10.3/255 两侧）。
+
+    ⚠ 必须密集覆盖 **10~14/255**：pow(2.2) 近似与真 sRGB 的最大分歧就在分段点
+    附近（pow 没有线性段 ⇒ 把 10/255 解码成 8e-4 而真值是 3.0e-3，差 4 倍），
+    这正是"暗部往返误差 9/255"的物理位置。
+    """
+    vals = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 20, 24,
+                     32, 48, 64, 96, 128, 192, 255], np.float32) / np.float32(255.0)
+    img = np.empty((h, w, 3), np.float32)
+    img[:] = vals[np.arange(w) % len(vals)][None, :, None]
+    return img
+
+
+# 区分度对照用的 pow(2.2) 近似（**绝不允许进引擎**，只用来证明 ⑪ 的判据有效）
+POW22_DECODE = """vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return pow(c, vec3(2.2));
+}"""
+
+
+def extract_fn(src, shader, sig):
+    """从 FrameRenderer.cpp 的某个 shader 里抠出一个函数定义（含函数体）。"""
+    m = re.search(re.escape(sig) + r' \{.*?\n\}', shader_src(src, shader), re.S)
+    return m.group(0) if m else None
+
+
+def run_fn(gl, eso, inp, fn_src, body):
+    """把引擎源码里的函数单独跑一遍：输入 = 编码域 float 图，输出 = RGBA16F 读回。
+
+    为什么不经过 kFsStyle：曲线必须能被**单独观测** —— 混在往返段里时，
+    "自洽但错误的曲线对"（pow(2.2) 解码 + pow(1/2.2) 编码）往返也是恒等的，
+    单看往返无法区分（这正是 ⑪ 必须直接对照解析解的原因）。
+    """
+    h, w = inp.shape[:2]
+    test = ('#version 300 es\nprecision highp float;\nin vec2 vUV0;\n'
+            'layout(location = 0) out vec4 oColor;\nuniform highp sampler2D uTex;\n'
+            + fn_src + '\nvoid main() {\n    vec3 c = texture(uTex, vUV0).rgb;\n'
+            '    ' + body + '\n}\n')
+    tex = gl.ctx.texture((w, h), 3, dtype='f2')
+    tex.write(inp.astype(np.float16).tobytes())
+    tex.filter = (eso.moderngl.LINEAR, eso.moderngl.LINEAR)
+    out = gl.run(test, {}, {'uTex': tex}, size=(w, h))
+    tex.release()
+    return out[..., :3].astype(np.float64)
+
+
+def rel_err(got, want):
+    """相对误差（RGBA16F 读回的精度是相对 4.9e-4 ⇒ 绝对判据在中高值处不可用）。"""
+    return np.abs(got - want) / np.maximum(np.abs(want), 1e-6)
+
 
 
 def check_pass_style_slots():
     """passStyle 的槽位**白名单**（精确匹配，不是子集）：只允许读这几项。
 
     ⚠ 这是"显式声明"式约束：**每新增一个编辑器链路支持的参数，必须同步加进 want**
-    （E4-2 暗角 = 加 [66][67][68]）；否则 passStyle 读到别处的槽位却没人发现 ——
-    ADR §5.1 的 I-2 要防的正是"数组里有值就莫名生效"。
+    （E4-2 暗角 = 加 [66][67][68]；E2-2 基础调整 = 加 [0][1][2][3][4][21][78]）；
+    否则 passStyle 读到别处的槽位却没人发现 —— ADR §5.1 的 I-2 要防的正是
+    "数组里有值就莫名生效"。
     """
     src = pathlib.Path(FR).read_text(encoding='utf-8')
     m = re.search(r'void FrameRenderer::passStyle\(.*?\n\}', src, re.S)
@@ -148,7 +247,12 @@ def check_pass_style_slots():
         return False, set(), 'passStyle 函数体未找到'
     refs = set(re.findall(r'\bp\.(\w+)', m.group(0)))
     want = {'grain_amount', 'grain_size', 'lut_strength',
-            'vignette_strength', 'vignette_radius', 'vignette_feather'}
+            'vignette_strength', 'vignette_radius', 'vignette_feather',
+            # E2-2 基础调整：曝光[0] / WB[1..3]（线性域往返）+ 对比度[4] /
+            # 饱和度[21] / 清晰度[78]（显示域）。饱和度读 [21]（UI 一个滑杆同写
+            # [20..22]，ADR §5.6④ 的伪代码是单值 uSat）。
+            'exposure_ev', 'wb_r', 'wb_g', 'wb_b', 'contrast', 'sat_mid',
+            'clarity'}
     return refs == want, refs, ''
 
 
@@ -349,6 +453,80 @@ def main():
     print(f'⑨ kFsOut 与 kFsStyle 的暗角实现逐字比对：差异段 = {diff9 or "无（0 处）"}')
     if diff9:
         fails.append('⑨ 两处一致性')
+
+    # ⑩ E2-2 往返无损（本卡技术风险点）：五个新参数取默认值 ⇒ 输出 = 输入。
+    # 与 ① 同口径，但**显式列出五个参数的默认值**（E2-2 之后 ① 只覆盖 LUT/颗粒）。
+    o10 = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                    grain=0.0, adj=dict(ev=0.0, wb=(1.0, 1.0, 1.0),
+                                        contrast=1.0, sat=1.0, clarity=0.0))
+    q10 = quant(o10, inp.shape)
+    d10 = np.abs(q10 - inp.astype(np.float64))
+    bad10 = int((d10 > 1).sum())
+    print(f'⑩ E2-2 往返无损（ev=0 WB=(1,1,1) ct=1 sat=1 clr=0）：'
+          f'max|Δ| = {d10.max():.0f} LSB, >1LSB 像素 = {bad10}/{d10.size}, '
+          f'零差占比 = {(d10 == 0).mean() * 100:.1f}%')
+    if bad10:
+        fails.append('⑩ 往返无损')
+
+    # ⑪ 真 sRGB 曲线（本卡门禁）：把引擎源码里的 srgbDecode / srgbEncode **单独抠出来
+    #    跑**，对照 numpy 解析解。为什么不能只看往返：自洽但错误的曲线对
+    #    （pow(2.2) 解码 + pow(1/2.2) 编码）往返同样恒等 —— 单看往返**无区分度**。
+    #    末项用 pow(2.2) 近似做区分度对照（ADR §6.5：判据定案前量化区分度）。
+    src_txt = pathlib.Path(FR).read_text(encoding='utf-8')
+    lad = code_ladder(n, n)
+    dec_src = extract_fn(src_txt, 'kFsStyle', 'vec3 srgbDecode(vec3 c)')
+    enc_src = extract_fn(src_txt, 'kFsOut', 'vec3 srgbEncode(vec3 c)')
+    if dec_src is None or enc_src is None:
+        print('⑪ FAIL 未能从 FrameRenderer.cpp 抠出 srgbDecode / srgbEncode')
+        fails.append('⑪ 真 sRGB 曲线')
+    else:
+        want_dec = srgb_decode_np(lad.astype(np.float64))
+        want_enc = srgb_encode_np(lad.astype(np.float64))
+        rel_dec = rel_err(run_fn(gl, eso, lad, dec_src,
+                                 'oColor = vec4(srgbDecode(c), 1.0);'), want_dec)
+        rel_enc = rel_err(run_fn(gl, eso, lad, enc_src,
+                                 'oColor = vec4(srgbEncode(c), 1.0);'), want_enc)
+        # 跨 shader 往返：kFsOut.srgbEncode → kFsStyle.srgbDecode 必须严格互逆
+        rt = run_fn(gl, eso, lad, enc_src + '\n' + dec_src,
+                    'oColor = vec4(srgbDecode(srgbEncode(c)), 1.0);')
+        d_rt = np.abs(rt - lad.astype(np.float64))
+        # 区分度对照：decode 换成 pow(2.2) ⇒ 相对误差必须显著（否则判据无效）
+        rel_pow = rel_err(run_fn(gl, eso, lad, POW22_DECODE,
+                                 'oColor = vec4(srgbDecode(c), 1.0);'), want_dec)
+        print(f'⑪ 真 sRGB 曲线（抠出源码单独跑 vs numpy 解析解，相对误差）：'
+              f'srgbDecode max = {rel_dec.max():.2e}, '
+              f'srgbEncode max = {rel_enc.max():.2e}'
+              f'（判据 ≤2e-3 = RGBA16F 读回精度 4.9e-4 的 4 倍）')
+        print(f'   跨 shader 往返（kFsOut.encode → kFsStyle.decode）max|Δ| = '
+              f'{d_rt.max() * 255:.2f} LSB（判据 ≤1）｜ 区分度对照（decode 换 pow(2.2)）：'
+              f'相对误差 max = {rel_pow.max():.2e}（须 >2e-3）')
+        if rel_dec.max() > 2e-3 or rel_enc.max() > 2e-3 or d_rt.max() * 255 > 1.0 \
+                or rel_pow.max() <= 2e-3:
+            fails.append('⑪ 真 sRGB 曲线')
+
+    # ⑫ 显示域三项真生效（不是死代码）+ 平坦区无副作用
+    o12c = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(contrast=1.5))
+    ch12c = float((quant(o12c, inp.shape) != inp).mean()) * 100.0
+    o12s = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(sat=0.0))
+    q12s = quant(o12s, inp.shape)
+    d_rg = float(np.abs(q12s[..., 0] - q12s[..., 1]).max())
+    d_gb = float(np.abs(q12s[..., 1] - q12s[..., 2]).max())
+    o12k = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(clarity=0.5))
+    q12k = quant(o12k, inp.shape)
+    ch12k = float((q12k != inp).mean()) * 100.0
+    d12k = float(np.abs(q12k - inp.astype(np.float64)).max())
+    o12f = run_style(gl, eso, sh, g180, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, adj=dict(clarity=0.5))
+    d12f = np.abs(quant(o12f, g180.shape) - 180.0)
+    print(f'⑫ 显示域三项：contrast=1.5 ⇒ 改动像素 = {ch12c:.1f}%；'
+          f'sat=0 ⇒ max|R−G| = {d_rg:.0f}, max|G−B| = {d_gb:.0f}（应为 0 ⇒ 真灰度）；'
+          f'clarity=0.5 ⇒ 噪声图改动 = {ch12k:.1f}%（max|Δ| = {d12k:.0f} LSB）, '
+          f'纯灰图 max|Δ| = {d12f.max():.0f} LSB（平坦区无副作用）')
+    if ch12c < 30.0 or d_rg > 1.0 or d_gb > 1.0 or ch12k < 5.0 or d12f.max() > 1.0:
+        fails.append('⑫ 显示域三项')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')

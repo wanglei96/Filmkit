@@ -1,0 +1,7 @@
+wrote raw_plain.rgba 50135040
+dither: min=-1.000000 max=0.999268 mean=-0.000331 std=0.408165
+  |d|>0.5 占比 = 24.985%  (理论 TPDF 25.000%)
+  P(d>0.5)=12.472%  P(d<-0.5)=12.513%  (理论各 12.5%)
+  预测 Δ_pre: =0 75.000%  =±1 25.000%  =±2 0.000%  max|Δ|=1
+wrote raw_dither.rgba 50135040
+wrote dither_field.npy

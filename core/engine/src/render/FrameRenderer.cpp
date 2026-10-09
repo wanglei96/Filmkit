@@ -4662,6 +4662,74 @@ vec3 lutApply(vec3 c) {
     return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
 }
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// ── E2-2 基础调整（ADR §5.6；域约定 ADR-7 订正 v2）──────────────────────────
+// **本 shader 内的成对往返只有两处**：① 主路径的曝光×WB（main 内，uExpWbOn 门控）；
+// ② 清晰度把 blur 基准提升到同域的标量往返（chainLuma，仅 clarity>0 时执行）。
+// **没有任何单程 OETF/EOTF** —— 对已编码值再编码一次 = "画面发灰变暗"（ADR-7 的
+// 事故来源；本 shader 的输入已经是 OETF 后的显示域成片）。
+uniform float uEv;         // [0] 曝光 EV（线性域）
+uniform vec3 uWbGain;      // [1..3] WB RGB 增益（线性域）
+uniform float uExpWbOn;    // 门控（CPU 侧算）：ev≠0 或 wb≠(1,1,1)
+uniform float uContrast;   // [4] 对比度（显示域绕中灰；1 = 恒等）
+uniform float uContrastOn;
+uniform float uSat;        // [21] 饱和度（显示域绕 luma；1 = 恒等）
+uniform float uSatOn;
+uniform float uClarity;    // [78] 清晰度（显示域局部对比；0 = 关）
+uniform vec2 uClarStep;    // 清晰度环半径（UV 单位）= r_px/(W,H)
+// 与 kFsOut:4540 的 srgbEncode **严格互逆**（IEC 61966-2-1：线性 0.0031308 ↔
+// 编码 0.04045，系数 12.92 / 1.055 / 2.4 / 0.055）。
+// **禁止 pow(2.2) 近似**：暗部往返误差可达 9/255（项目实测，见 kFsOut 4530 注释）。
+vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    vec3 lo = c / 12.92;
+    return mix(hi, lo, step(c, vec3(0.04045)));
+}
+vec3 srgbEncode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    vec3 lo = 12.92 * c;
+    return mix(hi, lo, step(c, vec3(0.0031308)));
+}
+// 清晰度的 16-tap 环形 luma 模糊（2 环 × 8 方向 = 16 tap，**全手动展开**）：
+// GLSL ES 无数组初始化器，且"循环内动态索引"在 Mali 上**静默失败**（ADR §6.1）
+// ⇒ 不写循环、不用数组、不把数组当函数参数。对称环 ⇒ 平坦区与一阶梯度区的
+// 环均值 = 中心值（清晰度在无细节处无副作用）。
+float blurLuma16(vec2 uv) {
+    vec2 d1 = uClarStep;
+    vec2 d2 = uClarStep * 2.0;
+    vec3 w = vec3(0.299, 0.587, 0.114);
+    float lb = 0.0;
+    lb += dot(texture(uTex, uv + vec2( d1.x, 0.0)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d1.x, 0.0)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(0.0,  d1.y)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(0.0, -d1.y)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2( d1.x,  d1.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d1.x,  d1.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2( d1.x, -d1.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d1.x, -d1.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2( d2.x, 0.0)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d2.x, 0.0)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(0.0,  d2.y)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(0.0, -d2.y)).rgb, w);
+    lb += dot(texture(uTex, uv + vec2( d2.x,  d2.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d2.x,  d2.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2( d2.x, -d2.y) * 0.70710678).rgb, w);
+    lb += dot(texture(uTex, uv + vec2(-d2.x, -d2.y) * 0.70710678).rgb, w);
+    return lb * 0.0625;
+}
+// 把 blur 基准（未调整的显示域 luma）提升到与中心 c 同域：曝光/WB 是逐通道乘性
+// ⇒ 标量 luma 上用 luma(WB 增益) 近似（一阶正确；二阶误差只影响清晰度的斜率标定，
+// 不会像"不提升"那样把清晰度变成整体提亮）。饱和度**不改 luma**
+//（mix(vec3(l), c, s) 的 luma 恒 = l）⇒ 不参与；对比度是 luma 域线性拉伸 ⇒ 参与。
+float chainLuma(float x) {
+    if (uExpWbOn > 0.5) {
+        float g = exp2(uEv) * dot(uWbGain, vec3(0.299, 0.587, 0.114));
+        x = srgbEncode(srgbDecode(vec3(x)) * g).r;
+    }
+    if (uContrastOn > 0.5) x = clamp((x - 0.5) * uContrast + 0.5, 0.0, 1.0);
+    return x;
+}
 // dither 专用 hash（无 sin 版，见 kFsOut 的注释：sin 版在大坐标下有规律图案）
 float dhash(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -4678,6 +4746,35 @@ float vnoise(vec2 p) {
 void main() {
     // 显示域直取：不 decode、不 encode（ADR-7）
     vec3 c = texture(uTex, vUV0).rgb;
+    // ── E2-2 ① 线性往返段（曝光 × WB **合并成一次**往返，ADR §5.6②）────────
+    // 为什么合并：两者都是线性域乘性操作；两次往返 = 两次量化误差 + 双倍开销。
+    // 门控 uExpWbOn（CPU 侧算）⇒ 默认恒等时整段跳过，输出逐位不变（零回归）。
+    // 必须用真 sRGB 分段曲线（srgbDecode/srgbEncode）：pow(2.2) 近似的暗部往返
+    // 误差实测可达 9/255 —— 这是"画面发灰"的独立来源之一。
+    if (uExpWbOn > 0.5) {
+        vec3 lin = srgbDecode(c);
+        lin *= exp2(uEv) * uWbGain;
+        c = srgbEncode(lin);
+    }
+    // ── E2-2 ② 对比度（显示域绕中灰 0.5 线性拉伸；1 = 恒等）────────────────
+    if (uContrastOn > 0.5) c = clamp((c - 0.5) * uContrast + 0.5, 0.0, 1.0);
+    // ── E2-2 ③ 饱和度（显示域绕 luma 插值；1 = 恒等）──────────────────────
+    if (uSatOn > 0.5) {
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        c = mix(vec3(l), c, uSat);
+    }
+    // ── E2-2 ④ 清晰度（显示域局部对比；0 = 关）────────────────────────────
+    // 形式 = **加性 luma USM**（照 ADR §5.6 的 `c += (c - blur) * uClarity`）：
+    // RGB 同加一个标量 ⇒ 只抬局部亮度，不逐通道拉伸。
+    // ⚠ 加性**不是严格保色度**（严格保色度的是乘性 `c *= 1 + gain`，见 kFsOut
+    //   的 sharpenLuma）；本段实际差值 |d| 通常 ≤ 数 LSB ⇒ 色度偏移可忽略。
+    //   若要"零色度污染"，把本段换成 sharpenLuma 的乘性形式即可（一行改动）。
+    // 差值限幅 ±0.25 拦高反差边缘过冲（标定旋钮）。
+    if (uClarity > 0.0) {
+        float l0 = dot(c, vec3(0.299, 0.587, 0.114));
+        float lb = chainLuma(blurLuma16(vUV0));
+        c += clamp(l0 - lb, -0.25, 0.25) * uClarity;
+    }
     // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
     // 域 = sRGB 显示域、乘法（ADR-7/ADR-9）：落在 LUT 之前 —— 与 darktable 的
     // 声明域（non-linear, RGB, display-referred）一致，且放 LUT 前可避免不同
@@ -6078,6 +6175,16 @@ bool FrameRenderer::init() {
   u_style_.vig_dscale = glGetUniformLocation(prog_style_, "uVigDscale");
   u_style_.vig_fscale = glGetUniformLocation(prog_style_, "uVigFscale");
   u_style_.vig_brightness = glGetUniformLocation(prog_style_, "uVigBrightness");
+  // E2-2 基础调整（ADR §5.6）
+  u_style_.ev = glGetUniformLocation(prog_style_, "uEv");
+  u_style_.wb_gain = glGetUniformLocation(prog_style_, "uWbGain");
+  u_style_.exp_wb_on = glGetUniformLocation(prog_style_, "uExpWbOn");
+  u_style_.contrast = glGetUniformLocation(prog_style_, "uContrast");
+  u_style_.contrast_on = glGetUniformLocation(prog_style_, "uContrastOn");
+  u_style_.sat = glGetUniformLocation(prog_style_, "uSat");
+  u_style_.sat_on = glGetUniformLocation(prog_style_, "uSatOn");
+  u_style_.clarity = glGetUniformLocation(prog_style_, "uClarity");
+  u_style_.clar_step = glGetUniformLocation(prog_style_, "uClarStep");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -6881,6 +6988,18 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h,
   kv += ",\"lutK\":" + std::to_string(p.lut_strength);
   kv += ",\"grain\":" + std::to_string(p.grain_amount);
   kv += ",\"grainSz\":" + std::to_string(p.grain_size);
+  // E2-2 基础调整：**下发参数值**（与上面三个同出口 —— ADR §6.2 要求"下发值 /
+  // 链接成功 / 本帧执行"三件套写在同一个日志出口；check-diag-fields.py 会核对
+  // 字段行必须晚于本函数内的 passStyle 调用）。
+  kv += ",\"ev\":" + jnum(p.exposure_ev, 5);
+  kv += ",\"wbOn\":";
+  kv += (p.exposure_ev != 0.0f || p.wb_r != 1.0f || p.wb_g != 1.0f ||
+         p.wb_b != 1.0f) ? "true" : "false";
+  kv += ",\"wb\":[" + jnum(p.wb_r, 5) + "," + jnum(p.wb_g, 5) + "," +
+        jnum(p.wb_b, 5) + "]";
+  kv += ",\"ct\":" + jnum(p.contrast, 5);
+  kv += ",\"sat\":" + jnum(p.sat_mid, 5);
+  kv += ",\"clr\":" + jnum(p.clarity, 5);
   kv += ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
   Logger::instance().log(ran ? LogLevel::kInfo : LogLevel::kError, "engine",
                          "render.style", kv);
@@ -11886,6 +12005,27 @@ void FrameRenderer::passStyle(int w, int h, const FilmParams& p) {
   glUniform1f(u_style_.seed, 0.0f);
   glUniform1f(u_style_.grain_amount, p.grain_amount);
   glUniform1f(u_style_.grain_size, p.grain_size);
+  // ── E2-2 基础调整（ADR §5.6；域约定见 kFsStyle 注释）─────────────────────
+  // 门控一律在 CPU 侧算 ⇒ 默认（ev=0、WB=(1,1,1)、contrast=1、sat=1、clarity=0）
+  // 时 shader 内**整段跳过**，输出逐位不变（零回归 / A/B 开关 = 这五个默认值）。
+  const bool exp_wb_on = p.exposure_ev != 0.0f || p.wb_r != 1.0f ||
+                         p.wb_g != 1.0f || p.wb_b != 1.0f;
+  glUniform1f(u_style_.ev, p.exposure_ev);
+  glUniform3f(u_style_.wb_gain, p.wb_r, p.wb_g, p.wb_b);
+  glUniform1f(u_style_.exp_wb_on, exp_wb_on ? 1.0f : 0.0f);
+  glUniform1f(u_style_.contrast, p.contrast);
+  glUniform1f(u_style_.contrast_on, p.contrast != 1.0f ? 1.0f : 0.0f);
+  // [20..22] 分区饱和三槽：编辑器 UI 一个滑杆**同写三个**（ADR §5.6④），引擎读
+  // 中灰档 [21]（ADR 的伪代码是单值 uSat）；三档展开留给后续卡（本卡不扩契约）。
+  glUniform1f(u_style_.sat, p.sat_mid);
+  glUniform1f(u_style_.sat_on, p.sat_mid != 1.0f ? 1.0f : 0.0f);
+  glUniform1f(u_style_.clarity, p.clarity);
+  // 清晰度环半径 = max(1px, 0.5% × min(W,H))：**相对短边** ⇒ 预览与全分辨率
+  // 导出的观感一致（固定像素半径在两种分辨率下会差出数倍）。
+  const float clar_px =
+      std::max(1.0f, 0.005f * static_cast<float>(std::min(w, h)));
+  glUniform2f(u_style_.clar_step, clar_px / static_cast<float>(w),
+              clar_px / static_cast<float>(h));
   // E4-2 暗角（vignette）：域常数在 CPU 侧算好（shader 内不做 W/H 除法）。
   // pv 尺度 = (W,H)/max(W,H)；fscale 的 100/min(W,H) 下限 = darktable 同款抗锯齿
   // 保护（feather=0 ⇒ 不产生硬边）。[66] ≥ 0 ⇒ uVigBrightness = 0 ⇒ shader 整段跳过。

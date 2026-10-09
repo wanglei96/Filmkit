@@ -1146,7 +1146,11 @@ class FrameRenderer {
           lut_on = -1, lut_strength = -1, lut_dmin = -1, lut_dinv = -1,
           lut_size = -1,
           // E4-2 暗角（vignette）：见 u_out_
-          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1;
+          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1,
+          // E2-2 基础调整（ADR §5.6）：ev/wb = 线性域往返段；contrast/sat/
+          // clarity = 显示域段。门控 *_on 由 CPU 侧算（默认恒等 ⇒ 整段跳过）。
+          ev = -1, wb_gain = -1, exp_wb_on = -1, contrast = -1, contrast_on = -1,
+          sat = -1, sat_on = -1, clarity = -1, clar_step = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,
