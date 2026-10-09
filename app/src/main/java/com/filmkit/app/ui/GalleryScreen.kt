@@ -66,11 +66,14 @@ private const val THUMB_MAX_COUNT = 300
 private const val GRID_COLUMNS = 3
 
 /**
- * 相册页（用户报的第 5/6 点）：网格显示**所有照片的缩略图**（按时间倒序 + 日期分组），
- * 点缩略图进内建编辑器。
+ * 相册页（用户报的第 5/6 点）：网格显示**所有照片的缩略图**（按时间倒序 + 日期分组）。
  *
- * 素材分级（用户明确要求，不可混）：**缩略图只喂网格**；编辑器拿到的仍是它自己去
- * `ContentResolver` 全尺寸解码的原图（EditorScreen.loadPreview，本卡一行未动）。
+ * 点缩略图 → **照片查看页**（E2-13，ADR-15：传统相册逻辑「网格看缩略图、点开看原图」）；
+ * 查看页里点「编辑」才进编辑器。此前是点缩略图直接进编辑器 —— 用户 2026-10-09 要求补上
+ * 查看页这一层，本页因此只负责"挑图"，不再直接把 URI 交给编辑器。
+ *
+ * 素材分级（用户明确要求，不可混）：**缩略图只喂网格**；查看页与编辑器各自去
+ * `ContentResolver` 全尺寸解码原图（[PhotoViewScreen.loadPhotoView] / EditorScreen.loadPreview）。
  *
  * 权限与降级：API 33+ 请求 READ_MEDIA_IMAGES、更早请求 READ_EXTERNAL_STORAGE。
  * 拿到 ⇒ 查整个 MediaStore（"所有照片"）；被拒 ⇒ **降级为本 App 的
@@ -80,8 +83,8 @@ private const val GRID_COLUMNS = 3
 @Composable
 fun GalleryScreen(
     onBack: () -> Unit = {},
-    /** 点缩略图：带该图的 MediaStore URI 进编辑器（编辑器自己解码原图，不用这里的缩略图） */
-    onOpenEditor: (Uri) -> Unit = {},
+    /** 点缩略图：带该图的 MediaStore URI 进**查看页**（查看页自己解码原图，不用这里的缩略图） */
+    onOpenPhoto: (Uri) -> Unit = {},
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -197,7 +200,7 @@ fun GalleryScreen(
                             uri = uri,
                             px = thumbPx,
                             cache = thumbs,
-                            onClick = { onOpenEditor(uri) },
+                            onClick = { onOpenPhoto(uri) },
                         )
                     }
                 }
