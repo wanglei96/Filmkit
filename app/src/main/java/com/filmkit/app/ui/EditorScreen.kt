@@ -40,6 +40,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -1985,6 +1986,7 @@ private fun EditorPanel(
         // ⑤ 参数图标行。滤镜组**拆成两行**（E2-15）：LUT 一行（42 个素材，横滚很深）+
         // 本组参数一行（褪色 / 强度）。挤在同一行时，参数被埋在几十张 LUT 卡片之后 ——
         // 用户横滚半天找不到「褪色」，等于参数不存在（ADR 记的"LUT 与参数挤一行"问题）。
+        // E2-16 再给 LUT 行加一条**分类标签行**（ADR-17）：从"横滚几十屏找徕卡"变成点一下。
         if (group == EditorTab.COLOR) {
             LutIconRow(
                 lutId = lutId,
@@ -2209,12 +2211,17 @@ private fun ParamIconRow(
 }
 
 /**
- * 滤镜组的 **LUT 图标行**（E2-1 的 LUT 圆形按钮；E2-15 从"与参数同行"拆出来独立一行）：
- * 「无」+ 各 LUT（有预览图时显示圆形缩略图）。
+ * 滤镜组的 **LUT 图标行**（E2-1 的 LUT 圆形按钮；E2-15 从"与参数同行"拆出来独立一行；
+ * E2-16 按 ADR-17 加**分类标签行**）：上面一行是分类标签（「全部」+ [LutLibrary] 的分类），
+ * 下面一行是「无」（= 清 LUT）+ 当前分类的 LUT 圆形缩略图。
  *
  * 为什么拆行（E2-15 用户反馈的连带修正）：LUT 有 42 个，横滚很深 —— 参数挤在同一行时
  * 用户要滑过几十张卡片才看得到「褪色」，等于参数不存在。拆开后 LUT 一行、参数一行，
  * 两者都一眼可见；代价只是面板高一点点（本组参数少，两行加起来仍矮于其他组的滑杆区）。
+ *
+ * E2-16：分类标签多占一行（≈30dp），换来的是"42 个 LUT 里找徕卡"从横滚几十屏变成点一下。
+ * 分类数据**全部来自 [LutLibrary]**（资产头部品牌 + 用户覆盖 / 自定义分类），此处不硬编码
+ * 任何分类名（ADR-17 第 6 条）；过滤与「全部」语义见 [lutInCategory] / [lutCategoryTabs]。
  */
 @Composable
 private fun LutIconRow(
@@ -2223,23 +2230,143 @@ private fun LutIconRow(
     onPick: (LutLibrary.Entry?) -> Unit,
 ) {
     val context = LocalContext.current
-    LazyRow(
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        contentPadding = PaddingValues(horizontal = 16.dp),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        item(key = "__none__") {
-            ParamChip(label = "无", selected = lutId == null, icon = Icons.Outlined.Close) { onPick(null) }
-        }
-        items(LutLibrary.entries(context), key = { it.id }) { e ->
-            ParamChip(
-                label = e.label,
-                selected = lutId == e.id,
-                bitmap = previews[e.id],
-            ) { onPick(e) }
+    val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+    val entries = LutLibrary.entries(context)
+    // 每次重组现算（42 次 prefs 内存读 + distinct，微秒级）：不做 remember 缓存就不会有
+    // "别处改了分类、这里还显示旧标签"的陈旧态。分类 = 条目分类 + 自定义分类，去重保序。
+    val categories = lutCategoryTabs(
+        entries.map { LutLibrary.categoryOf(prefs, it) },
+        LutLibrary.customCategories(prefs),
+    )
+    var category by remember { mutableStateOf<String?>(null) } // null = 「全部」（不过滤）
+    val shown = lutInCategory(entries, category) { LutLibrary.categoryOf(prefs, it) }
+    val listState = rememberLazyListState()
+    // 切分类后缩略图行回到行首：42 个 LUT 滚到深处再切分类，若保留旧滚动位置会被夹到列表末尾
+    // ——用户看到的是"这个分类没东西"，而内容其实在左边看不见的地方（"原图"也就跟着被滚走）。
+    LaunchedEffect(category) { listState.scrollToItem(0) }
+    Column(Modifier.fillMaxWidth()) {
+        LutCategoryRow(categories, category) { category = it }
+        Spacer(Modifier.height(6.dp))
+        LazyRow(
+            state = listState,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            // 「无」（= 清 LUT，ADR-17 说的「原图」）**固定在第一位且不随分类过滤** ——
+            // 任何时候都能一键回到"无 LUT"（既有能力，E2-16 只是确认保留）。
+            item(key = "__none__") {
+                ParamChip(label = "无", selected = lutId == null, icon = Icons.Outlined.Close) { onPick(null) }
+            }
+            items(shown, key = { it.id }) { e ->
+                ParamChip(
+                    label = e.label,
+                    selected = lutId == e.id,
+                    bitmap = previews[e.id],
+                ) { onPick(e) }
+            }
+            // 空分类（用户新建后没把任何 LUT 归进去，或原本归入的 LUT 被改走）：给一句明确
+            // 说明而不是留一行空白（ADR-17 验收允许"不显示空分类"或"显示空态提示"，取后者 ——
+            // 分类行是用户自己建的，凭空消失比"这里没东西"更让人困惑）。
+            if (shown.isEmpty()) {
+                item(key = "__empty__") {
+                    Box(Modifier.height(56.dp), contentAlignment = Alignment.Center) {
+                        Text("该分类下暂无 LUT", color = FilmTheme.CreamDim, fontSize = 11.sp, maxLines = 1)
+                    }
+                }
+            }
         }
     }
 }
+
+/**
+ * LUT 分类标签行（E2-16 / ADR-17）：横向滚动，「全部」+ 各分类，**选中态 = 强调色下划线**。
+ *
+ * [selected] 用 `String?` 表达三态（null = 「全部」），与 [lutInCategory] 的入参同源 ——
+ * "不过滤"只有一种表示，不需要额外的布尔标志。
+ */
+@Composable
+private fun LutCategoryRow(
+    categories: List<String>,
+    selected: String?,
+    onSelect: (String?) -> Unit,
+) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(18.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        item(key = "__all__") {
+            LutCategoryTab(label = "全部", selected = selected == null, dot = null) { onSelect(null) }
+        }
+        items(categories, key = { it }) { c ->
+            LutCategoryTab(
+                label = c,
+                selected = selected == c,
+                dot = LutDotColors[categoryDotIndex(c, LutDotColors.size)],
+            ) { onSelect(c) }
+        }
+    }
+}
+
+/**
+ * 单个分类标签：`● 分类名` + 选中下划线。
+ *
+ * 未选中时下划线画成透明（占位不塌陷）—— 否则切换分类时整行高度会跳 2dp，横滚位置也跟着抖。
+ */
+@Composable
+private fun LutCategoryTab(label: String, selected: Boolean, dot: Color?, onTap: () -> Unit) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .pressScale(pressedScale = 0.94f, onTap = onTap)
+            .padding(vertical = 4.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (dot != null) {
+                Box(
+                    Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(dot),
+                )
+                Spacer(Modifier.width(5.dp))
+            }
+            Text(
+                label,
+                color = if (selected) FilmTheme.Accent else FilmTheme.CreamDim,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 96.dp),
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Box(
+            Modifier
+                .width(22.dp)
+                .height(2.dp)
+                .background(if (selected) FilmTheme.Accent else Color.Transparent),
+        )
+    }
+}
+
+/**
+ * 分类圆点色板（E2-16 / ADR-17 第 5 条）：**纯装饰**，颜色不携带任何分类语义 ——
+ * 只帮眼睛在横滚时区分相邻标签。取色规则见 [categoryDotIndex]（同名恒同色，与顺序无关）。
+ *
+ * ⚠ 这 7 个色值没有进 [FilmTheme]（该文件要求"UI 只允许引用这里声明的颜色"）：本卡约束是
+ * "只改 EditorScreen.kt"，故暂放此处；要收口到单一色源就整块搬进 FilmTheme.kt，无其他引用点。
+ */
+private val LutDotColors = listOf(
+    Color(0xFFE8842C), // 琥珀
+    Color(0xFF6FA8DC), // 天蓝
+    Color(0xFF8FBF6F), // 苔绿
+    Color(0xFFD98CB3), // 藕粉
+    Color(0xFFB69CE0), // 藤紫
+    Color(0xFF7FCBC4), // 青瓷
+    Color(0xFFD9B25F), // 麦黄
+)
 
 /**
  * 圆形参数按钮（ADR-14 层⑤）：**未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄色描边 + 黄色图标**，
@@ -2604,6 +2731,42 @@ internal data class OriginalViewState(val pressed: Boolean = false) {
  */
 internal fun overwriteNeedsRawWarning(paramsUnchanged: Boolean, jpegSource: Boolean): Boolean =
     !paramsUnchanged && !jpegSource
+
+// ── E2-16 LUT 分类（ADR-17）：纯逻辑，无 Android 依赖 ⇒ JVM 单测直接钉住 ─────────
+
+/**
+ * 分类标签行的分类列表（E2-16 / ADR-17）：条目分类 + 自定义分类，**去空白、去重、保序**。
+ *
+ * 与 [LutLibrary.allCategories]（需要 Context，JVM 测不了）**同规则**：这里把规则抽成纯函数，
+ * 数据仍全部来自 LutLibrary（`entries` 的分类 + `customCategories`），不硬编码分类名。
+ * 顺序 = 资产扫描顺序（内置品牌按文件名序出现）+ 自定义分类按创建顺序追加 —— 不另排序：
+ * 排序规则一变，用户记的"徕卡在哪"就失效，且 42 个 LUT 的分类本来就是按品牌聚簇的。
+ */
+internal fun lutCategoryTabs(
+    entryCategories: List<String>,
+    customCategories: List<String>,
+): List<String> = (entryCategories + customCategories).filter { it.isNotBlank() }.distinct()
+
+/**
+ * 按分类过滤 LUT（E2-16 / ADR-17 第 3 条）：[category] 为 null（「全部」）⇒ **原样返回不过滤**；
+ * 否则按 [categoryOf] 精确匹配。无匹配 ⇒ 返回空表（调用侧显示空态提示，见 `LutIconRow`）。
+ *
+ * 泛型而非直接收 [LutLibrary.Entry]：让这条规则在 JVM 单测里零 Android 依赖可验。
+ */
+internal fun <T> lutInCategory(
+    items: List<T>,
+    category: String?,
+    categoryOf: (T) -> String,
+): List<T> = if (category == null) items else items.filter { categoryOf(it) == category }
+
+/**
+ * 分类圆点的色板下标（E2-16 / ADR-17 第 5 条）：按分类名哈希取色 —— 同名恒同色、与顺序无关。
+ *
+ * `and 0x7FFFFFFF` 而不是 `abs()`：`Int.MIN_VALUE` 的 `abs()` 仍是负数（溢出），取模会得到
+ * 负下标 ⇒ 越界崩溃。掩掉符号位没有这个洞。`paletteSize <= 0` 返回 0（防御，正常不会发生）。
+ */
+internal fun categoryDotIndex(name: String, paletteSize: Int): Int =
+    if (paletteSize <= 0) 0 else (name.hashCode() and 0x7FFFFFFF) % paletteSize
 
 /**
  * 面板出入场时长（E2-17，ms）。为什么是 240：
