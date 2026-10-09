@@ -8,7 +8,6 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
-import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -58,7 +57,11 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-/** 缩略图缓存上限：24MB / 300 张（12MP 成片的网格缩略图约 0.5MB/张 ⇒ 字节数先触顶） */
+/**
+ * 缩略图缓存上限：24MB / 300 张。12MP 成片按"屏宽/3"采样后约 0.5~0.8MB/张（典型手机 ⇒
+ * 字节数先触顶）；大屏上目标边长顶到 512 时采样率只到 4，单张 ≈3MB、缓存深度掉到个位数
+ * —— 这是 E2-18a 改用自解码（方向正确优先）后的代价，见交付报告。
+ */
 private const val THUMB_MAX_BYTES = 24L * 1024 * 1024
 private const val THUMB_MAX_COUNT = 300
 
@@ -123,7 +126,7 @@ fun GalleryScreen(
     val days = remember(photos) {
         photos?.let { groupByDay(it) }.orEmpty()
     }
-    // 网格项 ≈ 屏宽/3；按密度换算像素，交给平台缩略图接口拿"够用的那一档"
+    // 网格项 ≈ 屏宽/3；按密度换算像素，作为自解码的目标边长（采样率由 decodeOriented 算）
     val thumbPx = with(density) {
         (configuration.screenWidthDp.dp / GRID_COLUMNS).roundToPx().coerceIn(160, 512)
     }
@@ -251,8 +254,13 @@ private fun ThumbCell(
 }
 
 /**
- * 读一张缩略图（IO 线程）。API 29+ 用平台 `loadThumbnail`；API 26-28 没有这个接口，
- * 退到 `MediaStore.Images.Thumbnails`（同属平台能力，仍然**只用于网格**）。
+ * 读一张缩略图（IO 线程）：**自解码 + EXIF 方向转正**（[decodeOriented]）。
+ *
+ * E2-18a 由平台 API（API 29+ `loadThumbnail` / API 26-28 `Thumbnails.getThumbnail`）改过来：
+ * 平台缩略图对 **DNG** 返回的方向不对（用户真机反馈"相册里 dng 方向不对，要和成片一致"），
+ * 而方向正确优先于平台的缩略图缓存。`px` 是格子的目标边长，采样率（2 的幂）由
+ * [sampleSizeFor] 按它算 —— 12MP 原图在典型手机上采样率 ≈8，解出来 ≈0.5MP。
+ *
  * 失败返回 null，由调用方显示占位。
  */
 private fun loadThumb(
@@ -262,21 +270,7 @@ private fun loadThumb(
     cache: ThumbCache<String, Bitmap>,
 ): Bitmap? {
     cache.get(uri.toString())?.let { return it }
-    val bmp = try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            context.contentResolver.loadThumbnail(uri, Size(px, px), null)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Images.Thumbnails.getThumbnail(
-                context.contentResolver,
-                ContentUris.parseId(uri),
-                MediaStore.Images.Thumbnails.MINI_KIND,
-                null,
-            )
-        }
-    } catch (_: Throwable) {
-        null
-    } ?: return null
+    val bmp = decodeOriented(context, uri, px, px) ?: return null
     cache.put(uri.toString(), bmp)
     return bmp
 }

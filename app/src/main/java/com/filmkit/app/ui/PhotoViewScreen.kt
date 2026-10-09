@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -376,33 +375,11 @@ private data class LoadedPhoto(val bitmap: Bitmap?, val meta: PhotoMeta, val err
 /** 读原图 + 元数据（IO 线程）。解不出来给失败态，不抛。 */
 private fun loadPhotoView(context: Context, uri: Uri): LoadedPhoto {
     val meta = queryMeta(context, uri)
-    val bmp = decodeFull(context, uri)
+    // **全分辨率解码**（用户 2026-10-08："点开看原图"；与编辑器 loadPreview 同口径）：
+    // reqW/reqH = 0 ⇒ 不采样。方向由 [decodeOriented] 统一转正（E2-18a：DNG 写的是真实
+    // sensor 方向，BitmapFactory 自己不读 EXIF，不转正就会横竖颠倒）。
+    val bmp = decodeOriented(context, uri, 0, 0)
     return LoadedPhoto(bmp, meta, if (bmp == null) "照片已失效或无法读取" else "")
-}
-
-/**
- * **全分辨率解码**（用户 2026-10-08："点开看原图"；与编辑器 loadPreview 同口径）。
- * 唯一的兜底是 OOM 降一档重试一次（长边减半，宁可糊也不崩），仍失败才交失败态。
- */
-private fun decodeFull(context: Context, uri: Uri): Bitmap? {
-    var sample = 1
-    repeat(2) {
-        var bmp: Bitmap? = null
-        try {
-            val options = BitmapFactory.Options().apply { inSampleSize = sample }
-            bmp = context.contentResolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, options)
-            }
-            return bmp // null = 打不开 / 不是图片（降档也救不回来）
-        } catch (_: OutOfMemoryError) {
-            bmp?.recycle() // 降档前先还回去，否则重试时两份同时在（12MP 每份 ≈50MB）
-            sample *= 2
-        } catch (_: Throwable) {
-            bmp?.recycle()
-            return null
-        }
-    }
-    return null
 }
 
 /**
