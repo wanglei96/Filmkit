@@ -12,7 +12,8 @@ import org.junit.Test
  * 为什么只测这些：滑杆拖动、面板展开、引擎渲染都要真机（Compose + GL），JVM 单测跑不了。
  * 这里守住两条最容易悄悄错、且错了用户直接看得见的事实：
  *  1. **用户看不到负数**（UI 0..100% ↔ 槽位 −1..0），往返不丢读数、方向不写反；
- *  2. 打开编辑器时初值 = 参数快照（含暗角三条），且 [34] 恒 0（画面 = 原片，E2-1 拍板）。
+ *  2. 打开编辑器时初值 = **恒等基线**（[34] 恒 0），快照里的暗角 / 风格值一个都不重放
+ *     （E2-1 拍板"打开即原片"，E2-21 把范围从 LUT 扩到**全部**参数）。
  */
 class EditorVignetteUiTest {
 
@@ -70,39 +71,43 @@ class EditorVignetteUiTest {
     }
 
     @Test
-    fun openParamsTakeVignetteFromSnapshotAndForceLutOff() {
-        // 快照 = 这张成片当初真正下发给引擎的参数 + LUT 选择与强度（E1-2 口径）
+    fun openParamsIgnoreSnapshotVignetteAndForceLutOff() {
+        // ★ E2-21 修正：快照里的暗角（连同 LUT 强度）**不再**是打开时的起点 —— 成片已经把
+        // 当初的暗角烘焙进像素，再叠一遍 = 画面比原片更暗（用户报的"参数被二次应用"）。
         val snapParams = CameraPresets.standard()
         snapParams[34] = 0.85   // 原片当初用的 LUT 强度
         snapParams[66] = -0.36  // 暗角强度 36%
         snapParams[67] = 120.0  // 半径 120%
         snapParams[68] = 30.0   // 羽化 30%
-        val p = editorOpenParams(StillSnapshot(snapParams, "kodak_portra", 0.85, 0L))
+        val p = editorOpenParams()
 
-        // 暗角三条来自快照 ⇒ 滑杆初值就是这张片子当初的值（36% / 120% / 30%）
-        assertEquals(36, (vigStrengthUi(p[66]) * 100f).roundToInt())
-        assertEquals(120, (vigRadiusUi(p[67]) * 100f).roundToInt())
-        assertEquals(30, (vigFeatherUi(p[68]) * 100f).roundToInt())
+        // 暗角三条落在**基线**读数 0% / 80% / 50%（darktable 默认），不是快照的 36 / 120 / 30
+        assertEquals(0, (vigStrengthUi(p[66]) * 100f).roundToInt())
+        assertEquals(80, (vigRadiusUi(p[67]) * 100f).roundToInt())
+        assertEquals(50, (vigFeatherUi(p[68]) * 100f).roundToInt())
         // ★ [34] 强制 0：打开编辑器看到的 = 原片本身（不再把烘焙过的 LUT 又叠一遍）
         assertEquals(0.0, p[34], 0.0)
-        // 其余槽位照旧从快照继承（比如 LUT 之外的风格参数），契约长度不变
+        // 快照数组本身没被改动（它只用于展示 / 一键套用），契约长度不变
+        assertEquals(-0.36, snapParams[66], 0.0)
         assertEquals(CameraPresets.COUNT, p.size)
     }
 
     @Test
     fun openParamsWithoutSnapshotFallBackToStandardBaseline() {
-        val p = editorOpenParams(null)
+        val p = editorOpenParams()
         assertEquals(CameraPresets.COUNT, p.size)
         // 无快照 = 标准基线：暗角 0 / 80 / 50（ADR-4 的回退口径）
         assertEquals(0, (vigStrengthUi(p[66]) * 100f).roundToInt())
         assertEquals(80, (vigRadiusUi(p[67]) * 100f).roundToInt())
         assertEquals(50, (vigFeatherUi(p[68]) * 100f).roundToInt())
         assertEquals(0.0, p[34], 0.0)
-        // editorOpenParams 只动 [34]，基线其余槽位一个都没改（ADR-10：颗粒必须仍是 0）
+        // ★ E2-21：打开基线**逐槽** = CameraPresets.standard()，**只有 [34] 例外**（强制 0 ——
+        // standard 的默认 1.0 = LUT 全量混合，而编辑器打开时引擎里已经上传了快照那张 LUT 的
+        // 资产 ⇒ 不归零就会再叠一遍）。ADR-10：颗粒 [26] 必须仍是 0。
         val base = CameraPresets.standard()
         for (i in base.indices) {
-            if (i == 34) continue
-            assertEquals("slot[$i] 不该被编辑器初值改动", base[i], p[i], 0.0)
+            val want = if (i == 34) 0.0 else base[i]
+            assertEquals("slot[$i] 必须等于恒等基线", want, p[i], 0.0)
         }
     }
 }

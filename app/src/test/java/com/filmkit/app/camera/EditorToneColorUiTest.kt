@@ -344,7 +344,8 @@ class EditorToneColorUiTest {
     @Test
     fun discardConfirmFollowsTheSameRuleAsExportPassthrough() {
         // 「取消」二次确认的判据 = E2-9 的 paramsUnchanged（用户："如果改过参数，弹一句…"）
-        val open = editorOpenParams(null)
+        // 基准 = 打开时的参数 = **恒等基线**（E2-21：成片已含拍摄时的全部参数）
+        val open = editorOpenParams()
         assertFalse("刚打开 ⇒ 无修改 ⇒ 直接退出，不弹窗", discardNeedsConfirm(open.copyOf(), open))
         val changed = open.copyOf().also { it[0] = expSlot(0.5f) }
         assertTrue("改过曝光 ⇒ 要弹确认", discardNeedsConfirm(changed, open))

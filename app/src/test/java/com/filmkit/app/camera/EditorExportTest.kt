@@ -9,6 +9,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * E1-4 编辑器纯逻辑护栏：参数起点映射（集成点 I-3）与导出命名（ADR-3）。
@@ -82,9 +83,29 @@ class EditorExportTest {
 
     // ── E2-9：「无修改」判据（ADR-13 ⇒ 直通原片字节） ────────────────────────────────
 
-    /** 基准 = **打开编辑器时**的参数（`editorOpenParams` 的返回值），快照里带一个非 0 的 LUT 强度 */
-    private fun openBaseline(): DoubleArray = editorOpenParams(
-        StillSnapshot(CameraPresets.standard(), "kodak_portra", 0.85, 0L),
+    /**
+     * 基准 = **打开编辑器时**的参数（[editorOpenParams] 的返回值）。
+     *
+     * E2-21 起它与快照无关：**全恒等基线**（[CameraPresets.standard] + [34] 归 0）——
+     * 成片在拍摄时已把当时的全部参数烘焙进像素，打开时再从快照恢复 = 画面被二次应用。
+     */
+    private fun openBaseline(): DoubleArray = editorOpenParams()
+
+    /**
+     * 一张"拍的时候调过参数"的成片快照（E1-2 口径：成片就是这一套参数的产物）。
+     * 覆盖用户报的 bug 涉及的每一类：曝光 / 对比度 / 饱和度 / 清晰度 / 色温 / LUT 强度 / 暗角。
+     */
+    private fun snapshotWithStyle(): StillSnapshot = StillSnapshot(
+        CameraPresets.standard().also {
+            it[0] = 0.5               // +0.5 EV（用户看到的"滑杆上又出现基础曝光值"）
+            it[4] = 1.3               // 对比度 130%
+            writeSaturation(it, 1.2f) // 饱和度 120%（同写 [20][21][22]）
+            it[34] = 0.85             // LUT 强度 85%
+            it[66] = -0.36            // 暗角 36%
+            it[78] = 0.35             // 清晰度 35%
+            it[88] = tempSlot(5000f)  // 色温 5000K
+        },
+        "kodak_portra", 0.85, 0L,
     )
 
     @Test
@@ -108,7 +129,7 @@ class EditorExportTest {
     fun sliderRoundTripBackToOriginalIsUnchanged() {
         // ★ 核心场景 + E2-3 浮点坑的实证：滑杆是 Float、槽位是 Double。
         // 用户把暗角半径拖走再拖回 0.8（= 80%）：vigRadiusSlot(0.8f) = 80.0000011920929，
-        // 与快照来的 80.0 **不相等** ⇒ 用 `==` 比较会误判成"有修改"（白渲染 + 白编码一次）。
+        // 与基线里的 80.0 **不相等** ⇒ 用 `==` 比较会误判成"有修改"（白渲染 + 白编码一次）。
         val base = openBaseline()
         assertEquals(80.0, base[67], 0.0)
         val cur = base.copyOf()
@@ -183,22 +204,83 @@ class EditorExportTest {
     }
 
     @Test
-    fun baselineIsOpenParamsNotSnapshotRaw() {
-        // ★ 判据的语义护栏：基准必须是 [editorOpenParams] 的返回值（[34] 已强制 0），
-        // **不是快照原文**。快照里 [34] = 1.0（standard 默认）/ lutK = 0.85，打开编辑器时
-        // 被强制归零（E2-1"打开即与原片一致"）—— 若拿快照原文当基准，这一次**必然的归零**
-        // 会被误判成用户修改 ⇒ 直通永远失效（本卡白做）。
-        val snap = StillSnapshot(CameraPresets.standard(), "kodak_portra", 0.85, 0L)
+    fun baselineIsIdentityNotSnapshotRaw() {
+        // ★ 判据的语义护栏：基准必须是 [editorOpenParams] 的返回值（**全恒等基线**），
+        // **不是快照原文**。快照 = 这张成片当初真正下发给引擎的参数（成片就是它们的产物），
+        // 拿它当基准会把"打开时那一次必然的恒等化"误判成用户修改 ⇒ 直通永远失效；
+        // 而且参数会被二次应用（E2-21 修的正是这个）。
+        val snap = snapshotWithStyle()
         val raw = editorParams(snap.params)
-        val base = editorOpenParams(snap)
-        assertEquals(0.0, base[34], 0.0)
+        val base = editorOpenParams()
+        assertEquals(0.0, base[0], 0.0)    // 曝光：恒等
+        assertEquals(0.0, base[34], 0.0)   // LUT 强度：强制 0（打开即原片）
         assertTrue("打开后立刻导出 ⇒ 无修改（直通）", paramsUnchanged(base.copyOf(), base))
         assertFalse("拿快照原文当基准是错的", paramsUnchanged(base.copyOf(), raw))
 
-        // 用户点「套用原片风格」（[34] = 快照强度）⇒ 真的改了 ⇒ 必须走渲染
+        // 用户点「套用原片风格」（参数整槽下发）⇒ 真的改了 ⇒ 必须走渲染
         val applied = base.copyOf()
-        applied[34] = 0.85
-        assertFalse(paramsUnchanged(applied, base))
+        applySnapshotParams(applied, raw)
+        assertFalse("套用后与打开基线不同 ⇒ 有修改（走渲染）", paramsUnchanged(applied, base))
+    }
+
+    // ── E2-21：打开基线 = **全恒等**（成片已含拍摄时的全部参数，一个都不许重放）──────────
+
+    @Test
+    fun openBaselineIsIdentityForEverySlot() {
+        // 逐槽 == CameraPresets.standard()，**只有 [34] 例外**（强制 0）：standard 的默认
+        // 1.0 = "LUT 全量混合"，而编辑器打开时引擎里已经上传了快照那张 LUT 的资产
+        // （`bindLut` 的生效判据 = lut_size_ > 1 && k > 0）⇒ 不归零就会把烘焙过的 LUT
+        // 再叠一遍 —— E2-1 修的就是这个，E2-21 把同一条规则扩到全部参数。
+        val base = editorOpenParams()
+        val std = CameraPresets.standard()
+        assertEquals(CameraPresets.COUNT, base.size)
+        for (i in std.indices) {
+            val want = if (i == 34) 0.0 else std[i]
+            assertEquals("slot[$i] 打开基线必须等于恒等基线", want, base[i], 0.0)
+        }
+    }
+
+    @Test
+    fun snapshotValuesNeverLeakIntoOpenBaseline() {
+        // ★ 用户报的 bug（"打开曝光编辑时会把基础曝光的数值再次读出来显示到滑杆上"）的护栏：
+        // 快照里**每一个**非恒等槽位都不许出现在打开基线里 —— 不只是读数，画面也一样
+        //（这些参数在 kFsStyle 里全部生效，重放 = 二次应用）。
+        val raw = editorParams(snapshotWithStyle().params)
+        val std = CameraPresets.standard()
+        val base = editorOpenParams()
+        var checked = 0
+        for (i in raw.indices) {
+            if (raw[i] == std[i]) continue      // 快照里本来就恒等的槽位，无需比较
+            assertFalse("slot[$i] 的快照值泄漏进了打开基线", raw[i] == base[i])
+            checked++
+        }
+        assertTrue("前提：快照里确实有多个非恒等槽位（实际 $checked 个）", checked >= 6)
+        // 用户可见读数：曝光滑杆落在 0（不是快照的 +50），LUT 强度 0
+        assertEquals(0, (expUi(base[0]) * 100f).roundToInt())
+        assertEquals(100, (satUi(base[21]) * 100f).roundToInt())
+        assertEquals(0, (clarityUi(base[78]) * 100f).roundToInt())
+        assertEquals(0.0, base[34], 0.0)
+    }
+
+    @Test
+    fun applySnapshotParamsRestoresTheSnapshot() {
+        // 「套用原片风格」= 用户**主动点**才把快照参数下发（E2-21 起这是快照参数唯一的出口）
+        val raw = editorParams(snapshotWithStyle().params)
+        val base = editorOpenParams()
+        val applied = base.copyOf()
+        applySnapshotParams(applied, raw)
+        assertTrue("套用后逐槽 == 快照值", paramsUnchanged(applied, raw))
+        assertFalse("套用后 != 打开基线 ⇒ 有修改（走渲染，不是直通）", paramsUnchanged(applied, base))
+        // 原地写：不换数组对象（滑杆持有它，换对象 = 读数与槽位脱钩）
+        val same = base.copyOf()
+        applySnapshotParams(same, raw)
+        assertTrue(paramsUnchanged(same, raw))
+        // 长度不匹配时不许越界（防御：快照来自历史契约，长度可能更短）
+        val short = DoubleArray(3) { 9.0 }
+        applySnapshotParams(applied, short)
+        assertEquals(9.0, applied[0], 0.0)
+        assertEquals(9.0, applied[2], 0.0)
+        assertEquals("短快照不许越界写", CameraPresets.COUNT, applied.size)
     }
 
     // ── E2-18b：直通只对 JPEG 源图合法（架构师发现的 E2-9 连带 bug）──────────────

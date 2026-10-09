@@ -211,33 +211,39 @@ class EditorBasicUiTest {
     }
 
     @Test
-    fun openParamsExposeBasicValuesAsSliderStarts() {
-        // 快照 = 这张成片当初真正下发给引擎的参数（E1-2 口径）
+    fun openParamsIgnoreSnapshotBasicValuesAndStartAtIdentity() {
+        // ★ E2-21 修正：快照 = 这张成片当初真正下发给引擎的参数（E1-2 口径），成片就是它们的
+        // 产物 —— 打开编辑器时**一个都不该重放**，否则画面被二次应用（E2-1 只处理了 LUT，
+        // 因为当时 `kFsStyle` 只读 LUT / 颗粒 / 暗角；E2-2 / E2-11 之后它读的是这一整串）。
         val snap = CameraPresets.standard()
-        snap[0] = 1.5    // +1.5 EV ⇒ 滑杆 +50%
+        snap[0] = 1.5    // +1.5 EV ⇒ 旧语义下滑杆会显示 +50%（用户报的 bug）
         snap[1] = 1.2    // WB 红 120%
         snap[2] = 0.9    // WB 绿 90%
         snap[3] = 1.05   // WB 蓝 105%
         snap[4] = 0.6    // 对比度 60%
         snap[20] = 1.4; snap[21] = 1.4; snap[22] = 1.4   // 饱和度 140%
         snap[78] = 0.35  // 清晰度 35%
-        val p = editorOpenParams(StillSnapshot(snap, "kodak_portra", 0.85, 0L))
+        val p = editorOpenParams()
 
-        assertEquals(50, (expUi(p[0]) * 100f).roundToInt())
-        assertEquals(120, (wbGainUi(p[1]) * 100f).roundToInt())
-        assertEquals(90, (wbGainUi(p[2]) * 100f).roundToInt())
-        assertEquals(105, (wbGainUi(p[3]) * 100f).roundToInt())
-        assertEquals(60, (contrastUi(p[4]) * 100f).roundToInt())
-        assertEquals(140, (satUi(p[21]) * 100f).roundToInt())
-        assertEquals(35, (clarityUi(p[78]) * 100f).roundToInt())
-        // 契约长度不变；[34] 仍被强制 0（打开编辑器 = 原片本身）
+        // 快照里的非恒等值**不出现在**打开参数里：五类全部落在恒等读数
+        assertEquals(0, (expUi(p[0]) * 100f).roundToInt())
+        assertEquals(100, (wbGainUi(p[1]) * 100f).roundToInt())
+        assertEquals(100, (wbGainUi(p[2]) * 100f).roundToInt())
+        assertEquals(100, (wbGainUi(p[3]) * 100f).roundToInt())
+        assertEquals(100, (contrastUi(p[4]) * 100f).roundToInt())
+        assertEquals(100, (satUi(p[21]) * 100f).roundToInt())
+        assertEquals(0, (clarityUi(p[78]) * 100f).roundToInt())
+        // 契约长度不变；[34] 仍被强制 0（打开编辑器 = 原片本身，见 editorOpenParams 的 KDoc）
         assertEquals(CameraPresets.COUNT, p.size)
         assertEquals(0.0, p[34], 0.0)
+        // 快照数组本身只是"读进来展示/备用"，不是起点 ⇒ 一个字节都没被改
+        assertEquals(1.5, snap[0], 0.0)
     }
 
     @Test
     fun openParamsWithoutSnapshotFallBackToIdentitySliders() {
-        val p = editorOpenParams(null)
+        // 无快照 ⇒ **同一套**恒等基线（ADR-4：界面上提示"已用标准基线"）
+        val p = editorOpenParams()
         // 无快照 = 标准基线：五条滑杆全部落在恒等读数（曝光 0% / WB 100% / 对比度 100% /
         // 饱和度 100% / 清晰度 0%）—— 用户打开面板看到的是"什么都没改"
         assertEquals(0, (expUi(p[0]) * 100f).roundToInt())

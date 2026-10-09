@@ -36,6 +36,9 @@ import kotlin.math.roundToInt
  *    基线值而不是 0（0 在 [5..10] latitude 语义下是"极端 S 曲线"，不是"无效果"）；
  *  - 快照里的 NaN/Inf 是坏数据（JSON 写入侧已净化，读取侧仍防一手）：当作"没记录"。
  *
+ * ⚠ E2-21 起本函数**不再是编辑器打开时的起点**（那是 [editorOpenParams] 的恒等基线）：
+ * 它只服务「套用原片风格」—— 用户主动点，才把快照里这一整套参数重新下发一遍。
+ *
  * @param raw 快照参数；null = 这张没有参数记录（ADR-4：调用方要提示"已用标准基线"）
  */
 internal fun editorParams(raw: DoubleArray?): DoubleArray {
@@ -50,18 +53,39 @@ internal fun editorParams(raw: DoubleArray?): DoubleArray {
 }
 
 /**
- * 打开编辑器时的参数起点（E2-1，架构师 2026-10-08 拍板）：**画面必须与原片完全一致**。
+ * 打开编辑器时的参数起点（E2-1 拍板，E2-21 修正为**全恒等基线**）：**画面必须与原片完全一致**。
  *
- * 成片在拍摄时已经把 LUT 烘焙进去了，若编辑器再把快照里的同一个 LUT + 强度套一遍，
- * 用户第一眼看到的是"照片莫名其妙变浓了"。所以这里在 [editorParams] 之上把 **[34]
- * 强制置 0** —— 引擎侧 `bindLut` 见 `lut_strength = 0` ⇒ `uLutOn = 0` ⇒ LUT 整段旁路
- *（E1-3 离线验收：输出与输入 max|Δ| = 1 LSB，仅 dither）。
+ * 成片在拍摄时已经把**当时的全部参数**烘焙进了像素 —— 引擎 `kFsStyle` 会读曝光 [0]、
+ * 白平衡 [1..3]、对比度 [4]、饱和度 [20..22]、清晰度 [78]、色温 [88]、色调 [89]、
+ * 影调分区 [90..93]、褪色 [94]（以及 LUT 强度 [34] / 颗粒 [26] / 暗角 [66..68] /
+ * 局部 [79..87]），
+ * 成片就是它们的产物。所以打开时从快照恢复任何一个槽位 = **把同一个效果再叠一遍**
+ *（用户看到的"滑杆上又出现基础曝光值"只是表象，画面本身也变了）。
+ * 起点 = [CameraPresets.standard]（全恒等）。
  *
- * 快照里的 LUT 选择与强度**不丢**：调用方把它另存为 UI 状态（"原片风格：xxx · 85%"），
- * 配一个「套用」把当初的值原样下发。
+ * ⚠ **[34] LUT 强度必须额外归 0**：standard 的默认是 1.0 = 全量混合，而引擎侧 `bindLut`
+ * 的生效判据是 `lut_size_ > 1 && k > 0`，编辑器打开时又会上传快照那张 LUT 的资产
+ *（EditorScreen 的 `engine.setLut`）⇒ 强度留在 1.0 会让 LUT 再叠一遍，正是本函数要修的
+ * 那个 bug 的 LUT 版（E1-3 离线验收：强度 0 时输出与输入 max|Δ| = 1 LSB，仅 dither）。
+ *
+ * 快照信息**不丢**：调用方仍把它用于 UI 展示（"原片风格：xxx · 85%"）与「套用原片风格」
+ *（用户主动点才把快照参数下发，见 [applySnapshotParams]）。
  */
-internal fun editorOpenParams(snap: StillSnapshot?): DoubleArray =
-    editorParams(snap?.params).also { it[34] = 0.0 }
+internal fun editorOpenParams(): DoubleArray =
+    CameraPresets.standard().also { it[34] = 0.0 }
+
+/**
+ * 「套用原片风格」的参数下发（E2-21）：把快照参数逐槽写进 [current]。
+ *
+ * **原地写、不换数组对象** —— 滑杆组件持有这个数组的引用（换对象 = 读数与槽位脱钩）。
+ *
+ * 为什么抽成纯函数：E2-21 起这是快照参数**唯一**的下发入口（打开编辑器时一律恒等，见
+ * [editorOpenParams]），"套用后逐槽 == 快照值"这条语义必须能被 JVM 单测钉住 ——
+ * Compose 里的调用点（`applySnapshotStyle`）跑不了单测。
+ */
+internal fun applySnapshotParams(current: DoubleArray, snapshot: DoubleArray) {
+    snapshot.copyInto(current, 0, 0, min(current.size, snapshot.size))
+}
 
 /**
  * 「无修改」比较容差（E2-9 / ADR-13）。取 **1e-4** 的依据 —— 两侧余量都要够：
@@ -83,13 +107,14 @@ internal const val PARAM_EPS = 1e-4
  *
  * 三条设计约束：
  *  1. **基准是"打开时的参数"**（[editorOpenParams] 的返回值副本），不是快照原文 ——
- *     该函数已把 `[34] lut_strength` 强制置 0（E2-1 拍板"打开即与原片一致"），拿快照
- *     原文比会把"打开时那一次必然的 LUT 归零"误判成用户修改。
+ *     该函数返回的是**全恒等基线**（E2-21：成片已含拍摄时的全部参数，打开时一个都不重放），
+ *     拿快照原文比会把"打开时那一次必然的恒等化"误判成用户修改。
  *  2. **值比较，不是"是否碰过滑杆"**：用户改了又改回原值 ⇒ 画面与原片一致 ⇒ 该直通。
  *  3. **不用 `==`**（E2-3 踩过的浮点坑：`0.01f.toDouble()` = 0.009999999776…）：容差见
  *     [PARAM_EPS]。
  *
- * **非有限值（NaN/Inf）一律判"有修改"**：基准来自 [editorParams]（已过滤坏数据）⇒ 恒有限，
+ * **非有限值（NaN/Inf）一律判"有修改"**：基准来自 [editorOpenParams]（[CameraPresets.standard]
+ * 的字面量，无外部输入）⇒ 恒有限，
  * 所以出现非有限值只可能是 current 侧被写坏。此时宁可多渲染一次（安全），也不能拿它比出
  * "无修改"而把用户的修改丢掉 —— 直通是"输出原片字节"，误判的代价是**丢修改**。
  *

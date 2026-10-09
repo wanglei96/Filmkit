@@ -184,17 +184,19 @@ class EditorReadoutTest {
         Spec("局部角度", 0f..1f, 0f, "0°", "0°", "180°"),
         Spec("局部宽度", 0f..1f, 0.25f, "0", "25", "100"),
         Spec("局部羽化", 0f..1f, 0.5f, "0", "50", "100"),
-        Spec("局部曝光", -1f..1f, 0f, "-3.0 EV", "0.0 EV", "+3.0 EV"),
-        Spec("局部饱和度", 0f..2f, 1f, "-100", "0", "+100"),
+        // E2-21：局部组的两条改名（`曝光` → `区域内曝光` / `饱和度` → `区域内饱和度`），
+        // 这里跟着对齐 —— 本表是 EditorScreen 参数表的可执行版本，名字漂了就没法逐条对照
+        Spec("区域内曝光", -1f..1f, 0f, "-3.0 EV", "0.0 EV", "+3.0 EV"),
+        Spec("区域内饱和度", 0f..2f, 1f, "-100", "0", "+100"),
     )
 
     /** 按参数名调用对应的格式化函数（与 EditorScreen 参数表里的 `format` 一格一一对应） */
     private fun formatOf(name: String, v: Float): String = when (name) {
-        "曝光", "局部曝光" -> formatEv(v)
+        "曝光", "区域内曝光" -> formatEv(v)
         "清晰度", "LUT 强度", "暗角强度", "局部半径", "局部宽度", "局部羽化" -> formatZero100(v)
         "暗角半径", "暗角羽化" -> formatZero200(v)
         "局部角度" -> formatDegree(v)
-        else -> formatOffset100(v, 1f)   // 白平衡 / 对比度 / 饱和度 / 局部饱和度
+        else -> formatOffset100(v, 1f)   // 白平衡 / 对比度 / 饱和度 / 区域内饱和度
     }
 
     @Test

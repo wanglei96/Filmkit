@@ -138,6 +138,7 @@ import com.filmkit.app.camera.TINT_UI_RANGE
 import com.filmkit.app.camera.TONE_UI_RANGE
 import com.filmkit.app.camera.WB_GAIN_UI_RANGE
 import com.filmkit.app.camera.ZERO_UI_PIVOT
+import com.filmkit.app.camera.applySnapshotParams
 import com.filmkit.app.camera.claritySlot
 import com.filmkit.app.camera.clarityUi
 import com.filmkit.app.camera.contrastSlot
@@ -145,6 +146,7 @@ import com.filmkit.app.camera.contrastUi
 import com.filmkit.app.camera.discardNeedsConfirm
 import com.filmkit.app.camera.editorExportName
 import com.filmkit.app.camera.editorOpenParams
+import com.filmkit.app.camera.editorParams
 import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
@@ -233,10 +235,14 @@ import kotlinx.coroutines.withContext
  * 所以配套三条纪律：① 滑杆**拖动中不渲染、松手才渲染一次**（[SliderRenderGate]）；
  * ② 换输出位图前先回收旧的那张；③ 解码位图拷进 buffer 后立刻回收（[loadPreview]）。
  *
- * 参数起点（集成点 I-3）：打开时读该片的参数快照（`StillSnapshotStore`）；没有快照
- * 时回退 [CameraPresets.standard] 并在界面上明确提示"已用标准基线"（ADR-4）。
- * **打开时的画面 = 原片本身**（E2-1 架构师拍板）：LUT 强度初值强制 0（旁路），
- * 快照里的 LUT 与强度改为"原片风格"只读展示 + 一键套用，见 [editorOpenParams]。
+ * 参数起点（集成点 I-3，**E2-21 修正**）：**全恒等基线** —— [editorOpenParams] 返回
+ * [CameraPresets.standard]（[34] LUT 强度额外归 0）。成片在拍摄时已经把当时的**全部**参数
+ *（曝光 / WB / 对比度 / 饱和度 / 清晰度 / 色温 / 色调 / 影调分区 / 褪色 / LUT / 暗角）烘焙进
+ * 像素，打开时再从快照恢复 = 画面被**二次应用**（E2-1 只处理了 LUT，因为当时 `kFsStyle` 只有
+ * 那几条；E2-2 / E2-11 之后读的是一整串）。
+ * **打开时的画面 = 原片本身**：参数快照仍然读，但只用于「滤镜」组的"原片风格：xxx · 85%"
+ * 只读展示 + 一键套用（用户主动点才把快照参数下发，见 [editorOpenParams] /
+ * [applySnapshotParams]）；没有快照时提示"已用标准基线"（ADR-4）。
  *
  * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / 撤销·重做留位 /
  * 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**（满宽 + 密集刻度 +
@@ -321,9 +327,9 @@ fun EditorScreen(
     var shown by remember { mutableStateOf<Bitmap?>(null) }
     // 按住看原图时显示的输入像素（从常驻 buffer 重建，见 LaunchedEffect(showOriginal)）
     var origBmp by remember { mutableStateOf<Bitmap?>(null) }
-    // 参数数组（长度 = CameraPresets.COUNT）：编辑器只改得动基础五类 [0][1..3][4][20..22][78]、
-    // LUT 强度 [34] 与暗角 [66][67][68]；其余槽位原样带着（快照继承 → 导出时整体存回快照，
-    // 所以"没碰过的风格参数"不会因为进了一次编辑器就丢）
+    // 参数数组（长度 = CameraPresets.COUNT）：编辑器只改得动参数表里列出的那些槽位
+    //（调整 / 滤镜 / 暗角 / 局部四组，见文件末尾的参数表）；其余槽位带着基线值
+    //（E2-21 起打开时是**全恒等基线**，不再从快照继承）→ 导出时整体存回快照
     var params by remember { mutableStateOf<DoubleArray?>(null) }
     // 打开编辑器时的参数基准（E2-9 / ADR-13）：`params` 的**副本**，导出时逐槽比一次值
     //（同一个数组对象会被滑杆原地改写 ⇒ 必须 copy）。"无修改"⇒ 导出直通原片字节。
@@ -335,6 +341,9 @@ fun EditorScreen(
     // 快照里的"原片风格"（只读展示 + 一键套用）：不随滑杆变化，故与 lutId/lutK 分开存
     var snapLutId by remember { mutableStateOf<String?>(null) }
     var snapLutK by remember { mutableFloatStateOf(0f) }
+    // ★ E2-21：快照里的**参数**（完整长度数组）。打开编辑器时它**不下发**（起点是恒等基线，
+    // 成片已含这一套参数）；只有用户主动点「套用原片风格」才整槽写回（[applySnapshotParams]）。
+    var snapParams by remember { mutableStateOf<DoubleArray?>(null) }
     var hasSnapshot by remember { mutableStateOf(false) }
     // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 滤镜 / 暗角 / 局部。面板常驻
     //（不再是可折叠区），所以这里取代了 E2-1 的 `panelOpen`。
@@ -475,8 +484,12 @@ fun EditorScreen(
     /**
      * 下发 LUT 资产（null = 关闭）与强度，然后重渲染。两个入口共用：手动选卡片、
      * 「套用原片风格」。解析在 IO 线程（读 .cube 字节），上传与重渲染在渲染线程。
+     *
+     * @param onReady 资产**加载成功、即将下发**时回调。E2-21：「套用原片风格」要等 LUT 就绪
+     *   才写参数 —— 加载失败时参数与画面都不该动，否则会留下"参数已套用、LUT 还是旧那张"
+     *   的半套用状态（而提示还写着"已保持原状"）。
      */
-    fun applyLut(entry: LutLibrary.Entry?, k: Float) {
+    fun applyLut(entry: LutLibrary.Entry?, k: Float, onReady: () -> Unit = {}) {
         val film = params ?: return
         if (entry == null) {
             lutId = null
@@ -492,6 +505,7 @@ fun EditorScreen(
                 status = "LUT 解析失败，已保持原状"
                 return@launch
             }
+            onReady()
             lutId = entry.id
             film[34] = k.toDouble()
             engine.setLut(lut)
@@ -515,19 +529,40 @@ fun EditorScreen(
     }
 
     /**
-     * 一键套用原片风格：把快照里的 LUT + 强度原样下发（等价于手动把强度拖到那个值）。
-     * 资产在打开编辑器时已上传过，但用户可能已切到别的 LUT/关闭 ⇒ 这里重新走一遍
-     * [applyLut]（重复上传一次 3D 纹理，代价是一次 IO + 一次纹理上传，换"任何状态下都正确"）。
+     * 一键套用原片风格（E2-1 的功能；**E2-21 起同时下发参数**）：把快照里的参数（曝光 /
+     * 白平衡 / 对比度 / 饱和度 / 清晰度 / 色温 / 色调 / 影调分区 / 褪色 / LUT 强度）与 LUT
+     * 资产原样下发。
+     *
+     * 为什么参数也要下发：打开编辑器时起点是**恒等基线**（成片已含当初的全部参数，见
+     * [editorOpenParams]）—— 想复现原片风格只能由用户主动点这里。这也是"快照信息不丢"的
+     * 第二个出口（第一个是「滤镜」组那行只读展示）。
+     *
+     * 资产在打开编辑器时已上传过，但用户可能已切到别的 LUT / 关闭 / 调过滑杆 ⇒ 这里重新走
+     * 一遍 [applyLut]（重复上传一次 3D 纹理，代价是一次 IO + 一次纹理上传，换"任何状态下都
+     * 正确"）。
      */
     fun applySnapshotStyle() {
-        val id = snapLutId ?: return
-        if (lutId == id && lutK == snapLutK) return   // 已经一致：不重复上传/渲染
-        val entry = LutLibrary.byId(context, id)
+        val snapFilm = snapParams ?: return
+        // ① LUT：快照记了 id 且资产还在 ⇒ 下发（**资产就绪后才写参数**，见 applyLut 的 onReady）；
+        //    否则**显式关掉** —— 引擎的 LUT 是进程级状态，可能残留着用户刚选的那张
+        //    ⇒ 不关就是"套用出一张别的风格"。
+        val entry = snapLutId?.let { LutLibrary.byId(context, it) }
         if (entry == null) {
-            status = "原片用的 LUT 已不在库中"
+            if (snapLutId != null) status = "原片用的 LUT 已不在库中"
+            // 参数整体回快照（**原地**逐槽写：滑杆持有这个数组对象，换对象 = 读数脱钩），
+            // 但 [34] 归 0（没有 LUT 资产 ⇒ 强度再高也不生效，留着只会误导读数）
+            params?.let {
+                applySnapshotParams(it, snapFilm)
+                it[34] = 0.0
+            }
+            lutId = null
+            engine.setLut(null)
+            panelRefresh++
+            rerender()
             return
         }
-        applyLut(entry, snapLutK)   // 强度读数归位由 applyLut 统一负责
+        // ② 参数在 LUT 就绪后整体回快照（加载失败 ⇒ 参数与画面都不动，不留半套用状态）
+        applyLut(entry, snapLutK) { params?.let { applySnapshotParams(it, snapFilm) } }
     }
 
     // ── 参数写入（E2-10：数据驱动，取代 E2-3/E2-7 的 16 个一模一样的 setter）────────────
@@ -742,8 +777,8 @@ fun EditorScreen(
         val target = uri
         if (exporting || target == null) return
 
-        // ★ 参数判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值，
-        // 已把 [34] 强制置 0），不是快照原文；值比较 + 容差 ⇒ "改了又改回原值"也算无修改。
+        // ★ 参数判据：基准 = openParams（**打开时**的参数，即 editorOpenParams 的返回值：
+        // E2-21 起是全恒等基线），不是快照原文；值比较 + 容差 ⇒ "改了又改回原值"也算无修改。
         // openParams 为 null（理论上只在首帧就绪前，此时导出按钮不可点）⇒ 保守走渲染。
         val unchanged = openParams?.let { paramsUnchanged(snapshot, it) } ?: false
 
@@ -841,12 +876,13 @@ fun EditorScreen(
                 status = "正在渲染…"
                 // 参数起点 + 初始化引擎 + 上传 LUT 资产，全在 IO 线程做完再回主线程
                 val init = withContext(Dispatchers.IO) {
-                    // I-3：快照存在 ⇒ 用这张片子当初的参数；不存在 ⇒ 标准基线（ADR-4）
+                    // I-3（**E2-21 修正**）：快照照读，但打开时的**起点**是全恒等基线 ——
+                    // 成片在拍摄时已把当时的全部参数烘焙进像素，再从快照恢复 = 画面被二次
+                    // 应用（E2-1 只处理了 LUT，因为当时 kFsStyle 只有那几条）。
+                    // 快照参数另存为 snapParams，只由「套用原片风格」主动下发
+                    //（见 editorOpenParams / applySnapshotParams 的 KDoc）。
                     val snap = StillSnapshotStore.load(context, src.name)
-                    // ★ 打开编辑器 = 原片本身：[34] 强制 0（引擎侧 LUT 整段旁路）。
-                    // 快照里的 LUT 与强度不丢 —— 另存为"原片风格"，由面板给一键套用
-                    //（E2-1 架构师拍板，理由见 editorOpenParams 的 KDoc）。
-                    val film = editorOpenParams(snap)
+                    val film = editorOpenParams()
                     val snapId = snap?.lutId?.takeIf { it.isNotEmpty() }
                     val entry = snapId?.let { id -> LutLibrary.byId(context, id) }
                     val lut = entry?.let { LutLibrary.load(context, it) }
@@ -856,6 +892,7 @@ fun EditorScreen(
                     engine.setLut(lut)
                     EditorInit(
                         film = film,
+                        snapFilm = snap?.let { editorParams(it.params) },
                         hasSnapshot = snap != null,
                         // 资产加载失败时不算"选中"：否则 UI 显示选中、引擎里却没有这个 LUT
                         lutId = if (lut != null) entry.id else null,
@@ -868,6 +905,7 @@ fun EditorScreen(
                 // E2-9：导出直通的比较基准 = **打开时**的参数（`params` 会被滑杆原地改写
                 // ⇒ 必须留一份副本，且必须是 editorOpenParams 的结果，不是快照原文）
                 openParams = init.film.copyOf()
+                snapParams = init.snapFilm
                 hasSnapshot = init.hasSnapshot
                 lutId = init.lutId
                 snapLutId = init.snapLutId
@@ -1328,6 +1366,8 @@ private fun editorHint(status: String, hasSnapshot: Boolean, lutLabel: String?, 
 /** LaunchedEffect 里初始化结果的打包（避免在协程里零散赋值） */
 private class EditorInit(
     val film: DoubleArray,
+    /** 快照里的**参数**（E2-21）：打开时不下发，只由「套用原片风格」主动写回；null = 无快照 */
+    val snapFilm: DoubleArray?,
     val hasSnapshot: Boolean,
     val lutId: String?,
     /** 快照里**原片**用的 LUT id（≠ [lutId]：用户可能已改选或关闭；null = 原片没记 LUT） */
@@ -1607,14 +1647,17 @@ private val VignetteParams: List<EditorParam> = listOf(
 /**
  * 「局部」组的六条参数（E2-7 的滑杆，一个没少），**按模式过滤**（ADR-12：径向模式下"角度"
  * 对画面没有任何作用，就不该出现在界面上）：
- *  - 径向：半径 / 羽化 / 曝光 / 饱和度
- *  - 线性：角度 / 宽度 / 羽化 / 曝光 / 饱和度
+ *  - 径向：半径 / 羽化 / 区域内曝光 / 区域内饱和度
+ *  - 线性：角度 / 宽度 / 羽化 / 区域内曝光 / 区域内饱和度
  *  - 未选模式：全部六条（用户可以先设参数再选模式）
  *
  * 中心 [80][81] 没有滑杆 —— 定位在预览图上拖动完成（E2-7 的核心交互，本卡保留）。
  *
  * 读数口径：半径/宽度/羽化 `35`（0..100）；**角度 `90°`**（方向用度数，E2-7 定的口径）；
- * 曝光 `+1.0 EV`；饱和度 `+12`（±100）。
+ * 区域内曝光 `+1.0 EV`；区域内饱和度 `+12`（±100）。
+ *
+ * E2-21 改名：`曝光` → `区域内曝光`、`饱和度` → `区域内饱和度`（半径 / 羽化 / 角度 / 宽度
+ * 是几何参数，本来就只描述"圈在哪"，不改名）。理由见 [LOCAL_SCOPE_HINT]。
  */
 private fun localParams(mode: Int): List<EditorParam> = buildList {
     if (mode != LocalMode.LINEAR) {
@@ -1659,7 +1702,9 @@ private fun localParams(mode: Int): List<EditorParam> = buildList {
     )
     add(
         EditorParam(
-            key = "locEv", label = "曝光", icon = Icons.Outlined.Exposure,
+            // E2-21：加「区域内」前缀 —— 用户问"调节里有曝光和饱和度了，局部里也有是做什么的？"
+            // 说明只写"曝光"讲不清"只作用于圈定区域"（ADR-12：界面要自己说清楚，不靠用户猜）
+            key = "locEv", label = "区域内曝光", icon = Icons.Outlined.Exposure,
             range = LOCAL_EV_UI_RANGE, pivot = 0f,
             format = { formatEv(it) },
             read = { localEvUi(it[86]) },
@@ -1668,7 +1713,7 @@ private fun localParams(mode: Int): List<EditorParam> = buildList {
     )
     add(
         EditorParam(
-            key = "locSat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
+            key = "locSat", label = "区域内饱和度", icon = Icons.Outlined.WaterDrop,
             range = LOCAL_SAT_UI_RANGE, pivot = 1f,
             format = { formatOffset100(it, 1f) },
             read = { localSatUi(it[87]) },
@@ -1676,6 +1721,13 @@ private fun localParams(mode: Int): List<EditorParam> = buildList {
         ),
     )
 }
+
+/**
+ * 局部组的**一行说明**（E2-21）：全局组（调整）里的「曝光 / 饱和度」作用于整张图，局部组的
+ * 两条只作用于圈定的区域 —— 两条滑杆同名时用户会问"这不是重复了吗"，所以参数名加「区域内」
+ * 前缀之外，组顶部再直说一次。文案刻意短（面板高度有限，且提示行已经占了一条）。
+ */
+private const val LOCAL_SCOPE_HINT = "以下参数只作用于圈出的区域"
 
 /**
  * 局部组的说明行（E2-7 的提示文案，随面板重做挪到顶部提示位，内容一字未改）。
@@ -1687,7 +1739,10 @@ private fun localHint(mode: Int, active: Boolean, center: Pair<Float, Float>): S
     val cy = (center.second * 100).roundToInt()
     return when {
         mode == LocalMode.OFF -> "选「径向」或「线性」后，在预览上拖动定位"
-        !active -> "已选模式：调「曝光」或「饱和度」后画面才会变化（当前未调强度）"
+        // E2-21：滑杆改名「区域内曝光 / 区域内饱和度」后，这行提示里的称呼必须跟着走 ——
+        // 否则用户按提示去找一条叫「曝光」的滑杆，在局部组里根本找不到。
+        // 文案压到 28 字以内：这行是 maxLines=1 + Ellipsis，窄屏上尾部被截掉就白写了
+        !active -> "已选模式：调「区域内曝光 / 饱和度」后才会变化（未调强度）"
         mode == LocalMode.RADIAL -> "预览上拖动移动中心（当前 $cx%, $cy%）· 半径 100 = 图像宽度"
         else -> "预览上拖动移动轴线（当前 $cx%, $cy%）· 角度 0° = 条带竖直"
     }
@@ -1884,8 +1939,20 @@ private fun EditorPanel(
         if (group == EditorTab.COLOR) {
             SnapshotStyleRow(context, snapLutId, snapLutK, onApplySnapshot)
         }
-        // 局部组专属：模式选择（关 / 径向 / 线性）
-        if (group == EditorTab.LOCAL) LocalModeRow(localMode, onLocalMode)
+        // 局部组专属：一行**范围说明**（E2-21）+ 模式选择（关 / 径向 / 线性）
+        if (group == EditorTab.LOCAL) {
+            Text(
+                LOCAL_SCOPE_HINT,
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                maxLines = 1,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 1.dp),
+            )
+            LocalModeRow(localMode, onLocalMode)
+        }
 
         ParamNameRow(current, group, onResetParam, onResetGroup)
 
