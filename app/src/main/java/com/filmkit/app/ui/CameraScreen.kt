@@ -114,6 +114,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -1480,31 +1481,36 @@ fun CameraScreen(
  * 仅供 @Composable 上下文使用。
  *
  * internal 而非 private：编辑器（E1-4）复用同一套按压反馈 —— 两处各写一份，手感必然走样。
+ *
+ * [enabled] 是 E2-10（编辑器专业面板）加的可选参数，**默认值 = 现行为**（可点）：
+ * 编辑器顶栏的「完成 / 覆盖」在导出中或未就绪时要**真的禁用**（禁用态还带按下缩放 =
+ * 用户以为点上了）。禁用时不注册任何手势，也就不可能有按压反馈。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun Modifier.pressScale(
     pressedScale: Float = 0.92f,
+    enabled: Boolean = true,
     onTap: () -> Unit,
     onLongTap: (() -> Unit)? = null,
 ): Modifier {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val s = if (pressed) pressedScale else 1f
+    val s = if (pressed && enabled) pressedScale else 1f
     return this
         .graphicsLayer {
             scaleX = s
             scaleY = s
         }
         .then(
-            if (onLongTap == null) {
-                Modifier.clickable(
+            when {
+                !enabled -> Modifier
+                onLongTap == null -> Modifier.clickable(
                     interactionSource = interaction,
                     indication = ripple(bounded = false),
                     onClick = onTap,
                 )
-            } else {
-                Modifier.combinedClickable(
+                else -> Modifier.combinedClickable(
                     interactionSource = interaction,
                     indication = ripple(bounded = false),
                     onClick = onTap,
@@ -2263,14 +2269,31 @@ private fun LutSheet(
  * 相对模式 = 按下不改值、拖动按增量累加（专业相机 App 的标准交互），从机制上
  * 根除按下跳变；跨手势仍按最新值定位（rememberUpdatedState 回流）。
  * 视觉与原 M3 Slider 一致：ChipBorder 轨道 + Accent 已作用段 + Cream thumb。
+ *
+ * E2-10（编辑器专业面板）：private → internal，并加了四个**带默认值**的可选参数
+ * （[rowHeight] / [ticks] / [midFraction] / [barThumb]）—— 默认值就是上面这段现行为，
+ * 所以拍摄页与其余调用点**一个字符都不用改**，观感与手感零变化。编辑器用它们拿到
+ * "满宽 + 密集刻度 + 中点标记 + 竖条拇指"的调色台形态（ADR-14 三条关键修正的落点）。
  */
 @Composable
-private fun RelativeSlider(
+internal fun RelativeSlider(
     value: Float,
     onValueChange: (Float) -> Unit,
     onDragEnd: () -> Unit,
     modifier: Modifier = Modifier,
     range: ClosedFloatingPointRange<Float> = 0f..1.5f,
+    /** 行高（触摸热区）：拍摄页 32dp；编辑器 44dp（研究 §3.3.1 的滑杆行规格） */
+    rowHeight: Dp = 32.dp,
+    /** 密集刻度：等距细竖线（11dp 间距 / 1dp 宽 / 6dp 高，PC `manual_knob_dash_*` 的密度感） */
+    ticks: Boolean = false,
+    /**
+     * 基准值（"不变点"）在滑杆上的位置（0..1）：非空时画中点标记，且已作用段**从基准画到拇指**
+     * （不是从最左端 —— 曝光/对比度的"不变点"两侧是增减两个方向）。null = 现行为（从最左）。
+     * 位置由纯函数 `pivotFraction` 算好传进来，本组件不认识 range 与基准值的关系。
+     */
+    midFraction: Float? = null,
+    /** 拇指形态：false = 20dp 圆点（现行为）；true = 3dp × 20dp 竖条（调色台语言） */
+    barThumb: Boolean = false,
 ) {
     val span = range.endInclusive - range.start
     val fraction = ((value - range.start) / span).coerceIn(0f, 1f)
@@ -2279,10 +2302,10 @@ private fun RelativeSlider(
     val onChange by rememberUpdatedState(onValueChange)
     val onEnd by rememberUpdatedState(onDragEnd)
     val density = LocalDensity.current
-    val thumbPx = with(density) { 20.dp.toPx() }
+    val thumbPx = with(density) { (if (barThumb) 3.dp else 20.dp).toPx() }
     Box(
         modifier
-            .height(32.dp)
+            .height(rowHeight)
             .onSizeChanged { widthPx = it.width.toFloat() }
             .pointerInput(range) {
                 // v0.10.98b：手写 awaitPointerEvent 循环 —— drag() 原语的事件过滤
@@ -2309,30 +2332,71 @@ private fun RelativeSlider(
             },
         contentAlignment = Alignment.CenterStart,
     ) {
-        // 轨道：全宽 inactive + 到 thumb 为止的 active 段
+        // 轨道层：密集刻度（可选）+ 全宽 inactive 轨道 + 已作用段（可选从基准起）
         Canvas(
             Modifier
                 .fillMaxWidth()
-                .height(4.dp),
+                .height(if (ticks || midFraction != null) 20.dp else 4.dp),
         ) {
-            val r = CornerRadius(size.height / 2f)
-            drawRoundRect(color = FilmTheme.ChipBorder, cornerRadius = r)
-            val activeW = size.width * fraction
-            if (activeW > 0.5f) {
+            val cy = size.height / 2f
+            val th = 4.dp.toPx()
+            if (ticks) {
+                val gap = 11.dp.toPx()
+                val lw = 1.dp.toPx()
+                val lh = 6.dp.toPx()
+                val tickColor = FilmTheme.CreamDim.copy(alpha = 0.22f)
+                var x = lw / 2f
+                while (x < size.width) {
+                    drawLine(tickColor, Offset(x, cy - lh / 2f), Offset(x, cy + lh / 2f), lw)
+                    x += gap
+                }
+            }
+            val r = CornerRadius(th / 2f)
+            drawRoundRect(
+                color = FilmTheme.ChipBorder,
+                topLeft = Offset(0f, cy - th / 2f),
+                size = Size(size.width, th),
+                cornerRadius = r,
+            )
+            val from = midFraction?.coerceIn(0f, 1f) ?: 0f
+            val a = minOf(from, fraction)
+            val b = maxOf(from, fraction)
+            if ((b - a) * size.width > 0.5f) {
                 drawRoundRect(
                     color = FilmTheme.Accent,
-                    size = Size(activeW, size.height),
+                    topLeft = Offset(a * size.width, cy - th / 2f),
+                    size = Size((b - a) * size.width, th),
                     cornerRadius = r,
+                )
+            }
+            // 中点标记（E2-10）：2dp × 12dp —— 比刻度线长，一眼看到"不变点"
+            midFraction?.coerceIn(0f, 1f)?.let { f ->
+                val mw = 2.dp.toPx()
+                val mh = 12.dp.toPx()
+                drawLine(
+                    FilmTheme.CreamDim,
+                    Offset(f * size.width, cy - mh / 2f),
+                    Offset(f * size.width, cy + mh / 2f),
+                    mw,
                 )
             }
         }
         // thumb：随 fraction 平移（offset lambda 用 px，留 inset 防出界）
-        Box(
-            Modifier
-                .offset { IntOffset(((widthPx - thumbPx) * fraction).roundToInt(), 0) }
-                .size(20.dp)
-                .background(FilmTheme.Cream, CircleShape),
-        )
+        if (barThumb) {
+            Box(
+                Modifier
+                    .offset { IntOffset(((widthPx - thumbPx) * fraction).roundToInt(), 0) }
+                    .size(width = 3.dp, height = 20.dp)
+                    .background(FilmTheme.Cream, RoundedCornerShape(1.5.dp)),
+            )
+        } else {
+            Box(
+                Modifier
+                    .offset { IntOffset(((widthPx - thumbPx) * fraction).roundToInt(), 0) }
+                    .size(20.dp)
+                    .background(FilmTheme.Cream, CircleShape),
+            )
+        }
     }
 }
 

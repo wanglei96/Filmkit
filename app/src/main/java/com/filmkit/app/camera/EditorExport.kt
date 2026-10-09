@@ -18,6 +18,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * 编辑器导出（E1-4 / ADR-3）：参数起点、编码、**另存新片**与**覆盖原片**。
@@ -267,6 +268,88 @@ internal fun clarityUi(slot: Double): Float = if (!slot.isFinite()) {
 } else {
     slot.coerceIn(CLARITY_UI_RANGE.start.toDouble(), CLARITY_UI_RANGE.endInclusive.toDouble())
         .toFloat()
+}
+
+/**
+ * 读数格式化（E2-10）。**纯函数、无 Android 依赖** ⇒ JVM 单测逐条钉住（每个参数的格式 +
+ * 中点值 + 边界 + 坏数据）。
+ *
+ * 为什么单独抽出来：ADR-14 的差距第 3 条 —— "读数恒为 `%`（曝光显示 `100%` 而不是
+ * `+1.0 EV`）**这条最直接决定"专业感"**"。旧实现把读数写死在滑杆组件里（`v * 100%`），
+ * 既改不动也测不了；现在每个参数的读数格式是参数表里的一格（见 `EditorScreen.kt`）。
+ *
+ * 口径（全卡统一，研究 §3.3.3）：
+ *  - **有物理单位的一律用物理单位**（曝光 → `EV`，方向 → `°`）
+ *  - **相对量用 ±100 整数**（对比度 / 饱和度 / 白平衡增益；0 = 不变）
+ *  - **无符号量用 0..100 / 0..200 整数**（清晰度 / 暗角强度 / 半径 / 羽化 / LUT 强度）
+ *  - **不再出现 `%`**（百分比是"设置页"的语言，不是"调色台"的语言）
+ *
+ * 坏数据（NaN/Inf）一律回落到恒等读数（`0.0 EV` / `0` / `0°`）：读数绝不能显示 `NaN`。
+ */
+
+/** 一位小数（无 Locale 依赖、无 `String.format` 的分配开销）：`1.5` / `-0.5` / `0.0` */
+private fun oneDecimal(v: Float): String {
+    val n = (v * 10f).roundToInt()
+    val a = abs(n)
+    return "${if (n < 0) "-" else ""}${a / 10}.${a % 10}"
+}
+
+/**
+ * 曝光读数：UI（−1..1 = ±3 EV）→ `+1.0 EV` / `0.0 EV` / `-1.5 EV`。
+ *
+ * 零值不带正号；先四舍五入到一位小数再判零 ⇒ `-0.04 EV` 显示 `0.0 EV` 而不是 `-0.0 EV`。
+ */
+internal fun formatEv(ui: Float): String {
+    val ev = if (ui.isFinite()) (ui * 3f).coerceIn(-3f, 3f) else 0f
+    val r = (ev * 10f).roundToInt() / 10f
+    val s = oneDecimal(r)
+    return if (r > 0f) "+$s EV" else "$s EV"
+}
+
+/**
+ * 相对量读数：相对 [pivot] 的 ±100 整数偏移 → `+12` / `0` / `-34`。
+ *
+ * 适用：对比度 / 饱和度 / 白平衡增益（[pivot] = 1.0 = 不变）。量程不对称时（对比度
+ * 0.01..2.0）负数侧到不了 −100 —— 如实显示，不硬凑对称。
+ */
+internal fun formatOffset100(ui: Float, pivot: Float = 1f): String {
+    val v = if (ui.isFinite() && pivot.isFinite()) {
+        ((ui - pivot) * 100f).roundToInt().coerceIn(-100, 100)
+    } else {
+        0
+    }
+    return if (v > 0) "+$v" else "$v"
+}
+
+/**
+ * 0..100 整数读数（清晰度 / 暗角强度 / LUT 强度 / 局部半径·羽化·宽度）：UI 0..1 × 100。
+ * 这是"清晰度"的口径（研究 §3.3.3 的目标显示就是 `0..100` 无符号整数）。
+ */
+internal fun formatZero100(ui: Float): String =
+    if (ui.isFinite()) (ui * 100f).roundToInt().coerceIn(0, 100).toString() else "0"
+
+/** 0..200 整数读数（暗角半径 / 羽化）：UI 0..2 × 100 —— darktable 的 `scale` 本身就是 0..200 语义。 */
+internal fun formatZero200(ui: Float): String =
+    if (ui.isFinite()) (ui * 100f).roundToInt().coerceIn(0, 200).toString() else "0"
+
+/** 角度读数（局部调整的条带法线方向）：UI 0..1 = 0..180° → `90°`。 */
+internal fun formatDegree(ui: Float): String =
+    if (ui.isFinite()) "${(ui * 180f).roundToInt().coerceIn(0, 180)}°" else "0°"
+
+/**
+ * 基准值（"不变点" / 默认值）在滑杆上的位置（0..1）。返回 null = **不画中点标记**：
+ *  - 基准落在量程**端点**上（清晰度 0 / 暗角强度 0 / LUT 强度 0 都在最左端）—— 端点本身就是标记
+ *  - 基准在量程外，或量程退化（span ≤ 0）/ 非有限（坏数据）
+ *
+ * 这是"三条关键修正"第 2 条（中点标记）的**唯一**位置计算：滑杆绘制侧（`RelativeSlider`
+ * 只接收算好的 fraction）与单测共用同一份 —— 两处各算一次，必然出现"标记画在 0 处、
+ * 读数却是 +12"的错位。
+ */
+internal fun pivotFraction(range: ClosedFloatingPointRange<Float>, pivot: Float): Float? {
+    val span = range.endInclusive - range.start
+    if (!span.isFinite() || span <= 0f || !pivot.isFinite()) return null
+    val f = (pivot - range.start) / span
+    return if (f > 0f && f < 1f) f else null
 }
 
 /**

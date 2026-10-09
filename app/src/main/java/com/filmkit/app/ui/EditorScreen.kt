@@ -4,36 +4,54 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Redo
+import androidx.compose.material.icons.automirrored.outlined.RotateRight
+import androidx.compose.material.icons.automirrored.outlined.Undo
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.outlined.BlurOn
+import androidx.compose.material.icons.outlined.CenterFocusStrong
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.Contrast
+import androidx.compose.material.icons.outlined.Crop
+import androidx.compose.material.icons.outlined.Details
+import androidx.compose.material.icons.outlined.Exposure
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.PhotoFilter
+import androidx.compose.material.icons.outlined.RadioButtonUnchecked
+import androidx.compose.material.icons.outlined.SwapHoriz
+import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.Vignette
+import androidx.compose.material.icons.outlined.WaterDrop
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -49,19 +67,23 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -94,6 +116,11 @@ import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
+import com.filmkit.app.camera.formatDegree
+import com.filmkit.app.camera.formatEv
+import com.filmkit.app.camera.formatOffset100
+import com.filmkit.app.camera.formatZero100
+import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.imageFitRect
 import com.filmkit.app.camera.linearOutline
 import com.filmkit.app.camera.localActive
@@ -117,6 +144,7 @@ import com.filmkit.app.camera.localWidthSlot
 import com.filmkit.app.camera.localWidthUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
+import com.filmkit.app.camera.pivotFraction
 import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
@@ -165,11 +193,18 @@ import kotlinx.coroutines.withContext
  * **打开时的画面 = 原片本身**（E2-1 架构师拍板）：LUT 强度初值强制 0（旁路），
  * 快照里的 LUT 与强度改为"原片风格"只读展示 + 一键套用，见 [editorOpenParams]。
  *
- * 参数面板（E2-1 / E2-3）：底部操作区上方的**可折叠区**（不是覆盖式浮层）—— 展开时预览区
- * 自动让位，画面完整可见。暗角最明显的地方是四角，浮层挡住底边两点等于让用户盲调。
- * 分组按"完整编辑器"预留（见 [EditorParamGroup]），但**只渲染引擎已实现并验收的组**
- *（ADR-12：不许假滑杆），顺序按 ADR §5.6⑥ 的处理顺序：**基础 → 色彩（LUT）→ 暗角**。
- * 本轮 = 基础（[0][1..3][4][20..22][78]）+ 色彩（LUT）+ 暗角（[66][67][68]）。
+ * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / 撤销·重做留位 /
+ * 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**（满宽 + 密集刻度 +
+ * 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航（调整 / 色彩 / 暗角 /
+ * 局部；预设·裁剪置灰留位）。
+ *
+ * 与 E2-1/E2-3/E2-7 那版（可折叠区 + 纵向堆 7~19 条"标签｜细滑杆｜百分比"三段式表单行）的
+ * 区别就是 ADR-14 的三条关键修正：**满宽滑杆 + 标签在上方**、**中点标记**、**读数用物理量**
+ *（曝光 `+1.0 EV` 而不是 `100%`）。**只渲染引擎已实现并验收的参数**（ADR-12：不许假滑杆），
+ * 参数清单与槽位映射见文件末尾的参数表（[EditorParam]）。
+ *
+ * 面板仍**不是覆盖式浮层**（嵌在预览与底栏之间）：暗角最明显的地方是四角，浮层挡住底边
+ * 两点等于让用户盲调 —— 这是 E1-4 起的设计约束，本卡不改。
  *
  * ⚠ 编辑器**不写任何拍摄用的 prefs**（`lut_id` / `lut_strength`）：这里的 LUT 选择
  * 只对本次编辑会话有效，退出即丢 —— 否则用户在编辑器里试个滤镜，回到相机页拍照
@@ -220,16 +255,20 @@ fun EditorScreen(
     //（同一个数组对象会被滑杆原地改写 ⇒ 必须 copy）。"无修改"⇒ 导出直通原片字节。
     var openParams by remember { mutableStateOf<DoubleArray?>(null) }
     var lutId by remember { mutableStateOf<String?>(null) }   // 本会话的 LUT（不持久化）
-    var lutK by remember { mutableFloatStateOf(0f) }          // = params[34]；初值 0 = 与原片一致
+    // LUT 强度 = **派生值**（E2-10）：唯一数据源是 `params[34]`，不再单独存一份 state ——
+    // 存两份的代价是"滑杆写了 [34]、hint / 套用原片风格读到的还是旧值"这类状态不同步。
+    val lutK = params?.let { it[34].toFloat() } ?: 0f
     // 快照里的"原片风格"（只读展示 + 一键套用）：不随滑杆变化，故与 lutId/lutK 分开存
     var snapLutId by remember { mutableStateOf<String?>(null) }
     var snapLutK by remember { mutableFloatStateOf(0f) }
     var hasSnapshot by remember { mutableStateOf(false) }
-    var panelOpen by remember { mutableStateOf(false) }
-    // 面板"重建计数"（E2-3）：StrengthRow 的读数 state 只在首次组合时读初值（组件内部
-    // remember，无 key，且它的 initial 参数不受本卡控制）。所以凡是**绕过滑杆**改了参数
-    // 的操作（各组「重置」、套用原片风格），都要 ++ 让面板子树重建一次 —— 否则画面变了、
-    // 滑杆读数还停在原处，等于把 ADR-12 的假滑杆反过来演一遍（读数与状态不符）。
+    // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 色彩 / 暗角 / 局部。面板常驻
+    //（不再是可折叠区），所以这里取代了 E2-1 的 `panelOpen`。
+    var tab by remember { mutableStateOf(EditorTab.ADJUST) }
+    // 面板"重建计数"（E2-3）：滑杆的读数 state 只在首次组合时读初值（组件内部 remember，
+    // 由 `key(param.key, refreshTick)` 控制生命周期）。所以凡是**绕过滑杆**改了参数的操作
+    //（各组「重置」/ 单参数重置 / 套用原片风格），都要 ++ 让滑杆子树重建一次 —— 否则画面
+    // 变了、滑杆读数还停在原处，等于把 ADR-12 的假滑杆反过来演一遍（读数与状态不符）。
     var panelRefresh by remember { mutableIntStateOf(0) }
     var showOriginal by remember { mutableStateOf(false) }     // 按住预览 = 看输入原图
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
@@ -353,7 +392,6 @@ fun EditorScreen(
         val film = params ?: return
         if (entry == null) {
             lutId = null
-            lutK = 0f
             film[34] = 0.0                    // 关闭 = 强度 0（引擎 uLutOn = 0 整段旁路）
             engine.setLut(null)
             panelRefresh++                    // 强度行消失/读数归位（见 panelRefresh 的 KDoc）
@@ -367,7 +405,6 @@ fun EditorScreen(
                 return@launch
             }
             lutId = entry.id
-            lutK = k
             film[34] = k.toDouble()
             engine.setLut(lut)
             // 强度是"绕过滑杆"改的（本函数直接写 [34]）：不重建的话，用户点卡片/套用原片
@@ -405,69 +442,32 @@ fun EditorScreen(
         applyLut(entry, snapLutK)   // 强度读数归位由 applyLut 统一负责
     }
 
-    // ── 「基础」五类滑杆（E2-3）：曝光 [0] / 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] /
-    // 清晰度 [78]。与暗角同一范式（E2-8）：拖动中只写槽位 + gate.onValueChange()，
-    // 松手统一走 [onSliderRelease] 渲染一次 —— 全分辨率渲染约百毫秒，拖动中渲染 = 画面抖动。
-    // 槽位映射（含对比度"端点禁用 0"、饱和度"同写三槽"两个陷阱）全在 EditorExport.kt 的纯函数里。
-    fun setExposure(ui: Float) {
-        params?.let { it[0] = expSlot(ui) }
+    // ── 参数写入（E2-10：数据驱动，取代 E2-3/E2-7 的 16 个一模一样的 setter）────────────
+    // 每个参数一行 [EditorParam]（见文件末尾的参数表），槽位映射全在 EditorExport.kt 的纯函数里
+    //（含对比度"端点禁用 0"、饱和度"同写三槽"、局部"角度 = 弧度"这几个陷阱）。
+    // 范式不变（E2-8）：拖动中只写槽位 + gate.onValueChange()，松手走 [onSliderRelease] 渲染一次。
+    //
+    // 为什么合并：19 个参数写成 19 个几乎相同的函数 ⇒ 新增一个参数要改三处（setter / 面板签名 /
+    // 调用点），漏一处的表现是"滑杆动了、画面不动"（ADR-12 的假滑杆）。
+
+    /** 滑杆拖动中：写槽位（不渲染） */
+    fun commit(p: EditorParam, ui: Float) {
+        params?.let { p.write(it, ui) }
         gate.onValueChange()
     }
 
-    fun setWbR(ui: Float) {
-        params?.let { it[1] = wbGainSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setWbG(ui: Float) {
-        params?.let { it[2] = wbGainSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setWbB(ui: Float) {
-        params?.let { it[3] = wbGainSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setContrast(ui: Float) {
-        params?.let { it[4] = contrastSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setSaturation(ui: Float) {
-        params?.let { writeSaturation(it, ui) }
-        gate.onValueChange()
-    }
-
-    fun setClarity(ui: Float) {
-        params?.let { it[78] = claritySlot(ui) }
-        gate.onValueChange()
-    }
-
-    /** 「基础」组重置（E2-3）：五类参数回恒等值 —— 离散操作，直接渲染一次（不经过 gate） */
-    fun resetBasic() {
-        params?.let { resetBasicParams(it) }
+    /** 重置**单个参数**到基准值（E2-10 新增）—— 离散操作，直接渲染一次 */
+    fun resetParam(p: EditorParam) {
+        params?.let { p.write(it, p.pivot) }
         panelRefresh++
         rerender()
     }
 
-    // ── 暗角三条滑杆（E2-1 / E2-8）：只改同一份 params 的 [66][67][68] ⇒ 预览与导出天然一致 ──
-    // E2-8（用户 2026-10-08 拍板）：拖动中**只更新参数与滑杆读数、一次都不渲染**（全分辨率
-    // 一次约百毫秒，每帧渲染 = 画面抖动 + 反复分配 50MB 位图）；松手走 [onSliderRelease]
-    // 渲染一次。滑杆读数由 StrengthRow 自己持有 state，不依赖这里触发重组。
-    fun setVigStrength(ui: Float) {
-        params?.let { it[66] = vigStrengthSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setVigRadius(ui: Float) {
-        params?.let { it[67] = vigRadiusSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setVigFeather(ui: Float) {
-        params?.let { it[68] = vigFeatherSlot(ui) }
-        gate.onValueChange()
+    /** 「调整」组重置（E2-3）：五类参数回恒等值 —— 离散操作，直接渲染一次（不经过 gate） */
+    fun resetBasic() {
+        params?.let { resetBasicParams(it) }
+        panelRefresh++
+        rerender()
     }
 
     /**
@@ -514,41 +514,26 @@ fun EditorScreen(
         gate.onValueChange()
     }
 
-    fun setLocalRadius(ui: Float) {
-        params?.let { it[82] = localRadiusSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setLocalFeather(ui: Float) {
-        params?.let { it[83] = localFeatherSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setLocalAngle(ui: Float) {
-        params?.let { it[84] = localAngleSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setLocalWidth(ui: Float) {
-        params?.let { it[85] = localWidthSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setLocalEv(ui: Float) {
-        params?.let { it[86] = localEvSlot(ui) }
-        gate.onValueChange()
-    }
-
-    fun setLocalSat(ui: Float) {
-        params?.let { it[87] = localSatSlot(ui) }
-        gate.onValueChange()
-    }
-
     /** 「局部」组重置：几何回默认（中心/半径/羽化/角度/宽度），模式与强度不动（见纯函数 KDoc） */
     fun resetLocal() {
         params?.let { resetLocalGeometry(it) }
         panelRefresh++
         rerender()
+    }
+
+    /**
+     * 重置**当前组**（E2-10）：四条既有重置路径的**统一入口**（各组重置一个都没丢），
+     * 放在参数名行左侧的「重置本组」。
+     *
+     * 声明位置在四条路径之后是 Kotlin 局部函数的硬要求（局部函数不能前向引用）。
+     */
+    fun resetGroup(g: EditorTab) {
+        when (g) {
+            EditorTab.ADJUST -> resetBasic()
+            EditorTab.COLOR -> applyLut(null, 0f)
+            EditorTab.VIGNETTE -> resetVignette()
+            EditorTab.LOCAL -> resetLocal()
+        }
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -754,7 +739,7 @@ fun EditorScreen(
                 lutId = init.lutId
                 snapLutId = init.snapLutId
                 snapLutK = init.snapLutK
-                lutK = init.film[34].toFloat()   // 恒 0（打开时与原片逐像素一致）
+                // 注：LUT 强度（lutK）自 E2-10 起是 `params[34]` 的**派生值**，不再单独赋值
                 if (!init.engineStarted) {
                     status = "引擎不可用，显示原图"
                     return@LaunchedEffect
@@ -775,7 +760,17 @@ fun EditorScreen(
                 .fillMaxSize()
                 .statusBarsPadding(),
         ) {
-            SubPageTopBar("编辑", onBack, onMenu = onOpenGallery)
+            // ① 顶部栏（ADR-14 层①）：取消 ｜ 撤销/重做（**本卡留位**，置灰不可点）｜ 覆盖 ｜ 完成
+            // 「完成」= 黄色圆角矩形 + 黑字（主操作 = 另存新片，语义与原底部主按钮一致）；
+            // 「覆盖」= 深灰圆角 + 白字（危险操作，仍走二次确认对话框）。
+            EditorTopBar(
+                enabled = !exporting && phase == EditorPhase.Ready,
+                exporting = exporting,
+                onCancel = onBack,
+                onGallery = onOpenGallery,
+                onOverwrite = { confirmOverwrite = true },
+                onDone = { exportNow(false) },
+            )
 
             Box(
                 Modifier
@@ -893,9 +888,10 @@ fun EditorScreen(
                                         drawLocalOutline(outline, FilmTheme.Accent, localDragging)
                                     }
                                 }
-                                // 提示只在参数面板展开时给：用户正在调参时才需要 before/after
-                                // 与定位说明（收起面板后画面留给用户看）
-                                if (panelOpen && !showOriginal) {
+                                // 提示：**右上角**（研究 §3.5 —— 底部容易被手指遮）+ PC 式 1px 黑阴影
+                                //（ADR-14 抄的 `BoldTextWithShadow`：文字叠在预览图上的可读性技巧）。
+                                // 面板常驻（E2-10）⇒ 不再按 panelOpen 显隐，直接常显。
+                                if (!showOriginal) {
                                     Text(
                                         if (dragMode) {
                                             if (localDragging) "拖动定位中…松手生效" else "拖动画面移动局部区域"
@@ -903,10 +899,11 @@ fun EditorScreen(
                                             "按住画面看原图"
                                         },
                                         color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
-                                        fontSize = 10.sp,
+                                        fontSize = 11.sp,
+                                        style = TextStyle(shadow = TextShadow),
                                         modifier = Modifier
-                                            .align(Alignment.BottomCenter)
-                                            .padding(bottom = 6.dp),
+                                            .align(Alignment.TopEnd)
+                                            .padding(top = 8.dp, end = 12.dp),
                                     )
                                 }
                             }
@@ -915,139 +912,37 @@ fun EditorScreen(
                 }
             }
 
-            // ── 参数面板（E2-1）：嵌在预览与操作区之间，**不是覆盖式浮层** ——
-            // 展开时预览区（上面的 weight(1f)）自动让位，画面完整可见。暗角最明显的地方
-            // 是四角，用底部浮层挡住底边两点等于让用户盲调（这是不沿用 LutSheet 形态的原因）。
-            AnimatedVisibility(
-                visible = panelOpen,
-                enter = FilmMotion.panelEnter,
-                exit = FilmMotion.panelExit,
-            ) {
-                EditorParamsPanel(
-                    params = params,
-                    refreshTick = panelRefresh,
-                    lutId = lutId,
+            // ③④⑤⑥ 参数区（E2-10）：**常驻**（不再是可折叠区）—— 参数名 / 单滑杆 /
+            // 参数图标行 / 底部导航，四层顺序照 ADR-14 的 Filmix 结构。
+            // 仍嵌在预览与底栏之间、**不是覆盖式浮层**：暗角最明显的地方是四角，浮层挡住
+            // 底边两点等于让用户盲调（E1-4 起的设计约束，本卡不改）。
+            EditorPanel(
+                group = tab,
+                onGroup = { tab = it },
+                params = params,
+                refreshTick = panelRefresh,
+                status = status,
+                baseHint = editorHint(
+                    status = "",
+                    hasSnapshot = hasSnapshot,
+                    lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
                     lutK = lutK,
-                    previews = lutPreviews,
-                    snapLutId = snapLutId,
-                    snapLutK = snapLutK,
-                    onLutStrength = { v ->
-                        lutK = v
-                        params?.let { it[34] = v.toDouble() }
-                        gate.onValueChange()   // E2-8：拖动中只更新读数，松手才渲染
-                    },
-                    onLutStrengthFinished = { onSliderRelease() },
-                    onPickLut = { e -> pickLut(e) },
-                    onApplySnapshot = { applySnapshotStyle() },
-                    // 基础五类（E2-3）：拖动中只写槽位，松手统一渲染一次
-                    onExposure = { v -> setExposure(v) },
-                    onWbR = { v -> setWbR(v) },
-                    onWbG = { v -> setWbG(v) },
-                    onWbB = { v -> setWbB(v) },
-                    onContrast = { v -> setContrast(v) },
-                    onSaturation = { v -> setSaturation(v) },
-                    onClarity = { v -> setClarity(v) },
-                    onBasicFinished = { onSliderRelease() },
-                    onVigStrength = { v -> setVigStrength(v) },
-                    onVigRadius = { v -> setVigRadius(v) },
-                    onVigFeather = { v -> setVigFeather(v) },
-                    onVigFinished = { onSliderRelease() },
-                    // 局部调整（E2-7）：模式是离散操作（setLocalType 自己渲染），
-                    // 六条滑杆与其它组同款（拖动中只写槽位，松手渲染一次）
-                    onLocalMode = { m -> setLocalType(m) },
-                    onLocalRadius = { v -> setLocalRadius(v) },
-                    onLocalFeather = { v -> setLocalFeather(v) },
-                    onLocalAngle = { v -> setLocalAngle(v) },
-                    onLocalWidth = { v -> setLocalWidth(v) },
-                    onLocalEv = { v -> setLocalEv(v) },
-                    onLocalSat = { v -> setLocalSat(v) },
-                    onLocalFinished = { onSliderRelease() },
-                    onResetBasic = { resetBasic() },
-                    onResetColor = { applyLut(null, 0f) },
-                    onResetVignette = { resetVignette() },
-                    onResetLocal = { resetLocal() },
-                    onClose = { panelOpen = false },
-                )
-            }
-
-            // ── 底部：读数 + 参数来源提示 + 操作按钮 ──
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .background(FilmTheme.PanelSolid)
-                    .navigationBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-            ) {
-                val src = source
-                Text(
-                    text = src?.let { "${it.name} · ${it.srcW} × ${it.srcH}" } ?: "—",
-                    color = FilmTheme.Cream,
-                    fontFamily = FilmTheme.Mono,
-                    fontSize = 13.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = editorHint(
-                        status = status,
-                        hasSnapshot = hasSnapshot,
-                        lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
-                        lutK = lutK,
-                    ),
-                    color = FilmTheme.CreamDim,
-                    fontSize = 11.sp,
-                )
-                Spacer(Modifier.height(10.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedButton(
-                        onClick = { panelOpen = !panelOpen },
-                        enabled = !exporting && phase == EditorPhase.Ready,
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = if (panelOpen) FilmTheme.Accent else FilmTheme.Cream,
-                            disabledContentColor = FilmTheme.CreamDim,
-                        ),
-                    ) {
-                        Text("参数", fontFamily = FilmTheme.Mono, fontSize = 12.sp)
-                    }
-                    Button(
-                        onClick = { exportNow(false) },
-                        enabled = !exporting && phase == EditorPhase.Ready,
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = FilmTheme.Accent,
-                            contentColor = FilmTheme.OnAccent,
-                            disabledContainerColor = FilmTheme.ChipBg,
-                            disabledContentColor = FilmTheme.CreamDim,
-                        ),
-                    ) {
-                        Text("另存为新片", fontFamily = FilmTheme.Mono, fontSize = 12.sp)
-                    }
-                    OutlinedButton(
-                        onClick = { confirmOverwrite = true },
-                        enabled = !exporting && phase == EditorPhase.Ready,
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = FilmTheme.Cream,
-                            disabledContentColor = FilmTheme.CreamDim,
-                        ),
-                    ) {
-                        Text("覆盖原片", fontFamily = FilmTheme.Mono, fontSize = 12.sp)
-                    }
-                    if (exporting) {
-                        Spacer(Modifier.width(4.dp))
-                        CircularProgressIndicator(
-                            color = FilmTheme.Accent,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier.width(18.dp).height(18.dp),
-                        )
-                    }
-                }
-            }
+                ),
+                lutId = lutId,
+                previews = lutPreviews,
+                snapLutId = snapLutId,
+                snapLutK = snapLutK,
+                onPickLut = { e -> pickLut(e) },
+                onApplySnapshot = { applySnapshotStyle() },
+                localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF,
+                localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f),
+                localOn = params?.let { localActive(it) } ?: false,
+                onLocalMode = { m -> setLocalType(m) },
+                onCommit = { p, v -> commit(p, v) },
+                onFinished = { onSliderRelease() },
+                onResetParam = { p -> resetParam(p) },
+                onResetGroup = { g -> resetGroup(g) },
+            )
         }
 
         if (confirmOverwrite) {
@@ -1057,7 +952,7 @@ fun EditorScreen(
                 title = { Text("覆盖原片？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
                 text = {
                     Text(
-                        "会用当前编辑结果替换这张原片，原图无法恢复。\n想保留原片请改用「另存为新片」。",
+                        "会用当前编辑结果替换这张原片，原图无法恢复。\n想保留原片请改用「完成」（另存为新片）。",
                         color = FilmTheme.CreamDim,
                         fontSize = 13.sp,
                     )
@@ -1094,9 +989,10 @@ fun EditorScreen(
         }
     }
 
-    // 面板首次打开时才生成 LUT 卡片预览（复用拍摄页的一次性缓存，见 LutPreview）
-    LaunchedEffect(panelOpen) {
-        if (!panelOpen || lutPreviews.isNotEmpty()) return@LaunchedEffect
+    // LUT 卡片预览按需生成（一次性缓存，见 LutPreview）：切到「色彩」组时才做 ——
+    // 面板常驻后不再有"展开面板"这个时机，用 tab 代替（其余组不生成，进编辑器更快）。
+    LaunchedEffect(tab) {
+        if (tab != EditorTab.COLOR || lutPreviews.isNotEmpty()) return@LaunchedEffect
         lutPreviews = withContext(Dispatchers.IO) {
             LutLibrary.entries(context).mapNotNull { e ->
                 LutLibrary.load(context, e)?.let { lut ->
@@ -1179,8 +1075,8 @@ private fun editorHint(status: String, hasSnapshot: Boolean, lutLabel: String?, 
     status.isNotEmpty() -> status
     !hasSnapshot -> "这张没有参数记录，已用标准基线"
     lutLabel == null -> "当前：无 LUT（与原片一致）"
-    lutK <= 0f -> "当前：$lutLabel · 0%（与原片一致）"
-    else -> "当前：$lutLabel · ${(lutK * 100).roundToInt()}%（叠加在原片之上）"
+    lutK <= 0f -> "当前：$lutLabel · 强度 0（与原片一致）"
+    else -> "当前：$lutLabel · 强度 ${formatZero100(lutK)}（叠加在原片之上）"
 }
 
 /** LaunchedEffect 里初始化结果的打包（避免在协程里零散赋值） */
@@ -1194,376 +1090,638 @@ private class EditorInit(
     val engineStarted: Boolean,
 )
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 编辑器面板骨架（E2-10 / ADR-14）：Filmix 五层结构
+//   ① 顶部栏：取消 ｜ 撤销/重做（**留位**，置灰不可点）｜ 覆盖 ｜ 完成（黄底黑字）—— [EditorTopBar]
+//   ② 预览区：weight(1f)，约屏高 55%（在 EditorScreen 里，面板常驻但不遮挡画面）
+//   ③ 参数名：居中大字（当前选中参数）+ 1px 黑阴影 —— [ParamNameRow]
+//   ④ 单滑杆：**一屏只出当前选中参数的那一条**，满宽 + 密集刻度 + 中点标记 + 物理量读数 —— [EditorSlider]
+//   ⑤ 参数图标行：横向滚动圆形按钮（未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄描边 + 黄图标）—— [ParamIconRow]
+//   ⑥ 底部导航：调整 / 色彩 / 暗角 / 局部（预设 / 裁剪**置灰留位**）—— [EditorTabBar]
+//
+// 三条关键修正（"专业感"的真正来源，ADR-14「我们的差距」头三条）：
+//   1. **满宽滑杆 + 标签在上方**（不再是"标签｜细滑杆｜百分比"的三段式表单行）
+//   2. **中点标记**（对比度 / 饱和度的"不变点"必须看得见）—— 位置由纯函数 `pivotFraction` 算
+//   3. **读数用物理量**（曝光 `+1.0 EV` 而不是 `100%`）—— 格式化纯函数在 EditorExport.kt
+//
+// 一屏只出一条滑杆的理由（ADR-14）：Filmix 是"底部导航（大类）→ 参数图标行（具体参数）→
+// 只显示当前选中参数的那一条滑杆"。纵向堆 7 条滑杆是"设置页"的组织方式，不是"调色台"的。
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * 参数面板的分组（E2-1）。架构师 2026-10-08 拍板：**按"完整编辑器"预留分组**，
- * 但只渲染 [implemented] = true 的组。
- *
- * [implemented] 的含义是"引擎已实现且已验收"（ADR-12 硬约束：**不许假滑杆**）——
- * 用户滑了没反应比没有滑杆更糟。历史事故：[4] contrast、[11..19] cross 曾是 shader
- * 零引用的死参数，照调研文档直接做 UI 的结果就是一排滑了没反应的滑杆。
- *
- * 加新组 = 加一个枚举项 + 在 [EditorParamsPanel] 的 when 里加一个分支（数据驱动列表，
- * 组多到一屏放不下时靠面板自身的纵向滚动兜住，不需要改结构）。
+ * 面板文字阴影（ADR-14 从 PC 源码抄的 `BoldTextWithShadow`：dx / dy / radius = 1px）。
+ * 参数名 / 读数 / 提示都可能叠在预览图上，1px 黑阴影是"叠加时的可读性技巧"。
  */
-private enum class EditorParamGroup(val title: String, val implemented: Boolean) {
-    // E2-3 接入：曝光 [0] / 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] / 清晰度 [78]。
-    // 引擎侧 E2-2 已实现并独立验收（曝光×WB 线性域成对往返 + 对比度/饱和度/清晰度显示域三段）。
-    BASIC("基础", true),
-    COLOR("色彩", true),
-    VIGNETTE("暗角", true),
-    // E2-7 接入：模式 [79] / 中心 [80][81]（预览上拖动）/ 半径 [82] / 羽化 [83] /
-    // 角度 [84] / 宽度 [85] / 局部曝光 [86] / 局部饱和度 [87]。引擎侧 E2-6 已实现并
-    // 独立验收（ADR §5.7）；本卡只做"让用户点得到"。
-    LOCAL("局部", true),
-    // TODO(E4-3 颗粒)：[26] 强度 / [27] ISO / [60] 密度偏置 / [61] 枢轴。E4-3 验收后置 true。
-    GRAIN("颗粒", false),
-    // TODO(E4-5 光晕)：[62] 强度 / [63] 阈值 / [64] 半径 / [65] 暖度。E4-5 验收后置 true。
-    HALATION("光晕", false),
-    // 注：E4-4 趾肩（[5..10] latitude）在架构师给的 5 组里没有归口（它是影调/风格层参数）——
-    // 等 E4-4 验收后再决定进"基础"还是单开一组，本轮不猜。
+private val TextShadow = Shadow(Color.Black, Offset(1f, 1f), 1f)
+
+/** 禁用态前景（顶栏「撤销/重做」、底栏「预设/裁剪」留位用）：30% 奶油白，不新造色值 */
+private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
+
+/**
+ * 底部导航的功能大类（E2-10）。**只有引擎已实现并验收的组才进枚举**（ADR-12：不许假控件）。
+ * 预设（E3 预设管理）/ 裁剪（E2-12）在 [EditorTabBar] 里置灰留位，不进枚举、不可点。
+ */
+private enum class EditorTab(val label: String, val icon: ImageVector) {
+    ADJUST("调整", Icons.Outlined.Tune),
+    COLOR("色彩", Icons.Outlined.Palette),
+    VIGNETTE("暗角", Icons.Outlined.Vignette),
+    LOCAL("局部", Icons.Outlined.CenterFocusStrong),
 }
 
 /**
- * 参数面板（E2-1）：**可折叠区**，嵌在预览区与底部操作区之间（不是覆盖式浮层，
- * 见调用点注释：浮层会挡住画面底部两角，正好是看暗角的位置）。
+ * 一个可调参数（E2-10 的数据驱动核心）：图标行的一项 + 唯一那条滑杆 + 「重置」的目标。
  *
- * 高度 = 内容自适应、上限屏高 45% + 纵向滚动：组变多也不会把预览区挤没。
- * 分组标题复用设置页的 [SectionHeader]（全 App 统一形态）。
+ * 为什么做成表：E2-3 / E2-7 的写法是"每个参数一个 setter + 面板签名里一个 lambda + 调用点
+ * 一处绑定"（19 个参数 × 3 处）—— 新增参数漏改任何一处，表现都是"滑杆动了、画面不动"
+ *（ADR-12 的假滑杆）。表里每项自带槽位读写（[read] / [write] 都是 EditorExport.kt 的纯函数），
+ * 加一个参数只加一行。
+ */
+private class EditorParam(
+    /** 稳定 key：滑杆 state 的 `key(...)`（换参数必须重建，否则新参数沿用上一条的读数） */
+    val key: String,
+    val label: String,
+    /** 圆形按钮里的图标。与 [letter] 二选一 */
+    val icon: ImageVector? = null,
+    /** 字母图标（白平衡 R/G/B）：不为三个通道硬凑三个语义不符的图标，也不新造颜色 */
+    val letter: String? = null,
+    val range: ClosedFloatingPointRange<Float>,
+    /** 基准值（UI 单位）= **不变点 / 默认值**：中点标记画在这里，「重置」回到这里 */
+    val pivot: Float,
+    val format: (Float) -> String,
+    val read: (DoubleArray) -> Float,
+    val write: (DoubleArray, Float) -> Unit,
+)
+
+/**
+ * 「调整」组（E2-3 的「基础」组改名，参数一个没少）：曝光 [0] / 白平衡 [1..3] / 对比度 [4] /
+ * 饱和度 [20..22] / 清晰度 [78]。槽位语义与恒等值见 `EditorExport.kt` 的映射段。
+ *
+ * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
+ *  - **曝光** `+1.0 EV`（物理量，不再是 `100%`）；中点 = `0.0 EV`
+ *  - **红/绿/蓝** `+12`（相对增益 ±100）；中点 = `0`（= 增益 1.00 不变）
+ *  - **对比度 / 饱和度** `+12`（±100）；中点 = `0`（= 1.00 不变）
+ *  - **清晰度** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记（端点本身就是标记）
+ *
+ * 白平衡为什么仍是 R/G/B 三条（而不是色温/色调两条）：三条增益与三个槽位是**双射**，往返精确、
+ * 单测能守住；色温/色调是 2 自由度映射到 3 个增益，逆映射不唯一（E2-3 已论证）—— ADR-14
+ * 裁决 1 用新槽位 `[88] temp_mired` / `[89] tint` 解决，属 E2-11，本卡不动。
+ */
+private val AdjustParams: List<EditorParam> = listOf(
+    EditorParam(
+        key = "ev", label = "曝光", icon = Icons.Outlined.Exposure,
+        range = EXP_UI_RANGE, pivot = 0f,
+        format = { formatEv(it) },
+        read = { expUi(it[0]) },
+        write = { p, v -> p[0] = expSlot(v) },
+    ),
+    EditorParam(
+        key = "wbR", label = "红", letter = "R",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[1]) },
+        write = { p, v -> p[1] = wbGainSlot(v) },
+    ),
+    EditorParam(
+        key = "wbG", label = "绿", letter = "G",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[2]) },
+        write = { p, v -> p[2] = wbGainSlot(v) },
+    ),
+    EditorParam(
+        key = "wbB", label = "蓝", letter = "B",
+        range = WB_GAIN_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { wbGainUi(it[3]) },
+        write = { p, v -> p[3] = wbGainSlot(v) },
+    ),
+    EditorParam(
+        key = "contrast", label = "对比度", icon = Icons.Outlined.Contrast,
+        range = CONTRAST_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { contrastUi(it[4]) },
+        write = { p, v -> p[4] = contrastSlot(v) },
+    ),
+    EditorParam(
+        key = "sat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
+        range = SAT_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        // 一个滑杆同写 [20][21][22] 三槽（ADR §5.6④ 的硬约束，见 writeSaturation 的 KDoc）
+        read = { satUi(it[21]) },
+        write = { p, v -> writeSaturation(p, v) },
+    ),
+    EditorParam(
+        key = "clarity", label = "清晰度", icon = Icons.Outlined.Details,
+        range = CLARITY_UI_RANGE, pivot = 0f,
+        format = { formatZero100(it) },
+        read = { clarityUi(it[78]) },
+        write = { p, v -> p[78] = claritySlot(v) },
+    ),
+)
+
+/**
+ * 「色彩」组：只有 LUT 强度一条滑杆（[34]）—— 图标行是 LUT 选择（圆形按钮 + 预览图），
+ * 未选 LUT 时本表为空（面板显示"选一个 LUT 后可调强度"，**不给假滑杆**）。
+ *
+ * 强度读数 `85`（0..100 整数）；基准 0 = 关 ⇒ 不画中点标记。
+ */
+private val ColorParams: List<EditorParam> = listOf(
+    EditorParam(
+        key = "lutK", label = "强度", icon = Icons.Outlined.PhotoFilter,
+        range = 0f..1f, pivot = 0f,
+        format = { formatZero100(it) },
+        read = { p -> if (p[34].isFinite()) p[34].toFloat().coerceIn(0f, 1f) else 0f },
+        write = { p, v -> p[34] = v.coerceIn(0f, 1f).toDouble() },
+    ),
+)
+
+/**
+ * 「暗角」组（E2-1）：强度 [66] / 半径 [67] / 羽化 [68]。量程与读数口径：
+ *  - **强度** `50`（0..100，0 = 关，引擎侧 [66] ≥ 0 整段跳过）
+ *  - **半径 / 羽化** `80` / `50`（0..200 —— darktable 的 `scale` / `falloff_scale` 本身就是
+ *    百分比语义）；基准 = darktable 默认 80 / 50（画中点标记，告诉用户"默认在哪"）
+ */
+private val VignetteParams: List<EditorParam> = listOf(
+    EditorParam(
+        key = "vigStrength", label = "强度", icon = Icons.Outlined.Vignette,
+        range = 0f..1f, pivot = 0f,
+        format = { formatZero100(it) },
+        read = { vigStrengthUi(it[66]) },
+        write = { p, v -> p[66] = vigStrengthSlot(v) },
+    ),
+    EditorParam(
+        key = "vigRadius", label = "半径", icon = Icons.Outlined.RadioButtonUnchecked,
+        range = 0f..2f, pivot = 0.8f,
+        format = { formatZero200(it) },
+        read = { vigRadiusUi(it[67]) },
+        write = { p, v -> p[67] = vigRadiusSlot(v) },
+    ),
+    EditorParam(
+        key = "vigFeather", label = "羽化", icon = Icons.Outlined.BlurOn,
+        range = 0f..2f, pivot = 0.5f,
+        format = { formatZero200(it) },
+        read = { vigFeatherUi(it[68]) },
+        write = { p, v -> p[68] = vigFeatherSlot(v) },
+    ),
+)
+
+/**
+ * 「局部」组的六条参数（E2-7 的滑杆，一个没少），**按模式过滤**（ADR-12：径向模式下"角度"
+ * 对画面没有任何作用，就不该出现在界面上）：
+ *  - 径向：半径 / 羽化 / 曝光 / 饱和度
+ *  - 线性：角度 / 宽度 / 羽化 / 曝光 / 饱和度
+ *  - 未选模式：全部六条（用户可以先设参数再选模式）
+ *
+ * 中心 [80][81] 没有滑杆 —— 定位在预览图上拖动完成（E2-7 的核心交互，本卡保留）。
+ *
+ * 读数口径：半径/宽度/羽化 `35`（0..100）；**角度 `90°`**（方向用度数，E2-7 定的口径）；
+ * 曝光 `+1.0 EV`；饱和度 `+12`（±100）。
+ */
+private fun localParams(mode: Int): List<EditorParam> = buildList {
+    if (mode != LocalMode.LINEAR) {
+        add(
+            EditorParam(
+                key = "locRadius", label = "半径", icon = Icons.Outlined.RadioButtonUnchecked,
+                range = LOCAL_RADIUS_UI_RANGE, pivot = 0.35f,
+                format = { formatZero100(it) },
+                read = { localRadiusUi(it[82]) },
+                write = { p, v -> p[82] = localRadiusSlot(v) },
+            ),
+        )
+    }
+    if (mode != LocalMode.RADIAL) {
+        add(
+            EditorParam(
+                key = "locAngle", label = "角度", icon = Icons.AutoMirrored.Outlined.RotateRight,
+                range = LOCAL_ANGLE_UI_RANGE, pivot = 0f,
+                format = { formatDegree(it) },
+                read = { localAngleUi(it[84]) },
+                write = { p, v -> p[84] = localAngleSlot(v) },
+            ),
+        )
+        add(
+            EditorParam(
+                key = "locWidth", label = "宽度", icon = Icons.Outlined.SwapHoriz,
+                range = LOCAL_WIDTH_UI_RANGE, pivot = 0.25f,
+                format = { formatZero100(it) },
+                read = { localWidthUi(it[85]) },
+                write = { p, v -> p[85] = localWidthSlot(v) },
+            ),
+        )
+    }
+    add(
+        EditorParam(
+            key = "locFeather", label = "羽化", icon = Icons.Outlined.BlurOn,
+            range = LOCAL_FEATHER_UI_RANGE, pivot = 0.5f,
+            format = { formatZero100(it) },
+            read = { localFeatherUi(it[83]) },
+            write = { p, v -> p[83] = localFeatherSlot(v) },
+        ),
+    )
+    add(
+        EditorParam(
+            key = "locEv", label = "曝光", icon = Icons.Outlined.Exposure,
+            range = LOCAL_EV_UI_RANGE, pivot = 0f,
+            format = { formatEv(it) },
+            read = { localEvUi(it[86]) },
+            write = { p, v -> p[86] = localEvSlot(v) },
+        ),
+    )
+    add(
+        EditorParam(
+            key = "locSat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
+            range = LOCAL_SAT_UI_RANGE, pivot = 1f,
+            format = { formatOffset100(it, 1f) },
+            read = { localSatUi(it[87]) },
+            write = { p, v -> p[87] = localSatSlot(v) },
+        ),
+    )
+}
+
+/**
+ * 局部组的说明行（E2-7 的提示文案，随面板重做挪到顶部提示位，内容一字未改）。
+ * **A/B 语义**（ADR 交互规格第 6 条）：只有 [86] ≠ 0 或 [87] ≠ 1 时画面才变 —— 所以
+ * "选了径向但没调强度"时预览不会变（正确行为），这行提示就是为了不让用户以为坏了。
+ */
+private fun localHint(mode: Int, active: Boolean, center: Pair<Float, Float>): String {
+    val cx = (center.first * 100).roundToInt()
+    val cy = (center.second * 100).roundToInt()
+    return when {
+        mode == LocalMode.OFF -> "选「径向」或「线性」后，在预览上拖动定位"
+        !active -> "已选模式：调「曝光」或「饱和度」后画面才会变化（当前未调强度）"
+        mode == LocalMode.RADIAL -> "预览上拖动移动中心（当前 $cx%, $cy%）· 半径 100 = 图像宽度"
+        else -> "预览上拖动移动轴线（当前 $cx%, $cy%）· 角度 0° = 条带竖直"
+    }
+}
+
+/**
+ * ① 顶部栏（ADR-14 层①）：`取消 ｜ 撤销 / 重做（留位）｜ 覆盖 ｜ 完成`。
+ *
+ * 「完成」= **黄色圆角矩形 + 黑字**（主操作，= 原来的「另存为新片」，语义不变）；
+ * 「覆盖」= 深灰圆角 + 白字（危险操作，仍走二次确认对话框）。
+ *
+ * **撤销 / 重做只留位、不做功能**（本卡范围）：图标给到、置灰、不注册点击 —— 撤销栈是后续卡。
+ * 为什么不干脆不渲染：ADR-14 的截图结构里它们就在那个位置，留位让"专业面板"的骨架完整；
+ * 置灰 + 无点击响应是**诚实的**（ADR-12 的精神：不做假控件），用户点了不会有任何反应。
  */
 @Composable
-private fun EditorParamsPanel(
-    /** 当前参数数组（长度 = `CameraPresets.COUNT`）：各组滑杆的初值都从这里读（槽位 → UI 纯函数） */
+private fun EditorTopBar(
+    enabled: Boolean,
+    exporting: Boolean,
+    onCancel: () -> Unit,
+    onGallery: () -> Unit,
+    onOverwrite: () -> Unit,
+    onDone: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .height(40.dp)
+                .pressScale(onTap = onCancel)
+                .padding(horizontal = 6.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("取消", color = FilmTheme.Cream, fontSize = 15.sp)
+        }
+        // 相册入口（用户报的第 5 点，E1-4 起就在顶栏）：保留，只是换成图标钮
+        Box(
+            Modifier
+                .size(40.dp)
+                .pressScale(onTap = onGallery),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.Menu,
+                contentDescription = "相册",
+                tint = FilmTheme.Cream,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        // 撤销 / 重做：**留位**（见 KDoc）
+        listOf(
+            Icons.AutoMirrored.Outlined.Undo to "撤销",
+            Icons.AutoMirrored.Outlined.Redo to "重做",
+        ).forEach { (ic, desc) ->
+            Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+                Icon(
+                    ic,
+                    contentDescription = desc,
+                    tint = DisabledInk,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        if (exporting) {
+            CircularProgressIndicator(
+                color = FilmTheme.Accent,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+        }
+        Box(
+            Modifier
+                .height(36.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(FilmTheme.ChipBg)
+                .pressScale(enabled = enabled, onTap = onOverwrite)
+                .padding(horizontal = 14.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "覆盖",
+                color = if (enabled) FilmTheme.Cream else DisabledInk,
+                fontSize = 13.sp,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(
+            Modifier
+                .height(36.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (enabled) FilmTheme.Accent else FilmTheme.ChipBg)
+                .pressScale(enabled = enabled, onTap = onDone)
+                .padding(horizontal = 18.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "完成",
+                color = if (enabled) FilmTheme.OnAccent else DisabledInk,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+/**
+ * ③④⑤⑥ 参数区（E2-10）：常驻面板，四层顺序照 ADR-14。
+ *
+ * 选中参数是**派生**的（`list.firstOrNull { key == selKey } ?: list.first()`）：换组 / 换局部
+ * 模式后原选中项可能不在新表里，自动回落到第一项 —— 不需要 `LaunchedEffect` 去"修"选中项，
+ * 那种写法本身就是状态不同步的来源。
+ */
+@Composable
+private fun EditorPanel(
+    group: EditorTab,
+    onGroup: (EditorTab) -> Unit,
     params: DoubleArray?,
-    /** 面板重建计数：重置 / 套用原片风格等"绕过滑杆"的改动后 ++，让滑杆读数归位（见调用点 KDoc） */
     refreshTick: Int,
+    /** 导出结果 / 失败原因（非空时**优先**显示在提示行） */
+    status: String,
+    /** 无 status 时的默认提示（快照缺失 / 当前 LUT 状态，[editorHint] 的结果） */
+    baseHint: String,
     lutId: String?,
-    lutK: Float,
     previews: Map<String, Bitmap>,
     snapLutId: String?,
     snapLutK: Float,
-    onLutStrength: (Float) -> Unit,
-    /** LUT 强度滑杆**松手**（E2-8：拖动中不渲染，松手渲染一次） */
-    onLutStrengthFinished: () -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onApplySnapshot: () -> Unit,
-    // ── 基础五类（E2-3）：onXxx = 拖动中（只写槽位），onBasicFinished = 松手（渲染一次）──
-    onExposure: (Float) -> Unit,
-    onWbR: (Float) -> Unit,
-    onWbG: (Float) -> Unit,
-    onWbB: (Float) -> Unit,
-    onContrast: (Float) -> Unit,
-    onSaturation: (Float) -> Unit,
-    onClarity: (Float) -> Unit,
-    onBasicFinished: () -> Unit,
-    onVigStrength: (Float) -> Unit,
-    onVigRadius: (Float) -> Unit,
-    onVigFeather: (Float) -> Unit,
-    onVigFinished: () -> Unit,
-    // ── 局部调整（E2-7）：onLocalMode = 选模式（离散，直接渲染）；onLocalXxx = 拖动中；
-    //    onLocalFinished = 松手（渲染一次）。中心由预览区拖动写，这里只显示读数 ──
+    localMode: Int,
+    localCenter: Pair<Float, Float>,
+    localOn: Boolean,
     onLocalMode: (Int) -> Unit,
-    onLocalRadius: (Float) -> Unit,
-    onLocalFeather: (Float) -> Unit,
-    onLocalAngle: (Float) -> Unit,
-    onLocalWidth: (Float) -> Unit,
-    onLocalEv: (Float) -> Unit,
-    onLocalSat: (Float) -> Unit,
-    onLocalFinished: () -> Unit,
-    onResetBasic: () -> Unit,
-    onResetColor: () -> Unit,
-    onResetVignette: () -> Unit,
-    onResetLocal: () -> Unit,
-    onClose: () -> Unit,
+    onCommit: (EditorParam, Float) -> Unit,
+    onFinished: () -> Unit,
+    onResetParam: (EditorParam) -> Unit,
+    onResetGroup: (EditorTab) -> Unit,
 ) {
     val context = LocalContext.current
-    // 各组滑杆初值（槽位 → UI）：params 为 null（还没加载完）时用恒等值占位 ——
-    // 面板按钮在 phase != Ready 时是禁用的，正常进不到这一支。
-    val exp = params?.let { expUi(it[0]) } ?: 0f
-    val wbR = params?.let { wbGainUi(it[1]) } ?: 1f
-    val wbG = params?.let { wbGainUi(it[2]) } ?: 1f
-    val wbB = params?.let { wbGainUi(it[3]) } ?: 1f
-    val contrast = params?.let { contrastUi(it[4]) } ?: 1f
-    val sat = params?.let { satUi(it[21]) } ?: 1f
-    val clarity = params?.let { clarityUi(it[78]) } ?: 0f
-    val vigStrength = params?.let { vigStrengthUi(it[66]) } ?: 0f
-    val vigRadius = params?.let { vigRadiusUi(it[67]) } ?: 0.8f
-    val vigFeather = params?.let { vigFeatherUi(it[68]) } ?: 0.5f
-    // 局部调整（E2-7）：模式与六条滑杆的初值（槽位 → UI 纯函数）
-    val localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF
-    val localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f)
-    val localRadius = params?.let { localRadiusUi(it[82]) } ?: 0.35f
-    val localFeather = params?.let { localFeatherUi(it[83]) } ?: 0.5f
-    val localAngle = params?.let { localAngleUi(it[84]) } ?: 0f
-    val localWidth = params?.let { localWidthUi(it[85]) } ?: 0.25f
-    val localEv = params?.let { localEvUi(it[86]) } ?: 0f
-    val localSat = params?.let { localSatUi(it[87]) } ?: 1f
-    val localOn = params?.let { localActive(it) } ?: false
+    val list = when (group) {
+        EditorTab.ADJUST -> AdjustParams
+        EditorTab.COLOR -> if (lutId != null) ColorParams else emptyList()
+        EditorTab.VIGNETTE -> VignetteParams
+        EditorTab.LOCAL -> localParams(localMode)
+    }
+    var selKey by remember { mutableStateOf<String?>(null) }
+    val current = list.firstOrNull { it.key == selKey } ?: list.firstOrNull()
+    val hint = when {
+        status.isNotEmpty() -> status
+        group == EditorTab.LOCAL -> localHint(localMode, localOn, localCenter)
+        else -> baseHint
+    }
+    val film = params
     Column(
         Modifier
             .fillMaxWidth()
             .background(FilmTheme.PanelSolid)
-            .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.45f).dp)
-            .verticalScroll(rememberScrollState())
-            .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+            .navigationBarsPadding()
+            .padding(top = 6.dp, bottom = 4.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "参数",
-                color = FilmTheme.Cream,
-                fontSize = 17.sp,
-                fontFamily = FilmTheme.Serif,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                "收起",
-                color = FilmTheme.CreamDim,
-                fontSize = 12.sp,
-                fontFamily = FilmTheme.Mono,
-                modifier = Modifier
-                    .pressScale(onTap = onClose)
-                    .padding(6.dp),
-            )
+        // 提示行（status / 快照缺失 / 当前 LUT / 局部说明）：11sp 居中 + 1px 黑阴影
+        Text(
+            hint,
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            style = TextStyle(shadow = TextShadow),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 2.dp),
+        )
+        // 色彩组专属：原片风格（只读）+ 一键套用 —— E2-1 的功能，一个都没丢
+        if (group == EditorTab.COLOR) {
+            SnapshotStyleRow(context, snapLutId, snapLutK, onApplySnapshot)
         }
-        // 只渲染引擎已实现并验收的组（ADR-12）；未实现的组连标题都不给 —— 空标题会让
-        // 用户以为"面板坏了"。顺序 = enum 声明顺序 = ADR §5.6⑥ 的处理顺序
-        //（基础 → 色彩 → 暗角）。
-        EditorParamGroup.entries.filter { it.implemented }.forEach { g ->
-            SectionHeader(g.title)
-            // refreshTick 交给各组，由各组**只重建滑杆区**（重置 / 选 LUT / 套用原片风格后
-            // 读数归位；LazyRow 等无状态区不重建，滚动位置不会被顶回最左）
-            when (g) {
-                EditorParamGroup.BASIC -> EditorBasicGroup(
-                    refreshTick = refreshTick,
-                    exp = exp,
-                    wbR = wbR,
-                    wbG = wbG,
-                    wbB = wbB,
-                    contrast = contrast,
-                    sat = sat,
-                    clarity = clarity,
-                    onExp = onExposure,
-                    onWbR = onWbR,
-                    onWbG = onWbG,
-                    onWbB = onWbB,
-                    onContrast = onContrast,
-                    onSat = onSaturation,
-                    onClarity = onClarity,
-                    onFinished = onBasicFinished,
-                    onReset = onResetBasic,
+        // 局部组专属：模式选择（关 / 径向 / 线性）
+        if (group == EditorTab.LOCAL) LocalModeRow(localMode, onLocalMode)
+
+        ParamNameRow(current, group, onResetParam, onResetGroup)
+
+        // ④ 单滑杆：**只显示当前选中参数的那一条**（ADR-14 最关键的结构差异）
+        if (current != null && film != null) {
+            // key：换参数 / 重置 / 套用原片风格后重建滑杆 state（否则读数与槽位不符 = 假滑杆）
+            key(current.key, refreshTick) {
+                EditorSlider(current, film, onCommit, onFinished)
+            }
+        } else {
+            // 无参数可调：色彩组选了「无」（要选一个 LUT 才有强度可调），或参数还没加载完 ——
+            // 两种情况都给一句明确说明，**不给假滑杆**（ADR-12）
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(60.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (film == null) "参数加载中…" else "选一个 LUT 后可调强度",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 12.sp,
                 )
-                EditorParamGroup.COLOR -> EditorColorGroup(
-                    refreshTick = refreshTick,
-                    lutId = lutId,
-                    lutK = lutK,
-                    previews = previews,
-                    snapLutId = snapLutId,
-                    snapLutK = snapLutK,
-                    onStrength = onLutStrength,
-                    onStrengthFinished = onLutStrengthFinished,
-                    onPick = onPickLut,
-                    onApplySnapshot = onApplySnapshot,
-                    onReset = onResetColor,
-                )
-                EditorParamGroup.VIGNETTE -> EditorVignetteGroup(
-                    refreshTick = refreshTick,
-                    strength = vigStrength,
-                    radius = vigRadius,
-                    feather = vigFeather,
-                    onStrength = onVigStrength,
-                    onRadius = onVigRadius,
-                    onFeather = onVigFeather,
-                    onFinished = onVigFinished,
-                    onReset = onResetVignette,
-                )
-                EditorParamGroup.LOCAL -> EditorLocalGroup(
-                    refreshTick = refreshTick,
-                    mode = localMode,
-                    center = localCenter,
-                    radius = localRadius,
-                    feather = localFeather,
-                    angle = localAngle,
-                    width = localWidth,
-                    ev = localEv,
-                    sat = localSat,
-                    active = localOn,
-                    onMode = onLocalMode,
-                    onRadius = onLocalRadius,
-                    onFeather = onLocalFeather,
-                    onAngle = onLocalAngle,
-                    onWidth = onLocalWidth,
-                    onEv = onLocalEv,
-                    onSat = onLocalSat,
-                    onFinished = onLocalFinished,
-                    onReset = onResetLocal,
-                )
-                // 未实现的组在上面已过滤掉；这里仅为 when 的穷尽性兜底
-                else -> Unit
             }
         }
+        Spacer(Modifier.height(6.dp))
+        // ⑤ 参数图标行（色彩组 = LUT 圆形按钮）
+        if (group == EditorTab.COLOR) {
+            LutIconRow(lutId, previews, onPickLut)
+        } else {
+            ParamIconRow(list, current?.key) { selKey = it.key }
+        }
+        Spacer(Modifier.height(8.dp))
+        // ⑥ 底部导航
+        EditorTabBar(group, onGroup)
+    }
+}
+
+/**
+ * ③ + 两个重置入口：`重置本组 ｜ 参数名（居中大字）｜ 重置`。
+ *
+ * 「重置本组」= E2-3 / E2-7 各组重置的统一入口（四条路径一个都没丢）；
+ * 「重置」= 当前参数回基准值（E2-10 新增，研究 §3.5 的"单条重置"，用明确按钮而不是双击 ——
+ * 双击手势与相对拖动的事件消费要真机验证，不值得为它冒滑杆拖不动的手感风险）。
+ */
+@Composable
+private fun ParamNameRow(
+    current: EditorParam?,
+    group: EditorTab,
+    onResetParam: (EditorParam) -> Unit,
+    onResetGroup: (EditorTab) -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(
-            "颗粒 / 光晕在后续版本支持 · 已裁切的高光与丢失的细节找不回来",
+            "重置本组",
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
-            modifier = Modifier.padding(top = 14.dp),
+            modifier = Modifier
+                .pressScale(onTap = { onResetGroup(group) })
+                .padding(vertical = 6.dp, horizontal = 2.dp),
         )
-    }
-}
-
-/**
- * 「基础」组（E2-3 本卡核心）：曝光 / 白平衡 / 对比度 / 饱和度 / 清晰度 —— 引擎侧 E2-2
- * 已实现并独立验收，本组是它们**第一次能被用户调到**的入口。
- *
- * 读数一律是 [StrengthRow] 的百分比（该组件读数恒为 `v * 100%`，量程由 `range` 给）：
- *  - **曝光** ±100% = ±3 EV（0% = 不变）
- *  - **白平衡** 红/绿/蓝增益 50%..200%（100% = 不变；提高红 = 偏暖，提高蓝 = 偏冷）
- *  - **对比度** 1%..200%（100% = 不变；下限 1% 而非 0% 见 [CONTRAST_UI_RANGE] 的 KDoc）
- *  - **饱和度** 0%..200%（100% = 不变；一个滑杆同写 [20][21][22] 三槽）
- *  - **清晰度** 0%..100%（0% = 关）
- *
- * 白平衡为什么是 R/G/B 三条而不是"色温/色调"两条：三条增益与三个槽位是**双射**，
- * 往返精确、单测能守住；色温/色调是 2 个自由度映射到 3 个增益，逆映射不唯一
- *（同一组增益可对应多组色温/色调）⇒ 用户松手后读数会跳，且需要引入一个近似的色温模型。
- *
- * E2-8：所有滑杆**拖动中只更新参数与读数**（`onXxx`），松手（[onFinished]）才渲染一次。
- */
-@Composable
-private fun EditorBasicGroup(
-    /** 面板重建计数（见 [EditorParamsPanel] 调用点）：重置后让滑杆读数归位 */
-    refreshTick: Int,
-    exp: Float,
-    wbR: Float,
-    wbG: Float,
-    wbB: Float,
-    contrast: Float,
-    sat: Float,
-    clarity: Float,
-    onExp: (Float) -> Unit,
-    onWbR: (Float) -> Unit,
-    onWbG: (Float) -> Unit,
-    onWbB: (Float) -> Unit,
-    onContrast: (Float) -> Unit,
-    onSat: (Float) -> Unit,
-    onClarity: (Float) -> Unit,
-    onFinished: () -> Unit,
-    onReset: () -> Unit,
-) {
-    GroupReset(onReset)
-    Text(
-        "曝光 ±100% = ±3 EV · 白平衡/对比度/饱和度 100% = 不变 · 清晰度 0% = 关",
-        color = FilmTheme.CreamDim,
-        fontSize = 11.sp,
-        modifier = Modifier.padding(top = 2.dp),
-    )
-    // key(refreshTick)：重置后重建滑杆区 ⇒ 读数重新从槽位读初值（否则画面回恒等、
-    // 滑杆还停在原处）。只包滑杆，不包整组。
-    key(refreshTick) {
-        StrengthRow(
-            initial = exp,
-            onCommit = onExp,
-            onFinished = { onFinished() },
-            label = "曝光",
-            range = EXP_UI_RANGE,
+        Text(
+            current?.label ?: "—",
+            color = FilmTheme.Cream,
+            fontSize = 19.sp,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            style = TextStyle(shadow = TextShadow),
+            modifier = Modifier.weight(1f),
         )
-        StrengthRow(
-            initial = wbR,
-            onCommit = onWbR,
-            onFinished = { onFinished() },
-            label = "红",
-            range = WB_GAIN_UI_RANGE,
-        )
-        StrengthRow(
-            initial = wbG,
-            onCommit = onWbG,
-            onFinished = { onFinished() },
-            label = "绿",
-            range = WB_GAIN_UI_RANGE,
-        )
-        StrengthRow(
-            initial = wbB,
-            onCommit = onWbB,
-            onFinished = { onFinished() },
-            label = "蓝",
-            range = WB_GAIN_UI_RANGE,
-        )
-        StrengthRow(
-            initial = contrast,
-            onCommit = onContrast,
-            onFinished = { onFinished() },
-            label = "对比度",
-            range = CONTRAST_UI_RANGE,
-        )
-        StrengthRow(
-            initial = sat,
-            onCommit = onSat,
-            onFinished = { onFinished() },
-            label = "饱和度",
-            range = SAT_UI_RANGE,
-        )
-        StrengthRow(
-            initial = clarity,
-            onCommit = onClarity,
-            onFinished = { onFinished() },
-            label = "清晰度",
-            range = CLARITY_UI_RANGE,
-        )
-    }
-}
-
-/**
- * 组内「重置」（E2-3）：把本组参数回**恒等值**（画面回到"这组没动过"）。
- * 右对齐小字，与"收起"同一形态（[pressScale] + 等宽小字）。
- */
-@Composable
-private fun GroupReset(onReset: () -> Unit) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Text(
             "重置",
-            color = FilmTheme.CreamDim,
+            color = if (current != null) FilmTheme.CreamDim else DisabledInk,
             fontSize = 11.sp,
-            fontFamily = FilmTheme.Mono,
             modifier = Modifier
-                .pressScale(onTap = onReset)
-                .padding(horizontal = 8.dp, vertical = 2.dp),
+                .pressScale(enabled = current != null, onTap = { current?.let(onResetParam) })
+                .padding(vertical = 6.dp, horizontal = 2.dp),
         )
     }
 }
 
 /**
- * 色彩组：LUT 选择 + 强度 + **原片风格**（参数快照记录的 LUT 与强度，只读）与一键套用。
+ * ④ 单滑杆（E2-10 的核心控件）：**满宽 + 密集刻度 + 中点标记 + 物理量读数**。
  *
- * 为什么必须显示"原片风格"：打开编辑器时 [34] 被强制 0（画面 = 原片），若不给用户一个
- * 入口把当初的风格套回来，快照里的 LUT 信息就等于白存了。
+ * 与旧形态（`StrengthRow` 的"标签｜细滑杆｜百分比"三段式）的三点区别，正好是 ADR-14 的
+ * 三条关键修正：标签已在上一行居中大字；滑杆满宽；读数在上方右侧且是物理量。
+ *
+ * 拖动 state 留在本组件内（[RelativeSlider] 的相对拖动要求手势内累加、不依赖重组回流）；
+ * 外层 `key(param.key, refreshTick)` 决定它何时重读槽位（换参数 / 重置 / 套用风格）。
  */
 @Composable
-private fun EditorColorGroup(
-    /** 面板重建计数：选卡片 / 套用原片风格 / 重置后让强度读数归位 */
-    refreshTick: Int,
-    lutId: String?,
-    lutK: Float,
-    previews: Map<String, Bitmap>,
+private fun EditorSlider(
+    param: EditorParam,
+    params: DoubleArray,
+    onCommit: (EditorParam, Float) -> Unit,
+    onFinished: () -> Unit,
+) {
+    var v by remember { mutableFloatStateOf(param.read(params)) }
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            Text(
+                param.format(v),
+                color = FilmTheme.Accent,
+                fontSize = 13.sp,
+                fontFamily = FilmTheme.Mono,
+                fontWeight = FontWeight.SemiBold,
+                style = TextStyle(shadow = TextShadow),
+            )
+        }
+        RelativeSlider(
+            value = v,
+            onValueChange = { nv ->
+                v = nv
+                onCommit(param, nv)
+            },
+            onDragEnd = { onFinished() },
+            range = param.range,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            rowHeight = 44.dp,
+            ticks = true,
+            // 中点标记的位置由**纯函数**算（EditorExport.kt 的 pivotFraction）：基准落在端点
+            // 或量程外时返回 null = 不画（清晰度 0 / 暗角强度 0 都在最左端，画了只是糊）
+            midFraction = pivotFraction(param.range, param.pivot),
+            barThumb = true,
+        )
+    }
+}
+
+/** 局部模式选择（关 / 径向 / 线性）：复用拍摄页的 [SheetPill]，不另写一套 pill（两页观感必须一致） */
+@Composable
+private fun LocalModeRow(mode: Int, onMode: (Int) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        listOf(
+            LocalMode.OFF to "关",
+            LocalMode.RADIAL to "径向",
+            LocalMode.LINEAR to "线性",
+        ).forEach { (m, label) ->
+            SheetPill(label = label, selected = mode == m) { onMode(m) }
+        }
+    }
+}
+
+/**
+ * 「原片风格」只读展示 + 一键套用（E2-1 的功能，形态随面板重做而变、语义不变）：
+ * 打开编辑器时 [34] 被强制 0（画面 = 原片），不给这个入口，快照里的 LUT 就等于白存了。
+ */
+@Composable
+private fun SnapshotStyleRow(
+    context: Context,
     snapLutId: String?,
     snapLutK: Float,
-    onStrength: (Float) -> Unit,
-    onStrengthFinished: () -> Unit,
-    onPick: (LutLibrary.Entry?) -> Unit,
-    onApplySnapshot: () -> Unit,
-    onReset: () -> Unit,
+    onApply: () -> Unit,
 ) {
-    val context = LocalContext.current
-    // 快照里的 LUT 可能已被用户从 LUT 库删掉（byId = null）：如实说明"已不在库中"，
-    // 并且**不给**套用按钮（点了注定失败的操作比没有按钮更糟）
+    // 快照里的 LUT 可能已被用户从库中删掉（byId = null）：如实说明，并且**不给**套用按钮
+    //（点了注定失败的操作比没有按钮更糟）
     val snapEntry = snapLutId?.let { LutLibrary.byId(context, it) }
-    // 「重置」= 关闭 LUT（强度 0，引擎整段旁路）= 与点「无」卡片同一条路径
-    GroupReset(onReset)
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(
             when {
                 snapLutId == null -> "原片未使用 LUT"
                 snapEntry == null -> "原片风格：$snapLutId（已不在库中）"
-                // 强度 0 = 当初就没叠加（编辑器导出的新片会落在这一档）：说"未叠加"比说 "0%" 清楚
+                // 强度 0 = 当初就没叠加（编辑器导出的新片会落在这一档）：说"未叠加"比 "0" 清楚
                 snapLutK <= 0f -> "原片风格：${snapEntry.label}（未叠加）"
-                else -> "原片风格：${snapEntry.label} · ${(snapLutK * 100).roundToInt()}%"
+                else -> "原片风格：${snapEntry.label} · 强度 ${formatZero100(snapLutK)}"
             },
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
@@ -1578,220 +1736,186 @@ private fun EditorColorGroup(
                 fontSize = 12.sp,
                 fontFamily = FilmTheme.Mono,
                 modifier = Modifier
-                    .pressScale(onTap = onApplySnapshot)
-                    .padding(6.dp),
+                    .pressScale(onTap = onApply)
+                    .padding(4.dp),
             )
         }
     }
-    // 强度只对已选中的 LUT 有意义；0% = 与原片一致（引擎侧 [34] = 0 整段旁路）
-    // 松手（onFinished）才渲染：E2-8 —— 拖动中只更新 [34] 与读数
-    // key(refreshTick)：选卡片 / 套用原片风格会绕过滑杆改 [34]，重建这一行读数才归位
-    //（LazyRow 在 key 外，卡片列表的滚动位置不受影响）
-    key(refreshTick) {
-        if (lutId != null) {
-            StrengthRow(initial = lutK, onCommit = onStrength, onFinished = { onStrengthFinished() })
+}
+
+/** ⑤ 参数图标行：横向滚动，一屏约 5 个（ADR-14 层⑤） */
+@Composable
+private fun ParamIconRow(
+    list: List<EditorParam>,
+    selectedKey: String?,
+    onSelect: (EditorParam) -> Unit,
+) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        items(list, key = { it.key }) { p ->
+            ParamChip(
+                label = p.label,
+                selected = p.key == selectedKey,
+                icon = p.icon,
+                letter = p.letter,
+            ) { onSelect(p) }
         }
     }
+}
+
+/** 色彩组的图标行：LUT 圆形按钮（"无" + 各 LUT，有预览图时显示圆形缩略图） */
+@Composable
+private fun LutIconRow(
+    lutId: String?,
+    previews: Map<String, Bitmap>,
+    onPick: (LutLibrary.Entry?) -> Unit,
+) {
+    val context = LocalContext.current
     LazyRow(
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        modifier = Modifier.padding(top = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth(),
     ) {
-        item {
-            LutCard(label = "无", selected = lutId == null, preview = null) { onPick(null) }
+        item(key = "__none__") {
+            ParamChip(label = "无", selected = lutId == null, icon = Icons.Outlined.Close) { onPick(null) }
         }
-        items(LutLibrary.entries(context)) { e ->
-            LutCard(
+        items(LutLibrary.entries(context), key = { it.id }) { e ->
+            ParamChip(
                 label = e.label,
                 selected = lutId == e.id,
-                preview = previews[e.id],
+                bitmap = previews[e.id],
             ) { onPick(e) }
         }
     }
 }
 
 /**
- * 暗角组（E2-1 本轮核心）：强度 [66] / 半径 [67] / 羽化 [68]。
- *
- * 三条滑杆的初值都来自同一份 `params`（即参数快照 → `editorParams` 的结果，
- * 无快照时 = `CameraPresets.standard()` 的 0 / 80 / 50），映射见 `EditorExport.kt`
- * 里的 `vigStrengthUi/Slot` 等函数。
- *
- * 量程与读数：强度 0..100%（0 = 关，引擎侧 [66] = 0 整段跳过）；半径/羽化 0..200%
- *（darktable `scale` / `falloff_scale` 本身就是百分比语义，默认 80 / 50）。
- *
- * E2-8：三条滑杆**拖动中只更新参数与读数、一次都不渲染**，松手（[StrengthRow] 的
- * `onFinished` = RelativeSlider 的 onDragEnd）才渲染一次 —— 接线见 EditorScreen 的
- * [SliderRenderGate] 与 `onSliderRelease`。所以 `onStrength`/`onRadius`/`onFeather` 是
- * "拖动中"回调，`onFinished` 是"松手"回调，两者语义不可互换。
+ * 圆形参数按钮（ADR-14 层⑤）：**未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄色描边 + 黄色图标**，
+ * 下方白色小字。56dp 圆（研究 §3.3.2 的 56–64dp 区间下沿：一屏能多放一个）。
  */
 @Composable
-private fun EditorVignetteGroup(
-    /** 面板重建计数（见 [EditorParamsPanel] 调用点）：重置后让滑杆读数归位 */
-    refreshTick: Int,
-    strength: Float,
-    radius: Float,
-    feather: Float,
-    onStrength: (Float) -> Unit,
-    onRadius: (Float) -> Unit,
-    onFeather: (Float) -> Unit,
-    onFinished: () -> Unit,
-    onReset: () -> Unit,
+private fun ParamChip(
+    label: String,
+    selected: Boolean,
+    icon: ImageVector? = null,
+    letter: String? = null,
+    bitmap: Bitmap? = null,
+    onTap: () -> Unit,
 ) {
-    GroupReset(onReset)
-    Text(
-        "强度 0% = 关闭 · 半径越大暗角越靠外 · 羽化越大过渡越柔",
-        color = FilmTheme.CreamDim,
-        fontSize = 11.sp,
-        modifier = Modifier.padding(top = 2.dp),
-    )
-    // key(refreshTick)：重置后重建滑杆区，三条读数一起归位（强度回 0%，半径/羽化不动）
-    key(refreshTick) {
-        StrengthRow(
-            initial = strength,
-            onCommit = onStrength,
-            onFinished = { onFinished() },
-            label = "强度",
-            range = 0f..1f,
-        )
-        StrengthRow(
-            initial = radius,
-            onCommit = onRadius,
-            onFinished = { onFinished() },
-            label = "半径",
-            range = 0f..2f,
-        )
-        StrengthRow(
-            initial = feather,
-            onCommit = onFeather,
-            onFinished = { onFinished() },
-            label = "羽化",
-            range = 0f..2f,
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier
+                .size(56.dp)
+                .clip(CircleShape)
+                .background(FilmTheme.ChipBg)
+                .border(
+                    if (selected) 2.dp else 1.dp,
+                    if (selected) FilmTheme.Accent else FilmTheme.ChipBorder,
+                    CircleShape,
+                )
+                .pressScale(pressedScale = 0.9f, onTap = onTap),
+            contentAlignment = Alignment.Center,
+        ) {
+            when {
+                bitmap != null -> Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                icon != null -> Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = if (selected) FilmTheme.Accent else FilmTheme.Cream,
+                    modifier = Modifier.size(24.dp),
+                )
+                letter != null -> Text(
+                    letter,
+                    color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FilmTheme.Mono,
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            label,
+            color = if (selected) FilmTheme.Accent else FilmTheme.Cream,
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 64.dp),
         )
     }
 }
 
 /**
- * 局部调整组（E2-7 本卡核心）：**模式选择 + 预览上拖动定位 + 六条滑杆**。
+ * ⑥ 底部导航（ADR-14 层⑥）：调整 / 色彩 / 暗角 / 局部，**选中 = 黄色圆角矩形底 + 深色图标与文字**。
  *
- * 为什么中心没有滑杆：让用户用滑杆输归一化坐标不现实（ADR 交互规格第 2 条）—— 定位在
- * 预览图上拖动完成（本组只显示"中心 x%,y%"读数），轮廓由预览区的 Canvas 画（与拖动共用
- * 同一套坐标换算，见 `EditorExport.kt` 的 `localCenterFromScreen` / `radialOutline`）。
+ * 选中态用「强调色实底 + [FilmTheme.OnAccent] 前景」而不是"黄底 + 黄字"：黄底黄字的对比度
+ * 约 1.4:1（WCAG 远不达标），实底 + 深字是 6.8:1。同一个"黄色圆角矩形底"的语言，可读性优先。
  *
- * 滑杆与引擎槽位的对应（槽位语义见 `EditorExport.kt` 的局部映射段）：
- *  - **半径** [82] 0..100% = UV（相对图像宽）；正圆语义 ⇒ 屏幕上永远是正圆
- *  - **羽化** [83] 0..100%（相对半径）：0 = 极窄过渡
- *  - **角度** [84] 显示 0..180°（条带**法线**：0° = 条带竖直、90° = 条带水平）
- *  - **宽度** [85] 0..100% = 线性半宽（UV，相对图像宽）
- *  - **曝光** [86] ±100% = ±3 EV（与全局曝光同一口径，0% = 不变）
- *  - **饱和度** [87] 0..200%（100% = 不变；0% = 局部完全去饱和，**不是"关"**）
- *
- * **A/B 语义**（ADR 交互规格第 6 条）：只有 [86] ≠ 0 或 [87] ≠ 1 时画面才变。所以
- * "选了径向但没调强度"时预览**不会变**（引擎侧 `uLocalOn` 判据）—— 这行提示就是
- * 为了不让用户以为坏了（[active] 与引擎同一判据，纯函数 [localActive]）。
- *
- * E2-8 闸门：六条滑杆拖动中只写槽位与读数，松手（[onFinished]）才渲染一次。
+ * 「预设」「裁剪」**置灰留位、不注册点击**：预设（E3 预设管理）与裁剪（E2-12）都还没实现 ——
+ * ADR-12 不许假控件，所以它们只占位、点不动，颜色用 30% 奶油白（一眼看出是禁用态）。
  */
 @Composable
-private fun EditorLocalGroup(
-    /** 面板重建计数：换模式 / 重置后让滑杆读数归位 */
-    refreshTick: Int,
-    mode: Int,
-    center: Pair<Float, Float>,
-    radius: Float,
-    feather: Float,
-    angle: Float,
-    width: Float,
-    ev: Float,
-    sat: Float,
-    /** 是否真的会改变画面（[localActive]）= 选了模式**且**调过强度 */
-    active: Boolean,
-    onMode: (Int) -> Unit,
-    onRadius: (Float) -> Unit,
-    onFeather: (Float) -> Unit,
-    onAngle: (Float) -> Unit,
-    onWidth: (Float) -> Unit,
-    onEv: (Float) -> Unit,
-    onSat: (Float) -> Unit,
-    onFinished: () -> Unit,
-    onReset: () -> Unit,
-) {
-    GroupReset(onReset)
+private fun EditorTabBar(selected: EditorTab, onSelect: (EditorTab) -> Unit) {
     Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.padding(top = 2.dp),
     ) {
-        listOf(
-            LocalMode.OFF to "关",
-            LocalMode.RADIAL to "径向",
-            LocalMode.LINEAR to "线性",
-        ).forEach { (m, label) ->
-            SheetPill(label = label, selected = mode == m) { onMode(m) }
+        EditorTab.entries.forEach { t ->
+            val on = t == selected
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (on) FilmTheme.Accent else Color.Transparent)
+                    .pressScale(pressedScale = 0.94f, onTap = { onSelect(t) })
+                    .padding(vertical = 6.dp),
+            ) {
+                Icon(
+                    t.icon,
+                    contentDescription = t.label,
+                    tint = if (on) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                    modifier = Modifier.size(22.dp),
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    t.label,
+                    color = if (on) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                )
+            }
         }
-    }
-    Text(
-        when {
-            mode == LocalMode.OFF -> "选「径向」或「线性」后，在预览上拖动定位"
-            !active -> "已选模式：调「曝光」或「饱和度」后画面才会变化（当前未调强度）"
-            mode == LocalMode.RADIAL ->
-                "预览上拖动移动中心（当前 ${(center.first * 100).roundToInt()}%, " +
-                    "${(center.second * 100).roundToInt()}%）· 半径 100% = 图像宽度"
-            else ->
-                "预览上拖动移动轴线（当前 ${(center.first * 100).roundToInt()}%, " +
-                    "${(center.second * 100).roundToInt()}%）· 角度 0° = 条带竖直"
-        },
-        color = if (mode != LocalMode.OFF && !active) FilmTheme.Accent else FilmTheme.CreamDim,
-        fontSize = 11.sp,
-        modifier = Modifier.padding(top = 2.dp),
-    )
-    // key(refreshTick)：换模式 / 重置后重建滑杆区 ⇒ 读数从槽位重读（否则画面回默认、
-    // 滑杆还停在原处）
-    key(refreshTick) {
-        StrengthRow(
-            initial = radius,
-            onCommit = onRadius,
-            onFinished = { onFinished() },
-            label = "半径",
-            range = LOCAL_RADIUS_UI_RANGE,
-        )
-        StrengthRow(
-            initial = feather,
-            onCommit = onFeather,
-            onFinished = { onFinished() },
-            label = "羽化",
-            range = LOCAL_FEATHER_UI_RANGE,
-        )
-        StrengthRow(
-            initial = angle,
-            onCommit = onAngle,
-            onFinished = { onFinished() },
-            label = "角度",
-            range = LOCAL_ANGLE_UI_RANGE,
-            // 角度读数用**度数**（0..180°）：百分比在"方向"上没有意义（ADR-12 的
-            // 读数必须与语义一致）。0° = 条带竖直、90° = 条带水平。
-            format = { v -> "${(v * 180f).roundToInt()}°" },
-        )
-        StrengthRow(
-            initial = width,
-            onCommit = onWidth,
-            onFinished = { onFinished() },
-            label = "宽度",
-            range = LOCAL_WIDTH_UI_RANGE,
-        )
-        StrengthRow(
-            initial = ev,
-            onCommit = onEv,
-            onFinished = { onFinished() },
-            label = "曝光",
-            range = LOCAL_EV_UI_RANGE,
-        )
-        StrengthRow(
-            initial = sat,
-            onCommit = onSat,
-            onFinished = { onFinished() },
-            label = "饱和度",
-            range = LOCAL_SAT_UI_RANGE,
-        )
+        listOf(
+            Icons.Outlined.Collections to "预设",
+            Icons.Outlined.Crop to "裁剪",
+        ).forEach { (ic, label) ->
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(vertical = 6.dp),
+            ) {
+                Icon(
+                    ic,
+                    contentDescription = "$label（暂未开放）",
+                    tint = DisabledInk,
+                    modifier = Modifier.size(22.dp),
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(label, color = DisabledInk, fontSize = 10.sp, maxLines = 1)
+            }
+        }
     }
 }
 
