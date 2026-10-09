@@ -17,8 +17,8 @@ import org.junit.Test
  *     先收起（消费返回）；已收起 ⇒ 交宿主退出编辑器。搞反的后果是"面板还开着就退出了"
  *     或者"收起后返回键失灵，退不出去"。
  *  2. **把手阈值**：抖动不切换、超过阈值才切换，且**方向正确**（下拉收起 / 上拉展开）。
- *  3. **原图两个来源独立**：按钮锁定与按住偷看互不干扰 —— 一个 Boolean 的写法会让
- *     "锁定后随手长按一下再松手"把锁定态一起清掉（原图莫名消失）。
+ *  3. **看原图 = 按住看（E2-17）**：按下即见、松手即回，**不是 toggle**；松手路径唯一
+ *     （手势被取消也复位）—— 错的后果是"按了没反应"或"画面永久钉在原图"。
  */
 class EditorPanelStateTest {
 
@@ -95,43 +95,54 @@ class EditorPanelStateTest {
         assertEquals("默认打开编辑器 = 展开", true, EditorPanelState().expanded)
     }
 
-    // ── 原图对比（按钮锁定 + 按住偷看）─────────────────────────────────────
+    // ── 看原图：按住看 / 松手回（E2-17）─────────────────────────────────────
 
     @Test
-    fun originalViewIsOffByDefaultAndTogglesByButton() {
+    fun originalViewIsOffByDefaultAndFollowsPress() {
         val off = OriginalViewState()
-        assertFalse("默认显示效果图", off.showing)
-        val on = off.toggleLocked()
-        assertTrue("按钮点一下 ⇒ 持续显示原图", on.showing)
-        assertFalse("再点一下 ⇒ 回效果图", on.toggleLocked().showing)
+        assertFalse("默认显示效果图（没人按着按钮）", off.showing)
+        val held = off.press(true)
+        assertTrue("按住按钮 ⇒ 显示原图", held.showing)
+        assertFalse("松手 ⇒ 立刻回效果图", held.press(false).showing)
     }
 
     @Test
-    fun longPressShowsOriginalOnlyWhilePressed() {
-        val s = OriginalViewState().press(true)
-        assertTrue("按住即见", s.showing)
-        assertFalse("松手即回", s.press(false).showing)
+    fun pressIsNotAToggle() {
+        // ★ 本卡的核心回归哨兵：**连续两次按住-松手**必须每次都"按住显示、松手恢复"。
+        // toggle 语义（E2-15 的旧行为）下第二次按住会变成"切回"，用户看到的就是"按了没反应"。
+        var s = OriginalViewState()
+        repeat(2) { round ->
+            s = s.press(true)
+            assertTrue("第 ${round + 1} 次按住要看得到原图", s.showing)
+            s = s.press(false)
+            assertFalse("第 ${round + 1} 次松手要回到效果图", s.showing)
+        }
     }
 
     @Test
-    fun releaseOfLongPressDoesNotClearButtonLock() {
-        // ★ 本卡最容易错的一条：按钮锁定后随手长按再松手，不能把锁定态一起清掉
-        val locked = OriginalViewState().toggleLocked()
-        val pressed = locked.press(true)
-        assertTrue(pressed.showing)
-        val released = pressed.press(false)
-        assertTrue("松手只解除按住那一路，按钮锁定仍在", released.showing)
-        assertTrue(released.locked)
-        assertFalse(released.pressed)
+    fun releaseAlwaysRestoresEffectEvenWhenGestureCancelled() {
+        // 手指滑出按钮 / 手势被抢：tryAwaitRelease 返回 false，调用方**照样**走 press(false)
+        //（松手路径只有一条）。重复松手幂等 —— 不能出现"按下了没复位"把画面永久钉在原图。
+        val cancelled = OriginalViewState().press(true).press(false).press(false)
+        assertFalse("取消 / 重复松手都必须回到效果图", cancelled.showing)
     }
 
     @Test
-    fun buttonToggleDoesNotDisturbActiveLongPress() {
-        val pressed = OriginalViewState().press(true)
-        val toggled = pressed.toggleLocked()
-        assertTrue(toggled.showing)
-        assertTrue("长按还在进行中", toggled.pressed)
-        // 松手后仍显示（按钮已锁定）
-        assertTrue(toggled.press(false).showing)
+    fun repeatedPressWhileHeldStaysShowing() {
+        // 按住期间重复收到 press(true)（手势事件抖动）不能翻转成"不显示"
+        assertTrue(OriginalViewState().press(true).press(true).showing)
+    }
+
+    @Test
+    fun showingIsExactlyPressed() {
+        // 显示判据只剩**一路**来源（E2-15 的 locked 字段已随 toggle 语义一起删除）：
+        // 任何时刻 showing ⇔ pressed —— 防止"残留锁定态让原图一直显示"的旧行为回归。
+        val seq = listOf(false, true, false, true, false)
+        var s = OriginalViewState()
+        seq.forEach { v ->
+            s = s.press(v)
+            assertEquals("showing 必须等于 pressed（v=$v）", v, s.showing)
+            assertEquals("pressed 字段就是唯一来源", v, s.pressed)
+        }
     }
 }

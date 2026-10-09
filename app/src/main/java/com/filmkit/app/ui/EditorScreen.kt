@@ -5,6 +5,16 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -85,6 +95,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -96,6 +107,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -234,10 +246,26 @@ import kotlinx.coroutines.withContext
  *     状态机是纯逻辑（[EditorPanelState]），JVM 单测覆盖。
  *  ② **色温/色调移入「调整」组**（用户："怎么放 lut 里了应该是调整里面"），褪色留在「色彩」
  *     组；色彩组的 LUT 与参数**拆成两行**（LUT 42 个，同行会把参数埋掉）。
- *  ③ **「查看原图」按钮**（用户："给个按钮"）：预览区右下角圆形按钮 = 持续对比，与按住偷看
- *     并存（两个来源独立，[OriginalViewState]）；局部模式下隐藏（不跟拖动定位抢事件）。
+ *  ③ **「查看原图」按钮**（用户："给个按钮"）：预览区右下角圆形按钮，**按住看原图 / 松手恢复**
+ *     （E2-17 改成 press-and-hold，见下）；局部模式下隐藏（不跟拖动定位抢事件）。
  *  ④ **「取消」二次确认**：有修改才弹「放弃本次修改？」—— 判据复用 E2-9 的 `paramsUnchanged`
  *     （[discardNeedsConfirm]），与导出直通同一份逻辑。
+ *
+ * E2-17（v0.11.5 验收反馈：三条里改两条 + 一条动画打磨）：
+ *  ① **面板出入场过渡**（用户："面板上下拉加过渡动画，现在是瞬变"）：收起/展开改由
+ *     [AnimatedContent] 承载 —— 内容交叉（面板 ⇄ 收起条）+ **尺寸过渡**（[SizeTransform]）
+ *     + 位移 + 淡入淡出，统一 240ms 减速曲线（[PANEL_ANIM_MS]）。尺寸过渡是关键：预览区是
+ *     `weight(1f)`，面板容器高度平滑变化时它**跟着伸缩**，不会"面板瞬间消失、预览区跳一下"。
+ *     **动画期间不触发任何渲染**：渲染调用点仍是打开首帧 / 滑杆松手 / 离散操作那几处，
+ *     面板的进出场只改变布局，不进 [rerender]（见该函数的 KDoc）。
+ *  ② **原图按钮 = 按住看**（用户："不要点一下切原图再点切回；按住按钮看原图，松手恢复效果图"）：
+ *     [OriginalViewState] 由 toggle（`locked` + `pressed` 两路）改成 **press/release 单路**语义；
+ *     按钮用 `onPress` + `tryAwaitRelease`（与原来长按预览区同一套 API），按下态 = 黄底 + 深色
+ *     图标 + 0.88 缩放（用户必须一眼看出"按住了"）。
+ *  ③ **取消「长按预览区看原图」**（用户："也不用长按图片查看原图"）：预览区的 Image 不再注册
+ *     任何 tap/long-press 手势。E2-7 的局部拖动定位（`detectDragGestures`）与轮廓绘制走的是
+ *     另一套 pointerInput 与同一批纯函数（[imageFitRect] / [localCenterFromScreen] /
+ *     [radialOutline] / [linearOutline]），本卡**一行未动** ⇒ 拖动定位与轮廓不受影响。
  *
  * 与 E2-1/E2-3/E2-7 那版（可折叠区 + 纵向堆 7~19 条"标签｜细滑杆｜百分比"三段式表单行）的
  * 区别就是 ADR-14 的三条关键修正：**满宽滑杆 + 标签在上方**、**中点标记**、**读数用物理量**
@@ -313,12 +341,13 @@ fun EditorScreen(
     //（各组「重置」/ 单参数重置 / 套用原片风格），都要 ++ 让滑杆子树重建一次 —— 否则画面
     // 变了、滑杆读数还停在原处，等于把 ADR-12 的假滑杆反过来演一遍（读数与状态不符）。
     var panelRefresh by remember { mutableIntStateOf(0) }
-    // ── E2-15 面板收起/展开 + 原图对比（用户真机反馈）────────────────────────
+    // ── E2-15 面板收起/展开 + E2-17 原图对比（用户真机反馈）──────────────────
     // 面板：唯一数据源 = 不可变状态（转换全是纯函数，见文件末尾 [EditorPanelState]）。
-    // 收起后面板整段不组合 ⇒ 预览区（weight 1f）自动吃满剩余空间。
+    // 收起后面板整段不组合 ⇒ 预览区（weight 1f）自动吃满剩余空间；E2-17 起进出场有过渡
+    //（[AnimatedContent] + 尺寸过渡，见下方参数区的用法）。
     var panel by remember { mutableStateOf(EditorPanelState()) }
-    // 原图对比：**按钮锁定 + 按住偷看**两个来源（[OriginalViewState]）—— 长按偷看保留，
-    // 按钮提供"持续对比"（用户反馈："查看原图给个按钮"）。
+    // 原图对比（E2-17）：**按住 = 看原图，松手 = 回效果图**（用户明确否掉了 toggle 语义）。
+    // 唯一来源就是这一个 pressed（[OriginalViewState]）—— 不再有"按钮锁定"那一路。
     var origView by remember { mutableStateOf(OriginalViewState()) }
     val showOriginal = origView.showing
     // 「取消」的二次确认（E2-15）：有修改才弹（判据 = E2-9 的 paramsUnchanged，见 [discardNeedsConfirm]）
@@ -893,14 +922,14 @@ fun EditorScreen(
                     }
                     EditorPhase.Ready -> {
                         val bmp = shown
-                        // 按住看原图：显示输入像素 —— 由 LaunchedEffect(showOriginal) 在 IO
+                        // 看原图：显示输入像素 —— 由 LaunchedEffect(showOriginal) 在 IO
                         // 线程从常驻 buffer 重建（见 EditorSource.displayBitmap），主线程零成本；
                         // 还没就绪时退回显示成片，绝不白屏
                         val orig = if (showOriginal) origBmp else null
                         if (bmp != null) {
-                            // 按住画面 = 看输入原图（before/after）。用 onPress + tryAwaitRelease
-                            // 而非 detectTapGestures(onLongPress)：按下即见、松手即回，不必等长按
-                            // 延时；预览区没有别的手势（pressScale 是给按钮的），不会冲突。
+                            // E2-17：预览区**不再注册任何手势** —— 长按画面看原图已按用户要求
+                            // 移除（"也不用长按图片查看原图"）。显示哪张只由右下角按钮的按住态
+                            // 决定（[OriginalViewState]），局部模式下则由拖动定位独占。
                             val image = remember(bmp, orig, showOriginal) {
                                 (if (showOriginal && orig != null) orig else bmp).asImageBitmap()
                             }
@@ -947,20 +976,7 @@ fun EditorScreen(
                                     bitmap = image,
                                     contentDescription = if (showOriginal) "原图" else "成片预览",
                                     contentScale = ContentScale.Fit,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .pointerInput(bmp, dragMode) {
-                                            detectTapGestures(onPress = {
-                                                // 局部模式下按下 = 开始拖动定位（拖动分支负责
-                                                // 渲染），不能再抢着显示原图
-                                                if (dragMode) return@detectTapGestures
-                                                // E2-15：按住 = 瞬时偷看（pressed），松手只解除这一路 ——
-                                                // 按钮的锁定态（locked）不受影响（[OriginalViewState]）
-                                                origView = origView.press(true)
-                                                tryAwaitRelease()
-                                                origView = origView.press(false)
-                                            })
-                                        },
+                                    modifier = Modifier.fillMaxSize(),
                                 )
                                 // ★ 辅助轮廓（E2-7）：**Compose 叠加层**，与 Image 同尺寸的
                                 // 兄弟节点 —— 导出走的是引擎输出位图，这里的东西**结构上
@@ -988,15 +1004,15 @@ fun EditorScreen(
                                 }
                                 // 提示：**右上角**（研究 §3.5 —— 底部容易被手指遮）+ PC 式 1px 黑阴影
                                 //（ADR-14 抄的 `BoldTextWithShadow`：文字叠在预览图上的可读性技巧）。
-                                // E2-15：看原图时也保留提示（文案切换）—— 按钮的选中态 + 文案双保险，
-                                // 用户任何时候都知道自己看的是哪张。
+                                // E2-17：看原图时也保留提示（文案切换）—— 按钮的按下态 + 文案双保险，
+                                // 用户任何时候都知道自己看的是哪张；未按时的文案指向**按钮**
+                                //（预览区已不看原图，文案再写"按住画面"就是骗人）。
                                 Text(
                                     when {
-                                        showOriginal && origView.locked -> "原图（点右下角按钮看效果）"
                                         showOriginal -> "原图（松手返回效果）"
                                         dragMode && localDragging -> "拖动定位中…松手生效"
                                         dragMode -> "拖动画面移动局部区域"
-                                        else -> "按住画面看原图"
+                                        else -> "按住右下角按钮看原图"
                                     },
                                     color = if (dragMode && localDragging) FilmTheme.Accent else FilmTheme.CreamDim,
                                     fontSize = 11.sp,
@@ -1005,14 +1021,14 @@ fun EditorScreen(
                                         .align(Alignment.TopEnd)
                                         .padding(top = 8.dp, end = 12.dp),
                                 )
-                                // ★ E2-15 原图对比按钮（用户反馈："查看原图给个按钮"）：右下角圆形按钮，
-                                // **点一下切换持续对比**（长按偷看保留，两者并存）。
+                                // ★ E2-15 原图按钮（用户："查看原图给个按钮"）→ E2-17 改成**按住看**
+                                //（用户："按住按钮 = 看原图；松手 = 恢复效果图"，明确否掉点一下切换）。
                                 // 局部模式下**隐藏**：拖动定位要用整个预览区（含右下角），按钮会抢走那
                                 // 一片的按下事件 ⇒ 用户在那儿拖不动（父代理已提示这个冲突）。
                                 if (!dragMode) {
-                                    OriginalToggleButton(
-                                        on = origView.locked,
-                                        onTap = { origView = origView.toggleLocked() },
+                                    OriginalPressButton(
+                                        pressed = origView.pressed,
+                                        onPress = { v -> origView = origView.press(v) },
                                         modifier = Modifier
                                             .align(Alignment.BottomEnd)
                                             .padding(end = 14.dp, bottom = 14.dp),
@@ -1031,41 +1047,75 @@ fun EditorScreen(
             // ★ E2-15 可收起（用户反馈："系统返回手势要可以收起编辑面板…收不起来"）：收起后
             // 整段不组合 ⇒ 上面的预览区（weight 1f）自动吃满剩余空间；底部只留一条把手，
             // 上拉/点击即可恢复（展开恢复原状态：tab / 选中参数 / 滑杆读数都在 remember 里）。
-            if (panel.expanded) {
-                EditorPanel(
-                    group = tab,
-                    onGroup = { tab = it },
-                    params = params,
-                    refreshTick = panelRefresh,
-                    status = status,
-                    baseHint = editorHint(
-                        status = "",
-                        hasSnapshot = hasSnapshot,
-                        lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
-                        lutK = lutK,
-                    ),
-                    lutId = lutId,
-                    previews = lutPreviews,
-                    snapLutId = snapLutId,
-                    snapLutK = snapLutK,
-                    onPickLut = { e -> pickLut(e) },
-                    onApplySnapshot = { applySnapshotStyle() },
-                    localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF,
-                    localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f),
-                    localOn = params?.let { localActive(it) } ?: false,
-                    onLocalMode = { m -> setLocalType(m) },
-                    onCommit = { p, v -> commit(p, v) },
-                    onFinished = { onSliderRelease() },
-                    onResetParam = { p -> resetParam(p) },
-                    onResetGroup = { g -> resetGroup(g) },
-                    onHandleDrag = { dy -> onHandleDrag(dy) },
-                    onTogglePanel = { panel = panel.toggled() },
-                )
-            } else {
-                CollapsedPanelBar(
-                    onDragEnd = { dy -> onHandleDrag(dy) },
-                    onTogglePanel = { panel = panel.toggled() },
-                )
+            //
+            // ★ E2-17 过渡（用户："面板上下拉加过渡动画"，此前是瞬变）：[AnimatedContent] 一次
+            // 做三件事 —— 内容交叉（面板 ⇄ 收起条）、**尺寸过渡**（[SizeTransform]：全高 ⇄ 42dp）、
+            // 位移 + 淡入淡出。尺寸过渡是关键：预览区是 `weight(1f)`，容器高度每帧都在变，预览区
+            // 跟着**平滑伸缩**（而不是"面板瞬间没了、预览区跳一下"）。全部用同一条 240ms 减速曲线
+            //（[PANEL_ANIM_MS]）—— 位移/淡入/尺寸若各配各的时长，会出现"内容先到位、容器后展开"的撕裂。
+            //
+            // 为什么不复用 FilmTheme.FilmMotion.panelEnter/panelExit：那套是**浮层**动效（相机页的
+            // 覆盖式面板），只做位移 + 淡入淡出、**不改变布局尺寸**；编辑器面板嵌在布局流里，没有
+            // 尺寸过渡就必然跳变。本卡限定只改本文件，故这套转场定义在这里（未动 FilmTheme.kt）。
+            //
+            // ⚠ 动画期间**不触发渲染**：这里只做布局与组合，渲染调用点仍是打开首帧 / 滑杆松手 /
+            // 离散操作（见 [rerender] 的 KDoc）；面板子树里没有任何 `rerender()`。
+            AnimatedContent(
+                targetState = panel.expanded,
+                transitionSpec = {
+                    val slide = tween<IntOffset>(PANEL_ANIM_MS, easing = FastOutSlowInEasing)
+                    val fade = tween<Float>(PANEL_ANIM_MS, easing = FastOutSlowInEasing)
+                    val size = tween<IntSize>(PANEL_ANIM_MS, easing = FastOutSlowInEasing)
+                    if (targetState) {
+                        // 展开：面板从下方推上来，收起条往上退。位移取内容高度的 1/3 —— 面板
+                        // 约 380dp ⇒ ≈125dp，正贴 ADR-14 记的 PC 源码面板出入场位移；收起条
+                        // 只有 42dp 高，自适应成 ≈14dp，不会从屏幕外飞进来。
+                        (slideInVertically(slide) { it / 3 } + fadeIn(fade)) togetherWith
+                            (slideOutVertically(slide) { -it / 3 } + fadeOut(fade))
+                    } else {
+                        // 收起：面板往下退，收起条从上方落回
+                        (slideInVertically(slide) { -it / 3 } + fadeIn(fade)) togetherWith
+                            (slideOutVertically(slide) { it / 3 } + fadeOut(fade))
+                    } using SizeTransform(clip = true, sizeAnimationSpec = { _, _ -> size })
+                },
+                label = "editorPanel",
+            ) { expanded ->
+                if (expanded) {
+                    EditorPanel(
+                        group = tab,
+                        onGroup = { tab = it },
+                        params = params,
+                        refreshTick = panelRefresh,
+                        status = status,
+                        baseHint = editorHint(
+                            status = "",
+                            hasSnapshot = hasSnapshot,
+                            lutLabel = lutId?.let { id -> LutLibrary.byId(context, id)?.label ?: id },
+                            lutK = lutK,
+                        ),
+                        lutId = lutId,
+                        previews = lutPreviews,
+                        snapLutId = snapLutId,
+                        snapLutK = snapLutK,
+                        onPickLut = { e -> pickLut(e) },
+                        onApplySnapshot = { applySnapshotStyle() },
+                        localMode = params?.let { localTypeUi(it[79]) } ?: LocalMode.OFF,
+                        localCenter = params?.let { localCenterUi(it[80], it[81]) } ?: (0.5f to 0.5f),
+                        localOn = params?.let { localActive(it) } ?: false,
+                        onLocalMode = { m -> setLocalType(m) },
+                        onCommit = { p, v -> commit(p, v) },
+                        onFinished = { onSliderRelease() },
+                        onResetParam = { p -> resetParam(p) },
+                        onResetGroup = { g -> resetGroup(g) },
+                        onHandleDrag = { dy -> onHandleDrag(dy) },
+                        onTogglePanel = { panel = panel.toggled() },
+                    )
+                } else {
+                    CollapsedPanelBar(
+                        onDragEnd = { dy -> onHandleDrag(dy) },
+                        onTogglePanel = { panel = panel.toggled() },
+                    )
+                }
             }
         }
 
@@ -2263,25 +2313,53 @@ private fun CollapsedPanelBar(onDragEnd: (Float) -> Unit, onTogglePanel: () -> U
 }
 
 /**
- * ★ E2-15 「查看原图」按钮（用户反馈："查看原图给个按钮"；形态照 Filmix 预览区右下角的
- * 圆形对比按钮）：**点一下切换持续对比**，长按偷看**同时保留**（两者并存，互不干扰 ——
- * 见 [OriginalViewState] 的两个来源）。选中态 = 黄底 + 深色图标，一眼看出当前看的是哪张。
+ * ★ E2-15 「看原图」按钮（用户："查看原图给个按钮"；形态照 Filmix 预览区右下角的圆形对比
+ * 按钮）→ **E2-17 改成 press-and-hold**（用户验收反馈："不要点一下切原图、再点切回；按住
+ * 按钮 = 看原图，松手 = 恢复效果图"）。
+ *
+ * 为什么不用全 App 的按压反馈规范 [pressScale]：它只暴露 `onTap`（点击回调），表达不了
+ * "按下期间持续为真"——而这里的按下态必须**贯穿整个按住过程**（[OriginalViewState.pressed]
+ * 就是"用户正按着"）。手势用 `onPress` + `tryAwaitRelease`（与 E2-15 长按预览区同一套 API）：
+ * 手指滑出按钮或手势被抢时 `tryAwaitRelease` 返回 false，**同样**往下走 `onPress(false)` ——
+ * 松手路径只有一条，不存在"按下了但没复位"（那会让画面永远停在原图，只能退出编辑器）。
+ *
+ * 按下态做三件事（用户必须一眼看出"按住了"）：黄底 + 深色图标 + 0.88 缩放（[PRESS_ANIM_MS]
+ * 的短过渡，比按钮自身的 240ms 面板动画快得多 —— 按压反馈要跟手）。
  */
 @Composable
-private fun OriginalToggleButton(on: Boolean, onTap: () -> Unit, modifier: Modifier = Modifier) {
+private fun OriginalPressButton(
+    pressed: Boolean,
+    onPress: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.88f else 1f,
+        animationSpec = tween(PRESS_ANIM_MS),
+        label = "originalButtonScale",
+    )
     Box(
         modifier
             .size(44.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
             .clip(CircleShape)
-            .background(if (on) FilmTheme.Accent else FilmTheme.ChipBg.copy(alpha = 0.85f))
-            .border(1.dp, if (on) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape)
-            .pressScale(pressedScale = 0.9f, onTap = onTap),
+            .background(if (pressed) FilmTheme.Accent else FilmTheme.ChipBg.copy(alpha = 0.85f))
+            .border(1.dp, if (pressed) FilmTheme.Accent else FilmTheme.ChipBorder, CircleShape)
+            .pointerInput(Unit) {
+                detectTapGestures(onPress = {
+                    onPress(true)
+                    tryAwaitRelease()
+                    onPress(false)
+                })
+            },
         contentAlignment = Alignment.Center,
     ) {
         Icon(
             Icons.Outlined.Compare,
-            contentDescription = if (on) "查看效果图" else "查看原图",
-            tint = if (on) FilmTheme.OnAccent else FilmTheme.Cream,
+            contentDescription = "按住查看原图",
+            tint = if (pressed) FilmTheme.OnAccent else FilmTheme.Cream,
             modifier = Modifier.size(22.dp),
         )
     }
@@ -2365,25 +2443,35 @@ internal data class EditorPanelState(val expanded: Boolean = true) {
 }
 
 /**
- * 「查看原图」的状态（E2-15，用户反馈："查看原图给个按钮"）：两个**独立**来源合成一个显示判据。
+ * 「看原图」的状态（E2-15 引入，**E2-17 改成 press/release 语义**）。
  *
- *  - [locked]：右下角按钮点出来的**持续对比**（再点一下回效果图）
- *  - [pressed]：按住预览的**瞬时偷看**（松手即回）
+ * 用户 v0.11.5 验收原话："不要点一下切原图、再点切回；按住按钮 = 看原图，松手 = 恢复效果图"，
+ * 并明确"也不用长按图片查看原图"。所以这里只剩**一路**来源：预览区右下角按钮的按住态。
  *
- * 为什么要两个字段而不是一个 Boolean：一个 Boolean 时"按住看原图"松手会把按钮的锁定态
- * 一起清掉（用户点开按钮锁定、随手长按一下再松手 ⇒ 原图莫名消失）。[showing] 是唯一的显示
- * 判据（`locked || pressed`），[press] 只动按下那一路、[toggleLocked] 只动锁定那一路。
+ * 为什么还留成一个不可变状态类、而不是直接用一个 Boolean（与 [SliderRenderGate] 同一套路）：
+ * 这条语义错了用户一眼就看见，但真机验证要点半天 —— 抽成纯逻辑，JVM 单测直接钉住
+ * "按下即见 / 松手即回 / 松手路径唯一（手势被取消也复位）"。
  */
-internal data class OriginalViewState(val locked: Boolean = false, val pressed: Boolean = false) {
-    /** 是否显示输入原图（两个来源取或） */
-    val showing: Boolean get() = locked || pressed
+internal data class OriginalViewState(val pressed: Boolean = false) {
+    /** 是否显示输入原图（= 用户正按着按钮） */
+    val showing: Boolean get() = pressed
 
-    /** 按钮点击：锁定态取反（不影响正在按住的偷看） */
-    fun toggleLocked(): OriginalViewState = copy(locked = !locked)
-
-    /** 按住预览（[v] = true 按下 / false 松手）：只动瞬时那一路 */
+    /** 按住（[v] = true 按下 / false 松手，**含手势被取消的松手**）：唯一的状态迁移 */
     fun press(v: Boolean): OriginalViewState = copy(pressed = v)
 }
+
+/**
+ * 面板出入场时长（E2-17，ms）。为什么是 240：
+ *  - 区间取 200~300ms —— 短于 200ms 在"容器尺寸 + 内容位移"双层动画下会被看成瞬变（用户
+ *    反馈的就是瞬变）；长于 300ms 会让"收起面板腾出预览区"这件小事显得拖沓。
+ *  - 240 落在区间中段：展开时够看清位移与伸缩的连贯，收起时也不拖手。
+ *  - 位移 / 淡入淡出 / 尺寸过渡**共用这一个时长**（配 [FastOutSlowInEasing] 减速曲线）——
+ *    三者时长不一致会出现"内容先到位、容器后展开"的撕裂感。
+ */
+private const val PANEL_ANIM_MS = 240
+
+/** 按钮按下态的缩放过渡（ms）：按压反馈要跟手，取面板动画的零头都不到 */
+private const val PRESS_ANIM_MS = 90
 
 /**
  * 全分辨率预览的常驻内存估算（MB，纯函数）：输入 direct buffer + 输出位图各 4 字节/像素
