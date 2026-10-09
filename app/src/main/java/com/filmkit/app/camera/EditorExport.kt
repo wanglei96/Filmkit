@@ -271,6 +271,135 @@ internal fun clarityUi(slot: Double): Float = if (!slot.isFinite()) {
 }
 
 /**
+ * 色温 / 色调 / 影调分区 / 褪色的 UI ↔ 槽位映射（E2-14）。槽位语义见 ADR 的「E2-11 槽位表」，
+ * 引擎实现在 `FrameRenderer.cpp` 的 `tempTintGain`（[88][89]）与 `kFsStyle` 的
+ * `uToneOn` / `uFade` 段（[90..94]）。
+ *
+ *  - [88] `temp_mired`：**目标白点的 mired 偏移**（基准 6500K），恒等 0
+ *  - [89] `tint`：绿 ↔ 品红（正 = 品红），恒等 0
+ *  - [90..93] `highlights` / `shadows` / `whites` / `blacks`：显示域影调分区（乘性 luma 增益），恒等 0
+ *  - [94] `fade`：褪色（抬黑场、白点不动），恒等 0 = 关
+ *
+ * **⚠ 方向约定（本卡最容易做错的一条）**：`temp_mired` 存的是目标白点的 mired
+ * （`mired_target = 1e6/6500 + 槽位值`、`K_target = 1e6/mired_target`）⇒ **槽位值正 =
+ * 目标 K 更低 = 画面变冷**。所以 **UI 滑杆直接用 K**（右移 = K 大 = **变暖**），写入时才换算成
+ * mired。若把 mired 当滑杆值，滑杆方向与读数方向正好相反。
+ *
+ * 量程常量由 UI 参数表与映射函数**共用同一份定义**（否则滑杆能拖到 clamp 之外 = 假滑杆）。
+ */
+
+/** 色温 UI 量程（K）：2500..12000，恒等 6500。下限 2500K 的依据见 ADR（更低时引擎 B 增益撞 3.0 clamp）。 */
+internal val TEMP_UI_RANGE = 2500f..12000f
+
+/** 色温恒等值 / 中点标记位置：6500K ≈ D65（引擎 `tempTintGain` 的参考白点 `k_ref`）。 */
+internal const val TEMP_UI_PIVOT = 6500f
+
+/** 色调 UI 量程：−0.5..+0.5（引擎侧 clamp ±1，UI 取 ADR 的建议范围）。恒等 0。 */
+internal val TINT_UI_RANGE = -0.5f..0.5f
+
+/** 影调分区（高光 / 阴影 / 白色色阶 / 黑色色阶）UI 量程：−1..+1 直通槽位。恒等 0。 */
+internal val TONE_UI_RANGE = -1f..1f
+
+/** 褪色 UI 量程：0..1（0 = 关，引擎 `uFade > 0` 才生效）。恒等/基准在最左端 ⇒ 不画中点标记。 */
+internal val FADE_UI_RANGE = 0f..1f
+
+/** 色调 / 影调分区 / 褪色共用的恒等值 = 中点标记位置（0）。 */
+internal const val ZERO_UI_PIVOT = 0f
+
+/** 参考白点 6500K（引擎 `k_ref`）。 */
+private const val TEMP_REF_K = 6500.0
+
+/**
+ * 参考白点的 mired = 1e6/6500。**写成表达式而不是 `153.846` 字面量**：`tempSlot(6500f)` 必须
+ * 精确得 0 —— 差 1.5e-4 就超过 ADR-13 的 `PARAM_EPS = 1e-4`，会把"滑杆停在 6500K"误判成
+ * 用户修改（白渲染一次全分辨率）。
+ */
+private const val TEMP_REF_MIRED = 1e6 / TEMP_REF_K
+
+/** 色温越界容差（K）：只吸收 1e-10 量级的浮点噪声，远小于滑杆的最小可辨步长。 */
+private const val TEMP_K_EPS = 0.5
+
+/** UI 色温（K）→ 槽位 [88]（mired 偏移；6500K ⇒ 0）。越界 K 夹到 2500..12000。 */
+internal fun tempSlot(k: Float): Double {
+    val kv = if (k.isFinite()) {
+        k.coerceIn(TEMP_UI_RANGE.start, TEMP_UI_RANGE.endInclusive).toDouble()
+    } else {
+        TEMP_REF_K
+    }
+    return 1e6 / kv - TEMP_REF_MIRED
+}
+
+/**
+ * 槽位 [88] → UI 色温（K）：`K = 1e6/(mired_ref + slot)`，夹紧 2500..12000。
+ *
+ * **坏数据兜底**：槽位非有限，或换出的 K 越出 UI 量程（含 `mired_ref + slot ≤ 0` 这种数学上
+ * 失效的槽位）⇒ 回落恒等读数 **6500K**。
+ *
+ * 为什么越界槽位不夹到端点：夹到端点会让"画面明显偏冷"配上"6500K 不变"的读数（假读数），
+ * 而越界槽位只可能来自坏快照（UI 永远写不出）。恒等值是最不容易误导用户的显示。
+ */
+internal fun tempUi(slot: Double): Float {
+    if (!slot.isFinite()) return TEMP_UI_PIVOT
+    val k = 1e6 / (TEMP_REF_MIRED + slot)   // mired + slot ≤ 0 ⇒ Inf / 负值，由下面的越界判定兜底
+    val lo = TEMP_UI_RANGE.start.toDouble()
+    val hi = TEMP_UI_RANGE.endInclusive.toDouble()
+    if (!k.isFinite() || k < lo - TEMP_K_EPS || k > hi + TEMP_K_EPS) return TEMP_UI_PIVOT
+    return k.coerceIn(lo, hi).toFloat()
+}
+
+/** UI 色调（−0.5..+0.5）→ 槽位 [89]。坏数据回落恒等 0。 */
+internal fun tintSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(TINT_UI_RANGE.start, TINT_UI_RANGE.endInclusive).toDouble()
+} else {
+    0.0
+}
+
+/** 槽位 [89] → UI 色调（−0.5..+0.5）。坏数据回落恒等 0。 */
+internal fun tintUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(TINT_UI_RANGE.start.toDouble(), TINT_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/** UI 影调分区（−1..+1）→ 槽位 [90..93]（高光 / 阴影 / 白色色阶 / 黑色色阶四条共用这一对函数）。 */
+internal fun toneSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(TONE_UI_RANGE.start, TONE_UI_RANGE.endInclusive).toDouble()
+} else {
+    0.0
+}
+
+/** 槽位 [90..93] → UI 影调分区（−1..+1）。坏数据回落恒等 0。 */
+internal fun toneUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(TONE_UI_RANGE.start.toDouble(), TONE_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/** UI 褪色（0..1）→ 槽位 [94]。坏数据回落恒等 0 = 关。 */
+internal fun fadeSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(FADE_UI_RANGE.start, FADE_UI_RANGE.endInclusive).toDouble()
+} else {
+    0.0
+}
+
+/** 槽位 [94] → UI 褪色（0..1）。**负值当"关"**（引擎 `uFade > 0` 才生效，负值不产生任何画面变化）。 */
+internal fun fadeUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(FADE_UI_RANGE.start.toDouble(), FADE_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/** 色温读数：`5000K`（整数 K，无空格）。坏数据回落恒等读数 `6500K`。 */
+internal fun formatKelvin(ui: Float): String {
+    val k = if (ui.isFinite()) {
+        ui.coerceIn(TEMP_UI_RANGE.start, TEMP_UI_RANGE.endInclusive).roundToInt()
+    } else {
+        TEMP_UI_PIVOT.roundToInt()
+    }
+    return "${k}K"
+}
+
+/**
  * 读数格式化（E2-10）。**纯函数、无 Android 依赖** ⇒ JVM 单测逐条钉住（每个参数的格式 +
  * 中点值 + 边界 + 坏数据）。
  *
@@ -353,8 +482,9 @@ internal fun pivotFraction(range: ClosedFloatingPointRange<Float>, pivot: Float)
 }
 
 /**
- * 「基础」组重置（E2-3）：五类参数回**恒等值** —— 曝光 0 / WB 1,1,1 / 对比度 1 /
- * 饱和度 1,1,1 / 清晰度 0。只动这 7 个槽位，其余槽位（快照继承来的风格参数）原样保留。
+ * 「调整」组重置（E2-3；E2-14 扩了范围）：本组全部参数回**恒等值** —— 曝光 0 / WB 1,1,1 /
+ * 对比度 1 / 饱和度 1,1,1 / 清晰度 0 / 高光·阴影·白·黑色阶 0。只动这 11 个槽位，其余槽位
+ * （快照继承来的风格参数、色温/色调/褪色/暗角/LUT）原样保留。
  */
 internal fun resetBasicParams(p: DoubleArray) {
     p[0] = 0.0
@@ -364,6 +494,22 @@ internal fun resetBasicParams(p: DoubleArray) {
     p[4] = 1.0
     writeSaturation(p, 1f)
     p[78] = 0.0
+    p[90] = 0.0
+    p[91] = 0.0
+    p[92] = 0.0
+    p[93] = 0.0
+}
+
+/**
+ * 「色彩」组的**引擎参数**重置（E2-14）：色温 [88] / 色调 [89] / 褪色 [94] 回恒等值。
+ *
+ * LUT 不在这里 —— 清 [34] 与卸载纹理是 `applyLut(null, 0f)` 的职责（两者在
+ * `EditorScreen.resetColor` 里合并成**一次**渲染，避免画面白闪一下）。
+ */
+internal fun resetColorParams(p: DoubleArray) {
+    p[88] = 0.0
+    p[89] = 0.0
+    p[94] = 0.0
 }
 
 /**

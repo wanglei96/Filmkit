@@ -35,17 +35,24 @@ import androidx.compose.material.icons.automirrored.outlined.RotateRight
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.outlined.BlurOn
+import androidx.compose.material.icons.outlined.Brightness4
+import androidx.compose.material.icons.outlined.Brightness7
 import androidx.compose.material.icons.outlined.CenterFocusStrong
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.Crop
+import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Details
 import androidx.compose.material.icons.outlined.Exposure
+import androidx.compose.material.icons.outlined.Gradient
+import androidx.compose.material.icons.outlined.InvertColors
+import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhotoFilter
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.SwapHoriz
+import androidx.compose.material.icons.outlined.Thermostat
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Vignette
 import androidx.compose.material.icons.outlined.WaterDrop
@@ -93,6 +100,7 @@ import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
+import com.filmkit.app.camera.FADE_UI_RANGE
 import com.filmkit.app.camera.ImageFitRect
 import com.filmkit.app.camera.LOCAL_ANGLE_UI_RANGE
 import com.filmkit.app.camera.LOCAL_EV_UI_RANGE
@@ -106,7 +114,12 @@ import com.filmkit.app.camera.OverwriteResult
 import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
 import com.filmkit.app.camera.StillSnapshotStore
+import com.filmkit.app.camera.TEMP_UI_PIVOT
+import com.filmkit.app.camera.TEMP_UI_RANGE
+import com.filmkit.app.camera.TINT_UI_RANGE
+import com.filmkit.app.camera.TONE_UI_RANGE
 import com.filmkit.app.camera.WB_GAIN_UI_RANGE
+import com.filmkit.app.camera.ZERO_UI_PIVOT
 import com.filmkit.app.camera.claritySlot
 import com.filmkit.app.camera.clarityUi
 import com.filmkit.app.camera.contrastSlot
@@ -116,8 +129,11 @@ import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
 import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
+import com.filmkit.app.camera.fadeSlot
+import com.filmkit.app.camera.fadeUi
 import com.filmkit.app.camera.formatDegree
 import com.filmkit.app.camera.formatEv
+import com.filmkit.app.camera.formatKelvin
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero200
@@ -148,9 +164,16 @@ import com.filmkit.app.camera.pivotFraction
 import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
+import com.filmkit.app.camera.resetColorParams
 import com.filmkit.app.camera.resetLocalGeometry
 import com.filmkit.app.camera.saveEditorCopy
 import com.filmkit.app.camera.satUi
+import com.filmkit.app.camera.tempSlot
+import com.filmkit.app.camera.tempUi
+import com.filmkit.app.camera.tintSlot
+import com.filmkit.app.camera.tintUi
+import com.filmkit.app.camera.toneSlot
+import com.filmkit.app.camera.toneUi
 import com.filmkit.app.camera.vigFeatherSlot
 import com.filmkit.app.camera.vigFeatherUi
 import com.filmkit.app.camera.vigRadiusSlot
@@ -481,6 +504,18 @@ fun EditorScreen(
         rerender()
     }
 
+    /**
+     * 「色彩」组重置（E2-14 扩了范围）：三条引擎参数（色温/色调/褪色）回恒等值 + LUT 关闭
+     * （[34] = 0、卸载纹理）。
+     *
+     * 两件事合成**一次**渲染（[applyLut] 自带 `rerender()`）：分两次会让画面白闪一下，也白跑
+     * 一次全分辨率渲染。
+     */
+    fun resetColor() {
+        params?.let { resetColorParams(it) }
+        applyLut(null, 0f)
+    }
+
     // ── 局部调整（E2-7）────────────────────────────────────────────────────
     // 与上面两组同一范式：滑杆拖动中只写槽位 + gate.onValueChange()，松手统一走
     // [onSliderRelease] 渲染一次。**模式选择与拖动定位**是离散操作 ⇒ 直接 rerender()
@@ -530,7 +565,7 @@ fun EditorScreen(
     fun resetGroup(g: EditorTab) {
         when (g) {
             EditorTab.ADJUST -> resetBasic()
-            EditorTab.COLOR -> applyLut(null, 0f)
+            EditorTab.COLOR -> resetColor()
             EditorTab.VIGNETTE -> resetVignette()
             EditorTab.LOCAL -> resetLocal()
         }
@@ -1154,14 +1189,17 @@ private class EditorParam(
 )
 
 /**
- * 「调整」组（E2-3 的「基础」组改名，参数一个没少）：曝光 [0] / 白平衡 [1..3] / 对比度 [4] /
- * 饱和度 [20..22] / 清晰度 [78]。槽位语义与恒等值见 `EditorExport.kt` 的映射段。
+ * 「调整」组（E2-3 的「基础」组改名，参数一个没少；E2-14 加影调分区四条）：曝光 [0] /
+ * 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] / 清晰度 [78] /
+ * 高光 [90] / 阴影 [91] / 白色色阶 [92] / 黑色色阶 [93]。槽位语义与恒等值见
+ * `EditorExport.kt` 的映射段。
  *
  * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
  *  - **曝光** `+1.0 EV`（物理量，不再是 `100%`）；中点 = `0.0 EV`
  *  - **红/绿/蓝** `+12`（相对增益 ±100）；中点 = `0`（= 增益 1.00 不变）
  *  - **对比度 / 饱和度** `+12`（±100）；中点 = `0`（= 1.00 不变）
  *  - **清晰度** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记（端点本身就是标记）
+ *  - **高光 / 阴影 / 白色色阶 / 黑色色阶** `+50`（±100，正 = 该分区提亮）；中点 = `0`
  *
  * 白平衡为什么仍是 R/G/B 三条（而不是色温/色调两条）：三条增益与三个槽位是**双射**，往返精确、
  * 单测能守住；色温/色调是 2 自由度映射到 3 个增益，逆映射不唯一（E2-3 已论证）—— ADR-14
@@ -1218,22 +1256,88 @@ private val AdjustParams: List<EditorParam> = listOf(
         read = { clarityUi(it[78]) },
         write = { p, v -> p[78] = claritySlot(v) },
     ),
+    // ── E2-14：影调分区四条（[90..93]，引擎 `kFsStyle` 的 `uToneOn` 段）────────────
+    // 量程 −1..+1 直通槽位，恒等 0；读数 = ±100 整数（`+50` / `0` / `-50`），中点 0。
+    // 方向：正 = 该分区提亮（引擎 `g = 1 + hl·l² + sh·s² + wh·l³ + bl·s³`，乘性保色度比）。
+    EditorParam(
+        key = "highlights", label = "高光", icon = Icons.Outlined.LightMode,
+        range = TONE_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { toneUi(it[90]) },
+        write = { p, v -> p[90] = toneSlot(v) },
+    ),
+    EditorParam(
+        key = "shadows", label = "阴影", icon = Icons.Outlined.DarkMode,
+        range = TONE_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { toneUi(it[91]) },
+        write = { p, v -> p[91] = toneSlot(v) },
+    ),
+    EditorParam(
+        key = "whites", label = "白色色阶", icon = Icons.Outlined.Brightness7,
+        range = TONE_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { toneUi(it[92]) },
+        write = { p, v -> p[92] = toneSlot(v) },
+    ),
+    EditorParam(
+        key = "blacks", label = "黑色色阶", icon = Icons.Outlined.Brightness4,
+        range = TONE_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { toneUi(it[93]) },
+        write = { p, v -> p[93] = toneSlot(v) },
+    ),
 )
 
 /**
- * 「色彩」组：只有 LUT 强度一条滑杆（[34]）—— 图标行是 LUT 选择（圆形按钮 + 预览图），
- * 未选 LUT 时本表为空（面板显示"选一个 LUT 后可调强度"，**不给假滑杆**）。
+ * 「色彩」组的**引擎参数**（E2-14）：色温 [88] / 色调 [89] / 褪色 [94]。
  *
- * 强度读数 `85`（0..100 整数）；基准 0 = 关 ⇒ 不画中点标记。
+ * **不依赖 LUT**（引擎侧这三条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时它们照样可调 —— 这也是
+ * 本组从"未选 LUT 就空表"变成常驻的原因。LUT 强度 [34] 是单独一条（[LutStrengthParam]），
+ * 选了 LUT 才进表。
+ *
+ * 读数口径：
+ *  - **色温** `5000K`（**物理量 K，不是 mired**）；中点 = `6500K`
+ *  - **色调** `+12`（±100，正 = 品红）；中点 = `0`
+ *  - **褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记
+ *
+ * ⚠️ 色温滑杆的值**直接就是 K**（右移 = K 大 = 画面变暖）—— 槽位 [88] 存的是 mired 偏移，
+ * 方向相反，换算在 `EditorExport.kt` 的 `tempSlot` / `tempUi` 里（见那里的方向约定）。
  */
 private val ColorParams: List<EditorParam> = listOf(
     EditorParam(
-        key = "lutK", label = "强度", icon = Icons.Outlined.PhotoFilter,
-        range = 0f..1f, pivot = 0f,
-        format = { formatZero100(it) },
-        read = { p -> if (p[34].isFinite()) p[34].toFloat().coerceIn(0f, 1f) else 0f },
-        write = { p, v -> p[34] = v.coerceIn(0f, 1f).toDouble() },
+        key = "temp", label = "色温", icon = Icons.Outlined.Thermostat,
+        range = TEMP_UI_RANGE, pivot = TEMP_UI_PIVOT,
+        format = { formatKelvin(it) },
+        read = { tempUi(it[88]) },
+        write = { p, v -> p[88] = tempSlot(v) },
     ),
+    EditorParam(
+        key = "tint", label = "色调", icon = Icons.Outlined.InvertColors,
+        range = TINT_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { tintUi(it[89]) },
+        write = { p, v -> p[89] = tintSlot(v) },
+    ),
+    EditorParam(
+        key = "fade", label = "褪色", icon = Icons.Outlined.Gradient,
+        range = FADE_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatZero100(it) },
+        read = { fadeUi(it[94]) },
+        write = { p, v -> p[94] = fadeSlot(v) },
+    ),
+)
+
+/**
+ * LUT 强度 [34]（E2-1）：**只有选了 LUT 才有意义** ⇒ 未选时整条不进参数表（ADR-12：不给假滑杆）。
+ * 强度读数 `85`（0..100 整数）；基准 0 = 关 ⇒ 不画中点标记。
+ */
+private val LutStrengthParam = EditorParam(
+    key = "lutK", label = "强度", icon = Icons.Outlined.PhotoFilter,
+    range = 0f..1f, pivot = 0f,
+    format = { formatZero100(it) },
+    read = { p -> if (p[34].isFinite()) p[34].toFloat().coerceIn(0f, 1f) else 0f },
+    write = { p, v -> p[34] = v.coerceIn(0f, 1f).toDouble() },
 )
 
 /**
@@ -1496,7 +1600,8 @@ private fun EditorPanel(
     val context = LocalContext.current
     val list = when (group) {
         EditorTab.ADJUST -> AdjustParams
-        EditorTab.COLOR -> if (lutId != null) ColorParams else emptyList()
+        // 色彩组（E2-14）：三条引擎参数（色温/色调/褪色）常驻 + LUT 强度（选了 LUT 才有）
+        EditorTab.COLOR -> if (lutId != null) ColorParams + LutStrengthParam else ColorParams
         EditorTab.VIGNETTE -> VignetteParams
         EditorTab.LOCAL -> localParams(localMode)
     }
@@ -1544,8 +1649,8 @@ private fun EditorPanel(
                 EditorSlider(current, film, onCommit, onFinished)
             }
         } else {
-            // 无参数可调：色彩组选了「无」（要选一个 LUT 才有强度可调），或参数还没加载完 ——
-            // 两种情况都给一句明确说明，**不给假滑杆**（ADR-12）
+            // 无参数可调：参数还没加载完（E2-14 起色彩组常驻三条引擎参数，不再有"未选 LUT
+            // 就空表"这一档）—— 给一句明确说明，**不给假滑杆**（ADR-12）
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -1553,16 +1658,28 @@ private fun EditorPanel(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    if (film == null) "参数加载中…" else "选一个 LUT 后可调强度",
+                    if (film == null) "参数加载中…" else "本组暂无可调参数",
                     color = FilmTheme.CreamDim,
                     fontSize = 12.sp,
                 )
             }
         }
         Spacer(Modifier.height(6.dp))
-        // ⑤ 参数图标行（色彩组 = LUT 圆形按钮）
+        // ⑤ 参数图标行：色彩组 = LUT 圆形按钮 + 本组三条引擎参数（**同一行**横向滚动，E2-14）
         if (group == EditorTab.COLOR) {
-            LutIconRow(lutId, previews, onPickLut)
+            ColorIconRow(
+                lutId = lutId,
+                previews = previews,
+                onPick = { e ->
+                    onPickLut(e)
+                    // 选了 LUT ⇒ 顺手选中「强度」（否则用户点完 LUT 还得自己找强度滑杆）；
+                    // 选「无」时强度条不在表里，选中项自动回落到第一条
+                    if (e != null) selKey = LutStrengthParam.key
+                },
+                list = list,
+                selectedKey = current?.key,
+                onSelect = { selKey = it.key },
+            )
         } else {
             ParamIconRow(list, current?.key) { selKey = it.key }
         }
@@ -1766,12 +1883,22 @@ private fun ParamIconRow(
     }
 }
 
-/** 色彩组的图标行：LUT 圆形按钮（"无" + 各 LUT，有预览图时显示圆形缩略图） */
+/**
+ * 色彩组的图标行（E2-1 的 LUT 圆形按钮 + E2-14 的本组引擎参数，**同一个横向滚动行**）：
+ * 先是「无」+ 各 LUT（有预览图时显示圆形缩略图），再是色温 / 色调 / 褪色（选了 LUT 时
+ * 末尾还有「强度」）。
+ *
+ * 为什么合成一行而不是两行：ADR-14 的层⑤ 就是"一屏一行参数图标"，两行会把滑杆挤下去；
+ * 且 LUT 与色温同属"改颜色"的操作，用户在同一行里横向找是自然的。
+ */
 @Composable
-private fun LutIconRow(
+private fun ColorIconRow(
     lutId: String?,
     previews: Map<String, Bitmap>,
     onPick: (LutLibrary.Entry?) -> Unit,
+    list: List<EditorParam>,
+    selectedKey: String?,
+    onSelect: (EditorParam) -> Unit,
 ) {
     val context = LocalContext.current
     LazyRow(
@@ -1788,6 +1915,14 @@ private fun LutIconRow(
                 selected = lutId == e.id,
                 bitmap = previews[e.id],
             ) { onPick(e) }
+        }
+        items(list, key = { it.key }) { p ->
+            ParamChip(
+                label = p.label,
+                selected = p.key == selectedKey,
+                icon = p.icon,
+                letter = p.letter,
+            ) { onSelect(p) }
         }
     }
 }
