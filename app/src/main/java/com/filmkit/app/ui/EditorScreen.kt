@@ -37,7 +37,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -54,22 +56,38 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.CLARITY_UI_RANGE
+import com.filmkit.app.camera.CONTRAST_UI_RANGE
+import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
 import com.filmkit.app.camera.OverwriteResult
+import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
 import com.filmkit.app.camera.StillSnapshotStore
+import com.filmkit.app.camera.WB_GAIN_UI_RANGE
+import com.filmkit.app.camera.claritySlot
+import com.filmkit.app.camera.clarityUi
+import com.filmkit.app.camera.contrastSlot
+import com.filmkit.app.camera.contrastUi
 import com.filmkit.app.camera.editorExportName
 import com.filmkit.app.camera.editorOpenParams
 import com.filmkit.app.camera.encodeEditorJpeg
+import com.filmkit.app.camera.expSlot
+import com.filmkit.app.camera.expUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.refreshOverwrittenExif
+import com.filmkit.app.camera.resetBasicParams
 import com.filmkit.app.camera.saveEditorCopy
+import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.vigFeatherSlot
 import com.filmkit.app.camera.vigFeatherUi
 import com.filmkit.app.camera.vigRadiusSlot
 import com.filmkit.app.camera.vigRadiusUi
 import com.filmkit.app.camera.vigStrengthSlot
 import com.filmkit.app.camera.vigStrengthUi
+import com.filmkit.app.camera.wbGainSlot
+import com.filmkit.app.camera.wbGainUi
+import com.filmkit.app.camera.writeSaturation
 import com.filmkit.app.kv
 import com.filmkit.app.lut.LutLibrary
 import com.filmkit.app.lut.LutPreview
@@ -82,12 +100,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * 内建编辑器（E1-4）：成片再风格化 —— 引擎后段（3D LUT → 颗粒 → TPDF dither）跑在
- * **显示域**，输入就是成片本身的 sRGB 像素（ADR-7：链路里任何地方都不得插入
- * OETF/EOTF；也绝不走 `submitStill`，那会对成片再跑一遍 filmic = 双重影调映射）。
+ * 内建编辑器（E1-4）：成片再风格化 —— 引擎后段（基础调整 → 暗角 → 3D LUT → 颗粒 →
+ * TPDF dither）跑在**显示域**，输入就是成片本身的 sRGB 像素（ADR-7：链路里任何地方都
+ * 不得插入**单程** OETF/EOTF；也绝不走 `submitStill`，那会对成片再跑一遍 filmic =
+ * 双重影调映射）。
  *
- * 素材分级（ADR-2）：编辑对象是**成片 JPEG**（OETF 之后），只能做后段风格化，
- * 改不了 WB/曝光 —— 底部文案必须把这条讲清楚，否则用户会以为在"重新显影"。
+ * 素材分级（ADR-2）：编辑对象是**成片 JPEG**（OETF 之后）—— **丢失的信息找不回来**
+ *（已裁切的高光、被降噪/去马赛克抹掉的细节），但**可逆的调整照做**（ADR-7 订正 v2）：
+ * 曝光/白平衡走线性域**成对往返**，对比度/饱和度/清晰度是显示域操作，LUT/暗角同理
+ *（E2-2 已实现并独立验收，E2-3 接入 UI）。
  *
  * 分辨率（E2-8，用户 2026-10-08 拍板）：**预览与导出同为全分辨率**（不再降采样到长边
  * 1600）—— 两者同分辨率、同参数、同 shader ⇒ "预览与导出不一致"这一整类问题从根上消失。
@@ -100,10 +121,11 @@ import kotlinx.coroutines.withContext
  * **打开时的画面 = 原片本身**（E2-1 架构师拍板）：LUT 强度初值强制 0（旁路），
  * 快照里的 LUT 与强度改为"原片风格"只读展示 + 一键套用，见 [editorOpenParams]。
  *
- * 参数面板（E2-1）：底部操作区上方的**可折叠区**（不是覆盖式浮层）—— 展开时预览区
+ * 参数面板（E2-1 / E2-3）：底部操作区上方的**可折叠区**（不是覆盖式浮层）—— 展开时预览区
  * 自动让位，画面完整可见。暗角最明显的地方是四角，浮层挡住底边两点等于让用户盲调。
  * 分组按"完整编辑器"预留（见 [EditorParamGroup]），但**只渲染引擎已实现并验收的组**
- *（ADR-12：不许假滑杆）。本轮 = 色彩（LUT）+ 暗角（[66][67][68]）。
+ *（ADR-12：不许假滑杆），顺序按 ADR §5.6⑥ 的处理顺序：**基础 → 色彩（LUT）→ 暗角**。
+ * 本轮 = 基础（[0][1..3][4][20..22][78]）+ 色彩（LUT）+ 暗角（[66][67][68]）。
  *
  * ⚠ 编辑器**不写任何拍摄用的 prefs**（`lut_id` / `lut_strength`）：这里的 LUT 选择
  * 只对本次编辑会话有效，退出即丢 —— 否则用户在编辑器里试个滤镜，回到相机页拍照
@@ -146,9 +168,9 @@ fun EditorScreen(
     var shown by remember { mutableStateOf<Bitmap?>(null) }
     // 按住看原图时显示的输入像素（从常驻 buffer 重建，见 LaunchedEffect(showOriginal)）
     var origBmp by remember { mutableStateOf<Bitmap?>(null) }
-    // 参数数组（长度 = CameraPresets.COUNT，编辑器只改得动 [34][66][67][68]；其余槽位原样带着
-    // —— 引擎侧只读
-    // [26][27][34][60][61][66][67][68]，其余槽位改了也不影响输出，ADR §5.1 I-2 契约）
+    // 参数数组（长度 = CameraPresets.COUNT）：编辑器只改得动基础五类 [0][1..3][4][20..22][78]、
+    // LUT 强度 [34] 与暗角 [66][67][68]；其余槽位原样带着（快照继承 → 导出时整体存回快照，
+    // 所以"没碰过的风格参数"不会因为进了一次编辑器就丢）
     var params by remember { mutableStateOf<DoubleArray?>(null) }
     var lutId by remember { mutableStateOf<String?>(null) }   // 本会话的 LUT（不持久化）
     var lutK by remember { mutableFloatStateOf(0f) }          // = params[34]；初值 0 = 与原片一致
@@ -157,6 +179,11 @@ fun EditorScreen(
     var snapLutK by remember { mutableFloatStateOf(0f) }
     var hasSnapshot by remember { mutableStateOf(false) }
     var panelOpen by remember { mutableStateOf(false) }
+    // 面板"重建计数"（E2-3）：StrengthRow 的读数 state 只在首次组合时读初值（组件内部
+    // remember，无 key，且它的 initial 参数不受本卡控制）。所以凡是**绕过滑杆**改了参数
+    // 的操作（各组「重置」、套用原片风格），都要 ++ 让面板子树重建一次 —— 否则画面变了、
+    // 滑杆读数还停在原处，等于把 ADR-12 的假滑杆反过来演一遍（读数与状态不符）。
+    var panelRefresh by remember { mutableIntStateOf(0) }
     var showOriginal by remember { mutableStateOf(false) }     // 按住预览 = 看输入原图
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     var exporting by remember { mutableStateOf(false) }
@@ -166,7 +193,8 @@ fun EditorScreen(
     var pendingRender by remember { mutableStateOf(false) }
 
     /**
-     * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 暗角三条 / LUT 强度全在这一条里）。
+     * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 基础五类 / 暗角三条 / LUT 强度
+     * 全在这一条里）。
      *
      * 为什么不拆成几个函数各记各的：本项目踩过"字段写进别的函数 ⇒ 真机日志缺项"的坑
      *（ADR §5.4 T-2）—— 一条日志里字段齐全，真机一次运行就能核对全部规格。
@@ -182,6 +210,8 @@ fun EditorScreen(
             kv(
                 "w" to w, "h" to h, "ms" to ms, "dragging" to dragging,
                 "dragTicks" to ticks, "ok" to ok, "memMb" to previewResidentMb(w, h),
+                "ev" to film[0], "wbR" to film[1], "wbG" to film[2], "wbB" to film[3],
+                "contrast" to film[4], "sat" to film[21], "clarity" to film[78],
                 "strength" to film[66], "radius" to film[67], "feather" to film[68],
                 "lut" to film[34],
             ),
@@ -254,6 +284,7 @@ fun EditorScreen(
             lutK = 0f
             film[34] = 0.0                    // 关闭 = 强度 0（引擎 uLutOn = 0 整段旁路）
             engine.setLut(null)
+            panelRefresh++                    // 强度行消失/读数归位（见 panelRefresh 的 KDoc）
             rerender()
             return
         }
@@ -267,6 +298,9 @@ fun EditorScreen(
             lutK = k
             film[34] = k.toDouble()
             engine.setLut(lut)
+            // 强度是"绕过滑杆"改的（本函数直接写 [34]）：不重建的话，用户点卡片/套用原片
+            // 风格后滑杆读数还停在旧值（画面变了、读数没变 = ADR-12 禁止的假滑杆的镜像）
+            panelRefresh++
             rerender()
         }
     }
@@ -296,7 +330,53 @@ fun EditorScreen(
             status = "原片用的 LUT 已不在库中"
             return
         }
-        applyLut(entry, snapLutK)
+        applyLut(entry, snapLutK)   // 强度读数归位由 applyLut 统一负责
+    }
+
+    // ── 「基础」五类滑杆（E2-3）：曝光 [0] / 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] /
+    // 清晰度 [78]。与暗角同一范式（E2-8）：拖动中只写槽位 + gate.onValueChange()，
+    // 松手统一走 [onSliderRelease] 渲染一次 —— 全分辨率渲染约百毫秒，拖动中渲染 = 画面抖动。
+    // 槽位映射（含对比度"端点禁用 0"、饱和度"同写三槽"两个陷阱）全在 EditorExport.kt 的纯函数里。
+    fun setExposure(ui: Float) {
+        params?.let { it[0] = expSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setWbR(ui: Float) {
+        params?.let { it[1] = wbGainSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setWbG(ui: Float) {
+        params?.let { it[2] = wbGainSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setWbB(ui: Float) {
+        params?.let { it[3] = wbGainSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setContrast(ui: Float) {
+        params?.let { it[4] = contrastSlot(ui) }
+        gate.onValueChange()
+    }
+
+    fun setSaturation(ui: Float) {
+        params?.let { writeSaturation(it, ui) }
+        gate.onValueChange()
+    }
+
+    fun setClarity(ui: Float) {
+        params?.let { it[78] = claritySlot(ui) }
+        gate.onValueChange()
+    }
+
+    /** 「基础」组重置（E2-3）：五类参数回恒等值 —— 离散操作，直接渲染一次（不经过 gate） */
+    fun resetBasic() {
+        params?.let { resetBasicParams(it) }
+        panelRefresh++
+        rerender()
     }
 
     // ── 暗角三条滑杆（E2-1 / E2-8）：只改同一份 params 的 [66][67][68] ⇒ 预览与导出天然一致 ──
@@ -316,6 +396,17 @@ fun EditorScreen(
     fun setVigFeather(ui: Float) {
         params?.let { it[68] = vigFeatherSlot(ui) }
         gate.onValueChange()
+    }
+
+    /**
+     * 「暗角」组重置：强度归 0 = **关**（引擎侧 [66] ≥ 0 ⇒ 整段跳过）。半径/羽化在强度为 0
+     * 时对画面没有任何影响，保持原值即可 —— 少一次无意义的写入，语义也更清楚（"重置"=
+     * 回到恒等 = 没有暗角）。
+     */
+    fun resetVignette() {
+        params?.let { it[66] = vigStrengthSlot(0f) }
+        panelRefresh++
+        rerender()
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -582,14 +673,13 @@ fun EditorScreen(
                 exit = FilmMotion.panelExit,
             ) {
                 EditorParamsPanel(
+                    params = params,
+                    refreshTick = panelRefresh,
                     lutId = lutId,
                     lutK = lutK,
                     previews = lutPreviews,
                     snapLutId = snapLutId,
                     snapLutK = snapLutK,
-                    vigStrength = params?.let { vigStrengthUi(it[66]) } ?: 0f,
-                    vigRadius = params?.let { vigRadiusUi(it[67]) } ?: 0.8f,
-                    vigFeather = params?.let { vigFeatherUi(it[68]) } ?: 0.5f,
                     onLutStrength = { v ->
                         lutK = v
                         params?.let { it[34] = v.toDouble() }
@@ -598,10 +688,22 @@ fun EditorScreen(
                     onLutStrengthFinished = { onSliderRelease() },
                     onPickLut = { e -> pickLut(e) },
                     onApplySnapshot = { applySnapshotStyle() },
+                    // 基础五类（E2-3）：拖动中只写槽位，松手统一渲染一次
+                    onExposure = { v -> setExposure(v) },
+                    onWbR = { v -> setWbR(v) },
+                    onWbG = { v -> setWbG(v) },
+                    onWbB = { v -> setWbB(v) },
+                    onContrast = { v -> setContrast(v) },
+                    onSaturation = { v -> setSaturation(v) },
+                    onClarity = { v -> setClarity(v) },
+                    onBasicFinished = { onSliderRelease() },
                     onVigStrength = { v -> setVigStrength(v) },
                     onVigRadius = { v -> setVigRadius(v) },
                     onVigFeather = { v -> setVigFeather(v) },
                     onVigFinished = { onSliderRelease() },
+                    onResetBasic = { resetBasic() },
+                    onResetColor = { applyLut(null, 0f) },
+                    onResetVignette = { resetVignette() },
                     onClose = { panelOpen = false },
                 )
             }
@@ -780,11 +882,9 @@ private class EditorInit(
  * 组多到一屏放不下时靠面板自身的纵向滚动兜住，不需要改结构）。
  */
 private enum class EditorParamGroup(val title: String, val implemented: Boolean) {
-    // TODO(E2-2 基础调整)：曝光 / 白平衡 / 对比度 / 饱和度 / 清晰度。E2-2 正在扩契约
-    //  （`FilmParams.h` 的 [78] clarity 等）并在 `kFsStyle` 内实现 —— 等它的滑杆落地后
-    //  把本项置 true、在 [EditorParamsPanel] 里加分支。曝光与 WB 要走"真 sRGB 解码 →
-    //  线性域增益 → 真 sRGB 编码"的往返，对比度/饱和度/清晰度是显示域操作。
-    BASIC("基础", false),
+    // E2-3 接入：曝光 [0] / 白平衡 [1..3] / 对比度 [4] / 饱和度 [20..22] / 清晰度 [78]。
+    // 引擎侧 E2-2 已实现并独立验收（曝光×WB 线性域成对往返 + 对比度/饱和度/清晰度显示域三段）。
+    BASIC("基础", true),
     COLOR("色彩", true),
     VIGNETTE("暗角", true),
     // TODO(E4-3 颗粒)：[26] 强度 / [27] ISO / [60] 密度偏置 / [61] 枢轴。E4-3 验收后置 true。
@@ -804,26 +904,51 @@ private enum class EditorParamGroup(val title: String, val implemented: Boolean)
  */
 @Composable
 private fun EditorParamsPanel(
+    /** 当前参数数组（长度 = `CameraPresets.COUNT`）：各组滑杆的初值都从这里读（槽位 → UI 纯函数） */
+    params: DoubleArray?,
+    /** 面板重建计数：重置 / 套用原片风格等"绕过滑杆"的改动后 ++，让滑杆读数归位（见调用点 KDoc） */
+    refreshTick: Int,
     lutId: String?,
     lutK: Float,
     previews: Map<String, Bitmap>,
     snapLutId: String?,
     snapLutK: Float,
-    vigStrength: Float,
-    vigRadius: Float,
-    vigFeather: Float,
     onLutStrength: (Float) -> Unit,
     /** LUT 强度滑杆**松手**（E2-8：拖动中不渲染，松手渲染一次） */
     onLutStrengthFinished: () -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onApplySnapshot: () -> Unit,
+    // ── 基础五类（E2-3）：onXxx = 拖动中（只写槽位），onBasicFinished = 松手（渲染一次）──
+    onExposure: (Float) -> Unit,
+    onWbR: (Float) -> Unit,
+    onWbG: (Float) -> Unit,
+    onWbB: (Float) -> Unit,
+    onContrast: (Float) -> Unit,
+    onSaturation: (Float) -> Unit,
+    onClarity: (Float) -> Unit,
+    onBasicFinished: () -> Unit,
     onVigStrength: (Float) -> Unit,
     onVigRadius: (Float) -> Unit,
     onVigFeather: (Float) -> Unit,
     onVigFinished: () -> Unit,
+    onResetBasic: () -> Unit,
+    onResetColor: () -> Unit,
+    onResetVignette: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
+    // 各组滑杆初值（槽位 → UI）：params 为 null（还没加载完）时用恒等值占位 ——
+    // 面板按钮在 phase != Ready 时是禁用的，正常进不到这一支。
+    val exp = params?.let { expUi(it[0]) } ?: 0f
+    val wbR = params?.let { wbGainUi(it[1]) } ?: 1f
+    val wbG = params?.let { wbGainUi(it[2]) } ?: 1f
+    val wbB = params?.let { wbGainUi(it[3]) } ?: 1f
+    val contrast = params?.let { contrastUi(it[4]) } ?: 1f
+    val sat = params?.let { satUi(it[21]) } ?: 1f
+    val clarity = params?.let { clarityUi(it[78]) } ?: 0f
+    val vigStrength = params?.let { vigStrengthUi(it[66]) } ?: 0f
+    val vigRadius = params?.let { vigRadiusUi(it[67]) } ?: 0.8f
+    val vigFeather = params?.let { vigFeatherUi(it[68]) } ?: 0.5f
     Column(
         Modifier
             .fillMaxWidth()
@@ -852,11 +977,34 @@ private fun EditorParamsPanel(
             )
         }
         // 只渲染引擎已实现并验收的组（ADR-12）；未实现的组连标题都不给 —— 空标题会让
-        // 用户以为"面板坏了"，而底部那行"下一版支持"已经把预期讲清楚了。
+        // 用户以为"面板坏了"。顺序 = enum 声明顺序 = ADR §5.6⑥ 的处理顺序
+        //（基础 → 色彩 → 暗角）。
         EditorParamGroup.entries.filter { it.implemented }.forEach { g ->
             SectionHeader(g.title)
+            // refreshTick 交给各组，由各组**只重建滑杆区**（重置 / 选 LUT / 套用原片风格后
+            // 读数归位；LazyRow 等无状态区不重建，滚动位置不会被顶回最左）
             when (g) {
+                EditorParamGroup.BASIC -> EditorBasicGroup(
+                    refreshTick = refreshTick,
+                    exp = exp,
+                    wbR = wbR,
+                    wbG = wbG,
+                    wbB = wbB,
+                    contrast = contrast,
+                    sat = sat,
+                    clarity = clarity,
+                    onExp = onExposure,
+                    onWbR = onWbR,
+                    onWbG = onWbG,
+                    onWbB = onWbB,
+                    onContrast = onContrast,
+                    onSat = onSaturation,
+                    onClarity = onClarity,
+                    onFinished = onBasicFinished,
+                    onReset = onResetBasic,
+                )
                 EditorParamGroup.COLOR -> EditorColorGroup(
+                    refreshTick = refreshTick,
                     lutId = lutId,
                     lutK = lutK,
                     previews = previews,
@@ -866,8 +1014,10 @@ private fun EditorParamsPanel(
                     onStrengthFinished = onLutStrengthFinished,
                     onPick = onPickLut,
                     onApplySnapshot = onApplySnapshot,
+                    onReset = onResetColor,
                 )
                 EditorParamGroup.VIGNETTE -> EditorVignetteGroup(
+                    refreshTick = refreshTick,
                     strength = vigStrength,
                     radius = vigRadius,
                     feather = vigFeather,
@@ -875,16 +1025,136 @@ private fun EditorParamsPanel(
                     onRadius = onVigRadius,
                     onFeather = onVigFeather,
                     onFinished = onVigFinished,
+                    onReset = onResetVignette,
                 )
                 // 未实现的组在上面已过滤掉；这里仅为 when 的穷尽性兜底
                 else -> Unit
             }
         }
         Text(
-            "基础（曝光 / 白平衡 / 对比度…）下一版支持",
+            "颗粒 / 光晕 / 局部调整在后续版本支持 · 已裁切的高光与丢失的细节找不回来",
             color = FilmTheme.CreamDim,
             fontSize = 11.sp,
             modifier = Modifier.padding(top = 14.dp),
+        )
+    }
+}
+
+/**
+ * 「基础」组（E2-3 本卡核心）：曝光 / 白平衡 / 对比度 / 饱和度 / 清晰度 —— 引擎侧 E2-2
+ * 已实现并独立验收，本组是它们**第一次能被用户调到**的入口。
+ *
+ * 读数一律是 [StrengthRow] 的百分比（该组件读数恒为 `v * 100%`，量程由 `range` 给）：
+ *  - **曝光** ±100% = ±3 EV（0% = 不变）
+ *  - **白平衡** 红/绿/蓝增益 50%..200%（100% = 不变；提高红 = 偏暖，提高蓝 = 偏冷）
+ *  - **对比度** 1%..200%（100% = 不变；下限 1% 而非 0% 见 [CONTRAST_UI_RANGE] 的 KDoc）
+ *  - **饱和度** 0%..200%（100% = 不变；一个滑杆同写 [20][21][22] 三槽）
+ *  - **清晰度** 0%..100%（0% = 关）
+ *
+ * 白平衡为什么是 R/G/B 三条而不是"色温/色调"两条：三条增益与三个槽位是**双射**，
+ * 往返精确、单测能守住；色温/色调是 2 个自由度映射到 3 个增益，逆映射不唯一
+ *（同一组增益可对应多组色温/色调）⇒ 用户松手后读数会跳，且需要引入一个近似的色温模型。
+ *
+ * E2-8：所有滑杆**拖动中只更新参数与读数**（`onXxx`），松手（[onFinished]）才渲染一次。
+ */
+@Composable
+private fun EditorBasicGroup(
+    /** 面板重建计数（见 [EditorParamsPanel] 调用点）：重置后让滑杆读数归位 */
+    refreshTick: Int,
+    exp: Float,
+    wbR: Float,
+    wbG: Float,
+    wbB: Float,
+    contrast: Float,
+    sat: Float,
+    clarity: Float,
+    onExp: (Float) -> Unit,
+    onWbR: (Float) -> Unit,
+    onWbG: (Float) -> Unit,
+    onWbB: (Float) -> Unit,
+    onContrast: (Float) -> Unit,
+    onSat: (Float) -> Unit,
+    onClarity: (Float) -> Unit,
+    onFinished: () -> Unit,
+    onReset: () -> Unit,
+) {
+    GroupReset(onReset)
+    Text(
+        "曝光 ±100% = ±3 EV · 白平衡/对比度/饱和度 100% = 不变 · 清晰度 0% = 关",
+        color = FilmTheme.CreamDim,
+        fontSize = 11.sp,
+        modifier = Modifier.padding(top = 2.dp),
+    )
+    // key(refreshTick)：重置后重建滑杆区 ⇒ 读数重新从槽位读初值（否则画面回恒等、
+    // 滑杆还停在原处）。只包滑杆，不包整组。
+    key(refreshTick) {
+        StrengthRow(
+            initial = exp,
+            onCommit = onExp,
+            onFinished = { onFinished() },
+            label = "曝光",
+            range = EXP_UI_RANGE,
+        )
+        StrengthRow(
+            initial = wbR,
+            onCommit = onWbR,
+            onFinished = { onFinished() },
+            label = "红",
+            range = WB_GAIN_UI_RANGE,
+        )
+        StrengthRow(
+            initial = wbG,
+            onCommit = onWbG,
+            onFinished = { onFinished() },
+            label = "绿",
+            range = WB_GAIN_UI_RANGE,
+        )
+        StrengthRow(
+            initial = wbB,
+            onCommit = onWbB,
+            onFinished = { onFinished() },
+            label = "蓝",
+            range = WB_GAIN_UI_RANGE,
+        )
+        StrengthRow(
+            initial = contrast,
+            onCommit = onContrast,
+            onFinished = { onFinished() },
+            label = "对比度",
+            range = CONTRAST_UI_RANGE,
+        )
+        StrengthRow(
+            initial = sat,
+            onCommit = onSat,
+            onFinished = { onFinished() },
+            label = "饱和度",
+            range = SAT_UI_RANGE,
+        )
+        StrengthRow(
+            initial = clarity,
+            onCommit = onClarity,
+            onFinished = { onFinished() },
+            label = "清晰度",
+            range = CLARITY_UI_RANGE,
+        )
+    }
+}
+
+/**
+ * 组内「重置」（E2-3）：把本组参数回**恒等值**（画面回到"这组没动过"）。
+ * 右对齐小字，与"收起"同一形态（[pressScale] + 等宽小字）。
+ */
+@Composable
+private fun GroupReset(onReset: () -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        Text(
+            "重置",
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            fontFamily = FilmTheme.Mono,
+            modifier = Modifier
+                .pressScale(onTap = onReset)
+                .padding(horizontal = 8.dp, vertical = 2.dp),
         )
     }
 }
@@ -897,6 +1167,8 @@ private fun EditorParamsPanel(
  */
 @Composable
 private fun EditorColorGroup(
+    /** 面板重建计数：选卡片 / 套用原片风格 / 重置后让强度读数归位 */
+    refreshTick: Int,
     lutId: String?,
     lutK: Float,
     previews: Map<String, Bitmap>,
@@ -906,11 +1178,14 @@ private fun EditorColorGroup(
     onStrengthFinished: () -> Unit,
     onPick: (LutLibrary.Entry?) -> Unit,
     onApplySnapshot: () -> Unit,
+    onReset: () -> Unit,
 ) {
     val context = LocalContext.current
     // 快照里的 LUT 可能已被用户从 LUT 库删掉（byId = null）：如实说明"已不在库中"，
     // 并且**不给**套用按钮（点了注定失败的操作比没有按钮更糟）
     val snapEntry = snapLutId?.let { LutLibrary.byId(context, it) }
+    // 「重置」= 关闭 LUT（强度 0，引擎整段旁路）= 与点「无」卡片同一条路径
+    GroupReset(onReset)
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
             when {
@@ -940,8 +1215,12 @@ private fun EditorColorGroup(
     }
     // 强度只对已选中的 LUT 有意义；0% = 与原片一致（引擎侧 [34] = 0 整段旁路）
     // 松手（onFinished）才渲染：E2-8 —— 拖动中只更新 [34] 与读数
-    if (lutId != null) {
-        StrengthRow(initial = lutK, onCommit = onStrength, onFinished = { onStrengthFinished() })
+    // key(refreshTick)：选卡片 / 套用原片风格会绕过滑杆改 [34]，重建这一行读数才归位
+    //（LazyRow 在 key 外，卡片列表的滚动位置不受影响）
+    key(refreshTick) {
+        if (lutId != null) {
+            StrengthRow(initial = lutK, onCommit = onStrength, onFinished = { onStrengthFinished() })
+        }
     }
     LazyRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -977,6 +1256,8 @@ private fun EditorColorGroup(
  */
 @Composable
 private fun EditorVignetteGroup(
+    /** 面板重建计数（见 [EditorParamsPanel] 调用点）：重置后让滑杆读数归位 */
+    refreshTick: Int,
     strength: Float,
     radius: Float,
     feather: Float,
@@ -984,34 +1265,39 @@ private fun EditorVignetteGroup(
     onRadius: (Float) -> Unit,
     onFeather: (Float) -> Unit,
     onFinished: () -> Unit,
+    onReset: () -> Unit,
 ) {
+    GroupReset(onReset)
     Text(
         "强度 0% = 关闭 · 半径越大暗角越靠外 · 羽化越大过渡越柔",
         color = FilmTheme.CreamDim,
         fontSize = 11.sp,
         modifier = Modifier.padding(top = 2.dp),
     )
-    StrengthRow(
-        initial = strength,
-        onCommit = onStrength,
-        onFinished = { onFinished() },
-        label = "强度",
-        range = 0f..1f,
-    )
-    StrengthRow(
-        initial = radius,
-        onCommit = onRadius,
-        onFinished = { onFinished() },
-        label = "半径",
-        range = 0f..2f,
-    )
-    StrengthRow(
-        initial = feather,
-        onCommit = onFeather,
-        onFinished = { onFinished() },
-        label = "羽化",
-        range = 0f..2f,
-    )
+    // key(refreshTick)：重置后重建滑杆区，三条读数一起归位（强度回 0%，半径/羽化不动）
+    key(refreshTick) {
+        StrengthRow(
+            initial = strength,
+            onCommit = onStrength,
+            onFinished = { onFinished() },
+            label = "强度",
+            range = 0f..1f,
+        )
+        StrengthRow(
+            initial = radius,
+            onCommit = onRadius,
+            onFinished = { onFinished() },
+            label = "半径",
+            range = 0f..2f,
+        )
+        StrengthRow(
+            initial = feather,
+            onCommit = onFeather,
+            onFinished = { onFinished() },
+            label = "羽化",
+            range = 0f..2f,
+        )
+    }
 }
 
 /**

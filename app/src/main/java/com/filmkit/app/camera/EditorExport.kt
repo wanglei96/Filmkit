@@ -102,6 +102,140 @@ internal fun vigFeatherSlot(ui: Float): Double = ui.coerceIn(0f, 2f).toDouble() 
 internal fun vigFeatherUi(slot: Double): Float =
     if (!slot.isFinite()) 0.5f else (slot / 100.0).coerceIn(0.0, 2.0).toFloat()
 
+/**
+ * 基础调整的 UI ↔ 槽位映射（E2-3）。与上面暗角同一范式：**纯逻辑、无 Android 依赖**
+ * ⇒ JVM 单测直接覆盖往返与边界。
+ *
+ * 槽位语义（E2-2 已实现并独立验收，见 ADR「架构师裁决（2026-10-09）」）：
+ *  - [0]      曝光 EV（线性域 × 2^ev），恒等 **0**
+ *  - [1..3]   白平衡 RGB 增益（线性域），恒等 **1,1,1**
+ *  - [4]      对比度（显示域绕中灰），恒等 **1**
+ *  - [20..22] 分区饱和度（引擎读 [21]），恒等 **1,1,1**
+ *  - [78]     清晰度（显示域局部对比），恒等 **0 = 关**
+ *
+ * UI 约定：滑杆读数由 [com.filmkit.app.ui.StrengthRow] 渲染，恒为 `v * 100%`，
+ * 所以下面每条都给出"百分比 ↔ 槽位"的对应（[EXP_UI_RANGE] 等量程常量由 UI 与
+ * 映射函数**共用同一份定义** —— 否则滑杆能拖到 clamp 之外，读数与槽位不符 = 假滑杆）。
+ */
+
+/** 曝光 UI 量程：显示 −100%..+100%，对应槽位 −3..+3 EV（0% = 不变）。 */
+internal val EXP_UI_RANGE = -1f..1f
+
+/** 白平衡增益 UI 量程：显示 50%..200%（100% = 不变）。 */
+internal val WB_GAIN_UI_RANGE = 0.5f..2f
+
+/**
+ * 对比度槽位下限（**Double** 字面量：`0.01f.toDouble()` = 0.009999999776…，会把槽位压到
+ * 0.01 以下 —— 硬规格写的是 [0.01, 2]，就用精确的那个数）。
+ */
+private const val CONTRAST_SLOT_MIN = 0.01
+
+/**
+ * 对比度 UI 量程：显示 1%..200%（100% = 不变）。
+ * **下限必须是 0.01 而不是 0**：`FilmParams::fromDoubles` 会把 [4] = 0 静默兜底成 1.0
+ *（既存防"全画面同一灰度"逻辑）⇒ 滑杆若能拖到 0，用户看到的是"拖到底了画面却没变"
+ *（ADR-12 的假滑杆）。
+ */
+internal val CONTRAST_UI_RANGE = CONTRAST_SLOT_MIN.toFloat()..2f
+
+/** 饱和度 UI 量程：显示 0%..200%（100% = 不变）。 */
+internal val SAT_UI_RANGE = 0f..2f
+
+/** 清晰度 UI 量程：显示 0%..100%（0% = 关，引擎整段跳过）。 */
+internal val CLARITY_UI_RANGE = 0f..1f
+
+/** UI 曝光满量程对应的 EV 数（UI ±1.0 = ±3 EV）。 */
+private const val EXP_UI_TO_EV = 3.0
+
+/** UI 曝光（−1..1 = 显示 ±100%）→ 槽位 [0]（−3..+3 EV）。 */
+internal fun expSlot(ui: Float): Double =
+    ui.coerceIn(EXP_UI_RANGE.start, EXP_UI_RANGE.endInclusive) * EXP_UI_TO_EV
+
+/** 槽位 [0]（−3..+3 EV）→ UI 曝光（−1..1）。坏数据（NaN/Inf）回落到恒等 0。 */
+internal fun expUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    (slot / EXP_UI_TO_EV)
+        .coerceIn(EXP_UI_RANGE.start.toDouble(), EXP_UI_RANGE.endInclusive.toDouble())
+        .toFloat()
+}
+
+/** UI 白平衡增益（0.5..2 = 显示 50%..200%）→ 槽位 [1]/[2]/[3]。 */
+internal fun wbGainSlot(ui: Float): Double =
+    ui.coerceIn(WB_GAIN_UI_RANGE.start, WB_GAIN_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [1]/[2]/[3] → UI 白平衡增益（0.5..2）。坏数据回落到恒等 1.0（= 100%）。 */
+internal fun wbGainUi(slot: Double): Float = if (!slot.isFinite()) {
+    1f
+} else {
+    slot.coerceIn(WB_GAIN_UI_RANGE.start.toDouble(), WB_GAIN_UI_RANGE.endInclusive.toDouble())
+        .toFloat()
+}
+
+/** UI 对比度（0.01..2 = 显示 1%..200%）→ 槽位 [4]。 */
+internal fun contrastSlot(ui: Float): Double = ui.toDouble().coerceIn(CONTRAST_SLOT_MIN, 2.0)
+
+/**
+ * 槽位 [4] → UI 对比度（0.01..2）。
+ * **0 与负数一律按 1.0（= 100% 不变）显示**：引擎的 `fromDoubles` 就是这么兜底的
+ *（[4] ≤ 0 ⇒ 1.0），显示 0.01 会与画面实际行为不符（用户以为在极端低对比，其实没变）。
+ */
+internal fun contrastUi(slot: Double): Float = if (!slot.isFinite() || slot <= 0.0) {
+    1f
+} else {
+    slot.coerceIn(CONTRAST_SLOT_MIN, 2.0).toFloat()
+}
+
+/** UI 饱和度（0..2 = 显示 0%..200%）→ 槽位 [20]/[21]/[22]（三槽同一个值）。 */
+internal fun satSlot(ui: Float): Double =
+    ui.coerceIn(SAT_UI_RANGE.start, SAT_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [21]（引擎读的那一档）→ UI 饱和度（0..2）。坏数据回落到恒等 1.0（= 100%）。 */
+internal fun satUi(slot: Double): Float = if (!slot.isFinite()) {
+    1f
+} else {
+    slot.coerceIn(SAT_UI_RANGE.start.toDouble(), SAT_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/**
+ * 一个饱和度滑杆**同写 [20][21][22] 三槽**（ADR §5.6④ 的硬约束）。
+ *
+ * 引擎当前只读 [21]，但将来改成按 luma 分区读取时，三槽不一致就会出现"滑杆只改了一档"
+ * 的隐性错 —— 所以从 UI 侧一次性写满三槽。
+ */
+internal fun writeSaturation(p: DoubleArray, ui: Float) {
+    val v = satSlot(ui)
+    p[20] = v
+    p[21] = v
+    p[22] = v
+}
+
+/** UI 清晰度（0..1 = 显示 0%..100%）→ 槽位 [78]。 */
+internal fun claritySlot(ui: Float): Double =
+    ui.coerceIn(CLARITY_UI_RANGE.start, CLARITY_UI_RANGE.endInclusive).toDouble()
+
+/** 槽位 [78] → UI 清晰度（0..1）。坏数据回落到恒等 0（= 关）。 */
+internal fun clarityUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(CLARITY_UI_RANGE.start.toDouble(), CLARITY_UI_RANGE.endInclusive.toDouble())
+        .toFloat()
+}
+
+/**
+ * 「基础」组重置（E2-3）：五类参数回**恒等值** —— 曝光 0 / WB 1,1,1 / 对比度 1 /
+ * 饱和度 1,1,1 / 清晰度 0。只动这 7 个槽位，其余槽位（快照继承来的风格参数）原样保留。
+ */
+internal fun resetBasicParams(p: DoubleArray) {
+    p[0] = 0.0
+    p[1] = 1.0
+    p[2] = 1.0
+    p[3] = 1.0
+    p[4] = 1.0
+    writeSaturation(p, 1f)
+    p[78] = 0.0
+}
+
 /** 另存文件名：`FILMKIT_20261008-213000_edit.jpg`（同拍摄链路的命名规则，`_edit` 区分原片） */
 internal fun editorExportName(timeMs: Long): String =
     "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(timeMs))}_edit.jpg"
