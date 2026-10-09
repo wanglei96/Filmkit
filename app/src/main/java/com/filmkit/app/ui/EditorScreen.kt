@@ -49,7 +49,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -76,9 +75,9 @@ import com.filmkit.app.lut.LutLibrary
 import com.filmkit.app.lut.LutPreview
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
-import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -90,9 +89,11 @@ import kotlinx.coroutines.withContext
  * 素材分级（ADR-2）：编辑对象是**成片 JPEG**（OETF 之后），只能做后段风格化，
  * 改不了 WB/曝光 —— 底部文案必须把这条讲清楚，否则用户会以为在"重新显影"。
  *
- * 分辨率分级（架构师拍板）：**预览用降采样图**（长边 ≤1600，交互实时），
- * **导出时才解码全分辨率原图**（成片质量优先）。这样编辑器停留期间常驻内存是
- * 预览级的几 MB，而不是 12MP 的 50MB。
+ * 分辨率（E2-8，用户 2026-10-08 拍板）：**预览与导出同为全分辨率**（不再降采样到长边
+ * 1600）—— 两者同分辨率、同参数、同 shader ⇒ "预览与导出不一致"这一整类问题从根上消失。
+ * 代价是常驻内存从 ~9MB 抬到 ~96MB 级（12MP：输入 direct buffer + 输出位图各 ≈50MB），
+ * 所以配套三条纪律：① 滑杆**拖动中不渲染、松手才渲染一次**（[SliderRenderGate]）；
+ * ② 换输出位图前先回收旧的那张；③ 解码位图拷进 buffer 后立刻回收（[loadPreview]）。
  *
  * 参数起点（集成点 I-3）：打开时读该片的参数快照（`StillSnapshotStore`）；没有快照
  * 时回退 [CameraPresets.standard] 并在界面上明确提示"已用标准基线"（ADR-4）。
@@ -119,21 +120,10 @@ fun EditorScreen(
     onOpenGallery: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val configuration = LocalConfiguration.current
-    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
-    // 预览解码目标：长边 ≤ 1600px（"屏幕尺寸级"，架构师拍板）。inSampleSize 只认
-    // 2 的幂 ⇒ 实际落在 800~1600 之间（12MP 的 4080×3072 解成 1020×768≈3.1MB）。
-    // 全分辨率 12MP 的 RGBA8 是 50MB/张（输入+输出+Bitmap 同时持有 = 150MB+，
-    // 勘察报告 U7），预览一律不碰那个量级。
-    val previewLong = max(
-        1600,
-        max(
-            with(density) { configuration.screenWidthDp.dp.roundToPx() },
-            with(density) { configuration.screenHeightDp.dp.roundToPx() },
-        ),
-    )
+    // 滑杆 → 渲染闸门（E2-8）：拖动中只更新参数与读数，松手才渲染一次
+    val gate = remember { SliderRenderGate() }
 
     // 编辑器自己的渲染线程 + 引擎会话（见 EditorEngineSession 的 KDoc：相机页的
     // 渲染线程此时已随 onDispose 退出，预览实例 g_renderer 必须由编辑器重建）
@@ -154,6 +144,8 @@ fun EditorScreen(
     var source by remember { mutableStateOf<EditorSource?>(null) }
     // 当前显示的位图：先显示解码图，首次渲染完成后替换为引擎输出
     var shown by remember { mutableStateOf<Bitmap?>(null) }
+    // 按住看原图时显示的输入像素（从常驻 buffer 重建，见 LaunchedEffect(showOriginal)）
+    var origBmp by remember { mutableStateOf<Bitmap?>(null) }
     // 参数数组（长度 = CameraPresets.COUNT，编辑器只改得动 [34][66][67][68]；其余槽位原样带着
     // —— 引擎侧只读
     // [26][27][34][60][61][66][67][68]，其余槽位改了也不影响输出，ADR §5.1 I-2 契约）
@@ -170,25 +162,85 @@ fun EditorScreen(
     var exporting by remember { mutableStateOf(false) }
     var confirmOverwrite by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
+    // 导出期间被挡下的预览请求（导出独占引擎，见 rerender / finish）
+    var pendingRender by remember { mutableStateOf(false) }
 
-    /** 提交一次预览渲染（合并/节流语义见 [EditorEngineSession.requestPreview]） */
+    /**
+     * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 暗角三条 / LUT 强度全在这一条里）。
+     *
+     * 为什么不拆成几个函数各记各的：本项目踩过"字段写进别的函数 ⇒ 真机日志缺项"的坑
+     *（ADR §5.4 T-2）—— 一条日志里字段齐全，真机一次运行就能核对全部规格。
+     *
+     * `dragging` 恒 false 是**回归哨兵**：E2-8 的规格是"拖动中不渲染"，真机日志里若出现
+     * dragging=true，说明有人把渲染又接回了 onValueChange。`dragTicks` = 本次渲染之前
+     * 拖动中收到的值变更次数（拖动 60 次只产生 1 条渲染日志 = 规格成立）。
+     */
+    fun logRender(w: Int, h: Int, ms: Long, ticks: Int, ok: Boolean, dragging: Boolean = false) {
+        val film = params ?: return
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "editor.render",
+            kv(
+                "w" to w, "h" to h, "ms" to ms, "dragging" to dragging,
+                "dragTicks" to ticks, "ok" to ok, "memMb" to previewResidentMb(w, h),
+                "strength" to film[66], "radius" to film[67], "feather" to film[68],
+                "lut" to film[34],
+            ),
+        )
+    }
+
+    /**
+     * 延迟一帧回收位图：刚换下来的那张可能还在本帧的绘制管线里（硬件加速的纹理上传在
+     * RenderThread 上异步进行），当场 recycle 有概率踩崩。等 64ms（≈4 帧）再还，内存上
+     * 没有任何区别。scope 随编辑器销毁取消 ⇒ 没来得及回收的那张交给 GC（不漏也不崩）。
+     */
+    fun recycleLater(bmp: Bitmap) {
+        scope.launch {
+            delay(64)
+            bmp.recycle()
+        }
+    }
+
+    /**
+     * 提交一次预览渲染（**全分辨率**，E2-8）。调用点只有三类：打开时的首帧、离散操作
+     *（选 LUT / 套用原片风格）、**滑杆松手**（[onSliderRelease]）—— 拖动中一律不调。
+     */
     fun rerender() {
         val src = source ?: return
         val film = params ?: return
-        // ★ 导出期间**不再发预览请求**（架构师要求落实到这一侧）：导出走全分辨率，
-        // 而引擎的 still_tex_/tex_cap_ 按尺寸复用 —— 两种分辨率交替会反复重建
-        // 数十 MB 的纹理，既慢又平白增加失败面。
-        if (exporting) return
-        engine.requestPreview(
-            src.buffer, src.bitmap.width, src.bitmap.height, film.copyOf(),
-        ) { out ->
+        // ★ 导出期间**不再发预览请求**（架构师要求落实到这一侧）：预览与导出现在同为
+        // 全分辨率（纹理尺寸一致，不再反复重建），但导出必须独占 g_renderer ——
+        // 让预览插进去排队只会把导出拖长。被挡下的这一次记成 pending：导出收尾时
+        //（finish）补渲染一次，否则用户在导出中拖完滑杆松手，看到的还是导出前那张
+        //（参数变了、画面不变 = 假滑杆，ADR-12 明确禁止）。
+        if (exporting) {
+            pendingRender = true
+            return
+        }
+        pendingRender = false
+        val ticks = gate.takeTicks()
+        val t0 = System.currentTimeMillis()
+        engine.requestPreview(src.buffer, src.w, src.h, film.copyOf()) { out ->
+            logRender(src.w, src.h, System.currentTimeMillis() - t0, ticks, out != null)
             if (out != null) {
+                val old = shown
                 shown = out
+                // 输入侧两张显示位图（首帧那张解码位图 / 按住看原图重建的那张）到此作废：
+                // 引用先断（Image 改用输出图），内存延迟一帧再还。
+                // 连同上一张输出一起回收 —— 全分辨率下每张都是 50MB，一张都不能攒
+                //（distinct = 同一张只回收一次，Bitmap 没有重写 equals ⇒ 就是同一性去重）
+                origBmp = null
+                (listOfNotNull(old) + src.takeDisplayBitmaps()).distinct()
+                    .forEach { recycleLater(it) }
                 status = ""
             } else {
                 status = "渲染失败，显示原图"
             }
         }
+    }
+
+    /** 滑杆松手（E2-8）：这次拖动真的改过值才渲染一次 —— 只点一下滑杆不白跑一次全分辨率 */
+    fun onSliderRelease() {
+        if (gate.onFinished()) rerender()
     }
 
     /**
@@ -247,31 +299,23 @@ fun EditorScreen(
         applyLut(entry, snapLutK)
     }
 
-    // ── 暗角三条滑杆（E2-1）：只改同一份 params 的 [66][67][68] ⇒ 预览与导出天然一致 ──
-    // 拖动中每帧调 rerender()：EditorEngineSession.requestPreview 自己就是 latest-wins
-    // 合并（同时最多 1 个在跑 + 1 个待跑），**不再叠加任何时间节流**。
+    // ── 暗角三条滑杆（E2-1 / E2-8）：只改同一份 params 的 [66][67][68] ⇒ 预览与导出天然一致 ──
+    // E2-8（用户 2026-10-08 拍板）：拖动中**只更新参数与滑杆读数、一次都不渲染**（全分辨率
+    // 一次约百毫秒，每帧渲染 = 画面抖动 + 反复分配 50MB 位图）；松手走 [onSliderRelease]
+    // 渲染一次。滑杆读数由 StrengthRow 自己持有 state，不依赖这里触发重组。
     fun setVigStrength(ui: Float) {
         params?.let { it[66] = vigStrengthSlot(ui) }
-        rerender()
+        gate.onValueChange()
     }
 
     fun setVigRadius(ui: Float) {
         params?.let { it[67] = vigRadiusSlot(ui) }
-        rerender()
+        gate.onValueChange()
     }
 
     fun setVigFeather(ui: Float) {
         params?.let { it[68] = vigFeatherSlot(ui) }
-        rerender()
-    }
-
-    /** 拖动结束记一条诊断：真机日志才能核对"暗角参数确实下发进了引擎"（ADR §5.4 T-2） */
-    fun logVignette() {
-        val film = params ?: return
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "app", "editor.vignette",
-            kv("strength" to film[66], "radius" to film[67], "feather" to film[68]),
-        )
+        gate.onValueChange()
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -279,6 +323,9 @@ fun EditorScreen(
         scope.launch {
             exporting = false
             status = msg
+            // 导出期间被挡下的预览请求在这里补渲染一次：否则用户在导出中拖完滑杆松手，
+            // 画面会停在旧参数上（滑杆读数变了、画面没变 = 假滑杆）
+            if (pendingRender) rerender()
         }
     }
 
@@ -347,7 +394,11 @@ fun EditorScreen(
         exportExec.execute {
             // ① 覆盖要用的原片字节：读**一次**，既作回滚备份又作 EXIF 来源
             val origBytes = if (overwrite) readImageBytes(context, target) else null
-            // ② 全分辨率解码（成片质量优先；预览那张只有长边 ≤1600）
+            // ② 全分辨率解码（E2-8 起预览也是全分辨率，但这里仍**独立**解一份：导出期间
+            //    两条链路的位图生命周期必须解耦）。⚠ 峰值内存 = 预览 buffer + 预览输出 +
+            //    这份解码位图 + 导出 buffer + 导出输出 ≈ 5×48MiB ≈ 240MiB —— 12MP 设备上
+            //    已接近堆上限；后续卡若改成复用 src.buffer（预览与导出同分辨率同像素），
+            //    可直接省掉两份 48MiB
             val full = decodeFull(context, target)
             if (full == null) {
                 finish("原图解码失败，未做任何改动")
@@ -382,10 +433,12 @@ fun EditorScreen(
         }
     }
 
-    LaunchedEffect(uri, previewLong) {
+    // 全分辨率解码一次（E2-8）：key 只有 uri —— 转屏不再整张重解（旧 key 里带着按屏幕
+    // 尺寸算出的 previewLong，转屏 = 再解一次 12MP）。
+    LaunchedEffect(uri) {
         phase = EditorPhase.Loading
         status = "正在读取成片…"
-        val res = withContext(Dispatchers.IO) { loadPreview(context, uri, previewLong) }
+        val res = withContext(Dispatchers.IO) { loadPreview(context, uri) }
         when (res) {
             is LoadResult.Err -> {
                 phase = EditorPhase.Failed(res.reason)
@@ -394,7 +447,9 @@ fun EditorScreen(
             is LoadResult.Ok -> {
                 val src = res.src
                 source = src
-                shown = src.bitmap
+                // 首帧画面 = 输入本身（打开时 [34] 等参数就是"原片参数"，输出 ≈ 输入）：
+                // 解码那张位图还在就直接显示（零成本），首次渲染成功后才还回内存
+                shown = src.displayBitmap()
                 phase = EditorPhase.Ready
                 status = "正在渲染…"
                 // 参数起点 + 初始化引擎 + 上传 LUT 资产，全在 IO 线程做完再回主线程
@@ -475,7 +530,10 @@ fun EditorScreen(
                     }
                     EditorPhase.Ready -> {
                         val bmp = shown
-                        val orig = source?.bitmap
+                        // 按住看原图：显示输入像素 —— 由 LaunchedEffect(showOriginal) 在 IO
+                        // 线程从常驻 buffer 重建（见 EditorSource.displayBitmap），主线程零成本；
+                        // 还没就绪时退回显示成片，绝不白屏
+                        val orig = if (showOriginal) origBmp else null
                         if (bmp != null) {
                             // 按住画面 = 看输入原图（before/after）。用 onPress + tryAwaitRelease
                             // 而非 detectTapGestures(onLongPress)：按下即见、松手即回，不必等长按
@@ -535,14 +593,15 @@ fun EditorScreen(
                     onLutStrength = { v ->
                         lutK = v
                         params?.let { it[34] = v.toDouble() }
-                        rerender()
+                        gate.onValueChange()   // E2-8：拖动中只更新读数，松手才渲染
                     },
+                    onLutStrengthFinished = { onSliderRelease() },
                     onPickLut = { e -> pickLut(e) },
                     onApplySnapshot = { applySnapshotStyle() },
                     onVigStrength = { v -> setVigStrength(v) },
                     onVigRadius = { v -> setVigRadius(v) },
                     onVigFeather = { v -> setVigFeather(v) },
-                    onVigFinished = { logVignette() },
+                    onVigFinished = { onSliderRelease() },
                     onClose = { panelOpen = false },
                 )
             }
@@ -654,6 +713,23 @@ fun EditorScreen(
         }
     }
 
+    // 按住看原图：在 IO 线程从常驻 buffer 重建输入像素（12MP ≈20~40ms；解码那张位图若还在
+    // 则零成本直接命中）。松手即断引用并回收 —— 不留给下一次按住，也不让它跟输出位图一起
+    // 常驻（全分辨率下每个 50MB 都要算清楚）。
+    // key 只用 showOriginal：把 source 也放进 key 会在解码完成的瞬间误触发一次回收，
+    // 而那一刻 shown 正指向那张解码位图（首帧还没渲染回来）。
+    LaunchedEffect(showOriginal) {
+        val src = source ?: return@LaunchedEffect
+        if (showOriginal) {
+            origBmp = withContext(Dispatchers.IO) { src.displayBitmap() }
+        } else {
+            origBmp = null
+            // 只还回"按需重建"的那张：它从不作为 shown 显示，回收是安全的。
+            // （解码那张归 [EditorSource.takeDisplayBitmaps] 管 —— 首帧渲染成功时统一还）
+            src.dropRebuilt()?.let { recycleLater(it) }
+        }
+    }
+
     // 面板首次打开时才生成 LUT 卡片预览（复用拍摄页的一次性缓存，见 LutPreview）
     LaunchedEffect(panelOpen) {
         if (!panelOpen || lutPreviews.isNotEmpty()) return@LaunchedEffect
@@ -737,6 +813,8 @@ private fun EditorParamsPanel(
     vigRadius: Float,
     vigFeather: Float,
     onLutStrength: (Float) -> Unit,
+    /** LUT 强度滑杆**松手**（E2-8：拖动中不渲染，松手渲染一次） */
+    onLutStrengthFinished: () -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onApplySnapshot: () -> Unit,
     onVigStrength: (Float) -> Unit,
@@ -785,6 +863,7 @@ private fun EditorParamsPanel(
                     snapLutId = snapLutId,
                     snapLutK = snapLutK,
                     onStrength = onLutStrength,
+                    onStrengthFinished = onLutStrengthFinished,
                     onPick = onPickLut,
                     onApplySnapshot = onApplySnapshot,
                 )
@@ -824,6 +903,7 @@ private fun EditorColorGroup(
     snapLutId: String?,
     snapLutK: Float,
     onStrength: (Float) -> Unit,
+    onStrengthFinished: () -> Unit,
     onPick: (LutLibrary.Entry?) -> Unit,
     onApplySnapshot: () -> Unit,
 ) {
@@ -859,8 +939,9 @@ private fun EditorColorGroup(
         }
     }
     // 强度只对已选中的 LUT 有意义；0% = 与原片一致（引擎侧 [34] = 0 整段旁路）
+    // 松手（onFinished）才渲染：E2-8 —— 拖动中只更新 [34] 与读数
     if (lutId != null) {
-        StrengthRow(initial = lutK, onCommit = onStrength, onFinished = {})
+        StrengthRow(initial = lutK, onCommit = onStrength, onFinished = { onStrengthFinished() })
     }
     LazyRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -888,6 +969,11 @@ private fun EditorColorGroup(
  *
  * 量程与读数：强度 0..100%（0 = 关，引擎侧 [66] = 0 整段跳过）；半径/羽化 0..200%
  *（darktable `scale` / `falloff_scale` 本身就是百分比语义，默认 80 / 50）。
+ *
+ * E2-8：三条滑杆**拖动中只更新参数与读数、一次都不渲染**，松手（[StrengthRow] 的
+ * `onFinished` = RelativeSlider 的 onDragEnd）才渲染一次 —— 接线见 EditorScreen 的
+ * [SliderRenderGate] 与 `onSliderRelease`。所以 `onStrength`/`onRadius`/`onFeather` 是
+ * "拖动中"回调，`onFinished` 是"松手"回调，两者语义不可互换。
  */
 @Composable
 private fun EditorVignetteGroup(
@@ -928,6 +1014,48 @@ private fun EditorVignetteGroup(
     )
 }
 
+/**
+ * 滑杆 → 渲染的触发闸门（E2-8，用户 2026-10-08 拍板："可以拖完松手再渲染，不用实时渲染"）。
+ *
+ * 纯逻辑、不依赖 Android ⇒ JVM 单测能守住本卡最容易错的一条：**松手必须渲染**
+ *（拖动中漏渲染是规格本身，松手漏渲染 = 用户调完参数画面纹丝不动，属于致命 bug）。
+ *
+ * 为什么还要判"这次拖动改过值"：RelativeSlider 按下不改值（相对拖动），用户点一下滑杆
+ * 再松手时值根本没变 ⇒ 没必要白跑一次全分辨率渲染（≈百毫秒 + 两张 50MB 位图）。
+ */
+internal class SliderRenderGate {
+    private var dirty = false
+    private var ticks = 0
+
+    /** 拖动中（onValueChange）：只记状态 —— 调用方**不要**在这里渲染 */
+    fun onValueChange() {
+        dirty = true
+        ticks++
+    }
+
+    /** 松手（onValueChangeFinished）：这次拖动真的改过值才返回 true（= 该渲染一次） */
+    fun onFinished(): Boolean {
+        val render = dirty
+        dirty = false
+        return render
+    }
+
+    /** 取走并清零"自上次渲染以来拖动中收到的值变更次数"（诊断字段 dragTicks） */
+    fun takeTicks(): Int {
+        val n = ticks
+        ticks = 0
+        return n
+    }
+}
+
+/**
+ * 全分辨率预览的常驻内存估算（MB，纯函数）：输入 direct buffer + 输出位图各 4 字节/像素
+ *（RGBA8）。12MP（4080×3072）≈ 96MB —— 这就是 E2-8 把预览改成全分辨率后必须盯住的量级
+ *（首帧那一刻还要多一张解码位图，见 [EditorSource]）。向上取整：估算宁可高估不可低估。
+ */
+internal fun previewResidentMb(w: Int, h: Int): Int =
+    ((4L * w * h * 2 + (1024 * 1024 - 1)) / (1024 * 1024)).toInt()
+
 /** 编辑器页面状态：三态显式建模，避免"位图与错误同时非空"这类非法组合 */
 private sealed interface EditorPhase {
     data object Loading : EditorPhase
@@ -936,19 +1064,64 @@ private sealed interface EditorPhase {
 }
 
 /**
- * 解码出来的预览素材。
+ * 编辑素材（E2-8：**全分辨率**）。
  *
- * [buffer] 是 [bitmap] 像素的 **direct 副本**，渲染输入复用它 —— 滑杆每次变化只改参数、
- * 不重拷像素（省掉每次 3MB 的 copyPixelsToBuffer）。
- * [srcW]/[srcH] 是**原图**像素尺寸（底部读数用），不是预览尺寸。
+ * 像素只留**一份常驻**：[buffer] = 解码像素的 direct 副本（渲染输入，也是"看原图"的唯一
+ * 像素来源）。解码那张位图（[decoded]）只为首帧显示而活，首次渲染成功即由
+ * [takeDisplayBitmaps] 取走回收。
+ *
+ * 内存账（12MP = 4080×3072，见 [previewResidentMb]）：buffer ≈50MB + 输出位图 ≈50MB
+ * ⇒ 常驻 ≈96MB；首帧渲染那一刻再多一张解码位图（≈150MB 峰值，之后回落）。
+ *
+ * [srcW]/[srcH] 是**原图**尺寸（底部读数用）；[w]/[h] 是实际解码尺寸 —— 正常两者相等，
+ * 只有解码 OOM 降档后 w/h 才小于原图（宁可糊也不崩）。
  */
 private class EditorSource(
-    val bitmap: Bitmap,
+    /** 渲染输入：解码像素的 direct 副本（RGBA_8888 的内存布局即 R,G,B,A，与引擎约定同序） */
     val buffer: ByteBuffer,
+    val w: Int,
+    val h: Int,
     val name: String,
     val srcW: Int,
     val srcH: Int,
-)
+) {
+    /** 解码位图：首帧画面（也是渲染失败 / 引擎不可用时的兜底画面） */
+    var decoded: Bitmap? = null
+
+    /** "按住看原图"按需重建的位图（解码那张已回收后才会出现）。跨线程读写 ⇒ Volatile */
+    @Volatile
+    private var rebuilt: Bitmap? = null
+    private var dead = false
+
+    /**
+     * 输入像素的显示位图：解码那张还在就直接用（零成本），否则从常驻 [buffer] 重建一份并
+     * 缓存。调用方应在 IO 线程调用（12MP 重建 ≈20~40ms）。失败（OOM）返回 null 且不再重试。
+     */
+    fun displayBitmap(): Bitmap? {
+        decoded?.let { return it }
+        rebuilt?.let { return it }
+        if (dead) return null
+        return try {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                copyPixelsFromBuffer(buffer.duplicate().apply { rewind() })
+            }.also { rebuilt = it }
+        } catch (t: Throwable) {
+            dead = true
+            null
+        }
+    }
+
+    /** 取走输入侧全部显示位图（调用方负责回收）。首次成功渲染后调 —— 此时画面已是引擎输出 */
+    fun takeDisplayBitmaps(): List<Bitmap> {
+        val out = listOfNotNull(decoded, rebuilt)
+        decoded = null
+        rebuilt = null
+        return out
+    }
+
+    /** 取走"按需重建"那张（松开"看原图"时调）：它从不作为主画面显示，回收是安全的 */
+    fun dropRebuilt(): Bitmap? = rebuilt?.also { rebuilt = null }
+}
 
 private sealed interface LoadResult {
     class Ok(val src: EditorSource) : LoadResult
@@ -956,10 +1129,15 @@ private sealed interface LoadResult {
 }
 
 /**
- * 读图（IO 线程）：先只读尺寸（inJustDecodeBounds）算采样比，再按采样比解码。
- * 先解码再缩是不行的 —— 大图在解码那一步就已经 OOM 了。
+ * 读图（IO 线程）：**全分辨率解码**（E2-8 用户 2026-10-08 拍板：预览与导出同分辨率，
+ * 见文件头 KDoc）。不再按屏幕尺寸降采样，只保留 OOM 兜底 —— 解不出来（超大图 / 低内存
+ * 设备）就**降一档重试一次**（inSampleSize ×2 = 长边减半，宁可糊也不崩），仍失败才报错。
+ * 尺寸预读（inJustDecodeBounds）只为拿**原图**尺寸做底部读数。
+ *
+ * 解码位图同时是首帧画面（[EditorSource.decoded]），首次渲染成功后由 rerender 回收 ——
+ * 首帧总得显示点什么，这张并不额外抬高常驻峰值。
  */
-private fun loadPreview(context: Context, uri: Uri?, targetLong: Int): LoadResult {
+private fun loadPreview(context: Context, uri: Uri?): LoadResult {
     if (uri == null) return LoadResult.Err("没有可编辑的成片")
     val resolver = context.contentResolver
 
@@ -973,30 +1151,33 @@ private fun loadPreview(context: Context, uri: Uri?, targetLong: Int): LoadResul
     val srcH = bounds.outHeight
     if (srcW <= 0 || srcH <= 0) return LoadResult.Err("图片已失效或无法读取")
 
-    // inSampleSize 只认 2 的幂（给别的值也会向下取整）：取"长边首次不超过目标"的那一档
-    var sample = 1
-    while (max(srcW, srcH) / sample > targetLong) sample *= 2
-
     // 文件名一律走 StillSnapshotStore.fileNameOf（ADR 集成点 I-1）：参数快照的键就是它，
     // 两处各写一份实现，一旦行为不一致，编辑器查到的键就不是落盘时那个（静默取不到快照）。
     // 查不到时的兜底保留原样（URI 末段 → "成片"）。
     val name = StillSnapshotStore.fileNameOf(context, uri) ?: uri.lastPathSegment ?: "成片"
-    // OOM 兜底：极端大图 / 低内存设备上降一档重试一次，仍失败才报错（宁可糊也不崩）
+    // 第一趟原尺寸（1），OOM 后降一档（2 = 长边减半）重试一次
+    var sample = 1
     repeat(2) {
+        var bmp: Bitmap? = null
         try {
             val options = BitmapFactory.Options().apply { inSampleSize = sample }
-            val bitmap = resolver.openInputStream(uri)?.use {
+            bmp = resolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, options)
             } ?: return LoadResult.Err("图片已失效或无法读取")
-            // 渲染输入：像素的一次性 direct 副本（RGBA_8888 的内存布局即 R,G,B,A，
-            // 与引擎的 RGBA8 约定一致，不需要任何通道重排）
-            val bytes = ByteBuffer.allocateDirect(bitmap.width * bitmap.height * 4)
-            bitmap.copyPixelsToBuffer(bytes)
+            val w = bmp.width
+            val h = bmp.height
+            val bytes = ByteBuffer.allocateDirect(w * h * 4)
+            bmp.copyPixelsToBuffer(bytes)
             bytes.rewind()
-            return LoadResult.Ok(EditorSource(bitmap, bytes, name, srcW, srcH))
+            return LoadResult.Ok(
+                EditorSource(bytes, w, h, name, srcW, srcH).also { it.decoded = bmp },
+            )
         } catch (_: OutOfMemoryError) {
+            // 降档前先把这一份还回去，否则重试时两份同时在（全分辨率下每份 50MB）
+            bmp?.recycle()
             sample *= 2
         } catch (_: Throwable) {
+            bmp?.recycle()
             return LoadResult.Err("图片已失效或无法读取")
         }
     }
