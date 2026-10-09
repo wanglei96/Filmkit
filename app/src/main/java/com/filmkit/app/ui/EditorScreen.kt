@@ -378,8 +378,13 @@ fun EditorScreen(
     // 唯一来源就是这一个 pressed（[OriginalViewState]）—— 不再有"按钮锁定"那一路。
     var origView by remember { mutableStateOf(OriginalViewState()) }
     val showOriginal = origView.showing
-    // 「取消」的二次确认（E2-15）：有修改才弹（判据 = E2-9 的 paramsUnchanged，见 [discardNeedsConfirm]）
-    var confirmDiscard by remember { mutableStateOf(false) }
+    // ── E2-24 离开编辑器的**统一收口** ─────────────────────────────────────
+    // 三条离开路径（「取消」/ 顶栏菜单图标 / 系统返回）全部走 [requestExit]；`pendingExit` =
+    // 正在等用户确认的**那一个出口**（null = 没有待确认的出口 ⇒ 确认框不显示）。
+    // 为什么是一个状态而不是 E2-15 那样的 Boolean：确认框「放弃」之后要去哪，取决于**谁**触发的
+    // 离开（返回键 ⇒ 回上一页；菜单 ⇒ 回相册）—— 只记"要不要确认"会把两者混成一条路。
+    // 单一状态也保证**只有一个**确认框（不存在两个对话框同时挂着的可能）。
+    var pendingExit by remember { mutableStateOf<ExitTarget?>(null) }
     var lutPreviews by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     var exporting by remember { mutableStateOf(false) }
     var confirmOverwrite by remember { mutableStateOf(false) }
@@ -729,17 +734,28 @@ fun EditorScreen(
         EditorPanelState.afterDrag(panel, dy, threshold)?.let { panel = it }
     }
 
-    /**
-     * 「取消」（E2-15 用户反馈："如果改过参数，弹一句『放弃本次修改？』→ 确认才退出"）：
-     * 无修改直接退出（不打扰），有修改先弹确认 —— 判据是 E2-9 的 [discardNeedsConfirm]
-     * （= `paramsUnchanged` 的包装），与导出直通判据**同一份逻辑**。
-     */
-    fun onCancel() {
-        if (discardNeedsConfirm(params, openParams, cropDirty = !crop.isFull)) {
-            confirmDiscard = true
-        } else {
-            onBack()
+    /** 真正切屏：出口 → 宿主回调（BACK = 回上一页，GALLERY = 相册）。 */
+    fun leave(target: ExitTarget) {
+        when (target) {
+            ExitTarget.BACK -> onBack()
+            ExitTarget.GALLERY -> onOpenGallery()
         }
+    }
+
+    /**
+     * 离开编辑器的**唯一请求入口**（E2-24，用户反馈："编辑一半直接点菜单会直接丢失全部编辑并
+     * 回到相册"）。三条路径都从这里走：
+     *  - 「取消」按钮 ⇒ [ExitTarget.BACK]（语义不变，仍回上一页）
+     *  - 顶栏菜单图标 ⇒ [ExitTarget.GALLERY]（去相册）
+     *  - 系统返回（面板已收起时）⇒ [ExitTarget.BACK]
+     *
+     * 判据是 E2-9 的 [discardNeedsConfirm]（= `paramsUnchanged` 的包装 + 裁剪），与导出直通
+     * **同一份逻辑**：无修改 ⇒ 直接走该出口（不打扰）；有修改 ⇒ 挂起出口弹确认（[pendingExitFor]）。
+     */
+    fun requestExit(target: ExitTarget) {
+        val needsConfirm = discardNeedsConfirm(params, openParams, cropDirty = !crop.isFull)
+        val pending = pendingExitFor(needsConfirm, target)
+        if (pending == null) leave(target) else pendingExit = pending
     }
 
     /** 导出收尾：状态改动一律回主线程（导出线程 / 渲染线程都会调到这里） */
@@ -974,12 +990,16 @@ fun EditorScreen(
         }
     }
 
-    // ★ E2-15 返回键**分层**（用户反馈："系统返回手势要可以收起编辑面板。目前编辑面板打开所有
-    // 照片点开默认展开收不起来！"）：面板展开时本 handler 启用 ⇒ 系统返回先**收起面板**（消费掉，
-    // 不退编辑器）；面板已收起时本 handler 不启用 ⇒ 返回事件落到宿主（MainActivity 的 Nav
-    // BackHandler）才退出编辑器。一次返回绝不会"面板还开着就直接退出"。
-    BackHandler(enabled = panel.expanded) {
-        panel = EditorPanelState.onBack(panel) ?: panel
+    // ★ E2-15 返回键**分层** + E2-24 **统一收口**（用户反馈："编辑一半直接点菜单会直接丢失全部
+    // 编辑并回到相册"）：本 handler **无条件启用** —— 以前只在 `panel.expanded` 时启用，面板一
+    // 收起返回事件就落到宿主（MainActivity 的 Nav BackHandler）⇒ 不弹确认直接换页，编辑全丢。
+    //
+    // 分层原样保留（E2-15 的验收点，用户明确说过"返回手势没问题"）：
+    //   面板展开 ⇒ 只收面板（[EditorPanelState.onBack] 消费掉这次返回，**绝不**退出编辑器）；
+    //   面板已收起 ⇒ requestExit(BACK)：有修改先弹确认，无修改直接退出。
+    BackHandler {
+        val collapsed = EditorPanelState.onBack(panel)
+        if (collapsed != null) panel = collapsed else requestExit(ExitTarget.BACK)
     }
 
     Box(
@@ -998,8 +1018,9 @@ fun EditorScreen(
             EditorTopBar(
                 enabled = !exporting && phase == EditorPhase.Ready,
                 exporting = exporting,
-                onCancel = { onCancel() },
-                onGallery = onOpenGallery,
+                onCancel = { requestExit(ExitTarget.BACK) },
+                // 相册入口（E2-24）：不再直接切屏 —— 有修改先弹确认，否则同样"点一下就丢光编辑"
+                onGallery = { requestExit(ExitTarget.GALLERY) },
                 onOverwrite = { confirmOverwrite = true },
                 onDone = { exportNow(false) },
             )
@@ -1471,12 +1492,15 @@ fun EditorScreen(
             )
         }
 
-        // ★ E2-15 「取消」的二次确认（用户反馈："如果改过参数，弹一句『放弃本次修改？』→ 确认才退出"）：
-        // 只有 [discardNeedsConfirm] 为真（= 参数与打开时不同）才会走到这里；无修改时「取消」
-        // 直接退出，不弹窗打扰。退出后回哪一页由路由层决定（E2-13 查看页），本页只管"放弃 + 退出"。
-        if (confirmDiscard) {
+        // ★ E2-24：三条离开路径**共用这一个**确认框（由 [pendingExit] 驱动，不存在第二个对话框）。
+        // 只有 [discardNeedsConfirm] 为真（参数与打开时不同，**或**裁了图）才会挂起出口走到这里；
+        // 无修改时三条路径都直接离开，不弹窗打扰。
+        // 「放弃」⇒ 走挂起的那个出口（[exitAfterConfirm]：BACK 回上一页 / GALLERY 回相册）；
+        // 「继续编辑」或点框外 ⇒ 只清空出口，留在编辑器（参数、裁剪、快照一律不动）。
+        val exit = pendingExit
+        if (exit != null) {
             AlertDialog(
-                onDismissRequest = { confirmDiscard = false },
+                onDismissRequest = { pendingExit = null },
                 shape = RoundedCornerShape(18.dp),
                 title = { Text("放弃本次修改？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
                 text = {
@@ -1488,12 +1512,12 @@ fun EditorScreen(
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        confirmDiscard = false
-                        onBack()
+                        pendingExit = null
+                        exitAfterConfirm(exit)?.let { leave(it) }
                     }) { Text("放弃", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono) }
                 },
                 dismissButton = {
-                    TextButton(onClick = { confirmDiscard = false }) {
+                    TextButton(onClick = { pendingExit = null }) {
                         Text("继续编辑", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
                     }
                 },
@@ -3041,6 +3065,36 @@ internal class SliderRenderGate {
         return n
     }
 }
+
+/**
+ * 编辑器的离开出口（E2-24）。三条离开路径收敛成这两个出口，**出口本身**决定确认后去哪：
+ *  - [BACK]：「取消」按钮、系统返回（面板已收起时）⇒ 回上一页（查看页 / 相机页，由路由层决定）
+ *  - [GALLERY]：顶栏菜单图标 ⇒ 回相册
+ *
+ * 为什么不直接存两个 lambda（`pendingExit: (() -> Unit)?`）：出口必须能在 JVM 单测里被断言
+ * "确认后走的是不是它"（[exitAfterConfirm]），lambda 断言不了。
+ */
+internal enum class ExitTarget { BACK, GALLERY }
+
+/**
+ * 请求离开时的**决策**（E2-24，纯逻辑）：需确认 ⇒ 返回待确认的那个出口（调用方弹确认框，
+ * 记住出口本身）；不需确认 ⇒ 返回 null，调用方**直接走** [target]（不打扰用户）。
+ *
+ * 判据（`needsConfirm`）由调用方从 [discardNeedsConfirm] 取 —— 与导出直通同一份逻辑，这里
+ * 不重复实现，只负责"要不要弹"这一层的选择。
+ */
+internal fun pendingExitFor(needsConfirm: Boolean, target: ExitTarget): ExitTarget? =
+    if (needsConfirm) target else null
+
+/**
+ * 用户在确认框里点「放弃」之后**实际走的出口**（E2-24，纯逻辑）：就是挂起的那个出口本身；
+ * `null`（出口已被清掉 / 框被点掉）⇒ 不动作。
+ *
+ * 这个恒等映射**就是分流的规格**：从菜单进来的（[ExitTarget.GALLERY]）确认后必须回相册，
+ * 从返回键进来的（[ExitTarget.BACK]）必须回上一页 —— 两者不许串（单测钉住，串了就是
+ * "点菜单确认后回上一页 / 按返回确认后跳相册"这种一眼可见的错）。
+ */
+internal fun exitAfterConfirm(pending: ExitTarget?): ExitTarget? = pending
 
 /**
  * 面板收起/展开的**纯逻辑状态机**（E2-15，用户真机反馈："系统返回手势要可以收起编辑面板。
