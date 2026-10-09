@@ -152,8 +152,11 @@ class EditorCropTest {
         assertEquals(4080 to 3072, cropViewSize(4080, 3072, 2))
         assertEquals(3072 to 4080, cropViewSize(4080, 3072, 3))
         assertEquals("超界 rot 取模", cropViewSize(4080, 3072, 5), cropViewSize(4080, 3072, 1))
-        // 不断言负 rot：`rot % 2 == 1` 对负数不成立（Kotlin 取模保号），而 rot 只由
-        // cropViewRotate 的 `(rot + 1) % 4` 产生 ⇒ 实际不可达（见交付报告的"不确定"一节）。
+        // ★ E2-12c：负 rot 先归一化再判奇偶（Kotlin `%` 保号 ⇒ `-1 % 2 == -1` 会被判成偶数）
+        assertEquals("-1 ≡ 3（奇数）", 3072 to 4080, cropViewSize(4080, 3072, -1))
+        assertEquals("-2 ≡ 2（偶数）", 4080 to 3072, cropViewSize(4080, 3072, -2))
+        assertEquals("-3 ≡ 1（奇数）", 3072 to 4080, cropViewSize(4080, 3072, -3))
+        assertEquals("-4 ≡ 0（偶数）", 4080 to 3072, cropViewSize(4080, 3072, -4))
     }
 
     /** 旋转按钮：4 步回到原状态，且 rot 恒在 0..3（不能让 rot 无界增长到引擎未定义分支）。 */
@@ -167,9 +170,147 @@ class EditorCropTest {
         }
         assertEquals(listOf(1, 2, 3, 0), seen)
         assertEquals("4 步必须回到原状态", CropView.FULL, v)
-        // 只改 rot：框不动（画面转、框不转）
+
+        // ★ E2-12c：画面转 ⇒ 框**跟随内容**转（以前"只改 rot、框不动" ⇒ 框住的画面区域
+        // 变了，锁定比例时更会直接锁不住 —— 见 cropViewRotateKeepsLockedPixelRatio）。
         val boxed = CropView(0.1f, 0.2f, 0.3f, 0.4f)
-        assertEquals(boxed, cropViewRotate(boxed).copy(rot = boxed.rot))
+        assertEquals(CropView(0.4f, 0.1f, 0.4f, 0.3f, 1), cropViewRotate(boxed))
+        val before = cropSpecOf(boxed, 4080, 3072)
+        val after = cropSpecOf(cropViewRotate(boxed), 4080, 3072)
+        assertEquals("覆盖的原图区域 x0 不变", before.x0, after.x0, 1e-6f)
+        assertEquals("覆盖的原图区域 y0 不变", before.y0, after.y0, 1e-6f)
+        assertEquals("覆盖的原图区域 cw 不变", before.cw, after.cw, 1e-6f)
+        assertEquals("覆盖的原图区域 ch 不变", before.ch, after.ch, 1e-6f)
+        assertEquals("rot 只前进一步", normalizeRot(before.rot + 1), after.rot)
+    }
+
+    /**
+     * ★ E2-12c 核心：**锁定比例 + 旋转 ⇒ 框的像素比仍等于锁定比例**。
+     *
+     * 缺陷原状（E2-12b 上报）：锁 1:1（源图 4080×3072 ⇒ 框 3072×3072）后旋转 90°，画面
+     * 宽高交换而框没重排 ⇒ 引擎入参变成 2313×4080（比值 0.567，期望 1.0）—— 用户直接点
+     * 「确认」就导出非 1:1。这里按**导出口径**（[cropSpecOf] + [CropSpec.outputSize]）断言，
+     * 正是缺陷实测的那条路径。
+     */
+    @Test
+    fun cropViewRotateKeepsLockedPixelRatio() {
+        val srcW = 4080
+        val srcH = 3072
+        val locked = listOf(
+            CropAspect.SQUARE, CropAspect.R4_3, CropAspect.R3_4, CropAspect.R16_9, CropAspect.ORIGINAL,
+        )
+        for (a in locked) {
+            for (steps in 1..3) {
+                // 模拟「点比例锁定 → 连点 steps 次旋转」
+                var rot = 0
+                var v = cropViewWithAspect(CropView.FULL, a.ratio(srcW, srcH), srcW, srcH)
+                repeat(steps) {
+                    rot = (rot + 1) % 4
+                    val (vw, vh) = cropViewSize(srcW, srcH, rot)
+                    v = cropViewRotate(v, a.ratio(vw, vh), vw, vh)
+                }
+                val (vw, vh) = cropViewSize(srcW, srcH, rot)
+                val aspect = a.ratio(vw, vh)!!
+                val tag = "${a.label} 旋转 $steps 步"
+                assertEquals("$tag 框的像素比", aspect, (v.w * vw) / (v.h * vh), 1e-3f)
+                // 导出口径：引擎入参会按 outputSize 出图，这里的比值必须还是锁定值
+                val (ow, oh) = cropSpecOf(v, srcW, srcH).outputSize(srcW, srcH)
+                assertEquals("$tag 导出的像素比", aspect, ow.toFloat() / oh, 5e-3f)
+                assertEquals("$tag rot", rot, v.rot)
+                assertNoOverflow(tag, v)
+            }
+        }
+
+        // 缺陷实测口径（源图 4080×3072）：锁 1:1 ⇒ 框 3072×3072；旋转 90° 后必须**还是正方形**。
+        // 修正前：画面宽高交换而框没重排 ⇒ 导出的引擎入参 2313×4080（比值 0.567）；
+        // 修正后：保持中心按新朝向重排 ⇒ 2313×2313（转 180° 回 3072×3072）。
+        val (vw1, vh1) = cropViewSize(srcW, srcH, 1)
+        val locked11 = cropViewWithAspect(CropView.FULL, 1f, srcW, srcH)
+        assertEquals("锁 1:1（未旋转）", 3072 to 3072, specSize(locked11, srcW, srcH))
+        val square = cropViewRotate(locked11, 1f, vw1, vh1)
+        assertEquals("★ 旋转 90° 后必须还是正方形", 2313 to 2313, specSize(square, srcW, srcH))
+        val (vw2, vh2) = cropViewSize(srcW, srcH, 2)
+        val square180 = cropViewRotate(square, 1f, vw2, vh2)
+        assertEquals("旋转 180°", 3072 to 3072, specSize(square180, srcW, srcH))
+    }
+
+    /** 导出口径的像素尺寸（= 引擎入参 [CropSpec] + [CropSpec.outputSize]）。 */
+    private fun specSize(v: CropView, srcW: Int, srcH: Int): Pair<Int, Int> =
+        cropSpecOf(v, srcW, srcH).outputSize(srcW, srcH)
+
+    /** 锁定比例旋转：**中心不漂**（用户选的那块地儿不跳走）+ 任何方向都不越界。 */
+    @Test
+    fun cropViewRotateLockedKeepsCenterAndStaysInside() {
+        val srcW = 4080
+        val srcH = 3072
+        val start = CropView(0.25f, 0.25f, 0.5f, 0.5f)
+        val cx = (start.l + start.r) / 2f
+        val cy = (start.t + start.b) / 2f
+        // 锁定比例才有"保持中心"的约定；自由是"框跟随内容转"（中心本来就会随画面走）
+        for (a in CropAspect.entries.filter { it != CropAspect.FREE }) {
+            var v = start
+            var rot = 0
+            repeat(3) {
+                rot = (rot + 1) % 4
+                val (vw, vh) = cropViewSize(srcW, srcH, rot)
+                v = cropViewRotate(v, a.ratio(vw, vh), vw, vh)
+                val tag = "${a.label} rot=$rot"
+                assertEquals("$tag 中心 x 不得漂移", cx, (v.l + v.r) / 2f, 1e-5f)
+                assertEquals("$tag 中心 y 不得漂移", cy, (v.t + v.b) / 2f, 1e-5f)
+                assertNoOverflow(tag, v)
+            }
+        }
+    }
+
+    /**
+     * ★ E2-12c ②：负 rot（`-1` / `-3`）下 [cropViewSize] / `CropSpec.outputSize` 的判据
+     * 必须与 [cropSpecOf] 一致 —— 三处都走 [normalizeRot]，不能再出现"一处归一化、
+     * 另一处 `rot % 2 == 1` 判反"的静默不一致。
+     */
+    @Test
+    fun negativeRotNormalizedEverywhere() {
+        val box = CropSpec(0.25f, 0.25f, 0.5f, 0.5f)
+        assertEquals("rot=-1 ≡ 3（奇数 ⇒ 交换）", 1536 to 2040, box.copy(rot = -1).outputSize(4080, 3072))
+        assertEquals("rot=-2 ≡ 2（偶数）", 2040 to 1536, box.copy(rot = -2).outputSize(4080, 3072))
+        assertEquals("rot=-3 ≡ 1（奇数 ⇒ 交换）", 1536 to 2040, box.copy(rot = -3).outputSize(4080, 3072))
+        assertEquals("rot=-4 ≡ 0（偶数）", 2040 to 1536, box.copy(rot = -4).outputSize(4080, 3072))
+
+        for (rot in listOf(-1, -3, -4, -5, 4, 5, 7)) {
+            val v = CropView(0.12f, 0.30f, 0.45f, 0.25f, rot)
+            assertEquals(
+                "rot=$rot 的 cropSpecOf 必须与归一化值一致",
+                cropSpecOf(v.copy(rot = normalizeRot(rot)), 4080, 3072),
+                cropSpecOf(v, 4080, 3072),
+            )
+            assertEquals(
+                "rot=$rot 的 outputSize 必须与归一化值一致",
+                box.copy(rot = normalizeRot(rot)).outputSize(4080, 3072),
+                box.copy(rot = rot).outputSize(4080, 3072),
+            )
+            assertEquals(
+                "rot=$rot 的 cropViewSize 必须与归一化值一致",
+                cropViewSize(4080, 3072, normalizeRot(rot)),
+                cropViewSize(4080, 3072, rot),
+            )
+            assertEquals(
+                "rot=$rot 旋转后 rot 仍须落在 0..3（引擎只认这四路）",
+                normalizeRot(rot + 1),
+                cropViewRotate(v).rot,
+            )
+        }
+        // 负 rot 与它的等价正 rot 旋转结果完全相同（几何变换与当前 rot 无关）
+        assertEquals(
+            cropViewRotate(CropView(0.1f, 0.2f, 0.3f, 0.4f, 3)),
+            cropViewRotate(CropView(0.1f, 0.2f, 0.3f, 0.4f, -1)),
+        )
+    }
+
+    /** 框必须留在画面内（越界 ⇒ 引擎按越界 UV 采样 = 黑边/拉伸）。 */
+    private fun assertNoOverflow(tag: String, v: CropView) {
+        assertTrue("$tag 左边界越界", v.l >= -1e-5f)
+        assertTrue("$tag 上边界越界", v.t >= -1e-5f)
+        assertTrue("$tag 右边界越界", v.r <= 1f + 1e-5f)
+        assertTrue("$tag 下边界越界", v.b <= 1f + 1e-5f)
     }
 
     /** 已确认裁剪 → 再次进入裁剪模式的草稿框：4 个方向都必须精确往返（否则"框会跳"）。 */

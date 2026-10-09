@@ -1322,7 +1322,18 @@ fun EditorScreen(
                             cropDraft = cropViewWithAspect(cropDraft, a.ratio(vw, vh), vw, vh)
                         }
                     },
-                    onRotate = { cropDraft = cropViewRotate(cropDraft) },
+                    // ★ E2-12c：旋转 = 画面转 90° **且框跟着走**（以前只改 rot、框不动 ⇒
+                    // 「锁 1:1 → 旋转 90° → 确认」导出 2313×4080，锁定比例静默失效）。
+                    // 自由 = 框跟随内容转（保持"框住哪块区域"）；锁定比例 = 保持中心、按新
+                    // 朝向重排成该比例（不越界）—— 两种行为都在 cropViewRotate 里。
+                    onRotate = {
+                        val (vw, vh) = source?.let {
+                            cropViewSize(it.w, it.h, cropDraft.rot + 1)
+                        } ?: (1 to 1)
+                        cropDraft = cropViewRotate(
+                            cropDraft, cropAspect.ratio(vw, vh), vw, vh,
+                        )
+                    },
                     // 取消 = 草稿复位成**已确认**的裁剪（画面回到进入裁剪模式前的样子）
                     onCancel = {
                         cropDraft = cropViewOf(crop)
@@ -2748,7 +2759,8 @@ private fun CropToolBar(
                 .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 旋转 90°（顺时针步进，4 个方向循环）：只转**画面**，框不动
+            // 旋转 90°（顺时针步进，4 个方向循环）：画面转，框跟着走 —— 自由 = 框跟随内容
+            // 转；锁定比例 = 保持中心按新朝向重排（见 [cropViewRotate]，E2-12c）
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier

@@ -977,9 +977,18 @@ internal data class CropView(
 /** 裁剪框的 8 个手柄（4 角 + 4 边） */
 internal enum class CropHandle { TL, T, TR, R, BR, B, BL, L }
 
+/**
+ * rot 归一化到 0..3。**凡是要判 rot（奇偶 / 分支 / 全幅）的地方都必须先过它**：
+ * Kotlin 的 `%` 保号（`-3 % 2 == -1`、`-3 % 4 == -3`）⇒ 直接判会把负 rot 判成偶数 / 判成
+ * 未定义分支。★ E2-12c：以前 [cropViewSize] 与 `CropSpec.outputSize` 漏了这一步，而
+ * [cropSpecOf] 归一化了 ⇒ 两处判据不一致（当前 rot 只来自 `(rot + 1) % 4` 所以不可达，
+ * 但 rot 一旦从快照 / 预设 / EXIF 进来就会**静默判反**）。
+ */
+internal fun normalizeRot(rot: Int): Int = ((rot % 4) + 4) % 4
+
 /** 旋转后画面的像素尺寸（rot 奇数 ⇒ 宽高交换）—— 比例锁定与最小尺寸的换算基准。 */
 internal fun cropViewSize(srcW: Int, srcH: Int, rot: Int): Pair<Int, Int> =
-    if (rot % 2 == 1) srcH to srcW else srcW to srcH
+    if (normalizeRot(rot) % 2 == 1) srcH to srcW else srcW to srcH
 
 /** 拖动移动：dx/dy = 屏幕位移 ÷ 画面显示尺寸（归一化）。夹紧在画面内（不越界）。 */
 internal fun cropViewMove(v: CropView, dx: Float, dy: Float): CropView {
@@ -1091,8 +1100,32 @@ internal fun cropViewWithAspect(v: CropView, aspect: Float?, viewW: Int, viewH: 
     )
 }
 
-/** 旋转 90°：只改 [CropView.rot]，框不动（画面转、框不转）。 */
-internal fun cropViewRotate(v: CropView): CropView = v.copy(rot = (v.rot + 1) % 4)
+/**
+ * ★ 旋转 90°（E2-12c 修正）：画面转，框**跟着走**。
+ *
+ * - [aspect] == null（自由）：框**跟随内容**转 —— 保持"框住哪块原图区域"的语义。
+ *   画面顺时针转 90° 后，旧画面的点 (u,v) 落在新画面的 (1−v, u) ⇒ 框 (l,t,w,h) 覆盖的
+ *   原图区域在新坐标里是 **(1−t−h, l, h, w)**（宽高互换 + 位置随画面转）。
+ *   数学上恒不越界（右边界 = 1−t ≤ 1、下边界 = l+w ≤ 1，前提是原框不越界）。
+ * - 锁定比例：保持**中心**不变、按**新朝向**重排成该比例（[cropViewWithAspect]，放不下则
+ *   整体缩小）⇒ 旋转后导出的像素比仍等于锁定比例。**不跟随内容**：跟随内容会把框挪走，
+ *   用户选的比例反而"跳"到别处。
+ *
+ * [viewW]/[viewH] = **旋转后**画面的像素尺寸（rot 奇数 ⇒ 宽高交换），仅供锁定比例换算是用。
+ *
+ * 为什么必须重排（E2-12c 的真 bug）：以前这里只改 rot、框不动 ⇒「锁 1:1 → 旋转 90° → 直接
+ * 确认」导出 2313×4080（比值 0.567）——画面朝向变了而框没重排，锁定比例静默失效。
+ */
+internal fun cropViewRotate(
+    v: CropView,
+    aspect: Float? = null,
+    viewW: Int = 1,
+    viewH: Int = 1,
+): CropView {
+    val r = normalizeRot(v.rot + 1)
+    if (aspect == null) return CropView(1f - v.t - v.h, v.l, v.h, v.w, r)
+    return cropViewWithAspect(v.copy(rot = r), aspect, viewW, viewH)
+}
 
 /**
  * 裁剪框（旋转后画面归一化）→ 引擎入参 [CropSpec]（**原图** UV 子矩形 + rot）。
@@ -1105,7 +1138,7 @@ internal fun cropSpecOf(v: CropView, srcW: Int, srcH: Int): CropSpec {
     val t = v.t.coerceIn(0f, 1f)
     val w = v.w.coerceIn(0f, 1f - l)
     val h = v.h.coerceIn(0f, 1f - t)
-    return when (((v.rot % 4) + 4) % 4) {
+    return when (normalizeRot(v.rot)) {
         1 -> CropSpec(t, 1f - l - w, h, w, 1)
         2 -> CropSpec(1f - l - w, 1f - t - h, w, h, 2)
         3 -> CropSpec(1f - t - h, l, h, w, 3)
@@ -1114,7 +1147,7 @@ internal fun cropSpecOf(v: CropView, srcW: Int, srcH: Int): CropSpec {
 }
 
 /** [cropSpecOf] 的逆：已确认的裁剪 → 再次进入裁剪模式时的初始草稿框。 */
-internal fun cropViewOf(spec: CropSpec): CropView = when (((spec.rot % 4) + 4) % 4) {
+internal fun cropViewOf(spec: CropSpec): CropView = when (normalizeRot(spec.rot)) {
     1 -> CropView(1f - spec.y0 - spec.ch, spec.x0, spec.ch, spec.cw, 1)
     2 -> CropView(1f - spec.x0 - spec.cw, 1f - spec.y0 - spec.ch, spec.cw, spec.ch, 2)
     3 -> CropView(spec.y0, 1f - spec.x0 - spec.cw, spec.ch, spec.cw, 3)

@@ -237,8 +237,10 @@ internal class EditorEngineSession {
         // E2-12：裁剪只改**输出**尺寸（输入纹理仍是整幅位图）；不裁剪时 == (w, h)
         val (outW, outH) = crop.outputSize(w, h)
         val bytes = try {
+            // ★ E2-12c：下发的 rot 必须与 outputSize 用**同一个**归一化值 —— 否则
+            // outputSize 交换了宽高、引擎却按 rot=0 分支渲染 ⇒ 尺寸与内容对不上。
             EngineBridge.nativeEngineSubmitDisplay(
-                rgba, w, h, outW, outH, crop.uvOrNull(), crop.rot,
+                rgba, w, h, outW, outH, crop.uvOrNull(), normalizeRot(crop.rot),
                 film,
             )
         } catch (t: Throwable) {
@@ -302,11 +304,14 @@ internal data class CropSpec(
     /**
      * 输出尺寸（ADR-16）：按裁剪矩形的**像素**尺寸算，旋转奇数步则交换宽高。
      * 4080×3072 裁中间 50% ⇒ 2040×1536；再转 90° ⇒ 1536×2040。
+     *
+     * ★ E2-12c：判奇偶前必须 [normalizeRot]（Kotlin `%` 保号 ⇒ `-1 % 2 == -1` 会被判成
+     * 偶数）。以前这里漏了，而 [cropSpecOf] 归一化了 ⇒ 两处判据不一致。
      */
     fun outputSize(srcW: Int, srcH: Int): Pair<Int, Int> {
         val pw = Math.round(cw * srcW).coerceIn(1, maxOf(srcW, 1))
         val ph = Math.round(ch * srcH).coerceIn(1, maxOf(srcH, 1))
-        return if (rot % 2 == 1) ph to pw else pw to ph
+        return if (normalizeRot(rot) % 2 == 1) ph to pw else pw to ph
     }
 
     /** JNI 入参：全幅传 null（引擎侧 nullptr = origin(0,0) / size(1,1) / rot 0） */
