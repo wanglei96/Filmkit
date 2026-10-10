@@ -49,8 +49,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Redo
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
+import androidx.compose.material.icons.automirrored.outlined.TrendingDown
+import androidx.compose.material.icons.automirrored.outlined.TrendingUp
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.outlined.AcUnit
 import androidx.compose.material.icons.outlined.BlurOn
 import androidx.compose.material.icons.outlined.Brightness4
 import androidx.compose.material.icons.outlined.Brightness7
@@ -66,6 +69,7 @@ import androidx.compose.material.icons.outlined.Exposure
 import androidx.compose.material.icons.outlined.Gradient
 import androidx.compose.material.icons.outlined.InvertColors
 import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.MonochromePhotos
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhotoFilter
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
@@ -74,6 +78,7 @@ import androidx.compose.material.icons.outlined.Thermostat
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Vignette
 import androidx.compose.material.icons.outlined.WaterDrop
+import androidx.compose.material.icons.outlined.WbSunny
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -132,6 +137,8 @@ import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.EditorSnapshot
 import com.filmkit.app.camera.FADE_UI_RANGE
 import com.filmkit.app.camera.ImageFitRect
+import com.filmkit.app.camera.LATITUDE_UI_PIVOT
+import com.filmkit.app.camera.LATITUDE_UI_RANGE
 import com.filmkit.app.camera.LOCAL_ANGLE_UI_RANGE
 import com.filmkit.app.camera.LOCAL_EV_UI_RANGE
 import com.filmkit.app.camera.LOCAL_FEATHER_UI_RANGE
@@ -141,11 +148,13 @@ import com.filmkit.app.camera.LOCAL_WIDTH_UI_RANGE
 import com.filmkit.app.camera.LUT_STRENGTH_UI_RANGE
 import com.filmkit.app.camera.LocalMode
 import com.filmkit.app.camera.LocalOutline
+import com.filmkit.app.camera.MONO_UI_RANGE
 import com.filmkit.app.camera.OverwriteResult
 import com.filmkit.app.camera.PRESET_AMOUNT_UI_RANGE
 import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.SAT_UI_RANGE
+import com.filmkit.app.camera.SPLIT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
 import com.filmkit.app.camera.StillSnapshotStore
 import com.filmkit.app.camera.TEMP_UI_PIVOT
@@ -179,15 +188,19 @@ import com.filmkit.app.camera.expSlot
 import com.filmkit.app.camera.expUi
 import com.filmkit.app.camera.fadeSlot
 import com.filmkit.app.camera.fadeUi
+import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatDegree
 import com.filmkit.app.camera.formatEv
 import com.filmkit.app.camera.formatKelvin
+import com.filmkit.app.camera.formatMono
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.imageFitRect
 import com.filmkit.app.camera.isJpegSource
+import com.filmkit.app.camera.latitudeSlot
+import com.filmkit.app.camera.latitudeUi
 import com.filmkit.app.camera.linearOutline
 import com.filmkit.app.camera.localActive
 import com.filmkit.app.camera.localAngleSlot
@@ -209,6 +222,8 @@ import com.filmkit.app.camera.localTypeUi
 import com.filmkit.app.camera.localWidthSlot
 import com.filmkit.app.camera.localWidthUi
 import com.filmkit.app.camera.mergePresets
+import com.filmkit.app.camera.monoSlot
+import com.filmkit.app.camera.monoUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
 import com.filmkit.app.camera.passthroughAllowed
@@ -225,6 +240,8 @@ import com.filmkit.app.camera.resetColorParams
 import com.filmkit.app.camera.resetLocalGeometry
 import com.filmkit.app.camera.saveEditorCopy
 import com.filmkit.app.camera.scalePresetSlots
+import com.filmkit.app.camera.splitSlot
+import com.filmkit.app.camera.splitUi
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.tempSlot
 import com.filmkit.app.camera.tempUi
@@ -240,6 +257,7 @@ import com.filmkit.app.camera.vigStrengthSlot
 import com.filmkit.app.camera.vigStrengthUi
 import com.filmkit.app.camera.wbGainSlot
 import com.filmkit.app.camera.wbGainUi
+import com.filmkit.app.camera.writeLatitude
 import com.filmkit.app.camera.writeSaturation
 import com.filmkit.app.kv
 import com.filmkit.app.lut.LutLibrary
@@ -2179,20 +2197,25 @@ private class EditorParam(
 )
 
 /**
- * 「调整」组（E2-3 的「基础」组改名；E2-14 加影调分区四条；E2-15 纳色温/色调）：
- * 曝光 [0] / 色温 [88] / 色调 [89] / 对比度 [4] / 高光 [90] / 阴影 [91] /
- * 白色色阶 [92] / 黑色色阶 [93] / 饱和度 [20..22] / 清晰度 [78] / 红 [1] / 绿 [2] / 蓝 [3]。
- * 槽位语义与恒等值见 `EditorExport.kt` 的映射段。
+ * 「调整」组（E2-3 的「基础」组改名；E2-14 加影调分区四条；E2-15 纳色温/色调；
+ * **U-6b 纳胶片曲线两条**）：
+ * 曝光 [0] / 色温 [88] / 色调 [89] / 对比度 [4] / **胶片曲线·肩部 [5..7] / 胶片曲线·趾部 [8..10]** /
+ * 高光 [90] / 阴影 [91] / 白色色阶 [92] / 黑色色阶 [93] / 饱和度 [20..22] / 清晰度 [78] /
+ * 红 [1] / 绿 [2] / 蓝 [3]。槽位语义与恒等值见 `EditorExport.kt` 的映射段。
  *
- * **排序理由（E2-15，用户要求"按逻辑排但要说明理由"）**——按用户调色的**实际决策顺序**：
+ * **排序理由（E2-15 立规，U-6b 沿用；用户要求"按逻辑排但要说明理由"）**——按用户调色的
+ * **实际决策顺序**：
  *  1. **曝光**：先定整体明暗 —— 后面所有参数（尤其影调分区与饱和度）的观感都建立在它之上；
  *  2. **色温 → 色调**：白平衡两条紧跟曝光。它们决定"这张照片的色偏"，而色偏会污染后面
  *     每一个关于颜色的判断（饱和度、清晰度看起来"发灰/发黄"常常只是白平衡没对）；
  *     两条**必须相邻**（同一套白平衡的两轴，分开找不着）；
- *  3. **对比度**：全局反差 —— 白平衡定色之后才谈得上"反差合不合适"；
+ *  3. **对比度 → 胶片曲线·肩部 → 胶片曲线·趾部**：都是"曲线形状"。**U-6b 把这两条紧跟对比度**
+ *     的理由是它们与对比度**同族**：对比度是"整体斜率"（一条直线），胶片曲线是"两端过渡区的
+ *     位置"（肩部 = 亮端、趾部 = 暗端）—— 用户发现"对比度不够精细"时，下一步就是来这里调端点，
+ *     中间隔着四条影调分区会把同一条曲线的两端拆散；
  *  4. **高光 → 阴影 → 白色色阶 → 黑色色阶**：四个影调分区按**从亮部到暗部**（Lightroom
- *     Basic 面板的既有顺序，用户肌肉记忆最省）；都在对比度之后，因为它们是"对比度不够
- *     精细"时的分区微调；
+ *     Basic 面板的既有顺序，用户肌肉记忆最省）；都在对比度/曲线之后，因为它们是"对比度不够
+ *     精细"时的**分区微调**（曲线改的是过渡区形状，分区改的是区段亮度，前者更"形"、后者更"量"）；
  *  5. **饱和度**：全局色彩强度 —— 影调定完再谈色彩浓度（影调变了，饱和的观感也变）；
  *  6. **清晰度**：局部质感（中频），放在全局色彩之后 —— 它是"最后一道质感调味"；
  *  7. **红 / 绿 / 蓝**：手动通道增益放最后。它们是白平衡的"手动挡"，与色温/色调功能重叠，
@@ -2205,6 +2228,8 @@ private class EditorParam(
  *  - **红/绿/蓝** `+12`（相对增益 ±100）；中点 = `0`（= 增益 1.00 不变）
  *  - **对比度 / 饱和度** `+12`（±100）；中点 = `0`（= 1.00 不变）
  *  - **清晰度** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记（端点本身就是标记）
+ *  - **胶片曲线·肩部 / 趾部** `0.30`（**两位小数**，latitude 0..1）；中点 = **`0.01`**（不是 0！）
+ *    —— 0 在 latitude 语义里是"过渡区紧贴中灰"的**极端 S 曲线**（详见 `latitudeSlot` 的 KDoc）
  *  - **高光 / 阴影 / 白色色阶 / 黑色色阶** `+50`（±100，正 = 该分区提亮）；中点 = `0`
  *
  * ⚠️ 色温滑杆的值**直接就是 K**（右移 = K 大 = 画面变暖）—— 槽位 [88] 存的是 mired 偏移，
@@ -2241,6 +2266,25 @@ private val AdjustParams: List<EditorParam> = listOf(
         format = { formatOffset100(it, 1f) },
         read = { contrastUi(it[4]) },
         write = { p, v -> p[4] = contrastSlot(v) },
+    ),
+    // ── U-6b：胶片曲线两条（肩部 [5..7] / 趾部 [8..10]，引擎 `kFsFilm` 的 latitude 段）─────
+    // 紧跟对比度、在影调分区**之前**（同属"曲线形状"，顺序理由见 [AdjustParams] 的 KDoc 第 3 条）。
+    // 量程 0..1 直通槽位；**一条滑杆同写 R/G/B 三槽**（同饱和度那种"一条滑杆多槽"，见 writeLatitude）。
+    // ⚠⚠ 恒等值/中点 = 0.01 而**不是 0**：0 = 过渡区紧贴中灰 = 极端 S 曲线（`latitudeSlot` 的 KDoc）。
+    // 滑杆允许拖到 0（用户主动要极端曲线），但 reset 必须回 0.01 —— 单测钉死。
+    EditorParam(
+        key = "curveShoulder", label = "胶片曲线 · 肩部", icon = Icons.AutoMirrored.Outlined.TrendingUp,
+        range = LATITUDE_UI_RANGE, pivot = LATITUDE_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { latitudeUi(it[5]) },
+        write = { p, v -> writeLatitude(p, 5, v) },
+    ),
+    EditorParam(
+        key = "curveToe", label = "胶片曲线 · 趾部", icon = Icons.AutoMirrored.Outlined.TrendingDown,
+        range = LATITUDE_UI_RANGE, pivot = LATITUDE_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { latitudeUi(it[8]) },
+        write = { p, v -> writeLatitude(p, 8, v) },
     ),
     // ── E2-14：影调分区四条（[90..93]，引擎 `kFsStyle` 的 `uToneOn` 段）────────────
     // 量程 −1..+1 直通槽位，恒等 0；读数 = ±100 整数（`+50` / `0` / `-50`），中点 0。
@@ -2313,18 +2357,58 @@ private val AdjustParams: List<EditorParam> = listOf(
 )
 
 /**
- * 「滤镜」组的**引擎参数**（E2-14；E2-15 只剩褪色 [94]）：褪色。
+ * 「滤镜」组的**引擎参数**（E2-14；E2-15 只剩褪色 [94]；**U-6b 纳入黑白 [25] + 分离色调 [23][24]**）：
+ * **黑白** / **分离色调 · 暖** / **分离色调 · 冷** / **褪色**。
  *
- * **不依赖 LUT**（引擎侧这条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时它照样可调 —— 这也是
+ * **不依赖 LUT**（引擎侧这四条在 `kFsStyle` 内独立生效）⇒ 没选 LUT 时照样可调 —— 这也是
  * 本组从"未选 LUT 就空表"变成常驻的原因。LUT 强度 [34] 是单独一条（[LutStrengthParam]），
  * 选了 LUT 才进表。
  *
  * 色温 [88] / 色调 [89] 已随 E2-15 移入「调整」组（用户反馈见 [AdjustParams] 的 KDoc）；
- * **褪色留在这里** —— 它是风格化参数（抬黑场、做"褪色胶片感"），不是基础调整。
+ * 胶片曲线 [5..10] 随 U-6b 归入「调整」组（它们是**曲线形状**，不是风格化调色）；
+ * **这四条留在这里** —— 它们是风格化参数（去色 / 分区染色 / 抬黑场做"褪色胶片感"），
+ * 不是基础调整。
  *
- * 读数口径：**褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记。
+ * **排序理由（U-6b）**：**黑白在前、分离色调在后** —— "整体去色"（把三个通道抹成一条灰阶）
+ * 在概念上先于"分区调色"（给暗部/亮部各染一个色）；顺序反了会诱导用户先分区染色再整体去色，
+ * 那样辛苦调的分离色调会被去色抹掉（引擎里 `uMono` 的 `mix` 在分离色调之后）。
+ * **分离色调两条与褪色相邻**：三者都是"胶片风格化"（暖/冷/洗白），挨着放便于一起比对；
+ * 且分离色调·暖 / 冷是一对（正负两半），必须相邻。
+ *
+ * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
+ *  - **黑白** `关` / `35`（0..100 整数；**0 = 彩色原样 ⇒ 显示"关"**，非零显示数值而不是"开"
+ *    —— 它是**连续**混合比，`formatMono` 的 KDoc 解释了为什么不用开关口径）；
+ *    基准在最左端 ⇒ 不画中点标记
+ *  - **分离色调 · 暖 / 冷** `+50`（±100，正 = 该半边染色增强）；中点 = `0`
+ *  - **褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记
  */
 private val ColorParams: List<EditorParam> = listOf(
+    // ── U-6b：黑白 [25]（整体去色，放在分区调色之前，理由见本段 KDoc）──────────────
+    // 引擎 `out3 = mix(out3, vec3(luma(out3)), uMono)` ⇒ **连续**混合，不是开关（U-1 已接线）。
+    EditorParam(
+        key = "mono", label = "黑白", icon = Icons.Outlined.MonochromePhotos,
+        range = MONO_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatMono(it) },
+        read = { monoUi(it[25]) },
+        write = { p, v -> p[25] = monoSlot(v) },
+    ),
+    // ── U-6b：分离色调 [23][24]（暖 / 冷一对，必须相邻）──────────────────────────
+    // 量程 −1..+1 直通槽位，恒等 0；读数 ±100 整数（`+50` / `0` / `-50`），中点 0。
+    EditorParam(
+        key = "splitWarm", label = "分离色调 · 暖", icon = Icons.Outlined.WbSunny,
+        range = SPLIT_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { splitUi(it[23]) },
+        write = { p, v -> p[23] = splitSlot(v) },
+    ),
+    EditorParam(
+        key = "splitCool", label = "分离色调 · 冷", icon = Icons.Outlined.AcUnit,
+        range = SPLIT_UI_RANGE, pivot = ZERO_UI_PIVOT,
+        format = { formatOffset100(it, ZERO_UI_PIVOT) },
+        read = { splitUi(it[24]) },
+        write = { p, v -> p[24] = splitSlot(v) },
+    ),
+    // ── E2-15：褪色 [94]（与上面的风格化调色相邻）────────────────────────────────
     EditorParam(
         key = "fade", label = "褪色", icon = Icons.Outlined.Gradient,
         range = FADE_UI_RANGE, pivot = ZERO_UI_PIVOT,

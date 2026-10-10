@@ -456,6 +456,148 @@ internal fun fadeUi(slot: Double): Float = if (!slot.isFinite()) {
     slot.coerceIn(FADE_UI_RANGE.start.toDouble(), FADE_UI_RANGE.endInclusive.toDouble()).toFloat()
 }
 
+/**
+ * ★ U-6b：**分离色调 [23][24] / 黑白 [25]** 的 UI ↔ 槽位映射。槽位语义见 ADR 的「E2-11 槽位表」，
+ * 引擎实现在 `FrameRenderer.cpp` 的 `kFsFilm`（U-1 已把这三个槽接到编辑器链路 ⇒ 两侧都生效）。
+ *
+ *  - [23] `split_warm`：暖部分离色调强度（给暗部加暖 / 亮部减暖的成对色向量），恒等 0
+ *  - [24] `split_cool`：冷部分离色调强度，恒等 0
+ *  - [25] `monochrome`：黑白混合比（引擎 `out3 = mix(out3, vec3(luma(out3)), uMono)`）
+ *    —— **0 = 彩色原样、1 = 全黑白，中间值 = 部分去色**（连续量，不是一个开关）
+ *
+ * ⚠ **为什么 [25] 是连续滑杆而不是开关**：引擎侧本来就是 `mix()` 的混合系数，预设 JSON 里
+ * 也真的出现过中间值 ⇒ 做成 0/1 开关会把"部分去色"这个既有能力从 UI 上抹掉（U-1 接线 `[25]`
+ * 的收益正是"黑白预设能生效"，但"能调多黑"同样要能调）。
+ *
+ * ⚠ 与「褪色」[94] 的区别（两者数值域都是 0..1，别混）：褪色抬**黑场**、白点不动（"洗白"观感），
+ * 黑白抹**色度**、亮度不变。因此它们是两条独立滑杆，各写各的槽，不共用映射函数。
+ */
+
+/** 分离色调 UI 量程：−1..+1 直通槽位（引擎 `uSplit` 无 clamp；UI 取与影调分区同口径的 ±1）。恒等 0。 */
+internal val SPLIT_UI_RANGE = -1f..1f
+
+/** 黑白 [25] UI 量程：0..1 直通（0 = 彩色原样、1 = 全黑白）。基准在最左端 ⇒ 不画中点标记。 */
+internal val MONO_UI_RANGE = 0f..1f
+
+/** UI 分离色调（−1..+1）→ 槽位 [23]（暖）/ [24]（冷）。坏数据回落恒等 0。 */
+internal fun splitSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(SPLIT_UI_RANGE.start, SPLIT_UI_RANGE.endInclusive).toDouble()
+} else {
+    0.0
+}
+
+/** 槽位 [23] / [24] → UI 分离色调（−1..+1）。坏数据回落恒等 0。 */
+internal fun splitUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(SPLIT_UI_RANGE.start.toDouble(), SPLIT_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/** UI 黑白（0..1）→ 槽位 [25]。坏数据回落恒等 0 = 彩色原样。 */
+internal fun monoSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(MONO_UI_RANGE.start, MONO_UI_RANGE.endInclusive).toDouble()
+} else {
+    0.0
+}
+
+/** 槽位 [25] → UI 黑白（0..1）。**负值当"关"**（`mix()` 的负系数无意义）。坏数据回落 0。 */
+internal fun monoUi(slot: Double): Float = if (!slot.isFinite()) {
+    0f
+} else {
+    slot.coerceIn(MONO_UI_RANGE.start.toDouble(), MONO_UI_RANGE.endInclusive.toDouble()).toFloat()
+}
+
+/**
+ * 黑白读数：**0 → `关`**，否则 0..100 整数（`35`）。
+ *
+ * 为什么零值显示 `关` 而不是 `0`：它是"完全没启用"（引擎 `uMono = 0` ⇒ `mix` 恒等），与清晰度 /
+ * 褪色那些"0 就是关"的参数同一口径，只是多一个更直白的词。
+ *
+ * 为什么非零**不做成"开/关"**：[25] 是**连续**的混合比例（见本段 KDoc 第 3 条）—— 0.35 显示"开"
+ * 会把量级吞掉（0.4 与 0.9 看起来一样），那正是 U-6b 要修掉的假读数。
+ */
+internal fun formatMono(ui: Float): String {
+    if (!ui.isFinite()) return "关"
+    val n = (ui.coerceIn(MONO_UI_RANGE.start, MONO_UI_RANGE.endInclusive) * 100f).roundToInt()
+    return if (n == 0) "关" else n.toString()
+}
+
+/**
+ * ★ U-6b：**胶片曲线 [5..10]** 的 UI ↔ 槽位映射（U-2 已把这条曲线接到编辑器链路）。
+ *
+ * 槽位语义 = **filmic latitude**（`FilmParams.h:58-59`：`shoulder[3]` = [5..7]、`toe[3]` = [8..10]；
+ * ⚠ `preset-DESIGN.md` §1 的表格把这两行写反了，以引擎字段名为准）。
+ *
+ * 一条滑杆**同写三通道**（R/G/B）同一个值 —— 与饱和度 [20..22] 同一种"一条滑杆多槽"的形态
+ * （[writeSaturation]），理由也一样：普通用户不逐通道调曲线；引擎是 per-channel ⇒ 写三槽让
+ * "三通道一致"成为默认，逐通道差异仍可由预设（数据层）表达。
+ *
+ * ## ⚠⚠ 默认值是 0.01 而不是 0（本卡最容易踩的坑）
+ *
+ * latitude 语义下 **`0` = 过渡区紧贴中灰 = 极端 S 曲线**，**不是"无效果"**
+ * （`CameraPresets.kt` 的 `[5..10]` 专章有同样的警告，`presetSlotCurve` 的非线性缩放也依赖它）。
+ * 由此三条硬结论：
+ *  - 恒等值 / reset 目标 / 中点标记 = **[LATITUDE_UI_PIVOT] = 0.01**（不是 0）；
+ *  - 滑杆**允许**拖到 0 —— 用户主动要极端曲线是**有意的能力**，不是 bug；
+ *  - 坏数据（NaN/Inf）回落 **0.01**：回落 0 会把"读不出来"变成"极端曲线"，
+ *    这是最容易造成画面突变的失败模式（[tempUi] 越界回落 6500K 是同一条纪律）。
+ *
+ * 读数两位小数（[formatDecimals2]）：latitude 在 0 附近敏感（0.01 / 0.02 是两档不同的曲线），
+ * 整数化会把它们都显示成 `1` / `2`。
+ */
+
+/** 胶片曲线 UI 量程：0..1（= `FilmParams.h` 的 latitude 取值域）。 */
+internal val LATITUDE_UI_RANGE = 0f..1f
+
+/**
+ * 胶片曲线恒等值 / reset 目标 / 中点标记位置 = **0.01**（darktable 默认 latitude）。
+ *
+ * ⚠ **不是 0**：0 在 latitude 语义里是"过渡区紧贴中灰"的极端 S 曲线（见上一段 KDoc）。
+ */
+internal const val LATITUDE_UI_PIVOT = 0.01f
+
+/** UI 胶片曲线（0..1）→ 槽位值。坏数据回落恒等 [LATITUDE_UI_PIVOT]（**不是 0**）。 */
+internal fun latitudeSlot(ui: Float): Double = if (ui.isFinite()) {
+    ui.coerceIn(LATITUDE_UI_RANGE.start, LATITUDE_UI_RANGE.endInclusive).toDouble()
+} else {
+    LATITUDE_UI_PIVOT.toDouble()
+}
+
+/** 槽位值 → UI 胶片曲线（0..1）。坏数据回落恒等 [LATITUDE_UI_PIVOT]（**不是 0**）。 */
+internal fun latitudeUi(slot: Double): Float = if (!slot.isFinite()) {
+    LATITUDE_UI_PIVOT
+} else {
+    slot.coerceIn(
+        LATITUDE_UI_RANGE.start.toDouble(),
+        LATITUDE_UI_RANGE.endInclusive.toDouble(),
+    ).toFloat()
+}
+
+/**
+ * 一条胶片曲线滑杆**同写三通道**：`[offset..offset + 2]` 写同一个值
+ * （肩部 `offset = 5`、趾部 `offset = 8`）。与 [writeSaturation] 同一形态（"一条滑杆多槽"），
+ * 区别只是这里三槽的语义是 R/G/B。
+ */
+internal fun writeLatitude(p: DoubleArray, offset: Int, ui: Float) {
+    val v = latitudeSlot(ui)
+    p[offset] = v
+    p[offset + 1] = v
+    p[offset + 2] = v
+}
+
+/**
+ * 两位小数读数：`0.30` / `0.01` / `1.00`（胶片曲线 [5..10] 专用，见那一段的 KDoc）。
+ *
+ * 只做格式化、**不做量程夹紧**：调用方传进来的已经是 UI 值（`read` 侧已回落恒等）；
+ * 坏数据回落 `0.00`（读数绝不能出现 `NaN`）。
+ */
+internal fun formatDecimals2(ui: Float): String {
+    val n = (if (ui.isFinite()) ui else 0f) * 100f
+    val r = n.roundToInt()
+    val a = abs(r)
+    return "${if (r < 0) "-" else ""}${a / 100}.${(a % 100).toString().padStart(2, '0')}"
+}
+
 /** 色温读数：`5000K`（整数 K，无空格）。坏数据回落恒等读数 `6500K`。 */
 internal fun formatKelvin(ui: Float): String {
     val k = if (ui.isFinite()) {
@@ -566,15 +708,19 @@ internal fun pivotFraction(range: ClosedFloatingPointRange<Float>, pivot: Float)
 }
 
 /**
- * 「调整」组重置（E2-3；E2-14 扩影调分区；E2-15 再纳色温/色调）：本组全部参数回**恒等值** ——
- * 曝光 0 / 色温 [88] 0（= 6500K）/ 色调 [89] 0 / WB 1,1,1 / 对比度 1 / 饱和度 1,1,1 /
- * 清晰度 0 / 高光·阴影·白·黑色阶 0。只动这 13 个槽位，其余槽位（快照继承来的风格参数、
- * 褪色/暗角/LUT）原样保留。
+ * 「调整」组重置（E2-3；E2-14 扩影调分区；E2-15 再纳色温/色调；**U-6b 再纳胶片曲线**）：
+ * 本组全部参数回**恒等值** —— 曝光 0 / 色温 [88] 0（= 6500K）/ 色调 [89] 0 / WB 1,1,1 /
+ * 对比度 1 / 饱和度 1,1,1 / 清晰度 0 / 高光·阴影·白·黑色阶 0 / **胶片曲线 [5..10] = 0.01**。
+ * 只动这 19 个槽位，其余槽位（快照继承来的风格参数、褪色/分离色调/黑白/暗角/LUT）原样保留。
  *
  * 色温/色调为什么在**这里**（E2-15 用户反馈："色温方向正确，放的位置不对，怎么放 lut 里了
  * 应该是调整里面"）：它们是白平衡的两条，与 [1..3] 通道增益同属"基础调整"；界面把它们放进
  * 「调整」组之后，重置入口也必须跟着走 —— 否则用户看到"调整组里有色温滑杆、重置本组却不动它"
- *（= 假重置，与 ADR-12 的假滑杆同一类问题）。
+ *（= 假重置，与 ADR-12 的假滑杆同一类问题）。**U-6b 的胶片曲线两条按同一条纪律并入本组**。
+ *
+ * ⚠ **胶片曲线回 [LATITUDE_UI_PIVOT] = 0.01 而不是 0**：latitude 语义下 0 = 极端 S 曲线
+ *（见 [latitudeSlot] 的 KDoc）。重置写成 `p[i] = 0.0` 会让"重置本组"把画面变成极端反差 ——
+ * 那不是恒等值。单测 `resetRestoresLatitudeToDefaultAndMonoSplitToZero` 钉死这一条。
  */
 internal fun resetBasicParams(p: DoubleArray) {
     p[0] = 0.0
@@ -582,6 +728,7 @@ internal fun resetBasicParams(p: DoubleArray) {
     p[2] = 1.0
     p[3] = 1.0
     p[4] = 1.0
+    for (i in 5..10) p[i] = LATITUDE_UI_PIVOT.toDouble()   // ← 0.01，不是 0（见 KDoc）
     writeSaturation(p, 1f)
     p[78] = 0.0
     p[88] = 0.0
@@ -593,13 +740,20 @@ internal fun resetBasicParams(p: DoubleArray) {
 }
 
 /**
- * 「色彩」组的**引擎参数**重置（E2-14；E2-15 缩到只剩褪色 [94]）：褪色回恒等 0。
+ * 「色彩」组的**引擎参数**重置（E2-14；E2-15 缩到只剩褪色；**U-6b 纳入分离色调/黑白**）：
+ * 褪色 [94] → 0、分离色调 [23][24] → 0、黑白 [25] → 0（= 彩色原样）。
  *
- * 色温 [88] / 色调 [89] 已随 E2-15 归入「调整」组（见 [resetBasicParams]）；
+ * 色温 [88] / 色调 [89] 已随 E2-15 归入「调整」组（见 [resetBasicParams]）；胶片曲线 [5..10]
+ * 随 U-6b 归入「调整」组（同上）。**判据只有一条**：界面上这条滑杆在哪个组，本组重置就得
+ * 把它带回恒等值 —— 否则就是"组里有滑杆、重置却不动它"的假重置。
+ *
  * LUT **不在这里、也不在 UI 的重置里** —— LUT 是用户选的"风格素材"，重置参数不该丢掉素材
  * 选择本身（E2-15 用户确认："这个你判断的对，不应该清"）。强度归 0 由 UI 侧写 [34] 完成。
  */
 internal fun resetColorParams(p: DoubleArray) {
+    p[23] = 0.0
+    p[24] = 0.0
+    p[25] = 0.0
     p[94] = 0.0
 }
 

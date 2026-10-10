@@ -8,12 +8,16 @@ import com.filmkit.app.camera.clarityUi
 import com.filmkit.app.camera.contrastUi
 import com.filmkit.app.camera.expUi
 import com.filmkit.app.camera.fadeUi
+import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatEv
 import com.filmkit.app.camera.formatKelvin
+import com.filmkit.app.camera.formatMono
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
+import com.filmkit.app.camera.latitudeUi
+import com.filmkit.app.camera.monoUi
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.tempUi
 import com.filmkit.app.camera.tintUi
@@ -139,20 +143,23 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     // 出作用域提示（名字沿用 P-5 当年的字面术语，现溯源到 §9.2 第 13 项）；量程 −1..1
     meta(23, SEC_COLOR, "分离色调 · 暖") { signed2(it) }
     meta(24, SEC_COLOR, "分离色调 · 冷") { signed2(it) }
-    // [25] 单色：★ U-1 同上（§9.2 第 14 项"单色（黑白）"；面板无滑杆，引擎侧是 0/1 开关）。
+    // [25] 黑白：★ U-1 把 `[25]` 接到编辑器链路（§9.2 第 14 项"单色（黑白）"）；★ U-6b 面板
+    // 补上"黑白"滑杆 ⇒ 读数**必须跟面板同口径**（`formatMono`：0 → `关`、否则 0..100 整数）。
+    // ⚠ 旧口径（`>= 0.5` 才算"开"）在面板能连续调之后是**假读数**：0.35 会被显示成"关"。
     // ⚠ 名字**不因提示消失而退回**工程名 `monochrome`（单测 `detailLabelsMatchScopeNoticeWording` 钉住）
-    meta(25, SEC_COLOR, "黑白") { if (it >= 0.5) "开" else "关" }
+    meta(25, SEC_COLOR, "黑白") { formatMono(monoUi(it)) }
     // [94] 褪色：面板「滤镜」组 label（0..100，0 = 关）
     meta(94, SEC_COLOR, "褪色") { formatZero100(fadeUi(it)) }
 
     // ── 影调曲线 ──────────────────────────────────────────────────────────────
     // [5..10] filmic latitude（`FilmParams.h:58-59`：**5..7 = shoulder、8..10 = toe**；
     // ⚠ preset-DESIGN.md §1 的表格把这两行写反了，以引擎字段名为准）。
-    // 名字沿用 PresetScope 的"胶片曲线"（普通用户不认"趾肩 latitude"），通道用面板原词（红/绿/蓝）。
-    // 读数保留两位小数（**不套 formatZero100**）：latitude 的语义在 0 附近敏感
-    //（0.01 = darktable 默认、0 = 极端 S 曲线）⇒ 整数化会把 0.01 / 0.02 都显示成 1 / 2。
-    for (i in 0..2) meta(5 + i, SEC_CURVE, "胶片曲线 · 肩部 ${RGB[i]}") { decimals2(it) }
-    for (i in 0..2) meta(8 + i, SEC_CURVE, "胶片曲线 · 趾部 ${RGB[i]}") { decimals2(it) }
+    // 名字 = 面板 label（U-6b 面板已有"胶片曲线 · 肩部 / 趾部"两条滑杆，逐字同文案）+ 通道后缀；
+    // 读数**与面板同一个函数**（`formatDecimals2(latitudeUi(...))`，两位小数、**不套 formatZero100**）：
+    // latitude 的语义在 0 附近敏感（0.01 = darktable 默认、0 = 极端 S 曲线）⇒ 整数化会把
+    // 0.01 / 0.02 都显示成 1 / 2。过 latitudeUi 而不是直读槽位 ⇒ 坏数据与面板回落同一个恒等值 0.01。
+    for (i in 0..2) meta(5 + i, SEC_CURVE, "胶片曲线 · 肩部 ${RGB[i]}") { formatDecimals2(latitudeUi(it)) }
+    for (i in 0..2) meta(8 + i, SEC_CURVE, "胶片曲线 · 趾部 ${RGB[i]}") { formatDecimals2(latitudeUi(it)) }
     // [37][38] filmic 黑白点：PresetScope 用"黑点"/"白点"（= SettingsScreen「黑点（多暗算黑）」）
     meta(37, SEC_CURVE, "黑点") { evText(it) }
     meta(38, SEC_CURVE, "白点") { evText(it) }
