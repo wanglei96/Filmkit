@@ -141,6 +141,7 @@ import com.filmkit.app.camera.LUT_STRENGTH_UI_RANGE
 import com.filmkit.app.camera.LocalMode
 import com.filmkit.app.camera.LocalOutline
 import com.filmkit.app.camera.OverwriteResult
+import com.filmkit.app.camera.PRESET_AMOUNT_UI_RANGE
 import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
@@ -218,6 +219,7 @@ import com.filmkit.app.camera.resetBasicParams
 import com.filmkit.app.camera.resetColorParams
 import com.filmkit.app.camera.resetLocalGeometry
 import com.filmkit.app.camera.saveEditorCopy
+import com.filmkit.app.camera.scalePresetSlots
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.tempSlot
 import com.filmkit.app.camera.tempUi
@@ -433,6 +435,14 @@ fun EditorScreen(
     // 数据模型 / 序列化 / 稀疏化 / 套用映射全在 EditorExport.kt（纯逻辑，JVM 单测覆盖）。
     var presetMode by remember { mutableStateOf(false) }
     var presets by remember { mutableStateOf<List<EditorPreset>>(emptyList()) }
+    // ── E3-1c 预设强度（Amount）──────────────────────────────────────────────
+    // `appliedPreset` = 当前生效的预设（**强度滑杆只在它非空时出现**：没有"正在生效的预设"就
+    //   没有强度可言）；`presetBase` = **套用前**的参数快照（强度每次从它重算 ⇒ 幂等、不累积
+    //   浮点误差、来回拖到同一个值得到同一画面）；`presetAmount` = 强度（0..1.5，1.0 = 预设原样）。
+    // 三者都**不进**预设 JSON（强度是"套用时的参数"，不是预设的一部分）。
+    var appliedPreset by remember { mutableStateOf<EditorPreset?>(null) }
+    var presetBase by remember { mutableStateOf<DoubleArray?>(null) }
+    var presetAmount by remember { mutableStateOf(1f) }
 
     // ── E2-25 撤销 / 重做 ─────────────────────────────────────────────────
     // 栈本身是**纯逻辑**（[EditorHistory]，JVM 单测覆盖）；这里只留两个"能不能点"的镜像
@@ -703,12 +713,25 @@ fun EditorScreen(
     }
 
     /**
+     * 丢弃"当前生效的预设"（强度滑杆随之消失）。三个调用点：**撤销 / 重做**（历史快照里没有
+     * "生效中的预设 + 强度"这一层状态 ⇒ 留着就是过期信息）与**删除**（预设没了）。
+     * 只清 UI 状态，**不动参数、画面与撤销栈**。
+     */
+    fun clearAppliedPreset() {
+        appliedPreset = null
+        presetBase = null
+        presetAmount = 1f
+    }
+
+    /**
      * 保存当前参数为预设。**只写与恒等值不同的槽**（[presetSparseSlots]，恒等值逐槽取
      * `CameraPresets.standard()`）—— 用户没动过的槽一个都不进库，这样套用时才不会把别人的
      * 画面打回默认（尤其是恒等值为 1.0 / 0.01 / 单位阵的那几组槽）。
      *
      * LUT 强度只在"当前真的选了 LUT"时才有意义：没选 LUT 时 `[34]` 是编辑器初值 0
      *（见 [editorOpenParams]），存下来会让"套用这条预设"凭空关掉用户当前的 LUT。
+     *
+     * ★ E3-1c：存的是**满强度**的槽值 —— 强度是"套用时的参数"，**不写进预设 JSON**。
      */
     fun savePreset(name: String, group: String) {
         val film = params ?: return
@@ -731,24 +754,50 @@ fun EditorScreen(
     }
 
     /**
+     * ★ E3-1c：把"预设 @ 强度"落到参数上（套用与强度重算的**唯一**落地点）。
+     *
+     * 从 [base]（**套用前**的参数快照）重算，而不是在上一次的结果上继续乘 —— 幂等：强度
+     * 0.8 → 0.6 → 0.4 与直接 0.4 得到完全相同的参数（不会累积浮点误差，也不会因为来回拖而漂移）。
+     *
+     * 只覆盖 [EditorPreset.slots] 里记下的槽（[presetSnapshot] 的"缺失 = 保留当前值"），
+     * 其余槽保持 [base] ⇒ 部分套用天然成立。
+     */
+    fun applyPresetAt(p: EditorPreset, base: DoubleArray, amount: Float) {
+        val film = params ?: return
+        val scaled = scalePresetSlots(p.slots, amount.toDouble())
+        applySnapshotParams(film, presetSnapshot(base, scaled))
+    }
+
+    /**
      * 套用预设（面板里点「套用」）。三件事，**全部复用既有机制**：
-     *  ① **参数**：`applySnapshotParams(params, presetSnapshot(params, p.slots))` —— 按 idx 覆盖
+     *  ① **参数**：`applySnapshotParams(params, presetSnapshot(base, scaled))` —— 按 idx 覆盖
      *     = 只改预设里记下的那几个槽，其余保持当前值 ⇒ **部分套用天然成立**；
      *  ② **LUT**：`applyLut(entry, strength, onReady)`（与 E2-21「套用原片风格」同一套调用序列，
      *     含"资产就绪后才写参数"这条顺序约束）；
      *  ③ **撤销**：落地后 `recordHistory()` **一次** = 一步撤销（E2-25）—— 带 LUT 的分支由
      *     [applyLut] 内部记（`record` 默认 true），不带 LUT 的分支在这里显式记。
      *
+     * ★ E3-1c：套用 = **强度 100% 的那一次缩放**（`scalePresetSlots(slots, 1.0)` 原样返回，
+     * 所以逐位等于 E3-1a 的行为 = 零回归），同时把**套用前的参数**记进 [presetBase]，供强度
+     * 滑杆重算；强度不是预设的一部分，预设 JSON 里没有它。
+     *
      * 套用后参数变了 ⇒ `paramsUnchanged` 为假 ⇒ 导出走**渲染**而不是直通（E2-9）、「取消」会弹
      * 「放弃本次修改？」（E2-24）—— 两条都是既有判据自动生效，本卡一行没改。
      */
     fun applyPreset(p: EditorPreset) {
         val film = params ?: return
+        val base = film.copyOf()          // ★ E3-1c：套用前快照（强度滑杆从它重算）
         val entry = p.lutId?.let { LutLibrary.byId(context, it) }
+        // 记录"当前生效的预设"（强度滑杆的数据源）：①② 两个同步分支直接记；③ 带 LUT 的分支
+        // 在**资产就绪之后**才记 —— LUT 解析失败时参数与画面都不动（applyLut 的既有语义），
+        // 此时强度行也不该冒出来（否则用户拖强度会"套用一个刚才明明失败了的预设"）。
         when {
             // ① 预设不含 LUT ⇒ **不动**当前 LUT 与 [34]（缺失字段 = 保留当前值）
             p.lutId == null -> {
-                applySnapshotParams(film, presetSnapshot(film, p.slots))
+                appliedPreset = p
+                presetBase = base
+                presetAmount = 1f
+                applyPresetAt(p, base, 1f)
                 panelRefresh++
                 recordHistory()
                 rerender()
@@ -758,7 +807,10 @@ fun EditorScreen(
             //    失败分支同口径：绝不留"UI 说选了 LUT、引擎里没有"的半状态）
             entry == null -> {
                 status = "预设「${p.name}」的 LUT 已不在库中"
-                applySnapshotParams(film, presetSnapshot(film, p.slots))
+                appliedPreset = p
+                presetBase = base
+                presetAmount = 1f
+                applyPresetAt(p, base, 1f)
                 film[34] = 0.0
                 lutId = null
                 engine.setLut(null)
@@ -768,7 +820,10 @@ fun EditorScreen(
             }
             // ③ 正常路径：参数在 LUT 就绪后才写（加载失败 ⇒ 参数与画面都不动，不留半套用状态）
             else -> applyLut(entry, p.lutStrength.toFloat()) {
-                params?.let { applySnapshotParams(it, presetSnapshot(it, p.slots)) }
+                appliedPreset = p
+                presetBase = base
+                presetAmount = 1f
+                applyPresetAt(p, base, 1f)
                 status = "已套用预设：${p.name}"
             }
         }
@@ -781,9 +836,60 @@ fun EditorScreen(
         )
     }
 
+    /**
+     * ★ E3-1c 强度滑杆**拖动中**：从 [presetBase] 重算参数，**只写槽位、不渲染**
+     *（[SliderRenderGate]，与其它滑杆同节奏 —— 拖动中画面不动，松手才渲染一次）。
+     *
+     * 注意这里**不碰 LUT 强度**：`[34]` 不在预设的 `slots` 里（由 [EditorPreset.lutStrength]
+     * 承载，见 [presetSlotIncluded]）⇒ 它由松手时的 [onPresetAmountRelease] 统一处理
+     *（拖动中重新上传 3D 纹理是纯浪费）。
+     */
+    fun dragPresetAmount(v: Float) {
+        val p = appliedPreset ?: return
+        val base = presetBase ?: return
+        presetAmount = v.coerceIn(PRESET_AMOUNT_UI_RANGE.start, PRESET_AMOUNT_UI_RANGE.endInclusive)
+        applyPresetAt(p, base, presetAmount)
+        gate.onValueChange()
+    }
+
+    /**
+     * ★ E3-1c 强度滑杆**松手**：渲染一次 + 记**一步**撤销（E2-25，与其它滑杆同口径：
+     * 一次松手 = 一步，拖动过程一次都不记）。
+     *
+     * LUT 强度必须在这里显式处理 —— 它不在 `slots` 里（[34] 由 `lutStrength` 承载），参数域的
+     * 重算够不到它。两种情形：
+     *  - **LUT 还在位**（`lutId == p.lutId`）⇒ 只写 `[34] = lutStrength * amount`，引擎的 LUT
+     *    强度是 uniform ⇒ **不需要重新上传纹理**（与既有的 LUT 强度滑杆同一条路）；
+     *  - **用户中途换了别的 LUT** ⇒ 重走 [applyLut]（= 重套预设；`record` 默认 true ⇒ 内部
+     *    记一步并渲染，不在外面重复记）。
+     */
+    fun onPresetAmountRelease() {
+        if (!gate.onFinished()) return
+        val p = appliedPreset ?: return
+        val film = params ?: return
+        // LUT 强度同样要夹到 0..1.5：预设自身的强度最大就是 1.5，再乘外推的 1.5 会到 2.25
+        //（引擎侧 t > 1 是外推混合，2.25 会把 LUT 变换推得离谱）—— 与 LUT 强度滑杆同一量程。
+        val k = (p.lutStrength * presetAmount)
+            .coerceIn(0.0, LUT_STRENGTH_UI_RANGE.endInclusive.toDouble()).toFloat()
+        val entry = p.lutId?.let { LutLibrary.byId(context, it) }
+        if (p.lutId != null && entry != null && lutId != p.lutId) {
+            applyLut(entry, k)          // 重套：内部 recordHistory() + rerender()
+        } else {
+            if (p.lutId != null && entry != null) film[34] = k.toDouble()
+            panelRefresh++
+            recordHistory()
+            rerender()
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "preset.amount",
+            kv("id" to p.id, "amount" to presetAmount, "lutK" to (p.lutId?.let { film[34] } ?: -1.0)),
+        )
+    }
+
     /** 删除预设（二次确认在面板里）：只动 prefs 与列表，**不动当前参数、画面与撤销栈** */
     fun deletePreset(p: EditorPreset) {
         presets = PresetStore.delete(prefs, p.id)
+        if (appliedPreset?.id == p.id) clearAppliedPreset()   // ★ E3-1c：生效中的预设被删 ⇒ 强度行收起
         status = "已删除预设：${p.name}"
     }
 
@@ -958,13 +1064,15 @@ fun EditorScreen(
 
     /** 撤销一步（顶栏「撤销」）：无可撤销内容时什么都不做（按钮已置灰，这里是第二道保险） */
     fun undoEdit() {
-        history.undo()?.let { applyHistorySnapshot(it) }
+        // ★ E3-1c：撤销回放的是参数 / 裁剪 / LUT 三件套，**不含"生效中的预设 + 强度"** ⇒ 一并
+        //   丢弃（留着就是过期信息：强度行还写着"某某预设 120%"，参数其实已经回退了）。
+        history.undo()?.let { applyHistorySnapshot(it); clearAppliedPreset() }
         syncHistory()
     }
 
     /** 重做一步（顶栏「重做」）：与 [undoEdit] 对称 */
     fun redoEdit() {
-        history.redo()?.let { applyHistorySnapshot(it) }
+        history.redo()?.let { applyHistorySnapshot(it); clearAppliedPreset() }
         syncHistory()
     }
 
@@ -1641,6 +1749,12 @@ fun EditorScreen(
                     presets = presets,
                     canSave = params != null,
                     status = status,
+                    // ★ E3-1c 强度：只在"有生效中的预设"时出现（Lightroom 的 Preset Amount 同款：
+                    // 套用之后才谈得上强度）；拖动中不渲染、松手渲染一次（SliderRenderGate）。
+                    applied = appliedPreset,
+                    amount = presetAmount,
+                    onAmount = { dragPresetAmount(it) },
+                    onAmountFinished = { onPresetAmountRelease() },
                     onSave = { n, g -> savePreset(n, g) },
                     onApply = { applyPreset(it) },
                     onDelete = { deletePreset(it) },
@@ -3169,6 +3283,12 @@ private fun PresetPanel(
     canSave: Boolean,
     /** 与参数面板共用同一行提示（保存 / 套用 / 删除的结果都在这里回显） */
     status: String,
+    /** ★ E3-1c：当前生效的预设（null = 还没有套用过 ⇒ 不显示强度行） */
+    applied: EditorPreset?,
+    /** ★ E3-1c：强度（0..1.5，1.0 = 预设原样） */
+    amount: Float,
+    onAmount: (Float) -> Unit,
+    onAmountFinished: () -> Unit,
     onSave: (String, String) -> Unit,
     onApply: (EditorPreset) -> Unit,
     onDelete: (EditorPreset) -> Unit,
@@ -3233,6 +3353,52 @@ private fun PresetPanel(
             )
         }
         Spacer(Modifier.height(6.dp))
+        // ★ E3-1c 强度（Amount）：**套用之后**出现，改它 = 立即重套（(b) 方案：滑杆常驻在
+        // 生效中的预设上，Lightroom Preset Amount 的语义）。读数 0..150 与 LUT 强度同口径
+        // （[formatZero150]）；量程 0..1.5 且**中点标记画在 100%**（[pivotFraction]），
+        // 让"预设原样"这条基准一眼可见 —— 与其它滑杆的"不变点"是同一种语言。
+        //
+        // 拖动中不渲染、松手渲染一次：`RelativeSlider` 的 onValueChange → 外部只写槽位 +
+        // SliderRenderGate.onValueChange()；onDragEnd → onPresetAmountRelease()（渲染 + 记一步）。
+        applied?.let { p ->
+            Spacer(Modifier.height(4.dp))
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "强度 · ${p.name}",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    formatZero150(amount),
+                    color = FilmTheme.Accent,
+                    fontSize = 13.sp,
+                    fontFamily = FilmTheme.Mono,
+                    fontWeight = FontWeight.SemiBold,
+                    style = TextStyle(shadow = TextShadow),
+                )
+            }
+            RelativeSlider(
+                value = amount,
+                onValueChange = onAmount,
+                onDragEnd = onAmountFinished,
+                range = PRESET_AMOUNT_UI_RANGE,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                rowHeight = 40.dp,
+                ticks = true,
+                midFraction = pivotFraction(PRESET_AMOUNT_UI_RANGE, 1f),
+                barThumb = true,
+            )
+        }
         if (presets.isEmpty()) {
             Box(
                 Modifier

@@ -1668,6 +1668,178 @@ internal fun presetSnapshot(base: DoubleArray, slots: Map<Int, Double>): DoubleA
     return out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// E3-1c 预设强度（Amount）：**参数域缩放**（调研报告 `docs/reports/editor-preset-RESEARCH.md` §5.6）
+//
+// 强度有两条互斥路线，走哪条**由参数的编码方式决定**（不是口味问题）：
+//  - **输出混合**（darktable `out = a*(1-mask)+b*mask`、RawTherapee `intp(strength, clut, 原像素)`）：
+//    它们的参数是二进制 blob（只能整块替换）⇒ 只能把"原像素"与"套用后的像素"混合；
+//  - **参数域缩放**（Lightroom `SupportsAmount` / 150% 参数算例）：参数是命名键值 ⇒ 逐槽插值。
+// 我们的 96 槽是**命名槽位**（每槽有明确语义与恒等值）⇒ 与 Lightroom 同构 ⇒ 走参数缩放。
+// 收益：**零额外渲染** —— 不需要第二个 pass，也不会与 LUT / 颗粒这些"引擎内本来就带混合系数"
+// 的效果叠加两次（`[34] lut_strength` 本身就是引擎里的混合系数）。
+//
+// 公式（§5.6）：`p_new[i] = neutral[i] + (p_preset[i] - neutral[i]) * amount`
+// ⚠ **相对恒等值 [neutral]，不是相对 0、也不是相对当前值**：本仓库大量槽的恒等值是 **1.0**
+//（`wb_* [1..3]` / `contrast [4]` / `sat_* [20..22]` / `lut_strength [34]` /
+// `interlayer_* [69..77]`）—— 相对 0 缩放的后果是：对比度预设 1.5、强度 50% ⇒ 0.75
+//（**画面变灰**），而正确值是 **1.25**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 强度 UI 量程 **0..1.5**（读数 0..150，[formatZero150]）：与 LUT 强度
+ * [LUT_STRENGTH_UI_RANGE] / 拍照页的 LUT 强度滑杆**同一口径**（E2-15 用户拍板"统一可调至 150"）。
+ *
+ * `> 1` 是**外推**：把预设相对恒等值的偏离量放大到 1.5 倍。数学上天然成立（与 LUT 强度
+ * `t > 1` 同理），但一部分槽位有**契约边界**（暗角强度 −1..0、LUT 强度 0..1.5、影调分区 ±1 …）
+ * ⇒ 外推路径逐槽夹紧（[presetSlotClamp]）。
+ */
+internal val PRESET_AMOUNT_UI_RANGE = 0f..1.5f
+
+/**
+ * 局部调整（[79..87]）的最低套用强度：低于它 ⇒ **整条局部通道不套用**（保持目标当前值）。
+ *
+ * 为什么需要阈值：局部通道里 [79] 是**离散枚举**（0 关 / 1 径向 / 2 线性），枚举不能插值
+ *（§5.6 表末行："amount < 阈值 ⇒ 整体不套用局部"）；而 [80..85] 是**构图几何**（中心 / 半径 /
+ * 羽化 / 角度 / 宽度）—— 强度不该移动用户圈好的区域（否则"减弱预设"会变成"挪走我的局部"）。
+ * 两者都只能"要么按原值、要么不套用"，阈值取 **0.5**：半强度以下不值得开启一个离散效果，
+ * 且这是保守方向（不套用 = 不动用户当前的设置）。
+ *
+ * ⚠ v1 的预设**不含局部通道**（[presetSlotIncluded] 排除了 [79..87]）⇒ 这段判定是防御性的
+ *（手改 JSON、或未来把局部纳入预设时才走到）。
+ */
+internal const val PRESET_LOCAL_MIN_AMOUNT = 0.5
+
+/** 局部通道里"按公式缩放"的第一槽：[79..85] 是离散枚举与几何（原值），[86][87] 是强度。 */
+private const val PRESET_LOCAL_STRENGTH_SLOT = 86
+
+/**
+ * 非线性曲线 / 形状类槽位：**[5..10]** filmic latitude（0.01 = darktable 默认，**0 = 极端
+ * S 曲线**）+ **[37][38]** filmic 黑白点（EV）。
+ *
+ * 为什么不缩放（§5.6 表："建议 v1 不参与缩放"）：这些槽的语义是**非线性**的 —— latitude
+ * 0.01 → 0.02 的视觉差异远大于 0.5 → 0.51，线性插值在 0 附近会产生剧烈且方向不可预期的变化。
+ * 规则：**amount > 0 ⇒ 原值套用**（形状不随强度变）；**amount = 0 ⇒ 回恒等值**（与其它槽一致地
+ * "完全不套用"）。这样从 100% 往左拖时曲线形状不动、其余参数变弱，1.0 附近没有跳变。
+ */
+private fun presetSlotCurve(i: Int): Boolean = i in 5..10 || i == 37 || i == 38
+
+/**
+ * "**0 = 关**"型的槽：效果量**就是槽值本身**（不是"相对恒等值的偏离"）⇒ 缩放用 `v * amount`。
+ *
+ * 只有 **[34] LUT 强度**一条：它的恒等值在 [CameraPresets.standard] 里写的是 **1.0**（拍摄链路
+ * 默认全量混合），但**编辑器语义里 0 才是"无 LUT"**（[editorOpenParams] 打开编辑器时把 [34]
+ * 归 0，引擎侧 `uLutOn = 0` 整段旁路）—— 效果量是"混合了多少"，不是"偏离 1.0 多少"。
+ * 若套用通用公式：预设 [34] = 1.0、强度 50% ⇒ 结果仍是 1.0（**强度滑杆对 LUT 完全无效**）。
+ */
+private fun presetSlotZeroBased(i: Int): Boolean = i == PRESET_LUT_STRENGTH_SLOT
+
+/**
+ * 逐槽合法范围（**只在 `amount > 1` 的外推路径上使用**）。取值两个来源：
+ *  - **UI 量程常量与映射函数**（[EXP_UI_RANGE] / [WB_GAIN_UI_RANGE] / [SAT_UI_RANGE] /
+ *    [CLARITY_UI_RANGE] / [LUT_STRENGTH_UI_RANGE] / [TINT_UI_RANGE] / [TONE_UI_RANGE] /
+ *    [FADE_UI_RANGE] / [LOCAL_EV_UI_RANGE] / [LOCAL_SAT_UI_RANGE]、[vigStrengthSlot] /
+ *    [vigRadiusSlot] / [vigFeatherSlot] / [expSlot] / [tempSlot]）—— **与滑杆同一份定义**，
+ *    不另抄一遍数字（两处各写一份必然漂移，而漂移的表现是"滑杆拖不到的值却出现在画面里"）；
+ *  - **`FilmParams.h` 的契约边界**（Kotlin 侧没有常量的那几条：颗粒 / 相纸响应 / halation），
+ *    逐条标注出处。
+ *
+ * 为什么只在外推时夹：`0 ≤ amount ≤ 1` 的结果是 `neutral` 与预设值的**凸组合** ⇒ 预设值本身在
+ * 范围内时结果必然在范围内（无需夹）。这也让 **`amount = 1.0` 的零回归成为结构性保证**：
+ * 外推路径根本不经过 `amount = 1`（[scalePresetSlots] 在入口就原样返回）。
+ */
+private val PRESET_SLOT_CLAMP: Map<Int, ClosedFloatingPointRange<Double>> = buildMap {
+    put(0, expSlot(EXP_UI_RANGE.start)..expSlot(EXP_UI_RANGE.endInclusive))    // ±3 EV
+    for (i in 1..3) put(i, slotRange(WB_GAIN_UI_RANGE))
+    put(4, CONTRAST_SLOT_MIN..2.0)
+    for (i in 20..22) put(i, slotRange(SAT_UI_RANGE))
+    put(26, 0.0..100.0)        // FilmParams.h:55-58 颗粒 `strength`（0..100）
+    put(27, 20.0..6400.0)      // 同上 `scale` = ISO（20..6400，越大越粗）
+    put(34, slotRange(LUT_STRENGTH_UI_RANGE))
+    put(60, 0.0..100.0)        // FilmParams.h:369 颗粒相纸响应 midtones_bias（%）
+    for (i in 62..65) put(i, 0.0..1.0)   // FilmParams.h:377-381 halation 强度/阈值/半径/暖度
+    put(66, vigStrengthSlot(1f)..vigStrengthSlot(0f))   // −1..0（强度越大越负）
+    put(67, vigRadiusSlot(0f)..vigRadiusSlot(2f))       // 0..200（%）
+    put(68, vigFeatherSlot(0f)..vigFeatherSlot(2f))     // 0..200（%）
+    put(78, slotRange(CLARITY_UI_RANGE))
+    put(86, expSlot(LOCAL_EV_UI_RANGE.start)..expSlot(LOCAL_EV_UI_RANGE.endInclusive))  // ±3 EV
+    put(87, slotRange(LOCAL_SAT_UI_RANGE))
+    put(88, tempSlot(TEMP_UI_RANGE.endInclusive)..tempSlot(TEMP_UI_RANGE.start))  // mired 域（递减 ⇒ 反写）
+    put(89, slotRange(TINT_UI_RANGE))
+    for (i in 90..93) put(i, slotRange(TONE_UI_RANGE))
+    put(94, slotRange(FADE_UI_RANGE))
+}
+
+/** UI 量程（Float）→ 槽位量程（Double）：槽位 = UI 值**直通**的那批参数用（见 [PRESET_SLOT_CLAMP]）。 */
+private fun slotRange(r: ClosedFloatingPointRange<Float>): ClosedFloatingPointRange<Double> =
+    r.start.toDouble()..r.endInclusive.toDouble()
+
+/** 外推夹紧：表里没有的槽原样返回（引擎对它们没有硬边界，越界只是"更浓"）。 */
+private fun presetSlotClamp(i: Int, v: Double): Double =
+    PRESET_SLOT_CLAMP[i]?.let { v.coerceIn(it.start, it.endInclusive) } ?: v
+
+/**
+ * 预设强度（Amount）的**逐类缩放**（§5.6 的表；逐类语义都有单测钉住）。
+ *
+ * @param slots 预设的稀疏槽位（**满强度**的原值；强度不是预设的一部分）
+ * @param amount 强度：0 = 完全不套用 / 1 = 预设原样（零回归）/ 0..1.5（> 1 = 外推）
+ * @param neutral 恒等值表（默认 [CameraPresets.standard]，**逐槽取，绝不假设 0**）
+ * @return **新 map**（不改入参）：`idx → 缩放后的槽值`。缺键 = 不套用该槽（RawTherapee 语义）。
+ *
+ * 逐类规则（§5.6 表 + 本卡的三个决定）：
+ *
+ * | 类别 | 槽位 | 规则 |
+ * |---|---|---|
+ * | 线性增益 / 强度型（含恒等 1.0 的乘性系数、恒等 0 的强度） | [0..4] [20..33] [35..36] [60..78] [88..95] | ✅ 相对恒等值插值 |
+ * | LUT 强度 | [34] | ✅ `v * amount`（"0 = 关"型，见 [presetSlotZeroBased]） |
+ * | 矩阵类 | [11..19] [69..77] | ✅ 同一公式（恒等值 = 单位阵 / 1.0 ⇒ 即 `I+(M−I)·k`） |
+ * | 非线性曲线 | [5..10] [37] [38] | ⚠️ 不缩放：amount > 0 原值、amount = 0 回恒等 |
+ * | 离散枚举 + 构图几何（局部通道） | [79..85] | ❌ 不缩放：amount < 0.5 整条不套用，≥ 0.5 原值 |
+ * | 局部强度（仍是线性量） | [86] [87] | ✅ 与第一类同（但同受 0.5 阈值约束） |
+ *
+ * 三条边界行为：
+ *  - `amount` 非有限（NaN/Inf，坏数据）⇒ **原样返回**（按满强度处理）：宁可"没减强度"，也不能让
+ *    `neutral + (v−neutral)*NaN = NaN` 写进参数数组（NaN 进引擎 = 画面崩坏）；
+ *  - `amount < 0` ⇒ 按 0 处理（不做"反向预设"）；
+ *  - 槽值非有限 / 下标越界 ⇒ **丢弃该槽**（与 [presetSnapshot] 的坏数据口径一致）。
+ */
+internal fun scalePresetSlots(
+    slots: Map<Int, Double>,
+    amount: Double,
+    neutral: DoubleArray = CameraPresets.standard(),
+): Map<Int, Double> {
+    // ★ amount = 1 ⇒ 原样返回：零回归是**结构性**的（一个缩放分支都不经过），而不是"算出来
+    //   恰好相等"。曲线类与局部通道也一并原样通过（含它们的原值语义）。
+    if (!amount.isFinite() || amount == 1.0) return slots
+    val a = amount.coerceAtLeast(0.0)
+    val extrapolate = a > 1.0
+    val out = LinkedHashMap<Int, Double>(slots.size)
+    for ((i, v) in slots) {
+        if (!v.isFinite() || i !in neutral.indices) continue
+        // 曲线 / 形状类：不缩放（amount = 0 ⇒ 回恒等；amount > 0 ⇒ 原值）
+        if (presetSlotCurve(i)) {
+            out[i] = if (a > 0.0) v else neutral[i]
+            continue
+        }
+        // 局部通道：低于阈值整条不套用（离散枚举不能插值 + 几何不该被强度移动）
+        if (i in PRESET_LOCAL_SLOTS) {
+            if (a < PRESET_LOCAL_MIN_AMOUNT) continue
+            if (i < PRESET_LOCAL_STRENGTH_SLOT) {
+                out[i] = v          // [79..85]：原值（离散枚举 / 构图几何都不参与缩放）
+                continue
+            }
+        }
+        // 通用：相对恒等值插值（外推时逐槽夹紧）
+        val scaled = if (presetSlotZeroBased(i)) {
+            v * a
+        } else {
+            neutral[i] + (v - neutral[i]) * a
+        }
+        out[i] = if (extrapolate) presetSlotClamp(i, scaled) else scaled
+    }
+    return out
+}
+
 /** JSON 数字字面量：坏数据（NaN/Inf）写成 0 —— 绝不写出 `NaN` / `Infinity` 这种非法 JSON。 */
 private fun jsonNum(v: Double): String = if (v.isFinite()) v.toString() else "0"
 
