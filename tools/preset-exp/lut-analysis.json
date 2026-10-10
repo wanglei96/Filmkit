@@ -1,0 +1,337 @@
+[
+  {
+    "file": "leica_m9.lut",
+    "title": "徕卡 M9",
+    "category": "徕卡",
+    "size": 33,
+    "gray_in_0_25_50_75_100": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        45.0,
+        45.0,
+        45.0
+      ],
+      [
+        111.0,
+        112.0,
+        112.0
+      ],
+      [
+        192.0,
+        192.0,
+        192.0
+      ],
+      [
+        255.0,
+        255.0,
+        255.0
+      ]
+    ],
+    "is_monochrome": false,
+    "max_channel_spread": 255.0,
+    "black_point_255": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "white_point_255": [
+      255.0,
+      255.0,
+      255.0
+    ],
+    "contrast_slope_at_mid": 1.318,
+    "mean_shift_rgb_255": [
+      -6.13,
+      -9.7,
+      -4.92
+    ],
+    "warm_cool_r_minus_b": -1.21,
+    "pure_red_out": [
+      0.0,
+      13.0,
+      253.0
+    ],
+    "pure_green_out": [
+      86.0,
+      255.0,
+      87.0
+    ],
+    "pure_blue_out": [
+      255.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "file": "ricoh_negative.lut",
+    "title": "理光 负片",
+    "category": "理光",
+    "size": 33,
+    "gray_in_0_25_50_75_100": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        72.0,
+        73.0,
+        72.0
+      ],
+      [
+        150.0,
+        150.0,
+        148.0
+      ],
+      [
+        196.0,
+        196.0,
+        195.0
+      ],
+      [
+        237.0,
+        237.0,
+        237.0
+      ]
+    ],
+    "is_monochrome": false,
+    "max_channel_spread": 211.0,
+    "black_point_255": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "white_point_255": [
+      237.0,
+      237.0,
+      237.0
+    ],
+    "contrast_slope_at_mid": 0.858,
+    "mean_shift_rgb_255": [
+      8.51,
+      15.7,
+      10.57
+    ],
+    "warm_cool_r_minus_b": -2.06,
+    "pure_red_out": [
+      52.0,
+      37.0,
+      142.0
+    ],
+    "pure_green_out": [
+      0.0,
+      208.0,
+      143.0
+    ],
+    "pure_blue_out": [
+      230.0,
+      83.0,
+      7.0
+    ]
+  },
+  {
+    "file": "leica_b_w_true.lut",
+    "title": "徕卡 黑白 True",
+    "category": "徕卡",
+    "size": 33,
+    "gray_in_0_25_50_75_100": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        60.0,
+        60.0,
+        60.0
+      ],
+      [
+        124.0,
+        124.0,
+        124.0
+      ],
+      [
+        189.0,
+        189.0,
+        189.0
+      ],
+      [
+        255.0,
+        255.0,
+        255.0
+      ]
+    ],
+    "is_monochrome": true,
+    "max_channel_spread": 0.0,
+    "black_point_255": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "white_point_255": [
+      255.0,
+      255.0,
+      255.0
+    ],
+    "contrast_slope_at_mid": 1.098,
+    "mean_shift_rgb_255": [
+      8.63,
+      8.63,
+      8.63
+    ],
+    "warm_cool_r_minus_b": 0.0,
+    "pure_red_out": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "pure_green_out": [
+      218.0,
+      218.0,
+      218.0
+    ],
+    "pure_blue_out": [
+      143.0,
+      143.0,
+      143.0
+    ]
+  },
+  {
+    "file": "leica_b_w_hc.lut",
+    "title": "徕卡 黑白 HC",
+    "category": "徕卡",
+    "size": 33,
+    "gray_in_0_25_50_75_100": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        56.0,
+        56.0,
+        56.0
+      ],
+      [
+        132.0,
+        132.0,
+        132.0
+      ],
+      [
+        206.0,
+        206.0,
+        206.0
+      ],
+      [
+        254.0,
+        254.0,
+        254.0
+      ]
+    ],
+    "is_monochrome": true,
+    "max_channel_spread": 0.0,
+    "black_point_255": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "white_point_255": [
+      254.0,
+      254.0,
+      254.0
+    ],
+    "contrast_slope_at_mid": 1.161,
+    "mean_shift_rgb_255": [
+      17.6,
+      17.6,
+      17.6
+    ],
+    "warm_cool_r_minus_b": 0.0,
+    "pure_red_out": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "pure_green_out": [
+      233.0,
+      233.0,
+      233.0
+    ],
+    "pure_blue_out": [
+      154.0,
+      154.0,
+      154.0
+    ]
+  },
+  {
+    "file": "leica_classic.lut",
+    "title": "徕卡 Classic",
+    "category": "徕卡",
+    "size": 33,
+    "gray_in_0_25_50_75_100": [
+      [
+        0.0,
+        1.0,
+        2.0
+      ],
+      [
+        64.0,
+        65.0,
+        68.0
+      ],
+      [
+        159.0,
+        160.0,
+        155.0
+      ],
+      [
+        212.0,
+        218.0,
+        207.0
+      ],
+      [
+        247.0,
+        252.0,
+        243.0
+      ]
+    ],
+    "is_monochrome": false,
+    "max_channel_spread": 240.0,
+    "black_point_255": [
+      0.0,
+      1.0,
+      2.0
+    ],
+    "white_point_255": [
+      247.0,
+      252.0,
+      243.0
+    ],
+    "contrast_slope_at_mid": 1.108,
+    "mean_shift_rgb_255": [
+      32.36,
+      15.72,
+      19.41
+    ],
+    "warm_cool_r_minus_b": 12.95,
+    "pure_red_out": [
+      105.0,
+      54.0,
+      241.0
+    ],
+    "pure_green_out": [
+      120.0,
+      253.0,
+      114.0
+    ],
+    "pure_blue_out": [
+      236.0,
+      1.0,
+      2.0
+    ]
+  }
+]
