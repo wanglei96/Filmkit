@@ -2,6 +2,7 @@ package com.filmkit.app.camera
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -9,6 +10,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.jsonEscape
 import com.filmkit.app.kv
 import com.filmkit.app.ui.CameraPresets
 import java.io.ByteArrayOutputStream
@@ -1500,6 +1502,515 @@ private fun writeEditorExif(context: Context, uri: Uri?, timeMs: Long, srcJpeg: 
             EngineBridge.LEVEL_WARN, "camera", "photo.edit_exif_failed",
             kv("error" to (it.message ?: it.toString())),
         )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E3-1a 预设（Preset）：**稀疏字段集** + schema 版本 + prefs 单键 JSON + 保存 / 套用 / 删除
+//
+// 为什么不是"整包 96 槽快照"（`ADR-19` 那版，**已被用户否掉**，见调研报告 §5.2 方案 A）：
+//  ① 全量覆盖会**清掉用户当前的调整**，而专业语义是"只改这条预设管的那几项"——
+//     Lightroom 的 Check All / Check None 逐项勾选、RawTherapee 的 `.pp3` 只写被编辑过的字段；
+//  ② `[39..59]` 是 **RAW 解码 / 拍摄链路**参数（sharpen / gamut / hr_raw / rcd_* / pc3d …），
+//     它们是"相机属性"而不是"风格"，套用会把别人的解码参数一起带过来；
+//  ③ 96 槽全量 ≈1.3 KB/个，稀疏 ≈300–700 B/个（调研 §5.3）。
+//
+// 语义来源：RawTherapee `saveToKeyfile(!pedited || edited.x)` —— **缺失的 key = 保留目标当前值**。
+// 这就是"部分套用"的全部实现：按 idx 覆盖 [presetSnapshot] 里记下的那几个槽，其余不动。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 预设格式版本（E3-1a 起）。**槽位语义变更时必须 +1 并写逐槽迁移**（见 [presetSchemaUsable]）。 */
+internal const val PRESET_SCHEMA = 1
+
+/** 预设在 prefs 里的键：单键 JSON 数组（与 `LutLibrary` 的 `lut_cats` 等同一套 prefs 风格）。 */
+internal const val PRESET_KEY = "presets_v1"
+
+/** 预设数量上限：稀疏格式 ≈300–700 B/个 ⇒ 100 个 ≈ 30–70 KB，SharedPreferences 无压力。 */
+internal const val PRESET_MAX = 100
+
+/** [EditorPreset.source] 的取值：用户自建（内置包 / 导入留给 E3-4 / E3-2）。 */
+internal const val PRESET_SOURCE_USER = "user"
+
+/**
+ * 不进预设的槽位区间：**[39..59] = RAW 解码 / 拍摄链路**（`FilmParams.h`：
+ * sharpen / gamut / white_hl / hr_raw / rcd_cdfix / defringe / moire / hl_grecon / ca_corr /
+ * chroma_gate / df_gate / pc3d / rcd_g_orig / hl_rb_recon / color_smooth / rcd_p3_split）。
+ *
+ * 判据是"这是**解码属性**还是**风格**"（调研 §5.1 D1）：解码参数描述的是"这张 RAW 怎么解"，
+ * 与用户想要的观感无关；把它们存进预设，套用时会把拍摄者的解码设定强加给另一张照片。
+ */
+private val PRESET_DECODE_SLOTS = 39..59
+
+/** [34] LUT 强度在 `slots` 里的下标（**不参与稀疏化**，见 [presetSlotIncluded]）。 */
+private const val PRESET_LUT_STRENGTH_SLOT = 34
+
+/**
+ * 不进预设的槽位区间：**[79..87] = 局部调整**（`local_type` / 中心 / 半径 / 羽化 / 角度 /
+ * 宽度 / 局部 EV / 局部饱和度）。
+ *
+ * 判据是"**构图相关**还是**风格**"（调研 §5.1 D7）：局部调整的坐标虽然归一化，但"画面哪块
+ * 该亮"依赖**具体画面内容** —— 套到另一张照片上，那块区域通常什么都不是。
+ * 证据：Lightroom 真实预设文件里**没有** crop / mask 字段（§3.1b 实测），Adobe 官方也把
+ * 几何类设置排除在 Amount 之外；Capture One 的局部走的是另一条通道（Style Brush）。
+ * ⇒ **v1 不做局部调整入预设**（要局部风格请用「套用原片风格」，那是同一张片子的参数）。
+ */
+private val PRESET_LOCAL_SLOTS = 79..87
+
+/**
+ * 槽位是否参与预设（稀疏化的白名单判据）。排除四类：
+ *  - **[34] LUT 强度**：由 [EditorPreset.lutId] / [EditorPreset.lutStrength] 承载。
+ *    ⚠ 这条不是洁癖，是**必须**：[editorOpenParams] 打开编辑器时把 [34] 归 **0**（成片已含
+ *    拍摄时的 LUT 混合，不能再叠一遍）⇒ 若 [34] 参与稀疏化，**每一条预设都会存下 "34":0**，
+ *    套用时把当前 LUT 的强度打成 0 —— 用户刚选的 LUT 被静默关掉（"套了预设，滤镜没了"）。
+ *  - **[39..59]**：RAW 解码 / 拍摄链路（[PRESET_DECODE_SLOTS]）。
+ *  - **[79..87]**：局部调整（[PRESET_LOCAL_SLOTS]，构图相关，v1 不做）。
+ *  - 数组越界（坏数据 / 未来契约变更）。
+ */
+internal fun presetSlotIncluded(i: Int): Boolean =
+    i in 0 until CameraPresets.COUNT &&
+        i != PRESET_LUT_STRENGTH_SLOT &&
+        i !in PRESET_DECODE_SLOTS &&
+        i !in PRESET_LOCAL_SLOTS
+
+/**
+ * 一条预设（调研 §5.2 方案 B 的 Kotlin 形态）。
+ *
+ * 字段与 JSON 一一对应（见 [presetToJson]），**结构上就能直接序列化成单文件**（E3-2 的
+ * `.fkpreset` 直接复用本结构，不依赖 prefs 的键命名）。
+ *
+ * @param slots ★ **稀疏**：只含与恒等值（[CameraPresets.standard] 的逐槽值）不同的槽。
+ *   "缺失 = 不套用该槽"（RawTherapee 语义）⇒ 天然支持"这条预设只改色彩"。
+ * @param lutId 资源引用（调研 §5.1 D2：预设必须带资源引用）。**null = 这条预设不含 LUT**
+ *   ⇒ 套用时**不动**当前 LUT（缺失字段 = 保留当前值）；非 null 但资产已不在库中 ⇒
+ *   降级为"无 LUT + 提示"（见 EditorScreen 的 applyPreset）。
+ * @param lutStrength LUT 强度（0..1.5，与 [LUT_STRENGTH_UI_RANGE] 同量程）。
+ */
+internal data class EditorPreset(
+    val id: String,
+    val name: String,
+    val group: String = "",
+    val favorite: Boolean = false,
+    val createdAt: Long = 0L,
+    val source: String = PRESET_SOURCE_USER,
+    val slots: Map<Int, Double> = emptyMap(),
+    val lutId: String? = null,
+    val lutStrength: Double = 1.0,
+)
+
+/**
+ * 预设 id（**稳定**：重命名不改，删除/更新按它定位）：`p_<毫秒>_<salt 的 36 进制>`。
+ *
+ * 带 salt 的理由：id 撞车会让"删一条"变成"删两条"。salt 由调用侧给（`Random.nextInt()`），
+ * 本函数保持纯逻辑 ⇒ JVM 单测可断言格式与稳定性。
+ */
+internal fun presetId(now: Long, salt: Int): String =
+    "p_${now}_${Integer.toString(salt and 0xFFF, 36)}"
+
+/**
+ * schema 版本判定（E3-1a 定案）：**只认 [PRESET_SCHEMA]，未知版本一律拒绝该预设**
+ *（跳过 + 诊断日志），**不做"尽力降级套用"**。
+ *
+ * 为什么拒绝而不是降级：`FilmParams.h:37-44` 记录过一次真实的**槽位语义漂移** ——
+ * `[5..10]` 从"高光软肩 / 阴影 toe（0 = 关）"**重定义**为"filmic latitude（0.01 = darktable
+ * 默认，**0 = 极端 S 曲线**）"：同一批数值在新语义下是**完全不同的画面**。
+ * 未来版本的预设里我们不知道哪些槽被重定义过 ⇒ 按旧语义套用 = 静默给出错误观感
+ *（用户根本不知道画面为什么不对），而"少一条预设 + 一条可读的诊断日志"是可解释、可恢复的失败。
+ *
+ * 逐版本迁移链（darktable `legacy_params` 模式）留给 E3-2（导入 / 导出卡）；
+ * 届时本函数变成"有迁移路径的旧版本也返回 true"。
+ */
+internal fun presetSchemaUsable(schema: Int?): Boolean = schema == PRESET_SCHEMA
+
+/**
+ * 稀疏化（保存侧的核心）：把当前参数压成"**只含与恒等值不同的槽**"的字典。
+ *
+ * ⚠ **恒等值必须逐槽取 [CameraPresets.standard]，绝不能假设 0**：本仓库大量槽位的恒等值
+ * 不是 0 —— `wb_* [1..3]` / `contrast [4]` / `sat_* [20..22]` / `lut_strength [34]` /
+ * `interlayer_* [69..77]` 是 **1.0**，`shoulder/toe [5..10]` 是 **0.01**（latitude 语义下
+ * 0 = 极端 S 曲线），`cross [11..19]` 是**单位阵**，`filmic_black_ev [37]` 是 −7.65。
+ * 用 0 当恒等值会把"用户没动过的槽"整片存进预设，套用时把画面打回默认。
+ *
+ * 容差用 [PARAM_EPS]（与 `paramsUnchanged` **同一份口径**）：Float→Double 的精度噪声
+ *（`0.01f.toDouble()` = 0.009999999776…）不会被误判成"改过"。
+ *
+ * 非有限值（NaN/Inf）一律丢弃：坏数据不进库（读取侧还有第二道防线）。
+ */
+internal fun presetSparseSlots(
+    params: DoubleArray,
+    neutral: DoubleArray = CameraPresets.standard(),
+): Map<Int, Double> {
+    val out = LinkedHashMap<Int, Double>()
+    val n = min(params.size, neutral.size)
+    for (i in 0 until n) {
+        if (!presetSlotIncluded(i)) continue
+        val v = params[i]
+        if (!v.isFinite()) continue
+        if (abs(v - neutral[i]) > PARAM_EPS) out[i] = v
+    }
+    return out
+}
+
+/**
+ * 套用映射（**部分套用的全部逻辑**）：以 [base] 为底，只把 [slots] 里记下的槽覆盖上去，
+ * 其余槽保持 [base] 的值 —— 这就是 RawTherapee 的"缺失 key = 保留当前值"。
+ *
+ * 返回**新数组**（不是原地写）：调用侧统一走 `applySnapshotParams(current, presetSnapshot(...))`
+ *（E2-21 的整槽下发入口，复用不重写），于是"原地写、不换数组对象"这条纪律只有一处实现
+ *（滑杆组件持有 `params` 的引用，换对象 = 读数与槽位脱钩）。
+ *
+ * 越界 / 非有限的槽**逐槽跳过**（不是整条预设作废）：未知槽位忽略正是调研 §5.7 第 3 条。
+ */
+internal fun presetSnapshot(base: DoubleArray, slots: Map<Int, Double>): DoubleArray {
+    val out = base.copyOf()
+    for ((i, v) in slots) {
+        if (i in out.indices && v.isFinite()) out[i] = v
+    }
+    return out
+}
+
+/** JSON 数字字面量：坏数据（NaN/Inf）写成 0 —— 绝不写出 `NaN` / `Infinity` 这种非法 JSON。 */
+private fun jsonNum(v: Double): String = if (v.isFinite()) v.toString() else "0"
+
+/**
+ * 单条预设 → JSON（**键序固定**：便于 diff 与单测逐字断言）。
+ *
+ * `lut` 为 null 时**省略该键**（不是写 `"lut":null`）：读取侧"缺失 = 无 LUT"，
+ * 与"缺失 key = 不套用该字段"的整套语义一致，也少 20 字节。
+ */
+internal fun presetToJson(p: EditorPreset): String = buildString {
+    append("{\"schema\":").append(PRESET_SCHEMA)
+    append(",\"id\":\"").append(jsonEscape(p.id)).append('"')
+    append(",\"name\":\"").append(jsonEscape(p.name)).append('"')
+    append(",\"group\":\"").append(jsonEscape(p.group)).append('"')
+    append(",\"favorite\":").append(p.favorite)
+    append(",\"createdAt\":").append(p.createdAt)
+    append(",\"source\":\"").append(jsonEscape(p.source)).append('"')
+    append(",\"slots\":{")
+    p.slots.entries.sortedBy { it.key }.forEachIndexed { i, (k, v) ->
+        if (i > 0) append(',')
+        append('"').append(k).append("\":").append(jsonNum(v))
+    }
+    append('}')
+    p.lutId?.let {
+        append(",\"lut\":{\"id\":\"").append(jsonEscape(it))
+            .append("\",\"strength\":").append(jsonNum(p.lutStrength)).append('}')
+    }
+    append('}')
+}
+
+/** 全部预设 → JSON 数组（prefs 单键的存储形态）。 */
+internal fun presetsToJson(list: List<EditorPreset>): String =
+    list.joinToString(",", "[", "]") { presetToJson(it) }
+
+/**
+ * 读取结果：**成功的列表 + 被跳过的项及原因**。
+ *
+ * 为什么把诊断信息返回而不是直接写日志：日志接口（`EngineBridge.nativeAppendLog`）是 native
+ * external，JVM 单测里不可用 ⇒ 由调用侧（[PresetStore]）落日志，纯逻辑这层保持可测
+ *（单测直接断言 skipped 的内容，容错行为才钉得住）。
+ */
+internal data class PresetLoadResult(
+    val presets: List<EditorPreset>,
+    /** 每项一句人话（含下标 / 原因），进 `preset.load_skipped` 诊断日志 */
+    val skipped: List<String> = emptyList(),
+)
+
+/**
+ * JSON 数组 → 预设列表（**容错读取，绝不抛异常**）。
+ *
+ * 容错分两档（粒度不同，理由也不同）：
+ *  - **结构字段坏了 ⇒ 跳过整项**：`schema` 不认识 / 缺 `id` / 缺 `name` / `slots` 不是对象
+ *    —— 这条预设要么没法用，要么没法被定位（删除 / 更新按 id），留下只会是幽灵条目；
+ *  - **槽位 / 资源坏了 ⇒ 逐项降级**：越界槽位忽略（调研 §5.7 第 3 条）、非数字 / 非有限值
+ *    忽略、等于恒等值的槽丢弃（保住"slots 只含非恒等槽"这条不变式）、`lut` 坏了当"无 LUT"
+ *    —— 一条预设里一个槽坏了不该让用户丢掉整条预设。
+ *
+ * @param raw prefs 原文；null / 空白 = 还没存过（**不是错误**，不产生诊断）
+ */
+internal fun presetsFromJson(raw: String?): PresetLoadResult {
+    if (raw.isNullOrBlank()) return PresetLoadResult(emptyList())
+    val skipped = mutableListOf<String>()
+    val root = try {
+        MiniJson.parse(raw)
+    } catch (t: Throwable) {
+        return PresetLoadResult(emptyList(), listOf("JSON 解析失败：${t.message}"))
+    }
+    val arr = root as? List<*> ?: return PresetLoadResult(emptyList(), listOf("顶层不是数组"))
+    val out = ArrayList<EditorPreset>(min(arr.size, PRESET_MAX))
+    arr.forEachIndexed { i, v ->
+        val p = parsePreset(v) { why -> skipped += "item#$i：$why" }
+        if (p != null) out += p
+    }
+    if (out.size > PRESET_MAX) {
+        skipped += "超出上限 $PRESET_MAX，丢弃最旧的 ${out.size - PRESET_MAX} 条"
+    }
+    return PresetLoadResult(out.take(PRESET_MAX), skipped)
+}
+
+/** 单项解析（[presetsFromJson] 的每一项）。[why] = 诊断回调；返回 null = 跳过该项。 */
+private fun parsePreset(v: Any?, why: (String) -> Unit): EditorPreset? {
+    val o = v as? Map<*, *> ?: run { why("不是 JSON 对象"); return null }
+    // ① schema：未知版本拒绝（理由见 presetSchemaUsable）
+    val schemaD = (o["schema"] as? Double)?.takeIf { it.isFinite() && it == Math.floor(it) }
+    val schema = schemaD?.toInt()
+    if (!presetSchemaUsable(schema)) {
+        why("schema=${o["schema"]} 不是本版本支持的 $PRESET_SCHEMA")
+        return null
+    }
+    // ② id / name：定位与展示都靠它们，缺了这条预设没有意义
+    val id = (o["id"] as? String)?.trim().orEmpty()
+    if (id.isEmpty()) {
+        why("缺少 id")
+        return null
+    }
+    val name = (o["name"] as? String)?.trim().orEmpty()
+    if (name.isEmpty()) {
+        why("缺少 name")
+        return null
+    }
+    // ③ slots：必须是对象（数组 / 字符串 / 数字一律当坏项 —— 本格式没有"定长数组"形态）
+    val rawSlots = o["slots"]
+    if (rawSlots != null && rawSlots !is Map<*, *>) {
+        why("slots 不是对象")
+        return null
+    }
+    val neutral = CameraPresets.standard()
+    val slots = LinkedHashMap<Int, Double>()
+    // 上面的形态检查已经让编译器把 rawSlots 智能转换成 Map? ⇒ 这里直接遍历（无需再 cast）
+    rawSlots?.forEach { (k, value) ->
+        val idx = (k as? String)?.toIntOrNull()
+        if (idx == null || !presetSlotIncluded(idx)) {
+            why("槽位 $k 越界 / 不参与预设，已忽略")
+            return@forEach
+        }
+        val d = (value as? Double)?.takeIf { it.isFinite() }
+        if (d == null) {
+            why("槽位 $k 的值非法，已忽略")
+            return@forEach
+        }
+        // 恒等值不入库（保住稀疏不变式：手改过的 JSON 也洗一遍）
+        if (abs(d - neutral[idx]) <= PARAM_EPS) return@forEach
+        slots[idx] = d
+    }
+    // ④ lut：资源引用坏了降级为"无 LUT"（资产丢失本来就有这条降级语义）
+    var lutId: String? = null
+    var lutStrength = 1.0
+    when (val rawLut = o["lut"]) {
+        null -> Unit
+        is Map<*, *> -> {
+            val lid = (rawLut["id"] as? String)?.trim().orEmpty()
+            if (lid.isEmpty()) {
+                why("lut.id 为空，按无 LUT 处理")
+            } else {
+                lutId = lid
+                val s = (rawLut["strength"] as? Double)?.takeIf { it.isFinite() } ?: 1.0
+                // 夹到 UI 量程（0..1.5）：手改的 5.0 会让引擎把 LUT 变换外推得离谱
+                lutStrength = s.coerceIn(
+                    LUT_STRENGTH_UI_RANGE.start.toDouble(),
+                    LUT_STRENGTH_UI_RANGE.endInclusive.toDouble(),
+                )
+            }
+        }
+        else -> why("lut 不是对象，按无 LUT 处理")
+    }
+    return EditorPreset(
+        id = id,
+        name = name,
+        group = (o["group"] as? String)?.trim().orEmpty(),
+        favorite = o["favorite"] as? Boolean ?: false,
+        createdAt = ((o["createdAt"] as? Double)?.takeIf { it.isFinite() && it >= 0 })?.toLong() ?: 0L,
+        source = (o["source"] as? String)?.takeIf { it.isNotBlank() } ?: PRESET_SOURCE_USER,
+        slots = slots,
+        lutId = lutId,
+        lutStrength = lutStrength,
+    )
+}
+
+/**
+ * 预设的 prefs 持久化（**唯一**的落盘入口）。薄到只剩"读字符串 / 写字符串"，
+ * 全部判定都在上面的纯函数里（JVM 单测覆盖），这一层不被单测覆盖也不该有逻辑。
+ *
+ * 写入用 `apply()`（异步落盘，与 `LutLibrary` 同一口径）：预设是用户主动点保存的低频操作，
+ * 不需要 `commit()` 的同步等待。
+ */
+internal object PresetStore {
+
+    /** 读取（含容错）：坏项跳过并记 `preset.load_skipped` 诊断日志 */
+    fun load(prefs: SharedPreferences): List<EditorPreset> {
+        val res = presetsFromJson(prefs.getString(PRESET_KEY, null))
+        if (res.skipped.isNotEmpty()) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "app", "preset.load_skipped",
+                kv("count" to res.skipped.size, "why" to res.skipped.joinToString("；").take(500)),
+            )
+        }
+        return res.presets
+    }
+
+    /** 全量写回（顺带做上限截断），返回**实际落盘**的列表 */
+    fun save(prefs: SharedPreferences, list: List<EditorPreset>): List<EditorPreset> {
+        val cut = list.take(PRESET_MAX)
+        prefs.edit().putString(PRESET_KEY, presetsToJson(cut)).apply()
+        return cut
+    }
+
+    /** 新增 / 覆盖同 id：新的放**最前**（最近保存的在列表顶部，超上限时丢最旧的） */
+    fun upsert(prefs: SharedPreferences, p: EditorPreset): List<EditorPreset> =
+        save(prefs, listOf(p) + load(prefs).filter { it.id != p.id })
+
+    /** 按 id 删除，返回删除后的列表 */
+    fun delete(prefs: SharedPreferences, id: String): List<EditorPreset> =
+        save(prefs, load(prefs).filter { it.id != id })
+}
+
+/**
+ * 极简 JSON 解析器（E3-1a）：只服务预设的读写，支持对象 / 数组 / 字符串 / 数字 / 布尔 / null。
+ *
+ * 为什么不用 `org.json`：**JVM 单测里它不可用**（android.jar 里是 stub，调用即抛），
+ * 而本卡最需要护栏的恰恰是"存 → 读 → 套用"这条往返链（往返一致、坏数据不崩）。
+ * 手写 ~90 行换来整条链可测，且与 `jsonEscape`（`JsonKv.kt`，同样是纯 Kotlin 手写）对称。
+ *
+ * 口径：数字一律 Double（槽位是 double，毫秒时间戳 < 2^53 ⇒ 精确）；解析失败抛
+ * [IllegalArgumentException]，由 [presetsFromJson] 兜住（**绝不把异常漏给 UI**）。
+ */
+internal object MiniJson {
+
+    fun parse(text: String): Any? = JsonReader(text).parse()
+}
+
+private class JsonReader(private val s: String) {
+    private var i = 0
+
+    fun parse(): Any? {
+        val v = value()
+        ws()
+        if (i != s.length) fail("尾部有多余字符")
+        return v
+    }
+
+    private fun fail(msg: String): Nothing = throw IllegalArgumentException("$msg @$i")
+
+    private fun ws() {
+        while (i < s.length && s[i].isWhitespace()) i++
+    }
+
+    private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+
+    private fun expect(c: Char) {
+        if (peek() != c) fail("期待 '$c'")
+        i++
+    }
+
+    private fun value(): Any? {
+        ws()
+        if (i >= s.length) fail("内容意外结束")
+        return when (val c = s[i]) {
+            '{' -> obj()
+            '[' -> arr()
+            '"' -> str()
+            't' -> lit("true", true)
+            'f' -> lit("false", false)
+            'n' -> lit("null", null)
+            else -> if (c == '-' || c.isDigit()) num() else fail("非法字符 '$c'")
+        }
+    }
+
+    private fun lit(word: String, v: Any?): Any? {
+        if (!s.startsWith(word, i)) fail("非法字面量")
+        i += word.length
+        return v
+    }
+
+    private fun obj(): Map<String, Any?> {
+        expect('{')
+        val m = LinkedHashMap<String, Any?>()
+        ws()
+        if (peek() == '}') {
+            i++
+            return m
+        }
+        while (true) {
+            ws()
+            val k = str()
+            ws()
+            expect(':')
+            m[k] = value()
+            ws()
+            when (peek()) {
+                ',' -> i++
+                '}' -> {
+                    i++
+                    return m
+                }
+                else -> fail("对象里期待 ',' 或 '}'")
+            }
+        }
+    }
+
+    private fun arr(): List<Any?> {
+        expect('[')
+        val out = ArrayList<Any?>()
+        ws()
+        if (peek() == ']') {
+            i++
+            return out
+        }
+        while (true) {
+            out += value()
+            ws()
+            when (peek()) {
+                ',' -> i++
+                ']' -> {
+                    i++
+                    return out
+                }
+                else -> fail("数组里期待 ',' 或 ']'")
+            }
+        }
+    }
+
+    private fun str(): String {
+        expect('"')
+        val sb = StringBuilder()
+        while (true) {
+            if (i >= s.length) fail("字符串未闭合")
+            when (val c = s[i++]) {
+                '"' -> return sb.toString()
+                '\\' -> {
+                    if (i >= s.length) fail("转义未闭合")
+                    when (val e = s[i++]) {
+                        '"' -> sb.append('"')
+                        '\\' -> sb.append('\\')
+                        '/' -> sb.append('/')
+                        'b' -> sb.append('\b')
+                        'f' -> sb.append('\u000C')
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        'u' -> {
+                            if (i + 4 > s.length) fail("\\u 转义不完整")
+                            val hex = s.substring(i, i + 4)
+                            val code = hex.toIntOrNull(16) ?: fail("\\u 转义非法")
+                            i += 4
+                            sb.append(code.toChar())
+                        }
+                        else -> fail("未知转义 '\\$e'")
+                    }
+                }
+                else -> sb.append(c)
+            }
+        }
+    }
+
+    private fun num(): Double {
+        val start = i
+        if (peek() == '-') i++
+        while (i < s.length && (s[i].isDigit() || s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
+                s[i] == '+' || s[i] == '-')
+        ) {
+            i++
+        }
+        return s.substring(start, i).toDoubleOrNull() ?: fail("非法数字")
     }
 }
 

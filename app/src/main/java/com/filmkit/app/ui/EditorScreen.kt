@@ -32,17 +32,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Redo
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
@@ -95,6 +98,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
@@ -123,6 +127,7 @@ import com.filmkit.app.camera.CropView
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
 import com.filmkit.app.camera.EditorHistory
+import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.EditorSnapshot
 import com.filmkit.app.camera.FADE_UI_RANGE
 import com.filmkit.app.camera.ImageFitRect
@@ -136,6 +141,7 @@ import com.filmkit.app.camera.LUT_STRENGTH_UI_RANGE
 import com.filmkit.app.camera.LocalMode
 import com.filmkit.app.camera.LocalOutline
 import com.filmkit.app.camera.OverwriteResult
+import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
 import com.filmkit.app.camera.StillSnapshotStore
@@ -203,6 +209,9 @@ import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
 import com.filmkit.app.camera.passthroughAllowed
 import com.filmkit.app.camera.pivotFraction
+import com.filmkit.app.camera.presetId
+import com.filmkit.app.camera.presetSnapshot
+import com.filmkit.app.camera.presetSparseSlots
 import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
@@ -231,6 +240,7 @@ import com.filmkit.app.lut.LutPreview
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
+import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -265,7 +275,14 @@ import kotlinx.coroutines.withContext
  * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / **撤销·重做
  *（E2-25 已做实）** / 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**
  *（满宽 + 密集刻度 + 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航
- *（调整 / 滤镜 / 暗角 / 局部 / **裁剪（E2-12 已实现）**；预设置灰留位）。
+ *（调整 / 滤镜 / 暗角 / 局部 / **裁剪（E2-12）** / **预设（E3-1a）**）。
+ *
+ * E3-1a（预设，本卡）：底栏「预设」由置灰留位改为**可点**，打开**预设面板**（取代参数面板，
+ * 与裁剪工具栏同一层）：保存当前 / 套用 / 删除（二次确认）。数据层（稀疏字段集 + schema 版本
+ * + prefs 单键 JSON）全在 `EditorExport.kt`（纯逻辑，JVM 单测覆盖）；套用**复用**
+ * [applySnapshotParams] + `applyLut`（与 E2-21「套用原片风格」同一条调用序列）⇒ 天然
+ * "部分套用"、天然一步撤销（E2-25）、参数变了 ⇒ 导出走渲染而非直通（E2-9）。
+ * 完整面板（缩略图 / 分组筛选 / 长按菜单）是 E3-1b，强度滑杆是 E3-1c。
  *
  * E2-15（用户真机反馈，本页四处修正）：
  *  ① **面板可收起**：顶部/底部把手（下拉收起·上拉展开·点击切换）+ **返回键分层**（展开时
@@ -410,6 +427,12 @@ fun EditorScreen(
     var cropDraft by remember { mutableStateOf(CropView.FULL) }
     var cropAspect by remember { mutableStateOf(CropAspect.FREE) }
     var cropHandle by remember { mutableStateOf<CropHandle?>(null) }
+    // ── E3-1a 预设（Preset）────────────────────────────────────────────────
+    // `presetMode` = 预设面板取代参数面板（与 `cropMode` **同构的独立模式**，两者互斥）；
+    // `presets` = 内存镜像（打开面板时从 prefs 读一次；保存 / 删除后由 PresetStore 返回新列表）。
+    // 数据模型 / 序列化 / 稀疏化 / 套用映射全在 EditorExport.kt（纯逻辑，JVM 单测覆盖）。
+    var presetMode by remember { mutableStateOf(false) }
+    var presets by remember { mutableStateOf<List<EditorPreset>>(emptyList()) }
 
     // ── E2-25 撤销 / 重做 ─────────────────────────────────────────────────
     // 栈本身是**纯逻辑**（[EditorHistory]，JVM 单测覆盖）；这里只留两个"能不能点"的镜像
@@ -663,6 +686,105 @@ fun EditorScreen(
         }
         // ② 参数在 LUT 就绪后整体回快照（加载失败 ⇒ 参数与画面都不动，不留半套用状态）
         applyLut(entry, snapLutK) { params?.let { applySnapshotParams(it, snapFilm) } }
+    }
+
+    // ── E3-1a 预设：保存 / 套用 / 删除（数据层 = EditorExport.kt 的纯逻辑 + [PresetStore]）──
+    // 本卡只做"核心闭环 + 最小入口"：完整面板（当前照片缩略图 / 分组筛选 / 长按菜单）是 E3-1b，
+    // 强度滑杆是 E3-1c。这里的三件事全部**复用**既有机制（applySnapshotParams / applyLut /
+    // recordHistory / rerender），没有一条新的渲染或撤销通路。
+
+    /** 打开 / 收起预设面板（底栏「预设」）：打开时读一次 prefs；与裁剪模式互斥（两块都取代参数面板） */
+    fun togglePresets() {
+        presetMode = !presetMode
+        if (presetMode) {
+            presets = PresetStore.load(prefs)
+            cropMode = false
+        }
+    }
+
+    /**
+     * 保存当前参数为预设。**只写与恒等值不同的槽**（[presetSparseSlots]，恒等值逐槽取
+     * `CameraPresets.standard()`）—— 用户没动过的槽一个都不进库，这样套用时才不会把别人的
+     * 画面打回默认（尤其是恒等值为 1.0 / 0.01 / 单位阵的那几组槽）。
+     *
+     * LUT 强度只在"当前真的选了 LUT"时才有意义：没选 LUT 时 `[34]` 是编辑器初值 0
+     *（见 [editorOpenParams]），存下来会让"套用这条预设"凭空关掉用户当前的 LUT。
+     */
+    fun savePreset(name: String, group: String) {
+        val film = params ?: return
+        val now = System.currentTimeMillis()
+        val p = EditorPreset(
+            id = presetId(now, Random.nextInt()),
+            name = name.trim().ifEmpty { "未命名" },
+            group = group.trim(),
+            createdAt = now,
+            slots = presetSparseSlots(film),
+            lutId = lutId,
+            lutStrength = if (lutId != null) film[34] else 1.0,
+        )
+        presets = PresetStore.upsert(prefs, p)
+        status = "已保存预设：${p.name}（${p.slots.size} 项参数）"
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "preset.save",
+            kv("id" to p.id, "slots" to p.slots.size, "lut" to (p.lutId ?: ""), "group" to p.group),
+        )
+    }
+
+    /**
+     * 套用预设（面板里点「套用」）。三件事，**全部复用既有机制**：
+     *  ① **参数**：`applySnapshotParams(params, presetSnapshot(params, p.slots))` —— 按 idx 覆盖
+     *     = 只改预设里记下的那几个槽，其余保持当前值 ⇒ **部分套用天然成立**；
+     *  ② **LUT**：`applyLut(entry, strength, onReady)`（与 E2-21「套用原片风格」同一套调用序列，
+     *     含"资产就绪后才写参数"这条顺序约束）；
+     *  ③ **撤销**：落地后 `recordHistory()` **一次** = 一步撤销（E2-25）—— 带 LUT 的分支由
+     *     [applyLut] 内部记（`record` 默认 true），不带 LUT 的分支在这里显式记。
+     *
+     * 套用后参数变了 ⇒ `paramsUnchanged` 为假 ⇒ 导出走**渲染**而不是直通（E2-9）、「取消」会弹
+     * 「放弃本次修改？」（E2-24）—— 两条都是既有判据自动生效，本卡一行没改。
+     */
+    fun applyPreset(p: EditorPreset) {
+        val film = params ?: return
+        val entry = p.lutId?.let { LutLibrary.byId(context, it) }
+        when {
+            // ① 预设不含 LUT ⇒ **不动**当前 LUT 与 [34]（缺失字段 = 保留当前值）
+            p.lutId == null -> {
+                applySnapshotParams(film, presetSnapshot(film, p.slots))
+                panelRefresh++
+                recordHistory()
+                rerender()
+                status = "已套用预设：${p.name}"
+            }
+            // ② 预设带 LUT 但资产已不在库中 ⇒ 降级"无 LUT" + 提示（与 applySnapshotStyle 的
+            //    失败分支同口径：绝不留"UI 说选了 LUT、引擎里没有"的半状态）
+            entry == null -> {
+                status = "预设「${p.name}」的 LUT 已不在库中"
+                applySnapshotParams(film, presetSnapshot(film, p.slots))
+                film[34] = 0.0
+                lutId = null
+                engine.setLut(null)
+                panelRefresh++
+                recordHistory()
+                rerender()
+            }
+            // ③ 正常路径：参数在 LUT 就绪后才写（加载失败 ⇒ 参数与画面都不动，不留半套用状态）
+            else -> applyLut(entry, p.lutStrength.toFloat()) {
+                params?.let { applySnapshotParams(it, presetSnapshot(it, p.slots)) }
+                status = "已套用预设：${p.name}"
+            }
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "preset.apply",
+            kv(
+                "id" to p.id, "slots" to p.slots.size, "lut" to (p.lutId ?: ""),
+                "lutFound" to (entry != null),
+            ),
+        )
+    }
+
+    /** 删除预设（二次确认在面板里）：只动 prefs 与列表，**不动当前参数、画面与撤销栈** */
+    fun deletePreset(p: EditorPreset) {
+        presets = PresetStore.delete(prefs, p.id)
+        status = "已删除预设：${p.name}"
     }
 
     // ── 参数写入（E2-10：数据驱动，取代 E2-3/E2-7 的 16 个一模一样的 setter）────────────
@@ -1125,8 +1247,14 @@ fun EditorScreen(
     //   面板展开 ⇒ 只收面板（[EditorPanelState.onBack] 消费掉这次返回，**绝不**退出编辑器）；
     //   面板已收起 ⇒ requestExit(BACK)：有修改先弹确认，无修改直接退出。
     BackHandler {
-        val collapsed = EditorPanelState.onBack(panel)
-        if (collapsed != null) panel = collapsed else requestExit(ExitTarget.BACK)
+        // ★ E3-1a：预设面板打开时，返回键先关面板（与"面板展开时先收面板"同一分层精神）——
+        // 预设面板是临时面板，用户按返回的意图是"退出预设"，不是"退出编辑器"。
+        if (presetMode) {
+            presetMode = false
+        } else {
+            val collapsed = EditorPanelState.onBack(panel)
+            if (collapsed != null) panel = collapsed else requestExit(ExitTarget.BACK)
+        }
     }
 
     Box(
@@ -1506,6 +1634,19 @@ fun EditorScreen(
                         rerender()
                     },
                 )
+            } else if (presetMode) {
+                // ★ E3-1a：预设面板（取代参数面板，与裁剪工具栏同一层）—— 最小入口：
+                // 保存当前 / 套用 / 删除（二次确认）。列表缩略图、分组筛选、长按菜单是 E3-1b。
+                PresetPanel(
+                    presets = presets,
+                    canSave = params != null,
+                    status = status,
+                    onSave = { n, g -> savePreset(n, g) },
+                    onApply = { applyPreset(it) },
+                    onDelete = { deletePreset(it) },
+                    onHandleDrag = { dy -> onHandleDrag(dy) },
+                    onTogglePanel = { panel = panel.toggled() },
+                )
             } else {
             AnimatedContent(
                 targetState = panel.expanded,
@@ -1562,7 +1703,11 @@ fun EditorScreen(
                             cropDraft = cropViewOf(crop)
                             cropAspect = CropAspect.FREE
                             cropMode = true
+                            presetMode = false   // ★ E3-1a：与预设面板互斥（两块都取代参数面板）
                         },
+                        // ★ E3-1a：底栏「预设」入口（打开 / 收起预设面板）
+                        onPreset = { togglePresets() },
+                        presetActive = presetMode,
                     )
                 } else {
                     CollapsedPanelBar(
@@ -1791,7 +1936,7 @@ private class EditorInit(
 //   ③ 参数名：居中大字（当前选中参数）+ 1px 黑阴影 —— [ParamNameRow]
 //   ④ 单滑杆：**一屏只出当前选中参数的那一条**，满宽 + 密集刻度 + 中点标记 + 物理量读数 —— [EditorSlider]
 //   ⑤ 参数图标行：横向滚动圆形按钮（未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄描边 + 黄图标）—— [ParamIconRow]
-//   ⑥ 底部导航：调整 / 滤镜 / 暗角 / 局部 / **裁剪**（E2-12 已实现，可点）＋ 预设（置灰留位）—— [EditorTabBar]
+//   ⑥ 底部导航：调整 / 滤镜 / 暗角 / 局部 / **裁剪**（E2-12）＋ **预设**（E3-1a）—— [EditorTabBar]
 //
 // 三条关键修正（"专业感"的真正来源，ADR-14「我们的差距」头三条）：
 //   1. **满宽滑杆 + 标签在上方**（不再是"标签｜细滑杆｜百分比"的三段式表单行）
@@ -1809,8 +1954,8 @@ private class EditorInit(
 private val TextShadow = Shadow(Color.Black, Offset(1f, 1f), 1f)
 
 /**
- * 禁用态前景（顶栏「覆盖 / 完成」不可用时、「撤销/重做」无可撤销内容时、底栏「预设」留位用）：
- * 30% 奶油白，不新造色值
+ * 禁用态前景（顶栏「覆盖 / 完成」不可用时、「撤销/重做」无可撤销内容时、预设面板的禁用按钮
+ * 与输入框占位文字）：30% 奶油白，不新造色值
  */
 private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
 
@@ -2332,6 +2477,10 @@ private fun EditorPanel(
     onTogglePanel: () -> Unit,
     /** E2-12：底栏「裁剪」项（进入裁剪模式） */
     onCrop: () -> Unit,
+    /** ★ E3-1a：底栏「预设」项（打开 / 收起预设面板） */
+    onPreset: () -> Unit,
+    /** ★ E3-1a：预设面板是否打开（底栏项高亮，与 `cropActive` 同一套选中态） */
+    presetActive: Boolean,
 ) {
     val context = LocalContext.current
     val list = when (group) {
@@ -2441,7 +2590,10 @@ private fun EditorPanel(
         }
         Spacer(Modifier.height(8.dp))
         // ⑥ 底部导航
-        EditorTabBar(group, onGroup, onCrop)
+        EditorTabBar(
+            group, onGroup, onCrop,
+            presetActive = presetActive, onPreset = onPreset,
+        )
     }
 }
 
@@ -2872,8 +3024,9 @@ private fun ParamChip(
  * 约 1.4:1（WCAG 远不达标），实底 + 深字是 6.8:1。同一个"黄色圆角矩形底"的语言，可读性优先。
  *
  * ★ E2-12：「裁剪」项**已激活**（可点，进裁剪模式时高亮 —— 由 `cropActive` 传入）。
- * 「预设」仍**置灰留位、不注册点击**：E3 预设管理还没实现 —— ADR-12 不许假控件，
- * 所以它只占位、点不动，颜色用 30% 奶油白（一眼看出是禁用态）。
+ * ★ E3-1a：「预设」项**也已激活**（可点，面板打开时高亮 —— 由 `presetActive` 传入）：
+ * 预设的保存入口就在它打开的面板里（**不新增顶栏按钮** —— 调研核查过 `EditorTopBar` 只有
+ * 取消 / 相册 / 撤销 / 重做 / 覆盖 / 完成，硬塞一个「保存预设」会挤占主操作位）。
  */
 /**
  * ★ E2-12 裁剪工具栏（ADR-16）：裁剪模式下**取代参数面板**（两块互斥，不叠在预览上 ——
@@ -2994,12 +3147,242 @@ private fun CropToolBar(
     }
 }
 
+/**
+ * ★ E3-1a 预设面板（**最小入口**）：与裁剪工具栏同一层 —— 取代参数面板，不叠在预览上。
+ *
+ * 本卡只做核心闭环：**保存当前 / 套用 / 删除（二次确认）**。缩略图（用用户自己的照片实时
+ * 渲染）、分组筛选 / 搜索、长按菜单（重命名 / 复制 / 收藏 / 更新为当前）留给 E3-1b，
+ * 强度滑杆留给 E3-1c —— 面板上每一个动作背后都已经有一条跑得通的纯逻辑（EditorExport.kt）。
+ *
+ * 为什么保存入口在这里而不是顶栏：`EditorTopBar` 只有 取消 / 相册 / 撤销 / 重做 / 覆盖 /
+ * 完成（调研 §5.4 的事实核对），硬塞一个「保存预设」会挤占主操作位；而底栏「预设」本来就是
+ * ADR-14 底栏六项之一（此前置灰留位），"在预设面板里保存"也正是 Lightroom 的组织方式
+ *（Presets 面板底部的 +）。
+ *
+ * 列表项显示"名称 + 分组 + 槽位数"而不是缩略图：缩略图必须用**用户自己的照片**渲染
+ *（Lightroom / Capture One 都如此），预烘焙的通用图反而会误导（调研 §5.1 D5）。
+ */
+@Composable
+private fun PresetPanel(
+    presets: List<EditorPreset>,
+    /** 参数已就绪（首帧前不能保存） */
+    canSave: Boolean,
+    /** 与参数面板共用同一行提示（保存 / 套用 / 删除的结果都在这里回显） */
+    status: String,
+    onSave: (String, String) -> Unit,
+    onApply: (EditorPreset) -> Unit,
+    onDelete: (EditorPreset) -> Unit,
+    onHandleDrag: (Float) -> Unit,
+    onTogglePanel: () -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var group by remember { mutableStateOf("") }
+    var pendingDelete by remember { mutableStateOf<EditorPreset?>(null) }
+    val canCommit = canSave && name.isNotBlank()
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(FilmTheme.PanelSolid)
+            .navigationBarsPadding()
+            .padding(bottom = 6.dp),
+    ) {
+        PanelHandle(onDragEnd = onHandleDrag, onToggle = onTogglePanel)
+        Text(
+            status.ifEmpty { "预设 · 只保存与默认值不同的项；套用时其余参数保持不动" },
+            color = FilmTheme.CreamDim,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            style = TextStyle(shadow = TextShadow),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 2.dp),
+        )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PresetField(name, { name = it }, "预设名称", Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            PresetField(group, { group = it }, "分组（可空）", Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "保存当前",
+                color = if (canCommit) FilmTheme.OnAccent else DisabledInk,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (canCommit) FilmTheme.Accent else Color.Transparent)
+                    .border(
+                        1.dp,
+                        if (canCommit) FilmTheme.Accent else DisabledInk,
+                        RoundedCornerShape(10.dp),
+                    )
+                    .pressScale(enabled = canCommit, onTap = {
+                        if (canCommit) {
+                            onSave(name, group)
+                            name = ""
+                            group = ""
+                        }
+                    })
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        if (presets.isEmpty()) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(72.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (canSave) "还没有预设：填名称 → 点「保存当前」" else "参数加载中…",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 12.sp,
+                )
+            }
+        } else {
+            // 限高：面板嵌在布局流里（预览区 weight(1f)），列表再长也不该把预览挤没
+            LazyColumn(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 168.dp),
+            ) {
+                items(presets, key = { it.id }) { p ->
+                    PresetRow(p, onApply = { onApply(p) }, onDelete = { pendingDelete = p })
+                }
+            }
+        }
+    }
+    // 删除二次确认（本卡硬要求）：取消 = 什么都不做，只关框（预设、参数、画面全不动）
+    pendingDelete?.let { p ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            shape = RoundedCornerShape(18.dp),
+            title = { Text("删除预设？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            text = {
+                Text(
+                    "「${p.name}」将被删除，无法恢复。\n当前画面与参数不受影响。",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDelete = null
+                    onDelete(p)
+                }) {
+                    Text("删除", color = FilmTheme.Accent, fontFamily = FilmTheme.Mono)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+        )
+    }
+}
+
+/** 预设面板的单行输入（名称 / 分组）：自绘底 + 描边，颜色只用 FilmTheme 的既有 token */
+@Composable
+private fun PresetField(
+    value: String,
+    onChange: (String) -> Unit,
+    hint: String,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(FilmTheme.ChipBg)
+            .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(10.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        if (value.isEmpty()) {
+            Text(hint, color = DisabledInk, fontSize = 12.sp, maxLines = 1)
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            textStyle = TextStyle(color = FilmTheme.Cream, fontSize = 12.sp),
+            cursorBrush = SolidColor(FilmTheme.Accent),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+/** 预设列表的一行：名称 + 副标题（分组 · 槽位数 · LUT）+「套用」/「删除」 */
+@Composable
+private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit) {
+    val sub = buildString {
+        if (p.group.isNotEmpty()) append(p.group).append(" · ")
+        append(p.slots.size).append(" 项参数")
+        if (p.lutId != null) append(" · LUT")
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                p.name,
+                color = FilmTheme.Cream,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                sub,
+                color = FilmTheme.CreamDim,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Text(
+            "套用",
+            color = FilmTheme.OnAccent,
+            fontSize = 12.sp,
+            maxLines = 1,
+            modifier = Modifier
+                .clip(RoundedCornerShape(9.dp))
+                .background(FilmTheme.Accent)
+                .pressScale(pressedScale = 0.94f, onTap = onApply)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            "删除",
+            color = FilmTheme.CreamDim,
+            fontSize = 12.sp,
+            maxLines = 1,
+            modifier = Modifier
+                .clip(RoundedCornerShape(9.dp))
+                .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                .pressScale(pressedScale = 0.94f, onTap = onDelete)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+    }
+}
+
 @Composable
 private fun EditorTabBar(
     selected: EditorTab,
     onSelect: (EditorTab) -> Unit,
     onCrop: () -> Unit,
     cropActive: Boolean = false,
+    /** ★ E3-1a：预设面板打开 / 收起 */
+    onPreset: () -> Unit = {},
+    presetActive: Boolean = false,
 ) {
     Row(
         Modifier
@@ -3033,21 +3416,31 @@ private fun EditorTabBar(
                 )
             }
         }
-        // 预设（E3）：置灰留位、不可点
+        // ★ E3-1a 预设：**已激活**（可点，面板打开时高亮）—— 不再是置灰留位项。
+        // 「保存当前参数为预设」的入口就在它打开的面板里：顶栏没有这个位置（调研 §5.4 的事实
+        // 核对：顶栏只有 取消 / 相册 / 撤销 / 重做 / 覆盖 / 完成），而底栏「预设」本来就是
+        // Filmix 的产品位（ADR-14 的底栏六项之一）。
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .weight(1f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (presetActive) FilmTheme.Accent else Color.Transparent)
+                .pressScale(pressedScale = 0.94f, onTap = onPreset)
                 .padding(vertical = 6.dp),
         ) {
             Icon(
                 Icons.Outlined.Collections,
-                contentDescription = "预设（暂未开放）",
-                tint = DisabledInk,
+                contentDescription = "预设",
+                tint = if (presetActive) FilmTheme.OnAccent else FilmTheme.CreamDim,
                 modifier = Modifier.size(22.dp),
             )
             Spacer(Modifier.height(2.dp))
-            Text("预设", color = DisabledInk, fontSize = 10.sp, maxLines = 1)
+            Text(
+                "预设",
+                color = if (presetActive) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                fontSize = 10.sp, maxLines = 1,
+            )
         }
         // ★ E2-12 裁剪：可点（进裁剪模式），裁剪模式下高亮（与其余四组同一套选中态）
         Column(
