@@ -40,7 +40,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -114,6 +113,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
@@ -132,8 +132,18 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.CAMERA_STANDARD_PRESET
+import com.filmkit.app.camera.CAMERA_STANDARD_PRESET_ID
 import com.filmkit.app.camera.CameraController
+import com.filmkit.app.camera.EditorPreset
+import com.filmkit.app.camera.PresetLutAction
+import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.RenderClient
+import com.filmkit.app.camera.cameraPresetParams
+import com.filmkit.app.camera.presetLutAction
+import com.filmkit.app.camera.presetSlotsText
+import com.filmkit.app.camera.presetSubtitle
+import com.filmkit.app.camera.resolveCameraPreset
 import com.filmkit.app.kv
 import com.filmkit.app.lut.LutIO
 import com.filmkit.app.lut.LutLibrary
@@ -211,7 +221,14 @@ fun CameraScreen(
     var surface by remember { mutableStateOf<Surface?>(null) }
     var resumed by remember { mutableStateOf(true) }
     var lensChips by remember { mutableStateOf(emptyList<Int>()) } // 启用镜头等效焦段（变焦刻度）
-    var presetIdx by rememberSaveable { mutableIntStateOf(0) } // 默认标准
+    // ── P-2a：预设（拍照 / 查看页「胶片」/ 编辑器「预设」**同一套数据**：PresetStore）──
+    // 列表与选中项都用 remember（**非 saveable**）+ prefs 回落，与 photoUri 同款（ADR §5.2 G-1）：
+    // prefs 本身就是持久层，Activity/进程重建后重读一次即可拿回同一个选中项，再叠一层 saveable
+    // 是多余的（EditorPreset 也不是 Parcelable）。冷启动恢复见下方 LaunchedEffect。
+    var presets by remember { mutableStateOf(PresetStore.load(prefs)) }
+    var selectedPreset by remember {
+        mutableStateOf(resolveCameraPreset(prefs.getString("camera_preset_id", null), presets))
+    }
     var focalBase by remember { mutableFloatStateOf(24f) } // 当前镜头等效焦距
 
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
@@ -435,9 +452,64 @@ fun CameraScreen(
         lutPending = null
     }
 
+    /**
+     * 套用预设（P-2a 的核心）：**参数 + LUT + 选中态**三件事，全部复用既有机制。
+     *
+     * 顺序有讲究：
+     *  ① LUT 判定放在最前 —— `MISSING`（引用的 LUT 已不在库）时**一个字节都不写** LUT 相关
+     *     状态（prefs 的 `lut_strength` / `lut_id` 与引擎的 `setLut` 全不动）= "保留当前 LUT"；
+     *  ② 带 LUT 时**先写 `prefs("lut_strength")` 再 `setFilmParams`**：后者内部的
+     *     `applyLutStrengthPref()` 会从 prefs 重读并写 `[34]`（既有设计）⇒ 顺序反了会被旧值覆盖；
+     *  ③ LUT 本体走既有 `lutPending` 链路（IO 解析 → `setLut` → 写 `lut_id`），不另开一条。
+     *
+     * 参数域用 [cameraPresetParams]（标准基线 + 稀疏覆盖）—— 与编辑器侧"以当前参数为底"不同，
+     * 理由见该函数的 KDoc。`[0]/[28]/[30]/[34]/[35]` 仍由 `setFilmParams` 内部的 prefs 覆盖层
+     * 重写：用户在拍照界面调的曝光补偿 / 斑马纹 / 影调开关**不会被预设顶掉**（既有设计）。
+     */
+    fun applyCameraPreset(p: EditorPreset) {
+        val lutEntry = p.lutId?.let { LutLibrary.byId(context, it) }
+        val action = presetLutAction(p) { lutEntry != null }
+        if (action == PresetLutAction.APPLY) {
+            prefs.edit().putFloat("lut_strength", p.lutStrength.toFloat()).apply()
+        }
+        controller.setFilmParams(cameraPresetParams(p))
+        when (action) {
+            PresetLutAction.APPLY -> lutEntry?.let { lutPending = it }
+            // 降级：不动当前 LUT + 明确提示（不静默、不清空）。与编辑器侧 applyPreset 的
+            // "清空 LUT" 不同，是架构师裁决（拍照界面的 LUT 是用户自己的选择）。
+            PresetLutAction.MISSING -> android.widget.Toast.makeText(
+                context,
+                "预设「${p.name}」的 LUT 已不在库中 · 保留当前 LUT",
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+            PresetLutAction.KEEP -> Unit
+        }
+        selectedPreset = p
+        prefs.edit().apply {
+            if (p.id == CAMERA_STANDARD_PRESET_ID) remove("camera_preset_id")
+            else putString("camera_preset_id", p.id)
+        }.apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.apply",
+            kv(
+                "id" to p.id, "name" to p.name, "slots" to p.slots.size,
+                "slotsText" to presetSlotsText(p),
+                "lut" to (p.lutId ?: ""), "lutAction" to action.name,
+            ),
+        )
+    }
+
     // 启动即应用选中预设与持久化的手动档（WB 走引擎补偿、AE 走手动曝光）
     LaunchedEffect(Unit) {
-        controller.setFilmParams(CameraPresets.byIndex(presetIdx))
+        // 冷启动恢复（P-2a）：选中项由 prefs 的 id 定位（resolveCameraPreset 已收敛"标准 /
+        // 命中 / 悬空"三种输入）；悬空 id（预设已被删）顺手清掉，下次少一次无用查找。
+        val savedPresetId = prefs.getString("camera_preset_id", null)
+        if (savedPresetId != null && savedPresetId != selectedPreset.id) {
+            prefs.edit().remove("camera_preset_id").apply()
+        }
+        // 恢复的预设若带 LUT：LUT 本体由下面的 lut_id 链路重传（[LaunchedEffect(Unit)] 启动恢复），
+        // 强度已在 prefs("lut_strength") 里 ⇒ 此处只下发参数，不重复动 LUT。
+        controller.setFilmParams(cameraPresetParams(selectedPreset))
         controller.setShutterSound(soundOn)
         if (!evAuto) controller.setEv(ev)
         if (!aeAuto) {
@@ -1049,7 +1121,7 @@ fun CameraScreen(
                             Modifier
                                 .padding(top = 1.dp)
                                 .size(3.dp)
-                                .alpha(if (presetIdx != 0) 1f else 0f)
+                                .alpha(if (selectedPreset.id != CAMERA_STANDARD_PRESET_ID) 1f else 0f)
                                 .background(FilmTheme.Accent, CircleShape),
                         )
                     }
@@ -1321,7 +1393,8 @@ fun CameraScreen(
             LutSheet(
                 tab = lutTab,
                 onTab = { lutTab = it },
-                presetIdx = presetIdx,
+                presets = presets,
+                selectedPreset = selectedPreset,
                 lutId = lutId,
                 lutStrength = prefs.getFloat("lut_strength", 1f), // 面板打开时的初值（事实源 = prefs）
                 previews = lutPreviews,
@@ -1361,10 +1434,7 @@ fun CameraScreen(
                 onStrengthFinished = { vFinal ->
                     prefs.edit().putFloat("lut_strength", vFinal).apply()
                 },
-                onPick = { i ->
-                    presetIdx = i
-                    controller.setFilmParams(CameraPresets.byIndex(i))
-                },
+                onPick = { p -> applyCameraPreset(p) },
                 onPickLut = { e ->
                     if (e == null) {
                         // 关闭（A/B 通路）：直接下发，无需解析
@@ -1894,12 +1964,17 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
  * LUT / 预设选择页（M4）：底部弹出，参考专业相机 App 的「分类 pill + 横向卡片」布局。
  * 面板外点击关闭由整机层的拦截层负责；这里只管内容与交互。
  * 选中项**不自动收起**面板 —— 便于连续切换、当场比较风格。
+ *
+ * P-2a：「预设」tab 的数据源 = [PresetStore]（与查看页「胶片」/ 编辑器「预设」**同一套**），
+ * 列表首项恒为内置的 [CAMERA_STANDARD_PRESET]（中性基线）。选中态按 **id** 判定
+ * （不是索引 —— 列表会被用户在编辑器里增删，索引不稳定）。
  */
 @Composable
 private fun LutSheet(
     tab: Int,
     onTab: (Int) -> Unit,
-    presetIdx: Int,
+    presets: List<EditorPreset>,
+    selectedPreset: EditorPreset,
     lutId: String?,
     lutStrength: Float,
     previews: Map<String, Bitmap>,
@@ -1914,7 +1989,7 @@ private fun LutSheet(
     onRenameCat: (String, String) -> Unit,
     onStrength: (Float) -> Unit,
     onStrengthFinished: (Float) -> Unit,
-    onPick: (Int) -> Unit,
+    onPick: (EditorPreset) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onImport: () -> Unit,
     onExport: (LutLibrary.Entry, Boolean) -> Unit,
@@ -1948,7 +2023,7 @@ private fun LutSheet(
                 if (tab == 0) {
                     LutLibrary.byId(context, lutId)?.label ?: "无 LUT"
                 } else {
-                    CameraPresets.names.getOrElse(presetIdx) { "标准" }
+                    selectedPreset.name
                 },
                 color = FilmTheme.Cream,
                 fontSize = 20.sp,
@@ -2022,12 +2097,31 @@ private fun LutSheet(
                 }
             }
         } else {
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                modifier = Modifier.padding(top = 10.dp),
-            ) {
-                itemsIndexed(CameraPresets.names) { i, name ->
-                    LutCard(label = name, selected = i == presetIdx, preview = null) { onPick(i) }
+            Column {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.padding(top = 10.dp),
+                ) {
+                    // 首项恒为内置「标准」（中性基线）；其余 = 用户在编辑器里保存的预设
+                    //（同一套 PresetStore 数据）。选中态按 id 判定 —— 列表会被增删，索引不稳定。
+                    items(listOf(CAMERA_STANDARD_PRESET) + presets) { p ->
+                        LutCard(
+                            label = p.name,
+                            sub = presetSubtitle(p),
+                            selected = p.id == selectedPreset.id,
+                            preview = null,
+                        ) { onPick(p) }
+                    }
+                }
+                // 空列表时给一句人话（此时只有「标准」一张卡，不是空白面板）
+                if (presets.isEmpty()) {
+                    Text(
+                        "还没有预设 · 在编辑器里保存",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 11.sp,
+                        fontFamily = FilmTheme.Mono,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
                 }
             }
         }
@@ -2498,12 +2592,17 @@ internal fun SheetPill(
  * 无图时显示名称。
  *
  * internal 而非 private：编辑器（E1-4）复用同一张卡片 —— 选中态/尺寸两处各写一份必然不一致。
+ *
+ * @param sub 名称下的第二行小字（P-2a 的预设卡片用它显示「分组 · LUT」，见 [presetSubtitle]）。
+ *   `null` = 不占一行（LUT 卡片与没有分组/LUT 的预设卡片因此保持原有高度）。
+ *   宽度钉在卡片宽度（76dp）并省略号截断 —— 否则长分组名会把卡片撑宽、与相邻卡片不齐。
  */
 @Composable
 internal fun LutCard(
     label: String,
     selected: Boolean,
     preview: Bitmap?,
+    sub: String? = null,
     onLongTap: (() -> Unit)? = null,
     onTap: () -> Unit,
 ) {
@@ -2542,6 +2641,18 @@ internal fun LutCard(
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
         )
+        if (sub != null) {
+            Text(
+                sub,
+                color = FilmTheme.CreamDim,
+                fontSize = 9.sp,
+                fontFamily = FilmTheme.Mono,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.width(76.dp),
+            )
+        }
     }
 }
 
