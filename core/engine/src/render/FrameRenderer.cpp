@@ -16,6 +16,7 @@
 #include "../log/Logger.h"
 #include "Align.h"
 #include "AmazeDemosaic.h"
+#include "GrainLut.h"
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
@@ -23,6 +24,37 @@
 
 namespace filmkit {
 namespace {
+
+// E4-3 颗粒：成片种子的**内容指纹**（FNV-1a 采样）。目的 = 成片的颗粒图案"同一张可
+// 复现、不同张不同"（darktable 用文件名 hash 达到同一目的）。
+// 为什么不用时间戳：引擎内**没有任何时间源**（全仓 grep timestamp / time() 零命中，
+// ChainCtx / submitStill 都没有该参数）；而验收判据 6 要求"同参数两次导出逐位相同"
+// ⇒ 时间戳反而会破坏它（两次导出时刻不同）。内容指纹同时满足两条。
+// 采样 ≤1024 点（步长 = 总长/1024）⇒ 12.5M px 的 RAW 也只读 1KB，成本可忽略。
+// ⚠ 必须定义在本匿名 namespace 内（调用点 submitStill/submitRaw/finishStillChain 都在
+// 文件前部，前置声明在这里）：定义放到文件后部会落到 `filmkit` 而非匿名 namespace，
+// 与声明是两个不同实体 ⇒ **链接期 undefined symbol**（本次已踩，见报告）。
+static uint32_t grainFingerprint(const void* p, size_t n_bytes) {
+  if (p == nullptr || n_bytes == 0) return 0;
+  const auto* b = static_cast<const uint8_t*>(p);
+  const size_t step = n_bytes > 1024 ? n_bytes / 1024 : 1;
+  uint32_t h = 2166136261u;  // FNV-1a offset basis
+  for (size_t i = 0; i < n_bytes; i += step) h = (h ^ b[i]) * 16777619u;
+  return h;
+}
+
+// E4-3：成片颗粒种子 = f(输出尺寸, 内容指纹) → [0, 64) 的**相对** x 偏移。
+// 为什么是相对量：噪声坐标已按短边归一化（uGrainNorm = 1/min(W,H)）⇒ 偏移也必须是
+// 无量纲的相对量，否则同一张图在不同输出分辨率下图案不同（ADR-11 的同一条要求）。
+static float grainSeedFrom(uint32_t fp, int w, int h) {
+  uint32_t x = fp * 2654435761u;
+  x ^= static_cast<uint32_t>(w) * 2246822519u;
+  x ^= static_cast<uint32_t>(h) * 3266489917u;
+  x ^= x >> 15;
+  x *= 2246822519u;
+  x ^= x >> 13;
+  return static_cast<float>(x & 0xffffu) / 65536.0f * 64.0f;
+}
 
 // 数值 → JSON 合法字符串（截断到 n 字符）。
 // 必须去掉截断后**孤立的尾部符号**：jnum(1139.4, 5) = "1139."
@@ -4466,9 +4498,15 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform vec2 uPx;
-uniform float uGrainAmount;
-uniform float uGrainSize;
-uniform float uTime;
+// ── E4-3 颗粒（granularity；darktable src/iop/grain.c）────────────────────
+// 域常数在 CPU 侧算好（shader 内不做 W/H 除法与 clamp，与 E4-2 暗角同款）：
+//   uGrainZoom = grainZoom([27])、uGrainNorm = 1/min(W,H)、uGrainSeed = 噪声坐标的
+//   **相对** x 偏移（成片按内容派生；预览/编辑器恒 0 ⇒ 取景时图案稳定不闪）。
+uniform float uGrainAmount;  // [26] 0..100（strength = /100；0 ⇒ 整段跳过，零成本）
+uniform float uGrainSeed;
+uniform float uGrainZoom;
+uniform float uGrainNorm;
+uniform highp sampler2D uGrainLut;  // 128² R16F 相纸响应 LUT（CPU 侧按 [60][61] 重算）
 uniform float uFlipY;  // 拍照读回 GL 底行在前，翻转后 JPEG 方向正确
 uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
 uniform float uSharpen;  // v0.9.6 轻度锐化强度（0 = 关，A/B 通路；FilmParams[39]）
@@ -4515,21 +4553,110 @@ vec3 lutApply(vec3 c) {
     vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
     return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
 }
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-// v0.10.67 dither 专用 hash：现有的 sin 版在 gl_FragCoord 大坐标（3072×4080）下
-// highp sin 精度不足，会产生**规律性图案** —— dither 一旦有规律就等于没有。
-// Dave Hoskins 的无 sin 整数风格 hash。单独一个函数，避免改动 grain 的既有观感。
+// v0.10.67 dither 专用 hash：sin 版（`fract(sin(dot(p,…)))`）在 gl_FragCoord 大坐标
+//（3072×4080）下 highp sin 精度不足，会产生**规律性图案** —— dither 一旦有规律就等于
+// 没有。Dave Hoskins 的无 sin 整数风格 hash。E4-3：原 sin 版 hash 与其上的单八度
+// value noise 只服务颗粒，已整体替换为下方 3 八度 simplex ⇒ 颗粒侧同型坑一并消除。
 float dhash(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
 }
-float vnoise(vec2 p) {
-    vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    float a = hash(i), b = hash(i + vec2(1, 0));
-    float c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+// ── E4-3 颗粒（granularity；darktable src/iop/grain.c 逐行移植）────────────
+// ① 噪声源 = **3 八度 3D simplex**（Gustavson 的 permutation[256] + grad3[12] 整数表，
+//    输出归一化 32·(n0+n1+n2+n3)），z 轴传八度序号 ⇒ 三阶在 3D 空间互不相关。
+//    频率 f={0.4910,0.9441,1.7280} / 幅度 a={0.2340,0.7850,1.2150} 取 darktable 常量
+//    （其注释：匹配真实颗粒扫描的功率谱）。旧的单八度 value noise（sin-hash +
+//    smoothstep）频谱低通、格子边界 C1 不连续 ⇒ 观感是"块状糊"而不是"颗粒"。
+// ② **严禁 sin-hash**：大坐标下 highp sin 精度不足会产生规律图案（本项目在 dither 上
+//    踩过同型坑，见 dhash 注释）⇒ 用整数 permutation 表（GLSL ES 3.0 支持数组初始化
+//    器与常量数组索引，同文件 kFsChromaDown 的 B3[5]/B3[i] 即先例）。
+// ③ 尺度按**短边归一化**（ADR-11）：噪声坐标 = 像素/短边 ⇒ 预览（降采样）与导出
+//    （全分辨率）的颗粒相对空间频率一致，与像素数无关。zoom 越大 ⇒ 频率越低 ⇒ 越粗。
+// ④ 密度调制 = 相纸响应 LUT（CPU 侧预计算 128²，x 轴 = 噪声·strength·0.15，
+//    y 轴 = 显示域 luma ≈ darktable 的 Lab L/100）⇒ shader 内**零** exp/log。
+// 采样用 texelFetch 手写双线性而非 texture()：Mali 上 16F 的硬件 LINEAR 不可靠
+//（项目多处实测，见 makeTex / LSC / kFsRcdChroma 注释）⇒ 依赖它会在 128 级台阶上
+// 静默退化成最近邻。
+const int kGrainPerm[256] = int[256](
+    151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225, 140, 36, 103, 30,
+    69, 142, 8, 99, 37, 240, 21, 10, 23, 190, 6, 148, 247, 120, 234, 75, 0, 26, 197, 62,
+    94, 252, 219, 203, 117, 35, 11, 32, 57, 177, 33, 88, 237, 149, 56, 87, 174, 20, 125, 136,
+    171, 168, 68, 175, 74, 165, 71, 134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122,
+    60, 211, 133, 230, 220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54, 65, 25, 63, 161,
+    1, 216, 80, 73, 209, 76, 132, 187, 208, 89, 18, 169, 200, 196, 135, 130, 116, 188, 159, 86,
+    164, 100, 109, 198, 173, 186, 3, 64, 52, 217, 226, 250, 124, 123, 5, 202, 38, 147, 118, 126,
+    255, 82, 85, 212, 207, 206, 59, 227, 47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170, 213,
+    119, 248, 152, 2, 44, 154, 163, 70, 221, 153, 101, 155, 167, 43, 172, 9, 129, 22, 39, 253,
+    19, 98, 108, 110, 79, 113, 224, 232, 178, 185, 112, 104, 218, 246, 97, 228, 251, 34, 242, 193,
+    238, 210, 144, 12, 191, 179, 162, 241, 81, 51, 145, 235, 249, 14, 239, 107, 49, 192, 214, 31,
+    181, 199, 106, 157, 184, 84, 204, 176, 115, 121, 50, 45, 127, 4, 150, 254, 138, 236, 205, 93,
+    222, 114, 67, 29, 24, 72, 243, 141, 128, 195, 78, 66, 215, 61, 156, 180);
+// darktable 的 perm[512]（= permutation[i & 255] 查表）等价形式 —— 表本身仍是 256 项。
+int grainPerm(int i) { return kGrainPerm[i & 255]; }
+// darktable `grad3[12][3]` 逐项照抄（12 个"面心"梯度）。
+const vec3 kGrainGrad3[12] = vec3[12](
+    vec3(1.0, 1.0, 0.0), vec3(-1.0, 1.0, 0.0), vec3(1.0, -1.0, 0.0), vec3(-1.0, -1.0, 0.0),
+    vec3(1.0, 0.0, 1.0), vec3(-1.0, 0.0, 1.0), vec3(1.0, 0.0, -1.0), vec3(-1.0, 0.0, -1.0),
+    vec3(0.0, 1.0, 1.0), vec3(0.0, -1.0, 1.0), vec3(0.0, 1.0, -1.0), vec3(0.0, -1.0, -1.0));
+// darktable `_simplex_noise`（Perlin 1998 / Gustavson 型）。六路 if-else 顶点次序逐字照抄；
+// floor() 对应其 FASTFLOOR（两者仅在**精确整数**输入上不同，噪声坐标不可能命中）。
+float grainSimplex3(vec3 v) {
+    const float F3 = 1.0 / 3.0;
+    const float G3 = 1.0 / 6.0;
+    float s = (v.x + v.y + v.z) * F3;
+    vec3 ip = floor(v + vec3(s));
+    float t = (ip.x + ip.y + ip.z) * G3;
+    vec3 x0 = v - ip + vec3(t);
+    int i1, j1, k1, i2, j2, k2;
+    if (x0.x >= x0.y) {
+        if (x0.y >= x0.z)      { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+        else if (x0.x >= x0.z) { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 0; k2 = 1; }
+        else                   { i1 = 0; j1 = 0; k1 = 1; i2 = 1; j2 = 0; k2 = 1; }
+    } else {
+        if (x0.y < x0.z)       { i1 = 0; j1 = 0; k1 = 1; i2 = 0; j2 = 1; k2 = 1; }
+        else if (x0.x < x0.z)  { i1 = 0; j1 = 1; k1 = 0; i2 = 0; j2 = 1; k2 = 1; }
+        else                   { i1 = 0; j1 = 1; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+    }
+    vec3 x1 = x0 - vec3(float(i1), float(j1), float(k1)) + G3;
+    vec3 x2 = x0 - vec3(float(i2), float(j2), float(k2)) + 2.0 * G3;
+    vec3 x3 = x0 - 1.0 + 3.0 * G3;
+    ivec3 ic = ivec3(ip) & 255;
+    int gi0 = grainPerm(ic.x + grainPerm(ic.y + grainPerm(ic.z))) % 12;
+    int gi1 = grainPerm(ic.x + i1 + grainPerm(ic.y + j1 + grainPerm(ic.z + k1))) % 12;
+    int gi2 = grainPerm(ic.x + i2 + grainPerm(ic.y + j2 + grainPerm(ic.z + k2))) % 12;
+    int gi3 = grainPerm(ic.x + 1 + grainPerm(ic.y + 1 + grainPerm(ic.z + 1))) % 12;
+    float n0 = 0.0, n1 = 0.0, n2 = 0.0, n3 = 0.0;
+    float t0 = 0.6 - dot(x0, x0);
+    if (t0 > 0.0) { t0 *= t0; n0 = t0 * t0 * dot(kGrainGrad3[gi0], x0); }
+    float t1 = 0.6 - dot(x1, x1);
+    if (t1 > 0.0) { t1 *= t1; n1 = t1 * t1 * dot(kGrainGrad3[gi1], x1); }
+    float t2 = 0.6 - dot(x2, x2);
+    if (t2 > 0.0) { t2 *= t2; n2 = t2 * t2 * dot(kGrainGrad3[gi2], x2); }
+    float t3 = 0.6 - dot(x3, x3);
+    if (t3 > 0.0) { t3 *= t3; n3 = t3 * t3 * dot(kGrainGrad3[gi3], x3); }
+    return 32.0 * (n0 + n1 + n2 + n3);
+}
+// darktable `_simplex_2d_noise`：f[]/a[] 逐一内联展开（**无数组、无循环** —— GLSL 三禁）。
+// z = zoom，三个八度各占 z 轴的一个整数标签 ⇒ 互不相关。
+float grainNoise(vec2 p, float z) {
+    return grainSimplex3(vec3(p.x * 0.4910 / z, p.y * 0.4910 / z, 0.0)) * 0.2340
+         + grainSimplex3(vec3(p.x * 0.9441 / z, p.y * 0.9441 / z, 1.0)) * 0.7850
+         + grainSimplex3(vec3(p.x * 1.7280 / z, p.y * 1.7280 / z, 2.0)) * 1.2150;
+}
+// darktable `dt_lut_lookup_2d_1c` 逐字移植：x 轴 ±0.5 偏移、两端 clamp 到 SIZE-1、
+// 索引上界 SIZE-2（末格靠 x_diff/y_diff = 1 外推）。
+float grainLutFetch(vec2 s) {
+    vec2 t = clamp(vec2((s.x + 0.5) * 127.0, s.y * 127.0), 0.0, 127.0);
+    ivec2 i0 = min(ivec2(t), ivec2(126));
+    vec2 f = t - vec2(i0);
+    float l00 = texelFetch(uGrainLut, i0, 0).r;
+    float l01 = texelFetch(uGrainLut, i0 + ivec2(1, 0), 0).r;
+    float l10 = texelFetch(uGrainLut, i0 + ivec2(0, 1), 0).r;
+    float l11 = texelFetch(uGrainLut, i0 + ivec2(1, 1), 0).r;
+    float xy0 = mix(l00, l10, f.y);
+    float xy1 = mix(l01, l11, f.y);
+    return mix(xy0, xy1, f.x);
 }
 // M4-6 高光滚降（线性域）：clamp 硬截断会把 >1 的高光直接拍成死白，而且**保留
 // 色相**，使过曝的灯/窗偏红偏粉（v0.5.37 用户反馈过）。
@@ -4633,11 +4760,17 @@ void main() {
     }
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
+    // ── E4-3 颗粒（granularity，darktable grain.c）────────────────────────
+    // 坐标 = 像素/短边（uGrainNorm = 1/min(W,H)）⇒ 与像素数无关（ADR-11）；seed 是
+    // **相对** x 偏移（成片按内容派生、预览/编辑器恒 0 ⇒ 取景稳定不闪）。密度调制 =
+    // 相纸响应 LUT：x 轴 = 噪声·strength·0.15（GRAIN_LIGHTNESS_STRENGTH_SCALE），
+    // y 轴 = 显示域 luma（≈ darktable 的 Lab L/100）。LUT 输出单位是 darktable 的
+    // L 单位（100×）⇒ ×0.01 回到显示域。
     if (uGrainAmount > 0.0) {
-        vec2 gp = gl_FragCoord.xy * 6.0 / max(uGrainSize, 0.25) + uTime;
+        float strength = uGrainAmount * 0.01;
+        vec2 gp = gl_FragCoord.xy * uGrainNorm + vec2(uGrainSeed, 0.0);
         float l = dot(c, vec3(0.299, 0.587, 0.114));
-        float w = 4.0 * l * (1.0 - l);
-        c += (vnoise(gp) - 0.5) * uGrainAmount * w;
+        c += grainLutFetch(vec2(grainNoise(gp, uGrainZoom) * strength * 0.15, l)) * 0.01;
     }
     // v0.10.67：RPDF ±0.5LSB → **TPDF ±1LSB**（两个独立均匀分布之和 = 三角分布）。
     // 依据：真机成片最平坦块实测 44.7% 相邻像素完全相同、行间 |Δ| 恰好 1.000 ——
@@ -4676,18 +4809,25 @@ void main() {
 //      编辑器不经 kFsStill ⇒ 这里再翻一次才会把图**上下颠倒**。
 //      （离线验收 tools/check-style-passthrough.py 的 ①/⑤ 真跑本 shader 证明。）
 //   ③ 无 uZebra —— 过曝提示绝不进成片；
-//   ④ 颗粒种子 = uSeed（外部固定）而非帧计数 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现
+//   ④ 颗粒种子 = uGrainSeed（外部固定）而非帧计数 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现
 //      （报告 R3：帧计数种子会让同一张图两次导出的颗粒图案不同，A/B 对比失真）。
-// lutTetra/lutApply/hash/dhash/vnoise 逐字拷自 kFsOut —— 显示域 LUT 的语义必须与
-// 成片一致（ADR-7 表格：LUT 资产本就是 display 域、OETF 后）。
+// lutTetra/lutApply/dhash 与**整段颗粒（permutation 表 / simplex / LUT 采样 / 主段）**
+// 逐字拷自 kFsOut —— 显示域 LUT 与颗粒的语义必须与成片一致（ADR-7 表格：LUT 资产本
+// 就是 display 域、OETF 后；E4-3 颗粒同在显示域、同在 LUT 之后）。
 const char* kFsStyle = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
-uniform float uSeed;        // 颗粒种子（外部固定 ⇒ 可复现；不随帧计数变化）
-uniform float uGrainAmount;
-uniform float uGrainSize;
+// ── E4-3 颗粒（granularity；darktable src/iop/grain.c）────────────────────
+// 域常数在 CPU 侧算好（shader 内不做 W/H 除法与 clamp，与 E4-2 暗角同款）：
+//   uGrainZoom = grainZoom([27])、uGrainNorm = 1/min(W,H)、uGrainSeed = 噪声坐标的
+//   **相对** x 偏移（成片按内容派生；预览/编辑器恒 0 ⇒ 取景时图案稳定不闪）。
+uniform float uGrainAmount;  // [26] 0..100（strength = /100；0 ⇒ 整段跳过，零成本）
+uniform float uGrainSeed;
+uniform float uGrainZoom;
+uniform float uGrainNorm;
+uniform highp sampler2D uGrainLut;  // 128² R16F 相纸响应 LUT（CPU 侧按 [60][61] 重算）
 // ── E2-12 裁剪 + 90° 步进旋转（ADR-16）：**引擎输入侧的 UV 子矩形** ──────────
 // 所有对 uTex 的采样都经 cropUV() 映射；**后续处理（暗角 / 局部调整 / LUT /
 // 颗粒）一律继续用 vUV0**（= 裁剪后的归一化坐标，仍覆盖 [0,1]）⇒ 暗角自动
@@ -4748,7 +4888,6 @@ vec3 lutApply(vec3 c) {
     vec3 c111 = texelFetch(uLut, clamp(i + ivec3(1, 1, 1), ivec3(0), mx), 0).rgb;
     return lutTetra(f, c000, c100, c010, c001, c110, c101, c011, c111);
 }
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 // ── E2-2 基础调整（ADR §5.6；域约定 ADR-7 订正 v2）──────────────────────────
 // **本 shader 内的成对往返只有两处**：① 主路径的曝光×WB（main 内，uExpWbOn 门控）；
 // ② 清晰度把 blur 基准提升到同域的标量往返（chainLuma，仅 clarity>0 时执行）。
@@ -4877,18 +5016,110 @@ float localMask(vec2 uv) {
     }
     return 1.0 - smoothstep(1.0, 1.0 + max(uLocalFeather, 1e-3), d);
 }
-// dither 专用 hash（无 sin 版，见 kFsOut 的注释：sin 版在大坐标下有规律图案）
+// v0.10.67 dither 专用 hash：sin 版（`fract(sin(dot(p,…)))`）在 gl_FragCoord 大坐标
+//（3072×4080）下 highp sin 精度不足，会产生**规律性图案** —— dither 一旦有规律就等于
+// 没有。Dave Hoskins 的无 sin 整数风格 hash。E4-3：原 sin 版 hash 与其上的单八度
+// value noise 只服务颗粒，已整体替换为下方 3 八度 simplex ⇒ 颗粒侧同型坑一并消除。
 float dhash(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
 }
-float vnoise(vec2 p) {
-    vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    float a = hash(i), b = hash(i + vec2(1, 0));
-    float c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+// ── E4-3 颗粒（granularity；darktable src/iop/grain.c 逐行移植）────────────
+// ① 噪声源 = **3 八度 3D simplex**（Gustavson 的 permutation[256] + grad3[12] 整数表，
+//    输出归一化 32·(n0+n1+n2+n3)），z 轴传八度序号 ⇒ 三阶在 3D 空间互不相关。
+//    频率 f={0.4910,0.9441,1.7280} / 幅度 a={0.2340,0.7850,1.2150} 取 darktable 常量
+//    （其注释：匹配真实颗粒扫描的功率谱）。旧的单八度 value noise（sin-hash +
+//    smoothstep）频谱低通、格子边界 C1 不连续 ⇒ 观感是"块状糊"而不是"颗粒"。
+// ② **严禁 sin-hash**：大坐标下 highp sin 精度不足会产生规律图案（本项目在 dither 上
+//    踩过同型坑，见 dhash 注释）⇒ 用整数 permutation 表（GLSL ES 3.0 支持数组初始化
+//    器与常量数组索引，同文件 kFsChromaDown 的 B3[5]/B3[i] 即先例）。
+// ③ 尺度按**短边归一化**（ADR-11）：噪声坐标 = 像素/短边 ⇒ 预览（降采样）与导出
+//    （全分辨率）的颗粒相对空间频率一致，与像素数无关。zoom 越大 ⇒ 频率越低 ⇒ 越粗。
+// ④ 密度调制 = 相纸响应 LUT（CPU 侧预计算 128²，x 轴 = 噪声·strength·0.15，
+//    y 轴 = 显示域 luma ≈ darktable 的 Lab L/100）⇒ shader 内**零** exp/log。
+// 采样用 texelFetch 手写双线性而非 texture()：Mali 上 16F 的硬件 LINEAR 不可靠
+//（项目多处实测，见 makeTex / LSC / kFsRcdChroma 注释）⇒ 依赖它会在 128 级台阶上
+// 静默退化成最近邻。
+const int kGrainPerm[256] = int[256](
+    151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225, 140, 36, 103, 30,
+    69, 142, 8, 99, 37, 240, 21, 10, 23, 190, 6, 148, 247, 120, 234, 75, 0, 26, 197, 62,
+    94, 252, 219, 203, 117, 35, 11, 32, 57, 177, 33, 88, 237, 149, 56, 87, 174, 20, 125, 136,
+    171, 168, 68, 175, 74, 165, 71, 134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122,
+    60, 211, 133, 230, 220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54, 65, 25, 63, 161,
+    1, 216, 80, 73, 209, 76, 132, 187, 208, 89, 18, 169, 200, 196, 135, 130, 116, 188, 159, 86,
+    164, 100, 109, 198, 173, 186, 3, 64, 52, 217, 226, 250, 124, 123, 5, 202, 38, 147, 118, 126,
+    255, 82, 85, 212, 207, 206, 59, 227, 47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170, 213,
+    119, 248, 152, 2, 44, 154, 163, 70, 221, 153, 101, 155, 167, 43, 172, 9, 129, 22, 39, 253,
+    19, 98, 108, 110, 79, 113, 224, 232, 178, 185, 112, 104, 218, 246, 97, 228, 251, 34, 242, 193,
+    238, 210, 144, 12, 191, 179, 162, 241, 81, 51, 145, 235, 249, 14, 239, 107, 49, 192, 214, 31,
+    181, 199, 106, 157, 184, 84, 204, 176, 115, 121, 50, 45, 127, 4, 150, 254, 138, 236, 205, 93,
+    222, 114, 67, 29, 24, 72, 243, 141, 128, 195, 78, 66, 215, 61, 156, 180);
+// darktable 的 perm[512]（= permutation[i & 255] 查表）等价形式 —— 表本身仍是 256 项。
+int grainPerm(int i) { return kGrainPerm[i & 255]; }
+// darktable `grad3[12][3]` 逐项照抄（12 个"面心"梯度）。
+const vec3 kGrainGrad3[12] = vec3[12](
+    vec3(1.0, 1.0, 0.0), vec3(-1.0, 1.0, 0.0), vec3(1.0, -1.0, 0.0), vec3(-1.0, -1.0, 0.0),
+    vec3(1.0, 0.0, 1.0), vec3(-1.0, 0.0, 1.0), vec3(1.0, 0.0, -1.0), vec3(-1.0, 0.0, -1.0),
+    vec3(0.0, 1.0, 1.0), vec3(0.0, -1.0, 1.0), vec3(0.0, 1.0, -1.0), vec3(0.0, -1.0, -1.0));
+// darktable `_simplex_noise`（Perlin 1998 / Gustavson 型）。六路 if-else 顶点次序逐字照抄；
+// floor() 对应其 FASTFLOOR（两者仅在**精确整数**输入上不同，噪声坐标不可能命中）。
+float grainSimplex3(vec3 v) {
+    const float F3 = 1.0 / 3.0;
+    const float G3 = 1.0 / 6.0;
+    float s = (v.x + v.y + v.z) * F3;
+    vec3 ip = floor(v + vec3(s));
+    float t = (ip.x + ip.y + ip.z) * G3;
+    vec3 x0 = v - ip + vec3(t);
+    int i1, j1, k1, i2, j2, k2;
+    if (x0.x >= x0.y) {
+        if (x0.y >= x0.z)      { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+        else if (x0.x >= x0.z) { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 0; k2 = 1; }
+        else                   { i1 = 0; j1 = 0; k1 = 1; i2 = 1; j2 = 0; k2 = 1; }
+    } else {
+        if (x0.y < x0.z)       { i1 = 0; j1 = 0; k1 = 1; i2 = 0; j2 = 1; k2 = 1; }
+        else if (x0.x < x0.z)  { i1 = 0; j1 = 1; k1 = 0; i2 = 0; j2 = 1; k2 = 1; }
+        else                   { i1 = 0; j1 = 1; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+    }
+    vec3 x1 = x0 - vec3(float(i1), float(j1), float(k1)) + G3;
+    vec3 x2 = x0 - vec3(float(i2), float(j2), float(k2)) + 2.0 * G3;
+    vec3 x3 = x0 - 1.0 + 3.0 * G3;
+    ivec3 ic = ivec3(ip) & 255;
+    int gi0 = grainPerm(ic.x + grainPerm(ic.y + grainPerm(ic.z))) % 12;
+    int gi1 = grainPerm(ic.x + i1 + grainPerm(ic.y + j1 + grainPerm(ic.z + k1))) % 12;
+    int gi2 = grainPerm(ic.x + i2 + grainPerm(ic.y + j2 + grainPerm(ic.z + k2))) % 12;
+    int gi3 = grainPerm(ic.x + 1 + grainPerm(ic.y + 1 + grainPerm(ic.z + 1))) % 12;
+    float n0 = 0.0, n1 = 0.0, n2 = 0.0, n3 = 0.0;
+    float t0 = 0.6 - dot(x0, x0);
+    if (t0 > 0.0) { t0 *= t0; n0 = t0 * t0 * dot(kGrainGrad3[gi0], x0); }
+    float t1 = 0.6 - dot(x1, x1);
+    if (t1 > 0.0) { t1 *= t1; n1 = t1 * t1 * dot(kGrainGrad3[gi1], x1); }
+    float t2 = 0.6 - dot(x2, x2);
+    if (t2 > 0.0) { t2 *= t2; n2 = t2 * t2 * dot(kGrainGrad3[gi2], x2); }
+    float t3 = 0.6 - dot(x3, x3);
+    if (t3 > 0.0) { t3 *= t3; n3 = t3 * t3 * dot(kGrainGrad3[gi3], x3); }
+    return 32.0 * (n0 + n1 + n2 + n3);
+}
+// darktable `_simplex_2d_noise`：f[]/a[] 逐一内联展开（**无数组、无循环** —— GLSL 三禁）。
+// z = zoom，三个八度各占 z 轴的一个整数标签 ⇒ 互不相关。
+float grainNoise(vec2 p, float z) {
+    return grainSimplex3(vec3(p.x * 0.4910 / z, p.y * 0.4910 / z, 0.0)) * 0.2340
+         + grainSimplex3(vec3(p.x * 0.9441 / z, p.y * 0.9441 / z, 1.0)) * 0.7850
+         + grainSimplex3(vec3(p.x * 1.7280 / z, p.y * 1.7280 / z, 2.0)) * 1.2150;
+}
+// darktable `dt_lut_lookup_2d_1c` 逐字移植：x 轴 ±0.5 偏移、两端 clamp 到 SIZE-1、
+// 索引上界 SIZE-2（末格靠 x_diff/y_diff = 1 外推）。
+float grainLutFetch(vec2 s) {
+    vec2 t = clamp(vec2((s.x + 0.5) * 127.0, s.y * 127.0), 0.0, 127.0);
+    ivec2 i0 = min(ivec2(t), ivec2(126));
+    vec2 f = t - vec2(i0);
+    float l00 = texelFetch(uGrainLut, i0, 0).r;
+    float l01 = texelFetch(uGrainLut, i0 + ivec2(1, 0), 0).r;
+    float l10 = texelFetch(uGrainLut, i0 + ivec2(0, 1), 0).r;
+    float l11 = texelFetch(uGrainLut, i0 + ivec2(1, 1), 0).r;
+    float xy0 = mix(l00, l10, f.y);
+    float xy1 = mix(l01, l11, f.y);
+    return mix(xy0, xy1, f.x);
 }
 void main() {
     // 显示域直取：不 decode、不 encode（ADR-7）
@@ -4977,11 +5208,17 @@ void main() {
     }
     // M4：display 域 3D LUT（与 kFsOut 4547 同式；强度 0 ⇒ uLutOn=0 ⇒ 逐像素恒等）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
+    // ── E4-3 颗粒（granularity，darktable grain.c）────────────────────────
+    // 坐标 = 像素/短边（uGrainNorm = 1/min(W,H)）⇒ 与像素数无关（ADR-11）；seed 是
+    // **相对** x 偏移（成片按内容派生、预览/编辑器恒 0 ⇒ 取景稳定不闪）。密度调制 =
+    // 相纸响应 LUT：x 轴 = 噪声·strength·0.15（GRAIN_LIGHTNESS_STRENGTH_SCALE），
+    // y 轴 = 显示域 luma（≈ darktable 的 Lab L/100）。LUT 输出单位是 darktable 的
+    // L 单位（100×）⇒ ×0.01 回到显示域。
     if (uGrainAmount > 0.0) {
-        vec2 gp = gl_FragCoord.xy * 6.0 / max(uGrainSize, 0.25) + uSeed;
+        float strength = uGrainAmount * 0.01;
+        vec2 gp = gl_FragCoord.xy * uGrainNorm + vec2(uGrainSeed, 0.0);
         float l = dot(c, vec3(0.299, 0.587, 0.114));
-        float w = 4.0 * l * (1.0 - l);
-        c += (vnoise(gp) - 0.5) * uGrainAmount * w;
+        c += grainLutFetch(vec2(grainNoise(gp, uGrainZoom) * strength * 0.15, l)) * 0.01;
     }
     // TPDF dither ±1LSB（与 kFsOut 4559 同式；RGBA8 量化前）
     c += (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / 255.0;
@@ -6328,9 +6565,12 @@ bool FrameRenderer::init() {
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
+  // E4-3 颗粒（granularity）：与 u_style_ 同名同义（见 FrameRenderer.h 的 u_out_ 注释）
   u_out_.grain_amount = glGetUniformLocation(prog_out_, "uGrainAmount");
-  u_out_.grain_size = glGetUniformLocation(prog_out_, "uGrainSize");
-  u_out_.time = glGetUniformLocation(prog_out_, "uTime");
+  u_out_.grain_seed = glGetUniformLocation(prog_out_, "uGrainSeed");
+  u_out_.grain_zoom = glGetUniformLocation(prog_out_, "uGrainZoom");
+  u_out_.grain_norm = glGetUniformLocation(prog_out_, "uGrainNorm");
+  u_out_.grain_lut = glGetUniformLocation(prog_out_, "uGrainLut");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
   u_out_.sharpen = glGetUniformLocation(prog_out_, "uSharpen");
@@ -6348,9 +6588,13 @@ bool FrameRenderer::init() {
 
   // E1-3 编辑器通路（kFsStyle）
   u_style_.tex = glGetUniformLocation(prog_style_, "uTex");
-  u_style_.seed = glGetUniformLocation(prog_style_, "uSeed");
+  // E4-3 颗粒（granularity）：见 u_out_。旧 uSeed 只服务颗粒（dither 走 dhash）⇒ 由
+  // uGrainSeed 取代，无连带影响。
   u_style_.grain_amount = glGetUniformLocation(prog_style_, "uGrainAmount");
-  u_style_.grain_size = glGetUniformLocation(prog_style_, "uGrainSize");
+  u_style_.grain_seed = glGetUniformLocation(prog_style_, "uGrainSeed");
+  u_style_.grain_zoom = glGetUniformLocation(prog_style_, "uGrainZoom");
+  u_style_.grain_norm = glGetUniformLocation(prog_style_, "uGrainNorm");
+  u_style_.grain_lut = glGetUniformLocation(prog_style_, "uGrainLut");
   // E2-12 裁剪 + 90° 步进旋转（ADR-16）
   u_style_.crop_origin = glGetUniformLocation(prog_style_, "uCropOrigin");
   u_style_.crop_size = glGetUniformLocation(prog_style_, "uCropSize");
@@ -6480,6 +6724,10 @@ void FrameRenderer::release() {
   if (tex_hist_) glDeleteTextures(1, &tex_hist_);
   if (tex_out_s_) glDeleteTextures(1, &tex_out_s_);
   if (lut_tex_) glDeleteTextures(1, &lut_tex_);
+  // E4-3 颗粒：相纸 LUT 纹理（128×128 R16F，64KB）+ 失效键复位（下次按需重建）
+  if (tex_grain_lut_) glDeleteTextures(1, &tex_grain_lut_);
+  grain_lut_mb_ = -1.0f;
+  grain_lut_pivot_ = -1.0f;
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
@@ -6815,6 +7063,9 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
                                 bool fill_test) {
   if (dst_w <= 0 || dst_h <= 0) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
+  // E4-3 颗粒：预览路径的种子**恒 0** ⇒ 图案不随帧变化。旧实现用 uTime =
+  // frames_ % 512，颗粒每帧重掷 = 取景时满屏闪烁（设计文档 §3.1.6 方案 A 的缺陷）。
+  grain_seed_ = 0.0f;
 
   // 预览降载（v0.10.93）：pass1/2/3 与后处理（局部色调映射、直方图统计、
   // filmic 统计）全按缩放后尺寸跑，成本随像素数下降（0.5 → 1/4）。显示不变：
@@ -7016,6 +7267,11 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
     cap_w_ = dst_w;
     cap_h_ = dst_h;
   }
+  // E4-3 颗粒：成片种子 = f(输出尺寸, 输入内容指纹) ⇒ 同一张两次导出**逐位相同**、
+  // 不同照片不同图案（验收判据 6）。预览/编辑器路径各自置 0（图案稳定不闪）。
+  // 指纹源 = rgb_stage_（CPU 转换后的 RGB8），与输出尺寸一起决定图案的起始相位。
+  grain_seed_ = grainSeedFrom(
+      grainFingerprint(rgb_stage_.data(), rgb_stage_.size()), dst_w, dst_h);
   passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   logPassDiag("pass3_still", fbo_cap_, false);
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
@@ -7040,6 +7296,9 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
                                   int out_h, const float crop_uv[4],
                                   int crop_rot, const FilmParams& p,
                                   std::vector<uint8_t>* out_rgba) {
+  // E4-3 颗粒：编辑器链路的种子**恒 0** ⇒ 预览稳定（不随帧变）+ 导出可复现
+  // （报告 R3 / 验收判据 6）。"成片每张不同"由 passOutput 的内容指纹承担。
+  grain_seed_ = 0.0f;
   const bool prog_ok = prog_style_ != 0;
   bool ran = false;
   // E2-12：输出尺寸缺省（≤0）⇒ 与输入同尺寸（不裁剪）。w/h 始终 = 输入位图尺寸，
@@ -7221,6 +7480,11 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
   kv += ",\"lutK\":" + std::to_string(p.lut_strength);
   kv += ",\"grain\":" + std::to_string(p.grain_amount);
   kv += ",\"grainSz\":" + std::to_string(p.grain_size);
+  // E4-3 颗粒（granularity）：生效值三件套 —— 密度调制参数 [60]、亮度枢轴 [61]、
+  // 本帧实际下发的种子（编辑器链路恒 0；成片链路的同名字段发在 raw.render）。
+  kv += ",\"grainMb\":" + std::to_string(p.grain_midtone_bias);
+  kv += ",\"grainPivot\":" + std::to_string(p.grain_pivot);
+  kv += ",\"grainSeed\":" + jnum(grain_seed_, 6);
   // E2-2 基础调整：**下发参数值**（与上面三个同出口 —— ADR §6.2 要求"下发值 /
   // 链接成功 / 本帧执行"三件套写在同一个日志出口；check-diag-fields.py 会核对
   // 字段行必须晚于本函数内的 passStyle 调用）。
@@ -9002,6 +9266,9 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
+  // E4-3 颗粒：成片种子的内容指纹（u16 RAW ⇒ 字节数 = w·h·2）。用**原始 RAW** 而不是
+  // 成片像素：RAW 是输入侧的不变量，重跑同一次拍摄必然得到同一指纹 ⇒ 导出可复现。
+  c.grain_fp = grainFingerprint(raw, static_cast<size_t>(w) * h * 2);
   // AMaZE 档（demosaic == 2，v0.10.172）：CPU 侧从这份 u16 RAW 直接跑 AMaZE
   c.amaze = demosaic == 2;
   if (c.amaze) {
@@ -9574,6 +9841,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     cap_w_ = dst_w;
     cap_h_ = dst_h;
   }
+  // E4-3 颗粒：成片种子 = f(输出尺寸, 输入内容指纹)（指纹由 submitRaw/submitRawBurst
+  // 填进 ChainCtx）⇒ 同一张两次导出**逐位相同**、不同照片不同图案（验收判据 6）。
+  // 预览/编辑器路径各自置 0（submitFrame/submitDisplay）⇒ 取景时图案稳定不闪。
+  grain_seed_ = grainSeedFrom(c.grain_fp, dst_w, dst_h);
   passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
   glFinish();
@@ -9822,6 +10093,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         jnum(static_cast<float>(dbg_hl_sum_[2]), 14) + "]";
   kv += ",\"hlCnt3\":[" + jnum(dbg_hl_cnt3_[0], 12) + "," + jnum(dbg_hl_cnt3_[1], 12) +
         "," + jnum(dbg_hl_cnt3_[2], 12) + "]";
+  // E4-3 颗粒（granularity）：成片链的生效值。颗粒段在 passOutput 内，已在本函数内
+  // 执行完 ⇒ 字段行晚于调用（check-diag-fields.py 的同一条纪律）。
+  // grainSeed = "同一张两次导出逐位相同"的核对依据（内容指纹派生，见 grainSeedFrom）。
+  kv += ",\"grain\":" + std::to_string(p.grain_amount);
+  kv += ",\"grainSz\":" + std::to_string(p.grain_size);
+  kv += ",\"grainMb\":" + std::to_string(p.grain_midtone_bias);
+  kv += ",\"grainPivot\":" + std::to_string(p.grain_pivot);
+  kv += ",\"grainSeed\":" + jnum(grain_seed_, 6);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
   // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
@@ -11506,6 +11785,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.p = &p;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
+  // E4-3 颗粒：内容指纹取**参考帧 frames[0]**（u16 RAW ⇒ 字节数 = w·h·2）—— 与
+  // 单帧路径同口径（同一场拍摄的单帧档与 burst 档得到不同图案是预期的：输入不同）。
+  c.grain_fp = grainFingerprint(frames[0], static_cast<size_t>(w) * h * 2);
   // AMaZE 档（demosaic == 2）：MFNR 的融合结果在 GPU（tex_fused_），CPU 侧拿不到
   // ⇒ burst 路径用**参考帧 frames[0]** 跑单帧 AMaZE（质量 = 单帧档，日志里
   // amazeSrc="burst0" 标注）。这是未完成项（见 REPORT.md），不是静默降级。
@@ -12261,9 +12543,50 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
 }
 
 
-// E1-3 编辑器通路：显示域输入（edit_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
+// E4-3：相纸响应 LUT（darktable grain.c `evaluate_grain_lut`；数学在 GrainLut.h）。
+// 为什么在 CPU 侧算：[60]/[61] 变化时才重算 128×128 = 16384 次 exp/log（亚毫秒级）；
+// 放进 shader 就是 12.5M px × 2 次 exp/log 的纯浪费（darktable 同样是 CPU 侧 LUT）。
+// 纹理 = 128×128 **R16F**（LUT 值域 ±100，half 的相对精度 2^-11 远优于 LUT 自身
+// 1/127 的采样分辨率），用 **glTexStorage2D**（不可变存储 —— v0.10.50 真机定案：
+// Mali 上 glTexImage2D 创建的纹理在部分路径上写入全丢）。
+// 过滤 = NEAREST：shader 侧手写双线性（texelFetch），不依赖 16F 的硬件 LINEAR
+//（X300/Mali 实测无线性过滤，项目多处手写，见 makeTex / kFsRcdChroma 注释）。
+// 布局 = x 轴噪声轴（gu ∈ ±0.5）、y 轴亮度轴（l ∈ [0,1]），与 darktable 的
+// grain_lut[j*SIZE + i] 一致。
+void FrameRenderer::ensureGrainLut(float mb, float pivot) {
+  if (tex_grain_lut_ != 0 && grain_lut_mb_ == mb && grain_lut_pivot_ == pivot) return;
+  float lut[grain::kLutSize * grain::kLutSize];
+  grain::buildGrainLut(lut, mb, pivot);
+  std::vector<uint16_t> px(static_cast<size_t>(grain::kLutSize) * grain::kLutSize);
+  for (size_t k = 0; k < px.size(); ++k) px[k] = grain::floatToHalf(lut[k]);
+  // ⚠ **必须显式切到纹理单元 2**：glBindTexture / glTexStorage2D / glTexSubImage2D 全部
+  // 作用于**当前 active 单元**，而本函数是在调用方的 `glActiveTexture(GL_TEXTURE0)` +
+  // 绑定输入帧（uTex）**之后**被调用的 —— 不切单元就会把单元 0 的输入帧纹理改绑成
+  // grain LUT ⇒ uTex 采样到 LUT 内容、整帧画面错乱。只在首帧与 [60]/[61] 变化时发生，
+  // 属于最难查的间歇性错误（离线验收走 Python 侧纹理绑定，覆盖不到这条路径）。
+  glActiveTexture(GL_TEXTURE2);
+  if (tex_grain_lut_ == 0) {
+    glGenTextures(1, &tex_grain_lut_);
+    glBindTexture(GL_TEXTURE_2D, tex_grain_lut_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R16F, grain::kLutSize, grain::kLutSize);
+  } else {
+    glBindTexture(GL_TEXTURE_2D, tex_grain_lut_);
+  }
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, grain::kLutSize, grain::kLutSize, GL_RED,
+                  GL_HALF_FLOAT, px.data());
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  grain_lut_mb_ = mb;
+  grain_lut_pivot_ = pivot;
+}
+
+// E1-3 编辑器通路：显示域输入（still_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
 // 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
-// 颗粒种子固定为 0 ⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
+// 颗粒种子固定为 0（submitDisplay 置）⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
 void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
                               int crop_rot, const FilmParams& p) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
@@ -12272,9 +12595,22 @@ void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, edit_tex_);  // E1-5：编辑器自己的 RGBA8 输入纹理
   glUniform1i(u_style_.tex, 0);
-  glUniform1f(u_style_.seed, 0.0f);
+  // ── E4-3 颗粒：CPU 侧算好尺度常数（shader 内不做 W/H 除法与 clamp）────────
+  // 短边归一化（ADR-11）：噪声坐标 = 像素/短边 ⇒ 预览（降采样）与导出（全分辨率）的
+  // 颗粒相对空间频率一致，与像素数无关。zoom 越大 ⇒ 频率越低 ⇒ 颗粒越粗。
+  // seed：预览/编辑器恒 0（图案稳定不闪）；成片由输出尺寸 + 输入内容指纹派生
+  //（同一张可复现、不同张不同 —— 验收判据 6）。
   glUniform1f(u_style_.grain_amount, p.grain_amount);
-  glUniform1f(u_style_.grain_size, p.grain_size);
+  glUniform1f(u_style_.grain_seed, grain_seed_);
+  glUniform1f(u_style_.grain_zoom, grain::grainZoom(p.grain_size));
+  glUniform1f(u_style_.grain_norm, 1.0f / static_cast<float>(std::min(w, h)));
+  // 相纸响应 LUT（[60]/[61] 变化才重算；**关闭态也绑** —— Mali 对未绑定的 sampler
+  // 会预测执行采样，与 bindLut 注释里的同型事故）。纹理单元 2（0 = 输入帧，1 = 3D LUT）。
+  ensureGrainLut(std::clamp(p.grain_midtone_bias, 0.0f, 100.0f),
+                 std::clamp(p.grain_pivot, 0.0f, 1.0f));
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_grain_lut_);
+  glUniform1i(u_style_.grain_lut, 2);
   // ── E2-12 裁剪 + 90° 步进旋转（ADR-16；几何变换，不占 FilmParams 槽位）──────
   // nullptr = 全幅：origin=(0,0)、size=(1,1)、rot=0 ⇒ shader 内 cropUV 恒等
   //（`0.0 + o × 1.0` 在 IEEE 下逐位精确）⇒ 不裁剪时输出与改动前逐位一致（零回归）。
@@ -12393,9 +12729,22 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1i(u_out_.tex, 0);
   glUniform2f(u_out_.px, 1.0f / static_cast<float>(w),
               1.0f / static_cast<float>(h));
+  // ── E4-3 颗粒：CPU 侧算好尺度常数（shader 内不做 W/H 除法与 clamp）────────
+  // 短边归一化（ADR-11）：噪声坐标 = 像素/短边 ⇒ 预览（降采样）与导出（全分辨率）的
+  // 颗粒相对空间频率一致，与像素数无关。zoom 越大 ⇒ 频率越低 ⇒ 颗粒越粗。
+  // seed：预览/编辑器恒 0（图案稳定不闪）；成片由输出尺寸 + 输入内容指纹派生
+  //（同一张可复现、不同张不同 —— 验收判据 6）。
   glUniform1f(u_out_.grain_amount, p.grain_amount);
-  glUniform1f(u_out_.grain_size, p.grain_size);
-  glUniform1f(u_out_.time, static_cast<float>(frames_.load() % 512));
+  glUniform1f(u_out_.grain_seed, grain_seed_);
+  glUniform1f(u_out_.grain_zoom, grain::grainZoom(p.grain_size));
+  glUniform1f(u_out_.grain_norm, 1.0f / static_cast<float>(std::min(w, h)));
+  // 相纸响应 LUT（[60]/[61] 变化才重算；**关闭态也绑** —— Mali 对未绑定的 sampler
+  // 会预测执行采样，与 bindLut 注释里的同型事故）。纹理单元 2（0 = 输入帧，1 = 3D LUT）。
+  ensureGrainLut(std::clamp(p.grain_midtone_bias, 0.0f, 100.0f),
+                 std::clamp(p.grain_pivot, 0.0f, 1.0f));
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_grain_lut_);
+  glUniform1i(u_out_.grain_lut, 2);
   glUniform1f(u_out_.flip_y, flip_y ? 1.0f : 0.0f);
   // 斑马纹只走预览：成片路径一律 0（提示不进成片）
   glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);

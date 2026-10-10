@@ -95,6 +95,8 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FR = os.path.join(REPO, 'core/engine/src/render/FrameRenderer.cpp')
 ESO = os.path.join(REPO, 'tools/engine-shader-offline.py')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import grain_lut_ref as grain_ref  # noqa: E402  E4-3：相纸响应 LUT 的 numpy 复算
 
 
 def load_eso():
@@ -173,6 +175,15 @@ def vig_falloff_np(w, h, strength, radius, feather, uv0=(0.0, 0.0), uv1=(1.0, 1.
 def grey_input(w, h, v=180):
     """纯灰输入：暗角是确定性径向增益，纯灰 ⇒ 剖面可逐点核对（dither 只 ±1 LSB）。"""
     return np.full((h, w, 3), v, np.uint8)
+
+
+def bands_input(w, h):
+    """三段灰（暗 40 / 中 128 / 亮 220）—— E4-3 ⑯c 按亮度分箱观测 [60] 的调制曲线。"""
+    img = np.empty((h, w, 3), np.uint8)
+    img[: h // 3] = 40
+    img[h // 3: 2 * h // 3] = 128
+    img[2 * h // 3:] = 220
+    return img
 
 
 def cplen_map(w, h):
@@ -340,8 +351,9 @@ def crop_out_size(w, h, crop, crop_rot):
 
 
 def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
-              grain, seed=0.0, vig=(0.0, 80.0, 50.0), adj=None,
-              crop=(0.0, 0.0, 1.0, 1.0), crop_rot=0):
+              grain, grain_seed=0.0, vig=(0.0, 80.0, 50.0), adj=None,
+              crop=(0.0, 0.0, 1.0, 1.0), crop_rot=0,
+              grain_size=400.0, grain_mb=100.0, grain_pivot=0.0):
     h, w = inp.shape[:2]
     # E2-12：输出尺寸 = 裁剪矩形（+ 旋转交换）。暗角尺度、清晰度环半径、局部半径拆分
     # 全部按**输出**尺寸下发 —— 与 FrameRenderer::passStyle 的 w/h 语义一致。
@@ -352,7 +364,11 @@ def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
     tex.write((inp.astype(np.float32) / np.float32(255.0)).astype(np.float16).tobytes())
     tex.filter = (eso.moderngl.LINEAR, eso.moderngl.LINEAR)
     uni = {
-        'uSeed': seed, 'uGrainAmount': grain, 'uGrainSize': 1.0,
+        'uGrainAmount': grain, 'uGrainSeed': grain_seed,
+        # E4-3：尺度与 LUT 坐标按 FrameRenderer::passStyle 的**同式**下发
+        # （zoom 由 ISO 换算、norm = 1/短边 —— 短边归一化 ADR-11）。
+        'uGrainZoom': grain_ref.grain_zoom(grain_size),
+        'uGrainNorm': 1.0 / float(min(out_w, out_h)),
         'uLutOn': lut_on, 'uLutStrength': lut_strength,
         'uLutDomainMin': (0.0, 0.0, 0.0), 'uLutDomainInv': (1.0, 1.0, 1.0),
         'uLutSize': float(lut_size),
@@ -360,11 +376,18 @@ def run_style(gl, eso, sh, inp, lut_tex, lut_size, *, lut_on, lut_strength,
     uni.update(vig_uniforms(out_w, out_h, *vig))
     uni.update(style_uniforms(out_w, out_h, **(adj or {}),
                               crop=crop, crop_rot=crop_rot))
+    # E4-3：相纸响应 LUT（128² R16F，与 ensureGrainLut 同一份 numpy 复算；
+    # 真机纹理是 NEAREST + shader 侧手写双线性，这里照同规格建）。
+    gtex = gl.ctx.texture((grain_ref.LUT_SIZE, grain_ref.LUT_SIZE), 1, dtype='f2')
+    gtex.write(grain_ref.build_grain_lut(grain_mb, grain_pivot).astype(np.float16).tobytes())
+    gtex.filter = (eso.moderngl.NEAREST, eso.moderngl.NEAREST)
     # size=(out_w, out_h) 必传：不传则用执行器初始化时的方形 FBO ⇒ **非方形画幅会被静默
     # 裁成正方形**（⑬h 正圆修正就靠非方形画幅，这里不传等于把判据变成空转）。
-    out = gl.run(sh['kFsStyle'], uni, {'uTex': tex, 'uLut': lut_tex},
+    out = gl.run(sh['kFsStyle'], uni,
+                 {'uTex': tex, 'uLut': lut_tex, 'uGrainLut': gtex},
                  size=(out_w, out_h))
     tex.release()
+    gtex.release()
     return out
 
 
@@ -491,6 +514,9 @@ def check_pass_style_slots():
         return False, set(), 'passStyle 函数体未找到'
     refs = set(re.findall(r'\bp\.(\w+)', m.group(0)))
     want = {'grain_amount', 'grain_size', 'lut_strength',
+            # E4-3 颗粒（granularity）：[60] 密度调制（CPU 侧重算相纸 LUT）+
+            # [61] 亮度枢轴（同样折进 LUT）。[26]/[27] 见上一行。
+            'grain_midtone_bias', 'grain_pivot',
             'vignette_strength', 'vignette_radius', 'vignette_feather',
             # E2-2 基础调整：曝光[0] / WB[1..3]（线性域往返）+ 对比度[4] /
             # 饱和度[21] / 清晰度[78]（显示域）。饱和度读 [21]（UI 一个滑杆同写
@@ -519,6 +545,44 @@ def shader_src(src, name):
 def slice_from(text, start, end):
     i = text.index(start)
     return text[i: text.index(end, i) + len(end)]
+
+
+def check_grain_parity():
+    """E4-3 ⑨：两条链路的颗粒实现必须**逐字相同**（shader 函数段 / uniform 声明 /
+    主段 / CPU 下发段）。
+
+    为什么必须一致：颗粒是"最终观感层"—— 预览（kFsOut 预览路径）、成片（kFsOut）、
+    编辑器（kFsStyle）三处看到的图案必须同一套数学，否则所见非所得。E4-2 暗角用同一
+    机制守住了，颗粒照做（这是设计上的直接收益：改一处必须改两处，漏了立刻红）。
+    """
+    src = pathlib.Path(FR).read_text(encoding='utf-8')
+    sh_start = '// ── E4-3 颗粒（granularity；darktable src/iop/grain.c 逐行移植）'
+    sh_end = '    return mix(xy0, xy1, f.x);\n}'
+    un_start = '// ── E4-3 颗粒（granularity；darktable src/iop/grain.c）'
+    un_end = 'uniform highp sampler2D uGrainLut;  // 128² R16F 相纸响应 LUT（CPU 侧按 [60][61] 重算）'
+    mn_start = '// ── E4-3 颗粒（granularity，darktable grain.c）'
+    mn_end = 'c += grainLutFetch(vec2(grainNoise(gp, uGrainZoom) * strength * 0.15, l)) * 0.01;\n    }'
+    pairs = [
+        ('shader 颗粒函数段',
+         slice_from(shader_src(src, 'kFsOut'), sh_start, sh_end),
+         slice_from(shader_src(src, 'kFsStyle'), sh_start, sh_end)),
+        ('uniform 声明',
+         slice_from(shader_src(src, 'kFsOut'), un_start, un_end),
+         slice_from(shader_src(src, 'kFsStyle'), un_start, un_end)),
+        ('shader 主段',
+         slice_from(shader_src(src, 'kFsOut'), mn_start, mn_end),
+         slice_from(shader_src(src, 'kFsStyle'), mn_start, mn_end)),
+    ]
+    # CPU 侧下发段：仅 u_out_ / u_style_ 前缀不同 ⇒ 归一后逐字比对
+    cpu = []
+    for fn in ('passOutput', 'passStyle'):
+        body = re.search(r'void FrameRenderer::' + fn + r'\(.*?\n\}', src, re.S).group(0)
+        body = body.replace('u_out_', 'u_xxx_').replace('u_style_', 'u_xxx_')
+        seg = slice_from(body, '// ── E4-3 颗粒：CPU 侧算好尺度常数',
+                         'glUniform1i(u_xxx_.grain_lut, 2);')
+        cpu.append(seg)
+    pairs.append(('CPU 下发段', cpu[0], cpu[1]))
+    return [name for name, a, b in pairs if a != b]
 
 
 def check_vignette_parity():
@@ -600,10 +664,12 @@ def main():
         fails.append('② 恒等 LUT')
 
     # ③ 颗粒生效 + 可复现
+    # ⚠ E4-3 语义变更：[26] 现在是 darktable 的 `strength`（0..100，进 LUT 时 ×0.15），
+    # 旧测试传 0.5 在新语义下 = 强度 0.005 ⇒ 几乎不可见。用 darktable 的默认强度 25。
     o3 = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
-                   grain=0.5)
+                   grain=25.0)
     o3b = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
-                    grain=0.5)
+                    grain=25.0)
     q3 = quant(o3, inp.shape)
     changed = float((q3 != inp).mean()) * 100.0
     same_run = bool(np.array_equal(o3, o3b))
@@ -710,6 +776,12 @@ def main():
     print(f'⑨ kFsOut 与 kFsStyle 的暗角实现逐字比对：差异段 = {diff9 or "无（0 处）"}')
     if diff9:
         fails.append('⑨ 两处一致性')
+
+    # ⑨b E4-3 颗粒：两条链路逐字一致（shader 函数段 / uniform 声明 / 主段 / CPU 下发段）
+    diff9b = check_grain_parity()
+    print(f'⑨b kFsOut 与 kFsStyle 的颗粒实现逐字比对：差异段 = {diff9b or "无（0 处）"}')
+    if diff9b:
+        fails.append('⑨b 颗粒两处一致性')
 
     # ⑩ E2-2 往返无损（本卡技术风险点）：五个新参数取默认值 ⇒ 输出 = 输入。
     # 与 ① 同口径，但**显式列出五个参数的默认值**（E2-2 之后 ① 只覆盖 LUT/颗粒）。
@@ -1222,6 +1294,53 @@ def main():
           f'区分度对照（局部中心若按**源图坐标**解释）max|Δ| = {d15d_wrong:.0f} LSB（须 >3）')
     if d15d > 3.0 or not near or d15d_wrong <= 3.0:
         fails.append('⑮d 裁剪后局部中心')
+
+    # ══ E4-3 颗粒（granularity，darktable grain.c）════════════════════════════
+    # ⑯a 默认零回归（ADR-10 红线）：[26]=0 ⇒ 整段跳过。**含 [60]/[61] 取极端值**，
+    # 证明门控只由 [26] 决定（否则"关着颗粒却因为 [60] 变了而改画面"）。
+    o16a = run_style(gl, eso, sh, inp, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                     grain=0.0, grain_mb=0.0, grain_pivot=1.0)
+    q16a = quant(o16a, inp.shape)
+    d16a = np.abs(q16a - inp.astype(np.float64))
+    bad16a = int((d16a > 1).sum())
+    print(f'⑯a 颗粒 [26]=0（且 [60]=0、[61]=1 极端值）：max|Δ| = {d16a.max():.0f} LSB，'
+          f'>1LSB 像素 = {bad16a}/{d16a.size} ⇒ 门控只由 [26] 决定')
+    if bad16a:
+        fails.append('⑯a 颗粒默认零回归')
+
+    # ⑯b [27] 单调 / 短边归一化 / 功率谱形态：**不在本脚本测**。
+    # 为什么：噪声坐标按短边归一化（ADR-11）⇒ 特征周期 = zoom/f × 短边像素数。
+    # 本脚本默认 n=96，此时最低频八度的周期 ≈ 0.25 px（ISO 20）~ 0.83 px（ISO 6400）
+    # —— **全部欠采样**，四档 ISO 在 96px 上都退化成逐像素白噪声，指标无区分度
+    #（实测差分/总量比 1.998/2.011/2.009/2.008，非单调）。这不是实现缺陷，是判据
+    # 与分辨率的匹配问题：真机短边 3072px 下同一 ISO 档的周期是 8.1~26.6 px。
+    # ⇒ 尺度类判据（[27] 单调、短边归一化、FFT 径向平均谱、按亮度分箱 RMS）放在
+    #    tools/grain-exp/grain-exp.py（专用离线验收，用 1024² 以上的图 + 真跑 shader）。
+    # 本脚本保留与分辨率无关的两条：⑯a 默认零回归、⑯c 调制曲线形状。
+
+    # ⑯c [60] 生效：mb=100（默认）⇒ 中间调最重、两端 falloff 强；mb=0 ⇒ 曲线更宽
+    #（两端衰减弱）。输入 = 三段灰（暗 40 / 中 128 / 亮 220），比较各段颗粒 RMS。
+    # 判据：① mb=100 时中间段 RMS 最大（两端趋 0）；② mb=0 的**两端/中间比**更大
+    #（= 覆盖整个影调范围）⇒ 两条曲线形状确实不同。
+    b_in = bands_input(n, n)
+    seg = ((0, n // 3), (n // 3, 2 * n // 3), (2 * n // 3, n))
+    prof = {}
+    for mb in (0.0, 100.0):
+        oo = run_style(gl, eso, sh, b_in, lut_off, 1, lut_on=0.0, lut_strength=0.0,
+                       grain=50.0, grain_mb=mb)
+        inc = oo[..., 0].astype(np.float64) - b_in[..., 0].astype(np.float64) / 255.0
+        prof[mb] = [float(inc[r0:r1].std()) for r0, r1 in seg]
+    mid_peak = prof[100.0][1] > prof[100.0][0] and prof[100.0][1] > prof[100.0][2]
+    edge_ratio0 = (prof[0.0][0] + prof[0.0][2]) / max(prof[0.0][1], 1e-9)
+    edge_ratio100 = (prof[100.0][0] + prof[100.0][2]) / max(prof[100.0][1], 1e-9)
+    print(f'⑯c [60] 调制曲线：mb=100 三段 RMS = ' +
+          '/'.join(f'{v * 255:.2f}' for v in prof[100.0]) +
+          f'（暗/中/亮，中间最大 = {mid_peak}）；mb=0 = ' +
+          '/'.join(f'{v * 255:.2f}' for v in prof[0.0]) +
+          f'；两端/中间比：mb=0 → {edge_ratio0:.3f} > mb=100 → {edge_ratio100:.3f}'
+          f' = {edge_ratio0 > edge_ratio100}')
+    if not mid_peak or not (edge_ratio0 > edge_ratio100):
+        fails.append('⑯c [60] 调制曲线')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')

@@ -54,6 +54,13 @@ EXPECT = {
     "lutK": ("submitDisplay", ["passStyle("]),
     "grain": ("submitDisplay", ["passStyle("]),
     "grainSz": ("submitDisplay", ["passStyle("]),
+    # E4-3 颗粒（granularity）：密度调制 [60] / 亮度枢轴 [61] / 本帧实际下发的种子。
+    # ⚠ 这五个字段**也**出现在 finishStillChain 的 raw.render 出口（成片链），而本脚本
+    # 取 `hits[0]` = 第一个匹配行 ⇒ 核对的始终是 submitDisplay 出口（行号更小）。
+    # 成片侧的同名字段（尤其是 grainSeed = "两次导出逐位相同"的依据）由真机日志核对。
+    "grainMb": ("submitDisplay", ["passStyle("]),
+    "grainPivot": ("submitDisplay", ["passStyle("]),
+    "grainSeed": ("submitDisplay", ["passStyle("]),
     # E1-5（2026-10-08 P0「真机编辑器打开全黑」）：render.style_diag 一次定位。
     # 字段行统一发在 passStyle **之后**（否则"没执行却报执行"），并要求
     # glReadPixels 也已在字段行之前 —— 输出统计才是本帧的真实读回值。

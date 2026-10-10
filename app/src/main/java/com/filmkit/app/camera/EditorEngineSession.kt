@@ -35,13 +35,14 @@ import java.util.concurrent.atomic.AtomicReference
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
  * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
- *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 29 个槽位**，
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 31 个槽位**，
  * 其余槽位不影响输出（ADR §5.1 I-2；白名单由 `tools/check-style-passthrough.py` 第 ④ 项
  * 精确匹配守着，本清单与它逐项对齐，由 `EditorStyleWhitelistTest` 钉住三方一致）：
  *
  * ```
  * [0] exposure_ev        [1] wb_r  [2] wb_g  [3] wb_b      [4] contrast     [21] sat_mid
  * [26] grain_amount      [27] grain_size                   [34] lut_strength
+ * [60] grain_midtone_bias  [61] grain_pivot
  * [66] vignette_strength [67] vignette_radius  [68] vignette_feather
  * [78] clarity
  * [79] local_type  [80] local_center_x  [81] local_center_y  [82] local_radius

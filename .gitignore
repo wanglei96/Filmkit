@@ -30,6 +30,13 @@ test_temp/
 
 # 本地工具二进制（不入库）
 tools/bin/
+# E4-3 颗粒离线实验的大二进制产物（.raw / .npy / .png + 编译出的 dump 工具）——
+# 只提交脚本与报告，见 tools/grain-exp/README.md
+tools/grain-exp/out/
+tools/grain-exp/grain-lut-dump
+# 预设配方的离线示意预览（7 MB PNG）——只提交脚本与分析数据，
+# 图按需重跑 `python3 tools/preset-exp/sim-preview.py` 生成
+tools/preset-exp/preview/
 # Python 字节码缓存（跑 tools/tuning 调参脚本时生成）
 __pycache__/
 handoff/

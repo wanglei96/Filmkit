@@ -360,6 +360,12 @@ class FrameRenderer {
     bool align_ab = false;
     bool p0_sub = false;   // P0 亚像素采样（prefs p0_sub，v0.10.75）
     bool nn = false;       // NN 降噪 pass（prefs nn_dn，v0.10.102；执行结果在 dbg_nn_*）
+    // E4-3 颗粒：输入数据的**内容指纹**（submitRaw/submitRawBurst/submitStill 填充；
+    // finishStillChain / submitStill 用它派生颗粒种子）。0 = 无指纹（种子退化为尺寸派生）。
+    // 为什么要内容指纹而不是时间戳：引擎内**没有任何时间源**（全仓 grep timestamp /
+    // time() 零命中），而验收判据 6 要求"同参数两次导出逐位相同" —— 内容指纹同时满足
+    // "同一张可复现"与"不同张不同图案"（darktable 用文件名 hash 达到同一目的）。
+    uint32_t grain_fp = 0;
     std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
   };
   void finishStillChain(const ChainCtx& c,
@@ -592,6 +598,10 @@ class FrameRenderer {
 
   static void makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w, int h);
   void logPassDiag(const char* stage, GLuint fbo, bool half_float);
+  // ── E4-3 颗粒：128×128 R16F 相纸响应 LUT（darktable grain.c 的 evaluate_grain_lut）
+  // mb = [60]、pivot = [61]（pivot 折进 LUT 亮度轴，见 GrainLut.h 的理由）。
+  // 缓存键 = (mb, pivot)：两者都未变则立即返回（每帧调用一次，开销 = 两次比较）。
+  void ensureGrainLut(float mb, float pivot);
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
@@ -626,6 +636,17 @@ class FrameRenderer {
   int yuv_matrix_ = 0;
   GLuint still_tex_ = 0;  // RGB8，静拍 CPU 转换后上传
   int still_w_ = 0, still_h_ = 0;
+  // ── E4-3 颗粒（granularity，darktable grain.c）──────────────────────────
+  // tex_grain_lut_ = 128×128 R16F 相纸响应 LUT（CPU 侧按 [60]/[61] 重算，见
+  //   ensureGrainLut）。**两条链路共用一份**：LUT 内容只依赖 [60][61]，与输入无关，
+  //   且两条链路同在一个 GL context ⇒ 没有理由各存一份（省 64KB 与一次重算）。
+  // grain_lut_mb_/grain_lut_pivot_ = 该 LUT 对应的参数（缓存的失效键）。
+  // grain_seed_ = 噪声坐标 x 的**相对**偏移：预览/编辑器恒 0（图案稳定、不闪），
+  //   成片由"输出尺寸 + 输入内容指纹"派生（同一张可复现、不同张不同）。
+  GLuint tex_grain_lut_ = 0;
+  float grain_lut_mb_ = -1.0f;
+  float grain_lut_pivot_ = -1.0f;
+  float grain_seed_ = 0.0f;
   // E1-5（2026-10-08 P0 全黑定位）：编辑器输入纹理。**独立于 still_tex_** ——
   // 编辑器上传的是 RGBA8，内部格式必须同为 RGBA8（RGB8 内部格式 + RGBA 上传是
   // 「内部/外部格式不匹配」，规范允许但部分驱动会拒绝或写入未定义内容）。
@@ -1149,7 +1170,11 @@ class FrameRenderer {
           exposure = -1;  // v0.7.8：用户 EV 滑杆（影调链后的显示亮度补偿）
   } u_film_;
   struct {
-    GLint tex = -1, px = -1, grain_amount = -1, grain_size = -1, time = -1,
+    GLint tex = -1, px = -1,
+          // E4-3 颗粒（granularity）：与 u_style_ 同名同义 —— 两条链路共用一段
+          // **逐字相同**的 shader 逻辑与 CPU 下发段（ADR-9 末段 / ADR-11）
+          grain_amount = -1, grain_seed = -1, grain_zoom = -1, grain_norm = -1,
+          grain_lut = -1,
           flip_y = -1, zebra = -1, sharpen = -1, lut = -1, lut_on = -1,
           lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1,
           // E4-2 暗角（vignette）：与 u_style_ 同名同义 —— 两条链路共用一段
@@ -1158,7 +1183,12 @@ class FrameRenderer {
   } u_out_;
   // kFsStyle（E1-3 编辑器通路）
   struct {
-    GLint tex = -1, seed = -1, grain_amount = -1, grain_size = -1, lut = -1,
+    GLint tex = -1, lut = -1,
+          // E4-3 颗粒（granularity）：见 u_out_。**旧的 uSeed 已删除** —— 全仓核对
+          // 确认它只服务颗粒（dither 走 dhash，不读 uSeed），故由 uGrainSeed 取代，
+          // 不存在"改名后 dither 跟着变"的连带影响。
+          grain_amount = -1, grain_seed = -1, grain_zoom = -1, grain_norm = -1,
+          grain_lut = -1,
           lut_on = -1, lut_strength = -1, lut_dmin = -1, lut_dinv = -1,
           lut_size = -1,
           // E4-2 暗角（vignette）：见 u_out_
