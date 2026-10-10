@@ -7217,6 +7217,29 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
 
 // （拍照走 submitStill 全分辨率路径；captureLastFrame 已移除）
 
+// ── U-3（2026-10-11）：[88] temp_mired / [89] tint 在**拍照链路**折成 RGB 增益 ──
+// 与编辑器链路 `passStyle` 的 `wb_tot` **同一算法、同一函数**（`tempTintGain`，
+// ADR-14 裁决 1）：两者同属线性域增益 ⇒ 同一个乘性操作 ⇒ 并入已有的成对往返，
+// **零额外 GPU 成本、零额外量化误差**（架构师定案 `preset-DESIGN.md` §9.3）。
+// 三个消费点全部走这里：`wbCompGNorm`（OES 预览 / YUV 静拍）+ `prepareRawCommon`
+// 的两个调用点（RAW 单帧 / MFNR 成片）—— 漏一处的后果正是"预览有色偏、成片没有"。
+// 恒等性（硬判据，逐位）：[88]=[89]=0 时**整个 if 分支不执行** ⇒ out 就是 [1..3] 的
+// 原值（不是"乘 1.0 得近似值"）⇒ 三条链的输出与接线前逐位一致。
+static void wbTempTint(const FilmParams& p, float out[3]) {
+  out[0] = p.wb_r;
+  out[1] = p.wb_g;
+  out[2] = p.wb_b;
+  if (p.temp_mired != 0.0f || p.tint != 0.0f) {
+    float tt[3];
+    tempTintGain(p.temp_mired, p.tint, tt);
+    out[0] *= tt[0];
+    // tt[1] 恒 1.0f（`tempTintGain` 的 G 通道不动）—— 保留这次乘法是为了与
+    // passStyle 的 `wb_tot` **逐字同式**（两侧算法一致性靠文本可比对维持，见报告）。
+    out[1] *= tt[1];
+    out[2] *= tt[2];
+  }
+}
+
 // ── 第 2 期 S13：三条链的 WB 统一 **G 归一**口径 ──────────────────────────────
 // RAW 成片链在 prepareRawCommon 里以 (wb_r/wb_g, 1, wb_b/wb_g) 乘在 asShotNeutral
 // 之上；而 OES 预览 / YUV 静拍此前把原始 (wb_r, wb_g, wb_b) 直接乘进 pass1 的线性值
@@ -7225,11 +7248,15 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
 // 【第 6 期已修】域标志独立为 `hal_domain`：YUV 静拍链与预览链同走域比归一
 //（uHalDomainMap），且域比的在线标定也只认 RAW 静拍帧（详见 passFilm 内注释）。
 // 逐通道防呆与 prepareRawCommon 完全同口径：该通道 WB 补偿非法（≤0）时取 1（不动）。
+// U-3：[88][89] 先并入 wbTempTint，再走本口径 —— `tempTintGain` 的输出本身就是
+// "R/B 相对 G 的增益"（G 恒 1）⇒ 与 G 归一**同一口径**，不需要额外换算。
 static void wbCompGNorm(const FilmParams& p, float out[3]) {
+  float wb[3];
+  wbTempTint(p, wb);   // U-3：[1..3] × [88][89]（[88]=[89]=0 时逐位 = [1..3]）
   const bool ok_g = p.wb_g > 1e-6f;
-  out[0] = (ok_g && p.wb_r > 1e-6f) ? p.wb_r / p.wb_g : 1.0f;
+  out[0] = (ok_g && wb[0] > 1e-6f) ? wb[0] / p.wb_g : 1.0f;
   out[1] = 1.0f;
-  out[2] = (ok_g && p.wb_b > 1e-6f) ? p.wb_b / p.wb_g : 1.0f;
+  out[2] = (ok_g && wb[2] > 1e-6f) ? wb[2] / p.wb_g : 1.0f;
 }
 
 void FrameRenderer::passOES(int dst_w, int dst_h, const float* st, int rot,
@@ -9323,9 +9350,12 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   if (!uploadRawTex(raw_tex_, raw, w, h, row_stride_px)) return false;
   const auto t1 = std::chrono::steady_clock::now();
 
+  // U-3：[1..3] × [88][89] 后交给 prepareRawCommon（同一口径，见 wbTempTint 注释）
+  float wb_tt[3];
+  wbTempTint(p, wb_tt);
   const RawCommon rc =
-      prepareRawCommon(neutral_r, neutral_g, neutral_b, p.wb_r, p.wb_g,
-                       p.wb_b, ccm9, lsc, lsc_cols, lsc_rows);
+      prepareRawCommon(neutral_r, neutral_g, neutral_b, wb_tt[0], wb_tt[1],
+                       wb_tt[2], ccm9, lsc, lsc_cols, lsc_rows);
 
   // 实际渲染旋转 = 界面方向 + 传感器旋转（与 submitStill 同一约定）
   const int effective_rot = (rotation + 1) % 4;
@@ -10107,6 +10137,18 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"wb\":[" + jnum(p.wb_r, 6) + "," +
         jnum(p.wb_g, 6) + "," +
         jnum(p.wb_b, 6) + "]";
+  // U-3（[4] + [88][89] 的**拍照链路生效值**，与 render.style_diag 的同名字段同义）：
+  // `ct` = 用户/预设的对比度，与同出口的 `cp`（自动白点上探补偿）**相乘**才是实际进入
+  // spline 求解的 contrast_param ⇒ 真机核对"预设的 [4] 是否真的进了引擎"看这两个字段；
+  // `wbTot` = [1..3] × [88][89] 折算后的**实际**白平衡增益（裸值，不除 wb_g —— 与
+  // 相邻 `wb` 字段同口径；三条链口的 G 归一在离线对拍时自行折算）。
+  kv += ",\"ct\":" + jnum(p.contrast, 5);
+  {
+    float wb_tt_diag[3];
+    wbTempTint(p, wb_tt_diag);
+    kv += ",\"wbTot\":[" + jnum(wb_tt_diag[0], 5) + "," +
+          jnum(wb_tt_diag[1], 5) + "," + jnum(wb_tt_diag[2], 5) + "]";
+  }
   // v0.7.3：ag 一并废除 —— 记录 filmic 的实际标定（EV，相对中灰 18.45%）与场景分位，
   // 供离线用同一组 EV 复算 spline 系数对拍（tools/tuning/filmic_offline.py 的 compute_spline）。
   // substr(0,9)：filmic_verify.py 用这些值复算 spline，截断到 "-5.024" 会把
@@ -11439,9 +11481,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     if (!uploadRawTex(tex_mfnr_[i - 1], frames[i], w, h, row_strides_px[i]))
       return false;
   }
+  // U-3：[1..3] × [88][89]（与单帧链同一口径 —— 两条成片链必须一致，见 wbTempTint 注释）
+  float wb_tt[3];
+  wbTempTint(p, wb_tt);
   const RawCommon rc =
-      prepareRawCommon(neutral_r, neutral_g, neutral_b, p.wb_r, p.wb_g,
-                       p.wb_b, ccm9, lsc, lsc_cols, lsc_rows);
+      prepareRawCommon(neutral_r, neutral_g, neutral_b, wb_tt[0], wb_tt[1],
+                       wb_tt[2], ccm9, lsc, lsc_cols, lsc_rows);
   const float wl = static_cast<float>(white_level);
   stage("pyr");
 
@@ -12396,6 +12441,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
                                   float user_black, float user_white,
                                   float white_hl, float white_floor,
                                   float white_probe, float user_ev,
+                                  float user_contrast,
                                   const float lat_sh[3], const float lat_toe[3]) {
   constexpr float kGrey = 0.1845f;
   // ── v0.7.6：黑白点由**用户配置**（FilmParams[37]/[38]），PC 的做法 ────────────
@@ -12519,7 +12565,29 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     ev_black_ = ev_smooth_black_;
     ev_white_ = ev_smooth_white_;
   }
-  filmic_ = computeFilmicSpline(ev_black_, ev_white_, cp, lat_sh, lat_toe);
+  // ── U-3（[4] contrast）：用户的对比度与内部补偿 `cp` **相乘**，不是覆盖 ────────
+  // 两个来源语义正交，先分清（这是本卡最容易做错的一处）：
+  //   · `cp`（本函数内算，初值 1.0）= **引擎内部补偿**：自动白点上探把 dr 拉大 ⇒
+  //     power 派生回落 ⇒ 中灰以上提亮变少（"通透感"回退）。cp = 上探前后 power 比，
+  //     clamp [1.0, 1.6]，**只补不降**；未上探 / 固定曲线（auto=0）时恒 1.0。
+  //   · `user_contrast`（= FilmParams[4]）= **用户/预设的风格参数**，规格量程
+  //     0.5..1.5，1.0 = 恒等。
+  // 相乘的依据：darktable 的 contrast 滑杆在 spline v3 里只改一处 —— 线性段斜率
+  // `slope = contrast_param · dr / 8`（`computeFilmicSpline` 内）。cp 与 [4] 作用的
+  // 是**同一个物理量**（同一处 log 域斜率）⇒ 相乘 = 两者叠加，覆盖则会让自动上探的
+  // 回退补偿被用户值吃掉（"高光压不住 + 中灰变灰"同时出现）。端点（[37][38] 与
+  // toe/shoulder 位置）不由 contrast 决定 ⇒ 正交性见交付报告。
+  // 零回归（硬判据，逐位）：默认 [4] = 1.0f ⇒ `cp * 1.0f` 在 IEEE 754 下逐位 == cp
+  //（cp 的取值由上面的 clamp 与初值限定在 [1.0, 1.6]，是有限规格化数）⇒ 5×5 系统的
+  // 右端项逐位不变 ⇒ 全部系数逐位不变（离线逐位对拍见 check-u3-camera-contrast-wb.py）。
+  // 防呆（信任边界，与本函数内 latitude 的纪律同款）：非有限值或非正值 → 恒等 1.0。
+  // NaN 会让 5×5 系统的右端项全 NaN ⇒ 整条 filmic 链输出 NaN（X300 同型事故）；
+  // 非正值在 FilmParams::fromDoubles 已回退，此处覆盖预设/直连 JNI 的旁路。
+  // ⚠ 不在此处加量程 clamp：编辑器链路 passStyle 也不 clamp（`u_style_.contrast` 直接
+  // 下发），两侧语义必须一致；越界值的兜底是 computeFilmicSpline 内的 contrast clamp。
+  const float contrast_user =
+      (std::isfinite(user_contrast) && user_contrast > 0.0f) ? user_contrast : 1.0f;
+  filmic_ = computeFilmicSpline(ev_black_, ev_white_, cp * contrast_user, lat_sh, lat_toe);
   last_w99_ = w99;
   last_w999_ = w999;
   last_cp_ = cp;
@@ -12545,9 +12613,11 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
   // E4-4：[5..7]=shoulder latitude（R/G/B）、[8..10]=toe latitude（R/G/B）透传给
   // CPU 侧 spline 求解（per-channel）。默认全 0.01 ⇒ 与接线前逐位一致。
+  // U-3：[4] contrast 一并透传（与内部补偿 cp **相乘**，见 updateFilmicEV 内注释）；
+  // 默认 1.0 ⇒ 逐位零回归。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
                  p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,
-                 p.exposure_ev, p.shoulder, p.toe);
+                 p.exposure_ev, p.contrast, p.shoulder, p.toe);
   // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────
   // 裁剪阈值恒 = RAW 饱和数据白点 1.0（物理量，与 filmic 白点解耦——0.10.17 的
   // 阈值随 white 自动掉到 0.5 曾把 47% 的块送进重建）。重建结果直接替换 filmic

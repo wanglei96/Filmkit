@@ -30,6 +30,13 @@ struct FilmParams {
   float wb_r = 1.0f;          // 1
   float wb_g = 1.0f;          // 2
   float wb_b = 1.0f;          // 3
+  // ★ U-3（2026-10-11）**拍照链路已接线**：`passFilm` → `updateFilmicEV` →
+  // `computeFilmicSpline(..., cp * [4], ...)` —— 与内部补偿 `cp`（自动白点上探的
+  // power 回退补偿，clamp [1.0,1.6]）**相乘**，不是覆盖：两者作用同一处 log 域斜率
+  // （spline v3 的线性段斜率 = contrast_param/8），覆盖会吃掉上探补偿。
+  // 编辑器链路早已生效（`kFsStyle` 的 `u_style_.contrast`，显示域）⇒ 本卡起两侧都读。
+  // 默认 1.0f：`cp * 1.0f` 在 IEEE 754 下逐位 == cp ⇒ 与接线前逐位一致（零回归）。
+  // 量程 0.5..1.5（规格 §3.4.3）；越界值的兜底 = computeFilmicSpline 内的 contrast clamp。
   float contrast = 1.0f;      // 4  log 域对比系数
   // ── [5..10] v0.11.0（E4-1）**语义重定义**：旧"高光软肩/阴影 toe 强度 0..1
   //（0 = 关）"→ 新 **filmic `latitude`（0..1）**，per-channel 拆分（R/G/B 三层
@@ -433,12 +440,20 @@ struct FilmParams {
 
   // ── v0.11.4（E2-11）：色温/色调 + 影调分区 + 褪色 [88..95] ────────────────
   // 语义与域约定见 docs/reports/editor-ADR.md 的 ADR-14 裁决 1/2 与 ADR-7 订正 v2。
-  // ⚠️ 与 [78..87] 同一纪律：**只被编辑器链路 `kFsStyle` 读取**，拍照链路 `kFsOut`
-  // 零引用（拍照链路零回归是铁律）。
+  // [90..95] 仍与 [78..87] 同一纪律：**只被编辑器链路 `kFsStyle` 读取**，拍照链路
+  // 零引用（拍照链路零回归是铁律）。U-4 才补 [90..94]。
   // [88][89] 色温/色调：**相对量**（不是绝对 K）。temp_mired 是相对原片白点的
   // mired 偏移（0 = 不改），tint 是绿↔品红轴偏移（0 = 不改）。引擎侧在 CPU 上
   // 转成 RGB 增益后**与 [1..3] 相乘**（同属线性域增益）⇒ 并入已有的成对往返，
   // 零额外 GPU 成本（ADR-14 裁决 1）。
+  // ★ U-3（2026-10-11）**已接线，两侧都生效**（用户"不统一的要统一掉"的第二批）：
+  // 编辑器 = `passStyle` 的 `wb_tot`（E2-11 起）；拍照 = `wbTempTint` → `wbCompGNorm`
+  // （OES 预览 / YUV 静拍）+ `prepareRawCommon` 的两个调用点（RAW 单帧 / MFNR），
+  // **同一个 `tempTintGain`、同一次乘法**。拍照链路的域 = kFsOes/kFsStill/kFsRaw 的
+  // 线性场景域，编辑器链路 = 已成片 sRGB 线性化后 —— 但 [88][89] 是**线性域增益**
+  // ⇒ 两条链路的域差异不影响本参数（同一次乘法的位置都在线性域，且都在各自
+  // OETF/曲线之前），这是"两侧同一物理量"的直接依据（见交付报告 §3）。
+  // ⚠️ 由此 [88][89] 在 UI 侧**不再需要"仅后期"提示**（PresetScope 已同步）。
   float temp_mired = 0.0f;     // 88 色温偏移（mired；目标白点 = 6500K 的 mired + 本值）
                                //    正 ⇒ 目标 K 更低（更暖的**光源假设**）⇒ **画面变冷**；
                                //    UI 建议直接以 K_target = 1e6/(153.846 + 本值) 作滑杆值

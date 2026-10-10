@@ -603,9 +603,13 @@ class FrameRenderer {
   // （白点仍用配置值）。理由见 .cpp。
   // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
   // E4-4：lat_sh/lat_toe = FilmParams[5..7]/[8..10]（filmic latitude，per-channel）。
+  // U-3：user_contrast = FilmParams[4]（darktable contrast 滑杆的用户值，规格 0.5..1.5）
+  // —— 与内部补偿 cp **相乘**后交给 computeFilmicSpline（不是覆盖：cp 保自动白点上探的
+  // 中间调回退补偿，[4] 是风格参数，两者作用同一处 log 域斜率）。
+  // 默认 1.0f ⇒ `cp * 1.0f` 逐位 == cp ⇒ 系数逐位不变（零回归）。
   void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
                       float user_white, float white_hl, float white_floor,
-                      float white_probe, float user_ev,
+                      float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
                 bool hal_domain);

@@ -105,18 +105,47 @@ class PresetScopeTest {
     fun editorOnlyParamsAreReportedInCamera() {
         val p = preset(78, 88, 89)
         assertEquals(
-            "含 3 项仅后期参数（清晰度/色温/色调），拍照时不生效",
+            "含 1 项仅后期参数（清晰度），拍照时不生效",
             presetScopeNotice(p, PresetScene.CAMERA),
         )
         assertNull("这三项在编辑器链路都读 ⇒ 编辑器里不提示", presetScopeNotice(p, PresetScene.EDITOR))
     }
 
+    /**
+     * ★ U-3（2026-10-11）：`[88][89]` 色温/色调**已两侧生效**（拍照链路接入 `wbTempTint` →
+     * `wbCompGNorm` + `prepareRawCommon`，与编辑器 `wb_tot` 同一个 `tempTintGain`）⇒ 拍照
+     * 界面不再提示 —— 这正是用户"缺的补上"在"套了预设没反应"这一侧的判据。
+     *
+     * ⚠ 与 `[23..25]`（U-1）的分工：那批是"编辑器里没反应"，这批是"拍照时没反应"。
+     */
+    @Test
+    fun tempTintAreEffectiveInCamera() {
+        val p = preset(88, 89)
+        assertNull(
+            "[88][89] U-3 起两侧都生效 ⇒ 拍照界面不该再提示",
+            presetScopeNotice(p, PresetScene.CAMERA),
+        )
+        assertNull("编辑器链路 E2-11 起就读 ⇒ 编辑器也不提示", presetScopeNotice(p, PresetScene.EDITOR))
+        assertEquals(
+            "判据表必须报「两侧都生效」（不在 SLOT_SCENES 里 = 两侧）",
+            setOf(PresetScene.CAMERA, PresetScene.EDITOR),
+            presetSlotScenes(88),
+        )
+        assertEquals("[89] 同 [88]（同一条白点偏移的两个轴）", setOf(PresetScene.CAMERA, PresetScene.EDITOR), presetSlotScenes(89))
+        assertEquals(
+            "[90] 影调分区仍是仅后期（U-4 才补）—— 与 [88][89] 的边界必须清楚",
+            setOf(PresetScene.EDITOR),
+            presetSlotScenes(90),
+        )
+    }
+
     /** 名字列表超过 3 项时截断成一行（卡片副标题/列表小字都只有一行）。 */
     @Test
     fun longNameListIsTruncated() {
+        // U-3 起 [88][89] 两侧生效 ⇒ 只剩 [90..94] 五项仅后期（名字去重后仍 > 3 ⇒ 截断）
         val p = preset(78, 88, 89, 90, 91, 92, 93, 94)
         val n = presetScopeNotice(p, PresetScene.CAMERA)
-        assertEquals("含 8 项仅后期参数（清晰度/色温/色调…），拍照时不生效", n)
+        assertEquals("含 6 项仅后期参数（清晰度/高光/阴影…），拍照时不生效", n)
         assertTrue("截断后也必须是一行能放下的长度：${n!!.length}", n.length <= 40)
     }
 
@@ -198,9 +227,9 @@ class PresetScopeTest {
             if (cam != ed) singleSide++
         }
         assertEquals(
-            "§1.6 里单侧生效**且进预设**的槽位数（[5..10]+[37][38]+[78]+[88..94]；" +
-                "U-1 起 [23..25] 两侧都生效 ⇒ 19−3 = 16）",
-            16,
+            "§1.6 里单侧生效**且进预设**的槽位数（[5..10]+[37][38]+[78]+[90..94]；" +
+                "U-1 起 [23..25] 两侧都生效（19−3 = 16）、U-3 起 [88][89] 两侧都生效（16−2 = 14））",
+            14,
             singleSide,
         )
         assertEquals(

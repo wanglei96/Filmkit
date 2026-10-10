@@ -9,7 +9,9 @@ package com.filmkit.app.camera
  * §1.6 的字段能力矩阵。实测后果：
  *  - 含 `[23][24]` 分离色调 / `[25]` 单色的预设，**在编辑器里套用不变黑白、不加分离色调**
  *    （★ U-1（2026-10-11）已补齐 ⇒ 这两组槽位现在两侧都生效，本表不再标记它们）；
- *  - 含 `[78]` 清晰度 / `[88..94]` 色温…的预设，**在拍照界面套用无效**；
+ *  - 含 `[88][89]` 色温/色调的预设，**在拍照界面套用无效**
+ *    （★ U-3（2026-10-11）已补齐 ⇒ 这一组现在两侧都生效，本表不再标记它们）；
+ *  - 含 `[78]` 清晰度 / `[90..94]` 影调分区…的预设，**在拍照界面套用无效**；
  * ⇒ 用户套了预设"没反应"，只会以为是 bug。ADR-12 禁止假滑杆，同理禁止"假装生效"：
  * 本文件把作用域说清楚，三处入口（拍照 / 查看页「胶片」/ 编辑器）共用同一份判据。
  *
@@ -67,8 +69,13 @@ private val SLOT_SCENES: Map<Int, Set<PresetScene>> = buildMap {
     // ── 仅编辑器链路（§1.6：`passStyle` 读、`passFilm` 零引用）────────────────
     // [78] 清晰度（显示域 USM，输入必须是已成片）。
     put(78, EDITOR_ONLY)
-    // [88..94] 色温/色调（相对**原片白点**的偏移，RAW 链路没有"原片"）+ 影调分区 + 褪色。
-    for (s in 88..94) put(s, EDITOR_ONLY)
+    // [88][89] 色温/色调：★ U-3 已接线（拍照链路 `wbTempTint` → `wbCompGNorm` +
+    // `prepareRawCommon` 的两个调用点，与 passStyle 的 `wb_tot` 同一个 `tempTintGain`、
+    // 同一次乘法）⇒ **不在表里**（= 两侧都生效）。留在这里会变成"死条目"：提示永远走
+    // 不到，还会让下一个读表的人以为它们"仅后期有效"（同 U-1 的 [23..25] 与
+    // excludedSlotsHaveNoScope 要防的那类腐烂）。
+    // [90..94] 影调分区 + 褪色（display 域；拍照侧落点 = passOutput，U-4 才补）。
+    for (s in 90..94) put(s, EDITOR_ONLY)
 }
 
 /**
@@ -100,8 +107,8 @@ private val SLOT_LABELS: List<Pair<IntRange, String>> = listOf(
     37..37 to "黑点",          // [37] filmic_black_ev（SettingsScreen「黑点（多暗算黑）」）
     38..38 to "白点",          // [38] filmic_white_ev（SettingsScreen「白点（多亮算白）」）
     78..78 to "清晰度",        // [78] clarity（EditorScreen「调整」组 label）
-    88..88 to "色温",          // [88] temp_mired
-    89..89 to "色调",          // [89] tint
+    // ⚠ 曾经的 88..88「色温」/ 89..89「色调」两行随 U-3 接线删除：拍照链路接入
+    // `wbTempTint` 后两侧都生效 ⇒ 永远不进提示 ⇒ 留着就是死条目（同 U-1 的判据）。
     90..90 to "高光",          // [90] highlights
     91..91 to "阴影",          // [91] shadows
     92..92 to "白色色阶",      // [92] whites
