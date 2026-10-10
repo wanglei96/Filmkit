@@ -35,12 +35,13 @@ import java.util.concurrent.atomic.AtomicReference
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
  * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
- *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 31 个槽位**，
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 34 个槽位**，
  * 其余槽位不影响输出（ADR §5.1 I-2；白名单由 `tools/check-style-passthrough.py` 第 ④ 项
  * 精确匹配守着，本清单与它逐项对齐，由 `EditorStyleWhitelistTest` 钉住三方一致）：
  *
  * ```
  * [0] exposure_ev        [1] wb_r  [2] wb_g  [3] wb_b      [4] contrast     [21] sat_mid
+ * [23] split_warm  [24] split_cool  [25] monochrome
  * [26] grain_amount      [27] grain_size                   [34] lut_strength
  * [60] grain_midtone_bias  [61] grain_pivot
  * [66] vignette_strength [67] vignette_radius  [68] vignette_feather
@@ -55,6 +56,8 @@ import java.util.concurrent.atomic.AtomicReference
  * "打开编辑器把成片已烘焙的参数**二次应用**"bug 的认知根源就是它：照旧注释判断，会以为
  * [0]/[1..3]/[4]/[78]/[88..94] 这些槽位"无所谓"，于是从快照恢复它们看着无害。**改这段前先跑
  * 脚本第 ④ 项，不要手抄**（`[95]` reserved 确实零引用，所以不在清单里）。
+ * U-1（2026-10-11）从 31 → 34：[23][24] 分离色调 + [25] 单色接线（此前 passStyle 零引用
+ * ⇒ 含 [25] 的"黑白预设"在编辑器里不变黑白）。
  */
 internal class EditorEngineSession {
 

@@ -1587,8 +1587,8 @@ private const val PRESET_LUT_STRENGTH_SLOT = 34
 private val PRESET_LOCAL_SLOTS = 79..87
 
 /**
- * 不进预设的槽位：**引擎模式旋钮 / 标定旋钮 / 预览辅助开关**（P-1 修正，见 `preset-DESIGN.md`
- * §7 裁决 A3）。三条判据逐条如下，都不是"口味"问题：
+ * 不进预设的槽位：**引擎模式旋钮 / 标定旋钮 / 预览辅助开关 / 色彩科学状态**
+ * （P-1 修正 + P-5 复核新增，见 `preset-DESIGN.md` §7 裁决 A3）。逐条判据如下，都不是"口味"问题：
  *
  *  - **[30] `zebra_thr`**（`FilmParams.h:72-73` 原文："过曝提示阈值（显示域亮度，0 = 关）：
  *    **仅预览 passOutput 使用**，成片一律 0"）—— 它是**预览辅助开关**。而编辑器链路的
@@ -1601,11 +1601,27 @@ private val PRESET_LOCAL_SLOTS = 79..87
  *  - **[36] `local_tone`**（`FilmParams.h:102` 原文："0 = 关；>0 = 暗部线性提亮比例
  *    （**标定旋钮**）"）—— **引擎标定参数**：同一张照片在不同标定下观感不同，它不是
  *    "可分享的风格"，而是"这台设备这条链路的调校量"。
+ *  - **[28] `tone_strength`**（`CameraPresets.kt:59-61` 原文："1.0 = 开（黑位 + 中灰锚定 S +
+ *    高光 rolloff，**非风格化**；治'发灰'）。0 = 恒等/旧行为"）—— 同类的**色彩科学状态**：
+ *    它是"这条链路的基础影调修不修"的开关，不是风格。且 `CameraController.applyTonePref`
+ *    按 prefs（`base_tone`，设置页「基准影调」）**重写它** ⇒ 存进预设等于把别人的引擎开关
+ *    带过来（与 [35] 同型），用户从 UI 上找不到画面变化的原因。
+ *  - **[31..33] `look_strength` / `look_sat` / `look_chroma`**（`CameraPresets.kt:66-88`
+ *    原文："31..33 = 色彩外观层（M3 P1）…… v0.7.7：1.35 → **1.0（恒等）**…… v0.7.9：
+ *    设置页「色彩外观层」开关已删除；31..33 槽位保留（FilmParams 契约不移位）"）——
+ *    同类的**色彩科学标定层**：它是对"寡淡"的补偿量（随机型 / 影调曲线标定），不是用户
+ *    可分享的风格；且 v0.7.7 已回恒等、设置页开关 v0.7.9 已删除 ⇒ **UI 上根本没有入口能改
+ *    它**，存进预设只会是"从别处悄悄带来的标定值"。
  *
- * 为什么单列一个集合而不是散在 [presetSlotIncluded] 的布尔表达式里：这三条的判据是**同一类**
+ * ⚠ **[28] / [31..33] 的恒等值都是 1.0**（不是 0，见 [CameraPresets.standard]）⇒ 排除它们
+ * **不会**改变"用户没改过的参数"的行为：稀疏化本来就按恒等值丢弃（[presetSparseSlots]），
+ * 且 [28] 在拍照侧还会被 `CameraController` 的 prefs 覆盖层重写。实测见
+ * `docs/reports/p5-preset-scope-REPORT.md`（内置三条不含这些槽）。
+ *
+ * 为什么单列一个集合而不是散在 [presetSlotIncluded] 的布尔表达式里：这些的判据是**同一类**
  *（"引擎状态，不是用户风格"），将来再加同类槽位只需往这里加一个数字。
  */
-private val PRESET_ENGINE_KNOB_SLOTS = setOf(30, 35, 36)
+private val PRESET_ENGINE_KNOB_SLOTS = setOf(28, 30, 31, 32, 33, 35, 36)
 
 /**
  * [29] = **已退役的槽位**（原 `hl_recon`，v0.10.15 删除；`FilmParams.h:68-71`："索引 29 留空不复用"）。
@@ -1619,13 +1635,14 @@ private val PRESET_ENGINE_KNOB_SLOTS = setOf(30, 35, 36)
 private const val PRESET_RETIRED_SLOT = 29
 
 /**
- * 槽位是否参与预设（稀疏化的白名单判据）。排除**八类**：
+ * 槽位是否参与预设（稀疏化的白名单判据）。排除**十类**：
  *  - **[34] LUT 强度**：由 [EditorPreset.lutId] / [EditorPreset.lutStrength] 承载。
  *    ⚠ 这条不是洁癖，是**必须**：[editorOpenParams] 打开编辑器时把 [34] 归 **0**（成片已含
  *    拍摄时的 LUT 混合，不能再叠一遍）⇒ 若 [34] 参与稀疏化，**每一条预设都会存下 "34":0**，
  *    套用时把当前 LUT 的强度打成 0 —— 用户刚选的 LUT 被静默关掉（"套了预设，滤镜没了"）。
- *  - **[30] / [35] / [36]**：预览辅助开关 / 引擎模式旋钮 / 标定旋钮
- *    （[PRESET_ENGINE_KNOB_SLOTS]，逐条判据与证据写在该常量的 KDoc 里）。
+ *  - **[28] / [30] / [31..33] / [35] / [36]**：基准影调开关 / 预览辅助开关 / 色彩外观层 /
+ *    引擎模式旋钮 / 标定旋钮（[PRESET_ENGINE_KNOB_SLOTS]，逐条判据与证据写在该常量的
+ *    KDoc 里）。判据是**同一类**：**引擎状态，不是用户风格**。
  *  - **[29]**：已退役的槽位，无语义名（[PRESET_RETIRED_SLOT]）。
  *  - **[39..59]**：RAW 解码 / 拍摄链路（[PRESET_DECODE_SLOTS]）。
  *  - **[79..87]**：局部调整（[PRESET_LOCAL_SLOTS]，构图相关，v1 不做）。

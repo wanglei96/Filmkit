@@ -22,6 +22,8 @@ import org.junit.Test
  *     （= 裁决 ② 改过头）不会有任何测试变红；只测 KEEP，则裁决 ② 静默退化回旧行为。
  *  4. ★ **选中态往返**：prefs 里的 id 读回必须命中同一条预设；预设被删后**回退标准**而不是崩 /
  *     悬空（ADR §5.2 的 G-1：冷启动丢状态的同型坑）。
+ *  5. ★ **U-7 预设曝光 = 偏移**（方案 B）：含 `[0]` 的预设取出偏移、不含 ⇒ 0、切预设/切标准 ⇒
+ *     归零、用户调 EV ⇒ 偏移叠加保留。旧行为（覆盖层丢弃预设 `[0]`）下第 ①④ 条必红。
  */
 class CameraPresetApplyTest {
 
@@ -183,5 +185,65 @@ class CameraPresetApplyTest {
         // 日志里的数值必须与展开后下发给引擎的数组逐槽一致（证据链闭合）
         val out = cameraPresetParams(p)
         assertTrue(out[4] == 1.2 && out[26] == 55.0)
+    }
+
+    // ── ⑦ U-7：预设曝光 `[0]` = 相对用户基准的**偏移**（方案 B，DESIGN §9.4）────
+    //
+    // 背景：拍照侧的 `[0]` 是"拍摄曝光补偿"（用户实时控制），编辑器侧是"后期曝光"（直接生效）
+    // —— §9.2 里唯一一个语义天然冲突的参数。用户 2026-10-11 拍板方案 B：拍照侧
+    // `[0] = base_ev + 用户 EV + 预设偏移`（拍前看得到预设的曝光，又不冲掉用户的实时调整）。
+    // 旧实现把预设的 `[0]` 整槽丢弃（防预设冲掉用户曝光）⇒ 预设的曝光**静默失效**。
+
+    @Test
+    fun presetWithExposureYieldsThatOffset() {
+        // ① 含曝光的预设 ⇒ 取出正确偏移（正负都要）
+        assertEquals("预设记 +1.0EV ⇒ 偏移 +1.0", 1.0, presetEvOffset(mapOf(0 to 1.0)), 0.0)
+        assertEquals(-0.7, presetEvOffset(mapOf(0 to -0.7, 26 to 55.0)), 0.0)
+        // 稀疏记录里只有 `[0]` 时也一样（偏移不与其它槽耦合）
+        assertEquals(0.35, presetEvOffset(mapOf(0 to 0.35)), 1e-12)
+        // 与展开数组的一致性：slots 说的值 = 下发数组的 `[0]`（两条通路不能各说一套）
+        assertEquals(1.0, cameraPresetParams(preset(slots = mapOf(0 to 1.0)))[0], 0.0)
+    }
+
+    @Test
+    fun presetWithoutExposureYieldsZeroOffset() {
+        // ② 不含曝光 ⇒ 0（缺失字段 = 不改变该参数，**不是**"把曝光打到 0"）
+        assertEquals("空 slots（= 标准基线）⇒ 0", 0.0, presetEvOffset(emptyMap()), 0.0)
+        assertEquals(0.0, presetEvOffset(mapOf(26 to 55.0, 4 to 1.2, 90 to -0.2)), 0.0)
+        // 显式记 0.0 与"没记"同义（都是 0）—— 预设编辑器把滑杆拖回 0 时不该有别的作用
+        assertEquals(0.0, presetEvOffset(mapOf(0 to 0.0)), 0.0)
+    }
+
+    @Test
+    fun switchingToExposureFreePresetOrDefaultZeroesTheOffset() {
+        // ③ 切预设 / 切回「标准」⇒ 偏移归零，**不残留**上一条预设的曝光。
+        // 纯逻辑层钉的是"每条预设各自算出什么"；CameraController 侧 `presetEvOffset = evOffset`
+        // 是**无条件覆盖**（不是"没值就保留旧值"）⇒ 新预设算出 0 就一定下发 0。
+        // 本用例是那句覆盖的护栏：若哪次重构把"缺失 = 保留上一条"引进 presetEvOffset（或让
+        // 调用侧只在非零时下发），下面两个 0 立刻变红。
+        val withEv = preset(id = "p_1_a", slots = mapOf(0 to 1.0))
+        val noEv = preset(id = "p_2_b", slots = mapOf(26 to 55.0))
+        assertEquals(1.0, presetEvOffset(withEv.slots), 0.0)
+        assertEquals("切到不含曝光的预设 ⇒ 归零", 0.0, presetEvOffset(noEv.slots), 0.0)
+        assertEquals("切回「标准」⇒ 归零", 0.0, presetEvOffset(CAMERA_STANDARD_PRESET.slots), 0.0)
+    }
+
+    @Test
+    fun userEvAddsOnTopOfPresetOffset() {
+        // ④ ★ 方案 B 的核心：用户调曝光补偿时预设偏移**保留**（叠加，不是覆盖）。
+        // 旧行为（预设 `[0]` 被覆盖层丢弃）= 每个断言都少 1.0 ⇒ 本用例必须红。
+        assertEquals(
+            "偏移 +1.0 叠在 base 0.7 + 用户 −0.3 之上",
+            1.4, effectiveExposureEv(0.7, -0.3, 1.0), 1e-12,
+        )
+        // 用户继续调 EV：偏移那一份始终在（差值恒定）
+        assertEquals(1.7, effectiveExposureEv(0.7, 0.0, 1.0), 1e-12)
+        assertEquals(2.2, effectiveExposureEv(0.7, 0.5, 1.0), 1e-12)
+        // 负向偏移同理（预设欠曝）
+        assertEquals(-0.9, effectiveExposureEv(0.7, -0.6, -1.0), 1e-12)
+        // ★ 回归哨兵：偏移 0（标准 / 不含曝光的预设）⇒ 逐位等于 v0.8.1 以来的旧行为。
+        // 既有三条内置预设都不含 `[0]` ⇒ 这条保证本卡对绝大多数用户是**零行为变化**。
+        assertEquals(0.4, effectiveExposureEv(0.7, -0.3, 0.0), 1e-12)
+        assertEquals(0.0, effectiveExposureEv(0.0, 0.0, 0.0), 1e-12)
     }
 }

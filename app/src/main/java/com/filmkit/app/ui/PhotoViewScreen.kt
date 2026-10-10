@@ -68,6 +68,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -87,6 +88,8 @@ import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
 import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.EditorPreset
+import com.filmkit.app.camera.PresetScene
+import com.filmkit.app.camera.presetScopeNotice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -167,6 +170,26 @@ internal fun clampAxis(offset: Float, view: Float, content: Float): Float {
 internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else index.coerceIn(0, size - 1)
 
 /**
+ * 单页该套用的缩放（E2-23，修用户报的"相册放大图片隔壁图片会入侵视野"）：
+ * **只有"停稳"的那一页（`settledPage`）跟随用户的捏合**，相邻页恒为 1×。
+ *
+ * 为什么必须有这条：`beyondViewportPageCount = 1` 让相邻页也被组合/绘制（E2-22 的预载），
+ * 而 `zoom` / `pan` 是**整页共享**的 state —— 相邻页的 Image 若跟着 3× 放大，它会以自己
+ * 的页心（在视口外 ±1 个页宽处）为中心向两侧各扩 1.5 页宽 ⇒ **跨过页边界画进视口**，
+ * 视口里就出现别张照片的像素。页宽 = 视口宽（`PageSize.Fill` 是 HorizontalPager 默认值），
+ * 所以相邻页只要保持恒等变换，就必然整个待在视口之外。
+ *
+ * 放大态下 Pager 本来就不滚（`userScrollEnabled = !zoomed`），切页时 `zoom` 又被复位成
+ * [MIN_ZOOM] ⇒ 恒等变换不会让"滑动切图"少画任何东西。
+ */
+internal fun pageScaleAt(isSettledPage: Boolean, zoom: Float): Float =
+    if (isSettledPage) zoom else 1f
+
+/** 同 [pageScaleAt]：相邻页也不跟随当前页的平移量（平移讲的是"当前这张在视口里怎么挪"）。 */
+internal fun pageShiftAt(isSettledPage: Boolean, shift: Float): Float =
+    if (isSettledPage) shift else 0f
+
+/**
  * 照片查看页（ADR-15，E2-13）：**网格点开先到这一页**，点「编辑」才进编辑器；编辑器退出
  * （取消 / 系统返回）回到本页 —— 用户 2026-10-09 明确要求"取消后应该回到照片查看页"。
  *
@@ -180,6 +203,14 @@ internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else inde
  * **E2-22 优化**（用户报"切图慢"，ADR-18 方案 B）：不再解全分辨率（12MP ≈48MB），改为
  * ① 按**显示尺寸**解码（[decodeFit]，Fit 档 ≈3MP ≈12MB）；② 360px 预览先上屏（[PREVIEW_SIDE]）；
  * ③ 相邻页只解预览（`beyondViewportPageCount = 1`）；④ 放大到 [ZOOM_HIRES] 补解一档。
+ *
+ * ★ **E2-23 修**（用户 2026-10-13 报："相册放大图片隔壁图片会入侵视野"）：E2-22 的
+ * `beyondViewportPageCount = 1` 让相邻页被组合/绘制，而 `zoom` / `pan` 是**整页共享**的
+ * state ⇒ 相邻页跟着当前页一起被放大，从视口外（页心在 ±1 页宽处）越界画进视口，
+ * 视口里出现别张照片的像素。两道闸修掉：
+ * ① [pageScaleAt] / [pageShiftAt] —— 缩放平移**只给停稳页**（根因）；
+ * ② 每页根容器 `clipToBounds()` —— 页边界裁剪（像素出不去本页，兜底）。
+ * 手势仲裁表（E2-20）与 P-3 的两个开关一行未改（见 [viewerGesture]）。
  *
  * ★ **P-3**（用户 2026-10-11 拍板）：底栏「胶片」由**置灰留位**改为**可点** —— 弹出
  * [FilmPresetSheet]（自绘底部面板，与拍照界面 `LutSheet` 同一套视觉语言），列出
@@ -468,6 +499,12 @@ fun PhotoViewScreen(
                     Box(
                         Modifier
                             .fillMaxSize()
+                            // ★ E2-23：**页边界裁剪**，修"隔壁图片入侵视野"。graphicsLayer 的
+                            // 缩放/平移是绘制层变换，默认 `clip = false`（Java 层 RenderNode 的
+                            // 裁剪也在变换之前生效）⇒ 页内放大的图会一路画到本页之外，落进相邻页
+                            // 的可见区域。裁到本页边界后，像素**出不去本页**（与 pageScaleAt 是
+                            // 两道独立的闸：一个治"邻页被放大"，一个治"任何越界绘制"）。
+                            .clipToBounds()
                             .pointerInput(p, showFilmPanel) {
                                 awaitEachGesture {
                                     awaitFirstDown(requireUnconsumed = false)
@@ -517,8 +554,9 @@ fun PhotoViewScreen(
                         contentAlignment = Alignment.Center,
                     ) {
                         // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 只解 360px 预览当占位
-                        // （不占全尺寸内存）。滑动时必然是 Fit 态（放大态 Pager 被禁用），
-                        // 所以下面那份 graphicsLayer 对相邻页等于无变换。
+                        // （不占全尺寸内存）。★ E2-23 更正：**"相邻页必然是 Fit 态所以等于无变换"
+                        // 是错的** —— 放大态下 Pager 只是不滚，相邻页照样被组合/绘制，而 zoom/pan
+                        // 是整页共享的 state ⇒ 邻页被一起放大后越界画进视口（见 [pageScaleAt]）。
                         val neighbor = if (p == page) {
                             null
                         } else {
@@ -533,14 +571,18 @@ fun PhotoViewScreen(
                                 contentDescription = "照片",
                                 contentScale = ContentScale.Fit,
                                 // graphicsLayer 的 block 在绘制阶段读 state ⇒ 手势只触发重绘，
-                                // 不触发重组（每帧拖动都重组整页会很卡）
+                                // 不触发重组（每帧拖动都重组整页会很卡）。
+                                // ★ E2-23：缩放/平移**只给停稳的那一页**（[pageScaleAt]）——
+                                // 相邻页跟着放大就会从视口外越界画进来（别张照片的像素盖在本页上，
+                                // 正是用户报的"入侵视野"）。此前这里对每页一视同仁，是这次 bug 的根因。
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .graphicsLayer {
-                                        scaleX = zoom.floatValue
-                                        scaleY = zoom.floatValue
-                                        translationX = pan.value.x
-                                        translationY = pan.value.y
+                                        val z = pageScaleAt(p == page, zoom.floatValue)
+                                        scaleX = z
+                                        scaleY = z
+                                        translationX = pageShiftAt(p == page, pan.value.x)
+                                        translationY = pageShiftAt(p == page, pan.value.y)
                                     },
                             )
                             p == page -> CircularProgressIndicator(color = FilmTheme.Accent)
@@ -792,7 +834,14 @@ private fun FilmPresetSheet(
     }
 }
 
-/** 面板里的一行：名称（主）+ 分组（次，空分组不占行）；点整行进编辑器 */
+/**
+ * 面板里的一行：名称（主）+ 分组（次，空分组不占行）+ **字段作用域提示**（P-5，可选第三行）；
+ * 点整行进编辑器。
+ *
+ * 提示只在"这条预设里有参数在编辑器链路不生效"时出现（[presetScopeNotice] 返回 null 就
+ * 不占行）—— 本页选预设 = 直接进编辑器，用户看到的第一眼就是编辑器的效果，先在列表里
+ * 说清楚"这条有 1 项在这里不会生效"，比让他进编辑器后怀疑是 bug 强。
+ */
 @Composable
 private fun FilmPresetRow(p: EditorPreset, onPick: () -> Unit) {
     Column(
@@ -815,6 +864,23 @@ private fun FilmPresetRow(p: EditorPreset, onPick: () -> Unit) {
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        // ★ P-5 字段作用域：本页选一条预设 = **直接进编辑器**（场景 = 编辑器链路 `passStyle`）
+        // ⇒ 含 [5..10] 肩部/趾部（胶片曲线）/ [37][38] 黑白点 的预设在这里套用**没有视觉效果**
+        //（编辑器链路 `kFsStyle` 里没有 filmic，等 U-2）。
+        // ⚠ ★ **U-1（2026-10-11）已接线 `[23][24]` 分离色调 + `[25]` 单色** ⇒ 它们两侧都生效、
+        // 不再出现在这里的提示里，内置三条也不再命中（本注释此前把这三槽与 `[5..10]` 并列，
+        // 已按接线后的实际行为更正；**判据的唯一维护点 = `PresetScope.kt`**，本文件不复述清单）。
+        // 全部生效 ⇒ null ⇒ 不显示任何东西（不挂"全部生效"这种每条都有的噪音）。
+        presetScopeNotice(p, PresetScene.EDITOR)?.let { notice ->
+            Text(
+                notice,
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp),
             )
         }
     }

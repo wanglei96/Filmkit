@@ -175,7 +175,8 @@ class CameraController(private val context: Context, private val render: RenderC
     private var burstHlUnderEv = 0.0
 
     /** 成片用 filmParams：把高光保护的欠曝量加到 EV（[0]）。预览用原始数组（预览曝光
-     *  由 HAL AE 决定、没有欠曝），故两侧中间调一致、成片高光更低。 */
+     *  由 HAL AE 决定、没有欠曝），故两侧中间调一致、成片高光更低。
+     *  U-7：偏移已在 `filmParams[0]` 里（exposureEv()），这里只加欠曝量 —— 别再叠一次偏移。 */
     private fun filmParamsForStill(): DoubleArray {
         val u = burstHlUnderEv
         if (u <= 1e-4) return filmParams
@@ -637,11 +638,13 @@ class CameraController(private val context: Context, private val render: RenderC
         // CONTROL_AE_EXPOSURE_COMPENSATION，而 X300 在 RAW 静拍上对它几乎不执行
         // （+0.7EV 实测只给 +0.1EV：sec 0.0014→0.0015s），RAW 成片纹丝不动。
         // v0.8.1：[0] = 基准曝光（base_ev，机型校准常量）+ 用户 EV。
+        // U-7：再加**预设偏移**（方案 B）—— 用户调的是自己的基准，预设的曝光叠在上面，
+        // 不因这次调整被冲掉（也不冲掉用户）。
         // v0.10.22：语义 = **filmic 前线性域曝光**（PC/Darktable BaselineExposure 语义，
         // 进曲线改工作点），与预览分支统一——此前链末乘性与预览分叉，且后置乘性
         // 只平移亮度、黑位/对比不动（−0.3EV 真机复拍仍灰）。auto 黑点已默认关，
         // v0.7.7"统计归一"的旧顾虑不再成立。
-        filmParams[0] = baseEvPref + (evSteps * evStep).toDouble()
+        filmParams[0] = exposureEv()
         rebuildRepeating()
     }
 
@@ -1061,7 +1064,18 @@ class CameraController(private val context: Context, private val render: RenderC
         stopInternalKeepClient(id)
     }
 
-    fun setFilmParams(p: DoubleArray) {
+    /**
+     * 套用一套完整参数（预设 / 冷启动恢复的唯一入口）。
+     *
+     * @param evOffset **U-7：`p[0]` 的相对偏移**（EV）—— 预设自带曝光时的语义（方案 B，
+     *   `preset-DESIGN.md` §9.4）：`[0] = base_ev + 用户 EV + 本偏移`。调用侧用
+     *   [presetEvOffset] 从预设的 slots 提取，标准 / 不含曝光的预设传 0.0。
+     *   ⚠ **不从 `p[0]` 读偏移**：本函数随即把那一槽整槽覆盖，且 `filmParams = p` 是引用赋值
+     *   （ADR §5.1 I-5）—— 从数组槽反推偏移会随"调用方复用/缓存数组"而静默漂移（第二次
+     *   套用把上次算出的绝对值当成新偏移 = 曝光翻倍）。显式参数让来源只有一个。
+     *   ⚠ **无默认值**是有意的：漏传 = 编译错误，而不是静默丢掉预设曝光。
+     */
+    fun setFilmParams(p: DoubleArray, evOffset: Double) {
         // E4-1 长度兜底（契约第四处，ADR-1）：短于 kCount 的数组**拒绝并记日志**，
         // 不抛异常 —— 本函数由预设切换（CameraScreen）直接调用，抛异常 = 相机页崩溃；
         // 保持旧参数只是"这次预设没生效"，可恢复（用户红线：失败不以丢照片为代价）。
@@ -1074,12 +1088,15 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             return
         }
+        // U-7：**无条件覆盖**（不是"有值才更新"）⇒ 切到不含曝光的预设或「标准」时偏移
+        // 必然归零，不会残留上一条预设的曝光（evOffset 已由 presetEvOffset 归一为 0.0）。
+        presetEvOffset = evOffset
         filmParams = p
-        // [0] = 基准曝光 + 用户 EV：预设基线里是 0，换数组后必须回填，否则初始化序列
-        // 会把曝光静默清零（v0.7.8 教训）。applyBaseEvPref 先把 prefs 的基准值灌进
-        // baseEvPref，再统一写入（v0.8.1 起含基准偏置）
+        // [0] = 基准曝光 + 用户 EV + 预设偏移：预设基线里是 0，换数组后必须回填，否则初始化
+        // 序列会把曝光静默清零（v0.7.8 教训）。applyBaseEvPref 先把 prefs 的基准值灌进
+        // baseEvPref，再统一写入（v0.8.1 起含基准偏置；U-7 起含预设偏移）。
         applyBaseEvPref()
-        p[0] = baseEvPref + (evSteps * evStep).toDouble()
+        filmParams[0] = exposureEv()
         presetWbBase = doubleArrayOf(p[1], p[2], p[3])
         tonePref = -1.0  // 换了新数组，强制重写 [28]
         zebraPref = -1.0 // 同上，[30]
@@ -1103,11 +1120,31 @@ class CameraController(private val context: Context, private val render: RenderC
     // 实测本机（X300）HAL 的 AE 比 PhotonCamera 策略暗 0.5–0.9 EV（室外 0.67 / 室内
     // 逆光 ~0.9）—— 影调引擎（filmic）只做映射、不产生曝光，这个差只能在校准层补。
     // 与 Lightroom/DNG 的 BaselineExposure 同语义；范围 −2..+2 覆盖机型间差异，
-    // 用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user。
+    // 用户 EV 滑杆（evSteps）叠加在其上：[0] = base + user（U-7 起再加预设偏移，
+    // 唯一算法在 exposureEv()）。
     // v0.10.22：作用点移到 filmic 前（曲线工作点语义，与 PC 的 Linear 域 EV 同构）。
     // v0.10.25：默认 +0.70 —— 同 DNG 双渲染实测（205833/205832，中性区净差 +0.57EV、
     // 红杯 C* 差 14.5%）标定：PC 链首恒乘 0.7EV 而我们为 0，工作点上移是色度差的主项。
     private var baseEvPref = 0.7
+
+    /**
+     * U-7：**当前预设带来的曝光偏移**（EV，`FilmParams[0]` 的相对量；标准 / 不含曝光的预设 = 0）。
+     *
+     * 语义（方案 B，`preset-DESIGN.md` §9.4，用户 2026-10-11 拍板）：预设的 `[0]` 不再被覆盖层
+     * 丢掉、也不覆盖用户的曝光补偿，而是**叠在用户基准之上** —— 拍前能看到预设的曝光效果，
+     * 用户继续拖 EV 时偏移保留（他调的是自己的基准）。
+     *
+     * 载体与冷启动：本字段由 [setFilmParams] 的 `evOffset` **无条件**赋值 —— 冷启动时
+     * `CameraScreen` 由 prefs `camera_preset_id` 恢复选中预设（[resolveCameraPreset]），再用
+     * [presetEvOffset] 从该预设的 slots 重算偏移 ⇒ 偏移跟着既有那条持久化路径一起回来，
+     * 不需要新 key（也顺带避开"预设被删后 prefs 里残留偏移"这类脏状态）。
+     */
+    private var presetEvOffset = 0.0
+
+    /** 拍照侧 `[0]` 的唯一算法（基准 + 用户 EV + 预设偏移）：写 `[0]` 与"将要施加的提亮"
+     *  判据都必须读它 —— [effectiveExposureEv] 是本式唯一的定义点。 */
+    private fun exposureEv(): Double =
+        effectiveExposureEv(baseEvPref, (evSteps * evStep).toDouble(), presetEvOffset)
 
     private fun applyBaseEvPref() {
         val v = appPrefs.getFloat("base_ev", 0.7f).toDouble().coerceIn(-2.0, 2.0)
@@ -1972,7 +2009,9 @@ class CameraController(private val context: Context, private val render: RenderC
         // 需要高光保护时可在设置页打开（判据已改用成片域 sw999，比旧版准）。
         val hlOn = expPrefs.getInt("hl_protect", 0) >= 1
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
-        val hlCompEv = baseEvPref + (evSteps * evStep).toDouble()
+        // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设
+        // 那部分就会少算 EV，高光保护判据放行 → 成片高光裁切。
+        val hlCompEv = exposureEv()
         var expPlan: ExposurePlanner.Plan? = null
         var capIso = liveIso
         var capSec = liveExposureNs

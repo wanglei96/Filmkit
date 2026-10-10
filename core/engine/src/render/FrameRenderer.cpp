@@ -4978,6 +4978,17 @@ uniform float uWhites;       // [92] 白色色阶（0 = 不动）
 uniform float uBlacks;       // [93] 黑色色阶（0 = 不动）
 uniform float uFade;         // [94] 褪色（抬起黑场；0 = 关）
 uniform float uToneOn;       // 门控（CPU 侧算）：[90..93] 任一非 0
+// ── U-1 分离色调 [23][24] + 单色 [25]（display 域；**与 kFsFilm 同式**，见 §9.3）──
+// 本 shader 的 **Rec.709** luma：逐字拷自 kFsFilm 4085/4733 的同名函数。
+// ⚠ 本 shader 其它段（blurLuma16 / 饱和度 / 影调分区 / 颗粒）用 Rec.601
+//   （0.299/0.587/0.114），这里**故意不统一** —— U-1 这三行的语义必须与 kFsFilm 逐字
+//   对齐（ws/wh 的分区边界由它决定），用户"不统一的要统一掉"针对的是**参数**而不是
+//   链路内部权重；E4-2 暗角 / E4-3 颗粒用的就是同一手法（两处逐字比对，改一处必红）。
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// 门控在 shader 内：三槽全默认（split=(0,0) 且 mono=0）⇒ 整段跳过 ⇒ **逐位零回归**
+//（A/B 通路口径就是这三个默认值；与 kFsFilm 一致 —— 那侧也是"数组里给 0 就等于不做"）。
+uniform vec2 uSplit;         // [23] split_warm / [24] split_cool（0 = 不动）
+uniform float uMono;         // [25] monochrome（0/1；0 = 不去色）
 // 与 kFsOut:4540 的 srgbEncode **严格互逆**（IEC 61966-2-1：线性 0.0031308 ↔
 // 编码 0.04045，系数 12.92 / 1.055 / 2.4 / 0.055）。
 // **禁止 pow(2.2) 近似**：暗部往返误差可达 9/255（项目实测，见 kFsOut 4530 注释）。
@@ -5254,6 +5265,27 @@ void main() {
         float vw = clamp((cplen - uVigDscale) / uVigFscale, 0.0, 1.0);
         vw = 0.5 - 0.5 * cos(3.14159265 * vw);     // 余弦平滑（darktable 同式）
         c *= (1.0 + vw * uVigBrightness);
+    }
+    // ── U-1 [23][24] 分离色调 + [25] 单色（与 kFsFilm 4486-4493 / 4539 **同式**）──
+    // 为什么这三行照抄 kFsFilm：用户 2026-10-11 指令"不统一的要统一掉" —— 效果对齐
+    // 的最稳做法就是同一套数学（同系数、同分区权重定义、同先后序）。**刻意不重设计**：
+    //   · 权重用 Rec.709（见顶部 luma()）= kFsFilm 的 `luma()`，换 601 就是"默默换一套"。
+    //   · 域差异（**已知、刻意保留**）：kFsFilm 的 l 是**线性域** luma（ACEScg 工作
+    //     空间），此处 c 已是 OETF 后的显示域 ⇒ 同一物理亮度下这里的 l 更大
+    //     （线性 0.18 → 显示 0.46）、阴影权重 exp(-3l) 更小。不把 c decode 回线性再算：
+    //     ADR-7 禁止本 shader 内任何**单程** EOTF（⑬f 的调用次数哨兵，多一次即红）
+    //     ⇒ 按显示域口径实现，域差异在报告里给量化对照（tools 的 ⑰ 项实测）。
+    // 位置 = **LUT 之前**（与拍照链路一致：kFsFilm 末端 → kFsOut 的 OETF → LUT）：
+    // LUT 可能是黑白 LUT（自带通道混合）也可能是彩色 LUT，顺序不同结果不同。
+    // 与 kFsFilm 的顺序也一致：split 先加偏移、mono 后去色（mono 会把 split 的偏移
+    // 部分转成亮度变化 —— 这是拍照链路的既有行为，照抄，不改）。
+    if (uSplit.x != 0.0 || uSplit.y != 0.0 || uMono > 0.0) {
+        float l = luma(c);
+        float ws = exp(-l * 3.0);
+        float wh = smoothstep(0.5, 1.0, l);
+        c += uSplit.x * ws * vec3(0.05, 0.02, -0.04)
+           + uSplit.y * wh * vec3(-0.03, 0.0, 0.05);
+        c = mix(c, vec3(luma(clamp(c, 0.0, 4.0))), uMono);
     }
     // M4：display 域 3D LUT（与 kFsOut 4547 同式；强度 0 ⇒ uLutOn=0 ⇒ 逐像素恒等）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
@@ -6696,6 +6728,9 @@ bool FrameRenderer::init() {
   u_style_.blacks = glGetUniformLocation(prog_style_, "uBlacks");
   u_style_.fade = glGetUniformLocation(prog_style_, "uFade");
   u_style_.tone_on = glGetUniformLocation(prog_style_, "uToneOn");
+  // U-1 分离色调 [23][24] + 单色 [25]（见 kFsStyle 的同名 uniform 声明）
+  u_style_.split = glGetUniformLocation(prog_style_, "uSplit");
+  u_style_.mono = glGetUniformLocation(prog_style_, "uMono");
   u_hist_.tex = glGetUniformLocation(prog_hist_, "uTex");
   u_hist_.lut = glGetUniformLocation(prog_hist_, "uLut");
   u_hist_.lut_on = glGetUniformLocation(prog_hist_, "uLutOn");
@@ -7575,6 +7610,13 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
     kv += ",\"blk\":" + jnum(p.blacks, 4);
     kv += ",\"fade\":" + jnum(p.fade, 4);
   }
+  // U-1：[23][24] 分离色调 + [25] 单色的**生效值**（同一个日志出口 —— 真机核对
+  // "黑白预设是否真的进了编辑器链路"就靠这三个字段）。字段名带 W/C/On 后缀，避免与
+  // diag.stats 的 `split`/`mono`（kFsFilm 的快照，见 g_diag_params）在日志里同名歧义。
+  kv += ",\"splitW\":" + jnum(p.split_warm, 4);
+  kv += ",\"splitC\":" + jnum(p.split_cool, 4);
+  kv += ",\"monoOn\":";
+  kv += p.monochrome > 0.0f ? "true" : "false";
   // E2-6 局部调整：下发值全部进**同一个出口**（历史事故：字段写进别的函数 ⇒
   // 真机日志缺项、整轮 A/B 白跑）。locOn 与 passStyle 内的门控同式重算。
   kv += ",\"locOn\":";
@@ -12822,6 +12864,11 @@ void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
               std::max(p.vignette_feather, 100.0f / vig_min) / 100.0f);
   glUniform1f(u_style_.vig_brightness,
               std::clamp(p.vignette_strength, -1.0f, 0.0f));
+  // ── U-1 [23][24] 分离色调 + [25] 单色（display 域；与 passFilm 同式）──────────
+  // 门控在 shader 内（三槽全默认 ⇒ 整段跳过）；这里照 passFilm 的裸值下发，
+  // 不做 clamp —— kFsFilm 也读同一对槽位的原值，两侧口径必须一致。
+  glUniform2f(u_style_.split, p.split_warm, p.split_cool);
+  glUniform1f(u_style_.mono, p.monochrome);
   // 与 passOutput 同款：先落 pending LUT，再 bindLut 下发（关闭态也绑定纹理 + 下发
   // 全部 uniform —— 提前 return 会让 sampler3D 指向未绑定单元，Mali 预测执行采样
   // ⇒ draw 报 1282、整帧全黑，见 bindLut 注释）

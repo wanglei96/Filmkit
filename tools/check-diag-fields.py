@@ -67,6 +67,12 @@ EXPECT = {
     "grainMb": ("submitDisplay", ["passStyle("]),
     "grainPivot": ("submitDisplay", ["passStyle("]),
     "grainSeed": ("submitDisplay", ["passStyle("]),
+    # U-1（[23][24] 分离色调 + [25] 单色）：编辑器链路的**生效值**。字段名带 W/C/On 后缀，
+    # 刻意不叫 `split`/`mono` —— 那两个名字已被 diag.stats 的 kFsFilm 快照占用（行号更小，
+    # 而本脚本取 hits[0]）⇒ 同名会让核对指到错误的函数上（假红）。
+    "splitW": ("submitDisplay", ["passStyle("]),
+    "splitC": ("submitDisplay", ["passStyle("]),
+    "monoOn": ("submitDisplay", ["passStyle("]),
     # E1-5（2026-10-08 P0「真机编辑器打开全黑」）：render.style_diag 一次定位。
     # 字段行统一发在 passStyle **之后**（否则"没执行却报执行"），并要求
     # glReadPixels 也已在字段行之前 —— 输出统计才是本帧的真实读回值。

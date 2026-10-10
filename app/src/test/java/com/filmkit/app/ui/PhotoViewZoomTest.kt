@@ -162,4 +162,30 @@ class PhotoViewZoomTest {
         assertEquals(0, clampIndex(0, 0))
         assertEquals(0, clampIndex(5, 0))
     }
+
+    // ── ⑥ 相邻页不得跟随当前页的缩放/平移（E2-23：用户报"隔壁图片入侵视野"）──────
+
+    @Test
+    fun neighborPageKeepsIdentityTransformWhileZoomed() {
+        // 根因：`beyondViewportPageCount = 1` 让相邻页也被组合/绘制（E2-22 预载），而 zoom/pan
+        // 是**整页共享**的 state —— 邻页的 Image 若跟着放大，它会以自己页心（视口外 ±1 页宽）
+        // 为中心向两侧各扩 1.5 页宽 ⇒ 跨过页边界画进视口：视口里出现别张照片的像素，
+        // 就是用户报的"入侵视野"。所以相邻页必须是恒等变换（不缩放，也不平移）。
+        // 改回共享变换 ⇒ 这条立刻红。
+        assertEquals(1f, pageScaleAt(isSettledPage = false, zoom = 3f), eps)
+        assertEquals(1f, pageScaleAt(isSettledPage = false, zoom = MAX_ZOOM), eps)
+        assertEquals(0f, pageShiftAt(isSettledPage = false, shift = 540f), eps)
+        assertEquals(0f, pageShiftAt(isSettledPage = false, shift = -540f), eps)
+    }
+
+    @Test
+    fun settledPageStillFollowsUserTransform() {
+        // 这一条防"修过头"：E2-20 的双指缩放 + 放大后单指平移**不许被这次修复削弱**，
+        // 停稳页要原样透传用户的缩放量和平移量（3× 就该是 3×，不是 1×）。
+        assertEquals(3f, pageScaleAt(isSettledPage = true, zoom = 3f), eps)
+        assertEquals(MAX_ZOOM, pageScaleAt(isSettledPage = true, zoom = MAX_ZOOM), eps)
+        assertEquals(MIN_ZOOM, pageScaleAt(isSettledPage = true, zoom = MIN_ZOOM), eps)
+        assertEquals(540f, pageShiftAt(isSettledPage = true, shift = 540f), eps)
+        assertEquals(-540f, pageShiftAt(isSettledPage = true, shift = -540f), eps)
+    }
 }

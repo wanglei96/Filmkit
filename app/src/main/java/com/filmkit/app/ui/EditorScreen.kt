@@ -143,6 +143,7 @@ import com.filmkit.app.camera.LocalMode
 import com.filmkit.app.camera.LocalOutline
 import com.filmkit.app.camera.OverwriteResult
 import com.filmkit.app.camera.PRESET_AMOUNT_UI_RANGE
+import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.SAT_UI_RANGE
 import com.filmkit.app.camera.StillSnapshot
@@ -214,6 +215,7 @@ import com.filmkit.app.camera.passthroughAllowed
 import com.filmkit.app.camera.pivotFraction
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetId
+import com.filmkit.app.camera.presetScopeNotice
 import com.filmkit.app.camera.presetSnapshot
 import com.filmkit.app.camera.presetSparseSlots
 import com.filmkit.app.camera.radialOutline
@@ -910,6 +912,40 @@ fun EditorScreen(
         presets = mergePresets(PresetStore.delete(prefs, p.id), BuiltinPresets.load(context))
         if (appliedPreset?.id == p.id) clearAppliedPreset()   // ★ E3-1c：生效中的预设被删 ⇒ 强度行收起
         status = "已删除预设：${p.name}"
+    }
+
+    /**
+     * ★ U-6a「**更新为当前设置**」：把**当前编辑器的参数**重新稀疏化后写回该预设
+     * （改的是预设库里的那条，不是当前画面）。
+     *
+     * 四条口径：
+     *  1. **只对 `source == "user"` 可用**：判据复用 [presetDeletable]（内置只读，与删除同一
+     *     条判据，不在 UI 里重写一遍 `source` 比较）—— UI 侧内置详情里根本不渲染这个按钮；
+     *  2. **复用保存那一套稀疏化**（[presetSparseSlots] + [PresetStore.upsert]）：恒等值逐槽取
+     *     `CameraPresets.standard()`、"缺失 = 套用时保留当前值"这两条语义与 [savePreset] 逐位
+     *     相同 —— 另写一套稀疏化必然漂移，而漂移的表现是"更新后套用会把画面打回默认"；
+     *  3. **id / 名称 / 分组 / 创建时间 / source 全部不动**：更新的是"配方内容"，不是身份
+     *     （重命名是 E3-1b 的事，本卡不做）；
+     *  4. **不进编辑历史、不渲染**：它改的是预设库，当前参数与画面一位没动 ⇒ 记一步撤销会让
+     *     用户"撤销一次画面不动"（E2-25 的反面）。
+     *
+     * 列表刷新的坑与 [savePreset] 逐字相同（★ P-2c）：`PresetStore` 的返回值只含**用户预设**，
+     * 直接赋值会让内置三条当场从面板上消失 ⇒ 必须 `mergePresets(..., BuiltinPresets.load)`。
+     */
+    fun updatePreset(p: EditorPreset) {
+        if (!presetDeletable(p)) return              // 内置只读（与删除同一判据）
+        val film = params ?: return
+        val next = p.copy(
+            slots = presetSparseSlots(film),
+            lutId = lutId,
+            lutStrength = if (lutId != null) film[34] else 1.0,
+        )
+        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
+        status = "已更新预设：${next.name}（${next.slots.size} 项参数）"
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "preset.update",
+            kv("id" to next.id, "slots" to next.slots.size, "lut" to (next.lutId ?: "")),
+        )
     }
 
     // ── 参数写入（E2-10：数据驱动，取代 E2-3/E2-7 的 16 个一模一样的 setter）────────────
@@ -1784,6 +1820,8 @@ fun EditorScreen(
                     onAmountFinished = { onPresetAmountRelease() },
                     onSave = { n, g -> savePreset(n, g) },
                     onApply = { applyPreset(it) },
+                    // ★ U-6a：「更新为当前设置」（仅 user 预设；内置在详情里不渲染该按钮）
+                    onUpdate = { updatePreset(it) },
                     onDelete = { deletePreset(it) },
                     onHandleDrag = { dy -> onHandleDrag(dy) },
                     onTogglePanel = { panel = panel.toggled() },
@@ -3292,13 +3330,16 @@ private fun CropToolBar(
  * ★ E3-1a 预设面板（**最小入口**）：与裁剪工具栏同一层 —— 取代参数面板，不叠在预览上。
  *
  * 本卡只做核心闭环：**保存当前 / 套用 / 删除（二次确认）**。缩略图（用用户自己的照片实时
- * 渲染）、分组筛选 / 搜索、长按菜单（重命名 / 复制 / 收藏 / 更新为当前）留给 E3-1b，
+ * 渲染）、分组筛选 / 搜索、长按菜单（重命名 / 复制 / 收藏）留给 E3-1b，
  * 强度滑杆留给 E3-1c —— 面板上每一个动作背后都已经有一条跑得通的纯逻辑（EditorExport.kt）。
+ *
+ * ★ U-6a：**详情 +「更新为当前设置」已做**（点列表行的名称区进详情，见 [PresetDetailPanel]）
+ * —— "展示全部可调参数"与"编辑预设"这两条用户需求的落点。
  *
  * ★ P-2c：列表 = 用户预设 + **内置三条**（`BuiltinPresets.all`）。内置预设**不可删** ——
  * 它们的删除按钮根本不渲染（[PresetRow] 按 [presetDeletable] 分支，不是"点了才报错"）；
- * 其余操作（套用 / 强度）与用户预设完全一致。重命名 / 更新为当前这类操作本面板**还没有**
- *（E3-1b 才做），所以本卡不需要为它们加保护。
+ * 其余操作（套用 / 强度 / 看详情）与用户预设完全一致，只有「更新为当前设置」与「删除」
+ * 按 [presetDeletable] 隐藏（★ U-6a 沿用同一条判据）。重命名 / 复制本面板**还没有**（E3-1b）。
  *
  * 为什么保存入口在这里而不是顶栏：`EditorTopBar` 只有 取消 / 相册 / 撤销 / 重做 / 覆盖 /
  * 完成（调研 §5.4 的事实核对），硬塞一个「保存预设」会挤占主操作位；而底栏「预设」本来就是
@@ -3323,6 +3364,8 @@ private fun PresetPanel(
     onAmountFinished: () -> Unit,
     onSave: (String, String) -> Unit,
     onApply: (EditorPreset) -> Unit,
+    /** ★ U-6a：「更新为当前设置」—— 用当前编辑器参数重写这条预设（仅 user 预设） */
+    onUpdate: (EditorPreset) -> Unit,
     onDelete: (EditorPreset) -> Unit,
     onHandleDrag: (Float) -> Unit,
     onTogglePanel: () -> Unit,
@@ -3330,6 +3373,11 @@ private fun PresetPanel(
     var name by remember { mutableStateOf("") }
     var group by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<EditorPreset?>(null) }
+    // ★ U-6a 详情：存 **id** 而不是对象 —— `presets` 刷新后（保存 / 更新 / 删除）详情自动显示
+    // 新内容；预设被删（不在列表里）⇒ null ⇒ 自动回到列表。存对象会显示过期参数（"更新了
+    // 为当前设置，详情里还是旧值"这种最难查的 bug 在结构上就不存在）。
+    var detailId by remember { mutableStateOf<String?>(null) }
+    val detail = detailId?.let { id -> presets.firstOrNull { it.id == id } }
     val canCommit = canSave && name.isNotBlank()
     Column(
         Modifier
@@ -3351,6 +3399,18 @@ private fun PresetPanel(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 2.dp),
         )
+        if (detail != null) {
+            // ★ U-6a：详情**取代列表**（同一层，不叠控件）—— 顶部「‹ 返回」回列表。
+            // 用 if/else 而不是 `return@Column`：Composable 的 early return 在重组路径上更难读，
+            // 而这里两个分支互斥且都在同一个 Column 里。
+            PresetDetailPanel(
+                p = detail,
+                onBack = { detailId = null },
+                onApply = { onApply(detail) },
+                onUpdate = { onUpdate(detail) },
+                onDelete = { pendingDelete = detail },
+            )
+        } else {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -3452,9 +3512,16 @@ private fun PresetPanel(
                     .heightIn(max = 168.dp),
             ) {
                 items(presets, key = { it.id }) { p ->
-                    PresetRow(p, onApply = { onApply(p) }, onDelete = { pendingDelete = p })
+                    PresetRow(
+                        p,
+                        onApply = { onApply(p) },
+                        // ★ U-6a：点名称区进详情（"›" 是入口提示；「套用」仍是右侧那个实心按钮）
+                        onOpenDetail = { detailId = p.id },
+                        onDelete = { pendingDelete = p },
+                    )
                 }
             }
+        }
         }
     }
     // 删除二次确认（本卡硬要求）：取消 = 什么都不做，只关框（预设、参数、画面全不动）
@@ -3519,13 +3586,31 @@ private fun PresetField(
 /**
  * 预设列表的一行：名称 + 副标题（分组 · 槽位数 · LUT）+「套用」/「删除」。
  *
+ * ★ P-5：副标题下可能再多一行**字段作用域提示**（[presetScopeNotice]，场景 = 编辑器链路
+ * `passStyle`）—— 含 `[5..10]` 胶片曲线 / `[37][38]` 黑白点 的预设在本页套用**没有视觉效果**
+ * （编辑器链路 `kFsStyle` 里没有 filmic，等 U-2）。全部生效时这行**不渲染** ⇒ 内置三条
+ * （只含颗粒 / 暗角 / 分离色调）**现在都不出这行**。
+ *
+ * ⚠ ★ **U-1（2026-10-11）已接线 `[23][24]` 分离色调 + `[25]` 单色** ⇒ 它们两侧都生效、
+ * 不再是"仅拍照"（本注释此前写的就是这三槽 + `[5..10]`，已按接线后的实际行为更正；
+ * `PresetScope.kt` 是判据的唯一维护点，本文件不复述槽位清单的第二份）。
+ *
  * ★ P-2c：**内置预设不可删**（[presetDeletable]）—— 删除按钮的位置换成一枚**不可点**的
  * 「内置」标记。**不是"点了才报错"**：删除按钮根本不渲染（也就没有"点了才发现删不掉"的路径）。
  * 理由：内置包随包分发，删了下次启动又回来；留一个能点的删除按钮，用户会以为删掉了。
  * 用户自建预设（`source == "user"`）的渲染与行为**逐位不变**。
+ *
+ * ★ U-6a：**点名称区 = 进详情**（[onOpenDetail]），名称右侧一枚「›」是入口提示 ——
+ * 「套用」仍是右边那个实心按钮，两者的分工与既有风格一致（主操作永远是实心 accent 按钮）。
+ * 没有做成"长按"：长按在这块面板里没有任何既有手势，用户不会去试（ADR-12：界面要自己说清楚）。
  */
 @Composable
-private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit) {
+private fun PresetRow(
+    p: EditorPreset,
+    onApply: () -> Unit,
+    onOpenDetail: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val sub = buildString {
         if (p.group.isNotEmpty()) append(p.group).append(" · ")
         append(p.slots.size).append(" 项参数")
@@ -3537,14 +3622,24 @@ private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit
             .padding(horizontal = 16.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                p.name,
-                color = FilmTheme.Cream,
-                fontSize = 13.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        Column(
+            Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(8.dp))
+                .pressScale(pressedScale = 0.98f, onTap = onOpenDetail)
+                .padding(vertical = 2.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    p.name,
+                    color = FilmTheme.Cream,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(" ›", color = DisabledInk, fontSize = 13.sp, maxLines = 1)
+            }
             Text(
                 sub,
                 color = FilmTheme.CreamDim,
@@ -3552,6 +3647,17 @@ private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // ★ P-5：**单独一行**而不是拼进 sub —— sub 是单行省略号，拼进去会把后半句
+            //（"编辑器里不生效"）截掉，只剩半句话比不提示更糟。全部生效 ⇒ null ⇒ 不占行。
+            presetScopeNotice(p, PresetScene.EDITOR)?.let { notice ->
+                Text(
+                    notice,
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         Text(
             "套用",
@@ -3590,6 +3696,212 @@ private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit
                     .border(1.dp, DisabledInk, RoundedCornerShape(9.dp))
                     .padding(horizontal = 10.dp, vertical = 6.dp),
             )
+        }
+    }
+}
+
+/**
+ * ★ U-6a 预设**详情**（只读展示）：这条预设到底包含哪些参数、各是多少。
+ *
+ * 用户需求原话："**预设应该展示全部可调参数**" —— 在此之前用户只能看到"7 项参数"这么个数字，
+ * 选预设等于盲选。详情把 `EditorPreset.slots`（稀疏索引键）翻成人话：按
+ * `docs/reports/preset-DESIGN.md` §9.2 的四组（基础调整 / 色彩 / 影调曲线 / 胶片质感）列出，
+ * **只列这条预设真正包含的槽**（稀疏语义 = "缺失 = 套用时保留当前值"）。
+ *
+ * 三件事**刻意不做**（本卡的边界，见 `docs/reports/u6a-preset-detail-REPORT.md`）：
+ *  - **不做逐项编辑**：改参数是参数面板的职责（详情的"操作"只有套用 / 更新为当前设置 / 删除）；
+ *  - **不做重命名 / 复制 / 导入导出**：E3-1b / E3-2；
+ *  - **不显示"仅拍照 / 仅后期"作用域提示**：那是 P-5 的行内提示（[presetScopeNotice]），
+ *    在列表行上已经有了；详情再抄一遍会变成两处文案各自漂移。
+ *
+ * 入口 = 列表行的名称区（[PresetRow] 的「›」）；布局上详情**取代列表**（同一层，不叠控件），
+ * 顶部「‹ 返回」回列表 —— 与裁剪工具栏"取代参数面板"是同一种层级语言。
+ */
+@Composable
+private fun PresetDetailPanel(
+    p: EditorPreset,
+    onBack: () -> Unit,
+    onApply: () -> Unit,
+    onUpdate: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val context = LocalContext.current
+    val sections = presetDetailSections(p.slots)
+    val lut = presetLutLine(p)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(bottom = 2.dp),
+    ) {
+        // ① 标题：返回 + 名称（名称是元数据里的身份，不在下面重复一行）
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "‹ 返回",
+                color = FilmTheme.Accent,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                    .pressScale(pressedScale = 0.94f, onTap = onBack)
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                p.name,
+                color = FilmTheme.Cream,
+                fontSize = 14.sp,
+                fontFamily = FilmTheme.Serif,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = TextStyle(shadow = TextShadow),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        // ② 元数据：来源（用户 / 内置 / 导入）· 分组 · 创建时间
+        Text(
+            "${presetSourceText(p.source)} · ${p.group.ifEmpty { "未分组" }} · ${presetCreatedAtText(p.createdAt)}",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 3.dp),
+        )
+        // ③ 参数清单：分组标题 + 「名称 读数」。限高 208dp（比列表的 168dp 略高，仍不挤预览区）
+        LazyColumn(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(max = 208.dp),
+        ) {
+            sections.forEach { sec ->
+                item(key = "sec_${sec.title}") {
+                    Text(
+                        sec.title,
+                        color = FilmTheme.Accent,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        modifier = Modifier.padding(start = 16.dp, top = 5.dp, bottom = 1.dp),
+                    )
+                }
+                items(sec.rows, key = { "row_${it.slot}" }) { r ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            r.label,
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            r.value,
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            fontFamily = FilmTheme.Mono,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+            if (sections.isEmpty()) {
+                item(key = "noParams") {
+                    Text(
+                        "这条预设不含参数（套用时其余参数全部保持不动）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                }
+            }
+            // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进参数清单
+            lut?.let { line ->
+                item(key = "lut") {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "LUT",
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            fontFamily = FilmTheme.Mono,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+        // ④ 操作：套用（主）/ 更新为当前设置（仅 user）/ 删除（仅 user，二次确认复用面板那份）
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "套用",
+                color = FilmTheme.OnAccent,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(FilmTheme.Accent)
+                    .pressScale(pressedScale = 0.94f, onTap = onApply)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            )
+            // ★ 只对 user 预设：判据复用 presetDeletable（内置只读）—— 内置详情里这两个按钮
+            //   根本不渲染（与 PresetRow 的「内置」标记同一条纪律：不做"点了才报错"）
+            if (presetDeletable(p)) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "更新为当前设置",
+                    color = FilmTheme.Accent,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .border(1.dp, FilmTheme.Accent, RoundedCornerShape(9.dp))
+                        .pressScale(pressedScale = 0.94f, onTap = onUpdate)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "删除",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                        .pressScale(pressedScale = 0.94f, onTap = onDelete)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            } else {
+                Spacer(Modifier.width(8.dp))
+                Text("内置预设 · 只读", color = DisabledInk, fontSize = 11.sp, maxLines = 1)
+            }
         }
     }
 }

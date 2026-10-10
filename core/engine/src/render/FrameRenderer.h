@@ -1239,6 +1239,9 @@ class FrameRenderer {
           // 零额外 GPU 成本；也因此 chainLuma 的域提升自动带上它们，无需改动）。
           highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
           tone_on = -1,
+          // U-1 分离色调 [23][24] + 单色 [25]（display 域）：与 u_film_ 同名同义 ——
+          // kFsStyle 里照抄 kFsFilm 的同一套数学（同系数、同 Rec.709 分区权重）。
+          split = -1, mono = -1,
           // E2-12 裁剪 + 90° 步进旋转（ADR-16）：输出坐标 → 原图 UV 的仿射映射
           //（origin + o×size，再按 rot 置换轴）。不裁剪 = (0,0)/(1,1)/0 ⇒ 恒等。
           crop_origin = -1, crop_size = -1, crop_rot = -1;

@@ -101,13 +101,18 @@ class EditorPresetTest {
     }
 
     /**
-     * ★ 七类排除槽**一个都不进 slots**：`[34]`（LUT 强度）、`[30]`（过曝斑马纹阈值）、
-     * `[35]`（`auto_tone`）/ `[36]`（`local_tone`）（引擎模式 / 标定旋钮）、`[39..59]`（RAW 解码 /
-     * 拍摄链路）、`[79..87]`（局部调整）。
+     * ★ 排除槽**一个都不进 slots**：`[34]`（LUT 强度）、`[28]`（基准影调开关）、
+     * `[30]`（过曝斑马纹阈值）、`[31..33]`（色彩外观层）、`[35]`（`auto_tone`）/ `[36]`
+     * （`local_tone`）（引擎模式 / 标定 / **色彩科学状态**）、`[39..59]`（RAW 解码 / 拍摄链路）、
+     * `[79..87]`（局部调整）。
      *
      * ⚠ [30] 这条是 P-1 修掉的**真实缺陷**：它是**预览辅助开关**（`FilmParams.h:72`：仅预览
      * `passOutput` 使用，成片一律 0），但编辑器链路 `passStyle` **也读它** ⇒ 存进预设后套用会
      * 凭空打开 / 关闭别人的过曝斑马纹。判据逐条写在 `PRESET_ENGINE_KNOB_SLOTS` 的 KDoc 里。
+     *
+     * ⚠ [28] / [31..33] 是 **P-5 复核**新加的排除（架构师裁决）：判据 = "引擎色彩科学状态，
+     * 不是用户风格"（[28] 还被 `CameraController.applyTonePref` 按 prefs 重写；[31..33] 在
+     * v0.7.7 已回恒等、设置页开关 v0.7.9 已删除 ⇒ UI 上根本没有入口能改它们）。
      */
     @Test
     fun engineKnobsDecodeSlotsLutStrengthAndLocalAreNeverStored() {
@@ -118,6 +123,8 @@ class EditorPresetTest {
         p[30] = 0.42    // 恒等 0.95（斑马纹阈值）
         p[35] = 1.0     // 恒等 0.0
         p[36] = 0.5     // 恒等 0.25
+        p[28] = 0.0     // 恒等 1.0（基准影调开关，P-5 复核新增排除）
+        for (i in 31..33) p[i] = 1.5  // 恒等 1.0（色彩外观层，P-5 复核新增排除）
         for (i in 39..59) p[i] = 7.5
         for (i in 79..87) p[i] = 3.3
         val slots = presetSparseSlots(p)
@@ -126,6 +133,10 @@ class EditorPresetTest {
         assertFalse("过曝斑马纹阈值 = 预览辅助开关（passStyle 也读它）", presetSlotIncluded(30))
         assertFalse("auto_tone = 引擎模式旋钮", presetSlotIncluded(35))
         assertFalse("local_tone = 引擎标定旋钮", presetSlotIncluded(36))
+        assertFalse("基准影调 = 色彩科学状态（且被 prefs 覆盖层重写），P-5 复核排除", presetSlotIncluded(28))
+        assertFalse("色彩外观层 = 色彩科学标定层，P-5 复核排除", presetSlotIncluded(31))
+        assertFalse(presetSlotIncluded(32))
+        assertFalse(presetSlotIncluded(33))
         assertFalse(presetSlotIncluded(39))
         assertFalse(presetSlotIncluded(59))
         assertFalse("局部模式是构图相关，v1 不进预设（调研 D7）", presetSlotIncluded(79))
@@ -136,6 +147,14 @@ class EditorPresetTest {
         assertTrue(presetSlotIncluded(88))
         assertFalse(presetSlotIncluded(-1))
         assertFalse(presetSlotIncluded(CameraPresets.COUNT))
+
+        // ★ P-5 复核的**前提**（实测，不是假设）：[28] / [31..33] 的恒等值都是 **1.0**
+        //（不是 0）⇒ 把它们排除**不会**改变"用户没改过的参数"的行为：稀疏化本来就按恒等值
+        // 丢弃（[presetSparseSlots]）。恒等值哪天变成别的数，这条会红 ⇒ 提醒重审排除决定。
+        val neutral = CameraPresets.standard()
+        for (i in listOf(28, 31, 32, 33)) {
+            assertEquals("槽位 [$i] 的恒等值必须是 1.0（P-5 排除它的前提）", 1.0, neutral[i], 0.0)
+        }
     }
 
     /**

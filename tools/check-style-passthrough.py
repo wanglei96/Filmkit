@@ -275,6 +275,7 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
                    local_width=0.25, local_ev=0.0, local_sat=1.0,
                    temp_mired=0.0, tint=0.0, highlights=0.0, shadows=0.0,
                    whites=0.0, blacks=0.0, fade=0.0,
+                   split=(0.0, 0.0), mono=0.0,
                    crop=(0.0, 0.0, 1.0, 1.0), crop_rot=0):
     """E2-2 基础调整 + E2-6 局部调整的 CPU 侧下发值（**与 FrameRenderer::passStyle
     同式**，含门控）。
@@ -334,6 +335,10 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         'uBlacks': float(blacks),
         'uFade': float(fade),
         'uToneOn': 1.0 if tone_on else 0.0,
+        # U-1 [23][24] 分离色调 + [25] 单色（passStyle / passFilm 同式：**裸值下发**，
+        # 门控在 shader 内 = 三槽全默认）⇒ 这里不做任何折算。
+        'uSplit': (float(split[0]), float(split[1])),
+        'uMono': float(mono),
         # E2-12 裁剪 + 90° 步进旋转（passStyle 同式）：nullptr/全幅 ⇒ (0,0)/(1,1)/0
         # ⇒ shader 内 cropUV 逐位恒等（`0.0 + o × 1.0`）。
         'uCropOrigin': (float(crop[0]), float(crop[1])),
@@ -532,7 +537,10 @@ def check_pass_style_slots():
             # [90..93] + 褪色[94]。⚠️ [95] reserved **不在**白名单 —— 它确实零引用，
             # 这正是本项要守的（"每新增一个编辑器链路支持的参数必须显式加进来"）。
             'temp_mired', 'tint', 'highlights', 'shadows', 'whites', 'blacks',
-            'fade'}
+            'fade',
+            # U-1：[23][24] 分离色调 + [25] 单色（用户 2026-10-11"不统一的要统一掉"）。
+            # 此前 passStyle 零引用 ⇒ 含 [25] 的"黑白预设"在编辑器里不变黑白。
+            'split_warm', 'split_cool', 'monochrome'}
     return refs == want, refs, ''
 
 
@@ -613,6 +621,75 @@ def check_vignette_parity():
         cpu.append(seg.replace('u_out_', 'u_xxx_').replace('u_style_', 'u_xxx_'))
     pairs.append(('CPU 下发段', cpu[0], cpu[1]))
     return [name for name, a, b in pairs if a != b]
+
+
+def check_split_mono_parity():
+    """U-1 ⑰d：`kFsFilm` 与 `kFsStyle` 的 [23][24][25] 数学必须**逐字相同**。
+
+    与 ⑨（暗角）/ ⑨b（颗粒）同一手法：这是"效果对齐"的直接证据 —— 比"两个 shader 各跑
+    一遍比对数字"更强（域不同、数字本来就不会逐位相等；但**公式**必须逐字相同）。
+    比对四段（变量名归一化 out3/c 后）：
+      · `float luma(vec3 c)` 定义（718 权重）· ws/wh 权重定义 · split 加法偏移 · mono 去色。
+    """
+    src = pathlib.Path(FR).read_text(encoding='utf-8')
+    film, style = shader_src(src, 'kFsFilm'), shader_src(src, 'kFsStyle')
+
+    def grab(text):
+        """抠出四段原文；split/mono 段把左值变量名（out3 / c）归一化成 X 后比对。"""
+        pats = {
+            'luma 定义': r'float luma\(vec3 c\) \{ return dot\(c, vec3\(0\.2126, '
+                         r'0\.7152, 0\.0722\)\); \}',
+            'ws/wh 权重': r'float ws = exp\(-l \* 3\.0\);\s*\n\s*'
+                          r'float wh = smoothstep\(0\.5, 1\.0, l\);',
+            'split 加法': r'(\w+) \+= uSplit\.x \* ws \* vec3\(0\.05, 0\.02, -0\.04\)\s*\n\s*'
+                          r'\+ uSplit\.y \* wh \* vec3\(-0\.03, 0\.0, 0\.05\);',
+            'mono 去色': r'(\w+) = mix\(\1, vec3\(luma\(clamp\(\1, 0\.0, 4\.0\)\)\), uMono\);',
+        }
+        out = {}
+        for k, p in pats.items():
+            m = re.search(p, text)
+            if not m:
+                out[k] = None
+                continue
+            seg = re.sub(r'\s+', ' ', m.group(0))
+            out[k] = (re.sub(r'\b%s\b' % re.escape(m.group(1)), 'X', seg)
+                      if m.groups() else seg)
+        return out
+
+    a, b = grab(film), grab(style)
+    return [f'{k}（film={a[k]!r} vs style={b[k]!r}）' for k in a if a[k] != b[k]]
+
+
+def split_mono_np(c0, split, mono):
+    """kFsStyle 的 U-1 段 numpy 直译（输入/输出都是 **显示域编码值 0..1**）。"""
+    c = c0.astype(np.float64).copy()
+    l = c @ np.array([0.2126, 0.7152, 0.0722])
+    ws = np.exp(-l * 3.0)
+    wh = smoothstep_np(0.5, 1.0, l)
+    c = c + (split[0] * ws)[..., None] * np.array([0.05, 0.02, -0.04]) \
+          + (split[1] * wh)[..., None] * np.array([-0.03, 0.0, 0.05])
+    lum = np.clip(c, 0.0, 4.0) @ np.array([0.2126, 0.7152, 0.0722])
+    return c + (lum[..., None] - c) * mono
+
+
+def expect8(c01):
+    """解析期望 → **8bit 输出口径**（与 [quant] 同式：rint + clamp 到 0..255）。
+
+    ⚠ 这一步不能省：shader 末尾是 `clamp(c, 0.0, 1.0)` + RGBA8 量化 ⇒ 解析期望若停在
+    浮点域，"超白被截断"的段落（如 luma250 吃满 +0.05 的高光冷偏移）会差出 7.7 LSB，
+    看起来像实现错了（本卡第一次跑就踩到）。它不是实现差异，是 8bit 边界的本征行为。
+    """
+    return np.clip(np.rint(np.asarray(c01) * 255.0), 0, 255)
+
+
+def grey_steps(w, h, vals):
+    """横向灰阶阶梯（每段一个编码值 0..255）—— U-1 ⑰c 的"分区"判据要看**逐段**偏移。"""
+    img = np.empty((h, w, 3), np.uint8)
+    seg = max(1, w // len(vals))
+    for i, v in enumerate(vals):
+        img[:, i * seg: (i + 1) * seg] = v
+    img[:, seg * len(vals):] = vals[-1]
+    return img
 
 
 def main():
@@ -1341,6 +1418,119 @@ def main():
           f' = {edge_ratio0 > edge_ratio100}')
     if not mid_peak or not (edge_ratio0 > edge_ratio100):
         fails.append('⑯c [60] 调制曲线')
+
+    # ══ U-1（[23][24] 分离色调 + [25] 单色）════════════════════════════════════
+    # 用户 2026-10-11："影调重建拍照侧和编辑器侧不一样？不统一的要统一掉，缺的补上。"
+    # 本段四个判据：零回归（逐位）/ 单色生效 / 分离色调生效+分区 / 与 kFsFilm 逐字同式。
+
+    # ⑰a **零回归（硬判据）**：三槽默认 ⇒ 与"把 U-1 段整段删掉的 shader"**逐位相同**。
+    # 为什么不能只测"与输入 ≤1 LSB"（①⑩⑭a 那种口径）：dither 是 ±1 LSB 的确定性噪声，
+    # 它会掩盖"新增段在默认值下真的没跑"这一点。这里的"删段 shader"就是"这段不存在"的
+    # **可执行定义** ⇒ 逐位相同 = 门控短路且对链路其它段零影响（不依赖 git 旧版本）。
+    style_src = shader_src(src_txt, 'kFsStyle')
+    u1_start = '    if (uSplit.x != 0.0'
+    u1_end = 'c = mix(c, vec3(luma(clamp(c, 0.0, 4.0))), uMono);\n    }'
+    u1_seg = (slice_from(style_src, u1_start, u1_end)
+              if u1_start in style_src and u1_end in style_src else '')
+    if 'uSplit' not in u1_seg:
+        print('⑰a FAIL 未能从 kFsStyle 定位 U-1 主段（源码结构变了）')
+        fails.append('⑰a U-1 零回归')
+    else:
+        sh_no_u1 = {'kFsStyle': style_src.replace(u1_seg, '')}
+        # 参数取"非平凡"：LUT 开 + 颗粒开 + 对比度/饱和度/影调分区/暗角全部非默认
+        # ⇒ 任何串味（例如 U-1 段意外改动 l 或 c 的后续使用者）都会露出来。
+        adj_u1 = dict(split=(0.0, 0.0), mono=0.0, contrast=1.15, sat=1.1,
+                      highlights=0.2, shadows=-0.1, fade=0.1, clarity=0.3)
+        vig_u1 = (-0.6, 80.0, 50.0)
+        o_new = run_style(gl, eso, sh, inp, lut_id, 33, lut_on=1.0, lut_strength=0.8,
+                          grain=25.0, vig=vig_u1, adj=adj_u1)
+        o_cut = run_style(gl, eso, sh_no_u1, inp, lut_id, 33, lut_on=1.0,
+                          lut_strength=0.8, grain=25.0, vig=vig_u1, adj=adj_u1)
+        same = bool(np.array_equal(o_new, o_cut))
+        dmax = float(np.abs(o_new - o_cut).max() * 255.0)
+        print(f'⑰a U-1 默认零回归（[23]=[24]=[25]=0，LUT/颗粒/对比度/影调分区/暗角全开）：'
+              f'与"删掉 U-1 段的 shader"逐位相同 = {same}（max|Δ| = {dmax:.0f} LSB，'
+              f'非零像素 = {int((o_new != o_cut).any(axis=-1).sum())}）')
+        if not same:
+            fails.append('⑰a U-1 零回归')
+
+    # ⑰b [25] 单色生效（显示域去色到 Rec.709 luma）+ 与解析期望对照（判据 ≤1 LSB）
+    # ⚠ 期望值直接来自 [split_mono_np]（shader 同式的 numpy 直译）⇒ 同时验收"口径"。
+    lut_off_u1 = lut_off
+    o_m = run_style(gl, eso, sh, inp, lut_off_u1, 1, lut_on=0.0, lut_strength=0.0,
+                    grain=0.0, adj=dict(mono=1.0))
+    q_m = quant(o_m, inp.shape)
+    c0 = inp.astype(np.float64) / 255.0
+    want_m = expect8(split_mono_np(c0, (0.0, 0.0), 1.0))
+    d_m = float(np.abs(q_m - want_m).max())
+    rg = float(np.abs(q_m[..., 0] - q_m[..., 1]).max())
+    gb = float(np.abs(q_m[..., 1] - q_m[..., 2]).max())
+    # luma 保持：去色不改变 709 luma（shader 就是 mix 到 vec3(luma)）
+    lum_i = float((c0 @ np.array([0.2126, 0.7152, 0.0722])).mean() * 255.0)
+    lum_o = float((q_m / 255.0 @ np.array([0.2126, 0.7152, 0.0722])).mean())
+    print(f'⑰b [25]=1 单色：实测 max|R−G| = {rg:.0f}, max|G−B| = {gb:.0f} LSB'
+          f'（判据 ≤1 = 只剩 dither ⇒ 真灰）；与解析期望（709 luma 去色）max|Δ| = '
+          f'{d_m:.1f} LSB（判据 ≤3 = dither±1 + 舍入模式差 ≤1 + 16F 余量，与 ⑬b 同口径）；'
+          f'平均 luma 输入 {lum_i:.1f} → 输出 {lum_o * 255:.1f}（应保持）')
+    if rg > 1.0 or gb > 1.0 or d_m > 3.0:
+        fails.append('⑰b 单色')
+
+    # ⑰c [23]/[24] 分离色调生效 + **真的分区**（逐段灰阶）：阴影暖 [23]=+1 / 高光冷
+    # [24]=+1 各跑一次，逐段打印实测偏移与解析偏移 —— "阴影段吃暖、高光段吃冷"是判据。
+    steps = [16, 32, 64, 96, 128, 160, 192, 224, 250]
+    g_steps = grey_steps(n, n, steps)
+    segw = max(1, n // len(steps))
+    ok17c = True
+    for name, sp in (('[23]=+1 阴影暖', (1.0, 0.0)), ('[24]=+1 高光冷', (0.0, 1.0))):
+        o = run_style(gl, eso, sh, g_steps, lut_off_u1, 1, lut_on=0.0,
+                      lut_strength=0.0, grain=0.0, adj=dict(split=sp))
+        q = quant(o, g_steps.shape).astype(np.float64)
+        want = expect8(split_mono_np(g_steps.astype(np.float64) / 255.0, sp, 0.0))
+        d = float(np.abs(q - want).max())
+        ok17c = ok17c and d <= 3.0
+        parts = []
+        for i, v in enumerate(steps):
+            sl = np.s_[:, i * segw:(i + 1) * segw]
+            dg = (q[sl] - g_steps[sl].astype(np.float64)).mean(axis=(0, 1))
+            parts.append(f'luma{v}: ΔRGB=({dg[0]:+.1f},{dg[1]:+.1f},{dg[2]:+.1f})')
+        print(f'⑰c {name}：与解析期望 max|Δ| = {d:.1f} LSB（判据 ≤3 = dither±1 + '
+              f'舍入模式差 ≤1 + 16F 余量，与 ⑬b 同口径）')
+        print('   ' + ' | '.join(parts))
+        # 方向判据：阴影暖 ⇒ 暗段 ΔR > 0 且 ΔB < 0；高光冷 ⇒ 亮段 ΔB > 0 且 ΔR < 0。
+        # 亮段取 luma224（不是 luma250）：250 段（0.98）吃满高光偏移后会**撞白点 clamp**
+        #（8bit 边界的本征行为，见 [expect8]），方向判据在那里会退化成"看截断"。
+        dark = (q[:, :segw] - g_steps[:, :segw].astype(np.float64)).mean(axis=(0, 1))
+        bright = (q[:, -2 * segw:-segw]
+                  - g_steps[:, -2 * segw:-segw].astype(np.float64)).mean(axis=(0, 1))
+        good = (dark[0] > 0.5 and dark[2] < -0.5) if sp[0] > 0 else \
+               (bright[2] > 0.5 and bright[0] < -0.5)
+        if not good:
+            ok17c = False
+        print(f'   方向：暗段({steps[0]}/255) ΔR={dark[0]:+.1f} ΔB={dark[2]:+.1f}；'
+              f'亮段({steps[-2]}/255) ΔR={bright[0]:+.1f} ΔB={bright[2]:+.1f}'
+              f' ⇒ {"方向正确" if good else "方向错误"}')
+    if not ok17c:
+        fails.append('⑰c 分离色调')
+
+    # ⑰d 与 kFsFilm **逐字同式**（四段文本比对）+ 域差异量化（同一物理亮度下两侧的
+    # 权重与偏移幅度）—— "方向与幅度量级一致"的可核对数字就在这里。
+    diff17d = check_split_mono_parity()
+    print(f'⑰d kFsFilm 与 kFsStyle 的 U-1 数学逐字比对：差异段 = '
+          f'{diff17d or "无（0 处）"}')
+    if diff17d:
+        fails.append('⑰d 两处一致性')
+    print('   域差异量化（同一**物理**亮度：线性域 l 与其显示域编码 srgbEncode(l)）：')
+    for l_lin in (0.02, 0.05, 0.18, 0.5, 0.9):
+        l_disp = float(srgb_encode_np(np.array(l_lin)))
+        ws_f, wh_f = math.exp(-l_lin * 3.0), float(smoothstep_np(0.5, 1.0, np.array(l_lin)))
+        ws_s, wh_s = math.exp(-l_disp * 3.0), float(smoothstep_np(0.5, 1.0, np.array(l_disp)))
+        print(f'   l_lin={l_lin:<5} l_disp={l_disp:.4f} | kFsFilm ws={ws_f:.4f} '
+              f'wh={wh_f:.4f} ΔR(阴影暖)={0.05 * ws_f * 255:+.2f} ΔB(高光冷)={0.05 * wh_f * 255:+.2f}'
+              f' | kFsStyle ws={ws_s:.4f} wh={wh_s:.4f} ΔR={0.05 * ws_s * 255:+.2f} '
+              f'ΔB={0.05 * wh_s * 255:+.2f} LSB')
+    print('   ⇒ 系数/权重公式逐字相同（⑰d 文本比对），差异 **100% 来自 luma 的域**：'
+          '同一物理亮度下显示域 l 更大 ⇒ 阴影权重更小（中灰 0.18：film 0.583 vs '
+          'style 0.250 = 43%）、高光权重更早起跳（l_disp ≥ 0.5 即 l_lin ≥ 0.214）。')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')

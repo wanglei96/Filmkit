@@ -42,10 +42,47 @@ internal val CAMERA_STANDARD_PRESET = EditorPreset(
  * 用户在拍照界面调的曝光补偿 / 斑马纹 / 影调开关由 `CameraController.setFilmParams` 内部
  * 的 prefs 覆盖层（`[0]/[28]/[30]/[34]/[35]`）重新写回，**不经过本函数**（既有设计）。
  *
+ * ★ **U-7：`[0]` 是唯一例外** —— 覆盖层不再把它整槽丢掉，而是转成**相对偏移**叠加在用户的
+ * 曝光补偿上（方案 B）：调用侧用 [presetEvOffset] 把这条预设的 `[0]` 提取出来交给
+ * `setFilmParams(p, evOffset)`，`[0] = base_ev + 用户 EV + 该偏移`。
+ *
  * 展开本身复用编辑器侧的 [presetSnapshot]（"缺失 key = 保留 base 值"的唯一实现）。
  */
 internal fun cameraPresetParams(preset: EditorPreset): DoubleArray =
     presetSnapshot(CameraPresets.standard(), preset.slots)
+
+/**
+ * U-7：预设曝光 `[0]` 的**偏移量**（方案 B，`preset-DESIGN.md` §9.4；用户 2026-10-11 拍板）。
+ *
+ * 语义统一（§9.2 第 1 行唯一一个天然冲突的参数）：
+ *  - **拍照侧**：`[0] = 用户基准曝光 + 本偏移 + 其它修正`（见 [effectiveExposureEv]）——
+ *    拍前就能看到预设的曝光效果，又不冲掉用户正在调的曝光补偿；
+ *  - **编辑器侧**：`[0]` 仍是**后期曝光**（直接生效）—— 它作用在已成片上，没有"用户的基准"
+ *    可叠加；两边的**含义**因此一致（都是"相对当前画面再亮/暗多少 EV"），只是叠加对象不同。
+ *
+ * 为什么从 `slots` 取而不是从 [cameraPresetParams] 展开后数组的 `[0]` 取：展开时未记入的槽
+ * 取基线值（中性基线的 `[0]` = 0.0），两者当前等价；但 `slots` 是**预设自己的记录**，不随
+ * 基线的将来改动漂移，也不受 `setFilmParams` 的引用赋值（ADR §5.1 I-5）影响。
+ *
+ * **不含 `[0]`（缺失 key）⇒ 偏移 0**：与"缺失字段 = 不改变该参数"的既有口径一致，不是
+ * "把曝光打到 0"。[CAMERA_STANDARD_PRESET] 的 slots 为空 ⇒ 切回「标准」必然归零，
+ * 不残留上一条预设的曝光。
+ */
+internal fun presetEvOffset(slots: Map<Int, Double>): Double = slots[0] ?: 0.0
+
+/**
+ * U-7：拍照侧 `[0]` 的**唯一算法** = 基准曝光 + 用户 EV + 预设偏移（方案 B 的"叠加而非覆盖"）。
+ *
+ * [CameraController] 的三处 `[0]` 计算全部走这里，一处都不能漏：
+ *  ① 套用预设（`setFilmParams`）—— 预设偏移的注入点；
+ *  ② 用户拖曝光补偿（`setEv`）—— 偏移**保留**（用户调的是自己的基准，预设叠在上面）；
+ *  ③ 高光保护判据的"将要施加的提亮"（`hlCompEv`）—— 漏了偏移就少算预设的提亮 ⇒ 成片高光裁切。
+ *
+ * [presetOffset] == 0（标准 / 不含曝光的预设）时逐位等于 v0.8.1 以来的旧行为
+ * `baseEv + userEv` ⇒ 没有预设曝光的场景一个数值都不会变。
+ */
+internal fun effectiveExposureEv(baseEv: Double, userEv: Double, presetOffset: Double): Double =
+    baseEv + userEv + presetOffset
 
 /**
  * 套用预设时对 **LUT** 的动作。

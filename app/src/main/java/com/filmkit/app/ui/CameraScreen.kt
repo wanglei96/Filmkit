@@ -138,9 +138,12 @@ import com.filmkit.app.camera.CAMERA_STANDARD_PRESET_ID
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetLutAction
+import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.camera.cameraPresetParams
+import com.filmkit.app.camera.presetEvOffset
 import com.filmkit.app.camera.presetLutAction
+import com.filmkit.app.camera.presetScopeNotice
 import com.filmkit.app.camera.presetSlotsText
 import com.filmkit.app.camera.presetSubtitle
 import com.filmkit.app.camera.resolveCameraPreset
@@ -491,12 +494,19 @@ fun CameraScreen(
      *（[PresetLutAction.KEEP]，有意的"缺失 = 保留"语义）—— 别把两者一起改掉。
      *
      * 参数域用 [cameraPresetParams]（标准基线 + 稀疏覆盖）—— 与编辑器侧"以当前参数为底"不同，
-     * 理由见该函数的 KDoc。`[0]/[28]/[30]/[34]/[35]` 仍由 `setFilmParams` 内部的 prefs 覆盖层
-     * 重写：用户在拍照界面调的曝光补偿 / 斑马纹 / 影调开关**不会被预设顶掉**（既有设计）。
+     * 理由见该函数的 KDoc。`[28]/[30]/[34]/[35]` 仍由 `setFilmParams` 内部的 prefs 覆盖层
+     * 重写：用户在拍照界面调的斑马纹 / 影调开关**不会被预设顶掉**（既有设计）。
+     *
+     * ★ **U-7：`[0]` 不再被这层丢弃，而是转成"相对偏移"**（方案 B，`preset-DESIGN.md` §9.4）：
+     * 预设自带的曝光经 [presetEvOffset] 提出后作为第二个实参传给 `setFilmParams`，最终
+     * `[0] = base_ev + 用户 EV + 该偏移` —— 预设的曝光**拍前可见**，用户正在调的曝光补偿
+     * **不被冲掉**（他调的是自己的基准）。不含 `[0]` 的预设 / 「标准」⇒ 偏移 0，不残留上一条。
      */
     fun applyCameraPreset(p: EditorPreset) {
         val lutEntry = p.lutId?.let { LutLibrary.byId(context, it) }
         val action = presetLutAction(p) { lutEntry != null }
+        // U-7：这一条预设的曝光偏移（缺失 key ⇒ 0.0）—— 下发与日志共用同一个值。
+        val evOffset = presetEvOffset(p.slots)
         if (action == PresetLutAction.APPLY) {
             prefs.edit().putFloat("lut_strength", p.lutStrength.toFloat()).apply()
         }
@@ -504,7 +514,7 @@ fun CameraScreen(
         // 判据读枚举属性（[PresetLutAction.clearsCurrentLut]），不在 UI 里重写一遍 —— 单测
         // 断言该属性就等于断言这里的行为。
         if (action.clearsCurrentLut) clearCameraLut()
-        controller.setFilmParams(cameraPresetParams(p))
+        controller.setFilmParams(cameraPresetParams(p), evOffset)
         when (action) {
             PresetLutAction.APPLY -> lutEntry?.let { lutPending = it }
             // 裁决 ②：清空 + 明确提示。文案必须说清"当前 LUT 已被清掉"—— 只说"已不在库中"
@@ -528,6 +538,7 @@ fun CameraScreen(
             kv(
                 "id" to p.id, "name" to p.name, "slots" to p.slots.size,
                 "slotsText" to presetSlotsText(p),
+                "evOffset" to evOffset,   // U-7：真机证据 —— 预设曝光偏移（叠加在用户 EV 上）
                 "lut" to (p.lutId ?: ""), "lutAction" to action.name,
             ),
         )
@@ -543,7 +554,10 @@ fun CameraScreen(
         }
         // 恢复的预设若带 LUT：LUT 本体由下面的 lut_id 链路重传（[LaunchedEffect(Unit)] 启动恢复），
         // 强度已在 prefs("lut_strength") 里 ⇒ 此处只下发参数，不重复动 LUT。
-        controller.setFilmParams(cameraPresetParams(selectedPreset))
+        // U-7：**冷启动偏移的恢复点** —— selectedPreset 由 prefs `camera_preset_id` 反查
+        //（[resolveCameraPreset]：悬空 id 回退「标准」），偏移从它的 slots 重算 ⇒ 偏移与预设
+        // 同生共死，**不需要第二个 prefs key**（预设被删 ⇒ 回退标准 ⇒ 偏移 0，不残留脏值）。
+        controller.setFilmParams(cameraPresetParams(selectedPreset), presetEvOffset(selectedPreset.slots))
         controller.setShutterSound(soundOn)
         if (!evAuto) controller.setEv(ev)
         if (!aeAuto) {
@@ -2133,6 +2147,25 @@ private fun LutSheet(
                             preview = null,
                         ) { onPick(p) }
                     }
+                }
+                // ★ P-5 字段作用域：这条预设里有几项**只在编辑器链路**生效（[78] 清晰度 /
+                // [88..94] 色温…），拍照时画面不会有任何变化 —— 套用前先说清楚
+                //（ADR-12：不假装生效）。全部生效 ⇒ [presetScopeNotice] 返回 null ⇒ **不显示**。
+                //
+                // 为什么是一行面板级提示而不是卡片 sub：`LutCard` 的 sub 是**定宽 76dp / 9sp /
+                // 单行省略号**（P-2a 为"分组 · LUT"设计的），一句话在它上面必然被截成
+                // "徕卡 · LUT · 仅…"（≈8 个中文字宽，连"含 1 项仅后期参数"都放不下）。
+                // 这里用列表下方那行小字（与"还没有预设"同一排版），整屏宽度放得下一句人话。
+                presetScopeNotice(selectedPreset, PresetScene.CAMERA)?.let { notice ->
+                    Text(
+                        notice,
+                        color = FilmTheme.CreamDim,
+                        fontSize = 11.sp,
+                        fontFamily = FilmTheme.Mono,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
                 }
                 // 空列表时给一句人话（此时只有「标准」一张卡，不是空白面板）
                 if (presets.isEmpty()) {
