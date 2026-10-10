@@ -1,0 +1,57 @@
+[
+  {
+    "schema": 2,
+    "id": "builtin_leica_m9",
+    "name": "徕卡一瞬",
+    "group": "徕卡",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Leica M9 CCD 风格 · 高对比正片感 · 细颗粒",
+    "params": {
+      "grain_amount": 20.0,
+      "grain_size": 160.0,
+      "vignette_strength": -0.18,
+      "vignette_radius": 85.0,
+      "vignette_feather": 55.0,
+      "split_warm": 0.10,
+      "split_cool": 0.05
+    },
+    "lut": { "id": "leica_m9", "strength": 1.0 }
+  },
+  {
+    "schema": 2,
+    "id": "builtin_ricoh_negative",
+    "name": "理光负片",
+    "group": "理光",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Ricoh GR 负片模式 · 低对比 · 黄绿调 · 中颗粒",
+    "params": {
+      "grain_amount": 30.0,
+      "grain_size": 400.0,
+      "vignette_strength": -0.28,
+      "vignette_radius": 75.0,
+      "vignette_feather": 48.0,
+      "split_warm": -0.10,
+      "split_cool": 0.10
+    },
+    "lut": { "id": "ricoh_negative", "strength": 1.0 }
+  },
+  {
+    "schema": 2,
+    "id": "builtin_leica_bw",
+    "name": "徕卡黑白",
+    "group": "徕卡",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Leica B&W HC · 高反差黑白 · 红压暗绿提亮 · 明显颗粒",
+    "params": {
+      "grain_amount": 40.0,
+      "grain_size": 400.0,
+      "vignette_strength": -0.24,
+      "vignette_radius": 80.0,
+      "vignette_feather": 52.0
+    },
+    "lut": { "id": "leica_b_w_hc", "strength": 1.0 }
+  }
+]
