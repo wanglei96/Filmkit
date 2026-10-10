@@ -626,6 +626,119 @@ internal fun discardNeedsConfirm(
 }
 
 /**
+ * 撤销 / 重做的**一步**（E2-25）：一次可回退的编辑状态。
+ *
+ * 三个字段缺一不可 —— 少任何一个都会出现"撤销了但画面没变"：
+ *  - [params]：`FilmParams` 数组。★ **必须是副本**：滑杆是**原地改写**这个数组的
+ *    （`EditorParam.write` 直接写槽位、`dragLocalCenter` 直接写 [80]/[81]）⇒ 存引用等于
+ *    存了个"跟着当前状态一起变"的快照，撤销永远回到现在（经典 bug）。构造时统一
+ *    `copyOf()`，调用方不必记得。
+ *  - [crop]：裁剪是**几何变换、不进 FilmParams**（ADR-16）⇒ 参数比不出它，
+ *    漏了它"裁了图撤不回全幅"，连带直通与「放弃修改」确认都会判错（见 [discardNeedsConfirm]）。
+ *  - [lutId]：LUT **资产 id 不在 FilmParams 里**（数组里只有强度 [34]）⇒ 漏了它
+ *    "换了 LUT 撤不回去"。强度 [34] 随 [params] 一起回退，不必单列。
+ *
+ * [sameAs] = "画面是否相同"，也就是**无变化不入栈**的判据：参数走 [paramsUnchanged]
+ * （复用 E2-9 的容差 —— `0.01f.toDouble()` 这类 Float→Double 噪声不会被误判成一次修改），
+ * 裁剪与 LUT id 是离散值 ⇒ 精确比。
+ */
+internal class EditorSnapshot(
+    params: DoubleArray,
+    val crop: CropSpec,
+    val lutId: String?,
+) {
+    /** ★ 副本（见类 KDoc 第 1 条） */
+    val params: DoubleArray = params.copyOf()
+
+    /** 画面是否与 [other] 相同（= 无变化判据；容差与导出直通同一份） */
+    fun sameAs(other: EditorSnapshot): Boolean =
+        crop == other.crop && lutId == other.lutId && paramsUnchanged(params, other.params)
+
+    companion object {
+        /** 撤销栈深度上限（E2-25：30 步；内存账见 [EditorHistory] 的 KDoc） */
+        const val MAX_STEPS = 30
+    }
+}
+
+/**
+ * 撤销 / 重做栈（E2-25）。纯逻辑、无 Android / Compose 依赖 ⇒ JVM 单测直接钉住
+ * 入栈 / 出栈 / redo 失效 / 深度裁剪 / 无变化不入栈 / 快照是副本。
+ *
+ * **记录时机 = "变更落地之后记一步"**（调用方在操作生效后调 [record]）：`current` 恒等于
+ * 当前画面，[record] 把**变更前**的那个状态压进 undo 栈 —— 与"离散操作前记一步"是同一件事
+ *（撤销回到操作前的状态），但多一条保证：**操作其实没改变任何东西时不产生空步**。
+ * 若反过来在操作前无条件记，用户连点两次「重置本组」而中间无变化 ⇒ 栈里多一个与当前相同的
+ * 状态 ⇒ 点撤销画面不动（正是本卡要避免的"点了撤销没反应"）。
+ * 滑杆同理：松手时参数**已经**改完（拖动中写入），这里记的是松手后的状态。
+ *
+ * 为什么存**状态快照**而不是"反向操作"：一个快照 ≈ 96 个 double（768B）+ 3 个字段
+ * ≈ 800B，30 步 ≈ 24KB —— 可忽略；而反向操作要给 19 个参数 × 4 组重置 × LUT × 裁剪
+ * 各写一遍逆运算（裁剪的逆、LUT 资产的重新上传…），是 bug 农场。
+ *
+ * @param limit 深度上限：超限丢**最旧**的（[ArrayDeque.removeFirst]）。redo 栈不必单独限制
+ *   —— 它的元素只来自 undo 栈 / current，规模天然 ≤ limit。
+ */
+internal class EditorHistory(private val limit: Int = EditorSnapshot.MAX_STEPS) {
+    private var current: EditorSnapshot? = null
+    private val undoStack = ArrayDeque<EditorSnapshot>()
+    private val redoStack = ArrayDeque<EditorSnapshot>()
+
+    val canUndo: Boolean get() = undoStack.isNotEmpty()
+    val canRedo: Boolean get() = redoStack.isNotEmpty()
+
+    /** 栈深（单测断言深度裁剪用） */
+    val undoDepth: Int get() = undoStack.size
+    val redoDepth: Int get() = redoStack.size
+
+    /** 落地基线（打开编辑器 / 换图完成时）：两个栈一起清空 —— 新图没有可撤销的历史。 */
+    fun reset(baseline: EditorSnapshot) {
+        current = baseline
+        undoStack.clear()
+        redoStack.clear()
+    }
+
+    /**
+     * 记一步（**操作生效之后**调）。
+     *
+     * @return true = 真的入栈；false = 与当前状态画面相同 ⇒ 丢弃（"无变化不入栈"，
+     *   避免出现"点撤销画面不动"的空步）
+     */
+    fun record(s: EditorSnapshot): Boolean {
+        val cur = current
+        if (cur == null) {
+            // 基线还没落地（首帧就绪前的理论路径）：只当基线，不产生可撤销步
+            current = s
+            return false
+        }
+        if (cur.sameAs(s)) return false
+        undoStack.addLast(cur)
+        while (undoStack.size > limit) undoStack.removeFirst()   // 超限丢最旧的
+        current = s
+        redoStack.clear()                                        // ★ 新操作后 redo 必须失效
+        return true
+    }
+
+    /** 撤销：当前状态进 redo 栈，返回**要恢复到的**状态；没得撤 ⇒ null（调用方不动画面） */
+    fun undo(): EditorSnapshot? {
+        val cur = current ?: return null
+        val prev = undoStack.removeLastOrNull() ?: return null
+        redoStack.addLast(cur)
+        current = prev
+        return prev
+    }
+
+    /** 重做：与 [undo] 对称（撤销过的状态重新进 undo 栈，所以"重做后再撤销"能原路返回） */
+    fun redo(): EditorSnapshot? {
+        val cur = current ?: return null
+        val next = redoStack.removeLastOrNull() ?: return null
+        undoStack.addLast(cur)
+        while (undoStack.size > limit) undoStack.removeFirst()
+        current = next
+        return next
+    }
+}
+
+/**
  * 局部调整的 UI ↔ 槽位映射 + **预览坐标换算**（E2-7）。与上面两组同一范式：纯逻辑、
  * 无 Android / Compose 依赖 ⇒ JVM 单测直接覆盖往返、letterbox 偏移与边界夹紧。
  *

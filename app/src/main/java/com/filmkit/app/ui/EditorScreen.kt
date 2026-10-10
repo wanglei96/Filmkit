@@ -122,6 +122,8 @@ import com.filmkit.app.camera.CropSpec
 import com.filmkit.app.camera.CropView
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.EditorEngineSession
+import com.filmkit.app.camera.EditorHistory
+import com.filmkit.app.camera.EditorSnapshot
 import com.filmkit.app.camera.FADE_UI_RANGE
 import com.filmkit.app.camera.ImageFitRect
 import com.filmkit.app.camera.LOCAL_ANGLE_UI_RANGE
@@ -260,10 +262,10 @@ import kotlinx.coroutines.withContext
  * 只读展示 + 一键套用（用户主动点才把快照参数下发，见 [editorOpenParams] /
  * [applySnapshotParams]）；没有快照时提示"已用标准基线"（ADR-4）。
  *
- * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / 撤销·重做留位 /
- * 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**（满宽 + 密集刻度 +
- * 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航（调整 / 滤镜 / 暗角 /
- * 局部 / **裁剪（E2-12 已实现）**；预设置灰留位）。
+ * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / **撤销·重做
+ *（E2-25 已做实）** / 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**
+ *（满宽 + 密集刻度 + 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航
+ *（调整 / 滤镜 / 暗角 / 局部 / **裁剪（E2-12 已实现）**；预设置灰留位）。
  *
  * E2-15（用户真机反馈，本页四处修正）：
  *  ① **面板可收起**：顶部/底部把手（下拉收起·上拉展开·点击切换）+ **返回键分层**（展开时
@@ -409,6 +411,33 @@ fun EditorScreen(
     var cropAspect by remember { mutableStateOf(CropAspect.FREE) }
     var cropHandle by remember { mutableStateOf<CropHandle?>(null) }
 
+    // ── E2-25 撤销 / 重做 ─────────────────────────────────────────────────
+    // 栈本身是**纯逻辑**（[EditorHistory]，JVM 单测覆盖）；这里只留两个"能不能点"的镜像
+    // 状态供顶栏重组 —— 栈内部状态（ArrayDeque）不是 Compose state，读了不会触发重组。
+    val history = remember { EditorHistory() }
+    var canUndo by remember { mutableStateOf(false) }
+    var canRedo by remember { mutableStateOf(false) }
+
+    /**
+     * 记一步（**操作生效之后**调）。快照三件套 = 参数副本 + 裁剪 + LUT 资产 id
+     *（[EditorSnapshot] 的 KDoc 讲了为什么缺一不可）。
+     *
+     * 无变化 ⇒ [EditorHistory.record] 自己丢弃（不会出现"点撤销画面不动"的空步）。
+     * `params` 还没就绪（首帧前）⇒ 不记。
+     */
+    fun recordHistory() {
+        val film = params ?: return
+        history.record(EditorSnapshot(film, crop, lutId))
+        canUndo = history.canUndo
+        canRedo = history.canRedo
+    }
+
+    /** 撤销 / 重做栈的镜像状态同步（[recordHistory] 之外的两个入口：undo / redo） */
+    fun syncHistory() {
+        canUndo = history.canUndo
+        canRedo = history.canRedo
+    }
+
     /**
      * 渲染诊断（**单一出口**：分辨率 / 耗时 / 拖动状态 / 基础五类 / 暗角三条 / LUT 强度
      * / **E2-7 局部调整** 全在这一条里）。
@@ -524,9 +553,18 @@ fun EditorScreen(
         }
     }
 
-    /** 滑杆松手（E2-8）：这次拖动真的改过值才渲染一次 —— 只点一下滑杆不白跑一次全分辨率 */
+    /**
+     * 滑杆松手（E2-8）：这次拖动真的改过值才渲染一次 —— 只点一下滑杆不白跑一次全分辨率。
+     *
+     * ★ E2-25：**松手时记一步撤销**（拖动过程一次都不记，否则一次拖动 = 每帧一步）。
+     * 与渲染同一判据（`gate.onFinished()`）：拖动中参数已经写进数组了，这里记的是"松手后的
+     * 状态"，栈里存下的则是"按下前的状态"⇒ 撤销回到拖动前。局部拖动定位走同一条路径。
+     */
     fun onSliderRelease() {
-        if (gate.onFinished()) rerender()
+        if (gate.onFinished()) {
+            recordHistory()
+            rerender()
+        }
     }
 
     /**
@@ -536,14 +574,24 @@ fun EditorScreen(
      * @param onReady 资产**加载成功、即将下发**时回调。E2-21：「套用原片风格」要等 LUT 就绪
      *   才写参数 —— 加载失败时参数与画面都不该动，否则会留下"参数已套用、LUT 还是旧那张"
      *   的半套用状态（而提示还写着"已保持原状"）。
+     * @param record E2-25：默认 true = 下发成功后记一步撤销（换 LUT / 关闭 LUT 都是用户操作）。
+     *   **撤销 / 重做回放 LUT 时必须传 false** —— 否则撤销自己变成可撤销的一步，而且
+     *   [EditorHistory.record] 会清空 redo 栈（重做从此永远不可用）。
      */
-    fun applyLut(entry: LutLibrary.Entry?, k: Float, onReady: () -> Unit = {}) {
+    fun applyLut(
+        entry: LutLibrary.Entry?,
+        k: Float,
+        /** ★ E2-25：false = **不记撤销步**（撤销 / 重做自己回放 LUT 时用，见 [applyHistorySnapshot]） */
+        record: Boolean = true,
+        onReady: () -> Unit = {},
+    ) {
         val film = params ?: return
         if (entry == null) {
             lutId = null
             film[34] = 0.0                    // 关闭 = 强度 0（引擎 uLutOn = 0 整段旁路）
             engine.setLut(null)
             panelRefresh++                    // 强度行消失/读数归位（见 panelRefresh 的 KDoc）
+            if (record) recordHistory()       // ★ E2-25：关闭 LUT 也是一步（换 LUT 撤得回）
             rerender()
             return
         }
@@ -560,6 +608,9 @@ fun EditorScreen(
             // 强度是"绕过滑杆"改的（本函数直接写 [34]）：不重建的话，用户点卡片/套用原片
             // 风格后滑杆读数还停在旧值（画面变了、读数没变 = ADR-12 禁止的假滑杆的镜像）
             panelRefresh++
+            // ★ E2-25：换 LUT / 改 LUT 强度各记一步。**LUT 资产 id 不在 FilmParams 里**
+            //（数组里只有强度 [34]）⇒ 快照必须带上 lutId，否则撤销后"参数回退了、LUT 还是新的"
+            if (record) recordHistory()
             rerender()
         }
     }
@@ -606,6 +657,7 @@ fun EditorScreen(
             lutId = null
             engine.setLut(null)
             panelRefresh++
+            recordHistory()   // ★ E2-25：「套用参数」= 离散操作，一步（与 LUT 分支同一节奏）
             rerender()
             return
         }
@@ -627,10 +679,11 @@ fun EditorScreen(
         gate.onValueChange()
     }
 
-    /** 重置**单个参数**到基准值（E2-10 新增）—— 离散操作，直接渲染一次 */
+    /** 重置**单个参数**到基准值（E2-10 新增）—— 离散操作，直接渲染一次（E2-25：记一步） */
     fun resetParam(p: EditorParam) {
         params?.let { p.write(it, p.pivot) }
         panelRefresh++
+        recordHistory()
         rerender()
     }
 
@@ -638,6 +691,7 @@ fun EditorScreen(
     fun resetBasic() {
         params?.let { resetBasicParams(it) }
         panelRefresh++
+        recordHistory()   // ★ E2-25：四组重置都是离散操作，各记一步
         rerender()
     }
 
@@ -649,6 +703,7 @@ fun EditorScreen(
     fun resetVignette() {
         params?.let { it[66] = vigStrengthSlot(0f) }
         panelRefresh++
+        recordHistory()
         rerender()
     }
 
@@ -667,6 +722,7 @@ fun EditorScreen(
         params?.let { resetColorParams(it) }   // 褪色 [94] → 0
         params?.let { it[34] = 0.0 }           // LUT 强度 → 0（**不动** lutId / 引擎纹理）
         panelRefresh++
+        recordHistory()
         rerender()
     }
 
@@ -686,6 +742,7 @@ fun EditorScreen(
         params?.let { it[79] = localTypeSlot(mode) }
         localDragging = false
         panelRefresh++
+        recordHistory()   // ★ E2-25：切模式是离散操作（改 [79]）⇒ 一步
         rerender()
     }
 
@@ -707,6 +764,7 @@ fun EditorScreen(
     fun resetLocal() {
         params?.let { resetLocalGeometry(it) }
         panelRefresh++
+        recordHistory()
         rerender()
     }
 
@@ -723,6 +781,69 @@ fun EditorScreen(
             EditorTab.VIGNETTE -> resetVignette()
             EditorTab.LOCAL -> resetLocal()
         }
+    }
+
+    // ── E2-25 撤销 / 重做的落地 ─────────────────────────────────────────────
+
+    /**
+     * 把一份历史快照**落回**编辑器（撤销 / 重做共用）。三件套按同一顺序回退：
+     * 参数（原地逐槽）→ 裁剪 → LUT 资产，最后**重渲染一次**（与滑杆松手同一条路径
+     * [rerender]，所以"撤销了但画面没变"不可能发生）。
+     *
+     * 参数为什么原地写（`copyInto`）而不是换数组：滑杆 / 轮廓 / 面板读的都是 `params` 这个
+     * 数组对象，换对象 = 读数与槽位脱钩（与 [applySnapshotParams] 同一条纪律）。
+     *
+     * 裁剪：`crop` 是引擎入参，回退它 = 画面回退；**crop 真的变了**且正处裁剪模式时草稿一并
+     * 跟随 —— 否则用户"撤销裁剪 → 点确认"会用旧草稿把刚撤销掉的裁剪又装回去（撤销看起来
+     * 没生效）。只在 crop 变化时动草稿：用户正在裁剪模式里拖框时点了撤销（撤的是别的操作），
+     * 草稿不该被无端复位。
+     *
+     * LUT：**id 变了才重新加载资产**（没变 ⇒ 引擎里那张纹理还是对的，直接渲染）。资产已不在
+     * 库中 ⇒ 清选择并把强度归 0（与 [applySnapshotStyle] 的失败分支同口径），绝不留下
+     * "UI 说选了 LUT、引擎里没有"的半状态。
+     */
+    fun applyHistorySnapshot(s: EditorSnapshot) {
+        val film = params ?: return
+        s.params.copyInto(film)
+        val cropChanged = s.crop != crop
+        crop = s.crop
+        if (cropMode && cropChanged) cropDraft = cropViewOf(s.crop)
+        panelRefresh++                       // 绕过滑杆改了参数 ⇒ 滑杆读数重建（同四组重置）
+        val want = s.lutId
+        when {
+            want == lutId -> rerender()
+            want == null -> {
+                lutId = null
+                engine.setLut(null)
+                rerender()
+            }
+            else -> {
+                val entry = LutLibrary.byId(context, want)
+                if (entry == null) {
+                    lutId = null
+                    film[34] = 0.0
+                    engine.setLut(null)
+                    rerender()
+                } else {
+                    // ★ record = false：**撤销 / 重做本身绝不能进撤销栈** —— 否则撤销一步
+                    // 自己变成可撤销的一步，而且 [EditorHistory.record] 会清空 redo 栈
+                    // ⇒ 重做永远不可用（"撤销后重做没反应"）。
+                    applyLut(entry, s.params[34].toFloat(), record = false)
+                }
+            }
+        }
+    }
+
+    /** 撤销一步（顶栏「撤销」）：无可撤销内容时什么都不做（按钮已置灰，这里是第二道保险） */
+    fun undoEdit() {
+        history.undo()?.let { applyHistorySnapshot(it) }
+        syncHistory()
+    }
+
+    /** 重做一步（顶栏「重做」）：与 [undoEdit] 对称 */
+    fun redoEdit() {
+        history.redo()?.let { applyHistorySnapshot(it) }
+        syncHistory()
     }
 
     /**
@@ -980,6 +1101,12 @@ fun EditorScreen(
                 snapLutId = init.snapLutId
                 snapLutK = init.snapLutK
                 // 注：LUT 强度（lutK）自 E2-10 起是 `params[34]` 的**派生值**，不再单独赋值
+                // ★ E2-25：撤销 / 重做栈的**基线** = 刚打开时的状态（参数恒等基线 + 全幅裁剪
+                // + 打开时选中的 LUT）。基线进栈 ⇒ "改若干 → 全部撤销"能精确回到打开时的画面
+                // ⇒ `paramsUnchanged` 重新为真、`cropDirty` 为假 ⇒ 导出仍走直通（E2-9 的
+                // "我撤销回原样了，导出却还是二代损失"这一条）。
+                history.reset(EditorSnapshot(init.film, CropSpec.FULL, init.lutId))
+                syncHistory()
                 if (!init.engineStarted) {
                     status = "引擎不可用，显示原图"
                     return@LaunchedEffect
@@ -1012,15 +1139,19 @@ fun EditorScreen(
                 .fillMaxSize()
                 .statusBarsPadding(),
         ) {
-            // ① 顶部栏（ADR-14 层①）：取消 ｜ 撤销/重做（**本卡留位**，置灰不可点）｜ 覆盖 ｜ 完成
+            // ① 顶部栏（ADR-14 层①）：取消 ｜ 撤销/重做（**E2-25 已做实**，无内容时置灰）｜ 覆盖 ｜ 完成
             // 「完成」= 黄色圆角矩形 + 黑字（主操作 = 另存新片，语义与原底部主按钮一致）；
             // 「覆盖」= 深灰圆角 + 白字（危险操作，仍走二次确认对话框）。
             EditorTopBar(
                 enabled = !exporting && phase == EditorPhase.Ready,
                 exporting = exporting,
+                canUndo = canUndo,
+                canRedo = canRedo,
                 onCancel = { requestExit(ExitTarget.BACK) },
                 // 相册入口（E2-24）：不再直接切屏 —— 有修改先弹确认，否则同样"点一下就丢光编辑"
                 onGallery = { requestExit(ExitTarget.GALLERY) },
+                onUndo = { undoEdit() },
+                onRedo = { redoEdit() },
                 onOverwrite = { confirmOverwrite = true },
                 onDone = { exportNow(false) },
             )
@@ -1364,9 +1495,14 @@ fun EditorScreen(
                     // 确认 = 草稿写入 crop（引擎入参）并渲染一次。
                     // ⚠ 先退裁剪模式再 rerender：rerender 的回收分支按 cropMode 决定要不要
                     //   回收输入位图（裁剪模式下它是裁剪框的底图，不能回收）。
+                    // ★ E2-25：**裁剪确认记一步**（裁剪是几何量、不进 FilmParams ⇒ 快照必须
+                    //   单独带 CropSpec）。粒度 = 一次「确认」= 用户视角的一次裁剪操作：
+                    //   拖动框 / 旋转都在草稿阶段，不产生可撤销步（草稿不是生效状态，记了会
+                    //   出现"点撤销画面不动"）；撤销一次即回到进裁剪模式前的框（含那次旋转）。
                     onConfirm = {
                         source?.let { src -> crop = cropSpecOf(cropDraft, src.w, src.h) }
                         cropMode = false
+                        recordHistory()
                         rerender()
                     },
                 )
@@ -1650,7 +1786,7 @@ private class EditorInit(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 编辑器面板骨架（E2-10 / ADR-14）：Filmix 五层结构
-//   ① 顶部栏：取消 ｜ 撤销/重做（**留位**，置灰不可点）｜ 覆盖 ｜ 完成（黄底黑字）—— [EditorTopBar]
+//   ① 顶部栏：取消 ｜ 撤销/重做（**E2-25 已做实**，无内容时置灰）｜ 覆盖 ｜ 完成（黄底黑字）—— [EditorTopBar]
 //   ② 预览区：weight(1f)，约屏高 55%（在 EditorScreen 里，面板常驻但不遮挡画面）
 //   ③ 参数名：居中大字（当前选中参数）+ 1px 黑阴影 —— [ParamNameRow]
 //   ④ 单滑杆：**一屏只出当前选中参数的那一条**，满宽 + 密集刻度 + 中点标记 + 物理量读数 —— [EditorSlider]
@@ -1672,7 +1808,10 @@ private class EditorInit(
  */
 private val TextShadow = Shadow(Color.Black, Offset(1f, 1f), 1f)
 
-/** 禁用态前景（顶栏「撤销/重做」、底栏「预设」留位用）：30% 奶油白，不新造色值 */
+/**
+ * 禁用态前景（顶栏「覆盖 / 完成」不可用时、「撤销/重做」无可撤销内容时、底栏「预设」留位用）：
+ * 30% 奶油白，不新造色值
+ */
 private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
 
 /**
@@ -2021,21 +2160,26 @@ private fun localHint(mode: Int, active: Boolean, center: Pair<Float, Float>): S
 }
 
 /**
- * ① 顶部栏（ADR-14 层①）：`取消 ｜ 撤销 / 重做（留位）｜ 覆盖 ｜ 完成`。
+ * ① 顶部栏（ADR-14 层①）：`取消 ｜ 撤销 / 重做 ｜ 覆盖 ｜ 完成`。
  *
  * 「完成」= **黄色圆角矩形 + 黑字**（主操作，= 原来的「另存为新片」，语义不变）；
  * 「覆盖」= 深灰圆角 + 白字（危险操作，仍走二次确认对话框）。
  *
- * **撤销 / 重做只留位、不做功能**（本卡范围）：图标给到、置灰、不注册点击 —— 撤销栈是后续卡。
- * 为什么不干脆不渲染：ADR-14 的截图结构里它们就在那个位置，留位让"专业面板"的骨架完整；
- * 置灰 + 无点击响应是**诚实的**（ADR-12 的精神：不做假控件），用户点了不会有任何反应。
+ * **撤销 / 重做（E2-25 起做实）**：栈非空才可点，否则置灰（[DisabledInk]，与「覆盖 / 完成」
+ * 同一口径）—— 这正是 ADR-12 要的"不做假控件"：置灰是**诚实**的（此刻确实没得撤销），
+ * 而不是"能点但没反应"。导出中 / 未就绪时（[enabled] = false）同样不可点：导出独占引擎，
+ * 此时撤销只会在导出收尾时补一次渲染（[pendingRender] 机制），不如等它做完。
  */
 @Composable
 private fun EditorTopBar(
     enabled: Boolean,
     exporting: Boolean,
+    canUndo: Boolean,
+    canRedo: Boolean,
     onCancel: () -> Unit,
     onGallery: () -> Unit,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
     onOverwrite: () -> Unit,
     onDone: () -> Unit,
 ) {
@@ -2068,20 +2212,19 @@ private fun EditorTopBar(
                 modifier = Modifier.size(20.dp),
             )
         }
-        // 撤销 / 重做：**留位**（见 KDoc）
-        listOf(
-            Icons.AutoMirrored.Outlined.Undo to "撤销",
-            Icons.AutoMirrored.Outlined.Redo to "重做",
-        ).forEach { (ic, desc) ->
-            Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
-                Icon(
-                    ic,
-                    contentDescription = desc,
-                    tint = DisabledInk,
-                    modifier = Modifier.size(20.dp),
-                )
-            }
-        }
+        // 撤销 / 重做（E2-25）：有可撤销 / 可重做内容才可点，否则置灰（复用既有 DisabledInk）
+        UndoRedoButton(
+            icon = Icons.AutoMirrored.Outlined.Undo,
+            desc = "撤销",
+            active = enabled && canUndo,
+            onTap = onUndo,
+        )
+        UndoRedoButton(
+            icon = Icons.AutoMirrored.Outlined.Redo,
+            desc = "重做",
+            active = enabled && canRedo,
+            onTap = onRedo,
+        )
         Spacer(Modifier.weight(1f))
         if (exporting) {
             CircularProgressIndicator(
@@ -2123,6 +2266,27 @@ private fun EditorTopBar(
                 fontWeight = FontWeight.SemiBold,
             )
         }
+    }
+}
+
+/**
+ * 顶栏的一个撤销 / 重做图标钮（E2-25）。`active = false` ⇒ 置灰 **且不注册任何手势**
+ *（[pressScale] 的 enabled 语义：禁用态还带按下缩放 = 用户以为点上了）。
+ */
+@Composable
+private fun UndoRedoButton(icon: ImageVector, desc: String, active: Boolean, onTap: () -> Unit) {
+    Box(
+        Modifier
+            .size(36.dp)
+            .pressScale(enabled = active, onTap = onTap),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            icon,
+            contentDescription = desc,
+            tint = if (active) FilmTheme.Cream else DisabledInk,
+            modifier = Modifier.size(20.dp),
+        )
     }
 }
 
