@@ -1,0 +1,803 @@
+{
+  "kind": "samples",
+  "name": "ricoh-negative-grblog-official",
+  "n_images": 12,
+  "tone": {
+    "luma_mean_255": {
+      "mean": 73.027,
+      "median": 70.975,
+      "min": 33.72,
+      "max": 113.87,
+      "n": 12
+    },
+    "luma_std_255": {
+      "mean": 54.051,
+      "median": 51.02,
+      "min": 43.57,
+      "max": 73.14,
+      "n": 12
+    },
+    "contrast_p95_minus_p5_255": {
+      "mean": 171.31,
+      "median": 159.205,
+      "min": 136.36,
+      "max": 217.94,
+      "n": 12
+    },
+    "contrast_p99_minus_p1_255": {
+      "mean": 206.49,
+      "median": 206.595,
+      "min": 164.37,
+      "max": 243.5,
+      "n": 12
+    },
+    "shadow_clip_frac": {
+      "mean": 0.014,
+      "median": 0.002,
+      "min": 0.0,
+      "max": 0.076,
+      "n": 12
+    },
+    "highlight_clip_frac": {
+      "mean": 0.001,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.006,
+      "n": 12
+    },
+    "skewness": {
+      "mean": 0.977,
+      "median": 0.865,
+      "min": 0.209,
+      "max": 2.545,
+      "n": 12
+    }
+  },
+  "tone_percentile_median_255": {
+    "p0_1": 0.85,
+    "p1": 5.46,
+    "p5": 7.07,
+    "p25": 25.41,
+    "p50": 58.42,
+    "p75": 102.17,
+    "p95": 190.0,
+    "p99": 216.81,
+    "p99_9": 236.73
+  },
+  "color": {
+    "mean_chroma": {
+      "mean": 6.883,
+      "median": 6.21,
+      "min": 1.82,
+      "max": 14.67,
+      "n": 12
+    },
+    "chroma_p50": {
+      "mean": 4.316,
+      "median": 2.69,
+      "min": 1.04,
+      "max": 11.01,
+      "n": 12
+    },
+    "chroma_p90": {
+      "mean": 15.372,
+      "median": 18.175,
+      "min": 3.94,
+      "max": 29.45,
+      "n": 12
+    },
+    "chroma_p99": {
+      "mean": 30.489,
+      "median": 25.585,
+      "min": 14.19,
+      "max": 75.17,
+      "n": 12
+    },
+    "neutral_frac": {
+      "mean": 0.704,
+      "median": 0.851,
+      "min": 0.251,
+      "max": 0.96,
+      "n": 12
+    },
+    "neutral_a_mean": {
+      "mean": -0.111,
+      "median": -0.16,
+      "min": -0.88,
+      "max": 0.42,
+      "n": 12
+    },
+    "neutral_b_mean": {
+      "mean": -0.4,
+      "median": -0.21,
+      "min": -1.2,
+      "max": 0.54,
+      "n": 12
+    },
+    "sat_frac_chroma_gt20": {
+      "mean": 0.098,
+      "median": 0.073,
+      "min": 0.003,
+      "max": 0.47,
+      "n": 12
+    }
+  },
+  "grain": {
+    "rms_all_255": null,
+    "psd_radial_loglog_slope": null
+  },
+  "per_image": [
+    {
+      "file": "IP024734_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 2.86,
+          "p5": 6.0,
+          "p25": 13.0,
+          "p50": 35.43,
+          "p75": 103.28,
+          "p95": 222.37,
+          "p99": 235.37,
+          "p99_9": 244.11
+        },
+        "luma_mean_255": 65.86,
+        "luma_std_255": 67.15,
+        "contrast_p95_minus_p5_255": 216.37,
+        "contrast_p99_minus_p1_255": 232.51,
+        "shadow_clip_frac": 0.00569,
+        "highlight_clip_frac": 0.00024,
+        "skewness": 1.167
+      },
+      "color": {
+        "mean_chroma": 2.73,
+        "chroma_p50": 2.16,
+        "chroma_p90": 6.36,
+        "chroma_p99": 14.38,
+        "neutral_frac": 0.8848,
+        "neutral_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "neutral_a_mean": -0.15,
+        "neutral_b_mean": -0.11,
+        "overall_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "highlight_ab_median": [
+          -0.86,
+          -3.49
+        ],
+        "shadow_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "sat_frac_chroma_gt20": 0.0053
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP024771_R.jpg",
+      "orig_size": [
+        1120,
+        747
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 0.0,
+          "p5": 2.0,
+          "p25": 7.07,
+          "p50": 16.0,
+          "p75": 36.72,
+          "p95": 155.5,
+          "p99": 219.02,
+          "p99_9": 229.37
+        },
+        "luma_mean_255": 33.72,
+        "luma_std_255": 47.18,
+        "contrast_p95_minus_p5_255": 153.5,
+        "contrast_p99_minus_p1_255": 219.02,
+        "shadow_clip_frac": 0.0446,
+        "highlight_clip_frac": 0.0,
+        "skewness": 2.545
+      },
+      "color": {
+        "mean_chroma": 1.82,
+        "chroma_p50": 1.04,
+        "chroma_p90": 3.94,
+        "chroma_p99": 18.7,
+        "neutral_frac": 0.96,
+        "neutral_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "neutral_a_mean": -0.37,
+        "neutral_b_mean": -0.11,
+        "overall_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "highlight_ab_median": [
+          -0.09,
+          -3.53
+        ],
+        "shadow_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "sat_frac_chroma_gt20": 0.0094
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP024854_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 3.0,
+          "p1": 7.0,
+          "p5": 13.5,
+          "p25": 47.14,
+          "p50": 76.08,
+          "p75": 133.63,
+          "p95": 225.58,
+          "p99": 250.5,
+          "p99_9": 255.0
+        },
+        "luma_mean_255": 94.36,
+        "luma_std_255": 64.53,
+        "contrast_p95_minus_p5_255": 212.08,
+        "contrast_p99_minus_p1_255": 243.5,
+        "shadow_clip_frac": 0.00029,
+        "highlight_clip_frac": 0.00603,
+        "skewness": 0.789
+      },
+      "color": {
+        "mean_chroma": 5.11,
+        "chroma_p50": 2.65,
+        "chroma_p90": 16.42,
+        "chroma_p99": 27.38,
+        "neutral_frac": 0.7987,
+        "neutral_ab_median": [
+          0.48,
+          -0.31
+        ],
+        "neutral_a_mean": 0.42,
+        "neutral_b_mean": -0.31,
+        "overall_ab_median": [
+          0.24,
+          -1.25
+        ],
+        "highlight_ab_median": [
+          0.14,
+          2.06
+        ],
+        "shadow_ab_median": [
+          0.46,
+          -1.54
+        ],
+        "sat_frac_chroma_gt20": 0.0579
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025005_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 0.0,
+          "p5": 1.0,
+          "p25": 5.0,
+          "p50": 12.37,
+          "p75": 76.95,
+          "p95": 218.94,
+          "p99": 226.37,
+          "p99_9": 250.15
+        },
+        "luma_mean_255": 52.7,
+        "luma_std_255": 73.14,
+        "contrast_p95_minus_p5_255": 217.94,
+        "contrast_p99_minus_p1_255": 226.37,
+        "shadow_clip_frac": 0.07595,
+        "highlight_clip_frac": 0.00067,
+        "skewness": 1.392
+      },
+      "color": {
+        "mean_chroma": 2.69,
+        "chroma_p50": 1.05,
+        "chroma_p90": 7.06,
+        "chroma_p99": 18.52,
+        "neutral_frac": 0.8672,
+        "neutral_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "neutral_a_mean": -0.45,
+        "neutral_b_mean": -1.16,
+        "overall_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "highlight_ab_median": [
+          -1.23,
+          -3.74
+        ],
+        "shadow_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "sat_frac_chroma_gt20": 0.0084
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025159_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.85,
+          "p1": 10.77,
+          "p5": 35.87,
+          "p25": 79.27,
+          "p50": 104.08,
+          "p75": 151.79,
+          "p95": 198.5,
+          "p99": 212.37,
+          "p99_9": 237.52
+        },
+        "luma_mean_255": 113.87,
+        "luma_std_255": 49.72,
+        "contrast_p95_minus_p5_255": 162.63,
+        "contrast_p99_minus_p1_255": 201.59,
+        "shadow_clip_frac": 0.00172,
+        "highlight_clip_frac": 0.00019,
+        "skewness": 0.209
+      },
+      "color": {
+        "mean_chroma": 10.1,
+        "chroma_p50": 6.16,
+        "chroma_p90": 19.93,
+        "chroma_p99": 21.33,
+        "neutral_frac": 0.4946,
+        "neutral_ab_median": [
+          -0.0,
+          -0.85
+        ],
+        "neutral_a_mean": 0.17,
+        "neutral_b_mean": -1.02,
+        "overall_ab_median": [
+          0.43,
+          -4.94
+        ],
+        "highlight_ab_median": [
+          -0.36,
+          0.0
+        ],
+        "shadow_ab_median": [
+          0.51,
+          -1.76
+        ],
+        "sat_frac_chroma_gt20": 0.0877
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025284_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 1.43,
+          "p5": 3.0,
+          "p25": 10.0,
+          "p50": 31.0,
+          "p75": 101.07,
+          "p95": 153.09,
+          "p99": 180.58,
+          "p99_9": 220.23
+        },
+        "luma_mean_255": 53.42,
+        "luma_std_255": 52.32,
+        "contrast_p95_minus_p5_255": 150.09,
+        "contrast_p99_minus_p1_255": 179.15,
+        "shadow_clip_frac": 0.01673,
+        "highlight_clip_frac": 3e-05,
+        "skewness": 0.915
+      },
+      "color": {
+        "mean_chroma": 2.99,
+        "chroma_p50": 1.19,
+        "chroma_p90": 8.83,
+        "chroma_p99": 23.79,
+        "neutral_frac": 0.8544,
+        "neutral_ab_median": [
+          -0.66,
+          0.28
+        ],
+        "neutral_a_mean": -0.88,
+        "neutral_b_mean": 0.54,
+        "overall_ab_median": [
+          -0.93,
+          0.34
+        ],
+        "highlight_ab_median": [
+          -1.15,
+          -1.98
+        ],
+        "shadow_ab_median": [
+          -0.66,
+          0.34
+        ],
+        "sat_frac_chroma_gt20": 0.0179
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025310_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 11.0,
+          "p1": 16.36,
+          "p5": 25.73,
+          "p25": 44.71,
+          "p50": 69.45,
+          "p75": 105.21,
+          "p95": 181.5,
+          "p99": 227.93,
+          "p99_9": 235.93
+        },
+        "luma_mean_255": 80.93,
+        "luma_std_255": 47.33,
+        "contrast_p95_minus_p5_255": 155.78,
+        "contrast_p99_minus_p1_255": 211.57,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": 1.085
+      },
+      "color": {
+        "mean_chroma": 11.27,
+        "chroma_p50": 10.16,
+        "chroma_p90": 21.29,
+        "chroma_p99": 28.9,
+        "neutral_frac": 0.2837,
+        "neutral_ab_median": [
+          -0.0,
+          -0.19
+        ],
+        "neutral_a_mean": -0.2,
+        "neutral_b_mean": -0.22,
+        "overall_ab_median": [
+          -8.42,
+          4.16
+        ],
+        "highlight_ab_median": [
+          -0.79,
+          -1.67
+        ],
+        "shadow_ab_median": [
+          -0.38,
+          0.39
+        ],
+        "sat_frac_chroma_gt20": 0.1289
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025311_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 1.5,
+          "p1": 5.86,
+          "p5": 7.07,
+          "p25": 25.73,
+          "p50": 51.72,
+          "p75": 98.23,
+          "p95": 143.43,
+          "p99": 170.22,
+          "p99_9": 208.37
+        },
+        "luma_mean_255": 62.82,
+        "luma_std_255": 44.53,
+        "contrast_p95_minus_p5_255": 136.36,
+        "contrast_p99_minus_p1_255": 164.37,
+        "shadow_clip_frac": 0.00129,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.616
+      },
+      "color": {
+        "mean_chroma": 7.31,
+        "chroma_p50": 2.73,
+        "chroma_p90": 20.03,
+        "chroma_p99": 59.72,
+        "neutral_frac": 0.8565,
+        "neutral_ab_median": [
+          -0.0,
+          0.85
+        ],
+        "neutral_a_mean": 0.31,
+        "neutral_b_mean": 0.23,
+        "overall_ab_median": [
+          -0.0,
+          1.08
+        ],
+        "highlight_ab_median": [
+          -1.15,
+          -2.09
+        ],
+        "shadow_ab_median": [
+          0.54,
+          0.85
+        ],
+        "sat_frac_chroma_gt20": 0.1
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025346_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 8.0,
+          "p1": 13.5,
+          "p5": 21.86,
+          "p25": 42.23,
+          "p50": 65.13,
+          "p75": 100.95,
+          "p95": 166.36,
+          "p99": 214.59,
+          "p99_9": 225.72
+        },
+        "luma_mean_255": 76.09,
+        "luma_std_255": 44.73,
+        "contrast_p95_minus_p5_255": 144.5,
+        "contrast_p99_minus_p1_255": 201.09,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.995
+      },
+      "color": {
+        "mean_chroma": 12.45,
+        "chroma_p50": 11.01,
+        "chroma_p90": 23.77,
+        "chroma_p99": 31.67,
+        "neutral_frac": 0.2505,
+        "neutral_ab_median": [
+          -0.01,
+          0.0
+        ],
+        "neutral_a_mean": -0.17,
+        "neutral_b_mean": -0.2,
+        "overall_ab_median": [
+          -8.02,
+          6.41
+        ],
+        "highlight_ab_median": [
+          -0.95,
+          -3.28
+        ],
+        "shadow_ab_median": [
+          -0.0,
+          0.35
+        ],
+        "sat_frac_chroma_gt20": 0.1808
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025347_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 1.5,
+          "p1": 5.07,
+          "p5": 7.07,
+          "p25": 25.08,
+          "p50": 48.92,
+          "p75": 85.92,
+          "p95": 144.0,
+          "p99": 170.23,
+          "p99_9": 208.36
+        },
+        "luma_mean_255": 59.39,
+        "luma_std_255": 43.57,
+        "contrast_p95_minus_p5_255": 136.93,
+        "contrast_p99_minus_p1_255": 165.16,
+        "shadow_clip_frac": 0.00136,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.816
+      },
+      "color": {
+        "mean_chroma": 8.6,
+        "chroma_p50": 2.99,
+        "chroma_p90": 21.13,
+        "chroma_p99": 75.17,
+        "neutral_frac": 0.8472,
+        "neutral_ab_median": [
+          -0.01,
+          0.76
+        ],
+        "neutral_a_mean": 0.37,
+        "neutral_b_mean": -0.06,
+        "overall_ab_median": [
+          -0.0,
+          0.89
+        ],
+        "highlight_ab_median": [
+          -1.19,
+          -2.1
+        ],
+        "shadow_ab_median": [
+          0.52,
+          0.75
+        ],
+        "sat_frac_chroma_gt20": 0.1019
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025354_R-rotated-1.jpg",
+      "orig_size": [
+        747,
+        1120
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.85,
+          "p1": 10.24,
+          "p5": 32.08,
+          "p25": 64.14,
+          "p50": 89.02,
+          "p75": 148.8,
+          "p95": 198.5,
+          "p99": 211.86,
+          "p99_9": 238.08
+        },
+        "luma_mean_255": 105.37,
+        "luma_std_255": 53.61,
+        "contrast_p95_minus_p5_255": 166.43,
+        "contrast_p99_minus_p1_255": 201.62,
+        "shadow_clip_frac": 0.00187,
+        "highlight_clip_frac": 0.00017,
+        "skewness": 0.41
+      },
+      "color": {
+        "mean_chroma": 14.67,
+        "chroma_p50": 8.24,
+        "chroma_p90": 29.45,
+        "chroma_p99": 32.12,
+        "neutral_frac": 0.458,
+        "neutral_ab_median": [
+          -0.0,
+          -1.04
+        ],
+        "neutral_a_mean": 0.18,
+        "neutral_b_mean": -1.2,
+        "overall_ab_median": [
+          0.95,
+          -7.47
+        ],
+        "highlight_ab_median": [
+          -0.36,
+          0.25
+        ],
+        "shadow_ab_median": [
+          0.64,
+          -1.24
+        ],
+        "sat_frac_chroma_gt20": 0.4702
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    },
+    {
+      "file": "IP025904_R.jpg",
+      "orig_size": [
+        1120,
+        747
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 1.0,
+          "p5": 5.0,
+          "p25": 22.08,
+          "p50": 79.93,
+          "p75": 105.37,
+          "p95": 208.11,
+          "p99": 232.93,
+          "p99_9": 254.15
+        },
+        "luma_mean_255": 77.79,
+        "luma_std_255": 60.8,
+        "contrast_p95_minus_p5_255": 203.11,
+        "contrast_p99_minus_p1_255": 231.93,
+        "shadow_clip_frac": 0.01389,
+        "highlight_clip_frac": 0.00143,
+        "skewness": 0.782
+      },
+      "color": {
+        "mean_chroma": 2.86,
+        "chroma_p50": 2.41,
+        "chroma_p90": 6.25,
+        "chroma_p99": 14.19,
+        "neutral_frac": 0.8885,
+        "neutral_ab_median": [
+          -0.85,
+          -1.34
+        ],
+        "neutral_a_mean": -0.56,
+        "neutral_b_mean": -1.18,
+        "overall_ab_median": [
+          -0.88,
+          -1.37
+        ],
+        "highlight_ab_median": [
+          -1.15,
+          -1.12
+        ],
+        "shadow_ab_median": [
+          -0.0,
+          0.0
+        ],
+        "sat_frac_chroma_gt20": 0.0034
+      },
+      "grain": {
+        "skipped": "resolution too low"
+      }
+    }
+  ]
+}

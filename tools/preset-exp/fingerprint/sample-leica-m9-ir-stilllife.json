@@ -1,0 +1,3277 @@
+{
+  "kind": "samples",
+  "name": "leica-m9-ir-stilllife",
+  "n_images": 30,
+  "tone": {
+    "luma_mean_255": {
+      "mean": 119.402,
+      "median": 130.215,
+      "min": 80.66,
+      "max": 140.16,
+      "n": 30
+    },
+    "luma_std_255": {
+      "mean": 66.217,
+      "median": 69.695,
+      "min": 45.14,
+      "max": 87.1,
+      "n": 30
+    },
+    "contrast_p95_minus_p5_255": {
+      "mean": 202.143,
+      "median": 202.375,
+      "min": 162.79,
+      "max": 243.56,
+      "n": 30
+    },
+    "contrast_p99_minus_p1_255": {
+      "mean": 226.731,
+      "median": 226.54,
+      "min": 197.72,
+      "max": 252.35,
+      "n": 30
+    },
+    "shadow_clip_frac": {
+      "mean": 0.006,
+      "median": 0.003,
+      "min": 0.0,
+      "max": 0.032,
+      "n": 30
+    },
+    "highlight_clip_frac": {
+      "mean": 0.002,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.022,
+      "n": 30
+    },
+    "skewness": {
+      "mean": -0.057,
+      "median": -0.332,
+      "min": -0.543,
+      "max": 1.002,
+      "n": 30
+    }
+  },
+  "tone_percentile_median_255": {
+    "p0_1": 0.93,
+    "p1": 3.68,
+    "p5": 14.34,
+    "p25": 61.45,
+    "p50": 141.01,
+    "p75": 179.18,
+    "p95": 216.89,
+    "p99": 229.82,
+    "p99_9": 243.93
+  },
+  "color": {
+    "mean_chroma": {
+      "mean": 14.453,
+      "median": 15.37,
+      "min": 7.55,
+      "max": 20.97,
+      "n": 30
+    },
+    "chroma_p50": {
+      "mean": 6.719,
+      "median": 5.36,
+      "min": 2.44,
+      "max": 14.33,
+      "n": 30
+    },
+    "chroma_p90": {
+      "mean": 39.902,
+      "median": 41.9,
+      "min": 9.78,
+      "max": 67.83,
+      "n": 30
+    },
+    "chroma_p99": {
+      "mean": 73.471,
+      "median": 76.07,
+      "min": 43.26,
+      "max": 85.25,
+      "n": 30
+    },
+    "neutral_frac": {
+      "mean": 0.488,
+      "median": 0.586,
+      "min": 0.107,
+      "max": 0.77,
+      "n": 30
+    },
+    "neutral_a_mean": {
+      "mean": -0.951,
+      "median": -1.19,
+      "min": -1.63,
+      "max": 0.34,
+      "n": 30
+    },
+    "neutral_b_mean": {
+      "mean": -0.828,
+      "median": -0.505,
+      "min": -4.38,
+      "max": 2.14,
+      "n": 30
+    },
+    "sat_frac_chroma_gt20": {
+      "mean": 0.22,
+      "median": 0.26,
+      "min": 0.08,
+      "max": 0.343,
+      "n": 30
+    }
+  },
+  "grain": {
+    "rms_all_255": {
+      "mean": 1.846,
+      "median": 1.288,
+      "min": 1.133,
+      "max": 10.713,
+      "n": 30
+    },
+    "psd_radial_loglog_slope": {
+      "mean": -1.717,
+      "median": -1.618,
+      "min": -2.854,
+      "max": -0.984,
+      "n": 30
+    }
+  },
+  "per_image": [
+    {
+      "file": "M9INBI0160.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 4.86,
+          "p5": 16.15,
+          "p25": 74.33,
+          "p50": 134.58,
+          "p75": 176.12,
+          "p95": 200.12,
+          "p99": 223.79,
+          "p99_9": 238.5
+        },
+        "luma_mean_255": 123.75,
+        "luma_std_255": 60.51,
+        "contrast_p95_minus_p5_255": 183.97,
+        "contrast_p99_minus_p1_255": 218.93,
+        "shadow_clip_frac": 0.00221,
+        "highlight_clip_frac": 0.00033,
+        "skewness": -0.398
+      },
+      "color": {
+        "mean_chroma": 14.26,
+        "chroma_p50": 13.22,
+        "chroma_p90": 24.18,
+        "chroma_p99": 43.26,
+        "neutral_frac": 0.1378,
+        "neutral_ab_median": [
+          -1.44,
+          2.09
+        ],
+        "neutral_a_mean": -1.4,
+        "neutral_b_mean": 2.14,
+        "overall_ab_median": [
+          -1.61,
+          11.01
+        ],
+        "highlight_ab_median": [
+          -0.86,
+          1.24
+        ],
+        "shadow_ab_median": [
+          -1.68,
+          2.04
+        ],
+        "sat_frac_chroma_gt20": 0.1338
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1806,
+        "flat_luma_mean_255": 162.71,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 2.324,
+            "n": 26
+          },
+          "0.30-0.45": {
+            "rms_255": 2.195,
+            "n": 12
+          },
+          "0.45-0.60": {
+            "rms_255": 2.366,
+            "n": 61
+          },
+          "0.60-0.75": {
+            "rms_255": 2.346,
+            "n": 214
+          },
+          "0.75-0.90": {
+            "rms_255": 2.315,
+            "n": 84
+          }
+        },
+        "rms_all_255": 2.33,
+        "psd_radial_loglog_slope": -2.316,
+        "psd_radial_profile": [
+          1.0,
+          0.1691,
+          0.0252,
+          0.0091,
+          0.0062,
+          0.0053,
+          0.0048,
+          0.0043,
+          0.0038,
+          0.0036,
+          0.0033,
+          0.003,
+          0.0028,
+          0.0021,
+          0.0016,
+          0.0011,
+          0.0008,
+          0.0006,
+          0.0005,
+          0.0004,
+          0.0004,
+          0.0003,
+          0.0003
+        ]
+      }
+    },
+    {
+      "file": "M9INBI0160_ACRu100r03.JPG",
+      "orig_size": [
+        5212,
+        3468
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.85,
+          "p1": 4.86,
+          "p5": 21.14,
+          "p25": 78.04,
+          "p50": 131.81,
+          "p75": 172.47,
+          "p95": 193.58,
+          "p99": 213.5,
+          "p99_9": 226.69
+        },
+        "luma_mean_255": 122.77,
+        "luma_std_255": 56.47,
+        "contrast_p95_minus_p5_255": 172.44,
+        "contrast_p99_minus_p1_255": 208.64,
+        "shadow_clip_frac": 0.00228,
+        "highlight_clip_frac": 4e-05,
+        "skewness": -0.417
+      },
+      "color": {
+        "mean_chroma": 15.38,
+        "chroma_p50": 14.33,
+        "chroma_p90": 26.18,
+        "chroma_p99": 44.56,
+        "neutral_frac": 0.1135,
+        "neutral_ab_median": [
+          -1.23,
+          2.24
+        ],
+        "neutral_a_mean": -1.04,
+        "neutral_b_mean": 2.01,
+        "overall_ab_median": [
+          -0.29,
+          11.94
+        ],
+        "highlight_ab_median": [
+          -0.52,
+          0.99
+        ],
+        "shadow_ab_median": [
+          -1.62,
+          2.22
+        ],
+        "sat_frac_chroma_gt20": 0.1734
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1758,
+        "flat_luma_mean_255": 171.87,
+        "rms_by_luma_255": {
+          "0.30-0.45": {
+            "rms_255": 2.097,
+            "n": 6
+          },
+          "0.45-0.60": {
+            "rms_255": 2.452,
+            "n": 42
+          },
+          "0.60-0.75": {
+            "rms_255": 2.325,
+            "n": 295
+          },
+          "0.75-0.90": {
+            "rms_255": 2.083,
+            "n": 53
+          }
+        },
+        "rms_all_255": 2.303,
+        "psd_radial_loglog_slope": -1.743,
+        "psd_radial_profile": [
+          1.0,
+          0.1941,
+          0.0265,
+          0.0083,
+          0.0064,
+          0.0058,
+          0.0064,
+          0.005,
+          0.0042,
+          0.004,
+          0.0039,
+          0.004,
+          0.0038,
+          0.0038,
+          0.0036,
+          0.0033,
+          0.0031,
+          0.0026,
+          0.0022,
+          0.0018,
+          0.0016,
+          0.0014,
+          0.0012
+        ]
+      }
+    },
+    {
+      "file": "M9LL01603.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 0.0,
+          "p5": 11.36,
+          "p25": 26.43,
+          "p50": 58.43,
+          "p75": 145.53,
+          "p95": 225.63,
+          "p99": 237.07,
+          "p99_9": 247.86
+        },
+        "luma_mean_255": 92.3,
+        "luma_std_255": 74.92,
+        "contrast_p95_minus_p5_255": 214.28,
+        "contrast_p99_minus_p1_255": 237.07,
+        "shadow_clip_frac": 0.02682,
+        "highlight_clip_frac": 0.00042,
+        "skewness": 0.586
+      },
+      "color": {
+        "mean_chroma": 8.24,
+        "chroma_p50": 2.44,
+        "chroma_p90": 23.95,
+        "chroma_p99": 77.45,
+        "neutral_frac": 0.7672,
+        "neutral_ab_median": [
+          -0.04,
+          1.12
+        ],
+        "neutral_a_mean": 0.03,
+        "neutral_b_mean": 1.26,
+        "overall_ab_median": [
+          -0.01,
+          1.42
+        ],
+        "highlight_ab_median": [
+          -0.03,
+          1.95
+        ],
+        "shadow_ab_median": [
+          -0.2,
+          1.08
+        ],
+        "sat_frac_chroma_gt20": 0.1069
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1821,
+        "flat_luma_mean_255": 100.04,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.259,
+            "n": 194
+          },
+          "0.45-0.60": {
+            "rms_255": 1.446,
+            "n": 122
+          },
+          "0.60-0.75": {
+            "rms_255": 0.997,
+            "n": 27
+          },
+          "0.75-0.90": {
+            "rms_255": 1.172,
+            "n": 24
+          },
+          "0.90-1.00": {
+            "rms_255": 1.052,
+            "n": 30
+          }
+        },
+        "rms_all_255": 1.279,
+        "psd_radial_loglog_slope": -1.665,
+        "psd_radial_profile": [
+          1.0,
+          0.4503,
+          0.2164,
+          0.1441,
+          0.109,
+          0.0976,
+          0.0882,
+          0.082,
+          0.0764,
+          0.0679,
+          0.0617,
+          0.054,
+          0.0485,
+          0.0373,
+          0.0279,
+          0.0209,
+          0.0149,
+          0.011,
+          0.0078,
+          0.0064,
+          0.0057,
+          0.0047,
+          0.0044
+        ]
+      }
+    },
+    {
+      "file": "M9OUTBCON1.JPG",
+      "orig_size": [
+        3472,
+        5216
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 1.08,
+          "p5": 6.85,
+          "p25": 31.91,
+          "p50": 68.13,
+          "p75": 142.24,
+          "p95": 229.73,
+          "p99": 243.94,
+          "p99_9": 253.57
+        },
+        "luma_mean_255": 90.4,
+        "luma_std_255": 72.62,
+        "contrast_p95_minus_p5_255": 222.88,
+        "contrast_p99_minus_p1_255": 242.87,
+        "shadow_clip_frac": 0.017,
+        "highlight_clip_frac": 0.00129,
+        "skewness": 0.773
+      },
+      "color": {
+        "mean_chroma": 15.43,
+        "chroma_p50": 12.4,
+        "chroma_p90": 34.78,
+        "chroma_p99": 68.66,
+        "neutral_frac": 0.3156,
+        "neutral_ab_median": [
+          -1.23,
+          0.47
+        ],
+        "neutral_a_mean": -1.22,
+        "neutral_b_mean": 0.68,
+        "overall_ab_median": [
+          -2.25,
+          9.62
+        ],
+        "highlight_ab_median": [
+          -1.23,
+          -0.84
+        ],
+        "shadow_ab_median": [
+          -0.97,
+          2.17
+        ],
+        "sat_frac_chroma_gt20": 0.2685
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1695,
+        "flat_luma_mean_255": 51.57,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 2.613,
+            "n": 160
+          },
+          "0.15-0.30": {
+            "rms_255": 3.173,
+            "n": 201
+          },
+          "0.30-0.45": {
+            "rms_255": 2.791,
+            "n": 25
+          },
+          "0.75-0.90": {
+            "rms_255": 3.1,
+            "n": 6
+          }
+        },
+        "rms_all_255": 2.932,
+        "psd_radial_loglog_slope": -2.422,
+        "psd_radial_profile": [
+          1.0,
+          0.1736,
+          0.0353,
+          0.0175,
+          0.0122,
+          0.0091,
+          0.0072,
+          0.0061,
+          0.0051,
+          0.0046,
+          0.004,
+          0.0035,
+          0.0031,
+          0.0023,
+          0.0017,
+          0.0013,
+          0.0009,
+          0.0007,
+          0.0005,
+          0.0004,
+          0.0004,
+          0.0003,
+          0.0003
+        ]
+      }
+    },
+    {
+      "file": "M9OUTBCON2.JPG",
+      "orig_size": [
+        3472,
+        5216
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 0.72,
+          "p5": 5.01,
+          "p25": 25.42,
+          "p50": 59.36,
+          "p75": 143.91,
+          "p95": 235.72,
+          "p99": 247.28,
+          "p99_9": 254.29
+        },
+        "luma_mean_255": 87.39,
+        "luma_std_255": 77.17,
+        "contrast_p95_minus_p5_255": 230.72,
+        "contrast_p99_minus_p1_255": 246.57,
+        "shadow_clip_frac": 0.02318,
+        "highlight_clip_frac": 0.00196,
+        "skewness": 0.832
+      },
+      "color": {
+        "mean_chroma": 15.36,
+        "chroma_p50": 11.79,
+        "chroma_p90": 35.89,
+        "chroma_p99": 71.92,
+        "neutral_frac": 0.3437,
+        "neutral_ab_median": [
+          -1.22,
+          0.63
+        ],
+        "neutral_a_mean": -1.22,
+        "neutral_b_mean": 0.75,
+        "overall_ab_median": [
+          -2.09,
+          8.77
+        ],
+        "highlight_ab_median": [
+          -1.34,
+          -0.7
+        ],
+        "shadow_ab_median": [
+          -0.95,
+          1.98
+        ],
+        "sat_frac_chroma_gt20": 0.2618
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1523,
+        "flat_luma_mean_255": 43.13,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 2.481,
+            "n": 263
+          },
+          "0.15-0.30": {
+            "rms_255": 3.05,
+            "n": 115
+          },
+          "0.90-1.00": {
+            "rms_255": 3.32,
+            "n": 13
+          }
+        },
+        "rms_all_255": 2.698,
+        "psd_radial_loglog_slope": -2.485,
+        "psd_radial_profile": [
+          1.0,
+          0.2108,
+          0.0394,
+          0.0191,
+          0.0129,
+          0.0092,
+          0.0069,
+          0.0058,
+          0.0052,
+          0.0044,
+          0.0037,
+          0.0032,
+          0.0028,
+          0.0021,
+          0.0015,
+          0.0012,
+          0.0008,
+          0.0006,
+          0.0005,
+          0.0004,
+          0.0004,
+          0.0003,
+          0.0003
+        ]
+      }
+    },
+    {
+      "file": "M9OUTBCON3D.JPG",
+      "orig_size": [
+        3472,
+        5216
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.0,
+          "p1": 0.29,
+          "p5": 3.58,
+          "p25": 20.44,
+          "p50": 49.42,
+          "p75": 142.72,
+          "p95": 241.22,
+          "p99": 250.29,
+          "p99_9": 254.72
+        },
+        "luma_mean_255": 83.82,
+        "luma_std_255": 81.06,
+        "contrast_p95_minus_p5_255": 237.65,
+        "contrast_p99_minus_p1_255": 250.0,
+        "shadow_clip_frac": 0.03187,
+        "highlight_clip_frac": 0.0038,
+        "skewness": 0.908
+      },
+      "color": {
+        "mean_chroma": 14.79,
+        "chroma_p50": 10.15,
+        "chroma_p90": 36.26,
+        "chroma_p99": 74.92,
+        "neutral_frac": 0.375,
+        "neutral_ab_median": [
+          -1.18,
+          0.76
+        ],
+        "neutral_a_mean": -1.19,
+        "neutral_b_mean": 0.88,
+        "overall_ab_median": [
+          -1.88,
+          7.4
+        ],
+        "highlight_ab_median": [
+          -1.32,
+          -0.58
+        ],
+        "shadow_ab_median": [
+          -0.96,
+          1.81
+        ],
+        "sat_frac_chroma_gt20": 0.2489
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1446,
+        "flat_luma_mean_255": 35.73,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 2.177,
+            "n": 303
+          },
+          "0.15-0.30": {
+            "rms_255": 3.009,
+            "n": 77
+          },
+          "0.90-1.00": {
+            "rms_255": 3.138,
+            "n": 19
+          }
+        },
+        "rms_all_255": 2.388,
+        "psd_radial_loglog_slope": -2.489,
+        "psd_radial_profile": [
+          1.0,
+          0.1649,
+          0.0315,
+          0.0159,
+          0.0117,
+          0.008,
+          0.0058,
+          0.0048,
+          0.004,
+          0.0035,
+          0.0031,
+          0.0026,
+          0.0024,
+          0.0017,
+          0.0012,
+          0.0009,
+          0.0007,
+          0.0005,
+          0.0004,
+          0.0003,
+          0.0003,
+          0.0003,
+          0.0002
+        ]
+      }
+    },
+    {
+      "file": "M9OUTBCON4.JPG",
+      "orig_size": [
+        3472,
+        5216
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.14,
+          "p1": 1.0,
+          "p5": 4.29,
+          "p25": 17.57,
+          "p50": 41.91,
+          "p75": 144.5,
+          "p95": 245.12,
+          "p99": 252.15,
+          "p99_9": 255.0
+        },
+        "luma_mean_255": 81.97,
+        "luma_std_255": 84.24,
+        "contrast_p95_minus_p5_255": 240.83,
+        "contrast_p99_minus_p1_255": 251.15,
+        "shadow_clip_frac": 0.02211,
+        "highlight_clip_frac": 0.00642,
+        "skewness": 0.952
+      },
+      "color": {
+        "mean_chroma": 14.35,
+        "chroma_p50": 8.65,
+        "chroma_p90": 36.91,
+        "chroma_p99": 78.13,
+        "neutral_frac": 0.4124,
+        "neutral_ab_median": [
+          -1.14,
+          1.11
+        ],
+        "neutral_a_mean": -1.15,
+        "neutral_b_mean": 1.16,
+        "overall_ab_median": [
+          -1.6,
+          6.06
+        ],
+        "highlight_ab_median": [
+          -1.17,
+          -0.12
+        ],
+        "shadow_ab_median": [
+          -0.96,
+          1.88
+        ],
+        "sat_frac_chroma_gt20": 0.2336
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1406,
+        "flat_luma_mean_255": 28.05,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.938,
+            "n": 360
+          },
+          "0.15-0.30": {
+            "rms_255": 2.541,
+            "n": 29
+          },
+          "0.90-1.00": {
+            "rms_255": 2.546,
+            "n": 11
+          }
+        },
+        "rms_all_255": 1.998,
+        "psd_radial_loglog_slope": -2.374,
+        "psd_radial_profile": [
+          1.0,
+          0.1926,
+          0.0338,
+          0.0134,
+          0.0091,
+          0.0071,
+          0.006,
+          0.005,
+          0.0042,
+          0.0038,
+          0.0034,
+          0.0029,
+          0.0027,
+          0.0019,
+          0.0014,
+          0.0011,
+          0.0009,
+          0.0007,
+          0.0005,
+          0.0004,
+          0.0004,
+          0.0004,
+          0.0003
+        ]
+      }
+    },
+    {
+      "file": "M9OUTBCON5.JPG",
+      "orig_size": [
+        3472,
+        5216
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.93,
+          "p1": 2.15,
+          "p5": 5.94,
+          "p25": 15.93,
+          "p50": 35.57,
+          "p75": 144.45,
+          "p95": 249.5,
+          "p99": 254.5,
+          "p99_9": 255.0
+        },
+        "luma_mean_255": 80.66,
+        "luma_std_255": 87.1,
+        "contrast_p95_minus_p5_255": 243.56,
+        "contrast_p99_minus_p1_255": 252.35,
+        "shadow_clip_frac": 0.00706,
+        "highlight_clip_frac": 0.02152,
+        "skewness": 1.002
+      },
+      "color": {
+        "mean_chroma": 13.86,
+        "chroma_p50": 6.98,
+        "chroma_p90": 38.21,
+        "chroma_p99": 81.22,
+        "neutral_frac": 0.4632,
+        "neutral_ab_median": [
+          -1.01,
+          1.51
+        ],
+        "neutral_a_mean": -1.06,
+        "neutral_b_mean": 1.48,
+        "overall_ab_median": [
+          -1.45,
+          4.89
+        ],
+        "highlight_ab_median": [
+          -1.12,
+          0.25
+        ],
+        "shadow_ab_median": [
+          -0.97,
+          2.0
+        ],
+        "sat_frac_chroma_gt20": 0.2153
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1455,
+        "flat_luma_mean_255": 18.73,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.593,
+            "n": 394
+          }
+        },
+        "rms_all_255": 1.595,
+        "psd_radial_loglog_slope": -2.31,
+        "psd_radial_profile": [
+          1.0,
+          0.212,
+          0.0534,
+          0.0206,
+          0.0128,
+          0.0095,
+          0.0077,
+          0.007,
+          0.0062,
+          0.0049,
+          0.0042,
+          0.0038,
+          0.0036,
+          0.0025,
+          0.0019,
+          0.0015,
+          0.0011,
+          0.0009,
+          0.0007,
+          0.0006,
+          0.0006,
+          0.0006,
+          0.0005
+        ]
+      }
+    },
+    {
+      "file": "M9hHOUSE.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 8.57,
+          "p1": 12.5,
+          "p5": 18.64,
+          "p25": 45.3,
+          "p50": 94.01,
+          "p75": 126.44,
+          "p95": 184.36,
+          "p99": 224.5,
+          "p99_9": 231.94
+        },
+        "luma_mean_255": 92.02,
+        "luma_std_255": 51.88,
+        "contrast_p95_minus_p5_255": 165.72,
+        "contrast_p99_minus_p1_255": 212.0,
+        "shadow_clip_frac": 5e-05,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.367
+      },
+      "color": {
+        "mean_chroma": 16.9,
+        "chroma_p50": 11.28,
+        "chroma_p90": 40.81,
+        "chroma_p99": 54.61,
+        "neutral_frac": 0.3421,
+        "neutral_ab_median": [
+          -1.16,
+          0.48
+        ],
+        "neutral_a_mean": -1.19,
+        "neutral_b_mean": 0.01,
+        "overall_ab_median": [
+          -3.76,
+          7.88
+        ],
+        "highlight_ab_median": [
+          -1.19,
+          -0.96
+        ],
+        "shadow_ab_median": [
+          -1.6,
+          2.3
+        ],
+        "sat_frac_chroma_gt20": 0.3431
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1795,
+        "flat_luma_mean_255": 84.87,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 8.339,
+            "n": 115
+          },
+          "0.15-0.30": {
+            "rms_255": 11.862,
+            "n": 65
+          },
+          "0.30-0.45": {
+            "rms_255": 11.564,
+            "n": 120
+          },
+          "0.45-0.60": {
+            "rms_255": 11.862,
+            "n": 67
+          },
+          "0.60-0.75": {
+            "rms_255": 12.02,
+            "n": 15
+          },
+          "0.75-0.90": {
+            "rms_255": 10.684,
+            "n": 18
+          }
+        },
+        "rms_all_255": 10.713,
+        "psd_radial_loglog_slope": -2.854,
+        "psd_radial_profile": [
+          1.0,
+          0.2896,
+          0.1637,
+          0.1013,
+          0.0622,
+          0.0649,
+          0.0402,
+          0.0287,
+          0.0261,
+          0.0179,
+          0.0127,
+          0.0091,
+          0.0062,
+          0.0042,
+          0.003,
+          0.002,
+          0.0013,
+          0.0008,
+          0.0006,
+          0.0003,
+          0.0002,
+          0.0002,
+          0.0001
+        ]
+      }
+    },
+    {
+      "file": "M9hSLCON1.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 2.0,
+          "p1": 5.86,
+          "p5": 23.94,
+          "p25": 76.52,
+          "p50": 153.29,
+          "p75": 182.23,
+          "p95": 203.92,
+          "p99": 216.5,
+          "p99_9": 233.08
+        },
+        "luma_mean_255": 130.89,
+        "luma_std_255": 60.5,
+        "contrast_p95_minus_p5_255": 179.98,
+        "contrast_p99_minus_p1_255": 210.65,
+        "shadow_clip_frac": 0.00091,
+        "highlight_clip_frac": 0.00029,
+        "skewness": -0.543
+      },
+      "color": {
+        "mean_chroma": 14.84,
+        "chroma_p50": 3.81,
+        "chroma_p90": 48.64,
+        "chroma_p99": 74.53,
+        "neutral_frac": 0.608,
+        "neutral_ab_median": [
+          -1.23,
+          -0.62
+        ],
+        "neutral_a_mean": -1.34,
+        "neutral_b_mean": -0.35,
+        "overall_ab_median": [
+          -0.88,
+          0.86
+        ],
+        "highlight_ab_median": [
+          -0.86,
+          -2.36
+        ],
+        "shadow_ab_median": [
+          -0.4,
+          0.38
+        ],
+        "sat_frac_chroma_gt20": 0.2586
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2074,
+        "flat_luma_mean_255": 178.61,
+        "rms_by_luma_255": {
+          "0.45-0.60": {
+            "rms_255": 1.496,
+            "n": 12
+          },
+          "0.60-0.75": {
+            "rms_255": 1.25,
+            "n": 262
+          },
+          "0.75-0.90": {
+            "rms_255": 0.844,
+            "n": 124
+          }
+        },
+        "rms_all_255": 1.133,
+        "psd_radial_loglog_slope": -1.521,
+        "psd_radial_profile": [
+          1.0,
+          0.2196,
+          0.1631,
+          0.148,
+          0.137,
+          0.1301,
+          0.1125,
+          0.0954,
+          0.0853,
+          0.0746,
+          0.0652,
+          0.0589,
+          0.0542,
+          0.0365,
+          0.0275,
+          0.0213,
+          0.0155,
+          0.012,
+          0.0091,
+          0.0077,
+          0.0074,
+          0.0065,
+          0.0059
+        ]
+      }
+    },
+    {
+      "file": "M9hSLCON2.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 1.14,
+          "p1": 4.44,
+          "p5": 18.36,
+          "p25": 69.43,
+          "p50": 155.98,
+          "p75": 188.07,
+          "p95": 210.84,
+          "p99": 223.5,
+          "p99_9": 238.64
+        },
+        "luma_mean_255": 131.6,
+        "luma_std_255": 65.46,
+        "contrast_p95_minus_p5_255": 192.48,
+        "contrast_p99_minus_p1_255": 219.07,
+        "shadow_clip_frac": 0.00253,
+        "highlight_clip_frac": 0.00033,
+        "skewness": -0.499
+      },
+      "color": {
+        "mean_chroma": 15.61,
+        "chroma_p50": 4.03,
+        "chroma_p90": 51.49,
+        "chroma_p99": 76.85,
+        "neutral_frac": 0.606,
+        "neutral_ab_median": [
+          -1.25,
+          -0.66
+        ],
+        "neutral_a_mean": -1.41,
+        "neutral_b_mean": -0.4,
+        "overall_ab_median": [
+          -0.89,
+          0.85
+        ],
+        "highlight_ab_median": [
+          -0.96,
+          -2.47
+        ],
+        "shadow_ab_median": [
+          -0.4,
+          0.5
+        ],
+        "sat_frac_chroma_gt20": 0.2684
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2040,
+        "flat_luma_mean_255": 180.8,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.539,
+            "n": 19
+          },
+          "0.45-0.60": {
+            "rms_255": 1.357,
+            "n": 9
+          },
+          "0.60-0.75": {
+            "rms_255": 1.414,
+            "n": 165
+          },
+          "0.75-0.90": {
+            "rms_255": 0.981,
+            "n": 207
+          }
+        },
+        "rms_all_255": 1.195,
+        "psd_radial_loglog_slope": -1.549,
+        "psd_radial_profile": [
+          1.0,
+          0.2129,
+          0.1539,
+          0.1319,
+          0.1119,
+          0.1011,
+          0.0963,
+          0.0855,
+          0.0799,
+          0.0702,
+          0.0629,
+          0.0543,
+          0.0506,
+          0.0348,
+          0.026,
+          0.0201,
+          0.014,
+          0.0108,
+          0.0082,
+          0.0065,
+          0.006,
+          0.0054,
+          0.0049
+        ]
+      }
+    },
+    {
+      "file": "M9hSLCON3D.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.79,
+          "p1": 3.0,
+          "p5": 14.24,
+          "p25": 60.31,
+          "p50": 156.21,
+          "p75": 192.14,
+          "p95": 216.63,
+          "p99": 229.5,
+          "p99_9": 243.93
+        },
+        "luma_mean_255": 130.83,
+        "luma_std_255": 69.78,
+        "contrast_p95_minus_p5_255": 202.39,
+        "contrast_p99_minus_p1_255": 226.51,
+        "shadow_clip_frac": 0.00589,
+        "highlight_clip_frac": 0.00041,
+        "skewness": -0.432
+      },
+      "color": {
+        "mean_chroma": 16.18,
+        "chroma_p50": 4.23,
+        "chroma_p90": 53.71,
+        "chroma_p99": 78.77,
+        "neutral_frac": 0.6033,
+        "neutral_ab_median": [
+          -1.25,
+          -0.62
+        ],
+        "neutral_a_mean": -1.5,
+        "neutral_b_mean": -0.43,
+        "overall_ab_median": [
+          -0.86,
+          0.91
+        ],
+        "highlight_ab_median": [
+          -1.05,
+          -2.57
+        ],
+        "shadow_ab_median": [
+          -0.38,
+          0.57
+        ],
+        "sat_frac_chroma_gt20": 0.2719
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1960,
+        "flat_luma_mean_255": 183.66,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.404,
+            "n": 14
+          },
+          "0.45-0.60": {
+            "rms_255": 1.438,
+            "n": 10
+          },
+          "0.60-0.75": {
+            "rms_255": 1.451,
+            "n": 133
+          },
+          "0.75-0.90": {
+            "rms_255": 1.082,
+            "n": 235
+          },
+          "0.90-1.00": {
+            "rms_255": 2.02,
+            "n": 6
+          }
+        },
+        "rms_all_255": 1.241,
+        "psd_radial_loglog_slope": -1.593,
+        "psd_radial_profile": [
+          1.0,
+          0.2369,
+          0.1758,
+          0.1453,
+          0.1313,
+          0.1211,
+          0.1096,
+          0.0937,
+          0.0782,
+          0.0706,
+          0.0633,
+          0.0559,
+          0.0496,
+          0.0357,
+          0.0264,
+          0.0196,
+          0.0139,
+          0.0104,
+          0.008,
+          0.0067,
+          0.0062,
+          0.0052,
+          0.0048
+        ]
+      }
+    },
+    {
+      "file": "M9hSLCON4.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 1.57,
+          "p1": 3.86,
+          "p5": 12.7,
+          "p25": 54.36,
+          "p50": 160.5,
+          "p75": 199.14,
+          "p95": 223.79,
+          "p99": 235.86,
+          "p99_9": 248.29
+        },
+        "luma_mean_255": 132.95,
+        "luma_std_255": 74.21,
+        "contrast_p95_minus_p5_255": 211.09,
+        "contrast_p99_minus_p1_255": 232.0,
+        "shadow_clip_frac": 0.00237,
+        "highlight_clip_frac": 0.00056,
+        "skewness": -0.4
+      },
+      "color": {
+        "mean_chroma": 16.75,
+        "chroma_p50": 4.36,
+        "chroma_p90": 57.03,
+        "chroma_p99": 81.26,
+        "neutral_frac": 0.6025,
+        "neutral_ab_median": [
+          -1.24,
+          -0.61
+        ],
+        "neutral_a_mean": -1.53,
+        "neutral_b_mean": -0.5,
+        "overall_ab_median": [
+          -0.84,
+          0.85
+        ],
+        "highlight_ab_median": [
+          -1.1,
+          -2.55
+        ],
+        "shadow_ab_median": [
+          -0.4,
+          0.6
+        ],
+        "sat_frac_chroma_gt20": 0.2717
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1874,
+        "flat_luma_mean_255": 188.85,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.432,
+            "n": 29
+          },
+          "0.15-0.30": {
+            "rms_255": 1.586,
+            "n": 5
+          },
+          "0.60-0.75": {
+            "rms_255": 1.572,
+            "n": 91
+          },
+          "0.75-0.90": {
+            "rms_255": 1.101,
+            "n": 255
+          },
+          "0.90-1.00": {
+            "rms_255": 0.909,
+            "n": 19
+          }
+        },
+        "rms_all_255": 1.23,
+        "psd_radial_loglog_slope": -1.639,
+        "psd_radial_profile": [
+          1.0,
+          0.1653,
+          0.1068,
+          0.0943,
+          0.0807,
+          0.0764,
+          0.0654,
+          0.055,
+          0.0522,
+          0.0443,
+          0.0399,
+          0.0368,
+          0.0332,
+          0.0239,
+          0.017,
+          0.0129,
+          0.0099,
+          0.0074,
+          0.0056,
+          0.0046,
+          0.004,
+          0.0034,
+          0.0032
+        ]
+      }
+    },
+    {
+      "file": "M9hSLCON5.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 2.86,
+          "p1": 5.72,
+          "p5": 12.28,
+          "p25": 48.51,
+          "p50": 162.57,
+          "p75": 205.22,
+          "p95": 230.43,
+          "p99": 241.86,
+          "p99_9": 252.79
+        },
+        "luma_mean_255": 134.03,
+        "luma_std_255": 78.16,
+        "contrast_p95_minus_p5_255": 218.15,
+        "contrast_p99_minus_p1_255": 236.14,
+        "shadow_clip_frac": 0.00053,
+        "highlight_clip_frac": 0.00094,
+        "skewness": -0.345
+      },
+      "color": {
+        "mean_chroma": 17.17,
+        "chroma_p50": 4.48,
+        "chroma_p90": 59.75,
+        "chroma_p99": 83.49,
+        "neutral_frac": 0.597,
+        "neutral_ab_median": [
+          -1.23,
+          -0.52
+        ],
+        "neutral_a_mean": -1.56,
+        "neutral_b_mean": -0.52,
+        "overall_ab_median": [
+          -0.84,
+          0.85
+        ],
+        "highlight_ab_median": [
+          -1.22,
+          -2.53
+        ],
+        "shadow_ab_median": [
+          -0.41,
+          0.66
+        ],
+        "sat_frac_chroma_gt20": 0.2688
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1858,
+        "flat_luma_mean_255": 186.95,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.624,
+            "n": 38
+          },
+          "0.15-0.30": {
+            "rms_255": 1.501,
+            "n": 5
+          },
+          "0.60-0.75": {
+            "rms_255": 1.656,
+            "n": 61
+          },
+          "0.75-0.90": {
+            "rms_255": 1.179,
+            "n": 277
+          },
+          "0.90-1.00": {
+            "rms_255": 1.116,
+            "n": 19
+          }
+        },
+        "rms_all_255": 1.295,
+        "psd_radial_loglog_slope": -1.601,
+        "psd_radial_profile": [
+          1.0,
+          0.1814,
+          0.1415,
+          0.1256,
+          0.1058,
+          0.0922,
+          0.0846,
+          0.0745,
+          0.0669,
+          0.057,
+          0.0493,
+          0.0445,
+          0.0417,
+          0.0305,
+          0.0218,
+          0.0169,
+          0.0122,
+          0.0092,
+          0.0069,
+          0.0055,
+          0.005,
+          0.0043,
+          0.0041
+        ]
+      }
+    },
+    {
+      "file": "M9hSLI0080.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.93,
+          "p1": 3.0,
+          "p5": 12.79,
+          "p25": 58.02,
+          "p50": 162.51,
+          "p75": 212.8,
+          "p95": 243.23,
+          "p99": 254.93,
+          "p99_9": 255.0
+        },
+        "luma_mean_255": 140.16,
+        "luma_std_255": 79.6,
+        "contrast_p95_minus_p5_255": 230.44,
+        "contrast_p99_minus_p1_255": 251.93,
+        "shadow_clip_frac": 0.0049,
+        "highlight_clip_frac": 0.01445,
+        "skewness": -0.318
+      },
+      "color": {
+        "mean_chroma": 17.51,
+        "chroma_p50": 5.62,
+        "chroma_p90": 58.13,
+        "chroma_p99": 85.25,
+        "neutral_frac": 0.5778,
+        "neutral_ab_median": [
+          -0.81,
+          -0.96
+        ],
+        "neutral_a_mean": -1.05,
+        "neutral_b_mean": -1.55,
+        "overall_ab_median": [
+          -0.14,
+          0.29
+        ],
+        "highlight_ab_median": [
+          -0.52,
+          -4.81
+        ],
+        "shadow_ab_median": [
+          -0.2,
+          0.29
+        ],
+        "sat_frac_chroma_gt20": 0.2753
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1803,
+        "flat_luma_mean_255": 198.22,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.518,
+            "n": 28
+          },
+          "0.45-0.60": {
+            "rms_255": 1.538,
+            "n": 12
+          },
+          "0.60-0.75": {
+            "rms_255": 1.692,
+            "n": 56
+          },
+          "0.75-0.90": {
+            "rms_255": 1.507,
+            "n": 191
+          },
+          "0.90-1.00": {
+            "rms_255": 0.991,
+            "n": 110
+          }
+        },
+        "rms_all_255": 1.396,
+        "psd_radial_loglog_slope": -1.666,
+        "psd_radial_profile": [
+          1.0,
+          0.187,
+          0.1508,
+          0.1132,
+          0.0993,
+          0.0907,
+          0.0796,
+          0.0688,
+          0.0618,
+          0.0573,
+          0.0488,
+          0.0423,
+          0.0347,
+          0.0269,
+          0.0209,
+          0.0154,
+          0.011,
+          0.008,
+          0.0059,
+          0.0049,
+          0.0043,
+          0.0036,
+          0.0032
+        ]
+      }
+    },
+    {
+      "file": "M9hSLI0160.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.93,
+          "p1": 3.5,
+          "p5": 14.72,
+          "p25": 62.3,
+          "p50": 156.6,
+          "p75": 193.72,
+          "p95": 217.07,
+          "p99": 230.0,
+          "p99_9": 244.14
+        },
+        "luma_mean_255": 132.1,
+        "luma_std_255": 69.73,
+        "contrast_p95_minus_p5_255": 202.35,
+        "contrast_p99_minus_p1_255": 226.5,
+        "shadow_clip_frac": 0.00411,
+        "highlight_clip_frac": 0.0004,
+        "skewness": -0.447
+      },
+      "color": {
+        "mean_chroma": 15.99,
+        "chroma_p50": 4.21,
+        "chroma_p90": 53.46,
+        "chroma_p99": 78.51,
+        "neutral_frac": 0.6133,
+        "neutral_ab_median": [
+          -0.92,
+          -1.44
+        ],
+        "neutral_a_mean": -1.13,
+        "neutral_b_mean": -1.15,
+        "overall_ab_median": [
+          -0.57,
+          0.27
+        ],
+        "highlight_ab_median": [
+          -0.67,
+          -3.56
+        ],
+        "shadow_ab_median": [
+          -0.28,
+          0.29
+        ],
+        "sat_frac_chroma_gt20": 0.2656
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1982,
+        "flat_luma_mean_255": 184.97,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.454,
+            "n": 20
+          },
+          "0.45-0.60": {
+            "rms_255": 1.512,
+            "n": 7
+          },
+          "0.60-0.75": {
+            "rms_255": 1.464,
+            "n": 129
+          },
+          "0.75-0.90": {
+            "rms_255": 1.074,
+            "n": 241
+          }
+        },
+        "rms_all_255": 1.229,
+        "psd_radial_loglog_slope": -1.585,
+        "psd_radial_profile": [
+          1.0,
+          0.1801,
+          0.1258,
+          0.1188,
+          0.1061,
+          0.0925,
+          0.0834,
+          0.0751,
+          0.0706,
+          0.0593,
+          0.051,
+          0.0472,
+          0.0435,
+          0.03,
+          0.0222,
+          0.0166,
+          0.0115,
+          0.0089,
+          0.0066,
+          0.0057,
+          0.0052,
+          0.0045,
+          0.0041
+        ]
+      }
+    },
+    {
+      "file": "M9hSLI0160_ACRu100r03.JPG",
+      "orig_size": [
+        5212,
+        3468
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 8.36,
+          "p1": 12.42,
+          "p5": 25.84,
+          "p25": 68.59,
+          "p50": 149.01,
+          "p75": 183.88,
+          "p95": 207.64,
+          "p99": 220.29,
+          "p99_9": 236.22
+        },
+        "luma_mean_255": 128.99,
+        "luma_std_255": 62.07,
+        "contrast_p95_minus_p5_255": 181.8,
+        "contrast_p99_minus_p1_255": 207.87,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.00029,
+        "skewness": -0.405
+      },
+      "color": {
+        "mean_chroma": 16.06,
+        "chroma_p50": 4.98,
+        "chroma_p90": 49.92,
+        "chroma_p99": 79.13,
+        "neutral_frac": 0.5943,
+        "neutral_ab_median": [
+          -0.41,
+          -2.59
+        ],
+        "neutral_a_mean": -0.52,
+        "neutral_b_mean": -1.99,
+        "overall_ab_median": [
+          0.34,
+          -0.67
+        ],
+        "highlight_ab_median": [
+          0.29,
+          -4.83
+        ],
+        "shadow_ab_median": [
+          0.58,
+          -0.75
+        ],
+        "sat_frac_chroma_gt20": 0.2724
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2031,
+        "flat_luma_mean_255": 180.18,
+        "rms_by_luma_255": {
+          "0.45-0.60": {
+            "rms_255": 1.817,
+            "n": 26
+          },
+          "0.60-0.75": {
+            "rms_255": 1.574,
+            "n": 194
+          },
+          "0.75-0.90": {
+            "rms_255": 1.034,
+            "n": 175
+          }
+        },
+        "rms_all_255": 1.357,
+        "psd_radial_loglog_slope": -0.984,
+        "psd_radial_profile": [
+          1.0,
+          0.137,
+          0.0916,
+          0.0915,
+          0.0812,
+          0.0754,
+          0.0658,
+          0.0604,
+          0.0551,
+          0.0527,
+          0.0516,
+          0.0516,
+          0.0486,
+          0.0449,
+          0.0427,
+          0.038,
+          0.0351,
+          0.0312,
+          0.0267,
+          0.022,
+          0.0193,
+          0.0161,
+          0.0142
+        ]
+      }
+    },
+    {
+      "file": "M9hSLI0160_DCR.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 6.3,
+          "p1": 10.63,
+          "p5": 27.34,
+          "p25": 69.03,
+          "p50": 142.71,
+          "p75": 183.24,
+          "p95": 216.03,
+          "p99": 238.58,
+          "p99_9": 254.0
+        },
+        "luma_mean_255": 128.5,
+        "luma_std_255": 62.59,
+        "contrast_p95_minus_p5_255": 188.69,
+        "contrast_p99_minus_p1_255": 227.94,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.00124,
+        "skewness": -0.247
+      },
+      "color": {
+        "mean_chroma": 15.81,
+        "chroma_p50": 6.41,
+        "chroma_p90": 47.36,
+        "chroma_p99": 76.16,
+        "neutral_frac": 0.4551,
+        "neutral_ab_median": [
+          -0.76,
+          -1.46
+        ],
+        "neutral_a_mean": -0.72,
+        "neutral_b_mean": -1.44,
+        "overall_ab_median": [
+          0.5,
+          -0.63
+        ],
+        "highlight_ab_median": [
+          -0.33,
+          -2.63
+        ],
+        "shadow_ab_median": [
+          0.66,
+          -0.72
+        ],
+        "sat_frac_chroma_gt20": 0.2609
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2050,
+        "flat_luma_mean_255": 174.4,
+        "rms_by_luma_255": {
+          "0.30-0.45": {
+            "rms_255": 1.649,
+            "n": 8
+          },
+          "0.45-0.60": {
+            "rms_255": 1.921,
+            "n": 82
+          },
+          "0.60-0.75": {
+            "rms_255": 1.861,
+            "n": 127
+          },
+          "0.75-0.90": {
+            "rms_255": 1.471,
+            "n": 172
+          },
+          "0.90-1.00": {
+            "rms_255": 1.362,
+            "n": 6
+          }
+        },
+        "rms_all_255": 1.693,
+        "psd_radial_loglog_slope": -1.022,
+        "psd_radial_profile": [
+          1.0,
+          0.1826,
+          0.1429,
+          0.1324,
+          0.1129,
+          0.0995,
+          0.0859,
+          0.077,
+          0.0691,
+          0.0626,
+          0.057,
+          0.0515,
+          0.0461,
+          0.0421,
+          0.0386,
+          0.0353,
+          0.0334,
+          0.0318,
+          0.0289,
+          0.0265,
+          0.0244,
+          0.0228,
+          0.0277
+        ]
+      }
+    },
+    {
+      "file": "M9hSLI0200.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.93,
+          "p1": 3.21,
+          "p5": 14.29,
+          "p25": 61.87,
+          "p50": 156.29,
+          "p75": 192.81,
+          "p95": 216.86,
+          "p99": 229.93,
+          "p99_9": 243.93
+        },
+        "luma_mean_255": 131.65,
+        "luma_std_255": 69.68,
+        "contrast_p95_minus_p5_255": 202.57,
+        "contrast_p99_minus_p1_255": 226.72,
+        "shadow_clip_frac": 0.00495,
+        "highlight_clip_frac": 0.00042,
+        "skewness": -0.448
+      },
+      "color": {
+        "mean_chroma": 16.01,
+        "chroma_p50": 4.47,
+        "chroma_p90": 53.23,
+        "chroma_p99": 78.31,
+        "neutral_frac": 0.6128,
+        "neutral_ab_median": [
+          -1.06,
+          -1.54
+        ],
+        "neutral_a_mean": -1.26,
+        "neutral_b_mean": -1.28,
+        "overall_ab_median": [
+          -0.58,
+          0.17
+        ],
+        "highlight_ab_median": [
+          -0.86,
+          -3.58
+        ],
+        "shadow_ab_median": [
+          -0.34,
+          0.29
+        ],
+        "sat_frac_chroma_gt20": 0.264
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1951,
+        "flat_luma_mean_255": 184.99,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.677,
+            "n": 15
+          },
+          "0.60-0.75": {
+            "rms_255": 1.511,
+            "n": 133
+          },
+          "0.75-0.90": {
+            "rms_255": 1.106,
+            "n": 243
+          },
+          "0.90-1.00": {
+            "rms_255": 1.618,
+            "n": 6
+          }
+        },
+        "rms_all_255": 1.272,
+        "psd_radial_loglog_slope": -1.612,
+        "psd_radial_profile": [
+          1.0,
+          0.2352,
+          0.1662,
+          0.1534,
+          0.1234,
+          0.1042,
+          0.0876,
+          0.0797,
+          0.0706,
+          0.0631,
+          0.056,
+          0.0507,
+          0.0438,
+          0.0339,
+          0.0258,
+          0.0196,
+          0.0141,
+          0.01,
+          0.0076,
+          0.0062,
+          0.0054,
+          0.0048,
+          0.0043
+        ]
+      }
+    },
+    {
+      "file": "M9hSLSAT1.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.79,
+          "p1": 3.0,
+          "p5": 14.36,
+          "p25": 62.01,
+          "p50": 157.08,
+          "p75": 192.71,
+          "p95": 216.92,
+          "p99": 229.72,
+          "p99_9": 243.91
+        },
+        "luma_mean_255": 131.7,
+        "luma_std_255": 69.63,
+        "contrast_p95_minus_p5_255": 202.57,
+        "contrast_p99_minus_p1_255": 226.72,
+        "shadow_clip_frac": 0.00567,
+        "highlight_clip_frac": 0.00041,
+        "skewness": -0.447
+      },
+      "color": {
+        "mean_chroma": 12.7,
+        "chroma_p50": 3.26,
+        "chroma_p90": 42.99,
+        "chroma_p99": 65.36,
+        "neutral_frac": 0.6321,
+        "neutral_ab_median": [
+          -1.11,
+          -0.13
+        ],
+        "neutral_a_mean": -1.22,
+        "neutral_b_mean": -0.22,
+        "overall_ab_median": [
+          -0.81,
+          0.79
+        ],
+        "highlight_ab_median": [
+          -0.9,
+          -1.97
+        ],
+        "shadow_ab_median": [
+          -0.4,
+          0.57
+        ],
+        "sat_frac_chroma_gt20": 0.2251
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2002,
+        "flat_luma_mean_255": 183.36,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.368,
+            "n": 11
+          },
+          "0.45-0.60": {
+            "rms_255": 1.455,
+            "n": 8
+          },
+          "0.60-0.75": {
+            "rms_255": 1.541,
+            "n": 149
+          },
+          "0.75-0.90": {
+            "rms_255": 1.057,
+            "n": 230
+          }
+        },
+        "rms_all_255": 1.257,
+        "psd_radial_loglog_slope": -1.628,
+        "psd_radial_profile": [
+          1.0,
+          0.1766,
+          0.1094,
+          0.1131,
+          0.1049,
+          0.093,
+          0.0784,
+          0.0662,
+          0.0599,
+          0.0551,
+          0.0485,
+          0.0428,
+          0.0385,
+          0.0261,
+          0.0198,
+          0.0149,
+          0.0105,
+          0.0081,
+          0.006,
+          0.0049,
+          0.0044,
+          0.0038,
+          0.0036
+        ]
+      }
+    },
+    {
+      "file": "M9hSLSAT2.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.79,
+          "p1": 3.0,
+          "p5": 14.29,
+          "p25": 61.03,
+          "p50": 156.57,
+          "p75": 192.23,
+          "p95": 216.85,
+          "p99": 229.57,
+          "p99_9": 243.72
+        },
+        "luma_mean_255": 131.18,
+        "luma_std_255": 69.71,
+        "contrast_p95_minus_p5_255": 202.56,
+        "contrast_p99_minus_p1_255": 226.57,
+        "shadow_clip_frac": 0.00571,
+        "highlight_clip_frac": 0.00041,
+        "skewness": -0.438
+      },
+      "color": {
+        "mean_chroma": 14.92,
+        "chroma_p50": 3.86,
+        "chroma_p90": 49.68,
+        "chroma_p99": 75.98,
+        "neutral_frac": 0.6159,
+        "neutral_ab_median": [
+          -1.18,
+          -0.49
+        ],
+        "neutral_a_mean": -1.36,
+        "neutral_b_mean": -0.39,
+        "overall_ab_median": [
+          -0.81,
+          0.8
+        ],
+        "highlight_ab_median": [
+          -0.96,
+          -2.45
+        ],
+        "shadow_ab_median": [
+          -0.4,
+          0.56
+        ],
+        "sat_frac_chroma_gt20": 0.2557
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1976,
+        "flat_luma_mean_255": 183.63,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.329,
+            "n": 15
+          },
+          "0.15-0.30": {
+            "rms_255": 1.669,
+            "n": 5
+          },
+          "0.45-0.60": {
+            "rms_255": 1.398,
+            "n": 8
+          },
+          "0.60-0.75": {
+            "rms_255": 1.475,
+            "n": 144
+          },
+          "0.75-0.90": {
+            "rms_255": 1.081,
+            "n": 224
+          }
+        },
+        "rms_all_255": 1.254,
+        "psd_radial_loglog_slope": -1.62,
+        "psd_radial_profile": [
+          1.0,
+          0.1679,
+          0.134,
+          0.1107,
+          0.1008,
+          0.0939,
+          0.0781,
+          0.0694,
+          0.0606,
+          0.0549,
+          0.0482,
+          0.0422,
+          0.0373,
+          0.0258,
+          0.0197,
+          0.015,
+          0.0107,
+          0.0081,
+          0.0063,
+          0.0053,
+          0.0048,
+          0.0041,
+          0.0036
+        ]
+      }
+    },
+    {
+      "file": "M9hSLSAT3D.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.72,
+          "p1": 3.0,
+          "p5": 14.29,
+          "p25": 60.41,
+          "p50": 156.3,
+          "p75": 192.15,
+          "p95": 216.78,
+          "p99": 229.57,
+          "p99_9": 243.93
+        },
+        "luma_mean_255": 130.93,
+        "luma_std_255": 69.8,
+        "contrast_p95_minus_p5_255": 202.49,
+        "contrast_p99_minus_p1_255": 226.57,
+        "shadow_clip_frac": 0.00569,
+        "highlight_clip_frac": 0.00041,
+        "skewness": -0.433
+      },
+      "color": {
+        "mean_chroma": 16.17,
+        "chroma_p50": 4.2,
+        "chroma_p90": 53.71,
+        "chroma_p99": 78.76,
+        "neutral_frac": 0.6049,
+        "neutral_ab_median": [
+          -1.25,
+          -0.7
+        ],
+        "neutral_a_mean": -1.47,
+        "neutral_b_mean": -0.51,
+        "overall_ab_median": [
+          -0.83,
+          0.84
+        ],
+        "highlight_ab_median": [
+          -0.96,
+          -2.57
+        ],
+        "shadow_ab_median": [
+          -0.38,
+          0.53
+        ],
+        "sat_frac_chroma_gt20": 0.2717
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1966,
+        "flat_luma_mean_255": 183.64,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.492,
+            "n": 17
+          },
+          "0.45-0.60": {
+            "rms_255": 1.403,
+            "n": 9
+          },
+          "0.60-0.75": {
+            "rms_255": 1.485,
+            "n": 139
+          },
+          "0.75-0.90": {
+            "rms_255": 1.055,
+            "n": 227
+          },
+          "0.90-1.00": {
+            "rms_255": 2.03,
+            "n": 5
+          }
+        },
+        "rms_all_255": 1.247,
+        "psd_radial_loglog_slope": -1.615,
+        "psd_radial_profile": [
+          1.0,
+          0.2218,
+          0.1431,
+          0.1206,
+          0.1107,
+          0.1056,
+          0.09,
+          0.0812,
+          0.0701,
+          0.0621,
+          0.0529,
+          0.0445,
+          0.0419,
+          0.031,
+          0.0222,
+          0.0171,
+          0.0126,
+          0.0093,
+          0.0071,
+          0.0056,
+          0.0051,
+          0.0046,
+          0.0043
+        ]
+      }
+    },
+    {
+      "file": "M9hSLSAT4.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.72,
+          "p1": 3.0,
+          "p5": 14.29,
+          "p25": 58.95,
+          "p50": 155.8,
+          "p75": 192.02,
+          "p95": 216.65,
+          "p99": 229.57,
+          "p99_9": 243.93
+        },
+        "luma_mean_255": 130.45,
+        "luma_std_255": 69.98,
+        "contrast_p95_minus_p5_255": 202.36,
+        "contrast_p99_minus_p1_255": 226.57,
+        "shadow_clip_frac": 0.00584,
+        "highlight_clip_frac": 0.0004,
+        "skewness": -0.42
+      },
+      "color": {
+        "mean_chroma": 18.8,
+        "chroma_p50": 5.21,
+        "chroma_p90": 62.26,
+        "chroma_p99": 82.23,
+        "neutral_frac": 0.5625,
+        "neutral_ab_median": [
+          -1.4,
+          -1.33
+        ],
+        "neutral_a_mean": -1.63,
+        "neutral_b_mean": -0.88,
+        "overall_ab_median": [
+          -0.85,
+          0.95
+        ],
+        "highlight_ab_median": [
+          -1.24,
+          -3.54
+        ],
+        "shadow_ab_median": [
+          -0.31,
+          0.49
+        ],
+        "sat_frac_chroma_gt20": 0.3008
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1959,
+        "flat_luma_mean_255": 180.4,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.675,
+            "n": 23
+          },
+          "0.45-0.60": {
+            "rms_255": 1.38,
+            "n": 8
+          },
+          "0.60-0.75": {
+            "rms_255": 1.473,
+            "n": 126
+          },
+          "0.75-0.90": {
+            "rms_255": 1.071,
+            "n": 237
+          }
+        },
+        "rms_all_255": 1.251,
+        "psd_radial_loglog_slope": -1.656,
+        "psd_radial_profile": [
+          1.0,
+          0.2904,
+          0.1778,
+          0.1181,
+          0.1088,
+          0.0972,
+          0.0818,
+          0.0726,
+          0.065,
+          0.0597,
+          0.053,
+          0.0474,
+          0.0408,
+          0.0296,
+          0.022,
+          0.017,
+          0.012,
+          0.0093,
+          0.0069,
+          0.0056,
+          0.0052,
+          0.0046,
+          0.0042
+        ]
+      }
+    },
+    {
+      "file": "M9hSLSAT5.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 0.72,
+          "p1": 3.0,
+          "p5": 14.33,
+          "p25": 57.67,
+          "p50": 155.22,
+          "p75": 191.84,
+          "p95": 216.52,
+          "p99": 229.5,
+          "p99_9": 243.86
+        },
+        "luma_mean_255": 129.98,
+        "luma_std_255": 70.06,
+        "contrast_p95_minus_p5_255": 202.18,
+        "contrast_p99_minus_p1_255": 226.5,
+        "shadow_clip_frac": 0.00569,
+        "highlight_clip_frac": 0.0004,
+        "skewness": -0.409
+      },
+      "color": {
+        "mean_chroma": 20.97,
+        "chroma_p50": 6.22,
+        "chroma_p90": 67.83,
+        "chroma_p99": 84.36,
+        "neutral_frac": 0.4718,
+        "neutral_ab_median": [
+          -1.23,
+          -1.84
+        ],
+        "neutral_a_mean": -1.47,
+        "neutral_b_mean": -1.36,
+        "overall_ab_median": [
+          -0.85,
+          0.97
+        ],
+        "highlight_ab_median": [
+          -1.05,
+          -4.29
+        ],
+        "shadow_ab_median": [
+          -0.28,
+          0.46
+        ],
+        "sat_frac_chroma_gt20": 0.3205
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1958,
+        "flat_luma_mean_255": 179.82,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.609,
+            "n": 22
+          },
+          "0.15-0.30": {
+            "rms_255": 1.985,
+            "n": 7
+          },
+          "0.45-0.60": {
+            "rms_255": 1.338,
+            "n": 8
+          },
+          "0.60-0.75": {
+            "rms_255": 1.473,
+            "n": 126
+          },
+          "0.75-0.90": {
+            "rms_255": 1.072,
+            "n": 235
+          }
+        },
+        "rms_all_255": 1.252,
+        "psd_radial_loglog_slope": -1.643,
+        "psd_radial_profile": [
+          1.0,
+          0.3191,
+          0.1846,
+          0.1282,
+          0.1088,
+          0.0998,
+          0.0909,
+          0.0766,
+          0.067,
+          0.0581,
+          0.052,
+          0.0476,
+          0.0445,
+          0.0322,
+          0.0244,
+          0.0175,
+          0.0123,
+          0.0099,
+          0.0075,
+          0.0062,
+          0.0057,
+          0.0049,
+          0.0045
+        ]
+      }
+    },
+    {
+      "file": "M9hVFAB.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 5.19,
+          "p1": 11.79,
+          "p5": 29.51,
+          "p25": 96.17,
+          "p50": 119.09,
+          "p75": 133.95,
+          "p95": 209.22,
+          "p99": 226.73,
+          "p99_9": 241.58
+        },
+        "luma_mean_255": 117.35,
+        "luma_std_255": 49.79,
+        "contrast_p95_minus_p5_255": 179.71,
+        "contrast_p99_minus_p1_255": 214.94,
+        "shadow_clip_frac": 8e-05,
+        "highlight_clip_frac": 7e-05,
+        "skewness": 0.082
+      },
+      "color": {
+        "mean_chroma": 11.66,
+        "chroma_p50": 8.84,
+        "chroma_p90": 17.59,
+        "chroma_p99": 71.98,
+        "neutral_frac": 0.2065,
+        "neutral_ab_median": [
+          0.41,
+          -4.12
+        ],
+        "neutral_a_mean": 0.34,
+        "neutral_b_mean": -3.87,
+        "overall_ab_median": [
+          1.01,
+          -8.16
+        ],
+        "highlight_ab_median": [
+          0.54,
+          -4.11
+        ],
+        "shadow_ab_median": [
+          0.03,
+          -3.81
+        ],
+        "sat_frac_chroma_gt20": 0.0917
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2051,
+        "flat_luma_mean_255": 128.0,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.925,
+            "n": 8
+          },
+          "0.15-0.30": {
+            "rms_255": 1.621,
+            "n": 5
+          },
+          "0.30-0.45": {
+            "rms_255": 1.367,
+            "n": 11
+          },
+          "0.45-0.60": {
+            "rms_255": 1.279,
+            "n": 347
+          },
+          "0.60-0.75": {
+            "rms_255": 1.047,
+            "n": 8
+          },
+          "0.75-0.90": {
+            "rms_255": 1.33,
+            "n": 21
+          }
+        },
+        "rms_all_255": 1.297,
+        "psd_radial_loglog_slope": -1.372,
+        "psd_radial_profile": [
+          1.0,
+          0.3673,
+          0.3143,
+          0.2771,
+          0.2353,
+          0.2094,
+          0.2063,
+          0.1887,
+          0.1749,
+          0.1593,
+          0.1455,
+          0.1306,
+          0.1151,
+          0.0866,
+          0.064,
+          0.0493,
+          0.035,
+          0.0261,
+          0.0193,
+          0.0154,
+          0.0132,
+          0.0109,
+          0.0101
+        ]
+      }
+    },
+    {
+      "file": "M9hVFAB_ACR.JPG",
+      "orig_size": [
+        5212,
+        3468
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 9.5,
+          "p1": 17.15,
+          "p5": 34.73,
+          "p25": 89.74,
+          "p50": 108.87,
+          "p75": 122.81,
+          "p95": 197.51,
+          "p99": 214.87,
+          "p99_9": 231.23
+        },
+        "luma_mean_255": 109.85,
+        "luma_std_255": 45.14,
+        "contrast_p95_minus_p5_255": 162.79,
+        "contrast_p99_minus_p1_255": 197.72,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.329
+      },
+      "color": {
+        "mean_chroma": 13.05,
+        "chroma_p50": 9.76,
+        "chroma_p90": 22.39,
+        "chroma_p99": 73.19,
+        "neutral_frac": 0.1066,
+        "neutral_ab_median": [
+          0.51,
+          -4.83
+        ],
+        "neutral_a_mean": 0.32,
+        "neutral_b_mean": -4.38,
+        "overall_ab_median": [
+          1.4,
+          -9.1
+        ],
+        "highlight_ab_median": [
+          0.62,
+          -4.44
+        ],
+        "shadow_ab_median": [
+          0.55,
+          -4.95
+        ],
+        "sat_frac_chroma_gt20": 0.1161
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2001,
+        "flat_luma_mean_255": 118.97,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.747,
+            "n": 6
+          },
+          "0.15-0.30": {
+            "rms_255": 1.316,
+            "n": 5
+          },
+          "0.30-0.45": {
+            "rms_255": 1.365,
+            "n": 161
+          },
+          "0.45-0.60": {
+            "rms_255": 1.395,
+            "n": 201
+          },
+          "0.60-0.75": {
+            "rms_255": 1.303,
+            "n": 23
+          }
+        },
+        "rms_all_255": 1.374,
+        "psd_radial_loglog_slope": -1.237,
+        "psd_radial_profile": [
+          1.0,
+          0.3495,
+          0.3315,
+          0.2771,
+          0.2222,
+          0.194,
+          0.1788,
+          0.1646,
+          0.1407,
+          0.1179,
+          0.1055,
+          0.0937,
+          0.0831,
+          0.0704,
+          0.0633,
+          0.0553,
+          0.0476,
+          0.0381,
+          0.0302,
+          0.0246,
+          0.0206,
+          0.0169,
+          0.0146
+        ]
+      }
+    },
+    {
+      "file": "M9hVFAI0160.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 5.37,
+          "p1": 14.86,
+          "p5": 29.51,
+          "p25": 121.43,
+          "p50": 139.31,
+          "p75": 147.38,
+          "p95": 232.79,
+          "p99": 241.29,
+          "p99_9": 251.36
+        },
+        "luma_mean_255": 133.88,
+        "luma_std_255": 52.99,
+        "contrast_p95_minus_p5_255": 203.28,
+        "contrast_p99_minus_p1_255": 226.43,
+        "shadow_clip_frac": 0.00052,
+        "highlight_clip_frac": 0.00065,
+        "skewness": -0.24
+      },
+      "color": {
+        "mean_chroma": 8.63,
+        "chroma_p50": 5.41,
+        "chroma_p90": 11.63,
+        "chroma_p99": 73.41,
+        "neutral_frac": 0.6055,
+        "neutral_ab_median": [
+          0.0,
+          -3.73
+        ],
+        "neutral_a_mean": -0.26,
+        "neutral_b_mean": -3.49,
+        "overall_ab_median": [
+          0.29,
+          -5.03
+        ],
+        "highlight_ab_median": [
+          0.06,
+          -2.17
+        ],
+        "shadow_ab_median": [
+          -0.57,
+          -2.01
+        ],
+        "sat_frac_chroma_gt20": 0.085
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2068,
+        "flat_luma_mean_255": 139.24,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.669,
+            "n": 7
+          },
+          "0.30-0.45": {
+            "rms_255": 1.485,
+            "n": 9
+          },
+          "0.45-0.60": {
+            "rms_255": 1.275,
+            "n": 346
+          },
+          "0.60-0.75": {
+            "rms_255": 0.845,
+            "n": 5
+          },
+          "0.75-0.90": {
+            "rms_255": 1.126,
+            "n": 28
+          }
+        },
+        "rms_all_255": 1.268,
+        "psd_radial_loglog_slope": -1.307,
+        "psd_radial_profile": [
+          1.0,
+          0.3992,
+          0.3276,
+          0.3198,
+          0.3042,
+          0.2779,
+          0.2385,
+          0.2279,
+          0.2173,
+          0.194,
+          0.1742,
+          0.1588,
+          0.1396,
+          0.1013,
+          0.0792,
+          0.0616,
+          0.0458,
+          0.0338,
+          0.0242,
+          0.019,
+          0.017,
+          0.0141,
+          0.0123
+        ]
+      }
+    },
+    {
+      "file": "M9hVFAS.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 6.79,
+          "p1": 15.57,
+          "p5": 29.22,
+          "p25": 119.58,
+          "p50": 137.16,
+          "p75": 145.37,
+          "p95": 231.08,
+          "p99": 239.15,
+          "p99_9": 249.86
+        },
+        "luma_mean_255": 132.02,
+        "luma_std_255": 52.64,
+        "contrast_p95_minus_p5_255": 201.86,
+        "contrast_p99_minus_p1_255": 223.57,
+        "shadow_clip_frac": 0.00029,
+        "highlight_clip_frac": 0.00041,
+        "skewness": -0.202
+      },
+      "color": {
+        "mean_chroma": 8.53,
+        "chroma_p50": 5.31,
+        "chroma_p90": 11.82,
+        "chroma_p99": 72.9,
+        "neutral_frac": 0.6354,
+        "neutral_ab_median": [
+          0.04,
+          -3.89
+        ],
+        "neutral_a_mean": -0.2,
+        "neutral_b_mean": -3.52,
+        "overall_ab_median": [
+          0.33,
+          -4.91
+        ],
+        "highlight_ab_median": [
+          0.2,
+          -2.15
+        ],
+        "shadow_ab_median": [
+          -0.57,
+          -1.78
+        ],
+        "sat_frac_chroma_gt20": 0.0845
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2059,
+        "flat_luma_mean_255": 137.16,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.283,
+            "n": 7
+          },
+          "0.15-0.30": {
+            "rms_255": 1.29,
+            "n": 8
+          },
+          "0.30-0.45": {
+            "rms_255": 1.145,
+            "n": 5
+          },
+          "0.45-0.60": {
+            "rms_255": 1.292,
+            "n": 339
+          },
+          "0.60-0.75": {
+            "rms_255": 0.969,
+            "n": 9
+          },
+          "0.75-0.90": {
+            "rms_255": 1.307,
+            "n": 31
+          }
+        },
+        "rms_all_255": 1.282,
+        "psd_radial_loglog_slope": -1.269,
+        "psd_radial_profile": [
+          1.0,
+          0.4545,
+          0.4304,
+          0.3855,
+          0.3438,
+          0.3316,
+          0.3171,
+          0.2863,
+          0.2538,
+          0.2359,
+          0.2259,
+          0.1986,
+          0.1803,
+          0.133,
+          0.1025,
+          0.0808,
+          0.0584,
+          0.0405,
+          0.0289,
+          0.0224,
+          0.0201,
+          0.0171,
+          0.0147
+        ]
+      }
+    },
+    {
+      "file": "M9hVFAS_ACR.JPG",
+      "orig_size": [
+        5212,
+        3468
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 11.93,
+          "p1": 24.93,
+          "p5": 35.57,
+          "p25": 110.51,
+          "p50": 125.94,
+          "p75": 134.16,
+          "p95": 220.86,
+          "p99": 227.86,
+          "p99_9": 235.44
+        },
+        "luma_mean_255": 124.23,
+        "luma_std_255": 47.58,
+        "contrast_p95_minus_p5_255": 185.29,
+        "contrast_p99_minus_p1_255": 202.93,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.089
+      },
+      "color": {
+        "mean_chroma": 10.11,
+        "chroma_p50": 6.89,
+        "chroma_p90": 17.5,
+        "chroma_p99": 74.68,
+        "neutral_frac": 0.2948,
+        "neutral_ab_median": [
+          0.57,
+          -3.28
+        ],
+        "neutral_a_mean": 0.25,
+        "neutral_b_mean": -3.45,
+        "overall_ab_median": [
+          0.86,
+          -6.42
+        ],
+        "highlight_ab_median": [
+          0.57,
+          -2.81
+        ],
+        "shadow_ab_median": [
+          0.59,
+          -2.99
+        ],
+        "sat_frac_chroma_gt20": 0.0914
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2014,
+        "flat_luma_mean_255": 127.42,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.673,
+            "n": 5
+          },
+          "0.30-0.45": {
+            "rms_255": 1.145,
+            "n": 9
+          },
+          "0.45-0.60": {
+            "rms_255": 1.4,
+            "n": 350
+          },
+          "0.60-0.75": {
+            "rms_255": 1.142,
+            "n": 27
+          },
+          "0.75-0.90": {
+            "rms_255": 0.764,
+            "n": 8
+          }
+        },
+        "rms_all_255": 1.368,
+        "psd_radial_loglog_slope": -1.176,
+        "psd_radial_profile": [
+          1.0,
+          0.3699,
+          0.308,
+          0.3043,
+          0.2606,
+          0.2373,
+          0.209,
+          0.1825,
+          0.162,
+          0.1437,
+          0.1249,
+          0.1144,
+          0.0974,
+          0.0853,
+          0.075,
+          0.0665,
+          0.0564,
+          0.0458,
+          0.0362,
+          0.0288,
+          0.0242,
+          0.0196,
+          0.0174
+        ]
+      }
+    },
+    {
+      "file": "M9hVFA_ADOBE.JPG",
+      "orig_size": [
+        5216,
+        3472
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 11.23,
+          "p1": 21.43,
+          "p5": 34.86,
+          "p25": 121.19,
+          "p50": 138.08,
+          "p75": 146.08,
+          "p95": 232.08,
+          "p99": 239.93,
+          "p99_9": 250.43
+        },
+        "luma_mean_255": 133.71,
+        "luma_std_255": 51.44,
+        "contrast_p95_minus_p5_255": 197.22,
+        "contrast_p99_minus_p1_255": 218.5,
+        "shadow_clip_frac": 0.00012,
+        "highlight_clip_frac": 0.00047,
+        "skewness": -0.138
+      },
+      "color": {
+        "mean_chroma": 7.55,
+        "chroma_p50": 4.78,
+        "chroma_p90": 9.78,
+        "chroma_p99": 64.28,
+        "neutral_frac": 0.7698,
+        "neutral_ab_median": [
+          -0.2,
+          -3.96
+        ],
+        "neutral_a_mean": -0.38,
+        "neutral_b_mean": -3.53,
+        "overall_ab_median": [
+          -0.09,
+          -4.29
+        ],
+        "highlight_ab_median": [
+          -0.09,
+          -2.05
+        ],
+        "shadow_ab_median": [
+          -0.65,
+          -1.51
+        ],
+        "sat_frac_chroma_gt20": 0.0798
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 2046,
+        "flat_luma_mean_255": 138.43,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 1.163,
+            "n": 6
+          },
+          "0.45-0.60": {
+            "rms_255": 1.263,
+            "n": 350
+          },
+          "0.60-0.75": {
+            "rms_255": 0.965,
+            "n": 10
+          },
+          "0.75-0.90": {
+            "rms_255": 1.417,
+            "n": 27
+          }
+        },
+        "rms_all_255": 1.263,
+        "psd_radial_loglog_slope": -1.557,
+        "psd_radial_profile": [
+          1.0,
+          0.2737,
+          0.1745,
+          0.1466,
+          0.1339,
+          0.118,
+          0.1026,
+          0.101,
+          0.0906,
+          0.0799,
+          0.0686,
+          0.0618,
+          0.0538,
+          0.0405,
+          0.0307,
+          0.0239,
+          0.0173,
+          0.0124,
+          0.009,
+          0.0074,
+          0.0066,
+          0.0054,
+          0.0047
+        ]
+      }
+    }
+  ]
+}
