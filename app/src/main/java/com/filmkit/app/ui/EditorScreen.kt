@@ -325,13 +325,22 @@ import kotlinx.coroutines.withContext
  * 只对本次编辑会话有效，退出即丢 —— 否则用户在编辑器里试个滤镜，回到相机页拍照
  * 也被套上（架构师 2026-10-08 明确要求隔离）。下次打开这张照片仍从快照的 LUT 起。
  *
+ * ★ P-3（查看页「胶片」→ 选预设 → **直接进编辑器**，用户 2026-10-11 拍板）：本页新增
+ * [initialPresetId] —— 非空时在**参数起点就绪之后**（[editorOpenParams] 的全恒等基线已写进
+ * `params`、历史栈基线已 reset）套用该预设**一次**，走的仍是既有的 `applyPreset` 通路
+ * （LUT 降级 / 一步撤销 / 状态提示全部复用，本卡一行没重写）。顺序不可颠倒：先基线、再预设
+ * 的稀疏覆盖（[presetSnapshot]），反过来会把预设整个抹掉。id 查不到（面板打开期间被删 /
+ * 数据变了）⇒ 与普通「编辑」入口**逐位一致**（什么都不做，见 [initialPresetOf]）。
+ *
  * @param uri 待编辑成片的 MediaStore URI；为 null（如进程重建后状态丢失）时显示失败态而非白屏。
+ * @param initialPresetId 打开时要套用的预设 id（null = 普通入口，行为与 P-3 之前完全一致）。
  * @param onOpenGallery 顶栏最左侧菜单图标 → 相册页（用户报的第 5 点）。素材仍由本页
  *   自己从 [uri] 全尺寸解码，相册网格里的缩略图**不会**流到这里（用户明确禁止）。
  */
 @Composable
 fun EditorScreen(
     uri: Uri?,
+    initialPresetId: String? = null,
     onBack: () -> Unit = {},
     onOpenGallery: () -> Unit = {},
 ) {
@@ -1342,7 +1351,13 @@ fun EditorScreen(
                     return@LaunchedEffect
                 }
                 status = ""
-                rerender()
+                // ★ P-3：从查看页「胶片」进来时带着初始预设 ⇒ 在**基线就绪之后**套用一次。
+                // 顺序铁律（E2-21）：上一行刚把 editorOpenParams()（全恒等基线）写进 `params`
+                // 并 reset 了历史栈基线，applyPreset 只把预设的**稀疏槽**覆盖上去
+                //（presetSnapshot）。反过来（先预设、再基线）会把预设整个抹掉 ⇒ 用户点了预设、
+                // 画面还是原片。applyPreset 三个分支内部都会 rerender() ⇒ 这里不重复调用。
+                val startPreset = initialPresetOf(PresetStore.load(prefs), initialPresetId)
+                if (startPreset != null) applyPreset(startPreset) else rerender()
             }
         }
     }

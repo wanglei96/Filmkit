@@ -1,5 +1,6 @@
 package com.filmkit.app.ui
 
+import com.filmkit.app.camera.EditorPreset
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -183,3 +184,24 @@ fun backTarget(screen: String, editorFrom: String, galleryFrom: String): String 
     in SETTINGS_SUB_PAGES -> "settings"
     else -> "camera"
 }
+
+// ── ⑥ 查看页「胶片」→ 选预设 → 直接进编辑器（★ P-3）─────────────────────────
+
+/**
+ * ★ P-3：打开编辑器时"要不要套用一条初始预设"的**纯判定** —— 把查看页「胶片」面板传来的
+ * [initialPresetId] 在预设列表里找出来（`null` = 普通「编辑」入口）。
+ *
+ * 为什么是"按 id 现取"而不是"把整条预设带过去"：预设在 prefs 里是**唯一真源**（ADR-7 裁决：
+ * 拍照 / 查看页 / 编辑器三处入口同一套数据），路由层只带一个字符串（`rememberSaveable` 能存，
+ * 跨进程重建也不丢）⇒ 不存在"面板打开时读到的那份副本"与"编辑器读到的"不一致的窗口。
+ *
+ * 为什么放在这个文件：本卡的**回归哨兵**是"查不到 ⇒ 什么都不做"这一条 —— `null` id、空列表、
+ * 预设已被删（面板打开期间被删 / 进程重建后数据变了）三种情形都必须退化成**与 P-3 之前逐位
+ * 一致的编辑器**（起点 = 全恒等基线、首帧渲染原片），绝不允许半套用。Compose 里那段分支跑不了
+ * 单测；判定留在纯逻辑文件（无 android import）就能钉住（见 PhotoViewPresetTest）。
+ *
+ * ⚠ 拿到非空结果后**必须**在基线就绪之后才套用（先基线、再预设的稀疏覆盖）—— 顺序反了会把
+ * 预设整个抹掉，用户点一下预设、画面还是原片。
+ */
+internal fun initialPresetOf(presets: List<EditorPreset>, initialPresetId: String?): EditorPreset? =
+    initialPresetId?.let { id -> presets.firstOrNull { it.id == id } }

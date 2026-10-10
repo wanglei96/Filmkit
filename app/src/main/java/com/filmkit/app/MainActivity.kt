@@ -75,6 +75,12 @@ class MainActivity : ComponentActivity() {
  *
  * E2-20：查看页可左右滑动切换（[viewerUris] + [viewerIndex] 也留在这一层）——
  * 滑到第 7 张再进编辑器，退出时回的仍是**第 7 张**（查看页重建时 initialPage = viewerIndex）。
+ *
+ * ★ P-3：查看页底栏「胶片」→ 面板选一条预设 → **同样进编辑器**，只是 [editorPresetId] 带上该
+ * 预设的 id（用户 2026-10-11 拍板："选预设 → 直接进编辑器"，不是保存副本）。两条入口的返回
+ * 语义完全一致（`editorFrom = "viewer"` ⇒ 退出回同一张）；普通「编辑」入口把 id 置 null ⇒
+ * 编辑器的行为与 P-3 之前逐位一致（起点仍是全恒等基线）。
+ *
  * 返回键的分层归属统一由纯函数 [backTarget] 决定（单测见 PhotoViewerModelTest）。
  */
 @Composable
@@ -83,6 +89,10 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     // 编辑器当前打开的成片。Uri 是 Parcelable，rememberSaveable 能跨进程重建保住；
     // 万一恢复后 URI 已失效，EditorScreen 自己会显示"图片已失效"，不会白屏。
     var editorUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    // ★ P-3：本次进编辑器要套用的预设 id（查看页「胶片」面板选中时带上；普通「编辑」入口
+    // 一律置 null）。只带 **id** 不带整条预设：预设在 prefs 里是唯一真源，编辑器自己按 id 取
+    // —— 跨进程重建时不会拿着一份过期副本。String? 是 Bundle 能存的可序列化类型。
+    var editorPresetId by rememberSaveable { mutableStateOf<String?>(null) }
     // 来源页：编辑器与相册各自记住"从哪进来的"，返回时回到那一页（见上面的 KDoc）
     var editorFrom by rememberSaveable { mutableStateOf("camera") }
     var galleryFrom by rememberSaveable { mutableStateOf("camera") }
@@ -123,6 +133,8 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         )
         // 查看页：全屏原图 + 左右滑动切图 + 双指缩放 + 底栏五项。点「编辑」才进编辑器，并记下
         // "从查看页来的"；删除成功后回相册（那张已经不存在，留在查看页只会看到失效图）。
+        // ★ P-3：底栏「胶片」→ 面板选一条预设 → **同样进编辑器**，但带上预设 id（直接看效果，
+        // 不是保存副本 —— 用户 2026-10-11 拍板）。两条入口的返回语义完全一致（回本页同一张）。
         "viewer" -> PhotoViewScreen(
             uris = viewerUris,
             index = viewerIndex,
@@ -131,6 +143,13 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             onEdit = { uri ->
                 editorUri = uri
                 editorFrom = "viewer"
+                editorPresetId = null // 普通「编辑」入口：起点仍是全恒等基线（与 P-3 之前一致）
+                screen = "editor"
+            },
+            onEditWithPreset = { uri, presetId ->
+                editorUri = uri
+                editorFrom = "viewer"
+                editorPresetId = presetId
                 screen = "editor"
             },
             onDeleted = { screen = backTarget("viewer", editorFrom, galleryFrom) },
@@ -138,6 +157,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
         "editor" -> EditorScreen(
             uri = editorUri,
+            initialPresetId = editorPresetId,
             onBack = { screen = backTarget("editor", editorFrom, galleryFrom) },
             onOpenGallery = {
                 galleryFrom = "editor"

@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,6 +19,8 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +29,7 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -33,7 +37,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
@@ -61,6 +67,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -71,19 +78,17 @@ import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
+import com.filmkit.app.camera.EditorPreset
+import com.filmkit.app.camera.PresetStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-
-/** 置灰（与编辑器「撤销/重做」留位同一档：可见但明确不可用） */
-private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
-
-/** 「胶片」项的实话：E3 预设管理未开工，不假装能进（ADR-12） */
-private const val FILM_PRESET_LATER = "胶片预设将在后续版本提供"
 
 // ── 缩放 / 平移 / 手势仲裁的纯逻辑（E2-20；JVM 单测见 PhotoViewZoomTest）────────
 // 与 PhotoViewerModel.kt 同规矩：**不 import 任何 android.\***。这里算错全是静默事故
@@ -176,6 +181,18 @@ internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else inde
  * ① 按**显示尺寸**解码（[decodeFit]，Fit 档 ≈3MP ≈12MB）；② 360px 预览先上屏（[PREVIEW_SIDE]）；
  * ③ 相邻页只解预览（`beyondViewportPageCount = 1`）；④ 放大到 [ZOOM_HIRES] 补解一档。
  *
+ * ★ **P-3**（用户 2026-10-11 拍板）：底栏「胶片」由**置灰留位**改为**可点** —— 弹出
+ * [FilmPresetSheet]（自绘底部面板，与拍照界面 `LutSheet` 同一套视觉语言），列出
+ * `PresetStore.load(prefs)` 的全部预设（**三处入口同一套数据**，ADR-7 裁决）。选一条 ⇒
+ * `onEditWithPreset(uri, presetId)` ⇒ 路由层带着该 id 进编辑器，编辑器在基线就绪后套用一次
+ * ⇒ **直接看到成片效果**（不做"保存副本"：用户拍板的是"进编辑器"）。
+ * 列表为空时给一句实话（"还没有预设 · 在编辑器里保存"），**不留点不动的按钮**（ADR-12）。
+ *
+ * 面板与 E2-20 两个手势的归属（本卡最容易出事故的地方）：面板打开时
+ * ① Pager 的 `userScrollEnabled` 关掉、② 缩放/平移的手势层在 [awaitEachGesture] 里直接返回
+ * ⇒ 面板区域的任何滑动/捏合都**不会**传到图片上（也不会"选着预设把图滑走了"）；
+ * 面板关闭后两个开关原样恢复，左右切图与双指缩放的行为与 P-3 之前逐位一致。
+ *
  * 素材分级（与相册页同一约定）：本页**自己解码原图**（按显示尺寸，不是网格缩略图那一档）。
  * 权限沿用相册页那套（未授权时相册只列本应用照片），本页不新增权限流程。
  *
@@ -184,6 +201,8 @@ internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else inde
  * @param onIndexChange 滑动切到新的一张时回调 —— 路由层必须跟着更新，否则"从查看页进编辑器、
  *   退出回查看页"会回到**上一张**（见 MainActivity 的 viewerIndex）。
  * @param onEdit 点「编辑」→ 交给编辑器（路由层记录"从查看页进来的"+当前索引，退出时回本页同一张）。
+ * @param onEditWithPreset 点「胶片」选中的预设 → 同样进编辑器，但**带上预设 id**（P-3）；
+ *   语义与 [onEdit] 完全一致（同一张照片、退出回本页），只是编辑器会先套用这条预设。
  * @param onDeleted 删除成功 → 回相册（那张已不存在，留在本页只会看到失效图）。
  */
 @Composable
@@ -193,6 +212,7 @@ fun PhotoViewScreen(
     onIndexChange: (Int) -> Unit = {},
     onBack: () -> Unit = {},
     onEdit: (Uri) -> Unit = {},
+    onEditWithPreset: (Uri, String) -> Unit = { _, _ -> },
     onDeleted: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -219,6 +239,12 @@ fun PhotoViewScreen(
     var status by remember { mutableStateOf("") }
     var showInfo by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    // ── ★ P-3「胶片」预设面板 ─────────────────────────────────────────────
+    // `showFilmPanel` = 面板是否打开（自绘覆盖层，**不用 M3 ModalBottomSheet**：真机返回要按
+    // 两次才关，用户 2026-10-03 实测，见 SettingsScreen 的 SettingsDrawer）；`presets` = 打开
+    // 面板时从 prefs 读一次的镜像（与 EditorScreen.togglePresets 同一节奏、同一数据源）。
+    var showFilmPanel by remember { mutableStateOf(false) }
+    var presets by remember { mutableStateOf<List<EditorPreset>>(emptyList()) }
     // 收藏的唯一数据源是这份 state；prefs 只负责持久化（见 KDoc 的"没有统一收藏 API"）
     var favorites by remember {
         mutableStateOf(favoritesFrom(prefs.getString(FAVORITES_KEY, null)))
@@ -352,6 +378,12 @@ fun PhotoViewScreen(
         snapshotFlow { pagerState.settledPage }.collect { onIndexChange(it) }
     }
 
+    // ★ P-3：面板打开时返回键**先关面板**（与编辑器预设面板 E3-1a 同一分层精神）—— 用户按
+    // 返回的意图是"退出预设"，不是"退出查看页回相册"。本页此前没有 BackHandler，返回键由
+    // MainActivity 的导航层接管；这里注册的是**内层**，Compose 的返回回调后进先出 ⇒ 面板打开
+    // 时它优先，关闭后交还导航层（行为与 P-3 之前逐位一致）。
+    BackHandler(enabled = showFilmPanel) { showFilmPanel = false }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -427,15 +459,22 @@ fun PhotoViewScreen(
                     beyondViewportPageCount = 1,
                     // 放大态关掉 Pager 的滚动（仲裁表第二行）；手势层自己也会消费放大态的事件，
                     // 这里是第二道保险 —— 两道都失效才会出现"放大后拖动把图切走"。
-                    userScrollEnabled = !zoomed,
+                    // ★ P-3：预设面板打开时同样关掉（第三道：面板打开时图片区手势全停，
+                    // 见下面手势层的早退）—— 否则"选预设时手一滑，图被切走"。
+                    userScrollEnabled = !zoomed && !showFilmPanel,
                     modifier = Modifier.fillMaxSize(),
                 ) { p ->
                     Box(
                         Modifier
                             .fillMaxSize()
-                            .pointerInput(p) {
+                            .pointerInput(p, showFilmPanel) {
                                 awaitEachGesture {
                                     awaitFirstDown(requireUnconsumed = false)
+                                    // ★ P-3：预设面板打开时图片区**一个手势都不处理**（也不消费）
+                                    // —— 面板区域的手势归面板（拦截层负责点外收起），图片既不会
+                                    // 被捏合缩放也不会被拖动平移。本块返回后 awaitEachGesture 会
+                                    // 等所有手指抬起再开下一轮，不会残留半截手势状态。
+                                    if (showFilmPanel) return@awaitEachGesture
                                     do {
                                         val event = awaitPointerEvent()
                                         val pressed = event.changes.count { it.pressed }
@@ -534,9 +573,11 @@ fun PhotoViewScreen(
         ) {
             val enabled = currentUri != null
             BottomAction(Icons.Filled.Edit, "编辑", enabled) { currentUri?.let(onEdit) }
-            // 胶片（E3 预设管理未开工）：**置灰 + 一句实话**，不做假入口（ADR-12）
-            BottomAction(Icons.Filled.PhotoFilter, "胶片", enabled, dimmed = true) {
-                status = FILM_PRESET_LATER
+            // 胶片（★ P-3 已开工）：打开预设面板 —— 打开时从 prefs 读一次（与编辑器
+            // 「预设」面板同一数据源，ADR-7 裁决：三处入口一套数据）
+            BottomAction(Icons.Filled.PhotoFilter, "胶片", enabled) {
+                presets = PresetStore.load(prefs)
+                showFilmPanel = true
             }
             BottomAction(Icons.Filled.Share, "分享", enabled) {
                 currentUri?.let { sharePhoto(context, it)?.let { msg -> status = msg } }
@@ -549,6 +590,20 @@ fun PhotoViewScreen(
                 tint = MaterialTheme.colorScheme.error,
             ) { confirmDelete = true }
         }
+    }
+
+    // ── ★ P-3「胶片」：选一条预设 ⇒ **直接进编辑器**（带预设 id，不是保存副本）──────
+    // 传的是 id 而不是整条预设：预设数据在 prefs 里是唯一真源，路由层只带一个字符串
+    //（rememberSaveable 可存），编辑器自己按 id 取 —— 跨进程重建也不会带一份过期副本。
+    if (showFilmPanel) {
+        FilmPresetSheet(
+            presets = presets,
+            onPick = { p ->
+                showFilmPanel = false
+                currentUri?.let { onEditWithPreset(it, p.id) }
+            },
+            onDismiss = { showFilmPanel = false },
+        )
     }
 
     // ── 「信息」：EXIF 展示（取不到的字段不出现在表里）────────────────────
@@ -648,17 +703,130 @@ private fun rememberPreview(cache: ThumbCache<String, Bitmap>, uri: String, cont
     return bmp
 }
 
-/** 底栏一项：图标 + 文字（[dimmed] = 可见但明确不可用，如未开工的「胶片」） */
+/**
+ * ★ P-3「胶片」预设选择面板（查看页底栏第二项）。列出 prefs 里的全部预设，点一条 ⇒ [onPick]
+ * ⇒ 路由层带着这条预设的 id 进编辑器（**直接看效果**，不是保存副本 —— 用户 2026-10-11 拍板）。
+ *
+ * 形态与拍照界面 `LutSheet` 同一套视觉语言：`FilmTheme.Panel` 圆角面板贴底 + 标题 + 列表
+ *（名称 + 分组）。**不用 M3 ModalBottomSheet**：真机返回要按两次才关（用户 2026-10-03 实测，
+ * 见 SettingsScreen 的 SettingsDrawer），本页沿用"自绘覆盖层 + BackHandler"那一套。
+ *
+ * 手势归属（E2-20 的两条手势不许被面板破坏）：整屏拦截层只吃 **tap**（点面板外收起）；
+ * 面板容器的 `clickable`（无涟漪）吃掉面板内点击、不透传给拦截层。**滑动/捏合不在这里处理**
+ * —— 图片区的 Pager 与缩放/平移在面板打开时已被显式关掉（见 PhotoViewScreen 的
+ * `userScrollEnabled` 与手势层的早退），所以不存在"面板打开时手势漏到图片上"的路径。
+ *
+ * **不做选中态**：选中即离开本页（[onPick] 后路由层立刻切到编辑器），面板不常驻，
+ * 没有"当前选中"可言（做出来只会是一闪而过的假状态，ADR-12）。
+ *
+ * 空列表给一句实话（ADR-12：不留点不动的按钮、也不假装有内容）。
+ */
+@Composable
+private fun FilmPresetSheet(
+    presets: List<EditorPreset>,
+    onPick: (EditorPreset) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Box(Modifier.fillMaxSize()) {
+        // 拦截层：点画面任意处收起（与 SettingsDrawer 同一浮层规则）
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color(0x66000000))
+                .pointerInput(Unit) { detectTapGestures { onDismiss() } },
+        )
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
+                .background(FilmTheme.Panel)
+                .navigationBarsPadding()
+                // 吃掉面板内的点击，不让它透传到拦截层（否则点面板空白处 = 收起）
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {}
+                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "胶片预设",
+                    color = FilmTheme.Cream,
+                    fontSize = 20.sp,
+                    fontFamily = FilmTheme.Serif,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "收起",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 12.sp,
+                    fontFamily = FilmTheme.Mono,
+                    modifier = Modifier
+                        .clickable { onDismiss() }
+                        .padding(6.dp),
+                )
+            }
+            if (presets.isEmpty()) {
+                Text(
+                    "还没有预设 · 在编辑器里保存",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(vertical = 18.dp),
+                )
+            } else {
+                // 预设上限 100 条（PRESET_MAX）⇒ 必须限高可滚，否则长列表会把图片区挤没
+                Column(
+                    Modifier
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    presets.forEach { p -> FilmPresetRow(p) { onPick(p) } }
+                }
+            }
+        }
+    }
+}
+
+/** 面板里的一行：名称（主）+ 分组（次，空分组不占行）；点整行进编辑器 */
+@Composable
+private fun FilmPresetRow(p: EditorPreset, onPick: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onPick)
+            .padding(vertical = 10.dp),
+    ) {
+        Text(
+            p.name,
+            color = FilmTheme.Cream,
+            fontSize = 15.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (p.group.isNotBlank()) {
+            Text(
+                p.group,
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** 底栏一项：图标 + 文字 */
 @Composable
 private fun RowScope.BottomAction(
     icon: ImageVector,
     label: String,
     enabled: Boolean,
     tint: Color = FilmTheme.Cream,
-    dimmed: Boolean = false,
     onClick: () -> Unit,
 ) {
-    val ink = if (dimmed) DisabledInk else tint
+    val ink = tint
     Column(
         Modifier
             .weight(1f)
