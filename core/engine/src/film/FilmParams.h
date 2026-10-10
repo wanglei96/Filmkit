@@ -34,14 +34,27 @@ struct FilmParams {
   // ── [5..10] v0.11.0（E4-1）**语义重定义**：旧"高光软肩/阴影 toe 强度 0..1
   //（0 = 关）"→ 新 **filmic `latitude`（0..1）**，per-channel 拆分（R/G/B 三层
   // 乳剂的 toe/shoulder 过渡位置不同 = 高光/阴影色偏的机制之一）。槽位形状与位置
-  // 不动（契约不移位），shader 侧当前仍零引用（旧 log 域链 v0.7.9 已删，E4-4 才接线）。
+  // 不动（契约不移位）。
+  // ★ v0.11.5（E4-4）**已接线**（2026-10-11）：消费点 =
+  // `FrameRenderer::updateFilmicEV` → `computeFilmicSpline`（CPU 侧 per-channel
+  // spline 求解，3×2 个 5×5 系统）→ `kFsFilm` 的逐通道三段多项式求值。
+  // **只对拍照链路生效**：编辑器链路走 `kFsStyle`（输入是已成片的 sRGB 显示域，
+  // 链内无 filmic），其影调由 [4] contrast + 影调分区 [90..93] 承担 ⇒ 同一预设里
+  // 的 [5..10] 在编辑器侧**无视觉效果**（`docs/reports/preset-DESIGN.md` §1.6
+  // 字段能力矩阵已按此标注，供三处入口 UI 灰显）。
   // ⚠️ **默认值必须是 0.01，不是 0** —— latitude 语义下 `0` 表示 toe/shoulder 过渡区
   // **紧贴中灰**（`toe_log = grey_log`），是**极端 S 曲线**，不是"无效果"！
-  // `0.01` = darktable 默认，也正是引擎当前的实际行为：`FrameRenderer.h` 的
-  // `computeFilmicSpline(..., float latitude = 0.01f)` 声明默认 0.01，而
-  // `FrameRenderer.cpp:11555` 的调用只传 3 个实参 ⇒ 恒取该默认值。
-  // ⚠️ E4-4 接线时必须处理旧数组（旧快照/预设里 [5..10] 存的是旧语义的 0）：
-  // 那个 0 在新语义下是极端曲线，不能直接透传。
+  // `0.01` = darktable 默认，也正是接线前引擎的实际行为（当时 `computeFilmicSpline`
+  // 的 latitude 形参默认 0.01 且调用只传 3 个实参）。
+  // ⚠️ 旧值 0 的迁移风险（E4-1 提请注意）**已核实不存在**，本卡不写迁移函数：
+  //   ① 拍照链路：`CameraController.filmParams` 从 `CameraPresets.standard()` 起步，
+  //      全仓只有 `neutral()` 写 [5..10]（无 prefs 覆盖层）⇒ 运行时恒 0.01；
+  //   ② 预设：v1（索引键）被 `presetSchemaUsable` 一律拒绝；v2 用语义名
+  //      `shoulder[0..2]`/`toe[0..2]`，`presetSparseSlots` 的恒等值逐槽取
+  //      `CameraPresets.standard()`（= 0.01）⇒ 只有用户显式调过才存非 0.01；
+  //   ③ 内置预设 `assets/presets/builtin.json` 三条均不含 [5..10]。
+  // 引擎侧对越界/非有限值仍有防线：`computeFilmicSpline` 内 clamp 到 [0,1]，
+  // 非有限值回退 0.01（见彼处注释；输入经 JNI/预设，属信任边界）。
   float shoulder[3] = {0.01f, 0.01f, 0.01f};  // 5..7 shoulder = latitude R/G/B
   float toe[3] = {0.01f, 0.01f, 0.01f};       // 8..10 toe = latitude R/G/B
   float cross[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // 11..19 log 域染料串扰

@@ -4133,8 +4133,26 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 //   POLY_4 toe·shoulder 的 5×5 线性系统（f(0)=black / f'(0)=0 / f(T)=y / f'(T)=c / f''(T)=0）。
 // 系数在 CPU 侧算好（computeFilmicSpline），这里只做 log 编码 + 三段多项式求值；
 // 与 PhotonCamera 的同名实现逐项一致（见其 RawDemosaicProcessor.kt / DarktableFilmicToneAlgorithm.kt）。
-uniform vec3 uFilmicM1, uFilmicM2, uFilmicM3, uFilmicM4, uFilmicM5;
-uniform float uFilmicLatMin, uFilmicLatMax;
+// ── E4-4：filmic latitude 的 per-channel 拆分（[5..7]=shoulder / [8..10]=toe）──────
+// 数学依据（darktable v3 `dt_iop_filmic_rgb_compute_spline`）：
+//   toe_log = (1 − lat)·grey_log + lat·xmin      ← 原版里 toe 与 shoulder **本来就是
+//   sh_log  = (1 − lat)·grey_log + lat·xmax        两个独立表达式**，只是共用一个 lat
+// ⇒ 拆成 lat_toe / lat_sh 并各给 R/G/B 一份，是**原版参数维度的自然展开**（三层乳剂
+// 的 toe/shoulder 位置不同 = 阴影/高光色偏的物理机制），不是自研机制、不新增曲线、
+// 不新增 pass。默认全 0.01（darktable 默认）⇒ 三通道系数逐位相同 ⇒ 与接线前逐位一致。
+// ⚠️ **与现有旋钮的正交性**（规格 §3.4.3；改本段时勿引入改变端点的项）：
+//   · [37][38] black/white EV → xmin/xmax = **端点**。本段只改 toe_log/sh_log 的**位置**，
+//     五条约束（f(0)=black_disp / f'(0)=0 / f(Tl)=toe_d / f'(Tl)=contrast / f''(Tl)=0）
+//     一条不动 ⇒ 端点与端点斜率不动，**只改中段形状**。
+//   · [4] contrast → 线性段斜率：与 lat 都作用在曲线中部 ⇒ **有交互**（lat 改过渡区
+//     位置、contrast 改斜率）；交互由 CPU 侧同一组求解自然表达，本段不读 contrast。
+//   · [28] tone_strength → mix(lin, toned, k)：正交（本段改 toned 的形状，[28] 改混合比）。
+// ⚠️ GPU 三禁（都是静默失败）：**手写 R/G/B 三份** —— 不用数组参数、不做动态索引、
+//    不用多行宏。系数按**段**分组、vec3 的 .r/.g/.b = R/G/B 三层乳剂。
+uniform vec3 uFilmicToeM1, uFilmicToeM2, uFilmicToeM3, uFilmicToeM4, uFilmicToeM5;
+uniform vec3 uFilmicShM1, uFilmicShM2, uFilmicShM3, uFilmicShM4, uFilmicShM5;
+uniform vec3 uFilmicLinM1, uFilmicLinM2;    // 中间线性段 y = m1 + m2·x
+uniform vec3 uFilmicLatMin, uFilmicLatMax;  // 逐通道 toe_log / shoulder_log
 uniform float uFilmicBlackEv, uFilmicDr, uFilmicInputMin, uFilmicInputMax;
 uniform float uFilmicPower, uFilmicBlackDisp;
 // v0.10.13：darktable filmic v5 gamut mapping 开关（1 = 开/标准，0 = A/B 关）
@@ -4149,17 +4167,46 @@ uniform float uGamut;
 uniform float uExposure;
 const float kFilmicGrey = 0.1845;               // darktable grey_source（18.45% 中灰）
 const float kFilmicNormMin = 1.52587890625e-5;  // 2^-16，与 darktable NORM_MIN 一致
-float filmicSpline(float e) {
-    if (e < uFilmicLatMin)
-        return uFilmicM1.x + e * (uFilmicM2.x + e * (uFilmicM3.x + e * (uFilmicM4.x + e * uFilmicM5.x)));
-    if (e > uFilmicLatMax)
-        return uFilmicM1.y + e * (uFilmicM2.y + e * (uFilmicM3.y + e * (uFilmicM4.y + e * uFilmicM5.y)));
-    return uFilmicM1.z + e * uFilmicM2.z;
+// 逐通道三段求值（Horner；vec3 的 .r/.g/.b = R/G/B）。手写三份的理由见上方三禁。
+float filmicSplineR(float e) {
+    if (e < uFilmicLatMin.r)
+        return uFilmicToeM1.r + e * (uFilmicToeM2.r + e * (uFilmicToeM3.r + e * (uFilmicToeM4.r + e * uFilmicToeM5.r)));
+    if (e > uFilmicLatMax.r)
+        return uFilmicShM1.r + e * (uFilmicShM2.r + e * (uFilmicShM3.r + e * (uFilmicShM4.r + e * uFilmicShM5.r)));
+    return uFilmicLinM1.r + e * uFilmicLinM2.r;
 }
-float filmicScalar(float v, float lo) {
+float filmicSplineG(float e) {
+    if (e < uFilmicLatMin.g)
+        return uFilmicToeM1.g + e * (uFilmicToeM2.g + e * (uFilmicToeM3.g + e * (uFilmicToeM4.g + e * uFilmicToeM5.g)));
+    if (e > uFilmicLatMax.g)
+        return uFilmicShM1.g + e * (uFilmicShM2.g + e * (uFilmicShM3.g + e * (uFilmicShM4.g + e * uFilmicShM5.g)));
+    return uFilmicLinM1.g + e * uFilmicLinM2.g;
+}
+float filmicSplineB(float e) {
+    if (e < uFilmicLatMin.b)
+        return uFilmicToeM1.b + e * (uFilmicToeM2.b + e * (uFilmicToeM3.b + e * (uFilmicToeM4.b + e * uFilmicToeM5.b)));
+    if (e > uFilmicLatMax.b)
+        return uFilmicShM1.b + e * (uFilmicShM2.b + e * (uFilmicShM3.b + e * (uFilmicShM4.b + e * uFilmicShM5.b)));
+    return uFilmicLinM1.b + e * uFilmicLinM2.b;
+}
+// 逐通道标量（log 编码 + 三段求值 + 幂）。三份**逐字复制**旧版 filmicScalar 的表达式
+// 序列（只换 spline 函数）⇒ 默认三通道相同时与接线前的运算序列完全一致（逐位一致）。
+float filmicScalarR(float v, float lo) {
     float s = max(v, kFilmicNormMin);
     float e = clamp((log2(s / kFilmicGrey) - uFilmicBlackEv) / max(uFilmicDr, 0.2), 0.0, 1.0);
-    float c = clamp(filmicSpline(e), lo, 1.0);
+    float c = clamp(filmicSplineR(e), lo, 1.0);
+    return pow(max(c, 0.0), uFilmicPower);
+}
+float filmicScalarG(float v, float lo) {
+    float s = max(v, kFilmicNormMin);
+    float e = clamp((log2(s / kFilmicGrey) - uFilmicBlackEv) / max(uFilmicDr, 0.2), 0.0, 1.0);
+    float c = clamp(filmicSplineG(e), lo, 1.0);
+    return pow(max(c, 0.0), uFilmicPower);
+}
+float filmicScalarB(float v, float lo) {
+    float s = max(v, kFilmicNormMin);
+    float e = clamp((log2(s / kFilmicGrey) - uFilmicBlackEv) / max(uFilmicDr, 0.2), 0.0, 1.0);
+    float c = clamp(filmicSplineB(e), lo, 1.0);
     return pow(max(c, 0.0), uFilmicPower);
 }
 // darktable 的颜色模式：0.5 × 逐通道 + 0.5 × max-RGB 归一。
@@ -4168,12 +4215,14 @@ float filmicScalar(float v, float lo) {
 // **不是可选项**：离线实测同一场景，缺它时高光 R/G 1.277，补上后 1.000。
 vec3 filmicTone(vec3 c) {
     vec3 p = max(c, vec3(0.0));
-    vec3 naive = vec3(filmicScalar(p.r, 0.0), filmicScalar(p.g, 0.0),
-                      filmicScalar(p.b, 0.0));
+    vec3 naive = vec3(filmicScalarR(p.r, 0.0), filmicScalarG(p.g, 0.0),
+                      filmicScalarB(p.b, 0.0));
     float mx = max(max(p.r, p.g), p.b);
     float ratioNorm = max(mx, uFilmicInputMin);
     float toneNorm = clamp(mx, uFilmicInputMin, uFilmicInputMax);
-    vec3 normed = (p / ratioNorm) * filmicScalar(toneNorm, uFilmicBlackDisp);
+    // E4-4：norm 分支的输入是**标量** max-RGB，必须挑一套通道系数 —— 取 **G**
+    //（主感光层，luma 权重 0.7152 最大）。默认三通道相同 ⇒ 与接线前逐位一致。
+    vec3 normed = (p / ratioNorm) * filmicScalarG(toneNorm, uFilmicBlackDisp);
     return 0.5 * naive + 0.5 * normed;
 }
 // ── darktable filmic v5 gamut mapping（v0.10.13，标准算法补全）──────────────
@@ -6543,11 +6592,19 @@ bool FrameRenderer::init() {
   // v0.7.8：用户 EV 滑杆（显示亮度补偿，乘在影调链之后，见 kFsFilm 注释）
   u_film_.exposure = glGetUniformLocation(prog_film_, "uExposure");
   // v0.7.3：filmic 的 spline 系数与 EV 标定（替代已废除的 uExposureGain）
-  u_film_.filmic_m1 = glGetUniformLocation(prog_film_, "uFilmicM1");
-  u_film_.filmic_m2 = glGetUniformLocation(prog_film_, "uFilmicM2");
-  u_film_.filmic_m3 = glGetUniformLocation(prog_film_, "uFilmicM3");
-  u_film_.filmic_m4 = glGetUniformLocation(prog_film_, "uFilmicM4");
-  u_film_.filmic_m5 = glGetUniformLocation(prog_film_, "uFilmicM5");
+  // E4-4：per-channel —— 系数按**段**分组、vec3 的 .r/.g/.b = R/G/B（见 u_film_ 注释）
+  u_film_.filmic_toe_m1 = glGetUniformLocation(prog_film_, "uFilmicToeM1");
+  u_film_.filmic_toe_m2 = glGetUniformLocation(prog_film_, "uFilmicToeM2");
+  u_film_.filmic_toe_m3 = glGetUniformLocation(prog_film_, "uFilmicToeM3");
+  u_film_.filmic_toe_m4 = glGetUniformLocation(prog_film_, "uFilmicToeM4");
+  u_film_.filmic_toe_m5 = glGetUniformLocation(prog_film_, "uFilmicToeM5");
+  u_film_.filmic_sh_m1 = glGetUniformLocation(prog_film_, "uFilmicShM1");
+  u_film_.filmic_sh_m2 = glGetUniformLocation(prog_film_, "uFilmicShM2");
+  u_film_.filmic_sh_m3 = glGetUniformLocation(prog_film_, "uFilmicShM3");
+  u_film_.filmic_sh_m4 = glGetUniformLocation(prog_film_, "uFilmicShM4");
+  u_film_.filmic_sh_m5 = glGetUniformLocation(prog_film_, "uFilmicShM5");
+  u_film_.filmic_lin_m1 = glGetUniformLocation(prog_film_, "uFilmicLinM1");
+  u_film_.filmic_lin_m2 = glGetUniformLocation(prog_film_, "uFilmicLinM2");
   u_film_.filmic_lat_min = glGetUniformLocation(prog_film_, "uFilmicLatMin");
   u_film_.filmic_lat_max = glGetUniformLocation(prog_film_, "uFilmicLatMax");
   u_film_.filmic_black_ev = glGetUniformLocation(prog_film_, "uFilmicBlackEv");
@@ -10025,18 +10082,39 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"linMid\":" + jnum(last_lin_mid_, 6);
   kv += ",\"pLo\":" + jnum(last_p_lo_, 7);
   kv += ",\"pHi\":" + jnum(last_p_hi_, 7);
-  // spline 系数（v0.7.3 自检）：真机日志 → 用 tools/tuning/filmic_offline.py 的
+  // spline 系数（v0.7.3 自检）：真机日志 → 用 tools/tuning/filmic_verify.py 的
   // compute_spline 按同一组 EV 复算，逐项对比 m1..m5 —— 系数不一致就是实现错了。
+  // E4-4（per-channel）：fM* 是 **9 个数**，通道优先展平
+  // [R.toe,R.sh,R.lin, G.toe,G.sh,G.lin, B.toe,B.sh,B.lin]；fLat 是 6 个数
+  // [toeR,toeG,toeB, shR,shG,shB] = 求解出的过渡区位置（随场景 EV 变）；
+  // latToe/latSh 是**实际生效的 latitude**（clamp 后，逐通道）—— 核对 [5..10]
+  // 是否真进了引擎看这两个字段（fLat 依赖 EV，不能反推参数值）。
   {
     const auto j3 = [](const float* v) {
       return "[" + std::to_string(v[0]) + "," + std::to_string(v[1]) + "," +
              std::to_string(v[2]) + "]";
     };
-    kv += ",\"fM1\":" + j3(filmic_.m1) + ",\"fM2\":" + j3(filmic_.m2) +
-          ",\"fM3\":" + j3(filmic_.m3) + ",\"fM4\":" + j3(filmic_.m4) +
-          ",\"fM5\":" + j3(filmic_.m5);
-    kv += ",\"fLat\":[" + std::to_string(filmic_.lat_min) + "," +
-          std::to_string(filmic_.lat_max) + "]";
+    const auto j9 = [](const float m[3][3]) {
+      std::string s = "[";
+      for (int ch = 0; ch < 3; ++ch) {
+        for (int seg = 0; seg < 3; ++seg) {
+          if (ch > 0 || seg > 0) s += ",";
+          s += std::to_string(m[ch][seg]);
+        }
+      }
+      return s + "]";
+    };
+    kv += ",\"fM1\":" + j9(filmic_.m1) + ",\"fM2\":" + j9(filmic_.m2) +
+          ",\"fM3\":" + j9(filmic_.m3) + ",\"fM4\":" + j9(filmic_.m4) +
+          ",\"fM5\":" + j9(filmic_.m5);
+    kv += ",\"fLat\":[" + std::to_string(filmic_.lat_min[0]) + "," +
+          std::to_string(filmic_.lat_min[1]) + "," +
+          std::to_string(filmic_.lat_min[2]) + "," +
+          std::to_string(filmic_.lat_max[0]) + "," +
+          std::to_string(filmic_.lat_max[1]) + "," +
+          std::to_string(filmic_.lat_max[2]) + "]";
+    kv += ",\"latToe\":" + j3(filmic_.lat_toe);
+    kv += ",\"latSh\":" + j3(filmic_.lat_sh);
     kv += ",\"fPow\":" + std::to_string(filmic_.output_power) +
           ",\"fCon\":" + std::to_string(filmic_.contrast);
   }
@@ -12146,19 +12224,20 @@ bool solve5(double a[5][5], double b[5], double x[5]) {
 // 每段 y = m1 + x·(m2 + x·(m3 + x·(m4 + x·m5)))。
 FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, float white_ev,
                                                                float contrast_param_in,
-                                                               float latitude_in) {
+                                                               const float lat_sh[3],
+                                                               const float lat_toe[3]) {
   // 全程 double：shoulder 的 5×5 系统条件数差，用 float 中间量会把 1e-7 的舍入放大到
   // 1e-5（与 float64 参考实现对拍时可见）。虽然远低于 8bit 量化精度（1/255 ≈ 4e-3），
   // 但没有理由把它引进来 —— darktable 的 gauss_solve 同样在 double 下求解。
   constexpr double kGrey = 0.1845;                // grey_source（18.45% 中灰）
   constexpr double kSafety = 0.01;                // darktable SAFETY_MARGIN
   constexpr double kBlackTargetPct = 0.01517634;  // black_point_target 默认（%）
-  // v0.10.27：contrast/latitude 由 constexpr 提升为函数参数 —— darktable 原版就是
-  // 四个独立滑杆（black/white/latitude/contrast），此前 latitude 恒 0.01、contrast 恒
-  // 1.0 只是不带滑杆的默认值。自动白点高光上探用 contrast 参数补偿 power 回退
-  // （updateFilmicEV）；latitude 保持 darktable 默认（0.01）。
+  // v0.10.27：contrast 由 constexpr 提升为函数参数 —— darktable 原版就是四个独立滑杆
+  // （black/white/latitude/contrast），此前 contrast 恒 1.0 只是不带滑杆的默认值。
+  // 自动白点高光上探用 contrast 参数补偿 power 回退（updateFilmicEV）。
+  // v0.11.5（E4-4）：latitude 同样由标量提升为 **per-channel**（lat_sh/lat_toe 各 3 个，
+  // 来自 FilmParams[5..7]/[8..10]）—— 见函数体内注释的"原版参数维度自然展开"论证。
   const double kContrastParam = static_cast<double>(contrast_param_in);
-  const double kLatitude = static_cast<double>(latitude_in);
   FilmicSpline sp;
   const double black =
       std::min(static_cast<double>(black_ev), static_cast<double>(white_ev) - 0.2);
@@ -12181,56 +12260,76 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
   const double li = grey_disp - contrast * grey_log;
   const double xmin = (black_disp + kSafety * (white_disp - black_disp) - li) / contrast;
   const double xmax = (white_disp - kSafety * (white_disp - black_disp) - li) / contrast;
-  const double toe_log = (1.0 - kLatitude) * grey_log + kLatitude * xmin;
-  const double sh_log = (1.0 - kLatitude) * grey_log + kLatitude * xmax;
-  const double toe_d = toe_log * contrast + li;
-  const double sh_d = sh_log * contrast + li;
+  // ── E4-4：per-channel 过渡区位置 + 3×2 个 5×5 系统 ────────────────────────
+  // 原版（darktable v3）里 toe 与 shoulder 的插值本来就是两个独立表达式
+  // （`toe_log = (1-lat)·grey_log + lat·xmin` / `sh_log = (1-lat)·grey_log + lat·xmax`），
+  // 只是共用一个 `lat` ⇒ 拆成 lat_toe/lat_sh 各 per-channel 是**原版参数维度的自然
+  // 展开**（三层乳剂的 toe/shoulder 位置不同 = 阴影/高光色偏的物理机制），不是自研。
+  // 端点/斜率约束（f(0)/f'(0)/f(Tl)/f'(Tl)/f''(Tl)）一条不改 ⇒ [37][38] 定义的端点
+  // 与 [5..10] 无关（正交性证据见交付报告）；[4] contrast 改的是线性段斜率，与
+  // lat 改的"过渡区位置"有交互 —— 由同一组求解自然表达。
+  // 默认全 0.01（= darktable 默认 = 接线前硬编码值）⇒ 三次求解的输入逐位相同 ⇒
+  // 系数与接线前逐位相同（A/B 通路纪律）。
+  for (int ch = 0; ch < 3; ++ch) {
+    // clamp 到 [0,1]（规格 §3.4.4）；非有限值（NaN/±Inf 经 clamp 后仍可能为 NaN）
+    // 回退 darktable 默认 0.01 —— 输入来自预设/JNI，属信任边界。
+    const float raw_toe = std::isfinite(lat_toe[ch]) ? lat_toe[ch] : 0.01f;
+    const float raw_sh = std::isfinite(lat_sh[ch]) ? lat_sh[ch] : 0.01f;
+    const double kLatToe = static_cast<double>(std::clamp(raw_toe, 0.0f, 1.0f));
+    const double kLatSh = static_cast<double>(std::clamp(raw_sh, 0.0f, 1.0f));
+    const double toe_log = (1.0 - kLatToe) * grey_log + kLatToe * xmin;
+    const double sh_log = (1.0 - kLatSh) * grey_log + kLatSh * xmax;
+    const double toe_d = toe_log * contrast + li;
+    const double sh_d = sh_log * contrast + li;
 
-  // POLY_4 toe：f(0)=black_disp / f'(0)=0 / f(Tl)=toe_d / f'(Tl)=contrast / f''(Tl)=0
-  {
-    const double t = toe_log;
-    double a[5][5] = {{0, 0, 0, 0, 1},
-                      {0, 0, 0, 1, 0},
-                      {t * t * t * t, t * t * t, t * t, t, 1},
-                      {4 * t * t * t, 3 * t * t, 2 * t, 1, 0},
-                      {12 * t * t, 6 * t, 2, 0, 0}};
-    double b[5] = {black_disp, 0.0, toe_d, contrast, 0.0};
-    double x[5] = {0, 0, 0, 0, 0};
-    if (solve5(a, b, x)) {  // 解按 x⁴..x⁰ 排列 → m5..m1
-      sp.m5[0] = static_cast<float>(x[0]);
-      sp.m4[0] = static_cast<float>(x[1]);
-      sp.m3[0] = static_cast<float>(x[2]);
-      sp.m2[0] = static_cast<float>(x[3]);
-      sp.m1[0] = static_cast<float>(x[4]);
+    // POLY_4 toe：f(0)=black_disp / f'(0)=0 / f(Tl)=toe_d / f'(Tl)=contrast / f''(Tl)=0
+    {
+      const double t = toe_log;
+      double a[5][5] = {{0, 0, 0, 0, 1},
+                        {0, 0, 0, 1, 0},
+                        {t * t * t * t, t * t * t, t * t, t, 1},
+                        {4 * t * t * t, 3 * t * t, 2 * t, 1, 0},
+                        {12 * t * t, 6 * t, 2, 0, 0}};
+      double b[5] = {black_disp, 0.0, toe_d, contrast, 0.0};
+      double x[5] = {0, 0, 0, 0, 0};
+      if (solve5(a, b, x)) {  // 解按 x⁴..x⁰ 排列 → m5..m1
+        sp.m5[ch][0] = static_cast<float>(x[0]);
+        sp.m4[ch][0] = static_cast<float>(x[1]);
+        sp.m3[ch][0] = static_cast<float>(x[2]);
+        sp.m2[ch][0] = static_cast<float>(x[3]);
+        sp.m1[ch][0] = static_cast<float>(x[4]);
+      }
     }
-  }
-  // POLY_4 shoulder：f(1)=white_disp / f'(1)=0 / f(Sl)=sh_d / f'(Sl)=contrast / f''(Sl)=0
-  {
-    const double s = sh_log;
-    double a[5][5] = {{1, 1, 1, 1, 1},
-                      {4, 3, 2, 1, 0},
-                      {s * s * s * s, s * s * s, s * s, s, 1},
-                      {4 * s * s * s, 3 * s * s, 2 * s, 1, 0},
-                      {12 * s * s, 6 * s, 2, 0, 0}};
-    double b[5] = {white_disp, 0.0, sh_d, contrast, 0.0};
-    double x[5] = {0, 0, 0, 0, 0};
-    if (solve5(a, b, x)) {
-      sp.m5[1] = static_cast<float>(x[0]);
-      sp.m4[1] = static_cast<float>(x[1]);
-      sp.m3[1] = static_cast<float>(x[2]);
-      sp.m2[1] = static_cast<float>(x[3]);
-      sp.m1[1] = static_cast<float>(x[4]);
+    // POLY_4 shoulder：f(1)=white_disp / f'(1)=0 / f(Sl)=sh_d / f'(Sl)=contrast / f''(Sl)=0
+    {
+      const double s = sh_log;
+      double a[5][5] = {{1, 1, 1, 1, 1},
+                        {4, 3, 2, 1, 0},
+                        {s * s * s * s, s * s * s, s * s, s, 1},
+                        {4 * s * s * s, 3 * s * s, 2 * s, 1, 0},
+                        {12 * s * s, 6 * s, 2, 0, 0}};
+      double b[5] = {white_disp, 0.0, sh_d, contrast, 0.0};
+      double x[5] = {0, 0, 0, 0, 0};
+      if (solve5(a, b, x)) {
+        sp.m5[ch][1] = static_cast<float>(x[0]);
+        sp.m4[ch][1] = static_cast<float>(x[1]);
+        sp.m3[ch][1] = static_cast<float>(x[2]);
+        sp.m2[ch][1] = static_cast<float>(x[3]);
+        sp.m1[ch][1] = static_cast<float>(x[4]);
+      }
     }
-  }
-  // 中间线性段：y = (toe_d − contrast·toe_log) + contrast·x
-  sp.m1[2] = static_cast<float>(toe_d - contrast * toe_log);
-  sp.m2[2] = static_cast<float>(contrast);
-  sp.m3[2] = 0.0f;
-  sp.m4[2] = 0.0f;
-  sp.m5[2] = 0.0f;
+    // 中间线性段：y = (toe_d − contrast·toe_log) + contrast·x
+    sp.m1[ch][2] = static_cast<float>(toe_d - contrast * toe_log);
+    sp.m2[ch][2] = static_cast<float>(contrast);
+    sp.m3[ch][2] = 0.0f;
+    sp.m4[ch][2] = 0.0f;
+    sp.m5[ch][2] = 0.0f;
 
-  sp.lat_min = static_cast<float>(toe_log);
-  sp.lat_max = static_cast<float>(sh_log);
+    sp.lat_min[ch] = static_cast<float>(toe_log);
+    sp.lat_max[ch] = static_cast<float>(sh_log);
+    sp.lat_toe[ch] = static_cast<float>(kLatToe);
+    sp.lat_sh[ch] = static_cast<float>(kLatSh);
+  }
   sp.black_ev = static_cast<float>(black);
   sp.white_ev = static_cast<float>(white);
   sp.dynamic_range = static_cast<float>(dr);
@@ -12254,7 +12353,8 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
 void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
                                   float user_black, float user_white,
                                   float white_hl, float white_floor,
-                                  float white_probe, float user_ev) {
+                                  float white_probe, float user_ev,
+                                  const float lat_sh[3], const float lat_toe[3]) {
   constexpr float kGrey = 0.1845f;
   // ── v0.7.6：黑白点由**用户配置**（FilmParams[37]/[38]），PC 的做法 ────────────
   // 默认 −7.65/+4.56 = darktable 默认值 = PhotonCamera 固化值（两边一致，有出处）；
@@ -12377,7 +12477,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     ev_black_ = ev_smooth_black_;
     ev_white_ = ev_smooth_white_;
   }
-  filmic_ = computeFilmicSpline(ev_black_, ev_white_, cp);
+  filmic_ = computeFilmicSpline(ev_black_, ev_white_, cp, lat_sh, lat_toe);
   last_w99_ = w99;
   last_w999_ = w999;
   last_cp_ = cp;
@@ -12401,9 +12501,11 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 开关语义（v0.7.6）：黑白点来自用户配置（FilmParams[37]/[38]，默认 −7.65/+4.56）；
   // auto_tone 开 = **黑点**改由场景分位自动（白点仍用配置值），默认关。
   // 注意：updateFilmicEV 内部会切 FBO/viewport（直方图统计），必须先于下面的绑定调用。
+  // E4-4：[5..7]=shoulder latitude（R/G/B）、[8..10]=toe latitude（R/G/B）透传给
+  // CPU 侧 spline 求解（per-channel）。默认全 0.01 ⇒ 与接线前逐位一致。
   updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
                  p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,
-                 p.exposure_ev);
+                 p.exposure_ev, p.shoulder, p.toe);
   // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────
   // 裁剪阈值恒 = RAW 饱和数据白点 1.0（物理量，与 filmic 白点解耦——0.10.17 的
   // 阈值随 white 自动掉到 0.5 曾把 47% 的块送进重建）。重建结果直接替换 filmic
@@ -12480,13 +12582,24 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glBindTexture(GL_TEXTURE_2D, film_src);  // v0.10.16：HR 重建结果替换 filmic 输入
   glUniform1i(u_film_.tex, 0);
   // filmic：spline 系数 + EV 标定（CPU 侧算好，见 computeFilmicSpline）
-  glUniform3f(u_film_.filmic_m1, filmic_.m1[0], filmic_.m1[1], filmic_.m1[2]);
-  glUniform3f(u_film_.filmic_m2, filmic_.m2[0], filmic_.m2[1], filmic_.m2[2]);
-  glUniform3f(u_film_.filmic_m3, filmic_.m3[0], filmic_.m3[1], filmic_.m3[2]);
-  glUniform3f(u_film_.filmic_m4, filmic_.m4[0], filmic_.m4[1], filmic_.m4[2]);
-  glUniform3f(u_film_.filmic_m5, filmic_.m5[0], filmic_.m5[1], filmic_.m5[2]);
-  glUniform1f(u_film_.filmic_lat_min, filmic_.lat_min);
-  glUniform1f(u_film_.filmic_lat_max, filmic_.lat_max);
+  // E4-4：per-channel —— 每个 uniform 的 .r/.g/.b = R/G/B 三层乳剂（[通道] 是第二维，
+  // 见 FilmicSpline 注释）。**逐通道手写**（GPU 三禁），不用 glUniform3fv 传数组。
+  glUniform3f(u_film_.filmic_toe_m1, filmic_.m1[0][0], filmic_.m1[1][0], filmic_.m1[2][0]);
+  glUniform3f(u_film_.filmic_toe_m2, filmic_.m2[0][0], filmic_.m2[1][0], filmic_.m2[2][0]);
+  glUniform3f(u_film_.filmic_toe_m3, filmic_.m3[0][0], filmic_.m3[1][0], filmic_.m3[2][0]);
+  glUniform3f(u_film_.filmic_toe_m4, filmic_.m4[0][0], filmic_.m4[1][0], filmic_.m4[2][0]);
+  glUniform3f(u_film_.filmic_toe_m5, filmic_.m5[0][0], filmic_.m5[1][0], filmic_.m5[2][0]);
+  glUniform3f(u_film_.filmic_sh_m1, filmic_.m1[0][1], filmic_.m1[1][1], filmic_.m1[2][1]);
+  glUniform3f(u_film_.filmic_sh_m2, filmic_.m2[0][1], filmic_.m2[1][1], filmic_.m2[2][1]);
+  glUniform3f(u_film_.filmic_sh_m3, filmic_.m3[0][1], filmic_.m3[1][1], filmic_.m3[2][1]);
+  glUniform3f(u_film_.filmic_sh_m4, filmic_.m4[0][1], filmic_.m4[1][1], filmic_.m4[2][1]);
+  glUniform3f(u_film_.filmic_sh_m5, filmic_.m5[0][1], filmic_.m5[1][1], filmic_.m5[2][1]);
+  glUniform3f(u_film_.filmic_lin_m1, filmic_.m1[0][2], filmic_.m1[1][2], filmic_.m1[2][2]);
+  glUniform3f(u_film_.filmic_lin_m2, filmic_.m2[0][2], filmic_.m2[1][2], filmic_.m2[2][2]);
+  glUniform3f(u_film_.filmic_lat_min, filmic_.lat_min[0], filmic_.lat_min[1],
+              filmic_.lat_min[2]);
+  glUniform3f(u_film_.filmic_lat_max, filmic_.lat_max[0], filmic_.lat_max[1],
+              filmic_.lat_max[2]);
   glUniform1f(u_film_.filmic_black_ev, filmic_.black_ev);
   glUniform1f(u_film_.filmic_dr, filmic_.dynamic_range);
   glUniform1f(u_film_.filmic_input_min, filmic_.input_min);

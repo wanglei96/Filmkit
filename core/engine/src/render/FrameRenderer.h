@@ -562,10 +562,27 @@ class FrameRenderer {
   SceneStats measureSceneStats(GLuint src);
   // ── filmic spline（darktable `dt_iop_filmic_rgb_compute_spline` 的 v3 分支）──
   // 公式出处与逐项对照见 .cpp；纯函数，可离线用同一组 EV 复算系数对拍。
+  //
+  // E4-4（2026-10-11）：**per-channel**。`m1..m5` 由 `float[3]`（段）扩为
+  // `float[3][3]`（[通道][段]）：通道 0=R/1=G/2=B，段 0=toe/1=shoulder/2=中间线性段。
+  // 依据 = darktable v3 里 toe 与 shoulder 的插值本来就是两个独立表达式
+  // （`toe_log = (1-lat)·grey_log + lat·xmin` / `sh_log = (1-lat)·grey_log + lat·xmax`），
+  // 只是共用一个 `lat` 值 ⇒ 拆成 `lat_toe`/`lat_sh` 各 per-channel 是**原版参数维度
+  // 的自然展开**（三层乳剂的 toe/shoulder 位置不同 = 阴影/高光色偏的物理机制），
+  // 不是自研机制。默认全 0.01（darktable 默认）⇒ 三通道系数逐位相同 ⇒ 与接线前
+  // 输出逐位一致（A/B 通路纪律）。
   struct FilmicSpline {
-    float m1[3] = {0, 0, 0}, m2[3] = {1, 1, 1}, m3[3] = {0, 0, 0};
-    float m4[3] = {0, 0, 0}, m5[3] = {0, 0, 0};   // [0]=toe [1]=shoulder [2]=线性段
-    float lat_min = 0.0f, lat_max = 1.0f;         // toe_log / shoulder_log
+    float m1[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    float m2[3][3] = {{1, 1, 1}, {1, 1, 1}, {1, 1, 1}};
+    float m3[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    float m4[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    float m5[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    float lat_min[3] = {0.0f, 0.0f, 0.0f};  // toe_log（逐通道）
+    float lat_max[3] = {1.0f, 1.0f, 1.0f};  // shoulder_log（逐通道）
+    // E4-4：**实际参与求解**的 latitude（= clamp 后，逐通道）—— 诊断日志的
+    // "生效值"直接取它，不取 FilmParams 的裸值（裸值可能越界/NaN）。
+    float lat_sh[3] = {0.01f, 0.01f, 0.01f};
+    float lat_toe[3] = {0.01f, 0.01f, 0.01f};
     float black_ev = -7.65f, white_ev = 4.56f, dynamic_range = 12.21f;
     float input_min = 0.0f, input_max = 1.0f;
     float output_power = 4.0f, black_disp = 0.0f, grey_log = 0.5f;
@@ -574,16 +591,22 @@ class FrameRenderer {
     // 时由 updateFilmicEV 按 power 前后比设定，补偿 gamma 回退；固定曲线恒 1.0。
     float contrast_param = 1.0f;
   };
+  // E4-4：latitude 由标量扩为 per-channel（`lat_sh` = FilmParams[5..7]、
+  // `lat_toe` = FilmParams[8..10]），调用方显式传入；内部 clamp 到 [0,1] 并回填
+  // `sp.lat_sh`/`sp.lat_toe`（诊断用）。
   static FilmicSpline computeFilmicSpline(float black_ev, float white_ev,
-                                          float contrast_param = 1.0f,
-                                          float latitude = 0.01f);
+                                          float contrast_param,
+                                          const float lat_sh[3],
+                                          const float lat_toe[3]);
   // filmic 黑白点（v0.7.6）：来自**用户配置**（FilmParams[37]/[38]，默认 −7.65/+4.56，
   // 即 darktable 默认 / PhotonCamera 固化值）。auto_on=true 时黑点改由场景分位自动
   // （白点仍用配置值）。理由见 .cpp。
   // still=true（静拍）用当帧值不做 EMA —— 单帧机会，历史值等于用错曝光（v0.6.28 实测）。
+  // E4-4：lat_sh/lat_toe = FilmParams[5..7]/[8..10]（filmic latitude，per-channel）。
   void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
                       float user_white, float white_hl, float white_floor,
-                      float white_probe, float user_ev);
+                      float white_probe, float user_ev,
+                      const float lat_sh[3], const float lat_toe[3]);
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
                 bool hal_domain);
   void passFilm(int w, int h, const FilmParams& p);
@@ -1160,10 +1183,18 @@ class FrameRenderer {
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
           local_size = -1, hal_domain = -1, domain_ratio = -1,
           // ── filmic（v0.7.3，darktable v3 spline）────────────────────────────
-          // 三段四次多项式 y = M1 + x·(M2 + x·(M3 + x·(M4 + x·M5)))，下标
-          // [0]=toe [1]=shoulder [2]=中间线性段。系数由 CPU 侧 computeFilmicSpline 求解。
-          filmic_m1 = -1, filmic_m2 = -1, filmic_m3 = -1, filmic_m4 = -1,
-          filmic_m5 = -1, filmic_lat_min = -1, filmic_lat_max = -1,
+          // 三段四次多项式 y = M1 + x·(M2 + x·(M3 + x·(M4 + x·M5)))。系数由 CPU 侧
+          // computeFilmicSpline 求解。
+          // E4-4：**per-channel**（vec3 的 .r/.g/.b = R/G/B 三层乳剂），按**段**分组
+          // （旧版是按段打包进一个 vec3、三通道共用）。toe 段 5 个 + shoulder 段 5 个 +
+          // 中间线性段 2 个（y = m1 + m2·x）+ 逐通道过渡区位置 2 个 = 14 个 vec3。
+          // shader 侧**手写 R/G/B 三份**求值（GPU 三禁：无数组参数、无动态索引、无多行宏）。
+          filmic_toe_m1 = -1, filmic_toe_m2 = -1, filmic_toe_m3 = -1,
+          filmic_toe_m4 = -1, filmic_toe_m5 = -1,
+          filmic_sh_m1 = -1, filmic_sh_m2 = -1, filmic_sh_m3 = -1,
+          filmic_sh_m4 = -1, filmic_sh_m5 = -1,
+          filmic_lin_m1 = -1, filmic_lin_m2 = -1,
+          filmic_lat_min = -1, filmic_lat_max = -1,
           filmic_black_ev = -1, filmic_dr = -1, filmic_input_min = -1,
           filmic_input_max = -1, filmic_power = -1, filmic_black_disp = -1,
           gamut = -1,  // v0.10.13：darktable filmic v5 gamut mapping（0 = A/B 关）

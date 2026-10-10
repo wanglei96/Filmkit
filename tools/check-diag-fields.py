@@ -33,6 +33,12 @@ EXPECT = {
     # v0.10.121 HR 白点（threshold = 2^hrWhiteEv × 0.1845）：passFilm 内的 HR 必须在
     # finishStillChain 内、日志行之前跑完，否则字段是上一帧的陈旧值
     "hrWhiteEv": ("finishStillChain", ["passFilm("]),
+    # E4-4 趾部/肩部（filmic latitude per-channel，FilmParams[5..10]）：字段 =
+    # **实际生效值**（clamp 到 [0,1] 后的逐通道 latitude）。生效点在
+    # passFilm → updateFilmicEV → computeFilmicSpline，字段发在 finishStillChain 的
+    # raw.render 出口 ⇒ 与 hrWhiteEv 同型，必须晚于 passFilm（否则是上一帧的系数）。
+    "latToe": ("finishStillChain", ["passFilm("]),
+    "latSh": ("finishStillChain", ["passFilm("]),
     # v0.10.122 opposed chrominance 分子/分通道样本（定位 chroma 偏大 3.4×）
     "hlSum": ("finishStillChain", ["passHighlightRaw("]),
     "hrStatRaw": ("finishStillChain", ["passHighlightRaw("]),
