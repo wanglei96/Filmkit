@@ -368,12 +368,18 @@ class EditorPresetAmountTest {
 
     // ── ⑪ 强度不是预设的一部分 ──────────────────────────────────────────────
 
-    /** 强度**不写进预设 JSON**：预设存的是满强度的槽值，缩放不改变预设对象本身 */
+    /**
+     * 强度**不写进预设 JSON**：预设存的是满强度的槽值，缩放不改变预设对象本身。
+     *
+     * ⚠ 断言必须用 `"amount":`（带引号 + 冒号 = 一个**独立字段名**）：P-1 改语义名后
+     * `grain_amount` 这个**参数名**里含 "amount" 子串，裸 `contains("amount")` 会把合法参数名
+     * 误判成"写了强度字段"。
+     */
     @Test
     fun presetJsonCarriesNoAmount() {
         val p = EditorPreset(id = "p_1_1", name = "午后暖调", slots = mapOf(4 to 1.5, 66 to -0.5))
         val json = presetToJson(p)
-        assertFalse("预设 JSON 里不该有 amount 字段：$json", json.contains("amount"))
+        assertFalse("预设 JSON 里不该有 amount 字段：$json", json.contains("\"amount\":"))
         scalePresetSlots(p.slots, 0.5)
         assertEquals("缩放不改变预设对象", mapOf(4 to 1.5, 66 to -0.5), p.slots)
     }

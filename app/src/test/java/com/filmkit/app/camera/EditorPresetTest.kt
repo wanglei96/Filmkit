@@ -10,7 +10,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * E3-1a 预设（[EditorPreset] / 稀疏化 / JSON 往返 / 部分套用 / 容错 / 版本判定）的纯逻辑护栏。
+ * E3-1a / P-1 预设（[EditorPreset] / 稀疏化 / JSON 往返 / 部分套用 / 容错 / 版本判定）的纯逻辑护栏。
  *
  * 为什么这些必须被钉住：预设的每一条规格错了，表现都是"用户点一下、画面静默变错"，
  * 而判据全落在纯逻辑里（不碰 prefs / Compose / GL）：
@@ -23,9 +23,12 @@ import org.junit.Test
  *     套用时把用户刚选的 LUT 静默关掉。
  *  3. ★ **部分套用**：预设里没记的槽必须保持目标当前值（RawTherapee 的"缺失 key = 保留"）。
  *  4. ★ **往返**：存 → 读 → 套用 == 原参数（含 LUT 引用与中文 / 转义字符的名称）。
- *  5. ★ **容错**：坏 JSON / 缺字段 / 未知 schema / 越界槽位 / slots 形态不对 ⇒ **不崩**，
- *     按既定粒度跳过（结构字段坏 ⇒ 跳整项；单个槽坏 ⇒ 跳该槽）。
+ *  5. ★ **容错**：坏 JSON / 缺字段 / 未知 schema / **未知语义名** / 已知名但值坏 ⇒ **不崩**，
+ *     按既定粒度跳过（结构字段坏 / 未知语义名 ⇒ 跳整项；单个槽坏 ⇒ 跳该槽）。
  *  6. ★ **套用 = 一步撤销**（E2-25）且套用后 `paramsUnchanged` 为假 ⇒ 导出走渲染而非直通（E2-9）。
+ *  7. ★ **P-1 线格式**：`params` 的键是**语义名**（[FilmParamKeys]），schema = 2；schema=1 的旧
+ *     数据一律拒绝（不写迁移函数，理由见 [presetSchemaUsable]）。线格式样例与体积实测见
+ *     `docs/reports/p1-preset-schema-REPORT.md`。
  *
  * 基线一律用真实的 [CameraPresets.standard] / [editorOpenParams]，不手搓数组 —— 恒等值表
  * 是这份测试的**被测对象之一**，手搓就等于把被测对象抄进断言里。
@@ -48,11 +51,13 @@ class EditorPresetTest {
         id: String = "p_1_1",
         name: String = "午后暖调",
         group: String = "我的胶片",
+        source: String = PRESET_SOURCE_USER,
+        note: String = "",
         slots: Map<Int, Double> = emptyMap(),
         lutId: String? = null,
         lutStrength: Double = 1.0,
     ) = EditorPreset(
-        id = id, name = name, group = group, createdAt = 1730000000L,
+        id = id, name = name, group = group, source = source, note = note, createdAt = 1730000000L,
         slots = slots, lutId = lutId, lutStrength = lutStrength,
     )
 
@@ -95,16 +100,32 @@ class EditorPresetTest {
         assertEquals(-0.4, slots.getValue(66), 0.0)
     }
 
-    /** ★ [34]（LUT 强度）、[39..59]（RAW 解码 / 拍摄链路）、[79..87]（局部调整）永不进 slots */
+    /**
+     * ★ 七类排除槽**一个都不进 slots**：`[34]`（LUT 强度）、`[30]`（过曝斑马纹阈值）、
+     * `[35]`（`auto_tone`）/ `[36]`（`local_tone`）（引擎模式 / 标定旋钮）、`[39..59]`（RAW 解码 /
+     * 拍摄链路）、`[79..87]`（局部调整）。
+     *
+     * ⚠ [30] 这条是 P-1 修掉的**真实缺陷**：它是**预览辅助开关**（`FilmParams.h:72`：仅预览
+     * `passOutput` 使用，成片一律 0），但编辑器链路 `passStyle` **也读它** ⇒ 存进预设后套用会
+     * 凭空打开 / 关闭别人的过曝斑马纹。判据逐条写在 `PRESET_ENGINE_KNOB_SLOTS` 的 KDoc 里。
+     */
     @Test
-    fun decodeSlotsLutStrengthAndLocalAreNeverStored() {
+    fun engineKnobsDecodeSlotsLutStrengthAndLocalAreNeverStored() {
         val p = CameraPresets.standard()
-        p[34] = 0.85
+        // ⚠ 每个都必须是**非恒等值**：等于恒等值时稀疏化本来就会丢它 ⇒ 用例会被恒等值"兜底"，
+        // 即使把该槽从排除列表里拿掉也照样绿（mutation 自检会发现这种恒真断言）。
+        p[34] = 0.85    // 恒等 1.0
+        p[30] = 0.42    // 恒等 0.95（斑马纹阈值）
+        p[35] = 1.0     // 恒等 0.0
+        p[36] = 0.5     // 恒等 0.25
         for (i in 39..59) p[i] = 7.5
         for (i in 79..87) p[i] = 3.3
         val slots = presetSparseSlots(p)
-        assertTrue("解码槽 / [34] / 局部槽都不该入库：$slots", slots.isEmpty())
-        assertFalse(presetSlotIncluded(34))
+        assertTrue("排除槽一个都不该入库：$slots", slots.isEmpty())
+        assertFalse("LUT 强度由 lutId/lutStrength 承载", presetSlotIncluded(34))
+        assertFalse("过曝斑马纹阈值 = 预览辅助开关（passStyle 也读它）", presetSlotIncluded(30))
+        assertFalse("auto_tone = 引擎模式旋钮", presetSlotIncluded(35))
+        assertFalse("local_tone = 引擎标定旋钮", presetSlotIncluded(36))
         assertFalse(presetSlotIncluded(39))
         assertFalse(presetSlotIncluded(59))
         assertFalse("局部模式是构图相关，v1 不进预设（调研 D7）", presetSlotIncluded(79))
@@ -179,7 +200,10 @@ class EditorPresetTest {
 
     // ── ③ JSON 往返 ────────────────────────────────────────────────────────
 
-    /** 存 → 读 ⇒ 逐字段相等（含中文 / 引号 / 反斜杠 / 换行的转义与 Double 精度） */
+    /**
+     * ★ 存 → 读 ⇒ **逐字段**相等（含中文 / 引号 / 反斜杠 / 换行的转义、Double 精度、LUT 与元数据）。
+     * P-1 的主往返用例：线格式换了键名（索引键 → 语义名），字段一个都不能丢。
+     */
     @Test
     fun jsonRoundTripPreservesEveryField() {
         val p = EditorPreset(
@@ -188,6 +212,8 @@ class EditorPresetTest {
             group = "我的\n胶片",
             favorite = true,
             createdAt = 1730000000L,
+            source = PRESET_SOURCE_BUILTIN,
+            note = "室内 1/60s，颗粒 +2 档",
             slots = mapOf(0 to 0.5, 34 to 0.85, 88 to 153.84615384615384, 90 to -0.2),
             lutId = "kodak_portra_400",
             lutStrength = 0.85,
@@ -199,7 +225,8 @@ class EditorPresetTest {
         assertEquals(p.group, back.group)
         assertTrue(back.favorite)
         assertEquals(p.createdAt, back.createdAt)
-        assertEquals("user", back.source)
+        assertEquals(PRESET_SOURCE_BUILTIN, back.source)
+        assertEquals(p.note, back.note)
         assertEquals(mapOf(0 to 0.5, 88 to 153.84615384615384, 90 to -0.2), back.slots)
         assertEquals("kodak_portra_400", back.lutId)
         assertEquals(0.85, back.lutStrength, 0.0)
@@ -225,13 +252,66 @@ class EditorPresetTest {
         assertEquals(1.0, back.lutStrength, 0.0)
     }
 
-    /** 键序固定（便于 diff / 人工核对）：schema 在最前、slots 键升序 */
+    /** 键序固定（便于 diff / 人工核对）：schema 在最前、`params` 按**槽位号升序**且键是语义名 */
     @Test
     fun jsonShapeIsStable() {
         val json = presetToJson(preset(slots = mapOf(90 to -0.2, 0 to 0.5), lutId = "x", lutStrength = 0.5))
-        assertTrue(json, json.startsWith("{\"schema\":1,\"id\":\"p_1_1\",\"name\":\"午后暖调\""))
-        assertTrue(json, json.contains("\"slots\":{\"0\":0.5,\"90\":-0.2}"))
+        assertTrue(json, json.startsWith("{\"schema\":2,\"id\":\"p_1_1\",\"name\":\"午后暖调\""))
+        assertTrue(json, json.contains("\"params\":{\"exposure_ev\":0.5,\"highlights\":-0.2}"))
         assertTrue(json, json.contains("\"lut\":{\"id\":\"x\",\"strength\":0.5}"))
+        // v2 固定字段：note 恒写（空串也写）⇒ 线格式的字段集合稳定，diff 时不会忽有忽无
+        assertTrue(json, json.contains("\"note\":\"\""))
+    }
+
+    /** 没有语义名的槽**不写进线格式**（[29] 已删除的 hl_recon，索引留空不复用 ⇒ 不为它发明名字） */
+    @Test
+    fun unmappedSlotIsNotWrittenToJson() {
+        // 只有 [29] ⇒ params 为空对象。这条同时钉住"第一项被跳过时不能写出 `{,`"
+        //（逗号必须用独立标志判，不能用 forEachIndexed 的下标 —— 下标会跳号）。
+        val only29 = presetToJson(preset(slots = mapOf(29 to 0.5)))
+        assertTrue(only29, only29.contains("\"params\":{}"))
+        val mixed = presetToJson(preset(slots = mapOf(29 to 0.5, 0 to 0.25)))
+        assertTrue(mixed, mixed.contains("\"params\":{\"exposure_ev\":0.25}"))
+    }
+
+    /**
+     * ★ **体积实测**（架构师要求"变大的代价要实测，不拍脑袋"）：一条**典型**预设（20 槽 + LUT +
+     * 元数据）的 JSON 长度落在合理区间，且语义名的 `params` 段确实比索引键长。
+     *
+     * 区间 `500..1200` 只挡"数量级错了"（例如退化成 96 槽全量 ≈1.3 KB+ 或字段被写重）；
+     * 精确数字打在 stdout（`PRESET_JSON_LEN=…`），报告引用的是同一份输出。
+     */
+    @Test
+    fun presetJsonSizeIsReasonable() {
+        val slots = linkedMapOf(
+            0 to 0.35, 1 to 1.04, 4 to 1.18, 20 to 0.92, 21 to 1.06, 22 to 1.1, 23 to 0.08,
+            26 to 55.0, 27 to 800.0, 60 to 60.0, 62 to 0.25, 63 to 0.75, 64 to 0.5, 65 to 0.3,
+            66 to -0.18, 67 to 70.0, 68 to 60.0, 78 to 0.15, 90 to -0.12, 94 to 0.06,
+        )
+        // ⚠ 每个值都必须**不等于** CameraPresets.standard() 的恒等值：真实预设是稀疏化的产物，
+        // 等于恒等值的槽在读取侧会被洗掉 ⇒ 上面那条"往返后 JSON 逐字相同"会红。
+        //（[60][63][64][65][67][68] 的恒等值分别是 100 / 0.80 / 0.45 / 0.40 / 80 / 50，不是 0。）
+        assertEquals("典型预设 = 20 槽", 20, slots.size)
+        val json = presetToJson(
+            preset(name = "CineStill 800T", group = "CineStill", slots = slots, lutId = "cinestill_800t", lutStrength = 0.9),
+        )
+        // 对照口径：同一条预设用 v1 的**索引键**写 params（其余字段逐字相同）
+        val v1Params = slots.entries.joinToString(",", "{\"slots\":{", "}}") { (k, v) -> "\"$k\":$v" }
+        val v2Params = json.substringAfter("\"params\":").substringBefore(",\"lut\"")
+        println(
+            "PRESET_JSON_LEN=${json.length} V2_PARAMS_LEN=${v2Params.length} " +
+                "V1_PARAMS_LEN=${v1Params.length} SLOTS=${slots.size}",
+        )
+        // 真实序列化输出（报告 `docs/reports/p1-preset-schema-REPORT.md` 引用的是这一行）
+        println("PRESET_JSON_SAMPLE=$json")
+        assertTrue("整条预设 JSON 长度应在 500..1200：${json.length}", json.length in 500..1200)
+        assertTrue(
+            "params 段：语义名(${v2Params.length} B) 必须比索引键(${v1Params.length} B) 长 —— 这就是改语义名的体积代价",
+            v2Params.length > v1Params.length,
+        )
+        // 往返之后体积不变（同一份槽位与元数据）
+        val back = presetsFromJson("[$json]").presets.single()
+        assertEquals("往返后 JSON 必须逐字相同", json, presetToJson(back))
     }
 
     /** 空列表往返（首次运行 / 全删光） */
@@ -258,7 +338,7 @@ class EditorPresetTest {
     /** 坏 JSON / 顶层不是数组 ⇒ 空列表 + 诊断，**绝不抛异常** */
     @Test
     fun malformedJsonIsReportedNotThrown() {
-        for (raw in listOf("{", "not json", "{\"a\":1}", "[1,2]", "[{\"schema\":1,]", "null")) {
+        for (raw in listOf("{", "not json", "{\"a\":1}", "[1,2]", "[{\"schema\":2,]", "null")) {
             val res = presetsFromJson(raw)
             assertTrue("坏输入不该产出预设：$raw", res.presets.isEmpty())
             assertTrue("坏输入必须有诊断：$raw", res.skipped.isNotEmpty())
@@ -268,8 +348,8 @@ class EditorPresetTest {
     /** 缺 id / 缺 name ⇒ 跳过整项（定位与展示都靠它们） */
     @Test
     fun missingIdOrNameSkipsItem() {
-        val noId = """[{"schema":1,"name":"x","slots":{}}]"""
-        val noName = """[{"schema":1,"id":"a","slots":{}}]"""
+        val noId = """[{"schema":2,"name":"x","params":{}}]"""
+        val noName = """[{"schema":2,"id":"a","params":{}}]"""
         assertEquals(1, presetsFromJson(noId).skipped.size)
         assertEquals(1, presetsFromJson(noName).skipped.size)
         assertTrue(presetsFromJson(noId).presets.isEmpty())
@@ -282,51 +362,89 @@ class EditorPresetTest {
         val cases = listOf(
             """{"id":"a","name":"x"}""",
             """{"schema":0,"id":"a","name":"x"}""",
-            """{"schema":2,"id":"a","name":"x"}""",
+            """{"schema":3,"id":"a","name":"x"}""",
             """{"schema":1.5,"id":"a","name":"x"}""",
-            """{"schema":"1","id":"a","name":"x"}""",
+            """{"schema":"2","id":"a","name":"x"}""",
         )
         cases.forEach { one ->
             val res = presetsFromJson("[$one]")
             assertTrue("必须拒绝：$one", res.presets.isEmpty())
             assertEquals(1, res.skipped.size)
         }
-        assertTrue(presetSchemaUsable(1))
+        assertTrue("当前版本 = 2", presetSchemaUsable(2))
         assertFalse(presetSchemaUsable(0))
-        assertFalse(presetSchemaUsable(2))
+        assertFalse(presetSchemaUsable(1))
+        assertFalse(presetSchemaUsable(3))
         assertFalse(presetSchemaUsable(null))
     }
 
-    /** slots 形态不对（数组 / 字符串 / 数字）⇒ 跳过整项（本格式没有"定长数组"形态） */
+    /**
+     * ★ **schema=1（槽位索引键格式）一律拒绝，且不写迁移函数**（裁决 A1）。这里喂的是一段
+     * **真实的 v1 形态数据**（`"slots":{"26":55.0}` = 颗粒 55），断言：跳过 + 不产生预设 +
+     * 有可读诊断。
+     *
+     * 为什么不能"尽力迁移"：v1 的键是槽位号，而 `[5..10]`（shoulder→latitude）与 `[26][27]`
+     * （颗粒）语义都漂移过 ⇒ `"5":0.0` 到底是旧 shoulder 还是新 latitude **无法分辨**，
+     * 猜错 = 静默给出错误观感。真实设备上也不存在 v1 数据（预设首发于 v0.11.11，未安装测试）
+     * ⇒ 拒绝的代价是零。
+     */
     @Test
-    fun slotsMustBeAnObject() {
+    fun legacySchemaOneIsRejected() {
+        val v1 = """
+            [{"schema":1,"id":"p_1728543600000_ab12","name":"旧格式预设","group":"G",
+              "favorite":false,"createdAt":1728543600000,"source":"user",
+              "slots":{"26":55.0,"90":-0.2},"lut":{"id":"cinestill_800t","strength":0.9}}]
+        """.trimIndent()
+        val res = presetsFromJson(v1)
+        assertTrue("v1 数据一条都不该读出来：${res.presets}", res.presets.isEmpty())
+        assertEquals(1, res.skipped.size)
+        assertTrue("诊断必须点名 schema：${res.skipped}", res.skipped.single().contains("schema"))
+        // 实际会进 `preset.load_skipped` 日志的 why 串（报告引用的是这一行）
+        println("SKIP_LEGACY=${res.skipped}")
+    }
+
+    /** params 形态不对（数组 / 字符串 / 数字）⇒ 跳过整项（本格式没有"定长数组"形态） */
+    @Test
+    fun paramsMustBeAnObject() {
         for (bad in listOf("[]", "[1,2,3]", "\"x\"", "3", "true")) {
-            val res = presetsFromJson("""[{"schema":1,"id":"a","name":"x","slots":$bad}]""")
-            assertTrue("slots=$bad 必须跳项", res.presets.isEmpty())
+            val res = presetsFromJson("""[{"schema":2,"id":"a","name":"x","params":$bad}]""")
+            assertTrue("params=$bad 必须跳项", res.presets.isEmpty())
             assertEquals(1, res.skipped.size)
         }
     }
 
-    /** 缺 slots ⇒ 合法（只有 LUT 的预设）；缺 group / favorite / createdAt ⇒ 走默认值 */
+    /** 缺 params ⇒ 合法（只有 LUT 的预设）；缺 group / favorite / createdAt / note / source ⇒ 默认值 */
     @Test
     fun missingOptionalFieldsFallBack() {
-        val res = presetsFromJson("""[{"schema":1,"id":"a","name":"x","lut":{"id":"l"}}]""")
+        val res = presetsFromJson("""[{"schema":2,"id":"a","name":"x","lut":{"id":"l"}}]""")
         val p = res.presets.single()
         assertTrue(p.slots.isEmpty())
         assertEquals("", p.group)
         assertFalse(p.favorite)
         assertEquals(0L, p.createdAt)
+        assertEquals(PRESET_SOURCE_USER, p.source)
+        assertEquals("", p.note)
         assertEquals("l", p.lutId)
         assertEquals(1.0, p.lutStrength, 0.0)
     }
 
-    /** 越界槽位 / 非数字值 / 非有限值 / 解码槽 / [34] ⇒ **逐槽跳过**，预设本身仍有效 */
+    /**
+     * **已知**语义名但值坏 / 槽位被策略排除 ⇒ **逐槽跳过**，预设本身仍有效。
+     *
+     * 覆盖六类：策略排除（`lut_strength` [34] / `zebra_thr` [30] / `auto_tone` [35] /
+     * `local_tone` [36] / 解码槽 `sharpen` [39] / 局部槽 `local_ev` [86]）、非数字、null、
+     * 非有限（`1e999` ⇒ Inf）、布尔。
+     *
+     * ⚠ 被排除的槽一律给**非恒等值**（`zebra_thr` 的恒等值是 0.95、`local_tone` 是 0.25、
+     * `sharpen` 是 0.5）：给了恒等值就等于让"恒等值洗白"来兜底，排除列表失效也照样绿。
+     */
     @Test
-    fun badSlotsAreDroppedOneByOne() {
+    fun badValuesAreDroppedOneByOne() {
         val raw = """
-            [{"schema":1,"id":"a","name":"x","slots":{
-              "0":0.5, "999":1.0, "-1":1.0, "abc":1.0, "39":3.0, "34":0.85,
-              "4":"x", "90":null, "91":1e999, "94":true
+            [{"schema":2,"id":"a","name":"x","params":{
+              "exposure_ev":0.5, "lut_strength":0.85, "zebra_thr":0.42, "auto_tone":1.0,
+              "local_tone":0.5, "sharpen":3.0, "local_ev":1.0,
+              "contrast":"x", "highlights":null, "shadows":1e999, "fade":true
             }}]
         """.trimIndent()
         val res = presetsFromJson(raw)
@@ -335,10 +453,37 @@ class EditorPresetTest {
         assertTrue("坏槽位必须有诊断：${res.skipped}", res.skipped.isNotEmpty())
     }
 
+    /**
+     * ★ **未知语义名 ⇒ 整项拒绝**（不是逐槽跳过）。理由：不知道这个键代表什么参数，跳过它
+     * 可能给出**另一种风格**且用户无从察觉；而"少一条预设 + 一条可读诊断"是可解释、可恢复的
+     * 失败（与"未知 schema 一律拒绝"同一逻辑）。
+     */
+    @Test
+    fun unknownParamNameRejectsWholeItem() {
+        val cases = listOf(
+            """{"nonexistent_key":1.0}""",
+            """{"exposure_ev":0.5,"grain_amout":55.0}""",   // 拼错一个字母（真实会发生的手改错误）
+            """{"26":55.0}""",                               // v1 的索引键（旧格式混进来）
+            """{"shoulder":0.02}""",                         // 数组字段必须带下标
+        )
+        cases.forEach { params ->
+            val res = presetsFromJson("""[{"schema":2,"id":"a","name":"x","params":$params}]""")
+            assertTrue("未知语义名必须拒绝整项：$params ⇒ ${res.presets}", res.presets.isEmpty())
+            assertEquals("必须有一条诊断：$params", 1, res.skipped.size)
+            assertTrue("诊断必须点名那个键：${res.skipped}", res.skipped.single().contains("未知参数名"))
+        }
+        // 实际会进 `preset.load_skipped` 日志的 why 串（报告引用的是这一行）
+        println("SKIP_UNKNOWN=${presetsFromJson("""[{"schema":2,"id":"a","name":"x","params":{"nonexistent_key":1.0}}]""").skipped}")
+        // 反证：同一个槽位换成**已知**名字就能读出来（证明上面拒的是名字，不是别的）
+        val ok = presetsFromJson("""[{"schema":2,"id":"a","name":"x","params":{"grain_amount":55.0}}]""")
+        assertEquals(mapOf(26 to 55.0), ok.presets.single().slots)
+    }
+
     /** 手改的 JSON 里等于恒等值的槽在**读取时**被洗掉（保住"slots 只含非恒等槽"的不变式） */
     @Test
     fun identityValuesAreWashedOutOnLoad() {
-        val raw = """[{"schema":1,"id":"a","name":"x","slots":{"4":1.0,"5":0.01,"11":1.0,"0":0.5}}]"""
+        val raw = """[{"schema":2,"id":"a","name":"x","params":{
+            "contrast":1.0,"shoulder[0]":0.01,"cross[0]":1.0,"exposure_ev":0.5}}]"""
         assertEquals(mapOf(0 to 0.5), presetsFromJson(raw).presets.single().slots)
     }
 
@@ -350,7 +495,7 @@ class EditorPresetTest {
             "{}", """{"id":""}""", """{"id":123}""",
         )
         cases.forEach { lut ->
-            val res = presetsFromJson("""[{"schema":1,"id":"a","name":"x","slots":{"0":0.5},"lut":$lut}]""")
+            val res = presetsFromJson("""[{"schema":2,"id":"a","name":"x","params":{"exposure_ev":0.5},"lut":$lut}]""")
             val p = res.presets.single()
             assertEquals("lut=$lut 应降级为无 LUT", null, p.lutId)
             assertEquals("lut=$lut 参数部分必须保住", mapOf(0 to 0.5), p.slots)
@@ -362,7 +507,7 @@ class EditorPresetTest {
     fun brokenLutStrengthFallsBackToOne() {
         val cases = listOf("\"x\"", "null", "1e999", "true")
         cases.forEach { s ->
-            val res = presetsFromJson("""[{"schema":1,"id":"a","name":"x","lut":{"id":"l","strength":$s}}]""")
+            val res = presetsFromJson("""[{"schema":2,"id":"a","name":"x","lut":{"id":"l","strength":$s}}]""")
             val p = res.presets.single()
             assertEquals("l", p.lutId)
             assertEquals("strength=$s 应回默认 1.0", 1.0, p.lutStrength, 0.0)
@@ -372,9 +517,9 @@ class EditorPresetTest {
     /** LUT 强度夹到 UI 量程 0..1.5（手改的 5.0 会让引擎把 LUT 变换外推得离谱） */
     @Test
     fun lutStrengthIsClampedToUiRange() {
-        val hi = presetsFromJson("""[{"schema":1,"id":"a","name":"x","lut":{"id":"l","strength":5}}]""")
+        val hi = presetsFromJson("""[{"schema":2,"id":"a","name":"x","lut":{"id":"l","strength":5}}]""")
         assertEquals(1.5, hi.presets.single().lutStrength, 0.0)
-        val lo = presetsFromJson("""[{"schema":1,"id":"a","name":"x","lut":{"id":"l","strength":-2}}]""")
+        val lo = presetsFromJson("""[{"schema":2,"id":"a","name":"x","lut":{"id":"l","strength":-2}}]""")
         assertEquals(0.0, lo.presets.single().lutStrength, 0.0)
     }
 
@@ -382,7 +527,7 @@ class EditorPresetTest {
     @Test
     fun overLimitIsTruncated() {
         val many = (1..PRESET_MAX + 5).joinToString(",") {
-            """{"schema":1,"id":"p$it","name":"n$it","slots":{"0":$it}}"""
+            """{"schema":2,"id":"p$it","name":"n$it","params":{"exposure_ev":$it}}"""
         }
         val res = presetsFromJson("[$many]")
         assertEquals(PRESET_MAX, res.presets.size)
@@ -390,17 +535,19 @@ class EditorPresetTest {
         assertTrue(res.skipped.isNotEmpty())
     }
 
-    /** 一项坏、一项好 ⇒ 好的照常读出（不因为邻居坏就整包丢弃） */
+    /** 一项坏、一项好 ⇒ 好的照常读出（不因为邻居坏就整包丢弃）—— 三种坏法各来一条 */
     @Test
     fun oneBadItemDoesNotKillTheRest() {
         val raw = """
-            [{"schema":9,"id":"bad","name":"x"},
-             {"schema":1,"id":"good","name":"好","slots":{"0":0.5}}]
+            [{"schema":9,"id":"bad-schema","name":"x"},
+             {"schema":2,"id":"bad-key","name":"x","params":{"nonexistent_key":1.0}},
+             {"schema":1,"id":"bad-legacy","name":"x","slots":{"0":0.5}},
+             {"schema":2,"id":"good","name":"好","params":{"exposure_ev":0.5}}]
         """.trimIndent()
         val res = presetsFromJson(raw)
         assertEquals(1, res.presets.size)
         assertEquals("good", res.presets.single().id)
-        assertEquals(1, res.skipped.size)
+        assertEquals(3, res.skipped.size)
     }
 
     // ── ⑤ 套用 = 一步撤销 + 直通失效 ───────────────────────────────────────
@@ -462,16 +609,22 @@ class EditorPresetTest {
         assertFalse(presetId(1L, -1).contains('-'))
     }
 
-    /** 预设默认值：分组空串、source = user（导入 / 内置留给 E3-2 / E3-4） */
+    /** 预设默认值：分组 / 说明空串、source = user（内置 / 导入的**常量**留给 E3-4 / E3-2 用） */
     @Test
     fun presetDefaults() {
         val p = EditorPreset(id = "a", name = "n")
         assertEquals("", p.group)
         assertFalse(p.favorite)
         assertEquals(0L, p.createdAt)
-        assertEquals("user", p.source)
+        assertEquals(PRESET_SOURCE_USER, p.source)
+        assertEquals("", p.note)
         assertTrue(p.slots.isEmpty())
         assertNull(p.lutId)
         assertEquals(1.0, p.lutStrength, 0.0)
+        // source 的三个取值（本卡只定常量，**不实现**内置包 / 导入功能）
+        assertEquals(
+            setOf("user", "builtin", "imported"),
+            setOf(PRESET_SOURCE_USER, PRESET_SOURCE_BUILTIN, PRESET_SOURCE_IMPORTED),
+        )
     }
 }

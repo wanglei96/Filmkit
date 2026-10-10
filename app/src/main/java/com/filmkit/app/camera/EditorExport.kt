@@ -1507,29 +1507,59 @@ private fun writeEditorExif(context: Context, uri: Uri?, timeMs: Long, srcJpeg: 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // E3-1a 预设（Preset）：**稀疏字段集** + schema 版本 + prefs 单键 JSON + 保存 / 套用 / 删除
+// P-1：线格式的键从**槽位索引**改为**语义名**（schema 2，见 [PRESET_SCHEMA] / [FilmParamKeys]）；
+//      内存模型（`Map<Int, Double>`）与套用 / 强度链路**零改动**。
 //
 // 为什么不是"整包 96 槽快照"（`ADR-19` 那版，**已被用户否掉**，见调研报告 §5.2 方案 A）：
 //  ① 全量覆盖会**清掉用户当前的调整**，而专业语义是"只改这条预设管的那几项"——
 //     Lightroom 的 Check All / Check None 逐项勾选、RawTherapee 的 `.pp3` 只写被编辑过的字段；
 //  ② `[39..59]` 是 **RAW 解码 / 拍摄链路**参数（sharpen / gamut / hr_raw / rcd_* / pc3d …），
 //     它们是"相机属性"而不是"风格"，套用会把别人的解码参数一起带过来；
-//  ③ 96 槽全量 ≈1.3 KB/个，稀疏 ≈300–700 B/个（调研 §5.3）。
+//  ③ 96 槽全量 ≈1.3 KB/个，稀疏 v1 ≈300–700 B/个（调研 §5.3）；P-1 改语义名后**实测 ≈750 B/个**
+//     （口径与数字见 `docs/reports/p1-preset-schema-REPORT.md`）。
 //
 // 语义来源：RawTherapee `saveToKeyfile(!pedited || edited.x)` —— **缺失的 key = 保留目标当前值**。
 // 这就是"部分套用"的全部实现：按 idx 覆盖 [presetSnapshot] 里记下的那几个槽，其余不动。
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 预设格式版本（E3-1a 起）。**槽位语义变更时必须 +1 并写逐槽迁移**（见 [presetSchemaUsable]）。 */
-internal const val PRESET_SCHEMA = 1
+/**
+ * 预设格式版本。沿革：
+ *  - **1**（E3-1a）：线格式用**槽位索引**当键（`"slots":{"26":55.0}`）；
+ *  - **2**（P-1）：线格式改用**语义名**（`"params":{"grain_amount":55.0}`）。
+ *
+ * ★ 为什么改语义名（`docs/reports/preset-DESIGN.md` §7 裁决 A1）：本仓库**槽位语义漂移已真实
+ * 发生两次** —— `[5..10]` 从"高光软肩 / 阴影 toe"重定义为 filmic latitude（`FilmParams.h:34-46`）、
+ * `[26][27]` 颗粒语义修正（`:54-64`）。索引键 JSON 在漂移后**无法分辨** `"5":0.0` 是旧 shoulder
+ * 还是新 latitude ⇒ **信息丢失、无法自动迁移**；语义名自带含义，迁移函数才写得出来。
+ *
+ * ★ **schema 2 起，槽位语义变更不再需要 +1**（那正是本卡的目的）：读取侧按**名字**认参数。
+ * 纯线格式字段增删（如 v2 新增 `note`）也**不**升版本：读取侧对未知**结构**字段本就宽容。
+ * 会改变既有名字含义的改动（重命名 / 重定义某槽语义）仍需 +1 并写迁移（见 [presetSchemaUsable]）。
+ */
+internal const val PRESET_SCHEMA = 2
 
-/** 预设在 prefs 里的键：单键 JSON 数组（与 `LutLibrary` 的 `lut_cats` 等同一套 prefs 风格）。 */
+/**
+ * 预设在 prefs 里的键：单键 JSON 数组（与 `LutLibrary` 的 `lut_cats` 等同一套 prefs 风格）。
+ *
+ * 键名**不跟着 schema 改**：版本判定由每项的 `schema` 字段承担，改键名等于主动丢弃用户数据
+ * 且没有任何收益（旧数据反正一律被拒绝）。
+ */
 internal const val PRESET_KEY = "presets_v1"
 
-/** 预设数量上限：稀疏格式 ≈300–700 B/个 ⇒ 100 个 ≈ 30–70 KB，SharedPreferences 无压力。 */
+/**
+ * 预设数量上限：语义名格式**实测 ≈750 B/个**（v1 索引键格式 ≈450 B/个）⇒ 100 个 ≈ 75 KB，
+ * SharedPreferences 无压力。实测口径与数字见 `docs/reports/p1-preset-schema-REPORT.md`。
+ */
 internal const val PRESET_MAX = 100
 
-/** [EditorPreset.source] 的取值：用户自建（内置包 / 导入留给 E3-4 / E3-2）。 */
+/** [EditorPreset.source] 的取值：用户自建。 */
 internal const val PRESET_SOURCE_USER = "user"
+
+/** [EditorPreset.source] 的取值：**随包分发的内置胶片预设**（E3-4 用；本卡只定常量）。 */
+internal const val PRESET_SOURCE_BUILTIN = "builtin"
+
+/** [EditorPreset.source] 的取值：**从外部文件导入**（E3-2 的 `.fkpreset` 用；本卡只定常量）。 */
+internal const val PRESET_SOURCE_IMPORTED = "imported"
 
 /**
  * 不进预设的槽位区间：**[39..59] = RAW 解码 / 拍摄链路**（`FilmParams.h`：
@@ -1557,20 +1587,206 @@ private const val PRESET_LUT_STRENGTH_SLOT = 34
 private val PRESET_LOCAL_SLOTS = 79..87
 
 /**
- * 槽位是否参与预设（稀疏化的白名单判据）。排除四类：
+ * 不进预设的槽位：**引擎模式旋钮 / 标定旋钮 / 预览辅助开关**（P-1 修正，见 `preset-DESIGN.md`
+ * §7 裁决 A3）。三条判据逐条如下，都不是"口味"问题：
+ *
+ *  - **[30] `zebra_thr`**（`FilmParams.h:72-73` 原文："过曝提示阈值（显示域亮度，0 = 关）：
+ *    **仅预览 passOutput 使用**，成片一律 0"）—— 它是**预览辅助开关**。而编辑器链路的
+ *    `passStyle` **也读它** ⇒ 存进预设后套用会**凭空打开 / 关闭别人的过曝斑马纹**：
+ *    用户看到的画面变化与"风格"毫无关系，且从 UI 上找不到原因（本卡修掉的真实缺陷）。
+ *  - **[35] `auto_tone`**（`FilmParams.h:96` 原文："0 = 关（黑白点用 [37]/[38]，默认）；
+ *    1 = 成对自动"）—— **引擎模式旋钮**（黑白点自动 / 手动二选一），不是风格；且它的实际
+ *    取值受用户设置与拍摄链路影响（`CameraController` 的 prefs 覆盖层）⇒ 存进预设 =
+ *    把别人的引擎开关带过来。
+ *  - **[36] `local_tone`**（`FilmParams.h:102` 原文："0 = 关；>0 = 暗部线性提亮比例
+ *    （**标定旋钮**）"）—— **引擎标定参数**：同一张照片在不同标定下观感不同，它不是
+ *    "可分享的风格"，而是"这台设备这条链路的调校量"。
+ *
+ * 为什么单列一个集合而不是散在 [presetSlotIncluded] 的布尔表达式里：这三条的判据是**同一类**
+ *（"引擎状态，不是用户风格"），将来再加同类槽位只需往这里加一个数字。
+ */
+private val PRESET_ENGINE_KNOB_SLOTS = setOf(30, 35, 36)
+
+/**
+ * [29] = **已退役的槽位**（原 `hl_recon`，v0.10.15 删除；`FilmParams.h:68-71`："索引 29 留空不复用"）。
+ *
+ * 为什么必须排除（P-1 由护栏测试 `FilmParamKeysTest.everyStorableSlotHasASemanticName` 发现）：
+ * 引擎里已经没有这个参数，[FilmParamKeys] 也**不给它名字**（不映射）⇒ 它一旦进了 `slots`，
+ * 序列化时只能被跳过 = **静默丢数据**。而 `CameraPresets.standard()[29]` 仍是历史遗留的 **1.0**
+ * ⇒ 只要有人在编辑器里改到它（或将来某个版本复用索引），这个洞就会真的漏。
+ * 三层口径因此对齐：`FilmParams.h` 无名 → [FilmParamKeys] 不映射 → **不进预设**。
+ */
+private const val PRESET_RETIRED_SLOT = 29
+
+/**
+ * 槽位是否参与预设（稀疏化的白名单判据）。排除**八类**：
  *  - **[34] LUT 强度**：由 [EditorPreset.lutId] / [EditorPreset.lutStrength] 承载。
  *    ⚠ 这条不是洁癖，是**必须**：[editorOpenParams] 打开编辑器时把 [34] 归 **0**（成片已含
  *    拍摄时的 LUT 混合，不能再叠一遍）⇒ 若 [34] 参与稀疏化，**每一条预设都会存下 "34":0**，
  *    套用时把当前 LUT 的强度打成 0 —— 用户刚选的 LUT 被静默关掉（"套了预设，滤镜没了"）。
+ *  - **[30] / [35] / [36]**：预览辅助开关 / 引擎模式旋钮 / 标定旋钮
+ *    （[PRESET_ENGINE_KNOB_SLOTS]，逐条判据与证据写在该常量的 KDoc 里）。
+ *  - **[29]**：已退役的槽位，无语义名（[PRESET_RETIRED_SLOT]）。
  *  - **[39..59]**：RAW 解码 / 拍摄链路（[PRESET_DECODE_SLOTS]）。
  *  - **[79..87]**：局部调整（[PRESET_LOCAL_SLOTS]，构图相关，v1 不做）。
  *  - 数组越界（坏数据 / 未来契约变更）。
+ *
+ * ⚠ 本函数是**策略层**（"哪些槽进预设"），与 [FilmParamKeys]（"槽位叫什么名字"，机械的一层）
+ * 是两件事：进了预设的槽**必然**有语义名（单测钉住这条），但有语义名的槽**不一定**进预设。
  */
 internal fun presetSlotIncluded(i: Int): Boolean =
     i in 0 until CameraPresets.COUNT &&
         i != PRESET_LUT_STRENGTH_SLOT &&
+        i != PRESET_RETIRED_SLOT &&
+        i !in PRESET_ENGINE_KNOB_SLOTS &&
         i !in PRESET_DECODE_SLOTS &&
         i !in PRESET_LOCAL_SLOTS
+
+/**
+ * ★ 槽位 ↔ **语义名**映射（`docs/reports/preset-DESIGN.md` §7 裁决 A1）：线格式的键名来源，
+ * **全代码唯一维护点**。
+ *
+ * 名字**逐字取自 `core/engine/src/film/FilmParams.h` 的字段名**（该文件形如
+ * `float grain_amount = 0.0f;  // 26`，字段名与槽位号写在同一行）。这样做的收益是**别的工具能
+ * 复用同一套名字**：`tools/check-style-passthrough.py` 的白名单、`EditorStyleWhitelistTest`
+ * 的 `p.<字段>` 对拍、本表的单测，三方认的是同一个标识符。
+ *
+ * 规则（机械的一层，无例外）：
+ *  - **覆盖所有在 `FilmParams.h` 里有名字的槽位**（95 个），不只是进预设的那些 ——
+ *    "哪些槽进预设"是 [presetSlotIncluded] 的**另一层独立策略**，两者不要混在一起；
+ *  - 数组字段（`float shoulder[3]` / `float cross[9]` / `float interlayer_*[3]`）逐元素展开成
+ *    `字段名[下标]`（`shoulder[0]` … `cross[8]`）。**不用** R/G/B 这类只存在于注释里的后缀：
+ *    从注释里读语义不可机械校验，而 `字段名[下标]` 能由 `float x[N] = …; // <起>..<末>` 一行
+ *    正则直接对拍（见 `FilmParamKeysTest`）；
+ *  - **[29] 不映射**：它曾经是 `hl_recon`，v0.10.15 删除后**留空不复用**（`FilmParams.h:68-71`），
+ *    现在没有任何字段名 ⇒ 没有名字可给，也不该为它发明一个；
+ *  - **[95] `reserved_95` 在表内**：它在 `FilmParams.h:440` 里**确实有字段名**（"预留（恒等；
+ *    `kFsStyle` 零引用，契约占位）"）。保留它是为了"表 = 有名字的槽位"这条规则**无例外**、
+ *    可机械校验；它恒等值 0 且零引用 ⇒ 稀疏化时会被恒等值丢弃，正常路径下永远不会出现在
+ *    任何预设的 `params` 里。
+ *
+ * 内存模型**不变**：`EditorPreset.slots` 仍是 `Map<Int, Double>`（索引键），本表只在
+ * [presetToJson] / [presetFromJson] 两个边界上做翻译 ⇒ `presetSnapshot` / `scalePresetSlots` /
+ * `applySnapshotParams` / `editorOpenParams` 零改动。
+ */
+internal object FilmParamKeys {
+
+    /** 槽位 → 语义名（**唯一维护点**；名字逐字等于 `FilmParams.h` 的字段名） */
+    val bySlot: Map<Int, String> = mapOf(
+        // [0..4] 基础调整（曝光 / 白平衡增益 / 对比度）
+        0 to "exposure_ev",
+        1 to "wb_r",
+        2 to "wb_g",
+        3 to "wb_b",
+        4 to "contrast",
+        // [5..10] filmic latitude（per-channel：R/G/B 两层乳剂）
+        5 to "shoulder[0]",
+        6 to "shoulder[1]",
+        7 to "shoulder[2]",
+        8 to "toe[0]",
+        9 to "toe[1]",
+        10 to "toe[2]",
+        // [11..19] log 域染料串扰（3×3 矩阵）
+        11 to "cross[0]",
+        12 to "cross[1]",
+        13 to "cross[2]",
+        14 to "cross[3]",
+        15 to "cross[4]",
+        16 to "cross[5]",
+        17 to "cross[6]",
+        18 to "cross[7]",
+        19 to "cross[8]",
+        // [20..28] 分区饱和 / 分离色调 / 单色 / 颗粒 / 基准影调
+        20 to "sat_shadow",
+        21 to "sat_mid",
+        22 to "sat_high",
+        23 to "split_warm",
+        24 to "split_cool",
+        25 to "monochrome",
+        26 to "grain_amount",
+        27 to "grain_size",
+        28 to "tone_strength",
+        // [29] 无字段名（已删除的 hl_recon，索引留空不复用）⇒ 不映射
+        // [30..36] 预览辅助 / 外观层 / LUT 强度 / 引擎模式旋钮
+        30 to "zebra_thr",
+        31 to "look_strength",
+        32 to "look_sat",
+        33 to "look_chroma",
+        34 to "lut_strength",
+        35 to "auto_tone",
+        36 to "local_tone",
+        // [37..59] filmic 黑白点 / 锐化 / gamut / RAW 解码链路
+        37 to "filmic_black_ev",
+        38 to "filmic_white_ev",
+        39 to "sharpen",
+        40 to "gamut",
+        41 to "hr_wavelet",
+        42 to "white_hl",
+        43 to "white_floor",
+        44 to "white_probe",
+        45 to "hr_raw",
+        46 to "rcd_cdfix",
+        47 to "defringe",
+        48 to "moire",
+        49 to "hl_grecon",
+        50 to "ca_corr",
+        51 to "chroma_gate",
+        52 to "cg_scope",
+        53 to "df_gate",
+        54 to "pc3d",
+        55 to "pc3d_msize",
+        56 to "rcd_g_orig",
+        57 to "hl_rb_recon",
+        58 to "rcd_p3_split",
+        59 to "color_smooth",
+        // [60..68] 颗粒调制 / halation / 暗角
+        60 to "grain_midtone_bias",
+        61 to "grain_pivot",
+        62 to "halation_strength",
+        63 to "halation_threshold",
+        64 to "halation_radius",
+        65 to "halation_warmth",
+        66 to "vignette_strength",
+        67 to "vignette_radius",
+        68 to "vignette_feather",
+        // [69..77] 层间效应（三区 × R/G/B）
+        69 to "interlayer_shadow[0]",
+        70 to "interlayer_shadow[1]",
+        71 to "interlayer_shadow[2]",
+        72 to "interlayer_mid[0]",
+        73 to "interlayer_mid[1]",
+        74 to "interlayer_mid[2]",
+        75 to "interlayer_high[0]",
+        76 to "interlayer_high[1]",
+        77 to "interlayer_high[2]",
+        // [78..87] 清晰度 + 局部调整
+        78 to "clarity",
+        79 to "local_type",
+        80 to "local_center_x",
+        81 to "local_center_y",
+        82 to "local_radius",
+        83 to "local_feather",
+        84 to "local_angle",
+        85 to "local_width",
+        86 to "local_ev",
+        87 to "local_sat",
+        // [88..95] 色温 / 色调 / 影调分区 / 褪色 / 预留
+        88 to "temp_mired",
+        89 to "tint",
+        90 to "highlights",
+        91 to "shadows",
+        92 to "whites",
+        93 to "blacks",
+        94 to "fade",
+        95 to "reserved_95",
+    )
+
+    /**
+     * 语义名 → 槽位。**由 [bySlot] 派生**（不是第二份手写表）⇒ 结构上不可能与它不一致；
+     * 单测仍断言双向恒等，防的是"有人把这里改成手写表"。
+     */
+    val byName: Map<String, Int> = bySlot.entries.associate { (i, name) -> name to i }
+}
 
 /**
  * 一条预设（调研 §5.2 方案 B 的 Kotlin 形态）。
@@ -1580,6 +1796,10 @@ internal fun presetSlotIncluded(i: Int): Boolean =
  *
  * @param slots ★ **稀疏**：只含与恒等值（[CameraPresets.standard] 的逐槽值）不同的槽。
  *   "缺失 = 不套用该槽"（RawTherapee 语义）⇒ 天然支持"这条预设只改色彩"。
+ *   ★ **内存里是索引键**（`Map<Int, Double>`）：线格式用语义名（[FilmParamKeys]），翻译只发生在
+ *   [presetToJson] / [presetFromJson] 两个边界上 ⇒ 套用 / 强度 / 打开编辑器那几条链路零改动。
+ * @param note 用户说明（可选，缺省空串）。v2 新增字段：读取侧缺失即空，写出侧**恒写**
+ *（空串也写）—— 线格式字段固定，diff / 人工核对更省事，代价只有 11 字节。
  * @param lutId 资源引用（调研 §5.1 D2：预设必须带资源引用）。**null = 这条预设不含 LUT**
  *   ⇒ 套用时**不动**当前 LUT（缺失字段 = 保留当前值）；非 null 但资产已不在库中 ⇒
  *   降级为"无 LUT + 提示"（见 EditorScreen 的 applyPreset）。
@@ -1592,6 +1812,7 @@ internal data class EditorPreset(
     val favorite: Boolean = false,
     val createdAt: Long = 0L,
     val source: String = PRESET_SOURCE_USER,
+    val note: String = "",
     val slots: Map<Int, Double> = emptyMap(),
     val lutId: String? = null,
     val lutStrength: Double = 1.0,
@@ -1607,17 +1828,22 @@ internal fun presetId(now: Long, salt: Int): String =
     "p_${now}_${Integer.toString(salt and 0xFFF, 36)}"
 
 /**
- * schema 版本判定（E3-1a 定案）：**只认 [PRESET_SCHEMA]，未知版本一律拒绝该预设**
- *（跳过 + 诊断日志），**不做"尽力降级套用"**。
+ * schema 版本判定：**只认 [PRESET_SCHEMA]，其它版本一律拒绝该预设**（跳过 + 诊断日志），
+ * **不做"尽力降级套用"**。
  *
- * 为什么拒绝而不是降级：`FilmParams.h:37-44` 记录过一次真实的**槽位语义漂移** ——
+ * 为什么拒绝而不是降级：`FilmParams.h:34-46` 记录过一次真实的**槽位语义漂移** ——
  * `[5..10]` 从"高光软肩 / 阴影 toe（0 = 关）"**重定义**为"filmic latitude（0.01 = darktable
  * 默认，**0 = 极端 S 曲线**）"：同一批数值在新语义下是**完全不同的画面**。
- * 未来版本的预设里我们不知道哪些槽被重定义过 ⇒ 按旧语义套用 = 静默给出错误观感
- *（用户根本不知道画面为什么不对），而"少一条预设 + 一条可读的诊断日志"是可解释、可恢复的失败。
+ * 不知道语义就套用 = 静默给出错误观感（用户根本不知道画面为什么不对），而"少一条预设 +
+ * 一条可读的诊断日志"是可解释、可恢复的失败。
  *
- * 逐版本迁移链（darktable `legacy_params` 模式）留给 E3-2（导入 / 导出卡）；
- * 届时本函数变成"有迁移路径的旧版本也返回 true"。
+ * ★ **schema=1 一律拒绝，且本卡不写迁移函数**（裁决 A1）：v1 的键是槽位索引，`"5":0.0` 在
+ * 漂移后**无法分辨**是旧 shoulder 还是新 latitude ⇒ 迁移函数在信息论上就写不出来（这正是
+ * 改语义名的原因）。而真实设备上**不存在** v1 数据：预设功能首次出现在 v0.11.11（versionCode
+ * 360），用户明确未安装该包测试 ⇒ 拒绝的代价是零。
+ *
+ * 将来若真要迁移（E3-2 导入外部文件），本函数变成"**有迁移路径**的旧版本也返回 true"，
+ * 迁移在 [parsePreset] 里按版本分支做（darktable `legacy_params` 模式）。
  */
 internal fun presetSchemaUsable(schema: Int?): Boolean = schema == PRESET_SCHEMA
 
@@ -1844,10 +2070,27 @@ internal fun scalePresetSlots(
 private fun jsonNum(v: Double): String = if (v.isFinite()) v.toString() else "0"
 
 /**
- * 单条预设 → JSON（**键序固定**：便于 diff 与单测逐字断言）。
+ * 单条预设 → JSON（**键序固定**：便于 diff 与单测逐字断言）。线格式（v2）长这样：
+ *
+ * ```jsonc
+ * {"schema":2,"id":"p_1728543600000_ab12","name":"CineStill 800T","group":"CineStill",
+ *  "favorite":false,"createdAt":1728543600000,"source":"user","note":"",
+ *  "params":{"grain_amount":55.0,"vignette_strength":-0.18},
+ *  "lut":{"id":"cinestill_800t","strength":0.9}}
+ * ```
+ *
+ * 三个刻意的形态（架构师裁决，别顺手改）：
+ *  - **`params` 的键是语义名**（[FilmParamKeys]），不是槽位索引 —— 理由见 [PRESET_SCHEMA]；
+ *  - **`lut` 是对象** `{id, strength}`（不是 `lut` + `lut_strength` 两个平铺字段）：资源引用天然
+ *    是一组，拆平后"有 id 没强度"这种非法组合在结构上就存在了；
+ *  - **没有 `base` 段**：恒等值永远取 [CameraPresets.standard]（[presetSnapshot] 的 base），
+ *    结构上不可能出现"全 0 数组"这种错误基线。
  *
  * `lut` 为 null 时**省略该键**（不是写 `"lut":null`）：读取侧"缺失 = 无 LUT"，
  * 与"缺失 key = 不套用该字段"的整套语义一致，也少 20 字节。
+ *
+ * 槽位按**槽位号升序**写出（不是名字字典序）：与 `FilmParams.h` 的物理顺序一致，人工核对时
+ * 可以一行一行对着看。
  */
 internal fun presetToJson(p: EditorPreset): String = buildString {
     append("{\"schema\":").append(PRESET_SCHEMA)
@@ -1857,10 +2100,17 @@ internal fun presetToJson(p: EditorPreset): String = buildString {
     append(",\"favorite\":").append(p.favorite)
     append(",\"createdAt\":").append(p.createdAt)
     append(",\"source\":\"").append(jsonEscape(p.source)).append('"')
-    append(",\"slots\":{")
-    p.slots.entries.sortedBy { it.key }.forEachIndexed { i, (k, v) ->
-        if (i > 0) append(',')
-        append('"').append(k).append("\":").append(jsonNum(v))
+    append(",\"note\":\"").append(jsonEscape(p.note)).append('"')
+    append(",\"params\":{")
+    // ⚠ 逗号不能用 forEachIndexed 的下标判：没有语义名的槽会被跳过 ⇒ 下标会跳号（`{,` 非法 JSON）。
+    var first = true
+    for ((k, v) in p.slots.entries.sortedBy { it.key }) {
+        // 没有语义名的槽不写进线格式（[29] / 越界）。正常路径不会出现：[presetSparseSlots] 只产出
+        // [presetSlotIncluded] 的槽，而"可入库 ⇒ 有语义名"被单测钉死 ⇒ 这里是防御性跳过。
+        val key = FilmParamKeys.bySlot[k] ?: continue
+        if (!first) append(',')
+        first = false
+        append('"').append(key).append("\":").append(jsonNum(v))
     }
     append('}')
     p.lutId?.let {
@@ -1890,12 +2140,17 @@ internal data class PresetLoadResult(
 /**
  * JSON 数组 → 预设列表（**容错读取，绝不抛异常**）。
  *
- * 容错分两档（粒度不同，理由也不同）：
- *  - **结构字段坏了 ⇒ 跳过整项**：`schema` 不认识 / 缺 `id` / 缺 `name` / `slots` 不是对象
+ * 容错分**三档**（粒度不同，理由也不同）：
+ *  - **结构字段坏了 ⇒ 跳过整项**：`schema` 不认识 / 缺 `id` / 缺 `name` / `params` 不是对象
  *    —— 这条预设要么没法用，要么没法被定位（删除 / 更新按 id），留下只会是幽灵条目；
- *  - **槽位 / 资源坏了 ⇒ 逐项降级**：越界槽位忽略（调研 §5.7 第 3 条）、非数字 / 非有限值
- *    忽略、等于恒等值的槽丢弃（保住"slots 只含非恒等槽"这条不变式）、`lut` 坏了当"无 LUT"
- *    —— 一条预设里一个槽坏了不该让用户丢掉整条预设。
+ *  - ★ **未知语义名 ⇒ 跳过整项**（v2 新增的一档）：`params` 的键是 [FilmParamKeys] 里的语义名，
+ *    遇到不认识的键 = **这条数据比本版本新**（或被人手改坏）。不能逐槽跳过：那个键代表的参数
+ *    我们不知道是什么，忽略它可能给出**另一种风格**且用户无从察觉；而"少一条预设 + 一条可读的
+ *    诊断日志"是可解释、可恢复的失败。这与"未知 schema 一律拒绝"（[presetSchemaUsable]）是
+ *    同一个逻辑 —— 不知道语义就不要猜；
+ *  - **单个槽 / 资源坏了 ⇒ 逐槽降级**：**已知**语义名但槽位被策略排除（[presetSlotIncluded]
+ *    为假 —— 这是我们自己的策略，不是数据损坏）、值非数字 / 非有限、等于恒等值（保住"slots 只含
+ *    非恒等槽"这条不变式）、`lut` 坏了当"无 LUT" —— 一个槽坏了不该让用户丢掉整条预设。
  *
  * @param raw prefs 原文；null / 空白 = 还没存过（**不是错误**，不产生诊断）
  */
@@ -1940,29 +2195,38 @@ private fun parsePreset(v: Any?, why: (String) -> Unit): EditorPreset? {
         why("缺少 name")
         return null
     }
-    // ③ slots：必须是对象（数组 / 字符串 / 数字一律当坏项 —— 本格式没有"定长数组"形态）
-    val rawSlots = o["slots"]
-    if (rawSlots != null && rawSlots !is Map<*, *>) {
-        why("slots 不是对象")
+    // ③ params：必须是对象（数组 / 字符串 / 数字一律当坏项 —— 本格式没有"定长数组"形态）
+    val rawParams = o["params"]
+    if (rawParams != null && rawParams !is Map<*, *>) {
+        why("params 不是对象")
         return null
     }
     val neutral = CameraPresets.standard()
     val slots = LinkedHashMap<Int, Double>()
-    // 上面的形态检查已经让编译器把 rawSlots 智能转换成 Map? ⇒ 这里直接遍历（无需再 cast）
-    rawSlots?.forEach { (k, value) ->
-        val idx = (k as? String)?.toIntOrNull()
-        if (idx == null || !presetSlotIncluded(idx)) {
-            why("槽位 $k 越界 / 不参与预设，已忽略")
-            return@forEach
+    // 上面的形态检查让编译器把 rawParams 智能转换成 Map? ⇒ 直接遍历（无需再 cast）
+    if (rawParams != null) {
+        for ((k, value) in rawParams) {
+            // ★ 未知语义名 ⇒ **整项拒绝**（不是逐槽跳过）。理由见 presetsFromJson 的 KDoc 第 2 档：
+            //   不知道这个键代表什么参数，跳过它可能给出另一种风格且用户无从察觉。
+            val idx = (k as? String)?.let { FilmParamKeys.byName[it] }
+            if (idx == null) {
+                why("未知参数名 \"$k\"（本版本没有这个语义）⇒ 整项拒绝")
+                return null
+            }
+            // 已知语义名但槽位被策略排除 ⇒ 逐槽跳过（这是我们自己的策略，不是数据损坏）
+            if (!presetSlotIncluded(idx)) {
+                why("参数 $k（槽 $idx）不参与预设，已忽略")
+                continue
+            }
+            val d = (value as? Double)?.takeIf { it.isFinite() }
+            if (d == null) {
+                why("参数 $k 的值非法，已忽略")
+                continue
+            }
+            // 恒等值不入库（保住稀疏不变式：手改过的 JSON 也洗一遍）
+            if (abs(d - neutral[idx]) <= PARAM_EPS) continue
+            slots[idx] = d
         }
-        val d = (value as? Double)?.takeIf { it.isFinite() }
-        if (d == null) {
-            why("槽位 $k 的值非法，已忽略")
-            return@forEach
-        }
-        // 恒等值不入库（保住稀疏不变式：手改过的 JSON 也洗一遍）
-        if (abs(d - neutral[idx]) <= PARAM_EPS) return@forEach
-        slots[idx] = d
     }
     // ④ lut：资源引用坏了降级为"无 LUT"（资产丢失本来就有这条降级语义）
     var lutId: String? = null
@@ -1992,6 +2256,8 @@ private fun parsePreset(v: Any?, why: (String) -> Unit): EditorPreset? {
         favorite = o["favorite"] as? Boolean ?: false,
         createdAt = ((o["createdAt"] as? Double)?.takeIf { it.isFinite() && it >= 0 })?.toLong() ?: 0L,
         source = (o["source"] as? String)?.takeIf { it.isNotBlank() } ?: PRESET_SOURCE_USER,
+        // note 是可选的自由文本（不 trim：用户写的说明原样保存）；形态坏了降级为空串，不跳整项
+        note = (o["note"] as? String).orEmpty(),
         slots = slots,
         lutId = lutId,
         lutStrength = lutStrength,
