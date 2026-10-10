@@ -1214,7 +1214,14 @@ class FrameRenderer {
           lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1,
           // E4-2 暗角（vignette）：与 u_style_ 同名同义 —— 两条链路共用一段
           // 逐字相同的 shader 逻辑（ADR-9）
-          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1;
+          vig_scale = -1, vig_dscale = -1, vig_fscale = -1, vig_brightness = -1,
+          // U-4 清晰度 + 影调分区 + 褪色（display 域，OETF 之后）：与 u_style_ 同名同义
+          // —— 两条链路共用一段**逐字相同**的 shader 数学（照抄 kFsStyle 的 ④/①/② 段）。
+          // 唯一的域差异 = 清晰度 tap 要在本 shader 内过 highlightRolloff + srgbEncode
+          //（uTex 是滚降前的线性显示域），见 kFsOut 的 blurLuma16 注释。
+          clarity = -1, clar_step = -1,
+          highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
+          tone_on = -1;
   } u_out_;
   // kFsStyle（E1-3 编辑器通路）
   struct {

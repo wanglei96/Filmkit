@@ -2,8 +2,8 @@
 """E4-4 趾部/肩部（filmic `latitude` per-channel）离线验收 —— **真跑引擎自己的 shader**。
 
 判据（任务卡 E4-4）：
-  ① 默认零回归：新 `kFsFilm`（[5..10] 全 0.01）vs 改前 `kFsFilm`（`git show HEAD`）
-     ⇒ RGBA16F 输出**逐位相同**。
+  ① 默认零回归：`[5..10]` 全默认 0.01 时，工作区的 `computeFilmicSpline`（per-channel）
+     求出的 **60 个系数**必须**逐位**等于脚本内固化的期望基线 `EXPECT_HEX`。
   ② 形状可控：`lat_toe` = 0.01 / 0.1 / 0.3 的影调曲线采样（11 个输入亮度，≥6）+
      过渡区随参数**单调**移动 + **端点不动**（f(0) / f(1) 逐位相同）。
   ③ per-channel 生效：只改 `toe_r`（[8]）⇒ **R 通道变、G/B 逐位不变**；
@@ -11,23 +11,32 @@
   ④ 正交性：固定 [37][38]（black/white EV）与 [4]（contrast），改 [5..10]
      ⇒ 端点值**真的不动**（给数字）。
 
+★ **2026-10-11（U-4）判据 ① 的改造 —— 从"对比 git HEAD"改成"自包含基线"**：
+  原判据 ① 拿 `git show HEAD:<FR>` 当"改前"，E4-4 提交后 HEAD 立刻变成"改后"⇒ 脚本
+  自己失效（`uFilmicM1` 在"旧版"里再也提取不到，AssertionError: shader 提取对不上）。
+  这是"把 git 历史当对照物"的固有缺陷：**对照物会随提交漂移**。
+  现在 ① = 工作区系数 vs 脚本内 `EXPECT_HEX`（= E4-4 提交 `a824170` 的实测值，60 项）：
+  与 git 状态无关、随时可跑，且仍然**逐位**（`%a` 十六进制浮点字符串相等）。
+  基线的来源与一次性复现（`a824170^` 单套求解 vs `a824170` per-channel，60 项 0 处不同）
+  写在 `EXPECT_HEX` 上方；完整零回归证据（GPU 逐位 + CPU 逐位 + 真机）见
+  `docs/reports/e4-4-toeshoulder-REPORT.md`。
+  判据 ②③④ **本来就是自包含的**（只用工作区 shader + 参考实现）⇒ 原样保留。
+
 为什么必须真跑 shader（不是 numpy 直译）：ADR §1.4 / §6.5 —— 判据必须来自引擎的
 shader 本身（历史事故：在显示域量的阈值 5.0 拿去比线性域，恒 false、三版全无效）。
 
 方法：
-  · shader 来源 = 工作区的 `core/engine/src/render/FrameRenderer.cpp`；旧版 = `git show
-    HEAD:<同文件>`。只做 `#version 300 es → 330 core` 的机械改写（与
-    `tools/engine-shader-offline.py` 完全同一套 GL 封装，直接 import 复用）。
+  · shader 来源 = 工作区的 `core/engine/src/render/FrameRenderer.cpp`；只做
+    `#version 300 es → 330 core` 的机械改写（与 `tools/engine-shader-offline.py`
+    完全同一套 GL 封装，直接 import 复用）。
   · 系数来源 = `tools/tuning/filmic_offline.py` 的 `compute_spline`（项目已验证的
-    参考实现，曾用于与真机日志 fM*/fLat 对拍）。**新旧两版用同一份复算** ⇒ 判据 ①
-    检验的正是"shader 重构本身"这一唯一变量。
+    参考实现，曾用于与真机日志 fM*/fLat 对拍）。
   · 曲线测量条件：uToneK=1 / uGamut=0 / uSat=(1,1,1) / uSplit=0 / uLook=0 /
     uLocalStrength=0 / uExposure=1 / uHalDomainMap=0 ⇒ 输出 = filmicTone(输入)。
-    ⚠️ 这是**离线隔离口径**（真机 uGamut 默认 1）；两版对比时口径相同，不影响判据。
-  · 判据 ① 的最后一步 = **CPU 侧系数逐位对拍**：把工作区与 `git HEAD` 的两版
-    `solve5` + `computeFilmicSpline` 从源码里括号配平提取出来，机械改名后编译真跑
-    （clang++），打印全部系数的十六进制浮点逐位比较 —— GPU 对比证明"shader 重构
-    零回归"，这一步证明"C++ 侧 per-channel 求解在默认 0.01 时与旧版单套求解逐位相同"。
+    ⚠️ 这是**离线隔离口径**（真机 uGamut 默认 1）；各判据内部口径相同。
+  · 判据 ① 走 **CPU 侧**（系数逐位）：把工作区的 `solve5` + `computeFilmicSpline` 从
+    源码里括号配平提取出来，机械改名后编译真跑（clang++），打印全部系数的十六进制
+    浮点与固化基线比较。**它不再依赖任何 git 历史对象**。
 
 用法：python3 tools/check-toeshoulder.py            # 全部判据
       python3 tools/check-toeshoulder.py --dump     # 额外打印系数表
@@ -66,9 +75,86 @@ def extract_film(src_text):
     return m.group(1)
 
 
-def old_shader_src():
-    txt = subprocess.check_output(["git", "show", f"HEAD:{FR_REL}"], cwd=REPO).decode()
-    return extract_film(txt)
+# ────────────────────────────────────────── 判据 ① 的固化基线（60 个 hex）
+# 来源 = **E4-4 提交 a824170** 的 `computeFilmicSpline(black=-7.65, white=4.56, cp=1.0,
+#        lat_sh=lat_toe=[0.01,0.01,0.01])` 的全部系数（`printf("%a")`）。
+# 生成/复现（一次性，2026-10-11 由 U-4 跑过）：
+#   编 `git show a824170^:…/FrameRenderer.cpp`（改前：单套求解）与
+#   `git show a824170:…`（改后：per-channel）两版 `solve5` + `computeFilmicSpline`，
+#   逐项比较 ⇒ **60 个 hex 浮点 0 处不同**（原判据 ① 的结论，与
+#   docs/reports/e4-4-toeshoulder-REPORT.md 记录一致）。
+# ⚠️ 这 60 个值是**逐位**基线：改了 computeFilmicSpline 的数学（或默认 latitude 的
+#    处理）就会红 —— 那正是"零回归"该有的反应。若某个刻意的改动更新了它，必须同时
+#    更新本常量 + 报告，不许"顺手重跑覆盖"。
+EXPECT_HEX = """\
+m1 0 0 0x1.67af0ap-4
+m1 0 1 -0x1.577304p-4
+m1 0 2 -0x1.16509ap-2
+m1 1 0 0x1.67af0ap-4
+m1 1 1 -0x1.577304p-4
+m1 1 2 -0x1.16509ap-2
+m1 2 0 0x1.67af0ap-4
+m1 2 1 -0x1.577304p-4
+m1 2 2 -0x1.16509ap-2
+m2 0 0 0x0p+0
+m2 0 1 0x1.23d038p+0
+m2 0 2 0x1.6f0d96p+0
+m2 1 0 0x0p+0
+m2 1 1 0x1.23d038p+0
+m2 1 2 0x1.6f0d96p+0
+m2 2 0 0x0p+0
+m2 2 1 0x1.23d038p+0
+m2 2 2 0x1.6f0d96p+0
+m3 0 0 0x1.581e44p+0
+m3 0 1 -0x1.72a8f8p+0
+m3 0 2 0x0p+0
+m3 1 0 0x1.581e44p+0
+m3 1 1 -0x1.72a8f8p+0
+m3 1 2 0x0p+0
+m3 2 0 0x1.581e44p+0
+m3 2 1 -0x1.72a8f8p+0
+m3 2 2 0x0p+0
+m4 0 0 0x1.a3084ep-1
+m4 0 1 0x1.e7df06p+1
+m4 0 2 0x0p+0
+m4 1 0 0x1.a3084ep-1
+m4 1 1 0x1.e7df06p+1
+m4 1 2 0x0p+0
+m4 2 0 0x1.a3084ep-1
+m4 2 1 0x1.e7df06p+1
+m4 2 2 0x0p+0
+m5 0 0 -0x1.3c0966p+0
+m5 0 1 -0x1.35b70ep+1
+m5 0 2 0x0p+0
+m5 1 0 -0x1.3c0966p+0
+m5 1 1 -0x1.35b70ep+1
+m5 1 2 0x0p+0
+m5 2 0 -0x1.3c0966p+0
+m5 2 1 -0x1.35b70ep+1
+m5 2 2 0x0p+0
+lat 0 0x1.3ee524p-1 0x1.421658p-1
+lat 1 0x1.3ee524p-1 0x1.421658p-1
+lat 2 0x1.3ee524p-1 0x1.421658p-1
+scalar -0x1.e9999ap+2 0x1.23d70ap+2 0x1.86b852p+3 0x1.e199bp-11 0x1.1687dep+2 0x1.ceb24ap+1
+scalar2 0x1.67af0ap-4 0x1.40c948p-1 0x1.6f0d96p+0"""
+
+
+def hex_pairs(lines):
+    """把 `%a` 打印行解析成 {(类别, 索引…) → hex}（60 项）。"""
+    out = {}
+    for ln in lines:
+        p = ln.split()
+        if not p:
+            continue
+        if p[0].startswith("m"):
+            out[(p[0], p[1], p[2])] = p[3]
+        elif p[0] == "lat":
+            out[("lat", p[1], "min")] = p[2]
+            out[("lat", p[1], "max")] = p[3]
+        elif p[0] in ("scalar", "scalar2"):
+            for i, v in enumerate(p[1:]):
+                out[(p[0], str(i))] = v
+    return out
 
 
 # ────────────────────────────────────────── 系数（参考实现 → uniform）
@@ -91,16 +177,6 @@ def common_uni(sp):
         "uFilmicBlackDisp": float(sp["black_disp"]),
         **STYLE_IDENTITY,
     }
-
-
-def uni_old(black, white, cp, lat=0.01):
-    sp = compute_spline(black, white, cp, lat)
-    m = [sp["m_toe"], sp["m_sh"], sp["m_mid"]]  # polyval 序 [x⁴..x⁰]
-    u = {f"uFilmicM{i + 1}": (float(m[0][4 - i]), float(m[1][4 - i]), float(m[2][4 - i]))
-         for i in range(5)}
-    u["uFilmicLatMin"] = float(sp["toe_log"])
-    u["uFilmicLatMax"] = float(sp["sh_log"])
-    return {**common_uni(sp), **u}, sp
 
 
 def uni_new(black, white, cp, lat_sh, lat_toe):
@@ -196,99 +272,77 @@ def struct_body(hdr, name="FilmicSpline"):
     return m.group(1)
 
 
-def cpu_bitcheck():
-    """CPU 侧：提取**新旧两版** `solve5` + `computeFilmicSpline` 源码真编真跑，逐位对拍。
+def cpu_baseline_check():
+    """判据 ①（CPU 侧，**自包含**）：工作区 `computeFilmicSpline` 的 60 个系数 vs `EXPECT_HEX`。
 
-    为什么必要：判据 ① 的 GPU 对比用的是**同一份** Python 复算系数 ⇒ 它证明"shader
-    重构零回归"，但证明不了"C++ 侧 per-channel 求解在默认 0.01 时与旧版单套求解逐位
-    相同"。本步骤把两版函数体机械改名后放进同一个 TU（结构体从各自的 .h 提取），
-    打印全部系数的十六进制浮点（%a）后逐位比较 —— 判据 ① 的另一半。"""
+    为什么必要：GPU 侧（判据 ②③④）用的是**参考实现** `filmic_offline.compute_spline` 算出的
+    系数 ⇒ 它检验的是 shader 的求值，检验不了"C++ 侧求解在默认 latitude 下是否还等于
+    E4-4 交付时的结果"。本步骤把工作区的 `solve5` + `computeFilmicSpline` 抠出来真编真跑，
+    打印全部系数的十六进制浮点（`%a`）与**固化基线**逐位比较 ⇒ 与 git 状态无关、随时可跑。
+
+    ⚠️ 这里**不再**与 `git show HEAD` 对比（2026-10-11 U-4 改造）：HEAD 会随提交漂移，
+    E4-4 一提交就使原判据自我失效（`uFilmicM1` 在"旧版"里不存在）。基线来源与一次性
+    复现见 `EXPECT_HEX` 上方注释。
+    """
     import tempfile
     new_cpp = open(FR, encoding="utf-8").read()
-    old_cpp = subprocess.check_output(["git", "show", f"HEAD:{FR_REL}"], cwd=REPO).decode()
     new_h = open(os.path.join(REPO, "core/engine/src/render/FrameRenderer.h"),
                  encoding="utf-8").read()
-    old_h = subprocess.check_output(
-        ["git", "show", "HEAD:core/engine/src/render/FrameRenderer.h"], cwd=REPO).decode()
 
-    def grab(cpp, sp_type):
-        solve = brace_block(cpp, "bool solve5(double a[5][5]")
-        fn = brace_block(cpp, "FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(")
-        fn = fn.replace("FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(",
-                        f"{sp_type} compute_spline(").replace("FilmicSpline sp;", f"{sp_type} sp;")
-        return solve, fn
-
-    old_solve, old_fn = grab(old_cpp, "OldSp")
-    new_solve, new_fn = grab(new_cpp, "NewSp")
+    solve = brace_block(new_cpp, "bool solve5(double a[5][5]")
+    fn = brace_block(new_cpp, "FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(")
+    fn = fn.replace("FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(",
+                    "NewSp compute_spline(").replace("FilmicSpline sp;", "NewSp sp;")
     src = f"""#include <algorithm>
 #include <cmath>
 #include <cstdio>
-struct OldSp {{
-{struct_body(old_h)}
-}};
 struct NewSp {{
 {struct_body(new_h)}
 }};
-namespace oldimpl {{
-{old_solve}
-{old_fn}
-}}
-namespace newimpl {{
-{new_solve}
-{new_fn}
+namespace impl {{
+{solve}
+{fn}
 }}
 int main() {{
   const float lat[3] = {{0.01f, 0.01f, 0.01f}};
-  OldSp o = oldimpl::compute_spline(-7.65f, 4.56f, 1.0f, 0.01f);
-  NewSp n = newimpl::compute_spline(-7.65f, 4.56f, 1.0f, lat, lat);
-  const float* om[5] = {{o.m1, o.m2, o.m3, o.m4, o.m5}};
+  NewSp n = impl::compute_spline(-7.65f, 4.56f, 1.0f, lat, lat);
   const float (*nm[5])[3] = {{n.m1, n.m2, n.m3, n.m4, n.m5}};
   for (int k = 0; k < 5; ++k)
-    for (int seg = 0; seg < 3; ++seg)
-      for (int ch = 0; ch < 3; ++ch)
-        printf("m%d %d %d %a %a\\n", k + 1, ch, seg, nm[k][ch][seg], om[k][seg]);
+    for (int ch = 0; ch < 3; ++ch)
+      for (int seg = 0; seg < 3; ++seg)
+        printf("m%d %d %d %a\\n", k + 1, ch, seg, nm[k][ch][seg]);
   for (int ch = 0; ch < 3; ++ch)
-    printf("lat %d %a %a %a %a\\n", ch, n.lat_min[ch], o.lat_min, n.lat_max[ch], o.lat_max);
-  printf("scalar %a %a %a %a %a %a %a %a %a %a %a %a\\n",
-         n.black_ev, o.black_ev, n.white_ev, o.white_ev, n.dynamic_range, o.dynamic_range,
-         n.input_min, o.input_min, n.input_max, o.input_max, n.output_power, o.output_power);
-  printf("scalar2 %a %a %a %a %a %a\\n",
-         n.black_disp, o.black_disp, n.grey_log, o.grey_log, n.contrast, o.contrast);
+    printf("lat %d %a %a\\n", ch, n.lat_min[ch], n.lat_max[ch]);
+  printf("scalar %a %a %a %a %a %a\\n",
+         n.black_ev, n.white_ev, n.dynamic_range,
+         n.input_min, n.input_max, n.output_power);
+  printf("scalar2 %a %a %a\\n", n.black_disp, n.grey_log, n.contrast);
   return 0;
 }}
 """
     with tempfile.TemporaryDirectory() as td:
-        cpp = os.path.join(td, "bitcheck.cpp")
-        exe = os.path.join(td, "bitcheck")
+        cpp = os.path.join(td, "basecheck.cpp")
+        exe = os.path.join(td, "basecheck")
         open(cpp, "w").write(src)
         r = subprocess.run(["clang++", "-std=c++20", "-O2", "-o", exe, cpp],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            check("① CPU 侧系数逐位（新 vs 改前 computeFilmicSpline）", False,
+            check("① 默认零回归（工作区系数 vs 固化基线，逐位）", False,
                   "clang++ 编译失败：\n" + r.stderr[-2000:])
             return
         out = subprocess.run([exe], capture_output=True, text=True).stdout
-    bad = []
-    n_cmp = 0
-    for ln in out.strip().split("\n"):
-        p = ln.split()
-        if p[0].startswith("m"):
-            pairs = [(p[3], p[4])]
-        elif p[0] == "lat":
-            pairs = [(p[2], p[3]), (p[4], p[5])]
-        elif p[0] == "scalar":
-            pairs = list(zip(p[1::2], p[2::2]))
-        elif p[0] == "scalar2":
-            pairs = list(zip(p[1::2], p[2::2]))
-        else:
-            continue
-        for a, b in pairs:
-            n_cmp += 1
-            if a != b:
-                bad.append(f"{ln} → {a} != {b}")
-    check("① CPU 侧系数逐位（新 vs 改前 computeFilmicSpline）", not bad,
-          f"比较 {n_cmp} 个 hex 浮点（15 个多项式系数 × 3 通道 + lat_min/max + 9 个标量）；"
-          f"不同 = {len(bad)}" + ("" if not bad else "；例：" + bad[0]))
+
+    want = hex_pairs(EXPECT_HEX.strip().split("\n"))
+    got = hex_pairs(out.strip().split("\n"))
+    bad = [f"{k}: {got.get(k)} != {want[k]}" for k in want if got.get(k) != want[k]]
+    extra = [k for k in got if k not in want]
+    detail = (f"{len(want)} 个 hex 浮点（15 个多项式系数 × 3 通道 + lat_min/max × 3 + "
+              f"9 个标量）；不同 = {len(bad)}")
+    if extra:
+        detail += f"；基线未覆盖的新项 = {len(extra)}（例：{extra[0]}）"
+    if bad:
+        detail += "；例：" + bad[0]
+    check("① 默认零回归（工作区系数 vs 固化基线，逐位）", not bad and not extra, detail)
 
 
 def main():
@@ -298,30 +352,29 @@ def main():
 
     gl_cls, to_core = load_offline_gl()
     new_src = extract_film(open(FR, encoding="utf-8").read())
-    old_src = old_shader_src()
-    assert "uFilmicToeM1" in new_src and "uFilmicM1" in old_src, "shader 提取对不上"
+    assert "uFilmicToeM1" in new_src, \
+        "kFsFilm 里找不到 per-channel 的 uFilmicToeM1（E4-4 的 shader 提取对不上）"
 
     # [37][38] / [4] 固定（判据 ④ 的前提）：darktable 默认 EV + 中性 contrast
     B, W, CP = -7.65, 4.56, 1.0
-    u_old, sp_old = uni_old(B, W, CP)
     u_def, cols_def = uni_new(B, W, CP, [0.01] * 3, [0.01] * 3)
-    e, v = e_grid(sp_old)
+    e, v = e_grid(cols_def[1][0])
     img = mk_img(v)
     W_, H_ = img.shape[1], img.shape[0]
 
     gl = gl_cls(W_, H_)
     try:
-        b_old = Bench(gl, to_core, old_src, W_, H_)
         b_new = Bench(gl, to_core, new_src, W_, H_)
-        out_old = b_old.run(img, u_old)
         out_def = b_new.run(img, u_def)
 
-        # ── 判据 ① 默认零回归：逐位相同 ────────────────────────────────
-        same = np.array_equal(out_def, out_old)
-        n_diff = int((out_def != out_old).sum())
-        check("① 默认零回归（新 vs 改前 shader，RGBA16F 逐位）", same,
-              f"{W_}×{H_}×4 个分量，不同 = {n_diff}；"
-              f"max|Δ| = {np.abs(out_def - out_old).max():.3e}")
+        # ── 判据 ①（GPU 侧补充，自包含）：默认 latitude ⇒ per-channel 结构必须退化为
+        # "三通道同一套"（= 与 E4-4 之前单套求解等价的必要条件）──────────────────
+        # 原判据 ① 的 GPU 部分（"新 shader vs 改前 shader 逐位相同"）依赖 `git show HEAD`，
+        # E4-4 提交后自我失效 ⇒ 由 ①（CPU 侧 vs 固化基线）+ 本条取代。
+        rgb_same = (np.array_equal(out_def[..., 0], out_def[..., 1]) and
+                    np.array_equal(out_def[..., 0], out_def[..., 2]))
+        check("① 默认 latitude 下 per-channel 退化为单套（GPU 输出 R=G=B 逐位）", rgb_same,
+              f"三通道全 0.01 ⇒ 系数逐通道相同 ⇒ {W_}×{H_} 上 R/G/B 逐位相同 = {rgb_same}")
 
         # ── 判据 ② 形状可控：lat_toe 0.01 / 0.1 / 0.3 ──────────────────
         lats = [0.01, 0.1, 0.3]
@@ -408,8 +461,8 @@ def main():
     finally:
         gl.close()
 
-    # 判据 ① 的另一半：C++ 侧系数（GPU 对比用的是同一份 Python 复算系数）
-    cpu_bitcheck()
+    # 判据 ① 的 CPU 侧主体：工作区系数 vs **固化基线**（自包含，不依赖 git 历史）
+    cpu_baseline_check()
 
     print("\n" + ("全部通过" if not FAIL else f"存在失败项：{FAIL}"))
     return 0 if not FAIL else 1

@@ -99,16 +99,33 @@ class PresetScopeTest {
         )
     }
 
-    // ── ③ 仅后期参数在拍照场景 ⇒ 提示（"黑白预设"问题的镜像）──────────────────
+    // ── ③ U-4（2026-10-11）：判据表里**再没有"仅后期"槽位** ───────────────────
 
+    /**
+     * ★ U-4：`[78]` 清晰度 + `[90..94]` 影调分区/褪色**已两侧生效**（拍照侧落点 =
+     * `passOutput` 的 `srgbEncode` 之后 = **显示域**，与 kFsStyle 同域同式）⇒ 拍照界面
+     * 不再有"仅后期参数"这类提示。
+     *
+     * 本测试**取代**原来的 `editorOnlyParamsAreReportedInCamera`（那条断言
+     * `含 1 项仅后期参数（清晰度），拍照时不生效` 随 U-4 作废）：口径从"提示文案对"升级为
+     * "这一类提示**不可能再出现**"—— 遍历全部槽位，任何槽位都不允许是 editor-only。
+     * 若将来新增只对编辑器生效的参数，本条会直接红（连同 §1.6 的对拍一起要求改）。
+     */
     @Test
-    fun editorOnlyParamsAreReportedInCamera() {
-        val p = preset(78, 88, 89)
-        assertEquals(
-            "含 1 项仅后期参数（清晰度），拍照时不生效",
+    fun noEditorOnlySlotsRemain() {
+        val p = preset(78, 90, 91, 92, 93, 94)
+        assertNull(
+            "U-4 起 [78]/[90..94] 两侧都生效 ⇒ 拍照界面不该再提示",
             presetScopeNotice(p, PresetScene.CAMERA),
         )
-        assertNull("这三项在编辑器链路都读 ⇒ 编辑器里不提示", presetScopeNotice(p, PresetScene.EDITOR))
+        assertNull("编辑器链路本来就读这六项 ⇒ 也不提示", presetScopeNotice(p, PresetScene.EDITOR))
+        for (slot in 0 until CameraPresets.COUNT) {
+            assertTrue(
+                "槽位 [$slot] 不该是「仅后期」（U-1 消 [23..25]、U-3 消 [88][89]、" +
+                    "U-4 消 [78]/[90..94]）—— 新增 editor-only 参数时本条与 §1.6 一起改",
+                PresetScene.CAMERA in presetSlotScenes(slot),
+            )
+        }
     }
 
     /**
@@ -133,20 +150,36 @@ class PresetScopeTest {
         )
         assertEquals("[89] 同 [88]（同一条白点偏移的两个轴）", setOf(PresetScene.CAMERA, PresetScene.EDITOR), presetSlotScenes(89))
         assertEquals(
-            "[90] 影调分区仍是仅后期（U-4 才补）—— 与 [88][89] 的边界必须清楚",
-            setOf(PresetScene.EDITOR),
+            "[90] 影调分区同 U-4 起两侧都生效（拍照侧落点 = passOutput 的显示域段）" +
+                "—— 与 [88][89] 同判据，不再是「仅后期」",
+            setOf(PresetScene.CAMERA, PresetScene.EDITOR),
             presetSlotScenes(90),
+        )
+        assertEquals(
+            "[94] 褪色同判据（同一条显示域段）",
+            setOf(PresetScene.CAMERA, PresetScene.EDITOR),
+            presetSlotScenes(94),
+        )
+        assertEquals(
+            "[78] 清晰度同判据（passOutput 的 16-tap 显示域 USM）",
+            setOf(PresetScene.CAMERA, PresetScene.EDITOR),
+            presetSlotScenes(78),
         )
     }
 
-    /** 名字列表超过 3 项时截断成一行（卡片副标题/列表小字都只有一行）。 */
+    /**
+     * 单侧生效槽位的名字去重后 ≤ 3 项 ⇒ 提示恒定一行放得下。
+     *
+     * ★ U-4 后**没有截断实例**（原 `longNameListIsTruncated` 随 `MAX_NAMES` 一并删除：
+     * 判据表里剩下的单侧槽位只有仅拍照的 `[5..10]`/`[37][38]`，去重名 = 胶片曲线/黑点/白点）。
+     * 本测试钉死这个上界 —— 一旦超过，说明有新槽位进了单侧集合，该考虑恢复截断了。
+     */
     @Test
-    fun longNameListIsTruncated() {
-        // U-3 起 [88][89] 两侧生效 ⇒ 只剩 [90..94] 五项仅后期（名字去重后仍 > 3 ⇒ 截断）
-        val p = preset(78, 88, 89, 90, 91, 92, 93, 94)
-        val n = presetScopeNotice(p, PresetScene.CAMERA)
-        assertEquals("含 6 项仅后期参数（清晰度/高光/阴影…），拍照时不生效", n)
-        assertTrue("截断后也必须是一行能放下的长度：${n!!.length}", n.length <= 40)
+    fun singleSideNoticeFitsInOneLine() {
+        val p = preset(5, 6, 7, 8, 9, 10, 37, 38)
+        val n = presetScopeNotice(p, PresetScene.EDITOR)
+        assertEquals("含 3 项仅拍照参数（胶片曲线/黑点/白点），编辑器里不生效", n)
+        assertTrue("必须是一行能放下的长度：${n!!.length}", n.length <= 40)
     }
 
     /** 每个"单侧生效"的槽位都必须有中文名（防名字表漏项 ⇒ 提示里冒出英文语义名）。 */
@@ -227,9 +260,9 @@ class PresetScopeTest {
             if (cam != ed) singleSide++
         }
         assertEquals(
-            "§1.6 里单侧生效**且进预设**的槽位数（[5..10]+[37][38]+[78]+[90..94]；" +
-                "U-1 起 [23..25] 两侧都生效（19−3 = 16）、U-3 起 [88][89] 两侧都生效（16−2 = 14））",
-            14,
+            "§1.6 里单侧生效**且进预设**的槽位数（U-4 后只剩仅拍照的 [5..10]+[37][38] = 8；" +
+                "历史：19 − [23..25]（U-1，3）− [88][89]（U-3，2）− [78]+[90..94]（U-4，6）= 8）",
+            8,
             singleSide,
         )
         assertEquals(
@@ -278,7 +311,8 @@ class PresetScopeTest {
      *  - **徕卡黑白不含 `[25]`**：黑白靠 `leica_b_w_hc` LUT 的通道混合实现（先 `[25]` 去色会把
      *    LUT 的通道混合作用在灰上 ⇒ 抹平黄绿滤镜响应，见 [BuiltinPresetsTest.bwPresetHasNoMonochrome]）
      *    ⇒ 编辑器里**全部生效**，不该有任何提示；
-     *  - 三条都不含 `[78]` / `[88..94]` ⇒ 拍照界面一条提示都不该有。
+     *  - ★ U-4（2026-10-11）起**拍照界面不可能再有"仅后期"提示**（判据表里已无 editor-only
+     *    槽位）—— 三条内置预设照旧一条提示都不该有。
      */
     @Test
     fun builtinPresetsNoticesMatchTheirData() {
@@ -288,7 +322,7 @@ class PresetScopeTest {
 
         for (p in presets) {
             assertNull(
-                "${p.id} 不含 [78]/[88..94] ⇒ 拍照界面不该有任何提示",
+                "${p.id} 拍照界面不该有任何提示（U-4 起判据表里无 editor-only 槽位）",
                 presetScopeNotice(p, PresetScene.CAMERA),
             )
             // ★ P-5 复核**实测**（不是假设）：内置配方不含新排除的 [28] / [31..33]

@@ -67,6 +67,22 @@ EXPECT = {
     "grainMb": ("submitDisplay", ["passStyle("]),
     "grainPivot": ("submitDisplay", ["passStyle("]),
     "grainSeed": ("submitDisplay", ["passStyle("]),
+    # U-4（2026-10-11）：显示域五项（[78] 清晰度 + [90..94] 影调分区/褪色）的**生效值**。
+    # 三段的 shader 数学与门控都在 passOutput 内（kFsOut 的 srgbEncode 之后 = 显示域）
+    # ⇒ 字段必须晚于 finishStillChain 内的 passOutput 调用（成片路径：passFilm →
+    # passOutput → 本日志行），否则读的是上一帧的下发值（同 p0s/颗粒的那条纪律）。
+    # ⚠ 名字全部带 `tone`/`clar` 前缀：submitDisplay 的 diag.stats 快照已占用
+    # `toneOn`/`hl`/`sh`/`wh`/`fade`（编辑器链路的同义字段），而本脚本取 hits[0] ⇒
+    # 同名会让核对指到 submitDisplay 上（U-1 的 splitW/splitC/monoOn 是同一条纪律）。
+    # clarR = 实际下发的清晰度环半径（px，与 passOutput 同源 = clarityStepPx）。
+    "clar": ("finishStillChain", ["passOutput("]),
+    "clarR": ("finishStillChain", ["passOutput("]),
+    "toneGate": ("finishStillChain", ["passOutput("]),
+    "toneHi": ("finishStillChain", ["passOutput("]),
+    "toneSh": ("finishStillChain", ["passOutput("]),
+    "toneWh": ("finishStillChain", ["passOutput("]),
+    "toneBl": ("finishStillChain", ["passOutput("]),
+    "toneFade": ("finishStillChain", ["passOutput("]),
     # U-1（[23][24] 分离色调 + [25] 单色）：编辑器链路的**生效值**。字段名带 W/C/On 后缀，
     # 刻意不叫 `split`/`mono` —— 那两个名字已被 diag.stats 的 kFsFilm 快照占用（行号更小，
     # 而本脚本取 hits[0]）⇒ 同名会让核对指到错误的函数上（假红）。

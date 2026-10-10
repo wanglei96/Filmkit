@@ -4557,6 +4557,23 @@ uniform float uGrainZoom;
 uniform float uGrainNorm;
 uniform highp sampler2D uGrainLut;  // 128² R16F 相纸响应 LUT（CPU 侧按 [60][61] 重算）
 uniform float uFlipY;  // 拍照读回 GL 底行在前，翻转后 JPEG 方向正确
+// ── U-4 清晰度 + 影调分区 + 褪色（display 域 = 本 shader 的 srgbEncode **之后**）──
+// 为什么是"照抄 kFsStyle"：这四项在两条链路上**同域**（编辑器链路的输入本就是已成片
+// sRGB 显示域；本 shader 的 srgbEncode 之后也是）⇒ 系数、权重定义、区间划分、先后序
+// 全部逐字照抄 kFsStyle 的 ①④ 段（U-1 起的两侧对齐就用这个手法，见其 chainLuma 注释）。
+// ⚠️ 落点绝不能在 srgbEncode **之前**：那里是线性显示域，同一物理亮度下 luma 差 2.5 倍
+//   （中灰 0.18 → 线性 0.18 / 显示 0.46）⇒ 分区权重曲线形状完全不同（U-1 的 split 段
+//   报告里有实测对照）。
+// 门控（默认值 ⇒ 整段跳过，零成本、逐位零回归）：clarity 与 fade 在 shader 内
+// （`> 0.0`）、tone_on 由 CPU 侧算（四项任一非 0）—— 与 kFsStyle 逐字同判据。
+uniform float uClarity;    // [78] 清晰度（显示域局部对比；0 = 关）
+uniform vec2 uClarStep;    // 清晰度环半径（UV 单位）= r_px/(W,H)
+uniform float uHighlights;   // [90] 高光提亮/压暗（0 = 不动）
+uniform float uShadows;      // [91] 阴影提亮/压暗（0 = 不动）
+uniform float uWhites;       // [92] 白色色阶（0 = 不动）
+uniform float uBlacks;       // [93] 黑色色阶（0 = 不动）
+uniform float uFade;         // [94] 褪色（抬起黑场；0 = 关）
+uniform float uToneOn;       // 门控（CPU 侧算）：[90..93] 任一非 0
 uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
 uniform float uSharpen;  // v0.9.6 轻度锐化强度（0 = 关，A/B 通路；FilmParams[39]）
 // ── M4 3D LUT（display 域）────────────────────────────────────────────
@@ -4787,6 +4804,52 @@ vec3 srgbEncode(vec3 c) {
     vec3 lo = 12.92 * c;                                // 线性段（暗部）
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
+// ── U-4 清晰度的 16-tap 环形 luma 模糊（2 环 × 8 方向 = 16 tap，**全手动展开**）──
+// 与 kFsStyle 的 blurLuma16 **同偏移序列、同权重、同 0.0625 归一**；唯一的实现差异 =
+// 每个 tap 要过 tapLuma（见下）—— 这是**域逼出来的**，不是自由发挥：
+//   · kFsStyle 的 uTex 是**已成片 sRGB**（显示域）⇒ tap 直接取 luma 就与中心同域，
+//     它只需要 chainLuma 把基准提升过"曝光/WB 往返 + 对比度 + 局部曝光"；
+//   · 本 shader 的 uTex 是**滚降前的线性显示域**工作纹理（tex_work_）⇒ 中心 c 已经过
+//     highlightRolloff + srgbEncode，tap 必须走**同一条链**才同域。否则 blur 基准偏低
+//     （线性 0.18 vs 显示 0.46）⇒ 清晰度变成"整体提亮"而不是局部对比（U-1 的
+//     chainLuma 注释里记的正是这一类事故）。
+// chainLuma 在本 shader 里**退化为恒等**：它要提升的三项（曝光/WB、对比度、局部曝光）
+//   在拍照链路全部位于更早的 pass（RAW 线性域）或根本不在本链路（局部调整只服务编辑器）
+//   ⇒ 不存在"中心已过、基准没过"的差。**不写空的 chainLuma**（YAGNI：留着会让人以为
+//   拍照链路也有域提升，改天有人往里加一项就出上面那个事故）。
+// ⚠️ 权重是 **Rec.601**（0.299/0.587/0.114），与本 shader 顶部的 luma()（Rec.709，
+//   服务 sharpenLuma）**故意不统一** —— 必须与 kFsStyle 的 blurLuma16 逐字一致（kFsStyle
+//   内部同样是"601 的局部对比 + 709 的 split/mono"两套，理由见那里的注释）。
+// ⚠️ GLSL 三禁：无数组参数、无循环、无多行宏（本段 16 行手动展开是硬要求）。
+// E2-12（对照 kFsStyle）：那里的 uv 是裁剪后坐标、逐 tap 经 cropUV 映射到原图；本 shader
+//   的裁剪在**引擎输入侧**就做完了（tex_work_ 已是裁剪后画面）⇒ tap 直接用 uv + 偏移。
+//   环偏移对称 ⇒ uFlipY 的 y 翻转不改变环形状（±d 仍是 ±d）。
+float tapLuma(vec2 uv) {
+    return dot(srgbEncode(highlightRolloff(texture(uTex, uv).rgb)),
+               vec3(0.299, 0.587, 0.114));
+}
+float blurLuma16(vec2 uv) {
+    vec2 d1 = uClarStep;
+    vec2 d2 = uClarStep * 2.0;
+    float lb = 0.0;
+    lb += tapLuma(uv + vec2( d1.x, 0.0));
+    lb += tapLuma(uv + vec2(-d1.x, 0.0));
+    lb += tapLuma(uv + vec2(0.0,  d1.y));
+    lb += tapLuma(uv + vec2(0.0, -d1.y));
+    lb += tapLuma(uv + vec2( d1.x,  d1.y) * 0.70710678);
+    lb += tapLuma(uv + vec2(-d1.x,  d1.y) * 0.70710678);
+    lb += tapLuma(uv + vec2( d1.x, -d1.y) * 0.70710678);
+    lb += tapLuma(uv + vec2(-d1.x, -d1.y) * 0.70710678);
+    lb += tapLuma(uv + vec2( d2.x, 0.0));
+    lb += tapLuma(uv + vec2(-d2.x, 0.0));
+    lb += tapLuma(uv + vec2(0.0,  d2.y));
+    lb += tapLuma(uv + vec2(0.0, -d2.y));
+    lb += tapLuma(uv + vec2( d2.x,  d2.y) * 0.70710678);
+    lb += tapLuma(uv + vec2(-d2.x,  d2.y) * 0.70710678);
+    lb += tapLuma(uv + vec2( d2.x, -d2.y) * 0.70710678);
+    lb += tapLuma(uv + vec2(-d2.x, -d2.y) * 0.70710678);
+    return lb * 0.0625;
+}
 void main() {
     vec2 uv = vUV0;
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
@@ -4794,6 +4857,45 @@ void main() {
     c = highlightRolloff(c);
     if (uSharpen > 0.0) sharpenLuma(c, uv);
     c = srgbEncode(c);
+    // ── U-4 ① 清晰度（显示域局部对比；0 = 关）*[78]* ───────────────────────────
+    // 形式 = **加性 luma USM**（照 kFsStyle 的 ④ 段 `c += (l0 - lb) * uClarity`，逐字同式）：
+    // RGB 同加一个标量 ⇒ 只抬局部亮度，不逐通道拉伸。差值限幅 ±0.25 拦高反差边缘过冲
+    //（标定旋钮，与 kFsStyle 同值）。
+    // ⚠️ 与 [39] sharpen 的分工（ADR 已裁决"不复用"）：[39] 是 OETF **之前**的 3×3 小半径
+    //   锐化、乘法 luma USM（保色度）、走相对增益（÷l0）；本段是显示域的 16-tap 中半径
+    //   加性 USM。两者语义不同（半径、域、保色度方式都不同）⇒ 并存，互不替代。
+    // 本段的 tap 用了 16 次额外纹理采样 + 每 tap 一次 highlightRolloff/srgbEncode
+    //（≈ 16 exp + 48 pow/px）—— 这是本卡唯一的显著 GPU 成本，量级估算见
+    // docs/reports/u4-camera-display-domain-REPORT.md。
+    if (uClarity > 0.0) {
+        float l0 = dot(c, vec3(0.299, 0.587, 0.114));
+        float lb = blurLuma16(uv);
+        c += clamp(l0 - lb, -0.25, 0.25) * uClarity;
+    }
+    // ── U-4 ② 影调分区（display 域 luma 分区**乘性**增益；全 0 = 整段跳过）──────
+    // 权重曲线（l = display 域 luma，s = 1−l）：高光 l²、阴影 s²（宽范围，覆盖中灰两侧），
+    // 白 l³、黑 s³（端部集中 = "白点/黑点"的窄作用域）。全是多项式 ⇒ 端点与一阶都连续，
+    // 分区之间**无硬边**。**逐字照抄 kFsStyle 的同名段**（含"为什么乘性"的推导）：
+    // 乘性保持色度比；端点行为 highlights=+1 ⇒ 纯白处 ×2（clamp 到 1）、blacks=-1 ⇒
+    // 纯黑处 ×0。
+    // 为什么在清晰度**之后**：kFsStyle 的顺序就是如此（那里的理由是 chainLuma 不必扩到
+    // 本段；本 shader 里连 chainLuma 都退化为恒等，顺序照抄是为了"两侧同一套先后"）。
+    if (uToneOn > 0.5) {
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        float s = 1.0 - l;
+        float g = 1.0 + uHighlights * l * l + uShadows * s * s +
+                  uWhites * l * l * l + uBlacks * s * s * s;
+        c *= max(g, 0.0);
+    }
+    // ── U-4 ③ 褪色（胶片褪色感 = 抬起黑场，白点保持 1）*[94]* ─────────────────
+    // c' = lift + c×(1−lift)：c=0 ⇒ lift（黑场抬起）、c=1 ⇒ 1（白点不动）。
+    // lift = uFade × 0.25（标定旋钮）：fade=1 ⇒ 黑场抬到 64/255（明显灰雾）、
+    // fade=0.2 ⇒ 13/255（轻微）。与 [93] blacks 的区别：blacks 是**乘性**（保色度），
+    // fade 是**加性抬黑**（发灰 = 褪色感本身），两者互补不重复。**逐字照抄 kFsStyle**。
+    if (uFade > 0.0) {
+        float lift = uFade * 0.25;
+        c = lift + c * (1.0 - lift);
+    }
     // ── E4-2 暗角（vignette，darktable vignette.c 正圆模型）────────────────
     // 域 = sRGB 显示域、乘法（ADR-7/ADR-9）：落在 LUT 之前 —— 与 darktable 的
     // 声明域（non-linear, RGB, display-referred）一致，且放 LUT 前可避免不同
@@ -6674,6 +6776,15 @@ bool FrameRenderer::init() {
   u_out_.vig_dscale = glGetUniformLocation(prog_out_, "uVigDscale");
   u_out_.vig_fscale = glGetUniformLocation(prog_out_, "uVigFscale");
   u_out_.vig_brightness = glGetUniformLocation(prog_out_, "uVigBrightness");
+  // U-4 清晰度 + 影调分区 + 褪色（display 域 = OETF 之后，见 kFsOut 的同名声明）
+  u_out_.clarity = glGetUniformLocation(prog_out_, "uClarity");
+  u_out_.clar_step = glGetUniformLocation(prog_out_, "uClarStep");
+  u_out_.highlights = glGetUniformLocation(prog_out_, "uHighlights");
+  u_out_.shadows = glGetUniformLocation(prog_out_, "uShadows");
+  u_out_.whites = glGetUniformLocation(prog_out_, "uWhites");
+  u_out_.blacks = glGetUniformLocation(prog_out_, "uBlacks");
+  u_out_.fade = glGetUniformLocation(prog_out_, "uFade");
+  u_out_.tone_on = glGetUniformLocation(prog_out_, "uToneOn");
 
   // E1-3 编辑器通路（kFsStyle）
   u_style_.tex = glGetUniformLocation(prog_style_, "uTex");
@@ -7257,6 +7368,17 @@ static void wbCompGNorm(const FilmParams& p, float out[3]) {
   out[0] = (ok_g && wb[0] > 1e-6f) ? wb[0] / p.wb_g : 1.0f;
   out[1] = 1.0f;
   out[2] = (ok_g && wb[2] > 1e-6f) ? wb[2] / p.wb_g : 1.0f;
+}
+
+// ── U-4（2026-10-11）：清晰度环半径的**唯一维护点**（三条调用链共用）───────────
+// 半径 = max(1px, 0.5% × 输出短边)：**相对短边**标定 ⇒ 预览与全分辨率导出的观感一致
+//（固定像素半径在两种分辨率下会差出数倍）。
+// 消费点三处：passStyle（编辑器 / 查看页「胶片」）、passOutput（拍照预览 + 成片）、
+// 以及 finishStillChain 的 raw.render 诊断字段 clarR —— "实际下发的半径"必须与下发值
+// **同源**，否则日志会撒谎（check-diag-fields.py 记的那一类静默失效）。
+// ⚠️ w/h 是**输出**尺寸（E2-12 起 = 裁剪后的尺寸），不是传感器/源尺寸。
+static float clarityStepPx(int w, int h) {
+  return std::max(1.0f, 0.005f * static_cast<float>(std::min(w, h)));
 }
 
 void FrameRenderer::passOES(int dst_w, int dst_h, const float* st, int rot,
@@ -10263,6 +10385,28 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"grainMb\":" + std::to_string(p.grain_midtone_bias);
   kv += ",\"grainPivot\":" + std::to_string(p.grain_pivot);
   kv += ",\"grainSeed\":" + jnum(grain_seed_, 6);
+  // ── U-4（2026-10-11）显示域五项：[78] 清晰度 + [90..94] 影调分区/褪色 ──────────
+  // 字段 = **实际下发的生效值**（不是默认值），用来在真机日志里核对"预设套用后这五项
+  // 真的进了引擎"。三段的门控与数学都在 passOutput 内（已在本函数内执行完）⇒ 字段行
+  // 晚于调用，符合 check-diag-fields.py 的纪律（前置调用 passOutput 必须更早）。
+  //  · clarR = 实际下发的清晰度环半径（px）—— 与 passOutput 同源（clarityStepPx）；
+  //  · toneGate = [90..93] 四项门控（0 ⇒ shader 整段跳过；[94] fade 由 shader 内自判）；
+  //  · 名字全部带 `tone`/`clar` 前缀：submitDisplay 的 diag.stats 快照已占用
+  //    `toneOn`/`hl`/`wh`/`fade`（编辑器链路的同义字段），本脚本取 hits[0] ⇒ 同名会让
+  //    核对指到 submitDisplay 上（U-1 的 splitW/splitC/monoOn 是同一条纪律）。
+  {
+    const float clar_px = clarityStepPx(dst_w, dst_h);
+    const bool tone_on = p.highlights != 0.0f || p.shadows != 0.0f ||
+                         p.whites != 0.0f || p.blacks != 0.0f;
+    kv += ",\"clar\":" + jnum(p.clarity, 6) + ",\"clarR\":" + jnum(clar_px, 7);
+    kv += ",\"toneGate\":" + std::to_string(tone_on ? 1 : 0);
+    // ⚠ 每个字段独立一行（check-diag-fields.py 按行取 "kv" 写入语句，折行会导致漏检）
+    kv += ",\"toneHi\":" + jnum(p.highlights, 6);
+    kv += ",\"toneSh\":" + jnum(p.shadows, 6);
+    kv += ",\"toneWh\":" + jnum(p.whites, 6);
+    kv += ",\"toneBl\":" + jnum(p.blacks, 6);
+    kv += ",\"toneFade\":" + jnum(p.fade, 6);
+  }
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
   // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
@@ -12875,10 +13019,9 @@ void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
   glUniform1f(u_style_.sat, p.sat_mid);
   glUniform1f(u_style_.sat_on, p.sat_mid != 1.0f ? 1.0f : 0.0f);
   glUniform1f(u_style_.clarity, p.clarity);
-  // 清晰度环半径 = max(1px, 0.5% × min(W,H))：**相对短边** ⇒ 预览与全分辨率
-  // 导出的观感一致（固定像素半径在两种分辨率下会差出数倍）。
-  const float clar_px =
-      std::max(1.0f, 0.005f * static_cast<float>(std::min(w, h)));
+  // 清晰度环半径 = max(1px, 0.5% × min(W,H))（唯一维护点 = clarityStepPx，U-4 起
+  // passStyle / passOutput / 成片诊断三处共用同一份公式）。
+  const float clar_px = clarityStepPx(w, h);
   glUniform2f(u_style_.clar_step, clar_px / static_cast<float>(w),
               clar_px / static_cast<float>(h));
   // ── E2-11 影调分区 + 褪色（display 域；门控在 CPU 侧算）────────────────────
@@ -12993,6 +13136,26 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
               std::max(p.vignette_feather, 100.0f / vig_min) / 100.0f);
   glUniform1f(u_out_.vig_brightness,
               std::clamp(p.vignette_strength, -1.0f, 0.0f));
+  // ── U-4 清晰度 + 影调分区 + 褪色（display 域；**与 passStyle 的同名段逐字同式**）──
+  // 落点 = shader 的 srgbEncode 之后 ⇒ 与 kFsStyle 的输入域（已成片 sRGB）**同域**，
+  // 因此这三段的公式全段照抄 passStyle（系数/权重/区间/先后序），不重设计。
+  // 门控与 passStyle 逐字同判据：clarity / fade 在 shader 内判（`> 0.0`）、
+  // tone_on 由 CPU 侧算（四项任一非 0）。默认值（[78]=0、[90..94]=0）⇒ 三段整段跳过
+  // ⇒ 逐位零回归（A/B 开关 = 这五个值）。
+  glUniform1f(u_out_.clarity, p.clarity);
+  // 清晰度环半径 = max(1px, 0.5% × min(W,H))（唯一维护点 = clarityStepPx，与
+  // passStyle / 成片诊断同源）。
+  const float clar_px = clarityStepPx(w, h);
+  glUniform2f(u_out_.clar_step, clar_px / static_cast<float>(w),
+              clar_px / static_cast<float>(h));
+  const bool tone_on = p.highlights != 0.0f || p.shadows != 0.0f ||
+                       p.whites != 0.0f || p.blacks != 0.0f;
+  glUniform1f(u_out_.tone_on, tone_on ? 1.0f : 0.0f);
+  glUniform1f(u_out_.highlights, p.highlights);
+  glUniform1f(u_out_.shadows, p.shadows);
+  glUniform1f(u_out_.whites, p.whites);
+  glUniform1f(u_out_.blacks, p.blacks);
+  glUniform1f(u_out_.fade, p.fade);
   // M4：display 域 LUT（同一 pass 内，不额外增加 pass；斑马纹判定排在 LUT 之后，
   // 与用户实际看到的画面一致）
   applyPendingLut();
