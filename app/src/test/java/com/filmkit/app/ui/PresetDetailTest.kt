@@ -229,7 +229,15 @@ class PresetDetailTest {
             assertTrue("槽 $slot：P-5 提示用「$name」，详情却叫「$label」", label.contains(name))
             checked++
         }
-        assertTrue("至少要真的比到 5 个槽（实际 $checked）", checked >= 5)
+        // ★ U-2（2026-10-11）：判据表清空 ⇒ `presetScopeNotice` 恒 `null` ⇒ **没有可比项**
+        // （原断言 `checked >= 5` 随 U-2 作废 —— 那时还有 [5..10]/[37][38] 三类单侧槽位）。
+        // 改成"必须为 0"：一旦又有单侧槽位，`checked` 会 > 0 ⇒ 本条红，逼着一起恢复上面的
+        // 逐槽比对（这正是保留这段循环的价值）。
+        assertEquals(
+            "U-2 起判据表为空 ⇒ 没有「跨链路差异」可比（重新出现时本条与 PresetScopeTest 一起红）",
+            0,
+            checked,
+        )
 
         // ★ U-1 口径对齐（架构师 2026-10-11 同步）：`[23][24]` 分离色调 / `[25]` 单色已接到编辑器
         // 链路 ⇒ **两侧都生效** ⇒ 作用域提示里**不得**再出现它们（"仅拍照"是旧口径）。

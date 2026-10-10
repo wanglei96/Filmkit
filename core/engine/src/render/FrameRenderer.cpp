@@ -5049,8 +5049,24 @@ uniform vec3 uWbGain;      // [1..3] WB RGB 增益（线性域）
 uniform float uExpWbOn;    // 门控（CPU 侧算）：ev≠0 或 wb≠(1,1,1)
 uniform float uContrast;   // [4] 对比度（显示域绕中灰；1 = 恒等）
 uniform float uContrastOn;
-uniform float uSat;        // [21] 饱和度（显示域绕 luma；1 = 恒等）
-uniform float uSatOn;
+// ── U-2 [20..22] 分区饱和三档（**与 kFsFilm 4486-4493 同口径**）──────────────────
+// 拍照侧：`sat = clamp(uSat.x·ws + uSat.y·wm + uSat.z·wh, 0, 2)`，权重
+// `ws = exp(−3l)` / `wh = smoothstep(0.5, 1, l)` / `wm = max(0, 1−ws−wh)`，
+// `l = luma()`（Rec.709，见下方同名函数）。U-2 起编辑器侧**逐字同式**：
+//   · 读数从"只读 [21]"改为三档（此前 UI 一个滑杆同写三槽 ⇒ 引擎只认中调；
+//     现在三档都生效 ⇒ "只改 [22]"这类预设也能被如实执行）；
+//   · luma 从 Rec.601 改为 **Rec.709**（与 kFsFilm 的分区判据同一个 luma）——
+//     ⚠ 这是本段**唯一的行为变更**：默认三槽 = 1.0 时 `sat = 1` ⇒ `mix(vec3(l), c, 1)`
+//     **恒等于 c**（与 luma 取值无关）⇒ 逐位零回归；非默认值下"中心 luma 与分区
+//     权重同源"比旧版混用两套 luma 更自洽。
+// 域差异（已知、刻意保留，与 U-1 的 split/mono 同款）：kFsFilm 的 l 是**线性域** luma
+// （filmic 之后、OETF 之前），这里是**显示域** luma ⇒ 同一物理亮度下这里的 l 更大
+// （线性 0.18 → 显示 0.4667）、阴影权重 exp(−3l) 更小。不把 c decode 回线性再算：
+// ADR-7 禁止本 shader 内任何**单程** EOTF（⑬f 的调用次数哨兵，多一次即红）。
+uniform float uSatShadow;  // [20] 暗部分区饱和度（1 = 恒等）
+uniform float uSatMid;     // [21] 中间调分区饱和度
+uniform float uSatHigh;    // [22] 高光分区饱和度
+uniform float uSatOn;      // 门控（CPU 侧算）：三槽任一 ≠ 1
 uniform float uClarity;    // [78] 清晰度（显示域局部对比；0 = 关）
 uniform vec2 uClarStep;    // 清晰度环半径（UV 单位）= r_px/(W,H)
 // ── E2-6 局部调整（ADR §5.7）：mask **程序化生成**（纯算术，零纹理、零额外 pass）
@@ -5091,6 +5107,72 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 //（A/B 通路口径就是这三个默认值；与 kFsFilm 一致 —— 那侧也是"数组里给 0 就等于不做"）。
 uniform vec2 uSplit;         // [23] split_warm / [24] split_cool（0 = 不动）
 uniform float uMono;         // [25] monochrome（0/1；0 = 不去色）
+// ── U-2 胶片曲线 [5..10] + [37][38]（display 域；设计依据见 .cpp 的 computeEditorCurve）──
+// 系数一律 CPU 侧算好（`computeEditorCurve`），这里只做"端点重映射 + 两段 Horner"：
+//   t = clamp(a·x + b, 0, 1)          ← [37][38]：分段仿射（以显示域中灰为界、中灰不动）
+//   y = clamp(t + cur(t) − base(t), 0, 1)   ← [5..10]：差值法（lat 默认 ⇒ 两项相消）
+// 两组三段多项式（cur = 当前 latitude、base = 默认 0.01 的参考曲线）—— 为什么必须两组：
+// 拍照链路的 filmic 是"场景线性 → 显示域"的完整映射，编辑器输入已是它的输出 ⇒ 直接
+// 重跑 = 二次影调。差值法给出"相对默认 latitude 的变化量"，端点严格不动（两条曲线在
+// 0/1 处同值）。若只用线性近似（k·(t − base)）省掉 cur，实测最大偏差 5.28/255 不可接受。
+// ⚠ GPU 三禁：**逐通道手写 R/G/B 三份** —— 不用数组参数、不做动态索引、不用多行宏。
+// 门控 uCurveOn 由 CPU 侧算（8 个槽位全默认 ⇒ 0）⇒ 整段不进 ⇒ 逐位零回归。
+uniform float uCurveOn;
+uniform vec4 uCurveLo;       // [37] 黑点段：t = .x·x + .y（x < 中灰）；默认 (1, 0)
+uniform vec4 uCurveHi;       // [38] 白点段：t = .x·x + .y（x ≥ 中灰）；默认 (1, 0)
+const float kCurveGrey = 0.4666961;   // srgbEncode(0.1845)：显示域中灰（分段界 + 中段锚点）
+uniform vec3 uCurveToeAt, uCurveShAt;   // cur 的分段点（逐通道）
+uniform vec3 uCurveToeM1, uCurveToeM2, uCurveToeM3, uCurveToeM4, uCurveToeM5;
+uniform vec3 uCurveShM1, uCurveShM2, uCurveShM3, uCurveShM4, uCurveShM5;
+uniform vec3 uCurveLinM1, uCurveLinM2;
+uniform vec3 uBaseToeAt, uBaseShAt;     // base（差值参考）的分段点
+uniform vec3 uBaseToeM1, uBaseToeM2, uBaseToeM3, uBaseToeM4, uBaseToeM5;
+uniform vec3 uBaseShM1, uBaseShM2, uBaseShM3, uBaseShM4, uBaseShM5;
+uniform vec3 uBaseLinM1, uBaseLinM2;
+// cur 曲线：逐通道三段求值（Horner；vec3 的 .r/.g/.b = R/G/B）。三份的理由见上方三禁。
+float curveR(float t) {
+    if (t < uCurveToeAt.r)
+        return uCurveToeM1.r + t * (uCurveToeM2.r + t * (uCurveToeM3.r + t * (uCurveToeM4.r + t * uCurveToeM5.r)));
+    if (t > uCurveShAt.r)
+        return uCurveShM1.r + t * (uCurveShM2.r + t * (uCurveShM3.r + t * (uCurveShM4.r + t * uCurveShM5.r)));
+    return uCurveLinM1.r + t * uCurveLinM2.r;
+}
+float curveG(float t) {
+    if (t < uCurveToeAt.g)
+        return uCurveToeM1.g + t * (uCurveToeM2.g + t * (uCurveToeM3.g + t * (uCurveToeM4.g + t * uCurveToeM5.g)));
+    if (t > uCurveShAt.g)
+        return uCurveShM1.g + t * (uCurveShM2.g + t * (uCurveShM3.g + t * (uCurveShM4.g + t * uCurveShM5.g)));
+    return uCurveLinM1.g + t * uCurveLinM2.g;
+}
+float curveB(float t) {
+    if (t < uCurveToeAt.b)
+        return uCurveToeM1.b + t * (uCurveToeM2.b + t * (uCurveToeM3.b + t * (uCurveToeM4.b + t * uCurveToeM5.b)));
+    if (t > uCurveShAt.b)
+        return uCurveShM1.b + t * (uCurveShM2.b + t * (uCurveShM3.b + t * (uCurveShM4.b + t * uCurveShM5.b)));
+    return uCurveLinM1.b + t * uCurveLinM2.b;
+}
+// base 曲线（默认 latitude 0.01）：表达式序列与上面三份**逐字相同**，只换 uniform。
+float baseR(float t) {
+    if (t < uBaseToeAt.r)
+        return uBaseToeM1.r + t * (uBaseToeM2.r + t * (uBaseToeM3.r + t * (uBaseToeM4.r + t * uBaseToeM5.r)));
+    if (t > uBaseShAt.r)
+        return uBaseShM1.r + t * (uBaseShM2.r + t * (uBaseShM3.r + t * (uBaseShM4.r + t * uBaseShM5.r)));
+    return uBaseLinM1.r + t * uBaseLinM2.r;
+}
+float baseG(float t) {
+    if (t < uBaseToeAt.g)
+        return uBaseToeM1.g + t * (uBaseToeM2.g + t * (uBaseToeM3.g + t * (uBaseToeM4.g + t * uBaseToeM5.g)));
+    if (t > uBaseShAt.g)
+        return uBaseShM1.g + t * (uBaseShM2.g + t * (uBaseShM3.g + t * (uBaseShM4.g + t * uBaseShM5.g)));
+    return uBaseLinM1.g + t * uBaseLinM2.g;
+}
+float baseB(float t) {
+    if (t < uBaseToeAt.b)
+        return uBaseToeM1.b + t * (uBaseToeM2.b + t * (uBaseToeM3.b + t * (uBaseToeM4.b + t * uBaseToeM5.b)));
+    if (t > uBaseShAt.b)
+        return uBaseShM1.b + t * (uBaseShM2.b + t * (uBaseShM3.b + t * (uBaseShM4.b + t * uBaseShM5.b)));
+    return uBaseLinM1.b + t * uBaseLinM2.b;
+}
 // 与 kFsOut:4540 的 srgbEncode **严格互逆**（IEC 61966-2-1：线性 0.0031308 ↔
 // 编码 0.04045，系数 12.92 / 1.055 / 2.4 / 0.055）。
 // **禁止 pow(2.2) 近似**：暗部往返误差可达 9/255（项目实测，见 kFsOut 4530 注释）。
@@ -5306,15 +5388,42 @@ void main() {
     }
     // ── E2-2 ② 对比度（显示域绕中灰 0.5 线性拉伸；1 = 恒等）────────────────
     if (uContrastOn > 0.5) c = clamp((c - 0.5) * uContrast + 0.5, 0.0, 1.0);
+    // ── U-2 胶片曲线 [5..10] + [37][38]（display 域；**与 [4] 正交、排在 [4] 之后**）──
+    // 为什么在 [4] 之后：`[4]` 决定"整体线性拉伸多少"，本段决定"拉伸后如何按 latitude
+    // 重新分布"；两者互不读取对方的参数（斜率 c 不含 p.contrast，见 .cpp 的 ⑤）。
+    // 为什么在饱和度**之前**：与 kFsFilm 的顺序一致（filmic → sat），且分区权重应当用
+    // 重分布后的 luma。
+    // 端点重映射（[37][38]）→ 差值曲线（[5..10]）；uCurveOn = 0 时整段不进（零回归）。
+    if (uCurveOn > 0.5) {
+        // 逐通道手写（GPU 三禁）：x < 中灰走 lo 段、x ≥ 中灰走 hi 段。
+        // 两段都在中灰处取 t = 中灰 ⇒ 中灰不动（与拍照链路 filmic 的中灰锚定同语义）。
+        vec3 t3 = vec3(c.r < kCurveGrey ? uCurveLo.x * c.r + uCurveLo.y
+                                        : uCurveHi.x * c.r + uCurveHi.y,
+                       c.g < kCurveGrey ? uCurveLo.x * c.g + uCurveLo.y
+                                        : uCurveHi.x * c.g + uCurveHi.y,
+                       c.b < kCurveGrey ? uCurveLo.x * c.b + uCurveLo.y
+                                        : uCurveHi.x * c.b + uCurveHi.y);
+        // clamp 到 [0,1]：分段仿射把"黑点以下/白点以上"推到界外 ⇒ 界外即硬端点
+        //（黑点以下全黑、白点以上全白），同时保证喂给多项式的是合法定义域。
+        t3 = clamp(t3, 0.0, 1.0);
+        c = clamp(vec3(t3.r + curveR(t3.r) - baseR(t3.r),
+                       t3.g + curveG(t3.g) - baseG(t3.g),
+                       t3.b + curveB(t3.b) - baseB(t3.b)), 0.0, 1.0);
+    }
     // ── E2-2 ③ + E2-6 饱和度（显示域绕 luma 插值；1 = 恒等）────────────────
     // 局部饱和度**合并进同一次 mix**：有效饱和度按 mask 在"全局值 ↔ 局部值"之间
     // 插值（mask 内 = 局部值，mask 外 = 全局值，边界随羽化平滑过渡）。
     // 数学上与 ADR §5.7 的 `mix(c, mix(vec3(l), c, uLocalSat), m)` 在**全局饱和度
     // 恒等时严格等价**；全局也开时本式语义更连贯（有效饱和度插值，而非两次叠加）。
     if (uSatOn > 0.5 || (uLocalSatOn > 0.5 && m > 0.0)) {
-        float s = uSat;
-        if (uLocalSatOn > 0.5) s = uSat + (uLocalSat - uSat) * m;
-        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        // U-2 [20..22]：三档分区加权（与 kFsFilm 同式，推导见 uniform 声明处）。
+        // 单滑杆场景（UI 同写三槽）⇒ 三档同值 ⇒ 加权和 = 该值 ⇒ 与单值语义等价。
+        float l = luma(c);
+        float wsv = exp(-l * 3.0);
+        float whv = smoothstep(0.5, 1.0, l);
+        float wmv = max(0.0, 1.0 - wsv - whv);
+        float s = clamp(uSatShadow * wsv + uSatMid * wmv + uSatHigh * whv, 0.0, 2.0);
+        if (uLocalSatOn > 0.5) s = s + (uLocalSat - s) * m;
         c = mix(vec3(l), c, s);
     }
     // ── E2-2 ④ 清晰度（显示域局部对比；0 = 关）────────────────────────────
@@ -6816,8 +6925,43 @@ bool FrameRenderer::init() {
   u_style_.exp_wb_on = glGetUniformLocation(prog_style_, "uExpWbOn");
   u_style_.contrast = glGetUniformLocation(prog_style_, "uContrast");
   u_style_.contrast_on = glGetUniformLocation(prog_style_, "uContrastOn");
-  u_style_.sat = glGetUniformLocation(prog_style_, "uSat");
+  // U-2 [20..22]：分区饱和三档（替代原来的单值 uSat；权重与 kFsFilm 同口径）
+  u_style_.sat_shadow = glGetUniformLocation(prog_style_, "uSatShadow");
+  u_style_.sat_mid = glGetUniformLocation(prog_style_, "uSatMid");
+  u_style_.sat_high = glGetUniformLocation(prog_style_, "uSatHigh");
   u_style_.sat_on = glGetUniformLocation(prog_style_, "uSatOn");
+  // U-2 胶片曲线 [5..10] + [37][38]（见 kFsStyle 的同名 uniform 声明）
+  u_style_.curve_on = glGetUniformLocation(prog_style_, "uCurveOn");
+  u_style_.curve_lo = glGetUniformLocation(prog_style_, "uCurveLo");
+  u_style_.curve_hi = glGetUniformLocation(prog_style_, "uCurveHi");
+  u_style_.curve_toe_at = glGetUniformLocation(prog_style_, "uCurveToeAt");
+  u_style_.curve_sh_at = glGetUniformLocation(prog_style_, "uCurveShAt");
+  u_style_.curve_toe_m1 = glGetUniformLocation(prog_style_, "uCurveToeM1");
+  u_style_.curve_toe_m2 = glGetUniformLocation(prog_style_, "uCurveToeM2");
+  u_style_.curve_toe_m3 = glGetUniformLocation(prog_style_, "uCurveToeM3");
+  u_style_.curve_toe_m4 = glGetUniformLocation(prog_style_, "uCurveToeM4");
+  u_style_.curve_toe_m5 = glGetUniformLocation(prog_style_, "uCurveToeM5");
+  u_style_.curve_sh_m1 = glGetUniformLocation(prog_style_, "uCurveShM1");
+  u_style_.curve_sh_m2 = glGetUniformLocation(prog_style_, "uCurveShM2");
+  u_style_.curve_sh_m3 = glGetUniformLocation(prog_style_, "uCurveShM3");
+  u_style_.curve_sh_m4 = glGetUniformLocation(prog_style_, "uCurveShM4");
+  u_style_.curve_sh_m5 = glGetUniformLocation(prog_style_, "uCurveShM5");
+  u_style_.curve_lin_m1 = glGetUniformLocation(prog_style_, "uCurveLinM1");
+  u_style_.curve_lin_m2 = glGetUniformLocation(prog_style_, "uCurveLinM2");
+  u_style_.base_toe_at = glGetUniformLocation(prog_style_, "uBaseToeAt");
+  u_style_.base_sh_at = glGetUniformLocation(prog_style_, "uBaseShAt");
+  u_style_.base_toe_m1 = glGetUniformLocation(prog_style_, "uBaseToeM1");
+  u_style_.base_toe_m2 = glGetUniformLocation(prog_style_, "uBaseToeM2");
+  u_style_.base_toe_m3 = glGetUniformLocation(prog_style_, "uBaseToeM3");
+  u_style_.base_toe_m4 = glGetUniformLocation(prog_style_, "uBaseToeM4");
+  u_style_.base_toe_m5 = glGetUniformLocation(prog_style_, "uBaseToeM5");
+  u_style_.base_sh_m1 = glGetUniformLocation(prog_style_, "uBaseShM1");
+  u_style_.base_sh_m2 = glGetUniformLocation(prog_style_, "uBaseShM2");
+  u_style_.base_sh_m3 = glGetUniformLocation(prog_style_, "uBaseShM3");
+  u_style_.base_sh_m4 = glGetUniformLocation(prog_style_, "uBaseShM4");
+  u_style_.base_sh_m5 = glGetUniformLocation(prog_style_, "uBaseShM5");
+  u_style_.base_lin_m1 = glGetUniformLocation(prog_style_, "uBaseLinM1");
+  u_style_.base_lin_m2 = glGetUniformLocation(prog_style_, "uBaseLinM2");
   u_style_.clarity = glGetUniformLocation(prog_style_, "uClarity");
   u_style_.clar_step = glGetUniformLocation(prog_style_, "uClarStep");
   // E2-6 局部调整（ADR §5.7）：mask 程序化生成（纯算术，无纹理/无额外 pass）
@@ -12444,6 +12588,15 @@ bool solve5(double a[5][5], double b[5], double x[5]) {
   }
   return true;
 }
+
+// U-2：CPU 侧 sRGB 编码（IEC 61966-2-1）—— 与 kFsOut/kFsStyle 的 `srgbEncode` **同一条
+// 曲线**（系数 12.92 / 1.055 / 2.4 / 0.055、拐点 0.0031308），只是把 [37][38] 的 EV 语义
+// 映射到显示域端点时用（`computeEditorCurve`），不参与逐像素路径。
+double srgbEncodeD(double c) {
+  if (!(c > 0.0)) return 0.0;
+  if (c >= 1.0) return 1.0;
+  return c > 0.0031308 ? 1.055 * std::pow(c, 1.0 / 2.4) - 0.055 : 12.92 * c;
+}
 }  // namespace
 
 // ── filmic spline（darktable `dt_iop_filmic_rgb_compute_spline` 的 v3 分支）────────
@@ -12574,6 +12727,176 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
   sp.contrast = static_cast<float>(contrast);
   sp.contrast_param = contrast_param_in;
   return sp;
+}
+
+// ── U-2：编辑器链路胶片曲线（[5..10] latitude + [37][38] 黑白点；显示域）────────────
+// 用户 2026-10-11 指令"不统一的要统一掉，缺的补上"（参数统一方案 §9 的最后一批：
+// 补完本段后 §9.2 的 9 项缺口全部关闭，P-5 的"仅拍照/仅后期"提示不再有实例）。
+//
+// ── ① 为什么是"相对默认 latitude 的差值"，而不是把 filmic 重跑一遍 ──────────────
+// 拍照链路的 filmic 是"**场景线性 → 显示域**"的完整映射：默认参数下线性 1.0 → 线性
+// 显示域 0.718（srgb 0.83）、线性 4.35 → 1.0，中灰 0.1845 → 0.1845（不动点）。编辑器
+// 的输入**已经是它的输出**（成片 sRGB）⇒ 再跑一遍 = 二次影调（整幅被再压一次、端点
+// 也不再是 0/1）。用户改 `[5..10]` 的真实意图是"把这条成片按另一个 latitude 重新分布"，
+// 数学上就是 **C(lat) ∘ C(lat0)⁻¹**。本实现取它的一阶等价形式：
+//     **y = t + C(lat, t) − C(lat0, t)**        （差值法）
+//   · t = 默认曲线时两项相消 ⇒ **逐位恒等**（零回归的 A/B 路径，配合下面的门控）；
+//   · 两条曲线在 t=0 / t=1 处同值 ⇒ **端点严格不动**（判据：只改 [5..10] 时 f(0)/f(1)
+//     逐位不变）；
+//   · 不需要求逆（GPU 上逐像素求四阶多项式的逆不可行）—— C(lat0)⁻¹ 只在"两曲线相近"
+//     时可用一阶展开替代，而实测两曲线差异下该近似的最大偏差达 5.28/255（lat=0.5，
+//     见报告 §5），**不足以**替代，故直接用差值（精确）。
+//
+// ── ② 曲线族 C(lat, ·)：显示域、端点 0/1、中段过显示域中灰 ──────────────────────
+//  · 域 = **显示域**（与 kFsStyle 的输入同域，与 kFsFilm 的 log 域不同 —— 见 §5 的口径）；
+//  · 中段 = 斜率 c 的直线，且**过显示域中灰 g = srgbEncode(0.1845) = 0.46670**
+//    （`li = g·(1−c)`）。中灰是**不动点**，与拍照链路 filmic 的"中灰永远映射到自己"
+//    同语义（[37][38] 只改两端、不改中灰）；
+//  · `toe = (1−lat_toe)·g + lat_toe·xmin`、`sh = (1−lat_sh)·g + lat_sh·xmax` ——
+//    **逐字沿用** computeFilmicSpline 的 `latitude → 过渡区位置` 公式，xmin/xmax 同款
+//    由"中段直线到达 kSafety 边界"解出（darktable SAFETY_MARGIN = 0.01）；
+//  · toe / shoulder 段 = 同款 5×5 系统，端点约束换成显示域的 `f(0)=0` / `f(1)=1`
+//    （拍照侧是 black_disp / white_disp）⇒ 曲线族在显示域 [0,1] 上闭合；
+//  · **c = 1 时整条曲线族恒等于 y = x**（5 条约束被恒等函数同时满足）——这是"差值 = 0"
+//    的第二条路径，A/B 自检用。
+//
+// ── ③ 中段斜率 c 的来源（为什么是"拍照链路同一个量"而不是自造常数）─────────────
+// c = `computeFilmicSpline(默认黑白点, contrast_param = 1, lat = 默认)` 的派生
+// `contrast`（≈ 1.4338，静态缓存一次）。依据两条：
+//   (a) **它就是拍照链路同一条 spline 的中段斜率** —— 同一份求解代码算出来的同一个量，
+//       不是新标定出来的数字（改 computeFilmicSpline 它会自动跟随）；
+//   (b) 实测用它时"编辑器改 lat 的效果幅度"与"拍照链路改 lat 的成片变化"**同阶**
+//       （lat = 0.1 / 0.3 时逐点最大差 ≤ 1.4/255，见 tools/check-u2-editor-curve-sat.py
+//       的判据 ⑤ 与报告 §5 的对照表）。
+// ⚠️ **诚实标注**：c 是 **log 域**（spline 的 e 轴）斜率，本曲线把它当**显示域**斜率用
+//    —— 域不同，只保证"方向一致 + 幅度同阶"，**不宣称逐点等价**。c=1（= 曲线族退化为
+//    恒等）时的幅度为 0，c 越大效果越强（实测 c=1.2/1.4338/2.0 → 22/28/41 计数单位）。
+// ⚠️ **c 不含 `p.contrast`**（[4]）：见 ④。
+//
+// ── ④ [37][38] 的落点 = 端点重映射（分段仿射、中灰不动）────────────────────────
+//  · `black_ev` 增大 = "更暗的地方算黑" ⇒ 显示域黑点 `bl` 抬高 ⇒ x < g 段被压缩到
+//    [0, g]（输入 ≤ bl 全黑）；`white_ev` 减小 = "更亮的地方算白" ⇒ 白点 `wh` 下降 ⇒
+//    x ≥ g 段被拉伸到 [g, 1]（输入 ≥ wh 全白）。**方向与拍照链路一致**：black_ev
+//    −7.65 → −6 的成片实测暗部 −2.2 ~ −5.4/255、中灰 0/255（见 exp3 对照表）。
+//  · bl/wh 用**同一套 EV 语义**映射到显示域：
+//      `bl = srgbEncode(grey·2^black_ev) − srgbEncode(grey·2^black_ev_default)`（默认恒 0）
+//      `wh = srgbEncode(grey·2^white_ev)`（默认恒 1.0）
+//    ⇒ 默认值下 (a,b) = (1,0)，且 `1.0·x + 0.0` 在 IEEE 下逐位 == x。
+//  · 防呆（信任边界，输入来自预设 / JNI）：非有限值回默认；`bl` clamp 到
+//    [−0.5, g−0.05]、`wh` clamp 到 [g+0.05, 1] —— 否则分段仿射的斜率爆炸（与 darktable
+//    的 SAFETY_MARGIN 同一性质）。极端设置退化为"暗部/亮部整段压死"，不会出 NaN。
+//
+// ── ⑤ 与既有 `[4]` contrast 的关系 = **正交；先后序 = [4] 先、本曲线后** ─────────
+// `[4]` = 显示域绕 0.5 的**线性拉伸**（E2-2 既有实现，本卡**一行不动**）；本曲线 =
+// "相对默认 latitude 的形状差"（非线性重分布）。两者都改对比度，但：
+//   · **互不读取对方的参数** —— 本段的 c 恒取"默认黑白点 + contrast_param = 1"的派生值，
+//     **不含 `p.contrast`**。若把 [4] 折进 c，"调 [4] 会连带改变胶片曲线的形状"——正是
+//     规格 §3.4.3 记的"多个影调旋钮互相打架"的事故形态（历史上出过一次）；
+//   · shader 里 [4] 在前（`uContrastOn` 段）、本曲线在后 ⇒ `[4]` 决定"整体拉伸多少"、
+//     本曲线决定"拉伸后如何重分布"；两者各自有独立门控，关掉任一个另一个照常工作
+//     （正交性实测数字见报告 §4：`[4]` ∈ {0.5, 1.0, 1.5} × lat ∈ {0.01, 0.3} 的 2×3 矩阵）。
+//
+// ── ⑥ 零回归（硬判据）────────────────────────────────────────────────────────
+// `[5..10]` 全 0.01 且 `[37][38]` 全默认 ⇒ `on = false` ⇒ kFsStyle 整段不进 ⇒ 逐位不变。
+// 门控判据用"与 `FilmParams{}` 默认值逐位比较"，默认值的唯一维护点仍是 FilmParams.h
+// （不在本函数里抄常数）。
+FrameRenderer::EditorCurve FrameRenderer::computeEditorCurve(const float lat_sh[3],
+                                                             const float lat_toe[3],
+                                                             float black_ev,
+                                                             float white_ev) {
+  EditorCurve ec;
+  constexpr double kGrey = 0.1845;   // darktable grey_source（与 computeFilmicSpline 同）
+  constexpr double kSafety = 0.01;   // darktable SAFETY_MARGIN（端点安全边距）
+  const FilmParams d{};              // 默认值 = 唯一维护点（FilmParams.h）
+  const double grey_disp = srgbEncodeD(kGrey);   // 显示域中灰 0.4666961…
+  // ── 门控（⑥）──
+  bool lat_on = false;
+  for (int ch = 0; ch < 3; ++ch) {
+    if (lat_sh[ch] != d.shoulder[ch] || lat_toe[ch] != d.toe[ch]) lat_on = true;
+  }
+  const bool bw_on =
+      black_ev != d.filmic_black_ev || white_ev != d.filmic_white_ev;
+  ec.on = lat_on || bw_on;
+  if (!ec.on) return ec;   // 默认：全部字段保持恒等值 ⇒ shader 整段跳过（零回归）
+  // ── ④ 端点重映射 ──
+  const double bl_def =
+      srgbEncodeD(kGrey * std::pow(2.0, static_cast<double>(d.filmic_black_ev)));
+  double bl =
+      srgbEncodeD(kGrey * std::pow(2.0, static_cast<double>(black_ev))) - bl_def;
+  double wh = srgbEncodeD(kGrey * std::pow(2.0, static_cast<double>(white_ev)));
+  if (!std::isfinite(bl)) bl = 0.0;
+  if (!std::isfinite(wh)) wh = 1.0;
+  bl = std::clamp(bl, -0.5, grey_disp - 0.05);
+  wh = std::clamp(wh, grey_disp + 0.05, 1.0);
+  // 分段仿射 t = a·x + b（两段都在中灰处取 t = g ⇒ 中灰不动；a=1/b=0 时逐位恒等）
+  const double s_lo = grey_disp / (grey_disp - bl);
+  const double s_hi = (1.0 - grey_disp) / (wh - grey_disp);
+  ec.lo_a = static_cast<float>(s_lo);
+  ec.lo_b = static_cast<float>(grey_disp * (1.0 - s_lo));
+  ec.hi_a = static_cast<float>(s_hi);
+  ec.hi_b = static_cast<float>(grey_disp * (1.0 - s_hi));
+  // ── ③ 中段斜率（静态缓存：与参数无关，只依赖 FilmParams 的默认值与同一条 spline）──
+  static const float kSlopeC = [] {
+    const FilmParams dd{};
+    const float lat[3] = {dd.shoulder[0], dd.shoulder[1], dd.shoulder[2]};
+    return computeFilmicSpline(dd.filmic_black_ev, dd.filmic_white_ev, dd.contrast,
+                               lat, lat).contrast;
+  }();
+  const double c = std::isfinite(kSlopeC) ? static_cast<double>(kSlopeC) : 1.0;
+  const double li = grey_disp * (1.0 - c);          // 中段：y = c·t + li（过 (g, g)）
+  const double xmin = (kSafety - li) / c;           // 中段直线到达 kSafety 的位置
+  const double xmax = (1.0 - kSafety - li) / c;     // 中段直线到达 1−kSafety 的位置
+  // ── ② 两组三段多项式（cur = 用户 lat；base = 默认 lat）──────────────────────────
+  // toe 段：f(0)=0 / f'(0)=0 / f(toe)=y_toe / f'(toe)=c / f''(toe)=0
+  // sh  段：f(1)=1 / f'(1)=0 / f(sh)=y_sh / f'(sh)=c / f''(sh)=0
+  // ⚠ 与 computeFilmicSpline 的同一套 solve5；中间线性段 y = li + c·x。
+  const auto build = [&](double lat_toe, double lat_sh, float* o_toe5, float* o_sh5,
+                         float* o_lin2, float* o_at2) {
+    const double lt = std::clamp(std::isfinite(lat_toe) ? lat_toe : 0.01, 0.0, 1.0);
+    const double ls = std::clamp(std::isfinite(lat_sh) ? lat_sh : 0.01, 0.0, 1.0);
+    const double toe = (1.0 - lt) * grey_disp + lt * xmin;
+    const double sh = (1.0 - ls) * grey_disp + ls * xmax;
+    const double y_toe = c * toe + li;
+    const double y_sh = c * sh + li;
+    {
+      const double t = toe;
+      double a[5][5] = {{0, 0, 0, 0, 1},
+                        {0, 0, 0, 1, 0},
+                        {t * t * t * t, t * t * t, t * t, t, 1},
+                        {4 * t * t * t, 3 * t * t, 2 * t, 1, 0},
+                        {12 * t * t, 6 * t, 2, 0, 0}};
+      double b[5] = {0.0, 0.0, y_toe, c, 0.0};   // 显示域黑点端点 = 0（拍照侧是 black_disp）
+      double x[5] = {0, 0, 0, 0, 0};
+      if (solve5(a, b, x)) {
+        for (int k = 0; k < 5; ++k) o_toe5[k] = static_cast<float>(x[4 - k]);
+      }
+    }
+    {
+      const double s = sh;
+      double a[5][5] = {{1, 1, 1, 1, 1},
+                        {4, 3, 2, 1, 0},
+                        {s * s * s * s, s * s * s, s * s, s, 1},
+                        {4 * s * s * s, 3 * s * s, 2 * s, 1, 0},
+                        {12 * s * s, 6 * s, 2, 0, 0}};
+      double b[5] = {1.0, 0.0, y_sh, c, 0.0};    // 显示域白点端点 = 1（拍照侧是 white_disp）
+      double x[5] = {0, 0, 0, 0, 0};
+      if (solve5(a, b, x)) {
+        for (int k = 0; k < 5; ++k) o_sh5[k] = static_cast<float>(x[4 - k]);
+      }
+    }
+    o_lin2[0] = static_cast<float>(li);
+    o_lin2[1] = static_cast<float>(c);
+    o_at2[0] = static_cast<float>(toe);
+    o_at2[1] = static_cast<float>(sh);
+  };
+  for (int ch = 0; ch < 3; ++ch) {
+    // clamp 到 [0,1]（规格 §3.4.4）；非有限值回退 darktable 默认 0.01 —— 输入来自
+    // 预设 / JNI，属信任边界（与 computeFilmicSpline 的逐通道防呆同款）。
+    build(lat_toe[ch], lat_sh[ch], ec.toe[ch], ec.sh[ch], ec.lin[ch], ec.at[ch]);
+    build(d.toe[ch], d.shoulder[ch], ec.b_toe[ch], ec.b_sh[ch], ec.b_lin[ch],
+          ec.b_at[ch]);
+  }
+  return ec;
 }
 
 // ── 自动 EV 标定（v0.7.3）────────────────────────────────────────────────────
@@ -13014,10 +13337,62 @@ void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
   glUniform1f(u_style_.exp_wb_on, exp_wb_on ? 1.0f : 0.0f);
   glUniform1f(u_style_.contrast, p.contrast);
   glUniform1f(u_style_.contrast_on, p.contrast != 1.0f ? 1.0f : 0.0f);
-  // [20..22] 分区饱和三槽：编辑器 UI 一个滑杆**同写三个**（ADR §5.6④），引擎读
-  // 中灰档 [21]（ADR 的伪代码是单值 uSat）；三档展开留给后续卡（本卡不扩契约）。
-  glUniform1f(u_style_.sat, p.sat_mid);
-  glUniform1f(u_style_.sat_on, p.sat_mid != 1.0f ? 1.0f : 0.0f);
+  // ── U-2 [20..22] 分区饱和三档（替代旧版"只读 [21]"）────────────────────────
+  // 用户 2026-10-11"不完整的要补上"：§1.6 记的"编辑器只读 [21]（UI 一个滑杆同写三槽）"
+  // 至此关闭 —— 三档都下发给引擎，预设里只含 [22] 时也能被如实执行。
+  // 门控：三槽**任一** ≠ 1 才开（旧版只看 [21]）⇒ 默认三槽 = 1.0 时门控与下发都与
+  // 改动前等价（`uSatOn = 0` ⇒ shader 整段跳过 ⇒ 逐位零回归）。
+  // ⚠ luma 从 Rec.601 改为 Rec.709（与 kFsFilm 的分区判据同源）：默认值下 `sat = 1`
+  // 使 mix 恒等（与 luma 无关）⇒ 零回归不受影响；非默认值下的输出变化 = 消除两侧
+  // luma 口径差异，逐位对照见 tools/check-u2-editor-curve-sat.py 的判据 ④。
+  // 量程：不 clamp（与 passFilm 同口径 —— 那里 `clamp(..., 0, 2)` 在 shader 内做）。
+  glUniform1f(u_style_.sat_shadow, p.sat_shadow);
+  glUniform1f(u_style_.sat_mid, p.sat_mid);
+  glUniform1f(u_style_.sat_high, p.sat_high);
+  const bool sat_on =
+      p.sat_shadow != 1.0f || p.sat_mid != 1.0f || p.sat_high != 1.0f;
+  glUniform1f(u_style_.sat_on, sat_on ? 1.0f : 0.0f);
+  // ── U-2 胶片曲线 [5..10] + [37][38]（display 域）──────────────────────────
+  // CPU 侧算 12 个 5×5 系统 + 端点仿射（见 computeEditorCurve 的长注释）；默认
+  // （8 个槽位全默认）⇒ `ec.on = false` ⇒ **一次 glUniform 都不发**、shader 整段不进
+  // ⇒ 逐位零回归。⚠ 只在 on 时下发是安全的：shader 在不进该段时**不读任何曲线
+  // uniform**，不存在"残留旧值"的路径（与 LUT/颗粒那种"关闭态也必须绑定纹理"的
+  // Mali 预测执行问题不同 —— 那些是 sampler，这里是纯数值 uniform）。
+  const EditorCurve ec = computeEditorCurve(p.shoulder, p.toe, p.filmic_black_ev,
+                                            p.filmic_white_ev);
+  glUniform1f(u_style_.curve_on, ec.on ? 1.0f : 0.0f);
+  if (ec.on) {
+    glUniform4f(u_style_.curve_lo, ec.lo_a, ec.lo_b, 0.0f, 0.0f);
+    glUniform4f(u_style_.curve_hi, ec.hi_a, ec.hi_b, 0.0f, 0.0f);
+    glUniform3f(u_style_.curve_toe_at, ec.at[0][0], ec.at[1][0], ec.at[2][0]);
+    glUniform3f(u_style_.curve_sh_at, ec.at[0][1], ec.at[1][1], ec.at[2][1]);
+    glUniform3f(u_style_.curve_toe_m1, ec.toe[0][0], ec.toe[1][0], ec.toe[2][0]);
+    glUniform3f(u_style_.curve_toe_m2, ec.toe[0][1], ec.toe[1][1], ec.toe[2][1]);
+    glUniform3f(u_style_.curve_toe_m3, ec.toe[0][2], ec.toe[1][2], ec.toe[2][2]);
+    glUniform3f(u_style_.curve_toe_m4, ec.toe[0][3], ec.toe[1][3], ec.toe[2][3]);
+    glUniform3f(u_style_.curve_toe_m5, ec.toe[0][4], ec.toe[1][4], ec.toe[2][4]);
+    glUniform3f(u_style_.curve_sh_m1, ec.sh[0][0], ec.sh[1][0], ec.sh[2][0]);
+    glUniform3f(u_style_.curve_sh_m2, ec.sh[0][1], ec.sh[1][1], ec.sh[2][1]);
+    glUniform3f(u_style_.curve_sh_m3, ec.sh[0][2], ec.sh[1][2], ec.sh[2][2]);
+    glUniform3f(u_style_.curve_sh_m4, ec.sh[0][3], ec.sh[1][3], ec.sh[2][3]);
+    glUniform3f(u_style_.curve_sh_m5, ec.sh[0][4], ec.sh[1][4], ec.sh[2][4]);
+    glUniform3f(u_style_.curve_lin_m1, ec.lin[0][0], ec.lin[1][0], ec.lin[2][0]);
+    glUniform3f(u_style_.curve_lin_m2, ec.lin[0][1], ec.lin[1][1], ec.lin[2][1]);
+    glUniform3f(u_style_.base_toe_at, ec.b_at[0][0], ec.b_at[1][0], ec.b_at[2][0]);
+    glUniform3f(u_style_.base_sh_at, ec.b_at[0][1], ec.b_at[1][1], ec.b_at[2][1]);
+    glUniform3f(u_style_.base_toe_m1, ec.b_toe[0][0], ec.b_toe[1][0], ec.b_toe[2][0]);
+    glUniform3f(u_style_.base_toe_m2, ec.b_toe[0][1], ec.b_toe[1][1], ec.b_toe[2][1]);
+    glUniform3f(u_style_.base_toe_m3, ec.b_toe[0][2], ec.b_toe[1][2], ec.b_toe[2][2]);
+    glUniform3f(u_style_.base_toe_m4, ec.b_toe[0][3], ec.b_toe[1][3], ec.b_toe[2][3]);
+    glUniform3f(u_style_.base_toe_m5, ec.b_toe[0][4], ec.b_toe[1][4], ec.b_toe[2][4]);
+    glUniform3f(u_style_.base_sh_m1, ec.b_sh[0][0], ec.b_sh[1][0], ec.b_sh[2][0]);
+    glUniform3f(u_style_.base_sh_m2, ec.b_sh[0][1], ec.b_sh[1][1], ec.b_sh[2][1]);
+    glUniform3f(u_style_.base_sh_m3, ec.b_sh[0][2], ec.b_sh[1][2], ec.b_sh[2][2]);
+    glUniform3f(u_style_.base_sh_m4, ec.b_sh[0][3], ec.b_sh[1][3], ec.b_sh[2][3]);
+    glUniform3f(u_style_.base_sh_m5, ec.b_sh[0][4], ec.b_sh[1][4], ec.b_sh[2][4]);
+    glUniform3f(u_style_.base_lin_m1, ec.b_lin[0][0], ec.b_lin[1][0], ec.b_lin[2][0]);
+    glUniform3f(u_style_.base_lin_m2, ec.b_lin[0][1], ec.b_lin[1][1], ec.b_lin[2][1]);
+  }
   glUniform1f(u_style_.clarity, p.clarity);
   // 清晰度环半径 = max(1px, 0.5% × min(W,H))（唯一维护点 = clarityStepPx，U-4 起
   // passStyle / passOutput / 成片诊断三处共用同一份公式）。

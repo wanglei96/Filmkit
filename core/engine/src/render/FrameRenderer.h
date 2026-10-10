@@ -598,6 +598,43 @@ class FrameRenderer {
                                           float contrast_param,
                                           const float lat_sh[3],
                                           const float lat_toe[3]);
+  // ── U-2 编辑器链路胶片曲线（[5..10] latitude + [37][38] 黑白点；**显示域**）────────
+  // 用户 2026-10-11"不统一的要统一掉，缺的补上"（参数统一方案 §9 的最后一批）。
+  // 完整设计依据（为什么是"相对默认的差值"、中段斜率 c 的来源、与 [4] 的正交性、
+  // [37][38] 的方向）逐条写在 .cpp 的 `computeEditorCurve` 上方；这里只声明形状。
+  //
+  // 为什么与 `FilmicSpline` 分开：那条是**拍照链路**的 log 域 spline（输入 = 场景线性，
+  // 输出 = 线性显示域，端点 = black_disp/1.0）；这条是**编辑器链路**的显示域曲线
+  // （输入 = 已成片 sRGB，输出 = 显示域，端点 = 0/1，且以"默认 latitude 的曲线"为
+  // 差值参考）。域与端点都不同 ⇒ 强行共用结构只会让两边的约束互相污染。
+  struct EditorCurve {
+    // 三段四次多项式 y = m1 + x·(m2 + x·(m3 + x·(m4 + x·m5)))；`[ch][m1..m5]`，
+    // linear 段只用 m1/m2（与 `FilmicSpline` 的系数组织一致，便于对拍）。
+    // 两组：`cur` = 当前 latitude、`base` = 默认 latitude(0.01) 的参考曲线。
+    // kFsStyle 里逐像素做 `y = t + cur(t) − base(t)`（差值法 ⇒ lat 默认时逐位恒等）。
+    float toe[3][5] = {};      // cur 的 toe 段
+    float sh[3][5] = {};       // cur 的 shoulder 段
+    float lin[3][2] = {{0.0f, 1.0f}, {0.0f, 1.0f}, {0.0f, 1.0f}};  // cur 的中间线性段
+    float at[3][2] = {};       // cur 的分段点 `[ch][toe_at, sh_at]`
+    float b_toe[3][5] = {};    // base（差值参考曲线）
+    float b_sh[3][5] = {};
+    float b_lin[3][2] = {{0.0f, 1.0f}, {0.0f, 1.0f}, {0.0f, 1.0f}};
+    float b_at[3][2] = {};
+    // [37][38] 的显示域**端点重映射**（分段仿射、以显示域中灰为界、中灰不动）：
+    // `t = a·x + b`，lo = `x < 中灰` 段、hi = `x ≥ 中灰` 段。默认（黑点 0 / 白点 1）
+    // ⇒ (a,b) = (1,0) 两段都精确恒等（IEEE 下 `1.0*x + 0.0` 逐位 == x）。
+    float lo_a = 1.0f, lo_b = 0.0f, hi_a = 1.0f, hi_b = 0.0f;
+    // 门控：8 个槽位（[5..10] + [37][38]）全默认 ⇒ false ⇒ kFsStyle 整段跳过。
+    bool on = false;
+  };
+  // U-2：CPU 侧求解（三段 × 2 组 × 3 通道 = 12 个 5×5 系统，成本与 filmic 同量级）。
+  // ⚠ **参数显式列出**（不传整个 FilmParams）—— 与 `updateFilmicEV` 同一风格，且让
+  // `passStyle` 的函数体里**字面出现** `p.shoulder`/`p.toe`/`p.filmic_*`：编辑器链路的
+  // 读取集合护栏（`EditorStyleWhitelistTest` / `tools/check-style-passthrough.py` ④）是
+  // 按"函数体内出现 `p.<字段>`"抽的，传整个结构体会让这 8 个槽位在护栏里**隐形**。
+  static EditorCurve computeEditorCurve(const float lat_sh[3], const float lat_toe[3],
+                                        float black_ev, float white_ev);
+
   // filmic 黑白点（v0.7.6）：来自**用户配置**（FilmParams[37]/[38]，默认 −7.65/+4.56，
   // 即 darktable 默认 / PhotonCamera 固化值）。auto_on=true 时黑点改由场景分位自动
   // （白点仍用配置值）。理由见 .cpp。
@@ -1238,7 +1275,25 @@ class FrameRenderer {
           // E2-2 基础调整（ADR §5.6）：ev/wb = 线性域往返段；contrast/sat/
           // clarity = 显示域段。门控 *_on 由 CPU 侧算（默认恒等 ⇒ 整段跳过）。
           ev = -1, wb_gain = -1, exp_wb_on = -1, contrast = -1, contrast_on = -1,
-          sat = -1, sat_on = -1, clarity = -1, clar_step = -1,
+          // U-2：[20..22] 分区饱和三档（替代原来的单值 uSat）——权重与 kFsFilm 同口径。
+          sat_shadow = -1, sat_mid = -1, sat_high = -1, sat_on = -1,
+          // U-2：胶片曲线（[5..10] latitude + [37][38] 黑白点，显示域）。`curve_on`
+          // 由 CPU 侧算；两组三段多项式（cur / base）+ 2×2 个分段点 + 端点重映射
+          // 的 2 个 vec4。逐通道手写 R/G/B 求值（GPU 三禁），见 kFsStyle 的同名声明。
+          curve_on = -1, curve_lo = -1, curve_hi = -1,
+          curve_toe_at = -1, curve_sh_at = -1,
+          curve_toe_m1 = -1, curve_toe_m2 = -1, curve_toe_m3 = -1,
+          curve_toe_m4 = -1, curve_toe_m5 = -1,
+          curve_sh_m1 = -1, curve_sh_m2 = -1, curve_sh_m3 = -1,
+          curve_sh_m4 = -1, curve_sh_m5 = -1,
+          curve_lin_m1 = -1, curve_lin_m2 = -1,
+          base_toe_at = -1, base_sh_at = -1,
+          base_toe_m1 = -1, base_toe_m2 = -1, base_toe_m3 = -1,
+          base_toe_m4 = -1, base_toe_m5 = -1,
+          base_sh_m1 = -1, base_sh_m2 = -1, base_sh_m3 = -1,
+          base_sh_m4 = -1, base_sh_m5 = -1,
+          base_lin_m1 = -1, base_lin_m2 = -1,
+          clarity = -1, clar_step = -1,
           // E2-6 局部调整（ADR §5.7）：mask 程序化生成（纯算术，无纹理/无 pass）。
           // 首版只支持**一个**局部调整（GLSL 三禁 ⇒ 多组参数无法安全表达）。
           local_on = -1, local_type = -1, local_center = -1, local_radius = -1,

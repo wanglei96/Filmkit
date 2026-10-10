@@ -45,10 +45,15 @@ struct FilmParams {
   // ★ v0.11.5（E4-4）**已接线**（2026-10-11）：消费点 =
   // `FrameRenderer::updateFilmicEV` → `computeFilmicSpline`（CPU 侧 per-channel
   // spline 求解，3×2 个 5×5 系统）→ `kFsFilm` 的逐通道三段多项式求值。
-  // **只对拍照链路生效**：编辑器链路走 `kFsStyle`（输入是已成片的 sRGB 显示域，
-  // 链内无 filmic），其影调由 [4] contrast + 影调分区 [90..93] 承担 ⇒ 同一预设里
-  // 的 [5..10] 在编辑器侧**无视觉效果**（`docs/reports/preset-DESIGN.md` §1.6
-  // 字段能力矩阵已按此标注，供三处入口 UI 灰显）。
+  // ★★ **U-2（2026-10-11）起两侧都生效**（用户"不统一的要统一掉，缺的补上"的最后一批）：
+  // 编辑器链路 `kFsStyle` 补了**显示域胶片曲线** —— CPU 侧 `computeEditorCurve` 沿用
+  // **同一套** `latitude → 过渡区位置` 数学（端点换成显示域 0/1），shader 侧做
+  // "端点重映射（`[37][38]`）+ cur/base **差值多项式**"。域不同（log vs 显示域）⇒
+  // 效果是**近似对齐**：实测 lat = 0.1 / 0.3 时与"用新 latitude 重拍"的逐点差
+  // ≤ 2.9/255（方向一致、幅度同阶）。证据见 `docs/reports/u2-editor-curve-sat-REPORT.md`；
+  // `preset-DESIGN.md` §1.6 已按此改标（该表不再有单侧槽位）。
+  // ⚠️ **历史（勿再引用为现状）**：E4-4 时曾判定"编辑器链路没有 filmic ⇒ 这 6 个槽位
+  // 只对拍照链路生效、编辑器侧永远无视觉效果"—— U-2 证明显示域近似曲线可行。
   // ⚠️ **默认值必须是 0.01，不是 0** —— latitude 语义下 `0` 表示 toe/shoulder 过渡区
   // **紧贴中灰**（`toe_log = grey_log`），是**极端 S 曲线**，不是"无效果"！
   // `0.01` = darktable 默认，也正是接线前引擎的实际行为（当时 `computeFilmicSpline`
@@ -65,6 +70,12 @@ struct FilmParams {
   float shoulder[3] = {0.01f, 0.01f, 0.01f};  // 5..7 shoulder = latitude R/G/B
   float toe[3] = {0.01f, 0.01f, 0.01f};       // 8..10 toe = latitude R/G/B
   float cross[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // 11..19 log 域染料串扰
+  // [20..22] 分区饱和（暗/中/高）。★ U-2（2026-10-11）：**编辑器链路补齐三档** ——
+  // 此前 `kFsStyle` 只读 `[21]`（UI 一个滑杆同写三槽），现在两链路口径一致：
+  // `sat = clamp(sat_shadow·ws + sat_mid·wm + sat_high·wh, 0, 2)`，
+  // `ws = exp(−3l)` / `wh = smoothstep(0.5,1,l)` / `wm = max(0, 1−ws−wh)`，
+  // `l` 用 **Rec.709 luma**（编辑器侧 U-2 起从 Rec.601 改为 709，与 kFsFilm 同源）。
+  // 默认三槽 = 1.0 ⇒ `sat = 1` ⇒ `mix(vec3(l), c, 1)` 精确恒等 ⇒ 逐位零回归。
   float sat_shadow = 1.0f;    // 20
   float sat_mid = 1.0f;       // 21
   float sat_high = 1.0f;      // 22
@@ -129,6 +140,10 @@ struct FilmParams {
   // 0.5% 钉在显示黑"—— 与已被否掉的 kTarget 中位锚定同型（抹掉"这个场景暗部有多深"），
   // 实测比 PC 的固定值高 2EV ⇒ 暗部压得更死、画面更暗。
   // auto_tone 开时黑点改由场景分位自动，白点仍用这里配置的值。
+  // ★ U-2（2026-10-11）：编辑器链路也已接线 —— 落点是**显示域胶片曲线的端点**
+  // （`computeEditorCurve` 把 EV 映射成显示域黑/白点 `srgbEncode(grey·2^EV)`，shader 侧
+  // 以显示域中灰为界做**分段仿射**：`black_ev` 增大 ⇒ 压暗暗部、`white_ev` 减小 ⇒
+  // 高光溢出，方向与拍照侧一致；中灰不动）。默认值下 (a,b) = (1,0) ⇒ 逐位恒等。
   float filmic_black_ev = -7.65f;  // 37
   float filmic_white_ev = 4.56f;   // 38
   // ── v0.9.6：轻度锐化（luma USM，OETF 前线性显示域）─────────────────────

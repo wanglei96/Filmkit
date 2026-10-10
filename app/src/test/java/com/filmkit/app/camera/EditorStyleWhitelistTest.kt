@@ -2,6 +2,8 @@ package com.filmkit.app.camera
 
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -49,17 +51,36 @@ class EditorStyleWhitelistTest {
             .associate { it.groupValues[1].toInt() to it.groupValues[2] }
     }
 
-    /** FilmParams.h 的 `float <字段> = ...;  // <槽位号>` */
-    private fun declaredSlots(): Map<String, Int> {
+    /**
+     * FilmParams.h 的 `float <字段>[可选 [N]] = ...;  // <槽位号>[..<末槽号>]` ⇒ 字段 → 槽位集合。
+     *
+     * ★ U-2（2026-10-11）：从"标量字段"扩为**数组字段** —— `[5..10]` 用的是
+     * `float shoulder[3]` / `float toe[3]`（一个字段覆盖 3 个槽位，`// 5..7` / `// 8..10`），
+     * 旧正则（`float\s+(\w+)\s*=`）匹配不到它们，映射会缺项。
+     */
+    private fun declaredSlots(): Map<String, Set<Int>> {
         val src = File("../core/engine/src/film/FilmParams.h").readText()
-        return Regex("float\\s+(\\w+)\\s*=[^;]*;\\s*//\\s*(\\d+)").findAll(src)
-            .associate { it.groupValues[1] to it.groupValues[2].toInt() }
+        return Regex(
+            "float\\s+(\\w+)\\s*(?:\\[(\\d+)])?\\s*=[^;]*;\\s*//\\s*(\\d+)(?:\\.\\.(\\d+))?",
+        ).findAll(src).associate { m ->
+            val a = m.groupValues[3].toInt()
+            val b = m.groupValues[4].ifEmpty { m.groupValues[3] }.toInt()
+            m.groupValues[1] to (a..b).toSet()
+        }
     }
 
     @Test
     fun kdocListMatchesScriptWhitelist() {
         val kdoc = kdocSlots()
-        assertEquals("KDoc 清单不得有重复槽位", kdoc.size, kdoc.values.toSet().size)
+        // 数组字段（`shoulder[3]` / `toe[3]`）会在 KDoc 里合法地出现多次 ⇒ 只要求
+        // "重复的字段名确实是 FilmParams.h 里的数组字段"（防复制粘贴把标量标成两个槽位）。
+        kdoc.values.groupingBy { it }.eachCount().filter { it.value > 1 }.forEach { (name, n) ->
+            assertEquals(
+                "字段 $name 在 KDoc 里标了 $n 个槽位 ⇒ 它必须是 FilmParams.h 里的数组字段",
+                n,
+                declaredSlots()[name]?.size ?: 0,
+            )
+        }
         assertEquals(
             "KDoc 槽位清单必须与脚本 want 逐项相同（新增编辑器参数时三处一起改）",
             scriptWhitelist(),
@@ -71,7 +92,12 @@ class EditorStyleWhitelistTest {
     fun kdocSlotNumbersMatchFilmParams() {
         val declared = declaredSlots()
         kdocSlots().forEach { (slot, name) ->
-            assertEquals("FilmParams.$name 的槽位号", slot, declared[name])
+            val slots = declared[name]
+            assertNotNull("FilmParams.h 里没有字段 $name（KDoc 清单写错了名字？）", slots)
+            assertTrue(
+                "FilmParams.$name 的槽位集合 $slots 不含 KDoc 标的 [$slot]",
+                slot in slots!!,
+            )
         }
     }
 

@@ -310,8 +310,18 @@ def style_uniforms(w, h, ev=0.0, wb=(1.0, 1.0, 1.0), contrast=1.0, sat=1.0,
         'uExpWbOn': 1.0 if (ev != 0.0 or wb_tot != (1.0, 1.0, 1.0)) else 0.0,
         'uContrast': float(contrast),
         'uContrastOn': 1.0 if contrast != 1.0 else 0.0,
-        'uSat': float(sat),
+        # ★ U-2：[20..22] 三档（替代旧单值 uSat）。本脚本的 `sat` 参数 = "三档同值"
+        # （UI 单滑杆的真实形态，ADR §5.6④）⇒ 三个 uniform 下发同一个值。
+        # 需要"只开一档"的用例请直接用 run_style 的 uni 覆盖（当前无此需求）。
+        'uSatShadow': float(sat),
+        'uSatMid': float(sat),
+        'uSatHigh': float(sat),
         'uSatOn': 1.0 if sat != 1.0 else 0.0,
+        # ★ U-2 胶片曲线 [5..10] + [37][38]：本脚本的既有判据全部在默认值下跑
+        # （uCurveOn = 0 ⇒ shader 整段不进）⇒ 只需下发门控；曲线专项目测在
+        # `tools/check-u2-editor-curve-sat.py`（那里会算 12 个 5×5 系统并把 34 个
+        # uniform 全部下发）。
+        'uCurveOn': 0.0,
         'uClarity': float(clarity),
         # 环半径 = max(1px, 0.5% × min(W,H))，转成 UV 步长（passStyle 同式）
         'uClarStep': (max(1.0, 0.005 * min(w, h)) / w,
@@ -439,14 +449,27 @@ def local_expect(inp, mask, ev_g=0.0, ev_l=0.0, sat_g=1.0, sat_l=1.0):
     """E2-6 的解析期望（kFsStyle 主流程同序）：一次往返（全局+局部曝光合并）→ 饱和度。
 
     局部曝光 = 线性域 `exp2(ev_g + ev_l × mask)`；局部饱和度 = 有效饱和度按 mask
-    在全局与局部之间插值（与 shader 的 `s = uSat + (uLocalSat − uSat) × m` 同式）。
+    在全局与局部之间插值（与 shader 的 `s = s0 + (uLocalSat − s0) × m` 同式）。
+
+    ★ U-2（2026-10-11）两处口径变更，**必须与 kFsStyle 逐字同式**：
+      · luma 从 Rec.601 改为 **Rec.709**（分区权重与 mix 中心同源，与 kFsFilm 一致）；
+      · 全局饱和度从"单值"改为 **`[20..22]` 三档加权**
+        （`s0 = clamp(sat_g·(ws+wm+wh), 0, 2)`，ws = exp(−3l) / wh = smoothstep(0.5,1,l)
+        / wm = max(0, 1−ws−wh)）—— 本脚本的参数 `sat_g` 是"三档同值"的简写
+        （UI 单滑杆的真实形态：同写三槽 ⇒ 加权和 = 该值，只是权重和在最亮处 1.0498
+        而非 1，与 kFsFilm 同款，不是 bug）。
+      ⚠ 未改的：**影调分区段**（`tone_expect`）仍用 Rec.601 —— shader 里那一段也没改。
     """
     x = inp.astype(np.float64) / 255.0
     lin = srgb_decode_np(x) * (2.0 ** (ev_g + ev_l * mask))[..., None]
     out = srgb_encode_np(lin)
     if sat_g != 1.0 or sat_l != 1.0:
-        s = (sat_g + (sat_l - sat_g) * mask)[..., None]
-        l = (out @ np.array([0.299, 0.587, 0.114]))[..., None]
+        l = (out @ np.array([0.2126, 0.7152, 0.0722]))[..., None]
+        ws = np.exp(-l * 3.0)
+        wh = smoothstep_np(0.5, 1.0, l)
+        wm = np.maximum(0.0, 1.0 - ws - wh)
+        s0 = np.clip(sat_g * (ws + wm + wh), 0.0, 2.0)
+        s = s0 + (sat_l - s0) * mask[..., None]
         out = l + (out - l) * s
     # 与 shader 末尾的 `oColor = vec4(clamp(c, 0.0, 1.0), 1.0)` 同口径
     return np.clip(out, 0.0, 1.0) * 255.0
@@ -524,10 +547,18 @@ def check_pass_style_slots():
             'grain_midtone_bias', 'grain_pivot',
             'vignette_strength', 'vignette_radius', 'vignette_feather',
             # E2-2 基础调整：曝光[0] / WB[1..3]（线性域往返）+ 对比度[4] /
-            # 饱和度[21] / 清晰度[78]（显示域）。饱和度读 [21]（UI 一个滑杆同写
-            # [20..22]，ADR §5.6④ 的伪代码是单值 uSat）。
-            'exposure_ev', 'wb_r', 'wb_g', 'wb_b', 'contrast', 'sat_mid',
+            # 清晰度[78]（显示域）。
+            # ★ U-2（2026-10-11）：饱和度从"只读 [21]"扩为 [20..22] 三档
+            # （与 kFsFilm 4866-4873 同口径：Rec.709 luma + exp(-3l)/smoothstep/
+            # wm 三段权重；默认三槽 = 1.0 ⇒ `sat = 1` ⇒ mix 恒等 ⇒ 逐位零回归）。
+            'exposure_ev', 'wb_r', 'wb_g', 'wb_b', 'contrast',
+            'sat_shadow', 'sat_mid', 'sat_high',
             'clarity',
+            # ★ U-2：[5..10] 趾肩 latitude（数组字段 shoulder[3]/toe[3]）+ [37][38]
+            # filmic 黑白点 —— 编辑器侧补"显示域胶片曲线"（`computeEditorCurve` 算
+            # 12 个 5×5 系统、kFsStyle 端点重映射 + 差值多项式）。此前 passStyle 零
+            # 引用 ⇒ 含这 8 个槽位的预设"在编辑器里没反应"。
+            'shoulder', 'toe', 'filmic_black_ev', 'filmic_white_ev',
             # E2-6 局部调整：type[79] / center[80][81] / radius[82] / feather[83]
             # / angle[84] / width[85] / ev[86] / sat[87]。
             'local_type', 'local_center_x', 'local_center_y', 'local_radius',

@@ -79,24 +79,55 @@ class PresetScopeTest {
         )
     }
 
-    /** 仍然仅拍照的槽位（`[37][38]` 黑白点；`[5..10]` 由下一条覆盖）照旧在编辑器里提示。 */
+    /**
+     * ★★ U-2（2026-10-11）：`[5..10]` 趾肩 latitude + `[37][38]` filmic 黑白点**已两侧生效**
+     * —— 编辑器侧落点 = **显示域胶片曲线**（`kFsStyle` 的端点重映射 + cur/base 差值多项式，
+     * 系数由 `computeEditorCurve` 求解）⇒ **判据表清空、编辑器里不再有"仅拍照"提示**。
+     *
+     * 本测试**取代**三条随 U-2 作废的用例：
+     *  · `stillCameraOnlyParamsAreReportedInEditor`（断言 `含 2 项仅拍照参数（黑点/白点）…`）；
+     *  · `filmCurveCountsAsOneItem`（断言 `含 1 项仅拍照参数（胶片曲线）…`）；
+     *  · `singleSideNoticeFitsInOneLine`（断言三类名字拼成一行 —— U-4 删截断时留下的上界）。
+     * 口径从"某个提示文案对"升级为"**这一类提示不可能再出现**"：遍历全部槽位，任何槽位都
+     * 不允许是单侧生效。若将来新增只对一条链路生效的参数，本条会直接红（连同 §1.6 的对拍
+     * 一起要求改）—— 那时 `SLOT_SCENES` 加条目，提示机制自动恢复（保留函数的价值就在这里）。
+     */
     @Test
-    fun stillCameraOnlyParamsAreReportedInEditor() {
-        val p = preset(37, 38)
-        assertEquals(
-            "含 2 项仅拍照参数（黑点/白点），编辑器里不生效",
+    fun noSingleSideSlotsRemain() {
+        val p = preset(5, 6, 7, 8, 9, 10, 37, 38)
+        assertNull(
+            "U-2 起 [5..10]/[37][38] 两侧都生效 ⇒ 编辑器里不该再提示",
             presetScopeNotice(p, PresetScene.EDITOR),
         )
+        assertNull("拍照链路本来就读这八项 ⇒ 拍照界面也不提示", presetScopeNotice(p, PresetScene.CAMERA))
+        for (slot in 0 until CameraPresets.COUNT) {
+            assertEquals(
+                "槽位 [$slot] 不该是「单侧生效」（U-1 消 [23..25]、U-3 消 [88][89]、" +
+                    "U-4 消 [78]/[90..94]、U-2 消 [5..10]/[37][38]）—— 新增单侧参数时" +
+                    "本条与 §1.6 一起改",
+                setOf(PresetScene.CAMERA, PresetScene.EDITOR),
+                presetSlotScenes(slot),
+            )
+        }
     }
 
-    /** `[5..10]` 六个槽位是同一条 latitude 的两端 ⇒ 提示里算**一项**（"胶片曲线"）。 */
+    /**
+     * ★ U-2 的"终局"断言：**判据表为空** ⇒ 任何预设、任何场景都拿不到提示。
+     *
+     * 为什么单列一条：`noSingleSideSlotsRemain` 走的是 `presetSlotScenes`（判据），
+     * 这条走的是**用户可见的输出**（`presetScopeNotice`）——"P-5 的提示还剩几条"的答案
+     * 必须是 0（本卡交付口径）。用一个含全部"历史单侧槽位"的预设压测：U-1 的 `[23..25]`、
+     * U-3 的 `[88][89]`、U-4 的 `[78]/[90..94]`、U-2 的 `[5..10]/[37][38]` 全放进去。
+     */
     @Test
-    fun filmCurveCountsAsOneItem() {
-        val p = preset(5, 6, 7, 8, 9, 10)
-        assertEquals(
-            "含 1 项仅拍照参数（胶片曲线），编辑器里不生效",
-            presetScopeNotice(p, PresetScene.EDITOR),
-        )
+    fun scopeNoticeIsAlwaysNullAfterU2() {
+        val everything = preset(23, 24, 25, 78, 88, 89, 90, 91, 92, 93, 94, 5, 6, 7, 8, 9, 10, 37, 38)
+        for (scene in PresetScene.entries) {
+            assertNull(
+                "U-2 后判据表为空 ⇒ $scene 场景下不该有任何作用域提示（P-5 实例数 = 0）",
+                presetScopeNotice(everything, scene),
+            )
+        }
     }
 
     // ── ③ U-4（2026-10-11）：判据表里**再没有"仅后期"槽位** ───────────────────
@@ -168,18 +199,21 @@ class PresetScopeTest {
     }
 
     /**
-     * 单侧生效槽位的名字去重后 ≤ 3 项 ⇒ 提示恒定一行放得下。
+     * 单侧生效槽位**一个都不剩**（U-4 时是"名字去重后 ≤ 3 项 ⇒ 一行放得下"；
+     * U-2 把最后三类也消掉了 ⇒ 上界收紧到 0）。
      *
-     * ★ U-4 后**没有截断实例**（原 `longNameListIsTruncated` 随 `MAX_NAMES` 一并删除：
-     * 判据表里剩下的单侧槽位只有仅拍照的 `[5..10]`/`[37][38]`，去重名 = 胶片曲线/黑点/白点）。
-     * 本测试钉死这个上界 —— 一旦超过，说明有新槽位进了单侧集合，该考虑恢复截断了。
+     * ⚠ 保留这条而不是删掉：它是"提示又回来时"的第一道报警 —— 一旦有槽位重新变成单侧，
+     * `count` 立刻 > 0 且本条红，逼着一起恢复截断/名字表（那时 `SLOT_LABELS` 的名字表
+     * 仍然在，见 `PresetScope.kt` 的 KDoc）。
      */
     @Test
-    fun singleSideNoticeFitsInOneLine() {
-        val p = preset(5, 6, 7, 8, 9, 10, 37, 38)
-        val n = presetScopeNotice(p, PresetScene.EDITOR)
-        assertEquals("含 3 项仅拍照参数（胶片曲线/黑点/白点），编辑器里不生效", n)
-        assertTrue("必须是一行能放下的长度：${n!!.length}", n.length <= 40)
+    fun noSingleSideSlotsAtAll() {
+        val single = (0 until CameraPresets.COUNT).filter { presetSlotScenes(it).size == 1 }
+        assertEquals(
+            "U-2 起判据表为空 ⇒ 单侧槽位数必须是 0（有的话本条 + §1.6 对拍 + PresetScope 一起改）",
+            emptyList<Int>(),
+            single,
+        )
     }
 
     /** 每个"单侧生效"的槽位都必须有中文名（防名字表漏项 ⇒ 提示里冒出英文语义名）。 */
@@ -260,9 +294,9 @@ class PresetScopeTest {
             if (cam != ed) singleSide++
         }
         assertEquals(
-            "§1.6 里单侧生效**且进预设**的槽位数（U-4 后只剩仅拍照的 [5..10]+[37][38] = 8；" +
-                "历史：19 − [23..25]（U-1，3）− [88][89]（U-3，2）− [78]+[90..94]（U-4，6）= 8）",
-            8,
+            "§1.6 里单侧生效**且进预设**的槽位数（★ U-2 后 = 0；历史：19 − [23..25]（U-1，3）" +
+                "− [88][89]（U-3，2）− [78]+[90..94]（U-4，6）− [5..10]+[37][38]（U-2，8）= 0）",
+            0,
             singleSide,
         )
         assertEquals(

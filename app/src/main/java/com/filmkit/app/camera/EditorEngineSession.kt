@@ -35,14 +35,17 @@ import java.util.concurrent.atomic.AtomicReference
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
  * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
- *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 34 个槽位**，
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 44 个槽位**，
  * 其余槽位不影响输出（ADR §5.1 I-2；白名单由 `tools/check-style-passthrough.py` 第 ④ 项
  * 精确匹配守着，本清单与它逐项对齐，由 `EditorStyleWhitelistTest` 钉住三方一致）：
  *
  * ```
- * [0] exposure_ev        [1] wb_r  [2] wb_g  [3] wb_b      [4] contrast     [21] sat_mid
+ * [0] exposure_ev        [1] wb_r  [2] wb_g  [3] wb_b      [4] contrast
+ * [5] shoulder  [6] shoulder  [7] shoulder    [8] toe  [9] toe  [10] toe
+ * [20] sat_shadow  [21] sat_mid  [22] sat_high
  * [23] split_warm  [24] split_cool  [25] monochrome
  * [26] grain_amount      [27] grain_size                   [34] lut_strength
+ * [37] filmic_black_ev   [38] filmic_white_ev
  * [60] grain_midtone_bias  [61] grain_pivot
  * [66] vignette_strength [67] vignette_radius  [68] vignette_feather
  * [78] clarity
@@ -58,6 +61,13 @@ import java.util.concurrent.atomic.AtomicReference
  * 脚本第 ④ 项，不要手抄**（`[95]` reserved 确实零引用，所以不在清单里）。
  * U-1（2026-10-11）从 31 → 34：[23][24] 分离色调 + [25] 单色接线（此前 passStyle 零引用
  * ⇒ 含 [25] 的"黑白预设"在编辑器里不变黑白）。
+ * ★ U-2（2026-10-11）从 34 → 44（参数统一方案的**最后一批**，§9.2 的 9 项缺口至此清零）：
+ *  · `[5..10]` 趾肩 latitude + `[37][38]` filmic 黑白点 → **显示域胶片曲线**
+ *    （`computeEditorCurve` 算系数、kFsStyle 端点重映射 + 差值多项式；设计依据见该函数注释）；
+ *  · `[20][22]` 分区饱和补上（此前只读 [21]，现在是三档加权、与 kFsFilm 同口径）。
+ *  ⚠️ `[5][6][7]` 与 `[8][9][10]` 用的是**数组字段** `shoulder[3]`/`toe[3]`（同一个字段
+ *  覆盖三个槽位）—— 这是本清单里唯一允许"字段名重复"的地方，`EditorStyleWhitelistTest`
+ *  按"FilmParams.h 里是否为数组字段"校验。
  */
 internal class EditorEngineSession {
 
