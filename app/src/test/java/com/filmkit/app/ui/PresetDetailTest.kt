@@ -76,21 +76,30 @@ class PresetDetailTest {
     // ── ② 真实内置预设的实际输出（验收判据 1）──────────────────────────────────
 
     /**
-     * "徕卡一瞬" = `grain_amount 20 / grain_size 160 / vignette_strength −0.18 / radius 85 /
-     * feather 55 / split_warm 0.1 / split_cool 0.05` + LUT `leica_m9` 100% —— 逐行断言
-     * 中文名 + 数值 + 单位（这句就是本卡交付物的样张）。
+     * "徕卡一瞬"的逐行渲染 —— R-1c 之后配方 = 在 `lut.strength ≥ 0.30` 下界下重拟合的产物
+     * （`builtin.json`：对比度 0.9741 / sat_mid 1.05 / latitude 0.34–0.39 / 黑白点 −4.24 + 2.7471），
+     * 且 R-1c 裁决 1 把 LUT 强度钉在 **0.30**（不再归零，理由见
+     * `docs/reports/r1c-lut-floor-REPORT.md`）。本断言逐行钉住"配方 → 用户可读读数"的换算。
      */
     @Test
     fun builtinLeicaMomentRendersHumanReadableRows() {
         val p = builtin("徕卡一瞬")
         assertEquals(
             listOf(
-                "色彩|分离色调 · 暖=+0.10;分离色调 · 冷=+0.05",
+                // 0.9741 ⇒ (0.9741−1)×100 = −2.59 ⇒ 取整 −3
+                "基础调整|对比度=-3",
+                // [20]/[22] 回恒等 1.0 ⇒ 不进 slots（稀疏）⇒ 只剩中间调 + 分离色调两行
+                "色彩|饱和度 · 中间调=+5;分离色调 · 暖=+0.10;分离色调 · 冷=+0.05",
+                // latitude 0.3417 / 0.3941 / 0.3944 ⇒ 两位小数（不套 formatZero100）
+                "影调曲线|胶片曲线 · 肩部 红=0.34;胶片曲线 · 肩部 绿=0.39;胶片曲线 · 肩部 蓝=0.39;" +
+                    "胶片曲线 · 趾部 红=0.34;胶片曲线 · 趾部 绿=0.39;胶片曲线 · 趾部 蓝=0.39;" +
+                    "黑点=-4.2 EV;白点=+2.7 EV",
                 "胶片质感|颗粒 · 强度=20;颗粒 · 尺寸=ISO 160;暗角 · 强度=18;暗角 · 半径=85;暗角 · 羽化=55",
             ),
             render(p.slots),
         )
-        assertEquals(PresetLutLine("leica_m9", "100"), presetLutLine(p))
+        // LUT 强度 0.30 ⇒ 读数 30（0..150 口径，与 LUT 强度滑杆同一函数）
+        assertEquals(PresetLutLine("leica_m9", "30"), presetLutLine(p))
     }
 
     /** 三条内置预设都要能渲染（不许有"表里缺名字"的槽 —— 缺了就会露出英文语义名）。 */

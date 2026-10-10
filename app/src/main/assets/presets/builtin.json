@@ -8,15 +8,25 @@
     "source": "builtin",
     "note": "Leica M9 CCD 风格 · 高对比正片感 · 细颗粒",
     "params": {
+      "contrast": 0.9741,
+      "shoulder[0]": 0.3417,
+      "shoulder[1]": 0.3941,
+      "shoulder[2]": 0.3944,
+      "toe[0]": 0.3417,
+      "toe[1]": 0.3941,
+      "toe[2]": 0.3944,
+      "sat_mid": 1.05,
+      "split_warm": 0.1,
+      "split_cool": 0.05,
+      "filmic_black_ev": -4.24,
+      "filmic_white_ev": 2.7471,
       "grain_amount": 20.0,
       "grain_size": 160.0,
       "vignette_strength": -0.18,
       "vignette_radius": 85.0,
-      "vignette_feather": 55.0,
-      "split_warm": 0.10,
-      "split_cool": 0.05
+      "vignette_feather": 55.0
     },
-    "lut": { "id": "leica_m9", "strength": 1.0 }
+    "lut": { "id": "leica_m9", "strength": 0.3 }
   },
   {
     "schema": 2,
@@ -27,15 +37,23 @@
     "source": "builtin",
     "note": "Ricoh GR 负片模式 · 低对比 · 黄绿调 · 中颗粒",
     "params": {
+      "contrast": 1.057,
+      "shoulder[1]": 0.0,
+      "shoulder[2]": 0.9459,
+      "toe[1]": 0.0,
+      "toe[2]": 0.9459,
+      "sat_shadow": 1.15,
+      "sat_mid": 0.65,
+      "split_cool": 0.5562,
+      "filmic_black_ev": -11.9963,
+      "filmic_white_ev": 2.6138,
       "grain_amount": 30.0,
       "grain_size": 400.0,
       "vignette_strength": -0.28,
       "vignette_radius": 75.0,
-      "vignette_feather": 48.0,
-      "split_warm": -0.10,
-      "split_cool": 0.10
+      "vignette_feather": 48.0
     },
-    "lut": { "id": "ricoh_negative", "strength": 1.0 }
+    "lut": { "id": "ricoh_negative", "strength": 0.3 }
   },
   {
     "schema": 2,
@@ -46,6 +64,15 @@
     "source": "builtin",
     "note": "Leica B&W HC · 高反差黑白 · 红压暗绿提亮 · 明显颗粒",
     "params": {
+      "contrast": 1.0926,
+      "shoulder[0]": 0.6609,
+      "shoulder[1]": 0.0009,
+      "shoulder[2]": 0.5566,
+      "toe[0]": 0.6609,
+      "toe[1]": 0.0009,
+      "toe[2]": 0.5566,
+      "filmic_black_ev": -3.5737,
+      "filmic_white_ev": 2.5438,
       "grain_amount": 40.0,
       "grain_size": 400.0,
       "vignette_strength": -0.24,
