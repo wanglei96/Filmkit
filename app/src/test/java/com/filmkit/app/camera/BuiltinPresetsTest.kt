@@ -36,6 +36,13 @@ class BuiltinPresetsTest {
     private fun preset(id: String): EditorPreset =
         presets.firstOrNull { it.id == id } ?: error("内置包里没有 $id（实得 ${presets.map { it.id }}）")
 
+    /** 用户自建预设（合并顺序 / 去重 / 可删判据的测试输入：与内置包无关，故手工构造） */
+    private fun userPreset(
+        id: String,
+        name: String = "用户预设",
+        source: String = PRESET_SOURCE_USER,
+    ) = EditorPreset(id = id, name = name, source = source)
+
     /**
      * 逐项断言一条预设的配方。
      *
@@ -283,5 +290,62 @@ class BuiltinPresetsTest {
             val out = BuiltinPresets.parse(raw)
             assertTrue("坏输入 ${raw.take(40).ifEmpty { "<空>" }} 必须降级为空列表，实得 ${out.size} 条", out.isEmpty())
         }
+    }
+
+    // ── ⑦ P-2c：三处列表的数据源（合并顺序 + 去重）与"内置不可删"的判据 ────────
+
+    /**
+     * [mergePresets] = `BuiltinPresets.all` 的**纯内核**（`all` 自己只多一层 Android 的 assets 读，
+     * 三处 UI 走的是同一个 `all`）。顺序与去重都不是洁癖：
+     *  - **顺序**（用户在前 + 内置在后）= 数据层给 UI 的稳定顺序，用户自己存的更常用；
+     *  - **去重**：id 是 UI 的**唯一判据** —— 列表 `key = { it.id }`（Compose 的 `LazyColumn`
+     *    遇到重复 key **直接抛异常**）、选中态比对 id、`initialPresetOf` 按 id 取第一条。
+     *    而 prefs 反序列化出来的 `id` 字段**不受任何格式约束**（将来还有导入功能）⇒ 撞车是可达的。
+     */
+    @Test
+    fun mergePutsUserFirstAndKeepsIdsUnique() {
+        val user = listOf(userPreset("p_1_a", "我的暖调"), userPreset("p_2_b", "我的冷调"))
+        val merged = mergePresets(user, presets)
+        assertEquals(
+            "用户预设在前 + 内置三条在后（顺序 = UI 呈现顺序，UI 不再排一次）",
+            listOf("p_1_a", "p_2_b") + presets.map { it.id },
+            merged.map { it.id },
+        )
+
+        // 同 id 撞车：只留**用户那份**（内置的被丢掉）
+        val clash = mergePresets(user, listOf(userPreset("p_1_a", "内置同 id", PRESET_SOURCE_BUILTIN)) + presets)
+        assertEquals("同 id 不得出现两次（LazyColumn 的 key 会崩）", clash.size, clash.map { it.id }.distinct().size)
+        assertEquals("同 id 时留下的是用户那份（用户数据优先）", "我的暖调", clash.first { it.id == "p_1_a" }.name)
+        assertEquals(
+            "总数 = 用户 2 + 内置（1 条伪造同 id + 真内置 3）− 重复 1",
+            5,
+            clash.size,
+        )
+
+        // 内置包内部重复（资产文件写重了）同样收敛成一条 —— 去重不能只对"用户 vs 内置"生效
+        val selfDup = mergePresets(emptyList(), presets + presets)
+        assertEquals("内置包内部重复也要收敛", presets.size, selfDup.size)
+
+        // 内置包坏掉（load 降级为空列表）时，用户预设一条不少、顺序不变
+        assertEquals("内置包不可用不能连累用户数据", user, mergePresets(user, emptyList()))
+    }
+
+    /**
+     * **内置预设不可删**（P-2c 任务 2）：判据 = [EditorPreset.source]（[presetDeletable] 是唯一
+     * 实现，编辑器预设面板按它决定是否渲染删除按钮）。这里钉住判据的两端：
+     *  - 内置包每一条都**必须**标 [PRESET_SOURCE_BUILTIN] —— 漏标一条，面板就会给它渲染删除按钮，
+     *    而删掉下次启动又回来（"删了个假的"）；
+     *  - 用户自建预设**必须**仍可删（行为不变，本卡不许把它一起保护掉）。
+     */
+    @Test
+    fun builtinPresetsAreNotDeletable() {
+        for (p in presets) {
+            assertEquals("${p.id} 的 source（保护逻辑的唯一判据）", PRESET_SOURCE_BUILTIN, p.source)
+            assertFalse("内置预设不得可删：${p.id}", presetDeletable(p))
+        }
+        assertTrue("用户预设必须仍可删（本卡不改变用户预设行为）", presetDeletable(userPreset("p_1_a")))
+        assertFalse("「标准」也是内置条目（拍照页基线，不是可删对象）", presetDeletable(CAMERA_STANDARD_PRESET))
+        // 从外部文件导入的预设（E3-2 的 .fkpreset）不在本卡范围，但它同样不是内置 ⇒ 可删
+        assertTrue("imported 预设不属于内置保护范围", presetDeletable(userPreset("i_1_a", source = PRESET_SOURCE_IMPORTED)))
     }
 }

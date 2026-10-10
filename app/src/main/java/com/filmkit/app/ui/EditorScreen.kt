@@ -118,6 +118,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
 import com.filmkit.app.camera.CropAspect
@@ -206,10 +207,12 @@ import com.filmkit.app.camera.localTypeSlot
 import com.filmkit.app.camera.localTypeUi
 import com.filmkit.app.camera.localWidthSlot
 import com.filmkit.app.camera.localWidthUi
+import com.filmkit.app.camera.mergePresets
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
 import com.filmkit.app.camera.passthroughAllowed
 import com.filmkit.app.camera.pivotFraction
+import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetId
 import com.filmkit.app.camera.presetSnapshot
 import com.filmkit.app.camera.presetSparseSlots
@@ -440,7 +443,8 @@ fun EditorScreen(
     var cropHandle by remember { mutableStateOf<CropHandle?>(null) }
     // ── E3-1a 预设（Preset）────────────────────────────────────────────────
     // `presetMode` = 预设面板取代参数面板（与 `cropMode` **同构的独立模式**，两者互斥）；
-    // `presets` = 内存镜像（打开面板时从 prefs 读一次；保存 / 删除后由 PresetStore 返回新列表）。
+    // `presets` = 内存镜像（打开面板时读一次 `BuiltinPresets.all` = 用户预设 + 内置三条；
+    // 保存 / 删除后由 PresetStore 返回新列表 —— 那两条路径只动用户预设，内置包不参与）。
     // 数据模型 / 序列化 / 稀疏化 / 套用映射全在 EditorExport.kt（纯逻辑，JVM 单测覆盖）。
     var presetMode by remember { mutableStateOf(false) }
     var presets by remember { mutableStateOf<List<EditorPreset>>(emptyList()) }
@@ -716,7 +720,9 @@ fun EditorScreen(
     fun togglePresets() {
         presetMode = !presetMode
         if (presetMode) {
-            presets = PresetStore.load(prefs)
+            // ★ P-2c：用户预设 + 内置三条（`BuiltinPresets.all`）—— 直接用 `PresetStore.load`
+            // 会让内置包在面板里根本看不见。
+            presets = BuiltinPresets.all(context, prefs)
             cropMode = false
         }
     }
@@ -754,7 +760,10 @@ fun EditorScreen(
             lutId = lutId,
             lutStrength = if (lutId != null) film[34] else 1.0,
         )
-        presets = PresetStore.upsert(prefs, p)
+        // ★ P-2c：**不能**直接把 PresetStore 的返回值赋给 `presets` —— 那个列表只含用户预设，
+        // 赋值会让内置三条当场从面板上消失（保存一条预设后"内置不见了"，直到重开面板）。
+        // 合并口径与 [BuiltinPresets.all] 完全一致（用户在前 + 内置在后 + 按 id 去重）。
+        presets = mergePresets(PresetStore.upsert(prefs, p), BuiltinPresets.load(context))
         status = "已保存预设：${p.name}（${p.slots.size} 项参数）"
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "preset.save",
@@ -897,7 +906,8 @@ fun EditorScreen(
 
     /** 删除预设（二次确认在面板里）：只动 prefs 与列表，**不动当前参数、画面与撤销栈** */
     fun deletePreset(p: EditorPreset) {
-        presets = PresetStore.delete(prefs, p.id)
+        // ★ P-2c：同 savePreset —— 合并内置包，否则删一条用户预设会让内置三条从面板上消失。
+        presets = mergePresets(PresetStore.delete(prefs, p.id), BuiltinPresets.load(context))
         if (appliedPreset?.id == p.id) clearAppliedPreset()   // ★ E3-1c：生效中的预设被删 ⇒ 强度行收起
         status = "已删除预设：${p.name}"
     }
@@ -1356,7 +1366,9 @@ fun EditorScreen(
                 // 并 reset 了历史栈基线，applyPreset 只把预设的**稀疏槽**覆盖上去
                 //（presetSnapshot）。反过来（先预设、再基线）会把预设整个抹掉 ⇒ 用户点了预设、
                 // 画面还是原片。applyPreset 三个分支内部都会 rerender() ⇒ 这里不重复调用。
-                val startPreset = initialPresetOf(PresetStore.load(prefs), initialPresetId)
+                // ★ P-2c：列表必须与查看页那一份**同一个来源**（`BuiltinPresets.all`）——
+                // 查看页能列出内置三条、这里却查不到，表现就是"点了内置预设、进编辑器毫无变化"。
+                val startPreset = initialPresetOf(BuiltinPresets.all(context, prefs), initialPresetId)
                 if (startPreset != null) applyPreset(startPreset) else rerender()
             }
         }
@@ -3283,6 +3295,11 @@ private fun CropToolBar(
  * 渲染）、分组筛选 / 搜索、长按菜单（重命名 / 复制 / 收藏 / 更新为当前）留给 E3-1b，
  * 强度滑杆留给 E3-1c —— 面板上每一个动作背后都已经有一条跑得通的纯逻辑（EditorExport.kt）。
  *
+ * ★ P-2c：列表 = 用户预设 + **内置三条**（`BuiltinPresets.all`）。内置预设**不可删** ——
+ * 它们的删除按钮根本不渲染（[PresetRow] 按 [presetDeletable] 分支，不是"点了才报错"）；
+ * 其余操作（套用 / 强度）与用户预设完全一致。重命名 / 更新为当前这类操作本面板**还没有**
+ *（E3-1b 才做），所以本卡不需要为它们加保护。
+ *
  * 为什么保存入口在这里而不是顶栏：`EditorTopBar` 只有 取消 / 相册 / 撤销 / 重做 / 覆盖 /
  * 完成（调研 §5.4 的事实核对），硬塞一个「保存预设」会挤占主操作位；而底栏「预设」本来就是
  * ADR-14 底栏六项之一（此前置灰留位），"在预设面板里保存"也正是 Lightroom 的组织方式
@@ -3499,7 +3516,14 @@ private fun PresetField(
     }
 }
 
-/** 预设列表的一行：名称 + 副标题（分组 · 槽位数 · LUT）+「套用」/「删除」 */
+/**
+ * 预设列表的一行：名称 + 副标题（分组 · 槽位数 · LUT）+「套用」/「删除」。
+ *
+ * ★ P-2c：**内置预设不可删**（[presetDeletable]）—— 删除按钮的位置换成一枚**不可点**的
+ * 「内置」标记。**不是"点了才报错"**：删除按钮根本不渲染（也就没有"点了才发现删不掉"的路径）。
+ * 理由：内置包随包分发，删了下次启动又回来；留一个能点的删除按钮，用户会以为删掉了。
+ * 用户自建预设（`source == "user"`）的渲染与行为**逐位不变**。
+ */
 @Composable
 private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit) {
     val sub = buildString {
@@ -3541,17 +3565,32 @@ private fun PresetRow(p: EditorPreset, onApply: () -> Unit, onDelete: () -> Unit
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         )
         Spacer(Modifier.width(6.dp))
-        Text(
-            "删除",
-            color = FilmTheme.CreamDim,
-            fontSize = 12.sp,
-            maxLines = 1,
-            modifier = Modifier
-                .clip(RoundedCornerShape(9.dp))
-                .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
-                .pressScale(pressedScale = 0.94f, onTap = onDelete)
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-        )
+        // ★ P-2c：内置预设没有删除按钮（只有一枚说明性的「内置」标记）——
+        // 判据是 presetDeletable，不在 UI 里重写一遍 source 比较。
+        if (presetDeletable(p)) {
+            Text(
+                "删除",
+                color = FilmTheme.CreamDim,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                    .pressScale(pressedScale = 0.94f, onTap = onDelete)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+        } else {
+            Text(
+                "内置",
+                color = DisabledInk,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .border(1.dp, DisabledInk, RoundedCornerShape(9.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+        }
     }
 }
 

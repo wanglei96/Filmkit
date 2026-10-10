@@ -8,12 +8,15 @@ import com.filmkit.app.ui.CameraPresets
  * 数据源 = [PresetStore]（与查看页「胶片」、编辑器「预设」**同一套**；架构师裁决见
  * `docs/reports/preset-DESIGN.md` §7）。本文件只做三件事：
  *  ① **展开**：`标准基线 + 稀疏覆盖` ⇒ 完整 96 槽（[cameraPresetParams]）；
- *  ② **LUT 三态**：不含 LUT ⇒ 不动；引用的 LUT 已不在库 ⇒ 不动 + 提示（[PresetLutAction]）；
+ *  ② **LUT 四态**：不含 LUT ⇒ 不动；引用的 LUT 已不在库 ⇒ **清空 + 提示**；「标准」⇒ **清空**
+ *     （[PresetLutAction]，P-2c 裁决 ①②）；
  *  ③ **选中态**：持久化 id ⇒ 预设（[resolveCameraPreset]）。
  *
- * ⚠ 与编辑器侧（`EditorScreen.applyPreset`）**唯一**的语义差异，是架构师裁决的口径：
- * 拍照侧"LUT 已不在库中"降级为**不动当前 LUT**（编辑器侧清空 LUT）—— 拍照界面的当前 LUT 是
- * 用户自己的选择，套一条引用已失效资产的预设不该把它一起抹掉。
+ * ★ **LUT 缺失口径与编辑器侧已统一为"清空 + 明确提示"**（P-2c 裁决 ②，`docs/reports/
+ * p2c-builtin-wiring-REPORT.md`）：保留一个无关 LUT 会产生"**预设 A 的参数 + 预设 B 的色彩**"
+ * 混合态，用户从界面上无法理解那是什么。清空后画面 = 这条预设能给出的部分，且提示明确。
+ * ⚠ 与"预设不含 LUT（`lutId == null`）⇒ 不动当前 LUT"**不是**同一件事：后者是有意的
+ * "缺失字段 = 保留当前值"语义（[PresetLutAction.KEEP]），别把两者一起改掉。
  */
 
 /** 内置「标准」的固定 id。前缀 `builtin_` 与用户预设的 `p_`（[presetId]）不重叠 ⇒ 不会撞车。 */
@@ -45,30 +48,54 @@ internal fun cameraPresetParams(preset: EditorPreset): DoubleArray =
     presetSnapshot(CameraPresets.standard(), preset.slots)
 
 /**
- * 套用预设时对 **LUT** 的三态动作。
+ * 套用预设时对 **LUT** 的动作。
  *
  * 判据来自 `preset-DESIGN.md` §7 裁决 A4 与调研 §5.1 D2：预设的 `lutId` 是**资源引用**，
  * `null` = 这条预设不含 LUT ⇒ 保留当前值（缺失字段 = 保留），不是"关掉 LUT"。
+ *
+ * ★ P-2c 裁决 ①（「标准」= 无风格，必须连 LUT 一起清）与 ②（LUT 缺失口径统一为"清空 + 明确
+ * 提示"）之后，本枚举从三态变四态：**"清空"有两种触发源，但提示只有一种**
+ *（[MISSING] 要提示，[CLEAR] 不提示 —— 用户主动选「标准」时画面变化是预期的）。
+ *
+ * @property clearsCurrentLut 该动作是否**清空**当前 LUT（引擎旁路 + prefs 摘选择）。
+ *   UI 的落地分支读这个属性（不是各写一遍 `when` 判断）⇒ 单测断言它 = 断言 UI 的真实行为。
  */
-internal enum class PresetLutAction {
+internal enum class PresetLutAction(val clearsCurrentLut: Boolean) {
     /** 预设不含 LUT ⇒ **不动**当前 LUT 与 LUT 强度（`[34]`）。 */
-    KEEP,
+    KEEP(false),
 
     /** 预设引用的 LUT 在库中 ⇒ 选中它 + 下发 [EditorPreset.lutStrength]。 */
-    APPLY,
+    APPLY(false),
 
-    /** 预设引用的 LUT **已不在库中** ⇒ 降级为不动当前 LUT + 明确提示（不静默、不清空）。 */
-    MISSING,
+    /**
+     * 预设引用的 LUT **已不在库中** ⇒ **清空**当前 LUT + 明确提示（裁决 ②，与编辑器侧统一）。
+     *
+     * 为什么是清空而不是保留：保留会让画面 = "这条预设的参数 + 上一个 LUT 的色彩"，
+     * 而用户刚点的那条预设**并不包含**那个 LUT ⇒ 混合态无法从界面解释。
+     */
+    MISSING(true),
+
+    /**
+     * 「标准」= 中性基线 = **无风格** ⇒ 清空 LUT（裁决 ①）。
+     *
+     * 为什么必须清：只把参数打回基线、留着上一个预设的 LUT，是**假标准** —— 画面仍带风格，
+     * 而 UI 上写着"标准"。提示不加：用户主动选"无风格"，LUT 消失正是这条语义本身。
+     */
+    CLEAR(true),
 }
 
 /**
  * LUT 动作判定（纯逻辑；`lutExists` 由调用侧注入 `LutLibrary.byId(context, id) != null`，
  * 于是本函数在 JVM 单测里可直接驱动"资产还在 / 已被删"两条路径）。
  *
- * 之所以是**三态**而不是布尔：`MISSING` 与 `KEEP` 在参数域完全同型（都不动 LUT），
- * 但**必须可分辨** —— 前者要给用户一句"LUT 已不在库中"，后者不该有任何提示。
+ * 判定顺序（**标准在最前**，不能挪到后面）：[CAMERA_STANDARD_PRESET] 的 `lutId` 是 null，
+ * 若先走 `lutId == null ⇒ KEEP` 就永远到不了 [PresetLutAction.CLEAR]（裁决 ① 静默失效）。
+ *
+ * 之所以 [MISSING] 与 [KEEP] 必须可分辨（尽管"保留"那条已改成清空）：前者要给用户一句
+ * "LUT 已不在库中"，后者不该有任何提示。
  */
 internal fun presetLutAction(preset: EditorPreset, lutExists: (String) -> Boolean): PresetLutAction {
+    if (preset.id == CAMERA_STANDARD_PRESET_ID) return PresetLutAction.CLEAR
     val id = preset.lutId ?: return PresetLutAction.KEEP
     return if (lutExists(id)) PresetLutAction.APPLY else PresetLutAction.MISSING
 }

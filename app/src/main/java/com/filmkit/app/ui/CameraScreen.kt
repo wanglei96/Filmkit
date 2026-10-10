@@ -132,12 +132,12 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CAMERA_STANDARD_PRESET
 import com.filmkit.app.camera.CAMERA_STANDARD_PRESET_ID
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetLutAction
-import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.camera.cameraPresetParams
 import com.filmkit.app.camera.presetLutAction
@@ -225,7 +225,9 @@ fun CameraScreen(
     // 列表与选中项都用 remember（**非 saveable**）+ prefs 回落，与 photoUri 同款（ADR §5.2 G-1）：
     // prefs 本身就是持久层，Activity/进程重建后重读一次即可拿回同一个选中项，再叠一层 saveable
     // 是多余的（EditorPreset 也不是 Parcelable）。冷启动恢复见下方 LaunchedEffect。
-    var presets by remember { mutableStateOf(PresetStore.load(prefs)) }
+    // ★ P-2c：数据源 = `BuiltinPresets.all`（用户预设在前 + 内置三条在后）—— 直接用
+    // `PresetStore.load` 会让内置包在界面上消失（本卡修掉的原始缺陷）。
+    var presets by remember { mutableStateOf(BuiltinPresets.all(context, prefs)) }
     var selectedPreset by remember {
         mutableStateOf(resolveCameraPreset(prefs.getString("camera_preset_id", null), presets))
     }
@@ -453,14 +455,40 @@ fun CameraScreen(
     }
 
     /**
+     * 回到「无 LUT」（P-2c 抽出的**唯一**实现）：引擎旁路 + prefs 摘选择 + 清掉在飞的加载。
+     *
+     * 三个触发源在语义上完全同型（用户点「无」/ 删掉当前选中的 LUT / 套用预设时清空），
+     * 所以只留这一处实现 —— 三份复制粘贴的下场是其中一份忘了摘 prefs，表现是"重启后 LUT 又回来了"。
+     *
+     * ⚠ `lutPending = null` 不是可有可无：在飞的 `LaunchedEffect(lutPending)` 会在 IO 解析完成后
+     * 重新 `setLut` + 写回 `lut_id` ⇒ 不清它，"清空"会被几百毫秒后回来的旧请求撤销。
+     */
+    fun clearCameraLut() {
+        lutPending = null
+        lutId = null
+        controller.setLut(null)
+        prefs.edit().remove("lut_id").apply()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "settings.lut",
+            kv("id" to "none", "title" to "none", "ok" to true),
+        )
+    }
+
+    /**
      * 套用预设（P-2a 的核心）：**参数 + LUT + 选中态**三件事，全部复用既有机制。
      *
      * 顺序有讲究：
-     *  ① LUT 判定放在最前 —— `MISSING`（引用的 LUT 已不在库）时**一个字节都不写** LUT 相关
-     *     状态（prefs 的 `lut_strength` / `lut_id` 与引擎的 `setLut` 全不动）= "保留当前 LUT"；
-     *  ② 带 LUT 时**先写 `prefs("lut_strength")` 再 `setFilmParams`**：后者内部的
-     *     `applyLutStrengthPref()` 会从 prefs 重读并写 `[34]`（既有设计）⇒ 顺序反了会被旧值覆盖；
-     *  ③ LUT 本体走既有 `lutPending` 链路（IO 解析 → `setLut` → 写 `lut_id`），不另开一条。
+     *  ① LUT 判定放在最前 —— [PresetLutAction.APPLY] 时**先写 `prefs("lut_strength")` 再
+     *     `setFilmParams`**：后者内部的 `applyLutStrengthPref()` 会从 prefs 重读并写 `[34]`
+     *     （既有设计）⇒ 顺序反了会被旧值覆盖；[PresetLutAction.clearsCurrentLut] 的动作
+     *     同样先清 LUT，再下发参数；
+     *  ② LUT 本体走既有 `lutPending` 链路（IO 解析 → `setLut` → 写 `lut_id`），不另开一条。
+     *
+     * ★ **P-2c 裁决 ①**：选「标准」= 无风格 ⇒ **连 LUT 一起清**。只把参数打回基线会留下
+     * "假标准"（画面仍带上一个预设的色彩，UI 上却写着"标准"）。
+     * ★ **P-2c 裁决 ②**：预设引用的 LUT 已不在库 ⇒ **清空 + 明确提示**（与编辑器侧
+     * `applyPreset` 统一）。⚠ 预设**不含** LUT（`lutId == null`）仍是不动当前 LUT
+     *（[PresetLutAction.KEEP]，有意的"缺失 = 保留"语义）—— 别把两者一起改掉。
      *
      * 参数域用 [cameraPresetParams]（标准基线 + 稀疏覆盖）—— 与编辑器侧"以当前参数为底"不同，
      * 理由见该函数的 KDoc。`[0]/[28]/[30]/[34]/[35]` 仍由 `setFilmParams` 内部的 prefs 覆盖层
@@ -472,16 +500,22 @@ fun CameraScreen(
         if (action == PresetLutAction.APPLY) {
             prefs.edit().putFloat("lut_strength", p.lutStrength.toFloat()).apply()
         }
+        // 裁决 ①②：清空类动作（MISSING / CLEAR）在参数下发前先把 LUT 摘干净。
+        // 判据读枚举属性（[PresetLutAction.clearsCurrentLut]），不在 UI 里重写一遍 —— 单测
+        // 断言该属性就等于断言这里的行为。
+        if (action.clearsCurrentLut) clearCameraLut()
         controller.setFilmParams(cameraPresetParams(p))
         when (action) {
             PresetLutAction.APPLY -> lutEntry?.let { lutPending = it }
-            // 降级：不动当前 LUT + 明确提示（不静默、不清空）。与编辑器侧 applyPreset 的
-            // "清空 LUT" 不同，是架构师裁决（拍照界面的 LUT 是用户自己的选择）。
+            // 裁决 ②：清空 + 明确提示。文案必须说清"当前 LUT 已被清掉"—— 只说"已不在库中"
+            // 的话，用户看到画面变了却不知道 LUT 没了（编辑器侧同一口径）。
             PresetLutAction.MISSING -> android.widget.Toast.makeText(
                 context,
-                "预设「${p.name}」的 LUT 已不在库中 · 保留当前 LUT",
+                "预设「${p.name}」的 LUT 已不在库中 · 已清除当前 LUT",
                 android.widget.Toast.LENGTH_SHORT,
             ).show()
+            // 裁决 ①：清 LUT 是「标准」这条语义本身，不加提示（用户主动选"无风格"）
+            PresetLutAction.CLEAR -> Unit
             PresetLutAction.KEEP -> Unit
         }
         selectedPreset = p
@@ -1438,13 +1472,7 @@ fun CameraScreen(
                 onPickLut = { e ->
                     if (e == null) {
                         // 关闭（A/B 通路）：直接下发，无需解析
-                        lutId = null
-                        controller.setLut(null)
-                        prefs.edit().remove("lut_id").apply()
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "app", "settings.lut",
-                            kv("id" to "none", "title" to "none", "ok" to true),
-                        )
+                        clearCameraLut()
                     } else {
                         lutPending = e
                     }
@@ -1456,15 +1484,7 @@ fun CameraScreen(
                         lutLibVersion++
                         refreshLutLib()
                         // 删除的是当前选中：摘选择 + 引擎旁路（回「无 LUT」）
-                        if (lutId == e.id) {
-                            lutId = null
-                            controller.setLut(null)
-                            prefs.edit().remove("lut_id").apply()
-                            EngineBridge.nativeAppendLog(
-                                EngineBridge.LEVEL_INFO, "app", "settings.lut",
-                                kv("id" to "none", "title" to "none", "ok" to true),
-                            )
-                        }
+                        if (lutId == e.id) clearCameraLut()
                     }
                 },
                 onClose = { lutOpen = false },
@@ -1965,8 +1985,9 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
  * 面板外点击关闭由整机层的拦截层负责；这里只管内容与交互。
  * 选中项**不自动收起**面板 —— 便于连续切换、当场比较风格。
  *
- * P-2a：「预设」tab 的数据源 = [PresetStore]（与查看页「胶片」/ 编辑器「预设」**同一套**），
- * 列表首项恒为内置的 [CAMERA_STANDARD_PRESET]（中性基线）。选中态按 **id** 判定
+ * P-2a：「预设」tab 的数据源 = [BuiltinPresets.all]（用户预设在前 + 内置三条在后；与查看页
+ * 「胶片」/ 编辑器「预设」**同一套**，P-2c 起三处都走这一个入口）。列表首项恒为内置的
+ * [CAMERA_STANDARD_PRESET]（中性基线）。选中态按 **id** 判定
  * （不是索引 —— 列表会被用户在编辑器里增删，索引不稳定）。
  */
 @Composable

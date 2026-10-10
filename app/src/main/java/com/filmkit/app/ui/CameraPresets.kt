@@ -4,23 +4,22 @@ package com.filmkit.app.ui
  * 内置预设：只保留「标准」= 无风格化中性基线（基准色彩科学：log 域 + 胶片曲线骨架，
  * 全部参数中性）。
  *
- * 预设机制定位（2026-09-20 拍板）：预设 = 用户自建（LUT + 参数调节保存），内置风格化
- * 预设（负片/黑白）无意义已删除。
+ * 预设机制定位（2026-09-20 拍板）：预设 = 用户自建（LUT + 参数调节保存）。
+ * ★ 2026-10-11 更新（P-2b/P-2c）：随包分发的**内置胶片预设**已重新引入（`BuiltinPresets` +
+ * `assets/presets/builtin.json`），但它走的是**另一条数据通道**（只读、不进 prefs）——
+ * 本文件仍然只有「标准」这一条基线，`names` / `byIndex` 那套"按索引取预设"的死代码已删除
+ *（P-2c 裁决 ④；列表与选中态现在一律按 **id** 走 `EditorPreset`）。
  *
  * 教训（X300 事故）：DoubleArray 默认全 0，而对比度 0 = 灰板、串扰矩阵 0 = 信号清零、
  * 白平衡 0 = 全黑——必须从 neutral() 基线出发再覆盖。
  */
 object CameraPresets {
 
-    val names = listOf("标准")
-
     /** 参数数组长度 = C++ `FilmParams.h::kCount`（E2-11 起 96）。
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
     const val COUNT = 96
-
-    fun byIndex(i: Int): DoubleArray = standard()
 
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
         a[i] = v0; a[i + 1] = v1; a[i + 2] = v2

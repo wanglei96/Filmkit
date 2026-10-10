@@ -97,12 +97,43 @@ internal object BuiltinPresets {
      *
      * ★ **内置包坏掉不能连累用户数据**：[load] 已保证不抛且失败返回空列表 ⇒ 这里的 `+`
      * 永远能返回用户预设。
+     *
+     * ★ **这是三处列表（拍照 / 查看页 / 编辑器）唯一的数据源入口**（P-2c）：任何一处直接写
+     * `PresetStore.load(prefs)` 都会让内置三条在界面上消失 —— 那是本卡修掉的原始缺陷。
      */
     fun all(context: Context, prefs: SharedPreferences): List<EditorPreset> =
-        PresetStore.load(prefs) + load(context)
+        mergePresets(PresetStore.load(prefs), load(context))
 
     /** 诊断日志（与 [PresetStore] 同一出口：`nativeAppendLog` 的 `app` 模块）。 */
     private fun log(event: String, vararg detail: Pair<String, Any?>) {
         EngineBridge.nativeAppendLog(EngineBridge.LEVEL_WARN, "app", event, kv(*detail))
     }
 }
+
+/**
+ * 合并两个列表（[BuiltinPresets.all] 的纯内核，JVM 单测直接驱动）：**用户在前 + 内置在后**，
+ * 且 **id 全局唯一**（先到者胜 ⇒ 用户那份留下）。
+ *
+ * 为什么要去重（不是洁癖）：id 是 UI 的**唯一判据** —— 列表 `key = { it.id }`（Compose 的
+ * `LazyColumn` 遇到重复 key **直接抛异常**）、选中态比对 id、`initialPresetOf` 按 id 取第一条。
+ * 一旦出现两条同 id，"用户看到两条一样的预设"只是表面，真机表现是拍照页 / 编辑器整片崩掉。
+ * 而两条来源（prefs 反序列化的 `id` 字段**不受格式约束** / 未来的导入功能）本来就能撞车。
+ *
+ * 用户优先的理由：用户数据是他的显式选择，内置包是随包分发的打底内容 —— 同 id 时丢掉内置那份，
+ * 用户不会"看到自己刚存的预设不见了"。
+ */
+internal fun mergePresets(
+    user: List<EditorPreset>,
+    builtin: List<EditorPreset>,
+): List<EditorPreset> {
+    val seen = user.mapTo(HashSet(user.size * 2)) { it.id }
+    return user + builtin.filter { seen.add(it.id) }
+}
+
+/**
+ * 该预设**用户是否可删**（P-2c）：内置包只读（随包分发，删了下次启动又回来），
+ * 因此编辑器预设面板对 `source == [PRESET_SOURCE_BUILTIN]` 的条目**不显示删除按钮**。
+ *
+ * 判据只有这一处：面板按它决定是否渲染删除按钮，测试按它钉住"内置不可删 / 用户可删"。
+ */
+internal fun presetDeletable(p: EditorPreset): Boolean = p.source != PRESET_SOURCE_BUILTIN

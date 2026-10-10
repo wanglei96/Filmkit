@@ -85,8 +85,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
+import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.EditorPreset
-import com.filmkit.app.camera.PresetStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -183,7 +183,8 @@ internal fun clampIndex(index: Int, size: Int): Int = if (size <= 0) 0 else inde
  *
  * ★ **P-3**（用户 2026-10-11 拍板）：底栏「胶片」由**置灰留位**改为**可点** —— 弹出
  * [FilmPresetSheet]（自绘底部面板，与拍照界面 `LutSheet` 同一套视觉语言），列出
- * `PresetStore.load(prefs)` 的全部预设（**三处入口同一套数据**，ADR-7 裁决）。选一条 ⇒
+ * `BuiltinPresets.all` 的全部预设 = **用户预设 + 内置三条**（**三处入口同一套数据**，ADR-7
+ * 裁决；P-2c 起统一走这一个入口）。选一条 ⇒
  * `onEditWithPreset(uri, presetId)` ⇒ 路由层带着该 id 进编辑器，编辑器在基线就绪后套用一次
  * ⇒ **直接看到成片效果**（不做"保存副本"：用户拍板的是"进编辑器"）。
  * 列表为空时给一句实话（"还没有预设 · 在编辑器里保存"），**不留点不动的按钮**（ADR-12）。
@@ -573,10 +574,11 @@ fun PhotoViewScreen(
         ) {
             val enabled = currentUri != null
             BottomAction(Icons.Filled.Edit, "编辑", enabled) { currentUri?.let(onEdit) }
-            // 胶片（★ P-3 已开工）：打开预设面板 —— 打开时从 prefs 读一次（与编辑器
-            // 「预设」面板同一数据源，ADR-7 裁决：三处入口一套数据）
+            // 胶片（★ P-3 已开工）：打开预设面板 —— 打开时读一次（与编辑器「预设」面板同一
+            // 数据源，ADR-7 裁决：三处入口一套数据）。★ P-2c：走 `BuiltinPresets.all`，
+            // 内置三条与用户预设一起列出（直接用 PresetStore.load 会让内置包在界面上消失）。
             BottomAction(Icons.Filled.PhotoFilter, "胶片", enabled) {
-                presets = PresetStore.load(prefs)
+                presets = BuiltinPresets.all(context, prefs)
                 showFilmPanel = true
             }
             BottomAction(Icons.Filled.Share, "分享", enabled) {
@@ -704,7 +706,8 @@ private fun rememberPreview(cache: ThumbCache<String, Bitmap>, uri: String, cont
 }
 
 /**
- * ★ P-3「胶片」预设选择面板（查看页底栏第二项）。列出 prefs 里的全部预设，点一条 ⇒ [onPick]
+ * ★ P-3「胶片」预设选择面板（查看页底栏第二项）。列出 `BuiltinPresets.all` 的全部预设
+ *（用户预设 + 内置三条），点一条 ⇒ [onPick]
  * ⇒ 路由层带着这条预设的 id 进编辑器（**直接看效果**，不是保存副本 —— 用户 2026-10-11 拍板）。
  *
  * 形态与拍照界面 `LutSheet` 同一套视觉语言：`FilmTheme.Panel` 圆角面板贴底 + 标题 + 列表
