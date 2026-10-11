@@ -140,19 +140,21 @@ class PhotoViewPreviewTest {
         }
     }
 
-    // ── ③ 相邻页预载缓存装得下 3 张新预览档 ─────────────────────────────────
+    // ── ③ 相邻页预载缓存装得下新预览档 ─────────────────────────────────────
 
     @Test
     fun previewCacheHoldsThreePreviewsOfTheNewTier() {
-        assertEquals("缓存要容下 当前页 + 左右邻页", 3, PREVIEW_CACHE_COUNT)
+        // ★ PV-2：口径从"当前页 + 左右邻页 = 3"改成"主动预载 page±2 = 4"（PC 的
+        // `preloadPreviews` 半径 2）。判据与字节账在 Pv2FlickerTest 里另有直测。
+        assertEquals("缓存要容下 page±2 的四张邻页", 4, PREVIEW_CACHE_COUNT)
         // 用**真实函数**算 1080p 容器上的预览档字节数（不是拍一个数字进来）
         val (pw, ph) = previewRequestFor(1080, 1700)
         val p = planFor(4000, 3000, pw, ph)
         val bytes = p.w.toLong() * p.h * 4 // ARGB_8888
         assertTrue(
-            "3 张预览（${bytes * PREVIEW_CACHE_COUNT / 1024 / 1024}MB）装不进上限" +
-                "（${PREVIEW_CACHE_BYTES / 1024 / 1024}MB）—— 预载会静默塌成 1 张，滑动时邻页没有" +
-                "现成预览，反而要现解（空白帧）",
+            "预载窗口（${bytes * PREVIEW_CACHE_COUNT / 1024 / 1024}MB）装不进上限" +
+                "（${PREVIEW_CACHE_BYTES / 1024 / 1024}MB）—— 预载会静默塌掉，滑动时邻页没有" +
+                "现成预览，反而要现解（回到 PV-2 要消灭的「未命中 ⇒ 转圈」）",
             bytes * PREVIEW_CACHE_COUNT <= PREVIEW_CACHE_BYTES,
         )
     }

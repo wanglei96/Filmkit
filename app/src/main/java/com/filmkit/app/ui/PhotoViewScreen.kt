@@ -65,6 +65,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -95,6 +96,7 @@ import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.presetScopeNotice
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 // ── 缩放 / 平移 / 手势仲裁的纯逻辑（E2-20；JVM 单测见 PhotoViewZoomTest）────────
@@ -142,15 +144,41 @@ internal fun previewRequestFor(viewW: Int, viewH: Int): Pair<Int, Int> =
     (viewW / 2).coerceAtLeast(1) to (viewH / 2).coerceAtLeast(1)
 
 /**
- * 相邻页预览缓存：3 张（= 当前页 + 左右邻页），PC `previewCache(3)` 的等价物。
+ * 相邻页预览缓存：字节上限 **12MB**、张数上限 **4**（★ PV-2：预载半径从"Pager 组合到谁算谁"
+ * 改成**主动的 ±[PRELOAD_RADIUS]** ⇒ 需要同时装下 4 张邻页）。
  *
- * ★ PV-1：字节上限从 4MB 提到 **12MB**。预览档提到 3MB/张（1080p/1440p 容器）后，4MB 只装得下
- * **1 张** —— 预载会静默失效（滑动时邻页没有现成预览 ⇒ 又要现解 ⇒ 空白帧，比修之前更糟）。
- * 12MB 刚好容下 3 张（9MB）。极端容器（≥2000px 宽 ⇒ 预览落到 sample=2 ⇒ 12MB/张）只装得下
- * 1 张：那种设备的目标档本身就是全分辨率 48MB，宁可少缓存也不能让预载把内存吃掉。
+ * PV-1 的口径是 3 张（当前页 + 左右邻页），但那是**被动**预载时代的账：邻页什么时候被组合、
+ * 什么时候解完，全看 Pager 的脸色，赶不上切页那一刻。PV-2 改成主动预载后要装的是
+ * `page±1`、`page±2` 四张（当前页由主解码负责，不进这个缓存）。
+ *
+ * 单张字节（`PhotoViewPreviewTest` 用真实的 [fitSizeFor] / [sampleSizeFor] 跑）：
+ * 1080p/1440p/1644p 横竖的 12MP 图预览档都是 **1000×750 ≈ 3MB**（采样台阶 sample=4），
+ * 4 张 = 12MB —— 正好装满上限。唯一的例外是 **1644p 竖图**（预览档落在 sample=2 ⇒
+ * 1500×2000 ≈ 12MB/张）⇒ 只装得下 1 张，那种设备上预载会退化（降级路径兜底，不会出错，
+ * 只是回到 PV-1 的命中率）。宁可少缓存也不让预载把内存吃掉。
  */
-internal const val PREVIEW_CACHE_COUNT = 3
+internal const val PREVIEW_CACHE_COUNT = 4
 internal const val PREVIEW_CACHE_BYTES = 12L * 1024 * 1024
+
+/**
+ * ★ PV-2：主动预载半径 —— **照抄 PC**（`ImageViewerFragment.preloadPreviews(centerPos)` 是
+ * `center ± 2`，在进入查看页时与每次翻页后显式调用）。PC 的保证是"任何时刻都有一张不透明的图
+ * 垫底"（`ImageAdapter.java:79` 的原注释：*small preview + native dimensions per position –
+ * shown immediately under tiles so no black flash*），而不是"等 Pager 顺手组合邻页"。
+ */
+internal const val PRELOAD_RADIUS = 2
+
+/**
+ * ★ PV-2：转圈的**显示延迟**（ms）。未命中预载时屏上先保持纯黑底，超过这个时间才画
+ * `CircularProgressIndicator`。
+ *
+ * 用户 2026-10-11 的实测线索是"**左右滑动一定会显示一下转圈，所以观感上就是闪一下**" ——
+ * 转圈出现再消失本身就是一次闪（它是个高对比的圆环，画在纯黑底上）。而绝大多数"未命中"
+ * 只持续一张预览档的解码时间（15–30ms ≈ 1–2 帧），那种情况下**黑底比转圈更不刺眼**
+ * （黑底与页面背景同色，看不出变化）。真的等久了（首次点开一张没预载的图）仍然给反馈，
+ * 不静默（ADR-12）。
+ */
+private const val SPINNER_DELAY_MS = 150L
 
 /**
  * ★ PV-1 交叉淡入时长（ms）：预览档 → 目标档的替换**不是瞬切**，上层（目标档）alpha 在这段
@@ -158,6 +186,45 @@ internal const val PREVIEW_CACHE_BYTES = 12L * 1024 * 1024
  * 150–250ms 是"看得出平滑、又不觉得慢"的窗口（与 CameraScreen 的快门反馈 190ms 同量级）。
  */
 private const val PREVIEW_FADE_MS = 180
+
+/**
+ * ★ PV-2：上屏位图的**档位**标记（`shownTier` 的取值，越大越清晰）。
+ *
+ * 用命名常量而不是裸数字：它们是状态机的状态（"此刻屏上这张是什么档"），而
+ * `shownTier >= target` 这种比较里的裸 `0` 读不出方向（0 是**最低**档，不是"没有"）。
+ */
+internal const val TIER_PREVIEW = 0
+internal const val TIER_FIT = 1
+internal const val TIER_HIRES = 2
+
+/**
+ * ★ PV-2：一帧位图的完整描述（uri + 档位 + 像素）。纯泛型，不碰 `android.graphics.Bitmap`
+ * ⇒ 能在 JVM 单测里真跑。
+ */
+internal data class ViewerFrame<B>(val uri: String?, val tier: Int, val bitmap: B?)
+
+/**
+ * ★ PV-2：**换页时的原子状态转移**（纯函数，无 suspend ⇒ 天然原子）。
+ *
+ * 这是 `PhotoViewScreen` 解码 effect 里 `if (shownUri != u)` 那一段的唯一真相，判据只有两条：
+ *
+ * 1. **位图只可能来自新页**（`cacheHit`）—— 命中就是新页的预览档，未命中就是 `null`。
+ *    **绝不沿用上一页的像素**：新页画上一张的图是错图，比黑底更糟。
+ * 2. **uri / 档位 / 位图三者一次给全** —— 不允许"先清空位图、再由另一个协程填"的两步走。
+ *    那两步之间的帧就是用户 2026-10-11 实测到的转圈（"**左右滑动一定会显示一下转圈**"）：
+ *    PV-1 正是把这两步分在了两个 `LaunchedEffect` 里。
+ *
+ * @param cacheHit 主动预载的结果（`previews.get(u)`）；null = 未命中（走现解预览档的降级路径）
+ */
+internal fun <B> frameAfterPageChange(uri: String, cacheHit: B?): ViewerFrame<B> =
+    ViewerFrame(uri = uri, tier = TIER_PREVIEW, bitmap = cacheHit)
+
+/**
+ * ★ PV-2：主动预载要覆盖的**相对页偏移**（纯函数），近的优先 —— 用户下一次滑动最可能落在 ±1。
+ * 不含 0：当前页由主解码负责，预载它纯属白解一张。
+ */
+internal fun preloadOffsets(radius: Int): List<Int> =
+    if (radius <= 0) emptyList() else (1..radius).flatMap { listOf(-it, it) }
 
 /**
  * 手势仲裁结果（本卡最容易出错的地方，故用枚举把仲裁表钉死）：
@@ -232,6 +299,31 @@ internal fun pageShiftAt(isSettledPage: Boolean, shift: Float): Float =
     if (isSettledPage) shift else 0f
 
 /**
+ * ★ PV-2（用户 2026-10-11 复测澄清："**闪一下不是糊到清晰，是屏幕闪烁**"）：单页的绘制 alpha。
+ *
+ * **只有"正在淡入的停稳页"才受 [fade] 影响**，其余一律 1（全不透明）—— 与 [pageScaleAt] /
+ * [pageShiftAt] **同款判据**：`fade` / `zoom` / `pan` 都是**整页共享**的 state，谁跟着它走谁
+ * 就会在别人的动画里被改掉。E2-23 给 `zoom` / `pan` 加这道闸时，alpha 还不存在（PV-1 才引入），
+ * 于是漏了同一个判据，代价是：
+ *
+ * - **相邻页也一起半透明**。而相邻页**没有下层兜底**（`under` 只画在停稳页）⇒ 半透明的图
+ *   直接压在 `Color.Black` 上 ⇒ **整片图片区变暗**。用户滑动时邻页正从边缘滑进视口，
+ *   这个变暗就落在视口正中 —— 正是他说的"屏幕闪烁"。
+ * - **停稳页在切页那一帧可能拿到中间 alpha**。PV-1 靠 `fade.snapTo(1f)` 复位，而它是
+ *   **挂起**函数：实测有动画在跑时要 24ms（≈1.5 帧）才生效，见 `Pv2FlickerTest` 的
+ *   `snapToOnRunningAnimationIsNotInstant`。那 1–2 帧里整页都是半透明的。
+ *
+ * 所以判据不能是 `fade < 1`（把"这一帧透不透明"交给一个挂起函数的结果），而是 [fading] ——
+ * 由调用方传 `under != null`，而 `under` 在切页 effect 里是**同步**清掉的 ⇒ **切页那一帧的
+ * alpha 必然是 1**，与 [fade] 当时停在哪个值、有没有动画正在垂死挣扎**都无关**。
+ *
+ * [fading] 为真时仍然返回 [fade]：淡入本身（预览档 → 目标档的清晰度过渡）保留，它只在
+ * 用户停在这一页时可见 —— 手指一动就会被 `isScrollInProgress` 那条 effect 结束掉（见调用侧）。
+ */
+internal fun pageAlphaAt(isSettledPage: Boolean, fading: Boolean, fade: Float): Float =
+    if (isSettledPage && fading) fade else 1f
+
+/**
  * 照片查看页（ADR-15，E2-13）：**网格点开先到这一页**，点「编辑」才进编辑器；编辑器退出
  * （取消 / 系统返回）回到本页 —— 用户 2026-10-09 明确要求"取消后应该回到照片查看页"。
  *
@@ -254,6 +346,30 @@ internal fun pageShiftAt(isSettledPage: Boolean, shift: Float): Float =
  * ② 换档时**交叉淡入** [PREVIEW_FADE_MS]ms —— 下层预览保持不动，上层目标档 alpha 0→1。
  * E2-22 的两段式节奏、E2-20 的手势仲裁、E2-23 的缩放边界（[pageScaleAt] / [pageShiftAt] /
  * `clipToBounds`）**一行未改**。
+ *
+ * ★ **PV-2 修**（用户 2026-10-11 复测，两条澄清把根因锁死：
+ * ① "**闪一下不是糊到清晰，是屏幕闪烁**" ⇒ PV-1 的"清晰度阶跃"根因判断是错的；
+ * ② "**左右滑动一定会显示一下转圈，所以观感上就是闪一下**" ⇒ 那条闪就是
+ * `CircularProgressIndicator`）。三条修，对应三个独立缺陷：
+ *
+ * ① **转圈（主因，用户点名的现象）**：PV-1 把"丢旧像素"（`bitmap = null`）放在切页 effect、
+ *    把"上新像素"（`bitmap = previews.get(u)`）放在**另一个**解码 effect —— 两个独立协程之间
+ *    只要有任何调度窗口，就会渲染出"新页已选中、位图为 null"的帧，而那一帧画的正是转圈。
+ *    修法：`bitmap` 的**所有写入收敛到解码 effect 的一段同步代码**里（`if (shownUri != u)` 块，
+ *    其中没有任何 suspend 调用）⇒ 判据是"任何时刻都不存在新页已选中但位图为 null 的可见帧"；
+ *    再加 [SPINNER_DELAY_MS] 的显示延迟兜底（短暂未命中时保持纯黑底，不画转圈）。
+ * ② **预载时机**：PV-1 依赖"Pager 组合邻页时顺手解一张"，时机不由我们决定，赶不上切页那一刻。
+ *    改成**主动预载 `page ± [PRELOAD_RADIUS]`**（PC `preloadPreviews(centerPos)` 的口径：
+ *    进入查看页与每次翻页后显式调度）⇒ 切页时 `previews.get(u)` 通常命中 ⇒ 同步上屏、零等待。
+ * ③ **alpha 缺闸**：PV-1 的 [fade] 漏了 E2-23 给 zoom/pan 加的那道闸 —— `viewerLayer` 的调用点
+ *    对**所有页**读 `fade.value` ⇒ 淡入的 180ms 里相邻页也半透明，而相邻页没有下层兜底
+ *    （`under` 只画停稳页）⇒ 半透明压在黑底上 ⇒ 变暗；且停稳页的复位靠 `fade.snapTo(1f)`，
+ *    它是**挂起**函数（实测 24ms ≈ 1.5 帧）⇒ 切页那一帧仍可能用中间 alpha 绘制。
+ *    修法：alpha 收进同一道闸（[pageAlphaAt]），复位改成"同步清 `under`"的状态而非挂起函数的结果；
+ *    手指一动就结束淡入（`isScrollInProgress` 那条 effect）。
+ * 淡入本身**保留**（只在静止时可见，仍有抹平清晰度过渡的价值）；手势 / 缩放边界 / 页裁剪
+ * （[viewerGesture] / [clampZoom] / [clampPan] / [pageScaleAt] / [pageShiftAt] / `clipToBounds` /
+ * `userScrollEnabled`）**一行未改**。
  *
  * ★ **E2-23 修**（用户 2026-10-13 报："相册放大图片隔壁图片会入侵视野"）：E2-22 的
  * `beyondViewportPageCount = 1` 让相邻页被组合/绘制，而 `zoom` / `pan` 是**整页共享**的
@@ -315,16 +431,24 @@ fun PhotoViewScreen(
     // ★ PV-1：被 [bitmap] 盖住的**下层位图**（只有"同页升档"那一下才有：预览档 → 目标档）。
     // 交叉淡入期间两层同时在屏上，[fade] 结束后立刻清掉（只多占 180ms 的一张预览内存）。
     // 切页时**必须**清空 —— 上一张的像素哪怕只当淡出层也不能留在新页上。
+    //
+    // ★ PV-2：它同时是**"是否正在淡入"的唯一判据**（[pageAlphaAt] 的 `fading` 参数）。
+    // 这样"alpha 该不该复位"就不再依赖 [fade] 的值（`Animatable` 的复位是挂起操作），
+    // 而是依赖一次**同步赋值** —— 切页 effect 里 `under = null` 一执行，alpha 立刻是 1。
+    // 手指开始滑动时也会被清掉（见 `isScrollInProgress` 那条 effect）。
     var under by remember { mutableStateOf<Bitmap?>(null) }
     // ★ PV-1：上层（[bitmap]）的淡入进度，1 = 全显。只在 `graphicsLayer` 的**绘制 block** 里读
-    // ⇒ 动画期间零重组（与 zoom/pan 同一套做法）。切页时必须 snapTo(1f) 复位：上一张的淡入
-    // 可能被取消在半路，不复位会让新页整张半透明。
+    // ⇒ 动画期间零重组（与 zoom/pan 同一套做法）。
+    // ★ PV-2 更正：**不再靠"切页时把它复位"来保证不透明**。`Animatable.snapTo` 是挂起函数，
+    // 实测有动画在跑时要 24ms ≈ 1.5 帧才生效（`Pv2FlickerTest` 钉住了这个事实）—— 靠它复位
+    // 等于把"切页那一帧透不透明"交给一个异步操作。现在由 [pageAlphaAt] 的 `fading`（= `under != null`）
+    // 门控：`under == null` 时 alpha 恒 1，这个值停在哪儿都无所谓。
     val fade = remember { Animatable(1f) }
     // bitmap 对应的**是哪张图、哪个档位**（0 = 预览档，1 = Fit，2 = 放大档）。
     // 用来区分"切页要重解"与"同页升档只需补解更高档"：缩回 Fit 时 shownTier=2 ≥ 目标 1 ⇒ 不重解
     // （高清留着更好，降回去反而更糊）。
     var shownUri by remember { mutableStateOf<String?>(null) }
-    var shownTier by remember { mutableStateOf(0) }
+    var shownTier by remember { mutableStateOf(TIER_PREVIEW) }
     var meta by remember { mutableStateOf(PhotoMeta()) }
     var error by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
@@ -349,11 +473,18 @@ fun PhotoViewScreen(
     val zoomed by remember { derivedStateOf { zoom.floatValue > MIN_ZOOM } }
     // 是否到了"补解一档"的放大程度（同理只在跨阈值那一下通知，捏合过程不重启解码）
     val hiRes by remember { derivedStateOf { zoom.floatValue >= ZOOM_HIRES } }
-    // 相邻页预载的 360px 预览（PC `previewCache(3)` 的等价物）：滑过去的那一瞬间就有内容。
-    // 只丢引用不 recycle（可能正被画在屏幕上，见 ThumbCache.clear 的 KDoc）。
+    // 相邻页预载的预览档（★ PV-2：主动预载 page±[PRELOAD_RADIUS]，见下面的预载 effect）：
+    // 滑过去的那一瞬间就有内容。只丢引用不 recycle（可能正被画在屏幕上，见 ThumbCache.clear 的 KDoc）。
     val previews = remember {
         ThumbCache<String, Bitmap>(PREVIEW_CACHE_BYTES, PREVIEW_CACHE_COUNT) { it.byteCount }
     }
+    // ★ PV-2：预载完成的信号。`ThumbCache` 是普通对象（不是 snapshot state）—— 主动预载把位图
+    // 填进去之后，**已经组合好的邻页不会自己重组**，也就取不到刚填进去的那张。这个计数器把
+    // "缓存有更新"告诉它们（`rememberNeighborPreview` 用它当 remember key）。每次预载完成 +1，
+    // 频率是"每张照片一次"，不是每帧。
+    var previewsVersion by remember { mutableIntStateOf(0) }
+    // ★ PV-2：转圈是否该显示（见 [SPINNER_DELAY_MS]）。未命中预载时先黑着，等久了才给反馈。
+    var showSpinner by remember { mutableStateOf(false) }
     DisposableEffect(Unit) {
         onDispose { previews.clear() }
     }
@@ -399,15 +530,15 @@ fun PhotoViewScreen(
         }
     }
 
-    // ── 切页：**缩放/平移复位**（新图从 Fit 开始）+ 元数据先到（顶栏立刻更新）────────
-    // 与解码协程分开：解码的 key 含 hiRes/viewSize，放大或窗口尺寸变化时它会重启 ——
-    // 复位/元数据**不能**跟着重启（放大一下就把用户的缩放弹回 Fit 是灾难）。
+    // ── 切页：**只做文字**（元数据 + 提示复位）────────────────────────────────
+    // ★ PV-2：这个 effect **一个字节的位图状态都不碰**。PV-1 把"丢旧像素"（`bitmap = null`）
+    // 放在这里、把"上新像素"（`bitmap = previews.get(u)`）放在下面的解码 effect —— 两个
+    // `LaunchedEffect` 是两个独立协程，它们之间只要有任何调度窗口，就会渲染出
+    // "新页已选中、位图为 null"的帧，而那一帧屏上画的正是 `CircularProgressIndicator`。
+    // 用户 2026-10-11 实测："**左右滑动一定会显示一下转圈，所以观感上就是闪一下**" ——
+    // "一定"说明这不是偶发的竞态，而是结构性的：`bitmap` 被两个协程分别写。
+    // 现在它只在解码 effect 的那一段同步代码里被写（见下），中间没有挂起点。
     LaunchedEffect(page, uris) {
-        zoom.floatValue = MIN_ZOOM
-        pan.value = Offset.Zero
-        bitmap = null // 上一张的像素内容不对，必须丢（不留作占位）
-        under = null // ★ PV-1：淡出层同理 —— 上一张的像素一个像素都不许留在新页上
-        fade.snapTo(1f) // ★ PV-1：上一张的淡入可能被取消在半路，新页必须从全显开始
         error = ""
         status = "" // 上一张的提示（分享失败等）不跟着跨图
         val u = uris.getOrNull(page)
@@ -419,9 +550,65 @@ fun PhotoViewScreen(
         meta = withContext(Dispatchers.IO) { queryMeta(context, Uri.parse(u)) }
     }
 
-    // ── 解码（E2-22 两段式 + 两档；★ PV-1 改预览档 + 交叉淡入）────────────────
-    // ① 预览档先上屏（命中相邻页预载就零成本）→ ② 按显示尺寸解目标档（Fit / viewSize×2）。
+    // ── ★ PV-2：主动预载 page±[PRELOAD_RADIUS]（PC `preloadPreviews(centerPos)` 的等价物）──
+    // 用户点名"相册你可以参考 PC 的实现"：PC 的保证是**任何时刻都有一张不透明的图垫底**
+    //（`ImageAdapter.java:79`：*small preview + native dimensions per position – shown
+    // immediately under tiles so no black flash*），手段是**主动**预载 ——
+    // `ImageViewerFragment` 在进入查看页时与每次翻页后显式调用 `preloadPreviews(center)`，
+    // 半径 2。PV-1 依赖的是"Pager 把邻页组合出来时顺手解一张"：**时机不由我们决定**
+    //（`beyondViewportPageCount = 1` 只管组合，不管什么时候解完），赶不上切页那一刻 ⇒
+    // `previews.get(u)` 未命中 ⇒ 那一帧就是转圈。
+    //
+    // **顺序预载，不并发**：① 不与当前页的目标档解码抢 CPU；② 不让 4 张预览同时解码
+    //（瞬时内存 ×4）。近的优先（±1 在 ±2 之前）—— 用户下一次滑动最可能落在 ±1。
+    // 已经缓存过的直接跳过（`previews.get(u) != null`）⇒ 反复翻页不重复解码。
+    LaunchedEffect(page, uris, viewSize) {
+        val vw = viewSize.width
+        val vh = viewSize.height
+        // 容器未测量 ⇒ 算不出预览请求。viewSize 是 key，测量完会重启。
+        if (vw <= 0 || vh <= 0) return@LaunchedEffect
+        val (pw, ph) = previewRequestFor(vw, vh)
+        for (d in preloadOffsets(PRELOAD_RADIUS)) {
+            val p = page + d
+            val u = uris.getOrNull(p) ?: continue
+            if (previews.get(u) != null) continue
+            val b = withContext(Dispatchers.IO) { decodeFit(context, Uri.parse(u), pw, ph) }
+            if (b != null) {
+                previews.put(u, b)
+                previewsVersion++ // 告诉已经组合好的邻页：缓存里有新东西了
+            }
+        }
+    }
+
+    // ── ★ PV-2：手指一动就结束淡入（用户 2026-10-11："闪一下不是糊到清晰，是屏幕闪烁"）──
+    // 交叉淡入只在"用户停在这一页看"时才有价值（抹平预览档 → 目标档的清晰度过渡）。一旦开始
+    // 滑动，它的唯一效果是让**停稳页**在整段滑动里半透明（露黑底）—— 淡入 180ms 与下一次
+    // 滑动重叠时必然出现，正是用户报的"屏幕闪烁"。
+    // 清掉下层 ⇒ [pageAlphaAt] 的判据立刻失效 ⇒ alpha 回到 1；正在跑的 `animateTo` 继续写
+    // [fade] 也无所谓（判据已经不看它了），它跑完把 `under` 再置一次 null 是幂等的。
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.isScrollInProgress }
+            .collect { scrolling -> if (scrolling) under = null }
+    }
+
+    // ── ★ PV-2：转圈的显示延迟（见 [SPINNER_DELAY_MS]）──────────────────────────
+    // 未命中预载时屏上先保持纯黑底；真的等久了才画转圈。`bitmap` 是 key ⇒ 一有内容就取消
+    // 这个协程并把转圈收掉（不会出现"图已经出来了转圈还挂着"）。
+    LaunchedEffect(page, bitmap) {
+        showSpinner = false
+        if (bitmap != null) return@LaunchedEffect
+        delay(SPINNER_DELAY_MS)
+        if (bitmap == null) showSpinner = true
+    }
+
+    // ── 解码（E2-22 两段式 + 两档；★ PV-1 改预览档 + 交叉淡入；★ PV-2 切页原子替换）────
+    // ① 预览档先上屏（命中主动预载就零成本）→ ② 按显示尺寸解目标档（Fit / viewSize×2）。
     // 目标档解码期间**旧位图一直占位**，解完才替换（★ PV-1：替换走 [fade]，不再是瞬切）。
+    //
+    // ★ PV-2：`bitmap` / `shownUri` / `shownTier` **只在这个 effect 里被写**，而且"换页复位 +
+    // 丢旧像素 + 上新像素"是**同一段没有挂起点的同步代码**（见下面的 `if (shownUri != u)` 块）。
+    // 判据：**任何时刻都不存在"新页已选中但位图为 null"的可见帧** —— 命中预载就同步换上
+    // 新页的预览档，未命中就同步置 null（配合 [SPINNER_DELAY_MS]，那一帧是纯黑底而不是转圈）。
     LaunchedEffect(page, uris, hiRes, viewSize) {
         val u = uris.getOrNull(page) ?: return@LaunchedEffect
         val vw = viewSize.width
@@ -429,29 +616,40 @@ fun PhotoViewScreen(
         // 容器还没测量（首帧 onSizeChanged 之前）⇒ 算不出 Fit 尺寸。viewSize 是 key，测量完会重启；
         // 这里直接返回，好过拿 0 去解码（那会退化成全分辨率 48MB）。
         if (vw <= 0 || vh <= 0) return@LaunchedEffect
-        val target = if (hiRes) 2 else 1
-        // 已经有"不差于目标档"的位图（同页缩回 Fit / 无关重组）⇒ 什么都不做
-        if (shownUri == u && shownTier >= target && bitmap != null) return@LaunchedEffect
+        val target = if (hiRes) TIER_HIRES else TIER_FIT
 
         val parsed = Uri.parse(u)
         if (shownUri != u) {
-            // 切页：相邻页预载过这张就直接上屏（零解码），否则下面补一张。
-            // ★ PV-1：这里**不保留淡出层** —— 换的是另一张图，交叉淡入会让上一张的像素在新页上
-            // 停留 180ms（用户滑动时看到的就是"糊着的前一张"）。换图就该是瞬切，淡入只用在升档。
+            // ★ PV-2 切页的**原子替换**（这一段里没有任何 suspend 调用 ⇒ 不可能渲染出中间态）：
+            //   ① 复位缩放/平移（新图从 Fit 开始）—— 与位图替换同一帧生效；
+            //   ② `under = null`（alpha 判据立刻失效 ⇒ 这一帧必然不透明，见 [pageAlphaAt]）；
+            //   ③ [frameAfterPageChange]：uri / 档位 / 位图**一次给全**。命中主动预载 ⇒ 新页的
+            //      预览档立刻上屏（零解码、零等待）；未命中 ⇒ null（纯黑底，配合
+            //      [SPINNER_DELAY_MS] 不画转圈），由下面**同一个协程**里补一张。
+            // 这里**不能**沿用 PV-1 的"先把 bitmap 置 null、等另一个 effect 来填"：那正是转圈的
+            // 来源。也不能"未命中时保留上一张"：那会让新页显示**上一张的像素**（错图比黑底更糟）。
+            // 判据本身在 [frameAfterPageChange] 里（纯函数，JVM 单测钉死）。
+            zoom.floatValue = MIN_ZOOM
+            pan.value = Offset.Zero
             under = null
-            bitmap = previews.get(u)
-            shownUri = u
-            shownTier = 0
+            val frame = frameAfterPageChange(u, previews.get(u))
+            bitmap = frame.bitmap
+            shownUri = frame.uri
+            shownTier = frame.tier
         }
+        // 已经有"不差于目标档"的位图（同页缩回 Fit / 无关重组）⇒ 什么都不做。
+        // （走到这里时 `shownUri == u` 恒成立：换页分支刚设过，没进分支说明本来就相等。）
+        if (shownTier >= target && bitmap != null) return@LaunchedEffect
+
         if (bitmap == null) {
+            // 未命中预载（首次点开一张 / 快速连滑 / 容器尺寸刚变）⇒ 现解一张预览档顶上。
+            // ★ PV-2：它**不写缓存** —— 缓存的语义是"page±[PRELOAD_RADIUS] 的预载档"，
+            // 把现解的这张塞进去会把还没滑到的邻页挤掉（12MB 只装 4 张）。
             val preview = withContext(Dispatchers.IO) {
                 val (pw, ph) = previewRequestFor(vw, vh)
                 decodeFit(context, parsed, pw, ph)
             }
-            if (preview != null) {
-                bitmap = preview
-                previews.put(u, preview)
-            }
+            if (preview != null) bitmap = preview
         }
         // 目标档：Fit（12MP ⇒ 2000×1500 ≈12MB）或放大档（viewSize×2；12MP 上这档等价全分辨率）
         val b = withContext(Dispatchers.IO) {
@@ -640,16 +838,16 @@ fun PhotoViewScreen(
                             },
                         contentAlignment = Alignment.Center,
                     ) {
-                        // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 只解预览档当占位
+                        // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 主动预载的预览档
                         // （不占全尺寸内存）。★ E2-23 更正：**"相邻页必然是 Fit 态所以等于无变换"
                         // 是错的** —— 放大态下 Pager 只是不滚，相邻页照样被组合/绘制，而 zoom/pan
                         // 是整页共享的 state ⇒ 邻页被一起放大后越界画进视口（见 [pageScaleAt]）。
+                        // ★ PV-2：这里不再自己解码，只读预载缓存（见 [rememberNeighborPreview]）。
                         val neighbor = if (p == page) {
                             null
                         } else {
                             uris.getOrNull(p)?.let {
-                                val (pw, ph) = previewRequestFor(viewSize.width, viewSize.height)
-                                rememberPreview(previews, it, context, pw, ph)
+                                rememberNeighborPreview(previews, it, previewsVersion)
                             }
                         }
                         val b = if (p == page) bitmap else neighbor
@@ -678,12 +876,24 @@ fun PhotoViewScreen(
                                     // 相邻页跟着放大就会从视口外越界画进来（别张照片的像素盖在本页上，
                                     // 正是用户报的"入侵视野"）。此前这里对每页一视同仁，是这次 bug 的根因。
                                     // ★ PV-1：alpha 也走同一个 block（[fade]），换档时 0→1 渐显。
-                                    modifier = Modifier.viewerLayer(p == page, zoom, pan) { fade.value },
+                                    // ★ PV-2：但 alpha 必须与缩放/平移**同一道闸**（[pageAlphaAt]）——
+                                    // PV-1 在这里对**所有页**读 `fade.value`，于是淡入期间相邻页也半透明，
+                                    // 而相邻页没有下层兜底 ⇒ 半透明压在黑底上 ⇒ 整片图片区变暗（用户报的
+                                    // "屏幕闪烁"）。判据是 `under != null`（不是 `fade < 1`），
+                                    // 原因见 [pageAlphaAt]。
+                                    modifier = Modifier.viewerLayer(p == page, zoom, pan) {
+                                        pageAlphaAt(p == page, under != null, fade.value)
+                                    },
                                 )
                             }
-                            p == page -> CircularProgressIndicator(color = FilmTheme.Accent)
-                            // 相邻页预览还没解出来：保持黑底（滑动动画里几乎看不见），
-                            // 不值得为它显示错误文案
+                            // ★ PV-2：停稳页还没有内容 —— **先保持纯黑底**，只有真的等久了
+                            // （[SPINNER_DELAY_MS]）才画转圈。用户实测"左右滑动一定会显示一下
+                            // 转圈，所以观感上就是闪一下"：转圈是个高对比圆环，画在纯黑底上
+                            // 出现再消失本身就是一次闪；而绝大多数"没内容"只持续一张预览档的
+                            // 解码时间（15–30ms ≈ 1–2 帧），那种情况黑底与页面背景同色，看不出
+                            // 变化。等久了仍然给反馈，不静默（ADR-12）。
+                            p == page && showSpinner -> CircularProgressIndicator(color = FilmTheme.Accent)
+                            // 相邻页预览还没解出来 / 停稳页还在解码的短暂窗口：保持黑底
                             else -> Unit
                         }
                     }
@@ -823,13 +1033,22 @@ private fun clampPan(pan: Offset, scale: Float, view: IntSize, bitmap: Bitmap?):
 
 /**
  * 照片的绘制层变换：**缩放/平移**（E2-20）+ **只给停稳页**（E2-23 [pageScaleAt] / [pageShiftAt]）
- * + **淡入 alpha**（★ PV-1）。
+ * + **淡入 alpha**（★ PV-1，★ PV-2 补上同一道闸 [pageAlphaAt]）。
  *
  * **为什么必须抽成一个函数**：PV-1 的交叉淡入要同时画两层（下层被换下去的预览 + 上层目标档），
  * 两层各抄一遍变换代码迟早会抄歪 —— 缩放态下两层错位就是重影，比它要修的"闪"更难查。
  *
  * block 在**绘制阶段**执行（读 [FloatState] / [State] 不触发重组）：捏合时每帧改 zoom 只重绘
- * 不重组；淡入时每帧改 alpha 同理。默认 alpha = 1（相邻页与下层都用默认值）。
+ * 不重组；淡入时每帧改 alpha 同理。
+ *
+ * **两个调用点的 alpha 不一样，这是故意的**（交叉淡入的定义就是"下层不动、上层渐显"）：
+ * - 下层（`under`，只画在停稳页）：用默认 `alpha = { 1f }` —— 它是**不动的底**，一旦跟着渐显
+ *   就会在 180ms 里露出黑底；
+ * - 上层（`bitmap`）：`{ pageAlphaAt(p == page, under != null, fade.value) }` —— 相邻页恒 1，
+ *   停稳页只在淡入期间用 [fade]。
+ *
+ * 两层的**几何变换**逐位相同（同一个 [pageScaleAt] / [pageShiftAt] + 同一份 zoom/pan）
+ * ⇒ 缩放态下不会错位、不会重影（真机观感见报告 §6 判据 D）。
  */
 private fun Modifier.viewerLayer(
     isSettledPage: Boolean,
@@ -846,37 +1065,26 @@ private fun Modifier.viewerLayer(
 }
 
 /**
- * 相邻页的预览档（E2-22 起；★ PV-1 改为按容器尺寸算请求，见 [previewRequestFor]）：
- * 命中 [cache] 直接返回，否则后台解一张（解完刷新并回填缓存）。
+ * 相邻页要画的位图：**只读 [cache]**（★ PV-2 —— PV-1 这里还兼着"按需自解一张"，已删）。
  *
- * **只在 `p != page` 时调用** —— 当前页由主解码负责，同一张图解两次纯属浪费。失败返回 null，
- * 调用方保持黑底（相邻页不值得显示错误文案）。方向转正沿用 [decodeFit]（8 值含镜像）。
+ * **为什么删掉自解**：预载改成主动的 `page±[PRELOAD_RADIUS]`（见预载 effect）之后，邻页的位图
+ * 由那一条 effect 负责生产，这里再解一遍就是**同一个 key 解两次**（谁先谁后不定），白白多占
+ * 一份解码 CPU 与瞬时内存 —— 而 PV-1 的"顺手解一张"恰恰是赶不上切页那一刻的那条路径。
+ * 现在职责单一：预载负责**生产**，这里负责**显示**。
  *
- * [reqW] / [reqH] 是 key 的一部分：容器**未测量**（0）时直接不解 —— `decodeFit(ctx, uri, 0, 0)`
- * 会退化成**全分辨率 48MB** 解码，那正是 E2-22 要消灭的东西。测量完成后 key 变化会重启，
- * 不需要额外的哨兵。
+ * **为什么需要 [version]**：`ThumbCache` 是普通对象，不是 snapshot state —— 预载把它填满之后，
+ * 已经组合好的邻页不会自己重组，也就取不到刚填进去的那张。`version` 是"缓存有更新"的信号
+ *（每次预载完成 +1），当 remember key 用。命中缓存时这里是零解码、零 IO 的纯读取。
+ *
+ * **只在 `p != page` 时调用** —— 当前页由主解码负责。取不到就返回 null，调用方保持黑底
+ *（相邻页不值得显示错误文案）。
  */
 @Composable
-private fun rememberPreview(
+private fun rememberNeighborPreview(
     cache: ThumbCache<String, Bitmap>,
     uri: String,
-    context: Context,
-    reqW: Int,
-    reqH: Int,
-): Bitmap? {
-    var bmp by remember(uri) { mutableStateOf(cache.get(uri)) }
-    LaunchedEffect(uri, reqW, reqH) {
-        if (bmp != null || reqW <= 0 || reqH <= 0) return@LaunchedEffect
-        val b = withContext(Dispatchers.IO) {
-            decodeFit(context, Uri.parse(uri), reqW, reqH)
-        }
-        if (b != null) {
-            cache.put(uri, b)
-            bmp = b
-        }
-    }
-    return bmp
-}
+    version: Int,
+): Bitmap? = remember(uri, version) { cache.get(uri) }
 
 /**
  * ★ P-3「胶片」预设选择面板（查看页底栏第二项）。列出 `BuiltinPresets.all` 的全部预设
