@@ -12,6 +12,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -57,7 +59,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.FloatState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -110,12 +114,50 @@ internal const val MAX_ZOOM = 5f
  */
 internal const val ZOOM_HIRES = 2f
 
-/** 预览占位边长（px）：与 PC 的 `PREVIEW_SIDE = 360` 同口径 —— 先上屏一张小图消灭等待感 */
-private const val PREVIEW_SIDE = 360
+/**
+ * ★ PV-1（用户 2026-10-11："相册滑动图片还是会闪一下"）：预览占位档的请求尺寸 = **容器尺寸的
+ * 一半**，不再用固定的 `PREVIEW_SIDE = 360`。
+ *
+ * **为什么 360 会闪**：[decodeFit] 先把请求尺寸按原图比例 Fit（[fitSizeFor]），再交给
+ * [sampleSizeFor] 算 `inSampleSize` —— 而采样率**只能取 2 的幂**，所以真正决定清晰度的是请求
+ * 尺寸落在哪个"采样台阶"上，不是请求了多少像素。12MP 横图（4000×3000）在 1080×1700 的容器里：
+ * 360px 的请求落到 **sample=8 ⇒ 实际只解 500×375**，被 `ContentScale.Fit` 放大到 1080×810 的
+ * 显示区是 **2.16×** 的双线性放大（竖图更糟，2.88×）；随后目标档（sample=2，2000×1500，缩到
+ * 1080×810）替换上去 ⇒ **一次肉眼可见的清晰度阶跃**。用户看到的"闪一下"就是它 —— 不是空白
+ * 帧、不是位置跳变、不是颜色差异（三条排除依据见 `docs/reports/pv1-flicker-REPORT.md` §1）。
+ *
+ * **为什么是"一半"**：[fitSizeFor] 对容器尺寸是**一次齐次**的（Fit 就是线性缩放），所以
+ * "请求容器的一半" ≡ "请求目标档 Fit 尺寸的一半" ⇒ 采样台阶**必然比目标档低一档**（解码像素量
+ * 1/4）。同一台 1080p 容器上预览从 sample=8（500×375）提到 sample=4（1000×750），放大倍数
+ * 2.16× → **1.08×**，与目标档肉眼无差（逐画幅逐容器的台账在 `PhotoViewPreviewTest` 里跑真实
+ * 的 [fitSizeFor] / [sampleSizeFor] 打印）。
+ *
+ * 代价（真机量级，见报告 §2）：预览解码像素 ×4（≈+15–25ms，只在相邻页预载与首次进入当前页时
+ * 付），预览内存 0.75MB → 3MB/张 —— 所以 [PREVIEW_CACHE_BYTES] 必须跟着放大，否则相邻页预载
+ * 会静默失效（比原来更糟）。
+ *
+ * 容器未测量（`viewW/viewH <= 0`）⇒ 夹到 1，调用侧另有 `<= 0` 的早退，不会拿 0 去解码。
+ */
+internal fun previewRequestFor(viewW: Int, viewH: Int): Pair<Int, Int> =
+    (viewW / 2).coerceAtLeast(1) to (viewH / 2).coerceAtLeast(1)
 
-/** 相邻页预览缓存：3 张（≈0.5–0.75MB/张），PC `previewCache(3)` 的等价物 */
-private const val PREVIEW_CACHE_COUNT = 3
-private const val PREVIEW_CACHE_BYTES = 4L * 1024 * 1024
+/**
+ * 相邻页预览缓存：3 张（= 当前页 + 左右邻页），PC `previewCache(3)` 的等价物。
+ *
+ * ★ PV-1：字节上限从 4MB 提到 **12MB**。预览档提到 3MB/张（1080p/1440p 容器）后，4MB 只装得下
+ * **1 张** —— 预载会静默失效（滑动时邻页没有现成预览 ⇒ 又要现解 ⇒ 空白帧，比修之前更糟）。
+ * 12MB 刚好容下 3 张（9MB）。极端容器（≥2000px 宽 ⇒ 预览落到 sample=2 ⇒ 12MB/张）只装得下
+ * 1 张：那种设备的目标档本身就是全分辨率 48MB，宁可少缓存也不能让预载把内存吃掉。
+ */
+internal const val PREVIEW_CACHE_COUNT = 3
+internal const val PREVIEW_CACHE_BYTES = 12L * 1024 * 1024
+
+/**
+ * ★ PV-1 交叉淡入时长（ms）：预览档 → 目标档的替换**不是瞬切**，上层（目标档）alpha 在这段
+ * 时间里从 0 走到 1，下层（预览）保持不动 ⇒ 残余的清晰度差被时间抹平，不再是一次"跳变"。
+ * 150–250ms 是"看得出平滑、又不觉得慢"的窗口（与 CameraScreen 的快门反馈 190ms 同量级）。
+ */
+private const val PREVIEW_FADE_MS = 180
 
 /**
  * 手势仲裁结果（本卡最容易出错的地方，故用枚举把仲裁表钉死）：
@@ -201,8 +243,17 @@ internal fun pageShiftAt(isSettledPage: Boolean, shift: Float): Float =
  * 双指捏合/展开缩放（下限 = Fit，见 [MIN_ZOOM]）、放大后单指拖动平移。
  *
  * **E2-22 优化**（用户报"切图慢"，ADR-18 方案 B）：不再解全分辨率（12MP ≈48MB），改为
- * ① 按**显示尺寸**解码（[decodeFit]，Fit 档 ≈3MP ≈12MB）；② 360px 预览先上屏（[PREVIEW_SIDE]）；
+ * ① 按**显示尺寸**解码（[decodeFit]，Fit 档 ≈3MP ≈12MB）；② 预览档先上屏（[previewRequestFor]）；
  * ③ 相邻页只解预览（`beyondViewportPageCount = 1`）；④ 放大到 [ZOOM_HIRES] 补解一档。
+ *
+ * ★ **PV-1 修**（用户 2026-10-11 报："相册滑动图片还是会闪一下"）：E2-22 的预览档是固定
+ * 360px ⇒ 实际只解 500×375，被 `ContentScale.Fit` 放大 2.16–2.88× 才铺满显示区，与目标档之间
+ * 有一次**清晰度阶跃** —— 那就是用户说的"闪"。两道修：
+ * ① 预览请求改为**容器的一半**（[previewRequestFor]）⇒ 采样台阶比目标档低一档，放大倍数降到
+ *    1.08–1.44×（剩余差由 ② 兜住）；
+ * ② 换档时**交叉淡入** [PREVIEW_FADE_MS]ms —— 下层预览保持不动，上层目标档 alpha 0→1。
+ * E2-22 的两段式节奏、E2-20 的手势仲裁、E2-23 的缩放边界（[pageScaleAt] / [pageShiftAt] /
+ * `clipToBounds`）**一行未改**。
  *
  * ★ **E2-23 修**（用户 2026-10-13 报："相册放大图片隔壁图片会入侵视野"）：E2-22 的
  * `beyondViewportPageCount = 1` 让相邻页被组合/绘制，而 `zoom` / `pan` 是**整页共享**的
@@ -261,7 +312,15 @@ fun PhotoViewScreen(
     val currentUri = remember(currentKey) { currentKey?.let { Uri.parse(it) } }
 
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
-    // bitmap 对应的**是哪张图、哪个档位**（0 = 360px 预览，1 = Fit，2 = 放大档）。
+    // ★ PV-1：被 [bitmap] 盖住的**下层位图**（只有"同页升档"那一下才有：预览档 → 目标档）。
+    // 交叉淡入期间两层同时在屏上，[fade] 结束后立刻清掉（只多占 180ms 的一张预览内存）。
+    // 切页时**必须**清空 —— 上一张的像素哪怕只当淡出层也不能留在新页上。
+    var under by remember { mutableStateOf<Bitmap?>(null) }
+    // ★ PV-1：上层（[bitmap]）的淡入进度，1 = 全显。只在 `graphicsLayer` 的**绘制 block** 里读
+    // ⇒ 动画期间零重组（与 zoom/pan 同一套做法）。切页时必须 snapTo(1f) 复位：上一张的淡入
+    // 可能被取消在半路，不复位会让新页整张半透明。
+    val fade = remember { Animatable(1f) }
+    // bitmap 对应的**是哪张图、哪个档位**（0 = 预览档，1 = Fit，2 = 放大档）。
     // 用来区分"切页要重解"与"同页升档只需补解更高档"：缩回 Fit 时 shownTier=2 ≥ 目标 1 ⇒ 不重解
     // （高清留着更好，降回去反而更糊）。
     var shownUri by remember { mutableStateOf<String?>(null) }
@@ -347,6 +406,8 @@ fun PhotoViewScreen(
         zoom.floatValue = MIN_ZOOM
         pan.value = Offset.Zero
         bitmap = null // 上一张的像素内容不对，必须丢（不留作占位）
+        under = null // ★ PV-1：淡出层同理 —— 上一张的像素一个像素都不许留在新页上
+        fade.snapTo(1f) // ★ PV-1：上一张的淡入可能被取消在半路，新页必须从全显开始
         error = ""
         status = "" // 上一张的提示（分享失败等）不跟着跨图
         val u = uris.getOrNull(page)
@@ -358,9 +419,9 @@ fun PhotoViewScreen(
         meta = withContext(Dispatchers.IO) { queryMeta(context, Uri.parse(u)) }
     }
 
-    // ── 解码（E2-22 两段式 + 两档）────────────────────────────────────────
-    // ① 360px 预览先上屏（命中相邻页预载就零成本）→ ② 按显示尺寸解目标档（Fit / viewSize×2）。
-    // 目标档解码期间**旧位图一直占位**，解完才替换 —— 全程没有"转圈等大图"。
+    // ── 解码（E2-22 两段式 + 两档；★ PV-1 改预览档 + 交叉淡入）────────────────
+    // ① 预览档先上屏（命中相邻页预载就零成本）→ ② 按显示尺寸解目标档（Fit / viewSize×2）。
+    // 目标档解码期间**旧位图一直占位**，解完才替换（★ PV-1：替换走 [fade]，不再是瞬切）。
     LaunchedEffect(page, uris, hiRes, viewSize) {
         val u = uris.getOrNull(page) ?: return@LaunchedEffect
         val vw = viewSize.width
@@ -374,14 +435,18 @@ fun PhotoViewScreen(
 
         val parsed = Uri.parse(u)
         if (shownUri != u) {
-            // 切页：相邻页预载过这张就直接上屏（零解码），否则下面补一张
+            // 切页：相邻页预载过这张就直接上屏（零解码），否则下面补一张。
+            // ★ PV-1：这里**不保留淡出层** —— 换的是另一张图，交叉淡入会让上一张的像素在新页上
+            // 停留 180ms（用户滑动时看到的就是"糊着的前一张"）。换图就该是瞬切，淡入只用在升档。
+            under = null
             bitmap = previews.get(u)
             shownUri = u
             shownTier = 0
         }
         if (bitmap == null) {
             val preview = withContext(Dispatchers.IO) {
-                decodeFit(context, parsed, PREVIEW_SIDE, PREVIEW_SIDE)
+                val (pw, ph) = previewRequestFor(vw, vh)
+                decodeFit(context, parsed, pw, ph)
             }
             if (preview != null) {
                 bitmap = preview
@@ -393,6 +458,16 @@ fun PhotoViewScreen(
             decodeFit(context, parsed, vw * target, vh * target)
         }
         if (b != null) {
+            // ★ PV-1 交叉淡入，三步顺序**不能换**（换了下场是"闪一帧全黑"）：
+            // ① 先摆下层 —— `prev` 就是此刻屏上那一张，这一帧即使立刻渲染也看不出任何变化；
+            // ② 再归零上层 —— 屏上剩下的是 prev，与①之前**逐像素相同**（同一张位图）；
+            // ③ 最后换上目标档 —— 从 alpha 0 起，由下面的 [LaunchedEffect] 渐显到 1。
+            // 反例（先归零再摆下层）：上层 alpha=0 且下层还是 null ⇒ 中间渲染出**一帧纯黑**，
+            // 比原来的清晰度阶跃更刺眼。`snapTo` 是挂起函数，它让不让出主线程不由这里决定，
+            // 所以只能靠"顺序本身在任何中断点都自洽"来保证不黑屏。
+            val prev = bitmap
+            under = prev
+            if (prev != null) fade.snapTo(0f)
             bitmap = b
             shownTier = target
         } else if (bitmap == null) {
@@ -402,6 +477,18 @@ fun PhotoViewScreen(
             // 如实说一句，别让用户以为"这图就是这么糊" —— 不静默。
             status = "大图解码失败，当前是低清预览"
         }
+    }
+
+    // ── ★ PV-1 交叉淡入的驱动（key = [bitmap] ⇒ 只有"换图"才重启）────────────────────
+    // 归零在换图前就做完了（见上面解码协程的①②③），这里只负责把上层推到 1。
+    // **中断也安全**：协程被取消（用户又滑走 / 又放大）时 `fade` 停在中间值，下一次 effect 会
+    // 从当前值继续走到 1；切页则被上面那个 effect 直接 snapTo(1f) 复位。两条路都不会留下
+    // 半透明的页面。
+    // 收尾把 under 交回 GC —— 那张（3MB 量级）只在换档的这 180ms 里有存在价值。
+    // ⚠ 整段是**绘制层行为，JVM 单测覆盖不到**：真机确认步骤见报告 §5。
+    LaunchedEffect(bitmap) {
+        if (under != null) fade.animateTo(1f, tween(PREVIEW_FADE_MS)) else fade.snapTo(1f)
+        under = null
     }
 
     // 当前是哪张要回写路由层：从查看页进编辑器、退出回查看页时必须回到**同一张**（E2-20）。
@@ -553,38 +640,47 @@ fun PhotoViewScreen(
                             },
                         contentAlignment = Alignment.Center,
                     ) {
-                        // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 只解 360px 预览当占位
+                        // 当前页 = 主解码的位图（Fit / 放大档）；相邻页 = 只解预览档当占位
                         // （不占全尺寸内存）。★ E2-23 更正：**"相邻页必然是 Fit 态所以等于无变换"
                         // 是错的** —— 放大态下 Pager 只是不滚，相邻页照样被组合/绘制，而 zoom/pan
                         // 是整页共享的 state ⇒ 邻页被一起放大后越界画进视口（见 [pageScaleAt]）。
                         val neighbor = if (p == page) {
                             null
                         } else {
-                            uris.getOrNull(p)?.let { rememberPreview(previews, it, context) }
+                            uris.getOrNull(p)?.let {
+                                val (pw, ph) = previewRequestFor(viewSize.width, viewSize.height)
+                                rememberPreview(previews, it, context, pw, ph)
+                            }
                         }
                         val b = if (p == page) bitmap else neighbor
                         when {
                             p == page && error.isNotEmpty() ->
                                 Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
-                            b != null -> Image(
-                                bitmap = b.asImageBitmap(),
-                                contentDescription = "照片",
-                                contentScale = ContentScale.Fit,
-                                // graphicsLayer 的 block 在绘制阶段读 state ⇒ 手势只触发重绘，
-                                // 不触发重组（每帧拖动都重组整页会很卡）。
-                                // ★ E2-23：缩放/平移**只给停稳的那一页**（[pageScaleAt]）——
-                                // 相邻页跟着放大就会从视口外越界画进来（别张照片的像素盖在本页上，
-                                // 正是用户报的"入侵视野"）。此前这里对每页一视同仁，是这次 bug 的根因。
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .graphicsLayer {
-                                        val z = pageScaleAt(p == page, zoom.floatValue)
-                                        scaleX = z
-                                        scaleY = z
-                                        translationX = pageShiftAt(p == page, pan.value.x)
-                                        translationY = pageShiftAt(p == page, pan.value.y)
-                                    },
-                            )
+                            b != null -> {
+                                // ★ PV-1：下层 = 被换下去的那张（只有同页升档才有，切页恒为 null）。
+                                // 它必须用**同一个** [viewerLayer] 变换 —— 缩放态下两层错位就是重影，
+                                // 比原来的闪更难查。contentDescription 留空：它是装饰层，不是内容。
+                                if (p == page) under?.let { u ->
+                                    Image(
+                                        bitmap = u.asImageBitmap(),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier.viewerLayer(p == page, zoom, pan),
+                                    )
+                                }
+                                Image(
+                                    bitmap = b.asImageBitmap(),
+                                    contentDescription = "照片",
+                                    contentScale = ContentScale.Fit,
+                                    // graphicsLayer 的 block 在绘制阶段读 state ⇒ 手势/淡入只触发重绘，
+                                    // 不触发重组（每帧拖动都重组整页会很卡）。
+                                    // ★ E2-23：缩放/平移**只给停稳的那一页**（[pageScaleAt]）——
+                                    // 相邻页跟着放大就会从视口外越界画进来（别张照片的像素盖在本页上，
+                                    // 正是用户报的"入侵视野"）。此前这里对每页一视同仁，是这次 bug 的根因。
+                                    // ★ PV-1：alpha 也走同一个 block（[fade]），换档时 0→1 渐显。
+                                    modifier = Modifier.viewerLayer(p == page, zoom, pan) { fade.value },
+                                )
+                            }
                             p == page -> CircularProgressIndicator(color = FilmTheme.Accent)
                             // 相邻页预览还没解出来：保持黑底（滑动动画里几乎看不见），
                             // 不值得为它显示错误文案
@@ -726,18 +822,53 @@ private fun clampPan(pan: Offset, scale: Float, view: IntSize, bitmap: Bitmap?):
 }
 
 /**
- * 相邻页的 360px 预览（E2-22）：命中 [cache] 直接返回，否则后台解一张（解完刷新并回填缓存）。
+ * 照片的绘制层变换：**缩放/平移**（E2-20）+ **只给停稳页**（E2-23 [pageScaleAt] / [pageShiftAt]）
+ * + **淡入 alpha**（★ PV-1）。
+ *
+ * **为什么必须抽成一个函数**：PV-1 的交叉淡入要同时画两层（下层被换下去的预览 + 上层目标档），
+ * 两层各抄一遍变换代码迟早会抄歪 —— 缩放态下两层错位就是重影，比它要修的"闪"更难查。
+ *
+ * block 在**绘制阶段**执行（读 [FloatState] / [State] 不触发重组）：捏合时每帧改 zoom 只重绘
+ * 不重组；淡入时每帧改 alpha 同理。默认 alpha = 1（相邻页与下层都用默认值）。
+ */
+private fun Modifier.viewerLayer(
+    isSettledPage: Boolean,
+    zoom: FloatState,
+    pan: State<Offset>,
+    alpha: () -> Float = { 1f },
+): Modifier = fillMaxSize().graphicsLayer {
+    val z = pageScaleAt(isSettledPage, zoom.floatValue)
+    scaleX = z
+    scaleY = z
+    translationX = pageShiftAt(isSettledPage, pan.value.x)
+    translationY = pageShiftAt(isSettledPage, pan.value.y)
+    this.alpha = alpha()
+}
+
+/**
+ * 相邻页的预览档（E2-22 起；★ PV-1 改为按容器尺寸算请求，见 [previewRequestFor]）：
+ * 命中 [cache] 直接返回，否则后台解一张（解完刷新并回填缓存）。
  *
  * **只在 `p != page` 时调用** —— 当前页由主解码负责，同一张图解两次纯属浪费。失败返回 null，
  * 调用方保持黑底（相邻页不值得显示错误文案）。方向转正沿用 [decodeFit]（8 值含镜像）。
+ *
+ * [reqW] / [reqH] 是 key 的一部分：容器**未测量**（0）时直接不解 —— `decodeFit(ctx, uri, 0, 0)`
+ * 会退化成**全分辨率 48MB** 解码，那正是 E2-22 要消灭的东西。测量完成后 key 变化会重启，
+ * 不需要额外的哨兵。
  */
 @Composable
-private fun rememberPreview(cache: ThumbCache<String, Bitmap>, uri: String, context: Context): Bitmap? {
+private fun rememberPreview(
+    cache: ThumbCache<String, Bitmap>,
+    uri: String,
+    context: Context,
+    reqW: Int,
+    reqH: Int,
+): Bitmap? {
     var bmp by remember(uri) { mutableStateOf(cache.get(uri)) }
-    LaunchedEffect(uri) {
-        if (bmp != null) return@LaunchedEffect
+    LaunchedEffect(uri, reqW, reqH) {
+        if (bmp != null || reqW <= 0 || reqH <= 0) return@LaunchedEffect
         val b = withContext(Dispatchers.IO) {
-            decodeFit(context, Uri.parse(uri), PREVIEW_SIDE, PREVIEW_SIDE)
+            decodeFit(context, Uri.parse(uri), reqW, reqH)
         }
         if (b != null) {
             cache.put(uri, b)
