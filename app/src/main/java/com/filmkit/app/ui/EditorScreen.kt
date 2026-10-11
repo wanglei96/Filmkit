@@ -118,6 +118,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -759,7 +760,13 @@ fun EditorScreen(
     }
 
     /**
-     * 保存当前参数为预设。**只写与恒等值不同的槽**（[presetSparseSlots]，恒等值逐槽取
+     * ★ PS-2b：**新增**一条预设（用户 2026-10-11："编辑器可以保存当前配置为预设"）——
+     * 编辑器侧**唯一**的"写预设"入口之一（另一个是 [deletePreset]）。
+     *
+     * **永远是新 id**（[presetId] + 随机数）⇒ 绝不覆盖任何已保存的预设：这就是"新增"与
+     * "修改"的分界（修改已保存的预设只能在拍照界面做，见 [editorPresetManageHint]）。
+     *
+     * **只写与恒等值不同的槽**（[presetSparseSlots]，恒等值逐槽取
      * `CameraPresets.standard()`）—— 用户没动过的槽一个都不进库，这样套用时才不会把别人的
      * 画面打回默认（尤其是恒等值为 1.0 / 0.01 / 单位阵的那几组槽）。
      *
@@ -932,39 +939,13 @@ fun EditorScreen(
         status = "已删除预设：${p.name}"
     }
 
-    /**
-     * ★ U-6a「**更新为当前设置**」：把**当前编辑器的参数**重新稀疏化后写回该预设
-     * （改的是预设库里的那条，不是当前画面）。
-     *
-     * 四条口径：
-     *  1. **只对 `source == "user"` 可用**：判据复用 [presetDeletable]（内置只读，与删除同一
-     *     条判据，不在 UI 里重写一遍 `source` 比较）—— UI 侧内置详情里根本不渲染这个按钮；
-     *  2. **复用保存那一套稀疏化**（[presetSparseSlots] + [PresetStore.upsert]）：恒等值逐槽取
-     *     `CameraPresets.standard()`、"缺失 = 套用时保留当前值"这两条语义与 [savePreset] 逐位
-     *     相同 —— 另写一套稀疏化必然漂移，而漂移的表现是"更新后套用会把画面打回默认"；
-     *  3. **id / 名称 / 分组 / 创建时间 / source 全部不动**：更新的是"配方内容"，不是身份
-     *     （重命名是 E3-1b 的事，本卡不做）；
-     *  4. **不进编辑历史、不渲染**：它改的是预设库，当前参数与画面一位没动 ⇒ 记一步撤销会让
-     *     用户"撤销一次画面不动"（E2-25 的反面）。
-     *
-     * 列表刷新的坑与 [savePreset] 逐字相同（★ P-2c）：`PresetStore` 的返回值只含**用户预设**，
-     * 直接赋值会让内置三条当场从面板上消失 ⇒ 必须 `mergePresets(..., BuiltinPresets.load)`。
-     */
-    fun updatePreset(p: EditorPreset) {
-        if (!presetDeletable(p)) return              // 内置只读（与删除同一判据）
-        val film = params ?: return
-        val next = p.copy(
-            slots = presetSparseSlots(film),
-            lutId = lutId,
-            lutStrength = if (lutId != null) film[34] else 1.0,
-        )
-        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
-        status = "已更新预设：${next.name}（${next.slots.size} 项参数）"
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "app", "preset.update",
-            kv("id" to next.id, "slots" to next.slots.size, "lut" to (next.lutId ?: "")),
-        )
-    }
+    // ★ PS-2b（用户 2026-10-11 第二条澄清："编辑器可以保存当前配置为预设，**不能修改已保存的
+    // 预设**，可以删除"）：本文件**没有**任何"修改已保存预设"的路径 ——
+    // 曾经存在的 `updatePreset`（U-6a 的「更新为当前设置」）/ `renamePreset`（PS-1）/
+    // `copyPreset`（PS-1）已整体撤除，连带它们的菜单项与编辑面板。
+    // 写预设库的入口只剩两个：新增（[savePreset]，恒为**新 id**）与删除（[deletePreset]）。
+    // 修改已保存的预设去**拍照界面**（`CameraScreen`，PS-2a）—— 引导文案见
+    // [editorPresetManageHint]（面板上常驻那一行）。
 
     // ── 参数写入（E2-10：数据驱动，取代 E2-3/E2-7 的 16 个一模一样的 setter）────────────
     // 每个参数一行 [EditorParam]（见文件末尾的参数表），槽位映射全在 EditorExport.kt 的纯函数里
@@ -1824,8 +1805,11 @@ fun EditorScreen(
                     },
                 )
             } else if (presetMode) {
-                // ★ E3-1a：预设面板（取代参数面板，与裁剪工具栏同一层）—— 最小入口：
-                // 保存当前 / 套用 / 删除（二次确认）。列表缩略图、分组筛选、长按菜单是 E3-1b。
+                // ★ E3-1a：预设面板（取代参数面板，与裁剪工具栏同一层）。
+                // ★ PS-2b（用户 2026-10-11）：编辑器侧 = **只读 + 套用 + 新增 + 删除** ——
+                // 面板里能做的只有：看配置（只读详情）/ 套用（含强度）/ 保存当前为新预设 /
+                // 删除（二次确认 + 内置只读）。**改不了任何已保存的预设**（没有编辑 / 重命名 /
+                // 复制 / 更新为当前设置）；要改请去拍照界面（面板上那行引导文案）。
                 PresetPanel(
                     presets = presets,
                     canSave = params != null,
@@ -1836,10 +1820,12 @@ fun EditorScreen(
                     amount = presetAmount,
                     onAmount = { dragPresetAmount(it) },
                     onAmountFinished = { onPresetAmountRelease() },
+                    // ★ PS-1：新建态的"参数清单"= 当前编辑器参数的稀疏集（用户看得见将要保存什么）。
+                    // 与 savePreset 走**同一个** presetSparseSlots ⇒ 清单与实际保存内容不可能不一致。
+                    currentSlots = params?.let { presetSparseSlots(it) } ?: emptyMap(),
+                    // ★ PS-2b：只剩"新增"（新 id）与"删除"两条写路径。
                     onSave = { n, g -> savePreset(n, g) },
                     onApply = { applyPreset(it) },
-                    // ★ U-6a：「更新为当前设置」（仅 user 预设；内置在详情里不渲染该按钮）
-                    onUpdate = { updatePreset(it) },
                     onDelete = { deletePreset(it) },
                     onHandleDrag = { dy -> onHandleDrag(dy) },
                     onTogglePanel = { panel = panel.toggled() },
@@ -3411,34 +3397,46 @@ private fun CropToolBar(
 }
 
 /**
- * ★ E3-1a 预设面板（**最小入口**）：与裁剪工具栏同一层 —— 取代参数面板，不叠在预览上。
+ * ★ E3-1a 预设面板：与裁剪工具栏同一层 —— 取代参数面板，不叠在预览上。
  *
- * 本卡只做核心闭环：**保存当前 / 套用 / 删除（二次确认）**。缩略图（用用户自己的照片实时
- * 渲染）、分组筛选 / 搜索、长按菜单（重命名 / 复制 / 收藏）留给 E3-1b，
- * 强度滑杆留给 E3-1c —— 面板上每一个动作背后都已经有一条跑得通的纯逻辑（EditorExport.kt）。
+ * ## ★ PS-2b（用户 2026-10-11 第二条澄清）：编辑器侧 = **看 / 套用 / 新增 / 删除**，改不了已有的
  *
- * ★ U-6a：**详情 +「更新为当前设置」已做**（点列表行的名称区进详情，见 [PresetDetailPanel]）
- * —— "展示全部可调参数"与"编辑预设"这两条用户需求的落点。
+ * 用户原话："**编辑器可以保存当前配置为预设，不能修改已保存的预设，可以删除**"。
+ * 于是本面板的动作面收窄到四项（清单的**唯一维护点** = [editorPresetActions]，UI 从它渲染、
+ * 单测从它断言 —— 改这条产品约束只需改那一处，`PresetPanelUiTest` 会跟着红）：
+ *  1. **看配置**：点行内名称区（行尾「›」）或「⋯」→「查看配置」进只读详情 [PresetDetailPanel]
+ *     （分组标题 + 「名称 读数」+ LUT 行，数据源 [presetDetailSections]）；列表行本身还显示
+ *     一行**参数摘要** [presetSummaryText] ⇒ "这条预设包含什么"在列表上就能看见。
+ *  2. **套用**：行内实心「套用」按钮（主操作）+ E3-1c 的强度滑杆（套用后出现在面板顶部）。
+ *  3. **新增**：顶部常驻「+ 新建预设」（PS-1 的形态保留）⇒ 进新建面板 [PresetNewPanel]：
+ *     名称 / 分组（**预填默认名** [defaultPresetName]）+ 将要保存的参数清单 + 「保存当前参数
+ *     为新预设」。落库走 [savePreset] —— **永远是新 id**，不覆盖任何已有预设。
+ *  4. **删除**：「⋯」→「删除」+ 二次确认 [pendingDelete]；内置预设置灰（判据 [presetDeletable]，
+ *     P-2c 的唯一实现）+ 菜单底部一句实话。
  *
- * ★ P-2c：列表 = 用户预设 + **内置三条**（`BuiltinPresets.all`）。内置预设**不可删** ——
- * 它们的删除按钮根本不渲染（[PresetRow] 按 [presetDeletable] 分支，不是"点了才报错"）；
- * 其余操作（套用 / 强度 / 看详情）与用户预设完全一致，只有「更新为当前设置」与「删除」
- * 按 [presetDeletable] 隐藏（★ U-6a 沿用同一条判据）。重命名 / 复制本面板**还没有**（E3-1b）。
+ * **撤掉的**（"修改已保存的预设"那一类，一条路径都不留）：`编辑` / `重命名` / `复制` 菜单项、
+ * 编辑面板的编辑态、「更新为当前设置」—— 要改已保存的预设请去**拍照界面**（`CameraScreen`，
+ * PS-2a）；面板上常驻的引导文案 [editorPresetManageHint] 会告诉用户这一点。
+ * 用户预设与内置预设在本面板**都不可改**：可改性不是"来源"的函数，本面板压根没有那条路径。
  *
- * 为什么保存入口在这里而不是顶栏：`EditorTopBar` 只有 取消 / 相册 / 撤销 / 重做 / 覆盖 /
+ * 为什么新增入口在这里而不是顶栏：`EditorTopBar` 只有 取消 / 相册 / 撤销 / 重做 / 覆盖 /
  * 完成（调研 §5.4 的事实核对），硬塞一个「保存预设」会挤占主操作位；而底栏「预设」本来就是
  * ADR-14 底栏六项之一（此前置灰留位），"在预设面板里保存"也正是 Lightroom 的组织方式
  *（Presets 面板底部的 +）。
  *
- * 列表项显示"名称 + 分组 + 槽位数"而不是缩略图：缩略图必须用**用户自己的照片**渲染
+ * 列表项显示"名称 + 分组 + **参数摘要**"而不是缩略图：缩略图必须用**用户自己的照片**渲染
  *（Lightroom / Capture One 都如此），预烘焙的通用图反而会误导（调研 §5.1 D5）。
+ *
+ * 刷新纪律（★ P-2c 的坑）：新增 / 删除两条写路径**一律**
+ * `mergePresets(PresetStore.xxx(...), BuiltinPresets.load(context))` —— 只赋 `PresetStore`
+ * 的返回值会让**内置三条当场从面板上消失**（回归哨兵见 `PresetPanelUiTest`）。
  */
 @Composable
 private fun PresetPanel(
     presets: List<EditorPreset>,
-    /** 参数已就绪（首帧前不能保存） */
+    /** 参数已就绪（首帧前不能保存 / 套用） */
     canSave: Boolean,
-    /** 与参数面板共用同一行提示（保存 / 套用 / 删除的结果都在这里回显） */
+    /** 与参数面板共用同一行提示（新增 / 套用 / 删除的结果都在这里回显） */
     status: String,
     /** ★ E3-1c：当前生效的预设（null = 还没有套用过 ⇒ 不显示强度行） */
     applied: EditorPreset?,
@@ -3446,23 +3444,43 @@ private fun PresetPanel(
     amount: Float,
     onAmount: (Float) -> Unit,
     onAmountFinished: () -> Unit,
+    /** ★ PS-1：新建面板的"参数清单"预览 = 当前编辑器参数的稀疏集 */
+    currentSlots: Map<Int, Double>,
+    /** ★ PS-2b：新增（保存当前参数为**新**预设） */
     onSave: (String, String) -> Unit,
     onApply: (EditorPreset) -> Unit,
-    /** ★ U-6a：「更新为当前设置」—— 用当前编辑器参数重写这条预设（仅 user 预设） */
-    onUpdate: (EditorPreset) -> Unit,
+    /** ★ PS-2b：删除（二次确认在本面板里；内置预设不可删） */
     onDelete: (EditorPreset) -> Unit,
     onHandleDrag: (Float) -> Unit,
     onTogglePanel: () -> Unit,
 ) {
+    val context = LocalContext.current
     var name by remember { mutableStateOf("") }
     var group by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<EditorPreset?>(null) }
-    // ★ U-6a 详情：存 **id** 而不是对象 —— `presets` 刷新后（保存 / 更新 / 删除）详情自动显示
-    // 新内容；预设被删（不在列表里）⇒ null ⇒ 自动回到列表。存对象会显示过期参数（"更新了
-    // 为当前设置，详情里还是旧值"这种最难查的 bug 在结构上就不存在）。
+    // ★ U-6a 详情：存 **id** 而不是对象 —— `presets` 刷新后（新增 / 删除）详情自动显示新内容；
+    // 预设被删（不在列表里）⇒ null ⇒ 自动回到列表。存对象会显示过期参数（"删了以后详情里
+    // 还留着它"这种最难查的 bug 在结构上就不存在）。
     var detailId by remember { mutableStateOf<String?>(null) }
     val detail = detailId?.let { id -> presets.firstOrNull { it.id == id } }
-    val canCommit = canSave && name.isNotBlank()
+    // ★ PS-2b 新建面板：只有"新建"这一态（编辑态随"改预设库"一起撤除）⇒ 一个布尔量就够。
+    var newOpen by remember { mutableStateOf(false) }
+    // ★ PS-1 操作菜单：菜单开着的那一条（null = 没开）
+    var menuFor by remember { mutableStateOf<EditorPreset?>(null) }
+
+    /** 打开新建面板：**预填默认名**（用户不必先想名字，保存按钮一路可点） */
+    fun openNew() {
+        name = defaultPresetName(presets)
+        group = ""
+        newOpen = true
+        detailId = null
+    }
+
+    /** 关闭新建面板（返回列表）。输入框内容留在原地，下次打开会被 [openNew] 覆盖。 */
+    fun closeNew() {
+        newOpen = false
+    }
+
     Column(
         Modifier
             .fillMaxWidth()
@@ -3483,49 +3501,65 @@ private fun PresetPanel(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 2.dp),
         )
-        if (detail != null) {
-            // ★ U-6a：详情**取代列表**（同一层，不叠控件）—— 顶部「‹ 返回」回列表。
+        if (newOpen) {
+            // ★ PS-2b：新建面板**取代列表**（同一层，不叠控件）—— 与详情、裁剪工具栏同一套层级语言。
+            // 参数清单 = 当前参数的稀疏集（用户看得见将要保存什么）；与 [savePreset] 走**同一个**
+            // [presetSparseSlots] ⇒ 清单与实际落库内容不可能不一致。
+            PresetNewPanel(
+                slots = currentSlots,
+                name = name,
+                onName = { name = it },
+                group = group,
+                onGroup = { group = it },
+                canSave = canSave,
+                onBack = { closeNew() },
+                onSave = {
+                    onSave(name, group)
+                    closeNew()
+                },
+            )
+        } else if (detail != null) {
+            // ★ U-6a：只读详情（「⋯」→「查看配置」或点行内名称区）—— 顶部「‹ 返回」回列表。
             // 用 if/else 而不是 `return@Column`：Composable 的 early return 在重组路径上更难读，
             // 而这里两个分支互斥且都在同一个 Column 里。
             PresetDetailPanel(
                 p = detail,
                 onBack = { detailId = null },
                 onApply = { onApply(detail) },
-                onUpdate = { onUpdate(detail) },
+                // ★ PS-2b：删除保留（用户："可以删除"）；内置预设那枚按钮**不渲染**（P-2c 的纪律：
+                // 不做"点了才报错"），换成一句"内置预设 · 只读"。
                 onDelete = { pendingDelete = detail },
             )
         } else {
+        // ★ PS-1：列表顶部**常驻**的「+ 新建预设」（用户第 1 条诉求的入口，不再需要先填名称）。
+        // ★ PS-2b：右侧改成**引导文案** [editorPresetManageHint] —— 编辑器改不了已保存的预设，
+        // 得让用户知道去哪改（否则"找不到入口"的老问题只是换了个方向）。
         Row(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PresetField(name, { name = it }, "预设名称", Modifier.weight(1f))
-            Spacer(Modifier.width(8.dp))
-            PresetField(group, { group = it }, "分组（可空）", Modifier.weight(1f))
-            Spacer(Modifier.width(8.dp))
             Text(
-                "保存当前",
-                color = if (canCommit) FilmTheme.OnAccent else DisabledInk,
+                "+ 新建预设",
+                color = FilmTheme.OnAccent,
                 fontSize = 12.sp,
                 maxLines = 1,
+                fontWeight = FontWeight.SemiBold,
                 modifier = Modifier
                     .clip(RoundedCornerShape(10.dp))
-                    .background(if (canCommit) FilmTheme.Accent else Color.Transparent)
-                    .border(
-                        1.dp,
-                        if (canCommit) FilmTheme.Accent else DisabledInk,
-                        RoundedCornerShape(10.dp),
-                    )
-                    .pressScale(enabled = canCommit, onTap = {
-                        if (canCommit) {
-                            onSave(name, group)
-                            name = ""
-                            group = ""
-                        }
-                    })
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                    .background(FilmTheme.Accent)
+                    .pressScale(pressedScale = 0.94f, onTap = { openNew() })
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                editorPresetManageHint(),
+                color = FilmTheme.CreamDim,
+                fontSize = 10.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
         }
         Spacer(Modifier.height(6.dp))
@@ -3583,7 +3617,7 @@ private fun PresetPanel(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    if (canSave) "还没有预设：填名称 → 点「保存当前」" else "参数加载中…",
+                    if (canSave) "还没有预设：点「+ 新建预设」保存当前参数" else "参数加载中…",
                     color = FilmTheme.CreamDim,
                     fontSize = 12.sp,
                 )
@@ -3598,15 +3632,100 @@ private fun PresetPanel(
                 items(presets, key = { it.id }) { p ->
                     PresetRow(
                         p,
+                        // ★ PS-1：参数摘要（LUT 的中文名要 Context 查 ⇒ 在这里查，纯逻辑层不碰）
+                        summary = presetSummaryText(
+                            p,
+                            lutLabel = p.lutId?.let { id -> LutLibrary.byId(context, id)?.label },
+                        ),
+                        // ★ PS-2b：套用可用性由动作清单判（[editorPresetActions]，参数没就绪时置灰）
+                        paramsReady = canSave,
                         onApply = { onApply(p) },
-                        // ★ U-6a：点名称区进详情（"›" 是入口提示；「套用」仍是右侧那个实心按钮）
+                        // ★ U-6a：点名称区进只读详情（行尾「›」是入口提示）
                         onOpenDetail = { detailId = p.id },
-                        onDelete = { pendingDelete = p },
+                        // ★ PS-1：行尾「⋯」= 操作菜单（显式入口，取代"猜哪里能点"）
+                        onMenu = { menuFor = p },
                     )
                 }
             }
         }
         }
+    }
+    // ★ PS-1/PS-2b 操作菜单（显式入口）：**由动作清单 [editorPresetActions] 驱动**（唯一维护点）——
+    // 菜单里只可能出现"看配置 / 删除"这两项；"编辑 / 重命名 / 复制 / 更新为当前设置"这类
+    // "改已保存预设"的动作在清单里**根本不存在**（改这条产品约束只需改那一处，单测跟着红）。
+    // 不可用的项置灰但**保留在列表里**（PS-1 的纪律），底部一句实话说明为什么灰。
+    // 用 AlertDialog 而不是 DropdownMenu：本页已有的浮层全是 AlertDialog（删除确认 / 取消确认），
+    // 一套层级语言。
+    menuFor?.let { p ->
+        AlertDialog(
+            onDismissRequest = { menuFor = null },
+            shape = RoundedCornerShape(18.dp),
+            title = {
+                Text(
+                    p.name,
+                    color = FilmTheme.Cream,
+                    fontFamily = FilmTheme.Serif,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            },
+            text = {
+                Column(Modifier.fillMaxWidth()) {
+                    // 「套用」是行内那个实心主按钮，菜单里不重复 ⇒ 这里渲染其余动作。
+                    editorPresetActions(p, canSave)
+                        .filter { it.action != PresetAction.APPLY }
+                        .forEach { item ->
+                            Text(
+                                item.label,
+                                color = if (item.enabled) FilmTheme.Cream else DisabledInk,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .pressScale(
+                                        pressedScale = 0.97f,
+                                        enabled = item.enabled,
+                                        onTap = {
+                                            menuFor = null
+                                            when (item.action) {
+                                                PresetAction.VIEW -> detailId = p.id
+                                                PresetAction.DELETE -> pendingDelete = p
+                                                // 编辑器清单里不该有别的动作；真冒出来 ⇒ 这里什么都不做，
+                                                // 由 `PresetPanelUiTest` 的清单哨兵喊出来，而不是让一个
+                                                // "能改预设库"的按钮悄悄生效。
+                                                else -> Unit
+                                            }
+                                        },
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 9.dp),
+                            )
+                        }
+                    // 一句实话（内置预设为什么删除是灰的）；用户预设 ⇒ 这行不出现
+                    if (editorPresetActions(p, canSave).none { it.action == PresetAction.DELETE && it.enabled }) {
+                        Text(
+                            "内置预设只读：可套用 / 查看配置，不能删除",
+                            color = FilmTheme.CreamDim,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                        )
+                    }
+                    // ★ PS-2b：引导文案（恒定一行）。菜单正是用户找"编辑"的地方 ⇒ 把"去哪改"
+                    // 放在他正在找的位置（ADR-12：界面要自己说清楚），而不是让他以为功能坏了。
+                    Text(
+                        editorPresetManageHint(),
+                        color = FilmTheme.CreamDim,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { menuFor = null }) {
+                    Text("取消", color = FilmTheme.CreamDim, fontFamily = FilmTheme.Mono)
+                }
+            },
+        )
     }
     // 删除二次确认（本卡硬要求）：取消 = 什么都不做，只关框（预设、参数、画面全不动）
     pendingDelete?.let { p ->
@@ -3668,38 +3787,46 @@ private fun PresetField(
 }
 
 /**
- * 预设列表的一行：名称 + 副标题（分组 · 槽位数 · LUT）+「套用」/「删除」。
+ * 预设列表的一行：名称（+ 来源标记 + 分组）+ **参数摘要** +「套用」+「⋯」。
  *
- * ★ P-5：副标题下可能再多一行**字段作用域提示**（[presetScopeNotice]，场景 = 编辑器链路
- * `passStyle`）—— 含 `[5..10]` 胶片曲线 / `[37][38]` 黑白点 的预设在本页套用**没有视觉效果**
- * （编辑器链路 `kFsStyle` 里没有 filmic，等 U-2）。全部生效时这行**不渲染** ⇒ 内置三条
- * （只含颗粒 / 暗角 / 分离色调）**现在都不出这行**。
+ * ★ PS-2b（用户 2026-10-11："不能修改已保存的预设"）本行两处口径：
+ *  1. **套用的可用性来自动作清单** [editorPresetActions]（[paramsReady] = 当前参数已就绪）：
+ *     清单里没有 APPLY ⇒ 按钮不存在；置灰与否由清单里的 `enabled` 说了算。UI 不自己再判一遍
+ *     "什么时候能套用"，否则清单与界面会各说各话。
+ *  2. **「⋯」菜单里只有"查看配置 / 删除"**（同样是清单驱动，见 [PresetPanel]）：本行不再承载
+ *     任何"改预设库"的入口 —— 编辑 / 重命名 / 复制在编辑器侧**不存在**，改预设请去拍照界面。
  *
- * ⚠ ★ **U-1（2026-10-11）已接线 `[23][24]` 分离色调 + `[25]` 单色** ⇒ 它们两侧都生效、
- * 不再是"仅拍照"（本注释此前写的就是这三槽 + `[5..10]`，已按接线后的实际行为更正；
- * `PresetScope.kt` 是判据的唯一维护点，本文件不复述槽位清单的第二份）。
+ * ★ PS-1 保留下来的三件事（用户投诉"看不到预设包含什么"的答案）：
+ *  **参数摘要**（[presetSummaryText]，由调用侧传进来 —— LUT 中文名要 Context 查；复用
+ *  [presetDetailSections] 的中文名 / 读数格式化，与详情页**逐字相同**）、**行尾「⋯」**
+ *  （操作菜单的显式入口，取代"猜哪里能点"）、**「内置」来源标记**（判据 [presetDeletable]，
+ *  P-2c 的唯一实现；内置不可删这件事同时由菜单里的置灰项 + 一句实话承载）。
  *
- * ★ P-2c：**内置预设不可删**（[presetDeletable]）—— 删除按钮的位置换成一枚**不可点**的
- * 「内置」标记。**不是"点了才报错"**：删除按钮根本不渲染（也就没有"点了才发现删不掉"的路径）。
- * 理由：内置包随包分发，删了下次启动又回来；留一个能点的删除按钮，用户会以为删掉了。
- * 用户自建预设（`source == "user"`）的渲染与行为**逐位不变**。
+ * ★ P-5：摘要下可能再多一行**字段作用域提示**（[presetScopeNotice]，场景 = 编辑器链路
+ * `passStyle`）。★ U-1（2026-10-11）已接线 `[23][24]` 分离色调 + `[25]` 单色，★ U-2 接线
+ * `[5..10]` / `[37][38]` ⇒ 判据表当前为空 ⇒ 内置三条与用户预设**都不出这行**
+ *（`PresetScope.kt` 是判据的唯一维护点，本文件不复述槽位清单的第二份）。
  *
- * ★ U-6a：**点名称区 = 进详情**（[onOpenDetail]），名称右侧一枚「›」是入口提示 ——
- * 「套用」仍是右边那个实心按钮，两者的分工与既有风格一致（主操作永远是实心 accent 按钮）。
+ * ★ U-6a：**点名称区 = 进只读详情**（[onOpenDetail]，行尾「›」是入口提示）——「套用」仍是
+ * 右边那个实心按钮，主操作永远最显眼。菜单里的「查看配置」是同一个落点的显式入口。
  * 没有做成"长按"：长按在这块面板里没有任何既有手势，用户不会去试（ADR-12：界面要自己说清楚）。
  */
 @Composable
 private fun PresetRow(
     p: EditorPreset,
+    /** ★ PS-1：参数摘要（含 LUT 行）；空串 ⇒ 显示"不含参数" */
+    summary: String,
+    /** ★ PS-2b：当前参数已就绪（套用的唯一前置条件，由 [editorPresetActions] 判） */
+    paramsReady: Boolean,
     onApply: () -> Unit,
     onOpenDetail: () -> Unit,
-    onDelete: () -> Unit,
+    /** ★ PS-1：打开「⋯」操作菜单 */
+    onMenu: () -> Unit,
 ) {
-    val sub = buildString {
-        if (p.group.isNotEmpty()) append(p.group).append(" · ")
-        append(p.slots.size).append(" 项参数")
-        if (p.lutId != null) append(" · LUT")
-    }
+    // ★ PS-2b：套用的可用性 = 动作清单里的 APPLY 项（清单是"编辑器能做什么"的唯一维护点）
+    val applyEnabled = editorPresetActions(p, paramsReady)
+        .first { it.action == PresetAction.APPLY }
+        .enabled
     Row(
         Modifier
             .fillMaxWidth()
@@ -3722,16 +3849,39 @@ private fun PresetRow(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false),
                 )
+                // ★ PS-1：来源标记（判据仍是 presetDeletable —— 内置只读的唯一实现）
+                if (!presetDeletable(p)) {
+                    Text(
+                        " 内置",
+                        color = DisabledInk,
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .border(1.dp, DisabledInk, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 4.dp, vertical = 1.dp),
+                    )
+                }
+                if (p.group.isNotEmpty()) {
+                    Text(
+                        "  ${p.group}",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 Text(" ›", color = DisabledInk, fontSize = 13.sp, maxLines = 1)
             }
+            // ★ PS-1：**这条预设包含什么**（用户第 1 条诉求的行内答案）
             Text(
-                sub,
+                summary.ifEmpty { "不含参数（套用时其余参数保持不动）" },
                 color = FilmTheme.CreamDim,
                 fontSize = 10.sp,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
-            // ★ P-5：**单独一行**而不是拼进 sub —— sub 是单行省略号，拼进去会把后半句
+            // ★ P-5：**单独一行**而不是拼进摘要 —— 摘要本身就会截断，拼进去会把后半句
             //（"编辑器里不生效"）截掉，只剩半句话比不提示更糟。全部生效 ⇒ null ⇒ 不占行。
             presetScopeNotice(p, PresetScene.EDITOR)?.let { notice ->
                 Text(
@@ -3743,44 +3893,40 @@ private fun PresetRow(
                 )
             }
         }
+        // ★ PS-2b：套用 = 唯一"改当前画面"的动作（参数 + LUT + 一步撤销），可用性来自清单。
+        // 不可用时**置灰**而不是隐藏（PS-1 的纪律：藏起来才是投诉的根因）。
         Text(
             "套用",
-            color = FilmTheme.OnAccent,
+            color = if (applyEnabled) FilmTheme.OnAccent else DisabledInk,
             fontSize = 12.sp,
             maxLines = 1,
             modifier = Modifier
                 .clip(RoundedCornerShape(9.dp))
-                .background(FilmTheme.Accent)
-                .pressScale(pressedScale = 0.94f, onTap = onApply)
+                .background(if (applyEnabled) FilmTheme.Accent else Color.Transparent)
+                .border(
+                    1.dp,
+                    if (applyEnabled) FilmTheme.Accent else DisabledInk,
+                    RoundedCornerShape(9.dp),
+                )
+                .pressScale(pressedScale = 0.94f, enabled = applyEnabled, onTap = onApply)
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         )
         Spacer(Modifier.width(6.dp))
-        // ★ P-2c：内置预设没有删除按钮（只有一枚说明性的「内置」标记）——
-        // 判据是 presetDeletable，不在 UI 里重写一遍 source 比较。
-        if (presetDeletable(p)) {
-            Text(
-                "删除",
-                color = FilmTheme.CreamDim,
-                fontSize = 12.sp,
-                maxLines = 1,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(9.dp))
-                    .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
-                    .pressScale(pressedScale = 0.94f, onTap = onDelete)
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-            )
-        } else {
-            Text(
-                "内置",
-                color = DisabledInk,
-                fontSize = 12.sp,
-                maxLines = 1,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(9.dp))
-                    .border(1.dp, DisabledInk, RoundedCornerShape(9.dp))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-            )
-        }
+        // ★ PS-1：「⋯」= 显式操作菜单入口（★ PS-2b：菜单里只有"查看配置 / 删除"）。
+        // 内置预设这一枚按钮**照样渲染**（菜单里的受限项置灰可见）—— 隐藏正是 PS-1 投诉的根因。
+        Text(
+            "⋯",
+            color = FilmTheme.Cream,
+            fontSize = 15.sp,
+            maxLines = 1,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .clip(RoundedCornerShape(9.dp))
+                .background(FilmTheme.ChipBg)
+                .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                .pressScale(pressedScale = 0.94f, onTap = onMenu)
+                .padding(horizontal = 12.dp, vertical = 3.dp),
+        )
     }
 }
 
@@ -3793,24 +3939,27 @@ private fun PresetRow(
  * **只列这条预设真正包含的槽**（稀疏语义 = "缺失 = 套用时保留当前值"）。
  *
  * 三件事**刻意不做**（本卡的边界，见 `docs/reports/u6a-preset-detail-REPORT.md`）：
- *  - **不做逐项编辑**：改参数是参数面板的职责（详情的"操作"只有套用 / 更新为当前设置 / 删除）；
- *  - **不做重命名 / 复制 / 导入导出**：E3-1b / E3-2；
+ *  - **不做逐项编辑**：改参数是参数面板的职责；
+ *  - **不做导入导出**：E3-2；
  *  - **不显示"仅拍照 / 仅后期"作用域提示**：那是 P-5 的行内提示（[presetScopeNotice]），
  *    在列表行上已经有了；详情再抄一遍会变成两处文案各自漂移。
  *
- * 入口 = 列表行的名称区（[PresetRow] 的「›」）；布局上详情**取代列表**（同一层，不叠控件），
- * 顶部「‹ 返回」回列表 —— 与裁剪工具栏"取代参数面板"是同一种层级语言。
+ * ★ PS-2b（用户 2026-10-11："不能修改已保存的预设，可以删除"）：本面板的"操作"只剩
+ * **套用**（主）与**删除**（仅用户预设，二次确认在 [PresetPanel] 里）——
+ * 曾经在这里的「更新为当前设置」已随 `updatePreset` 一起撤除（那是"改已保存的预设"）。
+ * **只读语义不变**：参数清单仍然一个字节都不写回预设库，改预设请去拍照界面
+ * （[editorPresetManageHint] 是界面上那句话的唯一定义处）。
+ *
+ * ★ PS-1：**两个显式入口**（点行内名称区 / 「⋯」→「查看配置」）；参数清单的渲染与新建面板
+ * **共用** [PresetParamList]（一份实现，两处不可能漂移）。
  */
 @Composable
 private fun PresetDetailPanel(
     p: EditorPreset,
     onBack: () -> Unit,
     onApply: () -> Unit,
-    onUpdate: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val sections = presetDetailSections(p.slots)
     val lut = presetLutLine(p)
     Column(
         Modifier
@@ -3858,86 +4007,10 @@ private fun PresetDetailPanel(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 3.dp),
         )
-        // ③ 参数清单：分组标题 + 「名称 读数」。限高 208dp（比列表的 168dp 略高，仍不挤预览区）
-        LazyColumn(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(max = 208.dp),
-        ) {
-            sections.forEach { sec ->
-                item(key = "sec_${sec.title}") {
-                    Text(
-                        sec.title,
-                        color = FilmTheme.Accent,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        modifier = Modifier.padding(start = 16.dp, top = 5.dp, bottom = 1.dp),
-                    )
-                }
-                items(sec.rows, key = { "row_${it.slot}" }) { r ->
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 1.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            r.label,
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            r.value,
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            fontFamily = FilmTheme.Mono,
-                            maxLines = 1,
-                        )
-                    }
-                }
-            }
-            if (sections.isEmpty()) {
-                item(key = "noParams") {
-                    Text(
-                        "这条预设不含参数（套用时其余参数全部保持不动）",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    )
-                }
-            }
-            // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进参数清单
-            lut?.let { line ->
-                item(key = "lut") {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 1.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "LUT",
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            fontFamily = FilmTheme.Mono,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-        }
-        // ④ 操作：套用（主）/ 更新为当前设置（仅 user）/ 删除（仅 user，二次确认复用面板那份）
+        // ③ 参数清单（★ PS-1 起与编辑面板**共用** [PresetParamList]：同一份渲染，不会各写一套）
+        PresetParamList(slots = p.slots, lut = lut, maxHeight = 208.dp)
+        // ④ 操作：**套用**（主）/ **删除**（仅用户预设，二次确认复用面板那份）——
+        //    ★ PS-2b：这里没有"改这条预设"的按钮，一个都没有（改预设去拍照界面）。
         Row(
             Modifier
                 .fillMaxWidth()
@@ -3955,21 +4028,9 @@ private fun PresetDetailPanel(
                     .pressScale(pressedScale = 0.94f, onTap = onApply)
                     .padding(horizontal = 12.dp, vertical = 6.dp),
             )
-            // ★ 只对 user 预设：判据复用 presetDeletable（内置只读）—— 内置详情里这两个按钮
+            // ★ 只对 user 预设：判据复用 presetDeletable（内置只读）—— 内置详情里那枚按钮
             //   根本不渲染（与 PresetRow 的「内置」标记同一条纪律：不做"点了才报错"）
             if (presetDeletable(p)) {
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    "更新为当前设置",
-                    color = FilmTheme.Accent,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(9.dp))
-                        .border(1.dp, FilmTheme.Accent, RoundedCornerShape(9.dp))
-                        .pressScale(pressedScale = 0.94f, onTap = onUpdate)
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                )
                 Spacer(Modifier.width(8.dp))
                 Text(
                     "删除",
@@ -3986,6 +4047,243 @@ private fun PresetDetailPanel(
                 Spacer(Modifier.width(8.dp))
                 Text("内置预设 · 只读", color = DisabledInk, fontSize = 11.sp, maxLines = 1)
             }
+        }
+    }
+}
+
+/**
+ * ★ PS-1：**参数清单**（分组标题 + 「名称 读数」+ LUT 行）—— 只读详情（U-6a）与编辑面板
+ *（PS-1）**共用同一份渲染**。
+ *
+ * 为什么抽出来：两处都要回答"这条预设包含什么"，各写一份的代价是字号 / 行高 / 空态文案
+ * 慢慢分叉（"详情里有 LUT 行、编辑面板里没有"这类 bug 只能靠肉眼发现）。数据源仍是
+ * [presetDetailSections]（中文名 / 单位 / 分组的**唯一维护点**）。
+ *
+ * @param slots 要展示的稀疏槽位（详情 = 这条预设的 slots；编辑面板新建态 = 当前参数的稀疏集）
+ * @param lut LUT 行（[presetLutLine]；null ⇒ 不渲染 —— 与"缺失 = 不套用"的语义一致）
+ * @param maxHeight 限高（面板嵌在布局流里，清单再长也不该把预览挤没）
+ */
+@Composable
+private fun PresetParamList(slots: Map<Int, Double>, lut: PresetLutLine?, maxHeight: Dp) {
+    val context = LocalContext.current
+    val sections = presetDetailSections(slots)
+    LazyColumn(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(max = maxHeight),
+    ) {
+        sections.forEach { sec ->
+            item(key = "sec_${sec.title}") {
+                Text(
+                    sec.title,
+                    color = FilmTheme.Accent,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    modifier = Modifier.padding(start = 16.dp, top = 5.dp, bottom = 1.dp),
+                )
+            }
+            items(sec.rows, key = { "row_${it.slot}" }) { r ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 1.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        r.label,
+                        color = FilmTheme.Cream,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        r.value,
+                        color = FilmTheme.Cream,
+                        fontSize = 12.sp,
+                        fontFamily = FilmTheme.Mono,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        if (sections.isEmpty()) {
+            item(key = "noParams") {
+                Text(
+                    "这条预设不含参数（套用时其余参数全部保持不动）",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+        }
+        // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进参数清单
+        lut?.let { line ->
+            item(key = "lut") {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 1.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "LUT",
+                        color = FilmTheme.Cream,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
+                        color = FilmTheme.Cream,
+                        fontSize = 12.sp,
+                        fontFamily = FilmTheme.Mono,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 预设面板里的一个动作按钮（★ PS-2b 起只被 [PresetNewPanel] 用）：禁用 ⇒ **置灰但看得见**
+ *（[DisabledInk] + 不注册手势）。
+ *
+ * PS-1 的纪律：不可用的操作**不隐藏**（隐藏正是用户"没法新增 / 编辑 / 删除"的根因）——
+ * 置灰 + 菜单里那句实话才是正确的表达方式。
+ */
+@Composable
+private fun PresetActionButton(
+    label: String,
+    enabled: Boolean,
+    primary: Boolean = false,
+    onTap: () -> Unit,
+) {
+    Text(
+        label,
+        color = when {
+            !enabled -> DisabledInk
+            primary -> FilmTheme.OnAccent
+            else -> FilmTheme.Accent
+        },
+        fontSize = 12.sp,
+        maxLines = 1,
+        modifier = Modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (enabled && primary) FilmTheme.Accent else Color.Transparent)
+            .border(1.dp, if (enabled) FilmTheme.Accent else DisabledInk, RoundedCornerShape(9.dp))
+            .pressScale(pressedScale = 0.94f, enabled = enabled, onTap = onTap)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    )
+}
+
+/**
+ * ★ PS-2b 预设**新建面板**（只有"新建"这一态）—— 用户"编辑器可以保存当前配置为预设"的落点。
+ *
+ * 内容 = **名称 / 分组输入框** + **将要保存的参数清单**（[PresetParamList]，与只读详情共用
+ * 同一份渲染）+ 底部动作「保存当前参数为新预设」（主）/「取消」。落库走 [savePreset]：
+ * **永远是新 id**（不覆盖任何已有预设）—— 这正是"新增"与"修改"的分界。
+ *
+ * ⚠ **本面板不做逐项拖滑杆**（架构师 2026-10-11 明确划定）：调参是参数面板的职责 ——
+ * 用户在参数面板里调好 → 回这里保存。理由：预设面板的空间被预览区挤着（限高 168~208dp），
+ * 塞进 20+ 条滑杆要么让面板吃掉整屏预览、要么给每条滑杆一个"迷你版"读数 —— 前者违背
+ * "面板不是覆盖式浮层"的既有约束（E1-4），后者是 ADR-12 禁止的假滑杆（读数与真实量程脱钩）。
+ *
+ * ⚠ **本面板不改任何已有预设**（PS-2b）：编辑态随「改预设库」一起撤除 —— 这里既没有「保存名称」
+ * 也没有「从当前参数更新」，改已保存的预设请去拍照界面（[editorPresetManageHint]）。
+ *
+ * 参数清单**只读**：它展示的是"这次将要存下什么"（当前参数的稀疏集 [presetSparseSlots]，
+ * 与 [savePreset] 走同一个函数 ⇒ 清单与实际落库内容不可能不一致）。
+ */
+@Composable
+private fun PresetNewPanel(
+    /** 将要保存的参数 = 当前编辑器参数的稀疏集 */
+    slots: Map<Int, Double>,
+    name: String,
+    onName: (String) -> Unit,
+    group: String,
+    onGroup: (String) -> Unit,
+    /** 参数已就绪（首帧前存不了） */
+    canSave: Boolean,
+    onBack: () -> Unit,
+    onSave: () -> Unit,
+) {
+    // 保存可用性 = 与拍照界面（PS-2a）**同一份判据**（[presetEditorButtons] 的新建态分支）：
+    // 参数就绪 + 名称非空。名称由 [defaultPresetName] 预填 ⇒ 打开就能保存（PS-1 的投诉点）。
+    val canSaveNow = presetEditorButtons(
+        isNew = true,
+        preset = null,
+        paramsReady = canSave,
+        name = name,
+    ).saveNew
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(bottom = 2.dp),
+    ) {
+        // ① 标题：返回 + 面板身份
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "‹ 返回",
+                color = FilmTheme.Accent,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .border(1.dp, FilmTheme.ChipBorder, RoundedCornerShape(9.dp))
+                    .pressScale(pressedScale = 0.94f, onTap = onBack)
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "新建预设",
+                color = FilmTheme.Cream,
+                fontSize = 14.sp,
+                fontFamily = FilmTheme.Serif,
+                maxLines = 1,
+                style = TextStyle(shadow = TextShadow),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        // ② 名称 / 分组（预填默认名 ⇒ 保存按钮一路可点，不必先想名字）
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PresetField(name, onName, "预设名称", Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            PresetField(group, onGroup, "分组（可空）", Modifier.weight(1f))
+        }
+        // ③ 将要保存的参数清单（只读）
+        Text(
+            "将要保存的参数（只与默认值不同的项）",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(start = 16.dp, top = 5.dp),
+        )
+        PresetParamList(slots = slots, lut = null, maxHeight = 168.dp)
+        // ④ 动作：保存（主）/ 取消 —— 没有第三个按钮（"改已有预设"在编辑器侧不存在）
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PresetActionButton("保存当前参数为新预设", canSaveNow, primary = true, onTap = onSave)
+            Spacer(Modifier.width(8.dp))
+            PresetActionButton("取消", enabled = true, onTap = onBack)
         }
     }
 }
@@ -4247,6 +4545,39 @@ internal class SliderRenderGate {
  * 为什么不直接存两个 lambda（`pendingExit: (() -> Unit)?`）：出口必须能在 JVM 单测里被断言
  * "确认后走的是不是它"（[exitAfterConfirm]），lambda 断言不了。
  */
+/**
+ * ★ PS-2b（用户 2026-10-11 第二条澄清）**编辑器（相册侧）预设面板允许的动作清单**。
+ *
+ * 用户原话："编辑器可以保存当前配置为预设，**不能修改已保存的预设**，可以删除"。
+ * 于是清单恰好三项（顺序 = 渲染顺序）：
+ *  1. **套用**（APPLY）—— 参数没就绪时置灰（套用要写当前参数）；
+ *  2. **查看配置**（VIEW）—— 只读详情，永远可用；
+ *  3. **删除**（DELETE）—— 判据复用 [presetDeletable]（内置只读的唯一实现，P-2c 立的规矩）。
+ *
+ * 「新增」**不在这份清单里**：它作用于**当前参数**（不是某一条预设），入口是面板顶部常驻的
+ * 「+ 新建预设」（走 `savePreset`，**永远是新 id**）。
+ *
+ * **清单里没有的东西 = 编辑器侧做不到的事**：EDIT / RENAME / COPY 以及 U-6a 的"更新为当前
+ * 设置"都不在 —— [presetMenuItems] 是**拍照界面**的完整动作集（PS-2a 用），别混用。
+ * UI 从这份清单渲染（[PresetRow] 的「套用」可用性、菜单里的"查看配置 / 删除"），
+ * `PresetPanelUiTest` 从这份清单断言：把某个"改已保存预设"的动作加回来 ⇒ 单测当场红。
+ */
+internal fun editorPresetActions(p: EditorPreset, paramsReady: Boolean): List<PresetMenuItem> = listOf(
+    PresetMenuItem(PresetAction.APPLY, "套用", paramsReady),
+    PresetMenuItem(PresetAction.VIEW, "查看配置", true),
+    PresetMenuItem(PresetAction.DELETE, "删除", presetDeletable(p)),
+)
+
+/**
+ * ★ PS-2b：编辑器预设面板上那句**引导文案**（唯一维护点 —— 列表顶部与「⋯」菜单底部渲染的
+ * 是同一份字符串，不可能一处改了另一处没改）。
+ *
+ * 为什么必须有：编辑器**不能修改已保存的预设**（用户 2026-10-11 拍板），但"把这次调好的参数
+ * 存进这条预设"是用户在编辑器里最自然的念头。不说清楚去哪改，用户只会得出"功能坏了"的结论
+ * —— 与 PS-1 那次投诉同型的问题（入口/规则不写在界面上）。
+ */
+internal fun editorPresetManageHint(): String = "新增 / 删除预设在这里；修改已保存的预设请到拍照界面"
+
 internal enum class ExitTarget { BACK, GALLERY }
 
 /**

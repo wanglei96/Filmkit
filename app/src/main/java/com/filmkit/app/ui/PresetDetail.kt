@@ -18,6 +18,7 @@ import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.latitudeUi
 import com.filmkit.app.camera.monoUi
+import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.tempUi
 import com.filmkit.app.camera.tintUi
@@ -280,4 +281,170 @@ private fun rawText(v: Double): String = when {
     !v.isFinite() -> "0"
     v % 1.0 == 0.0 && abs(v) < 1e9 -> v.toLong().toString()
     else -> decimals2(v)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ PS-1（用户 2026-10-11："预设还是没有展示预设包含的配置面板。还是没办法新增、编辑、
+// 删除预设。"）：列表行「⋯」菜单 / 参数摘要 / 编辑面板按钮 —— **全是纯逻辑**
+//（无 Compose / 无 Context ⇒ JVM 单测直接驱动）。
+//
+// 为什么可用性要抽成函数而不是写在 Composable 里：投诉的根因就是"UI 把能力藏起来"——
+// 内置预设的删除按钮此前**根本不渲染**（`if (presetDeletable(p))` 的 else 只有一枚「内置」
+// 标记），而用户手上只有内置三条 ⇒ 一个删除按钮都看不到，自然得出"没法删"的结论。
+// 抽成 `List<PresetMenuItem>` 之后，单测能逐项断言"内置：套用 / 查看配置可用，
+// 编辑 / 重命名 / 复制 / 删除**置灰但在列表里**"，UI 只负责把这份清单画出来。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 「⋯」菜单里的动作（枚举顺序 = [presetMenuItems] 的渲染顺序）。 */
+internal enum class PresetAction { APPLY, VIEW, EDIT, RENAME, COPY, DELETE }
+
+/**
+ * 菜单里的一项：[label] 是给用户看的词，[enabled] = 能不能点。
+ *
+ * **不可用的项照样在清单里**（UI 置灰渲染）—— 隐藏正是 PS-1 投诉的根因。
+ */
+internal data class PresetMenuItem(val action: PresetAction, val label: String, val enabled: Boolean)
+
+/**
+ * 列表行「⋯」菜单的完整清单（顺序固定：主操作在前、危险操作在后）。
+ *
+ * @param paramsReady 编辑器参数是否已就绪（首帧前谈不上套用 / 编辑）—— 与「保存当前」的
+ *   `canSave` 是**同一个判据**，调用侧传同一个值，不另算一份。
+ *
+ * 可删判据 = [presetDeletable]（内置只读的**唯一**实现，P-2c 立的规矩）：内置预设的
+ * 编辑 / 重命名 / 复制 / 删除四项全部由它置灰。"复制内置"技术上可行（产出一条用户预设副本），
+ * 但本卡按架构师口径把内置整条路径设为只读 —— 想改内置的配方就「+ 新建预设」+「从当前参数更新」。
+ */
+internal fun presetMenuItems(p: EditorPreset, paramsReady: Boolean): List<PresetMenuItem> {
+    val user = presetDeletable(p)
+    return listOf(
+        PresetMenuItem(PresetAction.APPLY, "套用", paramsReady),
+        PresetMenuItem(PresetAction.VIEW, "查看配置", true),
+        PresetMenuItem(PresetAction.EDIT, "编辑", user && paramsReady),
+        PresetMenuItem(PresetAction.RENAME, "重命名", user && paramsReady),
+        PresetMenuItem(PresetAction.COPY, "复制", user),
+        PresetMenuItem(PresetAction.DELETE, "删除", user),
+    )
+}
+
+/**
+ * 菜单底部的一句**实话**（内置预设 ⇒ 说明为什么上面四项是灰的）；用户预设 ⇒ null（不占行）。
+ *
+ * 与 [presetMenuItems] 同一条判据（[presetDeletable]）：文案与置灰状态不可能各说各话。
+ */
+internal fun presetReadOnlyNote(p: EditorPreset): String? = if (presetDeletable(p)) {
+    null
+} else {
+    "内置预设只读：可套用 / 查看配置，不能编辑、重命名、复制或删除"
+}
+
+/** 列表行的参数摘要最多显示几项（超出加「…」；LUT 那一项**不占**这个额度）。 */
+internal const val PRESET_SUMMARY_MAX = 4
+
+/**
+ * 列表行的**参数摘要**（用户第 1 条诉求"看不到这条预设包含什么"的行内答案）：
+ * 「标签 读数」若干项 + 「…」+ LUT 行。
+ *
+ * 数据源是 [presetDetailSections]（**唯一维护点**：中文名 / 单位 / 格式化全在那边，
+ * 这里只做"挑哪几项"）⇒ 摘要与详情页的读数**逐字相同**，不可能漂移。
+ *
+ * 挑选策略 = **分组轮转**（每组先取第一项，再取第二项…）：直接按槽位顺序取前 4 项，
+ * 内置「徕卡一瞬」会取到 `对比度 / 饱和度 / 分离色调×2`（全在基础与色彩两组），
+ * 用户最认的"颗粒 / 暗角"反而被截掉 —— 轮转让四个分组都有代表（实测输出见
+ * `PresetPanelUiTest`）。
+ *
+ * @param lutLabel LUT 的中文名（UI 层查 `LutLibrary`；纯逻辑层不碰 Context）——
+ *   null ⇒ 回落成 id（资产被删 / 单测）。
+ */
+internal fun presetSummaryParts(
+    p: EditorPreset,
+    lutLabel: String? = null,
+    max: Int = PRESET_SUMMARY_MAX,
+): List<String> {
+    val sections = presetDetailSections(p.slots)
+    val total = sections.sumOf { it.rows.size }
+    val out = ArrayList<String>(max + 2)
+    var depth = 0
+    while (out.size < max) {
+        var picked = false
+        for (sec in sections) {
+            if (out.size >= max) break
+            val row = sec.rows.getOrNull(depth) ?: continue
+            out += "${row.label} ${row.value}"
+            picked = true
+        }
+        if (!picked) break          // 所有分组都取空了
+        depth++
+    }
+    if (total > out.size) out += "…"
+    presetLutLine(p)?.let { out += "LUT ${lutLabel ?: it.lutId} ${it.strength}" }
+    return out
+}
+
+/** [presetSummaryParts] 的单行形态（列表行的副标题）。空预设 ⇒ 空串（UI 显示"不含参数"）。 */
+internal fun presetSummaryText(
+    p: EditorPreset,
+    lutLabel: String? = null,
+    max: Int = PRESET_SUMMARY_MAX,
+): String = presetSummaryParts(p, lutLabel, max).joinToString(" · ")
+
+/**
+ * 预设编辑面板底部按钮的可用性（**新建态 / 编辑态两套**，PS-1 的纯逻辑）。
+ *
+ * 与 [presetMenuItems] 分开的理由：菜单是"能对这条预设做什么"，这里是"面板里现在能提交什么"，
+ * 两者的输入不同（前者不知道输入框里有没有名字，后者不知道菜单开着没有）。
+ */
+internal data class PresetEditorButtons(
+    /** 新建态：「保存当前参数为新预设」（= E3-1a 的「保存当前」） */
+    val saveNew: Boolean,
+    /** 编辑态：「从当前参数更新」（U-6a 的 updatePreset） */
+    val updateFromCurrent: Boolean,
+    /** 编辑态：「保存名称 / 分组」（重命名 = 本卡新增的 renamePreset） */
+    val saveMeta: Boolean,
+    /** 编辑态：「删除」（二次确认在面板里，仅 user 预设） */
+    val delete: Boolean,
+)
+
+/**
+ * @param isNew 新建态（true）/ 编辑态（false）
+ * @param preset 编辑态的那条预设（新建态传 null）
+ * @param paramsReady 当前参数已就绪（首帧前存不了也更新不了）
+ * @param name 名称输入框的**当前内容**（空 ⇒ 保存类按钮置灰，但按钮仍在）
+ */
+internal fun presetEditorButtons(
+    isNew: Boolean,
+    preset: EditorPreset?,
+    paramsReady: Boolean,
+    name: String,
+): PresetEditorButtons {
+    val named = name.isNotBlank()
+    return if (isNew) {
+        PresetEditorButtons(
+            saveNew = paramsReady && named,
+            updateFromCurrent = false,
+            saveMeta = false,
+            delete = false,
+        )
+    } else {
+        PresetEditorButtons(
+            saveNew = false,
+            updateFromCurrent = paramsReady,
+            saveMeta = named,
+            delete = preset != null && presetDeletable(preset),
+        )
+    }
+}
+
+/**
+ * 新建预设的默认名：`我的预设 N`，N = 第一个不与**现有预设重名**的编号。
+ *
+ * 为什么给默认名而不是留空：留空时"保存"按钮是灰的 —— 用户看到的是一个点不动的按钮，
+ * 而 PS-1 投诉的第一句正是"要先填名称才可点"这件事没人告诉他。默认名让"新建 → 保存"
+ * 一路可点（用户想改名就在同一个面板里改）。
+ */
+internal fun defaultPresetName(existing: List<EditorPreset>): String {
+    val used = existing.mapTo(HashSet(existing.size * 2)) { it.name }
+    var n = 1
+    while ("我的预设 $n" in used) n++
+    return "我的预设 $n"
 }

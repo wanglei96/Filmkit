@@ -133,19 +133,18 @@ import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.BuiltinPresets
-import com.filmkit.app.camera.CAMERA_STANDARD_PRESET
 import com.filmkit.app.camera.CAMERA_STANDARD_PRESET_ID
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetLutAction
-import com.filmkit.app.camera.PresetScene
+import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.camera.cameraPresetParams
+import com.filmkit.app.camera.mergePresets
+import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetEvOffset
 import com.filmkit.app.camera.presetLutAction
-import com.filmkit.app.camera.presetScopeNotice
 import com.filmkit.app.camera.presetSlotsText
-import com.filmkit.app.camera.presetSubtitle
 import com.filmkit.app.camera.resolveCameraPreset
 import com.filmkit.app.kv
 import com.filmkit.app.lut.LutIO
@@ -163,6 +162,7 @@ import kotlin.math.roundToLong
 import kotlin.math.roundToInt
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.random.Random
 
 /**
  * M 档专业拍摄界面（方向 C 定稿，v0.5.1）。
@@ -541,6 +541,112 @@ fun CameraScreen(
                 "evOffset" to evOffset,   // U-7：真机证据 —— 预设曝光偏移（叠加在用户 EV 上）
                 "lut" to (p.lutId ?: ""), "lutAction" to action.name,
             ),
+        )
+    }
+
+    // ── ★ PS-2a：拍照界面的预设**管理**（用户 2026-10-11 方向纠正："预设的配置 / 新增 / 编辑 /
+    //    删除**我指的是拍照界面的预设**。这个**不能让用户在相册里面改这些配置**。"）──────────
+    //
+    // 五条写路径的**共同纪律**（P-2c 踩过的坑 + U-7 的"拍摄态"纪律）：
+    //  ① 列表刷新**一律** `mergePresets(PresetStore.xxx(...), BuiltinPresets.load(context))` ——
+    //     只赋 `PresetStore` 的返回值会让**内置三条当场从列表里消失**；
+    //  ② "当前相机参数" = `cameraPresetParams(selectedPreset)`（拍照界面没有风格参数滑杆 ⇒
+    //     参数数组的唯一来源就是当前生效的预设，见该函数的 KDoc）。**用户的 EV 补偿不在其中**
+    //     （它活在 `CameraController.exposureEv()` 里），而 `cameraPresetSlots` 还会把 `[0]`
+    //     整槽剔除 ⇒ 新建 / 更新都不会把拍摄态写进预设（U-7，`preset-DESIGN.md` §9.4）；
+    //  ③ 管理动作**只动 prefs 与列表**：当前画面、相机参数、选中态一位不动 —— 与编辑器侧
+    //     `updatePreset` / `deletePreset` 的"改的是预设库，不是当前画面"同一条口径。
+
+    /**
+     * 「+ 新建预设」：用**当前相机参数**（+ 当前 LUT）存成一条新的用户预设。
+     *
+     * 名称由面板预填默认名（`defaultPresetName`）⇒ 保存按钮一路可点，不必先想名字（PS-1 的教训）。
+     */
+    fun saveCameraPreset(name: String, group: String) {
+        val now = System.currentTimeMillis()
+        val p = newCameraPreset(
+            name = name,
+            group = group,
+            film = cameraPresetParams(selectedPreset),
+            lutId = lutId,
+            lutStrength = prefs.getFloat("lut_strength", 1f).toDouble(),
+            now = now,
+            salt = Random.nextInt(),
+        )
+        presets = mergePresets(PresetStore.upsert(prefs, p), BuiltinPresets.load(context))
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.save",
+            kv(
+                "id" to p.id, "name" to p.name, "group" to p.group,
+                "slots" to p.slots.size, "slotsText" to presetSlotsText(p),
+                "lut" to (p.lutId ?: ""),
+                // U-7 的证据：新建的预设**不含**曝光槽（拍摄态不入库）
+                "hasEvSlot" to p.slots.containsKey(CAMERA_PRESET_EV_SLOT),
+            ),
+        )
+    }
+
+    /**
+     * 「从当前相机参数更新」：用当前相机参数重写这条预设的**配方**（slots / LUT），
+     * id / 名称 / 分组 / 创建时间 / 来源一个都不动。
+     *
+     * 判据复用 [presetDeletable]（内置只读的**唯一**实现）—— UI 侧已把内置的这枚按钮置灰
+     * （`cameraPresetEditorButtons`），这里是第二道防线。
+     */
+    fun updateCameraPreset(p: EditorPreset) {
+        if (!presetDeletable(p)) return
+        val next = updatedCameraPreset(
+            p,
+            cameraPresetParams(selectedPreset),
+            lutId,
+            prefs.getFloat("lut_strength", 1f).toDouble(),
+        )
+        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.update",
+            kv("id" to next.id, "slots" to next.slots.size, "lut" to (next.lutId ?: "")),
+        )
+    }
+
+    /** 「保存名称 / 分组」：只动**元数据**（配方、id、创建时间、来源都不动）。 */
+    fun renameCameraPreset(p: EditorPreset, name: String, group: String) {
+        if (!presetDeletable(p)) return
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return          // UI 侧置灰，这里是第二道防线
+        val next = p.copy(name = trimmed, group = group.trim())
+        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
+        // 改的是当前生效那条 ⇒ 顶栏名字跟着变（画面与参数不动）
+        if (selectedPreset.id == next.id) selectedPreset = next
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.rename",
+            kv("id" to next.id, "name" to next.name, "group" to next.group),
+        )
+    }
+
+    /** 「复制」：另存为新的一条（新 id + 「副本」后缀 + 用户来源），配方原样带走。 */
+    fun copyCameraPreset(p: EditorPreset) {
+        val now = System.currentTimeMillis()
+        val copy = copiedCameraPreset(p, now, Random.nextInt())
+        presets = mergePresets(PresetStore.upsert(prefs, copy), BuiltinPresets.load(context))
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.copy",
+            kv("from" to p.id, "id" to copy.id, "slots" to copy.slots.size),
+        )
+    }
+
+    /**
+     * 「删除」（二次确认在面板里）：**只动 prefs 与列表**，当前画面 / 参数 / 选中态一位不动。
+     *
+     * 删掉的若是当前选中项：`selectedPreset` 仍指向内存里那个对象（画面与它一致，UI 不会
+     * "说一套做一套"），只是它已不在库里 —— 冷启动时 `resolveCameraPreset` 找不到 id 会自动
+     * 回退「标准」并清掉 prefs 里的脏 id（既有机制，本卡没改）。
+     */
+    fun deleteCameraPreset(p: EditorPreset) {
+        if (!presetDeletable(p)) return
+        presets = mergePresets(PresetStore.delete(prefs, p.id), BuiltinPresets.load(context))
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.delete",
+            kv("id" to p.id, "name" to p.name, "stillSelected" to (p.id == selectedPreset.id)),
         )
     }
 
@@ -1441,8 +1547,25 @@ fun CameraScreen(
             LutSheet(
                 tab = lutTab,
                 onTab = { lutTab = it },
-                presets = presets,
                 selectedPreset = selectedPreset,
+                // ★ PS-2a：预设 tab = **管理场所**（列表 / 「+ 新建预设」/ 每行「⋯」菜单 / 编辑面板）。
+                // 内容整块交给 CameraPresetTab，LutSheet 只让位（宿主不认识预设的数据结构）。
+                presetTab = {
+                    CameraPresetTab(
+                        presets = presets,
+                        selected = selectedPreset,
+                        // 新建态的"将要保存什么" = 当前相机参数的稀疏集（**已剔除 [0] 曝光**，U-7）
+                        currentSlots = cameraPresetSlots(cameraPresetParams(selectedPreset)),
+                        lutId = lutId,
+                        lutStrength = prefs.getFloat("lut_strength", 1f),
+                        onApply = { p -> applyCameraPreset(p) },
+                        onSave = { n, g -> saveCameraPreset(n, g) },
+                        onUpdate = { p -> updateCameraPreset(p) },
+                        onRename = { p, n, g -> renameCameraPreset(p, n, g) },
+                        onCopy = { p -> copyCameraPreset(p) },
+                        onDelete = { p -> deleteCameraPreset(p) },
+                    )
+                },
                 lutId = lutId,
                 lutStrength = prefs.getFloat("lut_strength", 1f), // 面板打开时的初值（事实源 = prefs）
                 previews = lutPreviews,
@@ -1482,7 +1605,6 @@ fun CameraScreen(
                 onStrengthFinished = { vFinal ->
                     prefs.edit().putFloat("lut_strength", vFinal).apply()
                 },
-                onPick = { p -> applyCameraPreset(p) },
                 onPickLut = { e ->
                     if (e == null) {
                         // 关闭（A/B 通路）：直接下发，无需解析
@@ -2000,16 +2122,21 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
  * 选中项**不自动收起**面板 —— 便于连续切换、当场比较风格。
  *
  * P-2a：「预设」tab 的数据源 = [BuiltinPresets.all]（用户预设在前 + 内置三条在后；与查看页
- * 「胶片」/ 编辑器「预设」**同一套**，P-2c 起三处都走这一个入口）。列表首项恒为内置的
- * [CAMERA_STANDARD_PRESET]（中性基线）。选中态按 **id** 判定
+ * 「胶片」/ 编辑器「预设」**同一套**，P-2c 起三处都走这一个入口）。选中态按 **id** 判定
  * （不是索引 —— 列表会被用户在编辑器里增删，索引不稳定）。
+ *
+ * ★ **PS-2a（用户方向纠正）**：「预设」tab 的内容**整块**由 [presetTab] 提供 ——
+ * 预设的**管理**（新增 / 编辑 / 删除 / 看配置）归拍照界面，实现全在 `CameraPresetPanel.kt`。
+ * 本函数只负责"哪个 tab 显示什么"，不认识预设的数据结构（宿主与功能解耦：
+ * LUT tab 的筛选 / 导入 / 强度一个字没动）。
  */
 @Composable
 private fun LutSheet(
     tab: Int,
     onTab: (Int) -> Unit,
-    presets: List<EditorPreset>,
     selectedPreset: EditorPreset,
+    /** ★ PS-2a：「预设」tab 的全部内容（`CameraPresetTab(...)` 的调用点） */
+    presetTab: @Composable () -> Unit,
     lutId: String?,
     lutStrength: Float,
     previews: Map<String, Bitmap>,
@@ -2024,7 +2151,6 @@ private fun LutSheet(
     onRenameCat: (String, String) -> Unit,
     onStrength: (Float) -> Unit,
     onStrengthFinished: (Float) -> Unit,
-    onPick: (EditorPreset) -> Unit,
     onPickLut: (LutLibrary.Entry?) -> Unit,
     onImport: () -> Unit,
     onExport: (LutLibrary.Entry, Boolean) -> Unit,
@@ -2132,52 +2258,9 @@ private fun LutSheet(
                 }
             }
         } else {
-            Column {
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    modifier = Modifier.padding(top = 10.dp),
-                ) {
-                    // 首项恒为内置「标准」（中性基线）；其余 = 用户在编辑器里保存的预设
-                    //（同一套 PresetStore 数据）。选中态按 id 判定 —— 列表会被增删，索引不稳定。
-                    items(listOf(CAMERA_STANDARD_PRESET) + presets) { p ->
-                        LutCard(
-                            label = p.name,
-                            sub = presetSubtitle(p),
-                            selected = p.id == selectedPreset.id,
-                            preview = null,
-                        ) { onPick(p) }
-                    }
-                }
-                // ★ P-5 字段作用域：这条预设里有几项**只在编辑器链路**生效（[78] 清晰度 /
-                // [88..94] 色温…），拍照时画面不会有任何变化 —— 套用前先说清楚
-                //（ADR-12：不假装生效）。全部生效 ⇒ [presetScopeNotice] 返回 null ⇒ **不显示**。
-                //
-                // 为什么是一行面板级提示而不是卡片 sub：`LutCard` 的 sub 是**定宽 76dp / 9sp /
-                // 单行省略号**（P-2a 为"分组 · LUT"设计的），一句话在它上面必然被截成
-                // "徕卡 · LUT · 仅…"（≈8 个中文字宽，连"含 1 项仅后期参数"都放不下）。
-                // 这里用列表下方那行小字（与"还没有预设"同一排版），整屏宽度放得下一句人话。
-                presetScopeNotice(selectedPreset, PresetScene.CAMERA)?.let { notice ->
-                    Text(
-                        notice,
-                        color = FilmTheme.CreamDim,
-                        fontSize = 11.sp,
-                        fontFamily = FilmTheme.Mono,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
-                // 空列表时给一句人话（此时只有「标准」一张卡，不是空白面板）
-                if (presets.isEmpty()) {
-                    Text(
-                        "还没有预设 · 在编辑器里保存",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 11.sp,
-                        fontFamily = FilmTheme.Mono,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
-            }
+            // ★ PS-2a：预设 tab = **管理场所**（列表 / 「+ 新建预设」/ 每行「⋯」菜单 / 编辑面板），
+            // 全部实现在 `CameraPresetPanel.kt` 的 [CameraPresetTab]。本函数不认识预设的数据结构。
+            presetTab()
         }
     }
     if (catNewOpen) {
@@ -2647,7 +2730,9 @@ internal fun SheetPill(
  *
  * internal 而非 private：编辑器（E1-4）复用同一张卡片 —— 选中态/尺寸两处各写一份必然不一致。
  *
- * @param sub 名称下的第二行小字（P-2a 的预设卡片用它显示「分组 · LUT」，见 [presetSubtitle]）。
+ * @param sub 名称下的第二行小字（P-2a 的预设卡片用它显示「分组 · LUT」，见
+ *   `CameraPresetApply.kt` 的 `presetSubtitle`；★ PS-2a 起拍照界面的预设列表改用整行布局，
+ *   本参数只剩 LUT 卡片在用）。
  *   `null` = 不占一行（LUT 卡片与没有分组/LUT 的预设卡片因此保持原有高度）。
  *   宽度钉在卡片宽度（76dp）并省略号截断 —— 否则长分组名会把卡片撑宽、与相邻卡片不齐。
  */
