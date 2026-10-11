@@ -67,6 +67,21 @@ EXPECT = {
     "grainMb": ("submitDisplay", ["passStyle("]),
     "grainPivot": ("submitDisplay", ["passStyle("]),
     "grainSeed": ("submitDisplay", ["passStyle("]),
+    # E4-5 halation（光晕）：[62..65] 的生效性 + 四参数。字段 = **实际下发值**，
+    # 其中 haloOn = 本帧 halo 链**真的执行了**（0 且 [62] > 0 ⇒ 静默失败：program
+    # 缺失 / 纹理分配失败 / FBO 不完整 —— 这是本卡最重要的真机失败判据）。
+    # halo 链由 passStyle（编辑器）与 passOutput（拍照）各自在内部调用 ⇒ 字段行必须
+    # 晚于 passStyle。同名字段也出现在 finishStillChain 出口（成片链路），而本脚本取
+    # hits[0] = 行号更小的 submitDisplay ⇒ 与上面 grain* 同一条纪律。
+    "haloOn": ("submitDisplay", ["passStyle("]),
+    "haloMs": ("submitDisplay", ["passStyle("]),
+    "haloStrength": ("submitDisplay", ["passStyle("]),
+    "haloThr": ("submitDisplay", ["passStyle("]),
+    "haloRadius": ("submitDisplay", ["passStyle("]),
+    "haloWarmth": ("submitDisplay", ["passStyle("]),
+    # E4-5b（R1）：halo 半径归一化的**基准短边**（= 成片短边）。核对"预览与成片是否用
+    # 同一基准"就靠它 —— 同一进程内两侧应恒等（成片调用在 passOutput 之前更新它）。
+    "haloRef": ("submitDisplay", ["passStyle("]),
     # U-4（2026-10-11）：显示域五项（[78] 清晰度 + [90..94] 影调分区/褪色）的**生效值**。
     # 三段的 shader 数学与门控都在 passOutput 内（kFsOut 的 srgbEncode 之后 = 显示域）
     # ⇒ 字段必须晚于 finishStillChain 内的 passOutput 调用（成片路径：passFilm →

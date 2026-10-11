@@ -571,7 +571,12 @@ def check_pass_style_slots():
             'fade',
             # U-1：[23][24] 分离色调 + [25] 单色（用户 2026-10-11"不统一的要统一掉"）。
             # 此前 passStyle 零引用 ⇒ 含 [25] 的"黑白预设"在编辑器里不变黑白。
-            'split_warm', 'split_cool', 'monochrome'}
+            'split_warm', 'split_cool', 'monochrome',
+            # E4-5 halation（光晕）：passStyle 里只读 [62]（门控 = 是否跑金字塔链）。
+            # ⚠ 另三个参数（[63] 阈值 / [64] 半径 / [65] 暖度）在 passStyle 调用的
+            #   `runHalation` 内读取 —— 那是**两条链路共享**的函数（passOutput 也调
+            #   它）⇒ 四参数的生效性与单调性由 tools/check-halation.py 覆盖。
+            'halation_strength'}
     return refs == want, refs, ''
 
 

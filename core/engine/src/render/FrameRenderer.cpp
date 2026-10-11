@@ -5517,6 +5517,152 @@ void main() {
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 })";
 
+// ══ E4-5 halation（光晕）═════════════════════════════════════════════════════
+// 物理：光穿过乳剂后在**片基**内全反射，重新曝光乳剂。CineStill 800T = Kodak
+// Vision3 500T 撕掉 remjet 防光晕层 ⇒ 点光源周围出现红橙晕。乳剂对红光的散射距离
+// 最长、蓝光最短 ⇒ "白 → 橙 → 红"的径向渐变（**通道相关半径**，不是均匀红雾）。
+//
+// 参考实现 = jie60517/emulsion `src/render/effects/library/halation.ts`（唯一有通道
+// 扩散的公开实现；darktable `bloom.c` 是 Orton 效应、**不含通道扩散**，仅作对照）。
+// 逐行对照见 docs/reports/editor-E4-film-params-DESIGN.md §3.2.1。
+//
+// 落点（规格 §3.2.2 = 本设计最关键的架构决定）：**3D LUT 之前、kFsFilm 之后的
+// 线性显示域**。拍照链路 = passFilm 与 passOutput 之间；编辑器链路 = passStyle
+// 之前（kFsStyle 是单 pass，无法做金字塔 ⇒ 金字塔独立成 pass 链，其"加法"落在
+// kFsStyle 的 LUT 之前，与拍照链路同序）。
+//
+// ⚠ 输入域由 `uDecodeIn` 选择：拍照链路的 tex_work_ 已是**线性**显示域（kFsFilm
+//   输出）⇒ 0；编辑器链路的 edit_tex_ 是**显示域 sRGB**（已成片 RGBA8）⇒ 1。
+//   两条链路因此喂给金字塔的是**同一个线性量** ⇒ 同参数下逐位可比（验收判据 4）。
+//   输出域跟随输入域（拍照 = 线性、编辑器 = 显示域），使 kFsOut/kFsStyle 各自
+//   拿到与自己域约定一致的结果，**两侧下游代码零改动**。
+//
+// ⚠ 移动 GPU 三禁的逐条规避（规格 §3.2.6）：
+//   · 数组作函数参数：**无**。5 级 halo 用 5 个独立 sampler2D，权重用 5 个独立 vec3。
+//   · 循环内动态索引：**无循环、无数组**。所有 tap 与 5 级合成**全部手动展开**。
+//   · 多行宏：**无宏**。
+//   · 附加（GLSL ES 无数组初始化器，仓库两次踩坑）：无任何 `float[5](...)` 写法。
+//   降采样/模糊的 tap 位置是**编译期常量表达式**（照 sharpenLuma 的手写风格）。
+
+// 高光提取 + 盒式降采样（同时服务 kFsHaloThr 与 4 次 kFsHaloDown —— 数学逐字相同，
+// 只有"是否过阈值/是否 sRGB 解码"两个门控不同；共用一份 = 少一个 program 与一份
+// 硬失败检查，**pass 数与 GPU 行为不变**）。输出 = 源分辨率的 1/2。
+// 为什么手写 2×2 盒式：emulsion 此 pass 靠硬件 LINEAR 过滤完成降采样，而 **X300 的
+// RGBA16F 无线性过滤**（项目多处手写，见 makeTex / kFsRcdChroma 注释）⇒ 4 采样/px。
+const char* kFsHaloThr = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uSrc;
+uniform vec2 uTexel;      // 1/源宽, 1/源高（CPU 侧算好，shader 内不做除法）
+uniform float uDecodeIn;  // 1 = 源是显示域 sRGB（编辑器链路）；0 = 已是线性
+uniform float uThrOn;     // 1 = 本 pass 做高光提取；0 = 纯降采样（kFsHaloDown）
+uniform float uThrLin;    // 线性显示域阈值 = srgbToLinear([63])
+uniform float uKnee;      // max(0.02, uThrLin·0.55)（emulsion 同式，硬编码不给槽位）
+vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    vec3 lo = c / 12.92;
+    return mix(hi, lo, step(c, vec3(0.04045)));
+}
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+void main() {
+    vec2 uv = vUV0;
+    vec3 s = texture(uSrc, uv + uTexel * vec2(-1.0, -1.0)).rgb;
+    s += texture(uSrc, uv + uTexel * vec2(1.0, -1.0)).rgb;
+    s += texture(uSrc, uv + uTexel * vec2(-1.0, 1.0)).rgb;
+    s += texture(uSrc, uv + uTexel * vec2(1.0, 1.0)).rgb;
+    s *= 0.25;
+    // 高光提取在**线性光**里做（emulsion 注释：blurring gamma-encoded values
+    // spreads the wrong amount of energy and turns bloom into grey mud）。
+    vec3 lin = (uDecodeIn > 0.5) ? srgbDecode(s) : s;
+    float w = 1.0;
+    if (uThrOn > 0.5) {
+        w = smoothstep(uThrLin - uKnee, uThrLin + uKnee, luma(lin));
+    }
+    oColor = vec4(lin * w, 1.0);
+})";
+
+// 逐级可分离高斯（先横后纵，共 10 次 draw）。权重与偏移逐字照抄 emulsion：
+// 0.227027·c + 0.3162162·(c±1.3846) + 0.0702703·(c±3.2308)（归一化 = 1）。
+// 等效 σ = 1.637 texel @ 该级（方差 2.6793，见规格 §3.2.3 的半径映射表）。
+// uScale：tmp 只有**最大级**（1/2）的尺寸（省 5 张逐级 tmp = 33MB），处理更小的
+// 级时把归一化 UV 缩到已写入的左下角子矩形上。level0 时 uScale = (1,1)。
+const char* kFsHaloBlur = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uSrc;
+uniform vec2 uDir;    // (1/w, 0) 或 (0, 1/h)（当前级 texel 步长）
+uniform vec2 uScale;  // 当前级尺寸 / tmp 尺寸
+void main() {
+    vec2 uv = vUV0 * uScale;
+    vec3 s = texture(uSrc, uv).rgb * 0.227027;
+    s += texture(uSrc, uv + uDir * 1.3846153846).rgb * 0.3162162162;
+    s += texture(uSrc, uv - uDir * 1.3846153846).rgb * 0.3162162162;
+    s += texture(uSrc, uv + uDir * 3.2307692308).rgb * 0.0702702703;
+    s += texture(uSrc, uv - uDir * 3.2307692308).rgb * 0.0702702703;
+    oColor = vec4(s, 1.0);
+})";
+
+// 合成（全分辨率，6 采样/px）：`added = Σ halo_i·w_i · tint · amount`，
+// `sum = src + added`（**线性域加法** —— 真实 halation 是曝光阶段现象）。
+//
+// 通道相关半径 = 5 个权重向量的**逐通道不同峰值**（CPU 侧按 [64] 与乳剂常数
+// SPREAD = {1.0, 0.6, 0.32} 算好）—— 这一项就是"白→橙→红"的成因，任何 tint
+// 滑杆都模仿不出来（emulsion 原注释）。
+//
+// ⚠ shoulder **不在这里做**：规格 §3.2.1 ⑦ / §3.2.4 —— 拍照链路的 kFsOut 已有
+//   `highlightRolloff`（同 knee 0.80、同指数形式），halo 加光交给它压缩。编辑器
+//   链路的 kFsStyle 没有滚降（输入已成片）⇒ 两侧在 `sum > 0.8`（线性）的像素上
+//   存在**已知且刻意**的差异，报告逐条列明（验收判据 4）。
+//
+// ⚠ `added = 0` 的像素（halo 未到达）仍会经 RGBA16F 往返一次 ⇒ 有半精度量化，
+//   规格 §3.2.4 要求实测确认不可见。**[62] = 0 时整链旁路 ⇒ 逐位零回归不受影响。**
+const char* kFsHaloMix = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uSrc;    // 全分辨率原图（与 uDecodeIn 同域）
+uniform highp sampler2D uHalo0;
+uniform highp sampler2D uHalo1;
+uniform highp sampler2D uHalo2;
+uniform highp sampler2D uHalo3;
+uniform highp sampler2D uHalo4;
+uniform vec3 uW0;   // 每级的逐通道权重（CPU 侧算好，5 个独立 uniform —— 三禁规避）
+uniform vec3 uW1;
+uniform vec3 uW2;
+uniform vec3 uW3;
+uniform vec3 uW4;
+uniform vec3 uTint;      // (1, 0.24+0.34·warmth, 0.44−0.22·warmth)
+uniform float uAmount;   // [62] 0..1
+uniform float uDecodeIn; // 1 = uSrc 是显示域（编辑器链路）
+vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    vec3 lo = c / 12.92;
+    return mix(hi, lo, step(c, vec3(0.04045)));
+}
+vec3 srgbEncode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    vec3 lo = 12.92 * c;
+    return mix(hi, lo, step(c, vec3(0.0031308)));
+}
+void main() {
+    vec2 uv = vUV0;
+    vec3 halo = texture(uHalo0, uv).rgb * uW0;
+    halo += texture(uHalo1, uv).rgb * uW1;
+    halo += texture(uHalo2, uv).rgb * uW2;
+    halo += texture(uHalo3, uv).rgb * uW3;
+    halo += texture(uHalo4, uv).rgb * uW4;
+    vec3 added = halo * uTint * uAmount;
+    vec3 s = texture(uSrc, uv).rgb;
+    vec3 lin = (uDecodeIn > 0.5) ? srgbDecode(s) : s;
+    vec3 sum = lin + added;
+    oColor = vec4((uDecodeIn > 0.5) ? srgbEncode(sum) : sum, 1.0);
+})";
+
 // 实时直方图采样（M3）：胶片输出下采样到 256×96 RGBA8，OETF 与 kFsOut 一致
 // —— 直方图必须是"显示域、用户实际看到"的分布。每次读回 24KB（UI 侧节流）。
 // M4：与 kFsOut 同样走 LUT，否则选了 LUT 之后直方图/斑马纹会与画面不符。
@@ -6126,6 +6272,13 @@ bool FrameRenderer::init() {
   // —— 历史事故：漏加进下面的检查列表，shader 编译失败连"引擎起不来"都不会发生，
   // 只在真机上表现为"新 pass 没效果"（ADR §6.2）。
   const GLuint fs_style = compileShader(GL_FRAGMENT_SHADER, kFsStyle);
+  // E4-5 halation（光晕）：3 个 fragment shader 服务 16 个 pass（Thr 与 4 次 Down
+  // 共用 kFsHaloThr —— 数学逐字相同，只有 uThrOn/uDecodeIn 两个门控不同）。
+  // **进硬失败检查**（同 fs_style 的理由：编译失败若不在 init 暴露，真机只表现为
+  // "光晕没效果"= 静默失败）。
+  const GLuint fs_halo_thr = compileShader(GL_FRAGMENT_SHADER, kFsHaloThr);
+  const GLuint fs_halo_blur = compileShader(GL_FRAGMENT_SHADER, kFsHaloBlur);
+  const GLuint fs_halo_mix = compileShader(GL_FRAGMENT_SHADER, kFsHaloMix);
   const GLuint fs_hist = compileShader(GL_FRAGMENT_SHADER, kFsHist);
   const GLuint fs_local = compileShader(GL_FRAGMENT_SHADER, kFsLocal);
   const GLuint fs_fill = compileShader(GL_FRAGMENT_SHADER, kFsFillTest);
@@ -6221,6 +6374,11 @@ bool FrameRenderer::init() {
   prog_out_ = linkProgram(vs_plain_, fs_out);
   // E1-3 编辑器通路：kFsStyle 与 kFsOut 同几何（vs_plain_，无旋转/无 ST）
   prog_style_ = linkProgram(vs_plain_, fs_style);
+  // E4-5 halation：三个 pass 都是全屏三角形 + vUV0 归一化采样（无旋转/无 ST），
+  // 与 kFsStyle / kFsOut 同几何。5 级金字塔各级尺寸不同 ⇒ 靠 glViewport 切换。
+  prog_halo_thr_ = linkProgram(vs_plain_, fs_halo_thr);
+  prog_halo_blur_ = linkProgram(vs_plain_, fs_halo_blur);
+  prog_halo_mix_ = linkProgram(vs_plain_, fs_halo_mix);
   prog_hist_ = linkProgram(vs_plain_, fs_hist);
   prog_local_ = linkProgram(vs_plain_, fs_local);
   prog_fill_ = linkProgram(vs_rot_, fs_fill);
@@ -6306,6 +6464,9 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_film);
   glDeleteShader(fs_out);
   glDeleteShader(fs_style);
+  glDeleteShader(fs_halo_thr);
+  glDeleteShader(fs_halo_blur);
+  glDeleteShader(fs_halo_mix);
   glDeleteShader(fs_hist);
   glDeleteShader(fs_local);
   glDeleteShader(fs_fill);
@@ -6352,6 +6513,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_pc3d_down);
   glDeleteShader(fs_pc3d_up);
   if (!prog_oes_ || !prog_still_ || !prog_film_ || !prog_out_ || !prog_style_ ||
+      !prog_halo_thr_ || !prog_halo_blur_ || !prog_halo_mix_ ||
       !prog_fill_ ||
       !prog_raw_ || !prog_rcd_dir_ || !prog_rcd_g_ || !prog_rcd_chroma_ ||
       !prog_ccm_ || !prog_amaze_up_ ||
@@ -6904,6 +7066,32 @@ bool FrameRenderer::init() {
   u_style_.grain_zoom = glGetUniformLocation(prog_style_, "uGrainZoom");
   u_style_.grain_norm = glGetUniformLocation(prog_style_, "uGrainNorm");
   u_style_.grain_lut = glGetUniformLocation(prog_style_, "uGrainLut");
+  // E4-5 halation（光晕）：三个 program 的 uniform。**全部逐项独立获取**（无数组：
+  // 5 级 sampler 与 5 个权重向量都是独立 uniform —— 移动 GPU 三禁的规避，见
+  // kFsHaloMix 顶部注释）。
+  u_halo_thr_.src = glGetUniformLocation(prog_halo_thr_, "uSrc");
+  u_halo_thr_.texel = glGetUniformLocation(prog_halo_thr_, "uTexel");
+  u_halo_thr_.decode_in = glGetUniformLocation(prog_halo_thr_, "uDecodeIn");
+  u_halo_thr_.thr_on = glGetUniformLocation(prog_halo_thr_, "uThrOn");
+  u_halo_thr_.thr_lin = glGetUniformLocation(prog_halo_thr_, "uThrLin");
+  u_halo_thr_.knee = glGetUniformLocation(prog_halo_thr_, "uKnee");
+  u_halo_blur_.src = glGetUniformLocation(prog_halo_blur_, "uSrc");
+  u_halo_blur_.dir = glGetUniformLocation(prog_halo_blur_, "uDir");
+  u_halo_blur_.scale = glGetUniformLocation(prog_halo_blur_, "uScale");
+  u_halo_mix_.src = glGetUniformLocation(prog_halo_mix_, "uSrc");
+  u_halo_mix_.halo0 = glGetUniformLocation(prog_halo_mix_, "uHalo0");
+  u_halo_mix_.halo1 = glGetUniformLocation(prog_halo_mix_, "uHalo1");
+  u_halo_mix_.halo2 = glGetUniformLocation(prog_halo_mix_, "uHalo2");
+  u_halo_mix_.halo3 = glGetUniformLocation(prog_halo_mix_, "uHalo3");
+  u_halo_mix_.halo4 = glGetUniformLocation(prog_halo_mix_, "uHalo4");
+  u_halo_mix_.w0 = glGetUniformLocation(prog_halo_mix_, "uW0");
+  u_halo_mix_.w1 = glGetUniformLocation(prog_halo_mix_, "uW1");
+  u_halo_mix_.w2 = glGetUniformLocation(prog_halo_mix_, "uW2");
+  u_halo_mix_.w3 = glGetUniformLocation(prog_halo_mix_, "uW3");
+  u_halo_mix_.w4 = glGetUniformLocation(prog_halo_mix_, "uW4");
+  u_halo_mix_.tint = glGetUniformLocation(prog_halo_mix_, "uTint");
+  u_halo_mix_.amount = glGetUniformLocation(prog_halo_mix_, "uAmount");
+  u_halo_mix_.decode_in = glGetUniformLocation(prog_halo_mix_, "uDecodeIn");
   // E2-12 裁剪 + 90° 步进旋转（ADR-16）
   u_style_.crop_origin = glGetUniformLocation(prog_style_, "uCropOrigin");
   u_style_.crop_size = glGetUniformLocation(prog_style_, "uCropSize");
@@ -7075,6 +7263,9 @@ void FrameRenderer::release() {
   if (tex_grain_lut_) glDeleteTextures(1, &tex_grain_lut_);
   grain_lut_mb_ = -1.0f;
   grain_lut_pivot_ = -1.0f;
+  // E4-5 halation：5 级金字塔 + tmp + 全分辨率输出（releaseHaloTargets 同时复位
+  // 缓存键 ⇒ 下次 [62] > 0 时按新尺寸重建）。
+  releaseHaloTargets();
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
@@ -7657,6 +7848,10 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   // 指纹源 = rgb_stage_（CPU 转换后的 RGB8），与输出尺寸一起决定图案的起始相位。
   grain_seed_ = grainSeedFrom(
       grainFingerprint(rgb_stage_.data(), rgb_stage_.size()), dst_w, dst_h);
+  // E4-5b（R1）：成片基准短边（同 finishStillChain 的同名段）—— **两条成片路径
+  // （YUV 静拍 = 本函数 / RAW 静拍 = finishStillChain）都要设**，否则本路径的成片
+  // shift ≠ 0：光晕半径与预览对不上，且会改变成片观感（本卡承诺"成片逐位不变"）。
+  halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
   passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   logPassDiag("pass3_still", fbo_cap_, false);
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
@@ -7870,6 +8065,20 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
   kv += ",\"grainMb\":" + std::to_string(p.grain_midtone_bias);
   kv += ",\"grainPivot\":" + std::to_string(p.grain_pivot);
   kv += ",\"grainSeed\":" + jnum(grain_seed_, 6);
+  // ── E4-5 halation（光晕）：编辑器链路的**生效性三件套 + 四参数**────────────
+  //  · haloOn = 本帧 halo 链**真的执行了**（0 且 [62] > 0 ⇒ 静默失败：program 缺失 /
+  //    纹理分配失败 / FBO 不完整）；字段行晚于上面的 passStyle 调用（纪律同 grain）。
+  //  · haloMs = CPU 侧提交耗时（真机性能判据之一，GPU 完成时间看成片 totalMs）。
+  //  · haloStrength/haloThr/haloRadius/haloWarmth = 实际下发的四个参数生效值。
+  kv += ",\"haloOn\":" + std::to_string(halo_on_);
+  kv += ",\"haloMs\":" + jnum(halo_ms_, 7);
+  kv += ",\"haloStrength\":" + jnum(p.halation_strength, 6);
+  kv += ",\"haloThr\":" + jnum(p.halation_threshold, 6);
+  kv += ",\"haloRadius\":" + jnum(p.halation_radius, 6);
+  kv += ",\"haloWarmth\":" + jnum(p.halation_warmth, 6);
+  // E4-5b（R1）：halo 半径归一化的**基准短边**（= 成片短边）。核对"预览与成片
+  // 是否用同一基准"就靠它 —— 两侧同一进程内应恒等（成片调用会更新它）。
+  kv += ",\"haloRef\":" + jnum(halo_ref_min_, 7);
   // E2-2 基础调整：**下发参数值**（与上面三个同出口 —— ADR §6.2 要求"下发值 /
   // 链接成功 / 本帧执行"三件套写在同一个日志出口；check-diag-fields.py 会核对
   // 字段行必须晚于本函数内的 passStyle 调用）。
@@ -10240,6 +10449,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 填进 ChainCtx）⇒ 同一张两次导出**逐位相同**、不同照片不同图案（验收判据 6）。
   // 预览/编辑器路径各自置 0（submitFrame/submitDisplay）⇒ 取景时图案稳定不闪。
   grain_seed_ = grainSeedFrom(c.grain_fp, dst_w, dst_h);
+  // ── E4-5b（R1）：halo 半径归一化的基准短边 = **本张成片的短边**（画幅的权威来源）
+  // 必须在 passOutput（其内部调 runHalation）**之前**设置：成片调用时
+  // `min(w,h) == halo_ref_min_` ⇒ `level_shift = log2(1.0f) = 0.0f` ⇒ 权重逐位等于
+  // 修正前（**成片零观感变化**）。预览/编辑器（短边 ≠ 成片短边）按同一基准归一化
+  // ⇒ 三者的光晕**相对**半径一致（修掉了"预览 2.8× 于成片"的 WYSIWYG 破绽）。
+  halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
   passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
   glFinish();
@@ -10551,6 +10766,20 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"toneBl\":" + jnum(p.blacks, 6);
     kv += ",\"toneFade\":" + jnum(p.fade, 6);
   }
+  // ── E4-5 halation（光晕）：成片链路的生效性 + 四参数 ────────────────────────
+  // halo 链在 passOutput 内、OETF 之前执行（已在本函数内跑完）⇒ 字段行晚于调用
+  // （check-diag-fields.py 的同一条纪律）。
+  // ⚠ 字段名与 submitDisplay 出口**同名**：本脚本取 hits[0]（行号更小的
+  //   submitDisplay）⇒ 白名单核对的是编辑器出口，成片侧由真机日志核对（grain 同款）。
+  kv += ",\"haloOn\":" + std::to_string(halo_on_);
+  kv += ",\"haloMs\":" + jnum(halo_ms_, 7);
+  kv += ",\"haloStrength\":" + jnum(p.halation_strength, 6);
+  kv += ",\"haloThr\":" + jnum(p.halation_threshold, 6);
+  kv += ",\"haloRadius\":" + jnum(p.halation_radius, 6);
+  kv += ",\"haloWarmth\":" + jnum(p.halation_warmth, 6);
+  // E4-5b（R1）：halo 半径归一化的**基准短边**（= 成片短边）。核对"预览与成片
+  // 是否用同一基准"就靠它 —— 两侧同一进程内应恒等（成片调用会更新它）。
+  kv += ",\"haloRef\":" + jnum(halo_ref_min_, 7);
   if (!c.mfnr_kv.empty()) kv += "," + c.mfnr_kv;
   // v0.10.59：新增算法的生效性字段 —— 必须在这里（finishStillChain 内、日志发出
   // 前一行），因为 P0 与色度多尺度两个 pass 都在本函数内执行完；此前误加在
@@ -13276,16 +13505,271 @@ void FrameRenderer::ensureGrainLut(float mb, float pivot) {
   grain_lut_pivot_ = pivot;
 }
 
+// ══ E4-5 halation（光晕）═════════════════════════════════════════════════════
+// 参考实现 = jie60517/emulsion `src/render/effects/library/halation.ts`（唯一有
+// **通道扩散**的公开实现；darktable `bloom.c` 是 Orton 效应、不含通道扩散，仅对照）。
+// 物理、逐行对照、落点、参数映射见 docs/reports/editor-E4-film-params-DESIGN.md §3.2。
+//
+// 乳剂的逐通道扩散比（emulsion 同名常量 CHANNEL_SPREAD）。**硬编码不给槽位** ——
+// 这是乳剂的物理常数（红光在片基里散射最远、蓝光最近），正是"白→橙→红"径向渐变的
+// 成因；做成滑杆反而会让用户把它调成均匀红雾（emulsion 原注释同义）。
+static constexpr float kHaloSpread[3] = {1.0f, 0.6f, 0.32f};
+static constexpr float kHaloSigma = 0.95f;  // emulsion SPREAD_SIGMA（级间高斯宽度）
+static constexpr int kHaloLevels = 5;       // emulsion LEVELS（1/2 … 1/32）
+
+// CPU 侧 sRGB 解码（IEC 61966-2-1，与 shader 的 srgbDecode 逐字同式）：[63] 的单位是
+// **显示域** sRGB 编码值（用户直觉"多亮算高光"），进 shader 前换算到线性显示域。
+// 用真分段曲线，不用 pow(2.2) 近似（暗部往返误差实测可达 9/255，见 kFsOut 注释）。
+static float srgbToLinear1(float c) {
+  c = std::clamp(c, 0.0f, 1.0f);
+  return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// emulsion `haloWeights`：逐通道高斯，峰值落在 level = radius01·(LEVELS−1)·SPREAD[c]。
+// ⇒ **红通道峰值在更高级（更大半径）、蓝通道在更低级** ⇒ 同一个点光源在三个通道上
+// 得到三个不同的扩散半径 ⇒ "白（核心）→ 橙（中环，R+G）→ 红（外环，仅 R）"。
+// 每通道**独立归一化**（权重和为 1）⇒ 半径只改"分布形状"，不改总能量。
+//
+// ── E4-5b（R1）：为什么需要 `level_shift` ────────────────────────────────────
+// 金字塔各级是**相对尺寸**（`w >> (i+1)`），但 blur 的 σ = 1.637 **texel @ 该级**
+// ⇒ 等效全分辨率 σ_px = `1.637·2^(i+1)`，**与图像尺寸无关** ⇒ halo 实际是**固定像素
+// 尺度**的：归一化半径 ∝ 1/短边。实测预览短边 1080 vs 成片 3072 ⇒ 预览的光晕相对
+// 半径是成片的 **2.8×**（WYSIWYG 破绽；规格 §3.2.5 的"等比缩放"声称不成立）。
+// 修正 = 把峰值按 `log2(min(w,h) / refMin)` 平移（**纯 CPU、零 GPU 成本**）：
+//   归一化半径 = 1.637·2^(centre+1) / min(w,h)，代入 centre' = centre + shift 得
+//   1.637·2^(centre+1) / refMin ⇒ **与 min(w,h) 无关** ✓。
+// `refMin` = 画幅短边（= 成片短边）⇒ **成片 shift = log2(1) = 0 ⇒ 逐位等于修正前**。
+// ⚠ 已知下限（记录，非缺陷）：`centre' < 0` 时权重被 level0 截断（金字塔没有更小的
+//   级）⇒ 预览在**很小的 [64]**（R 通道 `radius01 < ~0.38` @1080/3072）下归一化半径
+//   略大于成片。消除它需再加一级全分辨率 blur（+19% 采样）—— 不在本卡范围。
+void FrameRenderer::haloWeights(float radius01, float level_shift,
+                                float w[kHaloLevels][3]) {
+  for (int c = 0; c < 3; ++c) {
+    const float centre = radius01 * static_cast<float>(kHaloLevels - 1) *
+                             kHaloSpread[c] +
+                         level_shift;
+    float raw[kHaloLevels];
+    float sum = 0.0f;
+    for (int i = 0; i < kHaloLevels; ++i) {
+      const float d = static_cast<float>(i) - centre;
+      raw[i] = std::exp(-(d * d) / (2.0f * kHaloSigma * kHaloSigma));
+      sum += raw[i];
+    }
+    if (sum <= 0.0f) {
+      // 极端平移下全部下溢（float 的 exp < 1e-38）⇒ 退化为"最接近 centre 的级独占"
+      //（防 0/0 = NaN；实测范围内走不到这里，纯防御）。
+      const int nearest =
+          std::clamp(static_cast<int>(std::lround(centre)), 0, kHaloLevels - 1);
+      for (int i = 0; i < kHaloLevels; ++i) w[i][c] = (i == nearest) ? 1.0f : 0.0f;
+      continue;
+    }
+    for (int i = 0; i < kHaloLevels; ++i) w[i][c] = raw[i] / sum;
+  }
+}
+
+void FrameRenderer::releaseHaloTargets() {
+  for (int i = 0; i < kHaloLevels; ++i) {
+    if (tex_halo_[i]) glDeleteTextures(1, &tex_halo_[i]);
+    if (fbo_halo_[i]) glDeleteFramebuffers(1, &fbo_halo_[i]);
+    tex_halo_[i] = 0;
+    fbo_halo_[i] = 0;
+    halo_w_[i] = 0;
+    halo_h_[i] = 0;
+  }
+  if (tex_halo_tmp_) glDeleteTextures(1, &tex_halo_tmp_);
+  if (fbo_halo_tmp_) glDeleteFramebuffers(1, &fbo_halo_tmp_);
+  tex_halo_tmp_ = 0;
+  fbo_halo_tmp_ = 0;
+  halo_tmp_w_ = 0;
+  halo_tmp_h_ = 0;
+  if (tex_halo_out_) glDeleteTextures(1, &tex_halo_out_);
+  if (fbo_halo_out_) glDeleteFramebuffers(1, &fbo_halo_out_);
+  tex_halo_out_ = 0;
+  fbo_halo_out_ = 0;
+  halo_src_w_ = 0;
+  halo_src_h_ = 0;
+}
+
+// 5 级金字塔 + **单张**最大级 tmp + 全分辨率输出。尺寸变化（预览缩放 / 编辑器换图 /
+// 成片分辨率变化）时整体重建 —— 缓存键 = 输入尺寸（= 输出尺寸）。
+// ⚠ tmp 只有最大级（1/2）尺寸（省 5 张逐级 tmp ≈ 33MB）：处理更小的级时用 uScale 把
+//   归一化 UV 缩到 tmp **已写入的左下角子矩形**上（GL 的 FBO 原点在左下角 ⇒
+//   viewport(0,0,w_i,h_i) 写左下图块，纹理坐标 (0,0) 也在左下 ⇒ vUV0·scale 精确对上）。
+bool FrameRenderer::ensureHaloTargets(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  if (w == halo_src_w_ && h == halo_src_h_ && tex_halo_out_ != 0) return true;
+  releaseHaloTargets();
+  // @domain: D5 —— halation 的金字塔各级（kFsFilm 输出的**线性显示域**；编辑器链路在
+  // 入口先 sRGB 解码、出口再编码，中间全程同域）。域字典 D5 = "filmic 输出，白点 1.0，
+  // [0,1]，允许锐化/OETF" —— 与 tex_work_ 的显示域口径一致。
+  for (int i = 0; i < kHaloLevels; ++i) {
+    // emulsion：level_i = max(2, w >> (i+1)) —— 小图也有合法尺寸（1/32 级不为 0）
+    halo_w_[i] = std::max(2, w >> (i + 1));
+    halo_h_[i] = std::max(2, h >> (i + 1));
+    makeTex(&tex_halo_[i], &fbo_halo_[i], GL_RGBA16F, halo_w_[i], halo_h_[i]);
+  }
+  halo_tmp_w_ = halo_w_[0];
+  halo_tmp_h_ = halo_h_[0];
+  // @domain: D5 —— 横向模糊的中间量（只有最大级尺寸，更小的级靠 uScale 对齐子矩形）；
+  // 下方 tex_halo_out_ 同域（全分辨率合成结果）。
+  makeTex(&tex_halo_tmp_, &fbo_halo_tmp_, GL_RGBA16F, halo_tmp_w_, halo_tmp_h_);
+  makeTex(&tex_halo_out_, &fbo_halo_out_, GL_RGBA16F, w, h);
+  // FBO 不完整时 draw 被驱动**静默丢弃**（X300 实测：输出保持未初始化且 glErr=0）
+  // ⇒ 必须显式查一次，否则真机上只表现为"光晕没效果"（静默失败）。
+  bool ok = true;
+  for (int i = 0; i < kHaloLevels; ++i) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_[i]);
+    ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_tmp_);
+  ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_out_);
+  ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  if (!ok) {
+    Logger::instance().log(LogLevel::kError, "engine", "halo.fbo_incomplete",
+                           "{\"w\":" + std::to_string(w) +
+                               ",\"h\":" + std::to_string(h) + "}");
+    releaseHaloTargets();
+    return false;
+  }
+  halo_src_w_ = w;
+  halo_src_h_ = h;
+  return true;
+}
+
+// 16 个 pass：Thr(1) + Down(4) + Blur(10) + Mix(1)。
+// **任何一环不可用都返回 src_tex（直通）并把 halo_on_ 置 0** —— 真机日志因此能区分
+// "[62]=0 没开"与"[62]>0 但静默失败"（验收判据 6 的失败判据之一）。
+GLuint FrameRenderer::runHalation(int w, int h, GLuint src_tex, const FilmParams& p,
+                                  bool decode_in) {
+  halo_on_ = 0;
+  halo_ms_ = 0.0f;
+  const float amount = std::clamp(p.halation_strength, 0.0f, 1.0f);
+  // [62] ≤ 0 ⇒ **整链旁路**：零 pass、零纹理分配、零成本（验收判据 1 的 A/B 通路）。
+  if (amount <= 0.0f || src_tex == 0) return src_tex;
+  if (!prog_halo_thr_ || !prog_halo_blur_ || !prog_halo_mix_) return src_tex;
+  if (!ensureHaloTargets(w, h)) return src_tex;
+  const auto t0 = std::chrono::steady_clock::now();
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  // ── ① 高光提取（线性域）+ 手写 2×2 盒式降到 1/2（kFsHaloThr）──────────────
+  // emulsion 此 pass 靠硬件 LINEAR 完成降采样；X300 的 RGBA16F 无线性过滤 ⇒ 4 采样/px。
+  // 阈值与 knee 在 CPU 侧按 [63] 算好（shader 内不做 srgbToLinear 的 pow）。
+  const float thr_lin = srgbToLinear1(p.halation_threshold);
+  glUseProgram(prog_halo_thr_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src_tex);
+  glUniform1i(u_halo_thr_.src, 0);
+  glUniform1f(u_halo_thr_.decode_in, decode_in ? 1.0f : 0.0f);
+  glUniform1f(u_halo_thr_.thr_lin, thr_lin);
+  glUniform1f(u_halo_thr_.knee, std::max(0.02f, thr_lin * 0.55f));
+  glUniform1f(u_halo_thr_.thr_on, 1.0f);
+  glUniform2f(u_halo_thr_.texel, 1.0f / static_cast<float>(w),
+              1.0f / static_cast<float>(h));
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_[0]);
+  glViewport(0, 0, halo_w_[0], halo_h_[0]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ── ② 逐级降采样（同一 program，只关阈值/解码两个门控）────────────────────
+  glUniform1f(u_halo_thr_.thr_on, 0.0f);
+  glUniform1f(u_halo_thr_.decode_in, 0.0f);
+  for (int i = 1; i < kHaloLevels; ++i) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_[i]);
+    glViewport(0, 0, halo_w_[i], halo_h_[i]);
+    glBindTexture(GL_TEXTURE_2D, tex_halo_[i - 1]);
+    glUniform2f(u_halo_thr_.texel, 1.0f / static_cast<float>(halo_w_[i - 1]),
+                1.0f / static_cast<float>(halo_h_[i - 1]));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  // ── ③ 逐级可分离高斯（10 次 draw：每级先横后纵）──────────────────────────
+  // 横 pass 写 tmp（只有最大级尺寸 ⇒ 更小的级写进左下角子矩形，由 uScale 对齐）。
+  glUseProgram(prog_halo_blur_);
+  glUniform1i(u_halo_blur_.src, 0);
+  for (int i = 0; i < kHaloLevels; ++i) {
+    const float sx =
+        static_cast<float>(halo_w_[i]) / static_cast<float>(halo_tmp_w_);
+    const float sy =
+        static_cast<float>(halo_h_[i]) / static_cast<float>(halo_tmp_h_);
+    glUniform2f(u_halo_blur_.scale, sx, sy);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_tmp_);
+    glViewport(0, 0, halo_w_[i], halo_h_[i]);
+    glBindTexture(GL_TEXTURE_2D, tex_halo_[i]);
+    glUniform2f(u_halo_blur_.dir, 1.0f / static_cast<float>(halo_w_[i]), 0.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_[i]);
+    glViewport(0, 0, halo_w_[i], halo_h_[i]);
+    glBindTexture(GL_TEXTURE_2D, tex_halo_tmp_);
+    glUniform2f(u_halo_blur_.dir, 0.0f, 1.0f / static_cast<float>(halo_h_[i]));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  // ── ④ 合成（全分辨率，6 采样/px）：src + Σ halo_i·w_i·tint·amount ─────────
+  // 权重与 tint 都在 CPU 侧算好（emulsion 同款）；5 个权重是**独立 uniform**
+  // （三禁规避：不用数组 uniform、不用数组初始化器）。
+  // E4-5b（R1）：`level_shift` 把峰值按输出分辨率平移 ⇒ halo 的**归一化**半径与
+  // 图像尺寸无关（预览与成片一致）。成片（min == halo_ref_min_）时 shift = 0.0f
+  // ⇒ 权重逐位等于修正前（零观感变化）；两条链路都走这里 ⇒ 编辑器链路同样归一化
+  // （它的 w/h = edit_w_/edit_h_ = 输入位图尺寸，见 passStyle 的调用注释）。
+  const float level_shift =
+      std::log2(static_cast<float>(std::min(w, h)) / halo_ref_min_);
+  float wgt[kHaloLevels][3];
+  haloWeights(std::clamp(p.halation_radius, 0.0f, 1.0f), level_shift, wgt);
+  const float warmth = std::clamp(p.halation_warmth, 0.0f, 1.0f);
+  glUseProgram(prog_halo_mix_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src_tex);
+  glUniform1i(u_halo_mix_.src, 0);
+  for (int i = 0; i < kHaloLevels; ++i) {
+    glActiveTexture(GL_TEXTURE1 + i);
+    glBindTexture(GL_TEXTURE_2D, tex_halo_[i]);
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glUniform1i(u_halo_mix_.halo0, 1);
+  glUniform1i(u_halo_mix_.halo1, 2);
+  glUniform1i(u_halo_mix_.halo2, 3);
+  glUniform1i(u_halo_mix_.halo3, 4);
+  glUniform1i(u_halo_mix_.halo4, 5);
+  glUniform3f(u_halo_mix_.w0, wgt[0][0], wgt[0][1], wgt[0][2]);
+  glUniform3f(u_halo_mix_.w1, wgt[1][0], wgt[1][1], wgt[1][2]);
+  glUniform3f(u_halo_mix_.w2, wgt[2][0], wgt[2][1], wgt[2][2]);
+  glUniform3f(u_halo_mix_.w3, wgt[3][0], wgt[3][1], wgt[3][2]);
+  glUniform3f(u_halo_mix_.w4, wgt[4][0], wgt[4][1], wgt[4][2]);
+  glUniform3f(u_halo_mix_.tint, 1.0f, 0.24f + 0.34f * warmth,
+              0.44f - 0.22f * warmth);
+  glUniform1f(u_halo_mix_.amount, amount);
+  glUniform1f(u_halo_mix_.decode_in, decode_in ? 1.0f : 0.0f);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_halo_out_);
+  glViewport(0, 0, w, h);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  halo_on_ = 1;
+  // ⚠ CPU 侧**提交**耗时（与 passMs / rcdAMs 同口径，不是 GPU 完成耗时）。真机判据
+  //   见报告：成片路径末尾有 glFinish ⇒ totalMs 含 halo 的真实 GPU 时间。
+  halo_ms_ = std::chrono::duration<float, std::milli>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count();
+  return tex_halo_out_;
+}
+
 // E1-3 编辑器通路：显示域输入（still_tex_）→ LUT/颗粒/dither → fbo_cap_（RGBA8）。
 // 与 passOutput 的区别见 kFsStyle 注释：不重跑滚降/锐化/OETF，无翻转、无斑马纹。
 // 颗粒种子固定为 0（submitDisplay 置）⇒ 同一输入 + 同一参数 ⇒ 输出可复现（报告 R3）。
 void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
                               int crop_rot, const FilmParams& p) {
+  // ── E4-5 halation（光晕）：**在 passStyle 之前**跑金字塔 ────────────────────
+  // kFsStyle 是单 pass，装不下 5 级金字塔 ⇒ 金字塔独立成 pass 链，其"加法"落在
+  // kFsStyle 的 **LUT 之前**，与拍照链路（kFsFilm 后 / kFsOut 的 OETF 与 LUT 前）
+  // 同序（规格 §3.2.2）。输入 = edit_tex_（**显示域 sRGB** ⇒ decode_in=true），
+  // 输出域跟随输入域（显示域）⇒ kFsStyle 的域约定与下游代码**零改动**。
+  // ⚠ 尺寸用 edit_w_/edit_h_（**输入位图**尺寸），**不是**本函数的 w/h（= 裁剪后
+  //   输出尺寸）：halo 是片基上的固定物理尺寸，必须按原画幅归一化（规格 §3.2.5）。
+  //   裁剪只是取景，halo 坐标系不跟着放大 —— 这正是"按原画幅而非输出画幅"的实现。
+  GLuint style_src = edit_tex_;
+  if (p.halation_strength > 0.0f && edit_w_ > 0 && edit_h_ > 0) {
+    style_src = runHalation(edit_w_, edit_h_, edit_tex_, p, /*decode_in=*/true);
+  }
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_style_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, edit_tex_);  // E1-5：编辑器自己的 RGBA8 输入纹理
+  glBindTexture(GL_TEXTURE_2D, style_src);  // E1-5：编辑器自己的 RGBA8 输入纹理
   glUniform1i(u_style_.tex, 0);
   // ── E4-3 颗粒：CPU 侧算好尺度常数（shader 内不做 W/H 除法与 clamp）────────
   // 短边归一化（ADR-11）：噪声坐标 = 像素/短边 ⇒ 预览（降采样）与导出（全分辨率）的
@@ -13470,10 +13954,24 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
                                bool zebra) {
   // flip_y 仅在拍照路径使用（渲染到 fbo_cap_）；预览直接渲染到当前窗口面
   if (flip_y) glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
+  // ── E4-5 halation（光晕）：**在 OETF 之前**（tex_work_ = kFsFilm 输出的线性显示域）
+  // 加光交给本 shader 的 highlightRolloff 压缩（规格 §3.2.1 ⑦ / §3.2.4）⇒ halation
+  // pass 内**不做** shoulder，也不改变 kFsOut 的其余段。
+  // ⚠ 本函数**不改绑定**是调用方的约定（submitFrame 的降档分支已绑 fbo_out_s_、预览
+  //   路径已绑窗口 0）⇒ halo 链切过 FBO 后必须**恢复进入时的目标**，不能硬编码
+  //   `flip_y ? fbo_cap_ : 0`（那会把降档预览画到窗口上）。halo 关闭时**一个额外 GL
+  //   调用都不发**（glGetIntegerv 也在分支内）⇒ 与改动前逐位零回归。
+  GLuint out_src = tex_work_;
+  if (p.halation_strength > 0.0f) {
+    GLint prev_fbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    out_src = runHalation(w, h, tex_work_, p, /*decode_in=*/false);
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  }
   glViewport(0, 0, w, h);
   glUseProgram(prog_out_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_work_);
+  glBindTexture(GL_TEXTURE_2D, out_src);
   glUniform1i(u_out_.tex, 0);
   glUniform2f(u_out_.px, 1.0f / static_cast<float>(w),
               1.0f / static_cast<float>(h));

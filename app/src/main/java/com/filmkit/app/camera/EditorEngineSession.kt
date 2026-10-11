@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicReference
  * 两条线程并发持有引擎实例 = UAF，不允许出现。
  *
  * **参数**：调用方传进来的 `film` 是完整 FilmParams（长度 = `CameraPresets.COUNT`）的**副本**
- *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 44 个槽位**，
+ *（主线程可能同时在改滑杆值，不能共享同一数组）。引擎的 `passStyle` 读**下面这 45 个槽位**，
  * 其余槽位不影响输出（ADR §5.1 I-2；白名单由 `tools/check-style-passthrough.py` 第 ④ 项
  * 精确匹配守着，本清单与它逐项对齐，由 `EditorStyleWhitelistTest` 钉住三方一致）：
  *
@@ -47,6 +47,7 @@ import java.util.concurrent.atomic.AtomicReference
  * [26] grain_amount      [27] grain_size                   [34] lut_strength
  * [37] filmic_black_ev   [38] filmic_white_ev
  * [60] grain_midtone_bias  [61] grain_pivot
+ * [62] halation_strength
  * [66] vignette_strength [67] vignette_radius  [68] vignette_feather
  * [78] clarity
  * [79] local_type  [80] local_center_x  [81] local_center_y  [82] local_radius
@@ -68,6 +69,10 @@ import java.util.concurrent.atomic.AtomicReference
  *  ⚠️ `[5][6][7]` 与 `[8][9][10]` 用的是**数组字段** `shoulder[3]`/`toe[3]`（同一个字段
  *  覆盖三个槽位）—— 这是本清单里唯一允许"字段名重复"的地方，`EditorStyleWhitelistTest`
  *  按"FilmParams.h 里是否为数组字段"校验。
+ * ★ E4-5（2026-10-11）从 44 → 45：`[62]` 光晕强度。passStyle 里只读 `[62]`（门控 = 是否
+ *  跑金字塔链）；`[63]` 阈值 / `[64]` 半径 / `[65]` 暖度在它调用的 `runHalation` 里读 ——
+ *  那是**两条链路共享**的函数（`passOutput` 也调它），四参数的生效性由
+ *  `tools/check-halation.py` 覆盖。光晕链落在 kFsStyle 的 **LUT 之前**（与拍照链路同序）。
  */
 internal class EditorEngineSession {
 

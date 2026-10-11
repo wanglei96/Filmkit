@@ -667,6 +667,27 @@ class FrameRenderer {
   // 缓存键 = (mb, pivot)：两者都未变则立即返回（每帧调用一次，开销 = 两次比较）。
   void ensureGrainLut(float mb, float pivot);
 
+  // ── E4-5 halation（光晕；emulsion `halation.ts` 的通道扩散金字塔）──────────
+  // 5 级金字塔（1/2 … 1/32）+ 逐级可分离高斯 + 逐通道权重合成，共 16 个 pass。
+  // 输入/输出域**跟随调用方**（uDecodeIn）：拍照链路 = 线性显示域（tex_work_，
+  // kFsFilm 输出）；编辑器链路 = 显示域 sRGB（edit_tex_，已成片 RGBA8）。
+  // 两条链路喂给金字塔的是同一个线性量 ⇒ 同参数下逐位可比（验收判据 4）。
+  // 返回 = 合成结果纹理；**任何一步不可用（[62]≤0 / 分配失败 / program 缺失）都
+  // 返回 src_tex（直通）**，并把 halo_on_ 置 0 ⇒ 真机日志能区分"没开"与"静默失败"。
+  GLuint runHalation(int w, int h, GLuint src_tex, const FilmParams& p,
+                     bool decode_in);
+  // 5 级金字塔纹理 + 单张最大级 tmp + 全分辨率输出（尺寸变化时整体重建）。
+  bool ensureHaloTargets(int w, int h);
+  void releaseHaloTargets();
+  // emulsion `haloWeights`：逐通道高斯，峰值在 centre_c = radius01·4·SPREAD[c]。
+  // 输出 w[i][c]（级 i、通道 c），每通道**独立归一化**（和为 1）。
+  // ⚠ **E4-5b（R1 修正）**：`level_shift = log2(min(w,h) / halo_ref_min_)` —— 把峰值按
+  //   **输出分辨率**平移，使 halo 的**归一化**半径与图像尺寸无关（= 规格 §3.2.5 的原始
+  //   声称；原实现实测是"固定像素尺度"，预览与成片差 2.8×）。
+  //   成片（min(w,h) == refMin）时 shift = log2(1.0f) = 0.0f ⇒ `x + 0.0f` 逐位 == x
+  //   ⇒ **成片行为与修正前逐位一致**（零观感变化；见 e4-5b 报告）。
+  static void haloWeights(float radius01, float level_shift, float w[5][3]);
+
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
          prog_rcd_chroma_ = 0,
@@ -711,6 +732,45 @@ class FrameRenderer {
   float grain_lut_mb_ = -1.0f;
   float grain_lut_pivot_ = -1.0f;
   float grain_seed_ = 0.0f;
+  // ── E4-5 halation（光晕，emulsion halation.ts）────────────────────────────
+  // 5 级金字塔（1/2 … 1/32）+ **单张**最大级 tmp（25MB；逐级 tmp 要多 33MB，
+  // 靠 uScale 把更小级的归一化 UV 缩到 tmp 已写入的左下角子矩形上）+ 全分辨率
+  // 输出。**纹理只在 [62] > 0 时分配**（[62] = 0 = 整链旁路：零 pass、零纹理、
+  // 零成本 —— 验收判据 1）。
+  // 内存峰值（4080×3072，全分辨率独立输出方案）= 158.6MB：
+  //   金字塔 4.17M px + tmp 3.13M px + out 12.53M px = 19.83M px × 8B。
+  // ⚠ 规格 §3.2.7 的 D4（out 与 tex_work_ 乒乓，省 100MB）**不预先套用** ——
+  //   按项目铁律"先完整实现、真机实测内存后再由用户拍板"（报告 §降级选项）。
+  GLuint tex_halo_[5] = {0, 0, 0, 0, 0};
+  GLuint fbo_halo_[5] = {0, 0, 0, 0, 0};
+  int halo_w_[5] = {0, 0, 0, 0, 0};
+  int halo_h_[5] = {0, 0, 0, 0, 0};
+  GLuint tex_halo_tmp_ = 0, fbo_halo_tmp_ = 0;
+  int halo_tmp_w_ = 0, halo_tmp_h_ = 0;
+  GLuint tex_halo_out_ = 0, fbo_halo_out_ = 0;
+  int halo_src_w_ = 0, halo_src_h_ = 0;  // 缓存键 = 输入（= 输出）尺寸
+  // E4-5b（R1）：halo 半径归一化的**基准短边**（= 画幅短边 = 成片短边）。由
+  // finishStillChain 用 `min(dst_w, dst_h)` 更新（成片是"画幅"的权威来源）；
+  // 首拍之前用 kHaloRefMinDefault 兜底（= 4080×3072 画幅的短边，规格 §3.2.5
+  // "本版无裁切/固定画幅"）。同一个 [64] 在成片上因此**逐位等于修正前**。
+  float halo_ref_min_ = 3072.0f;
+  // 诊断：halo_on_ = 本帧 halo 链**真的执行了**（0 且 [62] > 0 ⇒ 静默失败：
+  // program 缺失 / 纹理分配失败 / FBO 不完整 —— 真机日志一眼可辨）。
+  int halo_on_ = 0;
+  float halo_ms_ = 0.f;
+  GLuint prog_halo_thr_ = 0, prog_halo_blur_ = 0, prog_halo_mix_ = 0;
+  struct {
+    GLint src = -1, texel = -1, decode_in = -1, thr_on = -1, thr_lin = -1,
+          knee = -1;
+  } u_halo_thr_;
+  struct {
+    GLint src = -1, dir = -1, scale = -1;
+  } u_halo_blur_;
+  struct {
+    GLint src = -1, halo0 = -1, halo1 = -1, halo2 = -1, halo3 = -1, halo4 = -1,
+          w0 = -1, w1 = -1, w2 = -1, w3 = -1, w4 = -1, tint = -1, amount = -1,
+          decode_in = -1;
+  } u_halo_mix_;
   // E1-5（2026-10-08 P0 全黑定位）：编辑器输入纹理。**独立于 still_tex_** ——
   // 编辑器上传的是 RGBA8，内部格式必须同为 RGBA8（RGB8 内部格式 + RGBA 上传是
   // 「内部/外部格式不匹配」，规范允许但部分驱动会拒绝或写入未定义内容）。
