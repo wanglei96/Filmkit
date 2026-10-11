@@ -73,6 +73,10 @@ class CameraStyleWhitelistTest {
      *    `passOutput` → `runHalation` 内读取（`runHalation` 是两条链路共享的函数，
      *    不在 [editorPathFuncs] 里 ⇒ 它的读取算拍照链路；编辑器链路只直接读 `[62]`，
      *    由 `EditorStyleWhitelistTest` 独立守着）。
+     *  - **SG-1（v0.11.17）起 = 41 个**：`[95..97]` 柔光 —— `[95]` 在 `passOutput` 里
+     *    直接读（门控），`[96]` 半径 / `[97]` 阈值在 `runGlow` 内读。`runGlow` 与
+     *    `runHalation` 一样是**两条链路共享**的函数（不在 [editorPathFuncs] 里）
+     *    ⇒ 三槽都算拍照链路；编辑器链路只直接读 `[95]`（`EditorStyleWhitelistTest` 守）。
      *  - **不含** `[28]`（基准影调）/ `[30]`（过曝提示）/ `[31..33]`（色彩外观层）/
      *    `[34]`（LUT 强度，由 `lut.strength` 承载）/ `[35][36]`（引擎标定）：`presetSlotIncluded`
      *    把它们排除在预设之外 ⇒ 与"预设作用域"无关，不在本集合的定义域内。
@@ -91,6 +95,7 @@ class CameraStyleWhitelistTest {
         add(78)
         add(88); add(89)
         addAll(90..94)
+        addAll(95..97)     // SG-1 柔光：[95] 强度 / [96] 半径 / [97] 阈值
     }
 
     /** 编辑器链路的函数（抽取时排除；新增编辑器专属函数时必须加进来，见类 KDoc 第 4 条）。 */

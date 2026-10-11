@@ -15,8 +15,9 @@ class CameraPresetsTest {
 
     @Test
     fun lengthMatchesContract() {
-        // E2-11：88 → 96（一次扩 8 槽，ADR-14 裁决 2）。此断言是 v0.10.196 启动崩溃的哨兵。
-        assertEquals(96, CameraPresets.COUNT)
+        // SG-1：96 → 98（[95] 预留槽启用为 glow_strength + 新增 [96][97]）。
+        // 此断言是 v0.10.196 启动崩溃的哨兵。
+        assertEquals(98, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
     }
 
@@ -24,8 +25,22 @@ class CameraPresetsTest {
     fun e2_11SlotsHoldNoEffectDefaults() {
         // E2-11 护栏：新增的 8 个槽位在 neutral() 里必须全是恒等值 ——
         // 任一非 0 都会让"编辑器无修改导出"悄悄改图（ADR-14 硬约束 2）。
+        // SG-1：区间收为 88..94（[95] 已从"预留"变为 glow_strength，见下个用例）。
         val p = CameraPresets.standard()
-        for (i in 88..95) assertEquals("slot[$i]", 0.0, p[i], 0.0)
+        for (i in 88..94) assertEquals("slot[$i]", 0.0, p[i], 0.0)
+    }
+
+    @Test
+    fun sg1SoftGlowSlotsHoldNoEffectDefaults() {
+        // SG-1 柔光护栏（契约扩展的第五处同步点：C++ kCount / neutral() /
+        // fromDoubles / setFilmParams 兜底 / FilmParamKeys 语义名）。
+        // ⚠️ 判据与 E4-1 的 [62] halation 同款：**[95] 必须为 0 = 整链旁路** ——
+        //    非 0 会让所有用户成片立刻带上柔光（成片外观回归）。
+        //    [96][97] 是"效果参数"（0.35 / 0.70），不是恒等值，但 [95] = 0 时不可达。
+        val p = CameraPresets.standard()
+        assertEquals("slot[95] glow_strength 必须为 0（整链旁路）", 0.0, p[95], 0.0)
+        assertEquals("slot[96] glow_radius", 0.35, p[96], 0.0)
+        assertEquals("slot[97] glow_threshold", 0.70, p[97], 0.0)
     }
 
     @Test

@@ -115,6 +115,9 @@ class FilmParamKeysTest {
         assertEquals("exposure_ev", FilmParamKeys.bySlot[0])
         assertEquals("grain_amount", FilmParamKeys.bySlot[26])
         assertEquals("vignette_strength", FilmParamKeys.bySlot[66])
-        assertEquals("reserved_95（预留槽，有字段名 ⇒ 在表内）", "reserved_95", FilmParamKeys.bySlot[95])
+        // SG-1（v0.11.17）：[95] 从预留槽启用为柔光强度 ⇒ 语义名随之改为字段名。
+        assertEquals("glow_strength（原 reserved_95 预留槽，现为柔光强度）", "glow_strength", FilmParamKeys.bySlot[95])
+        assertEquals("glow_radius", FilmParamKeys.bySlot[96])
+        assertEquals("glow_threshold", FilmParamKeys.bySlot[97])
     }
 }

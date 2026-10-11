@@ -15,11 +15,11 @@ package com.filmkit.app.ui
  */
 object CameraPresets {
 
-    /** 参数数组长度 = C++ `FilmParams.h::kCount`（E2-11 起 96）。
+    /** 参数数组长度 = C++ `FilmParams.h::kCount`（SG-1 柔光起 98）。
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 96
+    const val COUNT = 98
 
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
         a[i] = v0; a[i + 1] = v1; a[i + 2] = v2
@@ -296,7 +296,16 @@ object CameraPresets {
         this[92] = 0.0    // whites：白色色阶
         this[93] = 0.0    // blacks：黑色色阶
         this[94] = 0.0    // fade：褪色（抬起黑场）；0 = 关
-        this[95] = 0.0    // 预留（恒等；引擎零引用）
+        // ── SG-1（v0.11.17）：柔光 soft glow [95..97] ─────────────────────────
+        // ⚠️ **[95] 是原 `reserved_95` 预留槽的正式启用**（不是新槽）：旧快照/旧预设
+        // 里它就是 0 ⇒ 语义从"预留"变为"整链旁路"，**逐位等价**。
+        // 与 [62] halation 同一纪律：**0 = 整链旁路**（零 pass、零纹理分配）——
+        // 给非零会让所有用户成片立刻带上柔光（成片外观回归）。
+        this[95] = 0.0    // glow_strength：0 = 整链旁路（默认，无效果）
+        this[96] = 0.35   // glow_radius：模糊半径（0..1 归一，相对短边）；
+                          // 0.35 = 规格默认；[95] = 0 时不可达
+        this[97] = 0.70   // glow_threshold：高光阈值（显示域 sRGB 0..1，与 [63] 同口径）；
+                          // 0.70 = 规格默认；[95] = 0 时不可达
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

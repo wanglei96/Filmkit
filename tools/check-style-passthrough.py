@@ -576,7 +576,12 @@ def check_pass_style_slots():
             # ⚠ 另三个参数（[63] 阈值 / [64] 半径 / [65] 暖度）在 passStyle 调用的
             #   `runHalation` 内读取 —— 那是**两条链路共享**的函数（passOutput 也调
             #   它）⇒ 四参数的生效性与单调性由 tools/check-halation.py 覆盖。
-            'halation_strength'}
+            'halation_strength',
+            # ★ SG-1 柔光（soft glow）：与 halation 同款 —— passStyle 里只读 [95]
+            #（门控 = 是否跑共享金字塔链）。[96] 半径 / [97] 阈值在 `runGlow` 内读取，
+            # 那也是**两条链路共享**的函数（passOutput 也调它）⇒ 三参数的生效性与
+            # 单调性由 tools/check-softglow.py 覆盖。
+            'glow_strength'}
     return refs == want, refs, ''
 
 

@@ -1831,10 +1831,11 @@ internal fun presetSlotIncluded(i: Int): Boolean =
  *    正则直接对拍（见 `FilmParamKeysTest`）；
  *  - **[29] 不映射**：它曾经是 `hl_recon`，v0.10.15 删除后**留空不复用**（`FilmParams.h:68-71`），
  *    现在没有任何字段名 ⇒ 没有名字可给，也不该为它发明一个；
- *  - **[95] `reserved_95` 在表内**：它在 `FilmParams.h:440` 里**确实有字段名**（"预留（恒等；
- *    `kFsStyle` 零引用，契约占位）"）。保留它是为了"表 = 有名字的槽位"这条规则**无例外**、
- *    可机械校验；它恒等值 0 且零引用 ⇒ 稀疏化时会被恒等值丢弃，正常路径下永远不会出现在
- *    任何预设的 `params` 里。
+ *  - **[95] `glow_strength` 在表内**：它在 `FilmParams.h` 里**确实有字段名**。
+ *    ⚠️ SG-1（v0.11.17）前它叫 `reserved_95`（恒等占位、零引用）；本卡把预留槽启用为
+ *    柔光强度 ⇒ 名字随之改为字段名（表 = "有名字的槽位"这条规则不变，只是那个槽位
+ *    现在真的有消费者了）。它默认 0 = 整链旁路 ⇒ 稀疏化时被恒等值丢弃，正常路径下
+ *    仍不会出现在任何预设的 `params` 里。
  *
  * 内存模型**不变**：`EditorPreset.slots` 仍是 `Map<Int, Double>`（索引键），本表只在
  * [presetToJson] / [presetFromJson] 两个边界上做翻译 ⇒ `presetSnapshot` / `scalePresetSlots` /
@@ -1941,7 +1942,7 @@ internal object FilmParamKeys {
         85 to "local_width",
         86 to "local_ev",
         87 to "local_sat",
-        // [88..95] 色温 / 色调 / 影调分区 / 褪色 / 预留
+        // [88..94] 色温 / 色调 / 影调分区 / 褪色
         88 to "temp_mired",
         89 to "tint",
         90 to "highlights",
@@ -1949,7 +1950,11 @@ internal object FilmParamKeys {
         92 to "whites",
         93 to "blacks",
         94 to "fade",
-        95 to "reserved_95",
+        // SG-1（v0.11.17）柔光：**[95] 是预留槽 `reserved_95` 的正式启用**（名字随之
+        // 改为字段名 `glow_strength`），+[96] 半径 / [97] 阈值。
+        95 to "glow_strength",
+        96 to "glow_radius",
+        97 to "glow_threshold",
     )
 
     /**

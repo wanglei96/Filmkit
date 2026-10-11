@@ -134,16 +134,18 @@ class PresetDetailTest {
 
     @Test
     fun unknownSlotsFallBackToSemanticNamesAndNeverDisappear() {
-        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[96] 越界 ⇒ 连语义名都没有
-        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 96 to 2.0))
-        assertEquals("三个槽一个都不许消失", setOf(11, 29, 96), rows.keys)
+        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[98] 越界 ⇒ 连语义名都没有。
+        // ⚠ SG-1（v0.11.17）：越界例子从 [96] 改为 [98] —— kCount 96 → 98 后 [96] 已是
+        // 合法槽（glow_radius，有语义名）⇒ 继续用它会测的是"新槽有没有名字"而不是"越界"。
+        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 98 to 2.0))
+        assertEquals("三个槽一个都不许消失", setOf(11, 29, 98), rows.keys)
         assertEquals("cross[0]", rows.getValue(11).label)
         assertEquals("0.50", rows.getValue(11).value)
         assertEquals("槽29", rows.getValue(29).label)
         assertEquals("1", rows.getValue(29).value)
-        assertEquals("槽96", rows.getValue(96).label)
-        assertEquals("2", rows.getValue(96).value)
-        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 96 to 2.0)).map { it.title })
+        assertEquals("槽98", rows.getValue(98).label)
+        assertEquals("2", rows.getValue(98).value)
+        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 98 to 2.0)).map { it.title })
     }
 
     /** 被 `presetSlotIncluded` 排除的槽（引擎旋钮 / 解码 / 局部）若出现在坏数据里，同样不许消失。 */

@@ -332,20 +332,32 @@ def check_static(src):
     check("S1 runHalation 存在", m is not None, "找到函数体" if m else "未找到")
     if m:
         body = m.group(0)
+        # ★ SG-1 重构：①②③（提取 / 降采样 / 模糊）搬到 `runHaloPyramid` —— 那是
+        # **halation 与柔光共享**的一层（规格 §5）。⇒ 静态检查必须**跨两个函数**看：
+        # 提前 return 仍在 runHalation（⇒ 零 pass 零纹理的语义不变），纹理分配在
+        # runHaloPyramid。halation 的行为由下面的真跑判据（1a/1b/2a..7b）逐位守住。
+        mp = re.search(r"bool FrameRenderer::runHaloPyramid\(.*?\n}", src, re.S)
+        pyr = mp.group(0) if mp else ""
         i_ret = body.find("if (amount <= 0.0f || src_tex == 0) return src_tex;")
-        i_ens = body.find("ensureHaloTargets(w, h)")
+        i_ens = body.find("ensureHaloTargets(")
         check("S1 [62]=0 提前 return 先于纹理分配（零 pass 零纹理）",
-              i_ret >= 0 and i_ens > i_ret,
-              f"return@{i_ret} < ensureHaloTargets@{i_ens}")
-        ndraw = body.count("glDrawArrays(GL_TRIANGLES, 0, 3);")
+              i_ret >= 0 and i_ens > i_ret
+              and "ensureHaloTargets(w, h, /*need_out=*/true)" in body
+              and "if (!ensureHaloTargets(" in pyr,
+              f"return@{i_ret} < ensureHaloTargets@{i_ens}；金字塔侧先 ensure 再 draw"
+              f"（pyr={'找到' if pyr else '未找到'}）")
+        ndraw = body.count("glDrawArrays(GL_TRIANGLES, 0, 3);") + \
+            pyr.count("glDrawArrays(GL_TRIANGLES, 0, 3);")
         check("S2 pass 编排 = 16 次执行（1 Thr + 4 Down + 10 Blur + 1 Mix）",
-              ndraw == 5 and "for (int i = 1; i < kHaloLevels; ++i)" in body
-              and body.count("for (int i = 0; i < kHaloLevels; ++i)") == 2,
-              f"5 个调用点（2 个在 for 内：Down 循环 ×4、Blur 循环 ×2 层 ×5）"
-              f" ⇒ 执行 = 1 + 4 + 10 + 1 = 16")
+              ndraw == 5 and "for (int i = 1; i < kHaloLevels; ++i)" in pyr
+              and (pyr.count("for (int i = 0; i < kHaloLevels; ++i)") +
+                   body.count("for (int i = 0; i < kHaloLevels; ++i)")) == 2
+              and body.count("glDrawArrays(GL_TRIANGLES, 0, 3);") == 1,
+              f"5 个调用点（金字塔内 2 个 for：Down ×4、Blur ×2 层 ×5，+ mix 1）"
+              f" ⇒ 执行 = 1 + 4 + 10 + 1 = 16（SG-1 起跨 runHalation + runHaloPyramid）")
         check("S3 halo 链不做 shoulder（规格 §3.2.1 ⑦：交给 kFsOut 的 rolloff）",
-              "highlightRolloff" not in body,
-              "runHalation 内无 highlightRolloff 调用")
+              "highlightRolloff" not in body and "highlightRolloff" not in pyr,
+              "runHalation / runHaloPyramid 内均无 highlightRolloff 调用")
     sp = re.search(r"kHaloSpread\[3\] = \{([^}]*)\}", src)
     sg = re.search(r"kHaloSigma = ([0-9.]+)f", src)
     lv = re.search(r"kHaloLevels = (\d+)", src)

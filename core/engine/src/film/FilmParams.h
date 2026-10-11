@@ -24,7 +24,15 @@ struct FilmParams {
   // v0.11.4（E2-11）：88 → 96，+[88..95]（色温/色调 + 影调分区 + 褪色 + 预留）。
   // 一次到位（ADR-14 裁决 2）：契约变更次数越少，"漏改一处 = 启动即崩"的暴露面越小。
   // [88..94] 由本卡在 `kFsStyle` 内实现，[95] 仅预留（shader 零引用）。
-  static constexpr int kCount = 96;
+  // v0.11.17（SG-1 柔光 soft glow）：96 → 98，**[95] 预留槽正式启用**为
+  // `glow_strength`，并新增 [96] `glow_radius`、[97] `glow_threshold`。
+  // ⚠️ 与 E4-1/E2-11 的"只扩契约"不同，本卡**同时实现功能**（两条链路都接）——
+  //    因此三个默认值都必须取"无效果"值：`[95] = 0` = **整链旁路**（零 pass、
+  //    零纹理、零成本），[96][97] 在 [95] = 0 时不可达。
+  // 域与落点见 `docs/reports/soft-glow-SPEC.md` §2：提取/模糊与 halation 同域
+  //（线性显示域，`kFsOut` 的 srgbEncode 之前），Screen 混合落在**显示域**
+  //（`kFsOut`/`kFsStyle` 的褪色之后、暗角之前）。
+  static constexpr int kCount = 98;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -480,7 +488,16 @@ struct FilmParams {
   float whites = 0.0f;         // 92 白色色阶
   float blacks = 0.0f;         // 93 黑色色阶
   float fade = 0.0f;           // 94 褪色（抬起黑场，0 = 关）
-  float reserved_95 = 0.0f;    // 95 预留（恒等；`kFsStyle` 零引用，契约占位）
+  // ── SG-1 柔光（soft glow / Orton bloom；darktable `bloom.c` 的 Orton 支）──────
+  // 与 halation（[62..65]）的区别（规格 §1，**必须能分辨**）：
+  //   · halation = 通道**相关**（红扩散最远 ⇒ "白→橙→红"）+ **加法**混合；
+  //   · 柔光     = 通道**无关**（三通道同半径）+ **Screen** 混合（高光"发白外扩"）。
+  // 共享 halation 的 5 级金字塔基础设施（规格 §5）：提取/降采样/模糊三段**同一批
+  // pass 与纹理**，柔光只多"标量提取模式"与"单半径加权合成"两步。
+  float glow_strength = 0.0f;   // 95 柔光强度：**0 = 整链旁路**（默认，零 pass 零纹理）
+  float glow_radius = 0.35f;    // 96 模糊半径（0..1 归一，相对短边；[95]=0 时不可达）
+  float glow_threshold = 0.70f; // 97 高光阈值（**显示域** sRGB 0..1，与 [63] 同口径；
+                                //    进 shader 前由 CPU 换算到线性显示域）
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -603,7 +620,12 @@ struct FilmParams {
     if (n > 92) whites = static_cast<float>(v[92]);
     if (n > 93) blacks = static_cast<float>(v[93]);
     if (n > 94) fade = static_cast<float>(v[94]);
-    if (n > 95) reserved_95 = static_cast<float>(v[95]);  // 预留：读到即存，无消费者
+    // v0.11.17（SG-1）：[95..97] 柔光。⚠️ [95] 曾名 `reserved_95`（恒等占位）——
+    // 旧数组（长度 ≤ 96）里它是 0 ⇒ 读到即"整链旁路"，行为与改动前逐位一致。
+    // 长度 96 的旧数组读不到 [96][97] ⇒ 保持结构体默认（0.35 / 0.70）。
+    if (n > 95) glow_strength = static_cast<float>(v[95]);
+    if (n > 96) glow_radius = static_cast<float>(v[96]);
+    if (n > 97) glow_threshold = static_cast<float>(v[97]);
   }
 };
 

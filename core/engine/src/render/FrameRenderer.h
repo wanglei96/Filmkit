@@ -676,17 +676,37 @@ class FrameRenderer {
   // 返回 src_tex（直通）**，并把 halo_on_ 置 0 ⇒ 真机日志能区分"没开"与"静默失败"。
   GLuint runHalation(int w, int h, GLuint src_tex, const FilmParams& p,
                      bool decode_in);
-  // 5 级金字塔纹理 + 单张最大级 tmp + 全分辨率输出（尺寸变化时整体重建）。
-  bool ensureHaloTargets(int w, int h);
+
+  // ── SG-1 柔光（soft glow；darktable bloom.c 的 Orton 支）────────────────────
+  // **与 halation 共享金字塔**（规格 §5）：本函数只多"标量提取模式"（uGlowOn）与
+  // 一个 1/2 分辨率加权合成 pass（kFsGlowSum）。Screen 混合不在这里 —— 它在
+  // kFsOut/kFsStyle 的显示域段内（那里才拿得到"经过影调分区/褪色的当前 c"）。
+  // 返回 = 柔光图纹理（1/2 分辨率，R 通道 = 线性显示域模糊高光）；0 = 未执行。
+  GLuint runGlow(int w, int h, GLuint src_tex, const FilmParams& p, bool decode_in);
+
+  // 共享金字塔（**SG-1 重构**：E4-5 的 runHalation 内联版 ①②③ 逐字搬出）。
+  // glow_mode = 0 → halation 彩色提取（lin × smoothstep 权重，通道相关半径在 mix 实现）
+  //           = 1 → 柔光标量提取（max(0, luma−thr)/(1−thr)，**通道无关**）。
+  // 两者必须不同 —— 这是"红色外晕"与"发白外扩"可分辨的根源（规格 §1）。
+  // ⚠ 顺序契约：柔光图占用 tex_halo_tmp_ ⇒ 同一帧内 halation 必须先跑（见 .cpp）。
+  bool runHaloPyramid(int w, int h, GLuint src_tex, bool decode_in, float thr_lin,
+                      float knee, bool glow_mode);
+
+  // 5 级金字塔纹理 + 单张最大级 tmp（+ 可选的全分辨率输出）。尺寸变化时整体重建。
+  // `need_out`：halation 要全分辨率输出，柔光不要（省 100MB；缓存键含它）。
+  bool ensureHaloTargets(int w, int h, bool need_out);
   void releaseHaloTargets();
   // emulsion `haloWeights`：逐通道高斯，峰值在 centre_c = radius01·4·SPREAD[c]。
   // 输出 w[i][c]（级 i、通道 c），每通道**独立归一化**（和为 1）。
+  // `spread`（SG-1 起是参数）：halation 传 kHaloSpread = {1.0, 0.6, 0.32}（乳剂物理
+  //   常数 ⇒ 通道相关）；柔光传 {1,1,1}（**通道无关**，规格 §1）。
   // ⚠ **E4-5b（R1 修正）**：`level_shift = log2(min(w,h) / halo_ref_min_)` —— 把峰值按
   //   **输出分辨率**平移，使 halo 的**归一化**半径与图像尺寸无关（= 规格 §3.2.5 的原始
   //   声称；原实现实测是"固定像素尺度"，预览与成片差 2.8×）。
   //   成片（min(w,h) == refMin）时 shift = log2(1.0f) = 0.0f ⇒ `x + 0.0f` 逐位 == x
   //   ⇒ **成片行为与修正前逐位一致**（零观感变化；见 e4-5b 报告）。
-  static void haloWeights(float radius01, float level_shift, float w[5][3]);
+  static void haloWeights(float radius01, float level_shift, const float spread[3],
+                          float w[5][3]);
 
   GLuint prog_oes_ = 0, prog_still_ = 0, prog_film_ = 0, prog_out_ = 0,
          prog_fill_ = 0, prog_raw_ = 0, prog_rcd_dir_ = 0, prog_rcd_g_ = 0,
@@ -758,10 +778,17 @@ class FrameRenderer {
   // program 缺失 / 纹理分配失败 / FBO 不完整 —— 真机日志一眼可辨）。
   int halo_on_ = 0;
   float halo_ms_ = 0.f;
+  // ── SG-1 柔光（soft glow）─────────────────────────────────────────────────
+  // glow_on_ / glow_ms_ 与 halation 同口径（0 且 [95] > 0 ⇒ 静默失败）。
+  // **不新增任何纹理成员**：柔光复用 halation 的 5 级金字塔 + tmp（tex_halo_tmp_
+  // 兼作柔光图，1/2 分辨率）⇒ 额外显存 0（规格 §5 的"共享金字塔"收益，报告 §性能）。
+  int glow_on_ = 0;
+  float glow_ms_ = 0.f;
   GLuint prog_halo_thr_ = 0, prog_halo_blur_ = 0, prog_halo_mix_ = 0;
+  GLuint prog_glow_sum_ = 0;  // SG-1：5 级单半径加权合成（1/2 分辨率，5 采样/px）
   struct {
     GLint src = -1, texel = -1, decode_in = -1, thr_on = -1, thr_lin = -1,
-          knee = -1;
+          knee = -1, glow_on = -1;  // glow_on = SG-1 柔光提取模式门控
   } u_halo_thr_;
   struct {
     GLint src = -1, dir = -1, scale = -1;
@@ -771,6 +798,10 @@ class FrameRenderer {
           w0 = -1, w1 = -1, w2 = -1, w3 = -1, w4 = -1, tint = -1, amount = -1,
           decode_in = -1;
   } u_halo_mix_;
+  struct {
+    GLint g0 = -1, g1 = -1, g2 = -1, g3 = -1, g4 = -1,
+          s0 = -1, s1 = -1, s2 = -1, s3 = -1, s4 = -1;
+  } u_glow_sum_;
   // E1-5（2026-10-08 P0 全黑定位）：编辑器输入纹理。**独立于 still_tex_** ——
   // 编辑器上传的是 RGBA8，内部格式必须同为 RGBA8（RGB8 内部格式 + RGBA 上传是
   // 「内部/外部格式不匹配」，规范允许但部分驱动会拒绝或写入未定义内容）。
@@ -1318,7 +1349,10 @@ class FrameRenderer {
           //（uTex 是滚降前的线性显示域），见 kFsOut 的 blurLuma16 注释。
           clarity = -1, clar_step = -1,
           highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
-          tone_on = -1;
+          tone_on = -1,
+          // SG-1 柔光：与 u_style_ 同名同义 —— 两条链路共用一段**逐字相同**的
+          // shader 逻辑（glowFetch + Screen），落点都在各自 shader 的显示域段。
+          glow = -1, glow_on = -1, glow_strength = -1, glow_texel = -1;
   } u_out_;
   // kFsStyle（E1-3 编辑器通路）
   struct {
@@ -1370,7 +1404,11 @@ class FrameRenderer {
           split = -1, mono = -1,
           // E2-12 裁剪 + 90° 步进旋转（ADR-16）：输出坐标 → 原图 UV 的仿射映射
           //（origin + o×size，再按 rot 置换轴）。不裁剪 = (0,0)/(1,1)/0 ⇒ 恒等。
-          crop_origin = -1, crop_size = -1, crop_rot = -1;
+          crop_origin = -1, crop_size = -1, crop_rot = -1,
+          // SG-1 柔光：与 u_out_ 同名同义（同一段 shader 数学）。
+          // ⚠ 采样坐标用 cropUV(vUV0) —— 柔光图是**全图**（edit_w_×edit_h_，
+          //   与 halation 的 style_src 同坐标系），裁剪映射必须与 uTex 一致。
+          glow = -1, glow_on = -1, glow_strength = -1, glow_texel = -1;
   } u_style_;
   struct {
     GLint tex = -1, lut = -1, lut_on = -1, lut_strength = -1, lut_dmin = -1,

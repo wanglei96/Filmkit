@@ -82,6 +82,18 @@ EXPECT = {
     # E4-5b（R1）：halo 半径归一化的**基准短边**（= 成片短边）。核对"预览与成片是否用
     # 同一基准"就靠它 —— 同一进程内两侧应恒等（成片调用在 passOutput 之前更新它）。
     "haloRef": ("submitDisplay", ["passStyle("]),
+    # ★ SG-1 柔光（soft glow）：[95..97] 的生效性 + 三参数。与 halation 同一纪律：
+    # 柔光链由 passStyle（编辑器）与 passOutput（拍照）各自在内部调用（runGlow 里跑
+    # 共享金字塔 ①②③ + 1 个合成 pass）⇒ 字段行必须晚于 passStyle。
+    # glowOn = 本帧柔光链**真的执行了**（0 且 [95] > 0 ⇒ 静默失败：program 缺失 /
+    # 纹理分配失败 / FBO 不完整 —— 本卡最重要的真机失败判据）。
+    # 同名字段也出现在 finishStillChain 出口（成片链路），本脚本取 hits[0]（行号更小
+    # 的 submitDisplay）⇒ 与上面 grain*/halo* 同一条纪律。
+    "glowOn": ("submitDisplay", ["passStyle("]),
+    "glowMs": ("submitDisplay", ["passStyle("]),
+    "glowStrength": ("submitDisplay", ["passStyle("]),
+    "glowRadius": ("submitDisplay", ["passStyle("]),
+    "glowThr": ("submitDisplay", ["passStyle("]),
     # U-4（2026-10-11）：显示域五项（[78] 清晰度 + [90..94] 影调分区/褪色）的**生效值**。
     # 三段的 shader 数学与门控都在 passOutput 内（kFsOut 的 srgbEncode 之后 = 显示域）
     # ⇒ 字段必须晚于 finishStillChain 内的 passOutput 调用（成片路径：passFilm →
