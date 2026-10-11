@@ -218,6 +218,91 @@ internal fun vigFeatherUi(slot: Double): Float =
     if (!slot.isFinite()) 0.5f else (slot / 100.0).coerceIn(0.0, 2.0).toFloat()
 
 /**
+ * 光晕（halation `[62..65]`，E4-5）与柔光（soft glow `[95..97]`，SG-1）的 UI ↔ 槽位映射
+ * （**SG-2：把引擎已实现、但用户手动调不到的两组参数接进编辑器参数面板**）。
+ * **纯逻辑、无 Android 依赖** ⇒ JVM 单测直接覆盖往返与 pivot。
+ *
+ * 槽位语义与默认值（权威定义 = `core/engine/src/film/FilmParams.h`；两条链路
+ * `passOutput` / `passStyle` 消费同一个 `runHalation` / `runGlow`）：
+ *  - [62] `halation_strength` 0..1：**0 = 整链旁路**（默认）；>0 = 叠加量
+ *  - [63] `halation_threshold` 显示域 sRGB 0..1：**0.80**（[62] = 0 时不可达）
+ *  - [64] `halation_radius` 0..1 归一：**0.45**（同上）
+ *  - [65] `halation_warmth` 0..1（红橙程度）：**0.40**（同上）
+ *  - [95] `glow_strength` 0..1：**0 = 整链旁路**（默认，零 pass 零纹理）
+ *  - [96] `glow_radius` 0..1 归一：**0.35**（[95] = 0 时不可达）
+ *  - [97] `glow_threshold` 显示域 sRGB 0..1：**0.70**（同上）
+ *
+ * 这七条的 UI 量程 = 引擎契约量程（0..1 归一）⇒ **直通，不需要换算函数**，只需要夹紧与坏数据
+ * 兜底。**刻意不给"每条一对 `xxxSlot` / `xxxUi`"**：七条的量程与语义完全相同，七对同体函数
+ * 是样板；一个 [normalizedSlot] / [normalizedUi] + 七个 pivot 常量就够 —— 量程与 pivot 由 UI
+ * 参数表与本段**共用同一份定义**（否则滑杆能拖到 clamp 之外 = 假滑杆）。
+ *
+ * ⚠ **pivot 必须等于引擎中性值**（「重置」回到这里，`EditorParam.pivot`）：[62]/[95] 是 0 = 关，
+ * 其余五条是各自的设计默认值。写错的表现是"用户一 reset 画面就变"——
+ * `EditorHaloGlowUiTest` 把七个 pivot 同时与 `CameraPresets.standard()`（Kotlin 侧中性基线）和
+ * `FilmParams.h` 里解析出的 C++ 默认值**逐槽对拍**（两处都改才算改对）。
+ */
+
+/** 光晕 / 柔光七条共用的 UI 量程：0..1（= 引擎契约的归一域，直通槽位）。 */
+internal val HALO_GLOW_UI_RANGE = 0f..1f
+
+/** [62] 光晕 · 强度 pivot = **0 = 关**（`halation_strength = 0.0f` ⇒ 整链旁路）。 */
+internal const val HALO_UI_PIVOT = 0f
+
+/** [63] 光晕 · 触发阈值 pivot = **0.80**（`halation_threshold = 0.80f`，显示域 sRGB）。 */
+internal const val HALO_THRESHOLD_UI_PIVOT = 0.80f
+
+/** [64] 光晕 · 半径 pivot = **0.45**（`halation_radius = 0.45f`，0..1 归一）。 */
+internal const val HALO_RADIUS_UI_PIVOT = 0.45f
+
+/** [65] 光晕 · 暖度 pivot = **0.40**（`halation_warmth = 0.40f`）。 */
+internal const val HALO_WARMTH_UI_PIVOT = 0.40f
+
+/** [95] 柔光 · 强度 pivot = **0 = 关**（`glow_strength = 0.0f` ⇒ 整链旁路、零 pass 零纹理）。 */
+internal const val GLOW_UI_PIVOT = 0f
+
+/** [96] 柔光 · 半径 pivot = **0.35**（`glow_radius = 0.35f`，0..1 归一）。 */
+internal const val GLOW_RADIUS_UI_PIVOT = 0.35f
+
+/** [97] 柔光 · 触发阈值 pivot = **0.70**（`glow_threshold = 0.70f`，显示域 sRGB）。 */
+internal const val GLOW_THRESHOLD_UI_PIVOT = 0.70f
+
+/** UI 归一量（0..1）→ 槽位（[62..65] / [95..97] 共用）。越界夹到量程端点。 */
+internal fun normalizedSlot(ui: Float): Double =
+    ui.coerceIn(HALO_GLOW_UI_RANGE.start, HALO_GLOW_UI_RANGE.endInclusive).toDouble()
+
+/**
+ * 槽位（0..1）→ UI 归一量。**坏数据回落 [fallback]**（= 该槽的引擎默认值，调用方**显式**传）。
+ *
+ * 为什么 fallback 必须逐槽给、且不给默认参数值：七条的默认值各不相同（[63] 0.80 / [64] 0.45 /
+ * [97] 0.70 …），统一回 0 会把"读不出来"变成"阈值与半径被拖到最左端"（画面突变）——
+ * 与 [latitudeUi] 回落 0.01、[tempUi] 越界回落 6500K 是同一条纪律。越界（>1 / <0）夹到端点：
+ * UI 永远写不出越界值，快照里出现只可能是手改 prefs 的坏数据。
+ */
+internal fun normalizedUi(slot: Double, fallback: Float): Float = if (!slot.isFinite()) {
+    fallback
+} else {
+    slot.coerceIn(HALO_GLOW_UI_RANGE.start.toDouble(), HALO_GLOW_UI_RANGE.endInclusive.toDouble())
+        .toFloat()
+}
+
+/**
+ * 「质感」组重置（SG-2）：把**三个"强度"槽**归 0 = 关 —— [62] 光晕 / [66] 暗角 / [95] 柔光；
+ * 其余七条（[63..65] 光晕阈值·半径·暖度、[67][68] 暗角半径·羽化、[96][97] 柔光半径·阈值）
+ * **保持原值**。
+ *
+ * 为什么只归强度：三条强度为 0 时各自的整链都旁路（引擎侧 `strength > 0` 才跑），其余参数
+ * 不可达 ⇒ 画面回到恒等，而用户调好的阈值/半径**不必重调**（下次开强度即恢复原样）。
+ * 这也是 E2-1 时代 `resetVignette` 的既有语义（"重置 = 回到恒等 = 没有暗角"），SG-2 只是把
+ * 新增的两条强度一并纳入 —— 判据仍是"界面上这条滑杆在哪个组，本组重置就得把它带回恒等"。
+ */
+internal fun resetFilmTextureParams(p: DoubleArray) {
+    p[62] = HALO_UI_PIVOT.toDouble()
+    p[66] = vigStrengthSlot(0f)
+    p[95] = GLOW_UI_PIVOT.toDouble()
+}
+
+/**
  * 基础调整的 UI ↔ 槽位映射（E2-3）。与上面暗角同一范式：**纯逻辑、无 Android 依赖**
  * ⇒ JVM 单测直接覆盖往返与边界。
  *
@@ -508,17 +593,20 @@ internal fun monoUi(slot: Double): Float = if (!slot.isFinite()) {
 }
 
 /**
- * 黑白读数：**0 → `关`**，否则 0..100 整数（`35`）。
+ * "**0 就是关**"型连续量的读数：**0 → `关`**，否则 0..100 整数（`35`）。
  *
- * 为什么零值显示 `关` 而不是 `0`：它是"完全没启用"（引擎 `uMono = 0` ⇒ `mix` 恒等），与清晰度 /
+ * 为什么零值显示 `关` 而不是 `0`：它是"完全没启用"（引擎侧 0 = 整段旁路 / 恒等），与清晰度 /
  * 褪色那些"0 就是关"的参数同一口径，只是多一个更直白的词。
  *
- * 为什么非零**不做成"开/关"**：[25] 是**连续**的混合比例（见本段 KDoc 第 3 条）—— 0.35 显示"开"
- * 会把量级吞掉（0.4 与 0.9 看起来一样），那正是 U-6b 要修掉的假读数。
+ * 为什么非零**不做成"开/关"**：[25] 黑白 / [62] 光晕强度 / [95] 柔光强度都是**连续**的
+ * 混合比例 —— 0.35 显示"开"会把量级吞掉（0.4 与 0.9 看起来一样），那正是 U-6b 要修掉的假读数。
+ *
+ * 服务三条：黑白 [25]（`monoUi`）/ 光晕·强度 [62] / 柔光·强度 [95]（`normalizedUi`）。
+ * SG-2 前它叫 `formatMono`；改名是因为它现在服务的不止黑白 —— 名字必须说真话。
  */
-internal fun formatMono(ui: Float): String {
+internal fun formatOff100(ui: Float): String {
     if (!ui.isFinite()) return "关"
-    val n = (ui.coerceIn(MONO_UI_RANGE.start, MONO_UI_RANGE.endInclusive) * 100f).roundToInt()
+    val n = (ui.coerceIn(0f, 1f) * 100f).roundToInt()
     return if (n == 0) "关" else n.toString()
 }
 
@@ -2143,7 +2231,7 @@ private fun presetSlotZeroBased(i: Int): Boolean = i == PRESET_LUT_STRENGTH_SLOT
  *    [FADE_UI_RANGE] / [LOCAL_EV_UI_RANGE] / [LOCAL_SAT_UI_RANGE]、[vigStrengthSlot] /
  *    [vigRadiusSlot] / [vigFeatherSlot] / [expSlot] / [tempSlot]）—— **与滑杆同一份定义**，
  *    不另抄一遍数字（两处各写一份必然漂移，而漂移的表现是"滑杆拖不到的值却出现在画面里"）；
- *  - **`FilmParams.h` 的契约边界**（Kotlin 侧没有常量的那几条：颗粒 / 相纸响应 / halation），
+ *  - **`FilmParams.h` 的契约边界**（Kotlin 侧没有量程常量的那几条：颗粒 / 相纸响应），
  *    逐条标注出处。
  *
  * 为什么只在外推时夹：`0 ≤ amount ≤ 1` 的结果是 `neutral` 与预设值的**凸组合** ⇒ 预设值本身在
@@ -2159,7 +2247,8 @@ private val PRESET_SLOT_CLAMP: Map<Int, ClosedFloatingPointRange<Double>> = buil
     put(27, 20.0..6400.0)      // 同上 `scale` = ISO（20..6400，越大越粗）
     put(34, slotRange(LUT_STRENGTH_UI_RANGE))
     put(60, 0.0..100.0)        // FilmParams.h:369 颗粒相纸响应 midtones_bias（%）
-    for (i in 62..65) put(i, 0.0..1.0)   // FilmParams.h:377-381 halation 强度/阈值/半径/暖度
+    for (i in 62..65) put(i, slotRange(HALO_GLOW_UI_RANGE))  // 光晕 强度/阈值/半径/暖度（FilmParams.h [62..65]）
+    for (i in 95..97) put(i, slotRange(HALO_GLOW_UI_RANGE))  // SG-1 柔光 强度/半径/阈值（FilmParams.h [95..97]）
     put(66, vigStrengthSlot(1f)..vigStrengthSlot(0f))   // −1..0（强度越大越负）
     put(67, vigRadiusSlot(0f)..vigRadiusSlot(2f))       // 0..200（%）
     put(68, vigFeatherSlot(0f)..vigFeatherSlot(2f))     // 0..200（%）

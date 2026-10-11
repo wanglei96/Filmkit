@@ -204,7 +204,9 @@ class PresetDetailTest {
         assertTrue("解析 EditorScreen.kt 的 EditorParam 表失败（只有 ${panel.size} 条）", panel.size >= 15)
         // ★ 只喂**真能进预设**的槽（`presetSlotIncluded`）：局部调整 [79..87] 与 LUT 强度 [34]
         //   被策略排除 ⇒ 详情里本来就不会有它们的行（"坏数据里出现了"是另一条测试）。
-        val rows = allRows((0..95).filter { presetSlotIncluded(it) }.associateWith { 0.5 })
+        // ★ SG-2：上界 95 → **97** —— kCount 98（SG-1）后 [96]/[97] 也是合法槽，
+        //   不扩上界就会漏检柔光半径/阈值的文案（旧上界是 kCount = 96 时代的残留）。
+        val rows = allRows((0..97).filter { presetSlotIncluded(it) }.associateWith { 0.5 })
         var checked = 0
         for (p in panel) {
             val row = rows[p.slot] ?: continue      // 局部调整 [79..87] 不进预设 ⇒ 详情里没有行
@@ -225,11 +227,11 @@ class PresetDetailTest {
     @Test
     fun detailLabelsMatchScopeNoticeWording() {
         // ⚠ 清单**不硬编码**：作用域表随引擎接线而变（U-1 把 `[23..25]` 接到编辑器链路后
-        // P-5 就不再提示它们；U-2 接线 `[5..10]` / `[37][38]` 时同理）⇒ 遍历全部 96 槽，
+        // P-5 就不再提示它们；U-2 接线 `[5..10]` / `[37][38]` 时同理）⇒ 遍历全部 98 槽，
         // **由 `presetScopeNotice` 自己决定**哪些槽还有"跨链路差异"、提示里用的是什么词，
         // 再要求详情用同一个词。写死清单会在每次接线时假红（把"接线完成"报成"文案漂移"）。
         var checked = 0
-        for (slot in 0..95) {
+        for (slot in 0..97) {
             val slots = mapOf(slot to 0.5)
             val p = EditorPreset(id = "p", name = "n", slots = slots)
             val notice = presetScopeNotice(p, PresetScene.EDITOR)

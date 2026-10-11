@@ -2,6 +2,13 @@ package com.filmkit.app.ui
 
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.FilmParamKeys
+import com.filmkit.app.camera.GLOW_RADIUS_UI_PIVOT
+import com.filmkit.app.camera.GLOW_THRESHOLD_UI_PIVOT
+import com.filmkit.app.camera.GLOW_UI_PIVOT
+import com.filmkit.app.camera.HALO_RADIUS_UI_PIVOT
+import com.filmkit.app.camera.HALO_THRESHOLD_UI_PIVOT
+import com.filmkit.app.camera.HALO_UI_PIVOT
+import com.filmkit.app.camera.HALO_WARMTH_UI_PIVOT
 import com.filmkit.app.camera.PRESET_SOURCE_BUILTIN
 import com.filmkit.app.camera.PRESET_SOURCE_IMPORTED
 import com.filmkit.app.camera.clarityUi
@@ -11,13 +18,14 @@ import com.filmkit.app.camera.fadeUi
 import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatEv
 import com.filmkit.app.camera.formatKelvin
-import com.filmkit.app.camera.formatMono
+import com.filmkit.app.camera.formatOff100
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.formatZero200
 import com.filmkit.app.camera.latitudeUi
 import com.filmkit.app.camera.monoUi
+import com.filmkit.app.camera.normalizedUi
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.tempUi
@@ -44,10 +52,10 @@ import kotlin.math.roundToInt
  *
  * | 来源 | 槽位 | 说明 |
  * |---|---|---|
- * | **编辑器参数面板的既有 label**（`EditorScreen.kt` 的 `EditorParam` 表） | `[0..4]` `[20..22]` `[78]` `[88..94]` | 逐字照抄（"曝光"/"对比度"/"色温"/"高光"/"白色色阶"/"饱和度"/"清晰度"/"褪色"…），只加消歧前缀（见 [DetailMeta.label]） |
+ * | **编辑器参数面板的既有 label**（`EditorScreen.kt` 的 `EditorParam` 表） | `[0..4]` `[20..22]` `[62..65]` `[66..68]` `[78]` `[88..94]` `[95..97]` | 逐字照抄（"曝光"/"对比度"/"色温"/"高光"/"白色色阶"/"饱和度"/"清晰度"/"褪色"/"光晕 · 触发阈值"/"柔光 · 半径"…），只加消歧前缀（见 [DetailMeta.label]）。★ **SG-2**：光晕 `[62..65]` / 柔光 `[95..97]` 已进面板 ⇒ 从下一行**移上来**（名字不再取自设计文档，而是面板原词） |
  * | **`PresetScope.kt` 的 `SLOT_LABELS`**（P-5 已确立的用户可懂术语） | `[5..10]` `[37][38]` | "胶片曲线"（**不是**工程术语"趾肩 latitude"）/ "黑点" / "白点" |
  * | **同上表的历史术语**（★ U-1 起 `[23..25]` 已两侧生效 ⇒ 从 `SLOT_LABELS` 删除，但详情页仍要展示它们） | `[23..25]` | "分离色调" / "黑白"（与 `SLOT_LABELS` 曾经的字面一致，未新造译名） |
- * | **`preset-DESIGN.md` §1 第 2/3 层的参数表**（引擎刚补齐、面板暂无滑杆的那批） | `[26][27][60][61]` `[62..65]` `[66..68]` `[69..77]` | "颗粒 强度/尺寸/中间调偏置/枢轴"、"光晕 强度/触发阈值/半径/暖度"、"暗角 强度/半径/羽化"（暗角三条的面板 label 就是"强度/半径/羽化"）、"暗部/中间调/高光 R/G/B 增益" |
+ * | **`preset-DESIGN.md` §1 第 2/3 层的参数表**（引擎刚补齐、**面板仍无滑杆**的那批） | `[26][27][60][61]` `[69..77]` | "颗粒 强度/尺寸/中间调偏置/枢轴"、"暗部/中间调/高光 R/G/B 增益" |
  *
  * 三条纪律：
  *  1. **读数口径沿用 E2-10**（"读数改成物理量"）：曝光 `+0.5 EV`、色温 `5200K`、颗粒尺寸
@@ -145,10 +153,11 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     meta(23, SEC_COLOR, "分离色调 · 暖") { signed2(it) }
     meta(24, SEC_COLOR, "分离色调 · 冷") { signed2(it) }
     // [25] 黑白：★ U-1 把 `[25]` 接到编辑器链路（§9.2 第 14 项"单色（黑白）"）；★ U-6b 面板
-    // 补上"黑白"滑杆 ⇒ 读数**必须跟面板同口径**（`formatMono`：0 → `关`、否则 0..100 整数）。
+    // 补上"黑白"滑杆 ⇒ 读数**必须跟面板同口径**（`formatOff100`：0 → `关`、否则 0..100 整数；
+    // SG-2 起该函数同时服务光晕/柔光强度，名字从 `formatMono` 改过来）。
     // ⚠ 旧口径（`>= 0.5` 才算"开"）在面板能连续调之后是**假读数**：0.35 会被显示成"关"。
     // ⚠ 名字**不因提示消失而退回**工程名 `monochrome`（单测 `detailLabelsMatchScopeNoticeWording` 钉住）
-    meta(25, SEC_COLOR, "黑白") { formatMono(monoUi(it)) }
+    meta(25, SEC_COLOR, "黑白") { formatOff100(monoUi(it)) }
     // [94] 褪色：面板「滤镜」组 label（0..100，0 = 关）
     meta(94, SEC_COLOR, "褪色") { formatZero100(fadeUi(it)) }
 
@@ -165,7 +174,7 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     meta(37, SEC_CURVE, "黑点") { evText(it) }
     meta(38, SEC_CURVE, "白点") { evText(it) }
 
-    // ── 胶片质感（§1 第 3 层；引擎 E4-3/E4-2 已实现，面板暂无滑杆 ⇒ 名字取自设计文档）──
+    // ── 胶片质感（§1 第 3 层；引擎 E4-3/E4-2/E4-5/SG-1 已实现）──────────────────
     // [26][60] 的槽位量程是 **0..100**（`FilmParams.h:55-58` / `:369`），
     // 借 formatZero100（入参 0..1）的整数化与夹紧口径 ⇒ 先 /100。
     meta(26, SEC_FILM, "颗粒 · 强度") { formatZero100((it / 100.0).toFloat()) }
@@ -173,11 +182,17 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     meta(60, SEC_FILM, "颗粒 · 中间调偏置") { formatZero100((it / 100.0).toFloat()) }
     // [61] 枢轴是**形状/位置**参数（0.5 = 峰值不移）⇒ 两位小数，与 latitude 同口径
     meta(61, SEC_FILM, "颗粒 · 枢轴") { decimals2(it) }
-    meta(62, SEC_FILM, "光晕 · 强度") { formatZero100(it.toFloat()) }
-    meta(63, SEC_FILM, "光晕 · 触发阈值") { formatZero100(it.toFloat()) }
-    meta(64, SEC_FILM, "光晕 · 半径") { formatZero100(it.toFloat()) }
-    meta(65, SEC_FILM, "光晕 · 暖度") { formatZero100(it.toFloat()) }
-    // [66..68] 暗角：面板「暗角」组 label = "强度"/"半径"/"羽化"（槽位 66 负值 = 变暗 ⇒ 过 vig*Ui）
+    // [62..65] 光晕（halation）：★ **SG-2 起面板有滑杆** ⇒ 名字逐字 = 面板 label，读数口径
+    // 也必须与面板逐字相同（两边调的是同一个 `normalizedUi(slot, pivot)`，坏数据回落同一个
+    // pivot = 引擎默认值）。[62] 强度是"0 就是关"型 ⇒ `formatOff100`（0 → `关`）；
+    // [63..65] 是归一化形态量（显示域阈值 / 相对短边半径 / 红橙程度）⇒ **两位小数**，
+    // 整数化会把 0.45 与 0.50 显示成同一个数（SG-2 前这里用 formatZero100，已改）。
+    meta(62, SEC_FILM, "光晕 · 强度") { formatOff100(normalizedUi(it, HALO_UI_PIVOT)) }
+    meta(63, SEC_FILM, "光晕 · 触发阈值") { formatDecimals2(normalizedUi(it, HALO_THRESHOLD_UI_PIVOT)) }
+    meta(64, SEC_FILM, "光晕 · 半径") { formatDecimals2(normalizedUi(it, HALO_RADIUS_UI_PIVOT)) }
+    meta(65, SEC_FILM, "光晕 · 暖度") { formatDecimals2(normalizedUi(it, HALO_WARMTH_UI_PIVOT)) }
+    // [66..68] 暗角：面板「质感」组 label = "暗角 · 强度/半径/羽化"（★ SG-2 起带组内前缀 ——
+    // 扩组后组里有三条"强度"，不带前缀分不清；槽位 66 负值 = 变暗 ⇒ 过 vig*Ui）
     meta(66, SEC_FILM, "暗角 · 强度") { formatZero100(vigStrengthUi(it)) }
     meta(67, SEC_FILM, "暗角 · 半径") { formatZero200(vigRadiusUi(it)) }
     meta(68, SEC_FILM, "暗角 · 羽化") { formatZero200(vigFeatherUi(it)) }
@@ -186,6 +201,12 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     for ((zone, start) in zones) {
         for (i in 0..2) meta(start + i, SEC_FILM, "层间 · $zone ${RGB[i]}") { formatOffset100(it.toFloat(), 1f) }
     }
+    // [95..97] 柔光（soft glow）：★ **SG-2 起面板有滑杆**（引擎 SG-1 已实现）。三条与光晕
+    // [62..65] 是同族（共享模糊金字塔）⇒ 口径逐条对应：强度 `formatOff100`（0 → `关`）、
+    // 半径 / 触发阈值两位小数。名字逐字 = 面板 label（"柔光 · 强度/半径/触发阈值"）。
+    meta(95, SEC_FILM, "柔光 · 强度") { formatOff100(normalizedUi(it, GLOW_UI_PIVOT)) }
+    meta(96, SEC_FILM, "柔光 · 半径") { formatDecimals2(normalizedUi(it, GLOW_RADIUS_UI_PIVOT)) }
+    meta(97, SEC_FILM, "柔光 · 触发阈值") { formatDecimals2(normalizedUi(it, GLOW_THRESHOLD_UI_PIVOT)) }
 }
 
 /**

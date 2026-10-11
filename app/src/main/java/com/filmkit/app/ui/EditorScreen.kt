@@ -54,8 +54,12 @@ import androidx.compose.material.icons.automirrored.outlined.TrendingUp
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.outlined.AcUnit
+import androidx.compose.material.icons.outlined.Adjust
+import androidx.compose.material.icons.outlined.BlurCircular
 import androidx.compose.material.icons.outlined.BlurOn
 import androidx.compose.material.icons.outlined.Brightness4
+import androidx.compose.material.icons.outlined.Brightness5
+import androidx.compose.material.icons.outlined.Brightness6
 import androidx.compose.material.icons.outlined.Brightness7
 import androidx.compose.material.icons.outlined.CenterFocusStrong
 import androidx.compose.material.icons.outlined.Close
@@ -66,15 +70,19 @@ import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Details
 import androidx.compose.material.icons.outlined.Exposure
+import androidx.compose.material.icons.outlined.FilterVintage
+import androidx.compose.material.icons.outlined.Flare
 import androidx.compose.material.icons.outlined.Gradient
 import androidx.compose.material.icons.outlined.InvertColors
 import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.LocalFireDepartment
 import androidx.compose.material.icons.outlined.MonochromePhotos
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhotoFilter
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.outlined.Thermostat
+import androidx.compose.material.icons.outlined.TripOrigin
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Vignette
 import androidx.compose.material.icons.outlined.WaterDrop
@@ -137,6 +145,14 @@ import com.filmkit.app.camera.EditorHistory
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.EditorSnapshot
 import com.filmkit.app.camera.FADE_UI_RANGE
+import com.filmkit.app.camera.GLOW_RADIUS_UI_PIVOT
+import com.filmkit.app.camera.GLOW_THRESHOLD_UI_PIVOT
+import com.filmkit.app.camera.GLOW_UI_PIVOT
+import com.filmkit.app.camera.HALO_GLOW_UI_RANGE
+import com.filmkit.app.camera.HALO_RADIUS_UI_PIVOT
+import com.filmkit.app.camera.HALO_THRESHOLD_UI_PIVOT
+import com.filmkit.app.camera.HALO_UI_PIVOT
+import com.filmkit.app.camera.HALO_WARMTH_UI_PIVOT
 import com.filmkit.app.camera.ImageFitRect
 import com.filmkit.app.camera.LATITUDE_UI_PIVOT
 import com.filmkit.app.camera.LATITUDE_UI_RANGE
@@ -193,7 +209,7 @@ import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatDegree
 import com.filmkit.app.camera.formatEv
 import com.filmkit.app.camera.formatKelvin
-import com.filmkit.app.camera.formatMono
+import com.filmkit.app.camera.formatOff100
 import com.filmkit.app.camera.formatOffset100
 import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.formatZero150
@@ -225,6 +241,8 @@ import com.filmkit.app.camera.localWidthUi
 import com.filmkit.app.camera.mergePresets
 import com.filmkit.app.camera.monoSlot
 import com.filmkit.app.camera.monoUi
+import com.filmkit.app.camera.normalizedSlot
+import com.filmkit.app.camera.normalizedUi
 import com.filmkit.app.camera.overwriteOriginalPhoto
 import com.filmkit.app.camera.paramsUnchanged
 import com.filmkit.app.camera.passthroughAllowed
@@ -238,6 +256,7 @@ import com.filmkit.app.camera.radialOutline
 import com.filmkit.app.camera.refreshOverwrittenExif
 import com.filmkit.app.camera.resetBasicParams
 import com.filmkit.app.camera.resetColorParams
+import com.filmkit.app.camera.resetFilmTextureParams
 import com.filmkit.app.camera.resetLocalGeometry
 import com.filmkit.app.camera.saveEditorCopy
 import com.filmkit.app.camera.scalePresetSlots
@@ -301,7 +320,7 @@ import kotlinx.coroutines.withContext
  * 参数面板（E2-10 重做为**专业面板**，ADR-14）：五层结构 —— 顶部栏（取消 / **撤销·重做
  *（E2-25 已做实）** / 覆盖 / 完成）→ 预览区（weight 1f）→ 参数名（居中大字）→ **单滑杆**
  *（满宽 + 密集刻度 + 中点标记 + 物理量读数）→ 参数图标行（横向滚动圆形按钮）→ 底部导航
- *（调整 / 滤镜 / 暗角 / 局部 / **裁剪（E2-12）** / **预设（E3-1a）**）。
+ *（调整 / 滤镜 / **质感** / 局部 / **裁剪（E2-12）** / **预设（E3-1a）**）。
  *
  * E3-1a（预设，本卡）：底栏「预设」由置灰留位改为**可点**，打开**预设面板**（取代参数面板，
  * 与裁剪工具栏同一层）：保存当前 / 套用 / 删除（二次确认）。数据层（稀疏字段集 + schema 版本
@@ -398,7 +417,7 @@ fun EditorScreen(
     // 按住看原图时显示的输入像素（从常驻 buffer 重建，见 LaunchedEffect(showOriginal)）
     var origBmp by remember { mutableStateOf<Bitmap?>(null) }
     // 参数数组（长度 = CameraPresets.COUNT）：编辑器只改得动参数表里列出的那些槽位
-    //（调整 / 滤镜 / 暗角 / 局部四组，见文件末尾的参数表）；其余槽位带着基线值
+    //（调整 / 滤镜 / 质感 / 局部四组，见文件末尾的参数表）；其余槽位带着基线值
     //（E2-21 起打开时是**全恒等基线**，不再从快照继承）→ 导出时整体存回快照
     var params by remember { mutableStateOf<DoubleArray?>(null) }
     // 打开编辑器时的参数基准（E2-9 / ADR-13）：`params` 的**副本**，导出时逐槽比一次值
@@ -415,7 +434,7 @@ fun EditorScreen(
     // 成片已含这一套参数）；只有用户主动点「套用原片风格」才整槽写回（[applySnapshotParams]）。
     var snapParams by remember { mutableStateOf<DoubleArray?>(null) }
     var hasSnapshot by remember { mutableStateOf(false) }
-    // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 滤镜 / 暗角 / 局部。面板常驻
+    // 当前选中的功能大类（E2-10）：底部导航 = 调整 / 滤镜 / 质感 / 局部。面板常驻
     //（不再是可折叠区），所以这里取代了 E2-1 的 `panelOpen`。
     var tab by remember { mutableStateOf(EditorTab.ADJUST) }
     // 面板"重建计数"（E2-3）：滑杆的读数 state 只在首次组合时读初值（组件内部 remember，
@@ -978,12 +997,15 @@ fun EditorScreen(
     }
 
     /**
-     * 「暗角」组重置：强度归 0 = **关**（引擎侧 [66] ≥ 0 ⇒ 整段跳过）。半径/羽化在强度为 0
-     * 时对画面没有任何影响，保持原值即可 —— 少一次无意义的写入，语义也更清楚（"重置"=
-     * 回到恒等 = 没有暗角）。
+     * 「质感」组重置（SG-2 起本组 = 暗角 + 光晕 + 柔光）：三条**强度**归 0 = **关**
+     * （[62] 光晕 / [66] 暗角 / [95] 柔光），其余七条（阈值 / 半径 / 暖度 / 羽化）保持原值
+     * —— 强度为 0 时各自的整链都旁路，那些参数不可达，"重置 = 回到恒等"的语义已经成立。
+     *
+     * 纯逻辑在 [resetFilmTextureParams]（`EditorExport.kt`，JVM 单测直接覆盖），这里只负责
+     * 刷新 / 记一步 / 重渲染。
      */
-    fun resetVignette() {
-        params?.let { it[66] = vigStrengthSlot(0f) }
+    fun resetTexture() {
+        params?.let { resetFilmTextureParams(it) }
         panelRefresh++
         recordHistory()
         rerender()
@@ -1060,7 +1082,7 @@ fun EditorScreen(
         when (g) {
             EditorTab.ADJUST -> resetBasic()
             EditorTab.COLOR -> resetColor()
-            EditorTab.VIGNETTE -> resetVignette()
+            EditorTab.TEXTURE -> resetTexture()
             EditorTab.LOCAL -> resetLocal()
         }
     }
@@ -2119,7 +2141,7 @@ private class EditorInit(
 //   ③ 参数名：居中大字（当前选中参数）+ 1px 黑阴影 —— [ParamNameRow]
 //   ④ 单滑杆：**一屏只出当前选中参数的那一条**，满宽 + 密集刻度 + 中点标记 + 物理量读数 —— [EditorSlider]
 //   ⑤ 参数图标行：横向滚动圆形按钮（未选中 = 深灰圆 + 白图标；选中 = 深灰圆 + 黄描边 + 黄图标）—— [ParamIconRow]
-//   ⑥ 底部导航：调整 / 滤镜 / 暗角 / 局部 / **裁剪**（E2-12）＋ **预设**（E3-1a）—— [EditorTabBar]
+//   ⑥ 底部导航：调整 / 滤镜 / **质感** / 局部 / **裁剪**（E2-12）＋ **预设**（E3-1a）—— [EditorTabBar]
 //
 // 三条关键修正（"专业感"的真正来源，ADR-14「我们的差距」头三条）：
 //   1. **满宽滑杆 + 标签在上方**（不再是"标签｜细滑杆｜百分比"的三段式表单行）
@@ -2150,11 +2172,19 @@ private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
  * ★ E2-19：第二组的**显示名**从「色彩」改为「滤镜」（用户真机反馈："色彩名称改为滤镜"，
  * 与 Filmix 底栏命名一致）。**只改这一处字符串**：枚举名 `COLOR`、组内参数（LUT 选择 +
  * LUT 强度 + 褪色）与任何逻辑都没动。
+ *
+ * ★ **SG-2：第三组的显示名从「暗角」改为「质感」**（枚举名 `VIGNETTE` → `TEXTURE`）。
+ * 组里现在装的是**三种胶片质感**（暗角 [66..68] + 光晕 [62..65] + 柔光 [95..97]），
+ * "暗角"这个名字会让用户**根本不会点进来找光晕**（ADR-12：界面要自己说清楚，不靠用户猜）。
+ * 组名变更**会影响肌肉记忆**（老用户按位置点"暗角"），但组内**第一条仍是"暗角 · 强度"**、
+ * 位置也没变 ⇒ 老用户的动作路径（点第三格 → 拖第一条）逐字不变，只有格子上的两个字变了。
+ * 图标同时从 `Vignette` 换成 `FilterVintage`（胶片质感语义）：图标比文字更早被识别，
+ * 留着暗角图标会继续暗示"这组只有暗角"。
  */
 private enum class EditorTab(val label: String, val icon: ImageVector) {
     ADJUST("调整", Icons.Outlined.Tune),
     COLOR("滤镜", Icons.Outlined.Palette),
-    VIGNETTE("暗角", Icons.Outlined.Vignette),
+    TEXTURE("质感", Icons.Outlined.FilterVintage),
     LOCAL("局部", Icons.Outlined.CenterFocusStrong),
 }
 
@@ -2363,7 +2393,7 @@ private val AdjustParams: List<EditorParam> = listOf(
  *
  * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
  *  - **黑白** `关` / `35`（0..100 整数；**0 = 彩色原样 ⇒ 显示"关"**，非零显示数值而不是"开"
- *    —— 它是**连续**混合比，`formatMono` 的 KDoc 解释了为什么不用开关口径）；
+ *    —— 它是**连续**混合比，`formatOff100` 的 KDoc 解释了为什么不用开关口径）；
  *    基准在最左端 ⇒ 不画中点标记
  *  - **分离色调 · 暖 / 冷** `+50`（±100，正 = 该半边染色增强）；中点 = `0`
  *  - **褪色** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记
@@ -2374,7 +2404,7 @@ private val ColorParams: List<EditorParam> = listOf(
     EditorParam(
         key = "mono", label = "黑白", icon = Icons.Outlined.MonochromePhotos,
         range = MONO_UI_RANGE, pivot = ZERO_UI_PIVOT,
-        format = { formatMono(it) },
+        format = { formatOff100(it) },
         read = { monoUi(it[25]) },
         write = { p, v -> p[25] = monoSlot(v) },
     ),
@@ -2420,32 +2450,113 @@ private val LutStrengthParam = EditorParam(
 )
 
 /**
- * 「暗角」组（E2-1）：强度 [66] / 半径 [67] / 羽化 [68]。量程与读数口径：
- *  - **强度** `50`（0..100，0 = 关，引擎侧 [66] ≥ 0 整段跳过）
- *  - **半径 / 羽化** `80` / `50`（0..200 —— darktable 的 `scale` / `falloff_scale` 本身就是
- *    百分比语义）；基准 = darktable 默认 80 / 50（画中点标记，告诉用户"默认在哪"）
+ * 「质感」组（E2-1 的「暗角」组，**SG-2 扩组并改名**）：**暗角** [66..68] + **光晕** [62..65]
+ * + **柔光** [95..97]，共 10 条。
+ *
+ * **为什么组名从「暗角」改成「质感」**：这三类都是"胶片质感"层（光学渐晕 / 乳剂背反射光晕 /
+ * 柔光镜 bloom），而"暗角"这个名字会让用户**根本不会点进来找光晕与柔光**（用户 2026-10-11：
+ * "光晕、柔光要先做" —— 引擎已实现，但滑杆藏在名为"暗角"的组里 = 等于没做）。
+ * 肌肉记忆的影响被压到最小：**组的位置（第三格）与组内第一条（"暗角 · 强度"）都没变**，
+ * 老用户"点第三格 → 拖第一条"的动作路径逐字不变。理由与图标更换见 [EditorTab] 的 KDoc。
+ *
+ * **为什么每条 label 都带组内前缀**（"暗角 · 强度" / "光晕 · 强度" / "柔光 · 强度"）：
+ * 扩组后组内有 **3 条"强度"、3 条"半径"、2 条"阈值"** —— 不加前缀，参数名行（[ParamNameRow]
+ * 居中大字）会显示成三条一模一样的"强度"，用户不知道自己在调哪一个。前缀不是新名字，
+ * 就是**子类名**（与 `PresetDetail.kt` 的 `DETAIL_META` 逐字相同 —— 那边是跨组平铺清单，
+ * 本来就必须带前缀；两处文案由 `PresetDetailTest` 的护栏对拍，不可能漂移）。
+ *
+ * **排序理由**：**暗角 → 光晕 → 柔光**。暗角三条保持原位置（肌肉记忆 + 它是本组的历史主体）；
+ * 光晕与柔光相邻放在后面 —— 两者共享同一套模糊金字塔（`soft-glow-SPEC.md` §5），是同一族
+ * "高光扩散"，分开会让用户无法 A/B 对比（"夜景点光源的红色外晕 vs 白色柔光"是规格 §1 的判据）。
+ * 组内按**槽位升序**，与 `DETAIL_META` 的行序一致。
+ *
+ * 读数口径（E2-10 全卡统一，格式化函数都在 `EditorExport.kt`）：
+ *  - **暗角强度** `50`（0..100，0 = 关，引擎侧 [66] ≥ 0 整段跳过）；**暗角半径 / 羽化**
+ *    `80` / `50`（0..200 —— darktable 的 `scale` / `falloff_scale` 本身就是百分比语义）；
+ *    基准 = darktable 默认 80 / 50（画中点标记，告诉用户"默认在哪"）
+ *  - **光晕 / 柔光的强度** `关` / `35`（[formatOff100]：0 → `关`，否则 0..100 整数；
+ *    0 = 整链旁路）；基准在最左端 ⇒ 不画中点标记
+ *  - **阈值 / 半径 / 暖度** `0.80` / `0.45` / `0.40`（**两位小数**，[formatDecimals2]）：
+ *    这五条是**归一化形态量**（0..1 的显示域阈值 / 相对短边的半径 / 红橙程度），整数化会把
+ *    0.45 与 0.50 显示成同一个数，而它们对应明显不同的形态。基准 = 各自的引擎默认值
+ *    （画中点标记，告诉用户"重置会回到哪"）—— pivot 与引擎中性值的一致性由
+ *    `EditorHaloGlowUiTest` 逐槽对拍 `FilmParams.h` 与 `CameraPresets.standard()` 钉死。
  */
-private val VignetteParams: List<EditorParam> = listOf(
+private val TextureParams: List<EditorParam> = listOf(
     EditorParam(
-        key = "vigStrength", label = "强度", icon = Icons.Outlined.Vignette,
+        key = "vigStrength", label = "暗角 · 强度", icon = Icons.Outlined.Vignette,
         range = 0f..1f, pivot = 0f,
         format = { formatZero100(it) },
         read = { vigStrengthUi(it[66]) },
         write = { p, v -> p[66] = vigStrengthSlot(v) },
     ),
     EditorParam(
-        key = "vigRadius", label = "半径", icon = Icons.Outlined.RadioButtonUnchecked,
+        key = "vigRadius", label = "暗角 · 半径", icon = Icons.Outlined.RadioButtonUnchecked,
         range = 0f..2f, pivot = 0.8f,
         format = { formatZero200(it) },
         read = { vigRadiusUi(it[67]) },
         write = { p, v -> p[67] = vigRadiusSlot(v) },
     ),
     EditorParam(
-        key = "vigFeather", label = "羽化", icon = Icons.Outlined.BlurOn,
+        key = "vigFeather", label = "暗角 · 羽化", icon = Icons.Outlined.BlurOn,
         range = 0f..2f, pivot = 0.5f,
         format = { formatZero200(it) },
         read = { vigFeatherUi(it[68]) },
         write = { p, v -> p[68] = vigFeatherSlot(v) },
+    ),
+    // ── SG-2：光晕 halation [62..65]（E4-5 引擎已实现，本卡接进面板）──────────────
+    // 量程 0..1 直通槽位（`HALO_GLOW_UI_RANGE`，与 `normalizedSlot` 共用同一份定义）。
+    // ⚠ pivot = 引擎中性值：[62] = 0（关）、[63] 0.80、[64] 0.45、[65] 0.40。
+    EditorParam(
+        key = "haloStrength", label = "光晕 · 强度", icon = Icons.Outlined.Flare,
+        range = HALO_GLOW_UI_RANGE, pivot = HALO_UI_PIVOT,
+        format = { formatOff100(it) },
+        read = { normalizedUi(it[62], HALO_UI_PIVOT) },
+        write = { p, v -> p[62] = normalizedSlot(v) },
+    ),
+    EditorParam(
+        key = "haloThreshold", label = "光晕 · 触发阈值", icon = Icons.Outlined.Brightness6,
+        range = HALO_GLOW_UI_RANGE, pivot = HALO_THRESHOLD_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { normalizedUi(it[63], HALO_THRESHOLD_UI_PIVOT) },
+        write = { p, v -> p[63] = normalizedSlot(v) },
+    ),
+    EditorParam(
+        key = "haloRadius", label = "光晕 · 半径", icon = Icons.Outlined.Adjust,
+        range = HALO_GLOW_UI_RANGE, pivot = HALO_RADIUS_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { normalizedUi(it[64], HALO_RADIUS_UI_PIVOT) },
+        write = { p, v -> p[64] = normalizedSlot(v) },
+    ),
+    EditorParam(
+        key = "haloWarmth", label = "光晕 · 暖度", icon = Icons.Outlined.LocalFireDepartment,
+        range = HALO_GLOW_UI_RANGE, pivot = HALO_WARMTH_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { normalizedUi(it[65], HALO_WARMTH_UI_PIVOT) },
+        write = { p, v -> p[65] = normalizedSlot(v) },
+    ),
+    // ── SG-2：柔光 soft glow [95..97]（SG-1 引擎已实现，本卡接进面板）─────────────
+    // ⚠ pivot：[95] = 0（关，零 pass 零纹理）、[96] 0.35、[97] 0.70。
+    EditorParam(
+        key = "glowStrength", label = "柔光 · 强度", icon = Icons.Outlined.BlurCircular,
+        range = HALO_GLOW_UI_RANGE, pivot = GLOW_UI_PIVOT,
+        format = { formatOff100(it) },
+        read = { normalizedUi(it[95], GLOW_UI_PIVOT) },
+        write = { p, v -> p[95] = normalizedSlot(v) },
+    ),
+    EditorParam(
+        key = "glowRadius", label = "柔光 · 半径", icon = Icons.Outlined.TripOrigin,
+        range = HALO_GLOW_UI_RANGE, pivot = GLOW_RADIUS_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { normalizedUi(it[96], GLOW_RADIUS_UI_PIVOT) },
+        write = { p, v -> p[96] = normalizedSlot(v) },
+    ),
+    EditorParam(
+        key = "glowThreshold", label = "柔光 · 触发阈值", icon = Icons.Outlined.Brightness5,
+        range = HALO_GLOW_UI_RANGE, pivot = GLOW_THRESHOLD_UI_PIVOT,
+        format = { formatDecimals2(it) },
+        read = { normalizedUi(it[97], GLOW_THRESHOLD_UI_PIVOT) },
+        write = { p, v -> p[97] = normalizedSlot(v) },
     ),
 )
 
@@ -2737,7 +2848,7 @@ private fun EditorPanel(
         // 滤镜组（E2-15）：褪色（[ColorParams]）+ LUT 强度（选了 LUT 才有）。
         // 色温/色调已移入「调整」组 —— 它们是白平衡的两条，不属于"风格素材"这一类。
         EditorTab.COLOR -> if (lutId != null) ColorParams + LutStrengthParam else ColorParams
-        EditorTab.VIGNETTE -> VignetteParams
+        EditorTab.TEXTURE -> TextureParams
         EditorTab.LOCAL -> localParams(localMode)
     }
     var selKey by remember { mutableStateOf<String?>(null) }
@@ -3267,7 +3378,7 @@ private fun ParamChip(
 }
 
 /**
- * ⑥ 底部导航（ADR-14 层⑥）：调整 / 滤镜 / 暗角 / 局部，**选中 = 黄色圆角矩形底 + 深色图标与文字**。
+ * ⑥ 底部导航（ADR-14 层⑥）：调整 / 滤镜 / **质感** / 局部，**选中 = 黄色圆角矩形底 + 深色图标与文字**。
  *
  * 选中态用「强调色实底 + [FilmTheme.OnAccent] 前景」而不是"黄底 + 黄字"：黄底黄字的对比度
  * 约 1.4:1（WCAG 远不达标），实底 + 深字是 6.8:1。同一个"黄色圆角矩形底"的语言，可读性优先。

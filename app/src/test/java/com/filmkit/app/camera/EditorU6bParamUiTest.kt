@@ -157,17 +157,18 @@ class EditorU6bParamUiTest {
         assertEquals(1f, monoUi(9.0), 1e-6f)
         assertEquals("负槽位 = 关（mix 的负系数无意义）", 0f, monoUi(-1.0), 0f)
         assertEquals(0f, monoUi(Double.NaN), 0f)
-        // 读数：0 → `关`，否则 0..100 整数
-        assertEquals("关", formatMono(0f))
-        assertEquals("35", formatMono(0.35f))
-        assertEquals("90", formatMono(0.9f))
-        assertEquals("100", formatMono(1f))
+        // 读数：0 → `关`，否则 0..100 整数（SG-2 起函数名 `formatOff100` ——
+        // 它服务黑白 / 光晕强度 / 柔光强度三条，`formatMono` 这个名字已经不准了）
+        assertEquals("关", formatOff100(0f))
+        assertEquals("35", formatOff100(0.35f))
+        assertEquals("90", formatOff100(0.9f))
+        assertEquals("100", formatOff100(1f))
         // 越界夹到端点、坏数据回落 `关`（读数绝不出现 `NaN` 或越界值）
-        assertEquals("100", formatMono(1.8f))
-        assertEquals("关", formatMono(-0.5f))
-        assertEquals("关", formatMono(Float.NaN))
+        assertEquals("100", formatOff100(1.8f))
+        assertEquals("关", formatOff100(-0.5f))
+        assertEquals("关", formatOff100(Float.NaN))
         // ★ 旧详情口径（`>= 0.5` 才算"开"）会把这个值读成"关" —— 这正是本卡修掉的假读数
-        assertEquals("35", formatMono(monoUi(monoSlot(0.35f))))
+        assertEquals("35", formatOff100(monoUi(monoSlot(0.35f))))
         // 基准 0 = 关，落在量程最左端 ⇒ 不画中点标记（端点本身就是标记）
         assertNull(pivotFraction(MONO_UI_RANGE, ZERO_UI_PIVOT))
         // 往返不漂
@@ -321,13 +322,13 @@ class EditorU6bParamUiTest {
         // 面板读数（滑杆值 → 槽位 → 读数的完整回路 = 用户在屏幕上看到的那串字符）
         assertEquals("0.30", formatDecimals2(latitudeUi(p[5])))
         assertEquals("0.70", formatDecimals2(latitudeUi(p[8])))
-        assertEquals("35", formatMono(monoUi(p[25])))
+        assertEquals("35", formatOff100(monoUi(p[25])))
         assertEquals("+50", formatOffset100(splitUi(p[23]), ZERO_UI_PIVOT))
         assertEquals("-50", formatOffset100(splitUi(p[24]), ZERO_UI_PIVOT))
         // 端点读数也是用户可见的（拖到最左/最右）
         assertEquals("0.00", formatDecimals2(latitudeUi(latitudeSlot(0f))))
         assertEquals("1.00", formatDecimals2(latitudeUi(latitudeSlot(1f))))
-        assertEquals("100", formatMono(monoUi(monoSlot(1f))))
+        assertEquals("100", formatOff100(monoUi(monoSlot(1f))))
         assertEquals("+100", formatOffset100(splitUi(splitSlot(1f)), ZERO_UI_PIVOT))
         assertEquals("-100", formatOffset100(splitUi(splitSlot(-1f)), ZERO_UI_PIVOT))
         // 改回恒等值 ⇒ 判为无修改（导出直通原片字节）
