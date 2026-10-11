@@ -60,20 +60,26 @@ import org.junit.Test
 class CameraStyleWhitelistTest {
 
     /**
-     * 拍照链路读取集合的**唯一维护点**（代码侧白名单）。判据 = `FrameRenderer.cpp` 的
-     * 实际读取 ⇒ 本常量与引擎、§1.6 三者必须一致（三个用例分别钉住）。
+     * 拍照链路读取集合 —— **唯一维护点已移到生产代码**：`CameraPresetApply.kt` 的
+     * `CAMERA_PATH_SLOTS`（★ PS-3，2026-10-11：拍照界面的预设详情要按它决定"哪些参数能拖、
+     * 哪些必须灰显"，判据不能只活在测试里）。本测试**引用**它，三方对拍不变：
      *
-     * U-2（2026-10-11）起 = **34 个槽位**，逐组来源：
+     *     `FrameRenderer.cpp` 的实际读取 == [cameraPathSlots]（= 生产常量）== §1.6 的「拍照链路」列
+     *
+     * 因此本测试仍是"文档说引擎读了某槽位"的机器判据，且**常量漂移会被立刻抓住**
+     * （改生产常量 ⇒ [engineCameraPathMatchesWhitelist] 红；改引擎 ⇒ 同一条红）。
+     *
+     * U-2（2026-10-11）起 = **41 个槽位**，逐组来源：
      *  - `[0]` 曝光 / `[1..3]` WB / `[4]` 对比度（U-3 接线）/ `[5..10]` 趾肩 latitude
      *    （E4-4）/ `[20..22]` 分区饱和 / `[23..25]` 分离色调+单色（U-1）/
      *    `[26][27][60][61]` 颗粒（E4-3）/ `[37][38]` filmic 黑白点 /
      *    `[66..68]` 暗角（E4-2）/ `[78]` 清晰度 + `[90..94]` 影调分区·褪色（U-4）/
      *    `[88][89]` 色温色调（U-3）。
-     *  - **E4-5（2026-10-11）起 = 38 个**：`[62..65]` 光晕 —— 四槽都在拍照链路的
+     *  - **E4-5（2026-10-11）起 +4**：`[62..65]` 光晕 —— 四槽都在拍照链路的
      *    `passOutput` → `runHalation` 内读取（`runHalation` 是两条链路共享的函数，
      *    不在 [editorPathFuncs] 里 ⇒ 它的读取算拍照链路；编辑器链路只直接读 `[62]`，
      *    由 `EditorStyleWhitelistTest` 独立守着）。
-     *  - **SG-1（v0.11.17）起 = 41 个**：`[95..97]` 柔光 —— `[95]` 在 `passOutput` 里
+     *  - **SG-1（v0.11.17）起 +3**：`[95..97]` 柔光 —— `[95]` 在 `passOutput` 里
      *    直接读（门控），`[96]` 半径 / `[97]` 阈值在 `runGlow` 内读。`runGlow` 与
      *    `runHalation` 一样是**两条链路共享**的函数（不在 [editorPathFuncs] 里）
      *    ⇒ 三槽都算拍照链路；编辑器链路只直接读 `[95]`（`EditorStyleWhitelistTest` 守）。
@@ -81,22 +87,7 @@ class CameraStyleWhitelistTest {
      *    `[34]`（LUT 强度，由 `lut.strength` 承载）/ `[35][36]`（引擎标定）：`presetSlotIncluded`
      *    把它们排除在预设之外 ⇒ 与"预设作用域"无关，不在本集合的定义域内。
      */
-    private val cameraPathSlots: Set<Int> = buildSet {
-        add(0)
-        addAll(1..3)
-        add(4)
-        addAll(5..10)      // [5..7] shoulder[3] / [8..10] toe[3]（数组字段）
-        addAll(20..22)     // 分区饱和三档（U-2 补 [20][22]）
-        addAll(23..25)     // 分离色调 + 单色
-        add(26); add(27); add(60); add(61)
-        addAll(62..65)     // E4-5 光晕：[62] 强度 / [63] 阈值 / [64] 半径 / [65] 暖度
-        add(37); add(38)
-        addAll(66..68)
-        add(78)
-        add(88); add(89)
-        addAll(90..94)
-        addAll(95..97)     // SG-1 柔光：[95] 强度 / [96] 半径 / [97] 阈值
-    }
+    private val cameraPathSlots: Set<Int> = CAMERA_PATH_SLOTS
 
     /** 编辑器链路的函数（抽取时排除；新增编辑器专属函数时必须加进来，见类 KDoc 第 4 条）。 */
     private val editorPathFuncs = listOf("passStyle", "submitDisplay")

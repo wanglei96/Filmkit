@@ -238,6 +238,67 @@ internal fun presetDetailSections(slots: Map<Int, Double>): List<PresetDetailSec
 /** [34]：由 [EditorPreset.lutStrength] 承载，不进参数列表（与 `presetSlotIncluded` 同一条口径）。 */
 private const val LUT_STRENGTH_SLOT = 34
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ PS-3：拍照界面参数表的**全量**形态（"预设应该展示全部可调参数"）
+//
+// 与 [presetDetailSections] 的关系：那是"**这条预设包含什么**"（`slots` 的稀疏集，PS-1 的
+// 只读清单）；这是"**这条预设能调什么 + 现在设没设**"（数据源 = 传入的可调槽集合）。
+// 两者共用同一套中文名 / 单位 / 格式化（[DETAIL_META]）与分组顺序（[SECTION_ORDER]）——
+// **不新造第二套译名**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 拍照界面参数表的一行。
+ *
+ * @property value 该槽的读数（沿用 [DETAIL_META] 的格式化）；**null = 这条预设未包含该项**
+ *   —— UI 显示「未设置」，**绝不用当前相机值冒充**（那是在骗用户：他看到的会是"预设里的值"，
+ *   而实际上套用这条预设时该字段保持不动）。
+ */
+internal data class CameraParamRow(val slot: Int, val label: String, val value: String?)
+
+/** 拍照界面参数表的一个分组（标题取自 §9.2 的四组 + 兜底组，与 [presetDetailSections] 同一套）。 */
+internal data class CameraParamSection(val title: String, val rows: List<CameraParamRow>)
+
+/**
+ * 单个槽的展示行（复用 [DETAIL_META] 的 label / format；表里没有名字的槽走 [fallbackRow]）。
+ * 供拍照界面的全量参数表逐槽取行 —— 与 [presetDetailSections] 的输出**逐字一致**。
+ */
+internal fun presetDetailRowOf(slot: Int, v: Double): PresetDetailRow {
+    val meta = DETAIL_META[slot]
+    return if (meta != null) PresetDetailRow(slot, meta.label, meta.format(v)) else fallbackRow(slot, v)
+}
+
+/**
+ * ★ PS-3：**全量**参数表（拍照界面详情面板用）= 对 [tunable] 里的每一个槽都出一行，
+ * 按 §9.2 的四组 + 兜底组分组、组内按槽位升序。
+ *
+ *  - `slots` 里**有**该槽 ⇒ [CameraParamRow.value] = 它的读数（"这条预设包含该项"）；
+ *  - `slots` 里**没有** ⇒ `value = null` ⇒ UI 显示「未设置」（稀疏子集的可视化：
+ *    套用时该字段**保持不动**，所以不能显示当前相机值冒充预设值）。
+ *
+ * @param tunable 要展示的槽位集合（拍照界面 = `CAMERA_TUNABLE_SLOT_PARAM.keys`，即
+ *   "拍照链路真的读 + 参数面板真的有滑杆"的 35 槽 —— 判据在 `ParamControls.kt`，
+ *   本函数只管展示，不重写可用性判断）。
+ */
+internal fun cameraParamSections(
+    slots: Map<Int, Double>,
+    tunable: Collection<Int>,
+): List<CameraParamSection> {
+    val bySection = LinkedHashMap<String, MutableList<CameraParamRow>>()
+    for (slot in tunable.sorted()) {
+        if (slot == LUT_STRENGTH_SLOT) continue          // 与 presetDetailSections 同一条排除
+        val meta = DETAIL_META[slot]
+        val label = meta?.label ?: (FilmParamKeys.bySlot[slot] ?: "槽$slot")
+        val v = slots[slot]
+        val value = if (v != null) (meta?.format(v) ?: rawText(v)) else null
+        bySection.getOrPut(meta?.section ?: SEC_OTHER) { mutableListOf() }
+            .add(CameraParamRow(slot, label, value))
+    }
+    return SECTION_ORDER.mapNotNull { title ->
+        bySection[title]?.let { CameraParamSection(title, it) }
+    }
+}
+
 /**
  * 表里没有名字的槽位：显示**语义名**（[FilmParamKeys]）→ `槽N` 回落，值用原值文本。
  * "难看但看得见"比"静默消失"好 —— 前者是评审能发现的缺口，后者是用户永远不知道丢了什么。
@@ -317,7 +378,7 @@ private fun rawText(v: Double): String = when {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 「⋯」菜单里的动作（枚举顺序 = [presetMenuItems] 的渲染顺序）。 */
-internal enum class PresetAction { APPLY, VIEW, EDIT, RENAME, COPY, DELETE }
+internal enum class PresetAction { APPLY, VIEW, EDIT, RENAME, COPY, RESTORE, DELETE }
 
 /**
  * 菜单里的一项：[label] 是给用户看的词，[enabled] = 能不能点。
@@ -329,34 +390,51 @@ internal data class PresetMenuItem(val action: PresetAction, val label: String, 
 /**
  * 列表行「⋯」菜单的完整清单（顺序固定：主操作在前、危险操作在后）。
  *
+ * ★ **PS-3 口径变更（用户 2026-10-11 拍板："内置预设为什么不让修改？我觉得没有必要，
+ * 最多限制不能删除就行"）**：内置预设**不再是整体只读**，唯一限制 = **不能删除**。
+ *
+ * | 动作 | 内置 | 用户 | 判据 |
+ * |---|---|---|---|
+ * | 套用 | ✅ | ✅ | `paramsReady` |
+ * | 查看配置 | ✅ | ✅ | 恒 true（只读展示） |
+ * | 编辑 / 重命名 | ✅ **（新：以前是灰的）** | ✅ | `paramsReady` |
+ * | 复制 | ✅ **（新：以前是灰的）** | ✅ | 恒 true（复制出来的副本永远是用户预设） |
+ * | **恢复默认** | ✅ **（新）** | ❌ 置灰 | `!presetDeletable(p)`：只有内置有"出厂定义"可回退 |
+ * | **删除** | ❌ 置灰 | ✅ | [presetDeletable] —— **唯一**的限制 |
+ *
+ * 被推翻的旧口径（PS-1/P-2c）：`EDIT` / `RENAME` / `COPY` 都按 `presetDeletable` 置灰
+ * （"内置整条路径只读"）。当时的理由是"想改内置的配方就『+ 新建预设』+『从当前参数更新』"，
+ * 用户真机实测后明确否掉了这条 —— 多绕两步不是保护，是障碍。
+ *
  * @param paramsReady 编辑器参数是否已就绪（首帧前谈不上套用 / 编辑）—— 与「保存当前」的
  *   `canSave` 是**同一个判据**，调用侧传同一个值，不另算一份。
- *
- * 可删判据 = [presetDeletable]（内置只读的**唯一**实现，P-2c 立的规矩）：内置预设的
- * 编辑 / 重命名 / 复制 / 删除四项全部由它置灰。"复制内置"技术上可行（产出一条用户预设副本），
- * 但本卡按架构师口径把内置整条路径设为只读 —— 想改内置的配方就「+ 新建预设」+「从当前参数更新」。
  */
 internal fun presetMenuItems(p: EditorPreset, paramsReady: Boolean): List<PresetMenuItem> {
-    val user = presetDeletable(p)
+    val deletable = presetDeletable(p)
     return listOf(
         PresetMenuItem(PresetAction.APPLY, "套用", paramsReady),
         PresetMenuItem(PresetAction.VIEW, "查看配置", true),
-        PresetMenuItem(PresetAction.EDIT, "编辑", user && paramsReady),
-        PresetMenuItem(PresetAction.RENAME, "重命名", user && paramsReady),
-        PresetMenuItem(PresetAction.COPY, "复制", user),
-        PresetMenuItem(PresetAction.DELETE, "删除", user),
+        PresetMenuItem(PresetAction.EDIT, "编辑", paramsReady),
+        PresetMenuItem(PresetAction.RENAME, "重命名", paramsReady),
+        PresetMenuItem(PresetAction.COPY, "复制", true),
+        // ★ PS-3：内置的"改回来"入口（删掉覆盖层 ⇒ 回到随包分发的定义）
+        PresetMenuItem(PresetAction.RESTORE, "恢复默认", !deletable),
+        PresetMenuItem(PresetAction.DELETE, "删除", deletable),
     )
 }
 
 /**
- * 菜单底部的一句**实话**（内置预设 ⇒ 说明为什么上面四项是灰的）；用户预设 ⇒ null（不占行）。
+ * 菜单底部的一句**实话**（内置预设 ⇒ 说明它唯一的限制是什么）；用户预设 ⇒ null（不占行）。
+ *
+ * ★ PS-3 文案变更：旧文案是"内置预设只读：可套用 / 查看配置，不能编辑、重命名、复制或删除"
+ * —— 与新的口径（只有删除受限）直接矛盾，必须一起改，否则界面在骗用户。
  *
  * 与 [presetMenuItems] 同一条判据（[presetDeletable]）：文案与置灰状态不可能各说各话。
  */
 internal fun presetReadOnlyNote(p: EditorPreset): String? = if (presetDeletable(p)) {
     null
 } else {
-    "内置预设只读：可套用 / 查看配置，不能编辑、重命名、复制或删除"
+    "内置预设不能删除（可改参数 / 名称 / 分组；改过之后可「恢复默认」）"
 }
 
 /** 列表行的参数摘要最多显示几项（超出加「…」；LUT 那一项**不占**这个额度）。 */
@@ -420,9 +498,15 @@ internal data class PresetEditorButtons(
     val saveNew: Boolean,
     /** 编辑态：「从当前参数更新」（U-6a 的 updatePreset） */
     val updateFromCurrent: Boolean,
-    /** 编辑态：「保存名称 / 分组」（重命名 = 本卡新增的 renamePreset） */
+    /** 编辑态：「保存名称 / 分组」（重命名 = PS-1 新增的 renamePreset） */
     val saveMeta: Boolean,
-    /** 编辑态：「删除」（二次确认在面板里，仅 user 预设） */
+    /**
+     * ★ PS-3：编辑态：「**恢复默认**」—— 只有**内置**预设才有"出厂定义"可回退
+     *（判据 = `!presetDeletable`）。⚠ 这里只回答"这条预设**有没有**出厂定义"；
+     * "**当前是否改过**"（改过才需要恢复）由 UI 叠加覆盖层判据（`hasOverride`）⇒ 未改过时置灰。
+     */
+    val restore: Boolean,
+    /** 编辑态：「删除」（二次确认在面板里，**内置唯一受限的动作**） */
     val delete: Boolean,
 )
 
@@ -431,6 +515,10 @@ internal data class PresetEditorButtons(
  * @param preset 编辑态的那条预设（新建态传 null）
  * @param paramsReady 当前参数已就绪（首帧前存不了也更新不了）
  * @param name 名称输入框的**当前内容**（空 ⇒ 保存类按钮置灰，但按钮仍在）
+ *
+ * ★ PS-3 口径变更（用户 2026-10-11："内置预设为什么不让修改？…最多限制不能删除就行"）：
+ * 编辑态的 `updateFromCurrent` / `saveMeta` **不再因内置而置灰**（旧口径见
+ * `cameraPresetEditorButtons` 的历史注释）；**只有 `delete` 受 [presetDeletable] 限制**。
  */
 internal fun presetEditorButtons(
     isNew: Boolean,
@@ -444,6 +532,7 @@ internal fun presetEditorButtons(
             saveNew = paramsReady && named,
             updateFromCurrent = false,
             saveMeta = false,
+            restore = false,
             delete = false,
         )
     } else {
@@ -451,6 +540,8 @@ internal fun presetEditorButtons(
             saveNew = false,
             updateFromCurrent = paramsReady,
             saveMeta = named,
+            // 内置 ⇒ 有出厂定义（能不能点还看"改没改过"，UI 叠加覆盖层判据）
+            restore = preset != null && !presetDeletable(preset),
             delete = preset != null && presetDeletable(preset),
         )
     }

@@ -22,7 +22,7 @@ import org.junit.Test
  *     `core/engine/src/film/FilmParams.h` 的 `float <字段> = <默认值>f;  // <槽位>`）对拍 ——
  *     写错的表现是"用户一 reset 画面就变"（[62]/[95] 尤其：它们的 pivot 必须是 **0 = 关**，
  *     不是某个"看起来像默认值"的数）；
- *  3. **面板参数表真的接上了这 7 条**（正则解析 `EditorScreen.kt` 的 `EditorParam` 表，
+ *  3. **面板参数表真的接上了这 7 条**（正则解析 `ParamControls.kt` 的 `EditorParam` 表（★ PS-3：参数表从 `EditorScreen.kt` **逐字搬移**到这里，编辑器与拍照界面共用），
  *     与 `PresetDetailTest` 同一手法）：槽位 / 量程 / pivot 三格逐条对拍 —— 只定义常量而忘了
  *     加滑杆，或者 read 与 write 写到了不同槽位（复制粘贴的经典错），本条立刻红。
  *
@@ -151,7 +151,7 @@ class EditorHaloGlowUiTest {
         return re.findAll(src).associate { m -> m.groupValues[3].toInt() to m.groupValues[2].toDouble() }
     }
 
-    // ── ③ 面板参数表真的接上了这 7 条（正则解析 EditorScreen.kt）───────────────
+    // ── ③ 面板参数表真的接上了这 7 条（正则解析 ParamControls.kt；★ PS-3 搬移后）───────────────
 
     private class PanelParam(
         val key: String,
@@ -163,12 +163,12 @@ class EditorHaloGlowUiTest {
     )
 
     /**
-     * 解析 `EditorScreen.kt` 的 `EditorParam` 表（与 `PresetDetailTest.editorParamTable` 同一
+     * 解析 `ParamControls.kt` 的 `EditorParam` 表（★ PS-3：参数表从 `EditorScreen.kt` **逐字搬移**到这里，编辑器与拍照界面共用；与 `PresetDetailTest.editorParamTable` 同一
      * 手法：块内取 `label` / `range` / `pivot` / `read` / `write`）。`LutStrengthParam` 的
      * read 是 `p[34]`（没有 `it[N]`）⇒ 自然被跳过。
      */
     private fun editorParamTable(): List<PanelParam> {
-        val src = File("src/main/java/com/filmkit/app/ui/EditorScreen.kt").readText()
+        val src = File("src/main/java/com/filmkit/app/ui/ParamControls.kt").readText()
         val keyRe = Regex("""key = "(\w+)"""")
         val labelRe = Regex("""label = "([^"]+)"""")
         val rangeRe = Regex("""range = ([\w.]+)""")

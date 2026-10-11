@@ -174,12 +174,12 @@ class PresetDetailTest {
     private data class PanelParam(val key: String, val label: String, val slot: Int)
 
     /**
-     * 解析 `EditorScreen.kt` 的 `EditorParam` 表：块内取 `label = "…"` 与 `read = { … it[N] }`。
+     * 解析 `ParamControls.kt` 的 `EditorParam` 表（★ PS-3：参数表从 `EditorScreen.kt` **逐字搬移**到这里，编辑器与拍照界面共用）：块内取 `label = "…"` 与 `read = { … it[N] }`。
      * `LutStrengthParam` 的 read 里是 `p[34]`（没有 `it[N]`）⇒ 自然被跳过（[34] 本来就不该在
      * 详情里，见 ④）。
      */
     private fun editorParamTable(): List<PanelParam> {
-        val src = File("src/main/java/com/filmkit/app/ui/EditorScreen.kt").readText()
+        val src = File("src/main/java/com/filmkit/app/ui/ParamControls.kt").readText()
         val keyRe = Regex("""key = "(\w+)"""")
         val labelRe = Regex("""label = "([^"]+)"""")
         val readRe = Regex("""read = \{([^}]*)\}""")
@@ -201,7 +201,7 @@ class PresetDetailTest {
     @Test
     fun detailLabelsReuseEditorPanelWording() {
         val panel = editorParamTable()
-        assertTrue("解析 EditorScreen.kt 的 EditorParam 表失败（只有 ${panel.size} 条）", panel.size >= 15)
+        assertTrue("解析 ParamControls.kt 的 EditorParam 表失败（只有 ${panel.size} 条）", panel.size >= 15)
         // ★ 只喂**真能进预设**的槽（`presetSlotIncluded`）：局部调整 [79..87] 与 LUT 强度 [34]
         //   被策略排除 ⇒ 详情里本来就不会有它们的行（"坏数据里出现了"是另一条测试）。
         // ★ SG-2：上界 95 → **97** —— kCount 98（SG-1）后 [96]/[97] 也是合法槽，

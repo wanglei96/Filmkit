@@ -102,12 +102,101 @@ internal object BuiltinPresets {
      * `PresetStore.load(prefs)` 都会让内置三条在界面上消失 —— 那是本卡修掉的原始缺陷。
      */
     fun all(context: Context, prefs: SharedPreferences): List<EditorPreset> =
-        mergePresets(PresetStore.load(prefs), load(context))
+        mergePresets(
+            PresetStore.load(prefs),
+            applyBuiltinOverrides(load(context), BuiltinOverrides.load(prefs)),
+        )
 
     /** 诊断日志（与 [PresetStore] 同一出口：`nativeAppendLog` 的 `app` 模块）。 */
     private fun log(event: String, vararg detail: Pair<String, Any?>) {
         EngineBridge.nativeAppendLog(EngineBridge.LEVEL_WARN, "app", event, kv(*detail))
     }
+}
+
+/**
+ * ★ PS-3：**内置预设的用户覆盖层** —— 用户 2026-10-11 拍板："内置预设为什么不让修改？
+ * 我觉得没有必要，**最多限制不能删除就行**"。
+ *
+ * ## 为什么用覆盖层而不是"直接改内置常量 / 写进 PresetStore"
+ *
+ * [BuiltinPresets.load] 每次从 assets 读**出厂定义**（随包分发、版本升级会变）。用户对内置的
+ * 修改写进 prefs 的**按 id 覆盖表**（[KEY]），加载时叠加 ⇒ 三条性质同时成立：
+ *
+ *  1. **版本升级后，未被改过的内置跟着更新**（出厂配方的改进用户能吃到）；
+ *  2. **改过的内置保留用户版本**（升级不会把用户的调整冲掉）；
+ *  3. **「恢复默认」= 删掉那条覆盖**（[clear]）⇒ 立刻回到出厂定义，不需要第二份"原始副本"。
+ *
+ * 若改成"把内置也写进 `PresetStore`"，上面三条全废：出厂改进永远到不了用户手上（同 id 的
+ * 用户副本"先到者胜"），而且删除保护会失去依据 —— `PresetStore` 里的 `source` 是**用户可写**
+ * 的字段（JSON 反序列化不校验），手改 prefs 就能把内置变成可删除的普通预设。
+ *
+ * ## 存什么 / 不存什么
+ *
+ * 存**整条** [EditorPreset] 的 JSON（复用 [presetsToJson] / [presetsFromJson]，与用户预设
+ * 同一条序列化路径），但 [applyBuiltinOverrides] 只取**用户可改的字段**（名称 / 分组 /
+ * 配方 / LUT）—— **身份字段（id / source / createdAt）永远取出厂值** ⇒ 覆盖层不可能把内置
+ * 变成"可删除的用户预设"（删除保护在数据层就被钉住，不靠 UI 自觉）。
+ *
+ * ## 容错
+ *
+ * 坏 JSON / 坏条目 ⇒ **空表 + WARN 日志，绝不抛**（与 [BuiltinPresets.load] 同一条纪律）：
+ * 覆盖表坏掉的表现是"内置回到出厂值"，而不是拍照页崩掉。
+ */
+internal object BuiltinOverrides {
+
+    /** prefs key：覆盖表（一个 JSON 数组，元素 = 被用户改过的内置预设） */
+    const val KEY = "builtin_overrides"
+
+    /** 读取覆盖表（id → 覆盖后的预设）。坏数据 ⇒ 空表 + 一条 WARN 日志。 */
+    fun load(prefs: SharedPreferences): Map<String, EditorPreset> {
+        val res = presetsFromJson(prefs.getString(KEY, null))
+        if (res.skipped.isNotEmpty()) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "app", "preset.builtin_override_skipped",
+                kv("count" to res.skipped.size, "why" to res.skipped.joinToString("；").take(500)),
+            )
+        }
+        return res.presets.associateBy { it.id }
+    }
+
+    /** 写入 / 覆盖一条（新的放最前，与 [PresetStore.upsert] 同一顺序纪律）。 */
+    fun save(prefs: SharedPreferences, p: EditorPreset) {
+        val next = listOf(p) + load(prefs).values.filter { it.id != p.id }
+        prefs.edit().putString(KEY, presetsToJson(next)).apply()
+    }
+
+    /** 「恢复默认」：删掉该 id 的覆盖 ⇒ 下次加载得到出厂定义。 */
+    fun clear(prefs: SharedPreferences, id: String) {
+        val next = load(prefs).values.filter { it.id != id }
+        prefs.edit().apply {
+            if (next.isEmpty()) remove(KEY) else putString(KEY, presetsToJson(next))
+        }.apply()
+    }
+}
+
+/**
+ * 覆盖层的**纯内核**（JVM 单测直接驱动）：出厂列表 + 覆盖表 ⇒ 生效列表。
+ *
+ * 只取用户可改的字段（名称 / 分组 / 配方 / LUT / 收藏），**身份字段取出厂值**：
+ *  - `id` 必须与出厂一致（否则列表里会出现一条"野生内置"）；
+ *  - `source` 必须仍是 [PRESET_SOURCE_BUILTIN]（[presetDeletable] 的唯一判据 ⇒ 删除保护）；
+ *  - `createdAt` 取出厂（内置没有"创建时刻"这个语义，覆盖层也不该发明一个）。
+ *
+ * 覆盖表里有、出厂列表里没有的 id（旧版本的内置被删掉了）⇒ **忽略**（不凭空造预设）。
+ */
+internal fun applyBuiltinOverrides(
+    builtin: List<EditorPreset>,
+    overrides: Map<String, EditorPreset>,
+): List<EditorPreset> = builtin.map { b ->
+    val o = overrides[b.id] ?: return@map b
+    b.copy(
+        name = o.name,
+        group = o.group,
+        slots = o.slots,
+        lutId = o.lutId,
+        lutStrength = o.lutStrength,
+        favorite = o.favorite,
+    )
 }
 
 /**
@@ -131,9 +220,14 @@ internal fun mergePresets(
 }
 
 /**
- * 该预设**用户是否可删**（P-2c）：内置包只读（随包分发，删了下次启动又回来），
- * 因此编辑器预设面板对 `source == [PRESET_SOURCE_BUILTIN]` 的条目**不显示删除按钮**。
+ * 该预设**用户是否可删**（P-2c）：内置包随包分发（删了下次启动又回来，且「恢复默认」要有
+ * 出厂定义可回退），因此对 `source == [PRESET_SOURCE_BUILTIN]` 的条目**删除受限**。
  *
- * 判据只有这一处：面板按它决定是否渲染删除按钮，测试按它钉住"内置不可删 / 用户可删"。
+ * ★ **PS-3 口径收窄**（用户 2026-10-11："内置预设为什么不让修改？我觉得没有必要，**最多限制
+ * 不能删除就行**"）：本函数现在**只**回答"能不能删"。旧口径下它还被当作"内置整体只读"的
+ * 判据（编辑 / 重命名 / 复制全部置灰）—— 那三条已经放开，别再把它当"只读"用。
+ *
+ * 判据只有这一处：UI 按它决定删除项的可用性与那句实话，写路径按它做第二道防线，
+ * `applyBuiltinOverrides` 靠它（经 `source`）保证覆盖层改不出可删除的内置。
  */
 internal fun presetDeletable(p: EditorPreset): Boolean = p.source != PRESET_SOURCE_BUILTIN

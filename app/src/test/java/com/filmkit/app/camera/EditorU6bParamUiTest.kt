@@ -25,7 +25,7 @@ import org.junit.Test
  *  2. **[25] 是连续量不是开关**：0.35 必须读成 `35`（旧详情的"`>= 0.5` 才算开"在滑杆能连续调
  *     之后是假读数）。
  *  3. **分组/顺序**：分离色调/黑白进「滤镜」组（黑白在前），胶片曲线进「调整」组且紧跟对比度
- *     —— 直接正则解析 `EditorScreen.kt` 的参数表（与 `PresetDetailTest` 同一手法，
+ *     —— 直接正则解析 `ParamControls.kt` 的参数表（★ PS-3：参数表从 `EditorScreen.kt` **逐字搬移**到这里；与 `PresetDetailTest` 同一手法，
  *     不靠"下次记得同步"）。
  *
  * 滑杆拖动、图标行、面板布局要真机（Compose + GL），JVM 单测跑不了 —— 这里守的是**数值链路**
@@ -33,13 +33,14 @@ import org.junit.Test
  */
 class EditorU6bParamUiTest {
 
-    // ── 面板参数表：分组 + 顺序 + 槽位（解析 EditorScreen.kt，不硬编码副本）────────────
+    // ── 面板参数表：分组 + 顺序 + 槽位（解析 ParamControls.kt，不硬编码副本；★ PS-3 搬移后）────────────
 
     private data class PanelParam(val label: String, val slot: Int)
 
     private fun panelParams(section: String, until: String): List<PanelParam> {
-        val src = File("src/main/java/com/filmkit/app/ui/EditorScreen.kt").readText()
-        val body = src.substringAfter("private val $section").substringBefore("private val $until")
+        val src = File("src/main/java/com/filmkit/app/ui/ParamControls.kt").readText()
+        // ★ PS-3：搬移后是 `internal val …`（可见性从 private 放宽）⇒ 前缀只匹配 `val`
+        val body = src.substringAfter("val $section").substringBefore("val $until")
         val labelRe = Regex("""label = "([^"]+)"""")
         val readRe = Regex("""read = \{([^}]*)\}""")
         val slotRe = Regex("""it\[(\d+)]""")

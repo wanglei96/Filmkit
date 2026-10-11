@@ -35,6 +35,40 @@ internal val CAMERA_STANDARD_PRESET = EditorPreset(
 )
 
 /**
+ * ★ PS-3：**拍照链路（`passFilm` + `passOutput`）实际读取的槽位集合**（41 槽）——
+ * 拍照界面"哪些参数调了真的有效果"的**唯一判据**。
+ *
+ * 来源 = 引擎实测：`FrameRenderer.cpp` 的 `p.<字段>` 引用（排除编辑器链路函数
+ * `passStyle` / `submitDisplay` 的函数体）∩ `presetSlotIncluded`。抽取口径 / 盲区逐条写在
+ * `CameraStyleWhitelistTest` 的类 KDoc 里，那份测试**直接引用本常量**做三方对拍
+ * （引擎实际 == 本常量 == `preset-DESIGN.md` §1.6 的「拍照链路」列）⇒ 三处不可能各自漂移。
+ *
+ * 为什么要有这个常量（PS-3 的实际用途）：拍照界面的预设详情允许用户**逐项拖滑杆**，
+ * 而"能拖"必须等于"拖了画面会变"。引擎不读的槽（例如 `[69..77]` 层间效应）拖了没有任何
+ * 效果 —— ADR-12 明令禁止假滑杆 ⇒ 那些项在拍照界面**灰显 + 标注原因**，判据就是本集合。
+ *
+ * ⚠ **不含** `[28]`（基准影调）/ `[30]`（过曝提示）/ `[31..33]`（色彩外观层）/ `[34]`（LUT
+ * 强度，由 `lut.strength` 承载）/ `[35][36]`（引擎标定）：`presetSlotIncluded` 把它们排除在
+ * 预设之外 ⇒ 与"预设作用域"无关，不在本集合的定义域内（同 `CameraStyleWhitelistTest`）。
+ */
+internal val CAMERA_PATH_SLOTS: Set<Int> = buildSet {
+    add(0)                  // 曝光（**相对偏移**语义，见 presetEvOffset）
+    addAll(1..3)            // 白平衡 R/G/B 增益
+    add(4)                  // 对比度（U-3 接线）
+    addAll(5..10)           // [5..7] shoulder[3] / [8..10] toe[3]（胶片曲线两端 latitude）
+    addAll(20..22)          // 分区饱和三档
+    addAll(23..25)          // 分离色调 + 单色
+    add(26); add(27); add(60); add(61)   // 颗粒（强度 / 尺寸 / 中间调偏置 / 枢轴）
+    add(37); add(38)        // filmic 黑白点
+    addAll(62..65)          // 光晕（E4-5）
+    addAll(66..68)          // 暗角（E4-2）
+    add(78)                 // 清晰度（U-4）
+    add(88); add(89)        // 色温 / 色调（U-3）
+    addAll(90..94)          // 影调分区四条 + 褪色（U-4）
+    addAll(95..97)          // 柔光（SG-1）
+}
+
+/**
  * 套用到相机的**完整 96 槽数组** = `标准基线 + 预设的稀疏覆盖`。
  *
  * 为什么底是 [CameraPresets.standard] 而不是"当前参数"（编辑器侧走的是后者）：拍照界面没有
@@ -43,13 +77,34 @@ internal val CAMERA_STANDARD_PRESET = EditorPreset(
  * 的 prefs 覆盖层（`[0]/[28]/[30]/[34]/[35]`）重新写回，**不经过本函数**（既有设计）。
  *
  * ★ **U-7：`[0]` 是唯一例外** —— 覆盖层不再把它整槽丢掉，而是转成**相对偏移**叠加在用户的
- * 曝光补偿上（方案 B）：调用侧用 [presetEvOffset] 把这条预设的 `[0]` 提取出来交给
- * `setFilmParams(p, evOffset)`，`[0] = base_ev + 用户 EV + 该偏移`。
+ * 曝光补偿上（方案 B）：调用侧用 [presetEvOffset]（或带用户调整的
+ * [effectivePresetEvOffset]）把这条预设的 `[0]` 提取出来交给 `setFilmParams(p, evOffset)`，
+ * `[0] = base_ev + 用户 EV + 该偏移`。
  *
  * 展开本身复用编辑器侧的 [presetSnapshot]（"缺失 key = 保留 base 值"的唯一实现）。
+ *
+ * ★ **PS-3：`[0]` 的调整必须走 `evOffset` 参数，不能只写进返回数组** —— `setFilmParams`
+ * 随即把 `p[0]` 整槽覆盖成 `base + userEv + evOffset`（`CameraController.kt` 的
+ * `filmParams[0] = exposureEv()`）⇒ 只写数组的 `[0]` 会被静默丢掉。所以带 overrides 的
+ * 调用点必须**同时**用 [effectivePresetEvOffset] 算第二个实参。
+ *
+ * @param overrides ★ PS-3：用户在预设详情面板里**临时**拖出来的值（未保存）—— 优先于预设记录
+ * @param removed ★ PS-3：用户从这条预设里**移除**的字段（"未设置"的反向操作）—— 先摘掉它们，
+ *   等价于"这条预设不含该字段"（套用时保持不动）。同一个槽同时出现在两个集合里 ⇒ overrides 胜
+ *   （用户刚设了值 = 撤销那次移除）。
  */
-internal fun cameraPresetParams(preset: EditorPreset): DoubleArray =
-    presetSnapshot(CameraPresets.standard(), preset.slots)
+internal fun cameraPresetParams(
+    preset: EditorPreset,
+    overrides: Map<Int, Double> = emptyMap(),
+    removed: Set<Int> = emptySet(),
+): DoubleArray =
+    presetSnapshot(
+        CameraPresets.standard(),
+        run {
+            val base = if (removed.isEmpty()) preset.slots else preset.slots - removed
+            if (overrides.isEmpty()) base else base + overrides
+        },
+    )
 
 /**
  * U-7：预设曝光 `[0]` 的**偏移量**（方案 B，`preset-DESIGN.md` §9.4；用户 2026-10-11 拍板）。
@@ -69,6 +124,22 @@ internal fun cameraPresetParams(preset: EditorPreset): DoubleArray =
  * 不残留上一条预设的曝光。
  */
 internal fun presetEvOffset(slots: Map<Int, Double>): Double = slots[0] ?: 0.0
+
+/**
+ * ★ PS-3：**当前生效的**预设曝光偏移 = 用户在预设详情里拖过的值优先，否则预设自己的记录。
+ *
+ * 语义（与 [presetEvOffset] 同一件事，多一层"临时调整"）：
+ *  - `overrides[0]` 存在 ⇒ 用户正在详情面板里调"这条预设的曝光偏移"，**它就是这个偏移的
+ *    当前值**（绝对值，不是增量）⇒ 直接作为 `setFilmParams` 的 `evOffset`；
+ *  - 否则回落 [presetEvOffset]`(slots)`（缺 key ⇒ 0.0，与"缺失字段 = 不改变该参数"同口径）。
+ *
+ * ⚠ **用户自己的 EV 补偿 / 基准曝光不在这个值里**：那两项活在 `CameraController` 内部
+ * （`baseEvPref` / `evSteps`），由 `effectiveExposureEv` 在引擎侧叠加。本函数只回答
+ * "这条预设要额外偏移多少 EV" ⇒ 保存回预设时写进 `slots[0]` 的也正是这个数
+ *（[cameraPresetSlotsFor]），**不会**把拍摄态混进风格（U-7 的纪律不变）。
+ */
+internal fun effectivePresetEvOffset(slots: Map<Int, Double>, overrides: Map<Int, Double>): Double =
+    overrides[0] ?: presetEvOffset(slots)
 
 /**
  * U-7：拍照侧 `[0]` 的**唯一算法** = 基准曝光 + 用户 EV + 预设偏移（方案 B 的"叠加而非覆盖"）。

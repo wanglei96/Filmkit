@@ -132,6 +132,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.BuiltinOverrides
 import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CAMERA_STANDARD_PRESET_ID
 import com.filmkit.app.camera.CameraController
@@ -140,6 +141,7 @@ import com.filmkit.app.camera.PresetLutAction
 import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.RenderClient
 import com.filmkit.app.camera.cameraPresetParams
+import com.filmkit.app.camera.effectivePresetEvOffset
 import com.filmkit.app.camera.mergePresets
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetEvOffset
@@ -235,6 +237,29 @@ fun CameraScreen(
         mutableStateOf(resolveCameraPreset(prefs.getString("camera_preset_id", null), presets))
     }
     var focalBase by remember { mutableFloatStateOf(24f) } // 当前镜头等效焦距
+
+    /**
+     * ★ PS-3：预设详情面板里**尚未保存**的逐项微调（用户 2026-10-11："可直接在拍照界面
+     * 查看、修改预设"）。
+     *
+     * 三条纪律（数据结构与判据见 `CameraPresetPanel.kt` 的 `CameraParamOverrides`）：
+     *  ① 带 `presetId` ⇒ **切预设自动失效**（`applyCameraPreset` 里还会显式清一次，双保险）；
+     *  ② **拖动中不写这个 state**：每帧写它会把整个 `CameraScreen`（近 3000 行）拖进重组
+     *     （v0.10.96 的 LUT 强度滑杆踩过同型坑）⇒ 拖动只调 `previewCameraParams` 直通引擎，
+     *     松手（onDragEnd）才由面板提交到这里，一次拖动只重组一次；
+     *  ③ **不落盘**：只有「保存到预设 / 另存为新预设 / 新建预设」三条写路径会把它写进
+     *     `PresetStore`（用户诉求是"改完能存回预设"，不是"改完自动存"）。
+     */
+    var paramOverrides by remember { mutableStateOf<CameraParamOverrides?>(null) }
+
+    /**
+     * ★ PS-3：**内置预设的用户覆盖表**（id → 被改过的那条内置）。
+     *
+     * 与 [paramOverrides] 的区别：那是"**还没保存**的临时改动"，这是"**已经保存**进 prefs 的
+     * 内置改动"（`BuiltinOverrides`）。UI 用它做两件事：列表行标「已改」、「恢复默认」是否可点。
+     * 每次写路径后刷新（[persistPreset] / [restoreBuiltinPreset]）。
+     */
+    var builtinOverrides by remember { mutableStateOf(BuiltinOverrides.load(prefs)) }
 
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
     var quickOpen by rememberSaveable { mutableStateOf(false) } // 一级悬浮窗（画幅+更多设置）
@@ -528,6 +553,11 @@ fun CameraScreen(
             PresetLutAction.CLEAR -> Unit
             PresetLutAction.KEEP -> Unit
         }
+        // ★ PS-3：**切预设 = 丢弃上一条的微调**（用户换了一条预设，上一条的临时调整不该跟过来
+        // —— 否则画面与列表里选中的那条对不上，一旦保存还会把 A 的调整写进 B）。
+        // 数据结构的 presetId 判据（CameraParamOverrides.forPreset）是结构性兜底，这里是显式
+        // 清空：清完立刻由下面的 setFilmParams 把画面重设成新预设的配方。
+        paramOverrides = null
         selectedPreset = p
         prefs.edit().apply {
             if (p.id == CAMERA_STANDARD_PRESET_ID) remove("camera_preset_id")
@@ -558,30 +588,106 @@ fun CameraScreen(
     //     `updatePreset` / `deletePreset` 的"改的是预设库，不是当前画面"同一条口径。
 
     /**
-     * 「+ 新建预设」：用**当前相机参数**（+ 当前 LUT）存成一条新的用户预设。
+     * ★ PS-3：拖动中的**实时下发**（面板的滑杆每帧调它 —— "拖动即改，取景画面实时生效"）。
+     *
+     * **只直通引擎，不写任何 Compose state**：写 `paramOverrides` 会把整个 `CameraScreen`
+     * 拖进重组（近 3000 行的函数体每帧跑一遍），而拖动只需要引擎收到新参数。松手时面板才把
+     * 最终值提交进 `paramOverrides`（一次）。
+     *
+     * `[0]` 走第二个实参（[effectivePresetEvOffset]）：`setFilmParams` 会把 `p[0]` 整槽覆盖成
+     * `base + 用户 EV + 偏移` ⇒ 只写数组的 `[0]` 会被静默丢掉（PS-3 的那个坑，见
+     * `cameraPresetParams` 的 KDoc）。
+     *
+     * 传进来的改动经 [CameraParamOverrides.forPreset] 校验归属（防止别的预设的改动串进来）。
+     */
+    fun previewCameraParams(o: CameraParamOverrides?) {
+        val mine = o.forPreset(selectedPreset)
+        val values = mine?.values ?: emptyMap()
+        val removed = mine?.removed ?: emptySet()
+        controller.setFilmParams(
+            cameraPresetParams(selectedPreset, values, removed),
+            effectivePresetEvOffset(selectedPreset.slots, values),
+        )
+    }
+
+    /**
+     * ★ PS-3：**把一条预设写回库**（所有写路径的唯一出口）。
+     *
+     * 分流：**用户预设 → `PresetStore`**；**内置预设 → 覆盖层**（[BuiltinOverrides]，用户
+     * 2026-10-11："内置预设为什么不让修改？我觉得没有必要，最多限制不能删除就行"）。
+     *
+     * 覆盖层而不是"把内置写进 PresetStore"的三条理由（详见 `BuiltinPresets.kt` 的 KDoc）：
+     * ① 版本升级后未被改过的内置跟着更新；② 改过的保留用户版本；③「恢复默认」= 删覆盖。
+     *
+     * 写完统一用 [BuiltinPresets.all] 重新加载（**唯一列表源**：用户预设 + 出厂内置 + 覆盖层）
+     * —— 与 P-2c 立的纪律一致（任何一处直接赋 `PresetStore` 的返回值都会让内置三条消失）。
+     */
+    fun persistPreset(next: EditorPreset) {
+        if (presetDeletable(next)) PresetStore.upsert(prefs, next) else BuiltinOverrides.save(prefs, next)
+        builtinOverrides = BuiltinOverrides.load(prefs)
+        presets = BuiltinPresets.all(context, prefs)
+    }
+
+    /**
+     * 「+ 新建预设」：用**当前生效配方**（当前预设 + 详情面板里未保存的改动）存成一条新的用户预设。
+     *
+     * ★ **PS-3 口径**：配方走 [newCameraPresetFrom]（`preset.slots` − 移除 + overrides 稀疏化），
+     * 而不是旧的 `cameraPresetSlots(cameraPresetParams(...))` —— 后者会丢掉 `[0]` 曝光偏移
+     * （它从"已展开的相机数组"出发，分不清 `[0]` 来源）。新路径的 `[0]` 是**用户在详情面板里
+     * 明确调出来的预设偏移**，语义清楚 ⇒ 能存上；用户自己的 EV 补偿 / 机型基准曝光仍进不了
+     * 预设（它们活在 `CameraController` 里，本函数看不到）。
      *
      * 名称由面板预填默认名（`defaultPresetName`）⇒ 保存按钮一路可点，不必先想名字（PS-1 的教训）。
      */
-    fun saveCameraPreset(name: String, group: String) {
+    fun saveCameraPreset(name: String, group: String, overrides: CameraParamOverrides?) {
         val now = System.currentTimeMillis()
-        val p = newCameraPreset(
+        val mine = overrides.forPreset(selectedPreset)
+        val p = newCameraPresetFrom(
+            base = selectedPreset,
             name = name,
             group = group,
-            film = cameraPresetParams(selectedPreset),
+            overrides = mine?.values ?: emptyMap(),
+            removed = mine?.removed ?: emptySet(),
             lutId = lutId,
             lutStrength = prefs.getFloat("lut_strength", 1f).toDouble(),
             now = now,
             salt = Random.nextInt(),
         )
-        presets = mergePresets(PresetStore.upsert(prefs, p), BuiltinPresets.load(context))
+        persistPreset(p)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.preset.save",
             kv(
                 "id" to p.id, "name" to p.name, "group" to p.group,
                 "slots" to p.slots.size, "slotsText" to presetSlotsText(p),
                 "lut" to (p.lutId ?: ""),
-                // U-7 的证据：新建的预设**不含**曝光槽（拍摄态不入库）
+                // PS-3：含 `[0]` ⇒ 用户**明确**在详情面板里调过曝光偏移（可存，见 newCameraPresetFrom）；
+                // 不含 ⇒ 该预设不改变曝光。两种都不含拍摄态（用户 EV / 基准曝光）。
                 "hasEvSlot" to p.slots.containsKey(CAMERA_PRESET_EV_SLOT),
+            ),
+        )
+    }
+
+    /**
+     * ★ PS-3：「**保存到预设**」= 把详情面板里的改动（改值 + 移除项）写进这条预设自己的 slots
+     * （含 `[0]` 曝光偏移），id / 名称 / 分组 / 创建时间 / 来源 / LUT **一位不动**。
+     *
+     * ★ **内置预设同样走这条路径**（用户拍板"内置可以改，只是不能删"）—— [persistPreset] 把它
+     * 分流到覆盖层，出厂定义（assets）一个字都不动。
+     */
+    fun saveCameraPresetSlots(p: EditorPreset, overrides: CameraParamOverrides?) {
+        val mine = overrides.forPreset(p)
+        val next = p.copy(
+            slots = cameraPresetSlotsFor(p, mine?.values ?: emptyMap(), mine?.removed ?: emptySet()),
+        )
+        persistPreset(next)
+        // 改的是当前生效那条 ⇒ 顶栏与后续保存都该看到新对象（画面与相机参数不动）
+        if (selectedPreset.id == next.id) selectedPreset = next
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.save_slots",
+            kv(
+                "id" to next.id, "builtin" to !presetDeletable(next),
+                "slots" to next.slots.size, "slotsText" to presetSlotsText(next),
+                "hasEvSlot" to next.slots.containsKey(CAMERA_PRESET_EV_SLOT),
             ),
         )
     }
@@ -590,36 +696,61 @@ fun CameraScreen(
      * 「从当前相机参数更新」：用当前相机参数重写这条预设的**配方**（slots / LUT），
      * id / 名称 / 分组 / 创建时间 / 来源一个都不动。
      *
-     * 判据复用 [presetDeletable]（内置只读的**唯一**实现）—— UI 侧已把内置的这枚按钮置灰
-     * （`cameraPresetEditorButtons`），这里是第二道防线。
+     * ★ PS-3：`film` 用**当前生效参数**（`cameraPresetParams(selectedPreset, values, removed)`）
+     * —— 用户刚在详情面板里拖过的值也是"当前画面"的一部分，整包重写不该把它丢掉。
+     * ⚠ 这条路径仍按既有口径**丢弃 `[0]`**（`updatedCameraPreset` → `cameraPresetSlots`：从展开
+     * 数组出发分不清来源）。**曝光偏移的保存请用「保存到预设」**（[saveCameraPresetSlots]），
+     * 面板上也写了这句差别。
+     *
+     * 内置同样可走（分流到覆盖层）。
      */
-    fun updateCameraPreset(p: EditorPreset) {
-        if (!presetDeletable(p)) return
+    fun updateCameraPreset(p: EditorPreset, overrides: CameraParamOverrides?) {
+        val mine = overrides.forPreset(p)
         val next = updatedCameraPreset(
             p,
-            cameraPresetParams(selectedPreset),
+            cameraPresetParams(selectedPreset, mine?.values ?: emptyMap(), mine?.removed ?: emptySet()),
             lutId,
             prefs.getFloat("lut_strength", 1f).toDouble(),
         )
-        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
+        persistPreset(next)
+        if (selectedPreset.id == next.id) selectedPreset = next
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.preset.update",
-            kv("id" to next.id, "slots" to next.slots.size, "lut" to (next.lutId ?: "")),
+            kv("id" to next.id, "builtin" to !presetDeletable(next), "slots" to next.slots.size, "lut" to (next.lutId ?: "")),
         )
     }
 
-    /** 「保存名称 / 分组」：只动**元数据**（配方、id、创建时间、来源都不动）。 */
+    /** 「保存名称 / 分组」：只动**元数据**（配方、id、创建时间、来源都不动）。内置同样可改（覆盖层）。 */
     fun renameCameraPreset(p: EditorPreset, name: String, group: String) {
-        if (!presetDeletable(p)) return
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return          // UI 侧置灰，这里是第二道防线
         val next = p.copy(name = trimmed, group = group.trim())
-        presets = mergePresets(PresetStore.upsert(prefs, next), BuiltinPresets.load(context))
+        persistPreset(next)
         // 改的是当前生效那条 ⇒ 顶栏名字跟着变（画面与参数不动）
         if (selectedPreset.id == next.id) selectedPreset = next
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.preset.rename",
-            kv("id" to next.id, "name" to next.name, "group" to next.group),
+            kv("id" to next.id, "builtin" to !presetDeletable(next), "name" to next.name, "group" to next.group),
+        )
+    }
+
+    /**
+     * ★ PS-3：「**恢复默认**」（内置）—— 删掉覆盖层 ⇒ 这条内置回到**出厂定义**（assets 里的
+     * 那一条）。这是"改了还能回去"的兜底，也是"内置可改"这条裁决敢放开的依据。
+     *
+     * 恢复的是**当前生效**的那条 ⇒ 走完整的套用路径（[applyCameraPreset]：参数 + LUT 四态 +
+     * 清空未保存改动）—— 否则会出现"界面显示出厂值、画面还是改过的"这种两套真相。
+     */
+    fun restoreBuiltinPreset(p: EditorPreset) {
+        if (presetDeletable(p)) return         // 只有内置有出厂定义
+        BuiltinOverrides.clear(prefs, p.id)
+        builtinOverrides = BuiltinOverrides.load(prefs)
+        presets = BuiltinPresets.all(context, prefs)
+        val restored = presets.firstOrNull { it.id == p.id } ?: return
+        if (selectedPreset.id == restored.id) applyCameraPreset(restored)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.restore",
+            kv("id" to restored.id, "name" to restored.name, "slots" to restored.slots.size),
         )
     }
 
@@ -627,7 +758,7 @@ fun CameraScreen(
     fun copyCameraPreset(p: EditorPreset) {
         val now = System.currentTimeMillis()
         val copy = copiedCameraPreset(p, now, Random.nextInt())
-        presets = mergePresets(PresetStore.upsert(prefs, copy), BuiltinPresets.load(context))
+        persistPreset(copy)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.preset.copy",
             kv("from" to p.id, "id" to copy.id, "slots" to copy.slots.size),
@@ -636,6 +767,9 @@ fun CameraScreen(
 
     /**
      * 「删除」（二次确认在面板里）：**只动 prefs 与列表**，当前画面 / 参数 / 选中态一位不动。
+     *
+     * ★ **这是内置预设唯一受限的动作**（用户 2026-10-11 拍板）：判据 = [presetDeletable]，
+     * UI 侧把内置的这枚按钮置灰（+ 一句实话），这里是第二道防线。
      *
      * 删掉的若是当前选中项：`selectedPreset` 仍指向内存里那个对象（画面与它一致，UI 不会
      * "说一套做一套"），只是它已不在库里 —— 冷启动时 `resolveCameraPreset` 找不到 id 会自动
@@ -1554,13 +1688,19 @@ fun CameraScreen(
                     CameraPresetTab(
                         presets = presets,
                         selected = selectedPreset,
-                        // 新建态的"将要保存什么" = 当前相机参数的稀疏集（**已剔除 [0] 曝光**，U-7）
-                        currentSlots = cameraPresetSlots(cameraPresetParams(selectedPreset)),
                         lutId = lutId,
                         lutStrength = prefs.getFloat("lut_strength", 1f),
+                        // ★ PS-3：逐项调整（未保存的改动 / 拖动实时下发 / 松手提交 / 移除一项）
+                        overrides = paramOverrides,
+                        // ★ PS-3：内置覆盖表（列表标「已改」+「恢复默认」可用性）
+                        builtinOverrides = builtinOverrides,
+                        onPreview = { o -> previewCameraParams(o) },
+                        onOverrides = { paramOverrides = it },
                         onApply = { p -> applyCameraPreset(p) },
-                        onSave = { n, g -> saveCameraPreset(n, g) },
-                        onUpdate = { p -> updateCameraPreset(p) },
+                        onSave = { n, g, o -> saveCameraPreset(n, g, o) },
+                        onUpdate = { p, o -> updateCameraPreset(p, o) },
+                        onSaveSlots = { p, o -> saveCameraPresetSlots(p, o) },
+                        onRestore = { p -> restoreBuiltinPreset(p) },
                         onRename = { p, n, g -> renameCameraPreset(p, n, g) },
                         onCopy = { p -> copyCameraPreset(p) },
                         onDelete = { p -> deleteCameraPreset(p) },

@@ -399,20 +399,24 @@ class PresetPanelUiTest {
         val items = presetMenuItems(p, paramsReady = true)
         assertEquals(
             "拍照界面的动作集与顺序（主操作在前、危险操作在后）",
-            listOf("套用", "查看配置", "编辑", "重命名", "复制", "删除"),
+            listOf("套用", "查看配置", "编辑", "重命名", "复制", "恢复默认", "删除"),
             items.map { it.label },
         )
         assertEquals(
-            "内置预设：只有套用 / 查看配置可点，其余**置灰但可见**（不许隐藏）",
-            listOf(true, true, false, false, false, false),
+            "★ PS-3（用户：「内置预设为什么不让修改？…最多限制不能删除就行」）：内置**只有删除**置灰",
+            listOf(true, true, true, true, true, true, false),
             items.map { it.enabled },
         )
         val note = presetReadOnlyNote(p)
         assertNotNull("内置预设必须给一句实话", note)
-        assertTrue("实话里要写清哪些不能做：$note", note!!.contains("只读") && note.contains("删除"))
-        // 用户预设：六项全可用；没有"只读"这回事
-        val user = presetMenuItems(userPreset("p_1_a"), paramsReady = true)
-        assertTrue("用户预设六项都该可点", user.all { it.enabled })
+        assertTrue("实话里要写清「唯一限制是不能删」：$note", note!!.contains("不能删除") && note.contains("恢复默认"))
+        // 用户预设：除「恢复默认」外全可用（没有出厂定义可回退）；没有"只读"这回事
+        val user = presetMenuItems(userPreset("p_1_a"), paramsReady = true).associateBy { it.action }
+        assertTrue(
+            "用户预设除「恢复默认」外都该可点",
+            user.filterKeys { it != PresetAction.RESTORE }.values.all { it.enabled },
+        )
+        assertFalse("用户预设没有出厂定义 ⇒ 「恢复默认」置灰", user.getValue(PresetAction.RESTORE).enabled)
         assertNull("用户预设 ⇒ 菜单不占那行", presetReadOnlyNote(userPreset("p_1_a")))
         // 参数没就绪：只有"需要当前参数"的两项置灰
         val gated = presetMenuItems(userPreset("p_1_a"), paramsReady = false).associateBy { it.action }

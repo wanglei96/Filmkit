@@ -49,9 +49,10 @@ class CameraPresetPanelUiTest {
     // ── ① 「⋯」菜单可用性：内置 vs 用户（验收判据 2）──────────────────────────
 
     /**
-     * 内置预设：`套用` / `查看配置` 可用，`编辑 / 重命名 / 复制 / 删除` **置灰但必须在清单里**。
+     * ★ PS-3 口径（用户 2026-10-11："内置预设为什么不让修改？我觉得没有必要，**最多限制不能
+     * 删除就行**"）：内置预设**只有删除受限**，其余全部可点；「恢复默认」只对内置存在。
      *
-     * 断言 `size == 6` 是刻意的：投诉的根因就是"把不可用的项藏起来"（旧版对内置**根本不渲染**
+     * 断言 `size == 7` 是刻意的：投诉的根因就是"把不可用的项藏起来"（旧版对内置**根本不渲染**
      * 删除按钮），任何"过滤掉灰项"的改动都必须让这条测试红。
      */
     @Test
@@ -60,24 +61,29 @@ class CameraPresetPanelUiTest {
         val items = presetMenuItems(p, paramsReady = true)
         assertEquals(
             "菜单项与顺序（主操作在前、危险操作在后）",
-            listOf("套用", "查看配置", "编辑", "重命名", "复制", "删除"),
+            listOf("套用", "查看配置", "编辑", "重命名", "复制", "恢复默认", "删除"),
             items.map { it.label },
         )
         assertEquals(
-            "内置预设：只有套用 / 查看配置可点，其余**置灰但可见**（不许隐藏）",
-            listOf(true, true, false, false, false, false),
+            "内置预设：**只有删除置灰**（唯一限制），其余全可点；「恢复默认」是内置专属入口",
+            listOf(true, true, true, true, true, true, false),
             items.map { it.enabled },
         )
         val note = presetReadOnlyNote(p)
-        assertNotNull("内置预设必须给一句实话（用户要知道为什么灰）", note)
-        assertTrue("实话要写清哪些不能做：$note", note!!.contains("只读") && note.contains("删除"))
+        assertNotNull("内置预设必须给一句实话（用户要知道限制在哪）", note)
+        assertTrue("实话要写清「唯一限制是不能删」+ 改过能恢复：$note", note!!.contains("不能删除") && note.contains("恢复默认"))
     }
 
-    /** 用户预设：六项全可用；没有"只读"这回事 ⇒ 菜单不占那行。 */
+    /** 用户预设：除「恢复默认」外全可用（没有出厂定义可回退 ⇒ 那一项置灰但可见）。 */
     @Test
     fun userMenuIsFullyEnabled() {
         val p = userPreset("p_1_a")
-        assertTrue("用户预设六项都该可点", presetMenuItems(p, paramsReady = true).all { it.enabled })
+        val items = presetMenuItems(p, paramsReady = true).associateBy { it.action }
+        assertTrue(
+            "用户预设除「恢复默认」外都该可点",
+            items.filterKeys { it != PresetAction.RESTORE }.values.all { it.enabled },
+        )
+        assertFalse("用户预设没有出厂定义 ⇒ 「恢复默认」置灰（但仍在清单里）", items.getValue(PresetAction.RESTORE).enabled)
         assertNull("用户预设不该有只读提示", presetReadOnlyNote(p))
     }
 
@@ -241,17 +247,21 @@ class CameraPresetPanelUiTest {
     // ── ⑤ 编辑面板按钮（验收判据 4）────────────────────────────────────────────
 
     /**
-     * **内置只读修正**：`presetEditorButtons` 在编辑态只按 `paramsReady` / 名称非空决定
-     * `updateFromCurrent` / `saveMeta`，没查可删性 ⇒ 不修正的话内置预设的「从当前相机参数更新」
-     * 与「保存名称 / 分组」都是**亮的**（点了没反应 —— ADR-12 禁止的假按钮）。
+     * ★ PS-3 口径（用户拍板"内置最多限制不能删除"）：内置的编辑面板**除删除外全部可点**
+     * —— 「从当前相机参数更新」「保存名称 / 分组」都可用（写进覆盖层），
+     * 「恢复默认」可用（`restore` = 有出厂定义；能不能点还看"改没改过"，由 UI 叠加覆盖层判据）。
+     *
+     * 被推翻的旧口径（PS-1/P-2c）：`cameraPresetEditorButtons` 把内置的 `updateFromCurrent` /
+     * `saveMeta` 强制置灰 —— 那个 wrapper 已随本次口径变更删除（无价值的直通抽象）。
      */
     @Test
-    fun builtinEditorDisablesUpdateFromCurrent() {
+    fun builtinEditorIsEditableAndOnlyDeleteIsBlocked() {
         val p = builtin("徕卡黑白")
-        val b = cameraPresetEditorButtons(isNew = false, preset = p, paramsReady = true, name = p.name)
-        assertFalse("内置只读 ⇒ 「从当前相机参数更新」必须置灰", b.updateFromCurrent)
-        assertFalse("内置只读 ⇒ 「保存名称 / 分组」也置灰（改名同样是改库）", b.saveMeta)
-        assertFalse("内置只读 ⇒ 「删除」置灰（判据 presetDeletable）", b.delete)
+        val b = presetEditorButtons(isNew = false, preset = p, paramsReady = true, name = p.name)
+        assertTrue("内置可改 ⇒ 「从当前相机参数更新」可点", b.updateFromCurrent)
+        assertTrue("内置可改 ⇒ 「保存名称 / 分组」可点", b.saveMeta)
+        assertTrue("内置有出厂定义 ⇒ 「恢复默认」可用（改没改过由 UI 叠加判据）", b.restore)
+        assertFalse("内置**唯一**受限的动作：删除（判据 presetDeletable）", b.delete)
         assertNotNull("内置编辑面板要带那句实话", presetReadOnlyNote(p))
     }
 
@@ -264,17 +274,18 @@ class CameraPresetPanelUiTest {
         assertTrue("分组标题要在（基础调整 / 影调曲线 / 胶片质感）", presetDetailSections(p.slots).size >= 3)
     }
 
-    /** 用户预设的编辑态：三项动作都可用（参数就绪 + 名称非空）。 */
+    /** 用户预设的编辑态：四项动作都可用（参数就绪 + 名称非空）；没有「恢复默认」（无出厂定义）。 */
     @Test
     fun userEditorEnablesEveryAction() {
         val p = userPreset("p_1_a")
-        val b = cameraPresetEditorButtons(isNew = false, preset = p, paramsReady = true, name = "新名字")
+        val b = presetEditorButtons(isNew = false, preset = p, paramsReady = true, name = "新名字")
         assertTrue(b.updateFromCurrent)
         assertTrue(b.saveMeta)
         assertTrue(b.delete)
+        assertFalse("用户预设没有出厂定义 ⇒ 「恢复默认」不可用", b.restore)
         assertFalse("编辑态不该出现「另存为新预设」", b.saveNew)
         // 名称为空 ⇒ 「保存名称 / 分组」置灰（但按钮仍在）
-        assertFalse("名称为空 ⇒ 改名置灰", cameraPresetEditorButtons(false, p, true, "   ").saveMeta)
+        assertFalse("名称为空 ⇒ 改名置灰", presetEditorButtons(false, p, true, "   ").saveMeta)
     }
 
     /** 新建态：只有「保存当前相机参数为新预设」+「取消」；默认名预填 ⇒ 一路可点。 */
@@ -282,9 +293,9 @@ class CameraPresetPanelUiTest {
     fun newStateOffersSaveOnlyAndDefaultNameIsUsable() {
         val name = defaultPresetName(builtins)
         assertEquals("内置三条不占默认名", "我的预设 1", name)
-        val b = cameraPresetEditorButtons(isNew = true, preset = null, paramsReady = true, name = name)
+        val b = presetEditorButtons(isNew = true, preset = null, paramsReady = true, name = name)
         assertTrue("新建态：保存可点（默认名已预填）", b.saveNew)
-        assertFalse("新建态没有更新 / 改名 / 删除", b.updateFromCurrent || b.saveMeta || b.delete)
+        assertFalse("新建态没有更新 / 改名 / 恢复默认 / 删除", b.updateFromCurrent || b.saveMeta || b.restore || b.delete)
     }
 
     // ── ⑥ 删除后内置三条不消失（P-2c 那个坑的回归哨兵，验收判据 5）──────────────
@@ -308,8 +319,10 @@ class CameraPresetPanelUiTest {
 
     /**
      * **源码哨兵**：`CameraScreen.kt` 里每一条 `presets = …` 刷新都必须带上内置包 ——
-     * 要么 `mergePresets(..., BuiltinPresets.load(context))`（五条写路径：保存 / 更新 / 改名 /
-     * 复制 / 删除），要么 `BuiltinPresets.all(context, prefs)`（初始 remember）。
+     * 要么 `mergePresets(..., BuiltinPresets.load(context))`（删除那条路径），
+     * 要么 `BuiltinPresets.all(context, prefs)`（★ PS-3 起写路径统一到 `persistPreset`：
+     * 用户预设 → `PresetStore`，内置 → 覆盖层，刷新一律走 `BuiltinPresets.all` —— 它是
+     * **唯一列表源**：用户预设 + 出厂内置 + 覆盖层）。
      *
      * 为什么值得用正则读源码：这个坑（只赋 `PresetStore` 的返回值 ⇒ 内置三条当场消失）
      * 已经犯过一次（P-2c），而它**不会编译失败、不会崩**，只在界面上少三条 ——
@@ -320,8 +333,9 @@ class CameraPresetPanelUiTest {
         val src = File("src/main/java/com/filmkit/app/ui/CameraScreen.kt").readText()
         val assigns = Regex("""(?m)^\s*presets = .*\(.*$""").findAll(src).map { it.value.trim() }.toList()
         assertEquals(
-            "拍照界面的五条写路径（保存 / 更新 / 改名 / 复制 / 删除）都该在这里；条数变了 ⇒ 哨兵失效，需同步",
-            5,
+            "★ PS-3 起直接赋值的刷新点只剩 3 处（persistPreset / restoreBuiltinPreset / 删除）；" +
+                "条数变了 ⇒ 哨兵失效，需同步",
+            3,
             assigns.size,
         )
         for (a in assigns) {
@@ -333,8 +347,13 @@ class CameraPresetPanelUiTest {
         for (fn in listOf("PresetStore.upsert", "PresetStore.delete")) {
             assertTrue("$fn 的调用点消失了 ⇒ 写路径变了", src.contains(fn))
         }
-        // 写路径的第二道防线（UI 置灰之外）：内置只读判据仍是 presetDeletable 这一个实现
+        // 写路径的第二道防线（UI 置灰之外）：删除判据仍是 presetDeletable 这一个实现
         assertTrue("写路径必须用 presetDeletable 守卫（不许另写 source 比较）", src.contains("presetDeletable("))
+        // ★ PS-3：内置可改 ⇒ 写路径必须**分流**（用户 → PresetStore；内置 → 覆盖层）
+        assertTrue("写路径要统一走 persistPreset（分流到 PresetStore / BuiltinOverrides）", src.contains("fun persistPreset("))
+        assertTrue("内置的修改要写进覆盖层（出厂 assets 一个字不动）", src.contains("BuiltinOverrides.save(prefs, next)"))
+        assertTrue("内置预设仍不可删（唯一限制）", src.contains("if (!presetDeletable(p)) return"))
+        assertTrue("「恢复默认」必须存在（改过之后能改回来）", src.contains("fun restoreBuiltinPreset("))
     }
 
     /**
@@ -348,8 +367,9 @@ class CameraPresetPanelUiTest {
             "presetMenuItems(",        // 「⋯」菜单
             "presetReadOnlyNote(",     // 内置只读那句实话
             "presetSummaryText(",      // 每行的参数摘要
-            "presetDetailSections(",   // 编辑面板的完整参数清单（唯一维护点）
-            "presetEditorButtons(",    // 新建态 / 编辑态的按钮差异
+            "presetEditorButtons(",    // 新建态 / 编辑态的按钮差异（★ PS-3：内置只有删除受限）
+            "cameraParamSections(",    // ★ PS-3：全量参数表（未设置 / 已包含两态）
+            "cameraParamAdjustabilityNote(", // ★ PS-3：不可调项的原因（不做假滑杆）
             "defaultPresetName(",      // 新建时的默认名（不必先填名字）
         )) {
             assertTrue("CameraPresetPanel.kt 少了 $fn ⇒ 某条能力被藏起来了", panel.contains(fn))
