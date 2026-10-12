@@ -382,8 +382,14 @@ class CameraPresetPanelUiTest {
             "defaultPresetName(",      // 新建时的默认名（不必先填名字）
             // ── ★ PS-6a：图 2 的详情卡 + 用户点名的 5 项常用参数 ──────────────────
             "presetOverviewRows(",     // 当前搭配（两列只读清单）
-            "presetOverviewText(",     // 描述段落（可展开收起）
+            "presetOverviewText(",     // 描述（★ PS-7：一行真实信息；没有 ⇒ null 不显示）
             "presetQuickPath(",        // ★ 判据：清单里每一项点下去有没有反应
+            // ── ★ PS-7：详情卡"点得动 + 首屏可见"的判据 / 预算 / 值位口径 ──────────────
+            "presetRowTap(",           // 三态反应（档位高亮 / 滑杆 / 原因小字）—— 没有第四态
+            "PresetRowTap",            // 三态枚举（不许出现"点了什么都不做"的分支）
+            "presetPanelBudget(",      // 详情卡与列表的同屏高度预算
+            "presetOverviewMaxHeightDp(", // 清单限高（3 行 ↔ 8 行）
+            "presetRowValueText(",     // 值位只放真实值（没有 ⇒ 「—」）
             "quickAdjustLabelOf(",     // 提示文案里的档位名（颗粒 / 柔光 / 光晕 / 暗角 / 滤镜强度）
             "GrainLevel",              // 颗粒四档（关 / 细 / 中 / 粗）
             "QUICK_LEVEL_PARAMS",      // 柔光 / 光晕 / 暗角三行档位
@@ -437,8 +443,9 @@ class CameraPresetPanelUiTest {
         assertTrue("档位按钮必须真的接上回调（点了有反应）", panel.contains("onTap = { onPick(i) }"))
         assertTrue("颗粒档位写的是 GrainLevelParam（`[26]` + `[27]` 两个真实槽）", quick.contains("onPickLevel(GrainLevelParam"))
         assertTrue(
-            "选中项的滑杆必须由 presetQuickPath 守卫（两样都没有的项不许出滑杆 = 不做假控件）",
-            panel.contains("presetQuickPath(pickedRow.slot) == PresetQuickPath.SLIDER"),
+            "★ PS-7：选中项的滑杆必须由三态判据守卫（presetRowTap == SLIDER ⇒ 才出滑杆；" +
+                "LEVEL / NOTE 两态各有别的可见反应，见 Ps7PresetPanelLayoutTest）",
+            panel.contains("pickedTap == PresetRowTap.SLIDER"),
         )
         assertTrue("「完整参数 >」必须接上 PS-6b 的回调", panel.contains("onTap = onOpenFullEdit"))
         assertTrue(

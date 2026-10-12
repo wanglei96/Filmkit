@@ -2376,7 +2376,10 @@ private fun LutSheet(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
-            .background(FilmTheme.Panel)
+            // ★ PS-7：**不透明底**（用户 2026-10-12 真机截图："面板背景半透明 ⇒ 取景界面的拍摄
+            // 参数行透过来"，`1/60 1539 29cm 290`、`EV Tv ISO AF WB` 与预设内容混叠）。
+            // 面板只占下半屏，上方取景区不受影响 ⇒「实时效果」仍看得见画面。
+            .background(FilmTheme.PanelSolid)
             .navigationBarsPadding()
             .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
     ) {

@@ -1,6 +1,7 @@
 package com.filmkit.app.ui
 
 import com.filmkit.app.camera.BuiltinPresets
+import com.filmkit.app.camera.CAMERA_PATH_SLOTS
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.applyBuiltinOverrides
 import com.filmkit.app.camera.cameraPresetParams
@@ -11,6 +12,7 @@ import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -202,17 +204,50 @@ class CameraPresetMainViewTest {
         assertEquals("leica_m9 · 30", presetOverviewRows(p.slots, presetLutLine(p)).first().value)
     }
 
-    /** 描述段落（可展开收起）全部由真实数据拼成：来源 / 分组 / 项数 / LUT / 套用语义。 */
+    /**
+     * ★ PS-7 口径变更：描述**只留一行真实信息**（项数 · 滤镜名）。
+     *
+     * 用户 2026-10-12 真机截图点名两条：副标题与描述**重复**、描述是**机器拼接**
+     * （`包含 17 项参数（基础调整 / 色彩 / …`——还与副标题的"内置预设 · 分组「徕卡」"逐字重复）。
+     * 现在副标题已说的不再重复，且**没有真实信息就返回 null**（不拼字符串凑）。
+     */
     @Test
-    fun overviewTextIsBuiltFromRealData() {
-        val t = presetOverviewText(builtin("徕卡一瞬"), "徕卡 M9")
-        assertTrue("来源 + 分组：$t", t.startsWith("内置预设 · 分组「徕卡」"))
-        assertTrue("项数与覆盖的分组：$t", t.contains("包含 17 项参数") && t.contains("基础调整"))
-        assertTrue("LUT 与强度：$t", t.contains("滤镜 徕卡 M9（强度 30）"))
-        assertTrue("套用语义（未包含 = 保持不动）：$t", t.contains("未包含的参数保持当前值不动"))
-        val empty = presetOverviewText(userPreset("p_2"))
-        assertTrue("空预预设要说实话：$empty", empty.contains("不含参数（套用时其余参数保持不动）"))
-        assertTrue("没有 LUT 也要说实话：$empty", empty.contains("不含滤镜"))
+    fun overviewTextIsOneRealLineAndDisappearsWhenThereIsNothingToSay() {
+        val t = presetOverviewText(builtin("徕卡一瞬"), "徕卡 M9")!!
+        assertEquals("17 项参数 · 滤镜 徕卡 M9", t)
+        assertFalse("副标题已经说过的来源/分组不许在描述里重复：$t", t.contains("内置预设") || t.contains("分组"))
+        assertFalse("机器拼接的分组名清单已删：$t", t.contains("包含 ") || t.contains("基础调整"))
+        // 没有真实信息 ⇒ null（整行不渲染）——"没有真实描述就不显示"
+        assertNull("空预设 + 无滤镜 ⇒ 不显示描述行", presetOverviewText(userPreset("p_2")))
+        assertNull("空预设 + 有滤镜名但预设不含 LUT ⇒ 仍无真实信息", presetOverviewText(userPreset("p_3"), "徕卡 M9"))
+        // 只有一项真实信息时也照实显示（不硬凑第二项）；中文名查不到 ⇒ 回落 lutId
+        assertEquals(
+            "有 LUT 但没有参数 ⇒ 只报滤镜",
+            "滤镜 leica_m9",
+            presetOverviewText(EditorPreset(id = "p_4", name = "预设 p_4", lutId = "leica_m9")),
+        )
+    }
+
+    /**
+     * ★ PS-7：**值位只放真实值**，没有值就「—」——"为什么点不动"的说明走行下小字。
+     *
+     * 用户截图里的 `分离色调 · 暖 → 拍照生效 · 暂无需滑杆` 就是说明混进值位的毛病。
+     */
+    @Test
+    fun overviewRowValueNeverCarriesTheWhyItCannotMoveNote() {
+        assertEquals("暖", presetRowValueText("暖"))
+        assertEquals("—", presetRowValueText(""))
+        assertEquals("—", presetRowValueText("   "))
+        // 值位内容来自 presetDetailSections 的格式化 ⇒ 任何槽都不许把"为什么点不动"的说明当值
+        for (slot in CAMERA_PATH_SLOTS) {
+            val note = cameraParamAdjustabilityNote(slot) ?: continue
+            for (row in presetOverviewRows(mapOf(slot to 1.0))) {
+                assertFalse(
+                    "说明「$note」不许出现在值位（[${row.slot}] = ${row.value}）",
+                    presetRowValueText(row.value).contains(note),
+                )
+            }
+        }
     }
 
     // ── ⑤ 写值口径：档位 / 滑杆 → 预设（含稀疏化与 LUT 强度）────────────────────
