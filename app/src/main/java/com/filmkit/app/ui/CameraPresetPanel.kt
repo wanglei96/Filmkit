@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.AlertDialog
@@ -36,7 +37,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.camera.CAMERA_PATH_SLOTS
@@ -46,13 +46,13 @@ import com.filmkit.app.camera.PARAM_EPS
 import com.filmkit.app.camera.PRESET_SOURCE_USER
 import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.cameraPresetParams
-import com.filmkit.app.camera.formatZero150
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetId
 import com.filmkit.app.camera.presetScopeNotice
 import com.filmkit.app.camera.presetSparseSlots
 import com.filmkit.app.lut.LutLibrary
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * ★ PS-2a（用户 2026-10-11 **方向纠正**："预设的配置 / 新增 / 编辑 / 删除**我指的是拍照界面的
@@ -74,6 +74,33 @@ import kotlin.math.abs
  * 滑杆控件与参数表**不是照抄**：`EditorParam` / 三组参数表 / `EditorSlider` 已提取到
  * `ParamControls.kt`（**逐字搬移**），编辑器与本文件引用同一个对象 ⇒ 量程 / 读数 / 中点标记
  * 不可能漂移（编辑器侧的三组参数表单测是"搬移零回归"的机器判据）。
+ *
+ * ## ★ PS-6a（用户 2026-10-12 真机实测，v0.11.21）：**主视图按「图 2」重做 + 常用参数可调**
+ *
+ * 用户原话："**预设里滤镜强度都不可调？预设界面全部重做！！预设参数勾你妈的勾选，丑死……
+ * 瞎搞**。**点击预设按图 2 那样展示**，并提供几个常用参数调节（**lut强度，颗粒开、关、档位，
+ * 柔光档位，光晕档位，暗角调节**）。点击**完整参数**跳转类似**图1**页面提供完整、专业调节。"
+ *
+ * ⇒ **PS-5 的分组勾选树整体废弃**（用户否决的是"勾选框"这个形态，不是"能调参数"）：
+ * `CamParamCheckTree` / `CheckAllRow` / `SectionTriCheck` / `CamParamRow` / `CamParamExpand` 与
+ * 仅供它使用的纯函数（`CheckState` / `sectionCheckState` / `checkBoxText` / `triCheckText` /
+ * `cameraTreeSlots` / `showsSliderRow` / `checkSlots` / `uncheckSlots` / `removeSlot`）**全删**。
+ *
+ * 新形态 = **选中的那条预设的详情卡**（图 2）：
+ *  - 名称（大字）+ 副标题（来源 · 分组）+ **描述段落**（可展开收起，内容全部来自真实数据）；
+ *  - 「当前搭配」+ 右上「**完整参数 >**」（回调 [CameraPresetTab] 的 `onOpenFullEdit`，本卡不做那页）；
+ *  - **两列只读清单**（[presetOverviewRows]）：常用项折叠成"档位名 · 数值"（`颗粒 → 中颗粒 · 数量 30`）；
+ *  - 一行提示「选择一项开始调整」+「实时效果 开」；
+ *  - **常用参数调节区**（用户点名的 5 项）：LUT 强度滑杆 / 颗粒四档 / 柔光四档 / 光晕四档 / 暗角四档。
+ *
+ * 三条纪律（用户"每个能点的都必须有反应"）：
+ *  1. **点清单里的一项就有反应**：有滑杆的项 ⇒ 下方出那一条滑杆（一次一项，`presetQuickPath`）；
+ *     属于常用 5 项的 ⇒ 提示去下面哪个档位调；**两样都没有的 ⇒ 显示"为什么点不动"**（不做假控件）；
+ *  2. **写值只有一条路**：档位/滑杆一律经 `EditorParam.write`（[afterEdit] 记账 ⇒ 拖动实时下发
+ *     `onPreview`、松手 [onOverrides] 一次提交，不新增 state 通路）；
+ *     `[26]/[27]` 颗粒没有既有滑杆 ⇒ 用本文件私有的 [GrainLevelParam]（档位自己的两个真实值）；
+ *  3. **LUT 强度必须两路一起写**：`[34]` 会被 `CameraController.applyLutStrengthPref` 用 prefs
+ *     覆盖 ⇒ 拖动时同时写 prefs 的 `lut_strength`（引擎侧既有事实源），否则"拖了画面不变"。
  *
  * ## 与 PS-1 的关系（结构参考，宿主解耦）
  *
@@ -292,19 +319,45 @@ internal fun CameraParamOverrides?.afterEdit(
 }
 
 /**
- * ★ PS-3 P1：「**移除该项**」= 这条预设**不再包含**这个字段（稀疏子集的可视化操作）。
+ * ★ PS-6a：**LUT 强度 `[34]` 的记账**（与其它槽不同，必须特判 —— 否则"拖到 100%"会丢账）。
  *
- * 语义（与"缺失字段 = 套用时保持不动"完全一致）：把该槽从预设的记录里摘掉 ⇒ 画面回到基线
- * （用户立刻看得到"这项没了"），保存时它自然不会写进 `slots`。
+ * 为什么不能直接信任 [afterEdit] 的结果：它把"用户值"与**这条预设自己的配方**逐槽比对，而
+ * `[34]` 由 [EditorPreset.lutStrength] 承载、**不进 `slots`**（`EditorExport.kt` 的
+ * `presetSlotIncluded` 排除它）⇒ [cameraPresetParams] 展开出来的 `[34]` 恒为中性基线 1.0，
+ * 不是这条预设的强度。后果：预设强度 0.3、用户拖到 1.0（恰好等于基线值）⇒ [afterEdit] 认为
+ * "没改动"而丢账 ⇒「保存到预设」把 100% 存成 30%（**点了没反应**，正是用户投诉的那类假控件）。
  *
- * 同时把该槽从 [CameraParamOverrides.values] 里去掉 —— 否则"移除"之后又被那条改值覆盖回去，
- * 用户会看到"点了移除、画面没变"（ADR-12 的假控件）。
- *
- * ★ PS-5：本函数 = [uncheckSlots] 的单槽特例（实现只有一份）。UI 上的三个入口
- *（勾选框 / 「不包含此项」/ 组头三态框取消）走的都是 [uncheckSlots]。
+ * 本条口径：与这条预设**自己的** [EditorPreset.lutStrength] 比 ——
+ *  - 不同 ⇒ 记进 [CameraParamOverrides.values]`[34]`（保存时写回 `lutStrength`，见
+ *    [saveSlotsWithLutStrength]）；
+ *  - 拖回预设原值 ⇒ 撤销这次调整（与 [afterEdit] 的"拖回原值 = 撤销"同一条纪律）。
  */
-internal fun CameraParamOverrides?.removeSlot(preset: EditorPreset, slot: Int): CameraParamOverrides =
-    uncheckSlots(preset, listOf(slot))
+internal fun CameraParamOverrides?.afterLutStrengthEdit(
+    preset: EditorPreset,
+    uiValue: Float,
+): CameraParamOverrides {
+    val next = afterEdit(preset, LutStrengthParam, uiValue)
+    val v = uiValue.coerceIn(0f, 1.5f).toDouble()
+    return if (abs(v - preset.lutStrength) <= PARAM_EPS) {
+        next.copy(values = next.values - LUT_STRENGTH_SLOT)
+    } else {
+        next.copy(values = next.values + (LUT_STRENGTH_SLOT to v))
+    }
+}
+
+/**
+ * ★ PS-6a：「保存到预设」前把 `[34]`（LUT 强度）**带回** [EditorPreset.lutStrength]。
+ *
+ * 它不进 `slots`（同上）⇒ 保存通路必须显式带上，否则用户在预设详情里拖了强度、点了保存、
+ * 重新打开发现强度没变（= 假控件）。`[34]` 与 `lutStrength` 是**同一个数的两个落点**，不是两份。
+ */
+internal fun saveSlotsWithLutStrength(
+    preset: EditorPreset,
+    mine: CameraParamOverrides?,
+): EditorPreset = mine?.values?.get(LUT_STRENGTH_SLOT)
+    ?.takeIf { it.isFinite() }
+    ?.let { preset.copy(lutStrength = it) }
+    ?: preset
 
 /**
  * ★ **保存回预设的 slots 口径**（PS-3 的核心裁决，也是本卡唯一一处改变既有保存口径的地方）。
@@ -408,125 +461,253 @@ internal fun cameraParamAdjustabilityNote(slot: Int): String? = when (cameraPara
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ★ PS-5：**分组勾选树**的纯逻辑（规格来源 = `docs/reports/preset-panel-interaction-RESEARCH.md` §2）
+// ★ PS-6a：**常用参数（图 2 的 5 项）**的纯逻辑
 //
-// 用户 2026-10-11 真机投诉："预设面板交互逻辑太差，**全是滑杆**"。调研裁定（Lightroom Classic /
-// Capture One / darktable / RawTherapee **四家一致**）：把两件事拆成**两个正交动作** ——
-//   (a)「这条预设**包含哪些**参数」= **勾选**（本节：checkSlots / uncheckSlots / sectionCheckState）；
-//   (b)「已包含的某项**调到多少**」= **点开那一行再调**（滑杆只出现在点开的那一行里，
-//       判据 = showsSliderRow）。
-// 四家里**没有任何一家**把全量参数平铺成滑杆 —— PS-3 的错误正是后者。
+// 用户 2026-10-12 真机实测点名要这五项："**lut强度，颗粒开、关、档位，柔光档位，光晕档位，
+// 暗角调节**"。本节只做两件事：
+//   (a) **档位映射**（档位 → UI 值 / 当前值 → 档位），值写进数组仍走 `EditorParam.write`
+//       （`afterEdit` 记账 ⇒ 写值口径只有一份，见 [CameraParamOverrides.afterEdit]）；
+//   (b) **「当前搭配」清单**（[presetOverviewRows]）：图 2 的只读概览，常用项折叠成
+//       "档位名 · 数值"（`颗粒 → 中颗粒 · 数量 30`），数据源仍是稀疏集的唯一维护点
+//       [presetDetailSections]。
+//
+// ⚠ **不做"包含 / 不包含"这个概念**（PS-5 的勾选树连同它的 `checkSlots` / `uncheckSlots` /
+// `removed` 入口一并废弃）：用户否决的就是"勾选"。要"这条预设不管某一项" ⇒ 把该项调回中性值
+// 再保存（稀疏化会自动丢弃它 —— 与 PS-5 的 I3 是同一条既有口径，不是本卡新引入的行为）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 勾选树上**一个组**的勾选态（调研 §2.3 C4、不变量 I5）：全勾 / 半勾 / 全不勾。 */
-internal enum class CheckState { NONE, SOME, ALL }
+/** 四档位的名字：`关闭` / 轻档（逐项给字面）/ `中等…` / `强烈…`。 */
+private fun levelNames(light: String, label: String): List<String> =
+    listOf("关闭", light, "中等$label", "强烈$label")
 
 /**
- * 一个组的勾选态 = 组内「已包含」的槽数决定的**三态**（`0/n` ⇒ [CheckState.NONE]、
- * `k/n` ⇒ [CheckState.SOME]、`n/n` ⇒ [CheckState.ALL]）。
+ * 档位型常用参数（图 2 的四行档位）——**写值走 `CAMERA_TUNABLE_SLOT_PARAM[slot]` 那条既有滑杆**
+ * （[EditorParam.write]），本节只提供"档位 → UI 值"的映射表。
  *
- * @param included **已包含**的槽集合（= `slots.keys`，即"预设记录 − 移除 + 用户设的值"）
- * @param slots 该组展示的全部槽
+ * @param label 清单行名（"柔光"）
+ * @param slot 引擎槽位（`[95]` / `[62]` / `[66]`）
+ * @param levels 四档的 **UI 值**（与 [names] 同序；依据逐条见下面的常量注释）
+ * @param names 四档的**档位名**（图 2 字面）—— 逐项给字面而不是"前缀 + 参数名"拼：
+ *   中文里"轻柔光"顺口（图 2 的字面），而"轻" + "光晕" = "轻光晕"是生造词（摄影惯用"轻微光晕"）
  */
-internal fun sectionCheckState(included: Set<Int>, slots: Collection<Int>): CheckState {
-    val hit = slots.count { it in included }
+internal class QuickLevelParam(
+    val label: String,
+    val slot: Int,
+    val levels: List<Float>,
+    val names: List<String>,
+)
+
+// ★ 档位数值的依据（用户要求"每个档位写明依据"）——三类各有一句实话，不编造"行业惯例"：
+//  ① **关闭 = 引擎中性值**：`[62]`/`[95]` 的 0 = 整链旁路（零 pass、零纹理分配），
+//     `[66]` 的 0 = `kFsOut` 内整段跳过（来源 = `CameraPresets.neutral()` 的逐行注释）；
+//  ② **内置三条胶片预设没有开过光晕 / 柔光**（`app/src/main/assets/presets/builtin.json` 里
+//     没有 halation / glow 字段）⇒ 这两项的轻/中/强**没有"参考内置"可依据**，只能按
+//     **面板量程 0..1 四等分**（0.25 / 0.50 / 0.75）—— 如实写在报告里；
+//  ③ **暗角有内置依据**：三条内置的 `vignette_strength` = −0.18 / −0.28 / −0.24
+//     （UI 读数 = 正值 0.18 / 0.28 / 0.24）⇒ 轻档 0.20（= 内置最小档的最近整值）、
+//     中档 0.40（内置之上再加一档，0.2 步进）、强档 0.70（同一步进的第三档 = 明显但不糊）。
+internal val GLOW_LEVEL_PARAM =
+    QuickLevelParam("柔光", 95, listOf(0f, 0.25f, 0.5f, 0.75f), levelNames("轻柔光", "柔光"))
+internal val HALO_LEVEL_PARAM =
+    QuickLevelParam("光晕", 62, listOf(0f, 0.25f, 0.5f, 0.75f), levelNames("轻微光晕", "光晕"))
+internal val VIGNETTE_LEVEL_PARAM =
+    QuickLevelParam("暗角", 66, listOf(0f, 0.2f, 0.4f, 0.7f), levelNames("轻微暗角", "暗角"))
+
+/** 图 2 的三个档位行（顺序 = 组内既有顺序：柔光/光晕同族、暗角在其后，与 `TextureParams` 一致）。 */
+internal val QUICK_LEVEL_PARAMS =
+    listOf(GLOW_LEVEL_PARAM, HALO_LEVEL_PARAM, VIGNETTE_LEVEL_PARAM)
+
+/** 颗粒强度 `[26]`（0..100，**0 = 整段旁路**）与尺寸 `[27]`（**ISO 语义**，20..6400，越大越粗）。 */
+internal const val GRAIN_AMOUNT_SLOT = 26
+internal const val GRAIN_SIZE_SLOT = 27
+
+/**
+ * ★ 颗粒档位（用户点名："颗粒开、关、档位"）—— 档位 = **[26] 强度 + [27] 尺寸的组合**，
+ * 依据逐条写死在这里（数值全部有出处）：
+ *
+ * | 档位 | `[26]` 强度 | `[27]` 尺寸 | 依据 |
+ * |---|---|---|---|
+ * | 关闭 | 0 | 400 | **引擎中性值**（`CameraPresets.neutral()`：`[26] = 0` 整段旁路、`[27] = 400` 标定起点）|
+ * | 细颗粒 | 20 | 160 | 内置「徕卡一瞬」逐字（`grain_amount 20` / `grain_size 160`，note = "细颗粒"）|
+ * | 中颗粒 | 30 | 400 | 内置「理光负片」逐字（`30` / `400`，note = "中颗粒"；400 同时是引擎恒等值）|
+ * | 粗颗粒 | 40 | 800 | 强度 = 内置「徕卡黑白」逐字 40（note = "明显颗粒"）；尺寸 = 400 的**下一 ISO 标准档** 800 |
+ *
+ * ⚠ 一条档位**同时写两个槽**（与饱和度的"一条滑杆同写三槽"同型）⇒ 档位是"组合"，不是两个控件。
+ */
+internal enum class GrainLevel(val label: String, val amount: Double, val iso: Double) {
+    OFF("关闭", 0.0, 400.0),
+    FINE("细颗粒", 20.0, 160.0),
+    MEDIUM("中颗粒", 30.0, 400.0),
+    COARSE("粗颗粒", 40.0, 800.0),
+}
+
+/**
+ * 当前颗粒档位（按 `[26]` **强度**分档：分界 25 / 35 = 内置三条 20 / 30 / 40 的中点）。
+ *
+ * 为什么按强度而不是尺寸：尺寸只决定"颗粒长什么样"，决定"有没有 / 多明显"的是强度
+ * （ADR-10：`[26] = 0` 整段旁路）—— 三条内置按本函数读出的档位与 JSON 的 note 逐条一致。
+ */
+internal fun grainLevelOf(amount: Double): GrainLevel {
+    if (!amount.isFinite() || amount <= 0.0) return GrainLevel.OFF
     return when {
-        hit == 0 -> CheckState.NONE
-        hit == slots.size -> CheckState.ALL
-        else -> CheckState.SOME
+        amount < 25.0 -> GrainLevel.FINE
+        amount < 35.0 -> GrainLevel.MEDIUM
+        else -> GrainLevel.COARSE
     }
 }
 
-/** 单项勾选框的字面：`☑` / `☐`（未包含的项**照样显示**在树上，值列显示「—」）。 */
-internal fun checkBoxText(checked: Boolean): String = if (checked) "☑" else "☐"
-
-/** 组头三态框的字面（`▣` = 半勾，与调研 §2.2 的示意一致）—— 全勾 / 全不勾与单项同一套字面。 */
-internal fun triCheckText(state: CheckState): String =
-    if (state == CheckState.SOME) "▣" else checkBoxText(state == CheckState.ALL)
+/** [grainLevelOf] 的数组形态（读"当前生效参数"用）。 */
+internal fun grainLevelOf(params: DoubleArray): GrainLevel =
+    grainLevelOf(if (GRAIN_AMOUNT_SLOT in params.indices) params[GRAIN_AMOUNT_SLOT] else 0.0)
 
 /**
- * 勾选树展示的槽 = **拍照链路读的全部槽**（[CAMERA_PATH_SLOTS]，41 项）+ 这条预设**包含的**
- * 其它槽（含 `[69..77]` 层间效应这种"仅编辑器生效"的）。
+ * 颗粒档位的**写入器**：复用 [EditorParam] 的 `write` 通道（[CameraParamOverrides.afterEdit]
+ * 的记账因此与其它参数走在同一条路上）。
  *
- * 为什么是"全量 41 项"而不是现状的"可调的 35 项 + 已包含的不可调项"：调研 §1 表 3 的裁决是
- * **全量显示**（未包含的以"未勾选"出现 —— LrC 的树里所有设置都在）。否则"取消勾选 ⇒ 行消失 ⇒
- * 再也勾不回来"：点一次 `[全不选]` 整棵树就空了，用户把自己锁在门外。
- *
- * `[34]` LUT 强度**不进树**：它是"混合了多少"这个资源引用的一部分（由 `lutStrength` 承载），
- * 与 [cameraParamSections] 的同一条排除一致。
+ * 它不是"第二份参数表"：颗粒在编辑器参数面板里**从来没有滑杆**（`CAMERA_NO_SLIDER_SLOTS`），
+ * 写进数组的就是 [GrainLevel] 自己的两个真实值 —— 量程 / 读数 / 写值口径全部来自那个枚举，
+ * 不存在第二套数字。`range` 只是"档位序号 0..3"（界面上是 4 个档位按钮，不是滑杆）。
  */
-internal fun cameraTreeSlots(included: Set<Int>): Set<Int> =
-    (CAMERA_PATH_SLOTS + included) - LUT_STRENGTH_SLOT
+internal val GrainLevelParam = EditorParam(
+    key = "grainLevel", label = "颗粒",
+    range = 0f..3f, pivot = 0f,
+    format = { v -> GrainLevel.entries[v.roundToInt().coerceIn(0, GrainLevel.entries.lastIndex)].label },
+    read = { p -> grainLevelOf(p).ordinal.toFloat() },
+    write = { p, v ->
+        val lv = GrainLevel.entries[v.roundToInt().coerceIn(0, GrainLevel.entries.lastIndex)]
+        p[GRAIN_AMOUNT_SLOT] = lv.amount
+        p[GRAIN_SIZE_SLOT] = lv.iso
+    },
+)
 
 /**
- * ★ PS-5 机器判据（调研 §2.7 判据 1）：这一行**现在**要不要渲染 `EditorSlider`。
- *
- * 三条同时成立才渲染：
- *  ① [checked]：**未勾选的行绝不渲染滑杆** —— "不是全是滑杆"的机器判据；
- *  ② [tunable]：该项**有滑杆**（拍照链路不读的项 / 参数面板还没给滑杆的项永不渲染 —— ADR-12
- *     禁止假滑杆）；
- *  ③ [expanded]：用户点开了这一行（**一次只展开一项**；默认全部收起 ⇒ 进入详情**首屏可见
- *     滑杆数 = 0**，调研 §2.7 判据 5）。
+ * **最近档**判定（[levels] 与档位同序）：写进去的档位值必须能读回同一档（闭环由单测钉住）。
+ * 坏值（NaN）⇒ 0（关闭）—— NaN 的任何比较都是 false，不会污染结果。
  */
-internal fun showsSliderRow(checked: Boolean, tunable: Boolean, expanded: Boolean): Boolean =
-    checked && tunable && expanded
-
-/**
- * ★ PS-5：**勾选 = 加入**（调研 §2.4 #1；四家一致 —— 这是增删字段的**唯一手段**）。
- *
- * 写入的值 = [params] 里该槽的**当前生效值**（"值就是当前值"，画面因此不变）。整组勾选 /
- * `[全选]` 共用本函数 ⇒ **一次提交**（调研 §2.4 #8："不要每槽一次重组"）。
- *
- * ## ⚠ 已知语义差异（调研 §2.5 I3 —— 有意与 LrC 不同，照做）
- *
- * 我们的预设是**稀疏子集**（存差异，不存显式值），稀疏化在**保存**时生效
- * （[cameraPresetSlotsFor] → [presetSparseSlots]：`|v − 基线| <= PARAM_EPS` 的槽丢弃）。
- * 因此勾选一个"当前值恰好等于基线"的项，保存后它**不会**写进预设（重新打开时又显示 `☐`）。
- * 这不是丢数据：相机链路里"包含 + 值 = 基线"与"不包含"**没有任何可观察差异**（这正是本模型
- * 与 LrC 唯一无法对齐的地方 —— LrC 存的是显式值快照）。拖动路径（[afterEdit]）同理：拖回
- * 预设原值 ⇒ 该槽从改动集消失 ⇒ 行自动变 `☐`。
- */
-internal fun CameraParamOverrides?.checkSlots(
-    preset: EditorPreset,
-    slots: Collection<Int>,
-    params: DoubleArray,
-): CameraParamOverrides = checkedSlots(preset, slots, include = true) {
-    if (it in params.indices) params[it] else Double.NaN
-}
-
-/**
- * ★ PS-5：**取消勾选 = 移除**（调研 §2.4 #2 / #11）= 这条预设**不再包含**这些字段：
- * 画面立刻回基线（合成时不带它们），保存时它们不进 `slots`。
- *
- * 整组取消 / `[全不选]` / 单槽 [removeSlot] 共用本函数 ⇒ 三处不可能各自漂移。
- */
-internal fun CameraParamOverrides?.uncheckSlots(
-    preset: EditorPreset,
-    slots: Collection<Int>,
-): CameraParamOverrides = checkedSlots(preset, slots, include = false) { 0.0 }
-
-/** [checkSlots] / [uncheckSlots] / [removeSlot] 的**唯一实现**。 */
-private fun CameraParamOverrides?.checkedSlots(
-    preset: EditorPreset,
-    slots: Collection<Int>,
-    include: Boolean,
-    valueOf: (Int) -> Double,
-): CameraParamOverrides {
-    val mine = forPreset(preset)
-    val values = LinkedHashMap(mine?.values ?: emptyMap())
-    val removed = (mine?.removed ?: emptySet()).toMutableSet()
-    for (s in slots) {
-        if (include) {
-            val v = valueOf(s)
-            // 越界 / 坏值（NaN）不入库：宁可少一个槽，也不把一个读不出来的数写进改动集
-            if (v.isFinite()) values[s] = v
-            removed -= s
-        } else {
-            values -= s
-            removed += s
+internal fun nearestLevel(ui: Float, levels: List<Float>): Int {
+    var best = 0
+    var bestD = Float.MAX_VALUE
+    for (i in levels.indices) {
+        val d = abs(levels[i] - ui)
+        if (d < bestD) {
+            bestD = d
+            best = i
         }
     }
-    return CameraParamOverrides(preset.id, values, removed)
+    return best
+}
+
+/**
+ * 常用参数覆盖的槽（图 2 的 5 项）：`[34]` LUT 强度 / `[26][27]` 颗粒 / `[95]` 柔光 /
+ * `[62]` 光晕 / `[66]` 暗角。
+ */
+internal val QUICK_ADJUST_SLOTS: Set<Int> =
+    linkedSetOf(LUT_STRENGTH_SLOT, GRAIN_AMOUNT_SLOT, GRAIN_SIZE_SLOT, 95, 62, 66)
+
+/** 常用的**参数组名**（清单行 → 快捷控件名）：`[26][27]` ⇒ 颗粒、`[95]` ⇒ 柔光…。 */
+internal fun quickAdjustLabelOf(slot: Int): String? = when (slot) {
+    LUT_STRENGTH_SLOT -> "滤镜强度"
+    GRAIN_AMOUNT_SLOT, GRAIN_SIZE_SLOT -> "颗粒"
+    // 其余三槽的名字从档位表派生（**不写第二份字面**）
+    else -> QUICK_LEVEL_PARAMS.firstOrNull { it.slot == slot }?.label
+}
+
+/**
+ * 清单里的一项**点下去会发生什么**（用户"每个能点的都必须有反应"）：
+ *  - [QUICK] ⇒ 下面常用参数区里有对应的档位/滑杆（图 2 的 5 项）；
+ *  - [SLIDER] ⇒ 下方出这一项的滑杆（一次一项，`EditorSlider`）；
+ *  - [NONE] ⇒ 两项都没有 ⇒ **不许注册手势**，只显示"为什么点不动"（ADR-12，不做假控件）。
+ */
+internal enum class PresetQuickPath { QUICK, SLIDER, NONE }
+
+/** [PresetQuickPath] 的判据（唯一实现：UI 与单测都读它）。 */
+internal fun presetQuickPath(slot: Int): PresetQuickPath = when {
+    slot in QUICK_ADJUST_SLOTS -> PresetQuickPath.QUICK
+    slot in CAMERA_TUNABLE_SLOT_PARAM -> PresetQuickPath.SLIDER
+    else -> PresetQuickPath.NONE
+}
+
+/** 「当前搭配」清单的一行（图 2 的只读概览）：参数名 + 值。 */
+internal data class PresetOverviewRow(val slot: Int, val label: String, val value: String)
+
+/**
+ * ★ 图 2 的「**当前搭配**」清单：这条预设**包含**的项逐行（数据源 = [presetDetailSections]，
+ * 稀疏集的唯一维护点），并把常用项折叠成"**档位名 · 数值**"（图 2 的 `颗粒 → 中颗粒 · 数量 30`）。
+ *
+ * 三条折叠规则：
+ *  - `[27]` 颗粒尺寸**并进** `[26]` 那一行（图 2 里颗粒是一行，不是两行）；
+ *  - `[34]` LUT 强度**不在 `slots` 里**（由 [EditorPreset.lutStrength] 承载）⇒ 由 [lut] 参数
+ *    单独出第一行「滤镜 → 名字 · 强度」（图 2 的第一行）；
+ *  - 关闭档只显示「关闭」（`关闭 · 数量 0` 是废话）。
+ *
+ * ⚠ 只读：清单里的值**只来自这条预设**（含未保存的调整），**绝不显示当前相机值冒充** ——
+ * 未包含的项根本不出现（"当前搭配"的语义），不是显示成「—」也不是显示成当前值。
+ *
+ * @param slots 这条预设生效的槽（= `preset.slots` − 移除 + 用户刚设的值）
+ * @param lut [presetLutLine]（null = 这条预设不含 LUT ⇒ 不出滤镜行）
+ * @param lutLabel LUT 的中文名（UI 层查 `LutLibrary`，纯逻辑层不碰 Context）
+ */
+internal fun presetOverviewRows(
+    slots: Map<Int, Double>,
+    lut: PresetLutLine? = null,
+    lutLabel: String? = null,
+): List<PresetOverviewRow> {
+    val out = ArrayList<PresetOverviewRow>()
+    lut?.let { out += PresetOverviewRow(LUT_STRENGTH_SLOT, "滤镜", "${lutLabel ?: it.lutId} · ${it.strength}") }
+    for (row in presetDetailSections(slots).flatMap { it.rows }) {
+        val raw = slots[row.slot]
+        when (row.slot) {
+            // 尺寸并进颗粒那一行（图 2 的一行 = 档位名 + 数量）
+            GRAIN_SIZE_SLOT -> Unit
+            GRAIN_AMOUNT_SLOT -> {
+                val lv = grainLevelOf(raw ?: 0.0)
+                out += PresetOverviewRow(
+                    row.slot, "颗粒",
+                    if (lv == GrainLevel.OFF) lv.label else "${lv.label} · 数量 ${row.value}",
+                )
+            }
+            95 -> out += levelOverviewRow(GLOW_LEVEL_PARAM, raw, row.value)
+            62 -> out += levelOverviewRow(HALO_LEVEL_PARAM, raw, row.value)
+            66 -> out += levelOverviewRow(VIGNETTE_LEVEL_PARAM, raw, row.value)
+            else -> out += PresetOverviewRow(row.slot, row.label, row.value)
+        }
+    }
+    return out
+}
+
+/** 档位行（柔光 / 光晕 / 暗角）：档位名 + （非关时）数值。UI 读数与滑杆**同一个换算**。 */
+private fun levelOverviewRow(
+    quick: QuickLevelParam,
+    raw: Double?,
+    detail: String,
+): PresetOverviewRow {
+    val param = CAMERA_TUNABLE_SLOT_PARAM.getValue(quick.slot)
+    // 用滑杆自己的 read（`vigStrengthUi` / `normalizedUi`）算读数：坏值回落 pivot ⇒ 不会读出 NaN
+    val arr = DoubleArray(quick.slot + 1)
+    if (raw != null && raw.isFinite()) arr[quick.slot] = raw
+    val idx = nearestLevel(param.read(arr), quick.levels)
+    // 档位名与档位按钮**同一份字面**（[QuickLevelParam.names]）；关闭档不带数值（"关闭 · 0" 是废话）
+    val text = if (idx == 0) quick.names[0] else "${quick.names[idx]} · $detail"
+    return PresetOverviewRow(quick.slot, quick.label, text)
+}
+
+/**
+ * ★ 图 2 的**描述段落**（可展开收起）—— 全部由**真实数据**拼成，不编造"风格简介"：
+ * 来源 / 分组 / 参数项数 / 覆盖的分组 / LUT / 以及"未包含的参数保持当前值不动"这条套用语义。
+ */
+internal fun presetOverviewText(p: EditorPreset, lutLabel: String? = null): String {
+    val sections = presetDetailSections(p.slots)
+    val n = sections.sumOf { it.rows.size }
+    val src = "${presetSourceText(p.source)}预设"
+    val group = if (p.group.isNotEmpty()) " · 分组「${p.group}」" else ""
+    val lut = presetLutLine(p)?.let { " · 滤镜 ${lutLabel ?: it.lutId}（强度 ${it.strength}）" }
+        ?: " · 不含滤镜（套用时保持当前 LUT）"
+    val body = if (n == 0) {
+        "不含参数（套用时其余参数保持不动）"
+    } else {
+        "包含 $n 项参数（${sections.joinToString(" / ") { it.title }}）"
+    }
+    return "$src$group · $body$lut；套用这条预设时，未包含的参数保持当前值不动。"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -555,40 +736,50 @@ private val CamDisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
  * 点行 = **套用**；**长按行 = 打开详情面板**（用户："参考 PC **长按跳转预设配置详情**"）；
  * 行尾「⋯」= 操作菜单（**不可用的项置灰但可见** + 一句实话，绝不隐藏）。
  *
- * ## ★ PS-3：详情面板 = **参数可逐项修改**（用户："可直接在拍照界面查看、修改预设"）
+ * ## ★ PS-6a：详情卡（图 2）+ 常用参数（用户 2026-10-12 真机实测："预设界面全部重做！！"）
  *
- *  - 参数表是**全量**的（`cameraParamSections`：拍照链路可调的 35 项一个不少），
- *    按 §9.2 的四组 + 兜底组**分组可折叠**（面板限高 200 多 dp，全展开放不下）；
- *  - 每项两种状态：**已包含**（显示这条预设的值 + 「移除该项」）/ **未设置**
- *    （显示"未设置"，**绝不用当前相机值冒充** —— 套用时该字段保持不动）；
- *  - 点一行 ⇒ 展开该项滑杆（一次一项）⇒ 拖动**取景实时生效**；
- *  - 改动活在 [CameraParamOverrides] 里（**未保存不落盘**），面板底部：
- *    新建态「保存当前相机参数为新预设」/ 编辑态「保存到预设」+「从当前相机参数更新」；
- *  - **内置预设可改**（用户 2026-10-11："内置预设为什么不让修改？…最多限制不能删除就行"），
- *    改过之后有「恢复默认」；**删除**仍置灰（唯一限制）。
+ *  主视图（非编辑态）= 列表**上方**的详情卡，永远对应当前生效的那条预设：
+ *   - 名称（大字）+ 副标题（来源 · 分组）+ **描述段落**（可展开收起，[presetOverviewText]）；
+ *   - 「当前搭配」+ 右上「**完整参数 >**」（[onOpenFullEdit]；完整参数页由 PS-6b 实现，本卡不做）；
+ *   - **两列只读清单**（[presetOverviewRows]）：常用项折叠成"档位名 · 数值"；
+ *   - 一行提示「选择一项开始调整」+「实时效果 开」；
+ *   - **常用参数区**（用户点名的 5 项）：LUT 强度滑杆 / 颗粒四档 / 柔光四档 / 光晕四档 / 暗角四档；
+ *   - 有未保存改动时出「保存到预设」（[saveSlotsWithLutStrength] 把 `[34]` 带回 `lutStrength`）。
+ *
+ *  **点点看**：清单里每一项点下去都有反应（判据 [presetQuickPath]）—— 属于常用 5 项的 ⇒ 提示去
+ *  下面的哪个档位调；有滑杆的项 ⇒ 下方出那**一条**滑杆（一次一项）；两样都没有的 ⇒ 显示
+ *  "为什么点不动"（ADR-12，不做假控件）。
  *
  * ## 四条纪律
  *
- *  1. **不做假滑杆**：只有拍照链路真的读、且参数面板真的有滑杆的槽才可点
- *    （`cameraParamAdjustability`，判据 = 引擎实测白名单 `CAMERA_PATH_SLOTS`）。
+ *  1. **不做假控件**：能点 = 真的会变（[presetQuickPath] / `cameraParamAdjustability`）；不能点的
+ *     项不注册手势，并且写明原因。
  *  2. **拖动不写上层 state**：拖动每帧只调 [onPreview]（直通引擎），松手才 [onOverrides] ——
  *     每帧写 `CameraScreen` 的 state 会把整页拖进重组（v0.10.96 的 LUT 强度滑杆踩过同型坑）。
  *  3. **未保存不落盘**：只有保存动作写库（用户预设 → `PresetStore`；内置 → 覆盖层）。
- *  4. **编辑对象 == 生效对象**：进详情（长按 / 「查看配置」/「编辑」）会把该预设**套用**成当前
- *     生效的那条（见 [openEdit] 的不变量）—— 画面只有一份，"实时效果"必须有明确归属。
- *     ⇒ [onPreview] 因此永远作用于 `selectedPreset`（= 详情面板正在编辑的那条）。
+ *  4. **编辑对象 == 生效对象**：详情卡永远对应 `selected`（见 [openEdit] 的不变量）—— 画面只有
+ *     一份，"实时效果"必须有明确归属 ⇒ [onPreview] 因此永远作用于 `selectedPreset`。
+ *
+ * ## LUT 强度 `[34]` 为什么必须同时写 prefs
+ *
+ * 引擎侧 `CameraController.setFilmParams` 之后会走 `applyLutStrengthPref()`：只要 prefs 的
+ * `lut_strength` 与上次记录不同，就把 `filmParams[34]` **覆盖**成 prefs 的值 ⇒ 只把 `[34]`
+ * 放进下发数组是**无效**的（拖了画面不变 = 假控件）。所以拖动时同时写 prefs 这条**既有事实源**
+ * （LUT tab 的强度滑杆走的是同一条），保存时再经 [saveSlotsWithLutStrength] 落到预设的
+ * [EditorPreset.lutStrength]。
  *
  * @param presets `BuiltinPresets.all(context, prefs)`（用户预设在前 + 内置三条在后，含覆盖层）
  * @param selected 当前生效的预设（列表首项恒为 [CAMERA_STANDARD_PRESET]）
- * @param lutId / lutStrength 当前 LUT 与强度（新建态的清单要显示这一行，`[34]` 不进 slots）
+ * @param lutId / lutStrength 当前相机选中的 LUT 与强度（新建态 / "这条预设不含 LUT"的判据）
  * @param overrides ★ PS-3：当前**未保存**的改动（null = 没有；带归属 id ⇒ 切预设自动失效）
- * @param builtinOverrides ★ PS-3：内置覆盖表（判「恢复默认」是否可点：改过才需要恢复）
+ * @param builtinOverrides ★ PS-3：内置覆盖表（列表标「已改」+「恢复默认」可用性）
  * @param onPreview ★ PS-3：拖动中 ⇒ 立即下发取景（**不要**在这里写 Compose state）
- * @param onOverrides ★ PS-3：提交改动（松手 / 移除一项时；null = 清空）
+ * @param onOverrides ★ PS-3：提交改动（松手 / 点档位时；null = 清空）
  * @param onSave 新建（列表「+ 新建预设」）：名称 / 分组 / 改动
  * @param onUpdate 「从当前相机参数更新」：整包重写该预设的配方（既有能力，PS-3 带上改动）
- * @param onSaveSlots ★ PS-3：「保存到预设」= 把改动写进该预设（含移除项与 `[0]` 曝光偏移）
+ * @param onSaveSlots ★ PS-3：「保存到预设」= 把改动写进该预设（含 `[0]` 曝光偏移与 `[34]` 强度）
  * @param onRestore ★ PS-3：「恢复默认」（内置）—— 删掉覆盖层，回到出厂定义
+ * @param onOpenFullEdit ★ PS-6a：「完整参数 >」—— 打开完整参数页（PS-6b 在 `CameraScreen` 里实现）
  */
 @Composable
 internal fun CameraPresetTab(
@@ -608,8 +799,16 @@ internal fun CameraPresetTab(
     onRename: (EditorPreset, String, String) -> Unit,
     onCopy: (EditorPreset) -> Unit,
     onDelete: (EditorPreset) -> Unit,
+    /**
+     * ★ PS-6a：「**完整参数 >**」—— 打开完整参数页（PS-6b 在 `CameraScreen` 里传实际实现）。
+     * 默认空实现 ⇒ 本卡不依赖那一页，也不做它（两张卡只靠这一个回调对接）。
+     */
+    onOpenFullEdit: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    // ★ PS-6a：LUT 强度的**既有事实源**（`CameraController.applyLutStrengthPref` 每帧读它覆盖
+    // `filmParams[34]`）⇒ 预设详情里拖强度必须同时写这里，否则下发无效（见 [pushEdit] 的 KDoc）。
+    val prefs = remember(context) { context.getSharedPreferences("filmkit", 0) }
     var name by remember { mutableStateOf("") }
     var group by remember { mutableStateOf("") }
     // 编辑面板：`editorNew` = 新建态（没有 id），`editorId` = 编辑态。存 **id** 而不是对象 ——
@@ -655,43 +854,68 @@ internal fun CameraPresetTab(
         editorId = null
     }
 
-    if (editorOpen) {
-        // ★ PS-3：拖动中的改动持有者 —— **普通对象**（不参与 Compose 快照）⇒ 拖动每帧写它
-        // 不会触发任何重组（只有 [EditorSlider] 自己的拖动 state 在变）。松手时才经
-        // [onOverrides] 提交一次（上层 state 因此每帧都不动）。
-        val drag = remember { DragHolder() }
-        val p = editor
-        // **编辑对象**：编辑态 = 那条预设；新建态 = 当前生效的预设（"新建 = 以当前画面为起点"，
-        // 用户 2026-10-11："新建预设时目前参数居然不可配置？？"—— 新建态同样能逐项调）
-        val target = p ?: selected
-        val mine = overrides.forPreset(target)
-        val values = mine?.values ?: emptyMap()
-        val removed = mine?.removed ?: emptySet()
-        // 清单显示的"这条预设包含什么" = 预设记录 − 用户移除 + 用户设的值
-        //（**不含**那些没设过值的槽 ⇒ 它们显示「—」，不用当前相机值冒充）
-        val shown = (target.slots - removed) + values
-        // 滑杆读写数组（勾选时也读它取"当前生效值" ⇒ 勾选不改变画面）
-        val params = cameraPresetParams(target, values, removed)
-        /**
-         * ★ PS-5：勾选 / 取消勾选 = **一次性动作**（不是拖动）⇒ 算完**一次提交** + **一次下发**。
-         * 单项 / 整组三态框 / `[全选]` / `[全不选]` / 「不包含此项」全部走这里
-         *（调研 §2.4 #8："一次提交，不要每槽一次重组"）。
-         */
-        fun commitChecked(next: CameraParamOverrides) {
-            onOverrides(next)
-            onPreview(next)
+    // ★ PS-3：拖动中的改动持有者 —— **普通对象**（不参与 Compose 快照）⇒ 拖动每帧写它
+    // 不会触发任何重组（只有 [EditorSlider] 自己的拖动 state 在变）。松手时才经
+    // [onOverrides] 提交一次（上层 state 因此每帧都不动）。主视图与编辑面板共用（同时只有一个在屏上）。
+    val drag = remember { DragHolder() }
+    // **编辑对象**：编辑态 = 那条预设；新建态 / 主视图 = 当前生效的预设
+    //（"新建 = 以当前画面为起点"；主视图的详情卡永远对应 `selected`，见 `openEdit` 的不变量）
+    val target = editor ?: selected
+    val mine = overrides.forPreset(target)
+    val values = mine?.values ?: emptyMap()
+    val removed = mine?.removed ?: emptySet()
+    // 「当前搭配」显示的"这条预设包含什么" = 预设记录 − 移除 + 用户刚设的值
+    //（**不含**没设过值的槽 ⇒ 它们不出现在清单里，绝不用当前相机值冒充）
+    val shown = (target.slots - removed) + values
+    // 滑杆读写数组（= 当前生效参数：中性基线 + 稀疏覆盖）
+    val params = cameraPresetParams(target, values, removed)
+    // LUT 强度 `[34]`：不进 `slots` ⇒ 界面上的当前值 = 未保存的改动 → 预设自己的 → 新建态的当前相机值
+    val lutStrengthNow = values[LUT_STRENGTH_SLOT]?.toFloat()
+        ?: if (editorNew) lutStrength else target.lutStrength.toFloat()
+    // 有没有 LUT：新建态 = 当前相机选的 LUT；其余 = 这条预设自己的 LUT
+    val hasLut = (if (editorNew) lutId else target.lutId) != null
+
+    /**
+     * ★ PS-6a：**写值的唯一路径**（滑杆拖动 / 档位按钮都走这里；不新增 state 通路）。
+     *
+     * `[34]` LUT 强度是**唯一**一条特例：引擎侧 `CameraController.setFilmParams` 之后会调用
+     * `applyLutStrengthPref()`，只要 prefs 的 `lut_strength` 变了就把 `filmParams[34]` **覆盖**
+     * 成 prefs 的值 ⇒ 只把 `[34]` 放进下发数组是**无效**的（拖动画面不变 = 假控件）。
+     * 所以这里同时写 prefs 这条**既有事实源**（LUT tab 的强度滑杆走的是同一条），
+     * 先写 prefs 再 [onPreview]，`setFilmParams` 读到的就是新值。
+     */
+    fun pushEdit(param: EditorParam, v: Float) {
+        val next = if (param.key == LutStrengthParam.key) {
+            prefs.edit().putFloat("lut_strength", v.coerceIn(0f, 1.5f)).apply()
+            overrides.afterLutStrengthEdit(target, v)
+        } else {
+            overrides.afterEdit(target, param, v)
         }
+        drag.value = next
+        onPreview(next)
+    }
+
+    /** 松手（[EditorSlider] 的 onFinished）⇒ **一次提交**（拖动中一位 state 都不写）。 */
+    fun finishEdit() {
+        drag.value?.let { onOverrides(it) }
+        drag.value = null
+    }
+
+    /** 档位按钮 = **一次性动作**（不是拖动）⇒ 写值 + 立刻提交（否则「保存到预设」不会亮）。 */
+    fun pickLevel(param: EditorParam, uiValue: Float) {
+        pushEdit(param, uiValue)
+        finishEdit()
+    }
+
+    if (editorOpen) {
+        val p = editor
         CameraPresetEditorPanel(
             p = p,
             target = target,
-            slots = shown,
             params = params,
-            overrides = mine,
-            lut = if (editorNew) {
-                lutId?.let { PresetLutLine(it, formatZero150(lutStrength)) }
-            } else {
-                p?.let { presetLutLine(it) }
-            },
+            lutStrength = lutStrengthNow,
+            hasLut = hasLut,
+            hasChanges = mine != null && !mine.isEmpty,
             name = name,
             onName = { name = it },
             group = group,
@@ -701,24 +925,10 @@ internal fun CameraPresetTab(
             readOnlyNote = p?.let { presetReadOnlyNote(it) },
             // 内置改过 ⇒ 「恢复默认」可点（覆盖表里有这个 id）
             hasOverride = p != null && builtinOverrides.containsKey(p.id),
-            onEditParam = { param, v ->
-                val next = overrides.afterEdit(target, param, v)
-                drag.value = next
-                onPreview(next)
-            },
-            onEditFinished = {
-                drag.value?.let { onOverrides(it) }
-                drag.value = null
-            },
-            // ★ PS-5：勾选框 = 加入 / 移除（增删字段的唯一手段；值 = 当前生效值）
-            onChecked = { slotList, checked ->
-                val next = if (checked) {
-                    overrides.checkSlots(target, slotList, params)
-                } else {
-                    overrides.uncheckSlots(target, slotList)
-                }
-                commitChecked(next)
-            },
+            onEditParam = { param, v -> pushEdit(param, v) },
+            onEditFinished = { finishEdit() },
+            onPickLevel = { param, v -> pickLevel(param, v) },
+            onOpenFullEdit = onOpenFullEdit,
             onBack = { closeEditor() },
             onSaveNew = {
                 // 新建 = 当前生效预设 + 当前改动（含 `[0]` 曝光偏移，见 newCameraPresetFrom）
@@ -726,14 +936,39 @@ internal fun CameraPresetTab(
                 closeEditor()
             },
             onUpdate = { p?.let { onUpdate(it, overrides.forPreset(it)) } },
-            onSaveSlots = { p?.let { onSaveSlots(it, overrides.forPreset(it)) } },
+            onSaveSlots = {
+                p?.let {
+                    onSaveSlots(saveSlotsWithLutStrength(it, overrides.forPreset(it)), overrides.forPreset(it))
+                    onOverrides(null)
+                }
+            },
             onRestore = { p?.let { onRestore(it) } },
             onSaveMeta = { p?.let { onRename(it, name, group) } },
             onDelete = { p?.let { pendingDelete = it } },
         )
     } else {
         Column(Modifier.fillMaxWidth()) {
-            // ① 常驻的「+ 新建预设」+ 入口提示（"哪里能点"写在界面上，不靠用户猜）
+            // ① ★ PS-6a：详情卡（图 2）—— 名称 / 副标题 / 描述 / 当前搭配 / 常用参数
+            CameraPresetDetailCard(
+                p = selected,
+                params = params,
+                shown = shown,
+                lutStrength = lutStrengthNow,
+                hasLut = hasLut,
+                lutLabel = selected.lutId?.let { id -> LutLibrary.byId(context, id)?.label },
+                hasChanges = mine != null && !mine.isEmpty,
+                onEditParam = { param, v -> pushEdit(param, v) },
+                onEditFinished = { finishEdit() },
+                onPickLevel = { param, v -> pickLevel(param, v) },
+                onOpenFullEdit = onOpenFullEdit,
+                onSaveSlots = {
+                    // ★ 保存口径：`[34]` 不进 slots ⇒ 显式带回 `lutStrength`（见 saveSlotsWithLutStrength）
+                    onSaveSlots(saveSlotsWithLutStrength(selected, mine), mine)
+                    // 改动已落盘 ⇒ 清掉（按钮随之消失；**画面不变**：下发数组本来就是这些值）
+                    onOverrides(null)
+                },
+            )
+            // ② 常驻的「+ 新建预设」+ 入口提示（"哪里能点"写在界面上，不靠用户猜）
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -754,8 +989,8 @@ internal fun CameraPresetTab(
                 )
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    // PS-3：长按 = 详情（用户："参考 PC 长按跳转预设配置详情"）—— 入口写在界面上
-                    "点行套用 · 长按看配置并调整 · 「⋯」菜单",
+                    // 点行 = 套用（详情卡随之切换）；长按 = 编辑面板（改名 / 分组 / 删除）
+                    "点行套用 · 长按改名或删除 · 「⋯」菜单",
                     color = FilmTheme.CreamDim,
                     fontSize = 10.sp,
                     maxLines = 1,
@@ -763,13 +998,13 @@ internal fun CameraPresetTab(
                     modifier = Modifier.weight(1f),
                 )
             }
-            // ② 列表：首项恒为内置「标准」（P-2a 的列表契约），其余 = 用户预设 + 内置三条。
+            // ③ 列表：首项恒为内置「标准」（P-2a 的列表契约），其余 = 用户预设 + 内置三条。
             //    限高：面板与 LUT tab 共用一个高度预算，列表再长也不该把预览挤没。
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 224.dp)
+                    .heightIn(max = 200.dp)
                     .padding(top = 8.dp),
             ) {
                 items(listOf(CAMERA_STANDARD_PRESET) + presets, key = { it.id }) { p ->
@@ -784,13 +1019,13 @@ internal fun CameraPresetTab(
                         // 内置被改过 ⇒ 行上标一句（否则用户不知道"这条已不是出厂值"）
                         edited = builtinOverrides.containsKey(p.id),
                         onApply = { onApply(p) },
-                        // ★ PS-3：长按 = 打开详情面板（点行仍是套用，P-2a 行为一位不动）
+                        // ★ PS-3：长按 = 打开编辑面板（点行仍是套用，P-2a 行为一位不动）
                         onDetail = { openEdit(p) },
                         onMenu = { menuFor = p },
                     )
                 }
             }
-            // ③ P-5 字段作用域：当前这条预设里有几项只在编辑器链路生效 ⇒ 套用前先说清楚
+            // ④ P-5 字段作用域：当前这条预设里有几项只在编辑器链路生效 ⇒ 套用前先说清楚
             //   （ADR-12：不假装生效）。全部生效 ⇒ null ⇒ 不显示。
             presetScopeNotice(selected, PresetScene.CAMERA)?.let { notice ->
                 Text(
@@ -1071,337 +1306,409 @@ private fun CamPresetActionButton(
 }
 
 /**
- * ★ PS-5：**分组勾选树**（规格 = 调研 `preset-panel-interaction-RESEARCH.md` §2.2 界面 B /
- * §2.3 C1–C5）—— 本次重做的全部内容。
+ * ★ PS-6a：**预设详情卡**（用户 2026-10-12："点击预设按图 2 那样展示"）—— 主视图的上半部分。
  *
- * | 元素 | 交互 | 落点 |
- * |---|---|---|
- * | 组头 `▾ 基础调整   ▣ 4/9` | 点标题 / 箭头 = 折叠；点**三态框** = 整组勾选（半勾点一下 = 全勾，I5） | [SectionTriCheck] |
- * | 参数行 `☑ 曝光  +0.30 EV` | 点**勾选框** = 加入 / 移除（增删字段的唯一手段）；点**行体** = 展开这一项的滑杆 | [CamParamRow] |
- * | 展开区 | 读数 + `EditorSlider` + 「不包含此项」—— **全页唯一出现滑杆的地方** | [CamParamExpand] |
- * | 顶部 `已包含 12 · 未包含 29   [全选] [全不选]` | LrC 的 `Check All` / `Check None` | [CheckAllRow] |
+ * ```
+ * 徕卡一瞬  [内置]                              ← ① 名称（大字）
+ * 内置预设 · 分组「徕卡」                        ← ② 副标题（来源 · 分组）
+ * 包含 17 项参数（基础调整 / 色彩 / …）  展开    ← ③ 描述段落（可展开收起，全部是真实数据）
+ * 当前搭配                          完整参数 >  ← ④ 标题 + 完整参数页入口（PS-6b 的页面）
+ * 滤镜  徕卡 M9 · 30      对比度  -3            ← ⑤ 两列只读清单（[presetOverviewRows]）
+ * 颗粒  中颗粒 · 数量 30  …                     ←    常用项折叠成"档位名 · 数值"
+ * 选择一项开始调整                 实时效果 开   ← ⑥ 提示 + 实时标记（无手势，不是假开关）
+ * ▬▬▬▬▬▬  ← ⑦ 点清单里"有滑杆的项" ⇒ 出这一条的滑杆（**一次一项**）
+ * 常用参数                                      ← ⑧ 常用参数区（用户点名的 5 项）
+ * 滤镜强度 ▬▬▬▬  30
+ * 颗粒  [关闭][细颗粒][中颗粒][粗颗粒]
+ * 柔光  [关闭][轻柔光][中等柔光][强烈柔光]
+ * 光晕  [关闭][轻微光晕][中等光晕][强烈光晕]
+ * 暗角  [关闭][轻微暗角][中等暗角][强烈暗角]
+ * 未保存的调整                    [保存到预设]  ← ⑨ 有改动才出现（调完即存）
+ * ```
  *
- * **未包含的项照样出现在树上**（值列显示「—」），这是 LrC / RawTherapee / darktable 三家一致
- * 的做法 —— 藏起来的表现是"预设里有东西，界面上找不到"。
- *
- * ⚠ 「—」**绝不显示当前相机值**：套用这条预设时未包含的字段**保持不动**，显示当前值会让用户
- * 以为预设里存着它（那是在骗用户）。
- *
- * 分组默认**展开"这条预设已包含项所在的分组"**、其余收起（面板限高 150dp，全展开放不下）；
- * **行级展开默认全部收起** ⇒ 进入详情首屏可见滑杆数 = 0。
+ * **点点看**（判据 [presetQuickPath]，每个能点的都必须有反应）：常用 5 项 ⇒ 提示去下面哪个档位调；
+ * 有滑杆的项 ⇒ ⑦ 出那一条滑杆；两样都没有的项 ⇒ 行下写明"为什么点不动"（ADR-12，不做假控件）。
  */
 @Composable
-private fun CamParamCheckTree(
-    /** 生效的"这条预设包含什么"（= 预设记录 − 移除 + 用户设的值） */
-    slots: Map<Int, Double>,
+private fun CameraPresetDetailCard(
+    /** 当前生效的那条预设（详情卡永远对应它，见 [CameraPresetTab] 的不变量 ④） */
+    p: EditorPreset,
     /** 滑杆读写数组（= `cameraPresetParams(target, values, removed)`） */
     params: DoubleArray,
-    /** 归属预设 id：换预设 ⇒ 折叠态与滑杆 state 重建 */
-    presetId: String,
+    /** "这条预设包含什么"（= 预设记录 − 移除 + 用户刚设的值） */
+    shown: Map<Int, Double>,
+    /** `[34]` 的当前值（未保存改动 → 预设自己的 → 新建态的当前相机值） */
+    lutStrength: Float,
+    hasLut: Boolean,
+    lutLabel: String?,
+    /** 有没有未保存的改动（决定 ⑨「保存到预设」出不出现） */
+    hasChanges: Boolean,
     onEditParam: (EditorParam, Float) -> Unit,
     onEditFinished: () -> Unit,
-    /** ★ PS-5：勾选 / 取消勾选一组槽（单项 / 整组 / 全选三条路径共用 ⇒ 一次提交） */
-    onChecked: (List<Int>, Boolean) -> Unit,
-    lut: PresetLutLine?,
-    maxHeight: Dp,
+    onPickLevel: (EditorParam, Float) -> Unit,
+    onOpenFullEdit: () -> Unit,
+    onSaveSlots: () -> Unit,
 ) {
-    val context = LocalContext.current
-    // 展示的槽 = 拍照链路读的全部 41 项 + 这条预设包含的其它槽（未包含的照样出现，值列「—」）
-    val treeSlots = cameraTreeSlots(slots.keys)
-    val sections = cameraParamSections(slots, treeSlots)
-    val included = slots.keys
-    // 展开的是哪一项 —— 记 `param.key` 而不是槽号：一条滑杆覆盖多槽（肩部 `[5..7]` /
-    // 饱和度 `[20..22]`）时点其中任一行都是同一条滑杆，不能展开成三条。
-    // ★ **默认 null = 全部收起** ⇒ 首屏可见滑杆数 = 0（调研 §2.7 判据 5 的机器判据）。
-    var openKey by remember(presetId) { mutableStateOf<String?>(null) }
-    // 折叠态：初值 = **含已包含项的分组**（只算一次；勾选 / 拖动不该把用户折叠起来的分组又弹开）
-    var openSections by remember(presetId) {
-        mutableStateOf(
-            sections.filter { sec -> sec.rows.any { it.value != null } }.map { it.title }.toSet(),
-        )
-    }
-    Column(Modifier.fillMaxWidth()) {
-        CheckAllRow(
-            included = sections.sumOf { sec -> sec.rows.count { it.value != null } },
-            total = sections.sumOf { sec -> sec.rows.size },
-            onCheckAll = { onChecked(treeSlots.toList(), it) },
-        )
-        LazyColumn(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(max = maxHeight),
-        ) {
-            sections.forEach { sec ->
-                val expanded = sec.title in openSections
-                val groupSlots = sec.rows.map { it.slot }
-                val state = sectionCheckState(included, groupSlots)
-                item(key = "sec_${sec.title}") {
-                    SectionTriCheck(
-                        title = sec.title,
-                        state = state,
-                        included = sec.rows.count { it.value != null },
-                        total = sec.rows.size,
-                        expanded = expanded,
-                        onToggleOpen = {
-                            openSections = if (expanded) openSections - sec.title else openSections + sec.title
-                        },
-                        // 三态框点一下：非全勾 ⇒ 全勾；全勾 ⇒ 全不勾（I5，RawTherapee 同义）
-                        onToggleCheck = { onChecked(groupSlots, state != CheckState.ALL) },
-                    )
-                }
-                if (expanded) {
-                    items(sec.rows, key = { "row_${it.slot}" }) { r ->
-                        // null = 这一项没有滑杆（拍照不生效 / 参数面板还没给滑杆）⇒ 灰显 + 原因
-                        val param = CAMERA_TUNABLE_SLOT_PARAM[r.slot]
-                        val checked = r.value != null
-                        val open = param != null && openKey == param.key
-                        CamParamRow(
-                            row = r,
-                            param = param,
-                            note = cameraParamAdjustabilityNote(r.slot),
-                            checked = checked,
-                            open = open,
-                            params = params,
-                            onEditParam = onEditParam,
-                            onEditFinished = onEditFinished,
-                            // 勾选框 = 加入 / 移除（唯一手段）；取消时若正展开则收起（§2.4 #2）
-                            onToggleCheck = {
-                                onChecked(listOf(r.slot), !checked)
-                                if (checked && open) openKey = null
-                            },
-                            // 点行体 = 展开这一项的滑杆（一次一项）；未包含的**顺手勾上**
-                            //（§2.4 #4："我要调它 ⇒ 它进预设"）
-                            onToggleOpen = {
-                                if (open) {
-                                    openKey = null
-                                } else {
-                                    openKey = param?.key
-                                    if (!checked) onChecked(listOf(r.slot), true)
-                                }
-                            },
-                        )
-                    }
-                }
-            }
-            // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进勾选树
-            lut?.let { line ->
-                item(key = "lut") {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 1.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "LUT",
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
-                            color = FilmTheme.Cream,
-                            fontSize = 12.sp,
-                            fontFamily = FilmTheme.Mono,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * 顶部 `[全选] [全不选]` + 「已包含 n · 未包含 m」（调研 §2.3 C5；= LrC 的 `Check All` /
- * `Check None`）。
- *
- * 没有可勾 / 可取消的项时按钮**置灰**（点了没反应的假按钮正是投诉的根因）；置灰仍然**可见**
- *（隐藏才是问题）。
- */
-@Composable
-private fun CheckAllRow(included: Int, total: Int, onCheckAll: (Boolean) -> Unit) {
-    Row(
+    // 选中的那一项（换预设自动清空）：**一次只出一条滑杆** —— 用户否决的是"全是滑杆"
+    var picked by remember(p.id) { mutableStateOf<Int?>(null) }
+    var descOpen by remember(p.id) { mutableStateOf(false) }
+    val rows = presetOverviewRows(shown, presetLutLine(p), lutLabel)
+    val half = (rows.size + 1) / 2
+    val pickedRow = rows.firstOrNull { it.slot == picked }
+    Column(
         Modifier
             .fillMaxWidth()
-            .padding(top = 5.dp, bottom = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            // 限高 + 可滚：面板与 LUT tab 共用一个高度预算，详情再长也不该把列表挤没
+            .heightIn(max = 262.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(top = 8.dp),
     ) {
+        // ① 名称（大字）+ 来源标记（内置预设的唯一限制：不能删）
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                p.name,
+                color = FilmTheme.Cream,
+                fontSize = 18.sp,
+                fontFamily = FilmTheme.Serif,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (!presetDeletable(p)) {
+                Text(
+                    " 内置",
+                    color = CamDisabledInk,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .border(1.dp, CamDisabledInk, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                )
+            }
+        }
+        // ② 副标题：来源 · 分组
         Text(
-            "已包含 $included · 未包含 ${total - included}",
+            "${presetSourceText(p.source)}预设" + if (p.group.isNotEmpty()) " · 分组「${p.group}」" else "",
             color = FilmTheme.CreamDim,
             fontSize = 10.sp,
             maxLines = 1,
-            modifier = Modifier.weight(1f),
+            overflow = TextOverflow.Ellipsis,
         )
-        CamPresetActionButton("全选", enabled = included < total, onTap = { onCheckAll(true) })
-        Spacer(Modifier.width(6.dp))
-        CamPresetActionButton("全不选", enabled = included > 0, onTap = { onCheckAll(false) })
-    }
-}
-
-/**
- * 组头（调研 §2.3 C4）：`▾ 基础调整        ▣ 4/9`。
- *
- * 点标题 / 箭头 = **只**折叠展开该组；点三态框 = **整组勾选**（半勾点一下 = 全勾，I5，与
- * RawTherapee `everythingToggled` 的 `set_inconsistent(false)` 同义）。两个热区分开，不会
- * "想折叠却把整组参数删了"。
- */
-@Composable
-private fun SectionTriCheck(
-    title: String,
-    state: CheckState,
-    included: Int,
-    total: Int,
-    expanded: Boolean,
-    onToggleOpen: () -> Unit,
-    onToggleCheck: () -> Unit,
-) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Row(
-            Modifier
-                .weight(1f)
-                .clip(RoundedCornerShape(8.dp))
-                .pressScale(pressedScale = 0.98f, onTap = onToggleOpen)
-                .padding(top = 5.dp, bottom = 1.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                if (expanded) "▾ " else "▸ ",
-                color = FilmTheme.Accent,
-                fontSize = 11.sp,
-                maxLines = 1,
-            )
-            Text(
-                title,
-                color = FilmTheme.Accent,
-                fontSize = 11.sp,
-                maxLines = 1,
-                modifier = Modifier.weight(1f),
-            )
-        }
+        // ③ 描述段落（**可展开收起**；内容 = 来源 / 项数 / 分组 / LUT / 套用语义，全是真实数据）
         Text(
-            triCheckText(state),
-            color = if (state == CheckState.NONE) CamDisabledInk else FilmTheme.Accent,
-            fontSize = 13.sp,
+            presetOverviewText(p, lutLabel),
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            maxLines = if (descOpen) Int.MAX_VALUE else 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        Text(
+            if (descOpen) "收起" else "展开",
+            color = FilmTheme.Accent,
+            fontSize = 10.sp,
             maxLines = 1,
             modifier = Modifier
                 .clip(RoundedCornerShape(6.dp))
-                .pressScale(pressedScale = 0.90f, onTap = onToggleCheck)
-                .padding(horizontal = 4.dp),
+                .pressScale(pressedScale = 0.94f, onTap = { descOpen = !descOpen })
+                .padding(horizontal = 4.dp, vertical = 1.dp),
         )
-        // "这一组里这条预设包含了几项"（一眼看出哪些组有内容）
-        Text(
-            "$included/$total",
-            color = FilmTheme.CreamDim,
-            fontSize = 10.sp,
-            fontFamily = FilmTheme.Mono,
-            maxLines = 1,
-            modifier = Modifier.padding(end = 2.dp),
-        )
-    }
-}
-
-/**
- * 勾选树的一行（调研 §2.3 C2）：`☑/☐ + 参数名 + 值/「—」`。
- *
- * 两个**独立热区**（本次重做的核心 —— PS-3 只有"点整行 = 展开滑杆"）：
- *  - **勾选框 = 加入 / 移除**（不可调的项**照样可勾**，不变量 I6 —— 与 LrC 灰显 `Masking` 同型）；
- *  - **行体 = 展开这一项的滑杆**（没有滑杆的项不注册手势 = 不是假控件）。
- */
-@Composable
-private fun CamParamRow(
-    row: CameraParamRow,
-    param: EditorParam?,
-    note: String?,
-    checked: Boolean,
-    open: Boolean,
-    params: DoubleArray,
-    onEditParam: (EditorParam, Float) -> Unit,
-    onEditFinished: () -> Unit,
-    onToggleCheck: () -> Unit,
-    onToggleOpen: () -> Unit,
-) {
-    Column(Modifier.fillMaxWidth()) {
+        // ④ 「当前搭配」+ 右上「完整参数 >」（PS-6b 的入口；本卡只调回调，不做那一页）
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(vertical = 1.dp),
+                .padding(top = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // ① 勾选框：**增删字段的唯一手段**（调研 §2.4 #1/#2）
             Text(
-                checkBoxText(checked),
-                color = if (checked) FilmTheme.Accent else CamDisabledInk,
-                fontSize = 13.sp,
+                "当前搭配",
+                color = FilmTheme.Accent,
+                fontSize = 11.sp,
+                maxLines = 1,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "完整参数 >",
+                color = FilmTheme.Accent,
+                fontSize = 11.sp,
                 maxLines = 1,
                 modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .pressScale(pressedScale = 0.90f, onTap = onToggleCheck)
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(1.dp, FilmTheme.Accent, RoundedCornerShape(8.dp))
+                    .pressScale(pressedScale = 0.94f, onTap = onOpenFullEdit)
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
             )
-            // ② 行体：点一下 = 展开这一项的滑杆（一次一项）
+        }
+        // ⑤ 两列只读清单（空预设 ⇒ 一句实话，不是空白区）
+        if (rows.isEmpty()) {
+            Text(
+                "不含参数（套用时其余参数保持不动）",
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                maxLines = 2,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        } else {
             Row(
                 Modifier
-                    .weight(1f)
-                    .pressScale(pressedScale = 0.98f, enabled = param != null, onTap = onToggleOpen)
-                    .padding(vertical = 1.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .fillMaxWidth()
+                    .padding(top = 2.dp),
             ) {
-                Text(
-                    row.label,
-                    color = if (note == null) FilmTheme.Cream else CamDisabledInk,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                Text(
-                    // ★ 未包含 = 「—」（调研 §2.2）：稀疏子集的可视化 —— 套用时该字段保持不动，
-                    // 显示当前相机值会让用户以为预设里存着它（骗用户）
-                    row.value ?: "—",
-                    color = when {
-                        note != null -> CamDisabledInk
-                        row.value == null -> CamDisabledInk
-                        else -> FilmTheme.Cream
-                    },
-                    fontSize = 12.sp,
-                    fontFamily = FilmTheme.Mono,
-                    maxLines = 1,
-                )
-                if (param != null) {
-                    Text(
-                        if (open) " ▾" else " ▸",
-                        color = FilmTheme.Accent,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                    )
+                Column(Modifier.weight(1f)) {
+                    rows.take(half).forEach { r ->
+                        PresetOverviewRowText(r, picked = picked == r.slot) {
+                            picked = if (picked == r.slot) null else r.slot
+                        }
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    rows.drop(half).forEach { r ->
+                        PresetOverviewRowText(r, picked = picked == r.slot) {
+                            picked = if (picked == r.slot) null else r.slot
+                        }
+                    }
                 }
             }
         }
-        // 不可调的原因（可调 ⇒ null ⇒ 不占行）
-        note?.let {
+        // ⑥ 提示行（**实话**：选中了什么、去哪儿调）+「实时效果 开」（纯标记，无手势 ⇒ 不是假开关）
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(
-                it,
-                color = CamDisabledInk,
-                fontSize = 9.sp,
+                when {
+                    pickedRow == null -> "选择一项开始调整"
+                    presetQuickPath(pickedRow.slot) == PresetQuickPath.QUICK ->
+                        "已选「${pickedRow.label}」· 在下面「${quickAdjustLabelOf(pickedRow.slot)}」里调"
+                    pickedRow.slot in CAMERA_TUNABLE_SLOT_PARAM ->
+                        "已选「${pickedRow.label}」· 滑杆在下面"
+                    else -> "「${pickedRow.label}」暂无快捷滑杆 · 点右上「完整参数 >」"
+                },
+                color = FilmTheme.CreamDim,
+                fontSize = 10.sp,
+                maxLines = 2,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "实时效果 开",
+                color = FilmTheme.Accent,
+                fontSize = 10.sp,
                 maxLines = 1,
-                modifier = Modifier.padding(start = 22.dp, bottom = 1.dp),
             )
         }
-        // ★ 机器判据（调研 §2.7 判据 1）：**未勾选的行绝不渲染 `EditorSlider`**；默认全收起
-        //   ⇒ 进入详情首屏可见滑杆数 = 0（判据 5）。
-        if (showsSliderRow(checked = checked, tunable = param != null, expanded = open)) {
-            // showsSliderRow 已要求 tunable ⇒ 此处 param 必非空（`?.let` 只是让编译器看见）
-            param?.let {
-                CamParamExpand(
-                    param = it,
+        // ⑦ 选中项的滑杆（**有滑杆的项才有这一条**；`key(param.key, p.id)` ⇒ 换项 / 换预设重建）
+        if (pickedRow != null && presetQuickPath(pickedRow.slot) == PresetQuickPath.SLIDER) {
+            val param = CAMERA_TUNABLE_SLOT_PARAM.getValue(pickedRow.slot)
+            key(param.key, p.id) {
+                EditorSlider(
+                    param = param,
                     params = params,
-                    onEditParam = onEditParam,
-                    onEditFinished = onEditFinished,
-                    onRemove = onToggleCheck,
+                    onCommit = onEditParam,
+                    onFinished = onEditFinished,
+                )
+            }
+        }
+        // ⑧ 常用参数（用户点名的 5 项）
+        PresetQuickAdjustPanel(
+            presetId = p.id,
+            params = params,
+            lutStrength = lutStrength,
+            hasLut = hasLut,
+            onEditParam = onEditParam,
+            onEditFinished = onEditFinished,
+            onPickLevel = onPickLevel,
+        )
+        // ⑨ 有未保存改动 ⇒ 「保存到预设」（调完即存；落盘后上层清掉改动，这一行随之消失）
+        if (hasChanges) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "未保存的调整",
+                    color = FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f),
+                )
+                CamPresetActionButton("保存到预设", enabled = true, primary = true, onTap = onSaveSlots)
+            }
+        }
+    }
+}
+
+/**
+ * 清单里的一行（图 2 的只读概览）：`参数名 …… 值`。
+ *
+ * **点不动的项写明原因**（[cameraParamAdjustabilityNote]：拍照链路不读 / 参数面板还没有滑杆）——
+ * 用户点它时提示行会换成"暂无快捷滑杆"，行下就是那句实话（ADR-12，不做假控件）。
+ */
+@Composable
+private fun PresetOverviewRowText(
+    row: PresetOverviewRow,
+    picked: Boolean,
+    onTap: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (picked) FilmTheme.ChipBg else Color.Transparent)
+            .pressScale(pressedScale = 0.98f, onTap = onTap)
+            .padding(horizontal = 3.dp, vertical = 2.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                row.label,
+                color = if (picked) FilmTheme.Accent else FilmTheme.Cream,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                row.value,
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                fontFamily = FilmTheme.Mono,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (presetQuickPath(row.slot) == PresetQuickPath.NONE) {
+            cameraParamAdjustabilityNote(row.slot)?.let { note ->
+                Text(note, color = CamDisabledInk, fontSize = 9.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+/**
+ * ★ PS-6a：**常用参数区**（用户点名的 5 项）—— 详情卡与编辑面板**共用同一个组件**
+ * （一处实现、两处调用；不是两份控件）。
+ *
+ * 写值通路只有一条：滑杆经 [onEditParam]（`EditorSlider` → `EditorParam.write`），档位经
+ * [onPickLevel]（同一个 `write` + 立即提交）。本组件**不碰** [CameraParamOverrides]。
+ *
+ * `[34]` LUT 强度是唯一例外：它的界面当前值不在 `slots` 里（由 [EditorPreset.lutStrength]
+ * 承载）⇒ 借一份视图数组给 `EditorSlider` 读初值。
+ */
+@Composable
+private fun PresetQuickAdjustPanel(
+    /** 归属预设 id（换预设 ⇒ 滑杆重建，不沿用上一条的读数） */
+    presetId: String,
+    /** 滑杆读写数组（= `cameraPresetParams(target, values, removed)`） */
+    params: DoubleArray,
+    lutStrength: Float,
+    hasLut: Boolean,
+    onEditParam: (EditorParam, Float) -> Unit,
+    onEditFinished: () -> Unit,
+    onPickLevel: (EditorParam, Float) -> Unit,
+) {
+    Text(
+        "常用参数",
+        color = FilmTheme.Accent,
+        fontSize = 11.sp,
+        maxLines = 1,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(top = 6.dp),
+    )
+    if (hasLut) {
+        val view = params.copyOf().also { it[LUT_STRENGTH_SLOT] = lutStrength.toDouble() }
+        key(presetId, LutStrengthParam.key) {
+            EditorSlider(
+                param = LutStrengthParam,
+                params = view,
+                onCommit = onEditParam,
+                onFinished = onEditFinished,
+            )
+        }
+    } else {
+        // 没有 LUT ⇒ **不给假滑杆**（拖了画面不会变）：写明原因（套用时保持当前 LUT）
+        Text(
+            "滤镜强度：这条预设不含 LUT（套用时保持当前 LUT）",
+            color = CamDisabledInk,
+            fontSize = 10.sp,
+            maxLines = 2,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+    }
+    // 颗粒（★ 用户点名："颗粒开、关、档位"）—— 档位 = `[26]` 强度 + `[27]` 尺寸的组合
+    QuickLevelChips(
+        label = "颗粒",
+        names = GrainLevel.entries.map { it.label },
+        current = grainLevelOf(params).ordinal,
+        onPick = { i -> onPickLevel(GrainLevelParam, i.toFloat()) },
+    )
+    // 柔光 / 光晕 / 暗角（写值仍走这三条既有滑杆的 `write`；档位值 = [QuickLevelParam.levels]）
+    for (q in QUICK_LEVEL_PARAMS) {
+        val param = CAMERA_TUNABLE_SLOT_PARAM.getValue(q.slot)
+        QuickLevelChips(
+            label = q.label,
+            names = q.names,
+            current = nearestLevel(param.read(params), q.levels),
+            onPick = { i -> onPickLevel(param, q.levels[i]) },
+        )
+    }
+}
+
+/**
+ * 一行档位按钮（图 2 的 `[关闭][细颗粒][中颗粒][粗颗粒]`）：当前档位高亮。
+ *
+ * 档位 = **一次性动作**（点一下写值并立即提交），不是拖动 ⇒ 走 [onPick]（不是 `EditorSlider`）。
+ * 窄屏放不下时横向可滚（中文档名比英文长）。
+ */
+@Composable
+private fun QuickLevelChips(
+    label: String,
+    names: List<String>,
+    current: Int,
+    onPick: (Int) -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            color = FilmTheme.Cream,
+            fontSize = 11.sp,
+            maxLines = 1,
+            modifier = Modifier.width(48.dp),
+        )
+        Row(
+            Modifier
+                .weight(1f)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            names.forEachIndexed { i, n ->
+                val on = i == current
+                Text(
+                    n,
+                    color = if (on) FilmTheme.OnAccent else FilmTheme.CreamDim,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (on) FilmTheme.Accent else Color.Transparent)
+                        .border(
+                            1.dp,
+                            if (on) FilmTheme.Accent else FilmTheme.ChipBorder,
+                            RoundedCornerShape(8.dp),
+                        )
+                        .pressScale(pressedScale = 0.94f, onTap = { onPick(i) })
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
         }
@@ -1409,45 +1716,14 @@ private fun CamParamRow(
 }
 
 /**
- * 展开区（调研 §2.3 C3）：读数 + `EditorSlider` + 「不包含此项」——**全页唯一出现滑杆的地方**。
+ * 预设**编辑面板**（新建态 / 编辑态同一个面板）= **名称 / 分组 / 保存 / 删除**的落点。
  *
- * 「不包含此项」是勾选框的**同义冗余**（调研 §2.6 ③：保留它，避免用户找不到怎么移除）。
- */
-@Composable
-private fun CamParamExpand(
-    param: EditorParam,
-    params: DoubleArray,
-    onEditParam: (EditorParam, Float) -> Unit,
-    onEditFinished: () -> Unit,
-    onRemove: () -> Unit,
-) {
-    // `key(param.key)` ⇒ 换项 / 换预设时重建（[EditorSlider] 内部用 remember 取初值，
-    // 不重建就会沿用上一条参数的读数）。拖动仍然**不写 Compose state**（DragHolder 直通）。
-    key(param.key) {
-        EditorSlider(
-            param = param,
-            params = params,
-            onCommit = onEditParam,
-            onFinished = onEditFinished,
-        )
-    }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(start = 22.dp, bottom = 3.dp),
-    ) {
-        CamPresetActionButton("不包含此项", enabled = true, onTap = onRemove)
-    }
-}
-
-/**
- * 预设**编辑面板**（新建态 / 编辑态同一个面板）= 用户诉求的"配置面板"。
- *
- * 内容：**名称 / 分组输入框** + **分组勾选树**（★ PS-5：勾选决定"包含哪些参数"，点开某一行才出
- * 滑杆，见 [CamParamCheckTree]）+ 底部动作：
+ * ★ PS-6a：参数区改成**常用参数**（与详情卡**共用** [PresetQuickAdjustPanel]，一处实现两处调用）
+ * —— 新建态也能调参数（用户 2026-10-11 投诉过"新建预设时参数不可配置"），逐项参数（35 条）走
+ * 「完整参数 >」（PS-6b）。底部动作：
  *  - **新建态**（`p == null`）：「保存当前相机参数为新预设」（[newCameraPresetFrom]：当前预设 +
  *    当前改动，含 `[0]` 曝光偏移）+ 「取消」；
- *  - **编辑态**：「**保存到预设**」（把改动写进这条预设，含移除项与曝光偏移；无改动 ⇒ 置灰）、
+ *  - **编辑态**：「**保存到预设**」（把改动写进这条预设，含曝光偏移与 `[34]` 强度；无改动 ⇒ 置灰）、
  *    「从当前相机参数更新」（整包重写）、「保存名称 / 分组」、
  *    「**恢复默认**」（仅内置：删掉覆盖层回到出厂定义；改过才可点）、「删除」
  *    （**内置唯一受限的动作** —— 置灰 + 一句实话）。
@@ -1458,13 +1734,14 @@ private fun CameraPresetEditorPanel(
     p: EditorPreset?,
     /** ★ PS-3：滑杆的**归属**预设 —— 编辑态 = 那条预设；新建态 = 当前生效的预设 */
     target: EditorPreset,
-    /** 参数表的数据源（= 预设记录 − 移除 + 用户设的值） */
-    slots: Map<Int, Double>,
     /** 滑杆读写数组（= `cameraPresetParams(target, values, removed)`） */
     params: DoubleArray,
-    /** 该 target 的未保存改动（null = 没有） */
-    overrides: CameraParamOverrides?,
-    lut: PresetLutLine?,
+    /** `[34]` 的当前值（未保存改动 → 预设自己的 → 新建态的当前相机值） */
+    lutStrength: Float,
+    /** 有没有 LUT（新建态 = 当前相机选的；编辑态 = 这条预设的）⇒ 决定滤镜强度滑杆出不出现 */
+    hasLut: Boolean,
+    /** 有没有未保存的改动（「保存到预设」可点 / 「恢复默认」叠加判据） */
+    hasChanges: Boolean,
     name: String,
     onName: (String) -> Unit,
     group: String,
@@ -1475,8 +1752,10 @@ private fun CameraPresetEditorPanel(
     hasOverride: Boolean,
     onEditParam: (EditorParam, Float) -> Unit,
     onEditFinished: () -> Unit,
-    /** ★ PS-5：勾选 / 取消勾选一组槽（勾选框 / 组头三态框 / 全选 / 全不选 / 「不包含此项」共用） */
-    onChecked: (List<Int>, Boolean) -> Unit,
+    /** ★ PS-6a：档位按钮（点一下写值 + **立即提交**，不是拖动通路） */
+    onPickLevel: (EditorParam, Float) -> Unit,
+    /** ★ PS-6a：「完整参数 >」—— 打开完整参数页（PS-6b 的实现） */
+    onOpenFullEdit: () -> Unit,
     onBack: () -> Unit,
     onSaveNew: () -> Unit,
     onUpdate: () -> Unit,
@@ -1486,10 +1765,12 @@ private fun CameraPresetEditorPanel(
     onDelete: () -> Unit,
 ) {
     val isNew = p == null
-    val hasChanges = overrides != null && !overrides.isEmpty
     Column(
         Modifier
             .fillMaxWidth()
+            // 限高 + 可滚：编辑面板与 LUT tab 共用一个高度预算（窄屏 / 大字号下不该被裁掉）
+            .heightIn(max = 430.dp)
+            .verticalScroll(rememberScrollState())
             .padding(top = 8.dp),
     ) {
         // ① 标题：返回 + 面板身份（新建 / 编辑）
@@ -1530,34 +1811,30 @@ private fun CameraPresetEditorPanel(
             Spacer(Modifier.width(8.dp))
             CamPresetField(group, onGroup, "分组（可空）", Modifier.weight(1f))
         }
-        // ③ 分组勾选树（★ PS-5）+ 两行说明"这一页怎么用"（写在界面上，不靠用户猜）
+        // ③ 常用参数（★ PS-6a，与详情卡共用同一个组件）+ 逐项参数的入口（PS-6b 的完整参数页）
         Text(
-            // 勾选 = 包含哪些参数；点行体 = 展开那一项的滑杆（一次一项）
-            "☑ 勾选 = 这条预设包含它 · 点行体展开滑杆（拖动即时生效、未保存不写入预设）",
+            "拖动即时生效、未保存不写入预设 · 逐项参数（35 条）在「完整参数」里调",
             color = FilmTheme.CreamDim,
             fontSize = 10.sp,
             maxLines = 2,
             modifier = Modifier.padding(top = 5.dp),
         )
-        Text(
-            // 稀疏语义的**实话**：值 = 基准的项在保存时会被稀疏化丢掉（调研 §2.5 I3 —— 相机链路里
-            // 它与"不包含"没有任何可观察差异），未勾选的项套用时保持不动
-            "保存时值等于基准的项自动不写入 · 未勾选的项套用时保持不动",
-            color = FilmTheme.CreamDim,
-            fontSize = 10.sp,
-            maxLines = 2,
-            modifier = Modifier.padding(top = 1.dp),
-        )
-        CamParamCheckTree(
-            slots = slots,
-            params = params,
+        PresetQuickAdjustPanel(
             presetId = target.id,
+            params = params,
+            lutStrength = lutStrength,
+            hasLut = hasLut,
             onEditParam = onEditParam,
             onEditFinished = onEditFinished,
-            onChecked = onChecked,
-            lut = lut,
-            maxHeight = 150.dp,
+            onPickLevel = onPickLevel,
         )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp),
+        ) {
+            CamPresetActionButton("完整参数 >", enabled = true, onTap = onOpenFullEdit)
+        }
         // ④ 动作：横向可滚（中文按钮在窄屏上放不下时不该被裁掉）
         Row(
             Modifier
@@ -1590,7 +1867,7 @@ private fun CameraPresetEditorPanel(
         // 两个保存动作的差别（用户不必猜）：一句话说清，避免"点了没反应"的错觉
         if (!isNew) {
             Text(
-                "「保存到预设」写入本次改动（含移除项与曝光偏移）·「从当前相机参数更新」整包重写（不含曝光偏移）",
+                "「保存到预设」写入本次改动（含曝光偏移与 LUT 强度）·「从当前相机参数更新」整包重写（不含曝光偏移）",
                 color = FilmTheme.CreamDim,
                 fontSize = 10.sp,
                 maxLines = 2,

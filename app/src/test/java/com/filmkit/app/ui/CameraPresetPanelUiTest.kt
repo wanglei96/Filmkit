@@ -357,20 +357,19 @@ class CameraPresetPanelUiTest {
     }
 
     /**
-     * **能力可见性哨兵**：拍照界面这一层必须真的渲染"菜单 / 实话 / 摘要 / 完整清单 / 默认名"——
-     * 它们是本次投诉五条的落点，任何一处被删掉都该红（而不是靠肉眼在 2700 行里找）。
+     * **能力可见性哨兵**：拍照界面这一层必须真的渲染"菜单 / 实话 / 摘要 / 详情卡 / 常用参数"——
+     * 任何一处被删掉都该红（而不是靠肉眼在 2000 行里找）。
      *
-     * ★ **PS-5 口径变更**（用户："预设面板交互逻辑太差，**全是滑杆**"）：参数区从"全量清单 +
-     * 每项一条滑杆"（`CamPresetParamList`）重做成**分组勾选树**（`CamParamCheckTree`）⇒
-     * 本哨兵的期望函数名同步如下（逐条理由见 `docs/reports/ps5-preset-checkbox-tree-REPORT.md`）：
-     *  - **保留**：`cameraParamSections(`（树的数据源不变，仍是"槽位级 + 分组"的唯一维护点）、
-     *    `cameraParamAdjustabilityNote(`（不可调项的原因小字，I6）；
-     *  - **新增**：`CamParamCheckTree(`（勾选树本体）、`CamParamRow(`（`☑ + 名称 + 值` 一行）、
-     *    `CamParamExpand(`（**全页唯一出现滑杆的地方**）、`SectionTriCheck(`（组头三态框）、
-     *    `CheckAllRow(`（`[全选] / [全不选]`）、`cameraTreeSlots(`（展示哪些槽）、
-     *    `sectionCheckState(` / `checkSlots(` / `uncheckSlots(`（勾选口径的纯逻辑）、
-     *    `showsSliderRow(`（**"未勾选的行不渲染滑杆"的机器判据**）；
-     *  - **移除**：无（旧名字里其余各项都还在用）。
+     * ★ **PS-6a 口径变更**（用户 2026-10-12："预设参数勾你妈的勾选，丑死……点击预设按图 2 那样
+     * 展示，并提供几个常用参数调节"）：参数区从**分组勾选树**换成**详情卡 + 常用参数**
+     * ⇒ 期望函数名同步如下（逐条理由见 `docs/reports/ps6a-preset-mainview-REPORT.md`）：
+     *  - **保留**：`presetMenuItems(` / `presetReadOnlyNote(` / `presetSummaryText(` /
+     *    `presetEditorButtons(` / `defaultPresetName(`（列表、菜单、编辑面板的既有落点一位未动）；
+     *  - **新增**：`presetOverviewRows(`（当前搭配清单）、`presetOverviewText(`（描述段落）、
+     *    `presetQuickPath(`（"点了有没有反应"的判据）、`GrainLevel` / `QUICK_LEVEL_PARAMS`（档位）、
+     *    `CameraPresetDetailCard(` / `PresetQuickAdjustPanel(` / `QuickLevelChips(`（新控件）、
+     *    `saveSlotsWithLutStrength(`（`[34]` 的保存口径）、`onOpenFullEdit`（与 PS-6b 的接口）；
+     *  - **移除**：勾选树的全部符号（见下一条反向哨兵）。
      */
     @Test
     fun cameraPanelRendersEveryCapabilityWithoutRewritingTheLogic() {
@@ -380,71 +379,72 @@ class CameraPresetPanelUiTest {
             "presetReadOnlyNote(",     // 内置只读那句实话
             "presetSummaryText(",      // 每行的参数摘要
             "presetEditorButtons(",    // 新建态 / 编辑态的按钮差异（★ PS-3：内置只有删除受限）
-            "cameraParamSections(",    // ★ PS-3：参数表数据源（全量 / 分组，PS-5 起喂给勾选树）
-            "cameraParamAdjustabilityNote(", // ★ PS-3：不可调项的原因（不做假滑杆）
             "defaultPresetName(",      // 新建时的默认名（不必先填名字）
-            // ── ★ PS-5：分组勾选树（参数区重做后的新落点）────────────────────────
-            "CamParamCheckTree(",      // C1：勾选树本体
-            "CamParamRow(",            // C2：☑/☐ + 参数名 + 值/「—」
-            "CamParamExpand(",         // C3：展开区（唯一出现 EditorSlider 的地方）
-            "SectionTriCheck(",        // C4：组头三态框
-            "CheckAllRow(",            // C5：[全选] / [全不选]
-            "cameraTreeSlots(",        // 展示哪些槽（全量 + 「—」）
-            "sectionCheckState(",      // 三态判据
-            "checkSlots(",             // 勾选 = 加入
-            "uncheckSlots(",           // 取消勾选 = 移除
-            "showsSliderRow(",         // ★ 机器判据：未勾选的行不渲染滑杆
+            // ── ★ PS-6a：图 2 的详情卡 + 用户点名的 5 项常用参数 ──────────────────
+            "presetOverviewRows(",     // 当前搭配（两列只读清单）
+            "presetOverviewText(",     // 描述段落（可展开收起）
+            "presetQuickPath(",        // ★ 判据：清单里每一项点下去有没有反应
+            "quickAdjustLabelOf(",     // 提示文案里的档位名（颗粒 / 柔光 / 光晕 / 暗角 / 滤镜强度）
+            "GrainLevel",              // 颗粒四档（关 / 细 / 中 / 粗）
+            "QUICK_LEVEL_PARAMS",      // 柔光 / 光晕 / 暗角三行档位
+            "GLOW_LEVEL_PARAM", "HALO_LEVEL_PARAM", "VIGNETTE_LEVEL_PARAM",
+            "CameraPresetDetailCard(", // 详情卡本体（图 2）
+            "PresetQuickAdjustPanel(", // 常用参数区（详情卡与编辑面板共用）
+            "QuickLevelChips(",        // 档位按钮一行
+            "saveSlotsWithLutStrength(", // `[34]` LUT 强度保存回 lutStrength
+            "afterLutStrengthEdit(",   // `[34]` 记账（recipe 比对对它会丢账）
+            "onOpenFullEdit",          // ★ 与 PS-6b 的接口（完整参数页）
         )) {
             assertTrue("CameraPresetPanel.kt 少了 $fn ⇒ 某条能力被藏起来了", panel.contains(fn))
         }
         // 「+ 新建预设」常驻 + 「⋯」按钮字面（用户看得见的入口）
         assertTrue(panel.contains("+ 新建预设"))
         assertTrue(panel.contains("⋯"))
+        // ★ 反向哨兵：用户 2026-10-12 明确否决的**勾选树**符号一个都不许回来（带括号 ⇒ 不会
+        //   误伤 KDoc 里的历史说明）
+        for (dead in listOf(
+            "CamParamCheckTree(", "CheckAllRow(", "SectionTriCheck(", "CamParamRow(", "CamParamExpand(",
+            "checkSlots(", "uncheckSlots(", "removeSlot(", "sectionCheckState(",
+            "checkBoxText(", "triCheckText(", "cameraTreeSlots(", "showsSliderRow(",
+            "☑", "☐", "▣", "不包含此项", "全不选",
+        )) {
+            assertFalse("「$dead」是用户明确否决的勾选树残留 ⇒ 不许回来", panel.contains(dead))
+        }
     }
 
     /**
-     * ★ PS-5 **机器判据①（源码侧）**：进入预设详情，**首屏可见滑杆数 = 0**
-     *（调研 `preset-panel-interaction-RESEARCH.md` §2.7 判据 5）——
-     * "全是滑杆"的观感就是在这一条上被消灭的。
+     * ★ PS-6a：**滑杆只出现在两处**（用户否决赛的是"全是滑杆"与"勾选"，不是"能拖滑杆"）：
+     *  1. 常用参数区里的 **LUT 强度**（用户点名第一项："lut强度"）；
+     *  2. 清单里选中**有滑杆的那一项**时出的**一条**滑杆（一次一项，`presetQuickPath` 守卫）。
      *
-     * 逻辑侧的同一判据（对每一条内置预设 × 每一个槽算一遍）见
-     * [CameraPresetCheckTreeTest.firstScreenOfTheDetailPanelShowsZeroSliders]；这里钉的是**接线**：
-     *  1. 行级展开的初值是 `null`（= 全部收起）；
-     *  2. 全文件**只有一个** `EditorSlider(` 渲染点，且它在 [CamParamExpand] 里；
-     *  3. 那个渲染点的调用被 `showsSliderRow(` 守卫（未勾选 / 没有滑杆 / 没展开 ⇒ 不渲染）。
+     * 同时钉住三处"点了没反应就会假掉"的接线：档位按钮的 `onPick`、「完整参数 >」的
+     * `onOpenFullEdit`、以及滑杆拿到的 `params`（读的是当前生效参数数组）。
      */
     @Test
-    fun firstScreenOfTheDetailPanelHasNoSlider() {
+    fun theDetailCardRendersExactlyTwoSlidersAndEveryTapIsWired() {
         val panel = File("src/main/java/com/filmkit/app/ui/CameraPresetPanel.kt").readText()
-        assertTrue(
-            "行级展开（openKey）的初值必须是 null ⇒ 首屏一条滑杆都不出" +
-                "（注意：本文件里 `editorId` 也是 `mutableStateOf<String?>(null)` ⇒ 必须钉住 openKey 那一行）",
-            Regex("""var openKey by remember\(presetId\)\s*\{\s*mutableStateOf<String\?>\(null\)""")
-                .containsMatchIn(panel),
-        )
         assertEquals(
-            "滑杆渲染点必须唯一（散落在行里 = 又变回「全是滑杆」）",
-            1,
+            "滑杆渲染点只能是两个：常用参数区的 LUT 强度 + 选中项的滑杆（散落 = 又变回「全是滑杆」）",
+            2,
             Regex("""EditorSlider\(""").findAll(panel).count(),
         )
-        val expand = panel.substringAfter("private fun CamParamExpand(").take(1600)
-        assertTrue("唯一的滑杆必须在 CamParamExpand 里", expand.contains("EditorSlider("))
-        val row = panel.substringAfter("private fun CamParamRow(").take(6000)
+        val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").take(4000)
+        assertTrue("LUT 强度滑杆必须在常用参数区里（用户点名的第一项）", quick.contains("EditorSlider("))
         assertTrue(
-            "行的滑杆渲染必须由 showsSliderRow 守卫（未勾选 ⇒ 不渲染）",
-            row.contains("if (showsSliderRow("),
+            "LUT 强度滑杆读的必须是 lutStrength（`[34]` 不进 slots ⇒ 展开数组里是基线 1.0）",
+            quick.contains("it[LUT_STRENGTH_SLOT] = lutStrength.toDouble()"),
         )
-        assertTrue("守卫体内才调 CamParamExpand", row.contains("CamParamExpand("))
+        assertTrue("档位按钮必须真的接上回调（点了有反应）", panel.contains("onTap = { onPick(i) }"))
+        assertTrue("颗粒档位写的是 GrainLevelParam（`[26]` + `[27]` 两个真实槽）", quick.contains("onPickLevel(GrainLevelParam"))
         assertTrue(
-            "没有滑杆的项不注册点击手势（不可点 ⇒ 不是假控件）",
-            row.contains("enabled = param != null"),
+            "选中项的滑杆必须由 presetQuickPath 守卫（两样都没有的项不许出滑杆 = 不做假控件）",
+            panel.contains("presetQuickPath(pickedRow.slot) == PresetQuickPath.SLIDER"),
         )
-        assertTrue("勾选框必须真的接上回调（点了有反应）", row.contains("onTap = onToggleCheck"))
-        assertTrue("组头三态框必须渲染三态字面", panel.contains("triCheckText(state)"))
-        // 接线链：CameraPresetTab 算出 params → 编辑面板 → 勾选树 → 行 → 展开区（滑杆读的就是它）
+        assertTrue("「完整参数 >」必须接上 PS-6b 的回调", panel.contains("onTap = onOpenFullEdit"))
         assertTrue(
-            "勾选树必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",
-            panel.substringAfter("private fun CamParamCheckTree(").take(4000).contains("params = params"),
+            "详情卡必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",
+            panel.contains("params = params"),
         )
+        assertTrue("有未保存改动才出「保存到预设」（调完即存）", panel.contains("if (hasChanges)"))
     }
 }

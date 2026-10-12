@@ -358,39 +358,43 @@ class CameraPresetEditTest {
         )
     }
 
-    // ── ⑦ ★ PS-3 P1：「移除该项」与"未设置"态 ─────────────────────────────────
+    // ── ⑦ ★ PS-6a：没有「移除此项」这个概念之后，等效能力在哪 ──────────────────
 
     /**
-     * 「移除该项」= 这条预设**不再包含**该字段：画面回到基线（合成时不带它），保存后
-     * `slots` 里也没有它（"缺失字段 = 套用时保持不动"）。
+     * ★ PS-6a 口径变更（用户 2026-10-12："预设参数勾你妈的勾选，丑死"）：勾选树连同
+     * 「移除该项」（[CameraParamOverrides.removed] 的 **UI 入口**）一起废弃。**能力没有丢**：
+     * 把一项调回**中性值**再保存 ⇒ 稀疏化把它丢掉 ⇒ 这条预设不再覆盖它（与"缺失字段 = 套用时
+     * 保持不动"逐字同义）。本用例钉住这条替代路径。
      */
     @Test
-    fun removingASlotDropsItFromBothThePreviewAndTheSavedRecipe() {
+    fun draggingASlotBackToNeutralDropsItFromTheSavedRecipe() {
         val p = userPreset("p_1", slots = mapOf(4 to 1.2, 26 to 20.0))
         val none: CameraParamOverrides? = null
-        // 先**改过**这个槽（模拟"拖了一下又决定不要它"），再移除 —— 这样才测得到"移除必须
-        // 同时清掉那条改值"（从空改动集开始移除是测不出来的）
-        val edited = none.afterEdit(p, CAMERA_TUNABLE_SLOT_PARAM.getValue(4), 0.8f)
-        assertTrue("前提：改值已在改动集里", edited.values.containsKey(4))
-        val after = edited.removeSlot(p, 4)
-        assertEquals("移除记在 removed 里", setOf(4), after.removed)
-        assertTrue("移除必须同时清掉那条改值（否则移除会被它覆盖回去 = 假控件）", after.values.isEmpty())
-        assertEquals("画面回到基线（对比度不再是 1.2）", 1.0, cameraPresetParams(p, emptyMap(), after.removed)[4], 1e-9)
-        val slots = cameraPresetSlotsFor(p, after.values, after.removed)
-        assertFalse("保存后这条预设不再包含对比度", slots.containsKey(4))
+        val back = none.afterEdit(p, CAMERA_TUNABLE_SLOT_PARAM.getValue(4), contrastUiOf(1.0))
+        assertTrue("拖回中性值 ⇒ 记下这次调整（与预设原值 1.2 不同 ⇒ 按钮该亮）", back.values.containsKey(4))
+        val slots = cameraPresetSlotsFor(p, back.values, back.removed)
+        assertFalse("保存时值 == 中性基线 ⇒ 被稀疏化丢掉（= 这条预设不再覆盖对比度）", slots.containsKey(4))
         assertEquals("其余字段一位不动", mapOf(26 to 20.0), slots)
     }
 
-    /** 移除之后又给同一个槽设值 ⇒ **撤销那次移除**（用户刚设了值，预设显然又包含它了）。 */
+    /**
+     * [CameraParamOverrides.removed] 的**数据通路仍然有效**（`CameraScreen.previewCameraParams`
+     * 一位未改，PS-5 修的 `effectivePresetEvOffset(..., removed)` 还在）：本卡只是不再从 UI 产生
+     * removed。将来「完整参数」页若需要"不包含某一项"，直接用它即可 —— 这里钉住语义，
+     * 避免通路在无人使用时被当成死代码误删。
+     */
     @Test
-    fun settingAValueAfterRemovalCancelsTheRemoval() {
-        val p = userPreset("p_1", slots = mapOf(4 to 1.2))
-        val none: CameraParamOverrides? = null
-        val removed = none.removeSlot(p, 4)
-        val back = removed.afterEdit(p, CAMERA_TUNABLE_SLOT_PARAM.getValue(4), 0.9f)
-        assertTrue("设过值 ⇒ 不再是「已移除」", back.removed.isEmpty())
-        assertEquals("值进 values", contrastSlotOf(0.9f), back.values.getValue(4), 1e-9)
-        assertEquals("保存后这条预设包含新的对比度", contrastSlotOf(0.9f), cameraPresetSlotsFor(p, back.values, back.removed).getValue(4), 1e-9)
+    fun theRemovalPathStillWorksAtTheDataLayerWithoutAUiEntry() {
+        val p = userPreset("p_1", slots = mapOf(0 to 0.5, 4 to 1.2))
+        val removed = setOf(0, 4)
+        assertEquals("数组回基线", 0.0, cameraPresetParams(p, emptyMap(), removed)[0], 1e-9)
+        assertEquals(
+            "偏移跟着回 0（PS-5 修的那条口径仍在数据层生效）",
+            0.0,
+            effectivePresetEvOffset(p.slots, emptyMap(), removed),
+            1e-9,
+        )
+        assertTrue("保存后两项都不在预设里", cameraPresetSlotsFor(p, emptyMap(), removed).isEmpty())
     }
 
     /**
@@ -466,8 +470,8 @@ class CameraPresetEditTest {
         // ★ PS-3 P0：**新建态也必须能调参数**（用户："新建预设时目前参数居然不可配置？？（参数
         //   点了没反应）"）—— 新建态以当前生效预设为底，参数表同样给滑杆（params 不能为 null）。
         assertTrue(
-            "新建态的参数表必须以当前生效预设为底（否则清单只读 = 用户点不动）",
-            panel.contains("val target = p ?: selected"),
+            "新建态 / 主视图的参数表必须以当前生效预设为底（否则清单只读 = 用户点不动）",
+            panel.contains("val target = editor ?: selected"),
         )
         assertTrue(
             "新建态也要给滑杆（params 恒非 null）",
