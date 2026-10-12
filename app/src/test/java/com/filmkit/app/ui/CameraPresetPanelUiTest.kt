@@ -363,13 +363,16 @@ class CameraPresetPanelUiTest {
      * ★ **PS-6a 口径变更**（用户 2026-10-12："预设参数勾你妈的勾选，丑死……点击预设按图 2 那样
      * 展示，并提供几个常用参数调节"）：参数区从**分组勾选树**换成**详情卡 + 常用参数**
      * ⇒ 期望函数名同步如下（逐条理由见 `docs/reports/ps6a-preset-mainview-REPORT.md`）：
-     *  - **保留**：`presetMenuItems(` / `presetReadOnlyNote(` / `presetSummaryText(` /
-     *    `presetEditorButtons(` / `defaultPresetName(`（列表、菜单、编辑面板的既有落点一位未动）；
-     *  - **新增**：`presetOverviewRows(`（当前搭配清单）、`presetOverviewText(`（描述段落）、
-     *    `presetQuickPath(`（"点了有没有反应"的判据）、`GrainLevel` / `QUICK_LEVEL_PARAMS`（档位）、
-     *    `CameraPresetDetailCard(` / `PresetQuickAdjustPanel(` / `QuickLevelChips(`（新控件）、
-     *    `saveSlotsWithLutStrength(`（`[34]` 的保存口径）、`onOpenFullEdit`（与 PS-6b 的接口）；
-     *  - **移除**：勾选树的全部符号（见下一条反向哨兵）。
+     *  - **保留**：`presetMenuItems(` / `presetReadOnlyNote(` / `presetEditorButtons(` /
+     *    `defaultPresetName(`（菜单、编辑面板的既有落点一位未动）；
+     *  - ★ **PS-8 口径变更**（用户 2026-10-12/13："UI 做得太丑了重新设计一下，**预设改成横向滚动**。
+     *    **第一级页面不需要提供全部参数**"）：一级页从"详情卡 + 当前搭配清单"换成
+     *    **横向预设条 + 一行滑杆 + 四行分段控件** ⇒ 期望函数名同步为
+     *    `presetStripItems(` / `presetStripBadge(` / `presetSubtitleText(` / `PresetStrip(` /
+     *    `PresetStripCard(` / `PresetNewCard(` / `PresetParamSliderRow(` / `PresetLevelSegments(`
+     *    （逐条理由见 `docs/reports/ps8-preset-ui-redesign-REPORT.md`）；
+     *  - **移除**：勾选树的全部符号（见下一条反向哨兵）+ 清单形态的符号
+     *    （反向哨兵在 [Ps7PresetPanelLayoutTest]）。
      */
     @Test
     fun cameraPanelRendersEveryCapabilityWithoutRewritingTheLogic() {
@@ -377,26 +380,22 @@ class CameraPresetPanelUiTest {
         for (fn in listOf(
             "presetMenuItems(",        // 「⋯」菜单
             "presetReadOnlyNote(",     // 内置只读那句实话
-            "presetSummaryText(",      // 每行的参数摘要
             "presetEditorButtons(",    // 新建态 / 编辑态的按钮差异（★ PS-3：内置只有删除受限）
             "defaultPresetName(",      // 新建时的默认名（不必先填名字）
-            // ── ★ PS-6a：图 2 的详情卡 + 用户点名的 5 项常用参数 ──────────────────
-            "presetOverviewRows(",     // 当前搭配（两列只读清单）
-            "presetOverviewText(",     // 描述（★ PS-7：一行真实信息；没有 ⇒ null 不显示）
-            "presetQuickPath(",        // ★ 判据：清单里每一项点下去有没有反应
-            // ── ★ PS-7：详情卡"点得动 + 首屏可见"的判据 / 预算 / 值位口径 ──────────────
-            "presetRowTap(",           // 三态反应（档位高亮 / 滑杆 / 原因小字）—— 没有第四态
-            "PresetRowTap",            // 三态枚举（不许出现"点了什么都不做"的分支）
-            "presetPanelBudget(",      // 详情卡与列表的同屏高度预算
-            "presetOverviewMaxHeightDp(", // 清单限高（3 行 ↔ 8 行）
-            "presetRowValueText(",     // 值位只放真实值（没有 ⇒ 「—」）
-            "quickAdjustLabelOf(",     // 提示文案里的档位名（颗粒 / 柔光 / 光晕 / 暗角 / 滤镜强度）
+            // ── ★ PS-8：一级页的新形态（横向条 + 一行副标题 + 分段控件）──────────────
+            "presetStripItems(",       // 横向条的顺序 / 选中 / 小标记（纯函数判据）
+            "presetStripBadge(",       // `内置` / `已改` / 分组 的小标记（一行）
+            "presetSubtitleText(",     // 一行副标题（没有真实信息 ⇒ null ⇒ 整行不渲染）
+            "PRESET_STRIP_HEIGHT_DP",  // 横向条高度（≤ 72dp 的克制口径）
+            "PresetStrip(",            // 横向条本体（LazyRow）
+            "PresetStripCard(",        // 横向卡片（点 = 套用 / 长按 = 详情 / ⋯ = 菜单）
+            "PresetNewCard(",          // 条首「＋ 新建预设」
+            "PresetParamSliderRow(",   // 一行滑杆（标签 │ 滑杆 │ 等宽数值）
+            "PresetLevelSegments(",    // 四档分段控件（等宽均分 + 选中填充强调色）
             "GrainLevel",              // 颗粒四档（关 / 细 / 中 / 粗）
             "QUICK_LEVEL_PARAMS",      // 柔光 / 光晕 / 暗角三行档位
             "GLOW_LEVEL_PARAM", "HALO_LEVEL_PARAM", "VIGNETTE_LEVEL_PARAM",
-            "CameraPresetDetailCard(", // 详情卡本体（图 2）
-            "PresetQuickAdjustPanel(", // 常用参数区（详情卡与编辑面板共用）
-            "QuickLevelChips(",        // 档位按钮一行
+            "PresetQuickAdjustPanel(", // 常用参数区（一级页与编辑面板共用）
             "saveSlotsWithLutStrength(", // `[34]` LUT 强度保存回 lutStrength
             "afterLutStrengthEdit(",   // `[34]` 记账（recipe 比对对它会丢账）
             "onOpenFullEdit",          // ★ 与 PS-6b 的接口（完整参数页）
@@ -419,39 +418,37 @@ class CameraPresetPanelUiTest {
     }
 
     /**
-     * ★ PS-6a：**滑杆只出现在两处**（用户否决赛的是"全是滑杆"与"勾选"，不是"能拖滑杆"）：
-     *  1. 常用参数区里的 **LUT 强度**（用户点名第一项："lut强度"）；
-     *  2. 清单里选中**有滑杆的那一项**时出的**一条**滑杆（一次一项，`presetQuickPath` 守卫）。
+     * ★ PS-8：**一级页只有一条滑杆**（常用参数区的 LUT 强度）—— 用户砍掉清单后，"选中项滑杆"
+     * 随之消失；其余四档是**分段控件**（不是滑杆，也不是散落的小 chip）。
      *
-     * 同时钉住三处"点了没反应就会假掉"的接线：档位按钮的 `onPick`、「完整参数 >」的
+     * 同时钉住三处"点了没反应就会假掉"的接线：分段控件的 `onPick`、「完整参数 >」的
      * `onOpenFullEdit`、以及滑杆拿到的 `params`（读的是当前生效参数数组）。
      */
     @Test
-    fun theDetailCardRendersExactlyTwoSlidersAndEveryTapIsWired() {
+    fun theQuickAdjustBlockRendersExactlyOneSliderAndEveryTapIsWired() {
         val panel = File("src/main/java/com/filmkit/app/ui/CameraPresetPanel.kt").readText()
         assertEquals(
-            "滑杆渲染点只能是两个：常用参数区的 LUT 强度 + 选中项的滑杆（散落 = 又变回「全是滑杆」）",
-            2,
-            Regex("""EditorSlider\(""").findAll(panel).count(),
+            "滑杆渲染点只能有一个：常用参数区的 LUT 强度（四档 = 分段控件）",
+            1,
+            Regex("""RelativeSlider\(""").findAll(panel).count(),
+        )
+        assertFalse(
+            "ParamControls 的 EditorSlider（读数在上 + 满宽 + 16dp 内边距）不再用于一级页",
+            panel.contains("EditorSlider("),
         )
         val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").take(4000)
-        assertTrue("LUT 强度滑杆必须在常用参数区里（用户点名的第一项）", quick.contains("EditorSlider("))
+        assertTrue("LUT 强度滑杆必须在常用参数区里（用户点名的第一项）", quick.contains("PresetParamSliderRow("))
         assertTrue(
             "LUT 强度滑杆读的必须是 lutStrength（`[34]` 不进 slots ⇒ 展开数组里是基线 1.0）",
             quick.contains("it[LUT_STRENGTH_SLOT] = lutStrength.toDouble()"),
         )
         assertTrue("档位按钮必须真的接上回调（点了有反应）", panel.contains("onTap = { onPick(i) }"))
         assertTrue("颗粒档位写的是 GrainLevelParam（`[26]` + `[27]` 两个真实槽）", quick.contains("onPickLevel(GrainLevelParam"))
-        assertTrue(
-            "★ PS-7：选中项的滑杆必须由三态判据守卫（presetRowTap == SLIDER ⇒ 才出滑杆；" +
-                "LEVEL / NOTE 两态各有别的可见反应，见 Ps7PresetPanelLayoutTest）",
-            panel.contains("pickedTap == PresetRowTap.SLIDER"),
-        )
         assertTrue("「完整参数 >」必须接上 PS-6b 的回调", panel.contains("onTap = onOpenFullEdit"))
         assertTrue(
-            "详情卡必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",
+            "常用参数区必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",
             panel.contains("params = params"),
         )
-        assertTrue("有未保存改动才出「保存到预设」（调完即存）", panel.contains("if (hasChanges)"))
+        assertTrue("有未保存改动才出「保存到预设」（调完即存）", panel.contains("if (mine != null && !mine.isEmpty)"))
     }
 }

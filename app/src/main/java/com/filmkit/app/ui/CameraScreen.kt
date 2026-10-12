@@ -11,6 +11,7 @@ import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
@@ -267,6 +268,20 @@ fun CameraScreen(
     // ★ PS-6b：完整参数编辑页（全屏覆盖层）。入口 = 预设面板的「完整参数 >」（PS-6a 的
     // `onOpenFullEdit` 回调：实参在下方 `CameraPresetTab(...)` 调用点、页面挂在本文件末尾）。
     var fullEditOpen by remember { mutableStateOf(false) }
+    // ★ PS-8：**系统返回键分层**（用户 2026-10-12："**一级页面系统返回按钮关闭预设页面，不要直接
+    // 退出 app**"）。本页的覆盖层全是**自绘**（没有 Dialog 窗口替我们消费 back）⇒ 不拦就退出 app。
+    // 优先级 = 从上层到下层的视觉层次（照 `PhotoViewScreen.kt` 的"面板打开时返回键先关面板"）：
+    //   完整参数页（最上）→ 快捷菜单 → LUT / 预设面板（最下）；都没开 ⇒ 不拦（正常退出）。
+    // AlertDialog（分类 / 删除 / ⋯ 菜单）由 Dialog 自己的窗口消费 back，不在此列（不打架）。
+    // 预设**编辑面板**是面板的子态 ⇒ 由 `CameraPresetTab` 内更晚注册的 BackHandler 先接住。
+    BackHandler(enabled = fullEditOpen || quickOpen || lutOpen) {
+        when (cameraBackTarget(fullEditOpen, quickOpen, lutOpen)) {
+            CameraBackTarget.FULL_EDIT -> fullEditOpen = false
+            CameraBackTarget.QUICK_MENU -> quickOpen = false
+            CameraBackTarget.LUT_SHEET -> lutOpen = false
+            null -> Unit
+        }
+    }
     var flashMode by rememberSaveable { mutableIntStateOf(0) }
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
     // 实时直方图（M3）：开关开时 ~7fps 从渲染线程取显示域亮度分布（引擎端 256×96
@@ -2332,6 +2347,26 @@ private fun ticksIso(maxIso: Int): List<Pair<Float, String>> {
  * 本函数只负责"哪个 tab 显示什么"，不认识预设的数据结构（宿主与功能解耦：
  * LUT tab 的筛选 / 导入 / 强度一个字没动）。
  */
+/**
+ * ★ PS-8：**系统返回键该关哪一层**（纯函数 —— UI 与单测读同一份判据，优先级不会两处漂移）。
+ *
+ * 顺序 = 视觉层次（**最上层先关**）：完整参数页 → 快捷菜单 → LUT / 预设面板。
+ * 都没开 ⇒ `null` ⇒ **不拦返回**（面板没开时返回键仍是"退出 app"，一位不改）。
+ */
+internal enum class CameraBackTarget { FULL_EDIT, QUICK_MENU, LUT_SHEET }
+
+/** [CameraBackTarget] 的判据（唯一实现：`CameraScreen` 的 `BackHandler` 与单测都读它）。 */
+internal fun cameraBackTarget(
+    fullEditOpen: Boolean,
+    quickOpen: Boolean,
+    lutOpen: Boolean,
+): CameraBackTarget? = when {
+    fullEditOpen -> CameraBackTarget.FULL_EDIT
+    quickOpen -> CameraBackTarget.QUICK_MENU
+    lutOpen -> CameraBackTarget.LUT_SHEET
+    else -> null
+}
+
 @Composable
 private fun LutSheet(
     tab: Int,

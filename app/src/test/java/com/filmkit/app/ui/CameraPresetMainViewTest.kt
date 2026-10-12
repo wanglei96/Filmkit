@@ -11,8 +11,6 @@ import com.filmkit.app.camera.presetDeletable
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -26,12 +24,15 @@ import org.junit.Test
  *
  *  1. **档位映射**（`GrainLevel` / `QuickLevelParam`）：每个档位的数值有出处（内置预设逐字 /
  *     引擎中性值 / 面板量程），且**写进去必须读得回来**（闭环）；
- *  2. **常用参数清单**（`QUICK_ADJUST_SLOTS` / `presetQuickPath` / `quickAdjustLabelOf`）：
- *     用户点名的 5 项一个不少，且"点了有没有反应"是**可判定**的（不做假控件）；
- *  3. **「当前搭配」清单**（`presetOverviewRows` / `presetOverviewText`）：只读概览的折叠规则
- *     （`颗粒 → 细颗粒 · 数量 20`）与"绝不用当前相机值冒充"；
- *  4. **写值口径**：档位 / 滑杆都经 `EditorParam.write` → `afterEdit` 记账 → 保存回预设
+ *  2. **常用参数清单**（`QUICK_ADJUST_SLOTS`）：用户点名的 5 项一个不少；
+ *  3. **写值口径**：档位 / 滑杆都经 `EditorParam.write` → `afterEdit` 记账 → 保存回预设
  *     （`[34]` LUT 强度必须显式带回 `lutStrength`，否则拖了存不上）。
+ *
+ * ★ **PS-8 口径变更**（用户 2026-10-12/13："**第一级页面不需要提供全部参数，点击查看完整参数
+ * 才提供**"）：一级页原先的「当前搭配」清单连同 `presetOverviewRows` / `presetOverviewText` /
+ * `presetRowTap` 三态判据**整块删除** ⇒ 本文件里盯清单与值位口径的三条用例随之退役（它们守的
+ * 控件已经不存在）；一级页的新形态（横向预设条 / 一行滑杆 / 四行分段控件 / 返回键分层）由
+ * [Ps8PresetUiRedesignTest] 正面钉住，本文件继续守**纯逻辑**：档位映射、写值口径、内置纪律。
  *
  * 真实数据来源 = `app/src/main/assets/presets/builtin.json`（工作目录 = `app/`，与
  * [CameraPresetEditTest] / [CameraPresetPanelUiTest] 同一口径）。
@@ -141,14 +142,14 @@ class CameraPresetMainViewTest {
         }
     }
 
-    // ── ③ 常用参数清单：用户点名的 5 项 + "点了有没有反应"可判定 ────────────────
+    // ── ③ 常用参数清单：用户点名的 5 项（★ PS-8：一级页直接可调的就是这一块）─────────
 
     /**
-     * `QUICK_ADJUST_SLOTS` = 用户点名的 5 项（LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角）。
+     * `QUICK_ADJUST_SLOTS` = 用户点名的 5 项（LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角）—— **一位没少**。
      *
-     * `presetQuickPath` 是"**每个能点的都必须有反应**"的机器判据：常用项 ⇒ QUICK（提示去下面
-     * 哪个档位调）；有滑杆的项 ⇒ SLIDER（下方出那一条滑杆）；两样都没有 ⇒ NONE（**不注册手势**，
-     * 行下写明原因 = `cameraParamAdjustabilityNote`）。
+     * ★ PS-8：一级页已无清单 ⇒ "点了有没有反应"不再由清单承担，而是"每个能调的就是控件本身"
+     * （滑杆 / 分段控件）。本用例只钉"常用清单没被砍"，且每一项都真的在拍照链路上
+     * （`CAMERA_PATH_SLOTS`）—— 渲染与接线见 [Ps8PresetUiRedesignTest]。
      */
     @Test
     fun quickAdjustCoversExactlyTheFiveItemsTheUserNamed() {
@@ -157,97 +158,14 @@ class CameraPresetMainViewTest {
             linkedSetOf(34, 26, 27, 95, 62, 66),
             QUICK_ADJUST_SLOTS,
         )
-        for (s in QUICK_ADJUST_SLOTS) {
-            assertNotNull("[$s] 必须能说清属于哪一项（提示文案要用）", quickAdjustLabelOf(s))
-            assertEquals("[$s] 属于常用项 ⇒ 快捷路径 = QUICK", PresetQuickPath.QUICK, presetQuickPath(s))
+        for (s in setOf(26, 27, 95, 62, 66)) {
+            assertTrue("[$s] 是拍照链路读得到的槽（常用项必须真的能调）", s in CAMERA_PATH_SLOTS)
         }
-        assertEquals("滤镜强度", quickAdjustLabelOf(LUT_STRENGTH_SLOT))
-        assertEquals("颗粒", quickAdjustLabelOf(GRAIN_SIZE_SLOT))
-        assertEquals("柔光", quickAdjustLabelOf(GLOW_LEVEL_PARAM.slot))
-        assertEquals("光晕", quickAdjustLabelOf(HALO_LEVEL_PARAM.slot))
-        assertEquals("暗角", quickAdjustLabelOf(VIGNETTE_LEVEL_PARAM.slot))
-        // 其余项：有滑杆 ⇒ SLIDER；两样都没有 ⇒ NONE **且必须给出原因**（不做假控件）
-        assertEquals(PresetQuickPath.SLIDER, presetQuickPath(4))
-        assertEquals(PresetQuickPath.NONE, presetQuickPath(38))
-        assertNotNull("「白点」没有滑杆 ⇒ 行下必须写明原因", cameraParamAdjustabilityNote(38))
-        assertEquals(PresetQuickPath.NONE, presetQuickPath(69))
-        assertNotNull("拍照链路不读的槽 ⇒ 同样写明原因", cameraParamAdjustabilityNote(69))
-    }
-
-    // ── ④ 「当前搭配」清单（图 2 的只读概览）──────────────────────────────────
-
-    /**
-     * 清单 = **这条预设包含的项**逐行（未包含的项根本不出现 —— "当前搭配"的语义），
-     * 常用项折叠成"档位名 · 数值"（图 2 的 `颗粒 → 中颗粒 · 数量 30`）：
-     *  - 第一行 = 滤镜（LUT 中文名 + 强度）；
-     *  - `[27]` 颗粒尺寸并进 `[26]` 那一行；
-     *  - 档位行（柔光 / 光晕 / 暗角）非关时带数值，关闭时只写「关闭」。
-     */
-    @Test
-    fun overviewRowsFoldLevelsAndNeverShowUnsetSlots() {
-        val p = builtin("徕卡一瞬")
-        val rows = presetOverviewRows(p.slots, presetLutLine(p), "徕卡 M9")
-        assertEquals("图 2 的第一行 = 滤镜（LUT 名 + 强度）", "滤镜", rows.first().label)
-        assertEquals("徕卡 M9 · 30", rows.first().value)
-        val grain = rows.first { it.label == "颗粒" }
-        assertEquals("内置「徕卡一瞬」= 20 ⇒ 细颗粒 + 数量（数值与清单同源）", "细颗粒 · 数量 20", grain.value)
-        assertFalse("颗粒尺寸并进颗粒那一行，不再单出一行", rows.any { it.slot == GRAIN_SIZE_SLOT })
-        val vig = rows.first { it.label == "暗角" }
-        assertEquals("轻微暗角 · 18", vig.value)
-        assertEquals(
-            "一行一槽（[27] 并入颗粒行）+ 滤镜行 ⇒ 行数 = 预设项数 − 1",
-            p.slots.size - 1,
-            rows.count { it.slot != LUT_STRENGTH_SLOT },
+        assertFalse(
+            "[34] LUT 强度**不在**拍照链路白名单里（它由 prefs 的 lut_strength + `[34]` 两路一起写，" +
+                "见 pushEdit）—— 把它当普通滑杆 = 拖了画面不变（PS-6a 踩过）",
+            34 in CAMERA_PATH_SLOTS,
         )
-        assertTrue("空预设 ⇒ 清单为空（UI 显示一句实话）", presetOverviewRows(emptyMap()).isEmpty())
-        // 没给 LUT 中文名 ⇒ 回落 id（资产被删的降级路径），不是空串
-        assertEquals("leica_m9 · 30", presetOverviewRows(p.slots, presetLutLine(p)).first().value)
-    }
-
-    /**
-     * ★ PS-7 口径变更：描述**只留一行真实信息**（项数 · 滤镜名）。
-     *
-     * 用户 2026-10-12 真机截图点名两条：副标题与描述**重复**、描述是**机器拼接**
-     * （`包含 17 项参数（基础调整 / 色彩 / …`——还与副标题的"内置预设 · 分组「徕卡」"逐字重复）。
-     * 现在副标题已说的不再重复，且**没有真实信息就返回 null**（不拼字符串凑）。
-     */
-    @Test
-    fun overviewTextIsOneRealLineAndDisappearsWhenThereIsNothingToSay() {
-        val t = presetOverviewText(builtin("徕卡一瞬"), "徕卡 M9")!!
-        assertEquals("17 项参数 · 滤镜 徕卡 M9", t)
-        assertFalse("副标题已经说过的来源/分组不许在描述里重复：$t", t.contains("内置预设") || t.contains("分组"))
-        assertFalse("机器拼接的分组名清单已删：$t", t.contains("包含 ") || t.contains("基础调整"))
-        // 没有真实信息 ⇒ null（整行不渲染）——"没有真实描述就不显示"
-        assertNull("空预设 + 无滤镜 ⇒ 不显示描述行", presetOverviewText(userPreset("p_2")))
-        assertNull("空预设 + 有滤镜名但预设不含 LUT ⇒ 仍无真实信息", presetOverviewText(userPreset("p_3"), "徕卡 M9"))
-        // 只有一项真实信息时也照实显示（不硬凑第二项）；中文名查不到 ⇒ 回落 lutId
-        assertEquals(
-            "有 LUT 但没有参数 ⇒ 只报滤镜",
-            "滤镜 leica_m9",
-            presetOverviewText(EditorPreset(id = "p_4", name = "预设 p_4", lutId = "leica_m9")),
-        )
-    }
-
-    /**
-     * ★ PS-7：**值位只放真实值**，没有值就「—」——"为什么点不动"的说明走行下小字。
-     *
-     * 用户截图里的 `分离色调 · 暖 → 拍照生效 · 暂无需滑杆` 就是说明混进值位的毛病。
-     */
-    @Test
-    fun overviewRowValueNeverCarriesTheWhyItCannotMoveNote() {
-        assertEquals("暖", presetRowValueText("暖"))
-        assertEquals("—", presetRowValueText(""))
-        assertEquals("—", presetRowValueText("   "))
-        // 值位内容来自 presetDetailSections 的格式化 ⇒ 任何槽都不许把"为什么点不动"的说明当值
-        for (slot in CAMERA_PATH_SLOTS) {
-            val note = cameraParamAdjustabilityNote(slot) ?: continue
-            for (row in presetOverviewRows(mapOf(slot to 1.0))) {
-                assertFalse(
-                    "说明「$note」不许出现在值位（[${row.slot}] = ${row.value}）",
-                    presetRowValueText(row.value).contains(note),
-                )
-            }
-        }
     }
 
     // ── ⑤ 写值口径：档位 / 滑杆 → 预设（含稀疏化与 LUT 强度）────────────────────
