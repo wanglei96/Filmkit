@@ -324,6 +324,46 @@ internal fun pageAlphaAt(isSettledPage: Boolean, fading: Boolean, fade: Float): 
     if (isSettledPage && fading) fade else 1f
 
 /**
+ * ★ PV-3：**这一页有没有资格画 [bitmap]** —— 绘制期的**归属校验**（纯函数，JVM 单测钉死）。
+ *
+ * [bitmap] 是**整页共享**的 state（所有页读同一个），[shownUri] 是它的**归属**（"此刻这张位图
+ * 是哪张照片的像素"）。只有"停稳页 + 归属就是本页"才成立。
+ *
+ * **为什么必须有这道闸（PV-2 的"原子替换"消不掉它）**：[bitmap] 由 key 含 `page` 的
+ * `LaunchedEffect` 写，而 `page`（= `settledPage`）由 Pager 的滚动驱动 —— 两个**独立来源**。
+ * Effect 的重启只有在**重组观察到新 key** 之后才可能发生，而 `Image` 的参数在**组合期**取值
+ * ⇒ **必然存在至少一次组合："读到了新页、而 [bitmap] 还是上一页的像素"**。那一次组合画出来的
+ * 就是用户真机看到的"左右滑已经显示下一张图了，上一张图还是会闪现一下"。把 effect 写得多原子
+ * 都消不掉这个窗口（PV-2 的原子替换只保证了它不画 null ⇒ 转圈没了，留下的是旧图）。
+ *
+ * 判据只有一条，三个调用点共用（位图 / 下层 `under` / 淡入 alpha）：**"是不是本页的像素"
+ * 决定画不画**，而不是"p 是不是停稳页"。与 [pageScaleAt] / [pageShiftAt] 是同一道闸的精神
+ * （那边管的是"放大/平移不能漏给邻页"，这边管的是"像素不能漏给邻页"）。
+ */
+internal fun bitmapBelongsToPage(
+    isSettledPage: Boolean,
+    pageUri: String?,
+    shownUri: String?,
+): Boolean = isSettledPage && pageUri != null && pageUri == shownUri
+
+/**
+ * ★ PV-3：**这一页这一帧到底画哪张位图**（纯函数）。归属相符 ⇒ [bitmap]；否则 ⇒ [cached]
+ * （这一页**自己的**预载档，通常是主动预载 `page±[PRELOAD_RADIUS]` 的结果；没有就是 null
+ * ⇒ 纯黑底，配合 [SPINNER_DELAY_MS] 不画转圈）。
+ *
+ * 关键：切页的那一帧（`page` 已经变了、[bitmap] 还是上一页的）**画的是新页的预载档**，
+ * 而不是旧页的像素，也不是黑底 —— 下一帧解码 effect 把 [bitmap] 也换成**同一个对象**
+ * （`previews.get(u)`），前后两帧逐像素相同 ⇒ 用户看到的是"新图（预览档）直接接上新图"。
+ */
+internal fun <B> visibleBitmapFor(
+    isSettledPage: Boolean,
+    pageUri: String?,
+    shownUri: String?,
+    bitmap: B?,
+    cached: B?,
+): B? = if (bitmapBelongsToPage(isSettledPage, pageUri, shownUri)) bitmap else cached
+
+/**
  * 照片查看页（ADR-15，E2-13）：**网格点开先到这一页**，点「编辑」才进编辑器；编辑器退出
  * （取消 / 系统返回）回到本页 —— 用户 2026-10-09 明确要求"取消后应该回到照片查看页"。
  *
@@ -370,6 +410,24 @@ internal fun pageAlphaAt(isSettledPage: Boolean, fading: Boolean, fade: Float): 
  * 淡入本身**保留**（只在静止时可见，仍有抹平清晰度过渡的价值）；手势 / 缩放边界 / 页裁剪
  * （[viewerGesture] / [clampZoom] / [clampPan] / [pageScaleAt] / [pageShiftAt] / `clipToBounds` /
  * `userScrollEnabled`）**一行未改**。
+ *
+ * ★ **PV-3 修**（用户 2026-10-11 真机复测 v0.11.19："**没有转圈了，但是左右滑已经显示下一张图了，
+ * 上一张图还是会闪现一下**"）：转圈（PV-2 ①）确实没了，但**同一处时序缺口换了个面** —— 过去是
+ * "新页位置上画 null ⇒ 转圈"，现在是"新页位置上画**上一张的像素** ⇒ 旧图闪现"。PV-2 的
+ * "原子替换"只保证了**不会画 null**，没有（也**不可能**）保证**不会画旧值**。
+ *
+ * 根因：[bitmap] 是**整页共享**的 state，由 key 含 `page` 的 `LaunchedEffect` 写；而 `page`
+ * （= `settledPage`）由 Pager 的滚动驱动 —— 它在**滚动结束那一帧**才从旧页跳到新页
+ *（`isScrollInProgress` 期间冻结在上一次滚动的页）。Effect 的重启必然晚于"重组第一次读到新
+ * `page`"，而 `Image` 的参数在**组合期**取值 ⇒ **必然存在至少一帧："新页已选中、[bitmap]
+ * 还是上一页的像素"** ⇒ 那一帧画在视口正中的就是上一张的图（Pager 的位移已经把新页摆好了，
+ * 所以用户看到的是"新页已经显示出来，旧图又闪一下"）。
+ *
+ * 修法：绘制期**归属校验**（[bitmapBelongsToPage] / [visibleBitmapFor]）—— 停稳页**只画属于
+ * 这一页的位图**（判据 = [shownUri]），归属不符时退回该页**自己的预载档**（主动预载命中 ⇒
+ * 那一帧直接是新图；未命中 ⇒ 黑底，仍不画旧图）。`under` 层与淡入 alpha 共用同一道闸
+ * （`pageAlphaAt(owns, …)`）；缩放/平移的页判据（[pageScaleAt] / [pageShiftAt] 的调用参数）
+ * **逐位未改**。
  *
  * ★ **E2-23 修**（用户 2026-10-13 报："相册放大图片隔壁图片会入侵视野"）：E2-22 的
  * `beyondViewportPageCount = 1` 让相邻页被组合/绘制，而 `zoom` / `pan` 是**整页共享**的
@@ -843,14 +901,19 @@ fun PhotoViewScreen(
                         // 是错的** —— 放大态下 Pager 只是不滚，相邻页照样被组合/绘制，而 zoom/pan
                         // 是整页共享的 state ⇒ 邻页被一起放大后越界画进视口（见 [pageScaleAt]）。
                         // ★ PV-2：这里不再自己解码，只读预载缓存（见 [rememberNeighborPreview]）。
-                        val neighbor = if (p == page) {
-                            null
-                        } else {
-                            uris.getOrNull(p)?.let {
-                                rememberNeighborPreview(previews, it, previewsVersion)
-                            }
+                        // ★ PV-3：**位图要校验归属**（见 [visibleBitmapFor]）。`bitmap` 是整页共享
+                        // 的 state，而它由 key 含 `page` 的 effect 写 ⇒ "重组第一次读到新 `page`"
+                        // 的那一帧它还是**上一张的像素**（用户真机："左右滑已经显示下一张图了，
+                        // 上一张图还是会闪现一下"）。归属不符 ⇒ 画这一页**自己的**预载档
+                        // （通常命中主动预载 ⇒ 那一帧直接是新图），**绝不画旧页的像素**。
+                        // 停稳页也要读缓存：切页那一帧它就是靠这份预载档接上的。
+                        val pageUri = uris.getOrNull(p)
+                        val cached = pageUri?.let {
+                            rememberNeighborPreview(previews, it, previewsVersion)
                         }
-                        val b = if (p == page) bitmap else neighbor
+                        // 位图 / 下层 `under` / 淡入 alpha 共用这一条判据（缩放平移的判据不变）
+                        val owns = bitmapBelongsToPage(p == page, pageUri, shownUri)
+                        val b = visibleBitmapFor(p == page, pageUri, shownUri, bitmap, cached)
                         when {
                             p == page && error.isNotEmpty() ->
                                 Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
@@ -858,7 +921,10 @@ fun PhotoViewScreen(
                                 // ★ PV-1：下层 = 被换下去的那张（只有同页升档才有，切页恒为 null）。
                                 // 它必须用**同一个** [viewerLayer] 变换 —— 缩放态下两层错位就是重影，
                                 // 比原来的闪更难查。contentDescription 留空：它是装饰层，不是内容。
-                                if (p == page) under?.let { u ->
+                                // ★ PV-3：`under` 也是**整页共享**的 state，同样要过归属校验 ——
+                                // 切页那一帧 `under` 可能还是上一页的（清它的是 effect，异步），
+                                // 只判 `p == page` 就会把上一张的像素画到新页上（旧图闪现的第二条路径）。
+                                if (owns) under?.let { u ->
                                     Image(
                                         bitmap = u.asImageBitmap(),
                                         contentDescription = null,
@@ -881,8 +947,12 @@ fun PhotoViewScreen(
                                     // 而相邻页没有下层兜底 ⇒ 半透明压在黑底上 ⇒ 整片图片区变暗（用户报的
                                     // "屏幕闪烁"）。判据是 `under != null`（不是 `fade < 1`），
                                     // 原因见 [pageAlphaAt]。
+                                    // ★ PV-3：闸门参数从 `p == page` 收紧成 `owns`（归属校验）——
+                                    // 切页那一帧 `under` 可能还是上一页的、`fade` 可能停在中间值，
+                                    // 只判 `p == page` 会让**新页的预载档**半透明地压在黑底上（变暗一闪）。
+                                    // 几何判据（[pageScaleAt] / [pageShiftAt]）仍然是 `p == page`，未改。
                                     modifier = Modifier.viewerLayer(p == page, zoom, pan) {
-                                        pageAlphaAt(p == page, under != null, fade.value)
+                                        pageAlphaAt(owns, under != null, fade.value)
                                     },
                                 )
                             }
@@ -1078,6 +1148,12 @@ private fun Modifier.viewerLayer(
  *
  * **只在 `p != page` 时调用** —— 当前页由主解码负责。取不到就返回 null，调用方保持黑底
  *（相邻页不值得显示错误文案）。
+ *
+ * ★ PV-3 更正：**停稳页现在也调用它**（`p == page` 时）—— 切页那一帧 [bitmap] 还是上一页的
+ * 像素，[visibleBitmapFor] 的归属校验会把它挡掉，此时这一页要画的正是这里的预载档
+ *（主动预载 `page±[PRELOAD_RADIUS]` 命中 ⇒ 那一帧直接是新图）。原判据"当前页由主解码负责"
+ * 说的是**生产**（谁解这张图），不是**显示**（这一帧画哪张）：生产仍然只有主解码与主动预载两条路，
+ * 这里始终是零解码、零 IO 的纯读取。
  */
 @Composable
 private fun rememberNeighborPreview(
