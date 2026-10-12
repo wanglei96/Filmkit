@@ -137,9 +137,21 @@ internal fun presetEvOffset(slots: Map<Int, Double>): Double = slots[0] ?: 0.0
  * （`baseEvPref` / `evSteps`），由 `effectiveExposureEv` 在引擎侧叠加。本函数只回答
  * "这条预设要额外偏移多少 EV" ⇒ 保存回预设时写进 `slots[0]` 的也正是这个数
  *（[cameraPresetSlotsFor]），**不会**把拍摄态混进风格（U-7 的纪律不变）。
+ *
+ * ★ **PS-5 补一个参数 [removed]**：用户从这条预设里**取消勾选**曝光项（= 移除该字段，与
+ * [cameraPresetSlotsFor] 的 `removed` 同一个集合）⇒ 偏移必须是 **0**，不能继续用 `slots[0]`。
+ *
+ * 为什么必须补：`setFilmParams` 会把 `p[0]` 整槽覆盖成 `base + 用户 EV + evOffset` ⇒ 只把
+ * `[0]` 写进数组（= 基线 0.0）而 evOffset 仍传预设原值时，**画面曝光根本不会回基线** ——
+ * 用户点「取消勾选曝光」/「全不选」看到的将是"点了没反应"（ADR-12 的假控件），
+ * 而调研 §2.4 #2/#11 明确要求"该参数**立即**回基线"。
+ *（数组与 evOffset 两份口径必须一致，这是 PS-3 就写下的纪律。）
  */
-internal fun effectivePresetEvOffset(slots: Map<Int, Double>, overrides: Map<Int, Double>): Double =
-    overrides[0] ?: presetEvOffset(slots)
+internal fun effectivePresetEvOffset(
+    slots: Map<Int, Double>,
+    overrides: Map<Int, Double>,
+    removed: Set<Int> = emptySet(),
+): Double = overrides[0] ?: if (0 in removed) 0.0 else presetEvOffset(slots)
 
 /**
  * U-7：拍照侧 `[0]` 的**唯一算法** = 基准曝光 + 用户 EV + 预设偏移（方案 B 的"叠加而非覆盖"）。

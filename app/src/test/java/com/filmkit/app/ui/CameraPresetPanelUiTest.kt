@@ -359,6 +359,18 @@ class CameraPresetPanelUiTest {
     /**
      * **能力可见性哨兵**：拍照界面这一层必须真的渲染"菜单 / 实话 / 摘要 / 完整清单 / 默认名"——
      * 它们是本次投诉五条的落点，任何一处被删掉都该红（而不是靠肉眼在 2700 行里找）。
+     *
+     * ★ **PS-5 口径变更**（用户："预设面板交互逻辑太差，**全是滑杆**"）：参数区从"全量清单 +
+     * 每项一条滑杆"（`CamPresetParamList`）重做成**分组勾选树**（`CamParamCheckTree`）⇒
+     * 本哨兵的期望函数名同步如下（逐条理由见 `docs/reports/ps5-preset-checkbox-tree-REPORT.md`）：
+     *  - **保留**：`cameraParamSections(`（树的数据源不变，仍是"槽位级 + 分组"的唯一维护点）、
+     *    `cameraParamAdjustabilityNote(`（不可调项的原因小字，I6）；
+     *  - **新增**：`CamParamCheckTree(`（勾选树本体）、`CamParamRow(`（`☑ + 名称 + 值` 一行）、
+     *    `CamParamExpand(`（**全页唯一出现滑杆的地方**）、`SectionTriCheck(`（组头三态框）、
+     *    `CheckAllRow(`（`[全选] / [全不选]`）、`cameraTreeSlots(`（展示哪些槽）、
+     *    `sectionCheckState(` / `checkSlots(` / `uncheckSlots(`（勾选口径的纯逻辑）、
+     *    `showsSliderRow(`（**"未勾选的行不渲染滑杆"的机器判据**）；
+     *  - **移除**：无（旧名字里其余各项都还在用）。
      */
     @Test
     fun cameraPanelRendersEveryCapabilityWithoutRewritingTheLogic() {
@@ -368,14 +380,71 @@ class CameraPresetPanelUiTest {
             "presetReadOnlyNote(",     // 内置只读那句实话
             "presetSummaryText(",      // 每行的参数摘要
             "presetEditorButtons(",    // 新建态 / 编辑态的按钮差异（★ PS-3：内置只有删除受限）
-            "cameraParamSections(",    // ★ PS-3：全量参数表（未设置 / 已包含两态）
+            "cameraParamSections(",    // ★ PS-3：参数表数据源（全量 / 分组，PS-5 起喂给勾选树）
             "cameraParamAdjustabilityNote(", // ★ PS-3：不可调项的原因（不做假滑杆）
             "defaultPresetName(",      // 新建时的默认名（不必先填名字）
+            // ── ★ PS-5：分组勾选树（参数区重做后的新落点）────────────────────────
+            "CamParamCheckTree(",      // C1：勾选树本体
+            "CamParamRow(",            // C2：☑/☐ + 参数名 + 值/「—」
+            "CamParamExpand(",         // C3：展开区（唯一出现 EditorSlider 的地方）
+            "SectionTriCheck(",        // C4：组头三态框
+            "CheckAllRow(",            // C5：[全选] / [全不选]
+            "cameraTreeSlots(",        // 展示哪些槽（全量 + 「—」）
+            "sectionCheckState(",      // 三态判据
+            "checkSlots(",             // 勾选 = 加入
+            "uncheckSlots(",           // 取消勾选 = 移除
+            "showsSliderRow(",         // ★ 机器判据：未勾选的行不渲染滑杆
         )) {
             assertTrue("CameraPresetPanel.kt 少了 $fn ⇒ 某条能力被藏起来了", panel.contains(fn))
         }
         // 「+ 新建预设」常驻 + 「⋯」按钮字面（用户看得见的入口）
         assertTrue(panel.contains("+ 新建预设"))
         assertTrue(panel.contains("⋯"))
+    }
+
+    /**
+     * ★ PS-5 **机器判据①（源码侧）**：进入预设详情，**首屏可见滑杆数 = 0**
+     *（调研 `preset-panel-interaction-RESEARCH.md` §2.7 判据 5）——
+     * "全是滑杆"的观感就是在这一条上被消灭的。
+     *
+     * 逻辑侧的同一判据（对每一条内置预设 × 每一个槽算一遍）见
+     * [CameraPresetCheckTreeTest.firstScreenOfTheDetailPanelShowsZeroSliders]；这里钉的是**接线**：
+     *  1. 行级展开的初值是 `null`（= 全部收起）；
+     *  2. 全文件**只有一个** `EditorSlider(` 渲染点，且它在 [CamParamExpand] 里；
+     *  3. 那个渲染点的调用被 `showsSliderRow(` 守卫（未勾选 / 没有滑杆 / 没展开 ⇒ 不渲染）。
+     */
+    @Test
+    fun firstScreenOfTheDetailPanelHasNoSlider() {
+        val panel = File("src/main/java/com/filmkit/app/ui/CameraPresetPanel.kt").readText()
+        assertTrue(
+            "行级展开（openKey）的初值必须是 null ⇒ 首屏一条滑杆都不出" +
+                "（注意：本文件里 `editorId` 也是 `mutableStateOf<String?>(null)` ⇒ 必须钉住 openKey 那一行）",
+            Regex("""var openKey by remember\(presetId\)\s*\{\s*mutableStateOf<String\?>\(null\)""")
+                .containsMatchIn(panel),
+        )
+        assertEquals(
+            "滑杆渲染点必须唯一（散落在行里 = 又变回「全是滑杆」）",
+            1,
+            Regex("""EditorSlider\(""").findAll(panel).count(),
+        )
+        val expand = panel.substringAfter("private fun CamParamExpand(").take(1600)
+        assertTrue("唯一的滑杆必须在 CamParamExpand 里", expand.contains("EditorSlider("))
+        val row = panel.substringAfter("private fun CamParamRow(").take(6000)
+        assertTrue(
+            "行的滑杆渲染必须由 showsSliderRow 守卫（未勾选 ⇒ 不渲染）",
+            row.contains("if (showsSliderRow("),
+        )
+        assertTrue("守卫体内才调 CamParamExpand", row.contains("CamParamExpand("))
+        assertTrue(
+            "没有滑杆的项不注册点击手势（不可点 ⇒ 不是假控件）",
+            row.contains("enabled = param != null"),
+        )
+        assertTrue("勾选框必须真的接上回调（点了有反应）", row.contains("onTap = onToggleCheck"))
+        assertTrue("组头三态框必须渲染三态字面", panel.contains("triCheckText(state)"))
+        // 接线链：CameraPresetTab 算出 params → 编辑面板 → 勾选树 → 行 → 展开区（滑杆读的就是它）
+        assertTrue(
+            "勾选树必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",
+            panel.substringAfter("private fun CamParamCheckTree(").take(4000).contains("params = params"),
+        )
     }
 }

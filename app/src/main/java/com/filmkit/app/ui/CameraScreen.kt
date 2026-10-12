@@ -598,6 +598,9 @@ fun CameraScreen(
      * `base + 用户 EV + 偏移` ⇒ 只写数组的 `[0]` 会被静默丢掉（PS-3 的那个坑，见
      * `cameraPresetParams` 的 KDoc）。
      *
+     * ★ PS-5：第三个实参 `removed` **必须传**（同上：数组已把移除的槽打回基线，偏移口径也得
+     * 跟上）—— 否则「取消勾选曝光」/「全不选」之后画面曝光仍带着预设偏移 = 点了没反应。
+     *
      * 传进来的改动经 [CameraParamOverrides.forPreset] 校验归属（防止别的预设的改动串进来）。
      */
     fun previewCameraParams(o: CameraParamOverrides?) {
@@ -606,7 +609,7 @@ fun CameraScreen(
         val removed = mine?.removed ?: emptySet()
         controller.setFilmParams(
             cameraPresetParams(selectedPreset, values, removed),
-            effectivePresetEvOffset(selectedPreset.slots, values),
+            effectivePresetEvOffset(selectedPreset.slots, values, removed),
         )
     }
 

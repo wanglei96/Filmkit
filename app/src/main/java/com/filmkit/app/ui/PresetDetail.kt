@@ -235,8 +235,13 @@ internal fun presetDetailSections(slots: Map<Int, Double>): List<PresetDetailSec
     }
 }
 
-/** [34]：由 [EditorPreset.lutStrength] 承载，不进参数列表（与 `presetSlotIncluded` 同一条口径）。 */
-private const val LUT_STRENGTH_SLOT = 34
+/**
+ * [34]：由 [EditorPreset.lutStrength] 承载，不进参数列表（与 `presetSlotIncluded` 同一条口径）。
+ *
+ * ★ PS-5 起同时被 `CameraPresetPanel.kt` 的 `cameraTreeSlots` 用（勾选树也不展示它）——
+ * 因此本常量从 private 提到 internal：**一份口径两处用**，不是两个 34。
+ */
+internal const val LUT_STRENGTH_SLOT = 34
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ★ PS-3：拍照界面参数表的**全量**形态（"预设应该展示全部可调参数"）

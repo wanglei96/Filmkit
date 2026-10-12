@@ -299,15 +299,12 @@ internal fun CameraParamOverrides?.afterEdit(
  *
  * 同时把该槽从 [CameraParamOverrides.values] 里去掉 —— 否则"移除"之后又被那条改值覆盖回去，
  * 用户会看到"点了移除、画面没变"（ADR-12 的假控件）。
+ *
+ * ★ PS-5：本函数 = [uncheckSlots] 的单槽特例（实现只有一份）。UI 上的三个入口
+ *（勾选框 / 「不包含此项」/ 组头三态框取消）走的都是 [uncheckSlots]。
  */
-internal fun CameraParamOverrides?.removeSlot(preset: EditorPreset, slot: Int): CameraParamOverrides {
-    val mine = forPreset(preset)
-    return CameraParamOverrides(
-        presetId = preset.id,
-        values = (mine?.values ?: emptyMap()) - slot,
-        removed = (mine?.removed ?: emptySet()) + slot,
-    )
-}
+internal fun CameraParamOverrides?.removeSlot(preset: EditorPreset, slot: Int): CameraParamOverrides =
+    uncheckSlots(preset, listOf(slot))
 
 /**
  * ★ **保存回预设的 slots 口径**（PS-3 的核心裁决，也是本卡唯一一处改变既有保存口径的地方）。
@@ -408,6 +405,128 @@ internal fun cameraParamAdjustabilityNote(slot: Int): String? = when (cameraPara
     CameraParamAdjustability.TUNABLE -> null
     CameraParamAdjustability.NO_SLIDER -> "拍照生效 · 暂无滑杆"
     CameraParamAdjustability.CAMERA_IGNORED -> "仅编辑器生效 · 拍照不变"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ PS-5：**分组勾选树**的纯逻辑（规格来源 = `docs/reports/preset-panel-interaction-RESEARCH.md` §2）
+//
+// 用户 2026-10-11 真机投诉："预设面板交互逻辑太差，**全是滑杆**"。调研裁定（Lightroom Classic /
+// Capture One / darktable / RawTherapee **四家一致**）：把两件事拆成**两个正交动作** ——
+//   (a)「这条预设**包含哪些**参数」= **勾选**（本节：checkSlots / uncheckSlots / sectionCheckState）；
+//   (b)「已包含的某项**调到多少**」= **点开那一行再调**（滑杆只出现在点开的那一行里，
+//       判据 = showsSliderRow）。
+// 四家里**没有任何一家**把全量参数平铺成滑杆 —— PS-3 的错误正是后者。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 勾选树上**一个组**的勾选态（调研 §2.3 C4、不变量 I5）：全勾 / 半勾 / 全不勾。 */
+internal enum class CheckState { NONE, SOME, ALL }
+
+/**
+ * 一个组的勾选态 = 组内「已包含」的槽数决定的**三态**（`0/n` ⇒ [CheckState.NONE]、
+ * `k/n` ⇒ [CheckState.SOME]、`n/n` ⇒ [CheckState.ALL]）。
+ *
+ * @param included **已包含**的槽集合（= `slots.keys`，即"预设记录 − 移除 + 用户设的值"）
+ * @param slots 该组展示的全部槽
+ */
+internal fun sectionCheckState(included: Set<Int>, slots: Collection<Int>): CheckState {
+    val hit = slots.count { it in included }
+    return when {
+        hit == 0 -> CheckState.NONE
+        hit == slots.size -> CheckState.ALL
+        else -> CheckState.SOME
+    }
+}
+
+/** 单项勾选框的字面：`☑` / `☐`（未包含的项**照样显示**在树上，值列显示「—」）。 */
+internal fun checkBoxText(checked: Boolean): String = if (checked) "☑" else "☐"
+
+/** 组头三态框的字面（`▣` = 半勾，与调研 §2.2 的示意一致）—— 全勾 / 全不勾与单项同一套字面。 */
+internal fun triCheckText(state: CheckState): String =
+    if (state == CheckState.SOME) "▣" else checkBoxText(state == CheckState.ALL)
+
+/**
+ * 勾选树展示的槽 = **拍照链路读的全部槽**（[CAMERA_PATH_SLOTS]，41 项）+ 这条预设**包含的**
+ * 其它槽（含 `[69..77]` 层间效应这种"仅编辑器生效"的）。
+ *
+ * 为什么是"全量 41 项"而不是现状的"可调的 35 项 + 已包含的不可调项"：调研 §1 表 3 的裁决是
+ * **全量显示**（未包含的以"未勾选"出现 —— LrC 的树里所有设置都在）。否则"取消勾选 ⇒ 行消失 ⇒
+ * 再也勾不回来"：点一次 `[全不选]` 整棵树就空了，用户把自己锁在门外。
+ *
+ * `[34]` LUT 强度**不进树**：它是"混合了多少"这个资源引用的一部分（由 `lutStrength` 承载），
+ * 与 [cameraParamSections] 的同一条排除一致。
+ */
+internal fun cameraTreeSlots(included: Set<Int>): Set<Int> =
+    (CAMERA_PATH_SLOTS + included) - LUT_STRENGTH_SLOT
+
+/**
+ * ★ PS-5 机器判据（调研 §2.7 判据 1）：这一行**现在**要不要渲染 `EditorSlider`。
+ *
+ * 三条同时成立才渲染：
+ *  ① [checked]：**未勾选的行绝不渲染滑杆** —— "不是全是滑杆"的机器判据；
+ *  ② [tunable]：该项**有滑杆**（拍照链路不读的项 / 参数面板还没给滑杆的项永不渲染 —— ADR-12
+ *     禁止假滑杆）；
+ *  ③ [expanded]：用户点开了这一行（**一次只展开一项**；默认全部收起 ⇒ 进入详情**首屏可见
+ *     滑杆数 = 0**，调研 §2.7 判据 5）。
+ */
+internal fun showsSliderRow(checked: Boolean, tunable: Boolean, expanded: Boolean): Boolean =
+    checked && tunable && expanded
+
+/**
+ * ★ PS-5：**勾选 = 加入**（调研 §2.4 #1；四家一致 —— 这是增删字段的**唯一手段**）。
+ *
+ * 写入的值 = [params] 里该槽的**当前生效值**（"值就是当前值"，画面因此不变）。整组勾选 /
+ * `[全选]` 共用本函数 ⇒ **一次提交**（调研 §2.4 #8："不要每槽一次重组"）。
+ *
+ * ## ⚠ 已知语义差异（调研 §2.5 I3 —— 有意与 LrC 不同，照做）
+ *
+ * 我们的预设是**稀疏子集**（存差异，不存显式值），稀疏化在**保存**时生效
+ * （[cameraPresetSlotsFor] → [presetSparseSlots]：`|v − 基线| <= PARAM_EPS` 的槽丢弃）。
+ * 因此勾选一个"当前值恰好等于基线"的项，保存后它**不会**写进预设（重新打开时又显示 `☐`）。
+ * 这不是丢数据：相机链路里"包含 + 值 = 基线"与"不包含"**没有任何可观察差异**（这正是本模型
+ * 与 LrC 唯一无法对齐的地方 —— LrC 存的是显式值快照）。拖动路径（[afterEdit]）同理：拖回
+ * 预设原值 ⇒ 该槽从改动集消失 ⇒ 行自动变 `☐`。
+ */
+internal fun CameraParamOverrides?.checkSlots(
+    preset: EditorPreset,
+    slots: Collection<Int>,
+    params: DoubleArray,
+): CameraParamOverrides = checkedSlots(preset, slots, include = true) {
+    if (it in params.indices) params[it] else Double.NaN
+}
+
+/**
+ * ★ PS-5：**取消勾选 = 移除**（调研 §2.4 #2 / #11）= 这条预设**不再包含**这些字段：
+ * 画面立刻回基线（合成时不带它们），保存时它们不进 `slots`。
+ *
+ * 整组取消 / `[全不选]` / 单槽 [removeSlot] 共用本函数 ⇒ 三处不可能各自漂移。
+ */
+internal fun CameraParamOverrides?.uncheckSlots(
+    preset: EditorPreset,
+    slots: Collection<Int>,
+): CameraParamOverrides = checkedSlots(preset, slots, include = false) { 0.0 }
+
+/** [checkSlots] / [uncheckSlots] / [removeSlot] 的**唯一实现**。 */
+private fun CameraParamOverrides?.checkedSlots(
+    preset: EditorPreset,
+    slots: Collection<Int>,
+    include: Boolean,
+    valueOf: (Int) -> Double,
+): CameraParamOverrides {
+    val mine = forPreset(preset)
+    val values = LinkedHashMap(mine?.values ?: emptyMap())
+    val removed = (mine?.removed ?: emptySet()).toMutableSet()
+    for (s in slots) {
+        if (include) {
+            val v = valueOf(s)
+            // 越界 / 坏值（NaN）不入库：宁可少一个槽，也不把一个读不出来的数写进改动集
+            if (v.isFinite()) values[s] = v
+            removed -= s
+        } else {
+            values -= s
+            removed += s
+        }
+    }
+    return CameraParamOverrides(preset.id, values, removed)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -549,13 +668,24 @@ internal fun CameraPresetTab(
         val values = mine?.values ?: emptyMap()
         val removed = mine?.removed ?: emptySet()
         // 清单显示的"这条预设包含什么" = 预设记录 − 用户移除 + 用户设的值
-        //（**不含**那些没设过值的槽 ⇒ 它们显示"未设置"，不用当前相机值冒充）
+        //（**不含**那些没设过值的槽 ⇒ 它们显示「—」，不用当前相机值冒充）
         val shown = (target.slots - removed) + values
+        // 滑杆读写数组（勾选时也读它取"当前生效值" ⇒ 勾选不改变画面）
+        val params = cameraPresetParams(target, values, removed)
+        /**
+         * ★ PS-5：勾选 / 取消勾选 = **一次性动作**（不是拖动）⇒ 算完**一次提交** + **一次下发**。
+         * 单项 / 整组三态框 / `[全选]` / `[全不选]` / 「不包含此项」全部走这里
+         *（调研 §2.4 #8："一次提交，不要每槽一次重组"）。
+         */
+        fun commitChecked(next: CameraParamOverrides) {
+            onOverrides(next)
+            onPreview(next)
+        }
         CameraPresetEditorPanel(
             p = p,
             target = target,
             slots = shown,
-            params = cameraPresetParams(target, values, removed),
+            params = params,
             overrides = mine,
             lut = if (editorNew) {
                 lutId?.let { PresetLutLine(it, formatZero150(lutStrength)) }
@@ -580,11 +710,14 @@ internal fun CameraPresetTab(
                 drag.value?.let { onOverrides(it) }
                 drag.value = null
             },
-            onRemoveSlot = { slot ->
-                // 「移除该项」= 一次性动作（不是拖动）⇒ 直接提交 + 立即下发
-                val next = overrides.removeSlot(target, slot)
-                onOverrides(next)
-                onPreview(next)
+            // ★ PS-5：勾选框 = 加入 / 移除（增删字段的唯一手段；值 = 当前生效值）
+            onChecked = { slotList, checked ->
+                val next = if (checked) {
+                    overrides.checkSlots(target, slotList, params)
+                } else {
+                    overrides.uncheckSlots(target, slotList)
+                }
+                commitChecked(next)
             },
             onBack = { closeEditor() },
             onSaveNew = {
@@ -938,27 +1071,27 @@ private fun CamPresetActionButton(
 }
 
 /**
- * **参数表**（★ PS-3：全量 + 分组折叠 + 每项可调）。
+ * ★ PS-5：**分组勾选树**（规格 = 调研 `preset-panel-interaction-RESEARCH.md` §2.2 界面 B /
+ * §2.3 C1–C5）—— 本次重做的全部内容。
  *
- * 数据源 = [cameraParamSections]（中文名 / 单位 / 分组 / 格式化的**唯一维护点**仍是
- * `PresetDetail.kt` 的 `DETAIL_META`）—— 本文件只负责画出来与收集交互。
- *
- * ## 三种行的状态
- *
- * | 状态 | 显示 | 交互 |
+ * | 元素 | 交互 | 落点 |
  * |---|---|---|
- * | **已包含** | 参数名 + 这条预设的值 | 点 ⇒ 展开滑杆（拖动实时生效）+ 「移除该项」 |
- * | **未设置** | 参数名 + "未设置"（灰） | 点 ⇒ 展开滑杆 ⇒ 设值 = 加入这条预设 |
- * | **拍照不生效** | 灰显 + 原因小字 | 点不动（ADR-12：不做假滑杆） |
+ * | 组头 `▾ 基础调整   ▣ 4/9` | 点标题 / 箭头 = 折叠；点**三态框** = 整组勾选（半勾点一下 = 全勾，I5） | [SectionTriCheck] |
+ * | 参数行 `☑ 曝光  +0.30 EV` | 点**勾选框** = 加入 / 移除（增删字段的唯一手段）；点**行体** = 展开这一项的滑杆 | [CamParamRow] |
+ * | 展开区 | 读数 + `EditorSlider` + 「不包含此项」—— **全页唯一出现滑杆的地方** | [CamParamExpand] |
+ * | 顶部 `已包含 12 · 未包含 29   [全选] [全不选]` | LrC 的 `Check All` / `Check None` | [CheckAllRow] |
  *
- * ⚠ "未设置"**绝不显示当前相机值**：套用这条预设时该字段保持不动，显示当前值会让用户以为
- * 预设里存着它（那是在骗用户）。
+ * **未包含的项照样出现在树上**（值列显示「—」），这是 LrC / RawTherapee / darktable 三家一致
+ * 的做法 —— 藏起来的表现是"预设里有东西，界面上找不到"。
  *
- * 分组默认**展开"这条预设已包含项所在的分组"**、其余收起（面板限高 200 多 dp，全展开放不下）；
- * 点分组标题随时展开 / 收起。
+ * ⚠ 「—」**绝不显示当前相机值**：套用这条预设时未包含的字段**保持不动**，显示当前值会让用户
+ * 以为预设里存着它（那是在骗用户）。
+ *
+ * 分组默认**展开"这条预设已包含项所在的分组"**、其余收起（面板限高 150dp，全展开放不下）；
+ * **行级展开默认全部收起** ⇒ 进入详情首屏可见滑杆数 = 0。
  */
 @Composable
-private fun CamPresetParamList(
+private fun CamParamCheckTree(
     /** 生效的"这条预设包含什么"（= 预设记录 − 移除 + 用户设的值） */
     slots: Map<Int, Double>,
     /** 滑杆读写数组（= `cameraPresetParams(target, values, removed)`） */
@@ -967,178 +1100,114 @@ private fun CamPresetParamList(
     presetId: String,
     onEditParam: (EditorParam, Float) -> Unit,
     onEditFinished: () -> Unit,
-    /** ★ P1：「移除该项」= 这条预设不再包含该字段 */
-    onRemoveSlot: (Int) -> Unit,
+    /** ★ PS-5：勾选 / 取消勾选一组槽（单项 / 整组 / 全选三条路径共用 ⇒ 一次提交） */
+    onChecked: (List<Int>, Boolean) -> Unit,
     lut: PresetLutLine?,
     maxHeight: Dp,
 ) {
     val context = LocalContext.current
-    // 展示的槽 = 拍照链路**可调**的全部 35 项 + **这条预设实际包含的不可调项**（灰显 + 原因）。
-    // 后者不能省：用户必须知道"这条预设里还有几项在拍照时不生效"（ADR-12：既不假装生效，
-    // 也不把它们藏起来 —— 藏起来的表现是"预设里有东西，界面上找不到"）。
-    val tunable = CAMERA_TUNABLE_SLOT_PARAM.keys
-    val sections = cameraParamSections(slots, tunable + slots.keys.filter { it !in tunable })
+    // 展示的槽 = 拍照链路读的全部 41 项 + 这条预设包含的其它槽（未包含的照样出现，值列「—」）
+    val treeSlots = cameraTreeSlots(slots.keys)
+    val sections = cameraParamSections(slots, treeSlots)
+    val included = slots.keys
     // 展开的是哪一项 —— 记 `param.key` 而不是槽号：一条滑杆覆盖多槽（肩部 `[5..7]` /
     // 饱和度 `[20..22]`）时点其中任一行都是同一条滑杆，不能展开成三条。
+    // ★ **默认 null = 全部收起** ⇒ 首屏可见滑杆数 = 0（调研 §2.7 判据 5 的机器判据）。
     var openKey by remember(presetId) { mutableStateOf<String?>(null) }
-    // 折叠态：初值 = **含已包含项的分组**（只算一次；拖动不该把用户折叠起来的分组又弹开）
+    // 折叠态：初值 = **含已包含项的分组**（只算一次；勾选 / 拖动不该把用户折叠起来的分组又弹开）
     var openSections by remember(presetId) {
         mutableStateOf(
             sections.filter { sec -> sec.rows.any { it.value != null } }.map { it.title }.toSet(),
         )
     }
-    LazyColumn(
-        Modifier
-            .fillMaxWidth()
-            .heightIn(max = maxHeight),
-    ) {
-        sections.forEach { sec ->
-            val expanded = sec.title in openSections
-            item(key = "sec_${sec.title}") {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .pressScale(pressedScale = 0.98f, onTap = {
+    Column(Modifier.fillMaxWidth()) {
+        CheckAllRow(
+            included = sections.sumOf { sec -> sec.rows.count { it.value != null } },
+            total = sections.sumOf { sec -> sec.rows.size },
+            onCheckAll = { onChecked(treeSlots.toList(), it) },
+        )
+        LazyColumn(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(max = maxHeight),
+        ) {
+            sections.forEach { sec ->
+                val expanded = sec.title in openSections
+                val groupSlots = sec.rows.map { it.slot }
+                val state = sectionCheckState(included, groupSlots)
+                item(key = "sec_${sec.title}") {
+                    SectionTriCheck(
+                        title = sec.title,
+                        state = state,
+                        included = sec.rows.count { it.value != null },
+                        total = sec.rows.size,
+                        expanded = expanded,
+                        onToggleOpen = {
                             openSections = if (expanded) openSections - sec.title else openSections + sec.title
-                        })
-                        .padding(top = 5.dp, bottom = 1.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        if (expanded) "▾ " else "▸ ",
-                        color = FilmTheme.Accent,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                    )
-                    Text(
-                        sec.title,
-                        color = FilmTheme.Accent,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        modifier = Modifier.weight(1f),
-                    )
-                    // "这一组里这条预设包含了几项"（一眼看出哪些组有内容）
-                    Text(
-                        "${sec.rows.count { it.value != null }}/${sec.rows.size}",
-                        color = FilmTheme.CreamDim,
-                        fontSize = 10.sp,
-                        fontFamily = FilmTheme.Mono,
-                        maxLines = 1,
+                        },
+                        // 三态框点一下：非全勾 ⇒ 全勾；全勾 ⇒ 全不勾（I5，RawTherapee 同义）
+                        onToggleCheck = { onChecked(groupSlots, state != CheckState.ALL) },
                     )
                 }
-            }
-            if (expanded) {
-                items(sec.rows, key = { "row_${it.slot}" }) { r ->
-                    // null = 这一项没有滑杆（拍照不生效 / 参数面板还没给滑杆）⇒ 灰显 + 原因
-                    val param = CAMERA_TUNABLE_SLOT_PARAM[r.slot]
-                    val note = cameraParamAdjustabilityNote(r.slot)
-                    val open = param != null && openKey == param.key
-                    Column(Modifier.fillMaxWidth()) {
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                // 可调 ⇒ 点一下展开 / 收起；不可调 ⇒ 手势不注册（按下去也没反馈，
-                                // 不会有"点了没反应"的假控件感）
-                                .pressScale(
-                                    pressedScale = 0.98f,
-                                    enabled = param != null,
-                                    onTap = { openKey = if (open) null else param?.key },
-                                )
-                                .padding(vertical = 1.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                r.label,
-                                color = if (note == null) FilmTheme.Cream else CamDisabledInk,
-                                fontSize = 12.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Text(
-                                // ★ "未设置"是**必需**的一档：它是稀疏子集的可视化，
-                                // 也是"套用时未包含的字段保持不动"能被用户理解的前提
-                                r.value ?: "未设置",
-                                color = when {
-                                    note != null -> CamDisabledInk
-                                    r.value == null -> CamDisabledInk
-                                    else -> FilmTheme.Cream
-                                },
-                                fontSize = 12.sp,
-                                fontFamily = FilmTheme.Mono,
-                                maxLines = 1,
-                            )
-                            if (param != null) {
-                                Text(
-                                    if (open) " ▾" else " ▸",
-                                    color = FilmTheme.Accent,
-                                    fontSize = 11.sp,
-                                    maxLines = 1,
-                                )
-                            }
-                        }
-                        // 不可调的原因（可调 ⇒ null ⇒ 不占行）
-                        note?.let {
-                            Text(
-                                it,
-                                color = CamDisabledInk,
-                                fontSize = 9.sp,
-                                maxLines = 1,
-                                modifier = Modifier.padding(start = 2.dp, bottom = 1.dp),
-                            )
-                        }
-                        // 展开的滑杆：`key(param.key)` ⇒ 换项 / 换预设时重建（[EditorSlider] 内部
-                        // 用 remember 取初值，不重建就会沿用上一条参数的读数）
-                        if (param != null && open) {
-                            key(param.key) {
-                                EditorSlider(
-                                    param = param,
-                                    params = params,
-                                    onCommit = onEditParam,
-                                    onFinished = onEditFinished,
-                                )
-                            }
-                            // 「移除该项」：只有**已包含**的字段才谈得上移除
-                            //（未设置的字段本来就不在这条预设里）
-                            if (r.value != null) {
-                                Row(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .padding(start = 16.dp, bottom = 3.dp),
-                                ) {
-                                    CamPresetActionButton("移除该项", enabled = true, onTap = { onRemoveSlot(r.slot) })
+                if (expanded) {
+                    items(sec.rows, key = { "row_${it.slot}" }) { r ->
+                        // null = 这一项没有滑杆（拍照不生效 / 参数面板还没给滑杆）⇒ 灰显 + 原因
+                        val param = CAMERA_TUNABLE_SLOT_PARAM[r.slot]
+                        val checked = r.value != null
+                        val open = param != null && openKey == param.key
+                        CamParamRow(
+                            row = r,
+                            param = param,
+                            note = cameraParamAdjustabilityNote(r.slot),
+                            checked = checked,
+                            open = open,
+                            params = params,
+                            onEditParam = onEditParam,
+                            onEditFinished = onEditFinished,
+                            // 勾选框 = 加入 / 移除（唯一手段）；取消时若正展开则收起（§2.4 #2）
+                            onToggleCheck = {
+                                onChecked(listOf(r.slot), !checked)
+                                if (checked && open) openKey = null
+                            },
+                            // 点行体 = 展开这一项的滑杆（一次一项）；未包含的**顺手勾上**
+                            //（§2.4 #4："我要调它 ⇒ 它进预设"）
+                            onToggleOpen = {
+                                if (open) {
+                                    openKey = null
+                                } else {
+                                    openKey = param?.key
+                                    if (!checked) onChecked(listOf(r.slot), true)
                                 }
-                            }
-                        }
+                            },
+                        )
                     }
                 }
             }
-        }
-        // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进参数清单
-        lut?.let { line ->
-            item(key = "lut") {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 1.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "LUT",
-                        color = FilmTheme.Cream,
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
-                        color = FilmTheme.Cream,
-                        fontSize = 12.sp,
-                        fontFamily = FilmTheme.Mono,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+            // LUT 与强度（若有）：[34] 由 lut.strength 承载 ⇒ 单独一行，不进勾选树
+            lut?.let { line ->
+                item(key = "lut") {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "LUT",
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "${LutLibrary.byId(context, line.lutId)?.label ?: line.lutId} · 强度 ${line.strength}",
+                            color = FilmTheme.Cream,
+                            fontSize = 12.sp,
+                            fontFamily = FilmTheme.Mono,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
         }
@@ -1146,10 +1215,236 @@ private fun CamPresetParamList(
 }
 
 /**
+ * 顶部 `[全选] [全不选]` + 「已包含 n · 未包含 m」（调研 §2.3 C5；= LrC 的 `Check All` /
+ * `Check None`）。
+ *
+ * 没有可勾 / 可取消的项时按钮**置灰**（点了没反应的假按钮正是投诉的根因）；置灰仍然**可见**
+ *（隐藏才是问题）。
+ */
+@Composable
+private fun CheckAllRow(included: Int, total: Int, onCheckAll: (Boolean) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 5.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "已包含 $included · 未包含 ${total - included}",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+        CamPresetActionButton("全选", enabled = included < total, onTap = { onCheckAll(true) })
+        Spacer(Modifier.width(6.dp))
+        CamPresetActionButton("全不选", enabled = included > 0, onTap = { onCheckAll(false) })
+    }
+}
+
+/**
+ * 组头（调研 §2.3 C4）：`▾ 基础调整        ▣ 4/9`。
+ *
+ * 点标题 / 箭头 = **只**折叠展开该组；点三态框 = **整组勾选**（半勾点一下 = 全勾，I5，与
+ * RawTherapee `everythingToggled` 的 `set_inconsistent(false)` 同义）。两个热区分开，不会
+ * "想折叠却把整组参数删了"。
+ */
+@Composable
+private fun SectionTriCheck(
+    title: String,
+    state: CheckState,
+    included: Int,
+    total: Int,
+    expanded: Boolean,
+    onToggleOpen: () -> Unit,
+    onToggleCheck: () -> Unit,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(8.dp))
+                .pressScale(pressedScale = 0.98f, onTap = onToggleOpen)
+                .padding(top = 5.dp, bottom = 1.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (expanded) "▾ " else "▸ ",
+                color = FilmTheme.Accent,
+                fontSize = 11.sp,
+                maxLines = 1,
+            )
+            Text(
+                title,
+                color = FilmTheme.Accent,
+                fontSize = 11.sp,
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Text(
+            triCheckText(state),
+            color = if (state == CheckState.NONE) CamDisabledInk else FilmTheme.Accent,
+            fontSize = 13.sp,
+            maxLines = 1,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .pressScale(pressedScale = 0.90f, onTap = onToggleCheck)
+                .padding(horizontal = 4.dp),
+        )
+        // "这一组里这条预设包含了几项"（一眼看出哪些组有内容）
+        Text(
+            "$included/$total",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            fontFamily = FilmTheme.Mono,
+            maxLines = 1,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+    }
+}
+
+/**
+ * 勾选树的一行（调研 §2.3 C2）：`☑/☐ + 参数名 + 值/「—」`。
+ *
+ * 两个**独立热区**（本次重做的核心 —— PS-3 只有"点整行 = 展开滑杆"）：
+ *  - **勾选框 = 加入 / 移除**（不可调的项**照样可勾**，不变量 I6 —— 与 LrC 灰显 `Masking` 同型）；
+ *  - **行体 = 展开这一项的滑杆**（没有滑杆的项不注册手势 = 不是假控件）。
+ */
+@Composable
+private fun CamParamRow(
+    row: CameraParamRow,
+    param: EditorParam?,
+    note: String?,
+    checked: Boolean,
+    open: Boolean,
+    params: DoubleArray,
+    onEditParam: (EditorParam, Float) -> Unit,
+    onEditFinished: () -> Unit,
+    onToggleCheck: () -> Unit,
+    onToggleOpen: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 1.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // ① 勾选框：**增删字段的唯一手段**（调研 §2.4 #1/#2）
+            Text(
+                checkBoxText(checked),
+                color = if (checked) FilmTheme.Accent else CamDisabledInk,
+                fontSize = 13.sp,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .pressScale(pressedScale = 0.90f, onTap = onToggleCheck)
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            )
+            // ② 行体：点一下 = 展开这一项的滑杆（一次一项）
+            Row(
+                Modifier
+                    .weight(1f)
+                    .pressScale(pressedScale = 0.98f, enabled = param != null, onTap = onToggleOpen)
+                    .padding(vertical = 1.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    row.label,
+                    color = if (note == null) FilmTheme.Cream else CamDisabledInk,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    // ★ 未包含 = 「—」（调研 §2.2）：稀疏子集的可视化 —— 套用时该字段保持不动，
+                    // 显示当前相机值会让用户以为预设里存着它（骗用户）
+                    row.value ?: "—",
+                    color = when {
+                        note != null -> CamDisabledInk
+                        row.value == null -> CamDisabledInk
+                        else -> FilmTheme.Cream
+                    },
+                    fontSize = 12.sp,
+                    fontFamily = FilmTheme.Mono,
+                    maxLines = 1,
+                )
+                if (param != null) {
+                    Text(
+                        if (open) " ▾" else " ▸",
+                        color = FilmTheme.Accent,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        // 不可调的原因（可调 ⇒ null ⇒ 不占行）
+        note?.let {
+            Text(
+                it,
+                color = CamDisabledInk,
+                fontSize = 9.sp,
+                maxLines = 1,
+                modifier = Modifier.padding(start = 22.dp, bottom = 1.dp),
+            )
+        }
+        // ★ 机器判据（调研 §2.7 判据 1）：**未勾选的行绝不渲染 `EditorSlider`**；默认全收起
+        //   ⇒ 进入详情首屏可见滑杆数 = 0（判据 5）。
+        if (showsSliderRow(checked = checked, tunable = param != null, expanded = open)) {
+            // showsSliderRow 已要求 tunable ⇒ 此处 param 必非空（`?.let` 只是让编译器看见）
+            param?.let {
+                CamParamExpand(
+                    param = it,
+                    params = params,
+                    onEditParam = onEditParam,
+                    onEditFinished = onEditFinished,
+                    onRemove = onToggleCheck,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 展开区（调研 §2.3 C3）：读数 + `EditorSlider` + 「不包含此项」——**全页唯一出现滑杆的地方**。
+ *
+ * 「不包含此项」是勾选框的**同义冗余**（调研 §2.6 ③：保留它，避免用户找不到怎么移除）。
+ */
+@Composable
+private fun CamParamExpand(
+    param: EditorParam,
+    params: DoubleArray,
+    onEditParam: (EditorParam, Float) -> Unit,
+    onEditFinished: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    // `key(param.key)` ⇒ 换项 / 换预设时重建（[EditorSlider] 内部用 remember 取初值，
+    // 不重建就会沿用上一条参数的读数）。拖动仍然**不写 Compose state**（DragHolder 直通）。
+    key(param.key) {
+        EditorSlider(
+            param = param,
+            params = params,
+            onCommit = onEditParam,
+            onFinished = onEditFinished,
+        )
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 22.dp, bottom = 3.dp),
+    ) {
+        CamPresetActionButton("不包含此项", enabled = true, onTap = onRemove)
+    }
+}
+
+/**
  * 预设**编辑面板**（新建态 / 编辑态同一个面板）= 用户诉求的"配置面板"。
  *
- * 内容：**名称 / 分组输入框** + **全量参数表**（逐项可调，见 [CamPresetParamList]）+
- * 底部动作：
+ * 内容：**名称 / 分组输入框** + **分组勾选树**（★ PS-5：勾选决定"包含哪些参数"，点开某一行才出
+ * 滑杆，见 [CamParamCheckTree]）+ 底部动作：
  *  - **新建态**（`p == null`）：「保存当前相机参数为新预设」（[newCameraPresetFrom]：当前预设 +
  *    当前改动，含 `[0]` 曝光偏移）+ 「取消」；
  *  - **编辑态**：「**保存到预设**」（把改动写进这条预设，含移除项与曝光偏移；无改动 ⇒ 置灰）、
@@ -1180,7 +1475,8 @@ private fun CameraPresetEditorPanel(
     hasOverride: Boolean,
     onEditParam: (EditorParam, Float) -> Unit,
     onEditFinished: () -> Unit,
-    onRemoveSlot: (Int) -> Unit,
+    /** ★ PS-5：勾选 / 取消勾选一组槽（勾选框 / 组头三态框 / 全选 / 全不选 / 「不包含此项」共用） */
+    onChecked: (List<Int>, Boolean) -> Unit,
     onBack: () -> Unit,
     onSaveNew: () -> Unit,
     onUpdate: () -> Unit,
@@ -1234,24 +1530,31 @@ private fun CameraPresetEditorPanel(
             Spacer(Modifier.width(8.dp))
             CamPresetField(group, onGroup, "分组（可空）", Modifier.weight(1f))
         }
-        // ③ 参数表（★ PS-3：全量 + 逐项可调）+ 一行说明"这一行能做什么"
+        // ③ 分组勾选树（★ PS-5）+ 两行说明"这一页怎么用"（写在界面上，不靠用户猜）
         Text(
-            // 参考截图的「选择一项开始调整」+「实时效果 开」两句，在这里合成一句实话：
-            // 拖动即时生效 + 未保存不落盘（用户最需要知道的两件事）
-            "点一项开始调整 · 拖动即时生效（未保存不写入预设）",
+            // 勾选 = 包含哪些参数；点行体 = 展开那一项的滑杆（一次一项）
+            "☑ 勾选 = 这条预设包含它 · 点行体展开滑杆（拖动即时生效、未保存不写入预设）",
             color = FilmTheme.CreamDim,
             fontSize = 10.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+            maxLines = 2,
             modifier = Modifier.padding(top = 5.dp),
         )
-        CamPresetParamList(
+        Text(
+            // 稀疏语义的**实话**：值 = 基准的项在保存时会被稀疏化丢掉（调研 §2.5 I3 —— 相机链路里
+            // 它与"不包含"没有任何可观察差异），未勾选的项套用时保持不动
+            "保存时值等于基准的项自动不写入 · 未勾选的项套用时保持不动",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            maxLines = 2,
+            modifier = Modifier.padding(top = 1.dp),
+        )
+        CamParamCheckTree(
             slots = slots,
             params = params,
             presetId = target.id,
             onEditParam = onEditParam,
             onEditFinished = onEditFinished,
-            onRemoveSlot = onRemoveSlot,
+            onChecked = onChecked,
             lut = lut,
             maxHeight = 150.dp,
         )
