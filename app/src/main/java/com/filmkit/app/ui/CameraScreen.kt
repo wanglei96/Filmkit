@@ -264,6 +264,9 @@ fun CameraScreen(
     var selectedControl by rememberSaveable { mutableStateOf<String?>(null) } // AF/EXP/EV/WB
     var quickOpen by rememberSaveable { mutableStateOf(false) } // 一级悬浮窗（画幅+更多设置）
     var lutOpen by rememberSaveable { mutableStateOf(false) } // LUT 二级菜单
+    // ★ PS-6b：完整参数编辑页（全屏覆盖层）。入口 = 预设面板的「完整参数 >」（PS-6a 的
+    // `onOpenFullEdit` 回调：实参在下方 `CameraPresetTab(...)` 调用点、页面挂在本文件末尾）。
+    var fullEditOpen by remember { mutableStateOf(false) }
     var flashMode by rememberSaveable { mutableIntStateOf(0) }
     var histOn by rememberSaveable { mutableStateOf(prefs.getBoolean("histogram", false)) }
     // 实时直方图（M3）：开关开时 ~7fps 从渲染线程取显示域亮度分布（引擎端 256×96
@@ -691,6 +694,35 @@ fun CameraScreen(
                 "id" to next.id, "builtin" to !presetDeletable(next),
                 "slots" to next.slots.size, "slotsText" to presetSlotsText(next),
                 "hasEvSlot" to next.slots.containsKey(CAMERA_PRESET_EV_SLOT),
+            ),
+        )
+    }
+
+    /**
+     * ★ PS-6b：**完整参数页的「保存」** = 参数写回预设（复用 [saveCameraPresetSlots]，唯一实现）
+     * **+ 把当前 LUT 与强度写进这条预设**（`lutId` / `lutStrength` 两字段）。
+     *
+     * 为什么带上 LUT：完整参数页顶部卡片的第一主角就是 LUT（用户 2026-10-12 的"图 1"形态），
+     * 用户在这里选 LUT 的意图必然是"这条预设的 LUT" —— 只存参数不存 LUT 就是"选了存不上"的坑。
+     * 口径与 [newCameraPresetFrom] / [updatedCameraPreset] 逐字一致（**没选 LUT ⇒ 强度回落 1.0**），
+     * 判据 = [fullEditLutChanged]（相同就不白写一次库）。
+     *
+     * 内置预设同样可存（用户 2026-10-11 拍板"内置可以改，只禁删"）：分流在 [persistPreset]。
+     */
+    fun saveCameraFullEdit(p: EditorPreset, overrides: CameraParamOverrides?) {
+        saveCameraPresetSlots(p, overrides)
+        // 上面刚写过库 ⇒ 列表已刷新；按 id 取**最新**对象（拿旧对象继续写会把上一次的结果覆盖回去）
+        val target = fullEditSaveTarget(p, presets)
+        val strength = prefs.getFloat("lut_strength", 1f).toDouble()
+        if (fullEditLutChanged(target, lutId, strength)) {
+            val (id, s) = fullEditLutFields(lutId, strength)
+            persistPreset(target.copy(lutId = id, lutStrength = s))
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.preset.save_full",
+            kv(
+                "id" to target.id, "name" to target.name, "builtin" to !presetDeletable(target),
+                "slots" to target.slots.size, "lut" to (lutId ?: ""), "lutStrength" to strength,
             ),
         )
     }
@@ -1688,6 +1720,8 @@ fun CameraScreen(
                 // ★ PS-2a：预设 tab = **管理场所**（列表 / 「+ 新建预设」/ 每行「⋯」菜单 / 编辑面板）。
                 // 内容整块交给 CameraPresetTab，LutSheet 只让位（宿主不认识预设的数据结构）。
                 presetTab = {
+                    // ★ PS-6b：「完整参数 >」的落点（PS-6a 在预设面板里把这个回调接到按钮上）。
+                    // 两张卡只靠这一个回调对接：它给参数（默认空实现），本页给实现 —— 各自落地都编译得过。
                     CameraPresetTab(
                         presets = presets,
                         selected = selectedPreset,
@@ -1707,6 +1741,8 @@ fun CameraScreen(
                         onRename = { p, n, g -> renameCameraPreset(p, n, g) },
                         onCopy = { p -> copyCameraPreset(p) },
                         onDelete = { p -> deleteCameraPreset(p) },
+                        // ★ PS-6b：打开完整参数编辑页（全屏覆盖层，见下方挂载点）
+                        onOpenFullEdit = { fullEditOpen = true },
                     )
                 },
                 lutId = lutId,
@@ -1839,6 +1875,29 @@ fun CameraScreen(
                     quickOpen = false
                     onOpenSettings()
                 },
+            )
+        }
+
+        // ── ★ PS-6b：完整参数编辑页（全屏覆盖层，浮于 LUT sheet / 快捷菜单**之上**）──
+        // 用**自绘覆盖层**而不是 M3 ModalBottomSheet：后者在真机上返回要按两次才关（项目已有裁决）。
+        if (fullEditOpen) {
+            CameraPresetFullEdit(
+                // 编辑对象 = 当前生效那条（PS-6a 的入口从详情面板进 ⇒ 二者恒相同）
+                preset = selectedPreset,
+                overrides = paramOverrides,
+                lutId = lutId,
+                lutStrength = prefs.getFloat("lut_strength", 1f),
+                lutCats = lutCats,
+                lutCatOf = lutCatOf,
+                lutPreviews = lutPreviews,
+                onPreview = { o -> previewCameraParams(o) },
+                onOverrides = { paramOverrides = it },
+                // 选 LUT 走既有两条链路：null = 清空（clearCameraLut），否则 lutPending（IO 解析 → setLut）
+                onPickLut = { e -> if (e == null) clearCameraLut() else lutPending = e },
+                onStrength = { v -> controller.setLutStrength(v) },
+                onStrengthFinished = { v -> prefs.edit().putFloat("lut_strength", v).apply() },
+                onSave = { p, o -> saveCameraFullEdit(p, o) },
+                onClose = { fullEditOpen = false },
             )
         }
     }
