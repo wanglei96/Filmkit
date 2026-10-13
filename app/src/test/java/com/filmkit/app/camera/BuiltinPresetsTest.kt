@@ -105,17 +105,19 @@ class BuiltinPresetsTest {
         assertEquals("徕卡", bw.group)
         assertEquals("leica_b_w_hc", bw.lutId)
 
-        // ★ R-1c 裁决 1：LUT 强度有**下限 0.30**，不接受 0。
+        // ★ R-3：白点提到 4.0（死白起点 3.55EV）+ 在 `--hi-floor 3.5` 约束下重拟合。
+        //   LUT 强度仍是**拟合的自由维度**，但受 R-1c 裁决 1 的下限 0.30 约束（不接受 0）：
         //   理由：`lut_strength = 0` 意味着这条预设只剩**影调**，而 M9 的色彩特征（红色浓、
         //   蓝绿偏青、品红倾向）是**色相选择性**的偏移 —— 只有 3D LUT 能表达，
         //   `saturation` / `split` / `tint` / WB 增益都做不到。归零 ⇒ 预设名不副实。
-        //   代价：影调残差比 R-1b 的 `lut = 0` 方案大（M9 编辑器 8.84 → 10.46），
-        //   见 `docs/reports/r1c-lut-floor-REPORT.md` 的三档权衡表（0.30 / 0.40 / 0.50）。
-        assertEquals("builtin_leica_m9 的 LUT 强度（贴下限）", 0.3, preset("builtin_leica_m9").lutStrength, 0.0)
+        //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
+        //   "不死白 vs 高光软肩"两套方案的数据）。
+        assertEquals("builtin_leica_m9 的 LUT 强度（贴下限）", 0.3085, preset("builtin_leica_m9").lutStrength, 0.0)
         assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
-            "builtin_leica_bw 的 LUT 强度（黑白靠 LUT 通道混合，1.0 本就在下限之上 ⇒ 不受裁决 1 影响）",
-            1.0, preset("builtin_leica_bw").lutStrength, 0.0,
+            "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
+                "与死白起点约束冲突；黑白靠 LUT 的通道混合仍是这条预设的核心）",
+            0.6123, preset("builtin_leica_bw").lutStrength, 0.0,
         )
 
         // 报告用的逐槽打印（test-results XML 的 system-out 里可读）
@@ -140,19 +142,20 @@ class BuiltinPresetsTest {
 
     @Test
     fun leicaM9RecipeMatchesSpec() {
-        // R-1c：曲线维度是在 `lut.strength ≥ 0.30` 的下界下重拟合的（裁决 1）；颗粒/暗角不动
+        // ★ R-3：白点 [38] 2.7471 → **4.0**（死白起点 2.60 → 3.55EV），并在 `--hi-floor 3.5`
+        // 约束下重拟合 [4][5..10][37][38][34]（`--lat-split` 解耦 shoulder/toe）；颗粒/暗角不动。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(4, 5, 6, 7, 8, 9, 10, 21, 23, 24, 26, 27, 37, 38, 66, 67, 68),
-            4 to 0.9741,     // contrast
-            5 to 0.3417, 6 to 0.3941, 7 to 0.3944,      // shoulder R/G/B
-            8 to 0.3417, 9 to 0.3941, 10 to 0.3944,     // toe R/G/B（与 shoulder 同值）
-            20 to 1.0, 22 to 1.0,   // ⚠ 拟合回恒等值 ⇒ **不进**稀疏 slots（显式声明，防"顺手补一条"）
-            21 to 1.05,             // sat_mid（实测 sat_gain 1.179，目标 1.178 ✅）
-            23 to 0.1, 24 to 0.05,  // 分离色调（原值：本条无 b* 目标，7 维模式不搜这两维）
+            setOf(4, 5, 6, 7, 8, 9, 10, 20, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68),
+            4 to 1.03,       // contrast（R-3 重拟合）
+            5 to 0.5278, 6 to 0.4253, 7 to 0.5806,      // shoulder R/G/B
+            8 to 0.9219, 9 to 0.8216, 10 to 0.9488,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
+            20 to 1.15,     // sat_shadow（R-3：高光约束下重新分配分区饱和）
+            21 to 1.0, 22 to 0.85,  // ⚠ [21] 拟合回恒等值 ⇒ **不进**稀疏 slots（显式声明，防"顺手补一条"）
+            23 to 0.1, 24 to 0.05,  // 分离色调（原值：本条无 b* 目标，不搜这两维）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
-            37 to -4.24, 38 to 2.7471,                  // filmic 黑白点
+            37 to -11.9726, 38 to 4.0,                  // filmic 黑白点（★ R-3：白点 = 4.0）
             66 to -0.18,     // vignette_strength（负 = 暗角）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
@@ -161,21 +164,21 @@ class BuiltinPresetsTest {
 
     @Test
     fun ricohNegativeRecipeMatchesSpec() {
-        // R-1c：在 `lut.strength ≥ 0.30` 的下界下重拟合（裁决 1）。R-1b 的 7 维曲线这次退化成
-        // "R 通道 latitude 回恒等 + G/B 两个值" —— 拟合主动删维度是正确行为（不写的槽 = 保持默认），
-        // 而 [23] `split_warm` 也回恒等（b* 目标全由 [24] 承担）⇒ 稀疏槽集合比 R-1b 少 4 个。
+        // ★ R-3：白点 2.6138 → **4.0**（死白起点 2.45 → 3.55EV）。**这一条是三条里代价最大的**
+        // （高光目标 251.9 本就超过拍照链路 246.53 的硬上限，白点提高后"不死白"与"高光够亮"
+        // 直接冲突 ⇒ 残差 8.40/11.85 → 17.42/19.55，见 R-3 报告 §3）。
         assertRecipe(
             "builtin_ricoh_negative",
-            // ⚠ [5]/[8]（R 通道 latitude）与 [27]（400 = 恒等值）不在 slots 里：都等于恒等值
-            setOf(4, 6, 7, 9, 10, 20, 21, 24, 26, 37, 38, 66, 67, 68),
-            4 to 1.057,
-            5 to 0.01, 6 to 0.0, 7 to 0.9459,      // shoulder：R 回恒等（0.01 = darktable 默认）、G/B 重拟合
-            8 to 0.01, 9 to 0.0, 10 to 0.9459,     // toe：与 shoulder 同值（否则 10 维）
-            20 to 1.15, 21 to 0.65, 22 to 1.0,     // sat：高光回恒等（1.0）
-            23 to 0.0, 24 to 0.5562,               // 分离色调：暖回恒等，冷加大（b* 目标 −1.7）
+            // ⚠ [22]（sat_high = 1.0）与 [27]（400 = 恒等值）不在 slots 里：都等于恒等值
+            setOf(4, 5, 6, 7, 8, 9, 10, 20, 21, 23, 24, 26, 37, 38, 66, 67, 68),
+            4 to 1.2,
+            5 to 0.0406, 6 to 0.0, 7 to 0.9906,    // shoulder（★ R-3 解耦后 R/G/B 各自独立）
+            8 to 0.0, 9 to 0.0, 10 to 0.0,         // toe：贴 0（早压暗部，与"晚弯肩部"相反方向）
+            20 to 0.85, 21 to 0.65, 22 to 1.0,     // sat：高光回恒等（1.0）
+            23 to 0.41, 24 to 0.6,                 // 分离色调（b* 目标 −1.7）
             26 to 30.0,
             27 to 400.0,
-            37 to -11.9963, 38 to 2.6138,          // ⚠ [37] 贴 −12 滑杆下界（R-1c 裁决 2）
+            37 to -12.0, 38 to 4.0,                // ⚠ [37] 贴 −12 滑杆下界；[38] = 4.0
             66 to -0.28,
             67 to 75.0,
             68 to 48.0,
@@ -184,18 +187,19 @@ class BuiltinPresetsTest {
 
     @Test
     fun leicaBwRecipeMatchesSpec() {
-        // R-1b：目标曲线是**间接推断**（该模式没有样片，用 M9 Contrast +2 代替）⇒ 可信度最低，
-        // 拟合残差也最大（报告 §3.3）。颗粒仍是"黑白胶片的标志" ⇒ 40% 不动。
+        // ★ R-3：白点 2.5438 → **4.0**（死白起点 2.40 → 3.55EV）。目标曲线仍是**间接推断**
+        // （该模式没有样片，用 M9 Contrast +2 代替）⇒ 可信度最低。颗粒仍是"黑白胶片的标志"
+        // ⇒ 40% 不动；LUT 强度从 1.0 降到 0.6123（全量会让高光更早到顶，与死白约束冲突）。
         assertRecipe(
             "builtin_leica_bw",
             // ⚠ [27]=400 与 [67]=80 都不在 slots 里：两者都等于恒等值
             setOf(4, 5, 6, 7, 8, 9, 10, 26, 37, 38, 66, 68),
-            4 to 1.0926,
-            5 to 0.6609, 6 to 0.0009, 7 to 0.5566,
-            8 to 0.6609, 9 to 0.0009, 10 to 0.5566,
+            4 to 1.3448,
+            5 to 0.1928, 6 to 0.0449, 7 to 0.1985,
+            8 to 0.311, 9 to 0.3028, 10 to 0.3148,
             26 to 40.0,
             27 to 400.0,
-            37 to -3.5737, 38 to 2.5438,
+            37 to -5.0725, 38 to 4.0,
             66 to -0.24,
             67 to 80.0,
             68 to 52.0,
@@ -277,7 +281,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("三条预设的参数键总数（R-1c 拟合后：17 + 15 + 14）", 46, names.size)
+        assertEquals("三条预设的参数键总数（R-3 拟合后：18 + 18 + 14）", 50, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

@@ -174,6 +174,29 @@ float srgb_decode(float c) {
   c = std::clamp(c, 0.0f, 1.0f);
   return c > 0.04045f ? std::pow((c + 0.055f) / 1.055f, 2.4f) : c / 12.92f;
 }
+
+// ★ R-3：高光层次探针 —— EV∈[floor, white_ev] 段的 8bit 输出极差（LSB）。
+// 为什么是这个量：R-2 的"死白起点"定义为"此后所有更高输入的输出整段极差 ≤1 LSB 的起点"
+// （`tools/preset-exp/r2-white-point.py::analyse` 的 `sat8`）⇒ **"死白起点 ≥ floor"
+// ⟺ "EV∈[floor, white_ev] 段的极差 > 1 LSB"**（EV > white_ev 时 e 恒为 1、输出逐位恒定）。
+// 口径 = R-2 的"无 LUT"口径：纯 filmic → `kFsOut` 的 highlightRolloff(knee 0.80) → OETF → luma。
+double hi_range_lsb(const FilmicSpline& sp, double floor_ev) {
+  if (sp.white_ev <= floor_ev) return 0.0;      // 白点本身就在地板之下 ⇒ 整段已死白
+  const double knee = 0.80;
+  double lo = 1e30, hi = -1e30;
+  const int N = 64;
+  for (int i = 0; i <= N; ++i) {
+    double ev = floor_ev + (sp.white_ev - floor_ev) * i / N;
+    double s = 0.1845 * std::pow(2.0, ev);
+    double y = 0.2126 * filmic_scalar(sp, 0, static_cast<float>(s))
+             + 0.7152 * filmic_scalar(sp, 1, static_cast<float>(s))
+             + 0.0722 * filmic_scalar(sp, 2, static_cast<float>(s));
+    double lc = y <= knee ? y : knee + (1.0 - knee) * (1.0 - std::exp(-(y - knee) / (1.0 - knee)));
+    double v = 255.0 * srgbEncodeD(lc);
+    lo = std::min(lo, v); hi = std::max(hi, v);
+  }
+  return hi - lo;
+}
 }  // namespace impl
 
 // 拍照链路的采样列：默认全 256（验收口径）；拟合阶段用 R1_XS 只算目标点
@@ -223,6 +246,8 @@ int main() {
       printf("clin1 %s %d %.9g\nclin2 %s %d %.9g\n", tag, ch, ec.lin[ch][0], tag, ch, ec.lin[ch][1]);
       printf("blin1 %s %d %.9g\nblin2 %s %d %.9g\n", tag, ch, ec.b_lin[ch][0], tag, ch, ec.b_lin[ch][1]);
     }
+    if (const char* hf = std::getenv("R1_HI_FLOOR"))   // ★ R-3 高光层次探针（见 hi_range_lsb）
+      std::printf("hl %s %.6f\n", tag, impl::hi_range_lsb(sp, std::atof(hf)));
     if (std::getenv("R1_NO_CAM") != nullptr) continue;
     emit_cam(sp, tag);
   }
@@ -276,6 +301,8 @@ class Cxx:
             env["R1_NO_CAM"] = "1"
         elif self.xs is not None:
             env["R1_XS"] = " ".join(str(int(v)) for v in self.xs)
+        if HI_FLOOR is not None:
+            env["R1_HI_FLOOR"] = repr(float(HI_FLOOR))
         out = subprocess.run([self.exe], input=inp, capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise RuntimeError("harness 运行失败：\n" + out.stderr[-2000:])
@@ -288,6 +315,8 @@ class Cxx:
             k = p[0]
             if k == "cam":
                 r["cam"][int(p[2])] = [float(p[3]), float(p[4]), float(p[5])]
+            elif k == "hl":                     # ★ R-3：EV∈[floor, white_ev] 的 8bit 极差（LSB）
+                r["hi"] = float(p[2])
             elif k == "on":
                 r["vals"]["on"] = float(p[2])
             elif k in ("lo", "hi"):
@@ -570,7 +599,7 @@ class Evaluator:
                 bs = float(np.mean(srgb_to_lab(img_cc)[CC_NEUTRAL, 2]
                                    - srgb_to_lab(CC_SRGB)[CC_NEUTRAL, 2]))
             out.append(dict(sl=sl, editor=ed, camera=cam, sat_gain=sg, b_shift=bs,
-                            ec=vals[t]["vals"]))
+                            ec=vals[t]["vals"], hi=vals[t].get("hi")))
         return out
 
     def one(self, override=None, both=True):
@@ -611,10 +640,63 @@ def report_line(tag, got, want):
 
 
 # ─────────────────────────────────────────── 拟合（坐标下降）
-def _pack(p):
-    """搜索向量 → 槽位覆盖。
+# ── 搜索向量布局（★ R-3：`--lat-split` 解耦 shoulder / toe）─────────────────────
+#   LAT_SPLIT=False（R-1/R-1b/R-1c 原布局，**逐位不变**）：
+#       [ls, ctr, lat_r, lat_g, lat_b, bev, wev] (+ [split_w, split_c])
+#   LAT_SPLIT=True（R-3）：
+#       [ls, ctr, sh_r, sh_g, sh_b, toe_r, toe_g, toe_b, bev, wev] (+ [split_w, split_c])
+#   `[8..10]`（toe）与 `[5..7]`（shoulder）在引擎里本来就是**两个独立的 latitude**
+#   （`computeFilmicSpline(…, lat_sh[3], lat_toe[3])` → `sh_log`/`toe_log` 两个表达式），
+#   R-1 的 7 维向量把它们绑成同一个值只是**为省维度做的简化**，不是引擎约束。
+LAT_SPLIT = False
+SPLIT_IDX = (7, 8)          # split_w / split_c 在向量里的位置（随布局变）
+_LUT_MIN, _WEV_FIX = 0.0, None   # 已下过的"钉子"（切换布局时重放）
 
-    前 7 维（R-1 原有）：`[ls, contrast, lat_r, lat_g, lat_b, black_ev, white_ev]`；
+
+def set_lat_split(on=True):
+    """★ R-3：解耦 `[5..7]` shoulder 与 `[8..10]` toe（把绑定的两维还原成引擎的两维）。
+
+    为什么必须解耦（R-3 实测）：白点从 2.6~2.75 提到 4.0 后，高光与暗部的诉求**方向相反** ——
+    高光要"晚弯"（`lat_sh → 1` 把 shoulder 段推到 `xmax`，线性段才够长、白纸才够白），
+    暗部要"早压"（`lat_toe` 小，否则暗部整段被抬亮）。绑定值只能二选一 ⇒ 三档白点下
+    minimax 残差从 8.4 恶化到 15~20（`fit/r3-wev*.json`）。解耦后引擎侧**零改动**
+    （它本来就分开读），只是把搜索空间还原成它的真实维度。
+
+    重建 `PBOUND` / `PSTEP` / `GRIDS` / `STARTS` 四件套（向量布局的唯一真源）。
+    """
+    global LAT_SPLIT, SPLIT_IDX, PBOUND, PSTEP, GRIDS, STARTS, _STARTS7
+    LAT_SPLIT = bool(on)
+    if not on:
+        PBOUND, PSTEP = _PB7.copy(), _PS7.copy()
+        GRIDS, SPLIT_IDX = [tuple(g) for g in _GR7], (7, 8)
+        STARTS = [list(s) for s in _STARTS7]
+    else:
+        PBOUND = np.array([[0.0, 1.0], [0.2, 3.0]] + [[0.0, 1.0]] * 6
+                          + [[-12.0, -0.5], [0.0, 12.0], [-0.60, 0.60], [-0.60, 0.60]])
+        PSTEP = np.array([0.15, 0.10] + [0.10] * 6 + [1.0, 0.8, 0.08, 0.08])
+        GRIDS = [("lut_strength", np.round(np.arange(0.0, 1.001, 0.05), 3)),
+                 ("contrast", np.round(np.arange(0.25, 3.001, 0.05), 3))]
+        GRIDS += [(f"lat{ch}", LAT_GRID) for ch in ("sh_r", "sh_g", "sh_b",
+                                                    "toe_r", "toe_g", "toe_b")]
+        GRIDS += [("filmic_black_ev", np.round(np.arange(-12.0, -0.49, 0.25), 3)),
+                  ("filmic_white_ev", np.round(np.arange(0.0, 12.01, 0.25), 3)),
+                  ("split_warm", SPLIT_GRID), ("split_cool", SPLIT_GRID)]
+        SPLIT_IDX = (10, 11)
+        # 起点：toe 初值 = shoulder（= 解耦前的绑定语义 ⇒ 起点不改变行为，由搜索自行解耦）
+        STARTS = [list(s[:2]) + list(s[2:5]) + list(s[2:5]) + list(s[5:7]) + [0.0, 0.0]
+                  for s in _STARTS7]
+    # 还原点是模块加载时的裸界 ⇒ 把已经下过的两道"钉子"重放一遍
+    if _LUT_MIN:
+        set_lut_min(_LUT_MIN)
+    if _WEV_FIX is not None:
+        set_white_ev(_WEV_FIX)
+    return LAT_SPLIT
+
+
+def _pack(p):
+    """搜索向量 → 槽位覆盖（布局见 `set_lat_split`）。
+
+    R-1 原布局前 7 维：`[ls, contrast, lat_r, lat_g, lat_b, black_ev, white_ev]`；
     第 8/9 维（R-1b 新增，**只在目标带 b* 时启用**）：`[split_warm, split_cool]`。
 
     为什么需要 split：理光负片的目标 b* = −1.7（样片实测的**整体冷调**），而 [34] LUT 强度、
@@ -627,6 +709,12 @@ def _pack(p):
     ⇒ 它是"把中性灰推冷"的正确旋钮，且在**两条链路同向生效**（工具只在编辑器链路上能测 b\*，
     但拍照链路用的是同一公式同方向的色向量，见报告 §缺口）。
     """
+    if LAT_SPLIT:
+        ls, ctr, sr, sg, sb, tr, tg, tb, bev, wev = p[:10]
+        o = {34: ls, 4: ctr, 37: bev, 38: wev, 5: sr, 6: sg, 7: sb, 8: tr, 9: tg, 10: tb}
+        if len(p) > 10:
+            o[23], o[24] = float(p[10]), float(p[11])
+        return o
     ls, ctr, lr, lg, lb, bev, wev = p[:7]
     o = {34: ls, 4: ctr, 37: bev, 38: wev,
          5: lr, 6: lg, 7: lb, 8: lr, 9: lg, 10: lb}
@@ -634,6 +722,18 @@ def _pack(p):
         o[23], o[24] = float(p[7]), float(p[8])
     return o
 
+
+def _dims(tgt):
+    """当前布局下该目标的搜索维度（b* 目标多两维 split）。"""
+    if LAT_SPLIT:
+        return 12 if tgt.get("bstar") is not None else 10
+    return 9 if tgt.get("bstar") is not None else 7
+
+
+# ★ R-3：死白起点约束（`--hi-floor`，默认关 ⇒ R-1/R-1b/R-1c 行为逐位不变）
+HI_FLOOR = None   # 死白起点地板（EV）；None = 不约束
+HI_TOL = 1.0      # 判据：EV∈[floor, white_ev] 的 8bit 极差必须 > 1 LSB（= R-2 的 sat8 判据）
+HI_PEN = 40.0     # 罚权（远大于残差的 p-norm 量级 ⇒ 约束优先于拟合目标）
 
 B_TOL = 0.15     # 色偏 b* 的约束带（超出即重罚）
 B_PEN = 25.0
@@ -659,6 +759,8 @@ def _cost(ev, overrides, pts, want, mode, bstar=None, bweight=0.5):
     最小化最大偏差**（残差拼接后取 p-norm），b* 用约束形式。
     """
     if mode == "camera":
+        # 注：camera-only 模式走 `cam_curve`（省一次 kFsStyle），它不返回高光探针 ⇒
+        # `--hi-floor` 在该模式下不生效（R-3 用 `both`；要约束就两条链路一起搜）。
         return [_pnorm(luma_curve(ev.cam_curve(o), pts, ev.xs) - want) for o in overrides]
     rep = ev.many(overrides, both=(mode == "both"), cc=(bstar is not None))
     out = []
@@ -675,6 +777,10 @@ def _cost(ev, overrides, pts, want, mode, bstar=None, bweight=0.5):
         if bstar is not None and r["b_shift"] is not None:
             # b* 也用**约束**形式：偏差 ≤ B_TOL 视为达标，超出重罚（R-1b 起）
             c += B_PEN * max(0.0, abs(r["b_shift"] - bstar) - B_TOL)
+        if HI_FLOOR is not None and r.get("hi") is not None:
+            # ★ R-3 约束②：死白起点 ≥ HI_FLOOR ⇒ EV∈[HI_FLOOR, white_ev] 的 8bit 极差 > 1 LSB。
+            # 罚权远大于残差的 p-norm 量级 ⇒ **约束优先于拟合目标**（残差在满足约束的解里最小化）。
+            c += HI_PEN * max(0.0, HI_TOL - r["hi"])
         out.append(c)
     return out
 
@@ -771,15 +877,15 @@ def fit_curve(ev, tgt, mode="editor", starts=None, rounds=6, verbose=True, probe
     """
     pts = tgt["pts"]
     want = np.array([w for _, w in pts])
-    dims = 9 if tgt.get("bstar") is not None else 7
+    dims = _dims(tgt)
     bstar = tgt.get("bstar")
     cands = [(list(x) + [0.0] * dims)[:dims] for x in (starts or STARTS)]
     if probe_n:
         rng = np.random.default_rng(7)
         P = np.stack([rng.uniform(PBOUND[i, 0], PBOUND[i, 1], probe_n) for i in range(dims)], 1)
-        if dims > 7:      # split 的随机初值收窄：避免一上来就 ±0.6 的重色偏（离样片太远）
-            P[:, 7] = rng.uniform(-0.30, 0.30, probe_n)
-            P[:, 8] = rng.uniform(-0.30, 0.30, probe_n)
+        for i in SPLIT_IDX:   # split 的随机初值收窄：避免一上来就 ±0.6 的重色偏（离样片太远）
+            if i < dims:
+                P[:, i] = rng.uniform(-0.30, 0.30, probe_n)
         cs = []
         for i in range(0, len(P), 300):
             cs += _cost(ev, [_pack(q) for q in P[i:i + 300]], pts, want, mode, bstar)
@@ -809,15 +915,24 @@ def fit_curve(ev, tgt, mode="editor", starts=None, rounds=6, verbose=True, probe
     ed = luma_curve(r["editor"], pts, ev.xs)
     cam = luma_curve(r["camera"], pts, ev.xs) if r["camera"] is not None else None
     if verbose:
+        lat = (f" sh/toe R/G/B={best_p[2]:.4f}/{best_p[3]:.4f}/{best_p[4]:.4f}"
+               f"/{best_p[5]:.4f}/{best_p[6]:.4f}/{best_p[7]:.4f}" if LAT_SPLIT else
+               f" lat R/G/B={best_p[2]:.4f}/{best_p[3]:.4f}/{best_p[4]:.4f}")
         print(f"   \u25b8 拟合（mode={mode}）lut={best_p[0]:.3f} contrast={best_p[1]:.3f}"
-              f" lat R/G/B={best_p[2]:.4f}/{best_p[3]:.4f}/{best_p[4]:.4f}"
-              f" black_ev={best_p[5]:.3f} white_ev={best_p[6]:.3f}"
-              + (f" split W/C={best_p[7]:+.3f}/{best_p[8]:+.3f}" if dims > 7 else ""))
+              + lat
+              + f" black_ev={best_p[8 if LAT_SPLIT else 5]:.3f}"
+                f" white_ev={best_p[9 if LAT_SPLIT else 6]:.3f}"
+              + (f" split W/C={best_p[SPLIT_IDX[0]]:+.3f}/{best_p[SPLIT_IDX[1]]:+.3f}"
+                 if dims > SPLIT_IDX[1] else ""))
         print(report_line("  编辑器 ", ed, want))
         if cam is not None:
             print(report_line("  拍照   ", cam, want))
         if r["b_shift"] is not None:
             print(f"  b*={r['b_shift']:+.2f}" + (f"（目标 {bstar:+.1f}）" if bstar is not None else ""))
+        if r.get("hi") is not None:
+            print(f"  高光层次探针：EV∈[{HI_FLOOR:.2f}, {best_p[9 if LAT_SPLIT else 6]:.2f}]"
+                  f" 的 8bit 极差 = {r['hi']:.2f} LSB（判据 > {HI_TOL:.1f}）"
+                  + ("" if r["hi"] > HI_TOL else "  ⚠ 未达标"))
     return best_p, dict(editor=ed, camera=cam, rep=r)
 
 
@@ -860,6 +975,10 @@ def _pnorm(d):
     d = np.abs(np.asarray(d, float))
     return float((d ** PNORM_P).sum() ** (1.0 / PNORM_P)) + 0.05 * float(d.mean())
 PSTEP = np.array([0.15, 0.10, 0.10, 0.10, 0.10, 1.0, 0.8, 0.08, 0.08])
+# R-1 原布局（7/9 维）的界与步长快照 —— `set_lat_split` 来回切换时的还原点
+_PB7, _PS7 = PBOUND.copy(), PSTEP.copy()
+_GR7 = [tuple(g) for g in GRIDS]
+_STARTS7 = [list(s) for s in STARTS]
 
 
 def _clamp_p(p):
@@ -924,11 +1043,38 @@ def set_lut_min(v):
       * `R1_LEVELS[0]`/`STARTS` —— `--grid` 的候选池与起点（同样不钳位）
     """
     v = float(min(max(v, 0.0), 1.0))
-    global STARTS
+    global STARTS, _LUT_MIN
+    _LUT_MIN = v
     PBOUND[0, 0] = v
     GRIDS[0] = ("lut_strength", np.round(np.arange(v, 1.001, 0.05), 3))
     R1_LEVELS[0] = [x for x in R1_LEVELS[0] if x >= v]
     STARTS = [[max(s[0], v)] + list(s[1:]) for s in STARTS]
+    return v
+
+
+def set_white_ev(v):
+    """★ R-3：把 `[38]` filmic 白点**钉死**在 `v`（从搜索向量里移除该自由度）。
+
+    为什么必须钉：白点是"死白起点"的**唯一**决定量 —— R-2 实测 `filmicScalar` 的
+    `e = clamp((log2(s/grey) − black)/dr, 0, 1)` 在输入 ≥ `white_ev` 时恒为 1 ⇒ 输出逐位恒定
+    （`tools/preset-exp/r2-white-point.py`，报告 §1）。本卡的验收判据 ① 是"死白起点 ≥3.5EV"，
+    所以白点必须由**外部依据**（真机高光 EV 分布）选定；若留在搜索向量里，拟合会为了压低
+    残差把它拉回 2.5（= 要修的那个病本身，R-2 §3 实测：白点 2.75 时残差最小）。
+
+    改的四处与 `set_lut_min` 同款，区别是上下界**都**收到 `v`（点区间 ⇒ 任何搜索都动不了）：
+      * `PBOUND[6]`   —— compass / NM / 随机探测的钳位界
+      * `GRIDS[6]`    —— `grid_sweep` 的逐维网格（它不钳位，必须在这里剔除）
+      * `R1_LEVELS[4]`/`STARTS` —— `--grid` 的候选池与起点
+    """
+    v = float(min(max(v, 0.0), 12.0))
+    global STARTS, _WEV_FIX
+    _WEV_FIX = v
+    i = 9 if LAT_SPLIT else 6          # 白点在向量里的位置随布局变
+    PBOUND[i, 0] = PBOUND[i, 1] = v
+    GRIDS[i] = ("filmic_white_ev", np.array([v]))
+    if not LAT_SPLIT:
+        R1_LEVELS[4] = [v]             # `--grid` 的候选池只在原布局下维护
+    STARTS = [list(s[:i]) + [v] + list(s[i + 1:]) for s in STARTS]
     return v
 
 
@@ -991,7 +1137,7 @@ def probe(ev, tgt, n, mode, seed=0, topk=8):
     rng = np.random.default_rng(seed)
     pts = tgt["pts"]
     want = np.array([w for _, w in pts])
-    dims = 9 if tgt.get("bstar") is not None else 7
+    dims = _dims(tgt)
     P = np.stack([rng.uniform(PBOUND[i, 0], PBOUND[i, 1], n) for i in range(dims)], 1)
     P = np.vstack([P, np.array([(list(s) + [0.0] * dims)[:dims] for s in STARTS[:4]])])
     cs = []
@@ -1107,10 +1253,30 @@ def main():
     ap.add_argument("--grid", action="store_true", help="多分辨率网格搜索（默认关：用单纯形法）")
     ap.add_argument("--lut-min", type=float, default=0.30,
                     help="[34] LUT 强度的搜索下界（R-1c 裁决 1；默认 0.30，设 0 恢复 R-1b 行为）")
+    ap.add_argument("--white-ev", type=float, default=None,
+                    help="★ R-3：把 [38] filmic 白点钉死在该值（不参与搜索）")
+    ap.add_argument("--lat-split", action="store_true",
+                    help="★ R-3：解耦 [5..7] shoulder 与 [8..10] toe（搜索向量 7/9 → 10/12 维）")
+    ap.add_argument("--hi-floor", type=float, default=None,
+                    help="★ R-3：死白起点地板（EV）—— 约束 EV∈[floor, white_ev] 的 8bit 极差 > tol")
+    ap.add_argument("--hi-tol", type=float, default=1.0,
+                    help="★ R-3：高光层次判据阈值（LSB；1.0 = R-2 的 sat8 判据）")
     a = ap.parse_args()
+    if a.hi_floor is not None:
+        global HI_FLOOR, HI_TOL
+        HI_FLOOR, HI_TOL = float(a.hi_floor), float(a.hi_tol)
+        print(f"[hi-floor] 死白起点约束 = {HI_FLOOR:.2f} EV"
+              f"（EV∈[{HI_FLOOR:.2f}, white_ev] 的 8bit 极差必须 > {HI_TOL:.1f} LSB）")
+    if a.lat_split:
+        print("[lat-split] shoulder[5..7] 与 toe[8..10] 解耦（引擎本来就分开读）"
+              " ⇒ 搜索维度 7/9 → 10/12")
+    set_lat_split(a.lat_split)
     lut_min = set_lut_min(a.lut_min)
     print(f"[lut-min] [34] LUT 强度下界 = {lut_min:.3f}"
           + ("（★ 裁决 1：不许把 LUT 归零 —— 色相选择性只有 3D LUT 能表达）" if lut_min > 0 else ""))
+    if a.white_ev is not None:
+        wev = set_white_ev(a.white_ev)
+        print(f"[white-ev] [38] filmic 白点钉死 = {wev:.4f}（★ R-3：死白起点由它唯一决定）")
 
     eso = U2.load_eso()
     recs = [r for r in load_builtin()
