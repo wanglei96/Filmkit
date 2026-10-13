@@ -2,7 +2,7 @@
 summary: WB复测与高光白根治收线
 created: 2026-09-29 17:45
 updated: 2026-09-29 17:45
-status: absorbed
+status: archived
 ---
 
 # WB复测与高光白根治收线

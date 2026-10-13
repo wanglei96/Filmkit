@@ -26,7 +26,7 @@ status: active
 - [2026-10-13] **相册 / 预设面板（本窗口主线）** | 进行中 | 相册：切图转圈（PV-2）、上一张图闪现（PV-3）、缩放锚点（PV-4）已修；预设：横向预设条 + 一级页只给常用参数 + 完整参数二级页 + 返回键分层（PS-6a/6b/7/8/9/10），内置白点 2.5~2.7 → 4.0 修高光死白（R-2/R-3）。**待真机验收**：白杯子高光是否不再死白、亮部变暗幅度可否接受 | handoffs/相册切图闪修与预设面板重做至v0.11.26.memo.md
 - [2026-10-13] **内建编辑器与预设** | 已完成（本窗口） | 取代 10-04 的"待立项"：拍照界面预设可查看/可逐项改/可增删（内置可改只禁删 + 恢复默认）；参数表单一来源 `ParamControls.kt`；`[37][38]` 黑白点可调 | 同上
 - [2026-10-13] **影调 whiteEv 默认值** | 已定案 4.0 | 取代 10-03"4.0 vs 6.x 待用户试"：R-2 实测证明 2.5~2.7 时死白起点 2.40~2.60 EV、真机高光常到 2.47~3.0 ⇒ 余量不足；R-3 定 4.0（死白起点 3.55 EV），代价亮部变暗 −15.9~−18.0 LSB | docs/reports/r3-white-point-refit-REPORT.md
-- [2026-10-13] **引擎切换（公共管线 + 引擎插槽）** | **阶段 0 已完成并提交**（`6a11833`），下一步 = 阶段 1 | 用户拍板：**引擎切换要做、第 2 步直接对齐 PC、交付上 10bit HEIF**。方案 `docs/engine-slots-design.md`（`kFsFilm` 三段拆解 / `[98] engine_slot` + 引擎私有 KV / 引擎注册表 / 4 阶段 + **CRC32 零回归判据**）。**阶段 0 交付**：`[98] engine_slot`（kCount 98→99，六处同步）+ `EngineRegistry.{h,cpp}` 骨架（只含引擎 0、渲染路径零引用）+ 离线基线（`docs/reports/stage0-engine-slot-BASELINE.md`）+ 新守卫 `tools/check-filmparams-contract.py`；验收 = `tests=596 failures=0`、shader/FrameRenderer 零改动。**⚠ 阶段 1 前置缺口**：① 离线执行器实际**未接入 `kFsFilm`**（文件头注释与实现不符，只跑到 D4）；② 拍照链无 filmic 参数日志（`engine.preview.filmic` 只在 `!still`）。**用户已拍板 A 方案**：先补离线执行器 FILM 段（+ PC3D），再开阶段 1 | docs/research/12–17 + docs/engine-slots-design.md + 提交 `6a11833`
+- [2026-10-13] **引擎切换（公共管线 + 引擎插槽）** | **阶段 0/1 已完成 + 真机验收通过**（`6a11833` / `f098ba8` / `ef1f50e`），下一步 = 阶段 2 sigmoid 引擎 | 用户拍板：**引擎切换要做、第 2 步直接对齐 PC、交付上 10bit HEIF**。方案 `docs/engine-slots-design.md`（`kFsFilm` 三段拆解 / `[98] engine_slot` + 引擎私有 KV / 引擎注册表 / 4 阶段 + **CRC32 零回归判据**）。**阶段 0** = `[98]` 契约（kCount 99，六处同步）+ `EngineRegistry` 骨架 + 基线 + `tools/check-filmparams-contract.py`；**离线链补齐** = `tools/engine-shader-offline.py` 接 FILM 段 + PC3D（`film_d5` 基线 `0x589f8364`）；**阶段 1** = `kFsFilm` 单真源切片（拼接逐字节等价 35154 B / `0x4fa1ebd3`）+ `[98]` 契约登记（新增 `CAMERA_ENGINE_SELECT_SLOTS`，参数面板零 UI 变化）。**真机验收通过**（包 `filmkit-0.11.27.apk`）：`engine.film_src` 6/6 条 `identical:true`、无 error/fatal、拍照出片正常。**⚠ 剩余缺口**：拍照链无 filmic 参数日志；HR/`uLocal*`/`kFsOut` 不在离线链内 ⇒ 成片零回归仍需真机同帧 A/B | docs/engine-slots-design.md + docs/reports/{stage0-engine-slot-BASELINE,stage1-acceptance-CHECKLIST}.md + 提交 `6a11833`/`f098ba8`/`ef1f50e`
 
 ## 进行中（2026-10-07，成像专项）
 
@@ -41,6 +41,8 @@ status: active
 
 ## 里程碑沿革（压缩）
 
+- [2026-10-13] **阶段 1 真机验收通过（10-13，本窗口）**：包 `filmkit-0.11.27.apk`（376 / 0.11.27）；真机日志 `filmkit-logs-20261013-215923` 的 `engine.film_src` **6/6 条** `identical:true` / 35154 字节 / `0x4fa1ebd3`，`film_split_missing`/`slot_unavailable` 各 0，无 error/fatal，拍照出片正常 ⇒ **零回归在设备上坐实**
+- [2026-10-13] **引擎插槽阶段 1（10-13，本窗口）**：`kFsFilm` 单真源切片拆成公共三段 + 引擎注入段（拼接逐字节等价 35154 B / `0x4fa1ebd3`）+ `[98]` 契约登记（第三种东西 ⇒ 新增 `CAMERA_ENGINE_SELECT_SLOTS`）+ 离线拼接判据链（`--verify-splice` 两路径 + 6 项 mutation）；597/0、validate-shaders 66/66；提交 `ef1f50e`
 - [2026-10-13] **离线链补齐（10-13，本窗口）**：`tools/engine-shader-offline.py` 补 FILM 段 + PC3D 真接入（纯增量，原 295 行未动）+ `filmic-spline-ref.py` / `check-film-offline.py` / `film-offline-REPORT.md`；`film_d5` 两组基线入档；旁路档逐位恒等自证；提交 `f098ba8`
 - [2026-10-13] **引擎插槽阶段 0（10-13，本窗口）**：`[98] engine_slot` + 六处同步 + `EngineRegistry` 骨架（零行为变化）+ 离线基线 + 契约守卫脚本；提交 `6a11833`。**实测发现两个缺口**（方案未写全）：离线执行器其实**没接 `kFsFilm`**（注释与实现不符）、拍照链无 filmic 日志 ⇒ 用户拍板先补离线 `kFsFilm`/PC3D 再开阶段 1
 

@@ -2,7 +2,7 @@
 summary: C 专项噪声模型全链与多摄标定
 created: 2026-09-29 21:35
 updated: 2026-09-30 12:30
-status: absorbed
+status: archived
 ---
 
 # C 专项噪声模型全链与多摄标定

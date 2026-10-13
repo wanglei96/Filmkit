@@ -2,7 +2,7 @@
 summary: M档WB断链修复与色度差复测待办
 created: 2026-09-29 12:00
 updated: 2026-09-29 12:00
-status: absorbed
+status: archived
 ---
 
 # M档WB断链修复与色度差复测待办
