@@ -8,20 +8,20 @@
 
 ## 1. 本阶段能采到什么（先说局限，再说数据）
 
-方案 §8 阶段 0 的验收判据是「四处同步通过 + `CameraPresetsTest` 绿 + **`[98]=0` 时同帧 CRC32
+方案 §8 阶段 0 的验收判据是「六处同步通过 + `CameraPresetsTest` 绿 + **`[98]=0` 时同帧 CRC32
 与基线逐字节一致**」。但**"同帧成片 CRC32"必须由真机拍照链路产生**，本机（macOS，无 adb、无
-Android GPU 运行时）采不到。实测下来，本机可采的基线只有**离线链路到 D4 为止的那一段**：
+Android GPU 运行时）采不到。本机可采的是**离线链路**：
 
 | 段 | 本机能否采基线 | 依据 |
 |---|---|---|
-| P0（`kFsRawDenoise`）→ RCD → CCM（D3→D4） | ✅ 可采（本文件） | `tools/engine-shader-offline.py` 已接入并跑通 |
-| **`kFsFilm`（FILM，含 filmic + gamut + 外观层）** | ❌ **未接入离线链** | 见 §4 —— 这是阶段 1 的**前置缺口** |
-| HR（高光重建）/ PC3D（`kFsPc3d`）/ `kFsOut`（OETF/颗粒/LUT/锐化） | ❌ 未接入 | 同上（方案 §10.6） |
+| P0（`kFsRawDenoise`）→ RCD → CCM（D3→D4） | ✅ 可采（本文件 §3） | `tools/engine-shader-offline.py` 已接入并跑通 |
+| **`kFsFilm`（FILM，含 filmic + gamut + 外观层）** | ✅ **已补齐**（本文件 §3.3） | 2026-10-13 补接，见 §4 与 `tools/film-offline-REPORT.md` |
+| PC3D（`kFsPc3d`） | ⚠ 已接入但 **LSC 恒等**（与真机有偏差） | §4 |
+| HR（高光重建）/ `kFsOut`（OETF/颗粒/LUT/锐化）/ MFNR | ❌ 不在链内 | §4（方案 §10.6） |
 
-**因此本基线对阶段 0 的作用是有限的、必须如实标注**：
-阶段 0 **没有改动任何 shader**（`FrameRenderer.{h,cpp}` 零改动），`[98]` 也**没有任何 kernel 读取**，
-所以「`[98]=0` 时与改动前逐字节一致」在阶段 0 是**结构性成立**的（见 §3 的三条机械依据），
-本基线在这一阶段主要起*哨兵*作用 —— 若有人误改了 RCD/CCM/P0 段，下面四个摘要会立刻变化。
+**阶段 0 自身的零回归是结构性成立的**（见 §3.2 三条机械依据）：
+阶段 0 **没有改动任何 shader**（`FrameRenderer.{h,cpp}` 零改动），`[98]` 也**没有任何 kernel 读取**。
+本基线在阶段 0 起*哨兵*作用（谁误改 P0/RCD/CCM/FILM 段，摘要立刻变化）；
 **它对阶段 1 才是真正的硬判据载体**（阶段 1 要拆 `kFsFilm`）。
 
 ---
@@ -75,25 +75,50 @@ ccm_d4   sha256=bf7388d97217aa1970b575d0af2d21a84ad1818b5f89fd4ac6bffed372a32353
 
 ---
 
-## 4. 缺口与阶段 1 的前置条件（**必须先解决**）
+### 3.3 FILM 段基线（`kFsFilm`，阶段 1 的**主判据**）
 
-`tools/engine-shader-offline.py` 的文件头声称"已接入 4 个 pass（…… 4. FILM `kFsFilm`）"，
-但**实读该脚本（295 行）没有任何 `kFsFilm` 代码路径**：它只跑到 CCM（`ccm_d4.npy`）就结束，
-`steps.json` 也只有 `p0/rcd/ccm` 三项。**文件头注释与实现不符**。
+2026-10-13 补接（`tools/engine-shader-offline.py` 纯增量 +383 行，原 295 行未动；
+交付与逐行对照见 `tools/film-offline-REPORT.md`）。产物 `<out>/film_d5.npy`
+（H×W×4 float32，**OETF 前的线性显示域**，与真机 `tex_work_` 同域）。
 
-后果：方案 §8 阶段 1 的硬判据是「拆 `kFsFilm` 为模板 + 引擎 0 注入段后，`[98]=0` 时 CRC32 逐字节等价」。
-**在这条离线链上，该判据当前无法执行** —— 能证明的只有"不涉及 FILM 的段没退化"。
+| 口径 | 命令差异 | `film_d5.npy` CRC32 | SHA-256 |
+|---|---|---|---|
+| **代码默认**（`[37]/[38]` = −7.65 / +4.56，与 `CameraPresets.neutral()`、darktable/PC 固化值一致） | 默认 | **`0x589f8364`** | `ce1c9a90c11dbb69278593cd20854970c7a99fc2bf0ee9da90fc10e3136e5391` |
+| 白点 4.0（2026-10-13 定档值；真机 prefs 若为 4.0 则用这组对照） | `--film-white-ev 4.0` | **`0xd46d7b5e`** | `7811827393c4af94fd206547d97a8a6b333e516464db8c5de97ff7832b2295ab` |
 
-阶段 1 开工前需要（二选一，由用户/架构师拍板）：
+- 两组均经**两次独立运行**校验字节一致（本机同驱动下逐位可比；**跨机器不保证** —— float16 与超越函数实现差异）。
+- 阶段 1 判据：拆 `kFsFilm` 为模板 + 引擎 0 注入段后，**同参数下上述摘要必须不变**。
+- 判据链自洽性已独立复核：`--film-tone-k 0 --film-look 0`（整段旁路）时 `film_d5` 与 `ccm_d4`
+  **逐位相同**（crc 都是 `0x189e4126`）⇒ FILM 段在旁路档确实是恒等，不是"看起来对"。
+- ⚠ **默认值口径修正**：`[37]/[38]` 的代码默认是 **−7.65 / +4.56**（`FilmParams.h:161-162` 与
+  `CameraPresets.kt:122-123` 两侧一致），**不是**记忆里"内置白点已定档 4.0"的那个值 ——
+  4.0 是 R-3 定档的**真机设置值**（经 prefs 覆盖），不是代码默认。两组都采，避免拿错口径对照。
 
-- **A（推荐，与既有并行待办合并做一次）**：给离线执行器补上 FILM 段 —— 直接执行 `kFsFilm`，
-  其中 filmic 系数由**照搬 `computeFilmicSpline` 的 CPU 侧求解**产生（需逐行对照 C++，避免
-  "numpy 直译"式偏差），同时按 `docs/engine-slots-design.md` §10.6 把 PC3D 一并接上（LSC 暂恒等）。
-  风险：FILM 段依赖 `uToneK/uSat/uLook/…` 等十余个 uniform 与 CPU 侧统计值，接线本身要一轮真机对拍。
-- **B（更省，但证明力弱）**：阶段 1 只做"结构等价"论证（拼接后的 shader 源码与改造前**逐字符相同**）+ 真机同帧 A/B CRC32。
+## 4. 缺口与阶段 1 的前置条件
 
-> 无论选哪条，**"离线好看、真机判死"的历史教训（`lessons.md` 10-06 那条）要求：离线链的缺口必须
-> 在判据里写明"哪一段不在链内"**，不能拿部分链的绿去主张整链零回归。
+### 4.1 已解决：FILM 段补齐（2026-10-13）
+
+原状：`tools/engine-shader-offline.py` 的文件头声称"已接入 4 个 pass（…… 4. FILM `kFsFilm`）"，
+但**实读该脚本（295 行）没有任何 `kFsFilm` 代码路径** —— 它只跑到 CCM（`ccm_d4.npy`）就结束，
+`steps.json` 只有 `p0/rcd/ccm` 三项。**文件头注释与实现不符** ⇒ 阶段 1 的核心判据当时无法执行。
+
+**处置（用户拍板 A 方案）**：补接 FILM 段 + PC3D（纯增量 +383 行，原 295 行未动）。
+交付与逐行对照见 `tools/film-offline-REPORT.md`；基线见本文件 §3.3；判据链自洽性由
+"旁路档逐位恒等"独立复核。**阶段 1 的 CRC32 判据现在可执行。**
+
+### 4.2 仍未在离线链内的部分（判据必须写明"哪一段不在链内"）
+
+| 不在链内 | 原因 | 对判据的影响 |
+|---|---|---|
+| **HR 高光重建**（`[45]` 真机默认 1.0） | 需要块级参考场；**真机上 FILM 的输入是它的输出** | FILM 基线的输入口径与真机不同 ⇒ **不能**用它判断成片观感 |
+| `uLocal*`（`[36]` 真机 0.25） | 依赖真机统计 | 离线按 `uLocalStrength = 0` 旁路；`>0` 档未验证 |
+| PC3D 的 **LSC / 噪声标定** | 需真机标定数据 | 离线 LSC = 恒等、sigA/sigB 非标定值 ⇒ PC3D 段只作结构验证 |
+| defringe / P5、`kFsOut`（OETF/颗粒/LUT/锐化）、MFNR、`uDomainRatio`、`auto_tone=1` | 未接入 / 需真机 | 同上 |
+| **同帧成片 CRC32** | 需真机拍照链路（本机无 adb） | 阶段 1 的最终零回归仍需**真机同帧 A/B** 兜底 |
+
+> **"离线好看、真机判死"的历史教训（`lessons.md` 2026-10-06）要求：不能拿部分链的绿去主张整链零回归。**
+> 本基线的正确用法 = 证明"拆 `kFsFilm` 这一步没有改变 `kFsFilm` 的输出"（同输入下逐字节等价），
+> **不是**证明"成片没变"。
 
 ## 5. 与方案 §8 的对应
 
@@ -101,9 +126,9 @@ ccm_d4   sha256=bf7388d97217aa1970b575d0af2d21a84ad1818b5f89fd4ac6bffed372a32353
 |---|---|---|
 | 建 `EngineRegistry`（只含引擎 0） | 已交付 | `core/engine/src/film/EngineRegistry.{h,cpp}` |
 | `FilmParams` 加 `[98]` | 已交付 | `core/engine/src/film/FilmParams.h`（`kCount` 98→99） |
-| 采集基线：成片 CRC32 | **部分**（离线到 D4；真机成片待采） | 本文件 §3 |
+| 采集基线：成片 CRC32 | **部分**：离线链已覆盖 P0/RCD/CCM/FILM（§3、§3.3）；**真机成片待采**（需 adb） | 本文件 §3 / §3.3 |
 | 采集基线：filmic 参数快照 | 见下 | 本文件 §5.1 |
-| 四处同步 + `CameraPresetsTest` 绿 | 已交付（六处同步，见 §3.2） | Kotlin 侧同批改动 |
+| 六处同步 + `CameraPresetsTest` 绿 | 已交付（`tests=596 failures=0`） | Kotlin 侧同批改动 + `tools/check-filmparams-contract.py` |
 
 ### 5.1 filmic 参数快照（改动前的取值来源）
 
@@ -113,17 +138,21 @@ ccm_d4   sha256=bf7388d97217aa1970b575d0af2d21a84ad1818b5f89fd4ac6bffed372a32353
   `blackEv / whiteEv / w99 / w999 / wmax / cp / linMid / ratio / pLo / pHi / localRef / w / h`。
 - **拍照链没有对应日志**（该事件在 `if (!still)` 分支内）⇒ 若阶段 1 需要"拍照时的 filmic 参数快照"，
   得先补一条 `engine.still.filmic`（或把该事件的 `still` 维度带上）。**这是阶段 1 的准备工作，不在阶段 0 内。**
-- 当前生效的白点取值（记忆 `project.md` 2026-10-13）：内置 `[37][38]` = `−8 / 4.0`（死白起点 3.55 EV，
-  见 `docs/reports/r3-white-point-refit-REPORT.md`）。
+- **白点口径两层，别混**：① **代码默认** `[37][38]` = `−7.65 / +4.56`（`FilmParams.h:161-162` +
+  `CameraPresets.kt:122-123`，darktable/PC 固化值）；② **2026-10-13 真机定档值** = 白点 `4.0`
+  （死白起点 3.55 EV，经 prefs 覆盖，见 `docs/reports/r3-white-point-refit-REPORT.md`）。
+  §3.3 两组基线各对应一层。
 
 ## 6. 变更记录
 
 | 日期 | 提交 | 说明 |
 |---|---|---|
 | 2026-10-13 | `a6adb35`（基线点） | 阶段 0 前的仓库状态；本文件 §2/§3 的基线在此采集 |
-| 2026-10-13 | （阶段 0 卡） | `[98] engine_slot` + `EngineRegistry` 骨架 + 本基线 |
+| 2026-10-13 | `6a11833` | 阶段 0：`[98] engine_slot` + `EngineRegistry` 骨架 + 本基线（§2/§3） |
+| 2026-10-13 | （离线链卡） | 补接 FILM 段 + PC3D ⇒ §3.3 新增 FILM 基线（两组白点口径）、§4 改写；交付见 `tools/film-offline-REPORT.md` |
+| 2026-10-13 | `46906f4` | 记忆库校准（kCount 99 / 引擎插槽 / 离线链缺口） |
 
-## 7. 本阶段新增的守卫脚本
+## 7. 本阶段新增的守卫与离线工具
 
 `tools/check-filmparams-contract.py`（**改参数契约时与单测一起跑**）：
 
@@ -136,3 +165,20 @@ python3 tools/check-filmparams-contract.py    # 0 = 通过
 **没有任何既有测试会因"C++ `kCount` 单独漂移"而变红**。本脚本把 `kCount` / 字段声明覆盖（0..kCount−1，
 [29] 留空例外）/ Kotlin `COUNT` / 语义名表 四条事实摆在一起对。已做 mutation 自检（4 种改坏方式全部报错，
 复原后 PASS）：`kCount` 99→100、`COUNT` 99→98、字段名 `engine_slot`→`engine_slotX`、bySlot 98→97。
+
+### 7.1 离线链（阶段 1 判据载体）
+
+| 文件 | 作用 |
+|---|---|
+| `tools/engine-shader-offline.py` | 离线执行器：P0 → RCD → CCM → **FILM**（+ `--pc3d`）。2026-10-13 纯增量 +383 行，原 295 行未动 |
+| `tools/filmic-spline-ref.py` | `computeFilmicSpline` + `solve5` 的 Python 逐行对照实现（可独立自检） |
+| `tools/check-film-offline.py` | 独立校验：`solve5` 对拍 numpy / spline 采样表 / **CPU 复现 vs GPU 实跑**（最大绝对差 2.44e-04 = RGBA16F 量化量级） |
+| `tools/film-offline-REPORT.md` | 交付报告：逐行对照、uniform 全表、shader 机械改写逐字记录、8 条链外清单 |
+
+**用法（阶段 1 零回归判据）**：
+
+```bash
+python3 tools/engine-shader-offline.py --dng test_temp/FILMKIT_20261009-090803.dng \
+  --roi 1800,2100,600,1000 --out /tmp/stage1-check
+# 然后比对 film_d5.npy 的 CRC32 与 §3.3 的 0x589f8364（默认口径）
+```

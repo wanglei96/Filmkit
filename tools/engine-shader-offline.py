@@ -7,18 +7,27 @@
 
 用法：
   python3 tools/engine-shader-offline.py --dng <path> --roi Y0,Y1,X0,X1 --out /tmp/chain
-产物：每个 pass 的输出存为 .npy（float32，H×W×3），外加 steps.json 记录 uniform。
+产物：每个 pass 的输出存为 .npy（float32，H×W×4），外加 steps.json 记录 uniform。
 
 已接入的 pass（按引擎成片链顺序）：
-  1. P0  kFsRawDenoise          RAW 域同色 bilateral（含 uMix 强度）
-  2. RCD kFsRcdDir / kFsRcdG / kFsRcdChroma（单 pass）或 kFsRcdChromaA+B（[58] 双 pass）
-  3. CCM kFsCcm                 D3 → D4（uCcm）
-  4. FILM kFsFilm               filmic + gamut + sat/look（uToneK/uGamut/uSat/uLook…）
+  1. P0   kFsRawDenoise   RAW 域同色 bilateral（含 uMix 强度）
+  2. RCD  kFsRcdDir / kFsRcdG / kFsRcdChroma（单 pass）或 kFsRcdChromaA+B（[58] 双 pass）
+  3. CCM  kFsCcm          D3 → D4（uCcm）
+  4. FILM kFsFilm         filmic + gamut + sat/look（uToneK/uGamut/uSat/uLook…）
+                          ⇒ film_d5.npy（OETF 前的线性显示域，与真机 tex_work_ 同域）
+                          CPU 侧 filmic 系数见 tools/filmic-spline-ref.py（逐行照搬
+                          FrameRenderer::computeFilmicSpline）；参数与 uniform 全表
+                          见 steps.json → steps.film；自检 tools/check-film-offline.py
+  5. PC3D kFsPc3d（--pc3d 1）  ESD3D2 移植（Down→pc3d→guidedUp→pc3d）
+                          ⚠ LSC = 恒等、sigA/sigB 非真机标定值 ⇒ 只作结构验证
 
 未接入（需要额外纹理/CPU 侧数据，按需再加）：
-  - P0 前置的 HR（高光重建，需要块级参考场）
-  - ESD3D2（kFsPc3d，多尺度 + LSC 纹理）
+  - P0 前置的 HR（高光重建，需要块级参考场）——**真机上 FILM 的输入是它的输出**，
+    故本脚本的 FILM 基线与真机输入口径不同，**不能**用它判断成片观感
   - passOutput 的 OETF/颗粒/dither（本脚本用 srgb_encode 近似，色度不受影响）
+
+阶段 1 判据（拆 kFsFilm 为模板 + 引擎注入段后的零回归）：
+  film_d5.npy 的 CRC32 必须与 docs/reports/stage0-engine-slot-BASELINE.md §3.3 一致。
 """
 import argparse
 import json
@@ -124,6 +133,39 @@ def main():
     ap.add_argument('--defringe', type=int, default=0, help='1 = 跑 defringe 三段并统计线性域量纲')
     ap.add_argument('--ccm', default='1.627,-0.561,-0.066,-0.139,1.347,-0.208,0.009,-0.564,1.554')
     ap.add_argument('--pc3d', type=int, default=0, help='1 = 执行 kFsPc3d（需 LSC，暂用恒等）')
+    # ── FILM 段参数（新增行，不改上面任何既有行；执行在文件尾部的 film_stage）──────
+    # 默认值一律回源码核实：FilmParams.h 的 [4]/[5..10]/[20..25]/[28]/[31..33]/[36]/[37]/[38]/[40]
+    # + computeFilmicSpline 的默认形参。**不取自本注释**，取不到的一律在 steps.json 里标出来。
+    ap.add_argument('--no-film', action='store_true', help='跳过 FILM（kFsFilm）段')
+    ap.add_argument('--film-black-ev', type=float, default=-7.65, help='FilmParams[37] 默认 -7.65')
+    ap.add_argument('--film-white-ev', type=float, default=4.56, help='FilmParams[38] 默认 4.56')
+    ap.add_argument('--film-contrast', type=float, default=1.0, help='FilmParams[4] 默认 1.0（真机 = cp×[4]，auto_tone=0 ⇒ cp=1.0）')
+    ap.add_argument('--film-lat-sh', type=float, default=0.01, help='FilmParams[5..7] shoulder latitude 默认 0.01')
+    ap.add_argument('--film-lat-toe', type=float, default=0.01, help='FilmParams[8..10] toe latitude 默认 0.01')
+    ap.add_argument('--film-tone-k', type=float, default=1.0, help='FilmParams[28] tone_strength 默认 1.0')
+    ap.add_argument('--film-gamut', type=float, default=1.0, help='FilmParams[40] gamut 默认 1.0')
+    ap.add_argument('--film-ev', type=float, default=0.0, help='FilmParams[0] exposure_ev 默认 0.0 ⇒ uExposure = 2^ev')
+    ap.add_argument('--film-look', type=float, default=1.0, help='FilmParams[31] look_strength 默认 1.0')
+    ap.add_argument('--film-look-sat', type=float, default=1.0, help='FilmParams[32] look_sat 默认 1.0')
+    ap.add_argument('--film-look-chroma', type=float, default=1.0, help='FilmParams[33] look_chroma 默认 1.0')
+    ap.add_argument('--film-sat', default='1,1,1', help='FilmParams[20,21,22] 阴影/中间/高光饱和')
+    ap.add_argument('--film-split', default='0,0', help='FilmParams[23,24] 阴影暖/高光冷')
+    ap.add_argument('--film-mono', type=float, default=0.0, help='FilmParams[25] 单色')
+    ap.add_argument('--film-local', type=float, default=0.0,
+                    help='uLocalStrength。**离线默认 0 = 旁路**（真机默认 FilmParams[36]=0.25，'
+                         '依赖 32×24 局部亮度图中位 ⇒ 离线链无法复现，见报告"不在离线链内"清单）')
+    ap.add_argument('--film-hal-domain', type=int, default=0,
+                    help='1 = 输入是 HAL 显示域（预览/YUV 静拍链），先除 uDomainRatio；'
+                         '0 = RAW 静拍链（本脚本的口径）')
+    ap.add_argument('--film-input', choices=['ccm', 'pc3d'], default='ccm',
+                    help='FILM 的输入：ccm = ccm_d4.npy（默认，阶段 1 基准口径）；'
+                         'pc3d = pc3d.npy（更接近真机链：真机 kFsFilm 吃 PC3D/defringe 的输出）')
+    ap.add_argument('--film-domain-ratio', type=float, default=2.0,
+                    help='uDomainRatio（仅 --film-hal-domain 1 时生效；真机 = 在线 EMA，初值 2.0）')
+    # PC3D 段参数（新增行；执行在文件尾部 pc3d_stage）
+    ap.add_argument('--pc3d-siga', type=float, default=1e-5, help='噪声模型斜率（非真机标定值）')
+    ap.add_argument('--pc3d-sigb', type=float, default=1e-6, help='噪声模型截距（非真机标定值）')
+    ap.add_argument('--pc3d-msize', type=float, default=0.0, help='FilmParams[55] 强制核尺寸，0=自动')
     args = ap.parse_args()
 
     Y0, Y1, X0, X1 = [int(v) for v in args.roi.split(',')]
@@ -293,3 +335,353 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILM 段（`kFsFilm`，D4 → D5）— 2026-10-12「引擎插槽阶段 1」前置补齐
+#
+# 为什么写在文件尾部、且用**独立的 GL 上下文**：上面的 P0/RCD/CCM 三段是**零回归基线**
+# （`docs/reports/stage0-engine-slot-BASELINE.md` §3 的四个字节摘要 = 阶段 1 的硬判据）。
+# 改它们一行都会让基线失效。所以本段**不碰上面任何一行**，只读它们的落盘产物
+# `ccm_d4.npy`；上面的 `main()`（含 `gl.close()`）跑完之后，这里重开一次上下文。
+#
+# 与真机的差异（**必读**，逐条写进 `steps.json` 的 `film.uniforms` 与报告"不在离线链内"）：
+#   · 输入域：真机 RAW 静拍链是 `tex_scene_`（P5 多尺度色度降噪 + **HR 高光重建**的输出），
+#     本段是 CCM 的 D4 直出 ⇒ **HR 不在离线链内**（[45] hr_raw 真机默认 1.0 开）。
+#   · `uLocal*`：真机喂 32×24 级低频亮度图 + 其中位（读回 8bit），**依赖真机统计** ⇒
+#     离线取旁路值 `uLocalStrength = 0`（shader 里 `if (uLocalStrength > 0.0)` 整段短路），
+#     其余 uLocal* 给源码常量/兜底值仅为满足 sampler 绑定。
+#   · PC3D（[54]）、defringe（[47]）、MFNR、OETF/颗粒/LUT/锐化：都不在本段内。
+# ═══════════════════════════════════════════════════════════════════════════════
+import zlib as _zlib          # noqa: E402  （新增，尾部追加；上面的 import 块不动）
+import hashlib as _hashlib    # noqa: E402
+
+
+def digest_f32(arr):
+    """float32 原始字节摘要（与 BASELINE 报告 §3 完全同一口径：`a.tobytes()`）。"""
+    b = np.ascontiguousarray(arr, dtype=np.float32).tobytes()
+    return {'shape': list(arr.shape), 'bytes': len(b),
+            'crc32': '0x%08x' % (_zlib.crc32(b) & 0xffffffff),
+            'sha256': _hashlib.sha256(b).hexdigest()}
+
+
+def load_spline_ref():
+    """载入 `tools/filmic-spline-ref.py`（computeFilmicSpline 的逐行 Python 对照实现）。
+
+    单独放一个文件是为了可独立运行自检（`python3 tools/filmic-spline-ref.py`），
+    避免同一份数学在这里和那里各写一遍。
+    """
+    import importlib.util
+    p = os.path.join(REPO, 'tools', 'filmic-spline-ref.py')
+    spec = importlib.util.spec_from_file_location('filmic_spline_ref', p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# 机械改写记录（判据可审计性：每一处改写都要能逐字回溯）
+FILM_REWRITES = [
+    ('#version 300 es → #version 330 core', '现有 to_core() 同一处改写（GLES3 → GL 330 core）'),
+]
+
+
+def film_stage(a):
+    """执行 `kFsFilm`：读 `<out>/ccm_d4.npy`（D4），写 `<out>/film_d5.npy`（D5）。
+
+    参数全部来自命令行（默认值 = FilmParams.h 的默认，逐槽在 add_argument 里标注），
+    并把**每一个 uniform 喂了什么**写进 steps.json。
+    """
+    d4p = os.path.join(a.out, 'pc3d.npy' if a.film_input == 'pc3d' else 'ccm_d4.npy')
+    if not os.path.exists(d4p):
+        print('⚠ FILM 段跳过：%s 不存在（请先跑 P0/RCD/CCM 前段%s）'
+              % (d4p, '与 --pc3d 1' if a.film_input == 'pc3d' else ''))
+        return None
+    ref = load_spline_ref()
+    d4 = np.load(d4p)
+    h, w = int(d4.shape[0]), int(d4.shape[1])
+
+    sh = extract_shaders()
+    # 引擎 shader 的 G2（ch==3）三目修正：kFsFilm 不含该模式（机械改写**未触发**），
+    # 保留同一处修正以保证与上面各段同口径（幂等）。
+    g2_hits = 0
+    for _k in list(sh):
+        if 'c == 1 ? m.g : m.b' in sh[_k]:
+            sh[_k] = sh[_k].replace('c == 1 ? m.g : m.b',
+                                    '(c == 1 || c == 3) ? m.g : m.b')
+            if _k == 'kFsFilm':
+                g2_hits += 1
+    if 'kFsFilm' not in sh:
+        raise RuntimeError('未能从 FrameRenderer.cpp 提取 kFsFilm')
+
+    # ── CPU 侧 filmic 系数（与真机 computeFilmicSpline 同口径）────────────────
+    lat_sh = [float(a.film_lat_sh)] * 3
+    lat_toe = [float(a.film_lat_toe)] * 3
+    sp = ref.compute_filmic_spline(a.film_black_ev, a.film_white_ev,
+                                   a.film_contrast, lat_sh, lat_toe)
+    sat = [float(v) for v in a.film_sat.split(',')]
+    split = [float(v) for v in a.film_split.split(',')]
+    assert len(sat) == 3 and len(split) == 2, '--film-sat 需 3 值、--film-split 需 2 值'
+
+    uniform_film = {}
+    # 逐通道手写（与真机 passFilm 的 glUniform3f 一一对应：vec3 的 .r/.g/.b = R/G/B）
+    for nm, seg in (('uFilmicToeM', 0), ('uFilmicShM', 1)):
+        for i in range(1, 6):
+            uniform_film['%s%d' % (nm, i)] = tuple(float(sp['m%d' % i][seg][ch]) for ch in range(3))
+    uniform_film['uFilmicLinM1'] = tuple(float(sp['m1'][2][ch]) for ch in range(3))
+    uniform_film['uFilmicLinM2'] = tuple(float(sp['m2'][2][ch]) for ch in range(3))
+    uniform_film['uFilmicLatMin'] = tuple(float(v) for v in sp['lat_min'])
+    uniform_film['uFilmicLatMax'] = tuple(float(v) for v in sp['lat_max'])
+    uniform_film['uFilmicBlackEv'] = float(sp['black_ev'])
+    uniform_film['uFilmicDr'] = float(sp['dynamic_range'])
+    uniform_film['uFilmicInputMin'] = float(sp['input_min'])
+    uniform_film['uFilmicInputMax'] = float(sp['input_max'])
+    uniform_film['uFilmicPower'] = float(sp['output_power'])
+    uniform_film['uFilmicBlackDisp'] = float(sp['black_disp'])
+    # ── 其余 uniform（逐条来源见 steps.json 的 film.uniforms）──────────────────
+    uniform_film.update({
+        'uExposure': float(2.0 ** a.film_ev),
+        'uGamut': float(a.film_gamut),
+        'uHalDomainMap': float(1.0 if a.film_hal_domain else 0.0),
+        'uDomainRatio': float(a.film_domain_ratio),
+        'uSat': tuple(sat),
+        'uSplit': tuple(split),
+        'uMono': float(a.film_mono),
+        'uToneK': float(a.film_tone_k),
+        'uLook': float(a.film_look),
+        'uLookSat': float(a.film_look_sat),
+        'uLookChroma': float(a.film_look_chroma),
+        # ↓↓ 旁路段：真机喂在线统计量，离线给恒等/兜底值（见文件头注释）
+        'uLocalStrength': float(a.film_local),
+        'uLocalKnee': 0.6,      # FrameRenderer.cpp:270 kLocalKnee
+        'uLocalKneeHi': 1.3,    # FrameRenderer.cpp:270 kLocalKneeHi
+        'uLocalRef': 0.5,       # passFilm 内 local_ref 兜底（局部图未生成时的中灰）
+        'uLocalSize': (1.0, 1.0),
+    })
+
+    gl = GL(w, h)
+    try:
+        tex_d4 = gl.ctx.texture((w, h), 4, dtype='f2')
+        tex_d4.write(d4.astype(np.float16).tobytes())   # 目标纹理是 RGBA16F，与上面各段同
+        tex_d4.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        # uLocal 是 sampler2D：即使 uLocalStrength=0 整段短路，**也必须有合法绑定**
+        # （v0.6.0-m4 全黑事故的成因；X300/Mali 上未绑定 sampler 是 UB）。
+        tex_local = gl.ctx.texture((1, 1), 4, dtype='f2')
+        tex_local.write(np.ones((1, 1, 4), np.float16).tobytes())
+        tex_local.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        d5 = gl.run(sh['kFsFilm'], uniform_film,
+                    {'uTex': tex_d4, 'uLocal': tex_local})
+    finally:
+        gl.close()
+    np.save(os.path.join(a.out, 'film_d5.npy'), d5)
+
+    info = {
+        'shader': 'kFsFilm',
+        'input': ('pc3d.npy (D4，PC3D 输出)' if a.film_input == 'pc3d'
+                  else 'ccm_d4.npy (D4，PC3D 未接入 FILM 输入)'),
+        'output': 'film_d5.npy (D5, display 域线性)',
+        'domain': 'RAW 静拍链口径（uHalDomainMap=%d，uDomainRatio=%.4f）'
+                  % (1 if a.film_hal_domain else 0, a.film_domain_ratio),
+        'shader_rewrites': [r[0] + ' ← ' + r[1] for r in FILM_REWRITES]
+                           + (['kFsFilm 内 G2 三目修正'] if g2_hits else []),
+        'filmic_spline': {
+            'source': 'FrameRenderer::computeFilmicSpline (FrameRenderer.cpp:13044) '
+                      '的 Python 逐行对照实现 tools/filmic-spline-ref.py',
+            'black_ev': sp['black_ev'], 'white_ev': sp['white_ev'],
+            'dynamic_range': sp['dynamic_range'], 'output_power': sp['output_power'],
+            'black_disp': sp['black_disp'], 'grey_log': sp['grey_log'],
+            'contrast': sp['contrast'], 'contrast_param': sp['contrast_param'],
+            'input_min': sp['input_min'], 'input_max': sp['input_max'],
+            'lat_sh': sp['lat_sh'], 'lat_toe': sp['lat_toe'],
+            'lat_min': sp['lat_min'], 'lat_max': sp['lat_max'],
+        },
+        'uniforms': {k: (list(v) if isinstance(v, tuple) else v)
+                     for k, v in sorted(uniform_film.items())},
+        'not_in_offline_chain': [
+            'HR 高光重建（[45] hr_raw 真机默认 1.0）：输入是它的输出，本段直接吃 ccm_d4',
+            'PC3D（[54] pc3d 真机默认 1.0）：不在本段内（见 --pc3d）',
+            'defringe（[47]）/ 多尺度色度降噪（[52]）：不在本段内',
+            'uLocal* 局部色调映射：依赖真机 32×24 低频图中位 ⇒ uLocalStrength=0 旁路',
+            'OETF/颗粒/dither/LUT/锐化（kFsOut）：本段输出是 **OETF 前**的线性显示域',
+        ],
+        'digest': digest_f32(d5),
+    }
+    print('FILM 段：film_d5.npy %s' % info['digest'])
+    _merge_steps(a.out, 'film', info)
+    return info
+
+
+def _merge_steps(out, key, value):
+    """把新段信息并入已有 steps.json（前段写的那份原样保留）。"""
+    p = os.path.join(out, 'steps.json')
+    doc = json.load(open(p)) if os.path.exists(p) else {}
+    doc.setdefault('steps', {})[key] = value
+    json.dump(doc, open(p, 'w'), indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PC3D 段（`kFsPc3d` + Down/Up，D4 → D4）— `--pc3d 1`
+#
+# 真机位置：P4 之后、kFsFilm **之前**（`[54] pc3d` 真机默认 1.0 = 替换档），
+# 与 kFsFilm 的输入等价性判据**无关**（阶段 1 两边都不变即等价），但它决定
+# `film_d5` 的真实性 ⇒ 一并接入。
+#
+# 与真机的差异（写进 steps.json）：
+#   · **LSC = 恒等**（1×1 全 1 纹理，与 RCD 段的 `tex_lsc` 同做法）：真机是标定好的
+#     逐通道镜头阴影增益图 ⇒ 本段在边缘/暗角的噪声权重与真机**有偏差**。
+#   · 输入 = `ccm_d4`（跳过 P5 多尺度色度降噪 / 色度平滑 tex_cs_）。
+#   · `sigA/sigB`（噪声模型 p4a/p4b）= 命令行参数；**默认值不是真机标定值**。
+# ═══════════════════════════════════════════════════════════════════════════════
+K_PC3D_NOISE_TO_KERNEL = 24.0     # FrameRenderer.cpp:9214
+K_PC3D_NOISE_TARGET = 1.0 / 256.0  # :9215
+K_PC3D_MIN_SIZE = 7               # :9216
+K_PC3D_MAX_SIZE = 21              # :9217
+K_PC3D_MOIRE = 1.5                # :9218
+K_PC3D_LUMA = 0.8                 # :9219
+
+
+def pc3d_stage(a):
+    d4p = os.path.join(a.out, 'ccm_d4.npy')
+    if not os.path.exists(d4p):
+        print('⚠ PC3D 段跳过：%s 不存在' % d4p)
+        return None
+    d4 = np.load(d4p)
+    h, w = int(d4.shape[0]), int(d4.shape[1])
+    sh = extract_shaders()
+    for k in list(sh):
+        if 'c == 1 ? m.g : m.b' in sh[k]:
+            sh[k] = sh[k].replace('c == 1 ? m.g : m.b',
+                                  '(c == 1 || c == 3) ? m.g : m.b')
+
+    sigA, sigB = float(a.pc3d_siga), float(a.pc3d_sigb)
+    # ② 核尺寸（照抄 ESD3D2.java:89-94，见 passPc3d 内注释）
+    noise_mpy = max((sigA + sigB) / K_PC3D_NOISE_TARGET, 1e-7)
+    kernel_size = 1.0 + np.sqrt(noise_mpy) * K_PC3D_NOISE_TO_KERNEL
+    msize = min(K_PC3D_MIN_SIZE + int(kernel_size) - int(kernel_size) % 2,
+                K_PC3D_MAX_SIZE)
+    if a.pc3d_msize > 0:                       # FilmParams[55] 强制核尺寸
+        forced = int(a.pc3d_msize + 0.5)
+        forced += (forced % 2 == 0)
+        msize = min(max(forced, K_PC3D_MIN_SIZE), K_PC3D_MAX_SIZE)
+    # ③ 尺度（照抄 ESD3D2.java:126-129）
+    n_sqrt = np.sqrt(0.5 * sigA + sigB)
+    scale_f = float(min(max(n_sqrt / K_PC3D_NOISE_TARGET, 1.0), 4.0))
+    scale = int(min(max(int(scale_f + 0.5), 1), 4))
+    lw, lh = max(1, w // scale), max(1, h // scale)
+
+    gl = GL(w, h)
+    try:
+        tex_src = gl.ctx.texture((w, h), 4, dtype='f2')
+        tex_src.write(d4.astype(np.float16).tobytes())
+        tex_src.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        # LSC = 恒等（1×1 全 1，3 通道 —— 与上面 RCD 段的 tex_lsc 同做法）
+        tex_lsc = gl.ctx.texture((1, 1), 3, dtype='f2')
+        tex_lsc.write(np.ones((1, 1, 3), np.float16).tobytes())
+        tex_lsc.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+        def as_tex(arr):
+            t = gl.ctx.texture((arr.shape[1], arr.shape[0]), 4, dtype='f2')
+            t.write(arr.astype(np.float16).tobytes())
+            t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            return t
+
+        def run_pc3d(src_tex, tw, th, ms, moire, sA, sB):
+            return gl.run(sh['kFsPc3d'], {
+                'uSize': (tw, th), 'uK': (ms - 1) // 2,
+                'uKernel': float(kernel_size), 'uSigA': sA, 'uSigB': sB,
+                'uMoire': moire, 'uLuma': K_PC3D_LUMA, 'uLscSize': (1, 1),
+            }, {'uTex': src_tex, 'uLsc': tex_lsc}, size=(tw, th))
+
+        trace = []
+        if scale > 1:
+            sc = max(scale_f * 0.75, 1e-3)
+            sig_a1, sig_b1 = sigA / sc, sigB / sc
+            stride = max(1, scale // 2)
+            blur = scale * 0.5
+            lo0 = gl.run(sh['kFsPc3dDown'], {
+                'uSize': (w, h), 'uResize': scale, 'uStride': stride,
+                'uSigma': blur / stride,
+            }, {'uTex': tex_src}, size=(lw, lh))
+            mp1 = max((sig_a1 + sig_b1) / K_PC3D_NOISE_TARGET, 1e-7)
+            ks1 = 1.0 + np.sqrt(mp1) * K_PC3D_NOISE_TO_KERNEL
+            ms1 = min(K_PC3D_MIN_SIZE + int(ks1) - int(ks1) % 2, K_PC3D_MAX_SIZE)
+            if a.pc3d_msize > 0:
+                ms1 = msize
+            lo1 = run_pc3d(as_tex(lo0), lw, lh, ms1, 0.0, sig_a1, sig_b1)
+            t1 = gl.run(sh['kFsPc3dUp'], {
+                'uLowSize': (lw, lh), 'uHiSize': (w, h), 'uR': scale,
+            }, {'uLow': as_tex(lo1), 'uGuideHi': tex_src}, size=(w, h))
+            trace.append('down(%dx%d)+pc3d(ms=%d)+guidedUp(r=%d)' % (lw, lh, ms1, scale))
+        else:
+            t1 = run_pc3d(tex_src, w, h, msize, 0.0, sigA, sigB)
+            trace.append('全分辨率 pc3d(ms=%d) 单趟（scale=1）' % msize)
+        out = run_pc3d(as_tex(t1), w, h, msize, K_PC3D_MOIRE, sigA, sigB)
+        trace.append('pc3d(ms=%d, moire=%.1f) 第二趟' % (msize, K_PC3D_MOIRE))
+    finally:
+        gl.close()
+    np.save(os.path.join(a.out, 'pc3d.npy'), out)
+
+    info = {
+        'shader': 'kFsPc3d (+kFsPc3dDown/+kFsPc3dUp)',
+        'input': 'ccm_d4.npy (D4)', 'output': 'pc3d.npy (D4，与输入同域)',
+        'pipeline': trace,
+        'params': {'sigA': sigA, 'sigB': sigB, 'noiseTarget': K_PC3D_NOISE_TARGET,
+                   'noiseToKernel': K_PC3D_NOISE_TO_KERNEL, 'kernelSize': float(kernel_size),
+                   'msize': msize, 'scaleF': scale_f, 'scale': scale, 'luma': K_PC3D_LUMA,
+                   'moire_pass2': K_PC3D_MOIRE},
+        'lsc': '**恒等**（1×1 全 1）⇒ 与真机（标定 LSC 增益图）有偏差：'
+               '边缘/暗角的噪声权重与真机不同',
+        'sig_source': '**命令行参数，不是真机噪声标定值**（真机 = NoiseCoef p4a/p4b）',
+        'not_in_offline_chain': ['P5 多尺度色度降噪 / 色度平滑（真机 PC3D 的输入是 tex_cs_）'],
+        'digest': digest_f32(out),
+    }
+    print('PC3D 段：pc3d.npy %s' % info['digest'])
+    _merge_steps(a.out, 'pc3d', info)
+    return info
+
+
+def _film_cli(argv):
+    """只解析本段自己的参数（用 parse_known_args ⇒ 前段参数不认识也不报错）。"""
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('--out', default='/tmp/chain')
+    ap.add_argument('--no-film', action='store_true')
+    ap.add_argument('--film-black-ev', type=float, default=-7.65)
+    ap.add_argument('--film-white-ev', type=float, default=4.56)
+    ap.add_argument('--film-contrast', type=float, default=1.0)
+    ap.add_argument('--film-lat-sh', type=float, default=0.01)
+    ap.add_argument('--film-lat-toe', type=float, default=0.01)
+    ap.add_argument('--film-tone-k', type=float, default=1.0)
+    ap.add_argument('--film-gamut', type=float, default=1.0)
+    ap.add_argument('--film-ev', type=float, default=0.0)
+    ap.add_argument('--film-look', type=float, default=1.0)
+    ap.add_argument('--film-look-sat', type=float, default=1.0)
+    ap.add_argument('--film-look-chroma', type=float, default=1.0)
+    ap.add_argument('--film-sat', default='1,1,1')
+    ap.add_argument('--film-split', default='0,0')
+    ap.add_argument('--film-mono', type=float, default=0.0)
+    ap.add_argument('--film-local', type=float, default=0.0)
+    ap.add_argument('--film-hal-domain', type=int, default=0)
+    ap.add_argument('--film-domain-ratio', type=float, default=2.0)
+    ap.add_argument('--film-input', choices=['ccm', 'pc3d'], default='ccm')
+    # ── PC3D 段（--pc3d 1）───────────────────────────────────────────────
+    ap.add_argument('--pc3d', type=int, default=0)
+    ap.add_argument('--pc3d-siga', type=float, default=1e-5,
+                    help='噪声模型斜率（真机 = NoiseCoef p4a 的 (0.25,0.5,0.25) 加权）；'
+                         '默认 1e-5 与 P0 段占位值同，**不是真机标定值**')
+    ap.add_argument('--pc3d-sigb', type=float, default=1e-6,
+                    help='噪声模型截距（真机 = p4b 同款加权）；默认 1e-6 同上')
+    ap.add_argument('--pc3d-msize', type=float, default=0.0,
+                    help='FilmParams[55] 强制核尺寸（奇数 7..21）；0 = 自动（PC 公式）')
+    a, _ = ap.parse_known_args(argv)
+    return a
+
+
+if __name__ == '__main__':
+    # 走到这里时上面的 main() 已经跑完（P0/RCD/CCM 产物已落盘、基线摘要不受影响）。
+    _a = _film_cli(sys.argv[1:])
+    if _a.pc3d:
+        pc3d_stage(_a)
+    if _a.no_film:
+        print('（--no-film：跳过 FILM 段）')
+    else:
+        film_stage(_a)
+

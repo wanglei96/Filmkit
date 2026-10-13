@@ -244,10 +244,11 @@ struct EngineEntry {
 
 > **阶段 0 已交付**（2026-10-13）：`[98] engine_slot`（`FilmParams.h`，`kCount` 98→99）+ 六处同步 +
 > `EngineRegistry.{h,cpp}` 骨架（只含引擎 0，渲染路径零引用）+ Kotlin 侧同步与测试护栏。
-> **基线**落在 `docs/reports/stage0-engine-slot-BASELINE.md` —— 其中记录了本机可采的离线基线
-> （P0/RCD/CCM→D4 的 CRC32 与 SHA-256）与**两个必须在阶段 1 前解决的缺口**：
-> ① 离线执行器实际**未接入 `kFsFilm`**（文件头注释与实现不符）⇒ 阶段 1 的核心判据在离线链上无法执行；
-> ② 拍照链**没有 filmic 参数日志**（`engine.preview.filmic` 只在预览分支）。
+> **基线**落在 `docs/reports/stage0-engine-slot-BASELINE.md` —— 记录离线链 P0/RCD/CCM/**FILM** 的
+> CRC32 与 SHA-256（§3、§3.3，两组白点口径）+ 链外清单（§4.2）。
+> **两个缺口的处置**：① 离线执行器实际**未接入 `kFsFilm`**（文件头注释与实现不符）⇒
+> **已补齐**（2026-10-13，纯增量 +383 行 + `tools/film-offline-REPORT.md`）⇒ 阶段 1 的 CRC32 判据可执行；
+> ② 拍照链**没有 filmic 参数日志**（`engine.preview.filmic` 只在预览分支）⇒ **仍未解决**，阶段 1 前补。
 
 ---
 
@@ -292,8 +293,11 @@ struct EngineEntry {
 5. **PC 式"引擎预览 LUT 图集"**：PC 最新 commit（`b9cf590` 附近）有
    `raw engine preview LUT atlas and shader sampling` —— 若我们也要"预设/引擎预览缩略图"，
    需要额外的资产管线（不在本方案范围，但注册表设计需预留字段）。
-6. **`--pc3d` 离线执行器缺口**：13 号报告核实离线链的 PC3D 用恒等 LSC ⇒ 阶段 1/2 的离线对照
-   必须明确"哪一段不在离线链内"，否则重演"离线好看真机判死"。
+6. **离线链的覆盖边界（2026-10-13 已实测澄清）**：原以为只是"PC3D 用恒等 LSC"，实测发现
+   **FILM 段当时根本没接入**（文件头注释与实现不符）⇒ 已补齐（含 PC3D 真接入，LSC 仍恒等）。
+   现行边界见 `docs/reports/stage0-engine-slot-BASELINE.md` §4.2：**HR 高光重建 / `uLocal*` /
+   PC3D 标定 / `kFsOut` / MFNR 不在链内** ⇒ 阶段 1/2 的离线对照只能证明"`kFsFilm` 自身输出没变"，
+   **不能**主张成片零回归（后者必须真机同帧 A/B）—— 否则重演"离线好看真机判死"。
 
 ---
 
