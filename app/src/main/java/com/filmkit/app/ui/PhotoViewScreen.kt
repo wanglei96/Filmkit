@@ -19,6 +19,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -253,6 +254,46 @@ internal fun clampZoom(current: Float, factor: Float): Float {
     val next = if (factor.isFinite() && factor > 0f) current * factor else current
     return next.coerceIn(MIN_ZOOM, MAX_ZOOM)
 }
+
+/**
+ * ★ PV-4：**以两指中心为锚点**的缩放补偿（用户 2026-10-12 真机："相册缩放要从两指中心缩，
+ * 现在都是从画面中心缩放，很奇怪"）。
+ *
+ * 根因在绘制层：`graphicsLayer { scaleX = scaleY = z; translationX/Y = pan }` 的 pivot 是默认的
+ * `TransformOrigin.Center` ⇒ 只改 `z` 就是**绕画面中心**缩放。要让两指之间的内容点不动，必须
+ * 同时改 [pan]。居中坐标系下内容点 `x` 的屏幕位置是 `ctr + z·(x − ctr) + pan`（[ctr] = 容器
+ * 中心 = pivot），要求同一个 `x` 在缩放前后都落在两指中心 [centroid] 上：
+ * ```
+ * c = ctr + z₁·(x − ctr) + pan₁      （缩放前）
+ * c = ctr + z₂·(x − ctr) + pan₂      （缩放后）
+ * ⇒ pan₂ = pan₁ + (c − ctr − pan₁)·(1 − z₂/z₁)
+ * ```
+ * 这就是本函数，纯函数（不动点性质由 JVM 单测钉死）。[z1] == [z2]（已顶到 [MAX_ZOOM]，或
+ * `calculateZoom()` 给了非法 factor）⇒ 补偿项为 0 ⇒ 只保留双指整体位移，不漂移；非有限输入
+ * （`calculateCentroid()` 在指针被消费 / 无按下指针时返回 `Offset.Unspecified` = NaN）⇒
+ * **原样返回**（与 [clampZoom] 的守卫同精神：宁可不动，也不能把 NaN 传给 `graphicsLayer` —— 那
+ * 会让整张图消失）。
+ *
+ * **[centroid] 必须取 current 帧**（`calculateCentroid(useCurrent = true)`）：`calculateZoom()`
+ * 与 `calculatePan()` 都是"current 相对 previous"的增量，本帧的几何状态就是 current。用
+ * previous 中心会让锚点比手指慢一帧（两指整体移动时缩放中心滞后于指间内容）；而 current 中心
+ * **加上先叠加的 `calculatePan()`** 恰好等价于"两指夹住的那个点跟着两指中心走" —— 数学上等价于
+ * "previous 中心 + 位移补偿"（推导见报告 §2），所以这不是近似，是同一件事。
+ */
+internal fun zoomAboutCentroid(
+    pan: Offset,
+    centroid: Offset,
+    center: Offset,
+    z1: Float,
+    z2: Float,
+): Offset {
+    if (!pan.finite() || !centroid.finite() || !center.finite()) return pan
+    if (!z1.isFinite() || !z2.isFinite() || z1 <= 0f) return pan
+    return pan + (centroid - center - pan) * (1f - z2 / z1)
+}
+
+/** 逐分量有限性（本文件用的 Compose 版本没有 `Offset.isFinite`） */
+private fun Offset.finite(): Boolean = x.isFinite() && y.isFinite()
 
 /**
  * `ContentScale.Fit` 之后图片在容器里的显示尺寸（像素）。图片尺寸未知（还没解码 / 解不开）
@@ -864,11 +905,29 @@ fun PhotoViewScreen(
                                         ) {
                                             // 双指：缩放（顺带支持双指拖动平移）
                                             ViewerGesture.Zoom -> {
-                                                zoom.floatValue =
-                                                    clampZoom(zoom.floatValue, event.calculateZoom())
+                                                // ★ PV-4：**以两指中心为锚点**缩放（此前只改 zoom
+                                                // ⇒ 绕画面中心缩放，用户真机："很奇怪"）。
+                                                // 顺序：① 先跟随两指整体位移（calculatePan，
+                                                // current − previous）；② 再按 [zoomAboutCentroid]
+                                                // 补掉"绕 pivot 缩放"多出来的那段平移。
+                                                // 锚点 = current 帧两指中心（理由见 [zoomAboutCentroid]）；
+                                                // 容器中心 = 本手势节点中心 = graphicsLayer 的 pivot
+                                                // （页 Box / Image 都是 fillMaxSize，同尺寸）。
+                                                // 倍率先夹紧再补偿：顶到 [MAX_ZOOM] 后 z₁ == z₂ ⇒
+                                                // 补偿项为 0，不会继续漂移。
+                                                val z1 = zoom.floatValue
+                                                val z2 = clampZoom(z1, event.calculateZoom())
+                                                val moved = pan.value + event.calculatePan()
+                                                zoom.floatValue = z2
                                                 pan.value = clampPan(
-                                                    pan.value + event.calculatePan(),
-                                                    zoom.floatValue,
+                                                    zoomAboutCentroid(
+                                                        moved,
+                                                        event.calculateCentroid(useCurrent = true),
+                                                        Offset(size.width / 2f, size.height / 2f),
+                                                        z1,
+                                                        z2,
+                                                    ),
+                                                    z2,
                                                     viewSize,
                                                     bitmap,
                                                 )
