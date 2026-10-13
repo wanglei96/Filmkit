@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-13 17:20
+updated: 2026-10-13 17:55
 status: active
 ---
 
@@ -41,6 +41,7 @@ status: active
 
 ## 里程碑沿革（压缩）
 
+- [2026-10-13] **离线链补齐（10-13，本窗口）**：`tools/engine-shader-offline.py` 补 FILM 段 + PC3D 真接入（纯增量，原 295 行未动）+ `filmic-spline-ref.py` / `check-film-offline.py` / `film-offline-REPORT.md`；`film_d5` 两组基线入档；旁路档逐位恒等自证；提交 `f098ba8`
 - [2026-10-13] **引擎插槽阶段 0（10-13，本窗口）**：`[98] engine_slot` + 六处同步 + `EngineRegistry` 骨架（零行为变化）+ 离线基线 + 契约守卫脚本；提交 `6a11833`。**实测发现两个缺口**（方案未写全）：离线执行器其实**没接 `kFsFilm`**（注释与实现不符）、拍照链无 filmic 日志 ⇒ 用户拍板先补离线 `kFsFilm`/PC3D 再开阶段 1
 
 - [2026-10-13] **引擎切换调研与方案（10-13）**：针对「黑白点反复手调」发起专项 —— 6 份调研（12–17 号：神经 ISP / 学习型影调 / **vivo X300 真机引擎取证** / 引擎架构 / 影调科学 / **独立复核**）+ 方案 `docs/engine-slots-design.md`；核心结论「白点难调 = filmic 参数化缺陷」+「工业界两样本（vivo/Google）都分层且成片零 NN」；拍板引擎切换 / 对齐 PC / 10bit HEIF；判据改「可分辨跨度」

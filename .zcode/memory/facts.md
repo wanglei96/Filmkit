@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-13 17:25
+updated: 2026-10-13 17:55
 status: active
 ---
 
@@ -35,7 +35,8 @@ status: active
 - [2026-09-27] **管线顺序（定稿）**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化 → OETF → 3D LUT → 颗粒 → JPEG；硬约束 LUT 必须在 OETF 后
 - [2026-10-13] **FilmParams 契约 kCount=99**（`film/FilmParams.h:41`，阶段 0 引擎插槽起；旧记忆的 36/43/48/56/59/**98** 均已过时）：[0] exposure_ev、[1..3] wb、[29] 空槽不复用、[31..34] 外观层/LUT 强度、[35] auto_tone（默认 0）、[37] filmic_black_ev / [38] filmic_white_ev、[42] white_hl=1、[43] white_floor、[44] white_probe=0.5、[45] hr_raw、[46] rcd_cdfix=1、[47] defringe、[48] moire、[49] hl_grecon、[50] ca_corr、[51] chroma_gate=2.0、[52] cg_scope=1.0、[53] df_gate=0.0、[54] **pc3d=1（替换档默认）**、[55] pc3d_msize=0、[56] rcd_g_orig=0、[57] hl_rb_recon=0、[58] rcd_p3_split=0、[59] color_smooth、[88]/[89] 色温色调（相对量）、[90..94] 高光/阴影/白/黑/褪色、[95..97] 柔光（默认 0.0/0.35/0.70）、**[98] engine_slot**（阶段 0，0 = 内置 filmic、默认）；**按实际长度读取（下限 26）**；⚠️ 下发数组必须按 **99**，且**六处同步**：`FilmParams.h` 的 `kCount` / 同文件字段声明行 `float <名> = …; // <槽位>`（机器可读，`FilmParamKeysTest` 正则抽取）/ `fromDoubles` 防呆 / Kotlin `CameraPresets.neutral()` 与 `COUNT` / Kotlin `FilmParamKeys.bySlot`（v0.10.196 只改 C++ ⇒ 启动崩）。**契约守卫**：`python3 tools/check-filmparams-contract.py`（2026-10-13 新增，四路对拍，补"C++ kCount 单独漂移"这条既有测试不覆盖的缝）
 - [2026-10-13] **EngineRegistry 骨架**（`core/engine/src/film/EngineRegistry.{h,cpp}`，阶段 0）：`kEngineCount = 1`，唯一表项 `{0, "filmic", "LinearSRGB", ExposureDomain::kLinear, 0.0f}`；`findEngine(slot)` 未命中返回 `nullptr`（**不回落**，回落是调用方策略）；无 GL/EGL 依赖；**渲染路径零引用**（阶段 1 才接线）
-- [2026-10-13] **离线执行器实际覆盖到 D4**（`tools/engine-shader-offline.py`）：真正跑通的是 P0 → RCD（`--p3-split` 双 pass）→ CCM，产物 `p0/rcd_g/rcd_d3/ccm_d4.npy`；**文件头注释声称"已接入 4. FILM kFsFilm"与实现不符**（代码里无 FILM 段）；HR / PC3D（`--pc3d` 的 LSC 恒等）/ `kFsOut` 亦不在链内 ⇒ 离线判据必须写明"哪一段不在链内"。基线摘要见 `docs/reports/stage0-engine-slot-BASELINE.md` §3
+- [2026-10-13] **离线执行器覆盖 = P0→RCD→CCM→FILM（+PC3D）**（`tools/engine-shader-offline.py`）：产物 `p0/rcd_g/rcd_d3/ccm_d4/**film_d5**.npy`；**FILM 段 2026-10-13 补齐**（此前文件头声称已接入而实现没有 ⇒ 阶段 1 判据曾无法执行，用户拍板 A 方案先补链），配套 `tools/filmic-spline-ref.py`（`computeFilmicSpline` 逐行对照）+ `tools/check-film-offline.py`（自检：solve5 对拍 numpy / CPU 复现 vs GPU 实跑差 2.44e-04）+ `tools/film-offline-REPORT.md`。**基线**（`docs/reports/stage0-engine-slot-BASELINE.md` §3.3）：`film_d5` 默认口径 `crc32=0x589f8364`、白点 4.0 口径 `0xd46d7b5e`。**仍不在链内**：HR 高光重建（真机 FILM 的输入是它 ⇒ 离线基线不能判成片观感）/ `uLocal*` / PC3D 的 LSC 与噪声标定 / `kFsOut` / MFNR / 同帧成片 CRC32（需真机 adb）
+- [2026-10-13] **filmic 黑白点默认值两层口径（别混）**：**代码默认** `[37]/[38]` = **−7.65 / +4.56**（`FilmParams.h:161-162` + `CameraPresets.kt:122-123`，darktable/PC 固化值）；**2026-10-13 真机定档**白点 = **4.0**（经 prefs 覆盖，死白起点 3.55 EV）
 - [2026-09-29] **影调链**：filmic 原生件（darktable v5 固定参数，base_ev 默认 +0.7）；黑白点自动三版证伪后默认关；`updateFilmicEV` 的 white 判据 = max 驱动探针 + 整体 +ev（渲染域对齐）；statistics 512×288、P99/P99.9/P100
 - [2026-09-29] **gamut mapping v5**（min+相锁+Y clamp+desaturate(0)+Yrg+clip chroma）；**输出 OETF 真 sRGB**（`kFsOut`/`kFsHist`/`measureSceneStats` 三处同步）；原生小波高光重建；锐化 = 线性显示域 luma USM（kFsOut 内）
 - [2026-09-27] **MFNR 采集**：maxImages 4 + 帧 1-3 拷贝即 close（maxImages 5+4 全程持有致 HAL 预配 125MB 闪退）；prefs `mfnr` 三档（0 关 / 1 自动暗光 ISO≥600 或 ≥25ms / 2 强制）
