@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-13 11:00
+updated: 2026-10-13 17:20
 status: active
 ---
 
@@ -15,8 +15,8 @@ status: active
 
 ## 结构
 
-- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）+ `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，kCount=56）
-- `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/（SpikeFftMerge）、log/（JSONL+GPU 计时）、jni/Bridge.cpp、`film/FilmParams.h`
+- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）+ `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=99**）
+- `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/（SpikeFftMerge）、log/（JSONL+GPU 计时）、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`（阶段 0 骨架）
 - `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、research/（12 个编号调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪 / 10=ARRI 引擎计划 + 内建编辑器与预设）
 - `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
 - `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
@@ -26,7 +26,7 @@ status: active
 - [2026-10-13] **相册 / 预设面板（本窗口主线）** | 进行中 | 相册：切图转圈（PV-2）、上一张图闪现（PV-3）、缩放锚点（PV-4）已修；预设：横向预设条 + 一级页只给常用参数 + 完整参数二级页 + 返回键分层（PS-6a/6b/7/8/9/10），内置白点 2.5~2.7 → 4.0 修高光死白（R-2/R-3）。**待真机验收**：白杯子高光是否不再死白、亮部变暗幅度可否接受 | handoffs/相册切图闪修与预设面板重做至v0.11.26.memo.md
 - [2026-10-13] **内建编辑器与预设** | 已完成（本窗口） | 取代 10-04 的"待立项"：拍照界面预设可查看/可逐项改/可增删（内置可改只禁删 + 恢复默认）；参数表单一来源 `ParamControls.kt`；`[37][38]` 黑白点可调 | 同上
 - [2026-10-13] **影调 whiteEv 默认值** | 已定案 4.0 | 取代 10-03"4.0 vs 6.x 待用户试"：R-2 实测证明 2.5~2.7 时死白起点 2.40~2.60 EV、真机高光常到 2.47~3.0 ⇒ 余量不足；R-3 定 4.0（死白起点 3.55 EV），代价亮部变暗 −15.9~−18.0 LSB | docs/reports/r3-white-point-refit-REPORT.md
-- [2026-10-13] **引擎切换（公共管线 + 引擎插槽）** | 方案定案、待开工 | 用户拍板：**引擎切换要做、第 2 步直接对齐 PC、交付上 10bit HEIF**。方案 `docs/engine-slots-design.md`（`kFsFilm` 三段拆解 / `[98] engine_slot` + 引擎私有 KV / 引擎注册表 / 4 阶段 + **CRC32 零回归判据**）。**开工起点 = 阶段 0**（只加 1 槽 + 注册表骨架 + 采基线，零行为变化）| docs/research/12–17 + docs/engine-slots-design.md
+- [2026-10-13] **引擎切换（公共管线 + 引擎插槽）** | **阶段 0 已完成并提交**（`6a11833`），下一步 = 阶段 1 | 用户拍板：**引擎切换要做、第 2 步直接对齐 PC、交付上 10bit HEIF**。方案 `docs/engine-slots-design.md`（`kFsFilm` 三段拆解 / `[98] engine_slot` + 引擎私有 KV / 引擎注册表 / 4 阶段 + **CRC32 零回归判据**）。**阶段 0 交付**：`[98] engine_slot`（kCount 98→99，六处同步）+ `EngineRegistry.{h,cpp}` 骨架（只含引擎 0、渲染路径零引用）+ 离线基线（`docs/reports/stage0-engine-slot-BASELINE.md`）+ 新守卫 `tools/check-filmparams-contract.py`；验收 = `tests=596 failures=0`、shader/FrameRenderer 零改动。**⚠ 阶段 1 前置缺口**：① 离线执行器实际**未接入 `kFsFilm`**（文件头注释与实现不符，只跑到 D4）；② 拍照链无 filmic 参数日志（`engine.preview.filmic` 只在 `!still`）。**用户已拍板 A 方案**：先补离线执行器 FILM 段（+ PC3D），再开阶段 1 | docs/research/12–17 + docs/engine-slots-design.md + 提交 `6a11833`
 
 ## 进行中（2026-10-07，成像专项）
 
@@ -40,6 +40,8 @@ status: active
 - [2026-10-01] **M5 诊断与基准** | 低 | 逐 pass GPU 计时、成像会话摘要、一键诊断包、性能基准脚本 + golden image 接 CI | decisions.md「色彩链、管线与 MFNR」
 
 ## 里程碑沿革（压缩）
+
+- [2026-10-13] **引擎插槽阶段 0（10-13，本窗口）**：`[98] engine_slot` + 六处同步 + `EngineRegistry` 骨架（零行为变化）+ 离线基线 + 契约守卫脚本；提交 `6a11833`。**实测发现两个缺口**（方案未写全）：离线执行器其实**没接 `kFsFilm`**（注释与实现不符）、拍照链无 filmic 日志 ⇒ 用户拍板先补离线 `kFsFilm`/PC3D 再开阶段 1
 
 - [2026-10-13] **引擎切换调研与方案（10-13）**：针对「黑白点反复手调」发起专项 —— 6 份调研（12–17 号：神经 ISP / 学习型影调 / **vivo X300 真机引擎取证** / 引擎架构 / 影调科学 / **独立复核**）+ 方案 `docs/engine-slots-design.md`；核心结论「白点难调 = filmic 参数化缺陷」+「工业界两样本（vivo/Google）都分层且成片零 NN」；拍板引擎切换 / 对齐 PC / 10bit HEIF；判据改「可分辨跨度」
 
