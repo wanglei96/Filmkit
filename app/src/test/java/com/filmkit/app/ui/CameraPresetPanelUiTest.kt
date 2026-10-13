@@ -392,7 +392,7 @@ class CameraPresetPanelUiTest {
             "PresetNewCard(",          // 条首「＋ 新建预设」
             "PresetParamSliderRow(",   // 一行滑杆（标签 │ 滑杆 │ 等宽数值）
             "PresetLevelSegments(",    // 四档分段控件（等宽均分 + 选中填充强调色）
-            "GrainLevel",              // 颗粒四档（关 / 细 / 中 / 粗）
+            "GrainStrengthParam",      // ★ PS-9：颗粒强度滑杆（只写 `[26]`，与 LUT 强度同一套视觉）
             "QUICK_LEVEL_PARAMS",      // 柔光 / 光晕 / 暗角三行档位
             "GLOW_LEVEL_PARAM", "HALO_LEVEL_PARAM", "VIGNETTE_LEVEL_PARAM",
             "PresetQuickAdjustPanel(", // 常用参数区（一级页与编辑面板共用）
@@ -418,17 +418,27 @@ class CameraPresetPanelUiTest {
     }
 
     /**
-     * ★ PS-8：**一级页只有一条滑杆**（常用参数区的 LUT 强度）—— 用户砍掉清单后，"选中项滑杆"
-     * 随之消失；其余四档是**分段控件**（不是滑杆，也不是散落的小 chip）。
+     * ★ PS-8：**一级页的滑杆只有两条**（常用参数区的 LUT 强度 + ★ PS-9 加入的颗粒强度）——
+     * 用户砍掉清单后，"选中项滑杆"随之消失；其余三档（柔光 / 光晕 / 暗角）是**分段控件**
+     * （不是滑杆，也不是散落的小 chip）。
+     *
+     * 判据落在 [PresetParamSliderRow] 的**调用点数量**（= 2）而不是 `RelativeSlider(` 的出现次数：
+     * 后者是那一行滑杆的**唯一实现**（两条滑杆共用它 —— 一处实现两处调用，正是 PS-8 立的规矩）。
      *
      * 同时钉住三处"点了没反应就会假掉"的接线：分段控件的 `onPick`、「完整参数 >」的
      * `onOpenFullEdit`、以及滑杆拿到的 `params`（读的是当前生效参数数组）。
      */
     @Test
-    fun theQuickAdjustBlockRendersExactlyOneSliderAndEveryTapIsWired() {
+    fun theQuickAdjustBlockRendersExactlyTwoSlidersAndEveryTapIsWired() {
         val panel = File("src/main/java/com/filmkit/app/ui/CameraPresetPanel.kt").readText()
+        val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").substringBefore("private fun PresetParamLabelRow(")
         assertEquals(
-            "滑杆渲染点只能有一个：常用参数区的 LUT 强度（四档 = 分段控件）",
+            "滑杆行 = 两条（LUT 强度 + ★ PS-9 颗粒强度；三档 = 分段控件）",
+            2,
+            Regex("""PresetParamSliderRow\(""").findAll(quick).count(),
+        )
+        assertEquals(
+            "RelativeSlider 只有一处实现（一行滑杆的控件本体，两条滑杆共用）",
             1,
             Regex("""RelativeSlider\(""").findAll(panel).count(),
         )
@@ -436,14 +446,16 @@ class CameraPresetPanelUiTest {
             "ParamControls 的 EditorSlider（读数在上 + 满宽 + 16dp 内边距）不再用于一级页",
             panel.contains("EditorSlider("),
         )
-        val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").take(4000)
         assertTrue("LUT 强度滑杆必须在常用参数区里（用户点名的第一项）", quick.contains("PresetParamSliderRow("))
         assertTrue(
             "LUT 强度滑杆读的必须是 lutStrength（`[34]` 不进 slots ⇒ 展开数组里是基线 1.0）",
             quick.contains("it[LUT_STRENGTH_SLOT] = lutStrength.toDouble()"),
         )
         assertTrue("档位按钮必须真的接上回调（点了有反应）", panel.contains("onTap = { onPick(i) }"))
-        assertTrue("颗粒档位写的是 GrainLevelParam（`[26]` + `[27]` 两个真实槽）", quick.contains("onPickLevel(GrainLevelParam"))
+        assertTrue(
+            "★ PS-9：颗粒 = 强度滑杆，只写 `[26]`（`[27]` 保持预设原值）",
+            quick.contains("param = GrainStrengthParam") && panel.contains("GrainStrengthParam = EditorParam("),
+        )
         assertTrue("「完整参数 >」必须接上 PS-6b 的回调", panel.contains("onTap = onOpenFullEdit"))
         assertTrue(
             "常用参数区必须拿到当前生效参数数组（否则滑杆读的是空数组 = 拖动没反应）",

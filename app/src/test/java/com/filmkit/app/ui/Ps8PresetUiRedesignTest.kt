@@ -222,24 +222,27 @@ class Ps8PresetUiRedesignTest {
             main.contains("verticalScroll("),
         )
         assertTrue("块间留白 = 统一常量（不是各写各的 dp）", main.contains("PRESET_BLOCK_GAP_DP.dp"))
-        assertTrue("留白在 12–16dp 之间", PRESET_BLOCK_GAP_DP in 12f..16f)
+        assertTrue("留白在 16–24dp 之间", PRESET_BLOCK_GAP_DP in 16f..24f)
     }
 
     /**
      * 常用参数区（用户点名的 5 项）：**能力与口径一字未改**，视觉换成
-     * ① 一行滑杆（标签 │ 滑杆 │ 等宽数值）+ ② 四行**分段控件**（等宽均分、选中填充强调色）。
+     * ① 两行滑杆（LUT 强度 + ★ PS-9 的颗粒强度，标签 │ 滑杆 │ 等宽数值）
+     * + ② 三行**分段控件**（等宽均分、选中填充强调色）。
      */
     @Test
     fun quickAdjustKeepsTheFiveItemsAndRendersSegmentsAndAMonoValueRow() {
         assertEquals(
-            "用户点名的 5 项一个不少（LUT 强度 / 颗粒两个槽 / 柔光 / 光晕 / 暗角）",
-            linkedSetOf(34, 26, 27, 95, 62, 66),
+            "用户点名的 5 项一个不少（LUT 强度 / 颗粒强度 / 柔光 / 光晕 / 暗角）",
+            linkedSetOf(34, 26, 95, 62, 66),
             QUICK_ADJUST_SLOTS,
         )
         val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").substringBefore("private fun PresetParamLabelRow(")
         assertTrue("LUT 强度 = 一行滑杆", quick.contains("PresetParamSliderRow("))
         assertTrue("LUT 强度读的是 lutStrength（`[34]` 不进 slots）", quick.contains("it[LUT_STRENGTH_SLOT] = lutStrength.toDouble()"))
-        assertTrue("颗粒 = 一条档位同写 `[26]`+`[27]`", quick.contains("onPickLevel(GrainLevelParam"))
+        // ★ PS-9：颗粒从四档分段控件改成**强度滑杆**（只写 `[26]`；`[27]` 保持原值）
+        assertTrue("★ 颗粒 = 强度滑杆（与 LUT 强度同一套视觉）", quick.contains("param = GrainStrengthParam"))
+        assertFalse("★ 颗粒不再是分段控件", quick.contains("GrainLevel.entries"))
         assertTrue("柔光 / 光晕 / 暗角 = 三行档位", quick.contains("for (q in QUICK_LEVEL_PARAMS)"))
         assertTrue("档位走 onPickLevel（点一下写值 + 立即提交）", quick.contains("onPickLevel(param, q.levels[i])"))
         assertTrue("没有 LUT ⇒ 不给假滑杆，只写一行实话", quick.contains("PresetParamLabelRow("))

@@ -49,6 +49,7 @@ import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PARAM_EPS
 import com.filmkit.app.camera.PRESET_SOURCE_USER
 import com.filmkit.app.camera.cameraPresetParams
+import com.filmkit.app.camera.formatZero100
 import com.filmkit.app.camera.pivotFraction
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetId
@@ -106,10 +107,26 @@ import kotlin.math.roundToInt
  * `presetOverviewMaxHeightDp` / `presetPanelBudget` …）：用户明确"第一级页面不需要提供全部参数"
  * ⇒ 逐项参数一律走「完整参数 >」（PS-6b 那一页**一个字没动**），一级页不留解释性小字与展开控件。
  *
+ * ## ★ PS-9（用户 2026-10-12 真机截图 + 三条反馈）：**间距 / 暗角档位 / 颗粒滑杆**
+ *
+ * 用户原话："**截图位置挤到一起了，优化布局**。**暗角轻微和中等跟没有一样，强烈顶多算轻微**。
+ * **颗粒改成滑杆吧**"
+ *
+ *  - **布局**：建立**统一间距阶**（[PRESET_GAP_SM_DP] 8 / [PRESET_BLOCK_GAP_DP] 16 /
+ *    [PRESET_GAP_LG_DP] 24，理由见常量上的 KDoc），一级页顶部留 24dp（它上方就是 `LutSheet`
+ *    的 tab 行）；卡片内边距 ≥10dp；**只调间距与去重，没有加任何装饰**；
+ *  - **标题去重**：`LutSheet` 顶行在预设 tab 下不再复述预设名（改为「预设」），
+ *    保留一级页那一行 18sp 衬线半粗的名称（见 `CameraScreen.kt` 的同段注释）；
+ *  - **暗角档位**：[VIGNETTE_LEVEL_PARAM] 从 0.20 / 0.40 / 0.70 改成 **0.35 / 0.65 / 1.0**
+ *    （引擎满量程；依据写在常量上方的注释里）；
+ *  - **颗粒**：四档分段控件 → **强度滑杆**（[GrainStrengthParam]，只写 `[26]`）；`[27]` 尺寸
+ *    在一级页不再有控件、**保持该预设原值**（二级页仍可看它，那一页一个字没动）。
+ *
  * 三条纪律（用户"每个能点的都必须有反应"，一位未改）：
- *  1. **写值只有一条路**：档位/滑杆一律经 `EditorParam.write`（[afterEdit] 记账 ⇒ 拖动实时下发
+ *  1. **写值只有一条路**：滑杆/档位一律经 `EditorParam.write`（[afterEdit] 记账 ⇒ 拖动实时下发
  *     `onPreview`、松手 [onOverrides] 一次提交，不新增 state 通路）；
- *     `[26]/[27]` 颗粒没有既有滑杆 ⇒ 用本文件私有的 [GrainLevelParam]（档位自己的两个真实值）；
+ *     ★ PS-9：`[26]` 颗粒在 `ParamControls.kt` 里**没有既有滑杆** ⇒ 用本文件私有的
+ *     [GrainStrengthParam]（只写 `[26]`，量程 / 读数口径沿用 `PresetDetail.kt` 对 `[26]` 的既有口径）；
  *  2. **LUT 强度必须两路一起写**：`[34]` 会被 `CameraController.applyLutStrengthPref` 用 prefs
  *     覆盖 ⇒ 拖动时同时写 prefs 的 `lut_strength`（引擎侧既有事实源），否则"拖了画面不变"；
  *  3. **返回键分层**：编辑面板（一级页子态）⇒ 面板内 `BackHandler`；完整参数页 / 一级面板 ⇒
@@ -512,81 +529,80 @@ internal class QuickLevelParam(
 //  ② **内置三条胶片预设没有开过光晕 / 柔光**（`app/src/main/assets/presets/builtin.json` 里
 //     没有 halation / glow 字段）⇒ 这两项的轻/中/强**没有"参考内置"可依据**，只能按
 //     **面板量程 0..1 四等分**（0.25 / 0.50 / 0.75）—— 如实写在报告里；
-//  ③ **暗角有内置依据**：三条内置的 `vignette_strength` = −0.18 / −0.28 / −0.24
-//     （UI 读数 = 正值 0.18 / 0.28 / 0.24）⇒ 轻档 0.20（= 内置最小档的最近整值）、
-//     中档 0.40（内置之上再加一档，0.2 步进）、强档 0.70（同一步进的第三档 = 明显但不糊）。
+//  ③ **暗角档位改用"引擎满量程"口径**（★ PS-9，用户 2026-10-12 真机实测："**暗角轻微和中等跟
+//     没有一样，强烈顶多算轻微**"）：旧档位 0.20 / 0.40 / 0.70 是按"内置的最近整值 + 0.2 步进"
+//     推出来的，**不是按引擎量程**——而引擎侧 `[66] ∈ [−1, 0]`（`vigStrengthSlot` 的 clamp、
+//     `FrameRenderer.cpp` 的 `clamp(p.vignette_strength, -1.0f, 0.0f)`），旧"强档"只用到量程的
+//     70%。更关键的是**暗角只在画面最外缘可见**：三条内置的 `vignette_radius` = 85 / 75 / 80
+//     （`builtin.json`）⇒ 衰减从 75%~85% 半径才开始，画面主体（vw ≈ 0）几乎看不出差别
+//     （`vw = clamp((cplen − radius/100) / feather, 0, 1)`，内置 feather = 48~55）。
+//     ⇒ 新档位按**引擎满量程四档**给：轻 0.35 / 中 0.65 / 强 **1.0（满量程）**。
+//     强档 `[66] = −1` 的语义是"角落权重 1 处增益归零"（`c *= 1 + 1 × (−1) = 0`）—— 量程内
+//     确实还有更暗的数学空间，但**引擎不接受**（CPU 侧 clamp 到 −1），所以 1.0 就是"最强"。
 internal val GLOW_LEVEL_PARAM =
     QuickLevelParam("柔光", 95, listOf(0f, 0.25f, 0.5f, 0.75f), levelNames("轻柔光", "柔光"))
 internal val HALO_LEVEL_PARAM =
     QuickLevelParam("光晕", 62, listOf(0f, 0.25f, 0.5f, 0.75f), levelNames("轻微光晕", "光晕"))
 internal val VIGNETTE_LEVEL_PARAM =
-    QuickLevelParam("暗角", 66, listOf(0f, 0.2f, 0.4f, 0.7f), levelNames("轻微暗角", "暗角"))
+    QuickLevelParam("暗角", 66, listOf(0f, 0.35f, 0.65f, 1.0f), levelNames("轻微暗角", "暗角"))
 
 /** 图 2 的三个档位行（顺序 = 组内既有顺序：柔光/光晕同族、暗角在其后，与 `TextureParams` 一致）。 */
 internal val QUICK_LEVEL_PARAMS =
     listOf(GLOW_LEVEL_PARAM, HALO_LEVEL_PARAM, VIGNETTE_LEVEL_PARAM)
 
-/** 颗粒强度 `[26]`（0..100，**0 = 整段旁路**）与尺寸 `[27]`（**ISO 语义**，20..6400，越大越粗）。 */
+/**
+ * ★ PS-9：**颗粒强度滑杆**（用户 2026-10-12 真机："**颗粒改成滑杆吧**"）。
+ *
+ * ## 为什么只写 `[26]`、`[27]` 在一级页不再出现
+ *
+ * 用户原话只要"强度"这一条滑杆；`[27]`（尺寸 / ISO 语义）在一级页**不再提供控件**，
+ * 但**保持该预设原值**（滑杆的 `write` 不碰它）⇒ 保存时 `[27]` 不会因为"用户动了颗粒"
+ * 而被改掉（`afterEdit` 逐槽比对：只记真正变了的 `[26]`）。二级「完整参数」页仍可看它
+ * （`CameraPresetFullEdit.kt` 那一页**一个字没动**）。
+ *
+ * ## 量程与读数口径：**沿用 `PresetDetail.kt` 对 `[26]` 的既有口径**（不另造一套）
+ *
+ * `ParamControls.kt` 里**没有**颗粒滑杆（`[26][27]` 在 [CAMERA_NO_SLIDER_SLOTS] 里，是
+ * 既有欠账）⇒ 本参数在拍照界面自建，但**数值口径不是新的**：
+ *  - 槽位量程 0..100（`FilmParams.h` 的 `grain_amount`；`PresetDetail.kt:178-180` 的注释
+ *    与格式化 `formatZero100((it / 100.0).toFloat())` 就是这一条）；
+ *  - 所以 UI 量程 = **0..1**、读数 = `formatZero100`（0..100 整数），与 `[26]` 在二级页
+ *    / 「完整参数」页显示的是**同一个数**（同一参数两处口径不一致 = 假读数）；
+ *  - `pivot = 0` = 引擎中性值（`[26] = 0` ⇒ `FrameRenderer` 的 `uGrainAmount > 0.0`
+ *    整段跳过，零成本旁路）⇒ 与 LUT 强度 / 暗角强度一样是"基准在最左端 ⇒ 不画中点标记"。
+ *
+ * ⚠ **`[27]` 不在本参数里**：旧 [GrainLevel] 的"一条档位同写两槽"随档位控件一并删除
+ * （滑杆只有一个自由度，写两个槽会让"用户只想加强颗粒"顺手改掉尺寸）。
+ */
 internal const val GRAIN_AMOUNT_SLOT = 26
+
+/** 颗粒尺寸 `[27]`（**ISO 语义**，越大越粗）—— ★ PS-9：一级页不再有它的控件（值保持原样）。 */
 internal const val GRAIN_SIZE_SLOT = 27
 
-/**
- * ★ 颗粒档位（用户点名："颗粒开、关、档位"）—— 档位 = **[26] 强度 + [27] 尺寸的组合**，
- * 依据逐条写死在这里（数值全部有出处）：
- *
- * | 档位 | `[26]` 强度 | `[27]` 尺寸 | 依据 |
- * |---|---|---|---|
- * | 关闭 | 0 | 400 | **引擎中性值**（`CameraPresets.neutral()`：`[26] = 0` 整段旁路、`[27] = 400` 标定起点）|
- * | 细颗粒 | 20 | 160 | 内置「徕卡一瞬」逐字（`grain_amount 20` / `grain_size 160`，note = "细颗粒"）|
- * | 中颗粒 | 30 | 400 | 内置「理光负片」逐字（`30` / `400`，note = "中颗粒"；400 同时是引擎恒等值）|
- * | 粗颗粒 | 40 | 800 | 强度 = 内置「徕卡黑白」逐字 40（note = "明显颗粒"）；尺寸 = 400 的**下一 ISO 标准档** 800 |
- *
- * ⚠ 一条档位**同时写两个槽**（与饱和度的"一条滑杆同写三槽"同型）⇒ 档位是"组合"，不是两个控件。
- */
-internal enum class GrainLevel(val label: String, val amount: Double, val iso: Double) {
-    OFF("关闭", 0.0, 400.0),
-    FINE("细颗粒", 20.0, 160.0),
-    MEDIUM("中颗粒", 30.0, 400.0),
-    COARSE("粗颗粒", 40.0, 800.0),
-}
+/** 颗粒强度 UI 量程（0..1 = 显示 0..100，直通槽位 `[26]` 的 0..100 语义）。 */
+internal val GRAIN_UI_RANGE = 0f..1f
+
+/** UI 颗粒强度（0..1）→ 槽位 `[26]`（0..100）。越界夹到端点（与 `[26]` 的引擎量程一致）。 */
+internal fun grainAmountSlot(ui: Float): Double =
+    ui.coerceIn(GRAIN_UI_RANGE.start, GRAIN_UI_RANGE.endInclusive).toDouble() * 100.0
 
 /**
- * 当前颗粒档位（按 `[26]` **强度**分档：分界 25 / 35 = 内置三条 20 / 30 / 40 的中点）。
- *
- * 为什么按强度而不是尺寸：尺寸只决定"颗粒长什么样"，决定"有没有 / 多明显"的是强度
- * （ADR-10：`[26] = 0` 整段旁路）—— 三条内置按本函数读出的档位与 JSON 的 note 逐条一致。
+ * 槽位 `[26]`（0..100）→ UI 颗粒强度（0..1）。**坏数据回落 0 = 关**（与 `[26] = 0` 整段旁路
+ * 同义：读不出来时不该凭空给画面加颗粒）；越界夹到端点（UI 写不出越界值）。
  */
-internal fun grainLevelOf(amount: Double): GrainLevel {
-    if (!amount.isFinite() || amount <= 0.0) return GrainLevel.OFF
-    return when {
-        amount < 25.0 -> GrainLevel.FINE
-        amount < 35.0 -> GrainLevel.MEDIUM
-        else -> GrainLevel.COARSE
-    }
-}
-
-/** [grainLevelOf] 的数组形态（读"当前生效参数"用）。 */
-internal fun grainLevelOf(params: DoubleArray): GrainLevel =
-    grainLevelOf(if (GRAIN_AMOUNT_SLOT in params.indices) params[GRAIN_AMOUNT_SLOT] else 0.0)
+internal fun grainAmountUi(slot: Double): Float =
+    if (!slot.isFinite()) 0f else (slot / 100.0).coerceIn(0.0, 1.0).toFloat()
 
 /**
- * 颗粒档位的**写入器**：复用 [EditorParam] 的 `write` 通道（[CameraParamOverrides.afterEdit]
- * 的记账因此与其它参数走在同一条路上）。
- *
- * 它不是"第二份参数表"：颗粒在编辑器参数面板里**从来没有滑杆**（`CAMERA_NO_SLIDER_SLOTS`），
- * 写进数组的就是 [GrainLevel] 自己的两个真实值 —— 量程 / 读数 / 写值口径全部来自那个枚举，
- * 不存在第二套数字。`range` 只是"档位序号 0..3"（界面上是 4 个档位按钮，不是滑杆）。
+ * 颗粒强度的**写入器**：复用 [EditorParam] 的 `write` 通道（[CameraParamOverrides.afterEdit]
+ * 的记账因此与其它参数走在同一条路上 —— 拖动 ⇒ 实时下发 + 松手记账 ⇒ 保存回预设）。
  */
-internal val GrainLevelParam = EditorParam(
-    key = "grainLevel", label = "颗粒",
-    range = 0f..3f, pivot = 0f,
-    format = { v -> GrainLevel.entries[v.roundToInt().coerceIn(0, GrainLevel.entries.lastIndex)].label },
-    read = { p -> grainLevelOf(p).ordinal.toFloat() },
-    write = { p, v ->
-        val lv = GrainLevel.entries[v.roundToInt().coerceIn(0, GrainLevel.entries.lastIndex)]
-        p[GRAIN_AMOUNT_SLOT] = lv.amount
-        p[GRAIN_SIZE_SLOT] = lv.iso
-    },
+internal val GrainStrengthParam = EditorParam(
+    key = "grainAmount", label = "颗粒",
+    range = GRAIN_UI_RANGE, pivot = 0f,
+    format = { formatZero100(it) },
+    read = { p -> if (GRAIN_AMOUNT_SLOT in p.indices) grainAmountUi(p[GRAIN_AMOUNT_SLOT]) else 0f },
+    write = { p, v -> p[GRAIN_AMOUNT_SLOT] = grainAmountSlot(v) },
 )
 
 /**
@@ -607,11 +623,15 @@ internal fun nearestLevel(ui: Float, levels: List<Float>): Int {
 }
 
 /**
- * 常用参数覆盖的槽（图 2 的 5 项）：`[34]` LUT 强度 / `[26][27]` 颗粒 / `[95]` 柔光 /
+ * 常用参数覆盖的槽（图 2 的 5 项）：`[34]` LUT 强度 / `[26]` 颗粒 / `[95]` 柔光 /
  * `[62]` 光晕 / `[66]` 暗角。
+ *
+ * ★ PS-9：`[27]` 颗粒**尺寸**从集合里去掉 —— 用户 2026-10-12："**颗粒改成滑杆吧**"，
+ * 一级页的颗粒只剩一条**只写 `[26]`** 的强度滑杆（`[27]` 保持预设原值，二级页仍可看）。
+ * 集合的口径 = "一级页真的能调的槽"，因此不含它。
  */
 internal val QUICK_ADJUST_SLOTS: Set<Int> =
-    linkedSetOf(LUT_STRENGTH_SLOT, GRAIN_AMOUNT_SLOT, GRAIN_SIZE_SLOT, 95, 62, 66)
+    linkedSetOf(LUT_STRENGTH_SLOT, GRAIN_AMOUNT_SLOT, 95, 62, 66)
 
 /**
  * ★ PS-8：**横向预设条**的一项 —— 预设 + 小标记（`内置` / `已改` / 分组名）+ 选中态。
@@ -675,6 +695,7 @@ internal fun presetSubtitleText(p: EditorPreset, lutLabel: String? = null): Stri
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ★ PS-8：一级页的**尺寸口径**（集中在这里 ⇒ 单测直接断言"横向条高度 ≤ 72dp"）
+// ★ PS-9：**统一间距阶**（用户 2026-10-12 真机截图："**截图位置挤到一起了，优化布局**"）
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 横向预设条的高度（用户："高度要克制（≤ 72dp 量级）"—— 省下的纵向空间留给取景与常用参数）。 */
@@ -683,14 +704,40 @@ internal const val PRESET_STRIP_HEIGHT_DP = 64f
 /** 横向卡片的宽度（等宽 ⇒ 条上每一项对齐；长名字省略号截断）。 */
 internal const val PRESET_STRIP_CARD_WIDTH_DP = 124f
 
-/** 一级页各"块"之间的留白（用户："块间留白一致（12–16dp）"）。 */
-internal const val PRESET_BLOCK_GAP_DP = 12f
+/**
+ * ★ PS-9：**统一间距阶**——三档，别处一律引用常量，不许再出现散落的魔数 dp。
+ *
+ * 为什么三档就够（用户："**只调间距与去重，不许加装饰**"）：
+ *  - [PRESET_GAP_SM_DP] **8dp**：**同一块内**相邻元素（名称行与其副标题、块内行距）；
+ *  - [PRESET_BLOCK_GAP_DP] **16dp**：一级页**各块之间**（横向条 / 名称行 / 常用参数 / 保存行）；
+ *  - [PRESET_GAP_LG_DP] **24dp**：**面板顶部**（`LutSheet` 的 tab 行与横向条之间）—— 用户截图
+ *    里最挤的一处就是这里（tab 与预设条贴在一起）。
+ *
+ * 为什么块间距从 PS-8 的 12dp 提到 16dp：用户实测"各区块贴在一起"，而 12dp 与块内行距（8dp）
+ * 只差 4dp ⇒ 层次在真机上分不出来；16dp 让"块"这件事看得见（间距阶的下一档 24dp 太松，
+ * 会把一级页推高 ~40dp，挤压取景区）。
+ */
+internal const val PRESET_GAP_SM_DP = 8f
+
+/** 一级页各"块"之间的留白（★ PS-9：12dp → 16dp，理由见 [PRESET_GAP_SM_DP] 的 KDoc）。 */
+internal const val PRESET_BLOCK_GAP_DP = 16f
+
+/** 面板顶部留白（`LutSheet` 的 tab 行 → 横向预设条；用户截图里最挤的一处）。 */
+internal const val PRESET_GAP_LG_DP = 24f
 
 /** 参数行左侧标签列宽（跨行对齐：标签左、滑杆中、数值右）。 */
 internal const val PRESET_LABEL_WIDTH_DP = 60f
 
 /** 参数行右侧数值列宽（等宽字体 + 右对齐 ⇒ 数值列对齐）。 */
 internal const val PRESET_VALUE_WIDTH_DP = 46f
+
+/**
+ * ★ PS-9：卡片 / 输入框的**内边距**（用户："卡片内文字与边框的内边距，都要重看"）。
+ * 水平 12dp / 垂直 10dp：PS-8 的 8dp 垂直内边距在 64dp 条高里让上下文字贴边
+ * （卡片高 64 − 2×8 = 48dp 内容区，13sp 名称 + 10sp 标记两行挤在中间）。
+ */
+internal const val PRESET_CARD_PAD_H_DP = 12f
+internal const val PRESET_CARD_PAD_V_DP = 10f
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compose：拍照界面「预设」tab（宿主 = LutSheet，父层已给 16dp 水平 padding）
@@ -933,7 +980,15 @@ internal fun CameraPresetTab(
         // + 有改动时的一行保存。用户 2026-10-12（v0.11.23）："**第一级页面不需要提供全部参数，
         // 点击查看完整参数才提供**" ⇒ 「当前搭配」长清单 / 展开收起 / 选中项滑杆 / 行下小字说明
         // **全部删除**（完整参数一律走「完整参数 >」，PS-6b 那一页一个字没动）。
-        Column(Modifier.fillMaxWidth()) {
+        //
+        // ★ PS-9：**间距阶**（用户 2026-10-12 真机截图："**截图位置挤到一起了，优化布局**"）——
+        // 顶部留 [PRESET_GAP_LG_DP]（它上方就是 `LutSheet` 的 LUT/预设 tab 行，用户截图里
+        // tab 与预设条贴在一起），块间一律 [PRESET_BLOCK_GAP_DP]，块内相邻元素 [PRESET_GAP_SM_DP]。
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = PRESET_GAP_LG_DP.dp),
+        ) {
             // ① 横向预设条（用户："预设改成横向滚动"）—— 首项 = 「＋ 新建预设」
             PresetStrip(
                 items = presetStripItems(presets, selected.id, builtinOverrides),
@@ -975,6 +1030,8 @@ internal fun CameraPresetTab(
                 CamPresetActionButton("完整参数 >", enabled = true, onTap = onOpenFullEdit)
             }
             // ③ 一行副标题（可选：分组 / 滤镜；没有真实信息 ⇒ 整行不渲染）
+            // ★ PS-9：它是**名称行这块的一部分** ⇒ 用块内小间距（PS-8 的 2dp 让副标题贴着标题，
+            // 用户截图里"副标题与滑杆"那一处正是这么挤出来的）。
             presetSubtitleText(selected, selected.lutId?.let { id -> LutLibrary.byId(context, id)?.label })?.let { line ->
                 Text(
                     line,
@@ -982,7 +1039,7 @@ internal fun CameraPresetTab(
                     fontSize = 11.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
+                    modifier = Modifier.padding(top = PRESET_GAP_SM_DP.dp),
                 )
             }
             // ④ 常用参数（用户点名的 5 项）—— 能力与口径一字未改，只重做视觉
@@ -1182,6 +1239,11 @@ private fun CamPresetActionButton(
  *  - 四档 = **分段控件**：一行内等宽均分、选中项填充强调色（[PresetLevelSegments]）。
  *    PS-7 的 `highlight`（清单选中 ⇒ 整行点亮）随清单一并删除 —— 一级页已没有清单。
  *
+ * ★ PS-9（用户 2026-10-12："**颗粒改成滑杆吧**"）：颗粒从四档分段控件改成
+ * **与 LUT 强度同一套视觉的强度滑杆**（[PresetParamSliderRow] + [GrainStrengthParam]，
+ * 只写 `[26]`）；`[27]` 尺寸在一级页不再有控件、保持预设原值。其余三行（柔光 / 光晕 / 暗角）
+ * 仍是分段控件，档位值见 [QuickLevelParam.levels]（暗角已按引擎满量程重定，见那里的注释）。
+ *
  * 写值通路**一字未改**：滑杆经 [onEditParam]（`EditorParam.write`），档位经 [onPickLevel]
  * （同一个 `write` + 立即提交）。本组件**不碰** [CameraParamOverrides]。
  */
@@ -1201,7 +1263,7 @@ private fun PresetQuickAdjustPanel(
         Modifier
             .fillMaxWidth()
             .padding(top = PRESET_BLOCK_GAP_DP.dp),
-        verticalArrangement = Arrangement.spacedBy(PRESET_BLOCK_GAP_DP.dp),
+        verticalArrangement = Arrangement.spacedBy(PRESET_GAP_SM_DP.dp),
     ) {
         if (hasLut) {
             // `[34]` 不进 `slots` ⇒ 借一份视图数组给滑杆读初值（换预设 / 换参数 ⇒ key 让它重建）
@@ -1218,13 +1280,16 @@ private fun PresetQuickAdjustPanel(
             // 没有 LUT ⇒ **不给假滑杆**（拖了画面不会变）：一行实话（套用时保持当前 LUT）
             PresetParamLabelRow(label = "滤镜强度", note = "不含 LUT（套用时保持当前）")
         }
-        // 颗粒（★ 用户点名："颗粒开、关、档位"）—— 档位 = `[26]` 强度 + `[27]` 尺寸的组合
-        PresetLevelSegments(
-            label = "颗粒",
-            names = GrainLevel.entries.map { it.label },
-            current = grainLevelOf(params).ordinal,
-            onPick = { i -> onPickLevel(GrainLevelParam, i.toFloat()) },
-        )
+        // 颗粒强度（★ PS-9：档位 → **滑杆**，与上面 LUT 强度同一套视觉；只写 `[26]`）
+        key(presetId, GrainStrengthParam.key) {
+            PresetParamSliderRow(
+                label = "颗粒",
+                param = GrainStrengthParam,
+                params = params,
+                onCommit = onEditParam,
+                onFinished = onEditFinished,
+            )
+        }
         // 柔光 / 光晕 / 暗角（写值仍走这三条既有滑杆的 `write`；档位值 = [QuickLevelParam.levels]）
         for (q in QUICK_LEVEL_PARAMS) {
             val param = CAMERA_TUNABLE_SLOT_PARAM.getValue(q.slot)
@@ -1452,7 +1517,9 @@ private fun PresetStripCard(
             )
             // 点 = 套用；长按 = 详情（PS-3 的第二入口）
             .pressScale(pressedScale = 0.96f, onTap = onApply, onLongTap = onDetail)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            // ★ PS-9：内边距走常量（PS-8 的 8dp 垂直内边距让两行文字贴着上下边框 —— 用户
+            // "卡片内文字与边框的内边距，都要重看"）
+            .padding(horizontal = PRESET_CARD_PAD_H_DP.dp, vertical = PRESET_CARD_PAD_V_DP.dp),
         verticalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(

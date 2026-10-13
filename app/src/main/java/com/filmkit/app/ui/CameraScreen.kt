@@ -2419,12 +2419,16 @@ private fun LutSheet(
             .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
     ) {
         // 顶行：当前选中名（左）+ 收起（右）
+        // ★ PS-9：**预设 tab 不再重复预设名** —— 用户 2026-10-12 真机截图指出"顶部一个
+        // 「徕卡一瞬」，详情里又一个「徕卡一瞬」"（标题重复）。预设名由一级页那一行
+        // **18sp 衬线半粗**承担（信息层次的第一段），这里只留页签身份；
+        // LUT tab 保持原样（它的名字没有第二个落点，去掉就没人说了）。
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (tab == 0) {
                     LutLibrary.byId(context, lutId)?.label ?: "无 LUT"
                 } else {
-                    selectedPreset.name
+                    "预设"
                 },
                 color = FilmTheme.Cream,
                 fontSize = 20.sp,
@@ -2444,9 +2448,10 @@ private fun LutSheet(
             )
         }
         // 分类
+        // ★ PS-9：标题行与 tab 行之间 8dp → 12dp（用户截图里这一处也挤在一起；只动间距，不加装饰）
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.padding(top = 8.dp),
+            modifier = Modifier.padding(top = 12.dp),
         ) {
             SheetPill("LUT", selected = tab == 0) { onTab(0) }
             SheetPill("预设", selected = tab == 1) { onTab(1) }
