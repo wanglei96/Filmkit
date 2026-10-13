@@ -732,6 +732,58 @@ internal fun formatEv(ui: Float): String {
     return if (r > 0f) "+$s EV" else "$s EV"
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ PS-10：filmic **黑白点**（`[37]` / `[38]`）—— 量程 / 基准 / 读数
+//
+// 这两个槽是胶片曲线的**两端**（`FilmParams.h:145-156`）：黑点 = "多暗算黑"（toe 端点）、
+// 白点 = "多亮算白"（显示上限的锚点），单位 = **相对中灰 18.45% 的 EV**（物理量，与机型 /
+// 曲线无关）。此前它们在 `CAMERA_NO_SLIDER_SLOTS` 里（只有显示、没有滑杆），PS-10 补滑杆。
+//
+// **量程的依据（不是自造）**：与 `SettingsScreen.kt` 的既有全局滑杆**逐位相同**
+// （黑点 `-12f..-1f` / 白点 `1f..8f`）—— 那是**同一个参数**的既有量程，用户已经在那里调它；
+// 参数表另定一套 = 同一个物理量有两个范围（ADR-12 的"两套真相"）。引擎侧对这两个槽
+// **没有绝对 clamp**（`FilmParams.h:550-551` 直通；`computeFilmicSpline` 只有相对约束
+// `black ≤ white − 0.2`）⇒ 量程纯粹是 UI 决定。
+//
+// **pivot = 引擎默认值**（`FilmParams.h` 的 `-7.65f` / `+4.56f`，也是 `CameraPresets.standard()`
+// 的基线 = 稀疏化的中性基准）：中点标记画在"重置会回到哪"，与 `EditorParam.pivot` 的定义一致。
+//
+// ⚠ **如实记录一条引擎侧的非对称**（本卡**不改引擎**）：拍照链路（`computeFilmicSpline`）两个
+// 端点在 1..8 全量程有效；**编辑器链路**（`computeEditorCurve`，显示域端点重映射）里白点有
+// 物理上限 —— `wh = clamp(srgbEncode(grey·2^white_ev), grey_disp + 0.05, 1.0)`，当
+// `white_ev ≥ log2(1/0.1845) ≈ 2.4377` 时 `wh` 恒为 `1.0` ⇒ **编辑器里白点拖到 2.44 以上与
+// 2.44 逐位相同**（显示域没有比 1.0 更亮的像素 —— 这是显示域曲线的物理上限，不是 bug）。
+// 默认 4.56 与内置三条的 2.54~2.75 **都已在该上限之上** ⇒ 编辑器里它们的白点效果相同。
+// 量程仍取 1..8：这两个槽的**主战场是拍照链路**（预设的白点就是给相机取景 / 成片用的），
+// 而 8 覆盖了真机实测有效的 6.2 档（见 `SettingsScreen.kt` 白点那一行的 desc）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `[37]` filmic 黑点（"多暗算黑"）的 UI 量程 —— 槽位**就是** EV ⇒ 直通，没有换算对。 */
+internal val FILMIC_BLACK_EV_UI_RANGE = -12f..-1f
+
+/** `[38]` filmic 白点（"多亮算白"）的 UI 量程 —— 槽位**就是** EV ⇒ 直通，没有换算对。 */
+internal val FILMIC_WHITE_EV_UI_RANGE = 1f..8f
+
+/** `[37]` 恒等值 / reset 目标 = 引擎默认（`FilmParams.h` 的 `filmic_black_ev = -7.65f`）。 */
+internal const val FILMIC_BLACK_EV_PIVOT = -7.65f
+
+/** `[38]` 恒等值 / reset 目标 = 引擎默认（`FilmParams.h` 的 `filmic_white_ev = 4.56f`）。 */
+internal const val FILMIC_WHITE_EV_PIVOT = 4.56f
+
+/**
+ * **槽位本身就是 EV** 的读数（`[37]` 黑点 / `[38]` 白点）：`+4.6 EV` / `-7.6 EV` / `0.0 EV`。
+ *
+ * 与 [formatEv] 的区别（混用会把 −7.65 显示成 `-3.0 EV`）：那条的入参是 **UI 域**
+ * （−1..1 = ±3 EV，内部 ×3 并 clamp 到 ±3），本条的入参就是槽位 EV 本身。
+ *
+ * **唯一实现**：`PresetDetail.kt` 的 `evText`（详情页 / 二级页只读格 / 列表摘要的读数）
+ * 委托本函数 ⇒ 同一个数在滑杆与详情页**必然同形**，不是"两处各自格式化后碰巧一样"。
+ */
+internal fun formatEvSlot(v: Float): String {
+    val r = if (v.isFinite()) (v * 10f).roundToInt() / 10f else 0f
+    return if (r > 0f) "+${oneDecimal(r)} EV" else "${oneDecimal(r)} EV"
+}
+
 /**
  * 相对量读数：相对 [pivot] 的 ±100 整数偏移 → `+12` / `0` / `-34`。
  *

@@ -55,13 +55,14 @@ class CameraPresetFullEditTest {
         val secs = fullParamSections(FullParamTab.ADVANCED, setOf(70))
         assertEquals(listOf("调整", "色彩", "质感", "只读"), secs.map { it.title })
         val tunable = secs.dropLast(1).flatMap { it.rows.flatten() }
-        // 29 = AdjustParams 15 + ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
-        assertEquals(29, CAMERA_TUNABLE_PARAMS.size)
-        assertEquals(29, tunable.size)
+        // 31 = AdjustParams 17 + ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
+        // （★ PS-10：AdjustParams 15 → 17，filmic 黑白点补上滑杆）
+        assertEquals(31, CAMERA_TUNABLE_PARAMS.size)
+        assertEquals(31, tunable.size)
         assertTrue(tunable.all { it.param != null })
         // 高级 ⊃ 基础（切档不丢项）
         assertTrue(tunable.map { it.key }.containsAll(BASIC_PARAM_KEYS))
-        // 只读组 = 无滑杆的 6 槽 + 这条预设包含的、拍照链路不读的槽（[70] 层间效应）
+        // 只读组 = 无滑杆的 4 槽 + 这条预设包含的、拍照链路不读的槽（[70] 层间效应）
         val ro = secs.last().rows.flatten()
         assertEquals((CAMERA_NO_SLIDER_SLOTS + 70).sorted(), ro.map { it.slot })
         assertTrue("只读格不许带滑杆", ro.all { it.param == null })
@@ -69,13 +70,15 @@ class CameraPresetFullEditTest {
         assertEquals("仅编辑器生效 · 拍照不变", cameraParamAdjustabilityNote(70))
         // 只读格的名字必须来自既有的详情表（不新造译名）
         assertEquals("颗粒 · 尺寸", ro.first { it.slot == 27 }.label)
+        // ★ PS-10：黑白点**不再**是只读格（它们有了滑杆）
+        assertTrue("黑白点不该再出现在只读组", ro.none { it.slot == 37 || it.slot == 38 })
     }
 
     @Test
     fun readonlyGroupExcludesLutStrengthAndEmptyPresetStillShowsNoSliderSlots() {
         // [34] LUT 强度由顶部 LUT 卡片 + 滤镜强度滑杆承载 ⇒ 不进只读组（与 presetDetailSections 同口径）
         assertEquals(CAMERA_NO_SLIDER_SLOTS.sorted(), fullEditReadonlySlots(setOf(34)))
-        // 空预设 ⇒ 只读组恰好 = 无滑杆的那 6 槽（其余"拍照不读"的槽不该凭空出现）
+        // 空预设 ⇒ 只读组恰好 = 无滑杆的那 4 槽（其余"拍照不读"的槽不该凭空出现）
         assertEquals(CAMERA_NO_SLIDER_SLOTS.sorted(), fullEditReadonlySlots(emptySet()))
         // 拍照链路读的槽不该落进只读组（它们要么可调、要么已在 NO_SLIDER 里）
         assertTrue(CAMERA_NO_SLIDER_SLOTS.all { it in CAMERA_PATH_SLOTS })
@@ -96,9 +99,10 @@ class CameraPresetFullEditTest {
             )
         }
         val adjust = secs.first()
-        assertEquals(15, adjust.rows.flatten().size)
-        assertEquals(4, adjust.rows.size)                       // 15 项 ⇒ 4/4/4/3
-        assertEquals(listOf(4, 4, 4, 3), adjust.rows.map { it.size })
+        // ★ PS-10：17 项（15 + filmic 黑白点两条）⇒ 5 行（4/4/4/4/1）
+        assertEquals(17, adjust.rows.flatten().size)
+        assertEquals(5, adjust.rows.size)
+        assertEquals(listOf(4, 4, 4, 4, 1), adjust.rows.map { it.size })
         assertEquals(1, secs[1].rows.size)                      // 色彩 4 项 ⇒ 1 行
         assertEquals(3, secs[2].rows.size)                      // 质感 10 项 ⇒ 3 行
         // 每格的 key 唯一（选中态按 key 走，重复 key 会让两格一起高亮）

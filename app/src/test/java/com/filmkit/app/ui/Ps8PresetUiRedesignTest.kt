@@ -226,15 +226,15 @@ class Ps8PresetUiRedesignTest {
     }
 
     /**
-     * 常用参数区（用户点名的 5 项）：**能力与口径一字未改**，视觉换成
-     * ① 两行滑杆（LUT 强度 + ★ PS-9 的颗粒强度，标签 │ 滑杆 │ 等宽数值）
+     * 常用参数区（用户点名的 5 项 + ★ PS-10 的 filmic 白点）：**能力与口径一字未改**，视觉换成
+     * ① 三行滑杆（LUT 强度 + ★ PS-9 的颗粒强度 + ★ PS-10 的白点，标签 │ 滑杆 │ 等宽数值）
      * + ② 三行**分段控件**（等宽均分、选中填充强调色）。
      */
     @Test
     fun quickAdjustKeepsTheFiveItemsAndRendersSegmentsAndAMonoValueRow() {
         assertEquals(
-            "用户点名的 5 项一个不少（LUT 强度 / 颗粒强度 / 柔光 / 光晕 / 暗角）",
-            linkedSetOf(34, 26, 95, 62, 66),
+            "用户点名的 5 项一个不少（LUT 强度 / 颗粒强度 / 柔光 / 光晕 / 暗角）+ ★ PS-10 的白点",
+            linkedSetOf(34, 26, 95, 62, 66, 38),
             QUICK_ADJUST_SLOTS,
         )
         val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").substringBefore("private fun PresetParamLabelRow(")
@@ -243,6 +243,11 @@ class Ps8PresetUiRedesignTest {
         // ★ PS-9：颗粒从四档分段控件改成**强度滑杆**（只写 `[26]`；`[27]` 保持原值）
         assertTrue("★ 颗粒 = 强度滑杆（与 LUT 强度同一套视觉）", quick.contains("param = GrainStrengthParam"))
         assertFalse("★ 颗粒不再是分段控件", quick.contains("GrainLevel.entries"))
+        // ★ PS-10：白点 = 滑杆，参数项复用 ParamControls.kt 那一条（三个页面同一个数）
+        assertTrue(
+            "★ PS-10 白点 = 强度滑杆（复用参数表的 EditorParam，不是第二份）",
+            quick.contains("param = CAMERA_TUNABLE_SLOT_PARAM.getValue(FILMIC_WHITE_EV_SLOT)"),
+        )
         assertTrue("柔光 / 光晕 / 暗角 = 三行档位", quick.contains("for (q in QUICK_LEVEL_PARAMS)"))
         assertTrue("档位走 onPickLevel（点一下写值 + 立即提交）", quick.contains("onPickLevel(param, q.levels[i])"))
         assertTrue("没有 LUT ⇒ 不给假滑杆，只写一行实话", quick.contains("PresetParamLabelRow("))

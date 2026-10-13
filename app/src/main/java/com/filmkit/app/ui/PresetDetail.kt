@@ -17,6 +17,7 @@ import com.filmkit.app.camera.expUi
 import com.filmkit.app.camera.fadeUi
 import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatEv
+import com.filmkit.app.camera.formatEvSlot
 import com.filmkit.app.camera.formatKelvin
 import com.filmkit.app.camera.formatOff100
 import com.filmkit.app.camera.formatOffset100
@@ -351,17 +352,14 @@ private fun decimals2(v: Double): String {
 /** 两位小数 + 正号：`+0.10` / `0.00` / `-0.50`（零不带符号，与 `formatOffset100` 同形）。 */
 private fun signed2(v: Double): String = if (v.isFinite() && v > 0) "+${decimals2(v)}" else decimals2(v)
 
-/** EV 读数（**槽位本身就是 EV**，不是 UI 值）：`+4.0 EV` / `0.0 EV` / `-7.6 EV`（`formatEv` 同形）。 */
-private fun evText(v: Double): String {
-    val n = if (v.isFinite()) (v * 10).roundToInt() else 0
-    val a = abs(n)
-    val s = "${a / 10}.${a % 10}"
-    return when {
-        n > 0 -> "+$s EV"
-        n < 0 -> "-$s EV"
-        else -> "$s EV"
-    }
-}
+/**
+ * EV 读数（**槽位本身就是 EV**，不是 UI 值）：`+4.0 EV` / `0.0 EV` / `-7.6 EV`。
+ *
+ * ★ PS-10：**委托 `EditorExport.kt` 的 [formatEvSlot]**（唯一实现）—— 黑点 `[37]` / 白点 `[38]`
+ * 补上滑杆后，同一个数必须在这张详情表和参数表的滑杆读数上**逐字相同**。两处各留一份
+ * 格式化实现 = 迟早漂移（本次改动就是那个时刻）；本函数只剩"Double → Float"的入参适配。
+ */
+private fun evText(v: Double): String = formatEvSlot(v.toFloat())
 
 /** 原值文本（未映射槽位）：整数不带小数点（`1` / `0.5` / `-0.18`）。 */
 private fun rawText(v: Double): String = when {

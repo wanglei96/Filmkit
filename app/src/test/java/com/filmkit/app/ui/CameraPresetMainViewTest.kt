@@ -188,7 +188,8 @@ class CameraPresetMainViewTest {
     // ── ③ 常用参数清单：用户点名的 5 项（★ PS-8：一级页直接可调的就是这一块）─────────
 
     /**
-     * `QUICK_ADJUST_SLOTS` = 用户点名的 5 项（LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角）—— **一位没少**。
+     * `QUICK_ADJUST_SLOTS` = 用户点名的 5 项（LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角）**＋ PS-10 的白点**
+     * —— 用户点名的 5 项**一位没少**。
      *
      * ★ PS-8：一级页已无清单 ⇒ "点了有没有反应"不再由清单承担，而是"每个能调的就是控件本身"
      * （滑杆 / 分段控件）。本用例只钉"常用清单没被砍"，且每一项都真的在拍照链路上
@@ -196,20 +197,28 @@ class CameraPresetMainViewTest {
      *
      * ★ PS-9：颗粒的 `[27]` 尺寸**从集合里去掉**（一级页只剩一条只写 `[26]` 的强度滑杆）——
      * 集合口径 = "一级页真的能调的槽"。
+     *
+     * ★ PS-10：加 `[38]` 白点（用户 2026-10-12："黑白点要可调"；高光死白的病灶），
+     * **不加 `[37]`** 黑点 —— 取舍依据见 `FILMIC_WHITE_EV_SLOT` 的 KDoc（黑点在「完整参数 >」）。
      */
     @Test
     fun quickAdjustCoversExactlyTheFiveItemsTheUserNamed() {
         assertEquals(
-            "用户点名的 5 项：LUT 强度 / 颗粒强度 / 柔光 / 光晕 / 暗角",
-            linkedSetOf(34, 26, 95, 62, 66),
+            "用户点名的 5 项（LUT 强度 / 颗粒强度 / 柔光 / 光晕 / 暗角）+ ★ PS-10 的白点",
+            linkedSetOf(34, 26, 95, 62, 66, 38),
             QUICK_ADJUST_SLOTS,
         )
-        for (s in setOf(26, 95, 62, 66)) {
+        for (s in setOf(26, 95, 62, 66, 38)) {
             assertTrue("[$s] 是拍照链路读得到的槽（常用项必须真的能调）", s in CAMERA_PATH_SLOTS)
         }
         assertTrue(
             "★ PS-9：`[27]` 颗粒尺寸仍是拍照链路读得到的槽，但**一级页不再有它的控件**",
             27 in CAMERA_PATH_SLOTS && 27 !in QUICK_ADJUST_SLOTS,
+        )
+        assertTrue(
+            "★ PS-10：黑点 `[37]` 在拍照链路上可调，但**一级页不给它控件**（在「完整参数 >」）" +
+                "—— 与白点 `[38]` 的取舍见 FILMIC_WHITE_EV_SLOT 的 KDoc",
+            37 in CAMERA_PATH_SLOTS && 37 !in QUICK_ADJUST_SLOTS && 38 in QUICK_ADJUST_SLOTS,
         )
         assertFalse(
             "[34] LUT 强度**不在**拍照链路白名单里（它由 prefs 的 lut_strength + `[34]` 两路一起写，" +

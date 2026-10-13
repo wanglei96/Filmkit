@@ -98,15 +98,15 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfLeicaMomentIsExact() {
         val p = builtin("徕卡一瞬")
-        assertEquals(17, p.slots.size)
+        assertEquals(18, p.slots.size)
         assertEquals(
-            "对比度 -3 · 饱和度 · 中间调 +5 · 胶片曲线 · 肩部 红 0.34 · 颗粒 · 强度 20 · … · LUT leica_m9 30",
+            "对比度 +3 · 饱和度 · 暗部 +15 · 胶片曲线 · 肩部 红 0.53 · 颗粒 · 强度 20 · … · LUT leica_m9 31",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）
         assertTrue(
             "LUT 中文名要能替换掉 id",
-            presetSummaryText(p, lutLabel = "徕卡 M9").endsWith("LUT 徕卡 M9 30"),
+            presetSummaryText(p, lutLabel = "徕卡 M9").endsWith("LUT 徕卡 M9 31"),
         )
     }
 
@@ -121,9 +121,9 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfRicohNegativeIsExact() {
         val p = builtin("理光负片")
-        assertEquals(14, p.slots.size)
+        assertEquals(17, p.slots.size)
         assertEquals(
-            "对比度 +6 · 饱和度 · 暗部 +15 · 胶片曲线 · 肩部 绿 0.00 · 颗粒 · 强度 30 · … · LUT ricoh_negative 30",
+            "对比度 +20 · 饱和度 · 暗部 -15 · 胶片曲线 · 肩部 红 0.04 · 颗粒 · 强度 30 · … · LUT ricoh_negative 30",
             presetSummaryText(p),
         )
     }
@@ -142,7 +142,7 @@ class CameraPresetPanelUiTest {
         val p = builtin("徕卡黑白")
         assertEquals(12, p.slots.size)
         assertEquals(
-            "对比度 +9 · 胶片曲线 · 肩部 红 0.66 · 颗粒 · 强度 40 · 胶片曲线 · 肩部 绿 0.00 · … · LUT leica_b_w_hc 100",
+            "对比度 +34 · 胶片曲线 · 肩部 红 0.19 · 颗粒 · 强度 40 · 胶片曲线 · 肩部 绿 0.04 · … · LUT leica_b_w_hc 61",
             presetSummaryText(p),
         )
         assertTrue("黑白预设不该有色彩组的行", presetDetailSections(p.slots).none { it.title == "色彩" })
@@ -418,12 +418,13 @@ class CameraPresetPanelUiTest {
     }
 
     /**
-     * ★ PS-8：**一级页的滑杆只有两条**（常用参数区的 LUT 强度 + ★ PS-9 加入的颗粒强度）——
+     * ★ PS-8：**一级页的滑杆只有三条**（常用参数区的 LUT 强度 + ★ PS-9 加入的颗粒强度
+     * + ★ PS-10 加入的 filmic 白点）——
      * 用户砍掉清单后，"选中项滑杆"随之消失；其余三档（柔光 / 光晕 / 暗角）是**分段控件**
      * （不是滑杆，也不是散落的小 chip）。
      *
-     * 判据落在 [PresetParamSliderRow] 的**调用点数量**（= 2）而不是 `RelativeSlider(` 的出现次数：
-     * 后者是那一行滑杆的**唯一实现**（两条滑杆共用它 —— 一处实现两处调用，正是 PS-8 立的规矩）。
+     * 判据落在 [PresetParamSliderRow] 的**调用点数量**（= 3）而不是 `RelativeSlider(` 的出现次数：
+     * 后者是那一行滑杆的**唯一实现**（三条滑杆共用它 —— 一处实现三处调用，正是 PS-8 立的规矩）。
      *
      * 同时钉住三处"点了没反应就会假掉"的接线：分段控件的 `onPick`、「完整参数 >」的
      * `onOpenFullEdit`、以及滑杆拿到的 `params`（读的是当前生效参数数组）。
@@ -433,12 +434,12 @@ class CameraPresetPanelUiTest {
         val panel = File("src/main/java/com/filmkit/app/ui/CameraPresetPanel.kt").readText()
         val quick = panel.substringAfter("private fun PresetQuickAdjustPanel(").substringBefore("private fun PresetParamLabelRow(")
         assertEquals(
-            "滑杆行 = 两条（LUT 强度 + ★ PS-9 颗粒强度；三档 = 分段控件）",
-            2,
+            "滑杆行 = 三条（LUT 强度 + ★ PS-9 颗粒强度 + ★ PS-10 白点；三档 = 分段控件）",
+            3,
             Regex("""PresetParamSliderRow\(""").findAll(quick).count(),
         )
         assertEquals(
-            "RelativeSlider 只有一处实现（一行滑杆的控件本体，两条滑杆共用）",
+            "RelativeSlider 只有一处实现（一行滑杆的控件本体，三条滑杆共用）",
             1,
             Regex("""RelativeSlider\(""").findAll(panel).count(),
         )
@@ -455,6 +456,11 @@ class CameraPresetPanelUiTest {
         assertTrue(
             "★ PS-9：颗粒 = 强度滑杆，只写 `[26]`（`[27]` 保持预设原值）",
             quick.contains("param = GrainStrengthParam") && panel.contains("GrainStrengthParam = EditorParam("),
+        )
+        assertTrue(
+            "★ PS-10：白点 = 强度滑杆，复用参数表那一条（不是第二份 EditorParam）",
+            quick.contains("param = CAMERA_TUNABLE_SLOT_PARAM.getValue(FILMIC_WHITE_EV_SLOT)") &&
+                !panel.contains("key = \"filmicWhite\""),
         )
         assertTrue("「完整参数 >」必须接上 PS-6b 的回调", panel.contains("onTap = onOpenFullEdit"))
         assertTrue(

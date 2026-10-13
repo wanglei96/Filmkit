@@ -579,6 +579,24 @@ internal const val GRAIN_AMOUNT_SLOT = 26
 /** 颗粒尺寸 `[27]`（**ISO 语义**，越大越粗）—— ★ PS-9：一级页不再有它的控件（值保持原样）。 */
 internal const val GRAIN_SIZE_SLOT = 27
 
+/**
+ * ★ PS-10：filmic **白点** `[38]`（"多亮算白"）—— 一级页给它的**唯一一条**滑杆。
+ *
+ * 用户 2026-10-12 真机："**黑白点要可调**，你白点默认才 2.7？那杯子高光变白的 bug 不就又出来了"
+ * ⇒ 白点是"高光死白"的直接病灶（内置三条 2.54~2.75，比引擎默认 4.56 近约 1.8 EV），
+ * 必须在一级页就能自救。
+ *
+ * **黑点 `[37]` 不上这一级页**（判断，依据三条）：
+ *  ① 用户报的是高光（白点），暗部没有报过问题；
+ *  ② 一级页的既有模式 = **每类只给主控一条**（柔光只给强度、暗角只给强度、颗粒只给强度，
+ *     半径 / 阈值 / 尺寸全在「完整参数 >」）—— 黑白点里白点是高光侧的主控；
+ *  ③ 一级页高度是用户明确要求守住的（PS-8 / PS-9 两张卡反复量过：~354dp）⇒ 一行 30dp + 8dp
+ *     间距是能接受的上限，两行就要再吃 38dp 取景面积。
+ * 黑点仍在「完整参数 >」的「调整」组里（与白点相邻、量程 / 读数同一份参数表）⇒ "黑白点可调"
+ * 整体成立。若真机上用户仍要黑点也上一级页：加一行 `PresetParamSliderRow` 即可（同一组件）。
+ */
+internal const val FILMIC_WHITE_EV_SLOT = 38
+
 /** 颗粒强度 UI 量程（0..1 = 显示 0..100，直通槽位 `[26]` 的 0..100 语义）。 */
 internal val GRAIN_UI_RANGE = 0f..1f
 
@@ -623,15 +641,18 @@ internal fun nearestLevel(ui: Float, levels: List<Float>): Int {
 }
 
 /**
- * 常用参数覆盖的槽（图 2 的 5 项）：`[34]` LUT 强度 / `[26]` 颗粒 / `[95]` 柔光 /
- * `[62]` 光晕 / `[66]` 暗角。
+ * 常用参数覆盖的槽（图 2 的 5 项 + ★ PS-10 的 filmic 白点）：`[34]` LUT 强度 / `[26]` 颗粒 /
+ * `[95]` 柔光 / `[62]` 光晕 / `[66]` 暗角 / `[38]` 白点。
  *
  * ★ PS-9：`[27]` 颗粒**尺寸**从集合里去掉 —— 用户 2026-10-12："**颗粒改成滑杆吧**"，
  * 一级页的颗粒只剩一条**只写 `[26]`** 的强度滑杆（`[27]` 保持预设原值，二级页仍可看）。
  * 集合的口径 = "一级页真的能调的槽"，因此不含它。
+ *
+ * ★ PS-10：加 `[38]`（白点）而**不加 `[37]`**（黑点）—— 取舍依据见 [FILMIC_WHITE_EV_SLOT] 的 KDoc。
+ * 集合口径不变（"一级页真的能调的槽"），只是这一级页多了一条滑杆。
  */
 internal val QUICK_ADJUST_SLOTS: Set<Int> =
-    linkedSetOf(LUT_STRENGTH_SLOT, GRAIN_AMOUNT_SLOT, 95, 62, 66)
+    linkedSetOf(LUT_STRENGTH_SLOT, GRAIN_AMOUNT_SLOT, 95, 62, 66, FILMIC_WHITE_EV_SLOT)
 
 /**
  * ★ PS-8：**横向预设条**的一项 —— 预设 + 小标记（`内置` / `已改` / 分组名）+ 选中态。
@@ -728,8 +749,15 @@ internal const val PRESET_GAP_LG_DP = 24f
 /** 参数行左侧标签列宽（跨行对齐：标签左、滑杆中、数值右）。 */
 internal const val PRESET_LABEL_WIDTH_DP = 60f
 
-/** 参数行右侧数值列宽（等宽字体 + 右对齐 ⇒ 数值列对齐）。 */
-internal const val PRESET_VALUE_WIDTH_DP = 46f
+/**
+ * 参数行右侧数值列宽（等宽字体 + 右对齐 ⇒ 数值列对齐）。
+ *
+ * ★ PS-10：**46dp → 64dp**。46dp 是按 `0..150` 这类 3 字符读数定的（PS-8）；而 PS-10 的
+ * 「白点」读数带物理单位（`+2.7 EV` / `-12.0 EV`，7~8 字符）—— 12sp 等宽字体下每字符 ≈7.2dp
+ * ⇒ 8 字符 ≈58dp，沿用 46dp 会把读数裁成 `+2.7 E`（单位被截掉 = 用户看不出这是 EV）。
+ * 数值列仍**所有行同一个宽度**（跨行对齐正是这个常量的目的），代价是滑杆短 18dp。
+ */
+internal const val PRESET_VALUE_WIDTH_DP = 64f
 
 /**
  * ★ PS-9：卡片 / 输入框的**内边距**（用户："卡片内文字与边框的内边距，都要重看"）。
@@ -1230,8 +1258,9 @@ private fun CamPresetActionButton(
 }
 
 /**
- * ★ PS-6a/PS-8：**常用参数区**（用户点名的 5 项：LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角）——
- * 一级页与编辑面板**共用同一个组件**（一处实现、两处调用；不是两份控件）。
+ * ★ PS-6a/PS-8：**常用参数区**（用户点名的 5 项：LUT 强度 / 颗粒 / 柔光 / 光晕 / 暗角
+ * ＋ ★ PS-10 的 filmic 白点）—— 一级页与编辑面板**共用同一个组件**（一处实现、两处调用；
+ * 不是两份控件）。
  *
  * ★ PS-8 视觉（用户："UI 做得太丑了重新设计一下"）：
  *  - **每个参数一块、块间留白一致**（[PRESET_BLOCK_GAP_DP]，不挤在一起）；
@@ -1285,6 +1314,19 @@ private fun PresetQuickAdjustPanel(
             PresetParamSliderRow(
                 label = "颗粒",
                 param = GrainStrengthParam,
+                params = params,
+                onCommit = onEditParam,
+                onFinished = onEditFinished,
+            )
+        }
+        // ★ PS-10：filmic **白点** `[38]`（用户 2026-10-12："黑白点要可调" —— 高光死白的病灶）。
+        // 参数项**复用 `ParamControls.kt` 的那一条**（量程 / 读数 / write 全在它自己身上），
+        // 与「完整参数 >」和编辑器是同一个对象 ⇒ 三个页面同一个数（不是第二份滑杆实现）。
+        // ⚠ 黑点 `[37]` 不在这里（取舍依据见 [FILMIC_WHITE_EV_SLOT] 的 KDoc）。
+        key(presetId, FILMIC_WHITE_EV_SLOT) {
+            PresetParamSliderRow(
+                label = "白点",
+                param = CAMERA_TUNABLE_SLOT_PARAM.getValue(FILMIC_WHITE_EV_SLOT),
                 params = params,
                 onCommit = onEditParam,
                 onFinished = onEditFinished,

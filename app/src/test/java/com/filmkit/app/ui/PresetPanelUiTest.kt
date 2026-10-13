@@ -296,15 +296,15 @@ class PresetPanelUiTest {
     @Test
     fun summaryOfLeicaMomentIsExact() {
         val p = builtin("徕卡一瞬")
-        assertEquals(17, p.slots.size)
+        assertEquals(18, p.slots.size)
         assertEquals(
-            "对比度 -3 · 饱和度 · 中间调 +5 · 胶片曲线 · 肩部 红 0.34 · 颗粒 · 强度 20 · … · LUT leica_m9 30",
+            "对比度 +3 · 饱和度 · 暗部 +15 · 胶片曲线 · 肩部 红 0.53 · 颗粒 · 强度 20 · … · LUT leica_m9 31",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）
         assertTrue(
             "LUT 中文名要能替换掉 id",
-            presetSummaryText(p, lutLabel = "徕卡 M9").endsWith("LUT 徕卡 M9 30"),
+            presetSummaryText(p, lutLabel = "徕卡 M9").endsWith("LUT 徕卡 M9 31"),
         )
     }
 

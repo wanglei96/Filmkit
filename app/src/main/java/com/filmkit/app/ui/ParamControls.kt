@@ -20,6 +20,8 @@ import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Details
 import androidx.compose.material.icons.outlined.Exposure
+import androidx.compose.material.icons.outlined.ExposureNeg2
+import androidx.compose.material.icons.outlined.ExposurePlus2
 import androidx.compose.material.icons.outlined.Flare
 import androidx.compose.material.icons.outlined.Gradient
 import androidx.compose.material.icons.outlined.InvertColors
@@ -52,6 +54,10 @@ import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
 import com.filmkit.app.camera.EXP_UI_RANGE
 import com.filmkit.app.camera.FADE_UI_RANGE
+import com.filmkit.app.camera.FILMIC_BLACK_EV_PIVOT
+import com.filmkit.app.camera.FILMIC_BLACK_EV_UI_RANGE
+import com.filmkit.app.camera.FILMIC_WHITE_EV_PIVOT
+import com.filmkit.app.camera.FILMIC_WHITE_EV_UI_RANGE
 import com.filmkit.app.camera.GLOW_RADIUS_UI_PIVOT
 import com.filmkit.app.camera.GLOW_THRESHOLD_UI_PIVOT
 import com.filmkit.app.camera.GLOW_UI_PIVOT
@@ -82,6 +88,7 @@ import com.filmkit.app.camera.fadeSlot
 import com.filmkit.app.camera.fadeUi
 import com.filmkit.app.camera.formatDecimals2
 import com.filmkit.app.camera.formatEv
+import com.filmkit.app.camera.formatEvSlot
 import com.filmkit.app.camera.formatKelvin
 import com.filmkit.app.camera.formatOff100
 import com.filmkit.app.camera.formatOffset100
@@ -176,8 +183,9 @@ internal class EditorParam(
 
 /**
  * 「调整」组（E2-3 的「基础」组改名；E2-14 加影调分区四条；E2-15 纳色温/色调；
- * **U-6b 纳胶片曲线两条**）：
+ * **U-6b 纳胶片曲线两条**；**PS-10 纳 filmic 黑白点两条**）：
  * 曝光 [0] / 色温 [88] / 色调 [89] / 对比度 [4] / **胶片曲线·肩部 [5..7] / 胶片曲线·趾部 [8..10]** /
+ * **黑点 [37] / 白点 [38]** /
  * 高光 [90] / 阴影 [91] / 白色色阶 [92] / 黑色色阶 [93] / 饱和度 [20..22] / 清晰度 [78] /
  * 红 [1] / 绿 [2] / 蓝 [3]。槽位语义与恒等值见 `EditorExport.kt` 的映射段。
  *
@@ -187,10 +195,13 @@ internal class EditorParam(
  *  2. **色温 → 色调**：白平衡两条紧跟曝光。它们决定"这张照片的色偏"，而色偏会污染后面
  *     每一个关于颜色的判断（饱和度、清晰度看起来"发灰/发黄"常常只是白平衡没对）；
  *     两条**必须相邻**（同一套白平衡的两轴，分开找不着）；
- *  3. **对比度 → 胶片曲线·肩部 → 胶片曲线·趾部**：都是"曲线形状"。**U-6b 把这两条紧跟对比度**
- *     的理由是它们与对比度**同族**：对比度是"整体斜率"（一条直线），胶片曲线是"两端过渡区的
+ *  3. **对比度 → 胶片曲线·肩部 → 胶片曲线·趾部 → 黑点 → 白点**：都是"曲线形状"。**U-6b 把这两条
+ *     紧跟对比度**的理由是它们与对比度**同族**：对比度是"整体斜率"（一条直线），胶片曲线是"两端过渡区的
  *     位置"（肩部 = 亮端、趾部 = 暗端）—— 用户发现"对比度不够精细"时，下一步就是来这里调端点，
  *     中间隔着四条影调分区会把同一条曲线的两端拆散；
+ *     **PS-10 把 filmic 黑白点接在趾部之后**：它们也是"曲线端点"，只是量的是**端点的位置**而不是
+ *     过渡区的宽度（肩部/趾部 = 形，黑白点 = 量）—— 用户在"曲线还不够用"时的下一步就是挪端点。
+ *     四条挨着放 ⇒ "曲线族"在参数表里是一整段，中间不插别的类别；
  *  4. **高光 → 阴影 → 白色色阶 → 黑色色阶**：四个影调分区按**从亮部到暗部**（Lightroom
  *     Basic 面板的既有顺序，用户肌肉记忆最省）；都在对比度/曲线之后，因为它们是"对比度不够
  *     精细"时的**分区微调**（曲线改的是过渡区形状，分区改的是区段亮度，前者更"形"、后者更"量"）；
@@ -208,6 +219,9 @@ internal class EditorParam(
  *  - **清晰度** `35`（0..100 整数，0 = 关）；基准在最左端 ⇒ 不画中点标记（端点本身就是标记）
  *  - **胶片曲线·肩部 / 趾部** `0.30`（**两位小数**，latitude 0..1）；中点 = **`0.01`**（不是 0！）
  *    —— 0 在 latitude 语义里是"过渡区紧贴中灰"的**极端 S 曲线**（详见 `latitudeSlot` 的 KDoc）
+ *  - **黑点 / 白点** `-7.6 EV` / `+4.6 EV`（**一位小数 + EV**，槽位**就是** EV ⇒ 无换算；
+ *    与 `PresetDetail.kt` 的 `evText` 同一个实现 [formatEvSlot]）；中点 = 引擎默认 `-7.65` / `+4.56`
+ *    —— 量程与"编辑器链路白点有 2.44 EV 物理上限"这两条依据见 `FILMIC_BLACK_EV_UI_RANGE` 的 KDoc
  *  - **高光 / 阴影 / 白色色阶 / 黑色色阶** `+50`（±100，正 = 该分区提亮）；中点 = `0`
  *
  * ⚠️ 色温滑杆的值**直接就是 K**（右移 = K 大 = 画面变暖）—— 槽位 [88] 存的是 mired 偏移，
@@ -263,6 +277,26 @@ internal val AdjustParams: List<EditorParam> = listOf(
         format = { formatDecimals2(it) },
         read = { latitudeUi(it[8]) },
         write = { p, v -> writeLatitude(p, 8, v) },
+    ),
+    // ── PS-10：filmic **黑白点**（[37] / [38]，引擎 `computeFilmicSpline` 的曲线两端）──────────
+    // 接在胶片曲线两条之后（同属"曲线端点"：肩/趾 = 过渡区宽度，黑白点 = 端点位置），
+    // 理由见 [AdjustParams] 的 KDoc 第 3 条。量程 / 基准 / 读数口径（含编辑器链路白点
+    // 2.44 EV 物理上限的如实标注）见 `EditorExport.kt` 的 `FILMIC_BLACK_EV_UI_RANGE` 段。
+    // 两个槽**两端都真生效**（拍照链路 `updateFilmicEV` + 编辑器链路 `computeEditorCurve`
+    // 都读 `p.filmic_black_ev` / `p.filmic_white_ev`）⇒ 不是假滑杆。
+    EditorParam(
+        key = "filmicBlack", label = "黑点", icon = Icons.Outlined.ExposureNeg2,
+        range = FILMIC_BLACK_EV_UI_RANGE, pivot = FILMIC_BLACK_EV_PIVOT,
+        format = { formatEvSlot(it) },
+        read = { it[37].toFloat() },
+        write = { p, v -> p[37] = v.toDouble() },
+    ),
+    EditorParam(
+        key = "filmicWhite", label = "白点", icon = Icons.Outlined.ExposurePlus2,
+        range = FILMIC_WHITE_EV_UI_RANGE, pivot = FILMIC_WHITE_EV_PIVOT,
+        format = { formatEvSlot(it) },
+        read = { it[38].toFloat() },
+        write = { p, v -> p[38] = v.toDouble() },
     ),
     // ── E2-14：影调分区四条（[90..93]，引擎 `kFsStyle` 的 `uToneOn` 段）────────────
     // 量程 −1..+1 直通槽位，恒等 0；读数 = ±100 整数（`+50` / `0` / `-50`），中点 0。
@@ -592,14 +626,18 @@ internal fun EditorSlider(
  *
  * 逐条来源（`CameraStyleWhitelistTest` 的白名单里确实有它们）：
  *  - 颗粒 `[26]` 强度 / `[27]` 尺寸 / `[60]` 中间调偏置 / `[61]` 枢轴（E4-3 引擎已实现，
- *    但 E2 系列参数面板从未给它滑杆）；
- *  - filmic 黑白点 `[37]` / `[38]`（引擎在两条链路都读，面板同样没有滑杆）。
+ *    但 E2 系列参数面板从未给它滑杆）。
  *
- * 这是**既有欠账**，PS-3 如实标注（"拍照生效 · 暂无滑杆"）而不是造一条没有引擎语义对应的
- * 假滑杆；将来给它们补滑杆时，**删掉本集合里的对应项 + 在 [CAMERA_TUNABLE_SLOT_PARAM] 里
+ * **PS-10 从本集合移除了 filmic 黑白点 `[37]` / `[38]`**（它们已在 `AdjustParams` 里有了
+ * 滑杆 ⇒ 进 [CAMERA_TUNABLE_SLOT_PARAM]）。这两个槽**拍照链路真的读**
+ * （`FrameRenderer.cpp` 的 `updateFilmicEV(..., p.filmic_black_ev, p.filmic_white_ev, ...)`）
+ * ⇒ 属于"可调"，不再欠账。
+ *
+ * 这是**既有欠账**的如实标注（"拍照生效 · 暂无滑杆"）而不是造一条没有引擎语义对应的
+ * 假滑杆；将来给颗粒补滑杆时，**删掉本集合里的对应项 + 在 [CAMERA_TUNABLE_SLOT_PARAM] 里
  * 加一行**即可（`CameraPresetEditTest` 会要求两处同步）。
  */
-internal val CAMERA_NO_SLIDER_SLOTS: Set<Int> = setOf(26, 27, 37, 38, 60, 61)
+internal val CAMERA_NO_SLIDER_SLOTS: Set<Int> = setOf(26, 27, 60, 61)
 
 /**
  * 槽位 → 参数表的项（**拍照界面可拖的槽 = [CAMERA_PATH_SLOTS] − [CAMERA_NO_SLIDER_SLOTS]**）。
@@ -620,6 +658,8 @@ internal val CAMERA_TUNABLE_SLOT_PARAM: Map<Int, EditorParam> = buildMap {
     // 影调曲线（一条滑杆三槽 —— 与编辑器 writeLatitude 同一条 write）
     bind("curveShoulder", 5, 6, 7)
     bind("curveToe", 8, 9, 10)
+    // ★ PS-10：filmic 黑白点（一条滑杆一槽；量程 / 读数 / 写值全在参数表那两条自己身上）
+    bind("filmicBlack", 37); bind("filmicWhite", 38)
     // 色彩
     bind("sat", 20, 21, 22)          // 一条滑杆三槽（writeSaturation）
     bind("splitWarm", 23); bind("splitCool", 24); bind("mono", 25)
