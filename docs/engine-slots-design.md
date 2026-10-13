@@ -236,11 +236,18 @@ struct EngineEntry {
 
 | 阶段 | 内容 | 验收判据（硬） |
 |---|---|---|
-| **0 契约与基线** | 建 `EngineRegistry`（只含引擎 0）；`FilmParams` 加 `[98]`；采集基线：现有成片 CRC32 + filmic 参数快照 | 四处同步通过 + `CameraPresetsTest` 绿；**`[98]=0` 时同帧 CRC32 与基线逐字节一致** |
+| **0 契约与基线** | 建 `EngineRegistry`（只含引擎 0）；`FilmParams` 加 `[98]`；采集基线：现有成片 CRC32 + filmic 参数快照 | 六处同步通过 + `CameraPresetsTest` 绿；**`[98]=0` 时同帧 CRC32 与基线逐字节一致** |
 | **1 模板化重构** | `kFsFilm` 拆成 `kFilmTemplateHead/Mid/Tail`，filmic+gamut 搬进引擎 0 注入段；初始化期拼接 | 同阶段 0 的 CRC32 判据（**这是零回归的唯一硬门槛**）；`validate-shaders.sh` 通过；`prog_film_ != 0` |
 | **2 sigmoid 引擎** | 加引擎 1（GLSL + CPU 参数求解 + 注册表两项） | §7 的五条判据 |
 | **3 切换与预设** | UI 切换入口（对齐 PC 的引擎选择面）；预设 schema 支持 `engine_slot` + 私有 KV | 两引擎互切无串扰；旧预设逐字节等价；删资产 → 该引擎灰显、其余正常 |
 | **4 ACES 预留** | 引入 `workingColorSpace` 非 D4 的引擎支持（`uProfileToEngineTransform` 实际启用） | 域往返残差 < 1e-6；单独一期实测（不在前四期内） |
+
+> **阶段 0 已交付**（2026-10-13）：`[98] engine_slot`（`FilmParams.h`，`kCount` 98→99）+ 六处同步 +
+> `EngineRegistry.{h,cpp}` 骨架（只含引擎 0，渲染路径零引用）+ Kotlin 侧同步与测试护栏。
+> **基线**落在 `docs/reports/stage0-engine-slot-BASELINE.md` —— 其中记录了本机可采的离线基线
+> （P0/RCD/CCM→D4 的 CRC32 与 SHA-256）与**两个必须在阶段 1 前解决的缺口**：
+> ① 离线执行器实际**未接入 `kFsFilm`**（文件头注释与实现不符）⇒ 阶段 1 的核心判据在离线链上无法执行；
+> ② 拍照链**没有 filmic 参数日志**（`engine.preview.filmic` 只在预览分支）。
 
 ---
 

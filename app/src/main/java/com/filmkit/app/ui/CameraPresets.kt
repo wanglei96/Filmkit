@@ -15,11 +15,11 @@ package com.filmkit.app.ui
  */
 object CameraPresets {
 
-    /** 参数数组长度 = C++ `FilmParams.h::kCount`（SG-1 柔光起 98）。
+    /** 参数数组长度 = C++ `FilmParams.h::kCount`（阶段 0 引擎插槽起 99）。
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 98
+    const val COUNT = 99
 
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
         a[i] = v0; a[i + 1] = v1; a[i + 2] = v2
@@ -167,7 +167,7 @@ object CameraPresets {
         // 48 = 伪彩感知色度降噪强度（档 A，v0.10.165）：0 = 关（A/B 通路），
         // >0 = σc 放大倍率（scEff = sc·(1 + moire·[48])，封顶 4·sc）。
         // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         this[48] = 2.0
         // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
         // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
@@ -195,7 +195,7 @@ object CameraPresets {
         // [52] = 权重形式（1 = PC 的 w2 = **默认**；0 = 只放大 wc = 字面版，留作 A/B）。
         // [53] = 紫边判据梯度自适应（v0.10.185：默认 0 → 8）。0 = 关；
         //        8 = 高梯度处把替换阈值 thr 放宽 1/(1+8·|∇L|)，让 1~3px 窄紫线进替换区。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         // 真机 A/B：prefs("chroma_gate")（见 CameraController 的下发层）。
         this[51] = 2.0
         this[52] = 1.0
@@ -214,7 +214,7 @@ object CameraPresets {
         // 用户真机拍板（2026-10-07，台灯逆光 + 红笔场景）："替换档紫边变细、
         // 且红笔不色散"，成片观感以用户为准；替换档旁路 P4/defringe/D-1 的
         // 色渗风险由 ESD3D2 自带逐像素门覆盖（pc3dK 诊断字段观察）。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         // 真机 A/B：prefs("pc3d") / prefs("pc3d_msize")。
         this[54] = 1.0
         this[55] = 0.0
@@ -233,7 +233,7 @@ object CameraPresets {
         // 分支 v0.10.161 哲学同源：满阱原值 = WB 增益伪影）；治亮暗交界经 CCM 后
         // 的 4~6px 品红窄带（2026-10-06 台灯样张 RAW 域定案，docs/research/11 §6）。
         // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         // 设置页开关写 prefs("hl_rb_recon")。
         this[57] = 0.0
         // 58 = RCD P3 拆双 pass（v0.10.180）：1 = 色度段拆成 3a（R/B 位对角
@@ -243,7 +243,7 @@ object CameraPresets {
         // G 陡错位（品红峰 +43.8 WB 域）被放大 2 倍（+85.6），治亮暗交界品红
         // 窄带（docs/research/11 号 §8）。拍照约慢 0.2 秒（日志 rcdAMs/rcdBMs）。
         // ⚠ 默认 0 = 旧行为逐位不变；1 = A/B 通路，改默认前真机数据说话。
-        // ⚠️ 本槽长度是**硬契约**：FilmParams.kCount = 78，数组越界会直接崩。
+        // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         // 设置页开关写 prefs("rcd_p3_split")。
         this[58] = 0.0
         // ── E4-1（v0.11.0）：胶片特有参数 [60..77] 的默认值 ──────────────────
@@ -306,6 +306,10 @@ object CameraPresets {
                           // 0.35 = 规格默认；[95] = 0 时不可达
         this[97] = 0.70   // glow_threshold：高光阈值（显示域 sRGB 0..1，与 [63] 同口径）；
                           // 0.70 = 规格默认；[95] = 0 时不可达
+        // ── 阶段 0（引擎插槽）：[98] engine_slot ──────────────────────────────
+        // 0 = 内置 filmic（默认、兼容档）⇒ 与改动前行为逐位一致。非 0 会让所有
+        // 现有预设静默切到别的引擎（本阶段还没有第二个引擎，等于渲染失败）。
+        this[98] = 0.0
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

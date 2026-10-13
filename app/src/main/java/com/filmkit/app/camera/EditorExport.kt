@@ -2095,6 +2095,8 @@ internal object FilmParamKeys {
         95 to "glow_strength",
         96 to "glow_radius",
         97 to "glow_threshold",
+        // [98] 阶段 0（引擎插槽）：影调引擎选择（0 = 内置 filmic）
+        98 to "engine_slot",
     )
 
     /**

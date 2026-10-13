@@ -7,16 +7,19 @@ namespace filmkit {
 // 胶片模拟参数（M1 简化模型，docs/开发计划.md §5 的子集）。
 // 通过 JNI double 数组传输，顺序由 kIdx* 常量与 Kotlin 侧约定保持一致。
 struct FilmParams {
-  // 契约**四处**必须同步（ADR-1 铁律；漏一处 = 启动崩溃）：
-  //   ① 本常量；② Kotlin 侧 `CameraPresets.neutral()` 的 `DoubleArray(N)`；
-  //   ③ `fromDoubles` 的 `if (n > idx)` 解析防呆；④ 下发点
-  //   `CameraController.setFilmParams` 的长度兜底。
+  // 契约**六处**必须同步（ADR-1 铁律；漏一处 = 启动崩溃）：
+  //   ① 本常量 `kCount`；② 本文件内每一条字段声明及其 `// 槽位` 行注释；
+  //   ③ `fromDoubles` 的 `if (n > idx)` 解析防呆；④ Kotlin
+  //   `CameraPresets.neutral()`（长度与默认值）；⑤ Kotlin `CameraPresets.COUNT`；
+  //   ⑥ Kotlin `FilmParamKeys.bySlot`（槽位 ↔ 语义名）。
+  //   ⚠️ ⑥ 由 `FilmParamKeysTest` 与本文件字段声明行**三方对拍** ⇒ 字段行的
+  //   `float <名字> = …; // <槽位>` 是**机器可读契约**，格式必须严格保持。
   // v0.10.196 真实事故：只改了本常量（59→60），Kotlin 侧仍是 59 ⇒ 下发点写
-  // `filmParams[59]` 越界 ⇒ **装包后应用启动即崩**。改这里必须四处一起改。
+  // `filmParams[59]` 越界 ⇒ **装包后应用启动即崩**。改这里必须六处一起改。
   // v0.11.0（E4-1）：60 → 78，+[60..77] 胶片特有参数（颗粒调制 / halation / 暗角 /
   // 层间效应）。**本卡只扩契约、不改 shader**（功能由 E4-2…E4-6 各自实现）⇒
   // 新槽位当前零引用，默认值一律取"无效果"值，成片与改动前逐位一致。
-  // 沿革：v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））
+  // 沿革：v0.10.180：+[58] rcd_p3_split（v0.10.179：+[57] hl_rb_recon（v0.10.178：+[56] rcd_g_orig（v0.10.175：+[55] pc3d_msize、+[54] pc3d（v0.10.173 +[53] df_gate、+[52] cg_scope、+[51] chroma_gate；v0.10.170 +[50] ca_corr；v0.10.169 +[49] hl_grecon；v0.10.165 +[48] moire；v0.10.134 +[47] defringe；v0.10.117 +[46] rcd_cdfix、v0.10.115 +[45] hr_raw、v0.10.111 +[43] white_floor）））；v0.11.27（阶段 0）：+[98] engine_slot
   // v0.11.1（E2-2）：78 → 88，+[78] clarity（编辑器基础调整的清晰度）+
   // [79..87] 局部调整（local_*，E2-6 才实现）。与 E4-1 同模式：**契约扩展与功能
   // 实现分离** —— 本卡只为 [79..87] 占位（shader 零引用），E2-6 不再改契约。
@@ -32,7 +35,10 @@ struct FilmParams {
   // 域与落点见 `docs/reports/soft-glow-SPEC.md` §2：提取/模糊与 halation 同域
   //（线性显示域，`kFsOut` 的 srgbEncode 之前），Screen 混合落在**显示域**
   //（`kFsOut`/`kFsStyle` 的褪色之后、暗角之前）。
-  static constexpr int kCount = 98;
+  // v0.11.27（阶段 0，引擎插槽）：98 → 99，+[98] `engine_slot`。**只扩契约与注册表
+  // 骨架，不接线**：shader / `FrameRenderer` 零改动、渲染路径不读该槽 ⇒ `[98] = 0`
+  // 时成片与改动前逐字节一致。引擎实现与注入见 `docs/engine-slots-design.md`。
+  static constexpr int kCount = 99;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -498,6 +504,14 @@ struct FilmParams {
   float glow_radius = 0.35f;    // 96 模糊半径（0..1 归一，相对短边；[95]=0 时不可达）
   float glow_threshold = 0.70f; // 97 高光阈值（**显示域** sRGB 0..1，与 [63] 同口径；
                                 //    进 shader 前由 CPU 换算到线性显示域）
+  // ── [98] 引擎插槽（阶段 0，见 `docs/engine-slots-design.md` §6）──────────────
+  // 语义：`0` = 内置 filmic（**默认、兼容档**）；`N` = `EngineRegistry` 第 N 个引擎。
+  // `0` 时行为与改动前**逐位一致**：本阶段没有任何 kernel 读这个值。
+  // 引擎私有参数**不进本数组**（否则每加一个引擎就要动契约布局，重演 PC 的 Fuji
+  // 下线 = 33 文件 + Room DB 迁移的事故），走独立有序 KV 通道
+  // `nativeSetEngineParams`（阶段 2 才加）。
+  // 旧预设数组长度 ≤ 98（即 < 99）⇒ 读不到该槽 ⇒ 保持结构体默认 ⇒ 与改动前一致。
+  float engine_slot = 0.0f;   // 98
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -626,6 +640,9 @@ struct FilmParams {
     if (n > 95) glow_strength = static_cast<float>(v[95]);
     if (n > 96) glow_radius = static_cast<float>(v[96]);
     if (n > 97) glow_threshold = static_cast<float>(v[97]);
+    // v0.11.27（阶段 0，引擎插槽）：[98] engine_slot。缺槽（旧数组 ≤ 98）时保持
+    // 结构体默认 0.0 = 内置 filmic ⇒ 与改动前逐位一致。
+    if (n > 98) engine_slot = static_cast<float>(v[98]);
   }
 };
 

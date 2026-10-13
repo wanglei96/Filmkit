@@ -1,6 +1,8 @@
 package com.filmkit.app.ui
 
+import com.filmkit.app.camera.presetSlotIncluded
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -15,9 +17,9 @@ class CameraPresetsTest {
 
     @Test
     fun lengthMatchesContract() {
-        // SG-1：96 → 98（[95] 预留槽启用为 glow_strength + 新增 [96][97]）。
+        // 阶段 0：98 → 99（[98] engine_slot）。
         // 此断言是 v0.10.196 启动崩溃的哨兵。
-        assertEquals(98, CameraPresets.COUNT)
+        assertEquals(99, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
     }
 
@@ -41,6 +43,23 @@ class CameraPresetsTest {
         assertEquals("slot[95] glow_strength 必须为 0（整链旁路）", 0.0, p[95], 0.0)
         assertEquals("slot[96] glow_radius", 0.35, p[96], 0.0)
         assertEquals("slot[97] glow_threshold", 0.70, p[97], 0.0)
+    }
+
+    @Test
+    fun stage0EngineSlotDefaultsToBuiltinFilmic() {
+        // 阶段 0 护栏：[98] 必须为 0 = 内置 filmic（兼容档）。
+        // 非 0 会让现有预设静默指向不存在的引擎 —— 本阶段注册表只有引擎 0。
+        val p = CameraPresets.standard()
+        assertEquals("slot[98] engine_slot 必须为 0（内置 filmic）", 0.0, p[98], 0.0)
+        // ★ 设计决策（架构师 2026-10-13 拍板，与 [PRESET_ENGINE_KNOB_SLOTS] 相反）：
+        //   **engine_slot 属于「口味」而非「引擎状态」** —— 阶段 3 验收要求"预设 schema 支持
+        //   engine_slot + 私有 KV"（`docs/engine-slots-design.md` §8），即每条预设各自记住
+        //   自己的引擎。这与 [28][30..33][35][36]（标定 / 预览辅助 / 色彩科学状态）不同：
+        //   那些是"引擎内部状态"，不是用户选择。故不加入任何排除集合。
+        assertTrue(
+            "slot[98] engine_slot 必须进预设（阶段 3 的预设 schema 要带引擎选择）",
+            presetSlotIncluded(98),
+        )
     }
 
     @Test

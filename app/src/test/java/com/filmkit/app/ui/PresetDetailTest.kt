@@ -135,18 +135,18 @@ class PresetDetailTest {
 
     @Test
     fun unknownSlotsFallBackToSemanticNamesAndNeverDisappear() {
-        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[98] 越界 ⇒ 连语义名都没有。
-        // ⚠ SG-1（v0.11.17）：越界例子从 [96] 改为 [98] —— kCount 96 → 98 后 [96] 已是
-        // 合法槽（glow_radius，有语义名）⇒ 继续用它会测的是"新槽有没有名字"而不是"越界"。
-        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 98 to 2.0))
-        assertEquals("三个槽一个都不许消失", setOf(11, 29, 98), rows.keys)
+        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[99] 越界 ⇒ 连语义名都没有。
+        // ⚠ 阶段 0（v0.11.27）：越界例子从 [98] 改为 [99] —— kCount 98 → 99 后 [98] 已是
+        // 合法槽（engine_slot，有语义名）⇒ 继续用它会测的是"新槽有没有名字"而不是"越界"。
+        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 99 to 2.0))
+        assertEquals("三个槽一个都不许消失", setOf(11, 29, 99), rows.keys)
         assertEquals("cross[0]", rows.getValue(11).label)
         assertEquals("0.50", rows.getValue(11).value)
         assertEquals("槽29", rows.getValue(29).label)
         assertEquals("1", rows.getValue(29).value)
-        assertEquals("槽98", rows.getValue(98).label)
-        assertEquals("2", rows.getValue(98).value)
-        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 98 to 2.0)).map { it.title })
+        assertEquals("槽99", rows.getValue(99).label)
+        assertEquals("2", rows.getValue(99).value)
+        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 99 to 2.0)).map { it.title })
     }
 
     /** 被 `presetSlotIncluded` 排除的槽（引擎旋钮 / 解码 / 局部）若出现在坏数据里，同样不许消失。 */
@@ -205,9 +205,9 @@ class PresetDetailTest {
         assertTrue("解析 ParamControls.kt 的 EditorParam 表失败（只有 ${panel.size} 条）", panel.size >= 15)
         // ★ 只喂**真能进预设**的槽（`presetSlotIncluded`）：局部调整 [79..87] 与 LUT 强度 [34]
         //   被策略排除 ⇒ 详情里本来就不会有它们的行（"坏数据里出现了"是另一条测试）。
-        // ★ SG-2：上界 95 → **97** —— kCount 98（SG-1）后 [96]/[97] 也是合法槽，
-        //   不扩上界就会漏检柔光半径/阈值的文案（旧上界是 kCount = 96 时代的残留）。
-        val rows = allRows((0..97).filter { presetSlotIncluded(it) }.associateWith { 0.5 })
+        // ★ 阶段 0：上界不再写死（`0 until CameraPresets.COUNT`）—— 扩槽后自动覆盖新槽，
+        //   不会再漏检（旧写死的上界 97 是 kCount = 98 时代的残留）。
+        val rows = allRows((0 until CameraPresets.COUNT).filter { presetSlotIncluded(it) }.associateWith { 0.5 })
         var checked = 0
         for (p in panel) {
             val row = rows[p.slot] ?: continue      // 局部调整 [79..87] 不进预设 ⇒ 详情里没有行
@@ -228,11 +228,12 @@ class PresetDetailTest {
     @Test
     fun detailLabelsMatchScopeNoticeWording() {
         // ⚠ 清单**不硬编码**：作用域表随引擎接线而变（U-1 把 `[23..25]` 接到编辑器链路后
-        // P-5 就不再提示它们；U-2 接线 `[5..10]` / `[37][38]` 时同理）⇒ 遍历全部 98 槽，
+        // P-5 就不再提示它们；U-2 接线 `[5..10]` / `[37][38]` 时同理）⇒ 遍历全部
+        // `CameraPresets.COUNT` 个槽，
         // **由 `presetScopeNotice` 自己决定**哪些槽还有"跨链路差异"、提示里用的是什么词，
         // 再要求详情用同一个词。写死清单会在每次接线时假红（把"接线完成"报成"文案漂移"）。
         var checked = 0
-        for (slot in 0..97) {
+        for (slot in 0 until CameraPresets.COUNT) {
             val slots = mapOf(slot to 0.5)
             val p = EditorPreset(id = "p", name = "n", slots = slots)
             val notice = presetScopeNotice(p, PresetScene.EDITOR)

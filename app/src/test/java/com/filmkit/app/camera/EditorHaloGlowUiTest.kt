@@ -108,7 +108,7 @@ class EditorHaloGlowUiTest {
     @Test
     fun everyPivotEqualsTheNeutralValueInCameraPresets() {
         val neutral = CameraPresets.standard()
-        assertEquals("契约长度（SG-1 起 98）", 98, neutral.size)
+        assertEquals("契约长度（阶段 0 引擎插槽起 99）", 99, neutral.size)
         for ((slot, pivot) in pivots) {
             assertEquals(
                 "槽 $slot 的 pivot 与 CameraPresets.standard() 的中性值不一致 —— " +

@@ -16,6 +16,7 @@ add_library(filmengine SHARED
         src/log/Logger.cpp
         src/log/GpuTimer.cpp
         src/pipeline/Pipeline.cpp
+        src/film/EngineRegistry.cpp
         src/render/Align.cpp
         src/render/AmazeDemosaic.cpp
         src/render/FrameRenderer.cpp
