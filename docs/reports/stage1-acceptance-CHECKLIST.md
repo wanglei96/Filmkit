@@ -25,7 +25,9 @@ engine.film_src  {"slot":0,"bytes":35154,"chars":25140,"crc32":"0x4fa1ebd3","ide
 **为什么这一条就够**：`identical:true` 意味着**设备上真正编译的那份 shader 源码，与改造前逐字节相同**；
 同一份 shader + 同一份输入 ⇒ 同一份输出（GPU 渲染是确定性的）。所以成片不可能因本次重构而变。
 
-- ⚠ 这是**初始化期只记一次**的日志（App 启动后拍一张或进一次相机页即可产生）。
+- ⚠ **每次引擎 init 记一条**（不是"整个 App 生命周期只一条"）：真机实测一次会话里出现 **6 条**
+  （`app.start` 1 条 + 切前后台/重建 context 各 1 条，每条都伴随 `engine.stop` → 重新 init）。
+  **判据是"每一条都必须 identical:true"**，条数本身不是判据。
 - ⚠ 若看到 `identical:false` 且 `zero_regression:"FAILED (stage-1 criterion)"`（level=Error）：
   **立即停止验收并回报** —— 那是零回归失效，不是可接受偏差。
 
