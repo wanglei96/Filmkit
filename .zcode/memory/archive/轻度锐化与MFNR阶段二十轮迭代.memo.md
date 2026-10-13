@@ -2,7 +2,7 @@
 summary: 轻度锐化与MFNR阶段二十轮迭代
 created: 2026-09-28 10:45
 updated: 2026-09-28 19:30
-status: absorbed
+status: archived
 ---
 
 # 轻度锐化与MFNR阶段二十轮迭代

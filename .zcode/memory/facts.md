@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-05 20:30
+updated: 2026-10-13 11:00
 status: active
 ---
 
@@ -100,6 +100,16 @@ status: active
 - [2026-10-02] **三摄 GCam 标定**：主摄 HPB A=2.72e-7 dg_ref 6400（100 张实测）、超广 JN1 A=3.07e-7（借用 NubiaZ50Ultra，非本机实测）、长焦 LYT602 A=1.05e-6；`BUILT_IN` 原先**无主摄条目**（主摄一直走 HAL cam2，其 G 通道比 R/B 低一半）；真机 `src:"builtin"` ×3 验证通过；手动选定是**全局**的（不随镜头切换）
 - [2026-10-02] **曝光 ×N + ISO ÷N 纯赚 SNR**：离线解析收益 √N 与物理上限逐位吻合（N=8.66 → 2.95×）；约束三条 = ISO 下限 / 快门上限 / 运动预算；纹理预算维持**细节优先 2.2px**；真机 250ms 档 `expCap:"250ms" expN:"8.33" altIso:167`，nzPreMed 0.005219→0.001688（**1/3.1**）；ISO167 = Filmix 的 ISO166
 - [2026-10-01] **连拍显存与耗时**：修后 7 张全成功零丢失；独立线程代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放回 ~400MB）；热机单张 totalMs 2091~3336ms；同帧 A/B CRC32 逐字节等价；`capture()` 在渲染期静默吞快门（"连按两下只出一张"根因）
+## 相册与预设（10-11 → 10-13）
+
+- [2026-10-13] **参数表单一来源 = `app/src/main/java/com/filmkit/app/ui/ParamControls.kt`**（`EditorParam` / `AdjustParams` / `ColorParams` / `TextureParams` / `LutStrengthParam` / `EditorSlider` / `CAMERA_NO_SLIDER_SLOTS` / `CAMERA_TUNABLE_SLOT_PARAM`）；由 PS-3 从 `EditorScreen.kt` **逐字搬移**（−429 行纯删除、零新增），拍照界面与编辑器共用 ⇒ 两页读数不可能漂移
+- [2026-10-13] **相册查看页关键纯函数**（`PhotoViewScreen.kt`）：`frameAfterPageChange`（切页原子替换）、`pageAlphaAt(isSettledPage, fading, fade)`（alpha 与 zoom/pan 同一道闸）、`bitmapBelongsToPage` + `visibleBitmapFor`（归属校验，防旧页像素画到新页）、`zoomAboutCentroid(pan, centroid, center, z1, z2)`（两指中心缩放）、`previewRequestFor`（预览档 = 容器一半）、`PRELOAD_RADIUS=2`、`SPINNER_DELAY_MS=150`
+- [2026-10-13] **filmic 黑白点**：`[37] filmic_black_ev`（引擎默认 −7.65）、`[38] filmic_white_ev`（引擎默认 4.56，`FilmParams.h:156`）；引擎无绝对 clamp（仅 `black ≤ white − 0.2`）；UI 值 = 槽位 EV 直通，**量程复用 `SettingsScreen.kt` 既有滑杆**（黑点 −12..−1 / 白点 1..8）
+- [2026-10-13] **内置三条预设 `[38]` = 4.0**（R-3 定案，原 2.7471/2.6138/2.5438）：死白起点 2.60/2.45/2.40 → **三条齐平 3.55 EV**；高光层次预算 6.6/3.0/1.1 → 24.4/21.0/15.8 LSB；代价 = 白纸 2.30EV −15.9~−18.0 LSB、拟合残差 8~10 → 12.7~17.4。配方见 `app/src/main/assets/presets/builtin.json`
+- [2026-10-13] **编辑器链路白点上限 2.4377 EV**：`computeEditorCurve` 的 `wh = clamp(srgbEncode(grey·2^white_ev), grey_disp+0.05, 1.0)` ⇒ `white_ev ≥ log2(1/0.1845)` 时 `wh` 恒 1.0（显示域最亮即 1.0）；拍照链路不受此限
+- [2026-10-13] **`auto_tone`（`[35]`，默认 0）**：0 = 黑白点用 `[37]/[38]` 固定值；1 = 成对自动。**引擎的"白点高光感知"（v0.10.27 加，修过"釉面/白瓷密集高光一路白上去"）只在 `auto_tone=1` 生效** ⇒ 预设走固定白点路径，治本方向 = 让预设也走自适应
+- [2026-10-13] **出包后版本/构建要点**：跑 gradle 必须 `JAVA_HOME=/opt/homebrew/opt/openjdk@23`（默认 java 8 跑不动 AGP 8.13）；单测必须 `--rerun-tasks`（否则 build cache 假绿）；出包 `tools/release.sh <code> <name>` 需同一 JAVA_HOME
+
 - [2026-10-01] **LUT 库结构**：`app/src/main/java/com/filmkit/app/lut/`（CubeLut 解析 1D/3D/二进制、MAX_SIZE 128；LutIO 嗅探/Hald·Unwrapped/重采样；LutLibrary 内置 42 + 用户库 files/luts、id 前缀 u_）；预览降载走 `g_preview_scale`；LUT 强度上限 1.5
 - [2026-10-02] **NN 路线判死但代码保留**：spike 真机 GPU **26ms/tile**（7× CPU）、12MP 0.51s 零温升、纹理保留 78–86% 优于 P0；集成五轮逐层修口径（JNI 桥 / KSigma / cvt_k×256 / 通道序 / neff 折减）后 **nnGain 与公式逐位吻合而观感零改善**（文字梯度 −24%、斑块状伪影）⇒ 跨域模型不可直接用；四次微调（监督×3 + N2N）留出集全过拟合（4 场景 vs 官方 3 万+）；代码落点 `nn/NnInferEngine.kt` + `kFsNnPack/Unpack`、`kNnAnchorS=1.0093e-3`，prefs nn_dn/nn_ab 默认关
 - [2026-10-04] **编辑器与预设调研（docs/research/10 号）**：预设 schema 增量 = 颗粒强度/尺寸/密度调制、halation 阈值/强度/半径/色相、暗角、趾肩、层间效应；E1–E5 阶段；基础设施 = CameraPresets 槽位 + `nativeEngineSubmitStill/Raw` 单帧直通 + 胶卷位占位（CameraScreen:1232）

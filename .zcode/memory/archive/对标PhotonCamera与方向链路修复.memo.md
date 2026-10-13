@@ -2,7 +2,7 @@
 summary: 对标PhotonCamera与方向链路修复
 created: 2026-09-24 10:20
 updated: 2026-09-24 10:20
-status: absorbed
+status: archived
 ---
 
 # 对标PhotonCamera与方向链路修复

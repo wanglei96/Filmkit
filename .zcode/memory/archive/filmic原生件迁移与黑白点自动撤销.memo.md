@@ -2,7 +2,7 @@
 summary: filmic原生件迁移与黑白点自动撤销
 created: 2026-09-28 19:30
 updated: 2026-09-28 20:13
-status: absorbed
+status: archived
 ---
 
 # filmic原生件迁移与黑白点自动撤销

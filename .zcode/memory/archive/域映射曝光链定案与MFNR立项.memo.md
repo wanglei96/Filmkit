@@ -2,7 +2,7 @@
 summary: 域映射曝光链定案与MFNR立项
 created: 2026-09-27 16:10
 updated: 2026-09-27 20:05
-status: absorbed
+status: archived
 ---
 
 # 域映射曝光链定案与MFNR立项
