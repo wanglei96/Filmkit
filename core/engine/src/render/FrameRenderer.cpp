@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <ctime>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../log/GpuTimer.h"
@@ -4540,6 +4542,154 @@ void main() {
     oColor = vec4(out3, 1.0);
 })";
 
+// ── 引擎插槽：kFsFilm = 公共模板三段 + 引擎注入段（docs/engine-slots-design.md §3.1）──
+// 阶段 1（2026-10-13）：初始化期按 `head + engine0_def + mid + engine0_main + tail`
+// 拼接后编译 —— **仍是同一个 pass**（不新增纹理 / draw call / uniform 布局，运行期零
+// 额外开销）。拼接产物与原 `kFsFilm` **逐字节相同**是阶段 1 的唯一硬门槛（方案 §8）。
+//
+// ★ 为什么是「单真源 + 切片」，而不是把 496 行物理拆成三段常量 ★
+//   物理拆分 = 35154 字节的 GLSL 在源码里出现 3 处**人为接缝**：任何一处接缝多/少一个
+//   换行或缩进，拼接结果就不再与改造前的 `kFsFilm` 逐字节相同 —— 而"是否相同"只能靠
+//   人工核对，接缝一旦漂移，真机表现是"画面悄悄变了"而不是编译错误。
+//   切片方式下五个片段是**同一字面量的连续区间划分**（[0,A) [A,B) [B,C) [C,D) [D,end)），
+//   拼接恒等于原文 ⇒ 等价性**由构造保证**，拼接后的 GLSL 与改造前**逐字符相同**。
+//   **请勿改成物理拆分**（架构师 2026-10-13 决定）。
+//
+// 切分点用**行首原文 `find` 定位**（字节偏移），不用行号计数：行号差一行是静默错误，
+// 且上游改注释即失效；锚点原文变了则 `find` 失败，走下面的显式失败路径（不静默）。
+//   A = 引擎 0 函数定义段起点（filmic spline + darktable filmic v5 gamut 全部函数）
+//   B = 公共中段起点（`void main()` 开头：tex 读取 / 曝光 / 域映射 / 局部色调映射）
+//   C = 引擎 0 main 调用段起点（`if (uToneK > 0.0) {`）
+//   D = 该调用段之后（收尾 `    }` 的下一个字节）。`    }` 全文出现多次，单独 find 会
+//       命中更早的同形行 ⇒ D 由「C 起 + 含主导语句的整块原文」定位。
+namespace {
+
+constexpr std::string_view kFilmSplitDefAnchor =
+    "// ── filmic 基准影调（v0.7.3）：darktable v3 spline 取代 Reinhard ──";
+constexpr std::string_view kFilmSplitMidAnchor = "void main() {";
+constexpr std::string_view kFilmSplitMainAnchor = "    if (uToneK > 0.0) {";
+constexpr std::string_view kFilmSplitMainBlockEnd = "out3 = mix(out3, toned, uToneK);\n    }";
+
+// `kFsFilm` 的五个切片视图（全部指向同一字面量 ⇒ 零拷贝，不可能与真源漂移）。
+struct FilmSlices {
+  bool ok = false;               // 四锚点齐全且严格递增；false ⇒ 见 filmSource 的失败策略
+  std::string_view head;         // 公共前段：precision / IO / 公共 uniforms / 公共函数
+  std::string_view engine_def;   // 引擎 0 注入①：算法函数（filmic + gamut）
+  std::string_view mid;          // 公共中段：main 前段（曝光 / 域映射 / 局部色调映射）
+  std::string_view engine_main;  // 引擎 0 注入②：main 调用段
+  std::string_view tail;         // 公共后段：外观层 sat/split/look/mono + 输出
+};
+
+const FilmSlices& filmSlices() {
+  static const FilmSlices s = [] {
+    FilmSlices r;
+    const std::string_view full{kFsFilm};
+    const size_t a = full.find(kFilmSplitDefAnchor);
+    const size_t b = (a == std::string_view::npos) ? a : full.find(kFilmSplitMidAnchor, a);
+    const size_t c = (b == std::string_view::npos) ? b : full.find(kFilmSplitMainAnchor, b);
+    const size_t e = (c == std::string_view::npos) ? c : full.find(kFilmSplitMainBlockEnd, c);
+    if (a == std::string_view::npos || b == std::string_view::npos ||
+        c == std::string_view::npos || e == std::string_view::npos ||
+        !(a < b && b < c && c < e)) {
+      // 锚点缺失/错序 = 模板结构被改坏（有人重写了 kFsFilm 的注释或结构）。
+      // 此处只记原因；filmSource 会退回整体字面量（= 改造前行为，不崩、不静默）。
+      Logger::instance().log(LogLevel::kError, "engine", "engine.film_split_missing",
+                             "{\"note\":\"kFsFilm split anchors not found\"}");
+      return r;
+    }
+    const size_t d = e + kFilmSplitMainBlockEnd.size();
+    r.head = full.substr(0, a);
+    r.engine_def = full.substr(a, b - a);
+    r.mid = full.substr(b, c - b);
+    r.engine_main = full.substr(c, d - c);
+    r.tail = full.substr(d);
+    r.ok = true;
+    return r;
+  }();
+  return s;
+}
+
+// 公共模板三段（= `kFsFilm` 的切片，即任务卡的 `kFilmTemplateHead/Mid/Tail`）。
+// 阶段 2 起：注册表为选中的引擎提供 uniforms / profile / functions 注入段，插在
+// `engine_def` 之后；三段模板本身不变。
+const std::string_view kFilmTemplateHead = filmSlices().head;
+const std::string_view kFilmTemplateMid = filmSlices().mid;
+const std::string_view kFilmTemplateTail = filmSlices().tail;
+
+// engine_slot 无对应引擎时的**明确降级**告警（阶段 1 注册表里只有引擎 0）。
+// 方案 §4 契约 5：不静默、不崩、不做 identity 伪装 —— 降级到引擎 0 并留下日志。
+// 去重：预览 30–60 fps 下每帧一条会刷爆日志环形缓冲（500 行）⇒ 只在取值变化时记。
+void warnEngineSlotUnavailable(int slot) {
+  static std::atomic<int> last{0};  // 0 = 尚无告警（0 本身是合法取值，不会进来）
+  if (slot == 0 || last.exchange(slot) == slot) return;
+  Logger::instance().log(LogLevel::kWarn, "engine", "engine.slot_unavailable",
+                         "{\"requested\":" + std::to_string(slot) +
+                             ",\"fallback\":0,\"stage\":1}");
+}
+
+// 按引擎插槽组装 film pass 的 fragment shader 源码：
+//   src = head + engine_def + mid + engine_main + tail
+// 阶段 1：唯一注册的引擎是 0（内置 filmic）⇒ 两个注入段恒为 `kFsFilm` 自身的切片；
+// `engine_slot != 0` 取不到引擎 ⇒ 按契约 5 降级到引擎 0 并记 WARN（阶段 2 换成注册表查表）。
+std::string filmSource(int engine_slot) {
+  const FilmSlices& s = filmSlices();
+  if (!s.ok) {
+    // 切分失败（锚点缺失）= 模板结构坏了。**不做 identity 伪装**：退回改造前的整体
+    // 字面量（行为与未接插槽一致），原因已在 filmSlices() 里记为 kError。
+    return std::string(kFsFilm);
+  }
+  if (engine_slot != 0) warnEngineSlotUnavailable(engine_slot);
+  std::string src;
+  src.reserve(kFilmTemplateHead.size() + s.engine_def.size() + kFilmTemplateMid.size() +
+              s.engine_main.size() + kFilmTemplateTail.size());
+  src += kFilmTemplateHead;   // 公共前段
+  src += s.engine_def;        // 引擎注入①（引擎 0：filmic + gamut）
+  src += kFilmTemplateMid;    // 公共中段
+  src += s.engine_main;       // 引擎注入②（引擎 0：main 调用段）
+  src += kFilmTemplateTail;   // 公共后段
+  return src;
+}
+
+// CRC32（IEEE 802.3 口径 = Python `zlib.crc32`：初值 ^0xFFFFFFFF、反射多项式
+// 0xEDB88320、末取反）—— 只为自检口径与离线链对齐，故不为此引入 zlib 依赖。
+uint32_t crc32Ieee(std::string_view s) {
+  static const std::array<uint32_t, 256> kTable = [] {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      t[i] = c;
+    }
+    return t;
+  }();
+  uint32_t c = 0xFFFFFFFFu;
+  for (const unsigned char ch : s) c = kTable[(c ^ ch) & 0xFFu] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+// 开发期自检（**只在初始化期调用一次**，不在每帧路径上）：拼接结果 vs `kFsFilm`
+// 定界符内的原文 —— 阶段 1 的唯一硬门槛 = 二者**逐字节相同**（方案 §8）。结果写进既有
+// 日志 ⇒ 真机日志直接给出"拼接是否等价"，不必等离线链。`chars` = UTF-8 码位数，与
+// `bytes` 并列打印：这两个口径（25140 / 35154）在本方案里被混用过，并列可立刻发现口径错误。
+void logFilmSourceSelfCheck(const std::string& src, int engine_slot) {
+  const std::string_view full{kFsFilm};
+  const bool identical = std::string_view(src) == full;
+  size_t chars = 0;
+  for (const unsigned char ch : src) {
+    if ((ch & 0xC0u) != 0x80u) ++chars;  // 非 UTF-8 续接字节 = 一个码位
+  }
+  char crc_hex[16];
+  std::snprintf(crc_hex, sizeof(crc_hex), "0x%08x", crc32Ieee(src));
+  Logger::instance().log(
+      identical ? LogLevel::kInfo : LogLevel::kError, "engine", "engine.film_src",
+      "{\"slot\":" + std::to_string(engine_slot) + ",\"bytes\":" + std::to_string(src.size()) +
+          ",\"chars\":" + std::to_string(chars) + ",\"crc32\":\"" + crc_hex +
+          "\",\"identical\":" + (identical ? "true" : "false") + ",\"zero_regression\":\"" +
+          (identical ? "ok" : "FAILED (stage-1 criterion)") + "\"}");
+}
+
+}  // namespace
+
 // Pass3：输出变换（OETF + 颗粒 + dither），量化到 8bit
 const char* kFsOut = R"(#version 300 es
 precision highp float;
@@ -6417,7 +6567,13 @@ bool FrameRenderer::init() {
   vs_plain_ = compileShader(GL_VERTEX_SHADER, kVertPlain);
   const GLuint fs_oes = compileShader(GL_FRAGMENT_SHADER, kFsOes);
   const GLuint fs_still = compileShader(GL_FRAGMENT_SHADER, kFsStill);
-  const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, kFsFilm);
+  // ── 引擎插槽（阶段 1）：film pass 的源码 = 公共模板三段 + 引擎 0 注入段，此处拼接 ──
+  // `slot` 恒为 0：init() 早于任何 FilmParams 下发（Bridge 在 EGL 建立后即 init，参数随
+  // 预览/静拍帧才到）⇒ 初始化期拿不到 `[98]`。运行期下发的非 0 取值由 passFilm 记 WARN
+  // 并降级（见 warnEngineSlotUnavailable），**不在此处重编译**（阶段 1 无引擎 1）。
+  const std::string fs_film_src = filmSource(0);
+  logFilmSourceSelfCheck(fs_film_src, 0);  // 开发期自检：拼接 vs 原文逐字节（只跑一次）
+  const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, fs_film_src.c_str());
   const GLuint fs_out = compileShader(GL_FRAGMENT_SHADER, kFsOut);
   // E1-3 编辑器通路（kFsStyle）：显示域输入 → LUT/颗粒/dither。**进硬失败检查**
   // —— 历史事故：漏加进下面的检查列表，shader 编译失败连"引擎起不来"都不会发生，
@@ -13508,6 +13664,13 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
                              bool still, bool hal_domain) {
+  // ── 引擎插槽（阶段 1）：`[98] engine_slot` 的降级路径 ─────────────────────────
+  // shader 在 init() 期按引擎 0 编译（那时拿不到 FilmParams ⇒ 见 init() 内注释）；
+  // 这里对运行期下发的非 0 取值**明确降级到引擎 0 + 记 WARN**（方案 §4 契约 5：
+  // 不静默、不崩、不做 identity 伪装）。阶段 2 注册引擎 1 后，此处改为按 slot 选 program。
+  // ⚠ 不在此处重编译 shader：每帧重编译会毁掉性能，且阶段 1 无第二个引擎可切。
+  const int engine_slot = static_cast<int>(std::lround(p.engine_slot));
+  if (engine_slot != 0) warnEngineSlotUnavailable(engine_slot);
   // filmic 的自动 EV 标定（v0.7.3）：**刻意放在 passFilm 内** —— 预览 / YUV 静拍 /
   // RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 开关语义（v0.7.6）：黑白点来自用户配置（FilmParams[37]/[38]，默认 −7.65/+4.56）；

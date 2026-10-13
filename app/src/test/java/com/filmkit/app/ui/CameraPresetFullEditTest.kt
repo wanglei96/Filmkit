@@ -84,6 +84,27 @@ class CameraPresetFullEditTest {
         assertTrue(CAMERA_NO_SLIDER_SLOTS.all { it in CAMERA_PATH_SLOTS })
     }
 
+    /**
+     * ★ 引擎插槽重构（阶段 1）：`[98]` 引擎插槽**不得**出现在只读组。
+     *
+     * 为什么：引擎插槽不是**可调参数**，也不属于"参数面板"这个概念域 —— 阶段 3 的切换入口
+     * 是**引擎选择面**（`docs/engine-slots-design.md` §8），不是参数格。既有"引擎状态类"
+     * 槽位（`[28]` auto_tone / `[30]` 过曝 / `[31..33]` / `[35][36]` / 解码段 `[39..59]`）
+     * 因为都不在 `CAMERA_PATH_SLOTS` 里而一致地不展示；`[98]` 是**唯一**同时进了
+     * `CAMERA_PATH_SLOTS`（`passFilm` 读它做非 0 降级判据）与 `CAMERA_NO_SLIDER_SLOTS`
+     * （确无滑杆）的槽 ⇒ 只有靠 [fullEditReadonlySlots] 的显式过滤才能与那条既有约定一致。
+     */
+    @Test
+    fun engineSlotIsNotShownInTheReadonlyGroup() {
+        assertFalse("空预设下 [98] 不得出现在只读组", 98 in fullEditReadonlySlots(emptySet()))
+        assertFalse("预设显式含 [98] 时也不得出现在只读组", 98 in fullEditReadonlySlots(setOf(98)))
+        // 防误伤：颗粒那四项本来就在只读组（"拍照生效 · 暂无滑杆"），这条过滤不得连带删掉
+        val readonly = fullEditReadonlySlots(emptySet())
+        for (slot in listOf(26, 27, 60, 61)) {
+            assertTrue("颗粒槽 [$slot] 应当仍在只读组", slot in readonly)
+        }
+    }
+
     // ── ② 网格排布（一行 4 格 = 用户要的"提高屏幕利用率"）──────────────────────
 
     @Test

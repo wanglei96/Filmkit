@@ -135,6 +135,12 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     for (i in 0..2) meta(1 + i, SEC_BASE, RGB[i]) { formatOffset100(wbGainUi(it), 1f) }
     meta(4, SEC_BASE, "对比度") { formatOffset100(contrastUi(it), 1f) }
     meta(78, SEC_BASE, "清晰度") { formatZero100(clarityUi(it)) }
+    // ★ 引擎插槽重构（阶段 1）：[98] `engine_slot` 的**中文显示名**。
+    // 必须在这里给 —— 否则 `fallbackRow` 会回落到 `FilmParamKeys.bySlot[98]`（英文语义名
+    // `engine_slot`），与 P-5 提示里的「引擎插槽」不一致
+    //（`PresetDetailTest.detailLabelsMatchScopeNoticeWording` 直接抓这一条）。
+    // 读数 = 槽位值本身（0 = 内置 filmic；阶段 3 起由**引擎选择面**写入）。
+    meta(98, SEC_BASE, "引擎插槽") { "引擎 ${it.toInt()}" }
     // [88..93] 面板「调整」组（E2-15 / E2-14）；[88] 槽位是 mired 偏移 ⇒ 必须过 tempUi 才是 K
     meta(88, SEC_BASE, "色温") { formatKelvin(tempUi(it)) }
     meta(89, SEC_BASE, "色调") { formatOffset100(tintUi(it), 0f) }

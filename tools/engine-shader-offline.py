@@ -333,7 +333,413 @@ def main():
         print(' ', k, '=', v)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 引擎插槽「阶段 1」判据 1：`kFsFilm` 切分/拼接验证（`--verify-splice`）
+#
+# 纯增量：不触碰上面的 P0/RCD/CCM/FILM 任何一行；只在下面的 `main()` **之前**插入
+# 一个模式分派（`--verify-splice` 时直接走本段并退出，不进 GPU 链路）。
+#
+# 契约（`docs/engine-slots-design.md` §3.1 / §8 阶段 1；架构师 2026-10-13 定档）：
+#   `kFsFilm` 体内 **496 行**，按 4 个切分点切 5 块（体内 1-based 行号）：
+#     head 1..78 │ engine0_def 79..372 │ mid 373..432 │ engine0_main 433..439 │ tail 440..496
+#   拼接顺序 = head + engine0_def + mid + engine0_main + tail，须逐字节等于原体内内容。
+#
+# ⚠ 口径（架构师更正 2026-10-13）：**字符 25140 ≠ 字节 35154**（含大量中文注释）。
+#   · 切分按**字符偏移**（行首定位后取前缀长度）；不用 `join('\n')` 相加 —— 会丢换行。
+#   · 摘要（CRC32 / SHA-256）按 `.encode('utf-8')` 的**字节**口径，字符数与字节数都打印。
+#
+# 判据 1 的证明力在哪（重要）：按偏移切片再拼回**恒等于原文**，这是平凡真。
+#   非平凡的是另外两条，任一不满足即 FAIL：
+#     ① 契约块拼接结果的摘要 == 阶段 1 前的 `kFsFilm` 源基线（下 `FILM_SRC_BASELINE`）
+#        ⇒ 证明"被切的这坨 shader 真的没被改动"；
+#     ② 切分点语义哨兵（head 首行 `#version`、mid 首行 `void main() {`、
+#        engine0_def 含 filmicTone/gamutMapV5 定义…）⇒ 证明"切在了契约说的语义位置"，
+#        而不是行号漂移后的随便一处。
+# ═══════════════════════════════════════════════════════════════════════════════
+import zlib as _zl        # noqa: E402  （本段自带；文件尾部的 _zlib/_hashlib 要等本段之后才执行）
+import hashlib as _hl     # noqa: E402
+
+FILM_SPLIT_POINTS = [79, 373, 433, 440]      # 各块起始行（体内 1-based）
+FILM_BLOCK_NAMES = ['head', 'engine0_def', 'mid', 'engine0_main', 'tail']
+FILM_BLOCK_LINES = ['1..78', '79..372', '373..432', '433..439', '440..496']
+FILM_TEMPLATE_NAMES = ['kFilmTemplateHead', 'kFilmTemplateMid', 'kFilmTemplateTail']
+# C++ 侧 `filmSlices()` 的四个锚点（FrameRenderer.cpp:4567-4571）——锚点被改坏必须报错，
+# 不静默回退到行号切分（否则判据会退化成"永远通过"）。
+FILM_ANCHOR_NAMES = ['kFilmSplitDefAnchor', 'kFilmSplitMidAnchor',
+                     'kFilmSplitMainAnchor', 'kFilmSplitMainBlockEnd']
+
+# 阶段 1 落地前的 `kFsFilm` 体内内容基线（**字节口径**，架构师 2026-10-13 实测更正）。
+# 出处：架构师切分契约消息 + `docs/reports/stage0-engine-slot-BASELINE.md` §3.3 同批采集。
+#   · 顶层 4 个数 = **整体**摘要（证明"被切的这坨 shader 没被改动"）；
+#   · `blocks` = **逐块**摘要（证明"切分点没漂移"）—— 只锚整体是不够的：切分点整体
+#     偏 1 行时，head/engine0_def 的边界行都是注释，语义哨兵与整体摘要**都抓不到**
+#     （本脚本 `--splice-selftest` 的 ① 号 mutation 就是这么抓出来的）。
+FILM_SRC_BASELINE = {
+    'chars': 25140, 'bytes': 35154,
+    'crc32': '0x4fa1ebd3',
+    'sha256': 'f1ebb3178bfb985ed3e0ca19fef95341cfe3be401cb2cc73ea8ae3377c13563c',
+    'blocks': {
+        'head': {'chars': 3839, 'bytes': 6936, 'crc32': '0x79355c53',
+                 'sha256': '5393c81c454a39326ea47608f5f53c8c5926c63a0e3cba220fcf3c7b3ef83ac5'},
+        'engine0_def': {'chars': 14778, 'bytes': 18195, 'crc32': '0x05f5351d',
+                        'sha256': '97972744125a123a8231a9ecc0cdb3e46325e84cc86ad0841bb161b0b1a58b44'},
+        'mid': {'chars': 3188, 'bytes': 5131, 'crc32': '0x0dab15dc',
+                'sha256': '5eaddd68828ecf7d3ebfdb19282b4d716f324c80851206f067831620d838fc3d'},
+        'engine0_main': {'chars': 343, 'bytes': 407, 'crc32': '0xbe41521e',
+                         'sha256': '3e16acd3b9789e882402b32623c30345d95573b37aaa66b351c504b03ab50e1d'},
+        'tail': {'chars': 2992, 'bytes': 4485, 'crc32': '0x20921afd',
+                 'sha256': 'bc8154c39f3e218e716be2e58cebc1aa0a46a5aed7c54fc61b7289d893edfd73'},
+    },
+}
+
+
+def _src_digest(s):
+    """字符串摘要：字符数 + 字节数 + 字节口径 CRC32/SHA-256。"""
+    b = s.encode('utf-8')
+    return {'chars': len(s), 'bytes': len(b),
+            'crc32': '0x%08x' % (_zl.crc32(b) & 0xffffffff),
+            'sha256': _hl.sha256(b).hexdigest()}
+
+
+def _line_offsets(body):
+    """第 i 项 = 第 i+1 行（1-based）的首字符偏移。"""
+    offs, pos = [], 0
+    for ln in body.split('\n'):
+        offs.append(pos)
+        pos += len(ln) + 1
+    return offs
+
+
+def _n_lines(s):
+    """块内实际行数（块尾的换行不算新起一行）。"""
+    return s.count('\n') + (0 if s.endswith('\n') else 1)
+
+
+def split_film_body(body, points=FILM_SPLIT_POINTS):
+    """按**字符偏移**切成契约 5 块（行首字符串定位后取前缀长度）。"""
+    offs = _line_offsets(body)
+    if len(offs) < points[-1]:
+        raise ValueError('kFsFilm 体内只有 %d 行，契约切分点需要 %d 行'
+                         % (len(offs), points[-1]))
+    cuts = [0] + [offs[p - 1] for p in points] + [len(body)]
+    return [body[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+
+
+def _split_sentinels(blocks):
+    """切分点语义哨兵 → 返回失败项描述（空 = 全过）。行号漂移时先红，避免判据变空头支票。"""
+    b = dict(zip(FILM_BLOCK_NAMES, blocks))
+    checks = [
+        ('head 首行 == "#version 300 es"', b['head'].split('\n')[0] == '#version 300 es'),
+        ('engine0_def 含 filmicTone 定义', 'filmicTone' in b['engine0_def']),
+        ('engine0_def 含 gamutMapV5 定义', 'gamutMapV5' in b['engine0_def']),
+        ('engine0_def 末行 == "}"', b['engine0_def'].rstrip('\n').split('\n')[-1] == '}'),
+        ('mid 首行 == "void main() {"', b['mid'].split('\n')[0] == 'void main() {'),
+        ('engine0_main 含 filmicTone(out3) 调用', 'filmicTone(out3)' in b['engine0_main']),
+        ('engine0_main 含 gamutMapV5(out3, toned) 调用', 'gamutMapV5(out3, toned)' in b['engine0_main']),
+        ('tail 末行 == "}"', b['tail'].rstrip('\n').split('\n')[-1] == '}'),
+    ]
+    return [name for name, ok in checks if not ok]
+
+
+def _first_diff(a, b, ctx=40):
+    """首个差异字符偏移 + 两侧各 ctx 字符上下文（共 80 字符窗口）。"""
+    n = min(len(a), len(b))
+    i = next((k for k in range(n) if a[k] != b[k]), n)
+    return {'char_offset': i, 'lengths': [len(a), len(b)],
+            'original_ctx': a[max(0, i - ctx):i + ctx],
+            'spliced_ctx': b[max(0, i - ctx):i + ctx]}
+
+
+def _collect_raw_strings(path=FR, text=None):
+    """全部 `const char* <name> = R"(...)"`（名字不限 `kFs*`）。"""
+    src = text if text is not None else open(path, encoding='utf-8', errors='replace').read()
+    return [(m.group(1), m.group(2))
+            for m in re.finditer(r'const char\*\s+(\w+)\s*=\s*R"\((.*?)\)";', src, re.S)]
+
+
+def _cxx_unescape(s):
+    """C++ 字符串字面量反转义（覆盖锚点用到的 \\n / \\t / \\" / \\\\）。"""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == '\\' and i + 1 < len(s):
+            out.append({'n': '\n', 't': '\t', '"': '"', '\\': '\\'}.get(s[i + 1], s[i + 1]))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return ''.join(out)
+
+
+def _anchor_path(body, src_text):
+    """路径 B：**复刻产品代码的锚点切分**（`FrameRenderer.cpp` 的 `filmSlices()`）。
+
+    C++ 侧实际形态（阶段 1 落盘，2026-10-13）：`kFsFilm` 是**单真源**，
+    `const std::string_view kFilmTemplate{Head,Mid,Tail} = filmSlices().{head,mid,tail};`
+    四个锚点字符串在体内 `find` 出 a/b/c/e，`d = e + len(kFilmSplitMainBlockEnd)`，
+    五段 = [0,a) [a,b) [b,c) [c,d) [d,end) ⇒ 零拷贝、不可能与真源漂移。
+    本路径照抄这套语义 ⇒ 证明的是"**产品代码切出来的东西**拼回去 == 原文"，
+    比脚本自己按行号切更有证明力。
+
+    ⚠ 本路径是 C++ 语义的 **Python 复刻**，不是执行 C++ 代码；真机侧另有
+    `logFilmSourceSelfCheck`（日志 `engine.film_src`：bytes/chars/crc32/identical）独立佐证。
+    """
+    decls = dict(re.findall(
+        r'const\s+std::string_view\s+(kFilmTemplate\w+)\s*=\s*([^;]+);', src_text))
+    anchors = {}
+    for n in FILM_ANCHOR_NAMES:
+        m = re.search(n + r'\s*=\s*"((?:[^"\\]|\\.)*)"', src_text)
+        if m:
+            anchors[n] = _cxx_unescape(m.group(1))
+    missing = [n for n in FILM_ANCHOR_NAMES if n not in anchors]
+    info = {'mode': 'anchor-splice', 'template_decls': decls, 'anchors': anchors}
+    if not decls and missing:
+        info.update(state='not_landed',
+                    reason='未发现 kFilmTemplate* 声明，也未发现 %s ⇒ C++ 侧尚未落盘'
+                          '（本路径判 n/a，不影响判据 1 结论）' % ' / '.join(missing))
+        return info
+    if missing:
+        info.update(state='broken',
+                    reason='模板声明在，但缺锚点 %s ⇒ 报错，不回退到行号切分' % ' / '.join(missing))
+        return info
+    if body is None:
+        info.update(state='broken',
+                    reason='kFsFilm 字面量已不在 FrameRenderer.cpp ⇒ 锚点切分无真源可比对')
+        return info
+    off = {n: body.find(anchors[n]) for n in FILM_ANCHOR_NAMES}
+    a, b, c, e = (off[n] for n in FILM_ANCHOR_NAMES)
+    info['offsets'] = {'a': a, 'b': b, 'c': c, 'e': e}
+    if -1 in (a, b, c, e) or not (a < b < c < e):
+        info.update(state='broken',
+                    reason='四锚点在 kFsFilm 体内未全部命中或非严格递增（a<b<c<e 不成立）'
+                          '⇒ 模板结构被改坏（有人重写了注释/结构）')
+        return info
+    d = e + len(anchors['kFilmSplitMainBlockEnd'])
+    blk = [body[0:a], body[a:b], body[b:c], body[c:d], body[d:]]
+    spliced = ''.join(blk)
+    sd = _src_digest(spliced)
+    info.update({
+        'state': 'ok', 'd': d, 'anchors_ordered': True,
+        'blocks': [dict(name=nm, lines=ln, n_lines=_n_lines(ch), **_src_digest(ch))
+                   for nm, ln, ch in zip(FILM_BLOCK_NAMES, FILM_BLOCK_LINES, blk)],
+        'spliced': sd, 'equals_kFsFilm': spliced == body,
+        'equals_baseline_anchor': _anchor_ok(sd),
+        'reason': '模板三段 = kFsFilm 单真源的锚点切片（C++ filmSlices() 语义复刻）',
+        'vs_contract_note': 'C++ 的 engine_main 含收尾 "    }"（d = e + len(mainBlockEnd)）'
+                            '⇒ 与契约表的行号口径（engine0_main 433..439 / tail 440..496）'
+                            '差 5 字符，但**拼接结果一致**（两条路径都判 PASS 的依据）'})
+    return info
+
+
+def _anchor_ok(d):
+    return all(d[k] == FILM_SRC_BASELINE[k] for k in ('chars', 'bytes', 'crc32', 'sha256'))
+
+
+def _blocks_anchor_ok(info):
+    """逐块摘要比对 → 返回漂移的块名（切分点漂移检测；空 = 5 块全部对上）。"""
+    base = FILM_SRC_BASELINE.get('blocks', {})
+    return [b['name'] for b in info
+            if b['name'] in base
+            and any(b[k] != base[b['name']][k] for k in ('chars', 'bytes', 'crc32', 'sha256'))]
+
+
+def splice_report():
+    """跑完两条路径，返回 (报告 dict, 是否通过)。"""
+    src_text = open(FR, encoding='utf-8', errors='replace').read()
+    src_sha = _hl.sha256(src_text.encode('utf-8')).hexdigest()
+    consts = _collect_raw_strings(text=src_text)
+    body = dict(consts).get('kFsFilm')
+    names = [n for n, _ in consts]
+    rep = {
+        'source': os.path.relpath(FR, REPO), 'source_sha256': src_sha,
+        'shader_count': len(consts),
+        'contract': {'split_points_1based': FILM_SPLIT_POINTS,
+                     'block_lines': dict(zip(FILM_BLOCK_NAMES, FILM_BLOCK_LINES)),
+                     'splice_order': FILM_BLOCK_NAMES,
+                     'authoritative': 'anchor-splice（C++ filmSlices() 的实际行为 = 判据基准）',
+                     'line_splice_role': 'line-splice（按行号切）仅作交叉验证；'
+                                         '唯一差异 = engine_main 是否含收尾 "    }"（5 字符）',
+                     'splitting': '字符偏移（行首定位后取前缀长度），非 join 相加',
+                     'digest_domain': 'utf-8 字节'},
+        'baseline_anchor': FILM_SRC_BASELINE,
+        'units_note': '字符 %d / 字节 %d（25140 是**字符**数，不是字节数）'
+                      % (FILM_SRC_BASELINE['chars'], FILM_SRC_BASELINE['bytes']),
+    }
+    ok = True
+    blocks = None
+    if 'kFsFilm' not in names:
+        rep['path_a_line_split'] = {'available': False,
+                                    'reason': 'FrameRenderer.cpp 中未找到 kFsFilm 原始字符串'}
+        ok = False
+    else:
+        blocks = split_film_body(body)
+        info = [dict(name=nm, lines=ln, n_lines=_n_lines(ch),
+                     first_line=ch.split('\n')[0][:80],
+                     last_line=ch.rstrip('\n').split('\n')[-1][:80], **_src_digest(ch))
+                for nm, ln, ch in zip(FILM_BLOCK_NAMES, FILM_BLOCK_LINES, blocks)]
+        spliced = ''.join(blocks)
+        orig, sp = _src_digest(body), _src_digest(spliced)
+        sent = _split_sentinels(blocks)
+        anchor = _anchor_ok(orig)
+        blk_drift = _blocks_anchor_ok(info)
+        rep['path_a_line_split'] = {
+            'available': True, 'original': orig, 'blocks': info, 'spliced': sp,
+            'original_n_lines': _n_lines(body), 'spliced_n_lines': _n_lines(spliced),
+            'spliced_bytes_sum': sum(b['bytes'] for b in info),
+            'byte_identical': spliced == body, 'equals_baseline_anchor': anchor,
+            'blocks_anchor_drifted': blk_drift,
+            'split_point_sentinels_failed': sent,
+            'first_diff': None if spliced == body else _first_diff(body, spliced)}
+        if spliced != body or sent or not anchor or blk_drift:
+            ok = False
+    try:
+        path_b = _anchor_path(body, src_text)
+    except Exception as e:                                   # noqa: BLE001
+        path_b = {'state': 'broken', 'reason': '路径 B 异常：%r' % (e,)}
+    rep['path_b_anchor_splice'] = path_b
+    # 两条路径都跑、都判 PASS 才算通过（架构师 2026-10-13）；'not_landed' = n/a 不判负。
+    if path_b.get('state') == 'broken' or (
+            path_b.get('state') == 'ok' and
+            not (path_b.get('equals_kFsFilm') and path_b.get('equals_baseline_anchor'))):
+        ok = False
+    rep['verdict'] = 'PASS' if ok else 'FAIL'
+    return rep, ok
+
+
+def _merge_steps_splice(out, key, value):
+    """把 splice 摘要并入 `<out>/steps.json`（前段的键原样保留）。"""
+    p = os.path.join(out, 'steps.json')
+    doc = json.load(open(p)) if os.path.exists(p) else {}
+    doc.setdefault('steps', {})[key] = value
+    json.dump(doc, open(p, 'w'), indent=2)
+
+
+def _splice_selftest():
+    """负向自检（mutation）：切分点、丢换行、锚点三处坏掉都必须被检出。
+
+    验证工具自身出错 = **假绿**（比不验证更危险），所以留一条可复跑的检查。
+    用法：`python3 tools/engine-shader-offline.py --verify-splice --splice-selftest`
+    """
+    body = dict(_collect_raw_strings()).get('kFsFilm')
+    if body is None:
+        print('自检跳过：kFsFilm 不在（C++ 侧已拆）'); return 1
+    blocks = split_film_body(body)
+    fails = []
+    drift = _blocks_anchor_ok([dict(name=nm, **_src_digest(ch)) for nm, ch in zip(
+        FILM_BLOCK_NAMES, split_film_body(body, [80, 373, 433, 440]))])
+    if not drift:
+        fails.append('① 切分点整体 +1 行：块级锚点未检出漂移')
+    if ''.join(b.rstrip('\n') for b in blocks) == body:
+        fails.append('② 丢换行（join 相加口径）：未被检出')
+    keep = dict(FILM_SRC_BASELINE)
+    FILM_SRC_BASELINE['crc32'] = '0xdeadbeef'
+    try:
+        rep, ok = splice_report()
+    finally:
+        FILM_SRC_BASELINE.update(keep)
+    if ok or rep.get('verdict') != 'FAIL' or rep['path_a_line_split'].get('equals_baseline_anchor'):
+        fails.append('③ 篡改基线锚点：verdict 未变 FAIL')
+    src_text = open(FR, encoding='utf-8', errors='replace').read()
+    bad_src = src_text.replace('kFilmSplitMidAnchor = "void main() {"',
+                               'kFilmSplitMidAnchor = "void main()  {"')
+    if bad_src == src_text:
+        fails.append('④ 自检自身失效：未能构造锚点 mutation')
+    elif _anchor_path(body, bad_src).get('state') != 'broken':
+        fails.append('④ 锚点被改坏：路径 B 未报 BROKEN（会静默回退到行号切分）')
+    fd = _first_diff(body, ''.join(b.rstrip('\n') for b in blocks))   # 人为丢换行
+    if not (0 <= fd['char_offset'] < len(body)) or not fd['original_ctx'] or not fd['spliced_ctx']:
+        fails.append('⑤ 不等路径：未给出首个差异偏移 + 80 字符上下文')
+    FILM_SRC_BASELINE['crc32'] = '0xdeadbeef'
+    _saved, sys.stdout = sys.stdout, open(os.devnull, 'w')
+    try:
+        rc = verify_splice_cli(['--verify-splice', '--out', '/tmp/stage1-selftest'])
+    finally:
+        sys.stdout.close()
+        sys.stdout = _saved
+        FILM_SRC_BASELINE.update(keep)
+    if rc != 1:
+        fails.append('⑥ CLI 退出码：不等/坏锚点时应为 1，实测 %r' % (rc,))
+    for f in fails:
+        print('FAIL ' + f)
+    print('splice 负向自检：%s（6 项 mutation）' % ('全部检出' if not fails else '有漏检'))
+    return 1 if fails else 0
+
+
+def verify_splice_cli(argv):
+    ap = argparse.ArgumentParser(prog='engine-shader-offline.py --verify-splice')
+    ap.add_argument('--verify-splice', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--splice-selftest', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--out', default='/tmp/stage1-splice', help='steps.json 落盘目录')
+    a, _ = ap.parse_known_args(argv)
+    if a.splice_selftest:
+        return _splice_selftest()
+    os.makedirs(a.out, exist_ok=True)
+    rep, ok = splice_report()
+    _merge_steps_splice(a.out, 'splice', rep)
+
+    print('── kFsFilm 切分/拼接验证（引擎插槽阶段 1 · 判据 1）──')
+    print('源 %s  sha256=%s…' % (rep['source'], rep['source_sha256'][:16]))
+    print('拼接顺序 %s' % ' + '.join(FILM_BLOCK_NAMES))
+    print('口径基准 **anchor-splice**（C++ filmSlices() 的实际行为 = 产品代码行为）；'
+          'line-splice（按行号 %s 切）仅作交叉验证 —— 两者唯一差异 = engine_main 是否含'
+          '收尾 "    }"（5 字符）'
+          % ' / '.join(str(p) for p in FILM_SPLIT_POINTS))
+    a_ = rep['path_a_line_split']
+    if a_.get('available'):
+        print('路径 A（line-splice：按行号字符偏移切分 · 交叉验证）:')
+        for b in a_['blocks']:
+            print('  %-12s %-9s %3d 行  字符 %6d  字节 %6d  %s  %s…'
+                  % (b['name'], b['lines'], b['n_lines'], b['chars'], b['bytes'],
+                     b['crc32'], b['sha256'][:12]))
+        o, s = a_['original'], a_['spliced']
+        print('  %-12s %-9s %3d 行  字符 %6d  字节 %6d  %s  %s…'
+              % ('原文', '1..496', a_['original_n_lines'], o['chars'], o['bytes'], o['crc32'],
+                 o['sha256'][:12]))
+        print('  %-12s %-9s %3d 行  字符 %6d  字节 %6d  %s  %s…'
+              % ('拼接结果', '(5 块)', a_['spliced_n_lines'], s['chars'], s['bytes'],
+                 s['crc32'], s['sha256'][:12]))
+        print('  5 块字节和 = %d ；拼接结果字节数 = %d' % (a_['spliced_bytes_sum'], s['bytes']))
+        print('  拼接结果 == 原文        : %s' % a_['byte_identical'])
+        print('  原文摘要 == 源基线锚点  : %s（锚点 %s / %s）'
+              % (a_['equals_baseline_anchor'], FILM_SRC_BASELINE['crc32'],
+                 FILM_SRC_BASELINE['sha256'][:12] + '…'))
+        print('  逐块摘要 == 块级锚点    : %s'
+              % ('5/5 通过（切分点未漂移）' if not a_['blocks_anchor_drifted']
+                 else '漂移 → ' + str(a_['blocks_anchor_drifted'])))
+        print('  切分点语义哨兵          : %s'
+              % ('8/8 通过' if not a_['split_point_sentinels_failed']
+                 else '失败 → ' + str(a_['split_point_sentinels_failed'])))
+        if a_['first_diff']:
+            fd = a_['first_diff']
+            print('  ！首个差异偏移 %d；原文…%s… / 拼接…%s…'
+                  % (fd['char_offset'], fd['original_ctx'], fd['spliced_ctx']))
+    else:
+        print('路径 A（line-splice）: 不可用 — %s' % a_['reason'])
+    pb = rep['path_b_anchor_splice']
+    if pb.get('state') == 'ok':
+        print('路径 B（C++ 锚点切分 · %s）: %s' % (pb['mode'], pb['reason']))
+        print('  模板声明: %s' % json.dumps(pb['template_decls'], ensure_ascii=False))
+        for b in pb['blocks']:
+            print('  %-12s %-9s %3d 行  字符 %6d  字节 %6d  %s  %s…'
+                  % (b['name'], b['lines'], b['n_lines'], b['chars'], b['bytes'],
+                     b['crc32'], b['sha256'][:12]))
+        o = pb['offsets']
+        print('  锚点偏移 a=%d b=%d c=%d e=%d d=%d（a<b<c<e 严格递增: True）'
+              % (o['a'], o['b'], o['c'], o['e'], pb['d']))
+        print('  == kFsFilm 原文: %s ；== 基线锚点: %s' %
+              (pb['equals_kFsFilm'], pb['equals_baseline_anchor']))
+        print('  %s' % pb['vs_contract_note'])
+    elif pb.get('state') == 'not_landed':
+        print('路径 B（C++ 锚点切分）: n/a — %s' % pb['reason'])
+    else:
+        print('路径 B（C++ 锚点切分）: BROKEN — %s' % pb['reason'])
+    print('判据 1 结论: %s   （steps.json → %s/splice）' % (rep['verdict'], a.out))
+    return 0 if ok else 1
+
+
 if __name__ == '__main__':
+    # ↓ 新增 3 行：--verify-splice 独立模式（不走 GPU 链路）；下面的 main() 一字未动
+    if '--verify-splice' in sys.argv:
+        sys.exit(verify_splice_cli(sys.argv[1:]))
     main()
 
 

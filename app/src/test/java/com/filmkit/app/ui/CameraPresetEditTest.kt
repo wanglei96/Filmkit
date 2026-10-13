@@ -2,6 +2,7 @@ package com.filmkit.app.ui
 
 import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.applyBuiltinOverrides
+import com.filmkit.app.camera.CAMERA_ENGINE_SELECT_SLOTS
 import com.filmkit.app.camera.CAMERA_PATH_SLOTS
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PRESET_SOURCE_USER
@@ -222,13 +223,24 @@ class CameraPresetEditTest {
      */
     @Test
     fun tunableSlotsAreExactlyTheCameraPathMinusTheSliderlessOnes() {
+        // ★ 引擎插槽重构（阶段 1）：本式原为 `PATH − NO_SLIDER`，隐含前提"白名单里除'无滑杆'
+        // 之外**都是可调参数**"。`[98]` 引擎插槽打破了这个前提 —— 它**进预设、拍照链路读、
+        // 但不是可调参数**（是"选哪个引擎"；阶段 3 走**引擎选择面**）⇒ 必须再减去
+        // [CAMERA_ENGINE_SELECT_SLOTS]。三者语义区分：
+        //   PATH          = 拍照链路读的槽（**含非参数槽**，如 [98]）
+        //   NO_SLIDER     = **是参数**、但暂无滑杆（颗粒 [26][27][60][61]）⇒ 只读组
+        //   ENGINE_SELECT = **不是参数**（[98]）⇒ 既无滑杆，也不进只读组
+        // 判据强度不变：仍是**精确相等**（多一个 = 假滑杆，少一个 = 能力被藏）。
         assertEquals(
-            "可拖的槽必须 = 拍照链路读的槽 − 没有滑杆的槽（多一个 = 假滑杆，少一个 = 能力被藏）",
-            CAMERA_PATH_SLOTS - CAMERA_NO_SLIDER_SLOTS,
+            "可拖的槽必须 = 拍照链路读的槽 − 没有滑杆的槽 − 非参数槽" +
+                "（多一个 = 假滑杆，少一个 = 能力被藏）",
+            CAMERA_PATH_SLOTS - CAMERA_NO_SLIDER_SLOTS - CAMERA_ENGINE_SELECT_SLOTS,
             CAMERA_TUNABLE_SLOT_PARAM.keys,
         )
         // 没有滑杆的槽确实在拍照链路上（它们不是"不生效"，是"UI 还没给滑杆"）
         assertTrue("无滑杆集合必须是白名单的子集", CAMERA_PATH_SLOTS.containsAll(CAMERA_NO_SLIDER_SLOTS))
+        // 非参数槽也在拍照链路上（[98] 由 passFilm 读取，用于"非 0 ⇒ 降级 + WARN"判据）
+        assertTrue("非参数槽必须是白名单的子集", CAMERA_PATH_SLOTS.containsAll(CAMERA_ENGINE_SELECT_SLOTS))
     }
 
     /**

@@ -221,6 +221,33 @@ class PresetDetailTest {
     }
 
     /**
+     * §1.6 里「单侧生效**且进预设**」的槽位集合（口径同 `PresetScopeTest.designMatrix()`：
+     * 单元格以 `❌` 开头 = 不生效；一行的多个 `[n]` / `[a..b]` 展开）。
+     *
+     * 为什么这里独立解析一遍：本测试要断言"提示集合 == 文档矩阵"。若复用被测代码的
+     * `presetSlotScenes`，期望与实现同源 = 自我一致（守卫失去独立性）⇒ 必须自己读文档。
+     */
+    private fun singleSideSlotsInDesignMatrix(): List<Int> {
+        val src = File("../docs/reports/preset-DESIGN.md").readText()
+        val section = src.substringAfter("### ★ 1.6").substringBefore("\n### ")
+        val out = sortedSetOf<Int>()
+        for (line in section.lines()) {
+            if (!line.startsWith("|")) continue
+            val cells = line.split("|").map { it.trim() }
+            if (cells.size < 6) continue
+            val cam = !cells[3].startsWith("❌")
+            val ed = !cells[4].startsWith("❌")
+            if (cam == ed) continue            // 两侧都生效 / 都 ❌ ⇒ 不是"跨链路差异"
+            Regex("\\[(\\d+)(?:\\.\\.(\\d+))?]").findAll(cells[1]).flatMap { m ->
+                val a = m.groupValues[1].toInt()
+                val b = m.groupValues[2].ifEmpty { m.groupValues[1] }.toInt()
+                (a..b).asSequence()
+            }.filter { presetSlotIncluded(it) }.forEach { out += it }
+        }
+        return out.toList()
+    }
+
+    /**
      * 与 P-5 的 [presetScopeNotice] 用词一致（两张表都描述同一批槽位，不许各叫各的）。
      *
      * ★ **清单不硬编码**：见循环上方的注释（U-1 接线 `[23..25]` 就是这条纪律的真实触发点）。
@@ -244,13 +271,14 @@ class PresetDetailTest {
             assertTrue("槽 $slot：P-5 提示用「$name」，详情却叫「$label」", label.contains(name))
             checked++
         }
-        // ★ U-2（2026-10-11）：判据表清空 ⇒ `presetScopeNotice` 恒 `null` ⇒ **没有可比项**
-        // （原断言 `checked >= 5` 随 U-2 作废 —— 那时还有 [5..10]/[37][38] 三类单侧槽位）。
-        // 改成"必须为 0"：一旦又有单侧槽位，`checked` 会 > 0 ⇒ 本条红，逼着一起恢复上面的
-        // 逐槽比对（这正是保留这段循环的价值）。
+        // ★ 引擎插槽重构（阶段 1）：原断言 = "有提示的槽位数必须是 0"（U-2 里程碑）。
+        // 阶段 1 起 `[98]` 引擎插槽是单侧（§1.6 标"仅拍照"）⇒ 改为"提示数 == §1.6 里单侧
+        // 生效且进预设的槽位数"：判据强度不变（精确相等），且期望**独立从文档读出**
+        //（不复用 `presetSlotScenes` ⇒ 不与实现同源）。上面的逐槽文案比对仍是活判据。
         assertEquals(
-            "U-2 起判据表为空 ⇒ 没有「跨链路差异」可比（重新出现时本条与 PresetScopeTest 一起红）",
-            0,
+            "「跨链路差异」的槽位数必须等于 §1.6 里单侧生效且进预设的槽位数" +
+                "（★ U-2 后曾 = 0；阶段 1 起因 [98] 引擎插槽 = 1）",
+            singleSideSlotsInDesignMatrix().size,
             checked,
         )
 

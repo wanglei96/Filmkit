@@ -199,6 +199,13 @@ internal const val FULL_GRID_COLUMNS = 4
  *
  * `[34]` LUT 强度排除（它由顶部 LUT 卡片与滤镜强度滑杆承载，与 `presetDetailSections`
  * 同一条排除）—— 否则参数网格里会多出一个"能看不能调"的 LUT 强度。
+ *
+ * `[98]` 引擎插槽**不需要在这里显式排除**（引擎插槽重构阶段 1）：它不是可调参数（是
+ * "选哪个引擎"；阶段 3 的切换入口是**引擎选择面**，见 `docs/engine-slots-design.md` §8），
+ * 而它属于 `CAMERA_PATH_SLOTS`（`passFilm` 读它做非 0 降级判据）⇒ 上面的
+ * `includedSlots.filter { it !in CAMERA_PATH_SLOTS }` 已经把它挡在只读组之外。既有
+ * "引擎状态类"槽位（`[28]` auto_tone / `[30]` 过曝 / `[31..33]` / `[35][36]` / 解码段
+ * `[39..59]`）同理不入只读组 —— 这正是本函数"参数面板只展示参数"的既有约定。
  */
 internal fun fullEditReadonlySlots(includedSlots: Set<Int>): List<Int> =
     (CAMERA_NO_SLIDER_SLOTS + includedSlots.filter { it !in CAMERA_PATH_SLOTS })

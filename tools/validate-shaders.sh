@@ -12,7 +12,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-SRC="core/engine/src/render/FrameRenderer.cpp"
+# 可选参数：被校验的源文件（默认 FrameRenderer.cpp）。用于验证本脚本自身
+# 在「kFsFilm 已拆成模板常量」形态下的行为（C++ 侧落盘前无法用真实文件覆盖）。
+SRC="${1:-core/engine/src/render/FrameRenderer.cpp}"
 
 GLSLANG_BIN=""
 for c in glslangValidator glslang tools/bin/glslang; do
@@ -34,8 +36,37 @@ python3 - "$SRC" "$TMP" <<'PY'
 import re, sys, pathlib
 src = pathlib.Path(sys.argv[1]).read_text()
 out = pathlib.Path(sys.argv[2])
-shaders = re.findall(r'R"\((.*?)\)"', src, re.DOTALL)
-glsl = [s for s in shaders if s.lstrip().startswith("#version")]
+
+named = {m.group(1): m.group(2) for m in
+         re.finditer(r'const char\*\s+(\w+)\s*=\s*R"\((.*?)\)";', src, re.DOTALL)}
+raw = re.findall(r'R"\((.*?)\)"', src, re.DOTALL)
+TEMPLATE = ("kFilmTemplateHead", "kFilmTemplateMid", "kFilmTemplateTail")
+
+# 阶段 1：「引擎插槽」把 kFsFilm 拆成 公共模板三段 + 引擎注入段（初始化期拼接）。
+# 两种形态都必须校验到 filmic shader，否则会漏检或误报：
+#   形态 1（当前）：kFsFilm 仍是完整字面量 ⇒ 走原逻辑，行为一字不变；
+#   形态 2（真拆成独立字面量）：单独校验任一段都会误报 FAIL（缺 main）/漏检（无 #version）
+#     ⇒ 按 head + engine_def + mid + engine_main + tail 拼回整份再校验，
+#       并把散段从候选池剔除。锚点缺一段即报错，不静默漏检。
+if "kFsFilm" in named:
+    glsl = [s for s in raw if s.lstrip().startswith("#version")]
+elif all(n in named for n in TEMPLATE):
+    order = [n for n in named if n.startswith("kFilm")]
+    h, m, t = (order.index(n) for n in TEMPLATE)
+    parts = ([named[TEMPLATE[0]]] + [named[n] for n in order[h + 1:m]]
+             + [named[TEMPLATE[1]]] + [named[n] for n in order[m + 1:t]]
+             + [named[TEMPLATE[2]]])
+    skip = {c for n, c in named.items() if n.startswith("kFilm")}
+    film_src = "".join(parts)   # 必须**先拼回整份再判断**：逐段过滤只有 head 带
+    assert film_src not in skip  # `#version`，会把 main 丢掉 ⇒ 校验一个残缺 shader（假绿）
+    glsl = ([film_src] if film_src.lstrip().startswith("#version") else []) + [
+        s for s in raw if s.lstrip().startswith("#version") and s not in skip]
+    print(f"kFsFilm 已拆为 {len(parts)} 段：拼回整份后校验 filmic（散段不再单独校验）")
+elif any(n in named for n in TEMPLATE):
+    sys.exit("错误：kFilmTemplate* 只落盘了一部分，且 kFsFilm 不在 —— 无法校验 filmic shader")
+else:
+    glsl = [s for s in raw if s.lstrip().startswith("#version")]
+
 for i, s in enumerate(glsl):
     if "gl_Position" in s:
         stage = "vert"

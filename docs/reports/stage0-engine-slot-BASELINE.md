@@ -182,3 +182,162 @@ python3 tools/engine-shader-offline.py --dng test_temp/FILMKIT_20261009-090803.d
   --roi 1800,2100,600,1000 --out /tmp/stage1-check
 # 然后比对 film_d5.npy 的 CRC32 与 §3.3 的 0x589f8364（默认口径）
 ```
+
+### 7.2 阶段 1 的「拼接等价」对照基准（架构师实测，2026-10-13）
+
+阶段 1 把 `kFsFilm`（`FrameRenderer.cpp:4046`）拆成「公共模板三段 + 引擎注入段」、初始化期拼接。
+**零回归由构造保证**：拼接结果必须与原 `kFsFilm` 体内内容**逐字节相同**。
+
+| 口径 | 值 |
+|---|---|
+| 行数 | 496 |
+| **字符数**（Python `len(str)`） | **25140** |
+| **字节数**（UTF-8 / C++ `std::string::size()`） | **35154** |
+| **CRC32**（对 UTF-8 字节） | **`0x4fa1ebd3`** |
+| **SHA-256** | `f1ebb3178bfb985ed3e0ca19fef95341cfe3be401cb2cc73ea8ae3377c13563c` |
+
+切分点（体内 1-based 行号）与拼接顺序：
+
+```
+head        = 1..78      （公共前段：precision/IO/公共 uniforms/luma/局部色调映射）
+engine0_def = 79..372    （引擎 0：filmic + gamut 全部函数定义）
+mid         = 373..432   （公共中段：main 开头 —— tex/曝光/域映射/局部色调映射）
+engine0_main= 433..439   （引擎 0：main 内的 if (uToneK>0) { … } 调用段）
+tail        = 440..496   （公共后段：外观层 sat/split/look/mono + 输出）
+
+拼接 = head + engine0_def + mid + engine0_main + tail  ⇒ 35154 字节 / crc32 0x4fa1ebd3
+```
+
+⚠ **口径坑（已踩过一次）**：`25140` 是**字符数**、`35154` 才是**字节数**（文件含大量中文注释）。
+`std::string::size()` 与 `zlib.crc32` 都是**字节**口径 ⇒ C++ 自检必须对 `35154 / 0x4fa1ebd3`，
+写成 `25140` 会误报"不等"。
+
+提取路径自证：`tools/validate-shaders.sh` 的宽松提取（`R"\((.*?)\)"`，66 段 GLSL）与
+`engine-shader-offline.py` 的严格提取（`const char* kFsXxx`，64 段）在 `kFsFilm` 上**得到同一份内容**；
+`kFsFilm` 体内不含 `)"` 与 `R"(` ⇒ 两种提取都不会被截断。
+
+## 8. 阶段 1 判据与执行清单
+
+> 上位：`docs/engine-slots-design.md` §8 阶段 1「模板化重构」。§7.2 给的是**口径基准**，
+> 本节给的是**可执行判据**（命令 + 期望值 + 出处 + 本机实测状态）。
+
+### 契约表（双口径；**判据以 `anchor-splice` 为准**）
+
+阶段 1 的切分有两条口径 —— 它们是**同一份源码**的两种切法，唯一差异是 `engine0_main` 是否
+包含收尾的 `    }`（5 字符）：
+
+| 块 | `line-splice`（按行号，交叉验证） | 字符 | `anchor-splice`（**C++ 实际实现 = 判据基准**） | 字符 |
+|---|---|---|---|---|
+| head | 1..78 | 3839 | `[0, a)`，a = 3839 | 3839 |
+| engine0_def | 79..372 | 14778 | `[a, b)`，b = 18617 | 14778 |
+| mid | 373..432 | 3188 | `[b, c)`，c = 21805 | 3188 |
+| engine0_main | 433..439 | **343** | `[c, d)`，d = 22153 | **348**（含收尾 `    }`） |
+| tail | 440..496 | **2992** | `[d, end)` | **2987** |
+
+- `anchor-splice` = `FrameRenderer.cpp` 的 `filmSlices()` 语义：四个锚点字符串在 `kFsFilm` 体内
+  `find` 出 a/b/c/e（3839 / 18617 / 21805 / 22115），`d = e + len(kFilmSplitMainBlockEnd)`；
+  `kFilmTemplateHead/Mid/Tail` 即其中三段的 `string_view`（单真源、零拷贝）。
+- **结论（写死）**：两条路径的**拼接结果都等于原文**（字节 **35154** / crc32 **`0x4fa1ebd3`** /
+  sha256 `f1ebb317…`）⇒ **判据等价**；但**以 `anchor-splice` 为准**（那是产品代码的实际行为），
+  `line-splice` 只作交叉验证。
+- §7.2 的行号表 = `line-splice` 口径，保留作交叉验证；**本表为权威口径** —— 后人按行号实现切分时，
+  不要再把 `    }` 划给 tail（否则与 C++ 差 5 字符）。
+
+### 判据 1（源等价）：拼接结果逐字节 == `kFsFilm` 原文
+
+```bash
+python3 tools/engine-shader-offline.py --verify-splice --out /tmp/stage1-splice
+python3 tools/engine-shader-offline.py --verify-splice --splice-selftest   # 守卫自检
+```
+
+2026-10-13 本机实测（`FrameRenderer.cpp` `sha256=452809b0f000c049…`，C++ 侧已按
+`filmSlices()` 锚点切片落盘）：
+
+| 项 | 实测值 |
+|---|---|
+| **路径 A** `line-splice`：按行号**字符偏移**切分（§7.2 的五个行号区间） | 5 块字节和 **35154**；拼接 == 原文 **True** |
+| **路径 B** `anchor-splice`：C++ 锚点切分复刻（`filmSlices()`；a/b/c/e = **3839 / 18617 / 21805 / 22115**，d = 22153）**= 判据基准** | 拼接 == 原文 **True**；== 基线锚点 **True** |
+| 逐块摘要 == 块级锚点 | **5/5**（切分点未漂移） |
+| 切分点语义哨兵 | **8/8** |
+| 结论 | **PASS**，退出码 **0** |
+
+- **证明力在哪（重要）**："按偏移切片再拼回"**恒等于**原文，属平凡真。判据 1 的非平凡部分是
+  ① 拼接结果摘要 == `0x4fa1ebd3`（证明 shader 真没被改）；② **逐块**摘要 == 块级锚点
+  （证明切分点没漂移）—— 只锚整体不够：切分点整体偏 1 行时 head/engine0_def 的边界行都只是注释，
+  整体摘要与语义哨兵**都抓不到**（该漏检由 `--splice-selftest` 的 ① 号 mutation 实测抓出后，
+  才补上块级锚点）。
+- **两条路径都跑、都判 PASS 才算通过**：C++ 锚点路径（`mode: anchor-splice`）证明的是
+  "**产品代码切出来的东西**拼回去 == 原文"，比脚本自己按行号切更有证明力；锚点缺失/错序 ⇒
+  路径 B 判 `BROKEN` 并**退出码非 0**（不回退到行号切分，否则判据退化成"永远通过"）。
+  ⚠ 它是 C++ 语义的 **Python 复刻**，不是执行 C++；真机侧另有 `engine.film_src` 日志佐证。
+- ⚠ **契约行号口径 vs C++ 锚点口径差 5 字符**（不影响判据）：C++ 的 `engine_main` 含收尾 `    }`
+  （`d = e + len(kFilmSplitMainBlockEnd)`）⇒ 该块 348 vs 343 字符、tail 2987 vs 2992 字符；
+  **拼接结果一致**，故两条路径都 PASS。
+- 守卫自检：`--splice-selftest` 的 4 项 mutation（切分点漂移 / 丢换行 / 篡改源基线 / 篡改锚点）
+  必须**全部检出** —— 验证工具自身出错 = 假绿，比不验证更危险。
+- 产物：`<out>/steps.json` → `steps.splice`（`verdict` / `path_a_line_split` / `path_b_anchor_splice`）。
+
+### 判据 2（链等价）：`film_d5.npy` 的 CRC32 不变
+
+```bash
+python3 tools/engine-shader-offline.py --dng test_temp/FILMKIT_20261009-090803.dng \
+  --roi 1800,2100,600,1000 --out /tmp/stage1
+# 白点 4.0 口径（R-3 真机定档值）加 --film-white-ev 4.0
+```
+
+| 口径 | 命令差异 | `film_d5.npy` CRC32（期望） | SHA-256 | 出处 |
+|---|---|---|---|---|
+| **代码默认**（`[37]/[38]` = −7.65 / +4.56） | 默认 | **`0x589f8364`** | `ce1c9a90c11dbb69…` | §3.3 |
+| 白点 4.0 | `--film-white-ev 4.0` | **`0xd46d7b5e`** | `7811827393c4af94…` | §3.3 |
+
+- 两口径已于 2026-10-13（C++ 落盘后）**复跑确认**与 §3.3 一致；摘要同时写进
+  `<out>/steps.json` 的 `steps.film.digest`。
+- **链外清单**（§4.2）：HR 高光重建 / `uLocal*` / PC3D 标定 / `kFsOut` / MFNR / defringe 不在链内
+  ⇒ 判据 2 只证明"`kFsFilm` 自身输出没变"，**不能**主张成片零回归。
+
+### 判据 3：shader 静态校验全绿 + 真机 program 链接成功
+
+```bash
+bash tools/validate-shaders.sh        # 期望：全部 shader 校验通过（退出码 0）
+```
+
+- 本机 2026-10-13 实测：提取 **66** 个 GLSL 字符串、**66 OK / 0 FAIL**（glslang = `tools/bin/glslang`，
+  该目录已 gitignore；缺失时脚本退出码 2 并提示 `brew install glslang`）。
+- **双形态适配**（阶段 1 后 `kFsFilm` 可能被真拆成模板常量 + 注入段）：形态 1（`kFsFilm` 完整）
+  走原逻辑、行为一字不变；形态 2（真拆）把模板三段 + 注入段**拼回整份**再校验，散段不再单独校验
+  （逐段过滤只有 head 带 `#version` ⇒ 会把 `main` 丢掉、校验一个残缺 shader = **假绿**；该 bug 已用
+  构造文件实测抓出并修复）；半拆（`kFilmTemplate*` 只落盘一部分）直接报错退出，不静默漏检。
+  脚本可带一个可选参数指定源文件，用于上述形态回归：`bash tools/validate-shaders.sh <path>`。
+- **真机**：`prog_film_ != 0`（`linkProgram(vs_plain_, fs_film)` 的结果）。v0.5.13 教训 = 设备端
+  编译失败即全链路黑屏，构建与单测全绿都不代表 GLSL 合法。
+
+### 判据 4（兜底，必须真机）：同帧 A/B 成片 CRC32
+
+离线链不含 HR / `uLocal*` / PC3D 标定 / `kFsOut` / MFNR（§4.2）⇒ 判据 1–3 全绿**仍不能**主张
+"成片零回归"。最终判据 = 真机同帧（同一 RAW、同参数、`[98]=0`）改造前 vs 改造后的**成片 CRC32
+逐字节一致**，并附两条日志：`prog_film_ != 0`、`engine.film_src` 的
+`"bytes":35154,"chars":25140,"crc32":"0x4fa1ebd3","identical":true,"zero_regression":"ok"`。
+> 本机（macOS，无 adb）**未跑**此条 —— 属真机/CI 项。
+
+### 判据速查
+
+| # | 命令 | 期望 | 本机状态 |
+|---|---|---|---|
+| 1 | `python3 tools/engine-shader-offline.py --verify-splice` | 两路径拼接 == 原文；CRC32 `0x4fa1ebd3`；退出 0 | ✅ 实测 PASS |
+| 1b | `… --verify-splice --splice-selftest` | **6** 项 mutation 全部检出（切分点漂移 / 丢换行 / 篡改源基线 / 篡改锚点 / 差异打印 / CLI 退出码） | ✅ 实测 |
+| 2 | `python3 tools/engine-shader-offline.py --dng … --roi … --out /tmp/stage1` | `0x589f8364`；白点 4.0 `0xd46d7b5e` | ✅ 实测一致 |
+| 3 | `bash tools/validate-shaders.sh` | 全绿（66/66）+ 真机 `prog_film_ != 0` | ✅ 本机全绿；真机项未跑 |
+| 3b | 真机日志 `engine.film_src` | `identical:true` / `zero_regression:"ok"` | ⬜ 未跑（需真机） |
+| 4 | 真机同帧 A/B 成片 CRC32 | 逐字节一致 | ⬜ 未跑（需真机） |
+
+### 本阶段抓出的两个假绿（教训）
+
+1. **只锚整体摘要不够**：切分点整体偏 1 行时，head 末行与 engine0_def 首行**都只是注释** ⇒ 整体摘要
+   与语义哨兵**都抓不到**，判据会给出假绿。**必须**给 5 块各锚 crc32/sha256（**块级锚点**）；
+   `--splice-selftest` 的 ① 号 mutation 就是这条的回归守卫。
+2. **`validate-shaders.sh` 形态 2 的逐段过滤**：模板真拆后若逐段判断 `#version`，则只有 head 带头 ⇒
+   拼回整份**根本没进候选**、filmic **实际未被校验**（假绿；glslang 对缺 `main` 的片段并不报错）。
+   **必须**先拼回整份再判断；半拆（`kFilmTemplate*` 只落盘一部分）应直接报错退出，不静默漏检。
+
+> 共同点：**验证工具自身出错 = 假绿，比不验证更危险**。两条都是靠**负向自检（mutation）**抓出来的，
+> 而不是靠正向跑绿 ⇒ `--splice-selftest` 与形态回归应与判据同跑（判据速查 1b）。

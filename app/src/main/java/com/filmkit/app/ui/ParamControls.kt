@@ -146,7 +146,7 @@ import com.filmkit.app.camera.writeSaturation
  *
  * ## 拍照界面侧的额外一层（本文件末尾）
  *
- * 拍照链路读的槽位**不是**全部槽位（引擎实测白名单 [CAMERA_PATH_SLOTS]，41 槽）⇒
+ * 拍照链路读的槽位**不是**全部槽位（引擎实测白名单 [CAMERA_PATH_SLOTS]，42 槽）⇒
  * 拍照界面只给白名单内、且有滑杆的槽展开滑杆；其余**灰显并标注原因**（ADR-12：不做假滑杆）。
  * 槽位 → 参数的索引是 [CAMERA_TUNABLE_SLOT_PARAM]（只有"哪个槽归哪条滑杆"，不含第二份数值）。
  */
@@ -636,11 +636,19 @@ internal fun EditorSlider(
  * 这是**既有欠账**的如实标注（"拍照生效 · 暂无滑杆"）而不是造一条没有引擎语义对应的
  * 假滑杆；将来给颗粒补滑杆时，**删掉本集合里的对应项 + 在 [CAMERA_TUNABLE_SLOT_PARAM] 里
  * 加一行**即可（`CameraPresetEditTest` 会要求两处同步）。
+ *
+ * ★ 引擎插槽重构（阶段 1）：`[98]` 引擎插槽**不进本集合** —— 它不是**参数**（是"选哪个
+ * 引擎"；阶段 3 的切换入口是**引擎选择面**，见 `docs/engine-slots-design.md` §8），而本
+ * 集合的语义是"**是参数、但暂无滑杆**"。它不出现在参数面板靠的是**另一侧**过滤：`[98]`
+ * 属于 `CAMERA_PATH_SLOTS`（`passFilm` 读它做非 0 降级判据）⇒ `fullEditReadonlySlots()`
+ * 的 `includedSlots.filter { it !in CAMERA_PATH_SLOTS }` 不会把它带进只读组。
  */
 internal val CAMERA_NO_SLIDER_SLOTS: Set<Int> = setOf(26, 27, 60, 61)
 
 /**
- * 槽位 → 参数表的项（**拍照界面可拖的槽 = [CAMERA_PATH_SLOTS] − [CAMERA_NO_SLIDER_SLOTS]**）。
+ * 槽位 → 参数表的项（**拍照界面可拖的槽 = [CAMERA_PATH_SLOTS] − [CAMERA_NO_SLIDER_SLOTS]
+ * − [CAMERA_ENGINE_SELECT_SLOTS]** —— 最后一项是"**根本不是参数**"的槽（引擎选择
+ * `[98]`，阶段 3 走引擎选择面），见该常量的 KDoc；三项的语义区分也见 `CameraPresetEditTest`）。
  *
  * 用 `key` 查找（[EditorParam.key] 是稳定 key）而不是下标：参数表顺序变化时**不会静默错位**
  * （下标引用会让"肩部"滑杆绑到"趾部"的槽上，且编译不报错）。

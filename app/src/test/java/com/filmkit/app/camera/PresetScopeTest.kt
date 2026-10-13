@@ -100,12 +100,28 @@ class PresetScopeTest {
             presetScopeNotice(p, PresetScene.EDITOR),
         )
         assertNull("拍照链路本来就读这八项 ⇒ 拍照界面也不提示", presetScopeNotice(p, PresetScene.CAMERA))
+        // ★ 引擎插槽重构（阶段 1）：本循环原为"任何槽位都不得是单侧"（U-2 里程碑 = 0）。
+        // 阶段 1 起 `[98]` 引擎插槽**确实是单侧**（`passStyle` 不读它 ⇒ §1.6 标"仅拍照"）
+        // ⇒ 改为"作用域必须与 §1.6 的矩阵一致"：判据强度不变（仍是精确相等），只是不再假定
+        // "单侧恒为 0"。上面两条 assertNull 仍是 [5..10]/[37][38] 的专门哨兵。
+        val matrix = designMatrix()
         for (slot in 0 until CameraPresets.COUNT) {
+            // 不进预设的槽位**无所谓作用域**（`[28]`/`[30]`/`[31..33]`/`[34]`/`[35][36]` 由
+            // presetSlotIncluded 排除，且 P-5 复核要求它们在表里必须是"两侧都生效"）——
+            // 与 scopeTableMatchesDesignMatrix / excludedSlotsHaveNoScope 同口径。
+            if (!presetSlotIncluded(slot)) continue
+            val (cam, ed) = matrix[slot] ?: (true to true)
+            val expected = when {
+                cam && ed -> setOf(PresetScene.CAMERA, PresetScene.EDITOR)
+                cam -> setOf(PresetScene.CAMERA)
+                ed -> setOf(PresetScene.EDITOR)
+                // 两侧都 ❌ = 引擎还没实现 ⇒ 表里按"两侧都生效"处理（同 scopeTableMatchesDesignMatrix）
+                else -> setOf(PresetScene.CAMERA, PresetScene.EDITOR)
+            }
             assertEquals(
-                "槽位 [$slot] 不该是「单侧生效」（U-1 消 [23..25]、U-3 消 [88][89]、" +
-                    "U-4 消 [78]/[90..94]、U-2 消 [5..10]/[37][38]）—— 新增单侧参数时" +
-                    "本条与 §1.6 一起改",
-                setOf(PresetScene.CAMERA, PresetScene.EDITOR),
+                "槽位 [$slot] 的作用域必须与 §1.6 一致（U-1 消 [23..25]、U-3 消 [88][89]、" +
+                    "U-4 消 [78]/[90..94]、U-2 消 [5..10]/[37][38]；阶段 1 起新增单侧 [98]）",
+                expected,
                 presetSlotScenes(slot),
             )
         }
@@ -208,10 +224,19 @@ class PresetScopeTest {
      */
     @Test
     fun noSingleSideSlotsAtAll() {
-        val single = (0 until CameraPresets.COUNT).filter { presetSlotScenes(it).size == 1 }
+        // ★ 引擎插槽重构（阶段 1）：原断言 = "单侧槽位数必须是 0"（U-2 里程碑）。
+        // 阶段 1 起 `[98]` 引擎插槽**是单侧**（§1.6 标"仅拍照"）⇒ 改为"单侧集合 ==
+        // §1.6 推导出的单侧集合"：判据强度不变（仍是精确相等），且清单不硬编码
+        //（文档改了这里跟着动）。
+        val fromMatrix = designMatrix()
+            .filter { (slot, ce) -> presetSlotIncluded(slot) && ce.first != ce.second }
+            .keys
+            .sorted()
+        val single = (0 until CameraPresets.COUNT).filter { presetSlotScenes(it).size == 1 }.sorted()
         assertEquals(
-            "U-2 起判据表为空 ⇒ 单侧槽位数必须是 0（有的话本条 + §1.6 对拍 + PresetScope 一起改）",
-            emptyList<Int>(),
+            "单侧生效槽位集合必须等于 §1.6 的「仅拍照 / 仅后期且进预设」集合" +
+                "（★ U-2 后曾 = 空；阶段 1 起因 [98] 引擎插槽 = [98]）",
+            fromMatrix,
             single,
         )
     }
@@ -266,7 +291,6 @@ class PresetScopeTest {
     fun scopeTableMatchesDesignMatrix() {
         val matrix = designMatrix()
         assertTrue("§1.6 表格解析出的槽位太少（${matrix.size}）—— 正则或文档结构漂移", matrix.size >= 55)
-        var singleSide = 0
         var excluded = 0
         matrix.forEach { (slot, ce) ->
             // 不进预设的槽位**无所谓作用域**：§1.6 里标"仅拍照"的 [28]/[31..33] 已被
@@ -291,13 +315,19 @@ class PresetScopeTest {
                 expected,
                 presetSlotScenes(slot),
             )
-            if (cam != ed) singleSide++
         }
+        // ★ 引擎插槽重构（阶段 1）：原断言 = "§1.6 里单侧生效且进预设的槽位数必须是 0"
+        // （U-2 里程碑）。阶段 1 起 `[98]` 引擎插槽是单侧（§1.6 标"仅拍照"）⇒ 改为
+        // "集合相等"：判据强度不变（仍是精确相等），且清单不硬编码（文档改了这里跟着动）。
         assertEquals(
-            "§1.6 里单侧生效**且进预设**的槽位数（★ U-2 后 = 0；历史：19 − [23..25]（U-1，3）" +
-                "− [88][89]（U-3，2）− [78]+[90..94]（U-4，6）− [5..10]+[37][38]（U-2，8）= 0）",
-            0,
-            singleSide,
+            "§1.6 里单侧生效**且进预设**的槽位集合，必须与代码作用域表的单侧集合一致" +
+                "（★ U-2 后曾 = 空；阶段 1 起因 [98] 引擎插槽 = [98]。历史：19 − [23..25]" +
+                "（U-1，3）− [88][89]（U-3，2）− [78]+[90..94]（U-4，6）" +
+                "− [5..10]+[37][38]（U-2，8）= 0）",
+            matrix.filter { (slot, ce) -> presetSlotIncluded(slot) && ce.first != ce.second }
+                .keys
+                .sorted(),
+            (0 until CameraPresets.COUNT).filter { presetSlotScenes(it).size == 1 }.sorted(),
         )
         assertEquals(
             "§1.6 里被 presetSlotIncluded 排除的槽位数（[28]+[30]+[31..33]+[34]+[35][36]）",

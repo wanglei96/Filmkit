@@ -35,7 +35,7 @@ internal val CAMERA_STANDARD_PRESET = EditorPreset(
 )
 
 /**
- * ★ PS-3：**拍照链路（`passFilm` + `passOutput`）实际读取的槽位集合**（41 槽）——
+ * ★ PS-3：**拍照链路（`passFilm` + `passOutput`）实际读取的槽位集合**（42 槽）——
  * 拍照界面"哪些参数调了真的有效果"的**唯一判据**。
  *
  * 来源 = 引擎实测：`FrameRenderer.cpp` 的 `p.<字段>` 引用（排除编辑器链路函数
@@ -66,7 +66,27 @@ internal val CAMERA_PATH_SLOTS: Set<Int> = buildSet {
     add(88); add(89)        // 色温 / 色调（U-3）
     addAll(90..94)          // 影调分区四条 + 褪色（U-4）
     addAll(95..97)          // 柔光（SG-1）
+    // 引擎插槽（阶段 1，引擎插槽重构）：`passFilm` 读它做"非 0 ⇒ 降级到引擎 0 + WARN"
+    // 的判据（方案 §4 契约 5：不静默、不崩、不做 identity 伪装）；阶段 2 起由它真正选引擎。
+    // ⚠ 编辑器链路 `passStyle` **不读**它（只有拍照链路有引擎选择）⇒ §1.6 标"仅拍照"。
+    add(98)
 }
+
+/**
+ * ★ 引擎插槽重构（阶段 1）：**拍照链路读取、但「不是可调参数」**的槽位。
+ *
+ * 与 [CAMERA_NO_SLIDER_SLOTS] 的区别（**别混**）：
+ *  - [CAMERA_NO_SLIDER_SLOTS] = "**是参数**、但暂无 UI 滑杆"（颗粒 `[26][27][60][61]`）
+ *    ⇒ 它们进参数面板的「只读」组（"拍照生效 · 暂无滑杆"）；
+ *  - 本集合 = "**根本不是参数**"：`[98]` 是"选哪个引擎"，是**选择**不是可连续调的量
+ *    ⇒ 既不出现在滑杆里，也不出现在参数面板的只读组里 —— 阶段 3 的切换入口是
+ *    **引擎选择面**（`docs/engine-slots-design.md` §8），不是滑杆。
+ *
+ * 阶段 1 的实际用途：`[98]` 只被 `passFilm` 读来做"非 0 ⇒ 降级到引擎 0 + 记 WARN"的判据
+ *（方案 §4 契约 5）⇒ 它属于 [CAMERA_PATH_SLOTS]；但它不产生可拖项 ⇒ `CAMERA_TUNABLE_SLOT_PARAM`
+ * 里没有它（三者关系由 `CameraPresetEditTest` 断言）。
+ */
+internal val CAMERA_ENGINE_SELECT_SLOTS: Set<Int> = setOf(98)
 
 /**
  * 套用到相机的**完整 96 槽数组** = `标准基线 + 预设的稀疏覆盖`。
