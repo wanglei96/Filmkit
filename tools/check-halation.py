@@ -396,9 +396,13 @@ def check_static(src):
     # ⚠ 成片路径有**两条**：YUV 静拍 `submitStill` / RAW 静拍 `finishStillChain`
     #   ⇒ 两处都要设（E4-5b 首版只设了后者，本判据把它抓了出来）。
     REF_ASSIGN = "halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));"
+    # 卡 H2：passOutput 增加第 6 参 = 交付档 dither 上限（8bit 255 / 10bit 1023）⇒ 锚点
+    # 从 `..., true, false);` 改为 `..., true, false, outputMaxOf(`（前缀匹配，数量仍须 = 2：
+    # 多一处 = 多了成片入口，少一处 = 有成片路径没走交付档口径）。
+    OUT_CALL = "passOutput(dst_w, dst_h, p, true, false, outputMaxOf("
     ok10, n_out, det10, pos = True, 0, [], 0
     while True:
-        i_out = src.find("passOutput(dst_w, dst_h, p, true, false);", pos)
+        i_out = src.find(OUT_CALL, pos)
         if i_out < 0:
             break
         n_out += 1

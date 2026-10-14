@@ -21,6 +21,7 @@
 #include "Align.h"
 #include "AmazeDemosaic.h"
 #include "GrainLut.h"
+#include "OutputBitDepth.h"
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
@@ -4753,6 +4754,9 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform vec2 uPx;
+// 交付位深上限（dither 除数）：由 CPU 按交付档下发 —— 8bit JPEG 链 = 255.0（默认，
+// 由 passOutput 显式下发）、10bit HEIF 链 = 1023.0。见下方 dither 行的兜底说明。
+uniform float uOutMax;
 // ── E4-3 颗粒（granularity；darktable src/iop/grain.c）────────────────────
 // 域常数在 CPU 侧算好（shader 内不做 W/H 除法与 clamp，与 E4-2 暗角同款）：
 //   uGrainZoom = grainZoom([27])、uGrainNorm = 1/min(W,H)、uGrainSeed = 噪声坐标的
@@ -5180,7 +5184,16 @@ void main() {
     // 规则量化斜坡被人眼 Mach band 放大成条带（用户报的"边缘断层"）。TPDF 把
     // 零变占比降到 35.6%，即把规则台阶打散为随机台阶。均匀分布(RPDF)只能移动
     // 台阶、不能打散，故必须用三角分布。
-    c += (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / 255.0;
+    // ── dither 幅度按**交付位深**重标（设计 §2.5 / §4.4：本期最易漏项）──────────
+    // 除数 = 交付档上限，由 CPU 侧按档下发 uOutMax（OutputBitDepth.h 的 kOutputMaxUniform
+    // / outputMaxOf：8bit JPEG = 255.0、10bit HEIF = 1023.0）。10bit 下若沿用 8bit 幅度
+    // （±1/255 = ±4 LSB@10bit）等于把 10bit 抖回 ~8.6bit 有效精度 ⇒ 静默降位。
+    // ⚠ 兜底 255.0 不可删：uniform 未下发时 GLSL 读 0 ⇒ 不加兜底会 /0 → NaN（既有
+    //   调用方 check-halation/check-softglow/离线脚本**不传**该 uniform，靠兜底保持
+    //   与改动前**逐位相同**）。兜底值必须 == 真源 kOutputMaxGlsl，
+    //   由 tools/check-bitdepth-single-source.py 锚定（改位深忘了改这里 ⇒ 守卫红）。
+    float ditherMax = uOutMax > 0.0 ? uOutMax : 255.0;
+    c += (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / ditherMax;
     // 过曝斑马纹（仅预览；成片路径由引擎把 uZebra 置 0 —— 提示绝不进成片）：
     // 显示域亮度达阈值的区域叠 45° 黑白斜纹。高光一旦全饱和就不可恢复
     // （DNG 实测：高光 1.089% 三通道同时饱和），拍前能看见就能少拍废片。
@@ -7669,6 +7682,9 @@ bool FrameRenderer::init() {
   u_out_.grain_lut = glGetUniformLocation(prog_out_, "uGrainLut");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
+  // 卡 H2：dither 除数（交付档上限）。shader 里是 uOutMax，名字的真源 =
+  // OutputBitDepth.h 的 kOutputMaxUniform（改名字要同时改守卫脚本的解析口径）。
+  u_out_.out_max = glGetUniformLocation(prog_out_, kOutputMaxUniform);
   u_out_.sharpen = glGetUniformLocation(prog_out_, "uSharpen");
   u_out_.lut = glGetUniformLocation(prog_out_, "uLut");
   u_out_.lut_on = glGetUniformLocation(prog_out_, "uLutOn");
@@ -8139,7 +8155,9 @@ void FrameRenderer::makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   // 类型必须与内部格式匹配：RGBA8 用 UNSIGNED_BYTE，RGBA16F 用 HALF_FLOAT。
   // （X300 实测：RGBA8 + HALF_FLOAT 非法组合静默失败 → 捕获 FBO 永不完整 → 照片全黑）
-  const GLenum type = internal == GL_RGBA8 ? GL_UNSIGNED_BYTE : GL_HALF_FLOAT;
+  // 卡 H2：交付档有三种内部格式（RGBA8 / GL_RGB10_A2 / RGBA16F）⇒ 映射收口到
+  // OutputBitDepth.h 的 outputUploadTypeOf（10bit 档 = GL_UNSIGNED_INT_2_10_10_10_REV）。
+  const GLenum type = outputUploadTypeOf(internal);
   glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internal), w, h, 0, GL_RGBA,
                type, nullptr);
   glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
@@ -8148,26 +8166,179 @@ void FrameRenderer::makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w,
 }
 
 // 逐 pass 诊断：GL 错误码 + 目标(0,0)像素，定位渲染断点层级
-void FrameRenderer::logPassDiag(const char* stage, GLuint fbo, bool half_float) {
+// internal（卡 H2）：目标附件的内部格式 —— 三种读回口径由真源统一给出：
+//   · 交付档（RGBA8 / GL_RGB10_A2）→ (kOutputGlReadFormat, outputUploadTypeOf)
+//     ⇒ 10bit 档按 GL_UNSIGNED_INT_2_10_10_10_REV 读，解包成 10bit 整数打印
+//     （**不再**用 8bit 口径去读 10bit 附件：非法组合会被驱动拒绝，把
+//      GL_INVALID_OPERATION 误报成"渲染失败"，诊断自己变成事故源）。
+//   · 中间纹理（RGBA16F）→ GL_HALF_FLOAT，照旧换算成浮点打印。
+void FrameRenderer::logPassDiag(const char* stage, GLuint fbo, GLenum internal) {
   const GLenum err = glGetError();
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   std::string kv =
       std::string("{\"stage\":\"") + stage + "\",\"glErr\":" + std::to_string(err);
-  if (half_float) {
+  if (isOutputInternal(internal)) {
+    // 交付档：RGBA8 与 RGB10_A2 都是定点，但**每通道位宽不同** ⇒ 分开解包。
+    GLubyte b4[4] = {0, 0, 0, 0};
+    if (internal == kOutput10GlInternalFormat) {
+      glReadPixels(0, 0, 1, 1, kOutput10GlReadFormat, kOutput10GlReadType, b4);
+      // 2_10_10_10_REV = LSB-first：bit0..9 = R、10..19 = G、20..29 = B
+      const uint32_t v = static_cast<uint32_t>(b4[0]) |
+                         (static_cast<uint32_t>(b4[1]) << 8) |
+                         (static_cast<uint32_t>(b4[2]) << 16) |
+                         (static_cast<uint32_t>(b4[3]) << 24);
+      kv += ",\"bits\":10,\"r\":" + std::to_string(v & 0x3FFu);
+      kv += ",\"g\":" + std::to_string((v >> 10) & 0x3FFu);
+      kv += ",\"b\":" + std::to_string((v >> 20) & 0x3FFu);
+      kv += ",\"a\":" + std::to_string((v >> 30) & 0x3u) + "}";
+    } else {
+      glReadPixels(0, 0, 1, 1, kOutputGlReadFormat, kOutputGlReadType, b4);
+      kv += ",\"bits\":8,\"r\":" + std::to_string(b4[0]);
+      kv += ",\"g\":" + std::to_string(b4[1]);
+      kv += ",\"b\":" + std::to_string(b4[2]);
+      kv += ",\"a\":" + std::to_string(b4[3]) + "}";
+    }
+  } else {
     GLushort raw[4] = {0, 0, 0, 0};
     glReadPixels(0, 0, 1, 1, GL_RGBA, GL_HALF_FLOAT, raw);
     kv += ",\"r\":" + std::to_string(halfToFloat(raw[0]));
     kv += ",\"g\":" + std::to_string(halfToFloat(raw[1]));
     kv += ",\"b\":" + std::to_string(halfToFloat(raw[2])) + "}";
-  } else {
-    GLubyte b4[4] = {0, 0, 0, 0};
-    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b4);
-    kv += ",\"r\":" + std::to_string(b4[0]);
-    kv += ",\"g\":" + std::to_string(b4[1]);
-    kv += ",\"b\":" + std::to_string(b4[2]);
-    kv += ",\"a\":" + std::to_string(b4[3]) + "}";
   }
   Logger::instance().log(LogLevel::kInfo, "engine", "render.diag", kv);
+}
+
+// ── 卡 H2：10bit 交付档读回自检（**绝对**验证，不是往返）─────────────────────
+// 为什么不能用上传→下载往返：同一种错误布局在往返里会**互相抵消**（写进去按错布局
+// 解释、读出来又按同一错布局还原），测出来是"通过"而实际交付错色。
+// 所以这里用 glClear 写**规范定义的浮点值**，再按交付口径读回，逐点与
+// "浮点 → 10bit 定点四舍五入"的期望值比对（容差 1 LSB，覆盖 round-half 的驱动差异）。
+// 颜色刻意选 R/G/B 各自独占满量程的三个 case ⇒ **通道位序**（LSB-first：R 在 bit0..9、
+// G 在 10..19、B 在 20..29）一旦不是预期就会立刻红 —— 这正是 Kotlin 侧
+// Heif10Pipeline.unpackRgb10 的前提。
+bool FrameRenderer::selfCheck10BitReadback(std::string* detail) {
+  struct Case {
+    float r, g, b;
+    int er, eg, eb;
+    const char* what;
+  };
+  // 期望值 = round(v × 1023)（ES 3.0 §2.1.2 定点转换 = 就近取整）；0.5×1023 = 511.5
+  // 处于 half-way，故容差取 1 LSB（驱动可 round-half-even 或 round-half-up）。
+  static const Case kCases[6] = {
+      {0.0f, 0.0f, 0.0f, 0, 0, 0, "black"},
+      {1.0f, 0.0f, 0.0f, 1023, 0, 0, "R-full"},
+      {0.0f, 1.0f, 0.0f, 0, 1023, 0, "G-full"},
+      {0.0f, 0.0f, 1.0f, 0, 0, 1023, "B-full"},
+      {0.25f, 0.5f, 0.75f, 256, 512, 767, "ramp"},
+      {1.0f, 1.0f, 1.0f, 1023, 1023, 1023, "white"},
+  };
+  constexpr int kN = 6;
+
+  // 保存将被改动的状态（本函数可在任意渲染阶段被调用）
+  GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0};
+  GLint prev_scissor[4] = {0, 0, 0, 0};
+  GLint prev_tex = 0;
+  GLfloat prev_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const GLboolean had_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glGetIntegerv(GL_VIEWPORT, prev_vp);
+  glGetIntegerv(GL_SCISSOR_BOX, prev_scissor);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, prev_clear);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+
+  GLuint tex = 0, fbo = 0;
+  makeTex(&tex, &fbo, kOutput10GlInternalFormat, kN, 1);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  bool ok = (status == GL_FRAMEBUFFER_COMPLETE);
+  int bad = 0;
+  std::string rows;
+  GLenum read_err = 0;
+  if (ok) {
+    glViewport(0, 0, kN, 1);
+    glEnable(GL_SCISSOR_TEST);
+    for (int i = 0; i < kN; ++i) {
+      glScissor(i, 0, 1, 1);
+      glClearColor(kCases[i].r, kCases[i].g, kCases[i].b, 1.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
+    // readback 必须用交付口径的 (format, type)；每像素 4 B（packed uint32）
+    unsigned char raw[kN * 4] = {0};
+    glReadPixels(0, 0, kN, 1, kOutput10GlReadFormat, kOutput10GlReadType, raw);
+    read_err = glGetError();
+    for (int i = 0; i < kN; ++i) {
+      const uint32_t v = static_cast<uint32_t>(raw[i * 4]) |
+                         (static_cast<uint32_t>(raw[i * 4 + 1]) << 8) |
+                         (static_cast<uint32_t>(raw[i * 4 + 2]) << 16) |
+                         (static_cast<uint32_t>(raw[i * 4 + 3]) << 24);
+      const int r = static_cast<int>(v & 0x3FFu);
+      const int g = static_cast<int>((v >> 10) & 0x3FFu);
+      const int b = static_cast<int>((v >> 20) & 0x3FFu);
+      const int a = static_cast<int>((v >> 30) & 0x3u);
+      const auto near1 = [](int got, int want) {
+        return got >= want - 1 && got <= want + 1;
+      };
+      // alpha 只有 2 bit（GL_RGB10_A2）：clear alpha=1.0 ⇒ 期望 3
+      const bool good = near1(r, kCases[i].er) && near1(g, kCases[i].eg) &&
+                        near1(b, kCases[i].eb) && a == 3;
+      if (!good) ++bad;
+      rows += std::string(rows.empty() ? "" : ",") + "{\"case\":\"" +
+              kCases[i].what + "\",\"got\":[" + std::to_string(r) + "," +
+              std::to_string(g) + "," + std::to_string(b) + "," +
+              std::to_string(a) + "],\"want\":[" + std::to_string(kCases[i].er) +
+              "," + std::to_string(kCases[i].eg) + "," +
+              std::to_string(kCases[i].eb) + ",3],\"ok\":" +
+              (good ? "true" : "false") + "}";
+    }
+  }
+
+  // 恢复状态 + 释放（自检不得留下任何痕迹：纹理/FBO/视口/清屏色/裁剪框全部还原）
+  glDisable(GL_SCISSOR_TEST);
+  if (tex) glDeleteTextures(1, &tex);
+  if (fbo) glDeleteFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
+  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  glScissor(prev_scissor[0], prev_scissor[1], prev_scissor[2], prev_scissor[3]);
+  if (had_scissor) glEnable(GL_SCISSOR_TEST);
+  glClearColor(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+
+  if (detail != nullptr) {
+    *detail = std::string("{\"cases\":[") + rows + "],\"fbStatus\":" +
+              std::to_string(status) + ",\"readErr\":" +
+              std::to_string(read_err) + ",\"bad\":" + std::to_string(bad) + "}";
+  }
+  return ok && bad == 0 && read_err == GL_NO_ERROR;
+}
+
+// 卡 H2：进程级一次性自检（见头文件注释）。状态机：0 = 未跑、3 = 运行中、
+// 1 = 通过、2 = 失败。compare_exchange 保证两个实例/两条线程只跑一次。
+bool FrameRenderer::selfCheck10BitOnce() {
+  static std::atomic<int> state{0};
+  int s = state.load(std::memory_order_acquire);
+  if (s == 0) {
+    int expect = 0;
+    if (state.compare_exchange_strong(expect, 3, std::memory_order_acq_rel)) {
+      std::string detail;
+      const bool ok = selfCheck10BitReadback(&detail);
+      // 事件名与真机探针的 heif10.* 同命名空间 ⇒ 用户导日志后一条 grep 就能看到
+      // 交付档是否可信（探针 = 编码器/容器侧，本自检 = GL 交付档侧）。
+      Logger::instance().log(ok ? LogLevel::kInfo : LogLevel::kError, "engine",
+                             "heif10.selfcheck",
+                             std::string("{\"ok\":") + (ok ? "true" : "false") +
+                                 ",\"detail\":" + detail + "}");
+      state.store(ok ? 1 : 2, std::memory_order_release);
+      return ok;
+    }
+    // 另一线程正在跑（自检 < 1 ms）：自旋等结果
+    while ((s = state.load(std::memory_order_acquire)) == 3) {
+    }
+  }
+  return s == 1;
 }
 
 bool FrameRenderer::ensureTargets(int w, int h) {
@@ -8219,7 +8390,7 @@ bool FrameRenderer::ensureOutScaleTarget(int w, int h) {
     }
     tex_out_s_ = fbo_out_s_ = 0;
     // @domain: D5 —— 预览降档输出（OETF 后，RGBA8）
-    makeTex(&tex_out_s_, &fbo_out_s_, GL_RGBA8, w, h);
+    makeTex(&tex_out_s_, &fbo_out_s_, kOutputGlInternalFormat, w, h);
     glBindTexture(GL_TEXTURE_2D, tex_out_s_);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -8286,13 +8457,13 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
 
   if (fill_test) {
     passFill(rw, rh);
-    if (diag) logPassDiag("pass1_fill", fbo_scene_, true);
+    if (diag) logPassDiag("pass1_fill", fbo_scene_, GL_RGBA16F);
   } else {
     passOES(rw, rh, st, rot, sx, sy, p);
-    if (diag) logPassDiag("pass1_oes", fbo_scene_, true);
+    if (diag) logPassDiag("pass1_oes", fbo_scene_, GL_RGBA16F);
   }
   passFilm(rw, rh, p, tex_scene_, /*still=*/false, /*hal_domain=*/true);
-  if (diag) logPassDiag("pass2_film", fbo_work_, true);
+  if (diag) logPassDiag("pass2_film", fbo_work_, GL_RGBA16F);
 
   if (scaled) {
     // 降档：pass3 在低分辨率 RGBA8 上完成，blit 升到窗口。blit 建不出/不完整
@@ -8318,7 +8489,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   passOutput(dst_w, dst_h, p, false, true);  // 预览：允许过曝斑马纹
-  if (diag) logPassDiag("pass3_out", 0, false);
+  if (diag) logPassDiag("pass3_out", 0, kOutputGlInternalFormat);
   return true;
 }
 
@@ -8416,8 +8587,11 @@ void FrameRenderer::passStill(int dst_w, int dst_h, int rot,
 bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
                                 int w, int h, int y_stride, int uv_stride,
                                 int uv_pix, int rotation, const FilmParams& p,
-                                std::vector<uint8_t>* out_rgba) {
+                                std::vector<uint8_t>* out_rgba, bool ten_bit) {
   if (w <= 0 || h <= 0 || !y || !u) return false;
+  // 卡 H2：10bit 交付前先跑**一次**读回自检（进程级缓存）。失败 ⇒ 拒绝本次 10bit
+  // 交付 ⇒ 调用方按回退链降级（照片优先红线：宁可回退 JPEG，不交付错位的数据）。
+  if (ten_bit && !selfCheck10BitOnce()) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
 
   if (still_w_ != w || still_h_ != h) {
@@ -8493,16 +8667,20 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   // 旧写法传 still=true 使它拿到 hal_domain=0，被当作场景线性域（亮度随 AWB 漂移）。
   passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/true, /*hal_domain=*/true);
 
-  if (cap_w_ != dst_w || cap_h_ != dst_h) {
+  // 卡 H2：**交付档切换**（8bit RGBA8 ↔ 10bit GL_RGB10_A2）也要重建 —— 只按尺寸
+  // 记账会让"同尺寸的 JPEG 与 HEIF 连拍"复用错档附件（readback 口径不匹配 ⇒ 整幅
+  // 错色且不报错）。cap_ten_bit_ 与 cap_w_/cap_h_ 同源记账。
+  if (cap_w_ != dst_w || cap_h_ != dst_h || cap_ten_bit_ != ten_bit) {
     if (tex_cap_) {
       glDeleteTextures(1, &tex_cap_);
       glDeleteFramebuffers(1, &fbo_cap_);
     }
     tex_cap_ = fbo_cap_ = 0;
-    // @domain: D5 —— 成片 RGBA8 输出
-    makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, dst_w, dst_h);
+    // @domain: D5 —— 成片输出（ten_bit ? GL_RGB10_A2 : RGBA8，见 OutputBitDepth.h）
+    makeTex(&tex_cap_, &fbo_cap_, outputInternalOf(ten_bit), dst_w, dst_h);
     cap_w_ = dst_w;
     cap_h_ = dst_h;
+    cap_ten_bit_ = ten_bit;
   }
   // E4-3 颗粒：成片种子 = f(输出尺寸, 输入内容指纹) ⇒ 同一张两次导出**逐位相同**、
   // 不同照片不同图案（验收判据 6）。预览/编辑器路径各自置 0（图案稳定不闪）。
@@ -8513,10 +8691,14 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   // （YUV 静拍 = 本函数 / RAW 静拍 = finishStillChain）都要设**，否则本路径的成片
   // shift ≠ 0：光晕半径与预览对不上，且会改变成片观感（本卡承诺"成片逐位不变"）。
   halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
-  passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
-  logPassDiag("pass3_still", fbo_cap_, false);
+  // 成片：斑马纹绝不进成片；dither 除数按交付档重标（255 / 1023）
+  passOutput(dst_w, dst_h, p, true, false, outputMaxOf(ten_bit));
+  logPassDiag("pass3_still", fbo_cap_, outputInternalOf(ten_bit));
+  // 10bit 档每像素仍是 4 B（packed uint32，GL_UNSIGNED_INT_2_10_10_10_REV）
+  // ⇒ 缓冲尺寸与 8bit 完全相同；解包在 Kotlin 侧（Heif10Pipeline.unpackRgb10）。
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
-  glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
+  glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(ten_bit),
+               outputReadTypeOf(ten_bit), out_rgba->data());
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   return true;
 }
@@ -8615,16 +8797,20 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
 
     // 输出目标：显示域 RGBA8（与成片同格式；dither 在 8bit 量化前生效）
     // E2-12：**输出**尺寸（裁剪后）—— 与输入纹理尺寸解耦；不裁剪时两者相同。
-    if (cap_w_ != out_w || cap_h_ != out_h) {
+    // 卡 H2：编辑器链路**恒 8bit**（JPEG 交付）⇒ 若 tex_cap_ 还是 10bit 档的附件
+    // （上一次 HEIF 拍照留下的，尺寸可能正好相同）必须重建：按 8bit 口径读一个
+    // GL_RGB10_A2 附件是非法组合 ⇒ 编辑器导出整幅错色且不报错。
+    if (cap_w_ != out_w || cap_h_ != out_h || cap_ten_bit_) {
       if (tex_cap_) {
         glDeleteTextures(1, &tex_cap_);
         glDeleteFramebuffers(1, &fbo_cap_);
       }
       tex_cap_ = fbo_cap_ = 0;
       // @domain: D5 —— 编辑器输出（OETF 后显示域，LUT/颗粒/dither 之后）
-      makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, out_w, out_h);
+      makeTex(&tex_cap_, &fbo_cap_, kOutputGlInternalFormat, out_w, out_h);
       cap_w_ = out_w;
       cap_h_ = out_h;
+      cap_ten_bit_ = false;
     }
     // FBO 不完整时 draw 被驱动静默丢弃（X300 实测：RGBA8 + HALF_FLOAT 非法组合
     // ⇒ 输出全黑且 glErr=0），必须显式查一次
@@ -8642,9 +8828,9 @@ bool FrameRenderer::submitDisplay(const void* rgba8, int w, int h, int out_w,
       passStyle(out_w, out_h, crop_uv, crop_rot, p);
       // ⚠ 必须在 logPassDiag 之前取：它内部会消费掉错误码
       e_pass = glGetError();
-      logPassDiag("style", fbo_cap_, false);
+      logPassDiag("style", fbo_cap_, kOutputGlInternalFormat);
       out_rgba->resize(static_cast<size_t>(out_w) * out_h * 4);
-      glReadPixels(0, 0, out_w, out_h, GL_RGBA, GL_UNSIGNED_BYTE,
+      glReadPixels(0, 0, out_w, out_h, kOutputGlReadFormat, kOutputGlReadType,
                    out_rgba->data());
       e_read = glGetError();
       // 输出统计：readback 失败时 resize 的零填充会让输出看起来"全黑" ⇒ 与
@@ -10487,8 +10673,10 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
                               int rotation, const FilmParams& p, int demosaic,
                               float noise_strength, const float* noise_model,
                               float noise_sigma, bool nn_dn,
-                              std::vector<uint8_t>* out_rgba) {
+                              std::vector<uint8_t>* out_rgba, bool ten_bit) {
   if (w <= 0 || h <= 0 || !raw || !black_phase) return false;
+  // 卡 H2：同 submitStill —— 自检未通过就拒绝 10bit 交付（fail-closed）
+  if (ten_bit && !selfCheck10BitOnce()) return false;
   frames_.fetch_add(1, std::memory_order_relaxed);
   // 分段计时（M3 §3.3 出口标准的度量基础）：上传 / pass 链 / 读回
   const auto t0 = std::chrono::steady_clock::now();
@@ -10563,6 +10751,8 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
   c.nn = nn_dn;
+  // 卡 H2：交付档（10bit HEIF）—— 成片 target / readback / dither 三处同源切换
+  c.ten_bit = ten_bit;
   // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
   dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
   dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0; dbg_nn_gain_ = 0.f;
@@ -11106,16 +11296,18 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 放在 t2 之后，passMs 不受统计耗时污染。
   diagStatsTex("FILM-out", tex_work_, dst_w, dst_h, &p);
 
-  if (cap_w_ != dst_w || cap_h_ != dst_h) {
+  // 卡 H2：交付档（c.ten_bit）与尺寸**一起**记账（理由见 submitStill 的同名段）
+  if (cap_w_ != dst_w || cap_h_ != dst_h || cap_ten_bit_ != c.ten_bit) {
     if (tex_cap_) {
       glDeleteTextures(1, &tex_cap_);
       glDeleteFramebuffers(1, &fbo_cap_);
     }
     tex_cap_ = fbo_cap_ = 0;
-    // @domain: D5 —— 成片 RGBA8 输出
-    makeTex(&tex_cap_, &fbo_cap_, GL_RGBA8, dst_w, dst_h);
+    // @domain: D5 —— 成片输出（c.ten_bit ? GL_RGB10_A2 : RGBA8，见 OutputBitDepth.h）
+    makeTex(&tex_cap_, &fbo_cap_, outputInternalOf(c.ten_bit), dst_w, dst_h);
     cap_w_ = dst_w;
     cap_h_ = dst_h;
+    cap_ten_bit_ = c.ten_bit;
   }
   // E4-3 颗粒：成片种子 = f(输出尺寸, 输入内容指纹)（指纹由 submitRaw/submitRawBurst
   // 填进 ChainCtx）⇒ 同一张两次导出**逐位相同**、不同照片不同图案（验收判据 6）。
@@ -11127,13 +11319,19 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 修正前（**成片零观感变化**）。预览/编辑器（短边 ≠ 成片短边）按同一基准归一化
   // ⇒ 三者的光晕**相对**半径一致（修掉了"预览 2.8× 于成片"的 WYSIWYG 破绽）。
   halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
-  passOutput(dst_w, dst_h, p, true, false);  // 成片：斑马纹绝不进成片
+  // 成片：斑马纹绝不进成片；dither 除数按交付档重标（255 / 1023）
+  passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
   glFinish();
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
-  glReadPixels(0, 0, dst_w, dst_h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba->data());
-  // 诊断统计 D5（最终成片，基准；引擎内本就是 u8，零 GL 调用的 CPU 侧统计）
-  diagStatsU8("D5-out-u8", out_rgba->data(), dst_w, dst_h, &p);
+  glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),
+               outputReadTypeOf(c.ten_bit), out_rgba->data());
+  // 诊断统计 D5（最终成片，基准；零 GL 调用的 CPU 侧统计）。
+  // ⚠ 卡 H2：该统计的口径是 **u8**（逐字节 /255 的直方图/均值），10bit 档下字节流是
+  //   打包的 2_10_10_10_REV ⇒ 统计值无意义（会把 10bit 位段读成 8bit 灰度）。
+  //   因此 10bit 档**跳过**（不是"改了统计"，而是"该口径不适用于该档"）——
+  //   对应的诊断需求由 heif10.selfcheck / render.diag 的 bits:10 分支承担。
+  if (!c.ten_bit) diagStatsU8("D5-out-u8", out_rgba->data(), dst_w, dst_h, &p);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   const auto t3 = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
@@ -12653,9 +12851,11 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float ref_noise_scale, bool use_dft,
                                    bool align_l1, bool align_ab, bool p0_sub,
                                    bool nn_dn,
-                                   std::vector<uint8_t>* out_rgba) {
+                                   std::vector<uint8_t>* out_rgba, bool ten_bit) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
+  // 卡 H2：同 submitStill / submitRaw —— 自检未通过就拒绝 10bit 交付（fail-closed）
+  if (ten_bit && !selfCheck10BitOnce()) return false;
   // 融合 shader 固定 4 输入（uRaw0..3 / uOff1..3）：帧数不符是调用方 bug
   if (count != 4) {
     Logger::instance().log(LogLevel::kError, "engine", "mfnr.bad_count",
@@ -13175,6 +13375,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
   c.nn = nn_dn;
+  // 卡 H2：交付档（10bit HEIF）—— 同 submitRaw
+  c.ten_bit = ten_bit;
   dbg_p0s_ = 0; dbg_cms_ = 0; dbg_cms_k_ = 0.f; dbg_p0w_ = 0.f;
   // NN 诊断字段每次合成都要清零（成员跨张残留会把上一张的读数记到这一张）
   dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
@@ -14827,7 +15029,7 @@ void FrameRenderer::passStyle(int w, int h, const float crop_uv[4],
 }
 
 void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
-                               bool zebra) {
+                               bool zebra, float out_max) {
   // flip_y 仅在拍照路径使用（渲染到 fbo_cap_）；预览直接渲染到当前窗口面
   if (flip_y) glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
   // ── E4-5 halation（光晕）：**在 OETF 之前**（tex_work_ = kFsFilm 输出的线性显示域）
@@ -14893,6 +15095,11 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1f(u_out_.flip_y, flip_y ? 1.0f : 0.0f);
   // 斑马纹只走预览：成片路径一律 0（提示不进成片）
   glUniform1f(u_out_.zebra, zebra ? p.zebra_thr : 0.0f);
+  // ── 卡 H2：dither 除数 = **交付档上限**（OutputBitDepth.h 的 outputMaxOf）────────
+  // 8bit JPEG 链 = 255.0（并与 shader 兜底同值 ⇒ 逐位同改动前）；10bit HEIF = 1023.0
+  //（dither 幅度随位深重标：设计 §2.5 / §4.4）。**必须显式下发**：若依赖 shader 兜底，
+  // 10bit 就会用 8bit 幅度抖动 ⇒ 有效精度掉回 ~8.6bit（静默降位）。
+  glUniform1f(u_out_.out_max, out_max);
   // v0.9.6 轻度锐化（luma USM，滚降后 OETF 前；0 = 关 = A/B 通路）
   glUniform1f(u_out_.sharpen, p.sharpen);
   // E4-2 暗角（vignette）：域常数在 CPU 侧算好（shader 内不做 W/H 除法）。

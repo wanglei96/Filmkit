@@ -1290,12 +1290,15 @@ private fun PresetQuickAdjustPanel(
 ) {
     // ★ 阶段 3（引擎插槽）：**这条预设的引擎** = 本面板正在读写的那份数组的 `[98]`（与下发给
     // 引擎的是同一个 `cameraPresetParams(...)`）⇒ 不必另找真相源。判据见 [slotActiveInEngine]。
-    // `getOrElse` 兜底短数组（同 E4-1 的长度纪律：读不到 ⇒ 按默认档 0 处理，不崩）。
+    // `getOrElse` 兜底短数组（同 E4-1 的长度纪律：读不到 ⇒ 按**默认档**处理，不崩）。
+    // ⛔ 默认档 = [CameraPresets.DEFAULT_ENGINE_SLOT]（P2 卡起 = 1 = sigmoid），**不是 0**：
+    //    内置预设不含该键、`cameraPresetParams` 以 `standard()` 为底重建 ⇒ 渲染走引擎 1
+    //    ⇒ UI 必须读同一个答案（否则就是"UI 按引擎 0 隐藏参数、渲染按引擎 1 出图"的假读数）。
     // ★ 阶段 3b：再 ⊕ 设置页的三档全局开关（prefs `engine_override`，缺省「跟随预设」）
     // ⇒ **生效引擎**。合成走契约函数（[effectiveEngineSlotOf] ⇒ `EngineScope.effectiveEngineSlot`），
     // 与设置页 /「完整参数」页**同一个入口**：否则一级页会按预设引擎显示、而渲染按生效引擎
     //（= "拖了画面不动"的假控件，ADR-12）。
-    val presetEngineSlot = params.getOrElse(ENGINE_SLOT) { 0.0 }.toInt()
+    val presetEngineSlot = params.getOrElse(ENGINE_SLOT) { CameraPresets.DEFAULT_ENGINE_SLOT.toDouble() }.toInt()
     val context = LocalContext.current
     val prefs = remember(context) { context.getSharedPreferences("filmkit", 0) }
     val engineSlot = effectiveEngineSlotOf(prefs, presetEngineSlot)

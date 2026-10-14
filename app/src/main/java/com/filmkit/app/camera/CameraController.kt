@@ -483,6 +483,18 @@ class CameraController(private val context: Context, private val render: RenderC
      */
     @Volatile private var stillRot = 0
     @Volatile private var stillAspect = 0f
+    /**
+     * 本张成片的**交付档**（卡 H2）：true = 10bit HEIF 链（成片 FBO/readback/dither 全切 10bit）
+     * / false = 现有 8bit JPEG 链。与 [stillRot]/[stillAspect] **同型**：在下发点（submitStill /
+     * tryProcessRaw / tryProcessBurst）按 prefs 冻结 —— 渲染要 3~4s，期间用户去设置页改
+     * 「照片格式」不该改变**这一张**（否则会出现"渲染按 10bit、落盘按 JPEG"这类错配）。
+     */
+    @Volatile private var stillTenBit = false
+
+    /** 交付档的读取点（唯一）：prefs `photo_format`，缺失/脏值 = JPEG（默认档）。 */
+    private fun tenBitForCapture(): Boolean =
+        com.filmkit.app.heif.PhotoFormat.read(context.getSharedPreferences("filmkit", 0)) ==
+            com.filmkit.app.heif.PhotoFormat.HEIF
 
     fun setCaptureAspect(a: Float) {
         captureAspect = a.coerceIn(0.2f, 5f)
@@ -2596,10 +2608,16 @@ class CameraController(private val context: Context, private val render: RenderC
         capturing = false
         capturePhase = 0
         releasePreviewScaleGuard()
-        if (bytes != null) queueJpegSave(bytes, w, h, snap)
+        if (bytes != null) {
+            // 卡 H2：按**冻结的交付档**分派 —— 10bit 流走 HEIF（失败回退 JPEG），
+            // 8bit 流走原 JPEG 链（一字不动）。
+            if (stillTenBit) queueHeifSave(bytes, w, h, snap) else queueJpegSave(bytes, w, h, snap)
+        }
     }
 
     private fun submitStill(img: Image) {
+        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
+        stillTenBit = tenBitForCapture()
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
@@ -2640,6 +2658,7 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill) {
             StillRenderClient.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+                tenBit = stillTenBit,
             ) { bytes, rw, rh ->
                 if (bytes != null) {
                     finishStillCapture(bytes, rw, rh, snap)
@@ -2652,12 +2671,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitStillBuf(
                         y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+                        tenBit = stillTenBit,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
                 }
             }
         } else {
             render.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
+                tenBit = stillTenBit,
             ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap) }
         }
     }
@@ -2748,6 +2769,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // NN 降噪（v0.10.102）：PMRID 接拍照链 —— NN 路线已判死（2026-10-02，
         // 跨域模型不可直接用、微调全过拟合），设置入口已删，恒关；代码路径保留
         val nnDn = false
+        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
+        stillTenBit = tenBitForCapture()
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -2787,7 +2810,7 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill) {
             StillRenderClient.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn,
+                demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
             ) { bytes, w, h ->
                 if (bytes != null) {
                     finishStillCapture(bytes, w, h, snap)
@@ -2800,14 +2823,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
-                        film, demosaic, noiseStrength, nnDn,
+                        film, demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn,
+                demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
             ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap) }
         }
     }
@@ -2977,6 +3000,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 例外：A/B 诊断分支（still_ab 默认关）下发的是 submitStillAb 内部用同一函数
         // 算出的 film，那里另有一份同源快照。
         val snap = snapshotOf(filmStill)
+        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
+        stillTenBit = tenBitForCapture()
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
@@ -3006,7 +3031,7 @@ class CameraController(private val context: Context, private val render: RenderC
         } else if (useStill) {
             StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub, nnDn) { bytes, w, h ->
+                useDft, alignL1, alignAb, p0Sub, nnDn, tenBit = stillTenBit) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -3018,13 +3043,15 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBurst(buffers, strides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
-                        burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn, done)
+                        burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
+                        tenBit = stillTenBit, onDone = done)
                 }
             }
         } else {
             render.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub, nnDn, done)
+                useDft, alignL1, alignAb, p0Sub, nnDn,
+                tenBit = stillTenBit, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -3444,6 +3471,170 @@ class CameraController(private val context: Context, private val render: RenderC
         creator.close()
     }
 
+    // ══ 卡 H2：10bit HEIF 落盘（含**回退链**与读头自检）════════════════════════════
+
+    /** HEIF 落盘入队（与 [queueJpegSave] 同型：主线程只做快照 + 入队）。 */
+    private fun queueHeifSave(
+        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, extraTag: String = "",
+    ) {
+        val iso = liveIso
+        val secNs = liveExposureNs
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.heif_queued",
+            kv("bytes" to bytes.size, "w" to w, "h" to h),
+        )
+        saver.execute { saveHeif(bytes, w, h, iso, secNs, extraTag, snap) }
+    }
+
+    /**
+     * 后台线程：10bit 交付流 → HEVC Main10 编码 → 自研 HEIF 容器 → 落盘 → **读头自检**。
+     *
+     * 回退链（照片优先是项目红线，**任何**失败都不许丢片）：
+     *   ① 编码/容器失败  ⇒ 降级 JPEG（用同一次 10bit readback 降位，**不重渲染**）；
+     *   ② 落盘失败        ⇒ 降级 JPEG；
+     *   ③ 读头自检不合格  ⇒ **删掉刚写的文件**再降级 JPEG（相册里绝不能留下错色/错位深的片子）。
+     * 8bit HEIF 回退**本卡不做**（见报告 §5）：androidx `HeifWriter` 是另一条 API 与另一条
+     * 验证路径，且它只能写 8bit（设计 §2.1）—— 在"默认 JPEG"的前提下没有收益。
+     */
+    private fun saveHeif(
+        rgba10: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
+        extraTag: String, snap: StillSnapshot,
+    ) {
+        val t0 = System.currentTimeMillis()
+        var heif: ByteArray? = null
+        var err: String? = null
+        try {
+            heif = com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h)
+        } catch (t: Throwable) {
+            err = t.message ?: t.toString()
+        }
+        val encMs = System.currentTimeMillis() - t0
+        if (heif == null) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.heif_failed",
+                kv("stage" to "encode", "ms" to encMs, "error" to (err ?: "?")),
+            )
+            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "encode")
+            return
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.heif_encoded",
+            kv("ms" to encMs, "bytes" to heif.size, "w" to w, "h" to h),
+        )
+
+        val now = Date()
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$extraTag.heic"
+        var savedUri: android.net.Uri? = null
+        var savedFile: File? = null
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val cv = android.content.ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/heic")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                context.contentResolver
+                    .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                    ?.let { uri ->
+                        context.contentResolver.openOutputStream(uri)?.use { it.write(heif) }
+                        cv.clear()
+                        cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                        context.contentResolver.update(uri, cv, null, null)
+                        savedUri = uri
+                    }
+            } else {
+                val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
+                dir.mkdirs()
+                val f = File(dir, name)
+                f.outputStream().use { it.write(heif) }
+                savedFile = f
+            }
+        } catch (t: Throwable) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.heif_failed",
+                kv("stage" to "write", "error" to (t.message ?: t.toString())),
+            )
+            runCatching { savedUri?.let { context.contentResolver.delete(it, null, null) } }
+            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "write")
+            return
+        }
+
+        // ── 运行时读头自检（设计 §4.5 判据 A；三件事：meta / colr 1-13-1-1 / hvcC 真 10bit）
+        val head = try {
+            if (savedUri != null) {
+                context.contentResolver.openInputStream(savedUri)?.use {
+                    com.filmkit.app.heif.HeifDeliverCheck.check(it)
+                }
+            } else {
+                savedFile?.let { com.filmkit.app.heif.HeifDeliverCheck.check(it) }
+            }
+        } catch (t: Throwable) {
+            com.filmkit.app.heif.HeifDeliverCheck.Result(
+                false, "{\"read\":false,\"err\":\"${t.message ?: t.toString()}\"}",
+            )
+        }
+        if (head == null || !head.ok) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.heif_head_check_failed",
+                kv("name" to name, "detail" to (head?.detail ?: "{\"read\":false}")),
+            )
+            // 删掉刚写的文件：相册里绝不能留下不符合交付口径的片子
+            val uriToDrop = savedUri
+            val deleted = runCatching {
+                if (uriToDrop != null) context.contentResolver.delete(uriToDrop, null, null) > 0
+                else savedFile?.delete() == true
+            }.getOrDefault(false)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "photo.heif_discarded",
+                kv("name" to name, "deleted" to deleted),
+            )
+            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "head_check")
+            return
+        }
+
+        if (savedUri != null) {
+            lastPhotoUri = savedUri
+            runCatching {
+                appPrefs.edit().putString("last_photo_uri", savedUri.toString()).apply()
+            }
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.heif_saved",
+            kv("name" to name, "w" to w, "h" to h, "iso" to iso,
+                "sec" to "%.4f".format(secNs / 1e9f), "detail" to head.detail),
+        )
+        // 成片参数快照（同 saveJpeg：**落盘成功后**才写，键 = MediaStore 的真实 DISPLAY_NAME）
+        StillSnapshotStore.save(
+            context,
+            savedUri?.let { StillSnapshotStore.fileNameOf(context, it) } ?: name,
+            snap.copy(timeMs = now.time),
+        )
+        // ⚠ 不写 EXIF：自研容器没写 Exif item，而 androidx ExifInterface 对 HEIC 的
+        //   写入会重写文件 —— 在"照片优先"红线面前不值得为元数据冒这个险（报告 §5 待办）。
+    }
+
+    /** HEIF 失败 ⇒ 用**同一次 10bit readback** 降位成 RGBA8 走现有 JPEG 链（不重渲染）。 */
+    private fun fallbackToJpeg(
+        rgba10: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
+        extraTag: String, snap: StillSnapshot, reason: String,
+    ) {
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_WARN, "camera", "photo.heif_fallback_jpeg",
+            kv("reason" to reason, "w" to w, "h" to h),
+        )
+        val rgba8 = try {
+            com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
+        } catch (t: Throwable) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.save_failed",
+                kv("error" to "10bit→8bit 降位失败: ${t.message ?: t.toString()}"),
+            )
+            return
+        }
+        saveJpeg(rgba8, w, h, iso, secNs, extraTag, snap)
+    }
+
     /** 把一帧成片投给后台保存队列。主线程在这里只做两件事：快照拍摄参数、
      *  入队 —— 返回后调用方（相机回调 / 渲染回调）立刻可以继续工作。
      *  日志 photo.save_queued 与 photo.saved 的时间差 = 后台实际耗时，用于验证
@@ -3466,7 +3657,7 @@ class CameraController(private val context: Context, private val render: RenderC
         rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
         extraTag: String = "", snap: StillSnapshot,
     ) {
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
         // 16×16 网格采样平均亮度：诊断「管线输出是否全黑」
         var sum = 0L

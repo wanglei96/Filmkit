@@ -21,6 +21,22 @@ object CameraPresets {
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
     const val COUNT = 99
 
+    /**
+     * `[98] engine_slot` 的**默认档位** = `1`（sigmoid）—— 用户 2026-10-14 拍板
+     * （`docs/rec2020-heif-design.md` §1b P2 行："默认拍照效果全面好于 filmic；filmic 后期可能想删，
+     * 本期先留"）。
+     *
+     * 与 C++ `core/engine/src/film/FilmParams.h` 的 `float engine_slot = 1.0f;` 是**同一件事的两侧**
+     * （那个文件是本仓库"默认值"的单一真源；JVM 单测读不到 C++ 常量，故两侧各写一次、由
+     * `CameraPresetsTest` + `Stage3EngineSlotPresetAuditTest` 钉住）。
+     *
+     * 为什么要一个常量而不是到处写 `1.0`：**"缺 `[98]` 时按哪一档解释"必须全仓一个答案** ——
+     * 读取侧有两类缺省形态（UI 读预设稀疏 slots / 引擎下发前读长度不足的历史快照），
+     * 它们与 C++ 的 `fromDoubles` 缺槽行为（保持结构体默认）必须一致，否则会出现
+     * "渲染走引擎 N、UI 按引擎 M 隐藏参数"的假读数（卡 C 2026-10-14 报过同型缺陷）。
+     */
+    const val DEFAULT_ENGINE_SLOT = 1
+
     private fun put3(a: DoubleArray, i: Int, v0: Double, v1: Double, v2: Double) {
         a[i] = v0; a[i + 1] = v1; a[i + 2] = v2
     }
@@ -306,10 +322,12 @@ object CameraPresets {
                           // 0.35 = 规格默认；[95] = 0 时不可达
         this[97] = 0.70   // glow_threshold：高光阈值（显示域 sRGB 0..1，与 [63] 同口径）；
                           // 0.70 = 规格默认；[95] = 0 时不可达
-        // ── 阶段 0（引擎插槽）：[98] engine_slot ──────────────────────────────
-        // 0 = 内置 filmic（默认、兼容档）⇒ 与改动前行为逐位一致。非 0 会让所有
-        // 现有预设静默切到别的引擎（本阶段还没有第二个引擎，等于渲染失败）。
-        this[98] = 0.0
+        // ── 引擎插槽（阶段 0 落地 / P2 卡改默认）：[98] engine_slot ─────────────
+        // 语义：`0` = 内置 filmic（**合法档位，不再是默认**）；`N` = `EngineRegistry` 第 N 个引擎。
+        // 默认 = [DEFAULT_ENGINE_SLOT] = 1（sigmoid）—— 用户 2026-10-14 拍板（§1b P2）。
+        // ⚠️ 内置预设 `builtin.json` **不含**该键（用户要求预设先不动）⇒ 套用内置预设时
+        //    `cameraPresetParams` 以本函数为底重建 ⇒ 缺键 = 取本行 = sigmoid（见报告 §2）。
+        this[98] = DEFAULT_ENGINE_SLOT.toDouble()
     }
 
     /** 标准 = 原片：全中性（含饱和度 1.0），偏差全部归零便于色彩问题归因 */

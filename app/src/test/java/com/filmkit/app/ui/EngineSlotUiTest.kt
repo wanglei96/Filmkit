@@ -255,23 +255,27 @@ class EngineSlotUiTest {
         assertEquals("契约的已注册引擎必须与 C++ kEngines 表逐项一致", slots, EngineScope.KNOWN_ENGINE_SLOTS.sorted())
         assertEquals("选择面只是契约的有序投影", EngineScope.KNOWN_ENGINE_SLOTS.sorted(), ENGINE_SLOT_CHOICES)
         assertTrue("注册表至少要有两个引擎（阶段 3 的切换才有意义）", ENGINE_SLOT_CHOICES.size >= 2)
-        assertTrue("引擎 0 = 内置 filmic（默认档）", 0 in ENGINE_SLOT_CHOICES)
+        assertTrue("引擎 0 = 内置 filmic（P2 卡起**合法档位**，不再是默认档）", 0 in ENGINE_SLOT_CHOICES)
     }
 
     @Test
     fun engineChoiceLandsInSlot98AndIsReadByTheRenderPath() {
         val p = preset()
+        // ★ P2 卡（2026-10-14 用户拍板默认档 = 1 = sigmoid）后的探针口径：
+        //   预设空 slots 展开后 [98] = 默认档 1 ⇒ **写 1 等于"没改动"**（改动集为空）。
+        //   选择面的"能写 [98]"因此必须用**非默认档**（0 = filmic）来测 —— 否则本用例
+        //   测的是空集（假绿）。
         // ① 选择面 → 改动集（复用参数滑杆那一条 afterEdit 记账）
-        val next = (null as CameraParamOverrides?).afterEdit(p, EngineSlotParam, 1f)
-        assertEquals("选择面必须写 [98]", 1.0, next.values.getValue(98), 1e-9)
+        val next = (null as CameraParamOverrides?).afterEdit(p, EngineSlotParam, 0f)
+        assertEquals("选择面必须写 [98]（非默认档 = filmic）", 0.0, next.values.getValue(98), 1e-9)
         // ② 改动集 → **下发引擎的同一个数组**（`previewCameraParams` → `setFilmParams` 的入参）
-        assertEquals(1, cameraPresetParams(p, next.values, next.removed)[98].toInt())
+        assertEquals(0, cameraPresetParams(p, next.values, next.removed)[98].toInt())
         // ③ 数组 → 预设（「保存」走 cameraPresetSlotsFor；[98] 在进预设的白名单里）
         assertTrue("[98] 必须能进预设", presetSlotIncluded(98))
-        assertEquals(1.0, cameraPresetSlotsFor(p, next.values, next.removed).getValue(98), 1e-9)
-        // ④ 选回原引擎 ⇒ 撤销这次改动（不是"存一个等于原值的覆盖"），保存按钮当场置灰
-        val back = next.afterEdit(p, EngineSlotParam, 0f)
-        assertTrue("选回引擎 0 = 无改动", back.values.isEmpty())
+        assertEquals(0.0, cameraPresetSlotsFor(p, next.values, next.removed).getValue(98), 1e-9)
+        // ④ 选回默认档（引擎 1）⇒ 撤销这次改动（不是"存一个等于原值的覆盖"），保存按钮当场置灰
+        val back = next.afterEdit(p, EngineSlotParam, 1f)
+        assertTrue("选回默认档 1 = 无改动", back.values.isEmpty())
     }
 
     @Test

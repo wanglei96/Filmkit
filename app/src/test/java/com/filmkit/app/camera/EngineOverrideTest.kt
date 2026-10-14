@@ -21,8 +21,11 @@ import java.io.File
  * 画面跑的仍是预设那个引擎。⇒ 判据 2/3 的 `[98]` 断言是核心，不是附带检查。
  *
  * ⛔ 零回归（阶段 3 判据 1）：档位 = 跟随预设时**逐位等价于阶段 3**；预设本来就是引擎 0
- * （含读不到 `[98]` 的短数组、未注册 slot）⇒ 返回**同一实例**。编辑器链路只走这一档
- * （`EditorEngineSession` 不传 override）：编辑一张照片要用它**拍摄时**的引擎。
+ * ⇒ 返回**同一实例**。⚠ P2 卡（用户 2026-10-14 拍板默认引擎 = sigmoid）之后，"读不到 `[98]`"
+ * 的短数组**不再**等价于"引擎 0"：两侧（Kotlin 读取缺省 / C++ `fromDoubles` 缺槽）
+ * 都按**默认档 1** 解释 ⇒ 短数组也走旁路（副本）。未注册 slot 仍是"按 0 处理、不旁路"。
+ * 编辑器链路只走"跟随预设"这一档（`EditorEngineSession` 不传 override）：
+ * 编辑一张照片要用它**拍摄时**的引擎。
  *
  * ⚠ 探针取值不得等于恒等值（§8.1 E5 的假绿陷阱）：`[20]/[21]/[22]/[28]` 的恒等值**都是 1.0**，
  * `[35]/[36]` 是 0.0，`[5..10]` 是 0.01，`[37]/[38]` 是 `FilmParams{}` 的默认黑白点 ——
@@ -185,23 +188,61 @@ class EngineOverrideTest {
         assertSame("未注册档位 + 预设 0 ⇒ 同实例", zero, engineScoped(zero, unregistered))
     }
 
+    // ── ★ P2 卡：出厂默认模板上的三档语义（默认档 = 1）────────────────────────────
+
+    /**
+     * 三档开关 × **出厂默认模板**（`CameraPresets.standard()`：[98] = 1 = sigmoid）。
+     *
+     * 与 [forceSigmoidRewritesSlot98AndNeutralizes] / [forceFilmicRewritesSlot98AndKeepsEverySlot]
+     * 的分工：那两条用"预设 0 / 预设 1"做输入，测的是**强制改写**；本条用默认模板，测的是
+     * "用户什么都不动时三档各自给出什么画面"——即本卡的用户可见行为：
+     *  - 跟随预设（缺省）⇒ sigmoid（**这就是本卡的改动本身**）；
+     *  - 强制 0 ⇒ filmic，且**filmic 参数一个都不能被归零**（`[5]` 仍是 0.01）；
+     *  - 强制 1 ⇒ 与跟随逐位相同（默认档本来就是 1 ⇒ 不产生多余的复制语义差异）。
+     */
+    @Test
+    fun theThreeOverrideLevelsOnTheStockDefaultTemplate() {
+        val stock = CameraPresets.standard()
+        assertEquals("前提：出厂默认档 = 1", CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), stock[98], 0.0)
+
+        val followed = engineScoped(stock, ENGINE_OVERRIDE_FOLLOW_PRESET)
+        assertEquals("跟随预设 ⇒ 默认档 1（sigmoid）", 1.0, followed[98], 0.0)
+        assertNotSame("…且走旁路（副本）", stock, followed)
+
+        val forcedFilmic = engineScoped(stock, 0)
+        assertEquals("强制 0 ⇒ filmic", 0.0, forcedFilmic[98], 0.0)
+        assertEquals("强制 0 ⇒ filmic 参数不得被归零（[5] 仍是标准基线的 0.01）", 0.01, forcedFilmic[5], 0.0)
+
+        assertArrayEquals(
+            "强制 1 与跟随在默认模板上逐位相同（默认档就是 1 ⇒ 无多余改写）",
+            followed, engineScoped(stock, 1), 0.0,
+        )
+    }
+
     // ── 判据 6：短数组（契约升级前的历史快照）不越界 ──────────────────────────────
 
     @Test
-    fun shortArrayIsTreatedAsNoPresetEngineWithoutOverrun() {
-        val short = DoubleArray(50).also { it[36] = 0.5 }   // 读不到 [98]
+    fun shortArrayIsTreatedAsTheDefaultEngineWithoutOverrun() {
+        val short = DoubleArray(50).also { it[36] = 0.5; it[5] = 0.5 }   // 读不到 [98]
 
-        assertSame(
-            "跟随预设 + 读不到 [98] ⇒ 视作无预设引擎（同实例、不越界）",
-            short, engineScoped(short, ENGINE_OVERRIDE_FOLLOW_PRESET),
-        )
-        assertSame("强制 0 与「无预设引擎」同值 ⇒ 也不必复制", short, engineScoped(short, 0))
-
-        val forced = engineScoped(short, 1)
-        assertNotSame("强制 1 与「无预设引擎」不同 ⇒ 副本", short, forced)
-        assertEquals("长度内的槽位照常归零", 0.0, forced[36], 0.0)
-        assertEquals("短数组没有 [98] 可写 ⇒ 不越界（长度不变）", 50, forced.size)
+        // ① 跟随预设 + 读不到 [98] ⇒ 按**默认档 1** 解释（P2 卡起；与 C++ 缺槽 = 1 同值）
+        //    ⇒ 走旁路：副本 + 长度内的表内槽归零，且**不越界**（长度不变）。
+        val followed = engineScoped(short, ENGINE_OVERRIDE_FOLLOW_PRESET)
+        assertNotSame("缺 [98] ⇒ 默认档 1 ⇒ 必须走旁路（副本）", short, followed)
+        assertEquals("长度必须原样带回（不越界写 [98]）", 50, followed.size)
+        assertEquals("[36] 长度内 ⇒ 照常归零", 0.0, followed[36], 0.0)
+        assertEquals("[5] 长度内 ⇒ 照常归零", EngineScope.NEUTRALIZE[5]!!, followed[5], 0.0)
         assertEquals("调用方数组不被污染", 0.5, short[36], 0.0)
+
+        // ② 强制 1 = 与"缺 [98] 的默认档"同值 ⇒ 同一条路径（逐位相同）
+        assertArrayEquals("强制 1 与默认档同值 ⇒ 结果逐位相同", followed, engineScoped(short, 1), 0.0)
+
+        // ③ 强制 0（filmic）⇒ 引擎 0 不旁路；[98] 不在长度内 ⇒ 只复制、不写越界
+        val forced0 = engineScoped(short, 0)
+        assertNotSame("要改 [98] 就必须复制（长度内无可写处 ⇒ 只剩复制这一步）", short, forced0)
+        assertEquals("长度不变", 50, forced0.size)
+        assertEquals("[36] 引擎 0 下不得归零（防误旁路）", 0.5, forced0[36], 0.0)
+        assertArrayEquals("调用方数组逐位不变", short, forced0, 0.0)
     }
 
     // ── 接缝：档位只许进拍照链（[98] 的写法与读法都必须收口）──────────────────────

@@ -281,7 +281,7 @@ internal class EditorEngineSession {
         return try {
             // 输出是显示域 RGBA8（顶行在前，与输入同序）—— 直接按 ARGB_8888 的内存
             // 布局（R,G,B,A）灌进去，不做任何翻转/转换（ADR-7：不插 OETF/EOTF）
-            Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888).apply {
+            Bitmap.createBitmap(outW, outH, EngineBridge.OUTPUT_BITMAP_CONFIG).apply {
                 copyPixelsFromBuffer(ByteBuffer.wrap(bytes))
             }
         } catch (t: Throwable) {

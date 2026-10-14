@@ -504,14 +504,18 @@ struct FilmParams {
   float glow_radius = 0.35f;    // 96 模糊半径（0..1 归一，相对短边；[95]=0 时不可达）
   float glow_threshold = 0.70f; // 97 高光阈值（**显示域** sRGB 0..1，与 [63] 同口径；
                                 //    进 shader 前由 CPU 换算到线性显示域）
-  // ── [98] 引擎插槽（阶段 0，见 `docs/engine-slots-design.md` §6）──────────────
-  // 语义：`0` = 内置 filmic（**默认、兼容档**）；`N` = `EngineRegistry` 第 N 个引擎。
-  // `0` 时行为与改动前**逐位一致**：本阶段没有任何 kernel 读这个值。
+  // ── [98] 引擎插槽（阶段 0 落地；P2 卡改默认，见 `docs/engine-slots-design.md` §6）──
+  // 语义：`0` = 内置 filmic（**合法档位，不再是默认**）；`N` = `EngineRegistry` 第 N 个引擎。
+  // 默认 = **1 = sigmoid** —— 用户 2026-10-14 拍板（"默认拍照效果全面好于 filmic；filmic 后期
+  // 可能想删，本期先留"，`docs/rec2020-heif-design.md` §1b P2）。Kotlin 侧同一件事的落点是
+  // `CameraPresets.DEFAULT_ENGINE_SLOT`（`neutral()` 的 [98]）。
+  // ⚠️ `[98] = 0` 的"引擎 0 路径逐字节零回归"判据**仍然有效**（它证明 filmic 路径没坏，
+  //    是将来删 filmic 时的安全网）；变的只是"默认档基线" ⇒ 今后默认档零回归以引擎 1 为准。
   // 引擎私有参数**不进本数组**（否则每加一个引擎就要动契约布局，重演 PC 的 Fuji
   // 下线 = 33 文件 + Room DB 迁移的事故），走独立有序 KV 通道
   // `nativeSetEngineParams`（阶段 2 才加）。
-  // 旧预设数组长度 ≤ 98（即 < 99）⇒ 读不到该槽 ⇒ 保持结构体默认 ⇒ 与改动前一致。
-  float engine_slot = 0.0f;   // 98
+  // 旧预设数组长度 ≤ 98（即 < 99）⇒ 读不到该槽 ⇒ 保持结构体默认 ⇒ 与本行一致（= 1）。
+  float engine_slot = 1.0f;   // 98
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -640,8 +644,10 @@ struct FilmParams {
     if (n > 95) glow_strength = static_cast<float>(v[95]);
     if (n > 96) glow_radius = static_cast<float>(v[96]);
     if (n > 97) glow_threshold = static_cast<float>(v[97]);
-    // v0.11.27（阶段 0，引擎插槽）：[98] engine_slot。缺槽（旧数组 ≤ 98）时保持
-    // 结构体默认 0.0 = 内置 filmic ⇒ 与改动前逐位一致。
+    // v0.11.27（阶段 0，引擎插槽）：[98] engine_slot。缺槽（旧数组 ≤ 98）时保持结构体
+    // 默认 1.0 = 内置 sigmoid（P2 卡改默认，2026-10-14 用户拍板）——与 Kotlin 侧
+    // `CameraPresets.DEFAULT_ENGINE_SLOT` 及读取缺省**必须同值**，否则会出现
+    // "C++ 走引擎 1、Kotlin 按引擎 0 判断旁路"的第三态（filmic 参数在引擎 1 下未归零）。
     if (n > 98) engine_slot = static_cast<float>(v[98]);
   }
 };

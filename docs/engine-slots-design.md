@@ -171,15 +171,23 @@ prog_film_ = linkProgram(vs_plain_, compileFragment(src));
 ## 5. `FilmParams` 扩展（只加 1 槽）
 
 ```
-[98] engine_slot   // 0 = 内置 filmic（兼容档，默认）；N = 注册表第 N 个引擎
+[98] engine_slot   // 0 = 内置 filmic（合法档位）；默认 = 1 = sigmoid；N = 注册表第 N 个引擎
 ```
+> ⚠ **2026-10-14（P2 卡，用户拍板）**：默认档由 `0`（filmic）改为 **`1`（sigmoid）** ——
+> 理由见 `docs/rec2020-heif-design.md` §1b P2 行（"个人观感默认拍照效果全面好于 filmic；
+> filmic 后期可能想删，本期先留"）。落点 = `FilmParams.h` 的 `engine_slot = 1.0f` +
+> `CameraPresets.DEFAULT_ENGINE_SLOT` + 两处读取缺省；`[98] = 0` 的**逐字节零回归判据保留**
+>（它证明引擎 0 路径没坏，是将来删 filmic 时的安全网），变的只是"默认档基线"。
+> 报告：`docs/reports/r-next-default-engine-sigmoid-REPORT.md`。
 
 - **不新增任何其它槽**。引擎私有参数走独立通道：
   `nativeSetEngineParams(int slot, byte[] orderedKv)`（新增 JNI 方法，与现有 `nativeStillStart` 并列）。
 - **四处同步点**只剩一处变化（`kCount` 98→99），且必须同批改：
   `FilmParams.h:35` / `CameraPresets.kt:22` / `fromDoubles` 防呆 / `CameraPresetsTest` 守卫。
-- 旧预设（长度 98 的数组）按现有"按实际长度读取（下限 26）"语义自然得到 `engine_slot=0`
-  ⇒ **旧预设默认走引擎 0，行为不变**。
+- 旧预设（长度 98 的数组）按现有"按实际长度读取（下限 26）"语义自然得到 `engine_slot` 的
+  **结构体默认值**：阶段 0–3 是 `0`（引擎 0），**P2 卡起是 `1`（sigmoid）** ⇒ 旧预设随默认档走
+  （这不是"行为回归"：它们的 `[98]` 从来就没被写过，语义一直是"用默认引擎"）。Kotlin 侧的
+  读取缺省（UI 读预设稀疏 slots / `engineScoped` 读短数组）读同一个常量，两侧不会分叉。
 
 ---
 

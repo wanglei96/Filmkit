@@ -224,7 +224,9 @@ class RenderClient {
     fun submitStillBuf(
         y: java.nio.ByteBuffer, u: java.nio.ByteBuffer, v: java.nio.ByteBuffer?,
         w: Int, h: Int, yStride: Int, uvStride: Int, uvPix: Int,
-        rotation: Int, film: DoubleArray, onDone: (ByteArray?, Int, Int) -> Unit,
+        rotation: Int, film: DoubleArray,
+        tenBit: Boolean = false,
+        onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h0 = handler
         if (h0 == null) {
@@ -240,7 +242,7 @@ class RenderClient {
             try {
                 bytes = EngineBridge.nativeEngineSubmitStill(
                     y, u, v, w, h, yStride, uvStride, uvPix, rotation, film,
-                    useStill = false,
+                    useStill = false, tenBit = tenBit,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -294,6 +296,7 @@ class RenderClient {
         buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
         meta: RawFrameMeta, rotation: Int, film: DoubleArray,
         demosaic: Int, noiseStrength: Float, nnDn: Boolean,
+        tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -314,7 +317,7 @@ class RenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, nnDn, film, useStill = false,
+                    meta.noiseSigma, nnDn, film, useStill = false, tenBit = tenBit,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -357,6 +360,7 @@ class RenderClient {
         alignAb: Boolean,
         p0Sub: Boolean,
         nnDn: Boolean,
+        tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -380,7 +384,7 @@ class RenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
-                    nnDn, film,
+                    nnDn, film, tenBit = tenBit,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

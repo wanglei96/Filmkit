@@ -433,8 +433,19 @@ class Stage3EngineScopeAuditTest {
         for (s in listOf(28, 35, 36)) {
             assertFalse("[$s] 必须被 presetSlotIncluded 排除（引擎旋钮，不是风格）", presetSlotIncluded(s))
         }
-        // [98] 自己**必须**进预设 —— 它正是这条预设的"引擎选择"
-        assertEquals("engine_slot [98] 必须进预设稀疏集（否则预设带不动引擎选择）", 1.0, sparse[98]!!, 0.0)
+        // [98] 自己：★ P2 卡（默认档 1 = sigmoid）后**默认档就是恒等值 ⇒ 不入库**（稀疏不变式）；
+        // 而**非默认档**（0 = filmic）必须进稀疏集 —— 否则"这条预设用 filmic"的决定被静默丢掉。
+        // （老实现默认档 = 0 时，`[98]=0` 不入库正是同一不变式的另一侧。）
+        assertFalse(
+            "默认档 [98] = standard()[98] ⇒ 必须被稀疏化识别为恒等、不入库" +
+                "（否则每条预设都白背一个引擎键）",
+            98 in sparse,
+        )
+        val filmic = presetSparseSlots(CameraPresets.standard().also { it[98] = 0.0 })
+        assertEquals(
+            "[98] = 0（filmic，非默认档）必须进稀疏集（否则预设带不动引擎选择）",
+            0.0, filmic[98]!!, 0.0,
+        )
     }
 
     // ══════════════════════════════════════════════════════════════════════════

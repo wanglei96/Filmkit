@@ -37,6 +37,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import com.filmkit.app.heif.PhotoFormat
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,6 +60,10 @@ import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.NoiseCalibStore
 import com.filmkit.app.camera.resolveCameraPreset
+import com.filmkit.app.diag.Heif10BitProbe
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /**
@@ -145,6 +151,25 @@ fun SettingsScreen(
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "settings.jpeg_444",
                         "{\"on\":$on}",
+                    )
+                },
+            )
+            // ── 卡 H2：照片格式（用户 2026-10-14 拍板 P3：默认 JPEG，HEIF 可选）──────
+            // 两档循环，交互沿用同文件既有形态（点一次切一档，不新造控件）。
+            var photoFormat by remember { mutableStateOf(PhotoFormat.read(prefs)) }
+            SettingValueRow(
+                title = "照片格式",
+                subtitle = "JPEG = 现有交付链（默认，一字不动）；HEIF = 10bit 交付" +
+                    "（HEVC Main10 + sRGB 显示域，容器 colr/nclx = 1/13/1/1，pixi 3×10bit）。" +
+                    "HEIF 编码失败或落盘后读头自检不合格会自动回退 JPEG —— 不会丢照片",
+                valueText = PhotoFormat.label(photoFormat),
+                onTap = {
+                    val v = if (photoFormat == PhotoFormat.HEIF) PhotoFormat.JPEG else PhotoFormat.HEIF
+                    photoFormat = v
+                    PhotoFormat.write(prefs, v)
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.photo_format",
+                        "{\"photo_format\":\"${if (v == PhotoFormat.HEIF) "heif" else "jpeg"}\"}",
                     )
                 },
             )
@@ -488,13 +513,16 @@ private fun ToneColorDrawerContent() {
      * 持久化（第二份 = 必然漂移的真相），也不改 `CameraController`（引擎槽位的运行期真源在那
      * 边，属另一张卡的"参数旁路"范围）。
      *
-     * `slots[98]` 缺失 ⇒ 0（与 `cameraPresetParams` 展开时的基线取值同一条口径：缺失 = 默认档）。
+     * `slots[98]` 缺失 ⇒ [CameraPresets.DEFAULT_ENGINE_SLOT]（P2 卡起 = 1 = sigmoid）——
+     * 与 `cameraPresetParams` 展开时的基线取值（`CameraPresets.standard()`）**同一条口径**：
+     * 缺失 = 默认档。⛔ 不许退回硬编码 0：内置预设（`builtin.json` 不含该键）在本抽屉里会显示
+     * "引擎 0"，而实际渲染走引擎 1 —— 正是卡 C 2026-10-14 报过的"UI 按 A 引擎、渲染按 B 引擎"同型假读数。
      */
     val presetEngineSlot = remember {
         resolveCameraPreset(
             prefs.getString("camera_preset_id", null),
             BuiltinPresets.all(context, prefs),
-        ).slots[ENGINE_SLOT]?.toInt() ?: 0
+        ).slots[ENGINE_SLOT]?.toInt() ?: CameraPresets.DEFAULT_ENGINE_SLOT
     }
     // ★ 阶段 3b（用户 2026-10-14 拍板）：**生效引擎** = 上面的预设 `[98]` ⊕ 下面那个三档开关。
     // 合成规则**不在这里**（唯一真源 = `EngineScope.effectiveEngineSlot`，含"未注册档位按跟随
@@ -813,6 +841,39 @@ private fun LowLightDrawerContent() {
 private fun LabDrawerContent() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    // 10bit HEIF 交付链能力探针（实现卡 A0；方案 docs/rec2020-heif-design.md §4.1）：
+    // 点一次 = 枚举 HEVC 编码器能力 → CPU 造已知测试图 → MediaCodec HEVC Main10 编 1 帧 →
+    // MediaMuxer(MUXER_OUTPUT_HEIF) 落盘 → 回读解析 colr/nclx 与 hvcC 位深。
+    // 全过程结论进 JSONL 日志（事件 heif10.probe / heif10.encoder / heif10.nclx），
+    // .heic 落在应用外部私有目录 heif10/ 下（报告里给出取文件路径）。
+    val heif10Scope = rememberCoroutineScope()
+    var heif10Out by remember { mutableStateOf<String?>(null) }
+    var heif10Running by remember { mutableStateOf(false) }
+    SettingNavRow(
+        if (heif10Running) "10bit HEIF 探针（运行中…）" else "10bit HEIF 能力探针",
+        "查 HEVC Main10/P010 编码器 → 编 1 帧测试图写 HEIF → 回读 colr/nclx 与位深；结论看日志 heif10.*",
+    ) {
+        if (!heif10Running) {
+            heif10Running = true
+            heif10Scope.launch {
+                val r = withContext(Dispatchers.IO) {
+                    runCatching { Heif10BitProbe.run(context) }
+                        .getOrElse { "探针异常：$it" }
+                }
+                heif10Out = r
+                heif10Running = false
+            }
+        }
+    }
+    heif10Out?.let {
+        Text(
+            "10bit HEIF 探针输出：$it",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            modifier = Modifier.padding(start = 16.dp, bottom = 6.dp),
+        )
+    }
 
     // 频域合并（降噪专项 A，2026-09-29 立项）：HDR+ §5 式 6/7 DFT 逐频
     // 收缩合并，替换 mismatch 加权融合。并联开关保留原路径（A/B 口径）。

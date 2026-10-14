@@ -129,7 +129,10 @@ internal fun engineScoped(
     p: DoubleArray,
     override: Int = ENGINE_OVERRIDE_FOLLOW_PRESET,
 ): DoubleArray {
-    val presetSlot = if (p.size > 98) p[98].toInt() else 0
+    // 短数组（契约升级前的历史快照）读不到 [98] ⇒ 按**默认档**解释，与 C++ `FilmParams`
+    // 的 `fromDoubles`（缺槽保持结构体默认 = 1 = sigmoid，P2 卡起）**必须同值**——否则会出现
+    // "C++ 走引擎 1 + filmic 参数未归零"的第三态（卡 C 报的 P2 同型）。
+    val presetSlot = if (p.size > 98) p[98].toInt() else CameraPresets.DEFAULT_ENGINE_SLOT
     val effective = EngineScope.effectiveEngineSlot(presetSlot, override)
     // 跟随预设 ⇒ 阶段 3 原路径：slot 0 / 未注册都是"同实例且不碰任何槽"，[98] 原样
     if (effective == presetSlot) return EngineScope.applyEngineScope(p, effective)

@@ -1,5 +1,6 @@
 package com.filmkit.app.ui
 
+import com.filmkit.app.camera.EngineScope
 import com.filmkit.app.camera.presetSlotIncluded
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -46,11 +47,26 @@ class CameraPresetsTest {
     }
 
     @Test
-    fun stage0EngineSlotDefaultsToBuiltinFilmic() {
-        // 阶段 0 护栏：[98] 必须为 0 = 内置 filmic（兼容档）。
-        // 非 0 会让现有预设静默指向不存在的引擎 —— 本阶段注册表只有引擎 0。
+    fun defaultEngineSlotIsSigmoidAndFilmicStaysAValidSlot() {
+        // ★ P2 卡（用户 2026-10-14 拍板）：默认影调引擎 **filmic → sigmoid**。
+        //   用户原话（`docs/rec2020-heif-design.md` §1b P2 行）："个人观感默认拍照效果全面好于
+        //   filmic；filmic 后期可能想删，本期先留"。
+        //   本断言 = 默认档的机器判据；C++ 侧同一件事 = `FilmParams.h` 的
+        //   `float engine_slot = 1.0f;`（跨文件对拍见 Stage3EngineSlotPresetAuditTest）。
         val p = CameraPresets.standard()
-        assertEquals("slot[98] engine_slot 必须为 0（内置 filmic）", 0.0, p[98], 0.0)
+        assertEquals(
+            "slot[98] engine_slot 的默认档必须 = 1（内置 sigmoid）",
+            CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), p[98], 0.0,
+        )
+        assertEquals(
+            "默认档常量本身（与 C++ `FilmParams.h` 的默认值同值；缺 [98] 的读取缺省也读它）",
+            1, CameraPresets.DEFAULT_ENGINE_SLOT,
+        )
+        // `[98] = 0` 仍是**合法档位**（filmic 未删、行为未改）：
+        //   "引擎 0 路径逐字节零回归"判据保留为守卫（离线链 `film_d5.npy` crc32 `0x589f8364`），
+        //   它是将来删 filmic 时的安全网。⇒ 注册表里 0 与 1 都在。
+        assertTrue("0（filmic）与 1（sigmoid）都必须仍在注册表里", 0 in EngineScope.KNOWN_ENGINE_SLOTS)
+        assertTrue("1（sigmoid）必须是默认档", CameraPresets.DEFAULT_ENGINE_SLOT in EngineScope.KNOWN_ENGINE_SLOTS)
         // ★ 设计决策（架构师 2026-10-13 拍板，与 [PRESET_ENGINE_KNOB_SLOTS] 相反）：
         //   **engine_slot 属于「口味」而非「引擎状态」** —— 阶段 3 验收要求"预设 schema 支持
         //   engine_slot + 私有 KV"（`docs/engine-slots-design.md` §8），即每条预设各自记住

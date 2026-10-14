@@ -58,6 +58,37 @@ class EngineScopeTest {
     private fun baseline(engineSlot: Int): DoubleArray =
         CameraPresets.standard().also { it[98] = engineSlot.toDouble() }
 
+    // ── ★ P2 卡（2026-10-14 拍板）：**出厂默认模板 = 引擎 1** ───────────────────
+
+    /**
+     * 默认档 = 引擎 1 的**端到端落点**：`CameraPresets.standard()`（拍照链路 `CameraController`
+     * 的 `filmParams` 初值、预设展开的基线）**未经任何修改**时 `[98]` = 1 ⇒ `engineScoped`
+     * 直接走旁路。
+     *
+     * 为什么值得一条独立用例：判据 2 的其它用例都是 `baseline(1)` **显式写** 1 的（它们测的是
+     * "给定 slot=1 时的旁路行为"，与默认档无关）—— 于是"默认值本身是不是 1"没人测。
+     * 而本卡的失败方式恰恰是：默认值忘了改（或只改了 C++ 一侧），此时判据 2 全绿、用户成片
+     * 却仍是 filmic。本用例是那条断言的守门人。
+     */
+    @Test
+    fun stockDefaultTemplateIsEngineOneAndTakesTheBypassPath() {
+        val stock = CameraPresets.standard()
+        assertEquals(
+            "[98] 默认档必须 = CameraPresets.DEFAULT_ENGINE_SLOT（= 1 = sigmoid）",
+            CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), stock[98], 0.0,
+        )
+        val out = engineScoped(stock)
+        assertNotSame("默认档 = 1 ⇒ 必须走旁路（副本）", stock, out)
+        assertEquals("[28] 归零到 1.0（sigmoid 的应用权重；置 0 会让引擎 1 空转）", 1.0, out[28], 0.0)
+        assertEquals("[36] local_tone 归零", 0.0, out[36], 0.0)
+        assertEquals("[5] latitude 归零", EngineScope.NEUTRALIZE[5]!!, out[5], 0.0)
+        assertEquals("[98] 原样保留 1（旁路不得把引擎槽位本身改掉）", 1.0, out[98], 0.0)
+        assertArrayEquals(
+            "默认模板本身不得被改写（`CameraController.filmParams` 持有它的引用）",
+            CameraPresets.standard(), stock, 0.0,
+        )
+    }
+
     // ── 判据 1：engine_slot = 0 ⇒ 同一实例 + 逐位不变（阶段 2 零回归）───────────
 
     @Test
@@ -250,9 +281,24 @@ class EngineScopeTest {
     // ── 边界：历史快照更短 / [98] 是坏数据或未注册 slot ────────────────────────
 
     @Test
-    fun shortArrayIsTreatedAsSlotZeroWithoutCrash() {
-        val short = DoubleArray(50)   // 契约升级前的历史快照
-        assertSame("读不到 [98] ⇒ 视作引擎 0（不归零、不越界）", short, engineScoped(short))
+    fun shortArrayWithoutSlot98IsInterpretedAsTheDefaultEngine() {
+        // 契约升级前的历史快照（长度 < 99）读不到 [98]。★ P2 卡（2026-10-14 拍板默认档 = sigmoid）
+        // 起，"读不到"的语义 = **默认档**（1），**不是**"引擎 0" —— 与 C++ `FilmParams::fromDoubles`
+        // 缺槽时保持结构体默认（= 1）**必须同值**。
+        // ⛔ 两侧分叉的后果是**第三种状态**：C++ 按 1 走 sigmoid、Kotlin 按 0 不旁路 ⇒
+        //    filmic 参数（[5..10]/[37]/[38]/[20..22]/[28]/[35]/[36]）在引擎 1 下**仍然生效**。
+        val short = DoubleArray(50) { 1.0 }
+        val out = engineScoped(short)
+        assertNotSame("缺 [98] ⇒ 按默认档 1 解释 ⇒ 走旁路（返回副本）", short, out)
+        assertEquals("长度必须原样带回（不越界）", 50, out.size)
+        // ⚠ 探针值 1.0 与 [28]/[20] 的恒等值同为 1.0 ⇒ 那些槽在本用例里假绿；用恒等值 ≠ 1 的槽。
+        assertEquals("[36] local_tone 长度内 ⇒ 照常归零", 0.0, out[36], 0.0)
+        assertEquals("[5] latitude 长度内 ⇒ 照常归零", EngineScope.NEUTRALIZE[5]!!, out[5], 0.0)
+        assertArrayEquals("调用方数组不得被污染", DoubleArray(50) { 1.0 }, short, 0.0)
+        assertEquals(
+            "默认档常量 = 1（C++ 侧同值由 Stage3EngineSlotPresetAuditTest 跨文件对拍）",
+            1, CameraPresets.DEFAULT_ENGINE_SLOT,
+        )
     }
 
     @Test

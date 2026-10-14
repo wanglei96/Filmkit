@@ -619,7 +619,7 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
     JNIEnv* env, jobject, jobject y_buf, jobject u_buf, jobject v_buf, jint w,
     jint h, jint y_stride, jint uv_stride, jint uv_pix, jint rotation,
-    jdoubleArray film, jboolean use_still) {
+    jdoubleArray film, jboolean use_still, jboolean ten_bit) {
   FrameRenderer* r = g_renderer;
   if (use_still == JNI_TRUE) {
     if (g_renderer_still.load() == nullptr) {
@@ -637,12 +637,13 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
   const bool ok = r->submitStill(
       env->GetDirectBufferAddress(y_buf), env->GetDirectBufferAddress(u_buf),
       v_buf ? env->GetDirectBufferAddress(v_buf) : nullptr, w, h, y_stride,
-      uv_stride, uv_pix, rotation, p, &rgba);
+      uv_stride, uv_pix, rotation, p, &rgba, ten_bit == JNI_TRUE);
   Logger::instance().log(
       LogLevel::kInfo, "camera", "render.single_done",
       "{\"kind\":\"yuv\",\"path\":\"" +
           std::string(use_still == JNI_TRUE ? "still" : "preview") +
-          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          "\",\"bits\":" + (ten_bit == JNI_TRUE ? "10" : "8") +
+          ",\"ms\":" + std::to_string(nowMs() - t0) +
           ",\"ok\":" + (ok ? "true" : "false") +
           ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
@@ -714,7 +715,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     // 落到 nn_dn 上（NN"已判死恒关"却真跑），film 数组落到 use_still（jboolean）、
     // nnDn=false 落到 film ⇒ FilmParams 解析到垃圾 ⇒ **整帧参数全错、成片全黑**。
     // 该路径只在"多帧融合=关"时走到，故长期未被发现（2026-10-05 用户实测暴露）。
-    jboolean nn_dn, jdoubleArray film, jboolean use_still) {
+    jboolean nn_dn, jdoubleArray film, jboolean use_still, jboolean ten_bit) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -768,12 +769,14 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
       lsc_ptr, lsc_cols, lsc_rows, rotation, p, demosaic, noise_strength,
-      model_ok ? model6 : nullptr, noise_sigma, nn_dn == JNI_TRUE, &rgba);
+      model_ok ? model6 : nullptr, noise_sigma, nn_dn == JNI_TRUE, &rgba,
+      ten_bit == JNI_TRUE);
   Logger::instance().log(
       LogLevel::kInfo, "camera", "render.single_done",
       "{\"kind\":\"raw\",\"path\":\"" +
           std::string(use_still == JNI_TRUE ? "still" : "preview") +
-          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          "\",\"bits\":" + (ten_bit == JNI_TRUE ? "10" : "8") +
+          ",\"ms\":" + std::to_string(nowMs() - t0) +
           ",\"ok\":" + (ok ? "true" : "false") +
           ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;
@@ -794,7 +797,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
     jboolean align_ab, jboolean p0_sub, jboolean nn_dn, jdoubleArray film,
-    jboolean use_still) {
+    jboolean use_still, jboolean ten_bit) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -863,14 +866,15 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
       lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale,
       use_dft == JNI_TRUE, align_l1 == JNI_TRUE, align_ab == JNI_TRUE,
-      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, &rgba);
+      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, &rgba, ten_bit == JNI_TRUE);
   // 每次 burst 落一条路径/耗时/结果记录（v0.10.85 审查 P2）：raw.render 不区分实例，
   // 靠这条把"哪条路、第几张、多久、成没成"钉住；失败也必须留痕。
   Logger::instance().log(
       LogLevel::kInfo, "camera", "render.burst_done",
       "{\"seq\":" + std::to_string(g_burst_seq.fetch_add(1) + 1) +
           ",\"path\":\"" + (use_still == JNI_TRUE ? "still" : "preview") +
-          "\",\"ms\":" + std::to_string(nowMs() - t0) +
+          "\",\"bits\":" + (ten_bit == JNI_TRUE ? "10" : "8") +
+          ",\"ms\":" + std::to_string(nowMs() - t0) +
           ",\"ok\":" + (ok ? "true" : "false") +
           ",\"bytes\":" + std::to_string(rgba.size()) + "}");
   if (!ok) return nullptr;

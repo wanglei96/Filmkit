@@ -1,5 +1,6 @@
 package com.filmkit.app
 
+import android.graphics.Bitmap
 import android.view.Surface
 import java.nio.ByteBuffer
 
@@ -29,6 +30,11 @@ object EngineBridge {
     const val LEVEL_INFO = 1
     const val LEVEL_WARN = 2
     const val LEVEL_ERROR = 3
+
+    // 引擎输出交付位深的 Kotlin 侧真源（C++ 侧 = core/engine/src/render/OutputBitDepth.h）：
+    // 引擎回传的 RGBA 字节流按此 Config 解释。提位深时必须与 C++ 侧同批改
+    // （守卫：tools/check-bitdepth-single-source.py 检查两侧位深一致）。
+    val OUTPUT_BITMAP_CONFIG: Bitmap.Config = Bitmap.Config.ARGB_8888
 
     // ── M0 ──
     external fun nativeInitLogger(dir: String): Boolean
@@ -84,6 +90,7 @@ object EngineBridge {
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
         rotation: Int, film: DoubleArray,
         useStill: Boolean = false,
+        tenBit: Boolean = false,
     ): ByteArray?
 
     /**
@@ -140,6 +147,7 @@ object EngineBridge {
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         nnDn: Boolean, film: DoubleArray,
         useStill: Boolean = false,
+        tenBit: Boolean = false,
     ): ByteArray?
 
     /**
@@ -173,6 +181,7 @@ object EngineBridge {
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
         alignAb: Boolean, p0Sub: Boolean, nnDn: Boolean, film: DoubleArray,
         useStill: Boolean = false,
+        tenBit: Boolean = false,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

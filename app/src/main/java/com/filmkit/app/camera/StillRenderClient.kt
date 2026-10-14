@@ -185,6 +185,7 @@ object StillRenderClient {
         alignAb: Boolean,
         p0Sub: Boolean,
         nnDn: Boolean,
+        tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -210,7 +211,7 @@ object StillRenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
-                    nnDn, film, useStill = true,
+                    nnDn, film, useStill = true, tenBit = tenBit,
                 )
                 if (bytes == null) {
                     // 合成失败先自愈再谈回退（v0.10.89）：真机 0.10.88 出现过
@@ -227,7 +228,7 @@ object StillRenderClient {
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
                             meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb,
-                            p0Sub, nnDn, film, useStill = true,
+                            p0Sub, nnDn, film, useStill = true, tenBit = tenBit,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
@@ -270,6 +271,7 @@ object StillRenderClient {
         buf: java.nio.ByteBuffer, width: Int, height: Int, rowStridePx: Int,
         meta: RenderClient.RawFrameMeta, rotation: Int, film: DoubleArray,
         demosaic: Int, noiseStrength: Float, nnDn: Boolean,
+        tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -292,7 +294,7 @@ object StillRenderClient {
                     meta.neutral[0], meta.neutral[1], meta.neutral[2],
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
-                    meta.noiseSigma, nnDn, film, useStill = true,
+                    meta.noiseSigma, nnDn, film, useStill = true, tenBit = tenBit,
                 )
                 if (bytes == null) {
                     // 自愈一次（v0.10.89 同款："空闲释放后重建，首次合成纹理分配
@@ -305,7 +307,7 @@ object StillRenderClient {
                             meta.neutral[0], meta.neutral[1], meta.neutral[2],
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
-                            meta.noiseSigma, nnDn, film, useStill = true,
+                            meta.noiseSigma, nnDn, film, useStill = true, tenBit = tenBit,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
@@ -346,6 +348,7 @@ object StillRenderClient {
         y: java.nio.ByteBuffer, u: java.nio.ByteBuffer, v: java.nio.ByteBuffer?,
         width: Int, height: Int, yStride: Int, uvStride: Int, uvPix: Int,
         rotation: Int, film: DoubleArray,
+        tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -364,14 +367,14 @@ object StillRenderClient {
             try {
                 bytes = EngineBridge.nativeEngineSubmitStill(
                     y, u, v, width, height, yStride, uvStride, uvPix,
-                    rotation, film, useStill = true,
+                    rotation, film, useStill = true, tenBit = tenBit,
                 )
                 if (bytes == null) {
                     EngineBridge.nativeStillDestroy()
                     if (EngineBridge.nativeStillStart()) {
                         bytes = EngineBridge.nativeEngineSubmitStill(
                             y, u, v, width, height, yStride, uvStride, uvPix,
-                            rotation, film, useStill = true,
+                            rotation, film, useStill = true, tenBit = tenBit,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",

@@ -11,6 +11,7 @@
 
 #include "../film/FilmParams.h"
 #include "../film/SigmoidParams.h"
+#include "OutputBitDepth.h"  // 交付位深单一真源（8bit JPEG / 10bit HEIF，卡 H2）
 
 namespace filmkit {
 
@@ -164,9 +165,14 @@ class FrameRenderer {
 
   // 静拍：全分辨率 YUV（CPU 转 RGB888 上传，避开 RG8 TexSub 驱动问题）
   // → 胶片链 → RGBA8 读回。旋转后尺寸 = (rot 为奇数 ? (h,w) : (w,h))。
+  // ten_bit（卡 H2）：true = 成片按**10bit 交付档**出（tex_cap_ 用 GL_RGB10_A2、
+  //   readback 用 GL_UNSIGNED_INT_2_10_10_10_REV、dither 除数 1023）——字节流仍是
+  //   4 B/像素（packed uint32，位序见 OutputBitDepth.h），由 Kotlin 侧解包。
+  //   false = 现有 8bit 链（**逐位不变**，JPEG 路径的零回归守卫）。
   bool submitStill(const void* y, const void* u, const void* v, int w, int h,
                    int y_stride, int uv_stride, int uv_pix, int rotation,
-                   const FilmParams& p, std::vector<uint8_t>* out_rgba);
+                   const FilmParams& p, std::vector<uint8_t>* out_rgba,
+                   bool ten_bit = false);
 
   // 编辑器通路（E1-3，2026-10-08）：**已经过 OETF 的成片**（RGBA8，显示域 sRGB，
   // 顶行在前）→ 只重跑 OETF 之后的三段（3D LUT → 颗粒 → TPDF dither）→ RGBA8 读回。
@@ -214,7 +220,7 @@ class FrameRenderer {
                  int lsc_rows, int rotation, const FilmParams& p, int demosaic,
                  float noise_strength, const float* noise_model,
                  float noise_sigma, bool nn_dn,
-                 std::vector<uint8_t>* out_rgba);
+                 std::vector<uint8_t>* out_rgba, bool ten_bit = false);
 
   // RAW 多帧融合（MFNR 阶段一，v0.9.0）：count 帧 u16 Bayer → Bayer 域
   // tile 对齐（Align.cpp，CPU 金字塔搜索）+ 置信度加权时域均值 → P0 降噪位
@@ -232,7 +238,7 @@ class FrameRenderer {
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
                       bool align_ab, bool p0_sub, bool nn_dn,
-                      std::vector<uint8_t>* out_rgba);
+                      std::vector<uint8_t>* out_rgba, bool ten_bit = false);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
   // 下采样 → 读回统计到 out[0..n-1]（n 建议 256）。渲染线程调用；无可用帧返回 false。
@@ -368,6 +374,10 @@ class FrameRenderer {
     // "同一张可复现"与"不同张不同图案"（darktable 用文件名 hash 达到同一目的）。
     uint32_t grain_fp = 0;
     std::string mfnr_kv;  // MFNR 时非空：追加进 raw.render
+    // 卡 H2：10bit 交付档（HEIF）。true ⇒ 成片 tex_cap_ = GL_RGB10_A2、readback 用
+    // GL_UNSIGNED_INT_2_10_10_10_REV、dither 除数 1023（三处同源，见 OutputBitDepth.h）。
+    // 由 submitRaw / submitRawBurst 的 ten_bit 参数填充；submitStill 不走本结构。
+    bool ten_bit = false;
   };
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
@@ -662,7 +672,10 @@ class FrameRenderer {
   // 回落引擎 0，符合方案 §4 契约 5：不 identity 伪装、不崩）。
   bool buildFilmProgram(int slot);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
-  void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
+  // out_max —— dither 除数 = **交付档上限**（卡 H2）。默认 kOutputMax(255) = 8bit 链，
+  //   与改动前逐位一致；10bit HEIF 链传 kOutput10Max(1023)。见 OutputBitDepth.h。
+  void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra,
+                  float out_max = static_cast<float>(kOutputMax));
   // E1-3 编辑器通路：显示域输入 → LUT/颗粒/dither → fbo_cap_（RGBA8）
   // E2-12：w/h = **输出**尺寸（裁剪后）；crop_uv/crop_rot 见 submitDisplay 注释
   // （nullptr = 全幅 + rot=0 ⇒ 与改动前逐位一致）。
@@ -671,7 +684,27 @@ class FrameRenderer {
   void passFill(int dst_w, int dst_h);
 
   static void makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w, int h);
-  void logPassDiag(const char* stage, GLuint fbo, bool half_float);
+  // internal —— 目标附件的**内部格式**（不再是 bool half_float 二态）：读回口径由
+  //   OutputBitDepth.h 的 isOutputInternal / outputUploadTypeOf 给出 ⇒ 10bit 档
+  //   （GL_RGB10_A2）也能取 (0,0) 诊断像素。用 8bit 口径去读 GL_RGB10_A2 是非法
+  //   组合，会把 GL_INVALID_OPERATION 误报成"渲染失败"（诊断本身变成事故源）。
+  void logPassDiag(const char* stage, GLuint fbo, GLenum internal);
+  // ── 卡 H2：10bit 交付档的**绝对**读回自检（防"静默交付错文件"）─────────────
+  // 为什么需要：GL_UNSIGNED_INT_2_10_10_10_REV 的位序（LSB-first：bit0..9=R、
+  //   10..19=G、20..29=B）是下游 Kotlin 解包（Heif10Pipeline.unpackRgb10）的**唯一
+  //   依据**；若驱动/平台实际布局不同，整幅成片会错色且**不报任何错**。
+  // 做法：建 1×6 的 10bit 交付 FBO → 分段 glClear **已知浮点值**（含 R/G/B 各自
+  //   独占满量程的三个 case ⇒ 通道位序一旦不符立刻红）→ 按交付口径 readback →
+  //   与"浮点 → 10bit 定点四舍五入"的规范期望逐点比对（容差 1 LSB）。
+  // ⚠ 必须用已知值做**绝对**比对：上传/下载往返（round-trip）同错会互相抵消，
+  //   测不出布局错误（这正是本自检不用 glTexSubImage2D 往返的原因）。
+  // 返回 true = 驱动行为与本项目解包口径一致；detail = 逐点实测（进日志）。
+  bool selfCheck10BitReadback(std::string* detail);
+  // 进程级**一次性**执行（结果缓存；两个 FrameRenderer 实例共享 —— 自检只取决于
+  // 驱动行为，与场景/参数无关）。失败 ⇒ 调用方**拒绝本次 10bit 交付**并回退，
+  // 这是"防静默交付错文件"的 fail-closed 落点。
+  bool selfCheck10BitOnce();
+
   // ── E4-3 颗粒：128×128 R16F 相纸响应 LUT（darktable grain.c 的 evaluate_grain_lut）
   // mb = [60]、pivot = [61]（pivot 折进 LUT 亮度轴，见 GrainLut.h 的理由）。
   // 缓存键 = (mb, pivot)：两者都未变则立即返回（每帧调用一次，开销 = 两次比较）。
@@ -1147,9 +1180,14 @@ class FrameRenderer {
                GLint loc_dinv, GLint loc_size, float strength);
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
-  GLuint fbo_cap_ = 0, tex_cap_ = 0;      // RGBA8 拍照读回
+  GLuint fbo_cap_ = 0, tex_cap_ = 0;      // 成片读回（8bit RGBA8 / 10bit GL_RGB10_A2）
   int scene_w_ = 0, scene_h_ = 0;
   int cap_w_ = 0, cap_h_ = 0;
+  // 卡 H2：tex_cap_ 当前所在的**交付档**（false = 8bit RGBA8 / true = 10bit GL_RGB10_A2）。
+  // ⚠ 必须与尺寸一起记账：两个档的内部格式与 readback 口径都不同，若只按尺寸判断复用，
+  //   连续拍"同尺寸的 JPEG 与 HEIF"会复用错档的 tex_cap_（8bit 附件按 2_10_10_10_REV 读
+  //   = 非法组合/整幅错色，且**不报错**）。编辑器链路恒 8bit，也靠它把 10bit 附件换回来。
+  bool cap_ten_bit_ = false;
   std::atomic<int64_t> frames_{0};
 
   struct {
@@ -1383,7 +1421,11 @@ class FrameRenderer {
           tone_on = -1,
           // SG-1 柔光：与 u_style_ 同名同义 —— 两条链路共用一段**逐字相同**的
           // shader 逻辑（glowFetch + Screen），落点都在各自 shader 的显示域段。
-          glow = -1, glow_on = -1, glow_strength = -1, glow_texel = -1;
+          glow = -1, glow_on = -1, glow_strength = -1, glow_texel = -1,
+          // 卡 H2：dither 除数（交付档上限）。8bit = 255.0、10bit HEIF = 1023.0 ——
+          // 值来自 OutputBitDepth.h 的 outputMaxOf()，**只在成片链**按档切换
+          //（预览/编辑器恒 8bit）。见 kFsOut 的 dither 行注释。
+          out_max = -1;
   } u_out_;
   // kFsStyle（E1-3 编辑器通路）
   struct {

@@ -1,22 +1,30 @@
 package com.filmkit.app.camera
 
 import com.filmkit.app.ui.CameraPresets
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 阶段 3 预设 schema：**`[98] engine_slot` 进预设之后的向后兼容**。
+ * 阶段 3 预设 schema：**`[98] engine_slot` 进预设之后的向后兼容**（P2 卡后口径更新）。
  *
- * 判据（架构师 §8.1 阶段表第 3 行）：**旧预设（JSON 里不含 `engine_slot`）加载后必须逐字节等价**，
- * `[98]` 落到默认 `0`。
+ * 判据（架构师 §8.1 阶段表第 3 行）：**旧预设（JSON 里不含 `engine_slot`）加载后必须逐位等价**，
+ * `[98]` 落到**展开基线**（`CameraPresets.standard()`）的值。
+ *
+ * ★ **P2 卡（用户 2026-10-14 拍板）把"默认档"从 0（filmic）改为 1（sigmoid）** ⇒ 本文件的口径
+ * 随之翻转，且**两件事都要钉**：
+ *  - 缺 `[98]` ⇒ 落 `CameraPresets.DEFAULT_ENGINE_SLOT` = **1**（默认档，不是硬编码 0）；
+ *  - `[98] = 0` 从"恒等值（不入库）"变为**合法非默认档位（要入库）** —— 否则用户"这条预设
+ *    用 filmic"的决定会被静默丢掉。
  *
  * 为什么值得单独一组：`[98]` 是**第一个进预设的"引擎状态"槽**（其余同类 `[28]/[30..33]/[35]/[36]`
  * 都被 `PRESET_ENGINE_KNOB_SLOTS` 挡在库外）⇒ 它是线格式里唯一能"改变渲染引擎"的键。
- * 它的失败方式是**静默**的：老预设若被解读成"引擎 = 0"或"引擎 = 未定义"，都会让用户在
- * 引擎 1 下套一条旧预设时**被悄悄切回 filmic**（或反之），而画面变化只表现为"风格不对"。
+ * 它的失败方式是**静默**的：老预设若被解读成"引擎 = 0"或"引擎 = 未定义"，都会让用户在默认档
+ * （引擎 1）下套一条旧预设时**被悄悄切回 filmic**（或反之），而画面变化只表现为"风格不对"。
  *
  * 与 `EditorPresetTest`（线格式 / 稀疏化 / 容错的**主用例**）分工：本文件只问 `[98]` 的三件事
  * —— ① 旧预设**不带**它时行为是否逐位不变；② 它自己能不能完整往返；③ 它进了库之后，
@@ -47,16 +55,21 @@ class Stage3EngineSlotPresetAuditTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // ① 旧预设（无 engine_slot 键）⇒ 逐字节等价
+    // ① 旧预设（无 engine_slot 键）⇒ 逐位等价（默认档口径 = P2 卡后的 1）
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    fun legacyPresetWithoutEngineSlotKeepsSlot98AtTheDefaultZero() {
+    fun legacyPresetWithoutEngineSlotFallsBackToTheDefaultEngine() {
         val slots = firstSlots(legacyJson())
         assertFalse("[98] 不得凭空出现在只有老键的预设里：${slots.keys}", 98 in slots)
 
         val applied = presetSnapshot(neutral, slots)
-        assertEquals("[98] 必须落到默认 0（= filmic 档）", 0.0, applied[98], 0.0)
+        // ★ P2 卡：默认档 = 1 = sigmoid。缺 key ⇒ 取展开基线的值（**不是**"历史默认 0"）——
+        //   这正是"缺键 ⇒ 重置为默认档"这条行为在拍照链路上的落点（报告 §2）。
+        assertEquals(
+            "[98] 缺键必须落到默认档 1（= sigmoid）",
+            CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), applied[98], 0.0,
+        )
         // "逐字节等价"的精确表述：**预设提到的槽照常生效，其余每一个槽（含 [98]）逐位不变**
         // ⚠ 不能整条 `assertArrayEquals(neutral, applied)`：这条旧预设**本来就**要改 `[26]` 颗粒，
         //   那样断言会把"预设正常生效"当成失败。
@@ -70,11 +83,63 @@ class Stage3EngineSlotPresetAuditTest {
     @Test
     fun legacyPresetDoesNotDragAPhotoBackToEngineZero() {
         // 语义 = "缺失 key ⇒ 保留目标当前值"（RawTherapee 口径，见 presetSnapshot 的 KDoc）。
-        // 为什么单列一条：这正是 `[98]` 与其它槽**不同**的地方 —— 用户在引擎 1 下套一条旧预设，
-        // 预期是"套风格"，不是"被切回 filmic"。断言它是有意的，而不是碰巧。
+        // 为什么单列一条：这正是 `[98]` 与其它槽**不同**的地方 —— 用户在默认档（引擎 1）下套一条
+        // 旧预设，预期是"套风格"，不是"被切回 filmic"。断言它是有意的，而不是碰巧。
         val base = neutral.copyOf().also { it[98] = 1.0 }
         val applied = presetSnapshot(base, firstSlots(legacyJson()))
         assertEquals("旧预设不得改动目标照片的引擎选择", 1.0, applied[98], 0.0)
+
+        // 反向（P2 卡新增）：目标照片是 filmic（用户在完整参数页显式选的 0）时同样不得被改。
+        val filmicBase = neutral.copyOf().also { it[98] = 0.0 }
+        assertEquals(
+            "旧预设也不得把 filmic 照片拽到默认档",
+            0.0, presetSnapshot(filmicBase, firstSlots(legacyJson()))[98], 0.0,
+        )
+    }
+
+    /**
+     * ★ P2 卡的**行为实测**（报告 §2 的机器判据）：**真实** `builtin.json` 的三条内置预设都
+     * 不含 `engine_slot` 键（用户 2026-10-14 要求"预设相关先不动"）⇒ 经 `cameraPresetParams`
+     * （拍照链路实际下发的那条路径）展开后，`[98]` = **默认档 1**。
+     *
+     * 为什么必须用真实资产而不是造一条 JSON：报告要回答的正是"内置预设这种形态会怎样"，
+     * 造出来的 JSON 只能证明 `presetSnapshot` 的语义，证明不了"内置预设确实缺这个键"
+     *（后者可能被将来某张卡改掉，届时本用例会红，正确）。
+     */
+    @Test
+    fun builtinPresetsWithoutTheEngineSlotKeyExpandToTheDefaultEngine() {
+        val json = File("src/main/assets/presets/builtin.json").readText()
+        val builtins = BuiltinPresets.parse(json)
+        assertTrue("前提：内置预设至少三条，实际 ${builtins.size}", builtins.size >= 3)
+        for (b in builtins) {
+            assertFalse("${b.id} 不得含 [98]（P2 卡要求内置预设零改动）", 98 in b.slots)
+            assertEquals(
+                "${b.id} 缺 engine_slot ⇒ 展开后必须是默认档（不是硬编码 0）",
+                CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), cameraPresetParams(b)[98], 0.0,
+            )
+        }
+    }
+
+    /**
+     * ★ P2 卡：**两个默认值必须同值**（本卡的改动核心就是这两个 + 读取缺省）。
+     *
+     * C++ `FilmParams.h` 的 `float engine_slot = 1.0f;` 是"缺槽时 C++ 用哪一档"的唯一真源；
+     * Kotlin `CameraPresets.DEFAULT_ENGINE_SLOT` 是"缺键/短数组时 Kotlin 按哪一档解释"的唯一真源。
+     * 两者分叉 ⇒ "C++ 走引擎 1、Kotlin 按引擎 0 判断旁路"的第三态（filmic 参数在引擎 1 下未归零）。
+     */
+    @Test
+    fun cppFilmParamsDefaultEngineSlotMatchesTheKotlinDefault() {
+        val src = File("../core/engine/src/film/FilmParams.h").readText()
+        val m = Regex("""float\s+engine_slot\s*=\s*(-?[\d.]+)f\s*;""").find(src)
+        assertNotNull("FilmParams.h 里找不到 `float engine_slot = …f;`（字段被改名？本用例需同步）", m)
+        assertEquals(
+            "C++ 默认档必须与 Kotlin 的 CameraPresets.DEFAULT_ENGINE_SLOT 同值",
+            CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), m!!.groupValues[1].toFloat().toDouble(), 0.0,
+        )
+        assertEquals(
+            "engine_slot 的**默认值定义**只许有一处（本卡纪律：两个默认值 + 测试口径）",
+            1, Regex("""float\s+engine_slot\s*=""").findAll(src).count(),
+        )
     }
 
     @Test
@@ -94,32 +159,42 @@ class Stage3EngineSlotPresetAuditTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    fun engineSlotSurvivesTheFullSparseJsonRoundTrip() {
-        val engine1 = neutral.copyOf().also { it[98] = 1.0 }
-        val sparse = presetSparseSlots(engine1)
-        assertEquals("[98] = 1 必须进稀疏集（否则预设带不动引擎选择）", 1.0, sparse[98]!!, 0.0)
+    fun nonDefaultEngineSlotSurvivesTheFullSparseJsonRoundTrip() {
+        // ★ P2 卡后的探针口径：**非默认档**才进稀疏集（默认档 1 = 恒等值，见下一个用例）。
+        //   用 0（filmic）—— 它同时是"将来删 filmic"时最需要被预设记住的那一档。
+        val engine0 = neutral.copyOf().also { it[98] = 0.0 }
+        val sparse = presetSparseSlots(engine0)
+        assertEquals("[98] = 0（≠ 默认档）必须进稀疏集（否则预设带不动引擎选择）", 0.0, sparse[98]!!, 0.0)
 
         val p = EditorPreset(
-            id = "p_1_1", name = "sigmoid 档", group = "G", source = PRESET_SOURCE_USER,
+            id = "p_1_1", name = "filmic 档", group = "G", source = PRESET_SOURCE_USER,
             note = "", createdAt = 1730000000L, slots = sparse,
         )
         val json = presetToJson(p)
-        assertTrue("线格式必须用语义名 engine_slot：$json", json.contains("\"engine_slot\":1.0"))
+        assertTrue("线格式必须用语义名 engine_slot：$json", json.contains("\"engine_slot\":0.0"))
 
         val back = firstSlots("[$json]")
-        assertEquals("[98] 必须原值读回", 1.0, back[98]!!, 0.0)
-        assertEquals("往返后套用必须回到引擎 1", 1.0, presetSnapshot(neutral, back)[98], 0.0)
+        assertEquals("[98] 必须原值读回", 0.0, back[98]!!, 0.0)
+        assertEquals("往返后套用必须回到 filmic 档", 0.0, presetSnapshot(neutral, back)[98], 0.0)
     }
 
     @Test
-    fun explicitEngineSlotZeroIsDroppedAsIdentityInsteadOfBeingStored() {
-        // 恒等值不入库（稀疏不变式）。这条同时守两件事：
-        //  ① `"engine_slot":0` 不是"坏数据"⇒ 不产生 skipped 诊断（否则用户每套一条都被吓一跳）；
-        //  ② 它不会被存进 slots ⇒ 套用时走"缺失 key = 保留"，不会把别人的引擎选择打成 0。
-        val res = presetsFromJson(legacyJson("""{"engine_slot":0.0,"grain_amount":55.0}"""))
-        assertEquals("不该被跳过", 1, res.presets.size)
-        assertTrue("恒等值被丢弃不该产生诊断：${res.skipped}", res.skipped.isEmpty())
-        assertFalse("[98]=0 是恒等值 ⇒ 不入库", 98 in res.presets.first().slots)
+    fun engineSlotIsStoredOnlyWhenItDiffersFromTheDefault() {
+        // 稀疏不变式（P2 卡后语义翻转：恒等值 = **默认档 1 = sigmoid**）。这条同时守两件事：
+        //  ① `"engine_slot":1`（= 默认档）**不入库** ⇒ 套用时走"缺失 key = 保留目标当前值"，
+        //     不会把别人的引擎选择打成 1；且它不该产生 skipped 诊断（不是坏数据）；
+        //  ② `"engine_slot":0`（filmic，**合法非默认档位**）**必须入库** —— 否则用户"这条预设
+        //     用 filmic"的决定会被静默丢掉。⚠ 老实现（默认档 = 0）正是靠"0 = 恒等值"把它丢掉的，
+        //     P2 卡后这条不再成立，本用例是那次口径翻转的回归护栏。
+        val defaults = presetsFromJson(legacyJson("""{"engine_slot":1.0,"grain_amount":55.0}"""))
+        assertEquals("不该被跳过", 1, defaults.presets.size)
+        assertTrue("恒等值被丢弃不该产生诊断：${defaults.skipped}", defaults.skipped.isEmpty())
+        assertFalse("[98]=1 是恒等值（= 默认档）⇒ 不入库", 98 in defaults.presets.first().slots)
+
+        val filmic = presetsFromJson(legacyJson("""{"engine_slot":0.0,"grain_amount":55.0}"""))
+        assertEquals("不该被跳过", 1, filmic.presets.size)
+        assertTrue("合法档位不该产生诊断：${filmic.skipped}", filmic.skipped.isEmpty())
+        assertEquals("[98]=0（filmic）≠ 默认档 ⇒ 必须入库", 0.0, filmic.presets.first().slots[98]!!, 0.0)
     }
 
     @Test
@@ -184,8 +259,11 @@ class Stage3EngineSlotPresetAuditTest {
 
         // **正对照**：同一条预设套到引擎 0 的照片上必须**真的改变**参数
         //（否则"引擎 1 下相同"可能只是因为预设压根没生效）
-        val engine0Applied = engineScoped(presetSnapshot(neutral.copyOf(), slots))
+        // ⚠ P2 卡后 `neutral` 的 [98] 已是默认档 1 ⇒ 必须**显式**写 0 才是引擎 0 的照片
+        //   （这正是"默认档基线变了、但 `[98]=0` 的路径没变"的现场）。
+        val engine0Applied = engineScoped(presetSnapshot(neutral.copyOf().also { it[98] = 0.0 }, slots))
         assertEquals("[5] 在引擎 0 下必须保留预设值（正对照）", 0.6, engine0Applied[5], 0.0)
         assertEquals("[37] 在引擎 0 下必须保留预设值（正对照）", -3.0, engine0Applied[37], 0.0)
+        assertEquals("正对照的照片仍是引擎 0（未被改写）", 0.0, engine0Applied[98], 0.0)
     }
 }
