@@ -389,7 +389,7 @@ class Stage3EngineScopeAuditTest {
             "uSat 的三分量必须整组在 NEUTRALIZE（半旁路 = 同一滑杆的槽位拿到互相矛盾的判据）",
             EngineScope.NEUTRALIZE.keys.containsAll(setOf(20, 21, 22)),
         )
-        // 引擎 1 现阶段无独占可调参数（固定默认 contrast=1.2）
+        // 引擎 1 现阶段无独占可调参数（固定默认 contrast=1.5 = darktable/PC 官方默认，方案 §7）
         assertTrue("阶段 3 引擎 1 无 UI 参数 ⇒ SIGMOID_OWNED_SLOTS 必须为空", EngineScope.SIGMOID_OWNED_SLOTS.isEmpty())
         // [4] contrast 两条链路都生效 ⇒ 不许被旁路（§8.1 B 的"保留"行）
         assertFalse("[4] contrast 必须保留（编辑器 kFsStyle 仍生效）", EngineScope.NEUTRALIZE.containsKey(4))
@@ -499,9 +499,10 @@ class Stage3EngineScopeAuditTest {
      *
      * 实测指纹（`tools/engine-shader-offline.py`，修前/修后）：
      *  - 修前 `NEUTRALIZE[28] = 0.0`：引擎 1@uToneK=0 的 `film_d5_sigmoid.npy` crc32 = **`0x189e4126`**，
-     *    与**引擎 0@uToneK=0 逐字节相同** ⇒ 引擎 1 空转；
-     *  - 修后 `= 1.0`：引擎 1@uToneK=1.0 = **`0x8fdb4e38`**（= 阶段 2 引擎 1 基线），
-     *    引擎 1@uToneK=0 → 1.0 的差异 max **11.96 LSB** / 25.4% 像素 >1 LSB。
+     *    与**引擎 0@uToneK=0 逐字节相同** ⇒ 引擎 1 空转（该值与 sigmoid 参数无关，改默认值后不变）；
+     *  - 修后 `= 1.0`：引擎 1@uToneK=1.0 = **`0x7c2646ef`**
+     *    （2026-10-14 起 contrast=1.5 与 PC 一致；1.2 时期是 `0x8fdb4e38`），
+     *    引擎 1@uToneK=0 → 1.0 的差异 max **13.25 LSB** / **59.7%** 通道 >1 LSB。
      */
     @Test
     fun p0ToneKIdentityMustNotDisableTheSigmoidEngine() {

@@ -6,6 +6,15 @@ status: draft
 
 # 阶段 2 · 引擎插槽（sigmoid）交付报告 —— 卡 C：离线判据链
 
+> ⚠ **2026-10-14 口径变更补记（用户拍板「跟 PC 一致」）**：引擎 1 默认 `contrast` 由 **1.2 → 1.5**
+> （= darktable / PhotonCamera 官方默认），`kSigmoidDefaultContrast` 已改。**本报告正文的
+> c=1.2 数值全部降为历史对照**；"同白纸口径"这一人为约束作废。新口径实测：
+> 白纸 **218.84 LSB**（PC 常量解 219.24）/ 判据 ① 跨度 **1.40 EV**（c=1.2 时 2.00）/
+> `film_d5_sigmoid.npy` crc32 **`0x7c2646ef`**（c=1.2 时 `0x8fdb4e38`；空转仍 `0x189e4126`）。
+> 切引擎差异（同 ROI，`tools/stage2-engine-diff.py`）：c=1.2 时中位 **0.0** LSB ⇒ c=1.5 时
+> 中位 **+2.45** / p90 **6.22** / max **12.9** LSB（该 ROI 无高光；白纸处纯曲线 +15.24）。
+> 包：`filmkit-0.11.30-ENGINE-PC-DEFAULT.apk`（379 / 0.11.30）。
+
 > 三张卡分工：**卡 A** CPU 参数求解（`film/SigmoidParams.{h,cpp}` + `tools/sigmoid-params-ref.py`）·
 > **卡 B** GLSL 注入段 + 注册表接线（`FrameRenderer.cpp` / `EngineRegistry.cpp`）· **卡 C（本卡）** 离线判据链 + 本报告。
 > 上位判据：`docs/engine-slots-design.md` §7（五条判据）+ §10 第 1 条（口径写死）。

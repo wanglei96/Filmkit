@@ -183,7 +183,8 @@ def main():
                     help='0 = 引擎 0 filmic（默认，行为与阶段 1 一字不变，输出 film_d5.npy）；'
                          '1 = 引擎 1 darktable sigmoid（输出 film_d5_sigmoid.npy，'
                          '**不覆盖** film_d5.npy ⇒ 判据⑤基线不被踩）')
-    ap.add_argument('--sig-contrast', type=float, default=1.2, help='kSigmoidDefaultContrast')
+    ap.add_argument('--sig-contrast', type=float, default=1.5,
+                    help='kSigmoidDefaultContrast（darktable/PC 官方默认，2026-10-14 起）')
     ap.add_argument('--sig-skew', type=float, default=0.0, help='kSigmoidDefaultSkew')
     ap.add_argument('--sig-white', type=float, default=100.0,
                     help='kSigmoidDefaultWhiteTarget（**百分数**）')
@@ -952,7 +953,7 @@ def film_stage(a):
     # 数值来源 = `tools/sigmoid-params-ref.py` 的 `compute_sigmoid_params()`
     # （darktable `commit_params` 的逐行 float32 复刻）—— **本脚本不重写公式**，
     # 只做「契约字段名 → uniform 名」的映射。默认参数 = `SigmoidParams.h` 的
-    # kSigmoidDefault*（contrast=1.2 / skew=0 / white=100 / black=0.0152 / hue=100）。
+    # kSigmoidDefault*（contrast=1.5 / skew=0 / white=100 / black=0.0152 / hue=100）。
     sig_params = None
     if engine == 1:
         sref = load_sigmoid_ref()
@@ -1012,7 +1013,7 @@ def film_stage(a):
         'sigmoid_params': ({k: float(v) for k, v in sig_params.items()} if sig_params else None),
         'sigmoid_cli': ({'contrast': a.sig_contrast, 'skew': a.sig_skew, 'white': a.sig_white,
                          'black': a.sig_black, 'hue': a.sig_hue,
-                         'defaults': 'SigmoidParams.h kSigmoidDefault*（1.2 / 0 / 100 / 0.0152 / 100）'}
+                         'defaults': 'SigmoidParams.h kSigmoidDefault*（1.5 / 0 / 100 / 0.0152 / 100）'}
                         if engine == 1 else None),
         'filmic_spline': {
             'source': 'FrameRenderer::computeFilmicSpline (FrameRenderer.cpp:13044) '
@@ -1229,7 +1230,7 @@ def _film_cli(argv):
     ap.add_argument('--film-input', choices=['ccm', 'pc3d'], default='ccm')
     # ── 引擎插槽（阶段 2）：与 main() 的声明同款（两处都声明 = 现有模式）────────
     ap.add_argument('--engine', type=int, choices=[0, 1], default=0)
-    ap.add_argument('--sig-contrast', type=float, default=1.2)
+    ap.add_argument('--sig-contrast', type=float, default=1.5)  # = kSigmoidDefaultContrast
     ap.add_argument('--sig-skew', type=float, default=0.0)
     ap.add_argument('--sig-white', type=float, default=100.0)
     ap.add_argument('--sig-black', type=float, default=0.0152)

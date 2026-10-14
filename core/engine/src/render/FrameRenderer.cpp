@@ -6413,13 +6413,15 @@ void diagEndFrame() { g_diag_chain = false; }
 //      `computeSigmoidParams`（`film/SigmoidParams.h`，逐行照抄 darktable
 //      `commit_params`）求解后下发 ⇒ **公式只有一处实现**，不存在"CPU 与 GPU 各写
 //      一遍公式"的漂移面（与既有 `computeFilmicSpline` → `uFilmic*` 同款做法）。
-//      ⚠ **别把 PC 的常量值当基准"修"回来**：PC 那 6 个常量 = darktable **默认
-//        contrast 1.5** 下的解（paper_exposure 0.354355423 / film_fog 0.00142637086 /
-//        film_power 1.5）；本项目按判据口径取 **contrast 1.2**（SigmoidParams.h 顶部
-//        注释：让白纸输出与引擎 0 的 204 LSB 对齐，判据 ① 才能在同白纸亮度下比较）
-//        ⇒ 实测解 = paper_exposure 0.592131495 / film_fog 0.000400747434 /
-//        film_power 1.19090915（white_target 1 / paper_power 1 / hue 1 两者相同）。
-//        差异是**参数不同**，不是公式不同 —— 公式逐行等价。
+//      ⚠ **PC 的 6 个常量 = darktable 默认 contrast 1.5 下的解**（paper_exposure
+//        0.354355423 / film_fog 0.00142637086 / film_power 1.5，double 预算值）。
+//        本项目**同取 1.5**（2026-10-14 用户拍板"跟 PC 一致"，见 `SigmoidParams.h`
+//        顶部）：float32 求解得 paper_exposure 0.359695 / film_fog 0.001384322 /
+//        film_power 1.490909（white_target 1 / paper_power 1 / hue 1 两者相同）
+//        ⇒ 8bit 输出上与 PC 常量逐点差 **≤0.41 LSB**（−6…+8 EV 全域实测）。
+//        差异是**参数精度口径**，不是公式不同 —— 公式逐行等价。
+//        （历史：2026-10-13 曾取 contrast 1.2 以对齐引擎 0 的白纸 204 LSB，只为判据 ①
+//        的"同白纸口径"服务；该人为约束已按用户拍板作废。）
 //   ② 函数名改项目风格（`sigmoid*` 前缀，入口 `sigmoidTone`）：与公共段 / 引擎 0 段
 //      的既有函数（`luma` / `filmic*` / `gamut*`）无重名（已全段 grep 核对）。
 //
@@ -6899,8 +6901,14 @@ bool FrameRenderer::buildFilmProgram(int slot) {
   film_engine_slot_ = slot;
   queryFilmUniforms();  // location 是 per-program 的 ⇒ 必须重查（含 uTex 等公共项）
   logFilmSourceSelfCheck(src, slot);  // 开发期自检：附 crc32/bytes/chars 供真机核对
+  // 一行日志说清"引擎 1 用的是哪套参数"（2026-10-14 用户要求：别再靠推断）：
+  // c=1.5（PC/darktable 默认）⇒ sig_pe 0.359695 / sig_fp 1.490909；c=1.2 ⇒ 0.592131 / 1.190909。
   Logger::instance().log(LogLevel::kInfo, "engine", "engine.slot_built",
-                         "{\"slot\":" + std::to_string(slot) + "}");
+                         "{\"slot\":" + std::to_string(slot) +
+                             ",\"sig_pe\":" + std::to_string(sigmoid_.paper_exposure) +
+                             ",\"sig_ff\":" + std::to_string(sigmoid_.film_fog) +
+                             ",\"sig_fp\":" + std::to_string(sigmoid_.film_power) +
+                             ",\"sig_wt\":" + std::to_string(sigmoid_.white_target) + "}");
   return true;
 }
 

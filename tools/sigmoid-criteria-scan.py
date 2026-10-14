@@ -9,6 +9,8 @@
   可分辨跨度 = 从**白纸亮度**（2.30 EV）起，每 0.1 EV 的输出差 **≥1 LSB** 能持续多远
   同白纸亮度前提：基准 = **204.0 LSB**（sigmoid c=1.2 在 `display_white_target = 99.4`
             时精确命中；默认 100 时 203.60）⇒ 两档并列报告
+  ⚠ **2026-10-14 起引擎 1 默认 = contrast 1.5**（darktable/PC 官方默认，用户拍板"跟 PC
+            一致"）⇒ 白纸 218.84 LSB，**同白纸口径作废**，本脚本的 c=1.2 各档降为历史对照。
 
 引擎 1（sigmoid）用 `tools/sigmoid-params-ref.py`（**float32**，= darktable 实跑口径）。
 引擎 0（filmic）用 `tools/filmic-spline-ref.py`（16 号报告时期的 `computeFilmicSpline`
@@ -311,6 +313,9 @@ def main():
             tag = f'引擎1 sigmoid(c={c}, white={w:g})'
             print(f'{tag:<34}{y8[i_white]:>10.3f}{y8[i_grey]:>10.3f}'
                   f'{sp_:>10.2f} EV{WHITE_PAPER_EV + sp_:>10.2f}')
+    print('\n  · **当前默认 = `c=1.5, white=100`**（`SigmoidParams.h` `kSigmoidDefaultContrast`，'
+          '2026-10-14 与 PC/darktable 官方一致）⇒ 判据 ① 跨度 1.40 EV，'
+          '不再与引擎 0 同白纸口径。')
     print('\n  · darktable 官方预设（`sigmoid.c:224-243`）—— 白纸/跨度仅供参考（未对齐）：')
     for nm, c, s in DT_PRESETS:
         p, ev, y8 = engine1_curve(c, s, 100.0)

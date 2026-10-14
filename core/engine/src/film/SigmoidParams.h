@@ -49,14 +49,23 @@ SigmoidParams computeSigmoidParams(float middle_grey_contrast,
                                    float display_black_target,
                                    float hue_preservation);
 
-// 引擎 1 的默认参数（方案 §7 + 17 号报告 §1.6 的「同白纸亮度」口径）：
-// contrast = 1.2 ⇒ 白纸（2.30 EV）输出 **203.60 LSB**（float32 口径），与引擎 0
-// （filmic 白点 4.0）的 204 LSB 对齐 ⇒ 判据 ①「可分辨跨度」可在**同白纸亮度**下比较。
-// 严格对齐 204.0 LSB 需 `display_white_target = 99.4`（17 号 §1.6 用的值）；默认 100
-// 与它差 0.4 LSB，远小于判据粒度（1 LSB）⇒ 默认用官方值 100，报告里两档并列。
-// ⚠ 这不是"照抄 darktable 默认 1.5"：1.5 时白纸 218.84 LSB（float32），与引擎 0
-//   不同口径，判据 ① 无法直接比较。1.2 是**判据口径**要求的值，且它仍是标准 sigmoid 参数。
-inline constexpr float kSigmoidDefaultContrast = 1.2f;
+// 引擎 1 的默认参数 = **darktable / PhotonCamera 的官方默认**（2026-10-14 用户拍板
+// 「跟 PC 一致」）：contrast = **1.5**、skew = 0、display_white_target = 100、
+// display_black_target = 0.0152、hue_preservation = 100。
+//   · **PC 的硬编码常量就是这个默认下的解**（`DarktableSigmoidToneAlgorithm.kt:6-10`
+//     的 paper_exposure 0.354355423 / film_fog 0.00142637086 / film_power 1.5 是
+//     **double 预算值**）；本实现走 float32 求解（= darktable 实跑口径）得
+//     paper_exposure 0.359695 / film_fog 0.001384322 / film_power 1.490909。
+//     参数差 ≈1.3%，**8bit 输出上逐点差 ≤0.41 LSB**（−6…+8 EV 全域实测，mean 0.168）
+//     ⇒ 与 PC 在 8bit 下不可分辨；**不要**为了"逐位像 PC"改回硬编码常量。
+//   · 白纸（2.30 EV）输出 **218.84 LSB**（float32；PC 常量 219.24）。
+//   · ⚠ **代价（如实记录，不隐去）**：不再"与引擎 0 同白纸口径"（引擎 0 纯曲线
+//     205.13 / 端到端 214.20 LSB）⇒ 判据 ①「可分辨跨度」由 2.00 EV（c=1.2）降为
+//     **1.40 EV**。这是**判据口径的产物、不是质量下降**：PC 从不做跨引擎白纸对齐
+//     （各引擎用自己的标准参数），"切引擎观感差异明显"正是这么来的。
+//   · 历史：c=1.2 是 2026-10-13 为「判据 ① 同白纸口径可比」人为取的值（白纸 203.60
+//     LSB ≈ 引擎 0 的 204），2026-10-14 用户拍板与 PC 一致 ⇒ **该人为约束作废**。
+inline constexpr float kSigmoidDefaultContrast = 1.5f;
 inline constexpr float kSigmoidDefaultSkew = 0.0f;
 inline constexpr float kSigmoidDefaultWhiteTarget = 100.0f;
 inline constexpr float kSigmoidDefaultBlackTarget = 0.0152f;

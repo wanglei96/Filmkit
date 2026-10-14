@@ -244,7 +244,7 @@ struct EngineEntry {
 | primaries inset/rotation | **本期省略**（只保留 hue preservation） | darktable 默认 `inset=0 / rotation=0 / purity=0` ⇒ `_calculate_adjusted_primaries` 是**恒等变换**，PC 亦省略 ⇒ 默认参数下与官方逐像素等价。非默认 inset 是"Rec.2020 基础 primaries"那期的挂点 |
 | 参数求解位置 | **全在 CPU**（`film/SigmoidParams.{h,cpp}`，逐行照抄 `commit_params`） | GLSL 只做曲线求值（吃 7 个标量 uniform）⇒ 公式**单处实现**，无 CPU/GPU 漂移面（对齐 `computeFilmicSpline` 既有做法） |
 | 精度口径 | **全程 float32**（`powf`） | 与 darktable 实跑一致（其 data 字段与 `commit_params` 局部量皆 `float`）⇒ contrast=1.5 的 `film_power` = **1.490909**，非 double 的 1.5 |
-| 默认参数 | `contrast=1.2 / skew=0 / white=100 / black=0.0152 / hue=100` | 判据 ① 的**纯曲线口径**下 c=1.2 白纸 **203.601 LSB**，与对齐基准 204.0 差 0.4 LSB（判据粒度 1 LSB 内）；c=1.5 是 218.84 ⇒ 不同口径不可直接比。⚠ **端到端口径**（含 gamut）下引擎 0（filmic，真机 `white_ev=4.0`）白纸是 **214.20 LSB**，与引擎 1 的 203.59 差 10.6 LSB —— 那是**引擎切换时的亮度差**，属阶段 3 预设标定项（且标定须查表，见 §10 第 1 条） |
+| 默认参数 | `contrast=**1.5** / skew=0 / white=100 / black=0.0152 / hue=100` = **darktable / PC 官方默认**（2026-10-14 用户拍板"跟 PC 一致"，取代原 c=1.2） | **PC 的硬编码常量就是这个默认下的 double 解**（`paper_exposure=0.354355423` / `film_fog=0.00142637086` / `film_power=1.5`）；本实现走 float32 求解得 `0.359695 / 0.001384322 / 1.490909`，**8bit 输出上逐点差 ≤0.41 LSB**（−6…+8 EV 全域实测，mean 0.168）⇒ 与 PC 在 8bit 下不可分辨。默认档白纸 **218.84 LSB**。⚠ **代价（如实记录）**：不再同白纸口径 ⇒ 判据 ① 跨度由 2.00 EV（c=1.2）降为 **1.40 EV**；这是**判据口径的产物、不是质量下降** —— PC 从不做跨引擎白纸对齐（各引擎用自己的标准参数），"切引擎观感差异"正是这么来的。**历史**：c=1.2 是 2026-10-13 为判据 ① 的"同白纸口径"人为取的值（白纸 203.601 LSB），该人为约束已按用户拍板作废 |
 | uniform 命名 | `uSig{WhiteTarget,BlackTarget,PaperExposure,FilmFog,FilmPower,PaperPower,HuePreservation}` | 前缀隔离；引擎 0 的 program 里 location = −1 ⇒ 无条件查询/下发即安全 no-op，零分支 |
 | 引擎 0 路径 | **零改动**（注入段仍从 `kFsFilm` 切片） | 保住判据 ⑤（`engine_slot=0` 逐字节等价） |
 | shader 校验 | 引擎 1 的段必须被 `validate-shaders.sh` 覆盖 + 负向自检 | 该脚本原只覆盖 `kFsFilm`（含"拆段后拼回整份"分支）⇒ 新增字面量会漏校验，语法错误只能到真机才发现 |
@@ -401,7 +401,13 @@ struct EngineEntry {
    - **输出口径**：线性显示值 → **真 sRGB OETF** → **8bit**（`c ≤ 0.0031308: 12.92c`；否则
      `1.055·c^(1/2.4) − 0.055`）；
    - **可分辨跨度** = 从**白纸亮度**起，每 0.1 EV 的输出差 **≥1 LSB** 能持续多远（单位 EV）；
-   - **同白纸亮度前提（必须满足才可比）**：比较两个引擎前，把白纸对齐到同一 LSB。基准 =
+   - ⚠ **2026-10-14 起引擎 1 默认 = `contrast 1.5`（用户拍板"跟 PC 一致"）⇒ 本「同白纸亮度
+     前提」在默认参数下不再满足**：sigmoid 白纸 **218.84 LSB** vs 引擎 0 的 205.13（纯曲线）
+     / 214.20（端到端）。判据 ① 因此**不可拿默认档与引擎 0 直接比**；本节下文的 c=1.2 各档
+     一律降为**历史对照**（要复现同口径须显式 `--sig-contrast 1.2`，或按上一条查表标定 white%）。
+     实测后果（`tools/stage2-engine-diff.py`，同一 ROI）：切引擎差异由"中位 **0.0** LSB"
+     变为"中位 **+2.45** / p90 **6.22** / max **12.9** LSB"（该 ROI 无高光；白纸处纯曲线 +15.24）。
+   - **同白纸亮度前提（历史口径，c=1.2 时期；必须满足才可比）**：比较两个引擎前，把白纸对齐到同一 LSB。基准 =
      **204.0 LSB**。⚠ 精度与可解性（2026-10-14 实测订正，取代本文早先的"99.4 精确命中"）：
      float32 下 sigmoid c=1.2 的**精确解是 `display_white_target = 99.525`** → 204.0 LSB；
      默认 100 给 **203.601**、99.4 给 **204.567**。**白纸 LSB 对 `display_white_target` 非单调**
