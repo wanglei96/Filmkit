@@ -263,9 +263,11 @@ internal class EditorEngineSession {
         val bytes = try {
             // ★ E2-12c：下发的 rot 必须与 outputSize 用**同一个**归一化值 —— 否则
             // outputSize 交换了宽高、引擎却按 rot=0 分支渲染 ⇒ 尺寸与内容对不上。
+            // ★ 阶段 3：参数出口归零（`[98] != 0` ⇒ 按 EngineScope 置恒等值）——
+            // 预览（requestPreview）与导出（requestFull）都经本函数，是编辑器链唯一出口。
             EngineBridge.nativeEngineSubmitDisplay(
                 rgba, w, h, outW, outH, crop.uvOrNull(), normalizeRot(crop.rot),
-                film,
+                engineScoped(film),
             )
         } catch (t: Throwable) {
             // UnsatisfiedLinkError / 引擎内部异常都算失败：宁可显示原图，不许崩

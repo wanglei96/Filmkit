@@ -16,6 +16,8 @@
 
 #include "../log/GpuTimer.h"
 #include "../log/Logger.h"
+#include "../film/EngineRegistry.h"
+#include "../film/SigmoidParams.h"
 #include "Align.h"
 #include "AmazeDemosaic.h"
 #include "GrainLut.h"
@@ -25,6 +27,18 @@
 #endif
 
 namespace filmkit {
+
+// 引擎 1（sigmoid）的两个 GLSL 注入段 —— **定义在本文件后部**（紧跟 `kFsFilm` 的
+// 切分/组装块之后），此处前置声明供下面的 `filmSource()` 使用。
+// 为什么放在 `filmkit` 作用域（而非本文件的匿名 namespace）：注册表
+// `film/EngineRegistry.cpp` 的表项要按这两个名字链接引用它们（见其 extern 声明与
+// `EngineRegistry.h` 顶部的"链接期依赖"说明）。**必须在匿名 namespace 之外**，
+// 否则是内部链接的另一个实体 ⇒ 链接期 undefined symbol。
+// 命名固定为 `kFsSigmoid{Def,Main}`：离线链（`tools/engine-shader-offline.py` 的
+// `_collect_raw_strings`）与 `tools/validate-shaders.sh` 都按**字面量名**提取。
+extern const char* kFsSigmoidDef;
+extern const char* kFsSigmoidMain;
+
 namespace {
 
 // E4-3 颗粒：成片种子的**内容指纹**（FNV-1a 采样）。目的 = 成片的颗粒图案"同一张可
@@ -4616,7 +4630,7 @@ const std::string_view kFilmTemplateHead = filmSlices().head;
 const std::string_view kFilmTemplateMid = filmSlices().mid;
 const std::string_view kFilmTemplateTail = filmSlices().tail;
 
-// engine_slot 无对应引擎时的**明确降级**告警（阶段 1 注册表里只有引擎 0）。
+// engine_slot 无对应引擎时的**明确降级**告警（阶段 2 起注册表里有 2 个引擎）。
 // 方案 §4 契约 5：不静默、不崩、不做 identity 伪装 —— 降级到引擎 0 并留下日志。
 // 去重：预览 30–60 fps 下每帧一条会刷爆日志环形缓冲（500 行）⇒ 只在取值变化时记。
 void warnEngineSlotUnavailable(int slot) {
@@ -4624,13 +4638,19 @@ void warnEngineSlotUnavailable(int slot) {
   if (slot == 0 || last.exchange(slot) == slot) return;
   Logger::instance().log(LogLevel::kWarn, "engine", "engine.slot_unavailable",
                          "{\"requested\":" + std::to_string(slot) +
-                             ",\"fallback\":0,\"stage\":1}");
+                             ",\"fallback\":0,\"stage\":2}");
 }
 
-// 按引擎插槽组装 film pass 的 fragment shader 源码：
-//   src = head + engine_def + mid + engine_main + tail
-// 阶段 1：唯一注册的引擎是 0（内置 filmic）⇒ 两个注入段恒为 `kFsFilm` 自身的切片；
-// `engine_slot != 0` 取不到引擎 ⇒ 按契约 5 降级到引擎 0 并记 WARN（阶段 2 换成注册表查表）。
+// 按引擎插槽组装 film pass 的 fragment shader 源码（方案 §3.1）：
+//   src = head + uniforms + profile + functions + mid + main + tail
+// 阶段 2 起**注册表驱动**：4 个注入段取自 `EngineEntry`，`nullptr` 语义 = "用 `kFsFilm`
+// 的对应切片"（引擎 0 四项全 nullptr ⇒ 拼回原文，逐字节等价不许破）。
+// slot 未命中 ⇒ 按契约 5 降级到引擎 0 并记 WARN（不静默、不崩、不 identity 伪装）。
+//
+// ⚠ 类型口径（架构师 2026-10-13 特别标注）：`kFsFilm` 的切片是 `std::string_view`
+//   （**不是** null-terminated），而表项里的是 `const char*` 字面量。两者统一成
+//   `std::string_view` 再组装 —— 不能把 `const char*` 当切片用（`strlen` 会越过切片
+//   边界），也不能把切片当 `const char*` 用。
 std::string filmSource(int engine_slot) {
   const FilmSlices& s = filmSlices();
   if (!s.ok) {
@@ -4638,14 +4658,30 @@ std::string filmSource(int engine_slot) {
     // 字面量（行为与未接插槽一致），原因已在 filmSlices() 里记为 kError。
     return std::string(kFsFilm);
   }
-  if (engine_slot != 0) warnEngineSlotUnavailable(engine_slot);
+  const EngineEntry* e = findEngine(engine_slot);
+  if (e == nullptr) {
+    warnEngineSlotUnavailable(engine_slot);
+    e = findEngine(0);  // 降级：注册表里必有引擎 0
+    if (e == nullptr) return std::string(kFsFilm);  // 表被改坏：退回整体字面量
+  }
+  // 注入段：`nullptr` ⇒ 用 `kFsFilm` 的切片（引擎 0 的两个注入段就是这么来的）。
+  const std::string_view uni =
+      e->uniforms_src ? std::string_view{e->uniforms_src} : std::string_view{};
+  const std::string_view prof =
+      e->profile_src ? std::string_view{e->profile_src} : std::string_view{};
+  const std::string_view func =
+      e->functions_src ? std::string_view{e->functions_src} : s.engine_def;
+  const std::string_view main =
+      e->main_src ? std::string_view{e->main_src} : s.engine_main;
   std::string src;
-  src.reserve(kFilmTemplateHead.size() + s.engine_def.size() + kFilmTemplateMid.size() +
-              s.engine_main.size() + kFilmTemplateTail.size());
+  src.reserve(kFilmTemplateHead.size() + uni.size() + prof.size() + func.size() +
+              kFilmTemplateMid.size() + main.size() + kFilmTemplateTail.size());
   src += kFilmTemplateHead;   // 公共前段
-  src += s.engine_def;        // 引擎注入①（引擎 0：filmic + gamut）
+  src += uni;                 // 引擎注入①：私有 uniforms
+  src += prof;                // 引擎注入②：profile / 资产声明
+  src += func;                // 引擎注入③：算法函数（含 gamut）
   src += kFilmTemplateMid;    // 公共中段
-  src += s.engine_main;       // 引擎注入②（引擎 0：main 调用段）
+  src += main;                // 引擎注入④：main 调用段
   src += kFilmTemplateTail;   // 公共后段
   return src;
 }
@@ -4667,28 +4703,48 @@ uint32_t crc32Ieee(std::string_view s) {
   return c ^ 0xFFFFFFFFu;
 }
 
-// 开发期自检（**只在初始化期调用一次**，不在每帧路径上）：拼接结果 vs `kFsFilm`
-// 定界符内的原文 —— 阶段 1 的唯一硬门槛 = 二者**逐字节相同**（方案 §8）。结果写进既有
-// 日志 ⇒ 真机日志直接给出"拼接是否等价"，不必等离线链。`chars` = UTF-8 码位数，与
-// `bytes` 并列打印：这两个口径（25140 / 35154）在本方案里被混用过，并列可立刻发现口径错误。
+// 开发期自检（**只在引擎编译期调用一次**，不在每帧路径上）：拼接结果 vs `kFsFilm`
+// 定界符内的原文。`chars` = UTF-8 码位数，与 `bytes` 并列打印：这两个口径
+// （25140 / 35154）在本方案里被混用过，并列可立刻发现口径错误。
+//
+// ⚠ **逐字节判据只对 slot == 0 生效**（阶段 1 的零回归硬门槛 = 引擎 0 的拼接结果与原
+//   `kFsFilm` **逐字节相同**）。引擎 1 的拼接结果**必然**不等于 `kFsFilm` —— 它本来就
+//   该是另一份 shader ⇒ slot != 0 记 kInfo，`zero_regression` 写明确的
+//   `n/a (engine N)`，同时照常打印 crc32 / bytes / chars 供真机核对"引擎 1 的源码确实
+//   变了"。**不许**把引擎 1 的正常状态报成 kError：那是一条假 error，会污染真机
+//   "零回归"判据（任务书第 8 条）。
 void logFilmSourceSelfCheck(const std::string& src, int engine_slot) {
   const std::string_view full{kFsFilm};
   const bool identical = std::string_view(src) == full;
+  const bool engine0 = (engine_slot == 0);
   size_t chars = 0;
   for (const unsigned char ch : src) {
     if ((ch & 0xC0u) != 0x80u) ++chars;  // 非 UTF-8 续接字节 = 一个码位
   }
   char crc_hex[16];
   std::snprintf(crc_hex, sizeof(crc_hex), "0x%08x", crc32Ieee(src));
+  const EngineEntry* e = findEngine(engine_slot);
+  const std::string zero_regression =
+      engine0 ? (identical ? "ok" : "FAILED (stage-1 criterion)")
+              : "n/a (engine " + std::to_string(engine_slot) + ")";
   Logger::instance().log(
-      identical ? LogLevel::kInfo : LogLevel::kError, "engine", "engine.film_src",
-      "{\"slot\":" + std::to_string(engine_slot) + ",\"bytes\":" + std::to_string(src.size()) +
+      (engine0 && !identical) ? LogLevel::kError : LogLevel::kInfo, "engine",
+      "engine.film_src",
+      "{\"slot\":" + std::to_string(engine_slot) + ",\"engine\":\"" +
+          (e != nullptr ? e->name : "unregistered") +
+          "\",\"bytes\":" + std::to_string(src.size()) +
           ",\"chars\":" + std::to_string(chars) + ",\"crc32\":\"" + crc_hex +
           "\",\"identical\":" + (identical ? "true" : "false") + ",\"zero_regression\":\"" +
-          (identical ? "ok" : "FAILED (stage-1 criterion)") + "\"}");
+          zero_regression + "\"}");
 }
 
 }  // namespace
+
+// ⚠ 引擎 1（sigmoid）的 GLSL 注入段**不在这里**：它们定义在本文件后部的
+//   `kFsSigmoidDef` / `kFsSigmoidMain`（`}  // namespace` 之后 = `filmkit` 作用域）。
+//   为什么不能放在本匿名 namespace 内：注册表 `film/EngineRegistry.cpp` 的表项要按名字
+//   **链接引用**它们，而匿名 namespace 里的名字是**内部链接** ⇒ 拿不到外部符号，链接期
+//   undefined symbol（实测：放这里时 `nm FrameRenderer.o` 查不到这两个符号）。
 
 // Pass3：输出变换（OETF + 颗粒 + dither），量化到 8bit
 const char* kFsOut = R"(#version 300 es
@@ -6342,6 +6398,213 @@ void diagEndFrame() { g_diag_chain = false; }
 
 }  // namespace
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 引擎 1（darktable sigmoid）的 GLSL 注入段 —— 阶段 2（方案 §7）
+//
+// 一手依据（**逐行照抄，不做简化、不重新推导**）：
+//   · PhotonCamera `DarktableSigmoidToneAlgorithm.kt` 的
+//     `DARKTABLE_SIGMOID_COMBINED_FUNCTIONS`（本地副本
+//     `/tmp/pc-tone/app/src/main/java/com/hinnka/mycamera/raw/`；包名是
+//     `com.hinnka.mycamera`，不是 `com.bjzhou.*`）；
+//   · 上游 = darktable `src/iop/sigmoid.c` 的 `_generalized_loglogistic_sigmoid`。
+//
+// 与 PC 的差异**只有两处机械改写**（函数体逐行等价，"顺手简化"一律禁止）：
+//   ① 6 个 `DT_SIGMOID_*` 编译期常量 → `uSig*` uniform。数值由 CPU 侧
+//      `computeSigmoidParams`（`film/SigmoidParams.h`，逐行照抄 darktable
+//      `commit_params`）求解后下发 ⇒ **公式只有一处实现**，不存在"CPU 与 GPU 各写
+//      一遍公式"的漂移面（与既有 `computeFilmicSpline` → `uFilmic*` 同款做法）。
+//      ⚠ **别把 PC 的常量值当基准"修"回来**：PC 那 6 个常量 = darktable **默认
+//        contrast 1.5** 下的解（paper_exposure 0.354355423 / film_fog 0.00142637086 /
+//        film_power 1.5）；本项目按判据口径取 **contrast 1.2**（SigmoidParams.h 顶部
+//        注释：让白纸输出与引擎 0 的 204 LSB 对齐，判据 ① 才能在同白纸亮度下比较）
+//        ⇒ 实测解 = paper_exposure 0.592131495 / film_fog 0.000400747434 /
+//        film_power 1.19090915（white_target 1 / paper_power 1 / hue 1 两者相同）。
+//        差异是**参数不同**，不是公式不同 —— 公式逐行等价。
+//   ② 函数名改项目风格（`sigmoid*` 前缀，入口 `sigmoidTone`）：与公共段 / 引擎 0 段
+//      的既有函数（`luma` / `filmic*` / `gamut*`）无重名（已全段 grep 核对）。
+//
+// ⚠ **必须显式标注的差异（不许默默省略）**：darktable 的 per-channel 路径还有
+//   **primaries inset / rotation**（`_calculate_adjusted_primaries`：把工作空间原色按
+//   inset / rotation 收缩旋转后再做 per-channel 曲线）。darktable 默认
+//   `inset = 0 / rotation = 0 / purity = 0` ⇒ 该段是**恒等变换**，PC 也省略了它，
+//   本阶段同样省略 —— **省略的是恒等段，默认参数下与官方逐像素等价**。
+//   非默认 inset / rotation 是将来"公共工作空间切 Rec.2020 / rec2020 primaries"那一期
+//   的挂点（方案 §10 第 3 条）：届时在本段函数之前插入 `_calculate_adjusted_primaries`
+//   的矩阵即可，曲线本体不动。
+//
+// ⚠ `uSigBlackTarget`（display black target）**声明但不参与曲线**：PC 的 per-channel
+//   路径没用到它，darktable 的 per-channel 路径**同样没用到**（只有 rgb-ratio 路径用它
+//   做黑点抬升）。保留声明有两个理由：① 与 CPU 侧 7 标量契约一一对应（少一个就是
+//   "求解了却不下发"的静默缺口）；② 将来 rgb-ratio 路径与完整性校验的挂点。
+//   它被 GLSL 编译器优化掉 ⇒ `glGetUniformLocation` 返回 −1 ⇒ 下发是安全 no-op。
+//
+// ⚠ 7 个 uniform 名与 CPU 侧下发名**逐字一致**（`FrameRenderer.cpp` 的
+//   `queryFilmUniforms()` / `passFilm()` 两处，`tools/validate-shaders.sh` 会核对）。
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⚠ **本块必须在匿名 namespace 之外**（就放在上面那个 `}  // namespace` 之后）：
+//   `film/EngineRegistry.cpp` 的表项按名字**链接引用**这两个指针，而匿名 namespace 里的
+//   名字是**内部链接** ⇒ 本 TU 不产出外部符号，链接期 undefined symbol。实测口径：
+//   放匿名 namespace 内时 `nm FrameRenderer.o | grep kFsSigmoid` **零命中**且 clang 报
+//   "unused variable"；放这里后为 `D filmkit::kFsSigmoidDef` / `D filmkit::kFsSigmoidMain`
+//   （`EngineRegistry.o` 侧的 `U` 由它们满足）。**移动本块前先看这条注释。**
+const char* kFsSigmoidDef = R"(// ── 引擎 1 私有 uniforms（7 个；前 6 个 = PC 的 6 个 DT_SIGMOID_* 常量）──────
+uniform float uSigWhiteTarget;
+uniform float uSigBlackTarget;
+uniform float uSigPaperExposure;
+uniform float uSigFilmFog;
+uniform float uSigFilmPower;
+uniform float uSigPaperPower;
+uniform float uSigHuePreservation;
+
+// ⚠ 公共 uniform，但**声明落在引擎 0 段内**（阶段 1 的切分点 A 在它之后）⇒ 引擎 1 必须
+// 补声明，否则公共中段的 `vec3 mapped = max(lin, vec3(0.0)) * uExposure;` 编译期就报
+// "undeclared identifier"（本卡实测：glslang 报 0:223 未声明，真机同错）。
+// 为什么**不**把它移进 head 段：移动 = 改动 `kFsFilm` 的字节 ⇒ 引擎 0 的零回归硬门槛
+// （25140 字符 / 35154 字节 / crc32 0x4fa1ebd3）当场红。正确修法是引擎 1 自带声明 ——
+// 两个引擎各自是**独立编译的 shader**，同名 uniform 各声明一次互不影响。
+// 全量核对过：engine0_def 段声明、而公共 mid/tail 段使用的 uniform **只有 uExposure**
+// 这一个（其余 21 个 uFilmic*/uGamut 只被引擎 0 自己的函数使用）。
+uniform float uExposure;
+
+// 负值去饱和：把负通道（宽色域工作空间的域外色）拉回正值域，先抬到"平均亮度"再按
+// 最小通道的负度缩放色差。逐行照抄 PC 的 `desaturateNegativeValues`。
+vec3 sigmoidDesaturateNegative(vec3 color) {
+    float pixelAverage = max((color.r + color.g + color.b) / 3.0, 0.0);
+    float minValue = min(color.r, min(color.g, color.b));
+    float saturationFactor =
+        minValue < 0.0 ? -pixelAverage / (minValue - pixelAverage) : 1.0;
+    return vec3(pixelAverage) + saturationFactor * (color - vec3(pixelAverage));
+}
+
+// generalized log-logistic：film 响应（幂律）+ paper 响应（有理式饱和）。
+// darktable `_generalized_loglogistic_sigmoid`；PC 的 `darktableSigmoidScalar` 逐行同。
+float sigmoidScalar(float value) {
+    float clampedValue = max(value, 0.0);
+    float filmResponse = pow(uSigFilmFog + clampedValue, uSigFilmPower);
+    float paperResponse = uSigWhiteTarget *
+        pow(filmResponse / (uSigPaperExposure + filmResponse), uSigPaperPower);
+    return clamp(paperResponse, 0.0, uSigWhiteTarget);
+}
+
+vec3 sigmoidCurve(vec3 color) {
+    return vec3(
+        sigmoidScalar(color.r),
+        sigmoidScalar(color.g),
+        sigmoidScalar(color.b)
+    );
+}
+
+// per-channel 曲线的通道排序（max / mid / min 三档）：darktable 的 per-channel 路径
+// 用"亮度排序"而非固定 RGB 顺序做 hue preservation，保证结果与通道排列无关。
+ivec3 sigmoidChannelOrder(vec3 color) {
+    if (color.r >= color.g) {
+        if (color.g > color.b) {
+            return ivec3(2, 1, 0);
+        } else if (color.b > color.r) {
+            return ivec3(1, 0, 2);
+        } else if (color.b > color.g) {
+            return ivec3(1, 2, 0);
+        }
+        return ivec3(2, 1, 0);
+    }
+    if (color.r >= color.b) {
+        return ivec3(2, 0, 1);
+    } else if (color.b > color.g) {
+        return ivec3(0, 1, 2);
+    }
+    return ivec3(0, 2, 1);
+}
+
+float sigmoidChannelValue(vec3 color, int index) {
+    if (index == 0) return color.r;
+    if (index == 1) return color.g;
+    return color.b;
+}
+
+vec3 sigmoidWithChannelValue(vec3 color, int index, float value) {
+    if (index == 0) {
+        color.r = value;
+    } else if (index == 1) {
+        color.g = value;
+    } else {
+        color.b = value;
+    }
+    return color;
+}
+
+// 色相 + 能量保持：先按 midScale 求"全色相校正"中点，再在"朴素色相中点"与它之间按
+// uSigHuePreservation 插值；能量目标 = 输入 min/mid 结构决定的混合因子 × per-channel
+// 总能量与朴素总能量的混合。两支分别解 correctedMid（分母即约束方程的系数），
+// 保证 outMin + outMid + outMax == energyTarget。逐行照抄 PC 的
+// `preserveSigmoidHueAndEnergy`。
+vec3 sigmoidPreserveHueAndEnergy(vec3 inputColor, vec3 perChannel) {
+    ivec3 order = sigmoidChannelOrder(inputColor);
+    float inputMin = sigmoidChannelValue(inputColor, order.x);
+    float inputMid = sigmoidChannelValue(inputColor, order.y);
+    float inputMax = sigmoidChannelValue(inputColor, order.z);
+    float perMin = sigmoidChannelValue(perChannel, order.x);
+    float perMid = sigmoidChannelValue(perChannel, order.y);
+    float perMax = sigmoidChannelValue(perChannel, order.z);
+
+    float chroma = inputMax - inputMin;
+    float midScale = chroma != 0.0 ? (inputMid - inputMin) / chroma : 0.0;
+    float fullHueCorrection = perMin + (perMax - perMin) * midScale;
+    float naiveHueMid = mix(perMid, fullHueCorrection, uSigHuePreservation);
+    float perChannelEnergy = perChannel.r + perChannel.g + perChannel.b;
+    float naiveHueEnergy = perMin + naiveHueMid + perMax;
+    float inputMinPlusMid = inputMin + inputMid;
+    float blendFactor = inputMinPlusMid != 0.0 ? 2.0 * inputMin / inputMinPlusMid : 0.0;
+    float energyTarget = blendFactor * perChannelEnergy + (1.0 - blendFactor) * naiveHueEnergy;
+
+    float outMin;
+    float outMid;
+    float outMax;
+    if (naiveHueMid <= perMid) {
+        float correctedMid =
+            ((1.0 - uSigHuePreservation) * perMid +
+                uSigHuePreservation *
+                (midScale * perMax + (1.0 - midScale) * (energyTarget - perMax))) /
+            (1.0 + uSigHuePreservation * (1.0 - midScale));
+        outMin = energyTarget - perMax - correctedMid;
+        outMid = correctedMid;
+        outMax = perMax;
+    } else {
+        float correctedMid =
+            ((1.0 - uSigHuePreservation) * perMid +
+                uSigHuePreservation *
+                (perMin * (1.0 - midScale) + midScale * (energyTarget - perMin))) /
+            (1.0 + uSigHuePreservation * midScale);
+        outMin = perMin;
+        outMid = correctedMid;
+        outMax = energyTarget - perMin - correctedMid;
+    }
+
+    vec3 result = vec3(0.0);
+    result = sigmoidWithChannelValue(result, order.x, outMin);
+    result = sigmoidWithChannelValue(result, order.y, outMid);
+    result = sigmoidWithChannelValue(result, order.z, outMax);
+    return result;
+}
+
+// 引擎 1 入口（对应 PC 的 `applyDarktableSigmoid`；PC 尾部的 `uOutputTransform` 是它
+// 自己的输出变换，本项目的输出契约由公共段负责 ⇒ 不搬）。
+vec3 sigmoidTone(vec3 color) {
+    vec3 positiveColor = sigmoidDesaturateNegative(color);
+    vec3 perChannel = sigmoidCurve(positiveColor);
+    return sigmoidPreserveHueAndEnergy(positiveColor, perChannel);
+}
+)";
+
+// 引擎 1 注入段②：main 内的调用段（与引擎 0 的 engine0_main **同形**）。
+// 只能用 `out3` 与 uniforms —— `float l = luma(out3);` 等变量在本段**之后**才定义。
+// sigmoid 的色域行为 = 上面的 hue preservation（darktable 的 per-channel 路径自带
+// 色相 / 能量守恒）⇒ **不接** `gamutMapV5`：gamut 归引擎（方案 §1.2），filmic v5 的
+// gamut 段是 filmic 引擎的私有部分，套到 sigmoid 上就是双份色域处理。
+[[maybe_unused]] const char* kFsSigmoidMain = R"(    if (uToneK > 0.0) {
+        vec3 toned = sigmoidTone(out3);
+        out3 = mix(out3, toned, uToneK);
+    })";
+
 // 诊断统计资源（4 张归约网格 + 1 张位打包输出）的惰性创建。**自带状态保存/恢复**：
 // 调用方在读"进入前状态"之前调用它，绝不能让它留下的 FBO/纹理绑定冒充成片链的状态。
 bool FrameRenderer::ensureDiagTargets() {
@@ -6562,15 +6825,104 @@ void FrameRenderer::diagStatsU8(const char* stage, const unsigned char* px, int 
 
 FrameRenderer::~FrameRenderer() { release(); }
 
+// `u_film_` 的**全部** location 查询（引擎插槽阶段 2 起独立成函数：换 program 后
+// location 全部失效，必须重跑 —— 包括 uTex 这类公共 uniform）。
+// 从 init() 原样搬出（阶段 1 之前它就写在那里），只**追加**引擎 1 的 7 个 uSig*。
+void FrameRenderer::queryFilmUniforms() {
+  u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
+  u_film_.hal_domain = glGetUniformLocation(prog_film_, "uHalDomainMap");
+  u_film_.domain_ratio = glGetUniformLocation(prog_film_, "uDomainRatio");
+  u_film_.sat = glGetUniformLocation(prog_film_, "uSat");
+  u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
+  u_film_.mono = glGetUniformLocation(prog_film_, "uMono");
+  u_film_.tone_k = glGetUniformLocation(prog_film_, "uToneK");
+  u_film_.look = glGetUniformLocation(prog_film_, "uLook");
+  u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
+  u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
+  // v0.7.8：用户 EV 滑杆（显示亮度补偿，乘在影调链之后，见 kFsFilm 注释）
+  u_film_.exposure = glGetUniformLocation(prog_film_, "uExposure");
+  // v0.7.3：filmic 的 spline 系数与 EV 标定（替代已废除的 uExposureGain）
+  // E4-4：per-channel —— 系数按**段**分组、vec3 的 .r/.g/.b = R/G/B（见 u_film_ 注释）
+  u_film_.filmic_toe_m1 = glGetUniformLocation(prog_film_, "uFilmicToeM1");
+  u_film_.filmic_toe_m2 = glGetUniformLocation(prog_film_, "uFilmicToeM2");
+  u_film_.filmic_toe_m3 = glGetUniformLocation(prog_film_, "uFilmicToeM3");
+  u_film_.filmic_toe_m4 = glGetUniformLocation(prog_film_, "uFilmicToeM4");
+  u_film_.filmic_toe_m5 = glGetUniformLocation(prog_film_, "uFilmicToeM5");
+  u_film_.filmic_sh_m1 = glGetUniformLocation(prog_film_, "uFilmicShM1");
+  u_film_.filmic_sh_m2 = glGetUniformLocation(prog_film_, "uFilmicShM2");
+  u_film_.filmic_sh_m3 = glGetUniformLocation(prog_film_, "uFilmicShM3");
+  u_film_.filmic_sh_m4 = glGetUniformLocation(prog_film_, "uFilmicShM4");
+  u_film_.filmic_sh_m5 = glGetUniformLocation(prog_film_, "uFilmicShM5");
+  u_film_.filmic_lin_m1 = glGetUniformLocation(prog_film_, "uFilmicLinM1");
+  u_film_.filmic_lin_m2 = glGetUniformLocation(prog_film_, "uFilmicLinM2");
+  u_film_.filmic_lat_min = glGetUniformLocation(prog_film_, "uFilmicLatMin");
+  u_film_.filmic_lat_max = glGetUniformLocation(prog_film_, "uFilmicLatMax");
+  u_film_.filmic_black_ev = glGetUniformLocation(prog_film_, "uFilmicBlackEv");
+  u_film_.filmic_dr = glGetUniformLocation(prog_film_, "uFilmicDr");
+  u_film_.filmic_input_min = glGetUniformLocation(prog_film_, "uFilmicInputMin");
+  u_film_.filmic_input_max = glGetUniformLocation(prog_film_, "uFilmicInputMax");
+  u_film_.filmic_power = glGetUniformLocation(prog_film_, "uFilmicPower");  u_film_.filmic_black_disp = glGetUniformLocation(prog_film_, "uFilmicBlackDisp");
+  u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
+  u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
+  u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
+  u_film_.local_knee_hi = glGetUniformLocation(prog_film_, "uLocalKneeHi");
+  u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
+  u_film_.local_size = glGetUniformLocation(prog_film_, "uLocalSize");
+  u_film_.gamut = glGetUniformLocation(prog_film_, "uGamut");
+  // 引擎 1（sigmoid，阶段 2）：7 个 uSig*。引擎 0 的 program 里全部返回 −1（那些
+  // uniform 不存在）⇒ 下发的 glUniform1f(−1, …) 是安全 no-op（GL 规范），零分支。
+  // ⚠ 名字必须与 `kFsSigmoidDef` 段首的声明**逐字一致**（validate-shaders.sh 会核对）。
+  u_film_.sig_white_target = glGetUniformLocation(prog_film_, "uSigWhiteTarget");
+  u_film_.sig_black_target = glGetUniformLocation(prog_film_, "uSigBlackTarget");
+  u_film_.sig_paper_exposure = glGetUniformLocation(prog_film_, "uSigPaperExposure");
+  u_film_.sig_film_fog = glGetUniformLocation(prog_film_, "uSigFilmFog");
+  u_film_.sig_film_power = glGetUniformLocation(prog_film_, "uSigFilmPower");
+  u_film_.sig_paper_power = glGetUniformLocation(prog_film_, "uSigPaperPower");
+  u_film_.sig_hue_preservation = glGetUniformLocation(prog_film_, "uSigHuePreservation");
+}
+
+// 引擎插槽（阶段 2）：按注册表把 `prog_film_` 换成 `slot` 的引擎。
+// 调用点只有一个（passFilm 检测到请求的 slot != 已编译 slot 时），**不是每帧路径**：
+// 一次引擎切换 = 一次编译（与 init() 编译引擎 0 同量级），之后每帧只是比一个 int。
+// 失败语义（方案 §4 契约 5）：**保持原 program 不变**并返回 false —— 调用方继续用
+// 引擎 0 渲染（照片优先，不崩、不 identity 伪装），失败原因已由 compileShader /
+// linkProgram 记 kError。
+bool FrameRenderer::buildFilmProgram(int slot) {
+  const std::string src = filmSource(slot);
+  const GLuint fs = compileShader(GL_FRAGMENT_SHADER, src.c_str());
+  if (fs == 0) return false;  // 编译失败：原因已记 kError，保持原 program
+  const GLuint prog = linkProgram(vs_plain_, fs);
+  glDeleteShader(fs);
+  if (prog == 0) return false;  // 链接失败：同上
+  if (prog_film_ != 0) glDeleteProgram(prog_film_);
+  prog_film_ = prog;
+  film_engine_slot_ = slot;
+  queryFilmUniforms();  // location 是 per-program 的 ⇒ 必须重查（含 uTex 等公共项）
+  logFilmSourceSelfCheck(src, slot);  // 开发期自检：附 crc32/bytes/chars 供真机核对
+  Logger::instance().log(LogLevel::kInfo, "engine", "engine.slot_built",
+                         "{\"slot\":" + std::to_string(slot) + "}");
+  return true;
+}
+
 bool FrameRenderer::init() {
   vs_rot_ = compileShader(GL_VERTEX_SHADER, kVertRot);
   vs_plain_ = compileShader(GL_VERTEX_SHADER, kVertPlain);
   const GLuint fs_oes = compileShader(GL_FRAGMENT_SHADER, kFsOes);
   const GLuint fs_still = compileShader(GL_FRAGMENT_SHADER, kFsStill);
-  // ── 引擎插槽（阶段 1）：film pass 的源码 = 公共模板三段 + 引擎 0 注入段，此处拼接 ──
-  // `slot` 恒为 0：init() 早于任何 FilmParams 下发（Bridge 在 EGL 建立后即 init，参数随
-  // 预览/静拍帧才到）⇒ 初始化期拿不到 `[98]`。运行期下发的非 0 取值由 passFilm 记 WARN
-  // 并降级（见 warnEngineSlotUnavailable），**不在此处重编译**（阶段 1 无引擎 1）。
+  // ── 引擎插槽（阶段 2）：film pass 的源码 = 公共模板三段 + 引擎注入段，此处拼接 ──
+  // ⚠ **为什么 init() 恒按 slot 0 编译**（任务书第 7 条的落地口径，已实测核对）：
+  //   `init()` **签名里没有 `FilmParams`**，调用方 `Bridge.cpp` 的 `nativeEngineStart`
+  //   也在任何参数下发**之前**就 init（参数随预览/静拍帧才到）⇒ 初始化期物理上拿不到
+  //   `[98] engine_slot`（阶段 1 的注释已写明这一点，本次复核确认无参数快照可用）。
+  //   因此：init() 编译**引擎 0**（= 默认档，旧预设/未下发时就是它），运行期首个非 0
+  //   取值由 `passFilm` 触发**一次性**重建（`buildFilmProgram`，见其注释）—— 那才是
+  //   "按 `[98]` 取 slot" 的实际落点。每帧只多一次 int 比较，不重编译。
+  // 引擎 1（sigmoid）的 CPU 侧参数：init() 期算一次（当前无 UI 通道 ⇒ 恒默认值，
+  // 见 SigmoidParams.h 的 `kSigmoidDefault*`），每帧无条件下发 7 个 uSig*（passFilm）。
+  // 公式只有一处实现（CPU 侧 computeSigmoidParams，逐行照抄 darktable commit_params）。
+  sigmoid_ = computeSigmoidParams(kSigmoidDefaultContrast, kSigmoidDefaultSkew,
+                                  kSigmoidDefaultWhiteTarget, kSigmoidDefaultBlackTarget,
+                                  kSigmoidDefaultHuePreservation);
   const std::string fs_film_src = filmSource(0);
   logFilmSourceSelfCheck(fs_film_src, 0);  // 开发期自检：拼接 vs 原文逐字节（只跑一次）
   const GLuint fs_film = compileShader(GL_FRAGMENT_SHADER, fs_film_src.c_str());
@@ -7297,46 +7649,7 @@ bool FrameRenderer::init() {
     }
   }
 
-  u_film_.tex = glGetUniformLocation(prog_film_, "uTex");
-  u_film_.hal_domain = glGetUniformLocation(prog_film_, "uHalDomainMap");
-  u_film_.domain_ratio = glGetUniformLocation(prog_film_, "uDomainRatio");
-  u_film_.sat = glGetUniformLocation(prog_film_, "uSat");
-  u_film_.split = glGetUniformLocation(prog_film_, "uSplit");
-  u_film_.mono = glGetUniformLocation(prog_film_, "uMono");
-  u_film_.tone_k = glGetUniformLocation(prog_film_, "uToneK");
-  u_film_.look = glGetUniformLocation(prog_film_, "uLook");
-  u_film_.look_sat = glGetUniformLocation(prog_film_, "uLookSat");
-  u_film_.look_chroma = glGetUniformLocation(prog_film_, "uLookChroma");
-  // v0.7.8：用户 EV 滑杆（显示亮度补偿，乘在影调链之后，见 kFsFilm 注释）
-  u_film_.exposure = glGetUniformLocation(prog_film_, "uExposure");
-  // v0.7.3：filmic 的 spline 系数与 EV 标定（替代已废除的 uExposureGain）
-  // E4-4：per-channel —— 系数按**段**分组、vec3 的 .r/.g/.b = R/G/B（见 u_film_ 注释）
-  u_film_.filmic_toe_m1 = glGetUniformLocation(prog_film_, "uFilmicToeM1");
-  u_film_.filmic_toe_m2 = glGetUniformLocation(prog_film_, "uFilmicToeM2");
-  u_film_.filmic_toe_m3 = glGetUniformLocation(prog_film_, "uFilmicToeM3");
-  u_film_.filmic_toe_m4 = glGetUniformLocation(prog_film_, "uFilmicToeM4");
-  u_film_.filmic_toe_m5 = glGetUniformLocation(prog_film_, "uFilmicToeM5");
-  u_film_.filmic_sh_m1 = glGetUniformLocation(prog_film_, "uFilmicShM1");
-  u_film_.filmic_sh_m2 = glGetUniformLocation(prog_film_, "uFilmicShM2");
-  u_film_.filmic_sh_m3 = glGetUniformLocation(prog_film_, "uFilmicShM3");
-  u_film_.filmic_sh_m4 = glGetUniformLocation(prog_film_, "uFilmicShM4");
-  u_film_.filmic_sh_m5 = glGetUniformLocation(prog_film_, "uFilmicShM5");
-  u_film_.filmic_lin_m1 = glGetUniformLocation(prog_film_, "uFilmicLinM1");
-  u_film_.filmic_lin_m2 = glGetUniformLocation(prog_film_, "uFilmicLinM2");
-  u_film_.filmic_lat_min = glGetUniformLocation(prog_film_, "uFilmicLatMin");
-  u_film_.filmic_lat_max = glGetUniformLocation(prog_film_, "uFilmicLatMax");
-  u_film_.filmic_black_ev = glGetUniformLocation(prog_film_, "uFilmicBlackEv");
-  u_film_.filmic_dr = glGetUniformLocation(prog_film_, "uFilmicDr");
-  u_film_.filmic_input_min = glGetUniformLocation(prog_film_, "uFilmicInputMin");
-  u_film_.filmic_input_max = glGetUniformLocation(prog_film_, "uFilmicInputMax");
-  u_film_.filmic_power = glGetUniformLocation(prog_film_, "uFilmicPower");  u_film_.filmic_black_disp = glGetUniformLocation(prog_film_, "uFilmicBlackDisp");
-  u_film_.local = glGetUniformLocation(prog_film_, "uLocal");
-  u_film_.local_strength = glGetUniformLocation(prog_film_, "uLocalStrength");
-  u_film_.local_knee = glGetUniformLocation(prog_film_, "uLocalKnee");
-  u_film_.local_knee_hi = glGetUniformLocation(prog_film_, "uLocalKneeHi");
-  u_film_.local_ref = glGetUniformLocation(prog_film_, "uLocalRef");
-  u_film_.local_size = glGetUniformLocation(prog_film_, "uLocalSize");
-  u_film_.gamut = glGetUniformLocation(prog_film_, "uGamut");
+  queryFilmUniforms();
 
   u_out_.tex = glGetUniformLocation(prog_out_, "uTex");
   u_out_.px = glGetUniformLocation(prog_out_, "uPx");
@@ -13664,13 +13977,31 @@ void FrameRenderer::passFill(int dst_w, int dst_h) {
 
 void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
                              bool still, bool hal_domain) {
-  // ── 引擎插槽（阶段 1）：`[98] engine_slot` 的降级路径 ─────────────────────────
-  // shader 在 init() 期按引擎 0 编译（那时拿不到 FilmParams ⇒ 见 init() 内注释）；
-  // 这里对运行期下发的非 0 取值**明确降级到引擎 0 + 记 WARN**（方案 §4 契约 5：
-  // 不静默、不崩、不做 identity 伪装）。阶段 2 注册引擎 1 后，此处改为按 slot 选 program。
-  // ⚠ 不在此处重编译 shader：每帧重编译会毁掉性能，且阶段 1 无第二个引擎可切。
+  // ── 引擎插槽（阶段 2）：`[98] engine_slot` 的选路 ────────────────────────────
+  // `init()` 只能编译引擎 0（那时拿不到 FilmParams，见 init() 内注释）⇒ 这里按请求的
+  // slot **一次性**换 program（`buildFilmProgram`，不是每帧重编译：只在 slot 与已编译
+  // 的 slot 不同时触发）。三种情况：
+  //   · 请求 slot == 已编译 slot（含恒定的 0）⇒ 只比一个 int，零开销（绝大多数帧）；
+  //   · 请求 slot 未注册 ⇒ 契约 5：明确降级到引擎 0 + 记 WARN（不静默、不崩、不伪装）；
+  //   · 请求 slot 已注册但编译/链接失败 ⇒ 保持原 program（= 引擎 0 继续出图）+ 记
+  //     kError，并记住该失败 slot **不重试**（否则每帧重编译一个坏 shader = 每帧一次
+  //     35KB 编译 + 日志刷屏）。请求的 slot 变化时才重新尝试。
   const int engine_slot = static_cast<int>(std::lround(p.engine_slot));
-  if (engine_slot != 0) warnEngineSlotUnavailable(engine_slot);
+  if (engine_slot != film_engine_slot_) {
+    if (findEngine(engine_slot) == nullptr) {
+      warnEngineSlotUnavailable(engine_slot);  // 未注册：降级到已编译的引擎 0
+    } else if (engine_slot != film_build_failed_slot_) {
+      if (buildFilmProgram(engine_slot)) {
+        film_build_failed_slot_ = -1;
+      } else {
+        film_build_failed_slot_ = engine_slot;  // 失败不重试，等 slot 变化
+        Logger::instance().log(
+            LogLevel::kError, "engine", "engine.slot_build_failed",
+            "{\"requested\":" + std::to_string(engine_slot) + ",\"fallback\":" +
+                std::to_string(film_engine_slot_) + "}");
+      }
+    }
+  }
   // filmic 的自动 EV 标定（v0.7.3）：**刻意放在 passFilm 内** —— 预览 / YUV 静拍 /
   // RAW 静拍三条路径都经过这里，一处实现即全覆盖。
   // 开关语义（v0.7.6）：黑白点来自用户配置（FilmParams[37]/[38]，默认 −7.65/+4.56）；
@@ -13783,6 +14114,18 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glUniform1f(u_film_.filmic_input_max, filmic_.input_max);
   glUniform1f(u_film_.filmic_power, filmic_.output_power);
   glUniform1f(u_film_.filmic_black_disp, filmic_.black_disp);
+  // ── 引擎 1（sigmoid，阶段 2）：7 个标量**无条件下发** ─────────────────────────
+  // 与上面 filmic 段同款：CPU 侧算好（`computeSigmoidParams`，init() 期一次），这里只
+  // 做 7 次 glUniform1f。**不按 slot 分支**：引擎 0 的 program 里这 7 个 location = −1，
+  // GL 规范下 `glUniform*(−1, …)` 是安全 no-op ⇒ 零分支、零风险（也避免"某天有人把
+  // 分支写反 ⇒ 引擎 1 拿到旧值"的静默失效）。
+  glUniform1f(u_film_.sig_white_target, sigmoid_.white_target);
+  glUniform1f(u_film_.sig_black_target, sigmoid_.black_target);
+  glUniform1f(u_film_.sig_paper_exposure, sigmoid_.paper_exposure);
+  glUniform1f(u_film_.sig_film_fog, sigmoid_.film_fog);
+  glUniform1f(u_film_.sig_film_power, sigmoid_.film_power);
+  glUniform1f(u_film_.sig_paper_power, sigmoid_.paper_power);
+  glUniform1f(u_film_.sig_hue_preservation, sigmoid_.hue_preservation);
   // v0.10.13：darktable v5 gamut mapping 开关（1 = 标准，0 = A/B 关）
   glUniform1f(u_film_.gamut, p.gamut);
   // 预览域映射（v0.8.0）：预览先 /uDomainRatio 回 RAW 等效域再走 filmic；静拍=1。

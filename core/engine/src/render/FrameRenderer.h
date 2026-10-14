@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../film/FilmParams.h"
+#include "../film/SigmoidParams.h"
 
 namespace filmkit {
 
@@ -651,6 +652,15 @@ class FrameRenderer {
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
                 bool hal_domain);
   void passFilm(int w, int h, const FilmParams& p);
+  // ── 引擎插槽（阶段 2）：film pass 的 program 按引擎 slot 编译 ────────────────
+  // `queryFilmUniforms()`：查询 `u_film_` 的**全部** location。**必须**在每次换
+  // program 之后重跑 —— location 是 per-program 的（重建后旧值全部失效，包括 uTex
+  // 这类公共 uniform）。init() 与 buildFilmProgram() 各调用一次。
+  void queryFilmUniforms();
+  // `buildFilmProgram(slot)`：按注册表组装源码 → 编译 → 链接 → 换掉 `prog_film_` →
+  // 重查 location。**任一环节失败都返回 false 且不换程序**（调用方保留原 program =
+  // 回落引擎 0，符合方案 §4 契约 5：不 identity 伪装、不崩）。
+  bool buildFilmProgram(int slot);
   // zebra —— 过曝提示（仅预览；成片传 false，提示绝不进成片）
   void passOutput(int w, int h, const FilmParams& p, bool flip_y, bool zebra);
   // E1-3 编辑器通路：显示域输入 → LUT/颗粒/dither → fbo_cap_（RGBA8）
@@ -1102,6 +1112,17 @@ class FrameRenderer {
   float lut_strength_ = 1.0f;  // 最近一次输出的 LUT 强度（histogram 沿用，保证同源）
   // ── filmic 状态（v0.7.3）─────────────────────────────────────────────────
   FilmicSpline filmic_{};                       // 本帧下发的 spline（CPU 侧算好）
+  // ── 引擎插槽状态（阶段 2）────────────────────────────────────────────────
+  // `sigmoid_` = 引擎 1 的 7 个标量（CPU 侧 `computeSigmoidParams` 在 init() 期算一次；
+  // 当前无 UI 通道 ⇒ 恒为 SigmoidParams.h 的 `kSigmoidDefault*`）。每帧无条件下发。
+  SigmoidParams sigmoid_{};
+  // 当前**已编译进 `prog_film_`** 的引擎 slot（0 = 内置 filmic）。
+  // `init()` 期拿不到 `FilmParams` ⇒ 恒先编译引擎 0；运行期首个非 0 取值由
+  // `passFilm` 触发一次性重建（见 buildFilmProgram）。
+  int film_engine_slot_ = 0;
+  // 重建**失败过**的 slot：失败后不重试（否则每帧重编译一个坏 shader = 每帧一次
+  // 35KB 编译 + 日志刷屏）。请求的 slot 变化时才重新尝试。
+  int film_build_failed_slot_ = -1;
   float ev_black_ = -7.65f, ev_white_ = 4.56f;  // 本帧实际 EV（日志用）
   float ev_smooth_black_ = 0.0f, ev_smooth_white_ = 0.0f;  // EMA（0 = 未初始化）
   // 排查"预览过曝 vs 成片正常"：预览统计 OES 预览流(passOES)、静拍统计 RAW/YUV 链，
@@ -1330,6 +1351,16 @@ class FrameRenderer {
           filmic_black_ev = -1, filmic_dr = -1, filmic_input_min = -1,
           filmic_input_max = -1, filmic_power = -1, filmic_black_disp = -1,
           gamut = -1,  // v0.10.13：darktable filmic v5 gamut mapping（0 = A/B 关）
+          // ── 引擎 1（sigmoid，阶段 2）────────────────────────────────────────
+          // 7 个标量由 CPU 侧 `computeSigmoidParams`（film/SigmoidParams.h，逐行照抄
+          // darktable `commit_params`）求解，init() 期算一次存 `sigmoid_`，每帧无条件
+          // 下发。**引擎 0 的 program 里这 7 个 location = −1**（该 program 不含这些
+          // uniform）⇒ GL 规范下 `glUniform*(−1, …)` 是安全 no-op ⇒ 零分支、零风险。
+          // `sig_black_target` 在 per-channel 路径下**不参与曲线**（见 shader 注释），
+          // 仍查询 + 下发 = 与 CPU 侧 7 标量契约一一对应。
+          sig_white_target = -1, sig_black_target = -1, sig_paper_exposure = -1,
+          sig_film_fog = -1, sig_film_power = -1, sig_paper_power = -1,
+          sig_hue_preservation = -1,
           exposure = -1;  // v0.7.8：用户 EV 滑杆（影调链后的显示亮度补偿）
   } u_film_;
   struct {

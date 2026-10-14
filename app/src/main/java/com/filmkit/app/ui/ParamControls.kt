@@ -1,5 +1,6 @@
 package com.filmkit.app.ui
 
+import android.content.SharedPreferences
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -50,9 +51,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.filmkit.app.camera.CAMERA_ENGINE_SELECT_SLOTS
 import com.filmkit.app.camera.CLARITY_UI_RANGE
 import com.filmkit.app.camera.CONTRAST_UI_RANGE
+import com.filmkit.app.camera.ENGINE_OVERRIDE_FOLLOW_PRESET
 import com.filmkit.app.camera.EXP_UI_RANGE
+import com.filmkit.app.camera.EngineScope
 import com.filmkit.app.camera.FADE_UI_RANGE
 import com.filmkit.app.camera.FILMIC_BLACK_EV_PIVOT
 import com.filmkit.app.camera.FILMIC_BLACK_EV_UI_RANGE
@@ -681,3 +685,146 @@ internal val CAMERA_TUNABLE_SLOT_PARAM: Map<Int, EditorParam> = buildMap {
     bind("haloStrength", 62); bind("haloThreshold", 63); bind("haloRadius", 64); bind("haloWarmth", 65)
     bind("glowStrength", 95); bind("glowRadius", 96); bind("glowThreshold", 97)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ 阶段 3（引擎插槽：切换与预设）：**参数归属哪个引擎**的 UI 判据 + 引擎选择面的选项
+//
+// 为什么判据落在这里：`EngineScope`（`camera/EngineScope.kt`）是"哪个槽归哪个引擎"的**唯一
+// 真源**，但它是 `camera` 包的契约对象、不认识 UI 的"参数项"（一条滑杆可写三个槽）。
+// 本段是**唯一**把契约翻译成"这个控件该不该渲染"的地方：
+//  - 参数面板（`CameraPresetFullEdit.kt` 的 [fullParamSections]）读 [paramActiveInEngine]；
+//  - 设置页「影调与色彩」（`SettingsScreen.kt`）读 [slotActiveInEngine]。
+// 两处**都不许**另抄一份"哪些参数属于 filmic"的清单（照抄 = 两份必然漂移的真相）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 引擎插槽 `[98]`（= [CAMERA_ENGINE_SELECT_SLOTS] 的唯一元素）。
+ *
+ * 取成单个 Int 只为少写 `.single()`；槽位号的真源仍是那个集合（阶段 1 的契约分类）。
+ */
+internal val ENGINE_SLOT: Int = CAMERA_ENGINE_SELECT_SLOTS.single()
+
+/**
+ * 引擎选择面的**可选值**（阶段 3）。
+ *
+ * **真源 = [EngineScope.KNOWN_ENGINE_SLOTS]**（已注册引擎 —— `applyEngineScope` 正是按它
+ * 判定"未注册值 ⇒ 按 0 处理"），这里只是它的**有序投影**（UI 的 pill 需要稳定顺序，
+ * 而 `Set` 的迭代序不该被当契约用）。
+ *
+ * ⚠ **不在 Kotlin 侧另立引擎表**：槽号来自契约，契约又由
+ * `EngineSlotUiTest.engineChoicesMatchTheCppRegistry` 直接解析 `core/engine/src/film/
+ * EngineRegistry.cpp` 的 `kEngines` 表对拍（与 `CameraStyleWhitelistTest` 同一条纪律）
+ * ⇒ 加引擎时忘了同步契约，单测立刻红。引擎名 / 工作空间 / 曝光域 / 注入段一律**不镜像**
+ * （UI 的叫法走 `PresetDetail` 给 `[98]` 的既有格式「引擎 N」，不新造译名）。
+ */
+internal val ENGINE_SLOT_CHOICES: List<Int> = EngineScope.KNOWN_ENGINE_SLOTS.sorted()
+
+// ── ★ 阶段 3b：设置页的**全局引擎开关**（prefs `engine_override`）────────────────
+// 语义 / 哨兵值 / "只作用于拍照链路"三条契约都在 `EngineScope.effectiveEngineSlot` 的 KDoc 里
+// （`camera/EngineScope.kt`）—— 本处只是 UI 侧的**键名、档位与读取入口**，不重复定义语义。
+// 三处 gate（设置页 / 完整参数页 / 一级页）都走 [effectiveEngineSlotOf]，不许各自拼
+// `if (override >= 0) ...`（那正是"UI 按 A 引擎隐藏、渲染用 B 引擎"的假读数来源）。
+
+/**
+ * prefs 键：设置页三档全局引擎开关（`-1` 跟随预设 / `0` / `1`）。
+ *
+ * **"跟随预设"的哨兵值不在本文件** —— 用渲染侧（`camera/EditorExport.kt`）的
+ * [com.filmkit.app.camera.ENGINE_OVERRIDE_FOLLOW_PRESET]，两份 -1 必然漂移。
+ * 键名字符串在渲染侧是硬编码（`CameraController.engineScopedForCapture`）⇒
+ * `EngineOverrideUiTest` 有一处源码对拍守着"两边同一个键"。
+ */
+internal const val ENGINE_OVERRIDE_PREFS_KEY: String = "engine_override"
+
+/**
+ * 设置页三档的**档位顺序**（控件循环切换的顺序 = 这个列表的顺序）。
+ *
+ * = 「跟随预设」（[com.filmkit.app.camera.ENGINE_OVERRIDE_FOLLOW_PRESET]）+ [ENGINE_SLOT_CHOICES]
+ * （**不另立引擎表**：加引擎时这里自动跟上）。
+ */
+internal val ENGINE_OVERRIDE_CHOICES: List<Int> =
+    listOf(ENGINE_OVERRIDE_FOLLOW_PRESET) + ENGINE_SLOT_CHOICES
+
+/**
+ * 档位的**显示文案**：强制档 = `PresetDetail` 给 `[98]` 的既有读数「引擎 N」
+ * （[presetDetailRowOf]，与「完整参数」页的引擎选择面显示**同一个字符串**，不新造译名）；
+ * 其余（跟随档 **与未注册值** —— 后者按契约就是"跟随预设"）⇒「跟随预设」
+ * （用户 2026-10-14 拍板的档名）。
+ *
+ * ⚠ 未注册值的收敛必须在这里：否则手改 prefs 成 `7` 会显示成「引擎 7」= 假读数。
+ */
+internal fun engineOverrideLabel(override: Int): String =
+    if (override in ENGINE_SLOT_CHOICES) presetDetailRowOf(ENGINE_SLOT, override.toDouble()).value
+    else "跟随预设"
+
+/** 读 prefs 的全局覆盖档（缺省 = [ENGINE_OVERRIDE_FOLLOW_PRESET]，与渲染侧同一常量）。 */
+internal fun engineOverrideOf(prefs: SharedPreferences): Int =
+    prefs.getInt(ENGINE_OVERRIDE_PREFS_KEY, ENGINE_OVERRIDE_FOLLOW_PRESET)
+
+/**
+ * **下一档**（设置页那个三档控件的点击推进：跟随预设 → 引擎 0 → 引擎 1 → 跟随预设）。
+ *
+ * 未注册的当前值按「跟随预设」处理（与 [engineOverrideLabel] / 契约同口径）⇒ 手改 prefs 成
+ * `7` 后点一下进「引擎 0」，不会卡在坏值上。
+ */
+internal fun nextEngineOverride(current: Int): Int {
+    val i = ENGINE_OVERRIDE_CHOICES.indexOf(current).coerceAtLeast(0)
+    return ENGINE_OVERRIDE_CHOICES[(i + 1) % ENGINE_OVERRIDE_CHOICES.size]
+}
+
+/**
+ * **生效引擎** = 预设的 `[98]` ⊕ prefs 的全局覆盖档 —— 三处 gate 的**唯一**入口。
+ *
+ * 合成规则不在这里（那是 [EngineScope.effectiveEngineSlot] 的契约，也含"未注册档位按跟随
+ * 预设处理"），本函数只负责"读哪个 prefs 键 / 缺省是什么"这一件事。
+ *
+ * @param presetSlot 该处自己读到的预设 `[98]`（完整参数页含本页未保存的改动）
+ */
+internal fun effectiveEngineSlotOf(prefs: SharedPreferences, presetSlot: Int): Int =
+    EngineScope.effectiveEngineSlot(presetSlot, engineOverrideOf(prefs))
+
+/**
+ * 槽位 [slot] 在引擎 [engineSlot] 下**是否仍有作用**（false ⇒ 属于别的引擎 ⇒ UI **不渲染**
+ * 该控件，不是置灰）。
+ *
+ * 判据两条，都读 `EngineScope` 的单一真源：
+ *  1. 槽位被别的引擎**独占**（[EngineScope.FILMIC_OWNED_SLOTS]）；
+ *  2. 槽位在 [EngineScope.NEUTRALIZE] 表里 —— 非 0 引擎下它被**置恒等**（切引擎 = 旁路）
+ *     ⇒ 控件留在界面上就是"拖了画面不动"的**假控件**（ADR-12）⇒ 同样不渲染。
+ *
+ * ★ **未注册的引擎值按 0 处理**（与 [EngineScope.applyEngineScope] 的 `effective` 逐字同一
+ * 口径，卡 C 的 P2 修复）：渲染侧对 `engine_slot = 2`（手改预设 JSON 才会出现）走**引擎 0、
+ * 不旁路**；UI 若仍按"非 0 ⇒ 隐藏"处理，就会藏起**实际正在生效**的 filmic 参数 = 假读数。
+ * 两侧必须用同一个 `effective`，否则又是"Kotlin 与 C++ 语义不一致"的同型缺陷。
+ *
+ * 顺带：定义域收敛后，`engineSlot == 0` 与"未注册值"共用同一条返回路径（恒 true）。
+ *
+ * ⚠ **已知边界**（加第 3 个引擎前必读）：[EngineScope.NEUTRALIZE] 目前的语义是"**非 0 即
+ * 恒等**"（`applyEngineScope` 的实现如此），所以"引擎 2 也吃 `[28]`"这种情形会被本函数误判成
+ * 隐藏。届时必须把 NEUTRALIZE 升级成 per-engine 的表（`Map<Int, Map<Int, Double>>`）——
+ * 在那之前本判据是准的。
+ */
+internal fun slotActiveInEngine(slot: Int, engineSlot: Int): Boolean {
+    val effective = if (engineSlot in EngineScope.KNOWN_ENGINE_SLOTS) engineSlot else 0
+    if (effective == 0) return true
+    return slot !in EngineScope.FILMIC_OWNED_SLOTS && slot !in EngineScope.NEUTRALIZE
+}
+
+/**
+ * ★ 阶段 3：**引擎插槽 `[98]` 的选择项** —— 它不是可连续调的量（是"选哪个引擎"），但复用
+ * [EditorParam] 的槽位读写形态 ⇒ 与参数滑杆走**同一条** `CameraParamOverrides` 记账 /
+ * 预览 / 保存链路（`afterEdit` / 「保存」/「重置」/「另存为」全部零新管道）。
+ *
+ * 读数格式**逐字复用** `PresetDetail` 给 `[98]` 的那条（[presetDetailRowOf] ⇒「引擎 N」）：
+ * 同一个槽在详情页与选择面显示同一个字符串（ADR-12：不做第二套读数）。
+ *
+ * [range] 由 [ENGINE_SLOT_CHOICES] 派生（**不写死 `0f..1f`**）：本项不画滑杆，但量程必须与
+ * 真实可选值同域，否则将来加引擎时这里会静默说谎。
+ */
+internal val EngineSlotParam: EditorParam = EditorParam(
+    key = "engineSlot", label = "引擎插槽",
+    range = ENGINE_SLOT_CHOICES.min().toFloat()..ENGINE_SLOT_CHOICES.max().toFloat(),
+    pivot = 0f,
+    format = { presetDetailRowOf(ENGINE_SLOT, it.toDouble()).value },
+    read = { it[ENGINE_SLOT].toFloat() },
+    write = { p, v -> p[ENGINE_SLOT] = v.toDouble() },
+)

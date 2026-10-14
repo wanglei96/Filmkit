@@ -1288,6 +1288,17 @@ private fun PresetQuickAdjustPanel(
     onEditFinished: () -> Unit,
     onPickLevel: (EditorParam, Float) -> Unit,
 ) {
+    // ★ 阶段 3（引擎插槽）：**这条预设的引擎** = 本面板正在读写的那份数组的 `[98]`（与下发给
+    // 引擎的是同一个 `cameraPresetParams(...)`）⇒ 不必另找真相源。判据见 [slotActiveInEngine]。
+    // `getOrElse` 兜底短数组（同 E4-1 的长度纪律：读不到 ⇒ 按默认档 0 处理，不崩）。
+    // ★ 阶段 3b：再 ⊕ 设置页的三档全局开关（prefs `engine_override`，缺省「跟随预设」）
+    // ⇒ **生效引擎**。合成走契约函数（[effectiveEngineSlotOf] ⇒ `EngineScope.effectiveEngineSlot`），
+    // 与设置页 /「完整参数」页**同一个入口**：否则一级页会按预设引擎显示、而渲染按生效引擎
+    //（= "拖了画面不动"的假控件，ADR-12）。
+    val presetEngineSlot = params.getOrElse(ENGINE_SLOT) { 0.0 }.toInt()
+    val context = LocalContext.current
+    val prefs = remember(context) { context.getSharedPreferences("filmkit", 0) }
+    val engineSlot = effectiveEngineSlotOf(prefs, presetEngineSlot)
     Column(
         Modifier
             .fillMaxWidth()
@@ -1323,14 +1334,18 @@ private fun PresetQuickAdjustPanel(
         // 参数项**复用 `ParamControls.kt` 的那一条**（量程 / 读数 / write 全在它自己身上），
         // 与「完整参数 >」和编辑器是同一个对象 ⇒ 三个页面同一个数（不是第二份滑杆实现）。
         // ⚠ 黑点 `[37]` 不在这里（取舍依据见 [FILMIC_WHITE_EV_SLOT] 的 KDoc）。
-        key(presetId, FILMIC_WHITE_EV_SLOT) {
-            PresetParamSliderRow(
-                label = "白点",
-                param = CAMERA_TUNABLE_SLOT_PARAM.getValue(FILMIC_WHITE_EV_SLOT),
-                params = params,
-                onCommit = onEditParam,
-                onFinished = onEditFinished,
-            )
+        // ★ 阶段 3：`[38]` 是引擎 0（filmic）独占槽 ⇒ 切到别的引擎后**整行不进 UI 树**
+        //（与「完整参数」页同一判据 —— 留着它拖了画面不动 = 假控件，ADR-12）。
+        if (slotActiveInEngine(FILMIC_WHITE_EV_SLOT, engineSlot)) {
+            key(presetId, FILMIC_WHITE_EV_SLOT) {
+                PresetParamSliderRow(
+                    label = "白点",
+                    param = CAMERA_TUNABLE_SLOT_PARAM.getValue(FILMIC_WHITE_EV_SLOT),
+                    params = params,
+                    onCommit = onEditParam,
+                    onFinished = onEditFinished,
+                )
+            }
         }
         // 柔光 / 光晕 / 暗角（写值仍走这三条既有滑杆的 `write`；档位值 = [QuickLevelParam.levels]）
         for (q in QUICK_LEVEL_PARAMS) {

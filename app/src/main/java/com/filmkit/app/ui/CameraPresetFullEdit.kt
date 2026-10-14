@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.camera.CAMERA_PATH_SLOTS
 import com.filmkit.app.camera.EditorPreset
+import com.filmkit.app.camera.EngineScope
 import com.filmkit.app.camera.cameraPresetParams
 import com.filmkit.app.lut.LutLibrary
 
@@ -158,6 +159,38 @@ private val PARAM_SLOTS: Map<String, List<Int>> by lazy {
  */
 internal fun paramSlotsOf(param: EditorParam): List<Int> = PARAM_SLOTS[param.key].orEmpty()
 
+/**
+ * ★ 阶段 3（引擎插槽）：参数项 [param] 在当前引擎下**是否渲染**（false ⇒ 整条**不进 UI 树**，
+ * 不是置灰 —— 对照 PC `RawEditPanel.kt:991` 的 `when (rawRenderingEngine) { … else -> Unit }`）。
+ *
+ * 判据 = "该参数涉及的槽里还有没有活着的"（[paramSlotsOf] × [slotActiveInEngine]，真源是
+ * `EngineScope`）：
+ *  - **胶片曲线 · 肩部/趾部**（`[5..7]` / `[8..10]`）与 **filmic 黑白点**（`[37]` / `[38]`）
+ *    全槽被引擎 0 独占 ⇒ 引擎 1 下整条消失；
+ *  - **对比度 `[4]` 必须留下**：它在编辑器链路（`kFsStyle` 的 `uContrast`）里是通用的，
+ *    切引擎后照样生效（详见 `EngineScope` 的 KDoc —— 用户当场纠正过"对比度怎么会是
+ *    filmic 专属"）。
+ *
+ * ⚠ **「饱和度」`sat` 的处置（用户 2026-10-14 拍板"引擎 1 下整体隐藏"）**：它同写
+ * `[20][21][22]` 三槽，而 `[22]` 已被纳入 [EngineScope.NEUTRALIZE]（卡 C 抓到的 P1 半旁路）
+ * ⇒ **三槽全部失效**，本函数的通用判据（`any`）**自动**把它隐藏 —— **不需要**产品级的显式
+ * 例外。`EngineScope` 里原本考虑的 `UI_HIDDEN_PARAM_KEYS` 已按"能自动推导的判据不要显式声明"
+ * 删除；本函数因此保持**只有一条**判据（槽位），少一个漂移面。
+ *
+ * 用 `any`（不是 `all`）：一条滑杆**不能**一半有效一半无效地留在界面上，藏整条才是诚实的
+ * 处置；而 `any` 恰好只在"**整条**都已失效"时才返回 false（`slots.isEmpty()` 的兜底是
+ * "没有槽可判 ⇒ 不隐藏"，宁可多显示也不静默吞掉一个真控件）。
+ *
+ * 未注册的引擎值（手改预设 JSON 才会出现）与 `engineSlot == 0` 同结果 —— 判据委托给
+ * [slotActiveInEngine]，后者按 `EngineScope.KNOWN_ENGINE_SLOTS` 收敛到"按 0 处理"
+ * （与渲染侧 `applyEngineScope` 的 `effective` 同口径）。
+ */
+internal fun paramActiveInEngine(param: EditorParam, engineSlot: Int): Boolean {
+    if (engineSlot == 0) return true
+    val slots = paramSlotsOf(param)
+    return slots.isEmpty() || slots.any { slotActiveInEngine(it, engineSlot) }
+}
+
 /** 组标题（**分组依据 = `ParamControls.kt` 的三张参数表** + 一个只读兜底组）。 */
 private const val GRP_ADJUST = "调整"
 private const val GRP_COLOR = "色彩"
@@ -218,12 +251,26 @@ internal fun fullEditReadonlySlots(includedSlots: Set<Int>): List<Int> =
  *  - **基础**：`BASIC_PARAM_KEYS` 里的参数项（只有「调整」组有内容）；
  *  - **高级**：全部可调参数项 + 末尾的「只读」组（[fullEditReadonlySlots]，[includedSlots]
  *    用来决定"这条预设包含的、拍照链路不读的槽"要不要出现）。
+ *
+ * ★ **阶段 3（引擎插槽）：按引擎过滤**（[engineSlot] = 当前生效的 `[98]`）——
+ *  - 参数项：不属于当前引擎的整条**不进**网格（[paramActiveInEngine]）；
+ *  - 只读槽：同理过滤（`[35] auto_tone` / `[40] gamut` 是 filmic 独占，预设显式含它们时
+ *    会进只读组 —— 切引擎后它们既无效也不该出现在界面上）。
+ *
+ * 空组**不会**留下空标题：两个分段的 `if (cells.isNotEmpty())` 是既有的兜底，
+ * 过滤后组变空即整组不出现（`engineSlot=1` 时实测「调整」组仍有 12 项，见 `EngineSlotUiTest`）。
+ *
+ * [engineSlot] 默认 0 ⇒ **既有调用点（含全部单测）逐字不变**：引擎 0 = 默认档 = 一切照旧。
  */
-internal fun fullParamSections(tab: FullParamTab, includedSlots: Set<Int>): List<FullParamSection> {
+internal fun fullParamSections(
+    tab: FullParamTab,
+    includedSlots: Set<Int>,
+    engineSlot: Int = 0,
+): List<FullParamSection> {
     val params = when (tab) {
         FullParamTab.BASIC -> CAMERA_TUNABLE_PARAMS.filter { it.key in BASIC_PARAM_KEYS }
         FullParamTab.ADVANCED -> CAMERA_TUNABLE_PARAMS
-    }
+    }.filter { paramActiveInEngine(it, engineSlot) }
     val out = ArrayList<FullParamSection>(FULL_GRID_COLUMNS)
     for (g in listOf(GRP_ADJUST, GRP_COLOR, GRP_FILM)) {
         val cells = params.filter { groupOf(it) == g }
@@ -232,6 +279,7 @@ internal fun fullParamSections(tab: FullParamTab, includedSlots: Set<Int>): List
     }
     if (tab == FullParamTab.ADVANCED) {
         val cells = fullEditReadonlySlots(includedSlots)
+            .filter { slotActiveInEngine(it, engineSlot) }
             .map { FullParamCell("slot:$it", it, null, presetDetailRowOf(it, 0.0).label) }
         if (cells.isNotEmpty()) out += FullParamSection(GRP_READONLY, cells.chunked(FULL_GRID_COLUMNS))
     }
@@ -336,6 +384,8 @@ internal fun CameraPresetFullEdit(
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
+    // 设置页的全局引擎开关（prefs `engine_override`）—— 本页只**读**它（写入口在设置页）。
+    val prefs = remember(context) { context.getSharedPreferences("filmkit", 0) }
     val mine = overrides.forPreset(preset)
     val values = mine?.values ?: emptyMap()
     val removed = mine?.removed ?: emptySet()
@@ -343,11 +393,23 @@ internal fun CameraPresetFullEdit(
     // ⇒ 网格里的读数就是画面上的值（ADR-12：不显示第二套读数）
     val film = remember(preset, values, removed) { cameraPresetParams(preset, values, removed) }
     val included = remember(preset, values, removed) { ((preset.slots - removed) + values).keys }
+    // ★ 阶段 3：**这条预设的引擎** `[98]`（含本页未保存的改动）—— 引擎选择面编辑的就是它。
+    val presetEngineSlot = film[ENGINE_SLOT].toInt()
+    // ★ 阶段 3b：**当前生效的引擎** = 预设值 ⊕ 设置页的三档全局开关（prefs `engine_override`）。
+    // 合成规则走契约函数（[effectiveEngineSlotOf] ⇒ `EngineScope.effectiveEngineSlot`）：
+    // 设置页处于"强制"档时，这里的网格按**生效**引擎显隐（否则就会出现"渲染用 A 引擎、
+    // 参数按 B 引擎显示"的假读数 —— 阶段 3 卡 C 报过的 P2 同型）。
+    // ⚠ 选择面仍写 `presetEngineSlot`（那是预设的配方），被强制覆盖时下面另给一行提示。
+    // 档位**不做缓存**（每次重组读一次 prefs，与渲染侧 `engineScopedForCapture` 同款口径）：
+    // 缓存 = 设置页改档后这里可能还按旧档提示（渲染侧已经是"每次下发前读一次"）。
+    val engineOverride = engineOverrideOf(prefs)
+    val engineSlot = effectiveEngineSlotOf(prefs, presetEngineSlot)
     var tab by remember { mutableStateOf(FullParamTab.BASIC) }
     var selected by remember { mutableStateOf<String?>(null) }
     var cat by remember { mutableStateOf<String?>(null) }
     val drag = remember { FullEditDrag() }
-    val sections = remember(tab, included) { fullParamSections(tab, included) }
+    // engineSlot 进 key：切引擎 ⇒ 网格重算（不属于该引擎的参数项整条消失）
+    val sections = remember(tab, included, engineSlot) { fullParamSections(tab, included, engineSlot) }
     val canSave = fullEditSaveEnabled(mine)
     val entries = remember(cat, lutCatOf) {
         LutLibrary.entries(context).filter { cat == null || lutCatOf[it.id] == cat }
@@ -425,6 +487,41 @@ internal fun CameraPresetFullEdit(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 12.dp),
                 )
+                // ── 引擎插槽（阶段 3）：选哪个影调引擎（写 `[98]`）──────────────────
+                // 落点理由：`[98]` 是**这条预设的配方**的一部分（不是全局设置、也不是可连续
+                // 调的量）⇒ 与预设名 / LUT 同级放在这张"这条预设是什么"的卡片里。
+                // 写入走参数滑杆**同一条** `CameraParamOverrides` 链路（见 [EngineSlotParam]）：
+                // afterEdit 逐槽比对 ⇒ 选回原引擎 = 撤销这次改动（「保存」当场置灰）。
+                // ★ 阶段 3b：选中态 = **预设的** `[98]`（不是在生效的那个）—— 用户 2026-10-14
+                // 明确要求本选择面**保留**，且"强制"档下**仍可编辑**（可以先把预设设好）。
+                EngineSlotSelector(
+                    engineSlot = presetEngineSlot,
+                    onPick = { slot ->
+                        val next = overrides.afterEdit(preset, EngineSlotParam, slot.toFloat())
+                        // 立刻下发（与「⟳ 重置」同一处置）：引擎切换要重建 shader 程序，
+                        // 不预览就是"点了没反应"（ADR-12）
+                        onPreview(next)
+                        onOverrides(next)
+                        // 切引擎后网格换了一套 ⇒ 选中的那格可能已不在网格里，收起底部滑杆
+                        selected = null
+                    },
+                )
+                // ★ 阶段 3b：设置页处于**强制**档 ⇒ 上面这排选中项当前不生效，一行实话说明
+                //（不是禁用/隐藏：本选择面仍然可编辑，用户可能想先把预设设好）。
+                // 形态沿用既有的作用域提示（`PresetScope` 那条：一行 10sp 的 `CreamDim`）。
+                // 判据 `engineOverride in ENGINE_SLOT_CHOICES` = "确实是已注册引擎的强制档"，
+                // 未注册值（按契约走跟随预设）与跟随档都不提示 —— 与本页网格的判据同源。
+                if (engineOverride in ENGINE_SLOT_CHOICES) {
+                    Text(
+                        "设置页已强制「${engineOverrideLabel(engineOverride)}」⇒ 本条预设的引擎插槽" +
+                            "暂不生效（画面与下方参数按「${engineOverrideLabel(engineOverride)}」）",
+                        color = FilmTheme.CreamDim,
+                        fontSize = 10.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 12.dp, top = 4.dp),
+                    )
+                }
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.padding(start = 12.dp, top = 8.dp),
@@ -558,6 +655,44 @@ internal fun CameraPresetFullEdit(
 
 /** 不可用文字（与预设面板同一条观感：`CamDisabledInk` 是 private ⇒ 这里各写一行常量，不是逻辑复制）。 */
 private val DisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
+
+/**
+ * ★ 阶段 3：**引擎选择面** —— 「引擎插槽」+ 每个可选引擎一枚 pill（形态对照 PC 的
+ * `RawRenderingEngineSelector`：一行可选项、选中项高亮；PC 的"不可用时灰显"概念本阶段
+ * **不需要** —— `ENGINE_SLOT_CHOICES` 的每一项都是 C++ 注册表里真实存在的引擎）。
+ *
+ * 三处刻意的复用（不新造）：
+ *  - 段落名 **「引擎插槽」** 逐字取自 `PresetScope.kt:144` 与 `PresetDetail.kt:138`；
+ *  - 选项文案 **「引擎 N」** 逐字取自 `PresetDetail` 给 `[98]` 的读数格式
+ *    （[presetDetailRowOf]）—— 同一个槽在详情页与这里显示同一个字符串，不新造译名；
+ *  - 控件 = 既有的 [SheetPill]（与「基础 / 高级」「全部 / 柯达 / 富士」同款）。
+ *
+ * @param engineSlot 当前引擎（= `film[ENGINE_SLOT]`）
+ * @param onPick 选中某个引擎（写入 `[98]`，见调用点）
+ */
+@Composable
+private fun EngineSlotSelector(engineSlot: Int, onPick: (Int) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 12.dp, top = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            "引擎插槽",
+            color = FilmTheme.CreamDim,
+            fontSize = 10.sp,
+            fontFamily = FilmTheme.Mono,
+        )
+        ENGINE_SLOT_CHOICES.forEach { slot ->
+            SheetPill(
+                label = presetDetailRowOf(ENGINE_SLOT, slot.toDouble()).value,
+                selected = engineSlot == slot,
+            ) { onPick(slot) }
+        }
+    }
+}
 
 /**
  * 网格里的一格：**数值（大字）+ 参数名（小字）**，选中 ⇒ 强调色。

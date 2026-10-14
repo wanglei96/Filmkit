@@ -53,9 +53,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.NoiseCalibStore
+import com.filmkit.app.camera.resolveCameraPreset
 import kotlin.math.roundToInt
 
 /**
@@ -478,24 +480,78 @@ private fun ToneColorDrawerContent() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
 
-    var toneOn by remember { mutableStateOf(prefs.getBoolean("base_tone", true)) }
-    SettingSwitchRow(
-        title = "基准影调",
-        subtitle = "黑位 + 中间调 S + 高光 rolloff（治发灰）；关 = 旧行为（恒等，无影调工程）。预览与成片同步",
-        checked = toneOn,
-        onChecked = { on ->
-            toneOn = on
-            prefs.edit().putBoolean("base_tone", on).apply()
+    /**
+     * ★ 阶段 3（引擎插槽）：**这条预设的引擎** `[98]` —— 本抽屉里 filmic 专属项显隐判据的来源之一。
+     *
+     * 读法与 `CameraScreen` 的冷启动恢复**逐字同一套**（prefs 的 `camera_preset_id` + 同一个
+     * "唯一列表源" [BuiltinPresets.all] + [resolveCameraPreset]）⇒ 不新引入"当前引擎"的第二份
+     * 持久化（第二份 = 必然漂移的真相），也不改 `CameraController`（引擎槽位的运行期真源在那
+     * 边，属另一张卡的"参数旁路"范围）。
+     *
+     * `slots[98]` 缺失 ⇒ 0（与 `cameraPresetParams` 展开时的基线取值同一条口径：缺失 = 默认档）。
+     */
+    val presetEngineSlot = remember {
+        resolveCameraPreset(
+            prefs.getString("camera_preset_id", null),
+            BuiltinPresets.all(context, prefs),
+        ).slots[ENGINE_SLOT]?.toInt() ?: 0
+    }
+    // ★ 阶段 3b（用户 2026-10-14 拍板）：**生效引擎** = 上面的预设 `[98]` ⊕ 下面那个三档开关。
+    // 合成规则**不在这里**（唯一真源 = `EngineScope.effectiveEngineSlot`，含"未注册档位按跟随
+    // 预设处理"）—— 本抽屉与另外两处 gate 走**同一个** [effectiveEngineSlotOf]。
+    // `engineOverride`（state）驱动本行读数与重组，判据仍从 prefs 读：onTap 里先写 prefs 再更新
+    // state ⇒ 重组时读到的必然是新档，两者不会不同步。
+    var engineOverride by remember { mutableStateOf(engineOverrideOf(prefs)) }
+    val engineSlot = effectiveEngineSlotOf(prefs, presetEngineSlot)
+
+    // ── ★ 阶段 3b：全局引擎开关（三档：跟随预设 / 强制引擎 N）────────────────────
+    // 用户 2026-10-14 拍板：设置页给一个"这台相机现在用哪个引擎"的全局开关；
+    // 「完整参数」页的引擎选择面**保留**（它写的是**这条预设的** `[98]`，是配方的一部分，
+    // 强制档下仍可编辑 —— 那边另有一行提示说明"当前被设置页覆盖"）。
+    // 档名沿用既有命名：段落名「引擎插槽」、选项读数「引擎 N」（[engineOverrideLabel]）。
+    // 交互沿用同抽屉里「色度降噪·多尺度」的三档循环（点一次进一档，不新造控件）。
+    SettingValueRow(
+        title = "引擎插槽",
+        subtitle = "跟随预设 = 每条预设用自己存的引擎（在「完整参数」页改）；强制 = 全局覆盖，" +
+            "只作用于拍照链路（编辑器仍按照片拍摄时的引擎）。引擎 0 = filmic，引擎 1 = sigmoid",
+        valueText = engineOverrideLabel(engineOverride),
+        onTap = {
+            val v = nextEngineOverride(engineOverride)
+            engineOverride = v
+            prefs.edit().putInt(ENGINE_OVERRIDE_PREFS_KEY, v).apply()
             EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.base_tone",
-                "{\"on\":$on}",
+                EngineBridge.LEVEL_INFO, "app", "settings.engine_override",
+                "{\"engine_override\":$v}",
             )
         },
     )
+
+    // ★ 阶段 3：下面这些旋钮分别写进 `[28]` / `[20][21]` / `[37]` / `[38]` / `[36]`，而
+    // `engine_slot != 0` 时这些槽在参数组装处被置**恒等**（`EngineScope.NEUTRALIZE`）⇒
+    // 留在界面上就是"拖了画面不动"的假控件（ADR-12）⇒ 整块**不进 UI 树**（不是置灰）。
+    // 判据 = 单一真源 `EngineScope`（本文件不另抄一份"哪些参数属于 filmic"的清单）。
+    if (slotActiveInEngine(28, engineSlot)) {
+        var toneOn by remember { mutableStateOf(prefs.getBoolean("base_tone", true)) }
+        SettingSwitchRow(
+            title = "基准影调",
+            subtitle = "黑位 + 中间调 S + 高光 rolloff（治发灰）；关 = 旧行为（恒等，无影调工程）。预览与成片同步",
+            checked = toneOn,
+            onChecked = { on ->
+                toneOn = on
+                prefs.edit().putBoolean("base_tone", on).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.base_tone",
+                    "{\"on\":$on}",
+                )
+            },
+        )
+    }
     // ── 基准曝光（v0.8.1）：机型 AE 基准差的校准常量 ─────────────────────────
     // 与 Lightroom/DNG 的 BaselineExposure 同语义。X300 对同场景参照渲染
     // 净差 +0.57 EV（v0.10.25 同 DNG 双渲染实测标定），默认 +0.7。
     // 用户 EV 滑杆叠加在其上（[0] = base + user），对齐参照后滑杆可归零。
+    // ★ 阶段 3：本项**不按引擎显隐** —— `[0]` 是公共段参数（两个引擎都吃，架构师定案 §8.1
+    // 的"保留（通用）"一条）。
     SliderRow(
         label = "基准曝光",
         desc = "校正机型自动曝光的基准差：成片整体偏暗拖右、偏亮拖左。对齐同场景参照后，EV 滑杆归零即可",
@@ -509,68 +565,78 @@ private fun ToneColorDrawerContent() {
             EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
         )
     }
-    // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
-    // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
-    // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
-    // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
-    SliderRow(
-        label = "饱和补偿",
-        desc = "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。对照同场景样张调到灰感消失，定值后回传",
-        initial = prefs.getFloat("sat_comp", 0f),
-        range = 0f..0.30f,
-        steps = 0,
-        valueText = { "+%d%%".format((it * 100).toInt()) },
-    ) { v ->
-        val snap = (v * 100).toInt() / 100f
-        prefs.edit().putFloat("sat_comp", snap).apply()
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "app", "settings.sat_comp", "{\"v\":$snap}",
-        )
-    }
-    // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
-    // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
-    // "配置项"而不是需要标定的数值。默认 −8.0/+4.0 = darktable filmic 出厂默认
-    // （= v0.10.113 起标准模式的固定值；v0.10.118 起滑杆恢复生效，默认值不变）。
-    SliderRow(
-        label = "黑点（多暗算黑）",
-        desc = "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
-        initial = prefs.getFloat("filmic_black_ev", -8.0f),
-        range = -12f..-1f,
-        steps = 0,
-        valueText = { "%+.2f EV".format(it) },
-    ) { v ->
-        prefs.edit().putFloat("filmic_black_ev", v).apply()
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "app", "settings.filmic_black_ev", "{\"v\":$v}",
-        )
-    }
-    SliderRow(
-        label = "白点（多亮算白）",
-        desc = "拖右 = 白点更远 ⇒ 影调曲线更平、噪声更不明显（真机 6.2 时红釉白点消失），代价是对比降低、画面更柔",
-        initial = prefs.getFloat("filmic_white_ev", 4.0f),
-        range = 1f..8f,
-        steps = 0,
-        valueText = { "%+.2f EV".format(it) },
-    ) { v ->
-        prefs.edit().putFloat("filmic_white_ev", v).apply()
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "app", "settings.filmic_white_ev", "{\"v\":$v}",
-        )
-    }
-    var localToneOn by remember { mutableStateOf(prefs.getBoolean("local_tone", true)) }
-    SettingSwitchRow(
-        title = "局部色调映射",
-        subtitle = "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",
-        checked = localToneOn,
-        onChecked = { on ->
-            localToneOn = on
-            prefs.edit().putBoolean("local_tone", on).apply()
+    // ★ 阶段 3：以下四项都是"引擎 0（filmic）语义"的旋钮 ⇒ 同一道 gate。
+    // 饱和补偿写 `[20]/[21]`（判据取 `[20]`：两槽同命运，见 `EngineScope.NEUTRALIZE`）。
+    if (slotActiveInEngine(20, engineSlot)) {
+        // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
+        // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
+        // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
+        // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
+        SliderRow(
+            label = "饱和补偿",
+            desc = "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。对照同场景样张调到灰感消失，定值后回传",
+            initial = prefs.getFloat("sat_comp", 0f),
+            range = 0f..0.30f,
+            steps = 0,
+            valueText = { "+%d%%".format((it * 100).toInt()) },
+        ) { v ->
+            val snap = (v * 100).toInt() / 100f
+            prefs.edit().putFloat("sat_comp", snap).apply()
             EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.local_tone",
-                "{\"on\":$on}",
+                EngineBridge.LEVEL_INFO, "app", "settings.sat_comp", "{\"v\":$snap}",
             )
-        },
-    )
+        }
+    }
+    if (slotActiveInEngine(37, engineSlot)) {
+        // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
+        // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是
+        // "配置项"而不是需要标定的数值。默认 −8.0/+4.0 = darktable filmic 出厂默认
+        // （= v0.10.113 起标准模式的固定值；v0.10.118 起滑杆恢复生效，默认值不变）。
+        SliderRow(
+            label = "黑点（多暗算黑）",
+            desc = "比它更暗的落到黑；拖左 = 暗部更黑、层次更少",
+            initial = prefs.getFloat("filmic_black_ev", -8.0f),
+            range = -12f..-1f,
+            steps = 0,
+            valueText = { "%+.2f EV".format(it) },
+        ) { v ->
+            prefs.edit().putFloat("filmic_black_ev", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.filmic_black_ev", "{\"v\":$v}",
+            )
+        }
+    }
+    if (slotActiveInEngine(38, engineSlot)) {
+        SliderRow(
+            label = "白点（多亮算白）",
+            desc = "拖右 = 白点更远 ⇒ 影调曲线更平、噪声更不明显（真机 6.2 时红釉白点消失），代价是对比降低、画面更柔",
+            initial = prefs.getFloat("filmic_white_ev", 4.0f),
+            range = 1f..8f,
+            steps = 0,
+            valueText = { "%+.2f EV".format(it) },
+        ) { v ->
+            prefs.edit().putFloat("filmic_white_ev", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.filmic_white_ev", "{\"v\":$v}",
+            )
+        }
+    }
+    if (slotActiveInEngine(36, engineSlot)) {
+        var localToneOn by remember { mutableStateOf(prefs.getBoolean("local_tone", true)) }
+        SettingSwitchRow(
+            title = "局部色调映射",
+            subtitle = "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",
+            checked = localToneOn,
+            onChecked = { on ->
+                localToneOn = on
+                prefs.edit().putBoolean("local_tone", on).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.local_tone",
+                    "{\"on\":$on}",
+                )
+            },
+        )
+    }
     // v0.7.9：「色彩外观层」设置项已删除 —— 该层（M3 P1 治"寡淡"）在 filmic 链下
     // 恒等（v0.7.7 起 look_sat/look_chroma = 1.0，`1+(c-1)*sk` ≡ 1），开关只控制
     // 一个空操作，还占设置页心智。FilmParams[31..33] 槽位保留（契约不移位）。

@@ -1108,6 +1108,23 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     private val appPrefs by lazy { context.getSharedPreferences("filmkit", 0) }
+
+    /**
+     * 拍照链的引擎档位（设置页三档，prefs `engine_override`）：[ENGINE_OVERRIDE_FOLLOW_PRESET]
+     * = 跟随预设（默认）/ `0` = 强制 filmic / `1` = 强制 sigmoid。
+     *
+     * **热更新**：每次下发前读一次 prefs —— 不留缓存 ⇒ 没有陈旧档位，设置页改档
+     * **下一次下发即生效**（预览帧 / 快门 / 连拍），无需重启 App。
+     * （`SharedPreferences` 首次 load 后是内存读，且 UI 侧 `apply()` 会先更新内存再落盘，
+     *  同进程立即可见。）
+     *
+     * ⚠ **只作用于拍照链**。编辑器链路（`EditorEngineSession.submit`）调 [engineScoped] 时不
+     * 传 override —— 编辑一张照片要用它**拍摄时**的引擎（照片元数据里的 `[98]`），
+     * 否则编辑旧照片会因设置页开关突然变样。
+     */
+    private fun engineScopedForCapture(p: DoubleArray): DoubleArray =
+        engineScoped(p, appPrefs.getInt("engine_override", ENGINE_OVERRIDE_FOLLOW_PRESET))
+
     private var tonePref = -1.0
     private var zebraPref = -1.0
     private var lutStrengthPref = -1.0
@@ -2487,7 +2504,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     // 解耦（成片像素转正 + EXIF 恒 ORIENTATION_NORMAL）。
                     render.frameAvailable(
                         texture, previewSize.width, previewSize.height,
-                        0, filmParams, fillTest,
+                        0, engineScopedForCapture(filmParams), fillTest,
                     )
                 }, render.looper?.let { android.os.Handler(it) })
             }
@@ -2610,7 +2627,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val uvStride = pU.rowStride
         val uvPix = pU.pixelStride
         runCatching { img.close() }
-        val film = filmParams
+        val film = engineScopedForCapture(filmParams)
         // E1-2：单帧路径下发的就是 filmParams（高光保护补偿是 burst 专属），快照同源；
         // 本函数在渲染线程（ImageReader 回调）上，与 filmParams 的写同线程，无竞态
         val snap = snapshotOf(film)
@@ -2761,13 +2778,15 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLutStrengthPref()
         // E1-2：快照必须在三个 applyXxxPref 之后取（它们会覆盖 filmParams 的槽位，
         // 这才是真正下发的值）；本函数在渲染线程上，与 filmParams 的写同线程，无竞态
-        val snap = snapshotOf(filmParams)
+        // 阶段 3：快照与下发必须是**同一份**数组（归零后）—— 否则快照记的是没生效的值
+        val film = engineScopedForCapture(filmParams)
+        val snap = snapshotOf(film)
         // 拍照线程路由（v0.10.93，prefs still_thread）：非阻塞判断 ready（本函数
         // 在渲染线程上，绝不干等）；预热在 capture() 入口 startAsync。
         val useStill = prefs.getBoolean("still_thread", false) && StillRenderClient.ready
         if (useStill) {
             StillRenderClient.submitRawBuf(
-                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, filmParams,
+                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
                 demosaic, noiseStrength, nnDn,
             ) { bytes, w, h ->
                 if (bytes != null) {
@@ -2781,13 +2800,13 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
-                        filmParams, demosaic, noiseStrength, nnDn,
+                        film, demosaic, noiseStrength, nnDn,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
                 }
             }
         } else {
             render.submitRawBuf(
-                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, filmParams,
+                rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
                 demosaic, noiseStrength, nnDn,
             ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap) }
         }
@@ -2950,7 +2969,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 高光保护（v0.10.110）：成片 EV 加上本次欠曝量做补偿（预览用原数组）——
         // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
         // ⚠ 定义在 done **之前**是 E1-2 的要求：下面的快照与下发必须是同一份数组。
-        val filmStill = filmParamsForStill()
+        // 阶段 3：engine_slot != 0 时在此归零（EngineScope）；= 0 时返回同一实例，零回归
+        val filmStill = engineScopedForCapture(filmParamsForStill())
         // 成片参数快照（E1-2 / ADR-4）：在此处取 —— 紧邻下发点；snapshotOf 内 copyOf()
         // 冻结（filmParamsForStill 在无欠曝补偿时返回的正是活跃数组 filmParams 本身，
         // 后台落盘线程执行时用户可能已改参数，不冻结就是假快照）。
@@ -3045,7 +3065,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 参数快照：两遍相隔 1.6s+，中间用户可能转手机/改设置 —— 直接读成员会让
         // A/B 混进第二个变量（本项目"跨时刻对比"翻车过多次）
         val rot = stillRot   // 快门瞬间快照（同上）
-        val film = filmParamsForStill()   // v0.10.110：A/B 两遍同样带高光保护补偿
+        val film = engineScopedForCapture(filmParamsForStill())   // v0.10.110：A/B 两遍同样带高光保护补偿
         // E1-2：快照 = 本函数下发的这份数组（两遍共用），同样在提交前冻结
         val snap = snapshotOf(film)
         val rn = burstRefNoiseScale

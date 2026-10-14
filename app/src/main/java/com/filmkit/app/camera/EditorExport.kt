@@ -90,6 +90,68 @@ internal fun applySnapshotParams(current: DoubleArray, snapshot: DoubleArray) {
 }
 
 /**
+ * 引擎作用域归零（阶段 3，2026-10-14）：**两条链路共用的下发出口** —— 拍照链
+ * （`CameraController` 的预览帧 / `submitStill` / `submitRaw` / `submitRawBurst`）与编辑器链
+ * （`EditorEngineSession.submit` → `nativeEngineSubmitDisplay`）都经它读 `[98]`，
+ * 口径结构上不可能漂移。
+ *
+ * 为什么"藏开关"不够：`kFsStyle`（`passStyle`）**不随 `[98]` 切换**，它照读 `[5..10]`
+ * latitude / `[37]`/`[38]` 黑白点（`computeEditorCurve`）与 `[20]`/`[21]` 分区饱和；
+ * 拍照链的**公共段**（`[28]` / `[20]`/`[21]` / `[36]`）两引擎共用 ⇒ 切到引擎 1 后它们
+ * **仍然生效**。所以必须在组装出口按 [EngineScope.NEUTRALIZE] 置恒等值。
+ *
+ * ⚠ **必须在所有 `applyXxxPref()` 之后调用**：那些函数会覆盖 `[28]` / `[20]`/`[21]` / `[36]`，
+ * 先归零会被它们写回去，"隐藏开关"就退化成"开关还在生效"。
+ *
+ * ## 引擎档位：预设 `[98]` × 设置页三档开关（2026-10-14 拍板）
+ *
+ * 生效引擎 = [EngineScope.effectiveEngineSlot]（**单一真源**）的合成结果：
+ * [override] = `-1`（[ENGINE_OVERRIDE_FOLLOW_PRESET]，缺省）⇒ 跟随预设；`0` / `1` ⇒ 强制档位。
+ *
+ * ⛔ **强制档位与预设不同时，`[98]` 必须真的被改写**：`FrameRenderer` 读 `p[98]` 决定用哪个
+ * program —— 只旁路不改 `[98]` 的"强制引擎"只是把参数清零，**引擎根本没换**（用户看到的
+ * 还是旧引擎的画面，只是 filmic 参数失效了）。⇒ 此时返回**副本**，且 `[98] = effective`。
+ *
+ * ⛔ **跟随预设时不碰 `[98]`**（`effective == presetSlot` ⇒ 走阶段 3 原路径，逐位一致）：
+ * `presetSlot == 0` **或未注册**（不在 [EngineScope.KNOWN_ENGINE_SLOTS]：本函数读到什么就转发
+ * 什么，降级判定在 `applyEngineScope` 内、与 C++ `warnEngineSlotUnavailable` 同语义）⇒ 返回
+ * **同一实例**（零回归：不复制、不触碰任何槽，阶段 2 基线逐位不变）；`presetSlot == 1` ⇒
+ * 返回**副本**、`[98]` 保持原值。两处的共同点是"调用方的数组（滑杆/后续组装持有其引用）
+ * 一律不被修改"。
+ *
+ * ⚠ **编辑器链路只传 `p`**（`EditorEngineSession.submit`）—— 用默认的跟随预设档位：编辑一张
+ * 照片要用它**拍摄时**的引擎（元数据里的 `[98]`），否则编辑旧照片会因设置页开关突然变样。
+ *
+ * @param p 组装好的 `FilmParams` 槽位数组（长度 = `CameraPresets.COUNT`；历史快照可能更短）
+ * @param override 设置页引擎档位：`-1` = 跟随预设（默认）/ `0` / `1` = 强制（未注册值 ⇒ 跟随预设）
+ */
+internal fun engineScoped(
+    p: DoubleArray,
+    override: Int = ENGINE_OVERRIDE_FOLLOW_PRESET,
+): DoubleArray {
+    val presetSlot = if (p.size > 98) p[98].toInt() else 0
+    val effective = EngineScope.effectiveEngineSlot(presetSlot, override)
+    // 跟随预设 ⇒ 阶段 3 原路径：slot 0 / 未注册都是"同实例且不碰任何槽"，[98] 原样
+    if (effective == presetSlot) return EngineScope.applyEngineScope(p, effective)
+    val scoped = EngineScope.applyEngineScope(p, effective)
+    // ⚠ 强制到 0 时 `applyEngineScope` 按"0 = 不旁路"返回**同一实例** ⇒ 改写 [98] 之前必须
+    //    自己复制，否则污染的是调用方数组（`filmParams` / 滑杆持有的那一份）。
+    val out = if (scoped === p) p.copyOf() else scoped
+    // 短数组（契约升级前的历史快照）读不到 [98] ⇒ 无需也无法改写；旁路仍按长度内生效
+    if (out.size > 98) out[98] = effective.toDouble()
+    return out
+}
+
+/**
+ * 拍照链引擎档位的"跟随预设"值（= 设置页 prefs `engine_override` 的缺省）。
+ *
+ * `-1` 是"没有强制"的哨兵：不在 [EngineScope.KNOWN_ENGINE_SLOTS] 里的 override 一律按
+ * 跟随预设处理（[EngineScope.effectiveEngineSlot]）⇒ 预设 JSON / prefs 被手改坏了也只是
+ * 回到"按预设走"，不会产生第三种引擎状态。
+ */
+internal const val ENGINE_OVERRIDE_FOLLOW_PRESET = -1
+
+/**
  * 「无修改」比较容差（E2-9 / ADR-13）。取 **1e-4** 的依据 —— 两侧余量都要够：
  *
  *  - **必须盖住 Float → Double 的精度损失**（判"无修改"的一侧）：槽位量级最大的是暗角
