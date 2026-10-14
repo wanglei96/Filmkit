@@ -12,10 +12,15 @@ import java.io.ByteArrayOutputStream
  * 被 macOS 原生解码器强制解码出正确像素（1024×256 RGB，左上亮度 208）。
  *
  * ## 与编码器的接口约定
- * `frame` 必须是 **4 字节长度前缀的 NAL 单元**（`hvcC.lengthSizeMinusOne == 3`）——
- * 真机实测 `c2.mtk.hevc.encoder` 的输出天然满足，**直接搬运、无需重打包**。
- * `hvcc` 取自编码器 `outputFormat` 的 `csd-0`（实测 106 B，`profile_idc=2` Main10、
- * `bitDepthLumaMinus8=2`）。
+ * `hvcc` 必须是 **hvcC record**（`configurationVersion==1`），`frame` 的 NAL 长度前缀宽度必须
+ * 与 `hvcc.lengthSizeMinusOne` 一致（本写入器**不做任何转换**，只按字节搬运）。
+ *
+ * ⚠ **卡 FIX3 认知修正**：此前这里写"真机实测 `c2.mtk.hevc.encoder` 的输出天然是 4 字节长度
+ * 前缀、直接搬运无需重打包"是**错的** —— 那条结论来自从 `MediaMuxer` 产出的 MP4 里提取的
+ * `stsd/hvc1/hvcC`，是 **muxer 转换后的产物**。编码器 `outputFormat` 的 `csd-0` 实测是
+ * **Annex-B**（X300：79 B，`00 00 00 01` + VPS/SPS/PPS）⇒ 自研容器必须自己做
+ * "Annex-B → hvcC + 帧数据长度前缀化"，唯一实现见 [HevcAnnexB] / [HevcCsd0]。
+ * 本写入器的契约不变：**只吃已经规范化好的 hvcC + 长度前缀帧**。
  *
  * ## 关键实现约束（照抄原型，勿改）
  * - `iloc` 的 extent offset 是 **绝对文件偏移** ⇒ 两遍构造：先按 0 占位算出 `meta` 长度，
@@ -52,7 +57,7 @@ object HeifContainerWriter {
         val fullRange: Boolean = true,
     )
 
-    /** 一个 HEVC 图像 item：`hvcC`（含 VPS/SPS/PPS）+ 4 字节长度前缀 NAL 帧数据 + 显示尺寸。 */
+    /** 一个 HEVC 图像 item：`hvcC`（含 VPS/SPS/PPS）+ 长度前缀 NAL 帧数据 + 显示尺寸。 */
     class Image(
         val hvcc: ByteArray,
         val frame: ByteArray,

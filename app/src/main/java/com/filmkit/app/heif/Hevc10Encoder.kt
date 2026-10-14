@@ -38,6 +38,13 @@ import java.io.ByteArrayOutputStream
  * `put(off, ((v10 and 3) shl 6)); put(off+1, v10 ushr 2)`。该对齐方式与 DXGI_FORMAT_P010 /
  * `HAL_PIXEL_FORMAT_YCbCr_420_P010` 约定一致（真机已验证可解码出正确像素）。
  *
+ * ## csd-0 与帧数据的形态（卡 FIX3 认知修正，勿再重踩）
+ * 真机 X300 的 `outputFormat` 给 `csd-0` 是 **Annex-B**（`00 00 00 01` + VPS/SPS/PPS，79 B），
+ * **不是** hvcC record；帧数据同样是 Annex-B。此前"编码器实测给 106 B hvcC"的结论来自
+ * `MediaMuxer` 产出的 MP4 里的 `stsd/hvc1/hvcC` box —— 那是 **muxer 转换后的产物**。
+ * ⇒ 本类把两种形态原样收下，统一交给 [HevcCsd0]/[HevcAnnexB] 规范化（hvcC + 帧长度前缀化），
+ * **不依赖 vendor 行为**（`prepend-sps-pps-to-idr-frames=0` 只是低成本尝试）。
+ *
  * ## RGB→YCbCr 挂点（**不在本卡范围**）
  * 本类只吃打包好的 YCbCr [IntArray] 图案，**不做** RGB→YCbCr 4:2:0 转换。交付链路上这一步属于
  * 相机管线（取数点 = `tex_cap_`，OETF 之后 / LUT / 颗粒 / 锐化之后的 **sRGB 显示域** RGB10），
@@ -102,6 +109,10 @@ object Hevc10Encoder {
         // 官方文档：设 profile 必须同时设 level（KEY_PROFILE 本身只是 hint）
         fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
         fmt.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41)
+        // 卡 FIX3 的低成本尝试（可回退）：探针的 outputFormat 里出现过这个键 ⇒ 编码器认它。
+        // 置 0 表示"不要在 IDR 前重复插入 SPS/PPS"——不过**即使 vendor 因此改给 hvcC 形态的
+        // csd-0，也照样走 [HevcCsd0] 的通用规范化路径**（两种形态都吃），不依赖 vendor 行为。
+        runCatching { fmt.setInteger("prepend-sps-pps-to-idr-frames", 0) }
         return fmt
     }
 
@@ -127,7 +138,7 @@ object Hevc10Encoder {
             ?: error("没有硬件 HEVC 编码器声明 Main10 + P010(54)（10bit 路线不可用，请回退）")
 
         var codec: MediaCodec? = null
-        var hvcc: ByteArray? = null
+        var csdRaw: ByteArray? = null
         var csdLogged = false
         try {
             codec = MediaCodec.createByCodecName(info.name)
@@ -144,13 +155,15 @@ object Hevc10Encoder {
             check(eosIdx >= 0) { "10s 内拿不到 EOS 输入缓冲（${info.name}）" }
             codec.queueInputBuffer(eosIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
 
-            val frame = ByteArrayOutputStream()
+            val raw = ByteArrayOutputStream()
             val bufInfo = MediaCodec.BufferInfo()
             val deadline = System.currentTimeMillis() + DEADLINE_MS
             while (System.currentTimeMillis() < deadline) {
                 val outIdx = codec.dequeueOutputBuffer(bufInfo, TIMEOUT_US)
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    hvcc = csd0(codec.outputFormat) // 实测 = 106 B 的 hvcC record
+                    // 卡 FIX3：这里的 csd-0 **不保证**是 hvcC —— 真机 X300 给的是 Annex-B
+                    // （79 B，`00 00 00 01` + VPS/SPS/PPS）。形态判定与转换统一交给 HevcCsd0。
+                    csdRaw = csd0(codec.outputFormat)
                     continue
                 }
                 if (outIdx < 0) continue
@@ -158,34 +171,33 @@ object Hevc10Encoder {
                 val isConfig = bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                 val buf = codec.getOutputBuffer(outIdx)
                 if (size > 0 && !isConfig && buf != null) {
-                    // 帧数据原样搬进 HEIF item data：NAL 长度前缀宽度 = hvcC 自己声明的
-                    // lengthSizeMinusOne（1/2/4 字节都合法，见 HevcCsd0 的文件头）。
+                    // 帧数据原样收集：形态（Annex-B / 长度前缀）在 HevcCsd0 里实测判定后再对齐
                     buf.position(bufInfo.offset)
                     buf.limit(bufInfo.offset + size)
                     val chunk = ByteArray(size)
                     buf.get(chunk)
-                    frame.write(chunk)
+                    raw.write(chunk)
                 }
                 codec.releaseOutputBuffer(outIdx, false)
                 if (bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
             }
 
-            // ── csd-0：结构检查（ISO/IEC 14496-15 §8.3.3.1）+ **无条件**诊断日志 ──────
-            // 卡 FIX2：此前这里硬要求 `h[21] & 3 == 3`（lengthSizeMinusOne == 3），真机上
-            // X300 + 3072×4080 恰好不是 3 ⇒ 10bit 交付被自己的断言打死两次。该字段是
-            // hvcC **自己声明**的长度前缀宽度，1/2/4 字节都合法；只要 hvcC 与帧数据同源
-            // 搬运，解码端就按它解析。现在只检查"它是不是一条 hvcC"，并如实搬运。
-            val h = try {
-                HevcCsd0.accept(hvcc) { fields -> csdLog(fields) }
-            } finally {
-                csdLogged = true // accept 无论成败都发过诊断（emit 在 check 之前）
-            }
-            val f = frame.toByteArray()
+            val f = raw.toByteArray()
             check(f.isNotEmpty()) { "编码器没有输出帧数据（${info.name}）" }
-            return HeifContainerWriter.Image(h, f, width, height)
+
+            // ── 规范化：Annex-B → hvcC + 帧数据长度前缀化（+ **无条件**诊断）──────────
+            // 卡 FIX3 的根因在这里：走 MediaMuxer 的两条路由 muxer 免费做了这步转换，自研容器
+            // 必须自己做。此前直接把 csd-0 搬进 ipco/hvcC ⇒ 真机 `csd-0 不是合法
+            // HEVCDecoderConfigurationRecord` ⇒ 10bit 交付 100% 失败（回退链兜住了片子）。
+            val n = try {
+                HevcCsd0.accept(csdRaw, f) { fields -> csdLog(fields) }
+            } finally {
+                csdLogged = true // accept 无论成败都发过诊断（emit 在 finally）
+            }
+            return HeifContainerWriter.Image(n.hvcc, n.frame, width, height)
         } finally {
-            // 连 outputFormat 都没到（编码器早期失败 / 异常）时也留一条 csd 诊断（len=0）
-            if (!csdLogged) csdLog(HevcCsd0.fields(null))
+            // 连 outputFormat 都没到（编码器早期失败 / 异常）时也留一条 csd 诊断（全空）
+            if (!csdLogged) csdLog(HevcCsd0.fields(null, null, false, "none"))
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
         }
@@ -196,7 +208,7 @@ object Hevc10Encoder {
         EngineBridge.nativeAppendLog(EngineBridge.LEVEL_INFO, "camera", HevcCsd0.EVENT, fields)
     }
 
-    /** `outputFormat` 的 `csd-0` → hvcC 字节；不改动调用方 ByteBuffer 的 position。 */
+    /** `outputFormat` 的 `csd-0` **原始字节**（可能是 hvcC，也可能是 Annex-B —— 交由 [HevcCsd0] 判定）。 */
     private fun csd0(format: MediaFormat): ByteArray? {
         val b = format.getByteBuffer("csd-0") ?: return null
         val d = b.duplicate()
