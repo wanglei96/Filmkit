@@ -3527,7 +3527,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val secNs = liveExposureNs
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.heif_queued",
-            kv("bytes" to bytes.size, "w" to w, "h" to h),
+            // 卡 FIX2：HEIF 恒 4:2:0（硬件 P010/YUV420）⇒ 「4:4:4」开关对它无效，日志明示
+            // （用户曾因此困惑；UI 侧同档灰显 + 切档自动关/恢复见 SettingsScreen / HeifJpeg444）。
+            kv("bytes" to bytes.size, "w" to w, "h" to h,
+                "chroma" to com.filmkit.app.heif.HeifChroma.CHROMA, "jpeg444Ignored" to true),
         )
         saver.execute { saveHeif(bytes, w, h, iso, secNs, extraTag, snap) }
     }
@@ -3547,26 +3550,56 @@ class CameraController(private val context: Context, private val render: RenderC
         extraTag: String, snap: StillSnapshot,
     ) {
         val t0 = System.currentTimeMillis()
-        var heif: ByteArray? = null
-        var err: String? = null
-        try {
-            heif = com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h)
-        } catch (t: Throwable) {
-            err = t.message ?: t.toString()
-        }
-        val encMs = System.currentTimeMillis() - t0
-        if (heif == null) {
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_ERROR, "camera", "photo.heif_failed",
-                kv("stage" to "encode", "ms" to encMs, "error" to (err ?: "?")),
-            )
-            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "encode")
-            return
-        }
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "camera", "photo.heif_encoded",
-            kv("ms" to encMs, "bytes" to heif.size, "w" to w, "h" to h),
+        // 三级回退（卡 FIX2）：10bit 自研容器 → 8bit HEIF（平台 muxer）→ JPEG。
+        // 顺序、逐级日志与"拿不准就往下落"的语义由 HeifDelivery 固化（纯 JVM 单测覆盖三条路径）。
+        var spec = com.filmkit.app.heif.HeifDeliverCheck.Spec.TEN_BIT
+        var enc8: com.filmkit.app.heif.Heif8Encoder.Encoded? = null
+        val deliv = com.filmkit.app.heif.HeifDelivery.run(
+            attempt10 = { com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) },
+            attempt8 = {
+                // 8bit 级复用**同一次** 10bit readback 的降位结果（不重渲染、不重新 readback）
+                val rgba8 = com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
+                com.filmkit.app.heif.Heif8Encoder.encodeToBytes(
+                    rgba8, w, h, File(context.cacheDir, "filmkit-8bit$extraTag.heic"),
+                ).also { enc8 = it }.bytes
+            },
+            log = { level, event, fields ->
+                EngineBridge.nativeAppendLog(level, "camera", event, fields)
+            },
         )
+        val encMs = System.currentTimeMillis() - t0
+        // HEIF 恒 4:2:0（10bit 档 = 硬件 P010；8bit 档 = YUV420）⇒ 设置页的「4:4:4」只作用于
+        // JPEG。日志明示这一点（用户曾因此困惑）：chroma + jpeg444Ignored。
+        val heif: ByteArray = when (deliv) {
+            is com.filmkit.app.heif.HeifDelivery.Result.TenBit -> {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "photo.heif_encoded",
+                    kv("ms" to encMs, "bytes" to deliv.bytes.size, "w" to w, "h" to h,
+                        "bits" to 10, "chroma" to com.filmkit.app.heif.Heif8Encoder.CHROMA,
+                        "jpeg444Ignored" to true),
+                )
+                deliv.bytes
+            }
+            is com.filmkit.app.heif.HeifDelivery.Result.EightBit -> {
+                spec = com.filmkit.app.heif.HeifDeliverCheck.Spec.EIGHT_BIT
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "camera", "photo.heif8_encoded",
+                    kv("ms" to encMs, "bytes" to deliv.bytes.size, "w" to w, "h" to h,
+                        "bits" to com.filmkit.app.heif.Heif8Encoder.BIT_DEPTH,
+                        "chroma" to com.filmkit.app.heif.Heif8Encoder.CHROMA,
+                        "codec" to (enc8?.codec ?: "?"), "mime" to (enc8?.mime ?: "?"),
+                        "jpeg444Ignored" to true),
+                )
+                deliv.bytes
+            }
+            is com.filmkit.app.heif.HeifDelivery.Result.Jpeg -> {
+                fallbackToJpeg(
+                    rgba10, w, h, iso, secNs, extraTag, snap,
+                    from = deliv.from, reason = deliv.reason,
+                )
+                return
+            }
+        }
 
         val now = Date()
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$extraTag.heic"
@@ -3602,18 +3635,23 @@ class CameraController(private val context: Context, private val render: RenderC
                 kv("stage" to "write", "error" to (t.message ?: t.toString())),
             )
             runCatching { savedUri?.let { context.contentResolver.delete(it, null, null) } }
-            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "write")
+            fallbackToJpeg(
+                rgba10, w, h, iso, secNs, extraTag, snap,
+                from = if (spec == com.filmkit.app.heif.HeifDeliverCheck.Spec.TEN_BIT) "10bit" else "8bit",
+                reason = "write",
+            )
             return
         }
 
-        // ── 运行时读头自检（设计 §4.5 判据 A；三件事：meta / colr 1-13-1-1 / hvcC 真 10bit）
+        // ── 运行时读头自检（设计 §4.5 判据 A；口径随交付档：10bit = colr 1-13-1-1 + hvcC 真 10bit；
+        //    8bit = majorBrand heic + hvcC 真 8bit，不要求 colr/pixi —— 见 HeifDeliverCheck.Spec）
         val head = try {
             if (savedUri != null) {
                 context.contentResolver.openInputStream(savedUri)?.use {
-                    com.filmkit.app.heif.HeifDeliverCheck.check(it)
+                    com.filmkit.app.heif.HeifDeliverCheck.check(it, spec)
                 }
             } else {
-                savedFile?.let { com.filmkit.app.heif.HeifDeliverCheck.check(it) }
+                savedFile?.let { com.filmkit.app.heif.HeifDeliverCheck.check(it, spec) }
             }
         } catch (t: Throwable) {
             com.filmkit.app.heif.HeifDeliverCheck.Result(
@@ -3635,7 +3673,11 @@ class CameraController(private val context: Context, private val render: RenderC
                 EngineBridge.LEVEL_WARN, "camera", "photo.heif_discarded",
                 kv("name" to name, "deleted" to deleted),
             )
-            fallbackToJpeg(rgba10, w, h, iso, secNs, extraTag, snap, "head_check")
+            fallbackToJpeg(
+                rgba10, w, h, iso, secNs, extraTag, snap,
+                from = if (spec == com.filmkit.app.heif.HeifDeliverCheck.Spec.TEN_BIT) "10bit" else "8bit",
+                reason = "head_check",
+            )
             return
         }
 
@@ -3646,9 +3688,14 @@ class CameraController(private val context: Context, private val render: RenderC
             }
         }
         EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "camera", "photo.heif_saved",
+            EngineBridge.LEVEL_INFO, "camera",
+            if (spec == com.filmkit.app.heif.HeifDeliverCheck.Spec.EIGHT_BIT) "photo.heif8_saved"
+            else "photo.heif_saved",
             kv("name" to name, "w" to w, "h" to h, "iso" to iso,
-                "sec" to "%.4f".format(secNs / 1e9f), "detail" to head.detail),
+                "sec" to "%.4f".format(secNs / 1e9f),
+                "bits" to if (spec == com.filmkit.app.heif.HeifDeliverCheck.Spec.EIGHT_BIT) 8 else 10,
+                "chroma" to com.filmkit.app.heif.Heif8Encoder.CHROMA,
+                "detail" to head.detail),
         )
         // 成片参数快照（同 saveJpeg：**落盘成功后**才写，键 = MediaStore 的真实 DISPLAY_NAME）
         StillSnapshotStore.save(
@@ -3663,11 +3710,11 @@ class CameraController(private val context: Context, private val render: RenderC
     /** HEIF 失败 ⇒ 用**同一次 10bit readback** 降位成 RGBA8 走现有 JPEG 链（不重渲染）。 */
     private fun fallbackToJpeg(
         rgba10: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
-        extraTag: String, snap: StillSnapshot, reason: String,
+        extraTag: String, snap: StillSnapshot, from: String, reason: String,
     ) {
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_WARN, "camera", "photo.heif_fallback_jpeg",
-            kv("reason" to reason, "w" to w, "h" to h),
+            kv("from" to from, "reason" to reason, "w" to w, "h" to h),
         )
         val rgba8 = try {
             com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
@@ -3797,14 +3844,25 @@ class CameraController(private val context: Context, private val render: RenderC
         val encT0 = System.nanoTime()
         // runCatching 兜住 UnsatisfiedLinkError（老 .so 被缓存等极端情形）：任何失败都退
         // 回 Bitmap.compress，绝不让编码环节把成片整张丢掉。
-        val jpegBytes: ByteArray? =
+        val native444: ByteArray? =
             if (jpeg444) runCatching {
                 EngineBridge.nativeEncodeJpeg444(outBmp, jpegQ)
             }.getOrNull() else null
+        // 卡 FIX2 可疑点：此前 4:2:0 分支的 `photo.encode{bytes:0,ms:0}` 是在 compress **之前**
+        // 记录的、且只统计 native 分支 ⇒ 无法区分"444 关闭"/"native 失败"，也看不出 4:2:0 是否
+        // 真编码。现在把 compress 提到日志之前，两条分支都在日志里报**真实字节数与耗时**。
+        var jpegBytes: ByteArray? = native444
+        if (jpegBytes == null) {
+            val bos = java.io.ByteArrayOutputStream()
+            outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, bos)   // Android 恒 4:2:0
+            jpegBytes = bos.toByteArray().takeIf { it.isNotEmpty() }
+        }
         val encMs = (System.nanoTime() - encT0) / 1_000_000
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.encode",
-            kv("chroma" to (if (jpegBytes != null) "444" else "420"),
+            kv("chroma" to (if (native444 != null) "444" else "420"),
+                "encoder" to (if (native444 != null) "native444" else "bitmap420"),
+                "jpeg444" to jpeg444, "nativeFail" to (jpeg444 && native444 == null),
                 "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0)),
         )
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
@@ -3816,9 +3874,10 @@ class CameraController(private val context: Context, private val render: RenderC
         // A/B 成片靠它区分文件名（MediaStore 同名会自动加 (1)，靠后缀更可读）
         val suffix = extraTag + if (lutTag.isNullOrEmpty()) "" else "_$lutTag"
         val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$suffix.jpg"
-        // 4:4:4 走 native 字节流，4:2:0 / native 失败走 Bitmap.compress
+        // 4:4:4 走 native 字节流；上面两步已保证 4:2:0 也拿到真实字节（含 compress 失败 ⇒ 落盘时再试一次）
+        val jpegOut: ByteArray? = jpegBytes
         val writeJpeg: (java.io.OutputStream) -> Unit = { os ->
-            if (jpegBytes != null) os.write(jpegBytes)
+            if (jpegOut != null) os.write(jpegOut)
             else outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, os)
         }
         try {

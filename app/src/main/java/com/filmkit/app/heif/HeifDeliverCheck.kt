@@ -32,6 +32,13 @@ object HeifDeliverCheck {
     /** 读头上限：`ftyp` + `meta` 恒在前部；64 KiB 足够，且与 mdat 体积无关。 */
     private const val HEAD_BYTES = 64 * 1024
 
+    /**
+     * 交付档的读头口径（卡 FIX2 追加块：三级回退链的 8bit 那一级）：
+     * - [TEN_BIT] = 自研容器（`colr` 1/13/1/1 + `pixi` 10 + hvcC Main10/10bit）；
+     * - [EIGHT_BIT] = 平台 muxer 的 8bit HEIF（无 `colr`/`pixi`，判据见 [check]）。
+     */
+    enum class Spec { TEN_BIT, EIGHT_BIT }
+
     /** 一次自检的结论。[detail] 直接进日志（含逐项实测值，便于用户导出日志后定位）。 */
     class Result(val ok: Boolean, val detail: String)
 
@@ -42,8 +49,8 @@ object HeifDeliverCheck {
      * 读 [file] 的头 [HEAD_BYTES] 字节并核对交付口径。
      * 文件不存在/读失败 ⇒ `ok = false`（调用方按回退链降级；绝不静默放过）。
      */
-    fun check(file: File): Result = try {
-        file.inputStream().use { check(it) }
+    fun check(file: File, spec: Spec = Spec.TEN_BIT): Result = try {
+        file.inputStream().use { check(it, spec) }
     } catch (t: Throwable) {
         Result(false, "{\"read\":false,\"err\":\"${escape(t.message ?: t.toString())}\"}")
     }
@@ -52,7 +59,7 @@ object HeifDeliverCheck {
      * 流版本（MediaStore 的 `openInputStream(uri)` 与本地 File 共用同一条路径）。
      * 只读前 [HEAD_BYTES] 字节，读完即关（调用方负责关流）。
      */
-    fun check(input: java.io.InputStream): Result {
+    fun check(input: java.io.InputStream, spec: Spec = Spec.TEN_BIT): Result {
         val head = try {
             val buf = ByteArray(HEAD_BYTES)
             var off = 0
@@ -65,41 +72,61 @@ object HeifDeliverCheck {
         } catch (t: Throwable) {
             return Result(false, "{\"read\":false,\"err\":\"${escape(t.message ?: t.toString())}\"}")
         }
-        return check(head)
+        return check(head, spec)
     }
 
     /** 纯函数版（单测直接喂字节；不触文件系统）。 */
-    fun check(head: ByteArray): Result {
+    fun check(head: ByteArray, spec: Spec = Spec.TEN_BIT): Result {
         val f = Heif10BitProbe.parseBoxes(head)
         val want = expected()
         val problems = mutableListOf<String>()
 
         // ① 顶层 meta —— 这份文件到底是不是 HEIF **图片**（muxer 走 MP4 老路时只有 moov）
         if (!f.topLevel.contains("meta")) problems += "noMeta"
-        // ② colr/nclx 四元组（sRGB 显示域：1/13/1/1）
-        if (f.colrType != "nclx") {
-            problems += "colrType=${f.colrType ?: "none"}"
+        if (spec == Spec.TEN_BIT) {
+            // ② colr/nclx 四元组（sRGB 显示域：1/13/1/1）
+            if (f.colrType != "nclx") {
+                problems += "colrType=${f.colrType ?: "none"}"
+            } else {
+                if (f.primaries != want.primaries) problems += "primaries=${f.primaries}"
+                if (f.transfer != want.transfer) problems += "transfer=${f.transfer}"
+                if (f.matrix != want.matrix) problems += "matrix=${f.matrix}"
+                val wantRange = if (want.fullRange) 1 else 0
+                if (f.fullRange != wantRange) problems += "fullRange=${f.fullRange}"
+            }
+            // ③ hvcC 位深与档次（bitDepthLumaMinus8 = 2 = 10bit；profile_idc = 2 = Main10）
+            if (!f.hvcCSeen) {
+                problems += "noHvcC"
+            } else {
+                if (f.bitDepthLumaMinus8 != 2) problems += "bitDepthLumaMinus8=${f.bitDepthLumaMinus8}"
+                if (f.bitDepthChromaMinus8 != 2) problems += "bitDepthChromaMinus8=${f.bitDepthChromaMinus8}"
+                if (f.profileIdc != 2) problems += "profileIdc=${f.profileIdc}"
+            }
+            // ④ pixi 声明（缺了 macOS/部分解码端读不到 10bit —— 探针里已作为独立字段观测）
+            if (!f.pixiSeen || f.pixiBitDepth != 10) problems += "pixi=${if (f.pixiSeen) f.pixiBitDepth else -1}"
         } else {
-            if (f.primaries != want.primaries) problems += "primaries=${f.primaries}"
-            if (f.transfer != want.transfer) problems += "transfer=${f.transfer}"
-            if (f.matrix != want.matrix) problems += "matrix=${f.matrix}"
-            val wantRange = if (want.fullRange) 1 else 0
-            if (f.fullRange != wantRange) problems += "fullRange=${f.fullRange}"
+            // ── 8bit 档（平台 muxer 路线；口径 = 探针第三臂真机实测事实）──────────────
+            // · majorBrand 必须是 heic（mp42 = muxer 又走了 MP4 老路 ⇒ 相册不认）；
+            // · hvcC 必须是真 8bit（bitDepthLuma/ChromaMinus8 == 0；读到 2 说明档位串了）；
+            // · iinf 里必须真有 hvc1 item、iloc 指向数据；
+            // · **不要求 colr / pixi**：AOSP 里这两项被 camera_heif_gainmap() flag 门控，
+            //   muxer 路线不写。8bit 装的就是 sRGB 显示域数据，下游按默认 sRGB 解释恰好
+            //   正确 ⇒ 缺失无害（论证见 docs/reports/r-next-fix2-heif-csd-REPORT.md §3）。
+            if (f.majorBrand != "heic") problems += "majorBrand=${f.majorBrand ?: "none"}"
+            if (!f.hvcCSeen) {
+                problems += "noHvcC"
+            } else {
+                if (f.bitDepthLumaMinus8 != 0) problems += "bitDepthLumaMinus8=${f.bitDepthLumaMinus8}"
+                if (f.bitDepthChromaMinus8 != 0) problems += "bitDepthChromaMinus8=${f.bitDepthChromaMinus8}"
+            }
+            if (!f.itemTypes.contains("hvc1")) problems += "noHvc1Item"
+            if (f.ilocItems < 1) problems += "noIloc"
         }
-        // ③ hvcC 位深与档次（bitDepthLumaMinus8 = 2 = 10bit；profile_idc = 2 = Main10）
-        if (!f.hvcCSeen) {
-            problems += "noHvcC"
-        } else {
-            if (f.bitDepthLumaMinus8 != 2) problems += "bitDepthLumaMinus8=${f.bitDepthLumaMinus8}"
-            if (f.bitDepthChromaMinus8 != 2) problems += "bitDepthChromaMinus8=${f.bitDepthChromaMinus8}"
-            if (f.profileIdc != 2) problems += "profileIdc=${f.profileIdc}"
-        }
-        // ④ pixi 声明（缺了 macOS/部分解码端读不到 10bit —— 探针里已作为独立字段观测）
-        if (!f.pixiSeen || f.pixiBitDepth != 10) problems += "pixi=${if (f.pixiSeen) f.pixiBitDepth else -1}"
 
         val ok = problems.isEmpty()
         val detail = buildString {
             append("{\"ok\":").append(ok)
+            append(",\"spec\":\"").append(if (spec == Spec.TEN_BIT) "10bit" else "8bit").append('"')
             append(",\"boxes\":\"").append(f.topLevel.joinToString(",")).append('"')
             append(",\"colr\":\"").append(f.colrType ?: "none").append('"')
             append(",\"nclx\":[").append(f.primaries).append(',').append(f.transfer)

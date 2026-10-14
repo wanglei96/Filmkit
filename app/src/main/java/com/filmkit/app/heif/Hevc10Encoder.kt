@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import com.filmkit.app.EngineBridge
 import java.io.ByteArrayOutputStream
 
 /**
@@ -126,6 +127,8 @@ object Hevc10Encoder {
             ?: error("没有硬件 HEVC 编码器声明 Main10 + P010(54)（10bit 路线不可用，请回退）")
 
         var codec: MediaCodec? = null
+        var hvcc: ByteArray? = null
+        var csdLogged = false
         try {
             codec = MediaCodec.createByCodecName(info.name)
             codec.configure(buildFormat(info, width, height, bitrate), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -141,7 +144,6 @@ object Hevc10Encoder {
             check(eosIdx >= 0) { "10s 内拿不到 EOS 输入缓冲（${info.name}）" }
             codec.queueInputBuffer(eosIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
 
-            var hvcc: ByteArray? = null
             val frame = ByteArrayOutputStream()
             val bufInfo = MediaCodec.BufferInfo()
             val deadline = System.currentTimeMillis() + DEADLINE_MS
@@ -156,7 +158,8 @@ object Hevc10Encoder {
                 val isConfig = bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                 val buf = codec.getOutputBuffer(outIdx)
                 if (size > 0 && !isConfig && buf != null) {
-                    // 4 字节长度前缀 NAL，直接搬进 HEIF item data（hvcC.lengthSizeMinusOne=3）
+                    // 帧数据原样搬进 HEIF item data：NAL 长度前缀宽度 = hvcC 自己声明的
+                    // lengthSizeMinusOne（1/2/4 字节都合法，见 HevcCsd0 的文件头）。
                     buf.position(bufInfo.offset)
                     buf.limit(bufInfo.offset + size)
                     val chunk = ByteArray(size)
@@ -167,17 +170,30 @@ object Hevc10Encoder {
                 if (bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
             }
 
-            val h = hvcc ?: error("编码器 outputFormat 未提供 csd-0（hvcC），无法自研封装（${info.name}）")
-            check((h[21].toInt() and 3) == 3) {
-                "hvcC.lengthSizeMinusOne != 3 ⇒ 帧数据不是 4 字节长度前缀，不能直接搬进 HEIF item data"
+            // ── csd-0：结构检查（ISO/IEC 14496-15 §8.3.3.1）+ **无条件**诊断日志 ──────
+            // 卡 FIX2：此前这里硬要求 `h[21] & 3 == 3`（lengthSizeMinusOne == 3），真机上
+            // X300 + 3072×4080 恰好不是 3 ⇒ 10bit 交付被自己的断言打死两次。该字段是
+            // hvcC **自己声明**的长度前缀宽度，1/2/4 字节都合法；只要 hvcC 与帧数据同源
+            // 搬运，解码端就按它解析。现在只检查"它是不是一条 hvcC"，并如实搬运。
+            val h = try {
+                HevcCsd0.accept(hvcc) { fields -> csdLog(fields) }
+            } finally {
+                csdLogged = true // accept 无论成败都发过诊断（emit 在 check 之前）
             }
             val f = frame.toByteArray()
             check(f.isNotEmpty()) { "编码器没有输出帧数据（${info.name}）" }
             return HeifContainerWriter.Image(h, f, width, height)
         } finally {
+            // 连 outputFormat 都没到（编码器早期失败 / 异常）时也留一条 csd 诊断（len=0）
+            if (!csdLogged) csdLog(HevcCsd0.fields(null))
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
         }
+    }
+
+    /** `photo.heif_csd` 的唯一出口（[HevcCsd0.EVENT]）。 */
+    private fun csdLog(fields: String) {
+        EngineBridge.nativeAppendLog(EngineBridge.LEVEL_INFO, "camera", HevcCsd0.EVENT, fields)
     }
 
     /** `outputFormat` 的 `csd-0` → hvcC 字节；不改动调用方 ByteBuffer 的 position。 */

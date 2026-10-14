@@ -38,6 +38,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import com.filmkit.app.heif.HeifChroma
+import com.filmkit.app.heif.HeifJpeg444
 import com.filmkit.app.heif.PhotoFormat
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -140,11 +142,21 @@ fun SettingsScreen(
                     )
                 },
             )
+            // 照片格式必须**先声明**：下面的「4:4:4 色度」行要按档位灰显（HEIF 恒 4:2:0）。
+            var photoFormat by remember { mutableStateOf(PhotoFormat.read(prefs)) }
             var jpeg444 by rememberSaveable { mutableStateOf(prefs.getBoolean("jpeg_444", true)) }
             SettingSwitchRow(
                 title = "成片 4:4:4 色度",
-                subtitle = "开 = 色度不降采样（默认；治强亮度边缘的紫/绿镶边，体积约 1.9×）；关 = 4:2:0 旧行为",
+                // ⚠ 措辞要点（卡 FIX2）：不是"HEIF 不支持这个选项"，而是 HEIF 走硬件编码器的
+                // 10bit P010（8bit 档走 YUV420），色度**固定 4:2:0** ⇒ 此项只作用于 JPEG。
+                subtitle = if (photoFormat == PhotoFormat.HEIF) {
+                    "HEIF 走硬件编码器的 10bit P010（8bit 档走 YUV420），色度固定 4:2:0，" +
+                        "故此项仅对 JPEG 生效（选 HEIF 时已自动关闭，切回 JPEG 会恢复原值）"
+                } else {
+                    "开 = 色度不降采样（默认；治强亮度边缘的紫/绿镶边，体积约 1.9×）；关 = 4:2:0 旧行为"
+                },
                 checked = jpeg444,
+                enabled = photoFormat != PhotoFormat.HEIF,
                 onChecked = { on ->
                     jpeg444 = on
                     prefs.edit().putBoolean("jpeg_444", on).apply()
@@ -156,20 +168,39 @@ fun SettingsScreen(
             )
             // ── 卡 H2：照片格式（用户 2026-10-14 拍板 P3：默认 JPEG，HEIF 可选）──────
             // 两档循环，交互沿用同文件既有形态（点一次切一档，不新造控件）。
-            var photoFormat by remember { mutableStateOf(PhotoFormat.read(prefs)) }
             SettingValueRow(
                 title = "照片格式",
                 subtitle = "JPEG = 现有交付链（默认，一字不动）；HEIF = 10bit 交付" +
                     "（HEVC Main10 + sRGB 显示域，容器 colr/nclx = 1/13/1/1，pixi 3×10bit）。" +
-                    "HEIF 编码失败或落盘后读头自检不合格会自动回退 JPEG —— 不会丢照片",
+                    "HEIF 编码失败会自动回退 8bit HEIF，再失败回退 JPEG；落盘后读头自检不合格" +
+                    "同样降级 —— 不会丢照片",
                 valueText = PhotoFormat.label(photoFormat),
                 onTap = {
                     val v = if (photoFormat == PhotoFormat.HEIF) PhotoFormat.JPEG else PhotoFormat.HEIF
                     photoFormat = v
                     PhotoFormat.write(prefs, v)
+                    // 卡 FIX2（用户实机行为对齐）：选 HEIF 时替用户关掉 4:4:4（HEIF 恒 4:2:0，
+                    // 该开关只作用于 JPEG），并把原值备份；切回 JPEG 精确恢复。
+                    val p444 = object : HeifJpeg444.Prefs {
+                        override fun getBoolean(key: String, def: Boolean) = prefs.getBoolean(key, def)
+                        override fun has(key: String) = prefs.contains(key)
+                        override fun putBoolean(key: String, value: Boolean) {
+                            prefs.edit().putBoolean(key, value).apply()
+                        }
+                        override fun remove(key: String) {
+                            prefs.edit().remove(key).apply()
+                        }
+                    }
+                    val hadBackup = HeifJpeg444.hasBackup(p444)
+                    jpeg444 = if (v == PhotoFormat.HEIF) HeifJpeg444.onHeif(p444)
+                    else HeifJpeg444.onJpeg(p444)
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "settings.photo_format",
-                        "{\"photo_format\":\"${if (v == PhotoFormat.HEIF) "heif" else "jpeg"}\"}",
+                        "{\"photo_format\":\"${if (v == PhotoFormat.HEIF) "heif" else "jpeg"}\"" +
+                            ",\"chroma\":\"${HeifChroma.CHROMA}\"" +
+                            ",\"jpeg444\":$jpeg444,\"jpeg444Ignored\":${!HeifChroma.honorsJpeg444(jpeg444)}" +
+                            ",\"jpeg444AutoOff\":${v == PhotoFormat.HEIF && !jpeg444}" +
+                            (if (hadBackup) ",\"jpeg444Restored\":true" else "") + "}",
                     )
                 },
             )
@@ -1529,6 +1560,8 @@ private fun SettingSwitchRow(
     subtitle: String?,
     checked: Boolean,
     onChecked: (Boolean) -> Unit,
+    /** `false` = 灰显不可点（卡 FIX2：HEIF 档下「4:4:4 色度」对它无效）。 */
+    enabled: Boolean = true,
 ) {
     val haptic = LocalHapticFeedback.current
     Row(
@@ -1538,11 +1571,11 @@ private fun SettingSwitchRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
+            Text(title, color = if (enabled) FilmTheme.Cream else FilmTheme.CreamDim, fontSize = 14.sp)
             if (subtitle != null) {
                 Text(
                     subtitle,
-                    color = FilmTheme.CreamDim,
+                    color = if (enabled) FilmTheme.CreamDim else FilmTheme.ChipBorder,
                     fontSize = 10.sp,
                     style = MaterialTheme.typography.labelSmall,
                 )
@@ -1550,17 +1583,29 @@ private fun SettingSwitchRow(
         }
         Switch(
             checked = checked,
+            enabled = enabled,
             onCheckedChange = {
                 haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
                 onChecked(it)
             },
-            colors = SwitchDefaults.colors(
-                checkedTrackColor = FilmTheme.Accent,
-                checkedThumbColor = FilmTheme.Cream,
-                uncheckedTrackColor = FilmTheme.ChipBg,
-                uncheckedThumbColor = FilmTheme.CreamDim,
-                uncheckedBorderColor = FilmTheme.ChipBorder,
-            ),
+            colors = if (enabled) {
+                SwitchDefaults.colors(
+                    checkedTrackColor = FilmTheme.Accent,
+                    checkedThumbColor = FilmTheme.Cream,
+                    uncheckedTrackColor = FilmTheme.ChipBg,
+                    uncheckedThumbColor = FilmTheme.CreamDim,
+                    uncheckedBorderColor = FilmTheme.ChipBorder,
+                )
+            } else {
+                // 灰显：轨道/滑块统一降到 ChipBorder（不可点状态一眼可辨）
+                SwitchDefaults.colors(
+                    checkedTrackColor = FilmTheme.ChipBorder,
+                    checkedThumbColor = FilmTheme.CreamDim,
+                    uncheckedTrackColor = FilmTheme.ChipBg,
+                    uncheckedThumbColor = FilmTheme.ChipBorder,
+                    uncheckedBorderColor = FilmTheme.ChipBorder,
+                )
+            },
         )
     }
 }
