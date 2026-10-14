@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-13 18:35
+updated: 2026-10-14 15:10
 status: active
 ---
 
@@ -10,26 +10,26 @@ status: active
 <!-- 2026-10-05 d3 整理：全量吸收 37 份快照 + 5 份归档，压缩折行、删除被取代的中间状态。 -->
 
 ## 目标
-
 胶片相机 App（Android 首发，vivo X300 专项适配）：Camera2 RAW/YUV 双输入 → 引擎胶片风格化（基准色彩科学 + 理光系 LUT 风格层）→ 全分辨率成片。核心卖点：M 档专业拍摄 + RAW 底片 + 胶片渲染全 GPU。里程碑 M0–M6 见 docs/开发计划.md（需求基线 v2.0 §0 D1–D13）。**色彩口径（D8/D9）**：基准 = 中性正确的色彩科学（追平 Adobe/libraw 标准链），风格（浓淡、胶片味）= 用户提供的理光系 LUT（M4）。
 
 ## 结构
-
 - `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）+ `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=99**）
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/（SpikeFftMerge）、log/（JSONL+GPU 计时）、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`（阶段 0 骨架）
 - `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、research/（12 个编号调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪 / 10=ARRI 引擎计划 + 内建编辑器与预设）
 - `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
 - `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
-## 进行中（2026-10-13，相册与预设收尾）
+## 进行中（2026-10-14，引擎插槽阶段 2/3 已落地）
+- [2026-10-14] **阶段 3 真机验收** | 待用户执行 | 清单 `docs/reports/stage3-acceptance-CHECKLIST.md` 判据 0–7；**先验判据 0**（引擎 1 必须真的改变画面 / 日志 `tone=1.0`）；判据 ①（高光可分辨跨度）需**固定机位 + 画面里有真正过曝区**（用户现有样片 `≥250` 只占 0.001%）| 包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378 / 0.11.29，项目根目录）
+- [2026-10-14] **切引擎"观感差异小"待用户定** | 待拍板 | 现为**设计使然**（sigmoid 按"与 filmic 同白纸口径"标定：中灰 0 LSB / 全图 p90 1.1 LSB）。要"明显风格差异"⇒ 三选一：给 sigmoid 加参数面板（contrast/skew/white/hue）/ 改默认 contrast 1.2→1.5（代价：与 filmic 不再同口径、判据① 可比性丢失）/ 保持现状 | handoffs/引擎插槽阶段2-3落地与全局开关.memo.md
 
+## 已收尾（2026-10-13，相册与预设）
 - [2026-10-13] **相册 / 预设面板（本窗口主线）** | 进行中 | 相册：切图转圈（PV-2）、上一张图闪现（PV-3）、缩放锚点（PV-4）已修；预设：横向预设条 + 一级页只给常用参数 + 完整参数二级页 + 返回键分层（PS-6a/6b/7/8/9/10），内置白点 2.5~2.7 → 4.0 修高光死白（R-2/R-3）。**待真机验收**：白杯子高光是否不再死白、亮部变暗幅度可否接受 | handoffs/相册切图闪修与预设面板重做至v0.11.26.memo.md
 - [2026-10-13] **内建编辑器与预设** | 已完成（本窗口） | 取代 10-04 的"待立项"：拍照界面预设可查看/可逐项改/可增删（内置可改只禁删 + 恢复默认）；参数表单一来源 `ParamControls.kt`；`[37][38]` 黑白点可调 | 同上
 - [2026-10-13] **影调 whiteEv 默认值** | 已定案 4.0 | 取代 10-03"4.0 vs 6.x 待用户试"：R-2 实测证明 2.5~2.7 时死白起点 2.40~2.60 EV、真机高光常到 2.47~3.0 ⇒ 余量不足；R-3 定 4.0（死白起点 3.55 EV），代价亮部变暗 −15.9~−18.0 LSB | docs/reports/r3-white-point-refit-REPORT.md
 - [2026-10-13] **引擎切换（公共管线 + 引擎插槽）** | **阶段 0/1 已完成 + 真机验收通过**（`6a11833` / `f098ba8` / `ef1f50e`），下一步 = 阶段 2 sigmoid 引擎 | 用户拍板：**引擎切换要做、第 2 步直接对齐 PC、交付上 10bit HEIF**。方案 `docs/engine-slots-design.md`（`kFsFilm` 三段拆解 / `[98] engine_slot` + 引擎私有 KV / 引擎注册表 / 4 阶段 + **CRC32 零回归判据**）。**阶段 0** = `[98]` 契约（kCount 99，六处同步）+ `EngineRegistry` 骨架 + 基线 + `tools/check-filmparams-contract.py`；**离线链补齐** = `tools/engine-shader-offline.py` 接 FILM 段 + PC3D（`film_d5` 基线 `0x589f8364`）；**阶段 1** = `kFsFilm` 单真源切片（拼接逐字节等价 35154 B / `0x4fa1ebd3`）+ `[98]` 契约登记（新增 `CAMERA_ENGINE_SELECT_SLOTS`，参数面板零 UI 变化）。**真机验收通过**（包 `filmkit-0.11.27.apk`）：`engine.film_src` 6/6 条 `identical:true`、无 error/fatal、拍照出片正常。**⚠ 剩余缺口**：拍照链无 filmic 参数日志；HR/`uLocal*`/`kFsOut` 不在离线链内 ⇒ 成片零回归仍需真机同帧 A/B | docs/engine-slots-design.md + docs/reports/{stage0-engine-slot-BASELINE,stage1-acceptance-CHECKLIST}.md + 提交 `6a11833`/`f098ba8`/`ef1f50e`
 
 ## 进行中（2026-10-07，成像专项）
-
 - [2026-10-07] **品红带机理闭环与替换档转正** | 进行中 | 机理定案：成片品红带 = B 通道 ~8px 缓爬 vs G ~2px 陡跳的错位（管线制造，RAW 干净，融合赦免，P0 缓解者，**RCD 类算法固有**，原版同款）；`[54]`=1 pc3d 替换档已转正（用户拍板：紫边细、红笔不色散）；`[56]`/`[57]`/`[58]` 三实验开关默认关存档。**待办**：[58] 加钳后灯盘回平确认；P0 边缘结构保护评估；pc3dK 色渗观察 | handoffs/品红带机理闭环与替换档转正.memo.md
 - [2026-10-08] **边缘彩边残留（少量）** | 低 · 优化项 | v0.10.209 后仍有少量彩边（用户："观感影响不大，先这样"）。**已定案的机理**：伪彩 = 边缘**色度过冲**（中心色度 > 两侧最大值），其中一部分**由 PC3D 自身产生**（D4 域无过冲、成片有）。**现行判据**：peakK=1.05 / sideK=0.5 / 尺度 [3,6,12] / 去饱和 k=0.15，跑在 PC3D **之前**（color_smooth 前置，v0.10.205）。**优化方向（按代价排序）**：① peakK 1.05→1.0（覆盖↑、色度代价约 −3%，最省事）；② 若仍不足，去 PC3D 内部查它的色度重建（过冲源头，比在外面补 pass 根本）；③ **不要**加"单侧中性"判据 —— 实测代价 −18~22%（19.5 万像素里大部分是真实色度边缘）。**已判死的路**：v0.10.208 的"PC3D 之后再加一次 + 搬最中性点"会把背景色搬进中性区（中性灰染蓝、全图过冲 932→1209）。
 - [2026-10-05] **低频色度噪声云（曝光给足事故）** | 待拍板 | 根因 4.8ms 短曝光；修正方向：有界给足 / D-1 低频扩展 / 暂缓（替换档下 D-1 被旁路，方向随之改变） | handoffs/紫边归因闭环与对标基准修正.memo.md（absorbed）
@@ -40,7 +40,8 @@ status: active
 - [2026-10-01] **M5 诊断与基准** | 低 | 逐 pass GPU 计时、成像会话摘要、一键诊断包、性能基准脚本 + golden image 接 CI | decisions.md「色彩链、管线与 MFNR」
 
 ## 里程碑沿革（压缩）
-
+- [2026-10-14] **引擎插槽阶段 3 + 3b（10-14，本窗口）**：契约 `EngineScope.kt`（14 槽旁路表 + `KNOWN_ENGINE_SLOTS` + `effectiveEngineSlot`）+ 拍照链 5 个下发点与编辑器唯一出口的旁路收口 + UI 按引擎显隐（参数面板 4 项 / 设置页 5 道 gate / 「饱和度」由通用判据自动隐藏）+ 「完整参数」页**引擎选择面**（写预设 `[98]`）+ **设置页全局三档开关**（prefs `engine_override`；渲染侧每次下发前读、并把 `[98]` 真改写）。**验证卡抓出阻断级 P0**（`[28]=0` 让引擎 1 完全空转）并连带修 P1（`[22]` 半旁路）/ P2（未注册值第三态）；**新增判据 0**（引擎必须真的在工作）。全量 **664 条 / 0 失败**；包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378）；提交 `c801f0a` / `1cf94a2` / `e3b7116`
+- [2026-10-14] **阶段 2 sigmoid 引擎（10-14，本窗口）**：darktable `process_loglogistic_per_channel` 移植（CPU 侧 `computeSigmoidParams` 三锚点求解 + 7 个 `uSig*` uniform + float32 精度）+ 运行期热切换 `buildFilmProgram(slot)`。**五条判据真机验收全过**：可分辨跨度 **2.00 EV**（filmic 1.70）/ 中灰偏差 **0.000 LSB** / 线性域**严格单调**（filmic 4.02 EV 起硬平顶、350 个非正差分）/ 真机 A/B / `[98]=0` 时 `film_d5` `0x589f8364` 与拼接 `0x4fa1ebd3` 逐字节不变
 - [2026-10-13] **阶段 1 真机验收通过（10-13，本窗口）**：包 `filmkit-0.11.27.apk`（376 / 0.11.27）；真机日志 `filmkit-logs-20261013-215923` 的 `engine.film_src` **6/6 条** `identical:true` / 35154 字节 / `0x4fa1ebd3`，`film_split_missing`/`slot_unavailable` 各 0，无 error/fatal，拍照出片正常 ⇒ **零回归在设备上坐实**
 - [2026-10-13] **引擎插槽阶段 1（10-13，本窗口）**：`kFsFilm` 单真源切片拆成公共三段 + 引擎注入段（拼接逐字节等价 35154 B / `0x4fa1ebd3`）+ `[98]` 契约登记（第三种东西 ⇒ 新增 `CAMERA_ENGINE_SELECT_SLOTS`）+ 离线拼接判据链（`--verify-splice` 两路径 + 6 项 mutation）；597/0、validate-shaders 66/66；提交 `ef1f50e`
 - [2026-10-13] **离线链补齐（10-13，本窗口）**：`tools/engine-shader-offline.py` 补 FILM 段 + PC3D 真接入（纯增量，原 295 行未动）+ `filmic-spline-ref.py` / `check-film-offline.py` / `film-offline-REPORT.md`；`film_d5` 两组基线入档；旁路档逐位恒等自证；提交 `f098ba8`
@@ -62,7 +63,6 @@ status: active
 - [2026-09-18/20] **M0–M2 前半**：YUV 全链路（SurfaceTexture+OES 预览、全分辨率静拍）、M 档专业 UI、镜头发现与设置页、手动 WB = HAL 恒 AWB + 引擎侧补偿、变焦画质优先（±3% 迟滞）
 
 ## 品红/紫边与曝光（10-04 → 10-06）
-
 - [2026-10-04] **定性修正**：品红 = 逆光边缘紫边渐晕（上窗口"色度高、亮度平坦"判据被真实样片否决：品红处亮度带通 = 全图 14×）；14.74% 基准系 uint8 回绕口径污染，紫边安全口径 0.65~0.78%
 - [2026-10-04] **defringe 落地（v0.10.134，c5133d9）**：4 pass 半分辨率（down+Lab a 门 / 11×11 检测 / 16×16 均值读回 chromave / 全分辨率替换），RT `PF_correct_RT` 机制复现（GPL 不抄码）；prefs `defringe` 默认开、FilmParams[47]、日志 `df`/`dfCavg`；对 >32px 低频云结构性无效
 - [2026-10-05] **真机剖面**：我们 = 窄峰（FWHM 4px）、PC = 宽缓斜坡（20+px、无峰）⇒ 高频窄峰与 >32px 低频云是两件事；1px 色度噪点 10.5%→0.04%（融合+P0/P4/D-1 有效）

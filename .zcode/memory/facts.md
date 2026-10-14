@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-13 18:35
+updated: 2026-10-14 15:10
 status: active
 ---
 
@@ -11,7 +11,6 @@ status: active
 <!-- 2026-10-05 d3 整理:压缩折行、删除被后续版本取代的"当时现状",保留当前有效值与口径。 -->
 
 ## 环境
-
 - [2026-09-18] 构建链：AGP 8.13.2 / Gradle 8.13 / Kotlin 2.3.21 / Compose BOM 2026.06.01 / NDK 29 / CMake 3.22.1 / minSdk 26 / compileSdk 36；依赖上限锁定（2026.09 版 AndroidX 需 AGP 9.1+/SDK 37）
 - [2026-09-18] 项目路径含中文（Downloads/胶片相机）：AGP externalNativeBuild 丢中文段（CXX1400），已改自定义 CMake Exec 直驱 NDK
 - [2026-09-23] 构建命令（本机已验证）：`JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`（系统默认 Java 8 跑不动 AGP 8.13）
@@ -22,7 +21,6 @@ status: active
 - [2026-09-21] 离线工具链：python3 + numpy + PIL + rawpy 0.27（`postprocess(use_camera_wb=True, no_auto_bright=True, gamma=(2.222,4.5))`）；mimosa 插件已禁用（`~/.zcode/cli/config.json`）；调参脚本 `tools/tuning/`
 
 ## 路径与约定
-
 - [2026-09-18] Git 远端 `git@github.com:wanglei96/Filmkit.git` main；**CI 仅手动触发**（`workflow_dispatch`，push 自动构建顶爆 500MB Actions 配额）；出包在本地做
 - [2026-09-18] APK 产物：`app/build/outputs/apk/debug/app-debug.apk` → 根目录 `filmkit-<versionName>.apk` 单文件覆盖制；**出包前 `rm -rf app/build/outputs/apk`**（防残留旧 so）；`*.apk` gitignore
 - [2026-09-18] 引擎 so `libfilmengine.so`，JNI 入口 `com.filmkit.app.EngineBridge`；源码 `core/engine/src/`（jni/Bridge.cpp、render/FrameRenderer.cpp、render/Align.{h,cpp}、spike/SpikeFftMerge.cpp、film/FilmParams.h）
@@ -31,7 +29,6 @@ status: active
 - [2026-10-07] **版本现状**：`filmkit-0.10.181.apk`（versionCode 320：`[54]`=1 **替换档默认**、`[56]` rcd_g_orig / `[57]` hl_rb_recon / `[58]` rcd_p3_split 三实验开关默认 0、3a/3b 填充值 per-channel 满阱钳）；**成片文件名小写 `filmkit_*`**；提交 2a67c42（feat）+ c7fef2d（docs: research/11 号）已 push；**验收 tag 最新仍为 v0.10.133**（未打 tag）；`app/src/main/java/com/filmkit/app/ui/CameraPresets.kt` 是 FilmParams 槽位唯一来源
 
 ## 引擎实现现状
-
 - [2026-09-27] **管线顺序（定稿）**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化 → OETF → 3D LUT → 颗粒 → JPEG；硬约束 LUT 必须在 OETF 后
 - [2026-10-13] **FilmParams 契约 kCount=99**（`film/FilmParams.h:41`，阶段 0 引擎插槽起；旧记忆的 36/43/48/56/59/**98** 均已过时）：[0] exposure_ev、[1..3] wb、[29] 空槽不复用、[31..34] 外观层/LUT 强度、[35] auto_tone（默认 0）、[37] filmic_black_ev / [38] filmic_white_ev、[42] white_hl=1、[43] white_floor、[44] white_probe=0.5、[45] hr_raw、[46] rcd_cdfix=1、[47] defringe、[48] moire、[49] hl_grecon、[50] ca_corr、[51] chroma_gate=2.0、[52] cg_scope=1.0、[53] df_gate=0.0、[54] **pc3d=1（替换档默认）**、[55] pc3d_msize=0、[56] rcd_g_orig=0、[57] hl_rb_recon=0、[58] rcd_p3_split=0、[59] color_smooth、[88]/[89] 色温色调（相对量）、[90..94] 高光/阴影/白/黑/褪色、[95..97] 柔光（默认 0.0/0.35/0.70）、**[98] engine_slot**（阶段 0，0 = 内置 filmic、默认）；**按实际长度读取（下限 26）**；⚠️ 下发数组必须按 **99**，且**六处同步**：`FilmParams.h` 的 `kCount` / 同文件字段声明行 `float <名> = …; // <槽位>`（机器可读，`FilmParamKeysTest` 正则抽取）/ `fromDoubles` 防呆 / Kotlin `CameraPresets.neutral()` 与 `COUNT` / Kotlin `FilmParamKeys.bySlot`（v0.10.196 只改 C++ ⇒ 启动崩）。**契约守卫**：`python3 tools/check-filmparams-contract.py`（2026-10-13 新增，四路对拍，补"C++ kCount 单独漂移"这条既有测试不覆盖的缝）
 - [2026-10-13] **kFsFilm 已拆成「公共模板三段 + 引擎注入段」**（阶段 1，提交 `ef1f50e`）：`FrameRenderer.cpp` 的 `filmSlices()`（:4583）用**四个锚点字符串**在 `kFsFilm` 体内 `find` 出偏移，切成 head `[0,a)` / engine0_def `[a,b)` / mid `[b,c)` / engine0_main `[c,d)` / tail `[d,end)`；`filmSource(slot)`（:4634）按该顺序组装；`init()` 用拼接结果编译。**单真源 + 运行时切片**（不是物理拆成三段字面量 —— 那样 25140 字符会出现 3 处人为接缝，等价性无法由构造保证）。锚点（字符口径）：a=3839 b=18617 c=21805 e=22115 d=22153（**engine_main 含收尾 `    }`**，故与"按行号 433..439"口径差 5 字符）。**判据值**：拼接 == 原文 = 496 行 / 25140 字符 / **35154 字节** / **crc32 0x4fa1ebd3** / sha256 f1ebb317…563c。锚点缺失 ⇒ 退回整体字面量 + kError。
@@ -55,7 +52,6 @@ status: active
 - [2026-10-05] **紫边相关 shader 落点**：`core/engine/src/render/FrameRenderer.cpp`——`kFsChromaDenoise`（P4 色度）/ `kFsPc3d`（ESD3D2 移植）/ `kFsHrMask`（小波 HR mask）/ `passHighlightRaw` + `runHighlightReconstruct`（RAW 域高光重建）/ `kFsDefringe*`（defringe 4 pass）；槽位常量与默认值在 `film/FilmParams.h` + `ui/CameraPresets.kt`
 
 ## PhotonCamera 参照事实（/tmp/photoncamera，hinnka 版）
-
 - [2026-09-28] **PC 降噪实现**：Spatial merge 空间域 RBF（`GlesMgcRawSpatialShaders.kt:1654`）+ Sabre 结构张量各向异性核（`GlesMgcRawSabreShaders.kt:139`）+ FullResolutionDenoise 五级金字塔（`raw/MgcFullResolutionDenoise.kt`）；噪声模型 = 128-bin 半 bin 居中功率谱；去马赛克噪声传播标定 `DemosaicNoisePropagationCalibrator.kt`
 - [2026-09-30] **PC 的"快门即撒手"架构**：`isCapturing` 只锁采集窗口；帧存 per-shot `PhotoCaptureContext`（`CapturedPhotoFrame(SafeImage)`，零拷贝持有 Image）；`resolveImageReaderMaxImages()` 按需放大；处理完才 close
 - [2026-09-30] **PC 的线程/context 模型**：预览在 `CameraGLSurfaceView`（GLSurfaceView 自有 GL 线程）；各后处理器**各自 `eglCreateContext`**（`GlesMgcRawSpatialStacker:9537`、`GlesMgcRawBaseFrameSelector:708`、`OglBokehProcessor:1796`）——这是它拍完不卡预览的原因
@@ -65,14 +61,12 @@ status: active
 - [2026-10-05] **PC ESD3D2（PC3D）**：核尺寸由噪声模型算 `min(7+(int)ks−(int)ks%2, 21)`（本机 ⇒ 11），两趟 + 引导上采样（`esd3d2_steered.glsl` / `ESD3D2.java` / `convdiff.glsl` / `guidedupsample.glsl` / `GLUtils.gaussdown`）；**`cap=0.2` 在 PC 里从不触发（实测吃满率 0.00%）**；**PC 成片本身也是 4:2:0**；PC 的 `CorrectingFlow` 只对 OnePlus 生效（样片 vivo 走 passthrough）
 
 ## 工具与脚本
-
 - [2026-10-01] `tools/still-thread-verify.py` + `still-thread-run.sh`（拍照线程验收：预览停更/burst 耗时/CRC 等价/落盘计数/帧率曲线）；`align-bench.cpp`+`align-bench-gen.py`（对齐离线基准）、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**，六点核对 compile/link/zero/uniforms/use/delete）
 - [2026-09-30] 其余 `tools/`：validate-shaders.sh、check-fft-tile-cover、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、ab-100pct、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 - [2026-09-22] 内置 LUT 资产 42 个 `.lut`（uint8、33³、4.3MB）与 `~/Downloads/LUT/滤镜.cube/` 逐点一致；`docs/research/` = 12 个编号调研（00 活入口 / 01–08 冻结证据附录 / 09 频域降噪 / 10 ARRI 引擎计划 + 内建编辑器与预设）+ filmulator 专题 + README + `90-工作流原始转储`（勿删，含独有内容）
 - [2026-10-06] **审计报告已存档 `docs/reports/`**（pcfix / pc3d / pc3d-reval / amaze / jpeg444 / chromagate2 / cacorr / phase-sigma 共 8 份+配套数据，代码内 27 处 /tmp 引用已改写；/tmp 原件已删，与 test_temp 旧场景合计释放 ≈9GB；PC 源码保留 `/tmp/pc`、`/tmp/photoncamera`）；**本轮评估报告未沉淀（重启即失）**：`/tmp/ab-1006`、`/tmp/ab-1006b`、`/tmp/ab-s4`；新工具 `tools/purple-fringe-kpi.py`、方案 `docs/紫边窄峰真机AB方案.md`
 
 ## 对标数据与测量口径（10-03 → 10-05）
-
 - [2026-10-03] **亮部降噪 = 唯一成像短板**：同场景 PC 亮部 σY 我们 0.82 / PC 0.49（**1.67×**，差距随亮度单调放大）；色度多尺度 1→32px 全面占优 1.2~1.8×；噪声模型 RAW 域实测准（R 1.39/G 1.04/G2 1.23/B 1.34）
 - [2026-10-05] **紫边对标基准修正**：`∇>60` 均值口径可自证复现 PC 的 **3.68413 / 0.44607%**，但它把 PC 高估 ≈**2.2×**（零假设检验：3.684 里只有 **+1.668** 与边缘有关）；正确目标 = **边缘局域超额 1.67 / 剖面 core 1.08**；**同一地点相隔 7 秒的两张成片读数可差 25.8×** ⇒ 该口径禁作跨图 KPI
 - [2026-10-05] **剖面形状**：我们 = 窄峰（**FWHM 4px**）、PC = 宽缓斜坡（**20+px、无峰**）；真机 1px 色度噪点 10.5%→**0.04%**（融合+P0/P4/D-1 有效）；用户所见品红主体 = **>32px 低频色度噪声云**（P90 3 级、品红绿成对、中亮区集中），根因 4.8ms 短曝光
@@ -88,7 +82,6 @@ status: active
 - [2026-10-06] **真机三轮基线（1777 尺度，新 KPI；跨场景不可混用，每场景以同场景 PC 为基准）**：台灯逆光（主场景）PC 超额 ≈0、叠加 +2.84、关闭 +2.34、替换 +4.24（替换暗区独有紫向 +2.80）；红笔亮场景六组：基线 +1.89、κ0 +1.15、defringe 关 +0.80（绿边/红渗反升 = 交换）、锐化关 **+0.12≈PC**、多尺度关 +0.87；**色散 = 成片域 dRG +0.9~1.0px 而 RAW 域三通道对齐 ⇒ 管线产生（非光学非 [51]）**；台灯窗框品红窄峰 +10@3px（135918，关锐化不消失）
 
 ## 相机能力与标定（仍有效）
-
 - [2026-10-03] **X300 畸变/几何能力（exp7 真机，4 次会话 × 2 cameraId 全一致）**：`DISTORTION_CORRECTION_AVAILABLE_MODES` = **none**、`LENS_DISTORTION` = `0.001,0,0,0,0`（AOSP 占位）、`LENS_RADIAL_DISTORTION` 空、`PRE_CORRECTION_ACTIVE_ARRAY == ACTIVE_ARRAY`；`LENS_INTRINSIC_CALIBRATION` fx=fy=**2790.18**（主摄）/ **2414.06**（超广）；AOSP 原文：校正 *"not applied to any RAW output"* 且该控制 *"on by default"* ⇒ 连 YUV 也未校正；超广桶形畸变实测幅度 **5.7%**（未校正）
 - [2026-10-03] **预览域 vs 成片域**：同场景 `w999`（EV 前 P99.9）预览 **2.09** / 成片 **2.674**（另一组 2.4383/2.674）⇒ 差 0.24~0.58EV 且逐次不同；预览走 OES（ISP 已 tonemap），成片是 RAW 归一化域 ⇒ 曝光判据只认成片域 `sw999`
 - [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同，可作为继承指纹）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
@@ -96,7 +89,6 @@ status: active
 - [2026-10-02] **曝光 ×N + ISO ÷N 纯赚 SNR**：离线解析收益 √N 与物理上限逐位吻合（N=8.66 → 2.95×）；约束三条 = ISO 下限 / 快门上限 / 运动预算；纹理预算维持**细节优先 2.2px**；真机 250ms 档 `expCap:"250ms" expN:"8.33" altIso:167`，nzPreMed 0.005219→0.001688（**1/3.1**）；ISO167 = Filmix 的 ISO166
 - [2026-10-01] **连拍显存与耗时**：修后 7 张全成功零丢失；独立线程代价 = 峰值 +455MB、常驻 +1.96GB（空闲释放回 ~400MB）；热机单张 totalMs 2091~3336ms；同帧 A/B CRC32 逐字节等价；`capture()` 在渲染期静默吞快门（"连按两下只出一张"根因）
 ## 相册与预设（10-11 → 10-13）
-
 - [2026-10-13] **参数表单一来源 = `app/src/main/java/com/filmkit/app/ui/ParamControls.kt`**（`EditorParam` / `AdjustParams` / `ColorParams` / `TextureParams` / `LutStrengthParam` / `EditorSlider` / `CAMERA_NO_SLIDER_SLOTS` / `CAMERA_TUNABLE_SLOT_PARAM`）；由 PS-3 从 `EditorScreen.kt` **逐字搬移**（−429 行纯删除、零新增），拍照界面与编辑器共用 ⇒ 两页读数不可能漂移
 - [2026-10-13] **相册查看页关键纯函数**（`PhotoViewScreen.kt`）：`frameAfterPageChange`（切页原子替换）、`pageAlphaAt(isSettledPage, fading, fade)`（alpha 与 zoom/pan 同一道闸）、`bitmapBelongsToPage` + `visibleBitmapFor`（归属校验，防旧页像素画到新页）、`zoomAboutCentroid(pan, centroid, center, z1, z2)`（两指中心缩放）、`previewRequestFor`（预览档 = 容器一半）、`PRELOAD_RADIUS=2`、`SPINNER_DELAY_MS=150`
 - [2026-10-13] **filmic 黑白点**：`[37] filmic_black_ev`（引擎默认 −7.65）、`[38] filmic_white_ev`（引擎默认 4.56，`FilmParams.h:156`）；引擎无绝对 clamp（仅 `black ≤ white − 0.2`）；UI 值 = 槽位 EV 直通，**量程复用 `SettingsScreen.kt` 既有滑杆**（黑点 −12..−1 / 白点 1..8）
@@ -117,3 +109,10 @@ status: active
 - [2026-10-13] **vivo X300 引擎取证（真机 adb 拉取，样本 `/tmp/x300-samples/`）**：`VivoCamera.apk` 396MB **内无 .so**（native 外置 `/system/app/VivoCamera/lib/arm64/`，**81 库**）+ 10 dex + 8 张 LUT；app 层 = **ACES 式 GLSL**（`OETF(OutputTransform(NormalizeLuminance(ToneMap(ScaleLuminance(InputTransform(EOTF(x)))))))` + `ScaleLuminance_ST2084`/`toneCurveHLG`）+ **模式枚举**（`TONEMAP_MODE`/`mToneMappingMode`/`mToneMappingSpace`）；LUT 容器 `CUBEB2BIN8`/`3DLUTBIN8`（56B 头、网格字段 0x21=**33**、**33³ float32**，431300 B）；**全量 dex 扫描：`autoTone` 0 命中、`histogram` 47 条全是 UI ⇒ app 层无自适应影调**；推理栈 `libvdnn`（含 OpenCL kernel 源串）+ `libxnn`（XNNPACK API）；`/vendor`、`/odm` 未 root **Permission denied**（成片主链未取证）。
 - [2026-10-13] **影调判据口径（待写死进方案）**：主判据用「**可分辨跨度**」= 从白纸起每 0.1 EV ≥1 LSB 能持续多远；对齐白纸 204 LSB 后 filmic **1.65 EV** / sigmoid c=1.2 **1.95 EV** / ACES2 **1.90 EV**（优势仅 **0.25~0.30 EV**），三架构只用掉 8bit 上界的 **32~41%**。**「死白起点」换阈值即翻转排序**（≤1 时 sigmoid 4.25 > filmic 3.55；≤2 时 filmic 3.90 > sigmoid 3.10）；filmic 的 plateau 在 **4.00 EV**（= 白点），是**连续不可逆**（任何位深都救不了）。
 - [2026-10-13] **PC 引擎下线的真实代价**：Fuji 引擎移除 = **33 个文件改动 + Room DB v49→v50**（`GalleryDatabase.kt` +42/−2、`MIGRATION_49_50` 整表重建跳过 `rawFujiFilmSimulation`）⇒ 引擎注册表必须集中化、**引擎私有参数不进 DB 列**。
+
+## 引擎插槽阶段 2/3 与全局开关（10-14）
+- [2026-10-14] **阶段 3 契约 `EngineScope.kt`**（`app/src/main/java/com/filmkit/app/camera/`，架构师落、三卡共用）：`FILMIC_OWNED_SLOTS` = {5..10, 35, 37, 38, 40}；`NEUTRALIZE` **14 槽** = `28`=1.0 / `20`,`21`,`22`=1.0 / `36`=0.0 / `35`=0.0 / `5..10`=`LATITUDE_UI_PIVOT`(0.01) / `37`,`38`=`FILMIC_BLACK/WHITE_EV_PIVOT`(−7.65/+4.56)；`KNOWN_ENGINE_SLOTS`={0,1}；`applyEngineScope(p, slot)`（slot∈{0,未注册} ⇒ **返回同一实例**，零回归）；`effectiveEngineSlot(presetSlot, override)`。
+- [2026-10-14] **阶段 3b prefs `engine_override`**（Int：`-1` 跟随预设 / `0` 强制 filmic / `1` 强制 sigmoid）：渲染侧唯一读点 `CameraController.engineScopedForCapture`（**每次下发前读、无缓存**）；UI 侧 `ParamControls.effectiveEngineSlotOf` 是三处 gate（设置页 / 完整参数页 / 一级页）的唯一入口。**强制档必须把 `[98]` 真的改写**（`FrameRenderer` 读 `p[98]` 决定 program）。编辑器链路**不参与**。
+- [2026-10-14] **引擎指纹（判定引擎真在工作）**：引擎 0 `film_d5` = `0x589f8364`；引擎 1 链上 = **`0x8fdb4e38`**；**空转（`uToneK=0`）= `0x189e4126`**（与"引擎 0 + uToneK=0"逐字节相同）。**日志判据 = `raw.render` 的 `tone=1.0`**（P0 未修时是 0.0）。引擎 1 shader 源码 = 23211 B / 15781 字符 / `0xbf298386`。
+- [2026-10-14] **三处 C++ 关键事实**：① `kFsSigmoidMain`（`FrameRenderer.cpp:6603`）**复用 `uToneK` 作为 sigmoid 整条曲线的权重**，`sigmoidTone` 定义 `:6591`、**全文件唯一调用 `:6604`**；② `updateFilmicEV` 定义 `:13811`、**唯一调用 `:14014`（无条件）**，而 `passFilm` 有 4 个调用点（`:8286`/`:8307` 预览、`:8486` YUV 静拍、`:11091` RAW 静拍）⇒ 四条链都会跑到它；③ `runHighlightReconstruct` 内 `:12439` 是 `(void)white_ev_input_domain;`（白点自 v0.10.145 起只写日志 `hrWhiteEv`，threshold 只依赖 CCM 第二列 + `kSaturationNormCalib`）。
+- [2026-10-14] **出包与版本（本窗口）**：包放**项目根目录**（用户明确要求，`filmkit-<versionName>.apk`，`*.apk` 已 gitignore、`.gitignore:20`）；`filmkit-0.11.28-ENGINE-SWITCH.apk`(377) / **`filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`(378)**。⚠ **验证新代码是否进包要 grep 全部 dex** —— 新符号分散在 `classes4.dex`（`engine_override`×3 / `ENGINE_OVERRIDE_PREFS_KEY` / `effectiveEngineSlotOf` / `engineOverrideLabel`）与 `classes7.dex`（`engineScopedForCapture` / `engine_override`×1），`classes.dex` 里是 0 命中；**dex 大小变化比包总大小可靠**（总大小可能被 ZIP 对齐填充吸收）。
