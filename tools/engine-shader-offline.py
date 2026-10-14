@@ -28,6 +28,15 @@
 
 阶段 1 判据（拆 kFsFilm 为模板 + 引擎注入段后的零回归）：
   film_d5.npy 的 CRC32 必须与 docs/reports/stage0-engine-slot-BASELINE.md §3.3 一致。
+
+阶段 2（`--engine {0,1}`，默认 0）：
+  · `--engine 0`：**一字不变**（仍是 `kFsFilm` 整份）⇒ 判据⑤的零回归守卫。
+  · `--engine 1`：`head + kFsSigmoidDef + mid + kFsSigmoidMain + tail`（= C++ `filmSource(1)`
+    的组装顺序）。head/mid/tail 走**锚点路径**（复刻 `filmSlices()`，非行号切分）；
+    两个注入段按**字面量名**从 FrameRenderer.cpp 提取 ⇒ 卡 B 微调 GLSL 后重跑即可。
+    7 个 `uSig*` 由 `tools/sigmoid-params-ref.py` 的 `compute_sigmoid_params()` 求解
+    （本脚本不重写公式），CLI = `--sig-contrast/-skew/-white/-black/-hue`。
+    输出 = `film_d5_sigmoid.npy`（**不覆盖** `film_d5.npy`）。
 """
 import argparse
 import json
@@ -94,9 +103,12 @@ void main() {
 '''
 
 
-    def run(self, fs_src, uniforms, textures, size=None):
+    def run(self, fs_src, uniforms, textures, size=None, report=None):
         """执行一个 fragment shader。textures: {uniform名: moderngl.Texture}
-        size=(w,h) 时用该尺寸的 framebuffer（同 context，可复用纹理）。"""
+        size=(w,h) 时用该尺寸的 framebuffer（同 context，可复用纹理）。
+        report: 传入 list 时，把**实际写入 program** 的 uniform 名追加进去
+        （`if k in prog` 是安全跳过式：被编译器优化掉的 uniform 不在 program 里，
+        给了无害但也没生效）—— 供 steps.json 留证，默认 None = 行为不变。"""
         tw, th = size if size else (self.w, self.h)
         if (tw, th) not in self._fbos:
             self._fbos[(tw, th)] = self.ctx.framebuffer(
@@ -109,9 +121,13 @@ void main() {
             tex.use(i)
             if name in prog:
                 prog[name].value = i
+        _written = []
         for k, v in uniforms.items():
             if k in prog:
                 prog[k].value = v
+                _written.append(k)
+        if report is not None:
+            report.extend(sorted(_written))
         vao = self.ctx.vertex_array(prog, [])       # 必须用本次的 program
         vao.render(moderngl.TRIANGLES, vertices=3)
         vao.release()
@@ -162,6 +178,19 @@ def main():
                          'pc3d = pc3d.npy（更接近真机链：真机 kFsFilm 吃 PC3D/defringe 的输出）')
     ap.add_argument('--film-domain-ratio', type=float, default=2.0,
                     help='uDomainRatio（仅 --film-hal-domain 1 时生效；真机 = 在线 EMA，初值 2.0）')
+    # ── 引擎插槽（阶段 2）───────────────────────────────────────────────────
+    ap.add_argument('--engine', type=int, choices=[0, 1], default=0,
+                    help='0 = 引擎 0 filmic（默认，行为与阶段 1 一字不变，输出 film_d5.npy）；'
+                         '1 = 引擎 1 darktable sigmoid（输出 film_d5_sigmoid.npy，'
+                         '**不覆盖** film_d5.npy ⇒ 判据⑤基线不被踩）')
+    ap.add_argument('--sig-contrast', type=float, default=1.2, help='kSigmoidDefaultContrast')
+    ap.add_argument('--sig-skew', type=float, default=0.0, help='kSigmoidDefaultSkew')
+    ap.add_argument('--sig-white', type=float, default=100.0,
+                    help='kSigmoidDefaultWhiteTarget（**百分数**）')
+    ap.add_argument('--sig-black', type=float, default=0.0152,
+                    help='kSigmoidDefaultBlackTarget（**百分数**）')
+    ap.add_argument('--sig-hue', type=float, default=100.0,
+                    help='kSigmoidDefaultHuePreservation（**百分数**）')
     # PC3D 段参数（新增行；执行在文件尾部 pc3d_stage）
     ap.add_argument('--pc3d-siga', type=float, default=1e-5, help='噪声模型斜率（非真机标定值）')
     ap.add_argument('--pc3d-sigb', type=float, default=1e-6, help='噪声模型截距（非真机标定值）')
@@ -530,6 +559,25 @@ def _anchor_path(body, src_text):
     return info
 
 
+def anchor_film_blocks(src_text=None):
+    """按 C++ `filmSlices()` 的锚点语义切出 5 块**文本**（head/engine0_def/mid/engine0_main/tail）。
+
+    复用 `_anchor_path()`（判据 1 的路径 B）⇒ 引擎 1 的组装与判据 1 走**同一份锚点解析**，
+    不可能"两处各写一遍再漂移"。锚点缺失/错序时**抛错**（不静默回退到行号切分 ——
+    任务卡明确：拿 head/mid/tail 必须用锚点路径，行号切分与真机不一致）。
+    """
+    src_text = (src_text if src_text is not None
+                else open(FR, encoding='utf-8', errors='replace').read())
+    body = dict(_collect_raw_strings(text=src_text)).get('kFsFilm')
+    info = _anchor_path(body, src_text)
+    if info.get('state') != 'ok':
+        raise RuntimeError('锚点切分不可用（state=%s）：%s'
+                           % (info.get('state'), info.get('reason')))
+    o = info['offsets']
+    cuts = [0, o['a'], o['b'], o['c'], info['d'], len(body)]
+    return [body[cuts[i]:cuts[i + 1]] for i in range(5)], info
+
+
 def _anchor_ok(d):
     return all(d[k] == FILM_SRC_BASELINE[k] for k in ('chars', 'bytes', 'crc32', 'sha256'))
 
@@ -771,18 +819,31 @@ def digest_f32(arr):
             'sha256': _hashlib.sha256(b).hexdigest()}
 
 
+def _load_tool_module(fname, modname):
+    """载入 `tools/` 下的独立复刻件（数学只写一处，避免同一份公式两处各写一遍）。"""
+    import importlib.util
+    p = os.path.join(REPO, 'tools', fname)
+    spec = importlib.util.spec_from_file_location(modname, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_spline_ref():
     """载入 `tools/filmic-spline-ref.py`（computeFilmicSpline 的逐行 Python 对照实现）。
 
     单独放一个文件是为了可独立运行自检（`python3 tools/filmic-spline-ref.py`），
     避免同一份数学在这里和那里各写一遍。
     """
-    import importlib.util
-    p = os.path.join(REPO, 'tools', 'filmic-spline-ref.py')
-    spec = importlib.util.spec_from_file_location('filmic_spline_ref', p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return _load_tool_module('filmic-spline-ref.py', 'filmic_spline_ref')
+
+
+def load_sigmoid_ref():
+    """载入 `tools/sigmoid-params-ref.py`（darktable `commit_params` 的逐行 float32 复刻）。
+
+    引擎 1 的 7 个 uniform **只做名字映射**，公式不在这里重写。
+    """
+    return _load_tool_module('sigmoid-params-ref.py', 'sigmoid_params_ref')
 
 
 # 机械改写记录（判据可审计性：每一处改写都要能逐字回溯）
@@ -818,6 +879,30 @@ def film_stage(a):
                 g2_hits += 1
     if 'kFsFilm' not in sh:
         raise RuntimeError('未能从 FrameRenderer.cpp 提取 kFsFilm')
+
+    # ── 引擎选择（阶段 2）────────────────────────────────────────────────────
+    #   --engine 0（默认）：行为与阶段 1 **一字不变**（仍是 `kFsFilm` 整份）⇒ 判据⑤
+    #     （film_d5.npy CRC32 = 0x589f8364）是零回归守卫，不许被引擎 1 踩到。
+    #   --engine 1：`head + kFsSigmoidDef + mid + kFsSigmoidMain + tail`，即 C++
+    #     `filmSource(1)` 的组装顺序（head/mid/tail 走**锚点路径** = `filmSlices()`
+    #     的真实语义；两个注入段按**字面量名**从 FrameRenderer.cpp 提取）。
+    #     输出另存 `film_d5_sigmoid.npy`，**不覆盖** `film_d5.npy`。
+    engine = int(getattr(a, 'engine', 0))
+    anchor_info = None
+    if engine == 0:
+        fs_src, out_name = sh['kFsFilm'], 'film_d5.npy'
+    elif engine == 1:
+        for _nm in ('kFsSigmoidDef', 'kFsSigmoidMain'):
+            if _nm not in sh:
+                raise RuntimeError('引擎 1 注入段 %s 未从 FrameRenderer.cpp 提取到' % _nm)
+        _blocks, anchor_info = anchor_film_blocks()
+        _head, _def0, _mid, _main0, _tail = _blocks
+        fs_src = _head + sh['kFsSigmoidDef'] + _mid + sh['kFsSigmoidMain'] + _tail
+        # 与上面各段同口径的 G2 三目修正（幂等；sigmoid 段实测不含该模式）
+        fs_src = fs_src.replace('c == 1 ? m.g : m.b', '(c == 1 || c == 3) ? m.g : m.b')
+        out_name = 'film_d5_sigmoid.npy'
+    else:
+        raise SystemExit('--engine 只支持 0（filmic）/ 1（sigmoid）')
 
     # ── CPU 侧 filmic 系数（与真机 computeFilmicSpline 同口径）────────────────
     lat_sh = [float(a.film_lat_sh)] * 3
@@ -863,8 +948,28 @@ def film_stage(a):
         'uLocalRef': 0.5,       # passFilm 内 local_ref 兜底（局部图未生成时的中灰）
         'uLocalSize': (1.0, 1.0),
     })
+    # ── 引擎 1（sigmoid）的 7 个私有 uniform ─────────────────────────────────
+    # 数值来源 = `tools/sigmoid-params-ref.py` 的 `compute_sigmoid_params()`
+    # （darktable `commit_params` 的逐行 float32 复刻）—— **本脚本不重写公式**，
+    # 只做「契约字段名 → uniform 名」的映射。默认参数 = `SigmoidParams.h` 的
+    # kSigmoidDefault*（contrast=1.2 / skew=0 / white=100 / black=0.0152 / hue=100）。
+    sig_params = None
+    if engine == 1:
+        sref = load_sigmoid_ref()
+        sig_params = sref.compute_sigmoid_params(
+            a.sig_contrast, a.sig_skew, a.sig_white, a.sig_black, a.sig_hue)
+        uniform_film.update({
+            'uSigWhiteTarget': float(sig_params['white_target']),
+            'uSigBlackTarget': float(sig_params['black_target']),
+            'uSigPaperExposure': float(sig_params['paper_exposure']),
+            'uSigFilmFog': float(sig_params['film_fog']),
+            'uSigFilmPower': float(sig_params['film_power']),
+            'uSigPaperPower': float(sig_params['paper_power']),
+            'uSigHuePreservation': float(sig_params['hue_preservation']),
+        })
 
     gl = GL(w, h)
+    written = []
     try:
         tex_d4 = gl.ctx.texture((w, h), 4, dtype='f2')
         tex_d4.write(d4.astype(np.float16).tobytes())   # 目标纹理是 RGBA16F，与上面各段同
@@ -874,21 +979,41 @@ def film_stage(a):
         tex_local = gl.ctx.texture((1, 1), 4, dtype='f2')
         tex_local.write(np.ones((1, 1, 4), np.float16).tobytes())
         tex_local.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        d5 = gl.run(sh['kFsFilm'], uniform_film,
-                    {'uTex': tex_d4, 'uLocal': tex_local})
+        d5 = gl.run(fs_src, uniform_film,
+                    {'uTex': tex_d4, 'uLocal': tex_local}, report=written)
     finally:
         gl.close()
-    np.save(os.path.join(a.out, 'film_d5.npy'), d5)
+    np.save(os.path.join(a.out, out_name), d5)
 
     info = {
-        'shader': 'kFsFilm',
+        'engine': {
+            'slot': engine,
+            'name': 'filmic' if engine == 0 else 'sigmoid',
+            'assembly': ('kFsFilm（整份字面量，与阶段 1 一字不变）' if engine == 0 else
+                         'head + kFsSigmoidDef + mid + kFsSigmoidMain + tail'
+                         '（= C++ filmSource(1) 的组装顺序）'),
+            'template_slicing': ('n/a（引擎 0 不走锚点路径）' if engine == 0 else
+                                 'anchor-splice（复刻 C++ filmSlices()：a=%d b=%d c=%d d=%d）'
+                                 % (anchor_info['offsets']['a'], anchor_info['offsets']['b'],
+                                    anchor_info['offsets']['c'], anchor_info['d'])),
+            'injection_sources': ({'kFsSigmoidDef': 'extract_shaders()["kFsSigmoidDef"]',
+                                   'kFsSigmoidMain': 'extract_shaders()["kFsSigmoidMain"]'}
+                                  if engine == 1 else {}),
+            'shader_digest': _src_digest(fs_src),
+        },
+        'shader': 'kFsFilm' if engine == 0 else 'kFsSigmoidDef + kFsSigmoidMain（注入段）',
         'input': ('pc3d.npy (D4，PC3D 输出)' if a.film_input == 'pc3d'
                   else 'ccm_d4.npy (D4，PC3D 未接入 FILM 输入)'),
-        'output': 'film_d5.npy (D5, display 域线性)',
+        'output': '%s (D5, display 域线性)' % out_name,
         'domain': 'RAW 静拍链口径（uHalDomainMap=%d，uDomainRatio=%.4f）'
                   % (1 if a.film_hal_domain else 0, a.film_domain_ratio),
         'shader_rewrites': [r[0] + ' ← ' + r[1] for r in FILM_REWRITES]
                            + (['kFsFilm 内 G2 三目修正'] if g2_hits else []),
+        'sigmoid_params': ({k: float(v) for k, v in sig_params.items()} if sig_params else None),
+        'sigmoid_cli': ({'contrast': a.sig_contrast, 'skew': a.sig_skew, 'white': a.sig_white,
+                         'black': a.sig_black, 'hue': a.sig_hue,
+                         'defaults': 'SigmoidParams.h kSigmoidDefault*（1.2 / 0 / 100 / 0.0152 / 100）'}
+                        if engine == 1 else None),
         'filmic_spline': {
             'source': 'FrameRenderer::computeFilmicSpline (FrameRenderer.cpp:13044) '
                       '的 Python 逐行对照实现 tools/filmic-spline-ref.py',
@@ -902,6 +1027,35 @@ def film_stage(a):
         },
         'uniforms': {k: (list(v) if isinstance(v, tuple) else v)
                      for k, v in sorted(uniform_film.items())},
+        # 每个 uniform 的**来源**（报告里要能逐条回溯）
+        'uniform_sources': {
+            **{k: 'computeFilmicSpline 逐行复刻（tools/filmic-spline-ref.py）'
+               for k in uniform_film if k.startswith('uFilmic')},
+            **{k: 'compute_sigmoid_params（tools/sigmoid-params-ref.py，逐行复刻 darktable '
+                  'commit_params；入参 = --sig-* CLI）'
+               for k in uniform_film if k.startswith('uSig')},
+            'uExposure': '--film-ev %g ⇒ uExposure = 2^ev' % a.film_ev,
+            'uGamut': '--film-gamut %g（FilmParams[40]；**引擎 1 无此 uniform ⇒ 安全跳过**）'
+                      % a.film_gamut,
+            'uHalDomainMap': '--film-hal-domain %d' % a.film_hal_domain,
+            'uDomainRatio': '--film-domain-ratio %g' % a.film_domain_ratio,
+            'uSat': '--film-sat %s（FilmParams[20,21,22]）' % a.film_sat,
+            'uSplit': '--film-split %s（FilmParams[23,24]）' % a.film_split,
+            'uMono': '--film-mono %g（FilmParams[25]）' % a.film_mono,
+            'uToneK': '--film-tone-k %g（FilmParams[28]）' % a.film_tone_k,
+            'uLook': '--film-look %g（FilmParams[31]）' % a.film_look,
+            'uLookSat': '--film-look-sat %g（FilmParams[32]）' % a.film_look_sat,
+            'uLookChroma': '--film-look-chroma %g（FilmParams[33]）' % a.film_look_chroma,
+            'uLocalStrength': '--film-local %g（**离线默认 0 = 整段旁路**）' % a.film_local,
+            'uLocalKnee': 'FrameRenderer.cpp kLocalKnee 常量 0.6',
+            'uLocalKneeHi': 'FrameRenderer.cpp kLocalKneeHi 常量 1.3',
+            'uLocalRef': 'passFilm 内 local_ref 兜底 0.5（离线无真机统计量）',
+            'uLocalSize': '1×1 占位（uLocal sampler 必须有合法绑定，否则 UB）',
+        },
+        # 实际写入 program 的 uniform（`if k in prog` 是安全跳过式）—— 直接证明
+        # "uSig* 7 个全给了"以及"引擎 1 里不存在的 uGamut/uFilmic* 被跳过"
+        'uniforms_written': written,
+        'uniforms_skipped': sorted(set(uniform_film) - set(written)),
         'not_in_offline_chain': [
             'HR 高光重建（[45] hr_raw 真机默认 1.0）：输入是它的输出，本段直接吃 ccm_d4',
             'PC3D（[54] pc3d 真机默认 1.0）：不在本段内（见 --pc3d）',
@@ -911,7 +1065,12 @@ def film_stage(a):
         ],
         'digest': digest_f32(d5),
     }
-    print('FILM 段：film_d5.npy %s' % info['digest'])
+    print('FILM 段（引擎 %d / %s）：%s %s'
+          % (engine, info['engine']['name'], out_name, info['digest']))
+    print('  shader %s' % info['engine']['shader_digest'])
+    print('  uniform 写入 %d 个；跳过 %d 个%s'
+          % (len(written), len(info['uniforms_skipped']),
+             ('（%s）' % ', '.join(info['uniforms_skipped']) if info['uniforms_skipped'] else '')))
     _merge_steps(a.out, 'film', info)
     return info
 
@@ -1068,6 +1227,13 @@ def _film_cli(argv):
     ap.add_argument('--film-hal-domain', type=int, default=0)
     ap.add_argument('--film-domain-ratio', type=float, default=2.0)
     ap.add_argument('--film-input', choices=['ccm', 'pc3d'], default='ccm')
+    # ── 引擎插槽（阶段 2）：与 main() 的声明同款（两处都声明 = 现有模式）────────
+    ap.add_argument('--engine', type=int, choices=[0, 1], default=0)
+    ap.add_argument('--sig-contrast', type=float, default=1.2)
+    ap.add_argument('--sig-skew', type=float, default=0.0)
+    ap.add_argument('--sig-white', type=float, default=100.0)
+    ap.add_argument('--sig-black', type=float, default=0.0152)
+    ap.add_argument('--sig-hue', type=float, default=100.0)
     # ── PC3D 段（--pc3d 1）───────────────────────────────────────────────
     ap.add_argument('--pc3d', type=int, default=0)
     ap.add_argument('--pc3d-siga', type=float, default=1e-5,
