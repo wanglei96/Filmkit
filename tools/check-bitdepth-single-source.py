@@ -125,6 +125,43 @@ def parse_header(hdr):
     }
 
 
+# ⑨ 交付档切换后**同帧 readback 格式正确**（卡 FIX1 的 native 侧离线判据）。
+# 语义：一个成片入口内，target 的内部格式 / readback 的 (format,type) / dither 除数上限
+# **必须由同一个交付档表达式派生** —— 只要其中一处写死或换成别的表达式，"同尺寸切档
+# 复用附件"就会静默按错口径读回（真机症状 = 霓虹伪彩 + 熵爆炸，FIX1 事故）。
+# 条目：入口函数名 → 期望的交付档表达式（`outputInternalOf(X)` 里的 X 文本）。
+DELIVER_ENTRIES = {
+    "submitStill": "ten_bit",
+    "finishStillChain": "c.ten_bit",
+}
+# ⑨a 三条成片入口的重建条件必须按**交付档**记账（只按尺寸记账 = 同尺寸切档复用错档附件）
+REBUILD_COND = [
+    ("if (cap_w_ != dst_w || cap_h_ != dst_h || cap_ten_bit_ != ten_bit) {", 1,
+     "submitStill 的附件重建条件丢了交付档比较"),
+    ("if (cap_w_ != dst_w || cap_h_ != dst_h || cap_ten_bit_ != c.ten_bit) {", 1,
+     "finishStillChain 的附件重建条件丢了交付档比较"),
+    ("if (cap_w_ != out_w || cap_h_ != out_h || cap_ten_bit_) {", 1,
+     "编辑器链路（恒 8bit）不再强制重建 10bit 附件"),
+]
+REBUILD_ASSIGN = [
+    ("cap_ten_bit_ = ten_bit;", 1, "submitStill 不再把交付档记进 cap_ten_bit_"),
+    ("cap_ten_bit_ = c.ten_bit;", 1, "finishStillChain 不再把交付档记进 cap_ten_bit_"),
+    ("cap_ten_bit_ = false;", 1, "编辑器链路不再把 cap_ten_bit_ 归零"),
+]
+DELIVER_FNS = ("outputInternalOf", "outputReadFormatOf", "outputReadTypeOf", "outputMaxOf")
+
+
+def fn_bodies(fr):
+    """按 `FrameRenderer::name(` 的顶层定义切函数体（返回 name → [body, ...]）。"""
+    marks = [(m.start(), m.group(1)) for m in
+             re.finditer(r"\n[A-Za-z_][A-Za-z0-9_:<>, &*]*FrameRenderer::(\w+)\(", fr)]
+    out = {}
+    for i, (pos, name) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(fr)
+        out.setdefault(name, []).append(fr[pos:end])
+    return out
+
+
 def verify(hdr, fr, bridge, kt_outs):
     """纯函数：返回失败信息列表（空 = 全部通过）。"""
     bad = []
@@ -279,6 +316,27 @@ def verify(hdr, fr, bridge, kt_outs):
         fail("⑧ 成片入口的 fail-closed 钩子 = %d 处 < %d（submitStill / submitRaw / "
              "submitRawBurst 三条都要：自检未通过 ⇒ 拒绝 10bit 交付并回退）"
              % (hooks, SELFCHECK_HOOK_MIN))
+
+    # ⑨ 交付档切换后 readback 格式正确（卡 FIX1）
+    for pat, want, why in REBUILD_COND + REBUILD_ASSIGN:
+        got = fr.count(pat)
+        if got != want:
+            fail("⑨ %s（`%s` 出现 %d 次，应 %d 次）—— 附件记账必须含交付档，"
+                 "否则同尺寸切档会复用错档附件并静默按错口径读回" % (why, pat[:52], got, want))
+    bodies = fn_bodies(fr)
+    for entry, expr in DELIVER_ENTRIES.items():
+        fn = bodies.get(entry)
+        if not fn:
+            fail("⑨ 找不到成片入口函数 %s（切函数体的正则与写法脱钩？）" % entry)
+            continue
+        # 同名重载只会落在不同的函数体里；本入口名唯一，取并集不掩盖"某处漂了"
+        joined = "\n".join(fn)
+        for name in DELIVER_FNS:
+            args = set(re.findall(r"%s\(([^)]*)\)" % name, joined))
+            if args != {expr}:
+                fail("⑨ %s 的 %s 实参 = %s ≠ {%s} —— target/readback/dither 必须由"
+                     "同一个交付档派生（否则切档后同帧 readback 口径错，静默交付错数据）"
+                     % (entry, name, sorted(args), expr))
     return bad
 
 
@@ -333,6 +391,18 @@ def selftest():
          lambda h, f, b, k: (h, f.replace(SELFCHECK_READ, "", 1), b, k), "⑧"),
         ("⑧ 成片入口的 fail-closed 钩子被摘",
          lambda h, f, b, k: (h, f.replace(SELFCHECK_HOOK, "if (false) return false;"), b, k), "⑧"),
+        # ── 卡 FIX1：⑨ 交付档切换后 readback 格式正确 ──
+        ("⑨ submitStill 的附件重建条件丢掉交付档比较（同尺寸切档复用错档附件）",
+         lambda h, f, b, k: (h, f.replace("if (cap_w_ != dst_w || cap_h_ != dst_h || cap_ten_bit_ != ten_bit) {",
+                                          "if (cap_w_ != dst_w || cap_h_ != dst_h) {", 1), b, k), "⑨"),
+        ("⑨ finishStillChain 的 readback 交付档与 target 脱钩（按 8bit 读 10bit 附件）",
+         lambda h, f, b, k: (h, f.replace("glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),\n"
+                                          "               outputReadTypeOf(c.ten_bit), out_rgba->data());",
+                                          "glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),\n"
+                                          "               outputReadTypeOf(false), out_rgba->data());", 1), b, k), "⑨"),
+        ("⑨ 编辑器链路不再强制重建 10bit 附件（按 8bit 读 10bit 附件）",
+         lambda h, f, b, k: (h, f.replace("if (cap_w_ != out_w || cap_h_ != out_h || cap_ten_bit_) {",
+                                          "if (cap_w_ != out_w || cap_h_ != out_h) {", 1), b, k), "⑨"),
     ]
     ok = True
     for title, mutate, tag in cases:

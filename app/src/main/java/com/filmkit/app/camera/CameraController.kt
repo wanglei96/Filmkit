@@ -484,14 +484,13 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile private var stillRot = 0
     @Volatile private var stillAspect = 0f
     /**
-     * 本张成片的**交付档**（卡 H2）：true = 10bit HEIF 链（成片 FBO/readback/dither 全切 10bit）
-     * / false = 现有 8bit JPEG 链。与 [stillRot]/[stillAspect] **同型**：在下发点（submitStill /
-     * tryProcessRaw / tryProcessBurst）按 prefs 冻结 —— 渲染要 3~4s，期间用户去设置页改
-     * 「照片格式」不该改变**这一张**（否则会出现"渲染按 10bit、落盘按 JPEG"这类错配）。
+     * 交付档的读取点（唯一）：prefs `photo_format`，缺失/脏值 = JPEG（默认档）。
+     *
+     * ⚠ 卡 FIX1（2026-10-14 P0）：调用方必须在**下发点**把返回值存进**局部 val**，并把它
+     * 一路传进落盘回调 —— **不得**存进成员变量再在回调里读。成员会被"渲染期间的第二张拍摄 /
+     * 用户改设置后的下一次冻结"覆盖，而回调要等 1~4s；本项目 [stillRot]/[stillAspect] 已经
+     * 因为同型错误翻过一次车（见其注释）。曾经的 `stillTenBit` 成员即因此被删。
      */
-    @Volatile private var stillTenBit = false
-
-    /** 交付档的读取点（唯一）：prefs `photo_format`，缺失/脏值 = JPEG（默认档）。 */
     private fun tenBitForCapture(): Boolean =
         com.filmkit.app.heif.PhotoFormat.read(context.getSharedPreferences("filmkit", 0)) ==
             com.filmkit.app.heif.PhotoFormat.HEIF
@@ -2599,25 +2598,51 @@ class CameraController(private val context: Context, private val render: RenderC
 
     private fun rotation(): Int = (sensorOrientation / 90) % 4
 
+    /**
+     * 成片交付的**唯一分派点**（卡 FIX1 收口）。
+     *
+     * 为什么必须是唯一：这个分派曾散落在各条拍照路径的收尾里，MFNR burst 的那份**漏了**
+     * 交付档判断、硬编码 `queueJpegSave` ⇒ HEIF 档下 native 按
+     * `GL_UNSIGNED_INT_2_10_10_10_REV` 读回的 **10bit packed** 缓冲被 `ARGB_8888` 按通道
+     * 错读 ⇒ 霓虹伪彩 + 边缘浮雕 + 熵爆炸（真机 37MB / 43MB，同场景正常 6.4MB）。
+     * 两种格式都是 **4 B/px**（50135040 B）⇒ 长度校验永远抓不到，只能靠"交付档随缓冲走"。
+     *
+     * ⚠ [tenBit] 必须是**下发点冻结的局部值**（由调用方传参），不许在这里读成员 —— 见
+     * [tenBitForCapture] 的注释。
+     */
+    private fun deliverStill(
+        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
+    ) {
+        val fmt = DeliverFormat.of(tenBit)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.deliver",
+            kv("bits" to fmt.bits, "path" to (if (tenBit) "heif" else "jpeg"),
+                "bytes" to bytes.size),
+        )
+        if (tenBit) queueHeifSave(bytes, w, h, snap, fmt) else queueJpegSave(bytes, w, h, snap, fmt)
+    }
+
     /** 单帧静拍统一收尾（YUV / 单帧 RAW 共用）：解锁 + 预览回升 + 落盘。
      *  回调可能在预览渲染线程（直拍/回退）或拍照线程（独立线程）上——只做
      *  轻量操作，与 v0.10.85 以来 "onDone 只收尾" 的约定一致。
-     *  [snap] 由下发点（submitStill / tryProcessRaw）冻结后传入：本函数在回调线程上，
-     *  不能再去读成员 filmParams（E1-2）。 */
-    private fun finishStillCapture(bytes: ByteArray?, w: Int, h: Int, snap: StillSnapshot) {
+     *  [snap] / [tenBit] 由下发点（submitStill / tryProcessRaw）冻结后传入：本函数在回调
+     *  线程上（1~4s 后），不能再去读成员 filmParams（E1-2）/ 交付档（FIX1）。 */
+    private fun finishStillCapture(
+        bytes: ByteArray?, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
+    ) {
         capturing = false
         capturePhase = 0
         releasePreviewScaleGuard()
         if (bytes != null) {
             // 卡 H2：按**冻结的交付档**分派 —— 10bit 流走 HEIF（失败回退 JPEG），
-            // 8bit 流走原 JPEG 链（一字不动）。
-            if (stillTenBit) queueHeifSave(bytes, w, h, snap) else queueJpegSave(bytes, w, h, snap)
+            // 8bit 流走原 JPEG 链（一字不动）。卡 FIX1：分派收口到 [deliverStill]。
+            deliverStill(bytes, w, h, snap, tenBit)
         }
     }
 
     private fun submitStill(img: Image) {
-        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
-        stillTenBit = tenBitForCapture()
+        // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
+        val tenBit = tenBitForCapture()
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
@@ -2658,10 +2683,10 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill) {
             StillRenderClient.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
-                tenBit = stillTenBit,
+                tenBit = tenBit,
             ) { bytes, rw, rh ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, rw, rh, snap)
+                    finishStillCapture(bytes, rw, rh, snap, tenBit)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -2671,15 +2696,15 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitStillBuf(
                         y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
-                        tenBit = stillTenBit,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
+                        tenBit = tenBit,
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit) }
                 }
             }
         } else {
             render.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
-                tenBit = stillTenBit,
-            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap) }
+                tenBit = tenBit,
+            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap, tenBit) }
         }
     }
 
@@ -2769,8 +2794,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // NN 降噪（v0.10.102）：PMRID 接拍照链 —— NN 路线已判死（2026-10-02，
         // 跨域模型不可直接用、微调全过拟合），设置入口已删，恒关；代码路径保留
         val nnDn = false
-        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
-        stillTenBit = tenBitForCapture()
+        // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
+        val tenBit = tenBitForCapture()
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -2810,10 +2835,10 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill) {
             StillRenderClient.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
+                demosaic, noiseStrength, nnDn, tenBit = tenBit,
             ) { bytes, w, h ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, w, h, snap)
+                    finishStillCapture(bytes, w, h, snap, tenBit)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -2823,15 +2848,15 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
-                        film, demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap) }
+                        film, demosaic, noiseStrength, nnDn, tenBit = tenBit,
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn, tenBit = stillTenBit,
-            ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap) }
+                demosaic, noiseStrength, nnDn, tenBit = tenBit,
+            ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap, tenBit) }
         }
     }
 
@@ -3000,8 +3025,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 例外：A/B 诊断分支（still_ab 默认关）下发的是 submitStillAb 内部用同一函数
         // 算出的 film，那里另有一份同源快照。
         val snap = snapshotOf(filmStill)
-        // 卡 H2：本张的交付档在**下发点**冻结（见 stillTenBit 注释）
-        stillTenBit = tenBitForCapture()
+        // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
+        val tenBit = tenBitForCapture()
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             rendersInFlight.decrementAndGet()
             capturePhase = 0
@@ -3011,7 +3036,10 @@ class CameraController(private val context: Context, private val render: RenderC
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
-            if (bytes != null) queueJpegSave(bytes, w, h, snap)
+            // ⚠ 卡 FIX1（2026-10-14 P0）：此处在修复前**硬编码 queueJpegSave**，
+            //   完全绕过交付档 ⇒ HEIF 档下 10bit packed 缓冲被 ARGB_8888 错读，
+            //   真机废掉两张照片（37MB/43MB）。必须走唯一分派点 [deliverStill]。
+            if (bytes != null) deliverStill(bytes, w, h, snap, tenBit)
         }
         // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
         // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
@@ -3031,7 +3059,7 @@ class CameraController(private val context: Context, private val render: RenderC
         } else if (useStill) {
             StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub, nnDn, tenBit = stillTenBit) { bytes, w, h ->
+                useDft, alignL1, alignAb, p0Sub, nnDn, tenBit = tenBit) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -3044,14 +3072,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     render.submitRawBurst(buffers, strides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
-                        tenBit = stillTenBit, onDone = done)
+                        tenBit = tenBit, onDone = done)
                 }
             }
         } else {
             render.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
-                tenBit = stillTenBit, onDone = done)
+                tenBit = tenBit, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -3126,8 +3154,12 @@ class CameraController(private val context: Context, private val render: RenderC
                     // NN A/B：两张成片都落盘（基线在前、NN 在后加 _nn 后缀区分）；
                     // done 传 null 避免外部收尾把 b2 再存一遍（0.10.102 真机实测
                     // 三张重复：b1 + b2 + done(b2)）
-                    if (b1 != null) queueJpegSave(b1, w1, h1, snap)
-                    if (b2 != null) queueJpegSave(b2, w2, h2, snap, "_nn")
+                    // 这两条 A/B 诊断路径（still_ab / nn_ab）下发时**不带 tenBit**
+                    // （submitRawBurst 默认 false）⇒ native 交付的恒是 8bit RGBA。
+                    if (b1 != null) queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8)
+                    if (b2 != null) {
+                        queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, "_nn")
+                    }
                     done(null, 0, 0)
                 } else {
                     // 第二遍失败（含相机页退出导致 post 失败）时仍要落第一遍的成片 ——
@@ -3473,10 +3505,24 @@ class CameraController(private val context: Context, private val render: RenderC
 
     // ══ 卡 H2：10bit HEIF 落盘（含**回退链**与读头自检）════════════════════════════
 
-    /** HEIF 落盘入队（与 [queueJpegSave] 同型：主线程只做快照 + 入队）。 */
+    /** HEIF 落盘入队（与 [queueJpegSave] 同型：主线程只做快照 + 入队）。
+     *
+     * ⚠ 卡 FIX1：[fmt] 是交付格式断言 —— HEIF 侧只接受 10bit packed（[Heif10Pipeline]
+     * 的 `unpackRgb10` 按 `GL_UNSIGNED_INT_2_10_10_10_REV` 位序解包，喂 8bit RGBA 会得到
+     * 错色）。不匹配时留 ERROR 日志并**改走 8bit JPEG**（数据本来就是 8bit ⇒ 正确交付）。 */
     private fun queueHeifSave(
-        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, extraTag: String = "",
+        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
+        extraTag: String = "",
     ) {
+        if (!DeliverFormat.heifAccepts(fmt)) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.deliver_format_mismatch",
+                kv("path" to "heif", "expectBits" to DeliverFormat.RGB10A2_PACKED.bits,
+                    "gotBits" to fmt.bits, "w" to w, "h" to h, "bytes" to bytes.size),
+            )
+            queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag)
+            return
+        }
         val iso = liveIso
         val secNs = liveExposureNs
         EngineBridge.nativeAppendLog(
@@ -3638,10 +3684,39 @@ class CameraController(private val context: Context, private val render: RenderC
     /** 把一帧成片投给后台保存队列。主线程在这里只做两件事：快照拍摄参数、
      *  入队 —— 返回后调用方（相机回调 / 渲染回调）立刻可以继续工作。
      *  日志 photo.save_queued 与 photo.saved 的时间差 = 后台实际耗时，用于验证
-     *  主线程确实没被编码阻塞。 */
+     *  主线程确实没被编码阻塞。
+     *
+     * ⚠ 卡 FIX1：[fmt] **故意不给默认值** —— 本次 P0 的成因正是"落盘点可以忘掉交付档"。
+     * 编译期强制每个调用点显式声明它凭什么格式把缓冲交给 JPEG 编码器。 */
     private fun queueJpegSave(
-        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, extraTag: String = "",
+        bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
+        extraTag: String = "",
     ) {
+        // ── 交付格式断言（照片优先红线：宁可失败/降位，绝不静默交付错数据）──────────
+        // JPEG 编码器只能吃 8bit RGBA（`EngineBridge.OUTPUT_BITMAP_CONFIG` = ARGB_8888）。
+        // 10bit packed 与它**同为 4 B/px** ⇒ 长度校验永远通过、位打包被按通道错读（FIX1）。
+        // 走到这里说明上游分派漏了：留 ERROR 日志（`photo.deliver_format_mismatch`），
+        // 并走 HEIF 回退链那条同样的降位路径把它变成真正的 RGBA8 —— **不丢片**。
+        if (!DeliverFormat.jpegAccepts(fmt)) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.deliver_format_mismatch",
+                kv("path" to "jpeg", "expectBits" to DeliverFormat.RGBA8.bits,
+                    "gotBits" to fmt.bits, "w" to w, "h" to h, "bytes" to bytes.size),
+            )
+            val iso8 = liveIso
+            val sec8 = liveExposureNs
+            val rgba8 = try {
+                com.filmkit.app.heif.Heif10Pipeline.toRgba8(bytes, w, h)
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "camera", "photo.save_failed",
+                    kv("error" to "10bit→8bit 降位失败: ${t.message ?: t.toString()}"),
+                )
+                return
+            }
+            saver.execute { saveJpeg(rgba8, w, h, iso8, sec8, extraTag, snap) }
+            return
+        }
         val iso = liveIso
         val secNs = liveExposureNs
         EngineBridge.nativeAppendLog(
@@ -3871,5 +3946,42 @@ class CameraController(private val context: Context, private val render: RenderC
                 kv("error" to (it.message ?: it.toString())),
             )
         }
+    }
+}
+
+/**
+ * 成片交付缓冲的**显式格式**（卡 FIX1）。
+ *
+ * 为什么必须显式：8bit RGBA 与 10bit packed（`GL_UNSIGNED_INT_2_10_10_10_REV`，
+ * `GL_RGB10_A2` 附件）都是 **4 字节/像素** —— 3072×4080 时两者都是 50135040 B，
+ * **长度校验永远抓不到**。唯一的判据是"这个缓冲是按哪个交付档从 native 读回来的"，
+ * 而交付档只能来自下发点冻结的那一个 bool（见 `CameraController.tenBitForCapture`）。
+ *
+ * 成员顺序 = 位深升序；[bits] 只用于日志（真机判据见
+ * `docs/reports/r-next-fix-heif-switch-REPORT.md` §7）。
+ */
+internal enum class DeliverFormat(val bits: Int) {
+    /** 8bit RGBA（`EngineBridge.OUTPUT_BITMAP_CONFIG` = ARGB_8888 直通）。 */
+    RGBA8(8),
+
+    /** 10bit packed uint32（LSB-first：bit0..9 = R、10..19 = G、20..29 = B、30..31 = A）。 */
+    RGB10A2_PACKED(10);
+
+    companion object {
+        /** 交付档 → 缓冲格式（**唯一真源**：native 侧同一 bool 决定 target 与 readback）。 */
+        fun of(tenBit: Boolean): DeliverFormat = if (tenBit) RGB10A2_PACKED else RGBA8
+
+        /**
+         * JPEG 编码器（`EngineBridge.OUTPUT_BITMAP_CONFIG` 直通 + `nativeEncodeJpeg444`）能否吃这种
+         * 缓冲。**只吃 8bit RGBA**：10bit packed 与它同为 4 B/px ⇒ 长度校验通过、位打包被
+         * 按通道错读 ⇒ 霓虹伪彩 + 熵爆炸（FIX1 事故）。
+         */
+        fun jpegAccepts(fmt: DeliverFormat): Boolean = fmt == RGBA8
+
+        /**
+         * HEIF 10bit 链（`Heif10Pipeline.unpackRgb10` 按 `2_10_10_10_REV` 位序解包）能否吃
+         * 这种缓冲。**只吃 10bit packed**：喂 8bit RGBA 会把通道字节当位段 ⇒ 错色。
+         */
+        fun heifAccepts(fmt: DeliverFormat): Boolean = fmt == RGB10A2_PACKED
     }
 }

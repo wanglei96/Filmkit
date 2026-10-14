@@ -98,7 +98,24 @@ dither 幅度按输出位深缩放（darktable `dither.c:326` 口径），10bit 
 `tools/engine-shader-offline.py:886`（`film_d5` CRC32 `0x589f8364`）+ `:409-422`（`FILM_SRC_BASELINE` 分段 crc32）· `check-film-offline.py:134` · `check-toeshoulder.py:5-21`（60 系数逐位）· `check-u2/u3/u4` · `check-halation.py:27` · `check-softglow.py:19` · `check-style-passthrough.py:136` · `check-srgb-oetf.py` · `domain-contract-check.py`；测试侧 `StdColorMatrixTest.kt:56-65`。
 ⇒ **期 B 开工第一步 = 把这批守卫按"新域下的新基线"重建，并保留旧基线作历史对照**（不许直接改期望值了事）。
 
-## 6. 拍板结果 / 待实测
+## 6b. ⛔ 事故记录（2026-10-14，0.11.34，用户真实照片损坏 2 张）
+
+**现象**：切到 HEIF 后再拍照，产出仍是 `.jpg`，但**画面霓虹伪彩 + 边缘浮雕、文件 37MB / 43MB**（同场景正常 6.4MB）。**两张照片不可恢复**（已用两种通道序尝试反解，均为噪声）。
+
+**根因方向（架构师复核）**：**10bit packed 缓冲被当成 8bit `ARGB_8888` 解释**。两个 4 字节格式的**长度完全相同**（3072×4080×4 = 50135040）⇒ **任何长度/尺寸校验都抓不到**；数据流的关键一跳是 `native readback ByteArray → Bitmap(ARGB_8888) → nativeEncodeJpeg444(bitmap)`（`JpegEncoder.cpp:53`、`CameraController.kt:3727`）。
+
+**不可恢复的原因**（写下来免得再试）：`GL_RGB10_A2` 的 4 字节布局是**跨通道位打包**（`R[7:0] | G[5:0]<<2|R[9:8] | B[3:0]<<4|G[9:6] | A[1:0]<<6|B[9:4]`），JPEG 只有 3 通道 ⇒ **第 4 字节（含 B 高 6 位）永久丢失**；且 JPEG 有损 + RGB↔YCbCr 往返的 ±1 LSB 会跨通道放大。
+
+**已暴露的三处防线缺口（修复必须覆盖）**：
+1. **格式靠长度推断** ⇒ 必须让交付缓冲带**显式格式**，在 `ByteArray → Bitmap` 一跳**断言**（8bit 档才允许 `ARGB_8888` 解释）。
+2. **自检只做在 HEIF 路径** ⇒ 事故全程**没有任何 `photo.heif_*` 事件**（它是 JPEG 路径在交付错数据）；8bit 交付路径也必须有一条最小自检/断言并留日志。
+3. ~~**根因链仍有一环未闭合**~~ **已闭合（FIX1，同日）**：`CameraController.kt:3005-3014` 的 **MFNR burst 落盘回调硬编码 `queueJpegSave`**，绕过同一下发点（`:3004`）冻结的交付档 ⇒ native 按 `GL_RGB10_A2` 读回、Kotlin 按 `ARGB_8888` 错读。**决定性证据两条**：① `heif10.selfcheck` 只在 `ten_bit=true` 的提交路径被调用 ⇒ 该张下发时确实是 10bit，而落盘无 `photo.heif_queued` ⇒ 只有 burst 路径能同时满足（`:3014` 是全文件唯一无条件 `queueJpegSave` 的成片落盘点）；② **位打包的物理证据** —— 按 `2_10_10_10_REV` 布局，废片的 G 通道应呈 4 段同构、B 通道 16 段同构，实测段间相关 **G=0.961/0.945、B=0.9977/0.9983**（R 无结构 0.058/−0.186），正常片全部 ~0。
+
+**修复形态（FIX1）**：删成员 `stillTenBit`（会被渲染期间的第二张覆盖 —— 与 `stillRot/stillAspect` 同型事故）⇒ 三处下发点各自 `val tenBit = tenBitForCapture()` 随回调传参；**唯一分派点 `deliverStill(bytes,w,h,snap,tenBit)`**（单帧 + burst 四条收尾全经它）+ 无条件留痕 `photo.deliver {"bits":8|10}`；**`DeliverFormat`（RGBA8 / RGB10A2_PACKED）+ `fmt` 参数故意无默认值**（编译期强制）+ 进 `Bitmap` 前断言（不匹配 ⇒ `photo.deliver_format_mismatch` + 先降位再落盘，失败而非静默且不丢片）；native 不改，改为离线机械守卫（第 ⑨ 组）。变异检验：M1/M3/M4 分别红 2/1/3 条。
+
+**真机判据（修复后必须能判定）**：`切 HEIF → 切回 JPEG → 拍照` 必须与 `从未切过 HEIF 的 JPEG` 等价（同场景同参数）。
+
+## 7. 待拍板 / 待实测
 
 **已拍板（2026-10-14）**：P1 分期 A → B ✓ · P2 默认引擎切 sigmoid ✓ · P3 照片格式设置项（默认 JPEG / 可选 HEIF）✓ · **R1 交付域与传输函数 = sRGB 显示域 + 10bit（选项 A）** ✓ —— 详见 §1b。
 
