@@ -342,8 +342,20 @@ latency = 3   priority = 0   intra-refresh-period = 0   video-qp-average = 0（�
 
 ### 仍未做（期 A 遗留）
 
-- **判据 F 的三端人工确认**：macOS ✅、微信 ✅（用户实测）；**系统相册 / Windows 待看**。
+- ~~判据 F 三端人工确认~~ ⇒ **2026-10-15 全部通过**：macOS ✅ · 微信 ✅ · 系统相册 ✅ ·
+  Windows ✅（用户实测）。
 - **4:2:0 色度是硬件硬限**（P010；探针实测 `p210: false`，无 4:2:2 / 4:4:4 10bit 路径）
   ⇒ 色度细节上 HEIF 档不如 JPEG 4:4:4，这是**格式 + 硬件**的取舍，不是 bug。
+
+### 期 A 收官状态（2026-10-15）
+
+**功能**：设置 →「拍摄」→「照片格式」（默认 JPEG / 可选 HEIF 10bit）⇒ 已定稿
+（`filmkit-0.11.46-HEIF-FINAL.apk` / 395）。链路 = 引擎 10bit readback（`GL_RGB10_A2` +
+`GL_UNSIGNED_INT_2_10_10_10_REV`）→ CPU BT.709 全范围 4:2:0 → P010 → 硬件 HEVC Main10
+（VBR + 官方 QP 键，QP=4）→ 自研 HEIF 容器（`colr/nclx = 1/13/1/1`，`pixi` 3×10bit）→
+落盘 + 读头自检；三级回退 `10bit → 8bit HEIF → JPEG`。
+
+**下一期**：期 B —— 公共工作空间切 **Rec.2020 线性**（§5 的 8 面爆炸半径 + A 组守卫会整体变红，
+必须单独一期）。
 
 **其他未确认项**（三份报告各自的 ⑦ 节，共 25 条）：`pow(2.2)` 是债还是刻意 · 42 个 `.lut` 是否携带域元数据 · `FrameRenderer.cpp:7868 tex_local_=GL_RGBA8` 是否为更早的隐藏降位点 · `computeXyzD50ToGamut` 是否 Bradford · vivo HEIC 静态照片是否真为 10bit 等。
