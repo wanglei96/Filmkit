@@ -70,6 +70,14 @@ object Hevc10Encoder {
     private const val DEADLINE_MS = 20_000L
 
     /**
+     * 编码器 `start()` 之后**首次提供输入缓冲**的等待上限 —— 见 [encode] 里 `awaitInput` 的注释：
+     * 这一步**不能**用 [TIMEOUT_US]（10 ms）单次试探，否则真机随机失败。
+     * 取值 5 s：正常情况下硬件编码器在数百毫秒内就绪；5 s 仍拿不到就说明它真没起来，
+     * 该失败就失败（回退链兜住照片），不要让用户干等 [DEADLINE_MS]（20 s）。
+     */
+    private const val INPUT_READY_MS = 5_000L
+
+    /**
      * 选型：声明 **Main10（或 Main10HDR10）+ P010(54)** 的**硬件** HEVC 编码器。
      * 返回 `null` = 本机没有这条路线 ⇒ 调用方回退（不静默降 8bit）。
      */
@@ -146,13 +154,28 @@ object Hevc10Encoder {
             codec.start()
 
             // 喂 1 帧 + EOS（HEIF 是 still image）
-            val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-            check(inIdx >= 0) { "10s 内拿不到输入缓冲（${info.name}）" }
+            //
+            // ⚠ **等输入缓冲必须用循环等到 [INPUT_READY_MS]，不能用 [TIMEOUT_US] 单次试探**：
+            // `TIMEOUT_US`（10 ms）是给**输出侧轮询**用的（那本来就在 while 循环里）；
+            // 而硬件编码器 `start()` 之后**首次**提供输入缓冲要先初始化硬件 + 分配缓冲，
+            // 耗时随系统负载/温度波动 ⇒ 真机实测同一颗 `c2.mtk.hevc.encoder` 同一份配置，
+            // 有时 10 ms 内就绪、有时远超（2026-10-15 表现为 08:13 成功 / 16:37、16:38 连续失败，
+            // 且旧文案写"10s 内拿不到"是错的，实际只等了 10 ms）。
+            fun awaitInput(what: String): Int {
+                val deadline = System.currentTimeMillis() + INPUT_READY_MS
+                while (true) {
+                    val idx = codec!!.dequeueInputBuffer(TIMEOUT_US)
+                    if (idx >= 0) return idx
+                    if (System.currentTimeMillis() >= deadline) {
+                        error("编码器 ${info.name} 在 ${INPUT_READY_MS}ms 内未提供$what（硬件编码器初始化超时）")
+                    }
+                }
+            }
+            val inIdx = awaitInput("输入缓冲")
             val fed = fillInput(codec, inIdx, pattern, width, height)
             check(fed > 0) { "输入缓冲填充失败（${info.name}）" }
             codec.queueInputBuffer(inIdx, 0, fed, 0, 0)
-            val eosIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-            check(eosIdx >= 0) { "10s 内拿不到 EOS 输入缓冲（${info.name}）" }
+            val eosIdx = awaitInput("EOS 输入缓冲")
             codec.queueInputBuffer(eosIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
 
             val raw = ByteArrayOutputStream()
