@@ -30,8 +30,8 @@ class HeifQualityTest {
         val jpeg = (w.toLong() * h * HeifQuality.JPEG_REFERENCE_BPP / 8.0).toLong()
         assertEquals("下界 = JPEG 估算 × 0.40", (jpeg * HeifQuality.TARGET_MIN_RATIO).toLong(), r.first)
         assertEquals("上界 = JPEG 估算 × 0.60", (jpeg * HeifQuality.TARGET_MAX_RATIO).toLong(), r.last)
-        assertEquals("12MP 区间应落在 2.6~4.0 MB（真机 JPEG 6.86 MB 的 40~60%）",
-            true, r.first in 2_500_000..2_800_000 && r.last in 3_800_000..4_100_000)
+        assertEquals("12MP 区间应落在 2.6~4.7 MB（真机 JPEG 6.86 MB 的 40~70%，质量优先口径）",
+            true, r.first in 2_500_000..2_800_000 && r.last in 4_500_000..4_700_000)
     }
 
     /** ② **核心**：码率必须按 frame-rate 折算成单帧预算给。 */
@@ -75,44 +75,55 @@ class HeifQualityTest {
     @Test
     fun stepQp_directionAndLimits() {
         val d = HeifQuality.QP_DEFAULT
-        assertEquals("压过头 ⇒ 降 QP 提质量", d - HeifQuality.QP_STEP, HeifQuality.stepQp(d, HeifQuality.Verdict.TOO_SMALL)!!)
+        assertNull(
+            "终值已是下界（QP_MIN == QP_DEFAULT）⇒ 压过头也不许再降 QP（这正是禁自校正的机制之一）",
+            HeifQuality.stepQp(d, HeifQuality.Verdict.TOO_SMALL),
+        )
         assertEquals("太胖 ⇒ 升 QP 降体积", d + HeifQuality.QP_STEP, HeifQuality.stepQp(d, HeifQuality.Verdict.TOO_BIG)!!)
-        assertNull("达标 ⇒ 停", HeifQuality.stepQp(d, HeifQuality.Verdict.OK))
+        assertNull("达标 ⇒ 停", HeifQuality.stepQp(d + 4, HeifQuality.Verdict.OK))
         assertNull("已到下界", HeifQuality.stepQp(HeifQuality.QP_MIN, HeifQuality.Verdict.TOO_SMALL))
         assertNull("已到上界", HeifQuality.stepQp(HeifQuality.QP_MAX, HeifQuality.Verdict.TOO_BIG))
     }
 
-    /** ⑥ 只有 QP 路能自校正，且受 MAX_QP_TRIES 约束（纯函数级，不依赖当前是否扫描轮）。 */
+    /**
+     * ⑥ **定稿后自校正被禁用**（画质已饱和）—— `refine` 对 qp 路也必须恒 null。
+     *
+     * 理由：QP 固定在饱和点后，同一个 QP 在不同场景的产出会在 3.13~4.34 MB 间浮动；
+     * 若还让 `verdict` 驱动自校正，`TOO_BIG` 会把 QP 往高推 = **为了体积主动降质量**。
+     */
     @Test
-    fun refine_onlyQpPathAndBounded() {
+    fun refine_disabledAtSaturation() {
         val qp = HeifQuality.Strategy("qp", HeifQuality.MODE_VBR, 26_320_888, qp = HeifQuality.QP_DEFAULT)
-        val once = HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, 0)
-        assertNotNull("第一次还能再试", once)
-        assertEquals("降一个步长", HeifQuality.QP_DEFAULT - HeifQuality.QP_STEP, once!!.second.qp)
-        assertNull("试满 MAX_QP_TRIES ⇒ 换路", HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, HeifQuality.MAX_QP_TRIES - 1))
-        val cq = HeifQuality.Strategy("cq", HeifQuality.MODE_CQ, 20_367_360, quality = HeifQuality.CQ_QUALITY)
-        val vbr = HeifQuality.Strategy("vbr", HeifQuality.MODE_VBR, 20_367_360)
-        assertNull("cq 没有旋钮 ⇒ 试一次就换路", HeifQuality.refine(cq, HeifQuality.Verdict.TOO_SMALL, 0))
+        assertNull(
+            "定稿后恒 null（TOO_SMALL 也不许再降 QP：QP 4→0 只差 1 LSB / +36% 体积）",
+            HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, 0),
+        )
+        assertNull("TOO_BIG 同样不许动（不许为体积降质量）", HeifQuality.refine(qp, HeifQuality.Verdict.TOO_BIG, 0))
+        val cq = HeifQuality.Strategy("cq", HeifQuality.MODE_CQ, 26_320_888, quality = HeifQuality.CQ_QUALITY)
+        val vbr = HeifQuality.Strategy("vbr", HeifQuality.MODE_VBR, 26_320_888)
+        assertNull("cq 没有旋钮", HeifQuality.refine(cq, HeifQuality.Verdict.TOO_SMALL, 0))
         assertNull("vbr 同上", HeifQuality.refine(vbr, HeifQuality.Verdict.TOO_SMALL, 0))
+        // stepQp 本身仍是纯函数（能力保留：换平台要重新标定时还用得上）
+        assertNotNull("换平台再标定时仍可用", HeifQuality.stepQp(HeifQuality.QP_MAX / 2, HeifQuality.Verdict.TOO_SMALL))
     }
 
     /**
-     * ⑦ 0.11.45 = **QP 对照轮**：两路 = qp0 → qp4（从最低 QP 往高排，保证两路都跑完）。
+     * ⑦ **定稿**（0.11.46）：两路 = qp(QP=4) → cq；QP 固定、**禁自校正**。
      *
-     * 0.11.44 的三点扫描已给出体积曲线（QP 0 ⇒ 4.62 MB、4 ⇒ 3.13 MB、10 ⇒ 2.05 MB），
-     * 但只落了 best ⇒ **QP=0 那张的画质无从判断**（QP 4→0 的体积代价比 10→4 还大）。
-     * 所以本版两路都跑、并由上层把两档都落盘，做同场景直接对照。
+     * 依据（0.11.45 同一次拍照的两档对照）：QP4 = 4.34 MB ↔ QP0 = 5.92 MB，
+     * 逐像素 **p99 仅差 1 LSB**、全局高频 +1.1%，却多付 36% 体积 ⇒ **QP=4 是画质饱和点**。
      */
     @Test
-    fun strategies_areQpScan() {
+    fun strategies_finalQp4() {
         val s = HeifQuality.strategies(w, h, 100_000_000)
-        assertEquals(listOf("qp0", "qp4"), s.map { it.mode })
-        assertEquals("两个对照点", listOf(0, 4), s.map { it.qp })
-        assertTrue("全部走 VBR（CQ 下 QP 键会被编码器拒绝）", s.all { it.bitrateMode == HeifQuality.MODE_VBR })
-        assertTrue("必须从最低 QP 往高排（高 QP 会先落在区间上界内 ⇒ 早停，拿不到全部点）",
-            s.map { it.qp!! } == s.map { it.qp!! }.sorted())
-        assertTrue("路名必须带 QP 值（日志一眼对齐，也用于对照档文件名）", s.all { it.mode == "qp${it.qp}" })
-        assertTrue("QP_MIN 必须容得下扫描下界", HeifQuality.QP_MIN <= s.first().qp!!)
+        assertEquals(listOf("qp", "cq"), s.map { it.mode })
+        assertEquals("QP 终值 = 画质饱和点", 4, HeifQuality.QP_DEFAULT)
+        assertEquals("qp 路带终值", HeifQuality.QP_DEFAULT, s[0].qp)
+        assertEquals("必须走 VBR（CQ 下 QP 键会被编码器拒绝）", HeifQuality.MODE_VBR, s[0].bitrateMode)
+        assertEquals("禁自校正：为体积降质量与质量优先正相反", 1, HeifQuality.MAX_QP_TRIES)
+        assertEquals("QP_MIN = 终值本身（再往下零收益）", 4, HeifQuality.QP_MIN)
+        assertEquals("兜底路 quality=100", HeifQuality.CQ_QUALITY, s[1].quality)
+        assertEquals("兜底路走 CQ", HeifQuality.MODE_CQ, s[1].bitrateMode)
     }
 
     /** ⑧ 都没达标时留"最接近区间"的那份（不是最大也不是最小）。 */
@@ -132,18 +143,15 @@ class HeifQualityTest {
     }
 
     /**
-     * ⑨ 防回归：最坏尝试次数必须有上限。
+     * ⑨ 防回归：最坏尝试次数必须有上限（用户可感的落盘等待）。
      *
-     * 没有它时最坏 = qp×MAX_QP_TRIES + cq + cbr（旧值 3+1+1 = 5 次编码 ≈ 9 s 落盘等待，用户可感）。
-     * 这条守护的意义是"以后有人把它改大必须先看见这个测试变红"。
+     * 定稿后只有一路（`qp4`）且禁自校正 ⇒ 正常路径**恒 1 次**；上限只需容得下"该路被编码器
+     * 拒绝时换兜底路"。这条守护的意义是"以后有人把它改大必须先看见这个测试变红"。
      */
     @Test
     fun totalTriesIsBounded() {
-        assertTrue("总尝试上限必须 ≤ 3（≈5.4 s）", HeifQuality.MAX_TOTAL_TRIES <= 3)
-        assertTrue(
-            "总上限必须容得下三路各一次（qp / cq / cbr）",
-            HeifQuality.MAX_TOTAL_TRIES >= 3,
-        )
+        assertTrue("总尝试上限必须 ≤ 3（单次 1.2~3.1 s）", HeifQuality.MAX_TOTAL_TRIES <= 3)
+        assertTrue("必须容得下兜底换路", HeifQuality.MAX_TOTAL_TRIES >= 2)
     }
 
     /** ⑩ 进日志的字段齐（下一轮定位靠它，不许少）。 */
