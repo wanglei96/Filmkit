@@ -159,12 +159,25 @@ object Heif10Pipeline {
         w: Int,
         h: Int,
         bitrate: Int = defaultBitrate(w, h),
+        /**
+         * **每一路**编码成功后的完整 HEIF 文件字节（容器已组装）。
+         *
+         * 0.11.45 起用：QP 标定需要"同一次拍照、同一场景"的两档对照 ⇒ 上层把非最终档也落盘
+         * （见 `CameraController` 的 `photo.heif_qp_extra`）。默认 `null` = 不关心其他档。
+         */
+        onAttempt: ((String, ByteArray) -> Unit)? = null,
         outStats: (HeifQuality.Stats) -> Unit = {},
     ): ByteArray {
         require(w % 2 == 0 && h % 2 == 0) { "HEIF 成片尺寸必须偶数（4:2:0），实际 ${w}x$h" }
         val rgb = unpackRgb10(bytes, w, h)
         val pattern = toP010(rgb, w, h)
-        val image = Hevc10Encoder.encode(w, h, pattern, bitrate, outStats)
+        val image = Hevc10Encoder.encode(
+            w, h, pattern, bitrate,
+            onImage = if (onAttempt == null) null else { mode, img ->
+                onAttempt(mode, HeifContainerWriter.build(img, HeifContainerWriter.Cicp(), bitDepth = 10))
+            },
+            outStats = outStats,
+        )
         return HeifContainerWriter.build(
             image,
             HeifContainerWriter.Cicp(),   // 交付口径真源：1/13/1/1（sRGB 显示域，R1 选项 A）

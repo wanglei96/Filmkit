@@ -97,20 +97,21 @@ class HeifQualityTest {
     }
 
     /**
-     * ⑦ 0.11.44 = **QP 扫描轮**：三路 = qp0 → qp4 → qp8（从最低 QP 往高排，保证三路都跑完）。
+     * ⑦ 0.11.45 = **QP 对照轮**：两路 = qp0 → qp4（从最低 QP 往高排，保证两路都跑完）。
      *
-     * 为什么扫而不是直接定终值：真机三点的**边际收益在急剧递减**（16→12 全局高频 +0.216，
-     * 12→10 只 +0.022），"继续降 QP 是在恢复细节还是只在保留噪声"靠推演答不出来。
+     * 0.11.44 的三点扫描已给出体积曲线（QP 0 ⇒ 4.62 MB、4 ⇒ 3.13 MB、10 ⇒ 2.05 MB），
+     * 但只落了 best ⇒ **QP=0 那张的画质无从判断**（QP 4→0 的体积代价比 10→4 还大）。
+     * 所以本版两路都跑、并由上层把两档都落盘，做同场景直接对照。
      */
     @Test
     fun strategies_areQpScan() {
         val s = HeifQuality.strategies(w, h, 100_000_000)
-        assertEquals(listOf("qp0", "qp4", "qp8"), s.map { it.mode })
-        assertEquals("三个扫描点", listOf(0, 4, 8), s.map { it.qp })
+        assertEquals(listOf("qp0", "qp4"), s.map { it.mode })
+        assertEquals("两个对照点", listOf(0, 4), s.map { it.qp })
         assertTrue("全部走 VBR（CQ 下 QP 键会被编码器拒绝）", s.all { it.bitrateMode == HeifQuality.MODE_VBR })
         assertTrue("必须从最低 QP 往高排（高 QP 会先落在区间上界内 ⇒ 早停，拿不到全部点）",
             s.map { it.qp!! } == s.map { it.qp!! }.sorted())
-        assertTrue("路名必须带 QP 值（日志一眼对齐）", s.all { it.mode == "qp${it.qp}" })
+        assertTrue("路名必须带 QP 值（日志一眼对齐，也用于对照档文件名）", s.all { it.mode == "qp${it.qp}" })
         assertTrue("QP_MIN 必须容得下扫描下界", HeifQuality.QP_MIN <= s.first().qp!!)
     }
 

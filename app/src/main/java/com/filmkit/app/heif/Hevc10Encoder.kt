@@ -233,9 +233,14 @@ object Hevc10Encoder {
         height: Int,
         pattern: IntArray,
         bitrate: Int = DEFAULT_BITRATE,
+        /**
+         * **每一路**编码成功后回调 `(路名, 该路的编码产物)` —— 0.11.45 起供上层把对照档
+         * 也落盘（每次拍照的两档 QP 对照），默认 `null` = 只关心最终生效那一档。
+         */
+        onImage: ((String, HeifContainerWriter.Image) -> Unit)? = null,
         outStats: (HeifQuality.Stats) -> Unit = {},
     ): HeifContainerWriter.Image = encodeWithQuality(
-        width, height, pattern, bitrate, strategies = null, outStats = outStats,
+        width, height, pattern, bitrate, strategies = null, onImage = onImage, outStats = outStats,
     ).first
 
     /** 同 [encode]，额外返回统计（供调用方直接进日志）。 */
@@ -257,6 +262,7 @@ object Hevc10Encoder {
         pattern: IntArray,
         bitrate: Int,
         strategies: List<HeifQuality.Strategy>?,
+        onImage: ((String, HeifContainerWriter.Image) -> Unit)? = null,
         outStats: (HeifQuality.Stats) -> Unit,
     ): Pair<HeifContainerWriter.Image, HeifQuality.Stats?> {
         require(width > 0 && height > 0) { "尺寸非法: ${width}x$height" }
@@ -304,6 +310,8 @@ object Hevc10Encoder {
             // 就能横向比较三路（mode/qp/bitrate/bytes/verdict 逐条对齐）。
             outStats(st)
             lastEmitted = st
+            // 每一路的产物也给上层（0.11.45 起把对照档落盘；回调失败不能打死照片）
+            runCatching { onImage?.invoke(plan.mode, img) }
             if (v == HeifQuality.Verdict.OK) {
                 return img to st
             }

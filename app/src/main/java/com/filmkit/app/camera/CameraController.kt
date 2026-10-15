@@ -3557,9 +3557,15 @@ class CameraController(private val context: Context, private val render: RenderC
         // 卡 FIX4：质量口径的统计出口（`bitrateMode`/`qp`/`bitrate`/`bytes`/`ms`/`verdict`）。
         // 10bit 那边逐路尝试，最终生效的那路由编码器回传 ⇒ 下一轮不用猜"走的哪条路"。
         var q10: com.filmkit.app.heif.HeifQuality.Stats? = null
+        // 0.11.45 诊断：同一次拍照里**其他 QP 档**的完整文件（QP 标定必须"同场景对照"才能判
+        // "多出来的体积换到了什么"；0.11.44 扫描只落了 best ⇒ QP=0 那张无从比较）。
+        val qpExtras = mutableListOf<Pair<String, ByteArray>>()
         val deliv = com.filmkit.app.heif.HeifDelivery.run(
             attempt10 = {
-                com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) { st ->
+                com.filmkit.app.heif.Heif10Pipeline.toHeifFile(
+                    rgba10, w, h,
+                    onAttempt = { mode, file -> qpExtras += mode to file },
+                ) { st ->
                     q10 = st
                     // **每一路都留一条 `photo.heif_try`**（不只最终生效的那路）：0.11.39 的真机
                     // 日志只剩最后一路 ⇒ "哪条路真的驱动了质量"只能反推。多条 try 让**一张照片**
@@ -3719,6 +3725,40 @@ class CameraController(private val context: Context, private val render: RenderC
                 reason = "head_check",
             )
             return
+        }
+
+        // ── 0.11.45 诊断：对照档落盘（**只在主档自检通过后**走到这里）────────────────────
+        // 走与主档同一条相册通道（用户才能从相册直接取出对比）；文件名带路名后缀（_qp0/_qp4）。
+        // ⚠ 照片优先红线：任何失败都只留一条 WARN，**绝不影响**已经落盘并通过自检的主片。
+        for ((mode, bytes) in qpExtras) {
+            runCatching {
+                val extraName = name.removeSuffix(".heic") + "_" + mode + ".heic"
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val cv = android.content.ContentValues().apply {
+                        put(MediaStore.Images.Media.DISPLAY_NAME, extraName)
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/heic")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                    context.contentResolver
+                        .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                        ?.let { uri ->
+                            context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                            cv.clear()
+                            cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                            context.contentResolver.update(uri, cv, null, null)
+                        }
+                }
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "photo.heif_qp_extra",
+                    kv("name" to extraName, "mode" to mode, "bytes" to bytes.size),
+                )
+            }.onFailure {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "camera", "photo.heif_qp_extra_failed",
+                    kv("mode" to mode, "error" to (it.message ?: it.toString())),
+                )
+            }
         }
 
         if (savedUri != null) {
