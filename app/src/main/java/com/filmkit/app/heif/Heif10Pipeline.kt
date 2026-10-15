@@ -129,15 +129,14 @@ object Heif10Pipeline {
     /**
      * 本次交付的码率（bit/s）——**按目标体积反算**，不再是"拍脑袋估算"。
      *
-     * ## 来历（卡 FIX4，取代旧的 `w·h·30·2` 夹 [8, 240] Mbps）
-     * 旧公式的 240 Mbps 上限对 12MP 就是 **单帧预算 1 MB**（240 Mbps ÷ 30 fps），而
-     * `KEY_BIT_RATE` 是**上界不是目标**：编码器为了省只会往下走 ⇒ 真机落到 **198 KB**
-     * （= 同场景 JPEG 5.1 MB 的 **1/25**），高频只剩 JPEG 的 30% ⇒ **压过头**。
-     *
-     * 新口径：目标 = 同场景 JPEG 的 **40~60%**（[HeifQuality.TARGET_MIN_RATIO] /
-     * [TARGET_MAX_RATIO]），由 [HeifQuality.bitrateFor] 按
-     * **目标体积中值 × 8 × frame-rate** 反算（⚠ `frame-rate` 参与折算，漏掉就差 30 倍）。
-     * 12MP ⇒ **611 Mbps**（旧上限只有 240，根本到不了目标 —— 这就是根因的算术）。
+     * ## 来历（卡 FIX4；0.11.40 修正 frame-rate 口径）
+     * ① 旧公式 `w·h·30·2` 夹 [8, 240] Mbps：对 12MP 算出 737 Mbps 却被夹到 240 ⇒ 单帧预算
+     *    1 MB ⇒ 真机 **198 KB**（同场景 JPEG 5.1 MB 的 1/25），高频只剩 30%。
+     * ② 卡 FIX4 改成"目标中值 × 8 × frame-rate"，但 `frame-rate` 仍照抄视频的 **30** ⇒
+     *    要报 **611 Mbps**，而真机 `bitrateRange.upper` = **100 Mbps** ⇒ 被夹 ⇒ 单帧预算
+     *    只剩 416 KB ⇒ 真机 **392 KB**（0.11.39 实测，高频 32%）。
+     * ③ **0.11.40 定案**：[HeifQuality.FRAME_RATE] = **1**（静态图 1 帧）⇒ 要报的码率 =
+     *    2.45 MB × 8 × 1 = **20.4 Mbps**，低于上限、**不再被夹**。这才是"细节不行"的根因。
      *
      * ⚠ **仍然要真机标定**的量只有两个：[HeifQuality.JPEG_REFERENCE_BPP]（JPEG 基准
      * bit/px，随场景噪声涨跌）与 [HeifQuality.QP_DEFAULT]（QP 起点）。标定后只改那两处。

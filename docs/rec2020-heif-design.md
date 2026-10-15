@@ -133,6 +133,54 @@ dither 幅度按输出位深缩放（darktable `dither.c:326` 口径），10bit 
 
 **期 A 仍待办**：① 判据 F 的 **Android 相册 / 微信 / Windows** 三端人工看；② 码率标定（10bit 档 161KB、8bit 档 368KB，场景不同不可直接比）；③ 8bit HEIF 与 JPEG 的画质对照。
 
+## 6d. ⚠ 0.11.39 真机复核：HEIC「细节还是不行」的算术根因（2026-10-15 晚，用户报）
+
+用户报（同场景样片 + 日志 `filmkit-logs-20261015-200134`）：
+
+| | JPEG | HEIC(10bit) | 比 |
+|---|---|---|---|
+| 文件 | `FILMKIT_20261015-200100.jpg` = 6,912,525 B | `FILMKIT_20261015-200054.heic` = 392,100 B | **1/17.6** |
+| 影调（亮度分位数） | p10 35.3 / p50 144.3 / p90 217.3 | p10 33.3 / p50 146.0 / p90 216.0 | **无偏**（≤2 LSB） |
+| 高频（拉普拉斯能量比） | 3.045 | 0.987 | **0.324** ← 用户说的"细节不行" |
+
+分块比值 p10 0.207 / p50 0.310 / p90 0.423 = **全画面均匀损失**（不是局部）。且对照 8bit 档（198 KB，高频 0.30）
+⇒ **体积翻倍只换来 0.30→0.32** ⇒ 瓶颈不是"编码器抠门"，而是**预算本身被锁死**。
+
+**根因（算术链，日志字段逐个对上）**：
+
+```
+photo.heif_encoded {"bitrateMode":"cq","qp":-1,"bitrate":100000000,
+                    "verdict":"TOO_SMALL","tries":2,
+                    "targetMin":2036736,"targetMax":3055104}     ← 目标 2.0~3.0 MB，实际 392 KB
+```
+
+1. `KEY_BIT_RATE` 单位是 **bit / 秒**，而静态图只编 **1 帧** ⇒ 单帧预算 = `bitrate / frame-rate`；
+2. `FRAME_RATE` 当时照抄视频口径 = **30** ⇒ 想要 2.45 MB/帧就得报 **611 Mbps**；
+3. 而真机 `c2.mtk.hevc.encoder` 声明 `bitrateRange.upper` = **100 Mbps** ⇒ `bitrateFor` 把 611 夹到 100
+   ⇒ 单帧预算 = 100/30 = **3.33 Mbit = 416 KB**；
+4. 实测 392 KB = 该预算的 **94%**（吻合）⇒ 编码器确实按这个预算编 ⇒ 高频被砍到 32%。
+
+⇒ **不是格式不行、也不是编码器不行，是码率报错了 30 倍**。（同一个 `FRAME_RATE=30` 也解释了 8bit 档的 198 KB。）
+
+**0.11.40 修复**（`filmkit-0.11.40-HEIF-DETAIL.apk`，389）：
+
+- **`HeifQuality.FRAME_RATE` 30 → 1**（`Hevc10Encoder` / `Heif8Encoder` 两处同源引用）：静态图 1 帧的**正确语义**；
+  要报的码率降到 **20.4 Mbps**，**低于**上限 ⇒ 不再被夹 ⇒ 单帧预算拿到 2.45 MB。
+- **QP 键换官方**：`video-qp-i-min` / `video-qp-i-max`（`javap android-36` 实测存在）替代 MTK vendor 键
+  —— 后者真机实测**失败**（设了连 `csd-0` 都拿不到：`photo.heif_csd {len:0, ok:false}`）。
+  静态图 all-intra ⇒ min==max==QP 即**恒定质量**。
+- **诊断补齐**（这两条是"下次不用再猜"的设施）：
+  · `photo.heif_try` —— **每一路**都留一条（0.11.39 只剩最后一路，"哪条路真的驱动质量"只能反推）；
+  · `photo.heif_enc_caps` —— 编码器**自述能力**：`bitrateMax` / `fpsMin,fpsMax` /
+    **`cqSupported`**（`isBitrateModeSupported`）/ `qpMin,qpMax`。一条日志即可判定
+    "CQ 模式到底被不被支持"和"`FRAME_RATE=1` 是否落在编码器接受范围（本改动唯一的真机风险）"。
+- 未达标时的 `verdict=TOO_SMALL` 仍升级成 WARN（**不许静默压过头**，0.11.39 就是这么被发现的）。
+
+**待真机验证（本改动尚未上机）**：一张 HEIF + 一张 JPEG 对照 ⇒ 期望 `photo.heif_try` 里有一路
+`verdict=OK`、`photo.heif_encoded.bytes` 落在 2.0~3.1 MB、高频 ≥ JPEG 的 0.7。
+⚠ 诚实边界：`FRAME_RATE=1` 是**算术推断 + 语义正确**（不是实测确证）；同时换 QP 键覆盖了
+"CQ 生效但按默认 QP 编"这一竞争解释 —— 两条路一起上，一轮真机即可定案。
+
 ## 7. 待拍板 / 待实测
 
 **已拍板（2026-10-14）**：P1 分期 A → B ✓ · P2 默认引擎切 sigmoid ✓ · P3 照片格式设置项（默认 JPEG / 可选 HEIF）✓ · **R1 交付域与传输函数 = sRGB 显示域 + 10bit（选项 A）** ✓ —— 详见 §1b。

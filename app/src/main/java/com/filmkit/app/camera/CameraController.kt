@@ -3559,7 +3559,20 @@ class CameraController(private val context: Context, private val render: RenderC
         var q10: com.filmkit.app.heif.HeifQuality.Stats? = null
         val deliv = com.filmkit.app.heif.HeifDelivery.run(
             attempt10 = {
-                com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) { q10 = it }
+                com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) { st ->
+                    q10 = st
+                    // **每一路都留一条 `photo.heif_try`**（不只最终生效的那路）：0.11.39 的真机
+                    // 日志只剩最后一路 ⇒ "哪条路真的驱动了质量"只能反推。多条 try 让**一张照片**
+                    // 就能横向比较三路（mode/qp/bitrate/bytes/verdict/frameRate/cap 逐条对齐）。
+                    EngineBridge.nativeAppendLog(
+                        if (st.verdict == com.filmkit.app.heif.HeifQuality.Verdict.OK) {
+                            EngineBridge.LEVEL_INFO
+                        } else {
+                            EngineBridge.LEVEL_WARN
+                        },
+                        "camera", "photo.heif_try", st.kv(),
+                    )
+                }
             },
             attempt8 = {
                 // 8bit 级复用**同一次** 10bit readback 的降位结果（不重渲染、不重新 readback）
@@ -3594,6 +3607,10 @@ class CameraController(private val context: Context, private val render: RenderC
                         "qp" to (st?.qp ?: -1), "bitrate" to (st?.bitrate ?: -1),
                         "encMs" to (st?.ms ?: -1), "verdict" to (st?.verdict?.name ?: "?"),
                         "tries" to (st?.tries ?: -1),
+                        // 0.11.40：把 frame-rate 与编码器声明的码率上限**一起**进日志 ——
+                        // 0.11.39 那次只能从 `bitrate:100000000` 反推"被夹了"，一个字段省掉这步。
+                        "frameRate" to com.filmkit.app.heif.HeifQuality.FRAME_RATE,
+                        "cap" to (st?.cap ?: -1),
                         "targetMin" to (st?.targetMin ?: -1), "targetMax" to (st?.targetMax ?: -1)),
                 )
                 deliv.bytes

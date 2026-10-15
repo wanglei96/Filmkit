@@ -33,20 +33,23 @@ class HeifQualityTest {
     @Test
     fun bitrateFor_scalesByFrameRate() {
         val want = HeifQuality.bitrateFor(w, h, null)
-        // 目标区间中值 2,545,920 B × 8 bit × 30 fps = 611,020,800 bps
-        assertEquals("12MP 目标中值对应码率", 611_020_800, want)
-        // 漏掉 FRAME_RATE 折算只有 1/30（≈20 Mbps）⇒ 必然压过头，这里锁死它
-        assertTrue("必须显著高于旧上限 240 Mbps", want > 240_000_000)
+        // 目标区间中值 2,545,920 B × 8 bit × 1 fps（静态图只编 1 帧）= 20,367,360 bps
+        assertEquals("12MP 目标中值对应码率", 20_367_360, want)
+        // ⚠ **核心守护**：这个值必须**低于真机编码器声明的上限**（X300 实测 100 Mbps）。
+        // frame-rate 一旦被改回 30，这里就是 611 Mbps > 100 Mbps ⇒ 被夹 ⇒ 单帧预算只剩
+        // 416 KB ⇒ 真机落盘 392 KB、高频掉到 JPEG 的 32%（0.11.39 的真机事实）。
+        assertTrue("必须低于真机上限 100 Mbps（否则被夹成 416 KB/帧）", want < 100_000_000)
     }
 
     /** ③ 编码器声明的上限与兜底上限都要夹住（夹小不报错 ⇒ 必须靠日志 + 本测试）。 */
     @Test
     fun bitrateFor_clampsToCaps() {
-        assertEquals("编码器上限更低 ⇒ 夹到它", 100_000_000, HeifQuality.bitrateFor(w, h, 100_000_000))
+        assertEquals("真机上限 100 Mbps 高于目标 ⇒ 不夹，按目标给",
+            20_367_360, HeifQuality.bitrateFor(w, h, 100_000_000))
         assertEquals("编码器上限极高 ⇒ 仍按目标给（兜底 2 Gbps 只是上界，不会把 want 抬上去）",
-            611_020_800, HeifQuality.bitrateFor(w, h, Int.MAX_VALUE))
+            20_367_360, HeifQuality.bitrateFor(w, h, Int.MAX_VALUE))
         assertEquals("编码器上限极低 ⇒ 抬到下界", 8_000_000, HeifQuality.bitrateFor(w, h, 1))
-        assertEquals("拿不到上限 ⇒ 用兜底", 611_020_800, HeifQuality.bitrateFor(w, h, null))
+        assertEquals("拿不到上限 ⇒ 用兜底", 20_367_360, HeifQuality.bitrateFor(w, h, null))
     }
 
     /** ④ 判定边界（闭区间：正好落在端点算达标）。 */
@@ -116,22 +119,44 @@ class HeifQualityTest {
     /**
      * ⑨ 防回归：最坏尝试次数必须有上限。
      *
-     * 没有它时最坏 = qp×MAX_QP_TRIES + cq + cbr = 5 次编码 ≈ 9 s 落盘等待（用户可感）。
+     * 没有它时最坏 = qp×MAX_QP_TRIES + cq + cbr（旧值 3+1+1 = 5 次编码 ≈ 9 s 落盘等待，用户可感）。
      * 这条守护的意义是"以后有人把它改大必须先看见这个测试变红"。
      */
     @Test
     fun totalTriesIsBounded() {
         assertTrue("总尝试上限必须 ≤ 3（≈5.4 s）", HeifQuality.MAX_TOTAL_TRIES <= 3)
-        assertTrue("总上限不得小于单路上限", HeifQuality.MAX_TOTAL_TRIES <= HeifQuality.MAX_QP_TRIES)
+        assertTrue(
+            "总上限必须容得下三路各一次（qp / cq / cbr）",
+            HeifQuality.MAX_TOTAL_TRIES >= 3,
+        )
     }
 
     /** ⑩ 进日志的字段齐（下一轮定位靠它，不许少）。 */
     @Test
     fun statsKvHasDiagnosticFields() {
         val r = HeifQuality.targetRange(w, h)
-        val kv = HeifQuality.Stats("qp", 16, 611_020_800, 2_500_000, 1800, HeifQuality.Verdict.OK, 1, r.first, r.last).kv()
-        for (k in listOf("bitrateMode", "qp", "bitrate", "bytes", "ms", "verdict", "tries", "targetMin", "targetMax")) {
+        val kv = HeifQuality.Stats(
+            "qp", 16, 20_367_360, 2_500_000, 1800, HeifQuality.Verdict.OK, 1,
+            r.first, r.last, cap = 100_000_000,
+        ).kv()
+        for (k in listOf("bitrateMode", "qp", "bitrate", "bytes", "ms", "verdict", "tries",
+                         "targetMin", "targetMax", "frameRate", "cap")) {
             assertTrue("kv 缺少字段 $k", kv.contains("\"$k\""))
         }
+    }
+
+    /**
+     * ⑪ **根因守护**（0.11.40）：静态图的 `frame-rate` 必须是 1。
+     *
+     * 改回 30 ⇒ 换算出的码率 611 Mbps 撞真机上限 100 Mbps ⇒ 被夹 ⇒ 单帧预算 416 KB
+     * ⇒ 落盘 392 KB、高频只剩 JPEG 的 32%（"细节还是不行"）。这一条与 ② 一起构成
+     * "改错立刻红"的双保险。
+     */
+    @Test
+    fun frameRateIsOneAndQpKeysAreOfficial() {
+        assertEquals("静态图只编 1 帧 ⇒ frame-rate 必须是 1", 1, HeifQuality.FRAME_RATE)
+        // QP 键必须是**官方** MediaFormat 键（vendor 键真机实测失败：设了拿不到 csd-0）
+        assertEquals("video-qp-i-min", HeifQuality.QP_I_MIN_KEY)
+        assertEquals("video-qp-i-max", HeifQuality.QP_I_MAX_KEY)
     }
 }

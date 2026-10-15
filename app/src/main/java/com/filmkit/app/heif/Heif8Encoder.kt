@@ -45,7 +45,12 @@ object Heif8Encoder {
     const val BIT_DEPTH = 8
     const val CHROMA = HeifChroma.CHROMA
 
-    private const val FRAME_RATE = 30
+    /**
+     * 与 [HeifQuality.FRAME_RATE] **同一个**值（**恒为 1**：静态图只编 1 帧）。
+     * 8bit 档走的是平台 muxer（`image/heic` track），但编码器**同一个**码率折算规则适用
+     * ⇒ frame-rate 报 30 会让单帧预算被砍 30 倍（8bit 档实测 198 KB 的同一根因）。
+     */
+    private const val FRAME_RATE = HeifQuality.FRAME_RATE
     private const val I_FRAME_INTERVAL = 1
     private const val TIMEOUT_US = 10_000L
     private const val DEADLINE_MS = 20_000L

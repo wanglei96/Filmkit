@@ -65,13 +65,14 @@ object Hevc10Encoder {
     const val DEFAULT_BITRATE = 4_000_000
 
     /**
-     * 与 [HeifQuality.FRAME_RATE] **同一个**值。
+     * 与 [HeifQuality.FRAME_RATE] **同一个**值（**恒为 1**，见那边的表格）。
      *
-     * ⚠ 两处必须一致：`KEY_BIT_RATE` 是 bit/s，而静态图只编 1 帧 ⇒ 单帧预算
-     *   = `bitrate / frame-rate`。[HeifQuality.bitrateFor] 按这个值反算码率，
-     *   这里落键 ⇒ 改一处忘另一处 = 目标体积整体偏 30 倍（`HeifQualityTest` 锁住）。
+     * ⚠ 两处必须一致：`KEY_BIT_RATE` 的单位是 bit / 秒，而静态图只编 **1 帧** ⇒ 单帧预算
+     *   = `bitrate / frame-rate`。[HeifQuality.bitrateFor] 按这个值反算码率，这里落键
+     *   ⇒ 改一处忘另一处 = 单帧预算整体偏 30 倍（`HeifQualityTest` 锁住）。
      */
     private const val FRAME_RATE = HeifQuality.FRAME_RATE
+    /** 每 1 秒一个 I 帧 ⇒ [FRAME_RATE]=1 时即 **all-intra**（静态图要的就是这个）。 */
     private const val I_FRAME_INTERVAL = 1
     private const val TIMEOUT_US = 10_000L
     private const val DEADLINE_MS = 20_000L
@@ -141,15 +142,21 @@ object Hevc10Encoder {
     /**
      * 把 [HeifQuality.Strategy] 落成 `MediaFormat` 键（**卡 FIX4 的质量驱动挂点**）。
      *
-     * - `bitrate-mode` + `quality`/vendor QP 用 `runCatching` 包：
+     * - `bitrate-mode` + QP/`quality` 用 `runCatching` 包：
      *   · 这些键在**旧平台/非 MTK**上不存在或不接受 ⇒ 抛异常不能打死照片（回退链兜住片子）；
      *   · 但**"设成功"不等于"生效"** ⇒ 真正判定生效的是 [HeifQuality.verdict]（产出体积
-     *     是否进目标区间）。非 MTK 平台忽略 vendor 键是**静默**的，只有体积判据能抓到。
+     *     是否进目标区间）。编码器忽略这些键是**静默**的，只有体积判据能抓到。
+     * - QP 走**官方** I 帧区间键（`video-qp-i-min`/`-max`，见 [HeifQuality.QP_I_MIN_KEY]）：
+     *   静态图 all-intra ⇒ 两键同值 = 恒定质量；此前用的 MTK vendor 键真机实测失败
+     *   （设了连 `csd-0` 都拿不到），已删。
      */
     fun applyQuality(fmt: MediaFormat, strategy: HeifQuality.Strategy?) {
         if (strategy == null) return
         runCatching { fmt.setInteger(HeifQuality.BITRATE_MODE_KEY, strategy.bitrateMode) }
-        strategy.qp?.let { runCatching { fmt.setInteger(HeifQuality.VENDOR_MTK_QP_KEY, it) } }
+        strategy.qp?.let { qp ->
+            runCatching { fmt.setInteger(HeifQuality.QP_I_MIN_KEY, qp) }
+            runCatching { fmt.setInteger(HeifQuality.QP_I_MAX_KEY, qp) }
+        }
         strategy.quality?.let { runCatching { fmt.setInteger(HeifQuality.QUALITY_KEY, it) } }
     }
 
@@ -159,6 +166,43 @@ object Hevc10Encoder {
             info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
                 .videoCapabilities?.bitrateRange?.upper
         }.getOrNull()
+
+    /**
+     * 编码器**声明的能力**进日志（每张 HEIF 一条，`photo.heif_enc_caps`）。
+     *
+     * 为什么值得单开一条：0.11.39 那次真机只能从 `bitrate:100000000` **反推**"被夹了"，
+     * 而"我们设的 `bitrate-mode=CQ` 到底被不被支持"根本无从判断（`isBitrateModeSupported`
+     * 是**平台自述**，比任何体积推断都硬）。有这一条，下一轮不用再猜：
+     * · `bitrateMax` = 真实上限（0.11.40 的 20.4 Mbps 目标是否被夹，一眼可见）；
+     * · `cqSupported=false` ⇒ 路 ①② 的 CQ 模式是无效键 ⇒ 只能靠路 ③ 的码率预算
+     *   （这正好也是 `FRAME_RATE=1` 的适用场景）；
+     * · `fpsMin/fpsMax` ⇒ `FRAME_RATE=1` 是否落在编码器接受的范围（**本改动唯一的真机风险**）；
+     * · `qpMin/qpMax` ⇒ 官方 QP 键的取值范围（API 31+ 才有）。
+     */
+    private fun logCaps(info: MediaCodecInfo, w: Int, h: Int) {
+        val caps = runCatching { info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC) }
+            .getOrNull() ?: return
+        val br = runCatching { caps.videoCapabilities?.bitrateRange }.getOrNull()
+        val fr = runCatching { caps.videoCapabilities?.getSupportedFrameRatesFor(w, h) }.getOrNull()
+        val cq = runCatching {
+            caps.encoderCapabilities?.isBitrateModeSupported(HeifQuality.MODE_CQ)
+        }.getOrNull()
+        val cbr = runCatching {
+            caps.encoderCapabilities?.isBitrateModeSupported(HeifQuality.MODE_CBR)
+        }.getOrNull()
+        // qualityRange 是 API 31+ 的方法：旧设备上直接调用会 NoSuchMethodError ⇒ 限版本再取
+        val qp = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            runCatching { caps.encoderCapabilities?.qualityRange }.getOrNull()
+        } else null
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.heif_enc_caps",
+            "{\"codec\":\"${info.name}\",\"hw\":${info.isHardwareAccelerated}," +
+                "\"bitrateMin\":${br?.lower ?: -1},\"bitrateMax\":${br?.upper ?: -1}," +
+                "\"fpsMin\":${fr?.lower ?: -1},\"fpsMax\":${fr?.upper ?: -1}," +
+                "\"cqSupported\":${cq ?: "null"},\"cbrSupported\":${cbr ?: "null"}," +
+                "\"qpMin\":${qp?.lower ?: -1},\"qpMax\":${qp?.upper ?: -1}}",
+        )
+    }
 
     /**
      * 编码一帧 10bit HEVC（**质量优先**：按 [HeifQuality.strategies] 逐路尝试，
@@ -214,10 +258,13 @@ object Hevc10Encoder {
         require(pattern.size == width * height) { "pattern 大小 ${pattern.size} ≠ ${width}x$height" }
         val info = selectEncoder()
             ?: error("没有硬件 HEVC 编码器声明 Main10 + P010(54)（10bit 路线不可用，请回退）")
-        val plans = (strategies ?: HeifQuality.strategies(width, height, bitrateCap(info))).toMutableList()
+        val cap = bitrateCap(info)
+        logCaps(info, width, height)
+        val plans = (strategies ?: HeifQuality.strategies(width, height, cap)).toMutableList()
         val t0 = System.currentTimeMillis()
         val tried = mutableListOf<Triple<HeifQuality.Strategy, Int, Long>>()
         var best: Pair<HeifContainerWriter.Image, HeifQuality.Stats>? = null
+        var lastEmitted: HeifQuality.Stats? = null
         var i = 0
         var qpTries = 0
         while (i < plans.size && tried.size < HeifQuality.MAX_TOTAL_TRIES) {
@@ -233,10 +280,14 @@ object Hevc10Encoder {
             val r = HeifQuality.targetRange(width, height)
             val st = HeifQuality.Stats(
                 mode = plan.mode, qp = plan.qp, bitrate = plan.bitrate, bytes = bytes, ms = ms,
-                verdict = v, tries = tried.size, targetMin = r.first, targetMax = r.last,
+                verdict = v, tries = tried.size, targetMin = r.first, targetMax = r.last, cap = cap,
             )
+            // **每一路都进日志**（不只最终生效的那路）：0.11.39 的真机日志只留下最后一路，
+            // 于是"哪条路真的驱动了质量"只能靠反推。多条 `photo.heif_encoded` = 一张照片
+            // 就能横向比较三路（mode/qp/bitrate/bytes/verdict 逐条对齐）。
+            outStats(st)
+            lastEmitted = st
             if (v == HeifQuality.Verdict.OK) {
-                outStats(st)
                 return img to st
             }
             // 该留还是该换 + 这一路还要不要再试一次（规则在 HeifQuality 里 ⇒ 纯函数可测）
@@ -262,7 +313,8 @@ object Hevc10Encoder {
             targetMin = r.first,
             targetMax = r.last,
         )
-        outStats(st)
+        // 最终选定那份若已在上面逐路记过（同一份产出），就不再重复一条
+        if (lastEmitted?.bytes != st.bytes) outStats(st)
         return b.first to st
     }
 
