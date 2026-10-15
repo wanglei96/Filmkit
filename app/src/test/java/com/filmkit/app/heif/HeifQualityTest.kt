@@ -67,9 +67,10 @@ class HeifQualityTest {
     /** ⑤ QP 自校正方向 + 撞界即放弃（不许无限调）。 */
     @Test
     fun stepQp_directionAndLimits() {
-        assertEquals("压过头 ⇒ 降 QP 提质量", 12, HeifQuality.stepQp(16, HeifQuality.Verdict.TOO_SMALL)!!)
-        assertEquals("太胖 ⇒ 升 QP 降体积", 20, HeifQuality.stepQp(16, HeifQuality.Verdict.TOO_BIG)!!)
-        assertNull("达标 ⇒ 停", HeifQuality.stepQp(16, HeifQuality.Verdict.OK))
+        val d = HeifQuality.QP_DEFAULT
+        assertEquals("压过头 ⇒ 降 QP 提质量", d - HeifQuality.QP_STEP, HeifQuality.stepQp(d, HeifQuality.Verdict.TOO_SMALL)!!)
+        assertEquals("太胖 ⇒ 升 QP 降体积", d + HeifQuality.QP_STEP, HeifQuality.stepQp(d, HeifQuality.Verdict.TOO_BIG)!!)
+        assertNull("达标 ⇒ 停", HeifQuality.stepQp(d, HeifQuality.Verdict.OK))
         assertNull("已到下界", HeifQuality.stepQp(HeifQuality.QP_MIN, HeifQuality.Verdict.TOO_SMALL))
         assertNull("已到上界", HeifQuality.stepQp(HeifQuality.QP_MAX, HeifQuality.Verdict.TOO_BIG))
     }
@@ -77,12 +78,12 @@ class HeifQualityTest {
     /** ⑥ 只有 QP 路能自校正，且受 MAX_QP_TRIES 约束。 */
     @Test
     fun refine_onlyQpPathAndBounded() {
-        // 0.11.42 起 qp 路回到三路首位（VBR + 官方 QP 三键同值）
         val qp = HeifQuality.strategies(w, h, 100_000_000)[0]
         assertEquals("qp", qp.mode)
+        assertEquals("起点 = 真机标定值", HeifQuality.QP_DEFAULT, qp.qp)
         val once = HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, 0)
         assertNotNull("第一次还能再试", once)
-        assertEquals(12, once!!.second.qp)
+        assertEquals("降一个步长", HeifQuality.QP_DEFAULT - HeifQuality.QP_STEP, once!!.second.qp)
         assertNull("试满 MAX_QP_TRIES ⇒ 换路", HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, HeifQuality.MAX_QP_TRIES - 1))
         val cq = HeifQuality.Strategy("cq", HeifQuality.MODE_CQ, 20_367_360, quality = HeifQuality.CQ_QUALITY)
         val vbr = HeifQuality.Strategy("vbr", HeifQuality.MODE_VBR, 20_367_360)
@@ -91,25 +92,21 @@ class HeifQualityTest {
     }
 
     /**
-     * ⑦ 三路顺序 = qp → cq-low → cq（0.11.42 诊断轮）。
+     * ⑦ 两路顺序 = qp → cq（0.11.43 起；QP 起点已是真机标定值）。
      *
-     * 依据（0.11.41 真机三路）：vbr 219 KB、**vbr-hi（预算给满 100 Mbps）187 KB**、
-     * cq（quality=100）649 KB ⇒ 编码器不读 `KEY_BIT_RATE`，码率这条线走死。
-     * 所以本轮不再动码率，改为回答两个能定案的问题：QP 键（换 VBR 重试 + 失败原因进日志）、
-     * `quality` 键是否有效（0 与 100 对照）。
+     * 三轮真机把"哪条路真的驱动质量"问清楚了（详见 `HeifQuality.strategies` 的表格）：
+     * 官方 QP 键 + VBR 是**唯一**的强旋钮（QP12 ⇒ 1,653 KB / 高频 0.594），
+     * `quality` 键天花板低（100 ⇒ 649 KB），码率键完全无效。
      */
     @Test
-    fun strategies_diagnosticOrder() {
+    fun strategies_orderAndQpStart() {
         val s = HeifQuality.strategies(w, h, 100_000_000)
-        assertEquals(listOf("qp", "cq-low", "cq"), s.map { it.mode })
-        assertEquals("qp 路换 VBR 重试（0.11.40 在 CQ 下失败）", HeifQuality.MODE_VBR, s[0].bitrateMode)
-        assertEquals("qp 路带官方 QP 起点", HeifQuality.QP_DEFAULT, s[0].qp)
-        assertEquals("cq-low 用 quality=0", HeifQuality.CQ_QUALITY_LOW, s[1].quality)
-        assertEquals("cq 用 quality=100（当前已知最优，兜底）", HeifQuality.CQ_QUALITY, s[2].quality)
-        assertTrue(
-            "cq-low 与 cq 必须构成 0/100 对照（否则测不出 quality 键是否有效）",
-            HeifQuality.CQ_QUALITY_LOW == 0 && HeifQuality.CQ_QUALITY == 100,
-        )
+        assertEquals(listOf("qp", "cq"), s.map { it.mode })
+        assertEquals("qp 路必须走 VBR（CQ 下 QP 键会被编码器拒绝）", HeifQuality.MODE_VBR, s[0].bitrateMode)
+        assertEquals("QP 起点 = 真机标定 10（= 目标区间中值 2.45 MB 对应的外推值）", 10, HeifQuality.QP_DEFAULT)
+        assertEquals("自校正步长 = 2（细收敛，避免跳过 8/12）", 2, HeifQuality.QP_STEP)
+        assertEquals("cq 路保留 quality=100 作兜底", HeifQuality.CQ_QUALITY, s[1].quality)
+        assertEquals("兜底路走 CQ", HeifQuality.MODE_CQ, s[1].bitrateMode)
     }
 
     /** ⑧ 都没达标时留"最接近区间"的那份（不是最大也不是最小）。 */

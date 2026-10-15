@@ -130,15 +130,24 @@ object HeifQuality {
     // ── QP 路的参数（可标定）────────────────────────────────────────────────
 
     /**
-     * QP 起始点。来历：目标 = [JPEG_REFERENCE_BPP] × 0.4~0.6 = **1.30~1.96 bit/px**；
-     * HEVC Main10 **all-intra** 的经验 bpp-QP 曲线上，该 bpp 区间大致对应 **QP 14~20**
-     * ⇒ 取中值 16。⚠ **待真机标定**：真机用 `tools/heif-quality-gate.py` 跑一次，
-     * 若 `verdict=TOO_SMALL` 就往下调（降 QP），`TOO_BIG` 就往上调。
+     * QP 起始点。**真机两点标定**（0.11.42，X300 `c2.mtk.hevc.encoder` + VBR + 官方 QP 键，
+     * `photo.heif_try` 实测，同场景 12MP）：
+     *
+     * | QP | 产出 | 高频比（vs JPEG） |
+     * |---|---|---|
+     * | 16 | 851 KB | — |
+     * | 12 | 1,653 KB | **0.594**（平坦区 0.375 / 细节区 0.716） |
+     *
+     * ⇒ 每降 4 个 QP 体积约 ×1.94 ⇒ 目标区间中值 2.45 MB 对应 **QP ≈ 10**（估 ~2.3 MB，落在
+     * 2.04~3.06 MB 内）⇒ 起点取 10，配合 [QP_STEP]=2 的细步长自校正即可一次命中。
+     *
+     * ⚠ 与旧值 16 的差别不只是"更接近目标"：16 那次只给 851 KB、高频 0.378 —— 也就是
+     * 0.11.41 时"细节追不上"的位置。**起点定错 = 每次拍照都从那个位置开始爬。**
      */
-    const val QP_DEFAULT = 16
+    const val QP_DEFAULT = 10
 
     /** 一次自校正的 QP 步长（压过头 ⇒ 降 QP 提质量；太胖 ⇒ 升 QP 降体积）。 */
-    const val QP_STEP = 4
+    const val QP_STEP = 2
 
     /** QP 下界：再低就是"接近无损但体积接近 JPEG"，违背目标区间。 */
     const val QP_MIN = 8
@@ -168,18 +177,8 @@ object HeifQuality {
      */
     const val MAX_TOTAL_TRIES = 3
 
-    /** CQ 路的 quality（0..100）—— 与用户 JPEG 质量默认档同档（PC 口径 100 / 用户默认 95）。 */
+    /** CQ 路的 quality（0..100）—— 兜底路用；真机实测 100 也只给 649 KB（上限低，见 [strategies]）。 */
     const val CQ_QUALITY = 100
-
-    /**
-     * **诊断用**的最低 quality（0）—— 与 [CQ_QUALITY] 配对，回答"`quality` 键到底有没有用"。
-     *
-     * 0.11.41 真机把码率这条线走死了：VBR/20.4 Mbps ⇒ 219 KB、VBR/100 Mbps ⇒ **187 KB**
-     * （预算给满反而更小）、CQ/20.4 Mbps ⇒ 649 KB。**三种模式、三档预算，产出全在 187~649 KB**
-     * ⇒ 这颗编码器**根本不读 `KEY_BIT_RATE`**。
-     * 若 `quality=0` 与 `quality=100` 的产出相同 ⇒ `quality` 键同样无效 ⇒ "质量旋钮"只剩 QP 键。
-     */
-    const val CQ_QUALITY_LOW = 0
 
     // ── 码率（路 ③ 用）──────────────────────────────────────────────────────
 
@@ -340,35 +339,30 @@ object HeifQuality {
     }
 
     /**
-     * 该分辨率下的**三路入口**（0.11.42 诊断轮：qp → cq-low → cq）。
+     * 该分辨率下的**两路入口**（0.11.43 起：qp → cq）。
      *
-     * ## 0.11.41 真机把"码率"这条线走死了（三路实测）
-     * | 路 | 键 | 产出 |
-     * |---|---|---|
-     * | `vbr` | VBR + 20.4 Mbps | 219 KB |
-     * | `vbr-hi` | VBR + **100 Mbps**（预算给满） | **187 KB**（更小！） |
-     * | `cq` | CQ + `quality`=100 + 20.4 Mbps | **649 KB** |
-     * ⇒ **预算从 20.4 提到 100 Mbps 反而更小** ⇒ 这颗编码器**根本不读 `KEY_BIT_RATE`**，
-     *   而 `vbrSupported/cqSupported/cbrSupported` 全是 true（键被接受，但不生效）。
-     *   所以 0.11.42 不再在码率上做文章，改为回答**两个能定案的问题**：
+     * ## 怎么定到这里的（三轮真机，每条都是 `photo.heif_try` 实测）
+     * | 轮次 | 关键发现 |
+     * |---|---|
+     * | 0.11.40 | `quality` 键在 CQ 下给 635 KB；CBR 198 KB；**QP 键在 CQ 下失败** |
+     * | 0.11.41 | VBR 20.4 Mbps ⇒ 219 KB、VBR **100 Mbps ⇒ 187 KB**（预算 ×5 更小）⇒ **编码器不读 `KEY_BIT_RATE`** |
+     * | 0.11.42 | **QP 键换到 VBR 下就通了**：QP16 ⇒ 851 KB、QP12 ⇒ **1,653 KB（高频 0.594）**；<br>`cq-low`（quality=0）⇒ 8 KB ⇒ `quality` 键有效但天花板低（100 也只有 649 KB） |
+     * ⇒ 结论：**官方 QP 键是这颗编码器唯一的强质量旋钮**，`bitrate-mode` 必须是 VBR（CQ 下 QP 键
+     *   会被拒），而码率 / `quality` 都只能做兜底。所以：
      *
-     * · 路 ① `qp`：官方 QP 键（i-min / i-max / average 三键同值）—— 0.11.40 在 CQ 下
-     *   **失败**（拿不到 `csd-0`）；本轮换到 VBR 下再试一次，且**失败原因现在会进
-     *   `photo.heif_try_failed`**（0.11.41 新增）⇒ 无论成败都能定案。
-     * · 路 ② `cq-low`：`quality`=**[CQ_QUALITY_LOW]**（0）—— 与路 ③ 的 100 构成**对照**：
-     *   两者体积相同 ⇒ `quality` 键也无效 ⇒ "质量旋钮"只剩 QP 键。
-     * · 路 ③ `cq`：`quality`=100（**当前已知最优**，兜底）。
+     * · 路 ① `qp`：VBR + 官方 QP 键（i-min / i-max / average 三键同值），起点 [QP_DEFAULT]=10，
+     *   按 [stepQp] 以 [QP_STEP]=2 自校正（最多 [MAX_QP_TRIES] 次）。
+     * · 路 ② `cq`：CQ + `quality`=100（649 KB）—— 只为"QP 键在别的平台静默失效"留兜底，
+     *   在 MTK 上永远选不中（它比路 ① 更小）。
      *
-     * 只给每路的**起点**：`qp` 路压过头 ⇒ 降 QP 重试（[stepQp]，最多 [MAX_QP_TRIES] 次）。
-     *
-     * @param capUpper 编码器声明的码率上限（见 [bitrateFor]）。
+     * @param capUpper 编码器声明的码率上限（见 [bitrateFor]；**对这颗编码器无实际作用**，
+     *   保留是因为 `MediaFormat` 要求它存在，且日志要能对照）。
      */
     fun strategies(w: Int, h: Int, capUpper: Int?): List<Strategy> {
         val br = bitrateFor(w, h, capUpper)
         return listOf(
-            Strategy("qp", MODE_VBR, br, qp = QP_DEFAULT),              // 官方 QP 三键（失败原因进日志）
-            Strategy("cq-low", MODE_CQ, br, quality = CQ_QUALITY_LOW),  // 诊断：quality=0
-            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),          // 兜底：已知 649 KB
+            Strategy("qp", MODE_VBR, br, qp = QP_DEFAULT),      // 唯一强旋钮（真机两点标定，QP=10）
+            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),  // 兜底：非 MTK 平台 QP 键无效时（649 KB）
         )
     }
 

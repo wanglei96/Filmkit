@@ -241,6 +241,47 @@ photo.heif_encoded {"bitrateMode":"cq","qp":-1,"bitrate":100000000,
 | b. HEIF 定位成小体积档 | 交付用 JPEG 4:4:4 q100（6.9 MB，质量已够），HEIF 只作分享/省空间 | 用户可能不接受 |
 | c. 继续挖 vendor 键 | 0.11.42 的 `heif_out_format` 出来后按回显的键逐个试 | 轮次成本；可能无质量键 |
 
+## 6f. ✅ 找到真正的质量旋钮：官方 QP 键 + **VBR**（2026-10-15 晚，0.11.42 → 0.11.43）
+
+0.11.42 的诊断轮一次问清了三件事（`photo.heif_try` + `photo.heif_out_format`）：
+
+| 问题 | 实测 | 结论 |
+|---|---|---|
+| QP 键为什么在 0.11.40 失败？ | **`video-qp-i-min/max` + VBR 下完全正常**（QP16 ⇒ 851 KB、QP12 ⇒ 1,653 KB） | 0.11.40 的失败是**与 CQ 模式冲突**，不是键本身不行 |
+| `quality` 键有没有用？ | `quality=0` ⇒ **8 KB**；`quality=100` ⇒ 649 KB | **有效但天花板低**（100 只有 649 KB） |
+| 有没有 vendor 质量键？ | 见下 | 都是 `-1`（未设），唯一非 -1 是 `luma-aq-enable=1`（AQ 开着） |
+
+**`outputFormat` 回显的 vendor 键清单**（0.11.42 起每路一条 `photo.heif_out_format`，备查）：
+
+```
+vendor.mtk.ext.venc.visual.quant = -1          vendor.mtk.ext.venc.visual.bfrm-quant = -1
+vendor.mtk.ext.venc.visual.pfrm-quant = -1     vendor.mtk.ext.venc.visual.rd = -1
+vendor.mtk.ext.venc.visual.aqoffset-reduction=-1   vendor.mtk.ext.venc.visual.luma-aq-enable = 1
+vendor.mtk.ext.venc.visual.luma-aq-10bit-enhance=-1
+latency = 3   priority = 0   intra-refresh-period = 0   video-qp-average = 0（回显 0，未生效）
+```
+
+**质量改善（同场景一手，`205420.heic` 1.65 MB vs `205406.jpg` 6.86 MB）**：
+
+| 指标 | 0.11.41（649 KB） | **0.11.42（1.65 MB，QP=12）** |
+|---|---|---|
+| 全局高频比 | 0.378 | **0.594** |
+| 最平坦 25% 块 | 0.182 | **0.375** |
+| 最细节 25% 块 | 0.438 | **0.716** |
+| 强边缘（梯度 p99） | 0.904 | 0.943 |
+| 影调 p50 | 无偏 | 无偏（81 vs 80） |
+
+**QP–体积标定**（真机两点，每降 4 QP 体积约 ×1.94）⇒ 目标区间中值 2.45 MB 对应 **QP ≈ 10**。
+
+**0.11.43（`filmkit-0.11.43-HEIF-QP10.apk` / 392）**：
+- `QP_DEFAULT` 16 → **10**（真机外推值）、`QP_STEP` 4 → **2**（细收敛）、`MAX_QP_TRIES` 2（qp 路两次）
+- 三路精简为**两路**：`qp`（VBR + 官方 QP 键，唯一强旋钮）→ `cq`（`quality`=100，兜底：
+  非 MTK 平台 QP 键静默失效时用；在 MTK 上永远选不中，因为它更小）
+- 删 `cq-low` 诊断路与 `CQ_QUALITY_LOW`（诊断已完成，不留死代码）
+
+**待真机验证**：QP=10 是否把体积送进 2.04~3.06 MB 且高频继续上升（期望 ≥0.65）。
+若 QP=10 落在区间外，自校正会走 QP=8 或 12（各一次）—— 反正每次拍照最多 2 次编码。
+
 ## 7. 待拍板 / 待实测
 
 **已拍板（2026-10-14）**：P1 分期 A → B ✓ · P2 默认引擎切 sigmoid ✓ · P3 照片格式设置项（默认 JPEG / 可选 HEIF）✓ · **R1 交付域与传输函数 = sRGB 显示域 + 10bit（选项 A）** ✓ —— 详见 §1b。
