@@ -73,6 +73,16 @@ object HeifQuality {
     /** `MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ`（javap 实测 = 0）。 */
     const val MODE_CQ = 0
 
+    /**
+     * `BITRATE_MODE_VBR`（javap 实测 = **1**）—— **0.11.41 的主路**。
+     *
+     * 为什么换成它：0.11.40 真机三路实测（`photo.heif_try`）证明 CQ 与 CBR **都不理会**
+     * 我们给的预算 —— CQ 落 635 KB（预算的 26%）、CBR 落 198 KB（更小）；而 QP 键那条路
+     * 直接失败（拿不到 `csd-0`）。**VBR 是唯一没测过、且语义上就该"朝目标码率走"的模式**：
+     * 它的平均码率是**目标**而不是上限 ⇒ 才是"用码率驱动质量"的标准做法。
+     */
+    const val MODE_VBR = 1
+
     /** `MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR`（javap 实测 = 2）。 */
     const val MODE_CBR = 2
 
@@ -247,11 +257,23 @@ object HeifQuality {
         val r = targetRange(w, h)
         val midBytes = (r.first + r.last) / 2
         val want = midBytes * 8 * FRAME_RATE
-        val cap = (capUpper?.toLong() ?: BITRATE_FALLBACK_CAP_BPS)
+        return want.coerceIn(BITRATE_MIN_BPS.toLong(), capBitrate(capUpper).toLong()).toInt()
+    }
+
+    /**
+     * **给满编码器上限**的码率（bit/s）—— 路 ② `vbr-hi` 用。
+     *
+     * 为什么需要它（0.11.40 真机一手）：`FRAME_RATE=1` 已让预算不再被夹（报 20.4 Mbps < 上限
+     * 100 Mbps），但**产出仍只有 635 KB = 预算的 26%**，而 CBR 路更小（198 KB）⇒
+     * **这颗编码器不按我们的预算走**（CQ 是恒定质量，CBR 在单帧下的时间窗口也不正常）。
+     * 所以留一手"把预算直接给满上限"（100 Mbps ⇒ 单帧 12.5 MB）：若 VBR 也只用一部分，
+     * 就用绝对预算换质量。
+     */
+    fun capBitrate(capUpper: Int?): Int =
+        (capUpper?.toLong() ?: BITRATE_FALLBACK_CAP_BPS)
             .coerceAtMost(BITRATE_FALLBACK_CAP_BPS)
             .coerceAtLeast(BITRATE_MIN_BPS.toLong())
-        return want.coerceIn(BITRATE_MIN_BPS.toLong(), cap).toInt()
-    }
+            .toInt()
 
     /** 产出体积是否落在目标区间内。`TOO_SMALL` = 压过头（本卡要消灭的形态）。 */
     fun verdict(bytes: Int, w: Int, h: Int): Verdict {
@@ -301,25 +323,27 @@ object HeifQuality {
     }
 
     /**
-     * 该分辨率下的**三路入口**（有序：qp → cq → cbr）。
+     * 该分辨率下的**三路入口**（有序：vbr → vbr-hi → cq）。
      *
-     * 只给每路的**起点**：qp 路往哪个方向走取决于实际产出（压过头降 QP、太胖升 QP）
-     * ⇒ 迭代由调用方用 [stepQp] 推进（最多 [MAX_QP_TRIES] 次），本函数不预摊梯度。
-     * 这样"起始点标定偏了"也能自己收敛，而不是一路撞到 [QP_MIN] 才发现方向错了。
+     * ## 0.11.41 重排的依据（0.11.40 真机三路实测，`photo.heif_try`）
+     * | 路 | 键 | 产出 | 判定 |
+     * |---|---|---|---|
+     * | 旧 `qp` | CQ + `video-qp-i-min/max`=16 | **失败**（拿不到 `csd-0`） | 键不被接受 |
+     * | 旧 `cq` | CQ + `quality`=100，预算 20.4 Mbps | **635 KB**（预算的 26%） | 忽略预算 |
+     * | 旧 `cbr` | CBR + 20.4 Mbps | **198 KB**（更小） | 单帧下窗口异常 |
+     * ⇒ 三个模式删掉两个、补上**唯一没测过的 VBR**（[MODE_VBR]），并把 `cq` 留作对照。
      *
-     * 三路都是**质量驱动**的三种说法，谁真的生效由 [verdict] 判（编码器可以静默忽略键）：
-     * ① `qp`  = CQ + 官方 I 帧 QP 区间（最直接：直接指定量化步长）；
-     * ② `cq`  = CQ + `quality`（次之：把质量交给编码器解释）；
-     * ③ `cbr` = CBR + 目标反算码率（兜底：只靠码率预算，质量随内容浮动）。
+     * 只给每路的**起点**：`qp` 路（若启用）往哪个方向走取决于实际产出（压过头降 QP、
+     * 太胖升 QP）⇒ 迭代由调用方用 [stepQp] 推进（最多 [MAX_QP_TRIES] 次）。
      *
      * @param capUpper 编码器声明的码率上限（见 [bitrateFor]）。
      */
     fun strategies(w: Int, h: Int, capUpper: Int?): List<Strategy> {
         val br = bitrateFor(w, h, capUpper)
         return listOf(
-            Strategy("qp", MODE_CQ, br, qp = QP_DEFAULT),
-            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),
-            Strategy("cbr", MODE_CBR, br),
+            Strategy("vbr", MODE_VBR, br),                              // 标准做法：朝目标码率走
+            Strategy("vbr-hi", MODE_VBR, capBitrate(capUpper)),         // 给满上限：绝对预算换质量
+            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),          // 对照（已知 635 KB）
         )
     }
 

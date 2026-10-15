@@ -190,6 +190,9 @@ object Hevc10Encoder {
         val cbr = runCatching {
             caps.encoderCapabilities?.isBitrateModeSupported(HeifQuality.MODE_CBR)
         }.getOrNull()
+        val vbr = runCatching {
+            caps.encoderCapabilities?.isBitrateModeSupported(HeifQuality.MODE_VBR)
+        }.getOrNull()
         // qualityRange 是 API 31+ 的方法：旧设备上直接调用会 NoSuchMethodError ⇒ 限版本再取
         val qp = if (android.os.Build.VERSION.SDK_INT >= 31) {
             runCatching { caps.encoderCapabilities?.qualityRange }.getOrNull()
@@ -200,6 +203,7 @@ object Hevc10Encoder {
                 "\"bitrateMin\":${br?.lower ?: -1},\"bitrateMax\":${br?.upper ?: -1}," +
                 "\"fpsMin\":${fr?.lower ?: -1},\"fpsMax\":${fr?.upper ?: -1}," +
                 "\"cqSupported\":${cq ?: "null"},\"cbrSupported\":${cbr ?: "null"}," +
+                "\"vbrSupported\":${vbr ?: "null"}," +
                 "\"qpMin\":${qp?.lower ?: -1},\"qpMax\":${qp?.upper ?: -1}}",
         )
     }
@@ -270,9 +274,21 @@ object Hevc10Encoder {
         while (i < plans.size && tried.size < HeifQuality.MAX_TOTAL_TRIES) {
             val plan = plans[i]
             val t = System.currentTimeMillis()
-            val img = runCatching { encodeOnce(info, width, height, pattern, plan.bitrate, plan) }
-                .getOrNull()
-            if (img == null) { ++i; continue }   // 该路失败（含 configure 拒绝）⇒ 换下一路
+            val attempt = runCatching { encodeOnce(info, width, height, pattern, plan.bitrate, plan) }
+            val img = attempt.getOrNull()
+            if (img == null) {
+                // 该路失败（含 configure 拒绝）⇒ 换下一路，但**必须留痕**：0.11.40 真机 qp 路
+                // （CQ + 官方 QP 键）失败时只有一条 `photo.heif_csd {len:0}`，异常信息被
+                // runCatching 吞掉 ⇒ 只能猜"是不是 QP 键与 CQ 冲突"。原因本身就是判据。
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "camera", "photo.heif_try_failed",
+                    "{\"mode\":\"${plan.mode}\",\"qp\":${plan.qp ?: -1}," +
+                        "\"bitrate\":${plan.bitrate},\"bitrateMode\":${plan.bitrateMode}," +
+                        "\"error\":\"${(attempt.exceptionOrNull()?.message ?: "?").replace("\"", "'")}\"}",
+                )
+                ++i
+                continue
+            }
             val bytes = img.frame.size
             val ms = System.currentTimeMillis() - t
             val v = HeifQuality.verdict(bytes, width, height)

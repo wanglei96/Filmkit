@@ -74,30 +74,42 @@ class HeifQualityTest {
         assertNull("已到上界", HeifQuality.stepQp(HeifQuality.QP_MAX, HeifQuality.Verdict.TOO_BIG))
     }
 
-    /** ⑥ 只有 QP 路能自校正，且受 MAX_QP_TRIES 约束。 */
+    /** ⑥ 只有 QP 路能自校正，且受 MAX_QP_TRIES 约束（QP 路当前不在三路里，见 ⑫）。 */
     @Test
     fun refine_onlyQpPathAndBounded() {
-        val qp = HeifQuality.strategies(w, h, null)[0]
-        assertEquals("qp", qp.mode)
+        // 直接构造 qp 路（0.11.41 起三路改成 vbr/vbr-hi/cq，但 QP 自校正能力保留：
+        // 官方 QP 键与 VBR 的组合尚未在真机排除，标定时要能直接挂上去）
+        val qp = HeifQuality.Strategy("qp", HeifQuality.MODE_VBR, 20_367_360, qp = HeifQuality.QP_DEFAULT)
         val once = HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, 0)
         assertNotNull("第一次还能再试", once)
         assertEquals(12, once!!.second.qp)
         assertNull("试满 MAX_QP_TRIES ⇒ 换路", HeifQuality.refine(qp, HeifQuality.Verdict.TOO_SMALL, HeifQuality.MAX_QP_TRIES - 1))
-        val cq = HeifQuality.strategies(w, h, null)[1]
-        val cbr = HeifQuality.strategies(w, h, null)[2]
+        val cq = HeifQuality.Strategy("cq", HeifQuality.MODE_CQ, 20_367_360, quality = HeifQuality.CQ_QUALITY)
+        val vbr = HeifQuality.Strategy("vbr", HeifQuality.MODE_VBR, 20_367_360)
         assertNull("cq 没有旋钮 ⇒ 试一次就换路", HeifQuality.refine(cq, HeifQuality.Verdict.TOO_SMALL, 0))
-        assertNull("cbr 同上", HeifQuality.refine(cbr, HeifQuality.Verdict.TOO_SMALL, 0))
+        assertNull("vbr 同上", HeifQuality.refine(vbr, HeifQuality.Verdict.TOO_SMALL, 0))
     }
 
-    /** ⑦ 三路顺序 = qp → cq → cbr（稳妥度排），且都带同一码率。 */
+    /**
+     * ⑦ 三路顺序 = vbr → vbr-hi → cq（0.11.41 依据 0.11.40 真机三路实测重排）。
+     *
+     * 旧三路 qp/cq/cbr 的真机结果：qp **失败**（拿不到 csd-0）、cq 635 KB（预算的 26%）、
+     * cbr 198 KB ⇒ CQ 与 CBR 都不理会预算，**VBR 是唯一没测过且语义上朝目标码率走的模式**。
+     */
     @Test
-    fun strategies_orderAndSharedBitrate() {
-        val s = HeifQuality.strategies(w, h, null)
-        assertEquals(listOf("qp", "cq", "cbr"), s.map { it.mode })
-        assertEquals(HeifQuality.QP_DEFAULT, s[0].qp)
-        assertEquals(HeifQuality.CQ_QUALITY, s[1].quality)
-        assertTrue("三路共用同一码率预算", s.map { it.bitrate }.distinct().size == 1)
-        assertEquals("qp/cq 走 CQ 模式，cbr 走 CBR", listOf(HeifQuality.MODE_CQ, HeifQuality.MODE_CQ, HeifQuality.MODE_CBR), s.map { it.bitrateMode })
+    fun strategies_orderAndBitrate() {
+        val s = HeifQuality.strategies(w, h, 100_000_000)
+        assertEquals(listOf("vbr", "vbr-hi", "cq"), s.map { it.mode })
+        assertEquals(
+            "前两路必须是 VBR，第三路保留 CQ 作对照",
+            listOf(HeifQuality.MODE_VBR, HeifQuality.MODE_VBR, HeifQuality.MODE_CQ),
+            s.map { it.bitrateMode },
+        )
+        assertEquals("vbr 路用目标反算码率", 20_367_360, s[0].bitrate)
+        assertEquals("vbr-hi 路给满编码器上限", 100_000_000, s[1].bitrate)
+        assertEquals("cq 路保留 quality=100 作对照", HeifQuality.CQ_QUALITY, s[2].quality)
+        assertTrue("三路都不带 QP 键（真机 QP 键在 CQ 下失败，待与 VBR 组合标定）",
+            s.all { it.qp == null })
     }
 
     /** ⑧ 都没达标时留"最接近区间"的那份（不是最大也不是最小）。 */
@@ -158,5 +170,24 @@ class HeifQualityTest {
         // QP 键必须是**官方** MediaFormat 键（vendor 键真机实测失败：设了拿不到 csd-0）
         assertEquals("video-qp-i-min", HeifQuality.QP_I_MIN_KEY)
         assertEquals("video-qp-i-max", HeifQuality.QP_I_MAX_KEY)
+    }
+
+    /**
+     * ⑫ 0.11.41：VBR 主路 + `capBitrate` 的边界。
+     *
+     * 依据（0.11.40 真机）：CQ 用预算的 26%（635 KB）、CBR 更小（198 KB）⇒ 都不按预算走，
+     * 所以补上唯一没测过的 VBR，并留"给满上限"的一手。
+     */
+    @Test
+    fun vbrIsPrimaryAndCapBitrateIsUpperBound() {
+        assertEquals("BITRATE_MODE_VBR 官方取值 = 1", 1, HeifQuality.MODE_VBR)
+        assertEquals("给满编码器上限", 100_000_000, HeifQuality.capBitrate(100_000_000))
+        assertEquals("拿不到上限 ⇒ 兜底 2 Gbps", 2_000_000_000, HeifQuality.capBitrate(null))
+        assertEquals("上限极低 ⇒ 抬到下界", 8_000_000, HeifQuality.capBitrate(1))
+        assertEquals("极高上限 ⇒ 夹到兜底", 2_000_000_000, HeifQuality.capBitrate(Int.MAX_VALUE))
+        assertTrue(
+            "vbr-hi 的码率必须 ≥ vbr 的目标码率（否则它没有存在意义）",
+            HeifQuality.capBitrate(100_000_000) >= HeifQuality.bitrateFor(w, h, 100_000_000),
+        )
     }
 }
