@@ -193,8 +193,12 @@ def main() -> int:
         return selftest()
     items = []
     for a in args:
-        p, _, tag = a.rpartition("=")
-        items.append((tag or Path(p).stem, p))
+        # `tag=path` 形式；不带 `=` 时整串是路径、tag 取文件名主干。
+        # ⚠ 别用 rpartition：它返回 (head, sep, tail) —— 把 head 当路径、tail 当标签就正好反了。
+        tag, sep, p = a.partition("=")
+        if not sep:
+            tag, p = Path(a).stem, a
+        items.append((tag, p))
     if len(items) < 2:
         print(__doc__)
         return 2
