@@ -57,7 +57,14 @@ object Heif8Encoder {
      * 一次 8bit 编码的结果。`codec`/`mime` 回给调用方进日志（真机核对 muxer 走的是 HEIC
      * 还是 MP4 老路）；日志统一由调用方发（本类不自己打日志 ⇒ 单一真源）。
      */
-    class Encoded(val bytes: ByteArray, val codec: String, val mime: String, val ms: Long)
+    class Encoded(
+        val bytes: ByteArray,
+        val codec: String,
+        val mime: String,
+        val ms: Long,
+        /** 卡 FIX4：质量口径统计（`bitrateMode`/`qp`/`bitrate`/`bytes`/`ms`/`verdict`）。 */
+        val quality: HeifQuality.Stats? = null,
+    )
 
     /**
      * 选型：声明 `COLOR_FormatYUV420Flexible` 的 HEVC 编码器，硬件加速优先。
@@ -79,7 +86,12 @@ object Heif8Encoder {
             .firstOrNull()
 
     /** 8bit HEVC 的输入格式（`KEY_COLOR_FORMAT` 必须是编码器声明支持的 8bit YUV420）。 */
-    fun buildFormat(width: Int, height: Int, bitrate: Int): MediaFormat {
+    fun buildFormat(
+        width: Int,
+        height: Int,
+        bitrate: Int,
+        strategy: HeifQuality.Strategy? = null,
+    ): MediaFormat {
         val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, width, height)
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -94,8 +106,34 @@ object Heif8Encoder {
         fmt.setInteger(MediaFormat.KEY_STRIDE, width)
         fmt.setInteger(MediaFormat.KEY_SLICE_HEIGHT, height)
         fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height * 3)
+        // 卡 FIX4：8bit 档同样要"质量优先"（真机 8bit HEIC 198 KB = JPEG 的 1/25 就是它压过头）。
+        // 复用 10bit 档的同一个质量口径（[HeifQuality]）⇒ 两档不会各漂各的。
+        // ⚠ **回退语义不变**：这些键都是 hint，设了不生效/被拒都由 runCatching 兜住 ⇒
+        //   本类的失败条件、产物（平台 muxer 写的 HEIF）与三级回退链**一行不动**。
+        Hevc10Encoder.applyQuality(fmt, strategy)
         return fmt
     }
+
+    /**
+     * 8bit 档的质量策略（单路：[HeifQuality.MODE_CQ] + `quality`）。
+     *
+     * 与 10bit 档**共用** [HeifQuality.bitrateFor] 的码率 ⇒ 8bit 档不再沿用"拍脑袋"的
+     * 240 Mbps 上限。⚠ 不在这里做多路迭代：8bit 档是**回退级**（10bit 失败才走），
+     * 时间预算要留给用户（再多编 3 次会明显拖慢失败路径）⇒ 只给一次机会 + 把
+     * `verdict` 回给调用方进日志（真机由此判定"8bit 档压过头了没"）。
+     */
+    fun qualityStrategy(width: Int, height: Int): HeifQuality.Strategy {
+        val br = HeifQuality.bitrateFor(width, height, bitrateCap())
+        return HeifQuality.Strategy("cq", HeifQuality.MODE_CQ, br, quality = HeifQuality.CQ_QUALITY)
+    }
+
+    /** 编码器声明的码率上限（bit/s）；拿不到 ⇒ `null`。 */
+    private fun bitrateCap(): Int? =
+        runCatching {
+            selectEncoder()
+                ?.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                ?.videoCapabilities?.bitrateRange?.upper
+        }.getOrNull()
 
     /**
      * RGBA8 → 8bit HEVC → `MediaMuxer(MUXER_OUTPUT_HEIF)` → **完整 HEIF 文件字节**。
@@ -132,7 +170,10 @@ object Heif8Encoder {
         var mimeUsed = "?"
         try {
             codec = MediaCodec.createByCodecName(info.name)
-            codec.configure(buildFormat(width, height, bitrate), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.configure(
+                buildFormat(width, height, bitrate, qualityStrategy(width, height)),
+                null, null, MediaCodec.CONFIGURE_FLAG_ENCODE,
+            )
             codec.start()
 
             // 喂 1 帧 + EOS（HEIF 是 still image）
@@ -188,10 +229,18 @@ object Heif8Encoder {
             runCatching { codec?.release() }
         }
 
-        val bytes = runCatching { outFile.takeIf { it.length() > 0 }?.readBytes() }.getOrNull()
+        val raw = runCatching { outFile.takeIf { it.length() > 0 }?.readBytes() }.getOrNull()
         runCatching { outFile.delete() }
+        val bytes = raw
         check(bytes != null && bytes.isNotEmpty()) { "8bit HEIF 产物为空（${info.name}）" }
-        return Encoded(bytes, info.name, mimeUsed, System.currentTimeMillis() - t0)
+        val ms = System.currentTimeMillis() - t0
+        val r = HeifQuality.targetRange(width, height)
+        val st = HeifQuality.Stats(
+            mode = "cq", qp = null, bitrate = bitrate, bytes = bytes.size, ms = ms,
+            verdict = HeifQuality.verdict(bytes.size, width, height),
+            tries = 1, targetMin = r.first, targetMax = r.last,
+        )
+        return Encoded(bytes, info.name, mimeUsed, ms, st)
     }
 
     /**

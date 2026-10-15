@@ -127,15 +127,22 @@ object Heif10Pipeline {
     // ── 交付组装 ──────────────────────────────────────────────────────────────
 
     /**
-     * 本次交付的码率（bit/s）。**质量优先**：静态图按 ~2 bit/像素/帧估算，再夹到编码器
-     * 普遍接受的上限（240 Mbps）。
+     * 本次交付的码率（bit/s）——**按目标体积反算**，不再是"拍脑袋估算"。
      *
-     * ⚠ 这是**待真机标定**的参数（报告 §5）：`MediaCodec` 的 `KEY_BIT_RATE` 对单帧 I 帧
-     * 只影响 QP 选择，实际帧大小由编码器决定；X300 上到底给多高才能让 10bit 的高光肩部/
-     * 暗部层次真正留存，必须用真机成片对照 JPEG q100 才能定。
+     * ## 来历（卡 FIX4，取代旧的 `w·h·30·2` 夹 [8, 240] Mbps）
+     * 旧公式的 240 Mbps 上限对 12MP 就是 **单帧预算 1 MB**（240 Mbps ÷ 30 fps），而
+     * `KEY_BIT_RATE` 是**上界不是目标**：编码器为了省只会往下走 ⇒ 真机落到 **198 KB**
+     * （= 同场景 JPEG 5.1 MB 的 **1/25**），高频只剩 JPEG 的 30% ⇒ **压过头**。
+     *
+     * 新口径：目标 = 同场景 JPEG 的 **40~60%**（[HeifQuality.TARGET_MIN_RATIO] /
+     * [TARGET_MAX_RATIO]），由 [HeifQuality.bitrateFor] 按
+     * **目标体积中值 × 8 × frame-rate** 反算（⚠ `frame-rate` 参与折算，漏掉就差 30 倍）。
+     * 12MP ⇒ **611 Mbps**（旧上限只有 240，根本到不了目标 —— 这就是根因的算术）。
+     *
+     * ⚠ **仍然要真机标定**的量只有两个：[HeifQuality.JPEG_REFERENCE_BPP]（JPEG 基准
+     * bit/px，随场景噪声涨跌）与 [HeifQuality.QP_DEFAULT]（QP 起点）。标定后只改那两处。
      */
-    fun defaultBitrate(w: Int, h: Int): Int =
-        (w.toLong() * h.toLong() * 30L * 2L).coerceIn(8_000_000L, 240_000_000L).toInt()
+    fun defaultBitrate(w: Int, h: Int): Int = HeifQuality.bitrateFor(w, h, null)
 
     /**
      * 引擎 10bit 交付档的 readback 字节流 → **完整 HEIF 文件字节**
@@ -144,14 +151,21 @@ object Heif10Pipeline {
      * 这是"10bit HEIF 交付链"的单一组装点：调用方（`CameraController.saveHeif`）只负责
      * 落盘与回退，不重复任何一步。
      *
+     * @param outStats 编码统计出口（`photo.heif_encoded` 的 `bitrateMode`/`qp`/`bitrate`/`bytes`/`ms`）。
      * @throws IllegalStateException 编码器不可用 / 编码失败 / 容器构造失败
      *   —— 调用方**必须**回退 JPEG（照片优先红线），不许把异常吞掉后当成功。
      */
-    fun toHeifFile(bytes: ByteArray, w: Int, h: Int, bitrate: Int = defaultBitrate(w, h)): ByteArray {
+    fun toHeifFile(
+        bytes: ByteArray,
+        w: Int,
+        h: Int,
+        bitrate: Int = defaultBitrate(w, h),
+        outStats: (HeifQuality.Stats) -> Unit = {},
+    ): ByteArray {
         require(w % 2 == 0 && h % 2 == 0) { "HEIF 成片尺寸必须偶数（4:2:0），实际 ${w}x$h" }
         val rgb = unpackRgb10(bytes, w, h)
         val pattern = toP010(rgb, w, h)
-        val image = Hevc10Encoder.encode(w, h, pattern, bitrate)
+        val image = Hevc10Encoder.encode(w, h, pattern, bitrate, outStats)
         return HeifContainerWriter.build(
             image,
             HeifContainerWriter.Cicp(),   // 交付口径真源：1/13/1/1（sRGB 显示域，R1 选项 A）

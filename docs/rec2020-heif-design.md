@@ -115,6 +115,24 @@ dither 幅度按输出位深缩放（darktable `dither.c:326` 口径），10bit 
 
 **真机判据（修复后必须能判定）**：`切 HEIF → 切回 JPEG → 拍照` 必须与 `从未切过 HEIF 的 JPEG` 等价（同场景同参数）。
 
+## 6c. ✅ 期 A 里程碑：10bit HEIF 端到端打通（2026-10-15，0.11.37）
+
+架构师亲自操作（adb 装包 → 快门 → `adb pull` → **独立解析，不信日志**）：
+
+| 项 | 实测 |
+|---|---|
+| 文件 | `Pictures/FilmKit/FILMKIT_20261015-081325.heic`（164732 B） |
+| 结构 | `ftyp(heic) + meta(hdlr/pitm/iinf/iloc/iprp(ipco(hvcC/ispe/pixi/colr)/ipma)) + mdat` |
+| `hvcC` | `len=105 ver=1 profile_idc=2`(Main10) `level=183 chromaFormat=1 bdlMinus8=2 bdcMinus8=2 lengthSize=3 numArrays=3` ⇒ **真 10bit** |
+| `pixi` | 3 通道 × **10bit** |
+| `colr/nclx` | **primaries 1 / transfer 13 / matrix 1 / full_range 1** = R1 拍板口径 |
+| macOS 原生 | `3072×4080 / bitsPerSample 10 / heic`，**强制解码成功且颜色正常**（判据 F 的 macOS 端 ✅） |
+| 链路日志 | `photo.heif_csd {csdInLen:79 → csdOutLen:105, converted:true, frameMode:"annexb", ok:true}`、`photo.heif_saved {bits:10}` |
+
+**写死的认知**：编码器 `csd-0` 是 **Annex-B**（`00 00 00 01` + VPS/SPS/PPS），**不是** hvcC；"实测 106 B hvcC"是 `MediaMuxer` 产出的 MP4 里的转换产物。走 muxer 的两条路（探针三臂 / 8bit 回退档）由 muxer 免费做这步，**自研容器必须自己转**（`HevcAnnexB`：切分 + H.265 SPS 完整语法解析 + hvcC 组装 + 帧长度前缀化）。
+
+**期 A 仍待办**：① 判据 F 的 **Android 相册 / 微信 / Windows** 三端人工看；② 码率标定（10bit 档 161KB、8bit 档 368KB，场景不同不可直接比）；③ 8bit HEIF 与 JPEG 的画质对照。
+
 ## 7. 待拍板 / 待实测
 
 **已拍板（2026-10-14）**：P1 分期 A → B ✓ · P2 默认引擎切 sigmoid ✓ · P3 照片格式设置项（默认 JPEG / 可选 HEIF）✓ · **R1 交付域与传输函数 = sRGB 显示域 + 10bit（选项 A）** ✓ —— 详见 §1b。

@@ -3554,8 +3554,13 @@ class CameraController(private val context: Context, private val render: RenderC
         // 顺序、逐级日志与"拿不准就往下落"的语义由 HeifDelivery 固化（纯 JVM 单测覆盖三条路径）。
         var spec = com.filmkit.app.heif.HeifDeliverCheck.Spec.TEN_BIT
         var enc8: com.filmkit.app.heif.Heif8Encoder.Encoded? = null
+        // 卡 FIX4：质量口径的统计出口（`bitrateMode`/`qp`/`bitrate`/`bytes`/`ms`/`verdict`）。
+        // 10bit 那边逐路尝试，最终生效的那路由编码器回传 ⇒ 下一轮不用猜"走的哪条路"。
+        var q10: com.filmkit.app.heif.HeifQuality.Stats? = null
         val deliv = com.filmkit.app.heif.HeifDelivery.run(
-            attempt10 = { com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) },
+            attempt10 = {
+                com.filmkit.app.heif.Heif10Pipeline.toHeifFile(rgba10, w, h) { q10 = it }
+            },
             attempt8 = {
                 // 8bit 级复用**同一次** 10bit readback 的降位结果（不重渲染、不重新 readback）
                 val rgba8 = com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
@@ -3572,23 +3577,41 @@ class CameraController(private val context: Context, private val render: RenderC
         // JPEG。日志明示这一点（用户曾因此困惑）：chroma + jpeg444Ignored。
         val heif: ByteArray = when (deliv) {
             is com.filmkit.app.heif.HeifDelivery.Result.TenBit -> {
+                // `verdict != OK` 直接升级成 WARN：体积没进 40~60% 目标区间 ⇒ 下一轮必须看见
+                // （这是"不许静默压过头"的落点——198 KB 那次就是因为没人报）。
+                val st = q10
                 EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "photo.heif_encoded",
+                    if (st == null || st.verdict == com.filmkit.app.heif.HeifQuality.Verdict.OK) {
+                        EngineBridge.LEVEL_INFO
+                    } else {
+                        EngineBridge.LEVEL_WARN
+                    },
+                    "camera", "photo.heif_encoded",
                     kv("ms" to encMs, "bytes" to deliv.bytes.size, "w" to w, "h" to h,
                         "bits" to 10, "chroma" to com.filmkit.app.heif.Heif8Encoder.CHROMA,
-                        "jpeg444Ignored" to true),
+                        "jpeg444Ignored" to true,
+                        "bitrateMode" to (st?.mode ?: "?"),
+                        "qp" to (st?.qp ?: -1), "bitrate" to (st?.bitrate ?: -1),
+                        "encMs" to (st?.ms ?: -1), "verdict" to (st?.verdict?.name ?: "?"),
+                        "tries" to (st?.tries ?: -1),
+                        "targetMin" to (st?.targetMin ?: -1), "targetMax" to (st?.targetMax ?: -1)),
                 )
                 deliv.bytes
             }
             is com.filmkit.app.heif.HeifDelivery.Result.EightBit -> {
                 spec = com.filmkit.app.heif.HeifDeliverCheck.Spec.EIGHT_BIT
+                val st = enc8?.quality
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_WARN, "camera", "photo.heif8_encoded",
                     kv("ms" to encMs, "bytes" to deliv.bytes.size, "w" to w, "h" to h,
                         "bits" to com.filmkit.app.heif.Heif8Encoder.BIT_DEPTH,
                         "chroma" to com.filmkit.app.heif.Heif8Encoder.CHROMA,
                         "codec" to (enc8?.codec ?: "?"), "mime" to (enc8?.mime ?: "?"),
-                        "jpeg444Ignored" to true),
+                        "jpeg444Ignored" to true,
+                        "bitrateMode" to (st?.mode ?: "?"),
+                        "qp" to (st?.qp ?: -1), "bitrate" to (st?.bitrate ?: -1),
+                        "encMs" to (st?.ms ?: -1), "verdict" to (st?.verdict?.name ?: "?"),
+                        "targetMin" to (st?.targetMin ?: -1), "targetMax" to (st?.targetMax ?: -1)),
                 )
                 deliv.bytes
             }

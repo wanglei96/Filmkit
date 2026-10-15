@@ -61,10 +61,17 @@ import java.io.ByteArrayOutputStream
  */
 object Hevc10Encoder {
 
-    /** 探针已验证的口径（1024×256 测试图）。**交付时按分辨率/质量目标覆盖**：码率直接决定成片质量。 */
+    /** 探针已验证的口径（1024×256 测试图）。**交付时按分辨率/质量目标覆盖**（见 [HeifQuality]）。 */
     const val DEFAULT_BITRATE = 4_000_000
 
-    private const val FRAME_RATE = 30
+    /**
+     * 与 [HeifQuality.FRAME_RATE] **同一个**值。
+     *
+     * ⚠ 两处必须一致：`KEY_BIT_RATE` 是 bit/s，而静态图只编 1 帧 ⇒ 单帧预算
+     *   = `bitrate / frame-rate`。[HeifQuality.bitrateFor] 按这个值反算码率，
+     *   这里落键 ⇒ 改一处忘另一处 = 目标体积整体偏 30 倍（`HeifQualityTest` 锁住）。
+     */
+    private const val FRAME_RATE = HeifQuality.FRAME_RATE
     private const val I_FRAME_INTERVAL = 1
     private const val TIMEOUT_US = 10_000L
     private const val DEADLINE_MS = 20_000L
@@ -101,7 +108,13 @@ object Hevc10Encoder {
             .firstOrNull { it.isHardwareAccelerated }
 
     /** HEVC Main10 + P010 的输入格式（键与探针 10bit 臂一致）。 */
-    fun buildFormat(info: MediaCodecInfo, width: Int, height: Int, bitrate: Int): MediaFormat {
+    fun buildFormat(
+        info: MediaCodecInfo,
+        width: Int,
+        height: Int,
+        bitrate: Int,
+        strategy: HeifQuality.Strategy? = null,
+    ): MediaFormat {
         val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, width, height)
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010)
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -121,17 +134,49 @@ object Hevc10Encoder {
         // 置 0 表示"不要在 IDR 前重复插入 SPS/PPS"——不过**即使 vendor 因此改给 hvcC 形态的
         // csd-0，也照样走 [HevcCsd0] 的通用规范化路径**（两种形态都吃），不依赖 vendor 行为。
         runCatching { fmt.setInteger("prepend-sps-pps-to-idr-frames", 0) }
+        applyQuality(fmt, strategy)
         return fmt
     }
 
     /**
-     * 编码一帧 10bit HEVC，返回 [HeifContainerWriter.build] 的直接输入。
+     * 把 [HeifQuality.Strategy] 落成 `MediaFormat` 键（**卡 FIX4 的质量驱动挂点**）。
+     *
+     * - `bitrate-mode` + `quality`/vendor QP 用 `runCatching` 包：
+     *   · 这些键在**旧平台/非 MTK**上不存在或不接受 ⇒ 抛异常不能打死照片（回退链兜住片子）；
+     *   · 但**"设成功"不等于"生效"** ⇒ 真正判定生效的是 [HeifQuality.verdict]（产出体积
+     *     是否进目标区间）。非 MTK 平台忽略 vendor 键是**静默**的，只有体积判据能抓到。
+     */
+    fun applyQuality(fmt: MediaFormat, strategy: HeifQuality.Strategy?) {
+        if (strategy == null) return
+        runCatching { fmt.setInteger(HeifQuality.BITRATE_MODE_KEY, strategy.bitrateMode) }
+        strategy.qp?.let { runCatching { fmt.setInteger(HeifQuality.VENDOR_MTK_QP_KEY, it) } }
+        strategy.quality?.let { runCatching { fmt.setInteger(HeifQuality.QUALITY_KEY, it) } }
+    }
+
+    /** 编码器声明的码率上限（bit/s）；拿不到 ⇒ `null`（由 [HeifQuality.bitrateFor] 兜底）。 */
+    fun bitrateCap(info: MediaCodecInfo): Int? =
+        runCatching {
+            info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                .videoCapabilities?.bitrateRange?.upper
+        }.getOrNull()
+
+    /**
+     * 编码一帧 10bit HEVC（**质量优先**：按 [HeifQuality.strategies] 逐路尝试，
+     * 产出体积进目标区间即停），返回 [HeifContainerWriter.build] 的直接输入。
+     *
+     * ## 卡 FIX4：为什么要"逐路尝试"
+     * 只允许一次编码的话，"设了 QP 但 vendor 静默忽略"和"设了就生效"从外面看不出区别
+     * （都不报错）⇒ 就会重演"压过头却没人知道"。本函数对每一路都跑完编码再用
+     * [HeifQuality.verdict] 判体积，不达标就换下一路（"设了不生效"的检测就在这里）；
+     * 全都不达标 ⇒ 留下 [HeifQuality.pickBest] 最接近的那份，并把 `verdict != OK`
+     * 回给调用方进日志 —— **不许静默压过头**。
      *
      * @param pattern 每像素打包 `y10 | (u10 shl 10) | (v10 shl 20)`，各分量 0..1023
      *   （全范围，与探针 `buildPattern()` 同一约定）。
      *   **必须是已经转换好的 YCbCr**：本类不做 RGB→YCbCr 转换
      *   （挂点见类注释「RGB→YCbCr 挂点」），且必须与容器 `colr` 的 `matrix_coefficients`
      *   一致 —— 默认口径是 **BT.709（matrix=1）**。
+     * @param outStats 输出：本次真正生效的路与统计（进 `photo.heif_encoded`）。
      * @throws IllegalStateException 没有可用的 10bit 硬件编码器 / 编码器未给 `csd-0` / 没有输出帧。
      */
     fun encode(
@@ -139,18 +184,110 @@ object Hevc10Encoder {
         height: Int,
         pattern: IntArray,
         bitrate: Int = DEFAULT_BITRATE,
-    ): HeifContainerWriter.Image {
+        outStats: (HeifQuality.Stats) -> Unit = {},
+    ): HeifContainerWriter.Image = encodeWithQuality(
+        width, height, pattern, bitrate, strategies = null, outStats = outStats,
+    ).first
+
+    /** 同 [encode]，额外返回统计（供调用方直接进日志）。 */
+    fun encodeWithStats(
+        width: Int,
+        height: Int,
+        pattern: IntArray,
+        bitrate: Int = DEFAULT_BITRATE,
+    ): Pair<HeifContainerWriter.Image, HeifQuality.Stats?> {
+        var stats: HeifQuality.Stats? = null
+        val img = encodeWithQuality(width, height, pattern, bitrate, null) { stats = it }.first
+        return img to stats
+    }
+
+    /** 本类的**唯一**编码实现（[encode]/[encodeWithStats] 都走它）。 */
+    private fun encodeWithQuality(
+        width: Int,
+        height: Int,
+        pattern: IntArray,
+        bitrate: Int,
+        strategies: List<HeifQuality.Strategy>?,
+        outStats: (HeifQuality.Stats) -> Unit,
+    ): Pair<HeifContainerWriter.Image, HeifQuality.Stats?> {
         require(width > 0 && height > 0) { "尺寸非法: ${width}x$height" }
         require(pattern.size == width * height) { "pattern 大小 ${pattern.size} ≠ ${width}x$height" }
         val info = selectEncoder()
             ?: error("没有硬件 HEVC 编码器声明 Main10 + P010(54)（10bit 路线不可用，请回退）")
+        val plans = (strategies ?: HeifQuality.strategies(width, height, bitrateCap(info))).toMutableList()
+        val t0 = System.currentTimeMillis()
+        val tried = mutableListOf<Triple<HeifQuality.Strategy, Int, Long>>()
+        var best: Pair<HeifContainerWriter.Image, HeifQuality.Stats>? = null
+        var i = 0
+        var qpTries = 0
+        while (i < plans.size && tried.size < HeifQuality.MAX_TOTAL_TRIES) {
+            val plan = plans[i]
+            val t = System.currentTimeMillis()
+            val img = runCatching { encodeOnce(info, width, height, pattern, plan.bitrate, plan) }
+                .getOrNull()
+            if (img == null) { ++i; continue }   // 该路失败（含 configure 拒绝）⇒ 换下一路
+            val bytes = img.frame.size
+            val ms = System.currentTimeMillis() - t
+            val v = HeifQuality.verdict(bytes, width, height)
+            tried += Triple(plan, bytes, ms)
+            val r = HeifQuality.targetRange(width, height)
+            val st = HeifQuality.Stats(
+                mode = plan.mode, qp = plan.qp, bitrate = plan.bitrate, bytes = bytes, ms = ms,
+                verdict = v, tries = tried.size, targetMin = r.first, targetMax = r.last,
+            )
+            if (v == HeifQuality.Verdict.OK) {
+                outStats(st)
+                return img to st
+            }
+            // 该留还是该换 + 这一路还要不要再试一次（规则在 HeifQuality 里 ⇒ 纯函数可测）
+            if (HeifQuality.isBetter(best?.second?.bytes, bytes, width, height)) {
+                best = img to st
+            }
+            val again = HeifQuality.refine(plan, v, qpTries)
+            if (again != null) {
+                qpTries = again.first
+                plans[i] = again.second
+                continue   // 同一格原地重试（不前进到下一路）
+            }
+            ++i
+            qpTries = 0
+        }
+        // 一路都没达标：留下最接近目标区间的那份 + 把 `verdict != OK` 说清楚（不许静默）
+        val b = best
+        if (b == null) error("全部 ${plans.size} 路编码策略都失败（${info.name}）")
+        val r = HeifQuality.targetRange(width, height)
+        val st = b.second.copy(
+            tries = tried.size,
+            ms = System.currentTimeMillis() - t0,
+            targetMin = r.first,
+            targetMax = r.last,
+        )
+        outStats(st)
+        return b.first to st
+    }
 
+    /**
+     * 单次编码（[encodeWithQuality] 的一路）。
+     *
+     * @param strategy 质量策略（落键见 [applyQuality]）。
+     */
+    private fun encodeOnce(
+        info: MediaCodecInfo,
+        width: Int,
+        height: Int,
+        pattern: IntArray,
+        bitrate: Int,
+        strategy: HeifQuality.Strategy?,
+    ): HeifContainerWriter.Image {
         var codec: MediaCodec? = null
         var csdRaw: ByteArray? = null
         var csdLogged = false
         try {
             codec = MediaCodec.createByCodecName(info.name)
-            codec.configure(buildFormat(info, width, height, bitrate), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.configure(
+                buildFormat(info, width, height, bitrate, strategy),
+                null, null, MediaCodec.CONFIGURE_FLAG_ENCODE,
+            )
             codec.start()
 
             // 喂 1 帧 + EOS（HEIF 是 still image）
