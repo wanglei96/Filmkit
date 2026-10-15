@@ -156,6 +156,7 @@ object Hevc10Encoder {
         strategy.qp?.let { qp ->
             runCatching { fmt.setInteger(HeifQuality.QP_I_MIN_KEY, qp) }
             runCatching { fmt.setInteger(HeifQuality.QP_I_MAX_KEY, qp) }
+            runCatching { fmt.setInteger(HeifQuality.QP_AVERAGE_KEY, qp) }
         }
         strategy.quality?.let { runCatching { fmt.setInteger(HeifQuality.QUALITY_KEY, it) } }
     }
@@ -391,7 +392,9 @@ object Hevc10Encoder {
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     // 卡 FIX3：这里的 csd-0 **不保证**是 hvcC —— 真机 X300 给的是 Annex-B
                     // （79 B，`00 00 00 01` + VPS/SPS/PPS）。形态判定与转换统一交给 HevcCsd0。
-                    csdRaw = csd0(codec.outputFormat)
+                    val of = codec.outputFormat
+                    logOutputFormat(of)   // 0.11.42：把"有哪些旋钮"列出来（含 vendor 键）
+                    csdRaw = csd0(of)
                     continue
                 }
                 if (outIdx < 0) continue
@@ -434,6 +437,36 @@ object Hevc10Encoder {
     /** `photo.heif_csd` 的唯一出口（[HevcCsd0.EVENT]）。 */
     private fun csdLog(fields: String) {
         EngineBridge.nativeAppendLog(EngineBridge.LEVEL_INFO, "camera", HevcCsd0.EVENT, fields)
+    }
+
+    /**
+     * **把 `outputFormat` 的全部键 dump 进日志**（`photo.heif_out_format`，每路一条）。
+     *
+     * 为什么值得单开一条：0.11.40 / 0.11.41 两轮把**标准**旋钮全试死了 ——
+     * 三种 `bitrate-mode` × 20.4/100 Mbps 预算 ⇒ 产出全在 187~649 KB（`vbr-hi` 给满 100 Mbps
+     * 反而更小），证明编码器**不读 `KEY_BIT_RATE`**；官方 QP 键在 CQ 下失败；`quality` 键待证。
+     * 剩下唯一可能生效的是 **vendor 私有键**（MTK 会在 `outputFormat` 里**回显**它们 ——
+     * 上轮就见过 `vendor.mtk.ext.venc.visual.quant`）⇒ 先把"有哪些旋钮"列出来，再决定拧哪个。
+     * **回显 = 编码器认这个键**，这本身就是判据（比猜键名强得多）。
+     */
+    private fun logOutputFormat(fmt: MediaFormat) {
+        val sb = StringBuilder("{")
+        for (k in fmt.keys.sorted()) {
+            // MediaFormat **没有** getValue(String)（javap 实测：只有 getValueTypeForKey）⇒
+            // 按类型逐个试；类型不匹配时 getter 会抛（ClassCastException / NPE）⇒ 用 runCatching 兜。
+            val v = runCatching { fmt.getByteBuffer(k) }.getOrNull()?.let { "bytes(${it.remaining()})" }
+                ?: runCatching { fmt.getInteger(k) }.getOrNull()?.toString()
+                ?: runCatching { fmt.getLong(k) }.getOrNull()?.toString()
+                ?: runCatching { fmt.getFloat(k) }.getOrNull()?.toString()
+                ?: runCatching { fmt.getString(k) }.getOrNull()
+                ?: "?"
+            if (sb.length > 1) sb.append(',')
+            sb.append('"').append(k).append("\":\"").append(v.replace("\"", "'")).append('"')
+        }
+        sb.append('}')
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.heif_out_format", sb.toString(),
+        )
     }
 
     /** `outputFormat` 的 `csd-0` **原始字节**（可能是 hvcC，也可能是 Annex-B —— 交由 [HevcCsd0] 判定）。 */

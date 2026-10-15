@@ -102,6 +102,13 @@ object HeifQuality {
     const val QP_I_MAX_KEY = "video-qp-i-max"
 
     /**
+     * `MediaFormat.KEY_VIDEO_QP_AVERAGE`（= `video-qp-average`）—— **平均 QP**，语义上比
+     * I 帧区间键更适合 CQ/VBR 模式。0.11.42 起与上面两键**同值一起设**：三键里任意一个被
+     * 编码器接受就能生效，而失败原因仍可从 `photo.heif_try_failed` 归因。
+     */
+    const val QP_AVERAGE_KEY = "video-qp-average"
+
+    /**
      * 与编码器 `frame-rate` **同一个**值（`Hevc10Encoder.FRAME_RATE` / `Heif8Encoder`）。
      * 它参与 bitrate→单帧预算的折算 ⇒ 改一处必须两处一起改（[bitrateFor] 的注释）。
      *
@@ -163,6 +170,16 @@ object HeifQuality {
 
     /** CQ 路的 quality（0..100）—— 与用户 JPEG 质量默认档同档（PC 口径 100 / 用户默认 95）。 */
     const val CQ_QUALITY = 100
+
+    /**
+     * **诊断用**的最低 quality（0）—— 与 [CQ_QUALITY] 配对，回答"`quality` 键到底有没有用"。
+     *
+     * 0.11.41 真机把码率这条线走死了：VBR/20.4 Mbps ⇒ 219 KB、VBR/100 Mbps ⇒ **187 KB**
+     * （预算给满反而更小）、CQ/20.4 Mbps ⇒ 649 KB。**三种模式、三档预算，产出全在 187~649 KB**
+     * ⇒ 这颗编码器**根本不读 `KEY_BIT_RATE`**。
+     * 若 `quality=0` 与 `quality=100` 的产出相同 ⇒ `quality` 键同样无效 ⇒ "质量旋钮"只剩 QP 键。
+     */
+    const val CQ_QUALITY_LOW = 0
 
     // ── 码率（路 ③ 用）──────────────────────────────────────────────────────
 
@@ -323,27 +340,35 @@ object HeifQuality {
     }
 
     /**
-     * 该分辨率下的**三路入口**（有序：vbr → vbr-hi → cq）。
+     * 该分辨率下的**三路入口**（0.11.42 诊断轮：qp → cq-low → cq）。
      *
-     * ## 0.11.41 重排的依据（0.11.40 真机三路实测，`photo.heif_try`）
-     * | 路 | 键 | 产出 | 判定 |
-     * |---|---|---|---|
-     * | 旧 `qp` | CQ + `video-qp-i-min/max`=16 | **失败**（拿不到 `csd-0`） | 键不被接受 |
-     * | 旧 `cq` | CQ + `quality`=100，预算 20.4 Mbps | **635 KB**（预算的 26%） | 忽略预算 |
-     * | 旧 `cbr` | CBR + 20.4 Mbps | **198 KB**（更小） | 单帧下窗口异常 |
-     * ⇒ 三个模式删掉两个、补上**唯一没测过的 VBR**（[MODE_VBR]），并把 `cq` 留作对照。
+     * ## 0.11.41 真机把"码率"这条线走死了（三路实测）
+     * | 路 | 键 | 产出 |
+     * |---|---|---|
+     * | `vbr` | VBR + 20.4 Mbps | 219 KB |
+     * | `vbr-hi` | VBR + **100 Mbps**（预算给满） | **187 KB**（更小！） |
+     * | `cq` | CQ + `quality`=100 + 20.4 Mbps | **649 KB** |
+     * ⇒ **预算从 20.4 提到 100 Mbps 反而更小** ⇒ 这颗编码器**根本不读 `KEY_BIT_RATE`**，
+     *   而 `vbrSupported/cqSupported/cbrSupported` 全是 true（键被接受，但不生效）。
+     *   所以 0.11.42 不再在码率上做文章，改为回答**两个能定案的问题**：
      *
-     * 只给每路的**起点**：`qp` 路（若启用）往哪个方向走取决于实际产出（压过头降 QP、
-     * 太胖升 QP）⇒ 迭代由调用方用 [stepQp] 推进（最多 [MAX_QP_TRIES] 次）。
+     * · 路 ① `qp`：官方 QP 键（i-min / i-max / average 三键同值）—— 0.11.40 在 CQ 下
+     *   **失败**（拿不到 `csd-0`）；本轮换到 VBR 下再试一次，且**失败原因现在会进
+     *   `photo.heif_try_failed`**（0.11.41 新增）⇒ 无论成败都能定案。
+     * · 路 ② `cq-low`：`quality`=**[CQ_QUALITY_LOW]**（0）—— 与路 ③ 的 100 构成**对照**：
+     *   两者体积相同 ⇒ `quality` 键也无效 ⇒ "质量旋钮"只剩 QP 键。
+     * · 路 ③ `cq`：`quality`=100（**当前已知最优**，兜底）。
+     *
+     * 只给每路的**起点**：`qp` 路压过头 ⇒ 降 QP 重试（[stepQp]，最多 [MAX_QP_TRIES] 次）。
      *
      * @param capUpper 编码器声明的码率上限（见 [bitrateFor]）。
      */
     fun strategies(w: Int, h: Int, capUpper: Int?): List<Strategy> {
         val br = bitrateFor(w, h, capUpper)
         return listOf(
-            Strategy("vbr", MODE_VBR, br),                              // 标准做法：朝目标码率走
-            Strategy("vbr-hi", MODE_VBR, capBitrate(capUpper)),         // 给满上限：绝对预算换质量
-            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),          // 对照（已知 635 KB）
+            Strategy("qp", MODE_VBR, br, qp = QP_DEFAULT),              // 官方 QP 三键（失败原因进日志）
+            Strategy("cq-low", MODE_CQ, br, quality = CQ_QUALITY_LOW),  // 诊断：quality=0
+            Strategy("cq", MODE_CQ, br, quality = CQ_QUALITY),          // 兜底：已知 649 KB
         )
     }
 
