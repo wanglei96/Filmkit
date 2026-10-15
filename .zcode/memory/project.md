@@ -19,9 +19,9 @@ status: active
 - `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
 - `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
-## 进行中（2026-10-14，引擎插槽阶段 2/3 已落地）
+## 进行中（2026-10-15，期 A 10bit HEIF 已定稿）
+- [2026-10-15] **期 B：公共工作空间切 Rec.2020 线性** | **待开工（用户已确认下一步做域空间）** | 方案 §5 的 8 面爆炸半径：filmic gamut primaries / CCM 链终点（`StdColorMatrix.kt:29-33`）/ OETF 5 处（4 处 shader `srgbEncode` + CPU `:14245`）/ LUT 域 / 预设重打标 / 输出映射 / 数值阈值 / 零回归基线 ⇒ **A 组守卫会整体变红，必须一次性重定基线**；⚠ 必须**单独一期** | docs/rec2020-heif-design.md §5 + handoffs/10bitHEIF交付链定稿与期A收官.memo.md
 - [2026-10-14] **阶段 3 真机验收** | 待用户执行 | 清单 `docs/reports/stage3-acceptance-CHECKLIST.md` 判据 0–7；**先验判据 0**（引擎 1 必须真的改变画面 / 日志 `tone=1.0`）；判据 ①（高光可分辨跨度）需**固定机位 + 画面里有真正过曝区**（用户现有样片 `≥250` 只占 0.001%）| 包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378 / 0.11.29，项目根目录）
-- [2026-10-14] **切引擎"观感差异小"待用户定** | 待拍板 | 现为**设计使然**（sigmoid 按"与 filmic 同白纸口径"标定：中灰 0 LSB / 全图 p90 1.1 LSB）。要"明显风格差异"⇒ 三选一：给 sigmoid 加参数面板（contrast/skew/white/hue）/ 改默认 contrast 1.2→1.5（代价：与 filmic 不再同口径、判据① 可比性丢失）/ 保持现状 | handoffs/引擎插槽阶段2-3落地与全局开关.memo.md
 
 ## 已收尾（2026-10-13，相册与预设）
 - [2026-10-13] **相册 / 预设面板（本窗口主线）** | 进行中 | 相册：切图转圈（PV-2）、上一张图闪现（PV-3）、缩放锚点（PV-4）已修；预设：横向预设条 + 一级页只给常用参数 + 完整参数二级页 + 返回键分层（PS-6a/6b/7/8/9/10），内置白点 2.5~2.7 → 4.0 修高光死白（R-2/R-3）。**待真机验收**：白杯子高光是否不再死白、亮部变暗幅度可否接受 | handoffs/相册切图闪修与预设面板重做至v0.11.26.memo.md
@@ -40,6 +40,7 @@ status: active
 - [2026-10-01] **M5 诊断与基准** | 低 | 逐 pass GPU 计时、成像会话摘要、一键诊断包、性能基准脚本 + golden image 接 CI | decisions.md「色彩链、管线与 MFNR」
 
 ## 里程碑沿革（压缩）
+- [2026-10-15] **期 A：10bit HEIF 交付链定稿（10-14/10-15，本窗口）**：设置页「照片格式」（默认 JPEG / 可选 HEIF 10bit）；链路 = 引擎 10bit readback（`GL_RGB10_A2` + `GL_UNSIGNED_INT_2_10_10_10_REV`）→ CPU BT.709 全范围 4:2:0 → P010 → 硬件 HEVC Main10（**VBR + 官方 QP 键，QP=4 = 画质饱和点**）→ **自研 HEIF 容器**（`ftyp+meta+mdat`，`colr/nclx=1/13/1/1`，**不引入 libheif**）→ 落盘 + 读头自检；三级回退 `10bit → 8bit HEIF → JPEG`。判据 F 三端全过（macOS/微信/系统相册+Windows）。**四轮真机标定出三条硬结论**：编码器**不读码率**（100 Mbps ⇒ 187 KB）· QP 键**只在 VBR 下生效** · 画质在 **QP≈4 饱和**（QP4↔QP0 逐像素 p99 差 1 LSB 而体积 +36%）。途中**一次 P0 事故**（MFNR 落盘绕过交付档 ⇒ 用户 2 张真实照片损坏，修法 = 交付档随回调传递 + 唯一分派点 + 格式参数不留默认值）。781 单测 / 0 失败；包 `filmkit-0.11.46-HEIF-FINAL.apk`（395）；提交 `152304d`/`362ef24`/`42b6c31`/`5bcefc6`/`925a505`/`258a32f`/`16686fc`
 - [2026-10-14] **引擎插槽阶段 3 + 3b（10-14，本窗口）**：契约 `EngineScope.kt`（14 槽旁路表 + `KNOWN_ENGINE_SLOTS` + `effectiveEngineSlot`）+ 拍照链 5 个下发点与编辑器唯一出口的旁路收口 + UI 按引擎显隐（参数面板 4 项 / 设置页 5 道 gate / 「饱和度」由通用判据自动隐藏）+ 「完整参数」页**引擎选择面**（写预设 `[98]`）+ **设置页全局三档开关**（prefs `engine_override`；渲染侧每次下发前读、并把 `[98]` 真改写）。**验证卡抓出阻断级 P0**（`[28]=0` 让引擎 1 完全空转）并连带修 P1（`[22]` 半旁路）/ P2（未注册值第三态）；**新增判据 0**（引擎必须真的在工作）。全量 **664 条 / 0 失败**；包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378）；提交 `c801f0a` / `1cf94a2` / `e3b7116`
 - [2026-10-14] **阶段 2 sigmoid 引擎（10-14，本窗口）**：darktable `process_loglogistic_per_channel` 移植（CPU 侧 `computeSigmoidParams` 三锚点求解 + 7 个 `uSig*` uniform + float32 精度）+ 运行期热切换 `buildFilmProgram(slot)`。**五条判据真机验收全过**：可分辨跨度 **2.00 EV**（filmic 1.70）/ 中灰偏差 **0.000 LSB** / 线性域**严格单调**（filmic 4.02 EV 起硬平顶、350 个非正差分）/ 真机 A/B / `[98]=0` 时 `film_d5` `0x589f8364` 与拼接 `0x4fa1ebd3` 逐字节不变
 - [2026-10-13] **阶段 1 真机验收通过（10-13，本窗口）**：包 `filmkit-0.11.27.apk`（376 / 0.11.27）；真机日志 `filmkit-logs-20261013-215923` 的 `engine.film_src` **6/6 条** `identical:true` / 35154 字节 / `0x4fa1ebd3`，`film_split_missing`/`slot_unavailable` 各 0，无 error/fatal，拍照出片正常 ⇒ **零回归在设备上坐实**

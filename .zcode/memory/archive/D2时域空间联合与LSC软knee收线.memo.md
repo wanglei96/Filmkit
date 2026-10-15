@@ -2,7 +2,7 @@
 summary: D2时域空间联合与LSC软knee收线
 created: 2026-09-30 18:05
 updated: 2026-09-30 21:50
-status: absorbed
+status: archived
 ---
 
 # D2时域空间联合与LSC软knee收线

@@ -2,7 +2,7 @@
 summary: A专项DFT合并与Mali写入丢失攻坚
 created: 2026-09-30 12:30
 updated: 2026-09-30 12:30
-status: absorbed
+status: archived
 ---
 
 # A专项DFT合并与Mali写入丢失攻坚
