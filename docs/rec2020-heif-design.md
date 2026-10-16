@@ -358,4 +358,15 @@ latency = 3   priority = 0   intra-refresh-period = 0   video-qp-average = 0（�
 **下一期**：期 B —— 公共工作空间切 **Rec.2020 线性**（§5 的 8 面爆炸半径 + A 组守卫会整体变红，
 必须单独一期）。
 
+**下下一期**：工程师插槽**阶段 4 = ACES 预留**（`docs/engine-slots-design.md` §8, §9）——
+前置条件正是期 B 的 `workingColorSpace` 非 D4，所以顺序天然衔接，**域空间不是"另一件事"，它就是阶段 4 的技术门**。
+- §9.1 域挂点：把 `ComputeXyzD50ToGamut` 对应的 `XYZ(D50) → 线性 sRGB(D65)` 换成 `→ AP0(D60)`；其他不动。
+- §9.2 有一项必须**先拍板**：`display_peak_nits`（绝对亮度锚 + "0EV/中灰 ↔ nits"口径）—— 没它 tone scale 无法参数化。
+- §9.3 资产：hue 表（≈6 KB RGBA32F）+ cusp 表；§9.4 判据沿用 §7 五条 + 高饱和色 hue 偏移（ΔE2000/Δh）。
+- **上不上 ACES 先看数据，别默认上**：§9.4 + 着色判据里，统一口径下 ACES 的层次只比 sigmoid 优 0.25~0.30 EV（三架构都只用到 8bit 上界的 32~41%），**唯一可能拉开差距的是高饱和色 hue 偏移**；所以域空间完成 + 阶段 4 技术门跑通后，用高饱和色样张实测 ACES 是否有 visible gain，再决定。
+
+**域空间完成后的伴随重估**（用户 2026-10-14 明示"预设先不动，等做完了再重新评估"）：
+- **内置预设重标**：§5 的 8 面之一就是"预设重 tagged"；域变了，预设标定基础跟着变 ⇒ 借此重估内置预设策略。
+- **filmic 去留（债到期）**：2026-10-13 记录"上 10bit 本身就是要求换掉 filmic（10bit 救不了 filmic 连续不可逆的平顶）"；10bit 期 A 已交付，这条债现在到期 ⇒ 域空间完成后重评 filmic 是否保留（用户 10-14 原话"后期可能想删"）。
+
 **其他未确认项**（三份报告各自的 ⑦ 节，共 25 条）：`pow(2.2)` 是债还是刻意 · 42 个 `.lut` 是否携带域元数据 · `FrameRenderer.cpp:7868 tex_local_=GL_RGBA8` 是否为更早的隐藏降位点 · `computeXyzD50ToGamut` 是否 Bradford · vivo HEIC 静态照片是否真为 10bit 等。
