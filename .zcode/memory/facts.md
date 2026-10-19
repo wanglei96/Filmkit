@@ -127,3 +127,11 @@ status: active
 - [2026-10-15] **工具链**：`tools/check-log-json.py`（**分析日志前必跑**）· `tools/heif-quality-gate.py` · `tools/engine-shader-offline.py --dng test_temp/FILMKIT_20261009-090803.dng --roi 1800,2100,600,1000`（零回归：`film_d5 0x589f8364` / 拼接 `0x4fa1ebd3` / 引擎 1 `0x7c2646ef`）· `tools/validate-shaders.sh`（66 shader 冻结校验）。本窗口实测 **781 单测 / 0 失败**。
 - [2026-10-15] **出包（本窗口）**：`filmkit-0.11.32-HEIF10-PROBE.apk`(381) … → **`filmkit-0.11.46-HEIF-FINAL.apk`(395，定稿)**。对照样片与差异可视化存 `test_temp/_diag/`。
 - [2026-10-15] **交付档实机表现**：12MP 10bit HEIC 定稿后约 **3.1~4.4 MB**（同场景 JPEG q100 4:4:4 约 5.1~6.9 MB），单次编码 1.2~1.5 s。`colr` 已由 macOS 原生解码器 + 微信 + 系统相册 + Windows 四端确认正常（**判据 F 全过**）。
+
+## 期 B 域空间（10-19）
+
+- [2026-10-19] **域矩阵真源** `tools/rec2020-domain-matrices.py`：构造法（`outputFromXyz(D50)·xyzFromWorking(D50)`，**非硬编码**）+ 三重对拍 —— 内部（sRGB→LMS 2.22e-16 / XYZ(D50)→sRGB 3.38e-04）+ 跨实现（PhotonCamera `DarktableFilmicToneAlgorithm.kt:14-19` 的 **BT2020 版** LMS 9.8e-11、逆 5.8e-09、`PreviewColorShaderModules.kt:341` 的 sRGB→BT2020 4.4e-07）。阶段 4（AP0/D60）只需再用它换一组。
+- [2026-10-19] **期 B 后的新基线（离线实测）**：`film_d5.npy` CRC32 **`0xf891c297`**（旧 `0x589f8364`）· `film_d5_sigmoid.npy` **`0x7c2646ef`** · `kFsFilm` 源 chars 25887 / bytes 36587 / crc32 `0x235cf3f5`（旧 25140 / 35154 / `0x4fa1ebd3`）· `kFsSigmoid` 拼装源 chars 16175 / bytes 24028 / crc32 `0xfbab6a8c`。⚠ `FILM_SRC_BASELINE` **尚未写入守卫脚本**（`--splice-selftest` 会误报）。
+- [2026-10-19] **PC 的引擎工作空间（一手源码 `/tmp/pc-tone`）**：`RawRenderingEngine.kt:10-74` —— AgX / DarktableSigmoid / **DarktableFilmic** 跑 **BT2020**，Spektrafilm/AdobeCurve 跑 ProPhoto，Lumix/Canon/Leica 跑 SRGB，Hncs 跑 HNCS。输出统一 `computeWorkingToOutputTransform(…, ColorSpace.SRGB)`（`RawDemosaicProcessor.kt:7105`）⇒ **PC 是"内部大盘子、输出小盘子"**；其 RAW 引擎显式 `includeShadowsHighlights = false`（阴影高光类调整在 LUT 阶段、Lab 域做，且**只有一处实现**）。
+- [2026-10-19] **PC 的预览是另一套实现**：`PreviewShadowsHighlightsShader.kt`（纯 RGB+luma 乘性近似）vs 正式版 `ShadowsHighlightsShader.kt`（Lab 域 + sigma 采样基准 + overlay 混合）⇒ PC 在"预览 vs 成片"上比我们**更不一致**（有意的性能妥协）。
+- [2026-10-19] **引擎 1 的 7 个 `uSig*` 全是曲线形状常量**（`uSigWhiteTarget` / `uSigBlackTarget` / `uSigPaperExposure` / `uSigFilmFog` / `uSigFilmPower` / `uSigPaperPower` / `uSigHuePreservation`，来自 PC 的 `DT_SIGMOID_*`）—— **里面没有"对比度"** ⇒ 引擎 1 此前完全没有对比度实现（滑杆无效的真因）。

@@ -2,7 +2,7 @@
 summary: M4无损LUT导入导出与预览降载收线
 created: 2026-10-01 22:05
 updated: 2026-10-01 22:05
-status: absorbed
+status: archived
 ---
 
 # M4无损LUT导入导出与预览降载收线

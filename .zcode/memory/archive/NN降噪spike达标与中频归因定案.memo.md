@@ -2,7 +2,7 @@
 summary: NN降噪spike达标与中频归因定案
 created: 2026-10-02 10:05
 updated: 2026-10-02 12:20
-status: absorbed
+status: archived
 ---
 
 # NN降噪spike达标与中频归因定案

@@ -2,7 +2,7 @@
 summary: 10bit HEIF 交付链定稿与期 A 收官
 created: 2026-10-15 22:05
 updated: 2026-10-15 22:05
-status: active
+status: absorbed
 ---
 
 # 10bit HEIF 交付链定稿与期 A 收官

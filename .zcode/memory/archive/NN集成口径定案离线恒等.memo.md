@@ -2,7 +2,7 @@
 summary: NN集成口径定案离线恒等
 created: 2026-10-02 12:20
 updated: 2026-10-02 15:10
-status: absorbed
+status: archived
 ---
 
 # NN集成口径定案离线恒等
