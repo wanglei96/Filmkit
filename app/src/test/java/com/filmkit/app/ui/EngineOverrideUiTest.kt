@@ -174,9 +174,11 @@ class EngineOverrideUiTest {
         assertTrue("档位推进走共用函数（不内联 indexOf/%）", drawer.contains("val v = nextEngineOverride(engineOverride)"))
         assertTrue("与同抽屉「基准影调」同款记一条日志", settings.contains("\"settings.engine_override\""))
         assertTrue("读数用共用文案", drawer.contains("valueText = engineOverrideLabel(engineOverride)"))
-        // 三档开关**不进** `slotActiveInEngine` 的 gate 计数（既有 5 项判据不许被搅动）
+        // 三档开关**不进** `slotActiveInEngine` 的 gate 计数。期 B 起是 **6 项**：原 5 项
+        // + `[40]` 色域映射（它本就在 `EngineScope.FILMIC_OWNED_SLOTS` 里，属设置页漏挂 ⇒
+        // 引擎 1 下显示却完全无效；补挂见 EngineSlotUiTest 的同名判据）。
         assertEquals(
-            listOf(28, 20, 37, 38, 36),
+            listOf(28, 20, 37, 38, 36, 40),
             Regex("""slotActiveInEngine\((\d+),""").findAll(settings).map { it.groupValues[1].toInt() }.toList(),
         )
     }

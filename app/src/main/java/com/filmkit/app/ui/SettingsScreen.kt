@@ -716,20 +716,25 @@ private fun ToneColorDrawerContent() {
             )
         },
     )
-    var gamutOn by remember { mutableStateOf(prefs.getBoolean("gamut", true)) }
-    SettingSwitchRow(
-        title = "色域映射",
-        subtitle = "filmic 色彩收尾：sRGB 色域内映射（治高光偏色/过饱和），域内像素不动；关 = 同场景 A/B 对照",
-        checked = gamutOn,
-        onChecked = { v ->
-            gamutOn = v
-            prefs.edit().putBoolean("gamut", v).apply()
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.gamut",
-                "{\"on\":$v}",
-            )
-        },
-    )
+    // 期 B：`[40]` 是**引擎 0 私有**（`uGamut` 只在 filmic 段被消费，引擎 1 的 program 里
+    // 根本没有这个 uniform ⇒ location = −1 ⇒ 下发落空）。此前漏了 gate ⇒ 引擎 1 下"显示但
+    // 完全无效"（用户实测："剩余开关全关了没影响"）。与 [37][38] 等私有项同一处理。
+    if (slotActiveInEngine(40, engineSlot)) {
+        var gamutOn by remember { mutableStateOf(prefs.getBoolean("gamut", true)) }
+        SettingSwitchRow(
+            title = "色域映射",
+            subtitle = "filmic 色彩收尾：sRGB 色域内映射（治高光偏色/过饱和），域内像素不动；关 = 同场景 A/B 对照",
+            checked = gamutOn,
+            onChecked = { v ->
+                gamutOn = v
+                prefs.edit().putBoolean("gamut", v).apply()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "app", "settings.gamut",
+                    "{\"on\":$v}",
+                )
+            },
+        )
+    }
     // 高光重建·小波（v0.10.15）：darktable filmic 原生高光重建（à trous 小波，
     // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
     // v0.10.162：默认关（与 CameraController.applyHrWaveletPref 的 prefs 默认值

@@ -207,13 +207,17 @@ class EngineSlotUiTest {
     }
 
     @Test
-    fun settingsScreenGatesExactlyTheFiveFilmicKnobsAndKeepsBaseEv() {
+    fun settingsScreenGatesExactlyTheSixFilmicKnobsAndKeepsBaseEv() {
         val src = File("src/main/java/com/filmkit/app/ui/SettingsScreen.kt").readText()
         val gated = Regex("""slotActiveInEngine\((\d+),""").findAll(src).map { it.groupValues[1].toInt() }.toList()
-        // 恰好五项挂了 gate：基准影调 [28] / 饱和补偿 [20] / 黑点 [37] / 白点 [38] / 局部色调 [36]
-        assertEquals(listOf(28, 20, 37, 38, 36), gated)
+        // 恰好六项挂了 gate：基准影调 [28] / 饱和补偿 [20] / 黑点 [37] / 白点 [38] / 局部色调 [36]
+        // **+ [40] 色域映射（期 B 补挂）** —— 它本来就在 `EngineScope.FILMIC_OWNED_SLOTS`
+        //（真源表本就含 40），只是设置页当初漏了 gate ⇒ 引擎 1 下"显示但完全无效"：
+        // `uGamut` 只被 filmic 段消费，引擎 1 的 program 里没有它 ⇒ location = −1 ⇒ 下发落空。
+        // 用户实测"剩余开关全关了没影响"抓到的正是它。
+        assertEquals(listOf(28, 20, 37, 38, 36, 40), gated)
         // ⚠「基准曝光」[0] 必须**不在** gate 里（通用能力，架构师定案 §8.1 的"保留"一条）：
-        // 上面那条"恰好五项"就是它的机器判据（多挂一项就红），这里再钉一次槽位号不在列表里
+        // 上面那条"恰好六项"就是它的机器判据（多挂一项就红），这里再钉一次槽位号不在列表里
         assertFalse("基准曝光 [0] 不许被 gate", 0 in gated)
         assertTrue("「基准曝光」条目本身不许被删", src.contains("label = \"基准曝光\""))
         for (t in listOf("基准影调", "饱和补偿", "黑点（多暗算黑）", "白点（多亮算白）", "局部色调映射")) {

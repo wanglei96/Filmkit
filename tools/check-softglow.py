@@ -521,7 +521,11 @@ def main():
     base = out_ref
     r_ch = chan_radius(out_glow, W, H, base)
     check("2a **三通道同半径**（通道差 = 0；与 halation 判据 2a 相反）",
-          float(np.ptp(r_ch)) < 1e-6,
+          # 期 B：kFsOut 编码前引入 3×3 域收口矩阵（workToSrgb）后，中性输入的三通道
+          # 产生 ~1e-6 的浮点微差（矩阵行和 = 1 ⇒ 理论恒等；实测极差 2.30e-06，折算
+          # 8bit 下 0.0006 LSB，不可见）。阈值放到 1e-4 —— 仍比"真通道相关"的 M1
+          # 对照值（0.319）小 3 个数量级 ⇒ 检出能力不变（理由见期 B 归档文档 §8）。
+          float(np.ptp(r_ch)) < 1e-4,
           f"r̄ = R {r_ch[0]:.5f} / G {r_ch[1]:.5f} / B {r_ch[2]:.5f}，"
           f"极差 = {np.ptp(r_ch):.2e}")
     w_halo = glow_weights(0.45, 0.0, SPREAD_HALO)

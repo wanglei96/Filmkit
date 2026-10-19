@@ -389,7 +389,10 @@ def check_text_parity(src):
 
     # 必须存在的差异（域逼出来的）：blurLuma16 的 tap 预处理 + 无 chainLuma
     tap_out = out[out.find("float tapLuma(vec2 uv) {"):out.find("float blurLuma16")]
-    has_tap = "srgbEncode(highlightRolloff(texture(uTex, uv).rgb))" in tap_out
+    # 期 B：kFsOut 编码前多了域收口（srgbEncode(workToSrgb(highlightRolloff(...)))）
+    # ⇒ 判"这对语义是否都在"而不是锚死整串字面量（形态会随域实现变）。
+    has_tap = ("highlightRolloff(texture(uTex, uv).rgb)" in tap_out
+               and "srgbEncode(" in tap_out)
     has_w = "vec3(0.299, 0.587, 0.114)" in tap_out
     has_w_style = "vec3(0.299, 0.587, 0.114)" in style[style.find("float blurLuma16"):]
     clar_out = grab(out, "if (uClarity > 0.0) {", "c += clamp(l0 - lb, -0.25, 0.25) * uClarity;\n    }", "cl:out")
@@ -427,9 +430,11 @@ def check_sharpen(rig, src):
               "一次性证据见报告）")
     else:
         segs = [
+            # 期 B：kFsOut 的**线性域** luma 已改名 `lumaLin`（腾出 `luma()` 给显示域用，
+            # 使 U-1 能与 kFsStyle **逐字照抄**）⇒ 比对前规范化函数名，功能未变。
             ("sharpenLuma 函数段",
              g(a, "void sharpenLuma(inout vec3 c, vec2 uv) {",
-               "c *= 1.0 + clamp(gain, -0.4, 0.4);\n}", "sl:out") ==
+               "c *= 1.0 + clamp(gain, -0.4, 0.4);\n}", "sl:out").replace("lumaLin(", "luma(") ==
              g(b, "void sharpenLuma(inout vec3 c, vec2 uv) {",
                "c *= 1.0 + clamp(gain, -0.4, 0.4);\n}", "sl:head")),
             ("调用行",

@@ -665,7 +665,11 @@ def check_vignette_parity():
 
 
 def check_split_mono_parity():
-    """U-1 ⑰d：`kFsFilm` 与 `kFsStyle` 的 [23][24][25] 数学必须**逐字相同**。
+    """U-1 ⑰d：`kFsOut` 与 `kFsStyle` 的 [23][24][25] 数学必须**逐字相同**。
+
+    ⚠ 期 B 起比对对象是 **kFsOut**（不再是 kFsFilm）：U-1 原在 kFsFilm 的**线性工作空间
+    域**，与编辑器差 43%（同一物理亮度下 luma 不同）⇒ 已挪到 kFsOut 的显示域段，
+    为其专门定义了显示域 `luma()`（与服务 sharpenLuma 的 `lumaLin()` 区分）。
 
     与 ⑨（暗角）/ ⑨b（颗粒）同一手法：这是"效果对齐"的直接证据 —— 比"两个 shader 各跑
     一遍比对数字"更强（域不同、数字本来就不会逐位相等；但**公式**必须逐字相同）。
@@ -673,13 +677,16 @@ def check_split_mono_parity():
       · `float luma(vec3 c)` 定义（718 权重）· ws/wh 权重定义 · split 加法偏移 · mono 去色。
     """
     src = pathlib.Path(FR).read_text(encoding='utf-8')
-    film, style = shader_src(src, 'kFsFilm'), shader_src(src, 'kFsStyle')
+    # 期 B：比对对象 = kFsOut（U-1 已从 kFsFilm 的线性域挪到显示域，见 docstring）
+    out, style = shader_src(src, 'kFsOut'), shader_src(src, 'kFsStyle')
 
     def grab(text):
         """抠出四段原文；split/mono 段把左值变量名（out3 / c）归一化成 X 后比对。"""
         pats = {
-            'luma 定义': r'float luma\(vec3 c\) \{ return dot\(c, vec3\(0\.2126, '
-                         r'0\.7152, 0\.0722\)\); \}',
+            # 期 B：luma 系数随工作空间变（kFsFilm = BT.2020 的 Y，kFsStyle 仍 Rec.709）
+            # ⇒ 正则不锚死系数值，只锚函数形态，让"系数不同"作为**真实差异**被报出来
+            #（该差异是预期的，见期 B 归档文档 §8）。
+            'luma 定义': r'float luma\(vec3 c\) \{ return dot\(c, vec3\([^)]*\)\); \}',
             'ws/wh 权重': r'float ws = exp\(-l \* 3\.0\);\s*\n\s*'
                           r'float wh = smoothstep\(0\.5, 1\.0, l\);',
             'split 加法': r'(\w+) \+= uSplit\.x \* ws \* vec3\(0\.05, 0\.02, -0\.04\)\s*\n\s*'
@@ -697,8 +704,8 @@ def check_split_mono_parity():
                       if m.groups() else seg)
         return out
 
-    a, b = grab(film), grab(style)
-    return [f'{k}（film={a[k]!r} vs style={b[k]!r}）' for k in a if a[k] != b[k]]
+    a, b = grab(out), grab(style)
+    return [f'{k}（out={a[k]!r} vs style={b[k]!r}）' for k in a if a[k] != b[k]]
 
 
 def split_mono_np(c0, split, mono):
@@ -1553,25 +1560,25 @@ def main():
     if not ok17c:
         fails.append('⑰c 分离色调')
 
-    # ⑰d 与 kFsFilm **逐字同式**（四段文本比对）+ 域差异量化（同一物理亮度下两侧的
-    # 权重与偏移幅度）—— "方向与幅度量级一致"的可核对数字就在这里。
+    # ⑰d 与 kFsStyle **逐字同式**（四段文本比对，对象 = kFsOut —— 期 B 起 U-1 已从
+    # kFsFilm 的线性工作空间域挪到 kFsOut 的显示域段，见 check_split_mono_parity 的 docstring）。
     diff17d = check_split_mono_parity()
-    print(f'⑰d kFsFilm 与 kFsStyle 的 U-1 数学逐字比对：差异段 = '
+    print(f'⑰d kFsOut 与 kFsStyle 的 U-1 数学逐字比对：差异段 = '
           f'{diff17d or "无（0 处）"}')
     if diff17d:
         fails.append('⑰d 两处一致性')
-    print('   域差异量化（同一**物理**亮度：线性域 l 与其显示域编码 srgbEncode(l)）：')
+    print('   【历史对照】挪动**前**的域差异量化（同一物理亮度下线性域 vs 显示域权重）：')
     for l_lin in (0.02, 0.05, 0.18, 0.5, 0.9):
         l_disp = float(srgb_encode_np(np.array(l_lin)))
         ws_f, wh_f = math.exp(-l_lin * 3.0), float(smoothstep_np(0.5, 1.0, np.array(l_lin)))
         ws_s, wh_s = math.exp(-l_disp * 3.0), float(smoothstep_np(0.5, 1.0, np.array(l_disp)))
-        print(f'   l_lin={l_lin:<5} l_disp={l_disp:.4f} | kFsFilm ws={ws_f:.4f} '
+        print(f'   l_lin={l_lin:<5} l_disp={l_disp:.4f} | 线性域 ws={ws_f:.4f} '
               f'wh={wh_f:.4f} ΔR(阴影暖)={0.05 * ws_f * 255:+.2f} ΔB(高光冷)={0.05 * wh_f * 255:+.2f}'
-              f' | kFsStyle ws={ws_s:.4f} wh={wh_s:.4f} ΔR={0.05 * ws_s * 255:+.2f} '
+              f' | 显示域 ws={ws_s:.4f} wh={wh_s:.4f} ΔR={0.05 * ws_s * 255:+.2f} '
               f'ΔB={0.05 * wh_s * 255:+.2f} LSB')
-    print('   ⇒ 系数/权重公式逐字相同（⑰d 文本比对），差异 **100% 来自 luma 的域**：'
-          '同一物理亮度下显示域 l 更大 ⇒ 阴影权重更小（中灰 0.18：film 0.583 vs '
-          'style 0.250 = 43%）、高光权重更早起跳（l_disp ≥ 0.5 即 l_lin ≥ 0.214）。')
+    print('   ⇒ 期 B 前 U-1 在 kFsFilm 用**线性域** luma ⇒ 同一物理亮度下权重比显示域小'
+          '（中灰 0.18：0.583 vs 0.250 = 43%）⇒ 编辑器调出来的效果与拍照对不上；'
+          '现已挪到 kFsOut 的显示域段，两条链路逐字同式（上一条判据）。')
 
     gl.close()
     print('全部通过' if not fails else f'失败项：{fails}')
