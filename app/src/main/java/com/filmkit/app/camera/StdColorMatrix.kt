@@ -24,11 +24,22 @@ import android.hardware.camera2.CameraCharacteristics
  */
 object StdColorMatrix {
 
-    /** XYZ(D50) → 线性 sRGB：Bradford D50→D65 与 sRGB 原色矩阵的乘积（离线算好）。 */
+    /** XYZ(D50) → **线性 Rec.2020**（期 B：公共工作空间切 Rec.2020 线性）。
+     *  Bradford D50→D65 与 Rec.2020 原色矩阵的乘积；由 `tools/rec2020-domain-matrices.py`
+     *  构造（构造法，非手填），并与 PhotonCamera 的 BT2020 矩阵逐位对拍（4.4e-07）。 */
     private val X2S = floatArrayOf(
-        3.133996f, -1.616931f, -0.490698f,
-        -0.978413f, 1.915921f, 0.033398f,
-        0.071996f, -0.228962f, 1.404947f,
+        1.647278558f, -0.393596939f, -0.235981058f,
+        -0.682614761f, 1.647609814f, 0.012815895f,
+        0.029664043f, -0.062919128f, 1.253431151f,
+    )
+
+    /** 线性 sRGB → 线性 Rec.2020（期 B：HAL 回退链的域补齐）。
+     *  真源 = `tools/rec2020-domain-matrices.py`；与 shader 里 kFsOes / kFsStill 的
+     *  `srgbToWork` **同值** —— 改这里必须同步那边（两处不同步 = 预览/成片再次域错配）。 */
+    private val SRGB_TO_WORK = floatArrayOf(
+        0.6274038959f, 0.3292830384f, 0.0433130657f,
+        0.0690972894f, 0.9195403951f, 0.0113623156f,
+        0.0163914389f, 0.0880133079f, 0.8955952532f,
     )
 
     /** 标定光源（DNG CalibrationIlluminant 码）→ XYZ 白点。只列本机型会用到的。 */
@@ -47,6 +58,18 @@ object StdColorMatrix {
     private fun mulVec(m: FloatArray, v: FloatArray): FloatArray = FloatArray(3) { r ->
         m[r * 3] * v[0] + m[r * 3 + 1] * v[1] + m[r * 3 + 2] * v[2]
     }
+
+    /**
+     * HAL 的 `COLOR_CORRECTION_TRANSFORM`（sensor → **线性 sRGB**）→ 工作空间（线性 Rec.2020）。
+     *
+     * 期 B：标准链（[compute]）的终点已切到 Rec.2020，而 HAL 回退在语义上必须与它**等价**
+     * （调用点是 `stdCcm ?: halCcm`）⇒ 回退链也要补同一层域转换。不补的话，"关闭 DNG
+     * 标准色彩链"时 sRGB 线性数据会被下游当成 Rec.2020 用 —— 真机症状：**偏饱和**
+     * （sRGB 原色三角更窄 ⇒ 同一物理色的数值饱和度更高）。
+     *
+     * @param hal 行主序 9 元素（读取口径见 `CameraController.halCcmOf`）
+     */
+    fun halToWorking(hal: FloatArray): FloatArray = mul(SRGB_TO_WORK, hal)
 
     private fun cst9(t: android.hardware.camera2.params.ColorSpaceTransform?): FloatArray? {
         t ?: return null

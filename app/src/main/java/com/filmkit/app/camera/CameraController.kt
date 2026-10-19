@@ -3248,9 +3248,13 @@ class CameraController(private val context: Context, private val render: RenderC
                 nR = 1f; nG = 1f; nB = 1f
             }
         }
-        val halCcm = halCcmOf(result)
+        // 期 B：HAL 的 COLOR_CORRECTION_TRANSFORM 终点是**线性 sRGB**，而标准链（下面的
+        // stdCcm）终点已切 Rec.2020。两者是"优先 / 回退"关系（`stdCcm ?: halCcm`）⇒
+        // 回退链必须补同一层域转换，否则"关闭标准色彩链"时 sRGB 线性数据被下游当 Rec.2020
+        // 用（真机症状：偏饱和）。日志 `ccmHal`（:2896）仍记**原始** HAL 矩阵，便于诊断。
+        val halCcm = StdColorMatrix.halToWorking(halCcmOf(result))
         // 色彩链（§3.2-7 / §3.4-4）：优先用 characteristics 标定矩阵自建标准链
-        // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→sRGB，与 Adobe/libraw 完整链同源）；
+        // （ColorMatrix/ForwardMatrix 双光源 + Bradford D50→Rec.2020，与 Adobe/libraw 完整链同源）；
         // 开关关或标定数据缺失 → 回退 HAL 的 COLOR_CORRECTION_TRANSFORM（跨机型兜底）
         val stdCcm = if (appPrefs.getBoolean("ccm_std", true)) {
             StdColorMatrix.compute(ch, floatArrayOf(nR, nG, nB))

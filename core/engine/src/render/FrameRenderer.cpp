@@ -328,10 +328,36 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform samplerExternalOES uTex;
 uniform vec3 uWb;
+// ── 期 B：预览链路的域补齐 ───────────────────────────────────────────────────
+// HAL 预览流是 **sRGB 编码**，pow(2.2) 之后是"近似 sRGB 线性"；而本链路**不进 CCM**
+//（实读：`uCcm` 只出现在 kFsRaw / kFsCcm，本 shader 没有）⇒ 数据一直停在 sRGB 线性，
+// 而下游 kFsFilm / kFsOut 已按 **Rec.2020** 工作 ⇒ 域错配（症状：预览与成片偏差拉大）。
+// 这里补一次 sRGB 线性 → Rec.2020 线性；矩阵与 kFsOut 的 workToSrgb **互逆**
+//（真源 `tools/rec2020-domain-matrices.py`）。
+// ⚠ uWb 保持在原位置（解码之后、域转换之前）：它是既有标定过的通道增益，不动作用域。
+vec3 srgbToWork(vec3 c) {
+    return vec3(dot(c, vec3(0.6274038959, 0.3292830384, 0.0433130657)),
+                dot(c, vec3(0.0690972894, 0.9195403951, 0.0113623156)),
+                dot(c, vec3(0.0163914389, 0.0880133079, 0.8955952532)));
+}
+// 期 B（D1 债清偿）：输入去 gamma 从 `pow(2.2)` 近似换成**真 sRGB EOTF**（IEC 61966-2-1
+// 分段，与 kFsOut / kFsStyle 的 `srgbEncode` 严格互逆）。
+// 为什么现在才换：换域**之前**输出端已是真 sRGB、输入端却是 2.2 幂 ⇒ 两侧不同步。
+// 实测差异（EOTF 方向 = display→线性）：display 0.2 处 真 sRGB 0.033105 vs 2.2 幂
+// 0.028991，差约 **1 LSB**；**2.2 幂在暗部一律偏暗**，中高光几乎重合（1.0 处完全一致）。
+// 用户实测"预览与成片仍有差距"⇒ 这是可消除的那一半；另一半是**架构性**的（预览拿不到
+// RAW、走厂商 ISP，成片走我们的 CCM）⇒ 消不掉。
+// ⚠ 会改变预览/静拍的**暗部亮度**；预览域比 `uDomainRatio` 是 EMA 在线标定，会自行收敛。
+vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    vec3 lo = c / 12.92;
+    return mix(hi, lo, step(c, vec3(0.04045)));
+}
 void main() {
     vec3 rgb = clamp(texture(uTex, vUV0).rgb, 0.0, 1.0);
-    vec3 lin = pow(rgb, vec3(2.2)) * uWb;
-    oColor = vec4(lin, 1.0);
+    vec3 lin = srgbDecode(rgb) * uWb;
+    oColor = vec4(srgbToWork(lin), 1.0);
 })";
 
 // 静拍 pass1：采样 CPU 转换后的 RGB888 全分辨率纹理。
@@ -343,11 +369,26 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform sampler2D uTex;
 uniform vec3 uWb;
+// 期 B：与 kFsOes 同一处域补齐（静拍链同样不进 CCM、同样被下游按 Rec.2020 消费）
+// —— 两处必须同式，否则预览与静拍会互相不一致。
+vec3 srgbToWork(vec3 c) {
+    return vec3(dot(c, vec3(0.6274038959, 0.3292830384, 0.0433130657)),
+                dot(c, vec3(0.0690972894, 0.9195403951, 0.0113623156)),
+                dot(c, vec3(0.0163914389, 0.0880133079, 0.8955952532)));
+}
+// 期 B（D1）：与 kFsOes **同式** —— 静拍链与预览链的去 gamma 口径必须一致，否则两者
+// 自己就先不一致了（真实 sRGB EOTF 而非 2.2 幂，理由见 kFsOes 的注释）。
+vec3 srgbDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    vec3 lo = c / 12.92;
+    return mix(hi, lo, step(c, vec3(0.04045)));
+}
 void main() {
     vec2 uv = vec2(vUV0.x, 1.0 - vUV0.y);
     vec3 rgb = clamp(texture(uTex, uv).rgb, 0.0, 1.0);
-    vec3 lin = pow(rgb, vec3(2.2)) * uWb;
-    oColor = vec4(lin, 1.0);
+    vec3 lin = srgbDecode(rgb) * uWb;
+    oColor = vec4(srgbToWork(lin), 1.0);
 })";
 
 // Pass1·填充测试：绕过 OES 采样（真机二分定位用）。
@@ -4099,7 +4140,10 @@ uniform float uLocalKnee;      // 提亮衰减 knee 下界（局部亮度 / 画�
 uniform float uLocalKneeHi;    // 上界：ratio 高于它完全不提亮
 uniform float uLocalRef;       // 画面基准亮度（局部图中位，CPU 侧下发）
 uniform vec2 uLocalSize;       // 局部图尺寸（用于手写双线性）
-float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// 期 B：工作空间 = 线性 Rec.2020 ⇒ luma 取 **BT.2020 的 Y 系数**（原 0.2126/0.7152/0.0722
+// 是 Rec.709/sRGB 原色的；域与系数不一致会让 uSat 分区权重 / uLook / uMono 偏）。
+// ⚠ 本 shader 内没有 OETF ⇒ 三处调用（uSat 分区、uLook、uMono）全在**线性工作空间域**。
+float luma(vec3 c) { return dot(c, vec3(0.2627, 0.6780, 0.0593)); }
 // ── 基准影调（M3 色彩内核 v1，治"发灰"）──────────────────────────────
 // 中性参数下本 pass 数学上恒等（out3 = lin），全链没有任何影调工程 —— 直方图
 // 挤中间（P0.1≈20、>224 占 0.00%、无真黑无真白）。三点锚定的 S 曲线：
@@ -4257,27 +4301,33 @@ vec3 filmicTone(vec3 c) {
 //   —— 常色度常色相裁剪；③ Y 合法后仍可能单通道越界 —— 恒 Y 恒色相下解析解
 //   最大合法色度（白/黑两边界）。此前"过曝灯管留品红/高饱和边缘过冲/色相漂移"
 //   的直接机制就在这三步的缺失。
-// 常量：全部来自 darktable 源码，不可调。
+// 常量：来自 darktable 源码，不可调。
+// ⚠ 期 B（公共工作空间切线性 Rec.2020）：下面 6 个 vec3 是**唯一随工作空间变**的一组
+//   （工作空间 RGB ↔ LMS2006）。其余全部与工作空间无关：Y 1931↔2006 换算、D65 色度锚、
+//   LMS2006↔Filmlight 变换、Vwright 加权，以及色域边界解析解内的系数（后者把"原色"
+//   经 coeffs 参数传入，见 gamutClipChroma 调用点）。
+//   新值由 `tools/rec2020-domain-matrices.py` 构造（构造法，非手填），并与 PhotonCamera
+//   的 BT2020 版逐位对拍（max|Δ| = 9.8e-11）；阶段 4（AP0/D60）只需再换这一组。
 const float kYchY1931To2006 = 1.05785528;
 const float kYchD65R = 0.21902143;
 const float kYchD65G = 0.54371398;
-const vec3 kLmsSrgbToLmsL = vec3(0.2986531876, 0.7060763220, 0.0656966248);
-const vec3 kLmsSrgbToLmsM = vec3(0.0959000021, 0.7198304285, 0.1011531117);
-const vec3 kLmsSrgbToLmsS = vec3(0.0224644230, 0.0449176289, 0.5270630110);
-const vec3 kLmsToSrgbRowR = vec3(4.8627131007, -4.7893329888, 0.3130405567);
-const vec3 kLmsToSrgbRowG = vec3(-0.6262137162, 2.0228185813, -0.3101607577);
-const vec3 kLmsToSrgbRowB = vec3(-0.1538905312, 0.0317407724, 1.9103966448);
+const vec3 kLmsWorkToLmsL = vec3(0.4067763459, 0.6178051992, 0.0458445893);
+const vec3 kLmsWorkToLmsM = vec3(0.0677498630, 0.7489671634, 0.1001665159);
+const vec3 kLmsWorkToLmsS = vec3(0.0221408643, -0.0153252588, 0.5876294574);
+const vec3 kLmsToWorkRowR = vec3(2.8380181192, -2.3373915421, 0.1770173204);
+const vec3 kLmsToWorkRowG = vec3(-0.2415770700, 1.5294941185, -0.2418685680);
+const vec3 kLmsToWorkRowB = vec3(-0.1132319088, 0.1279577821, 1.6887750821);
 const vec3 kLmsToFilmRowR = vec3(1.08771930, -0.66666667, 0.02061856);
 const vec3 kLmsToFilmRowG = vec3(-0.08771930, 1.66666667, -0.05154639);
 const vec3 kLmsToFilmRowB = vec3(0.0, 0.0, 1.03092784);
 const vec3 kFilmToLmsRowL = vec3(0.95, 0.38, 0.0);
 const vec3 kFilmToLmsRowM = vec3(0.05, 0.62, 0.03);
 const vec3 kFilmToLmsRowS = vec3(0.0, 0.0, 0.97);
-vec3 gamutSrgbToLms(vec3 c) {
-    return vec3(dot(kLmsSrgbToLmsL, c), dot(kLmsSrgbToLmsM, c), dot(kLmsSrgbToLmsS, c));
+vec3 gamutWorkToLms(vec3 c) {
+    return vec3(dot(kLmsWorkToLmsL, c), dot(kLmsWorkToLmsM, c), dot(kLmsWorkToLmsS, c));
 }
-vec3 gamutLmsToSrgb(vec3 l) {
-    return vec3(dot(kLmsToSrgbRowR, l), dot(kLmsToSrgbRowG, l), dot(kLmsToSrgbRowB, l));
+vec3 gamutLmsToWork(vec3 l) {
+    return vec3(dot(kLmsToWorkRowR, l), dot(kLmsToWorkRowG, l), dot(kLmsToWorkRowB, l));
 }
 vec3 gamutLmsToFilmlight(vec3 l) {
     return vec3(dot(kLmsToFilmRowR, l), dot(kLmsToFilmRowG, l), dot(kLmsToFilmRowB, l));
@@ -4312,8 +4362,8 @@ vec4 gamutYrgToYch(vec3 yrg) {
 vec3 gamutYchToYrg(vec4 ych) {
     return vec3(ych.x, ych.y * ych.z + kYchD65R, ych.y * ych.w + kYchD65G);
 }
-vec4 gamutRgbToYch(vec3 c) { return gamutYrgToYch(gamutLmsToYrg(gamutSrgbToLms(c))); }
-vec3 gamutYchToRgb(vec4 ych) { return gamutLmsToSrgb(gamutYrgToLms(gamutYchToYrg(ych))); }
+vec4 gamutRgbToYch(vec3 c) { return gamutYrgToYch(gamutLmsToYrg(gamutWorkToLms(c))); }
+vec3 gamutYchToRgb(vec4 ych) { return gamutLmsToWork(gamutYrgToLms(gamutYchToYrg(ych))); }
 // 历史注（勿再误读）：v0.10.14 曾按链级模拟预删「Ych 色度取 min」与 desaturate(0)
 // 两步，v0.10.17 起已按用户铁律**全量恢复**（先 100% 原版跑通→真机→数据评估）——
 // 下面的 gamutMapV5 函数体是完整五步，本注释仅为历史记录。2026-09-28 定性：min 的
@@ -4394,7 +4444,7 @@ vec3 gamutCheckRgb(vec4 ychIn) {
     vec4 ychB = gamutRgbToYch(brightened);
     float y = clamp(0.5 * (ychIn.x + ychB.x),
                     kYchY1931To2006 * 0.0001517634, kYchY1931To2006);
-    float newC = gamutClipChroma(kLmsToSrgbRowR, kLmsToSrgbRowG, kLmsToSrgbRowB,
+    float newC = gamutClipChroma(kLmsToWorkRowR, kLmsToWorkRowG, kLmsToWorkRowB,
                                  1.0, y, ychIn.z, ychIn.w, ychIn.y);
     return clamp(gamutYchToRgb(vec4(y, newC, ychIn.z, ychIn.w)), 0.0, 1.0);
 }
@@ -4506,8 +4556,11 @@ void main() {
     float wm = max(0.0, 1.0 - ws - wh);
     float sat = clamp(uSat.x * ws + uSat.y * wm + uSat.z * wh, 0.0, 2.0);
     out3 = mix(vec3(l), out3, sat);
-    out3 += uSplit.x * ws * vec3(0.05, 0.02, -0.04)
-          + uSplit.y * wh * vec3(-0.03, 0.0, 0.05);
+    // ⚠ U-1 [23][24] split + [25] mono **不在这里** —— 期 B 已挪到 kFsOut 的显示域段
+    //（LUT 之前），与 kFsStyle **同域同式**。原因：本 shader 是线性工作空间域，同一物理
+    // 亮度下 luma 比显示域小（线性 0.18 ↔ 显示 0.46）⇒ 阴影权重 exp(-3l) 差 43%，
+    // 编辑器里调出来的效果与拍照对不上（量化见归档文档 §8.1 的 ⑰d）。
+    // ws/wh 本身留在本段：uSat 的分区权重仍用它（那是另一回事，不受影响）。
     // ── 色彩外观层（M3 P1，治"寡淡"）────────────────────────────────
     // v0.5.42 诊断：中性色准（R/G 0.987）但饱和 -21% / 通道分离 -29% /
     // 近中性像素多 10pp —— 颜色全挤在中性附近。这里补"外观"（不是风格）：
@@ -4553,7 +4606,7 @@ void main() {
         out3 = la + cc * (1.0 + (uLookSat - 1.0) * uLook)
                        * (1.0 + (uLookChroma - 1.0) * sk * uLook);
     }
-    out3 = mix(out3, vec3(luma(clamp(out3, 0.0, 4.0))), uMono);
+    // U-1 [25] mono 与 split 一并挪到 kFsOut 的显示域段（同域同式，理由见上方 uSat 段注释）。
     oColor = vec4(out3, 1.0);
 })";
 
@@ -4785,6 +4838,18 @@ uniform float uBlacks;       // [93] 黑色色阶（0 = 不动）
 uniform float uFade;         // [94] 褪色（抬起黑场；0 = 关）
 uniform float uToneOn;       // 门控（CPU 侧算）：[90..93] 任一非 0
 uniform float uZebra;  // 过曝提示阈值（显示域，0 = 关；仅预览路径传非 0）
+// U-1 [23][24] 分离色调 + [25] 单色 —— 期 B 从 kFsFilm 挪来（那边是线性工作空间域、
+// 与编辑器差 43%）；本 shader 的这几段都在 OETF **之后**的显示域 ⇒ 与 kFsStyle 同域。
+// ⚠ 刻意放在 U-4 的 uniform 段（uClarity..uToneOn）**之外**：check-u4 判据①以"机械删除
+// U-4 三段"构造对照 shader，删除范围的终点哨兵是 `uZebra` —— 插在它之前会被一起删掉，
+// 于是对照 shader 里 U-1 段引用到未声明的 uniform，直接编译失败。
+uniform vec2 uSplit;         // [23] split_warm / [24] split_cool（0 = 不动）
+uniform float uMono;         // [25] 单色（0 = 关）
+// 期 B：引擎 1 的对比度（`[4]`）。引擎 0 的 `[4]` 在 updateFilmicEV 里折算成 filmic 曲线
+// 系数（引擎 1 的 program 里根本不存在那些 uniform）⇒ 引擎 1 此前**没有对比度实现**，
+// 滑杆完全无效（用户实测反馈）。本 uniform 由 CPU 侧按引擎下发：
+// 引擎 1 = `p.contrast`、引擎 0 = **1.0**（恒等 ⇒ 引擎 0 零回归，它的对比度已由曲线系数承担）。
+uniform float uContrastOut;
 uniform float uSharpen;  // v0.9.6 轻度锐化强度（0 = 关，A/B 通路；FilmParams[39]）
 // ── M4 3D LUT（display 域）────────────────────────────────────────────
 // 域感知插桩：display 域 LUT 必须接在输出 OETF 之后（§0-D10 / §6.1）。
@@ -4969,6 +5034,13 @@ vec3 highlightRolloff(vec3 c) {
     vec3 cc = c * (lc / l);                           // 等比压缩，保持色相
     return mix(cc, vec3(lc), smoothstep(knee, 1.0, l));  // 过曝趋白（终点 = 显示上限）
 }
+// 期 B：本函数只服务下面的 sharpenLuma（**OETF 前的线性显示域** = 工作空间域）
+// ⇒ 系数取 BT.2020 的 Y（原 0.2126/0.7152/0.0722 是 Rec.709/sRGB 原色的）。
+// ⚠ 同 shader 内 U-4 的 tapLuma 用的是 **Rec.601**（那是 OETF **之后**的显示域；
+//   两者故意不统一，理由见下方 tapLuma 注释）—— 不要把这两套混起来。
+float lumaLin(vec3 c) { return dot(c, vec3(0.2627, 0.6780, 0.0593)); }
+// 期 B：**显示域** luma（OETF 之后，Rec.709 系数）—— 与 kFsStyle 的同名函数**逐字相同**，
+// 供 U-1（split/mono）逐字照抄比对用。两条链路的一致性靠"同一套数学"维持（项目既有做法）。
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // ── v0.9.6 轻度锐化（luma USM，OETF 前线性显示域）─────────────────────────
 // 管线定稿顺序（2026-09-27 决策）：filmic → EV → 高光滚降 → **锐化** → OETF。
@@ -4988,24 +5060,24 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // 暗部小 l0 处 ÷l0 的放大；luma 地板 0.01（显示域 ≈ 42/255）防除零。
 // 8 邻手动展开 —— GLSL ES 不支持数组初始化器（desktop 4.2+ 特性，本仓库两次踩坑）。
 void sharpenLuma(inout vec3 c, vec2 uv) {
-    float l0 = luma(c);
+    float l0 = lumaLin(c);
     float lb = 4.0 * l0;
     vec3 t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, 0.0)).rgb);
-    lb += 2.0 * luma(t);
+    lb += 2.0 * lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, 0.0)).rgb);
-    lb += 2.0 * luma(t);
+    lb += 2.0 * lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(0.0, -1.0)).rgb);
-    lb += 2.0 * luma(t);
+    lb += 2.0 * lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(0.0, 1.0)).rgb);
-    lb += 2.0 * luma(t);
+    lb += 2.0 * lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, -1.0)).rgb);
-    lb += luma(t);
+    lb += lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, -1.0)).rgb);
-    lb += luma(t);
+    lb += lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(-1.0, 1.0)).rgb);
-    lb += luma(t);
+    lb += lumaLin(t);
     t = highlightRolloff(texture(uTex, uv + uPx * vec2(1.0, 1.0)).rgb);
-    lb += luma(t);
+    lb += lumaLin(t);
     float gain = uSharpen * (l0 - lb / 16.0) / max(l0, 0.01);
     c *= 1.0 + clamp(gain, -0.4, 0.4);
 }
@@ -5026,6 +5098,38 @@ vec3 srgbEncode(vec3 c) {
     vec3 lo = 12.92 * c;                                // 线性段（暗部）
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
+// ── 期 B：线性工作空间（Rec.2020）→ 线性 sRGB（含域外色压缩）──────────────────
+// 工作空间换成 Rec.2020 后，本 shader 的输入（tex_work_，滚降前的**线性显示域**）是
+// Rec.2020 线性；而输出编码仍是 sRGB（交付域不变，见设计 §7 R1）⇒ 编码前必须做一次
+// 色域收口。矩阵由 `tools/rec2020-domain-matrices.py` 构造，与 PhotonCamera 的
+// `computeWorkingToOutputTransform(BT2020, SRGB)` 同式（sRGB→Rec.2020 方向对拍 4.4e-07）。
+vec3 workToSrgb(vec3 c) {
+    return vec3(dot(c, vec3(1.6604910021, -0.5876411388, -0.0728498633)),
+                dot(c, vec3(-0.1245504745, 1.1328998971, -0.0083494226)),
+                dot(c, vec3(-0.0181507634, -0.1005788980, 1.1187296614)));
+}
+// 域外色压缩（**必须与 workToSrgb 成对使用**，否则 srgbEncode 入口的 clamp 会硬切）。
+// 为什么必须有：Rec.2020 装得下、sRGB 装不下的颜色（实物里的红花/霓虹），经 workToSrgb
+// 后会出现**负分量**；clamp(c,0,1) 把负值切为 0 ⇒ **饱和度被削掉**、色相也偏。
+// 真机实测（0.11.47）：开标准链「饱和偏低（对比实物肉眼观感）」正是这个硬切。
+// 做法 = 朝中性轴去饱和，直到最小分量 = 0（**保亮度、保色相**，比 clamp 正确得多）：
+//   解 mix(c, vec3(l), t) 的最小分量 = 0 ⇒ t = mn / (mn − l)（mn<0、l>0 ⇒ t∈(0,1]）。
+// ⚠ 只压**下界**（负值 = 域外色）；上界仍由 srgbEncode 的 clamp 处理（那是过曝，本就该切）。
+// ⚠ 升级路径：换 kFsFilm 里那套 gamutClipChroma（恒 Y 恒色相解析解），代价是要把 LMS
+//   那组函数搬进本 shader —— 先用简版实测，数据说需要再上（见归档文档 §6 D4）。
+vec3 gamutFit(vec3 c) {
+    float mn = min(min(c.r, c.g), c.b);
+    if (mn >= 0.0) return c;
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    // ⚠ 整色无正亮度（l ≤ 0）时，朝中性轴去饱和救不回来：t=1 的结果就是 vec3(l)，
+    //   而 l 本身为负 ⇒ 必须直接压到黑（数值自检抓到过这个边界）。
+    if (l <= 1e-8) return vec3(0.0);
+    float denom = mn - l;
+    if (denom > -1e-8) return vec3(0.0);   // 极端（整色无正亮度）⇒ 压到黑
+    return mix(c, vec3(l), clamp(mn / denom, 0.0, 1.0));
+}
+/// 域收口 = 转换 + 压缩（唯一入口：调用方不要直接调 workToSrgb，见上方注释）
+vec3 workToDisplayLinear(vec3 c) { return gamutFit(workToSrgb(c)); }
 // ── SG-1 柔光图取值：手写双线性 + 线性→显示域编码 ────────────────────────────
 // 手写双线性：RGBA16F 无 LINEAR 过滤（X300 实测，见 makeTex）⇒ 直接 texture() 采
 // 1/2 分辨率的柔光图会退化成 2×2 最近邻块，Screen 混合会把块边放大成可见方块。
@@ -5060,7 +5164,7 @@ float glowFetch(vec2 uv) {
 //   在拍照链路全部位于更早的 pass（RAW 线性域）或根本不在本链路（局部调整只服务编辑器）
 //   ⇒ 不存在"中心已过、基准没过"的差。**不写空的 chainLuma**（YAGNI：留着会让人以为
 //   拍照链路也有域提升，改天有人往里加一项就出上面那个事故）。
-// ⚠️ 权重是 **Rec.601**（0.299/0.587/0.114），与本 shader 顶部的 luma()（Rec.709，
+// ⚠️ 权重是 **Rec.601**（0.299/0.587/0.114），与本 shader 顶部的 lumaLin()（Rec.709，
 //   服务 sharpenLuma）**故意不统一** —— 必须与 kFsStyle 的 blurLuma16 逐字一致（kFsStyle
 //   内部同样是"601 的局部对比 + 709 的 split/mono"两套，理由见那里的注释）。
 // ⚠️ GLSL 三禁：无数组参数、无循环、无多行宏（本段 16 行手动展开是硬要求）。
@@ -5068,7 +5172,7 @@ float glowFetch(vec2 uv) {
 //   的裁剪在**引擎输入侧**就做完了（tex_work_ 已是裁剪后画面）⇒ tap 直接用 uv + 偏移。
 //   环偏移对称 ⇒ uFlipY 的 y 翻转不改变环形状（±d 仍是 ±d）。
 float tapLuma(vec2 uv) {
-    return dot(srgbEncode(highlightRolloff(texture(uTex, uv).rgb)),
+    return dot(srgbEncode(workToDisplayLinear(highlightRolloff(texture(uTex, uv).rgb))),
                vec3(0.299, 0.587, 0.114));
 }
 float blurLuma16(vec2 uv) {
@@ -5099,7 +5203,17 @@ void main() {
     vec3 c = texture(uTex, uv).rgb;
     c = highlightRolloff(c);
     if (uSharpen > 0.0) sharpenLuma(c, uv);
-    c = srgbEncode(c);
+    c = srgbEncode(workToDisplayLinear(c));
+    // ── 期 B：引擎 1 的对比度（`[4]`）──────────────────────────────────────────
+    // 放在 display 域、OETF 之后：引擎 0 的 `[4]` 在 updateFilmicEV 里折算成 filmic 曲线
+    // 系数，引擎 1 没有对应物 ⇒ 补一个与 kFsStyle **同式**的实现（display 域绕中灰 0.5
+    // 线性拉伸）。引擎 0 时 CPU 侧下发 1.0 ⇒ 本段恒等，**逐位零回归**。
+    // 位置 = U-4 段之前（与 kFsStyle 的次序一致：对比度在影调分区/清晰度之前）。
+    // ⚠ 判据必须写 `> 0.0`、**不能写 `!= 1.0`**：uniform 的默认值是 0，而任何没走到下发点
+    // 的路径（离线执行器 / 测试夹具）都会拿到它 —— 写 `!= 1.0` 就会执行
+    // `clamp((c−0.5)×0+0.5)` 把画面拉成**平坦灰 0.5**（实测踩过：check-u4 判据②
+    // max|Δ| = 119.5 LSB）。引擎 0 下发 1.0，clamp 在 [0,1] 内是恒等 ⇒ 零回归。
+    if (uContrastOut > 0.0) c = clamp((c - 0.5) * uContrastOut + 0.5, 0.0, 1.0);
     // ── U-4 ① 清晰度（显示域局部对比；0 = 关）*[78]* ───────────────────────────
     // 形式 = **加性 luma USM**（照 kFsStyle 的 ④ 段 `c += (l0 - lb) * uClarity`，逐字同式）：
     // RGB 同加一个标量 ⇒ 只抬局部亮度，不逐通道拉伸。差值限幅 ±0.25 拦高反差边缘过冲
@@ -5164,6 +5278,19 @@ void main() {
         float vw = clamp((cplen - uVigDscale) / uVigFscale, 0.0, 1.0);
         vw = 0.5 - 0.5 * cos(3.14159265 * vw);     // 余弦平滑（darktable 同式）
         c *= (1.0 + vw * uVigBrightness);
+    }
+    // ── U-1 [23][24] 分离色调 + [25] 单色（显示域；与 kFsStyle **逐字同式**）────────
+    // 期 B 从 kFsFilm 挪来：那边是线性工作空间域，同一物理亮度下 luma 更小（线性 0.18
+    // ↔ 显示 0.46）⇒ 阴影权重 exp(-3l) 差 43%，编辑器调出来的效果与拍照对不上。
+    // 位置与 kFsStyle 完全同序（暗角之后、LUT 之前）；数学**逐字照抄 kFsStyle**，
+    // 只用本 shader 的**显示域** `luma()`（不是服务 sharpenLuma 的 `lumaLin()`）。
+    if (uSplit.x != 0.0 || uSplit.y != 0.0 || uMono > 0.0) {
+        float l = luma(c);
+        float ws = exp(-l * 3.0);
+        float wh = smoothstep(0.5, 1.0, l);
+        c += uSplit.x * ws * vec3(0.05, 0.02, -0.04)
+           + uSplit.y * wh * vec3(-0.03, 0.0, 0.05);
+        c = mix(c, vec3(luma(clamp(c, 0.0, 4.0))), uMono);
     }
     // M4：display 域 3D LUT（在 OETF 之后 —— 显示域 LUT 放到线性域会错色）
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
@@ -5465,6 +5592,13 @@ vec3 srgbEncode(vec3 c) {
     vec3 lo = 12.92 * c;
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
+// ── 期 B 说明：本 shader **刻意不做**工作空间域转换 ──────────────────────────
+// 编辑器链的输入是**已成片 sRGB**（显示域），srgbDecode 得到 sRGB 线性；本链的线性
+// 操作只有"曝光 × WB"（见下方 E2-2 往返），而拍照链路的曝光/WB 在 **RAW 域与预览
+// 输入域**应用、根本不在工作空间里 ⇒ 这里不需要也不应该跟随工作空间。
+// ⚠ 曾经的教训：加过一次 workToSrgb/srgbToWork，结果**只改变了色温/色调**的显示效果
+//（实测 27~171 LSB），反而与拍照链路更不一致 ⇒ 已回滚（归档文档 §8.1）。
+// ⚠ chainLuma 那处是**标量**往返：任何保白点矩阵对中性值恒等，本来也不需要转换。
 // ── SG-1 柔光图取值：手写双线性 + 线性→显示域编码 ────────────────────────────
 // 手写双线性：RGBA16F 无 LINEAR 过滤（X300 实测，见 makeTex）⇒ 直接 texture() 采
 // 1/2 分辨率的柔光图会退化成 2×2 最近邻块，Screen 混合会把块边放大成可见方块。
@@ -5680,6 +5814,12 @@ void main() {
     // 必须用真 sRGB 分段曲线（srgbDecode/srgbEncode）：pow(2.2) 近似的暗部往返
     // 误差实测可达 9/255 —— 这是"画面发灰"的独立来源之一。
     if (uExpWbOn > 0.5 || (uLocalEvOn > 0.5 && m > 0.0)) {
+        // 期 B 结论：本段**刻意保持 sRGB 线性域**，不跟随工作空间。
+        // 实读 C++ 侧（`wbTempTint` → `wbCompGNorm` / `prepareRawCommon`）：拍照链路的
+        // 曝光/WB 在 **RAW 域与预览输入域**应用，根本不在工作空间里；而曝光是标量乘法
+        // ⇒ 在任何线性域等价。把本段改成 Rec.2020 线性只会**改变色温/色调的显示效果**
+        //（实测 27~171 LSB = 8bit 下 10~67%），反而与拍照链路更不一致 ⇒ 保持原域。
+        // 详见 `docs/reports/phaseB-old-domain-baseline-ARCHIVE.md` §8.1。
         vec3 lin = srgbDecode(c);
         lin *= exp2(uEv + uLocalEv * m) * uWbGain;
         c = srgbEncode(lin);
@@ -6092,9 +6232,29 @@ vec3 srgbEncode(vec3 c) {
     vec3 lo = 12.92 * c;
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
+// 期 B：与 kFsOut 的 workToSrgb/gamutFit 同式（矩阵同源，见那里的说明）。直方图/斑马纹
+// 必须与画面同域 —— 所以**连域外色压缩也要一样**：只用 workToSrgb 的话，直方图会把
+// 被硬切过的值与画面里被压缩过的值算成两回事。
+vec3 workToSrgb(vec3 c) {
+    return vec3(dot(c, vec3(1.6604910021, -0.5876411388, -0.0728498633)),
+                dot(c, vec3(-0.1245504745, 1.1328998971, -0.0083494226)),
+                dot(c, vec3(-0.0181507634, -0.1005788980, 1.1187296614)));
+}
+vec3 gamutFit(vec3 c) {
+    float mn = min(min(c.r, c.g), c.b);
+    if (mn >= 0.0) return c;
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    // ⚠ 整色无正亮度（l ≤ 0）时，朝中性轴去饱和救不回来：t=1 的结果就是 vec3(l)，
+    //   而 l 本身为负 ⇒ 必须直接压到黑（数值自检抓到过这个边界）。
+    if (l <= 1e-8) return vec3(0.0);
+    float denom = mn - l;
+    if (denom > -1e-8) return vec3(0.0);
+    return mix(c, vec3(l), clamp(mn / denom, 0.0, 1.0));
+}
+vec3 workToDisplayLinear(vec3 c) { return gamutFit(workToSrgb(c)); }
 void main() {
     vec3 raw = texture(uTex, vUV0).rgb;
-    vec3 c = srgbEncode(raw);
+    vec3 c = srgbEncode(workToDisplayLinear(raw));
     if (uLutOn > 0.5) c = mix(c, lutApply(c), uLutStrength);
     // max 与 luma 都在显示域；sRGB 编码单调 ⇒ CPU 侧按 sRGB EOTF 折回线性后仍是
     // 同一像素的 max 通道值，不是近似。
@@ -7682,6 +7842,10 @@ bool FrameRenderer::init() {
   u_out_.grain_lut = glGetUniformLocation(prog_out_, "uGrainLut");
   u_out_.flip_y = glGetUniformLocation(prog_out_, "uFlipY");
   u_out_.zebra = glGetUniformLocation(prog_out_, "uZebra");
+  // U-1（期 B 从 u_film_ 挪来）：split + mono 现在由显示域段（kFsOut）消费
+  u_out_.split = glGetUniformLocation(prog_out_, "uSplit");
+  u_out_.mono = glGetUniformLocation(prog_out_, "uMono");
+  u_out_.contrast_out = glGetUniformLocation(prog_out_, "uContrastOut");
   // 卡 H2：dither 除数（交付档上限）。shader 里是 uOutMax，名字的真源 =
   // OutputBitDepth.h 的 kOutputMaxUniform（改名字要同时改守卫脚本的解析口径）。
   u_out_.out_max = glGetUniformLocation(prog_out_, kOutputMaxUniform);
@@ -15135,6 +15299,13 @@ void FrameRenderer::passOutput(int w, int h, const FilmParams& p, bool flip_y,
   glUniform1f(u_out_.whites, p.whites);
   glUniform1f(u_out_.blacks, p.blacks);
   glUniform1f(u_out_.fade, p.fade);
+  // U-1（期 B 从 u_film_ 挪来）：与 passStyle 的 u_style_.split/mono 同一对参数
+  glUniform2f(u_out_.split, p.split_warm, p.split_cool);
+  glUniform1f(u_out_.mono, p.monochrome);
+  // 期 B：对比度只有引擎 1（sigmoid）需要 —— 引擎 0 的 `[4]` 已由 filmic 曲线系数承担
+  //（updateFilmicEV），在这里再乘一次就是双重对比度 ⇒ 引擎 0 下发 1.0（恒等、零回归）。
+  // 判据 = `engine_slot >= 0.5`（与 filmSource 的引擎选路同一口径；[98] 是 float 槽）。
+  glUniform1f(u_out_.contrast_out, p.engine_slot >= 0.5f ? p.contrast : 1.0f);
   // ── SG-1 柔光（soft glow）：生效值下发（与 kFsOut 逐字同段）────────────
   // uGlowOn = glow_src != 0（[95] > 0 且共享金字塔链成功）⇒ 关闭时 shader 整段跳过。
   // uGlowTexel 用 halo_tmp_*（柔光图写在 tex_halo_tmp_ 上，1/2 分辨率）：glowFetch 的

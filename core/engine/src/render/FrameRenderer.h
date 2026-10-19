@@ -1419,6 +1419,12 @@ class FrameRenderer {
           clarity = -1, clar_step = -1,
           highlights = -1, shadows = -1, whites = -1, blacks = -1, fade = -1,
           tone_on = -1,
+          // U-1 [23][24] split + [25] mono —— 期 B 从 u_film_ 挪来（那边是**线性工作空间
+          // 域**，与 u_style_ 的显示域差 43%）；与 u_style_ 同名同义，两条链路共用一段
+          // **逐字相同**的显示域数学。位置 = 暗角之后、LUT 之前（与 kFsStyle 同序）。
+          split = -1, mono = -1,
+          // 期 B：引擎 1 的对比度（引擎 0 恒等 1.0）—— 见 kFsOut 的 uContrastOut 注释
+          contrast_out = -1,
           // SG-1 柔光：与 u_style_ 同名同义 —— 两条链路共用一段**逐字相同**的
           // shader 逻辑（glowFetch + Screen），落点都在各自 shader 的显示域段。
           glow = -1, glow_on = -1, glow_strength = -1, glow_texel = -1,
