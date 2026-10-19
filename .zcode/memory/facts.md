@@ -135,3 +135,12 @@ status: active
 - [2026-10-19] **PC 的引擎工作空间（一手源码 `/tmp/pc-tone`）**：`RawRenderingEngine.kt:10-74` —— AgX / DarktableSigmoid / **DarktableFilmic** 跑 **BT2020**，Spektrafilm/AdobeCurve 跑 ProPhoto，Lumix/Canon/Leica 跑 SRGB，Hncs 跑 HNCS。输出统一 `computeWorkingToOutputTransform(…, ColorSpace.SRGB)`（`RawDemosaicProcessor.kt:7105`）⇒ **PC 是"内部大盘子、输出小盘子"**；其 RAW 引擎显式 `includeShadowsHighlights = false`（阴影高光类调整在 LUT 阶段、Lab 域做，且**只有一处实现**）。
 - [2026-10-19] **PC 的预览是另一套实现**：`PreviewShadowsHighlightsShader.kt`（纯 RGB+luma 乘性近似）vs 正式版 `ShadowsHighlightsShader.kt`（Lab 域 + sigma 采样基准 + overlay 混合）⇒ PC 在"预览 vs 成片"上比我们**更不一致**（有意的性能妥协）。
 - [2026-10-19] **引擎 1 的 7 个 `uSig*` 全是曲线形状常量**（`uSigWhiteTarget` / `uSigBlackTarget` / `uSigPaperExposure` / `uSigFilmFog` / `uSigFilmPower` / `uSigPaperPower` / `uSigHuePreservation`，来自 PC 的 `DT_SIGMOID_*`）—— **里面没有"对比度"** ⇒ 引擎 1 此前完全没有对比度实现（滑杆无效的真因）。
+
+## 色相路线与 HDR（10-19）
+
+- [2026-10-19] **红杯 ROI 的色相/色差（修正 D5 域口径后）**：sigmoid ΔE 3.69 / Δh 4.43° · filmic 2.11 / 1.50° · ACES 原生 11.71 / 3.44° · ACES 重锚（×1.7919）4.69 / 1.58° · Oklab L-only 5.42 / 1.83°。⇒ ACES 无优势；Oklab 用 ΔE 换 Δh。
+- [2026-10-19] **Oklab L-only 的 GLSL 实现**（已回滚，仅存档）：`kFsSigmoidDef` 内 `sigmoidOklabTone`，矩阵 = Oklab M1·inv(sRGB→XYZ)·Rec.2020→XYZ（预乘），`L' = cbrt(sigmoid(Y))`，`a/b` 按 `L'/L` 缩放；`uSigHuePreservation` 控制与 per-channel 的 mix（1.0 = Oklab）。回滚后 `kFsSigmoid` 恢复 `0xfbab6a8c`。
+- [2026-10-19] **PC 的 HDR JPEG 实现（一手源码）**：`gallery/Jpeg444ExportEncoder.kt` = 自研 4:4:4 JPEG（native `writeNative`）+ gainmap JPEG（`encodeGainmapNative`）+ **libultrahdr `packageJpegR`**（`cpp/jpeg_r_encoder.cpp`，vendored `libultrahdr`/`libjpeg-turbo`）；元数据 `ratioMin/Max` 0.25~4.0、`gamma`、`epsilonSdr/Hdr`、`displayRatioSdr/Hdr`。`hdr/UltraHdrWriter.kt`（`Bitmap.compress` + `Gainmap`）是 **4:2:0** 的另一条。
+- [2026-10-19] **PC 的 gainmap 数学**：`hdr/RawGainmapMath.kt` —— `ln((HDR+1e-4)/(SDR+1e-4))` 归一化到 `[ln(0.25), ln(4.0)]`，`DOWNSAMPLE=2`，SDR/HDR 都是 linear sRGB 亮度。
+- [2026-10-19] **默认 AE 不读场景统计**：`sw999` 只在 `updateFilmicEV` 的 `if (st.valid && auto_on)` 内写（`FrameRenderer.cpp:14204-14239`）；默认 `[35]=0`、引擎 1 下 `EngineScope` 再归零 ⇒ `sceneHighlightEv()` 返回 NaN ⇒ `ExposurePlanner` 的高光保护不参与。期 B 换域不影响默认 AE；开启自动影调后才需重调。
+- [2026-10-19] **工具**：`tools/aces2-offline-eval.py`（ACES/Oklab vs filmic/sigmoid，含 D5→sRGB 修正、ΔE2000/Δh、同白纸对齐）· `tools/hdr-probe.py`（adb 显示/编码/属性探针，无设备时输出待办清单）。

@@ -135,3 +135,7 @@ status: active
 - [2026-10-19] **`git stash` 回 baseline 对比是分清"预期红 vs 真红"的可靠手段**：本次用它确认 `srgb-oetf`/`hr-pre` 是预先就红，而 `softglow`/`u4`/`style-passthrough` 是被本期改红的。
 - [2026-10-19] **判据需要的产物要带配套参数生成**：`check-film-offline` 要求 `--film-tone-k 1 --film-ev 0 --film-gamut 0` 生成的产物；参数不匹配会误报红（我误判过一次"真红"）。
 - [2026-10-19] **注释里的数值要实测后再写**：曾在代码注释写"≈2 LSB"，实测 ~1 LSB ⇒ 已修正。同轮还纠正一个预判 —— `check-toeshoulder` 我以为换域必红（60 个 spline 系数），实际**绿**（它不依赖工作空间）。
+- [2026-10-19] **D5 域口径是比色的前提**：`film_d5` / `film_d5_sigmoid` 是 **Rec.2020 线性**（期 B 工作空间），不是 sRGB 线性。直接套 `srgb_oetf` 等于把 Rec.2020 原色当 sRGB 编码，会得出"ACES 色相显著更好"的假结论；修正为「Rec.2020→sRGB 线性→OETF」后，ACES 的优势消失（Δh 1.58° vs filmic 1.50°）。**任何拿 D5 比色的脚本都必须先转 sRGB。**
+- [2026-10-19] **离线 ROI 坐标必须用 RAW 坐标**：DNG RAW 是横的（4080×3072），预览是竖的（rawpy flip=6 旋转 90°）；按预览坐标直接取会跑到叶子/背景上。红杯 RAW 坐标 `Y 1570–1970, X 2300–2700`。
+- [2026-10-19] **Ultra HDR 有两条路，色度不同**：`Bitmap.compress` + `Gainmap` 是 **4:2:0**（平台路径）；4:4:4 + HDR 必须走 libultrahdr + 自研编码器（PC 的 `Jpeg444ExportEncoder`）。"PC 在 4:4:4 下也能 HDR"指的是后者。
+- [2026-10-19] **Oklab 的 ΔE/Δh 是折中曲线**：A/B/C 变体与混合 w=0.3~0.8 都试过，没有同时满足"ΔE≤3.7 且 Δh<2.5°"的交点；继续调参数只会在曲线上滑动，不会出现拐点。
