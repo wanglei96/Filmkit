@@ -343,6 +343,11 @@ class FrameRenderer {
   // 同域同格式，后段 P0/RCD/胶片链零改动）。mismatch/conf 权重按 HDR+ 原版
   // 不参与（逐频收缩自身鲁棒）。输出每 tile 的频率平均等效 neff（NS §3.3
   // "按实际合并更新 σ"），CPU 读回取均值供 P0/P4 折减与日志。
+  // 期 B bracket：参考帧饱和修复的目标纹理（R16UI，raw 尺寸）
+  bool ensureSatFixTarget(int w, int h);
+  void passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int h,
+                      const float black_phase[4], float white_level,
+                      float short_scale);
   bool ensureMfnrFftTargets(int w, int h);
   // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
   // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
@@ -889,7 +894,14 @@ class FrameRenderer {
   GLuint prog_mfnr_pyr_ = 0, prog_mfnr_down_ = 0, prog_mfnr_fuse_ = 0,
          prog_raw_dn_fused_ = 0;
   GLuint prog_mfnr_mis_ = 0;  // 阶段二（v0.10.0）：mismatch map
+  GLuint prog_mfnr_satfix_ = 0;  // 期 B bracket：参考帧饱和修复
   GLuint tex_mfnr_[3] = {0, 0, 0};  // R16UI，burst 帧 1..3（帧 0 复用 raw_tex_）
+  // 期 B bracket（0.11.72）：参考帧饱和修复 —— 把短帧归一后的真实高光移植到
+  // 参考帧的饱和像素上，再送进融合（否则长帧饱和处的短帧高光会被收缩/平均抹平）。
+  GLuint tex_ref_fix_ = 0, fbo_ref_fix_ = 0;
+  int sat_fix_w_ = 0, sat_fix_h_ = 0;
+  // 本张融合用的参考帧纹理（默认 raw_tex_；bracket 时 = tex_ref_fix_）
+  GLuint ref_fuse_tex_ = 0;
   GLuint tex_pyr1_ = 0, fbo_pyr1_ = 0;  // RGBA8，1/2 灰度（sqrt 预编码）
   GLuint tex_pyr2_ = 0, fbo_pyr2_ = 0;  // RGBA8，1/4（readback 层）
   GLuint tex_pyr3_ = 0, fbo_pyr3_ = 0;  // RGBA8，1/8（readback 层）
@@ -1323,6 +1335,9 @@ class FrameRenderer {
           s = -1, black = -1, white = -1, gain = -1, cfalut = -1,
           frame_scale = -1;   // 期 B bracket：逐帧归一
   } u_mfnr_mis_;
+  struct {
+    GLint ref = -1, shrt = -1, size = -1, black = -1, white = -1, scale = -1;
+  } u_mfnr_satfix_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1, mix = -1, moire = -1, moire_k = -1, cg_k = -1,

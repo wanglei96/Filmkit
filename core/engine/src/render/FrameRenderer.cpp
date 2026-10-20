@@ -2246,6 +2246,37 @@ void main() {
 // 域约定：对齐在 2×2 Bayer 块平均的灰度金字塔（1/4、1/8、1/16 readback）上做，
 // 位移场以 mosaic 域表示，融合采样 round 到**最近偶数**——1/2 域整数位移 ×2 恒
 // 为偶数，Bayer 相位不翻转（奇数位移会把 R 位采到 B，等价于把色度打乱）。
+// kFsMfnrSatFix（期 B bracket，0.11.72）：参考帧饱和修复。
+// 参考帧（长帧）在窗外/灯芯这类高光处已饱和（= 白点），信息已丢；短帧同位置
+// 往往还没饱和（实测 p995 0.62、sat 0.0%）⇒ 把短帧归一后的真实值移植过来。
+// 只替换"参考帧饱和 **且** 短帧未饱和 **且** 短帧值更大"的像素；其余保持原值。
+// 输出 R16UI（与 raw_tex_ 同格式），值可 > 白点 —— 那是真实的 scene-referred 高光，
+// 由 filmic/sigmoid 曲线负责压进显示域（融合侧不再 clamp）。
+const char* kFsMfnrSatFix = R"(#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) out uvec4 oColor;
+uniform highp usampler2D uRef;
+uniform highp usampler2D uShort;
+uniform ivec2 uSize;
+uniform vec4 uBlack;
+uniform float uWhite;
+uniform float uScale;
+void main() {
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+    float wl = max(uWhite, 1.0);
+    float r = float(texelFetch(uRef, p, 0).r);
+    float v = r;
+    float s = float(texelFetch(uShort, p, 0).r);
+    // 短帧未饱和才可信（短帧也饱和 ⇒ 那里确实没有更多光子）
+    if (r >= wl * 0.98 && s < wl * 0.98) {
+        float sNorm = (s - bl) * uScale + bl;
+        if (sNorm > v) v = sNorm;
+    }
+    oColor = uvec4(uint(clamp(v, 0.0, 65535.0) + 0.5), 0u, 0u, 1u);
+})";
+
 // kFsMfnrPyr：raw → 1/2 灰度（RGBA8）。sqrt 预编码：8bit 灰度域里暗部分辨率
 // 太低（线性 0.01 → 2.5 级），sqrt 把它抬到 25 级——对齐度量在感知域也更稳。
 const char* kFsMfnrPyr = R"(#version 300 es
@@ -2323,14 +2354,11 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
-// 期 B bracket（0.11.66）：逐帧曝光归一（短帧 = 长/短，其余 1）。归一值 clamp 到
-// 白点 —— 第 1 步饱和权重未落地，不让 >1 的值进 P0/HR；第 2 步换成饱和感知权重。
-// scale == 1（无 bracket / 长帧）时**不 clamp**：既有管线本来就有 >1 的值（LSC
-// 增益），加 clamp 会改变无 bracket 档的输出（零回归红线）。
+// 期 B bracket：逐帧曝光归一（短帧 = 长/短，其余 1）。**不再 clamp 到白点**
+// （0.11.72）：参考帧饱和修复后，高光值本就 >1（真实 scene-referred 高光），
+// 交给 filmic/sigmoid 压进显示域；clamp 会把刚修好的高光又抹平。
 uniform vec4 uFrameScale;
-float frameLin(float x, float sc) {
-    return min(x * sc, sc > 1.001 ? 1.0 : 1e6);
-}
+float frameLin(float x, float sc) { return x * sc; }
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2463,11 +2491,9 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
-// 期 B bracket（0.11.66）：逐帧曝光归一，与 kFsMfnrFuse 同口径（scale==1 不 clamp）。
+// 期 B bracket：逐帧曝光归一，与 kFsMfnrFuse 同口径（不 clamp，见其注释）。
 uniform vec4 uFrameScale;
-float frameLin(float x, float sc) {
-    return min(x * sc, sc > 1.001 ? 1.0 : 1e6);
-}
+float frameLin(float x, float sc) { return x * sc; }
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2974,8 +3000,8 @@ float linAt(int z, ivec2 p) {
     float sc = z == 0 ? uFrameScale.x : (z == 1 ? uFrameScale.y
                        : (z == 2 ? uFrameScale.z : uFrameScale.w));
     float lin = max((float(v) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
-    // scale == 1（无 bracket / 长帧）时不 clamp —— 与 kFsMfnrFuse 同口径（零回归）
-    return min(lin * sc, sc > 1.001 ? 1.0 : 1e6);
+    // 不 clamp —— 与 kFsMfnrFuse 同口径（高光交给曲线）
+    return lin * sc;
 }
 // 位移场双线性（与 kFsMfnrFuse 的 offNAt 同式；uOffTiles 为其网格）。
 vec2 offAt(highp sampler2D t, vec2 m) {
@@ -7286,6 +7312,7 @@ bool FrameRenderer::init() {
   const GLuint fs_mfnr_fuse = compileShader(GL_FRAGMENT_SHADER, kFsMfnrFuse);
   const GLuint fs_mfnr_mis =
       compileShader(GL_FRAGMENT_SHADER, kFsMfnrMismatch);
+  const GLuint fs_mfnr_satfix = compileShader(GL_FRAGMENT_SHADER, kFsMfnrSatFix);
   const GLuint fs_raw_dn_f = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFused);
   const GLuint fs_raw_dn_ts = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoiseFusedTs);
   // NN 降噪 pass（v0.10.102）：域桥 shader（pack/unpack），纯 fragment 低风险
@@ -7423,6 +7450,7 @@ bool FrameRenderer::init() {
   prog_mfnr_down_ = linkProgram(vs_plain_, fs_mfnr_down);
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
   prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
+  prog_mfnr_satfix_ = linkProgram(vs_plain_, fs_mfnr_satfix);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
   prog_raw_dn_ts_ = linkProgram(vs_plain_, fs_raw_dn_ts);
   prog_hl_mask_ = linkProgram(vs_plain_, fs_hl_mask);
@@ -7841,6 +7869,12 @@ bool FrameRenderer::init() {
   u_mfnr_mis_.white = glGetUniformLocation(prog_mfnr_mis_, "uWhite");
   u_mfnr_mis_.gain = glGetUniformLocation(prog_mfnr_mis_, "uGain");
   u_mfnr_mis_.frame_scale = glGetUniformLocation(prog_mfnr_mis_, "uFrameScale");
+  u_mfnr_satfix_.ref = glGetUniformLocation(prog_mfnr_satfix_, "uRef");
+  u_mfnr_satfix_.shrt = glGetUniformLocation(prog_mfnr_satfix_, "uShort");
+  u_mfnr_satfix_.size = glGetUniformLocation(prog_mfnr_satfix_, "uSize");
+  u_mfnr_satfix_.black = glGetUniformLocation(prog_mfnr_satfix_, "uBlack");
+  u_mfnr_satfix_.white = glGetUniformLocation(prog_mfnr_satfix_, "uWhite");
+  u_mfnr_satfix_.scale = glGetUniformLocation(prog_mfnr_satfix_, "uScale");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
@@ -12359,7 +12393,8 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
   glUseProgram(prog_mfnr_fuse_);
   const GLenum units[8] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
                            GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6, GL_TEXTURE7};
-  const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
+  const GLuint raws[4] = {ref_fuse_tex_, tex_mfnr_[0], tex_mfnr_[1],
+                          tex_mfnr_[2]};
   for (int i = 0; i < 4; ++i) {
     glActiveTexture(units[i]);
     glBindTexture(GL_TEXTURE_2D, raws[i]);
@@ -12394,6 +12429,61 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // burst 4 帧汇集到 R16UI 2DArray（GPU-GPU copy）→ kFsMfnrFft compute 4 次
 // dispatch（tile 相位组串行化 overlap-add）→ per-tile neff 读回均值。
 // 输出写进 tex_fused_（与 fuse 路径同域同格式），后段 P0/RCD/胶片链零改动。
+// 期 B bracket（0.11.72）：参考帧饱和修复目标（R16UI，raw 尺寸，可复用）
+bool FrameRenderer::ensureSatFixTarget(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  if (tex_ref_fix_ != 0 && sat_fix_w_ == w && sat_fix_h_ == h) return true;
+  if (tex_ref_fix_) {
+    glDeleteTextures(1, &tex_ref_fix_);
+    glDeleteFramebuffers(1, &fbo_ref_fix_);
+    tex_ref_fix_ = fbo_ref_fix_ = 0;
+  }
+  glGenTextures(1, &tex_ref_fix_);
+  glBindTexture(GL_TEXTURE_2D, tex_ref_fix_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, w, h, 0, GL_RED_INTEGER,
+               GL_UNSIGNED_SHORT, nullptr);
+  glGenFramebuffers(1, &fbo_ref_fix_);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ref_fix_);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex_ref_fix_, 0);
+  const GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  if (st != GL_FRAMEBUFFER_COMPLETE) {
+    Logger::instance().log(LogLevel::kError, "engine", "mfnr.satfix_fbo",
+                           "{\"status\":" + std::to_string(st) + "}");
+    return false;
+  }
+  sat_fix_w_ = w;
+  sat_fix_h_ = h;
+  return true;
+}
+
+void FrameRenderer::passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int h,
+                                   const float black_phase[4], float white_level,
+                                   float short_scale) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ref_fix_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_mfnr_satfix_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, ref_tex);
+  glUniform1i(u_mfnr_satfix_.ref, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, short_tex);
+  glUniform1i(u_mfnr_satfix_.shrt, 1);
+  glActiveTexture(GL_TEXTURE0);
+  glUniform2i(u_mfnr_satfix_.size, w, h);
+  glUniform4f(u_mfnr_satfix_.black, black_phase[0], black_phase[1],
+              black_phase[2], black_phase[3]);
+  glUniform1f(u_mfnr_satfix_.white, white_level);
+  glUniform1f(u_mfnr_satfix_.scale, short_scale);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
   if (burst_w_ == w && burst_h_ == h && tex_fft_out_[3] != 0) return true;
   for (auto& t : tex_fft_out_) {
@@ -12493,7 +12583,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   const int pw = (w + 1) / 2, ph = (h + 1) / 2;
   const int tx_max = (pw + 7) / 8 - 1, ty_max = (ph + 7) / 8 - 1;
   // 输入直接绑现有纹理(raw_tex_ = 帧 0,与 passMfnrFuse 同源同款 usampler2D)
-  const GLuint fft_raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1],
+  const GLuint fft_raws[4] = {ref_fuse_tex_, tex_mfnr_[0], tex_mfnr_[1],
                               tex_mfnr_[2]};
   for (int i = 0; i < 4; ++i) {
     glActiveTexture(GL_TEXTURE0 + i);
@@ -12649,7 +12739,8 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   glUseProgram(prog_mfnr_mis_);
   const GLenum units[7] = {GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3,
                            GL_TEXTURE4, GL_TEXTURE5, GL_TEXTURE6};
-  const GLuint raws[4] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2]};
+  const GLuint raws[4] = {ref_fuse_tex_, tex_mfnr_[0], tex_mfnr_[1],
+                          tex_mfnr_[2]};
   for (int i = 0; i < 4; ++i) {
     glActiveTexture(units[i]);
     glBindTexture(GL_TEXTURE_2D, raws[i]);
@@ -13490,6 +13581,14 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   };
   MfnrPyramid ref;
   capturePyr(raw_tex_, &ref, frame_scale[0]);
+  // 期 B bracket：参考帧饱和修复（对齐用原始 ref，融合用修复后的 ref）
+  ref_fuse_tex_ = raw_tex_;
+  if (bracket_on) {
+    if (!ensureSatFixTarget(w, h)) return false;
+    passMfnrSatFix(raw_tex_, tex_mfnr_[2], w, h, black_phase, wl,
+                   frame_scale[3]);
+    ref_fuse_tex_ = tex_ref_fix_;
+  }
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
