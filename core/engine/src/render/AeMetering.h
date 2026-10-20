@@ -52,11 +52,12 @@ inline constexpr float kAeFilmicWhiteOffsetEv = 0.34f;
 // 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）。
 inline constexpr float kAeMiddleGrey = 0.1845f;
 
-// 高光余量：死白起点前留 **1.5 EV**。死白点附近曲线已近平（<1 LSB/0.1 EV），
-// 0.5 EV 只留出约 15 个码值 ⇒ 窗外这类大面积高光会糊成一片（真机 0.11.72：
-// hi240 2.81%）。设计 §0 的目标态是 mean 70~90 + hi240 ≤0.5%，对应 ~1.5 EV 余量：
-// 高光落在曲线仍可分辨的区间（每 0.1 EV ≥1 LSB），中灰也还在合理亮度。
-inline constexpr float kAeHighlightHeadroomEv = 1.5f;
+// 高光余量（相对 **RAW 白点**）：量化/舍入的安全边距。
+// 2026-10-20 定案：AE 的高光上限用 **RAW 白点 2.438 EV**（不是引擎死白点 6.22）。
+// 用 6.22 时（0.11.70~0.11.81）天空这类大面积高光会被推到曲线肩部 ⇒ 真机反复
+// "死白一片"（0.11.81：hi240 18.89%）。RAW 白点是"光子还能区分的上限"，压到它
+// 之内的高光必然有层次；亮度损失由局部影调（tone equalizer）的暗部 +0.3EV 补回。
+inline constexpr float kAeHighlightHeadroomEv = 0.1f;
 
 // 允许裁切的像素比例（PhotonCamera `maximumClippedFraction`，同值 0.005）。
 inline constexpr float kAeMaxClippedFrac = 0.005f;

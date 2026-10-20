@@ -9003,13 +9003,10 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   in.p_hi995 = st_full.p_hi995;
   in.user_ev = p.exposure_ev;
   in.sat_frac = st_full.sat_frac;
-  // 高光上限 = **当前引擎曲线的死白起点**（不是 RAW 饱和点，也不是 [38]）：
-  // 引擎 1（sigmoid，默认）6.22 EV；引擎 0（filmic）随 [38] 平移 +0.34。
-  // ⚠ [38] 在引擎 1 下被 EngineScope 归零 ⇒ 绝不能无条件读它（0.11.70 的教训）。
-  const bool sigmoid_engine = static_cast<int>(p.engine_slot) == 1;
-  in.white_ev = sigmoid_engine
-                    ? kAeSigmoidDeadWhiteEv
-                    : (p.filmic_white_ev + kAeFilmicWhiteOffsetEv);
+  // 高光上限 = **RAW 白点**（2.438 EV，`log2(1.0/0.1845)`）：光子还能区分的上限。
+  // 不用引擎死白点（6.22 EV）—— 那是"曲线彻底压平"的位置，把高光推到那里只会得到
+  // 一片死白（真机 0.11.81 hi240 18.89%）。亮度靠局部影调补，不靠 AE 放宽高光。
+  in.white_ev = kAeRawWhiteEv;
   const AeDecision d = decideAe(in);
   ae_p50_ = st_center.p_mid;
   ae_p999_ = st_full.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
@@ -12011,9 +12008,15 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 本张 RAW 统计 ⇒ 渲染端 EV。必须在 passFilm 之前：ev 要参与 filmic 的黑白点标定、
   // HR 阈值与 uExposure 三处（它们都以 pe.exposure_ev 为唯一来源）。
   // 只在 still 链追加；预览/YUV 静拍不受影响（域不同，见 AeMetering.h）。
+  // ── 局部影调（tone equalizer）────────────────────────────────────────
+  // **必须在 passAutoExposure 之前**：teq 按 scene 绝对亮度分区（压高光/提暗部），
+  // 之后 AE 统计 teq 后的图再把中灰锚到 18.45% —— 中灰锁定由 AE 负责，teq 只做
+  // 分区曝光。反过来（先 AE 后 teq）会让 teq 的 +0.11EV（中灰 −3.85EV 处）叠加
+  // 在 AE 的计算外，中灰漂移无法收敛。
+  const GLuint teq_src = applyToneEq(dst_w, dst_h, film_src);
   FilmParams pe = p;
-  pe.exposure_ev += passAutoExposure(film_src, pe);
-  passFilm(dst_w, dst_h, pe, film_src, /*still=*/true, /*hal_domain=*/false);
+  pe.exposure_ev += passAutoExposure(teq_src, pe);
+  passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
   // 放在 t2 之后，passMs 不受统计耗时污染。

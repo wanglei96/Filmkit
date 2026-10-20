@@ -70,12 +70,12 @@ bool aeMeteringSelfTest(char* err, int err_cap) {
     in.valid = true;
     in.p_mid = 0.05f;  // 中灰偏暗（室内）
     in.p_hi995 = kAeMiddleGrey * std::exp2(4.085f);
-    in.white_ev = kAeSigmoidDeadWhiteEv;   // 默认引擎 = sigmoid
+    in.white_ev = kAeRawWhiteEv;           // 高光上限 = RAW 白点
     in.sat_frac = 0.05f;                   // 5% 裁切 ⇒ 必须走高光分支
     const AeDecision d = decideAe(in);
     if (d.why[0] != 'h') return fail("highlight path", 0.0f, 1.0f);
-    if (!near(d.ev, (kAeSigmoidDeadWhiteEv - kAeHighlightHeadroomEv) - 4.085f, 2e-3f)) {
-      return fail("highlight ev", d.ev, 1.635f);
+    if (!near(d.ev, (kAeRawWhiteEv - kAeHighlightHeadroomEv) - 4.085f, 2e-3f)) {
+      return fail("highlight ev", d.ev, -1.747f);
     }
   }
   // 3) 暗场景：中灰提亮受上限约束（不允许把噪声拉爆）。
