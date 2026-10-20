@@ -13561,6 +13561,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       std::isfinite(short_ratio) ? std::min(std::max(short_ratio, 1.0f), 8.0f) : 1.0f;
   frame_scale[3] = short_ratio_ok;
   const bool bracket_on = short_ratio_ok > 1.01f;
+  // 期 B bracket：短帧已提供真实高光 ⇒ **关掉 HR 高光重建**（[45] hr_raw）。
+  // HR 是对"饱和无信息"像素的邻域 inpaint；bracket 下高光并不缺信息，重建反而
+  // 把窗玻璃这类大面积高光填成一块块灰色（真机 0.11.74 截图）。关 HR = 原链路
+  // 逐位不变（见 passHighlightRaw 的 A/B 红线），只是不跑那一趟。
+  FilmParams p_burst = p;
+  if (bracket_on) p_burst.hr_raw = 0.f;
   stage("pyr");
 
   // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile kMfnrTile → tiles。
@@ -14028,7 +14034,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.white_level = wl;
   c.gains = rc.gains;
   c.ccm = rc.ccm;
-  c.p = &p;
+  c.p = &p_burst;
   c.effective_rot = effective_rot;
   c.rcd = rcd;
   // E4-3 颗粒：内容指纹取**参考帧 frames[0]**（u16 RAW ⇒ 字节数 = w·h·2）—— 与
