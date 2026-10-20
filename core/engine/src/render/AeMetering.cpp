@@ -27,7 +27,7 @@ AeDecision decideAe(const AeInputs& in) {
   //    film pass 的 exposure_ev 里，所以这里要扣掉它，只返回"还差多少"。
   d.ev_mid = evOf(kAeMiddleGrey, in.p_mid) - in.user_ev;
   // ② 高光约束：P99.5 提亮后 ≤ 白点 − 余量（允许 0.5% 像素裁切）。写成 EV 差，与 ① 同单位。
-  d.ev_hl = (kAeRawWhiteEv - kAeHighlightHeadroomEv) - evOf(in.p_hi995, kAeMiddleGrey) -
+  d.ev_hl = (in.white_ev - kAeDeadWhiteMarginEv) - evOf(in.p_hi995, kAeMiddleGrey) -
             in.user_ev;
   // ③ 高光优先：宁可画面偏暗，也不接受 RAW 已饱和的输入顶到显示白点。
   d.ev = std::min(d.ev_mid, d.ev_hl);
@@ -64,10 +64,11 @@ bool aeMeteringSelfTest(char* err, int err_cap) {
     in.valid = true;
     in.p_mid = 0.05f;  // 中灰偏暗（室内）
     in.p_hi995 = kAeMiddleGrey * std::exp2(4.085f);
+    in.white_ev = 4.0f;   // filmic 默认白点
     const AeDecision d = decideAe(in);
     if (d.why[0] != 'h') return fail("highlight path", 0.0f, 1.0f);
-    if (!near(d.ev, (kAeRawWhiteEv - kAeHighlightHeadroomEv) - 4.085f, 2e-3f)) {
-      return fail("highlight ev", d.ev, -1.747f);
+    if (!near(d.ev, (4.0f - kAeDeadWhiteMarginEv) - 4.085f, 2e-3f)) {
+      return fail("highlight ev", d.ev, -0.535f);
     }
   }
   // 3) 暗场景：中灰提亮受上限约束（不允许把噪声拉爆）。

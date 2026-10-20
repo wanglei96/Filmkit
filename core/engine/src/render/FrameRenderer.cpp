@@ -8783,6 +8783,8 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   in.p_mid = st.p_mid;
   in.p_hi995 = st.p_hi995;
   in.user_ev = p.exposure_ev;
+  // 高光上限跟 filmic 的实际白点走（[38]，预设可调）—— 而不是 RAW 饱和白点。
+  in.white_ev = p.filmic_white_ev;
   const AeDecision d = decideAe(in);
   ae_p50_ = st.p_mid;
   ae_p999_ = st.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）

@@ -16,8 +16,8 @@
 //
 // 两条约束（HDR+ §4 + darktable autodetect 口径）
 // ------------------------------------------------
-// ① 高光：`P99.9` 提亮后不得撞 RAW 饱和数据白点（2.438 EV，减去 headroom）。
-//    物理含义：RAW 一旦饱和，信息已丢，任何曲线都救不回。
+// ① 高光：`P99.5` 提亮后不得撞**渲染白点**（filmic `white_ev` − 死白余量 0.45 EV）。
+//    物理含义：RAW 饱和只说明没有更多光子；真正决定"会不会死白"的是 filmic 的白点。
 // ② 中灰：`P50` 应落在显示中灰 18.45%（= sRGB 118/255）。
 //    物理含义：这就是"亮度接近肉眼"的可测量定义 —— 不是"平均亮度好看"。
 //
@@ -31,7 +31,18 @@ namespace filmkit {
 
 // RAW 饱和数据白点（log2 相对中灰）：`log2(1.0 / 0.1845)`。
 // 与 Kotlin `ExposurePlanner.WHITE_POINT_EV` 同源同值 —— 两处必须一起改。
+// ⚠ 这是**采集域**白点（RAW 饱和），不是 AE 该用的高光上限（见 kAeDeadWhiteMarginEv）。
 inline constexpr float kAeRawWhiteEv = 2.438307f;
+
+// 渲染域白点（filmic 的 `[38]` white_ev，运行时由 FilmParams 传入）。
+// **2026-10-20 修正**：AE 此前把高光压到 RAW 白点（2.438 EV），而 filmic 能容纳到
+// white_ev（默认 4.0/4.56）—— 等于白白多压 1.1~1.5 EV（真机 0.11.69 实测
+// aeEv -1.97、mean 27.6、窗外死白）。高光该压到的是"渲染会死白的位置"，
+// 不是"RAW 会饱和的位置"：RAW 饱和只说明没有更多光子，不代表不能再往白点推。
+inline constexpr float kAeRenderWhiteEv = 4.0f;
+
+// filmic 死白余量：R-3 实测 white_ev=4.0 时死白起点 3.55 EV ⇒ 0.45 EV。
+inline constexpr float kAeDeadWhiteMarginEv = 0.45f;
 
 // 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）。
 inline constexpr float kAeMiddleGrey = 0.1845f;
@@ -51,6 +62,8 @@ struct AeInputs {
   float p_mid = 0.0f;      // 线性 P50（max 通道，与 filmic 同口径）
   float p_hi995 = 0.0f;    // 线性 P99.5（max 通道）—— 允许 0.5% 像素超白点
   float user_ev = 0.0f;    // 已经下发给 film pass 的 EV（基准 + 用户 + 采集欠曝补偿）
+  // 渲染白点（filmic white_ev，[38]）：高光上限 = white_ev − 死白余量。
+  float white_ev = kAeRenderWhiteEv;
   bool valid = false;      // 统计失败 ⇒ 不介入（保持历史行为）
 };
 
