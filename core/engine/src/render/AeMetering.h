@@ -58,6 +58,11 @@ inline constexpr float kAeMiddleGrey = 0.1845f;
 // 高光落在曲线仍可分辨的区间（每 0.1 EV ≥1 LSB），中灰也还在合理亮度。
 inline constexpr float kAeHighlightHeadroomEv = 1.5f;
 
+// 允许裁切的像素比例（PhotonCamera `maximumClippedFraction`，同值 0.005）。
+inline constexpr float kAeMaxClippedFrac = 0.005f;
+// 未超裁切阈值时的高光约束 = 无穷（不介入）。
+inline constexpr float kAeNoHighlightLimitEv = 1e3f;
+
 // 自动 EV 的安全限幅：欠曝上限 = **2 EV**，与 gainmap 的 `[0.25, 4.0]`（±2 EV）对齐 ——
 // AE 把 base 压暗超过 2 EV 后，Ultra HDR 的增益图就表达不了（被截断 ⇒ 高光信息丢失），
 // 那等于用 HDR 的动态范围换 SDR 的暗部，得不偿失。真正的 >2 EV 场景交给 bracket 采集。
@@ -73,6 +78,10 @@ struct AeInputs {
   // 渲染域死白起点（EV 相对中灰）：**按引擎填**（sigmoid 6.22 / filmic [38]+0.34）。
   // 高光上限 = white_ev − kAeHighlightHeadroomEv。
   float white_ev = kAeSigmoidDeadWhiteEv;
+  // v0.11.77：RAW 裁切像素比例（>=98% 白点）。PC legacy matcher 的
+  // `maximumClippedFraction = 0.005` 判据的**量本身** —— 未超阈值时不压高光，
+  // 哪怕分位很亮（此前用 P99.5 亮度当代理，会把"0.1% 像素很亮"误判成裁切）。
+  float sat_frac = 0.0f;
   bool valid = false;      // 统计失败 ⇒ 不介入（保持历史行为）
 };
 

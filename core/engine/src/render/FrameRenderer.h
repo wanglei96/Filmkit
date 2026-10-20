@@ -576,8 +576,11 @@ class FrameRenderer {
   //          1 = max 通道（filmic 自动 EV 的判据：filmic 内部按 max RGB 做归一，
   //              用 luma 会系统性偏低；darktable 的 auto-tune 同样取 max 通道）。
   // bypass_lut：程序性统计（自动 EV）不该被风格 LUT 改判据（UI 直方图仍含 LUT）。
+  // center_frac > 0 时只统计画面中央的该比例区域（0.667 = PC legacy matcher 的
+  // centerFractionPerAxis 默认值 2/3）—— 高光约束只看中央，边缘高光不参与。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false,
-                     int stat_ch = 0, int stat_mode = 0);
+                     int stat_ch = 0, int stat_mode = 0,
+                      float center_frac = 0.0f);
   // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
   // box_filter=false → kFsHist 单点采样（直方图统计用）；
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
@@ -601,9 +604,12 @@ class FrameRenderer {
     // 白点上探的主驱动量：小面积近饱和高光（白壶身镜面，占比 0.001% 级）
     // 任何分位都看不见，见 162012 真机定案。
     float p_max = 0.0f;
+    // v0.11.77：**RAW 裁切像素比例**（>= 0.98 白点的占比）—— PC legacy matcher 的
+    // `maximumClippedFraction = 0.005` 判据的量本身（此前用 P99.5 亮度当代理）。
+    float sat_frac = 0.0f;
     bool valid = false;
   };
-  SceneStats measureSceneStats(GLuint src);
+  SceneStats measureSceneStats(GLuint src, float center_frac = 0.0f);
   // ── filmic spline（darktable `dt_iop_filmic_rgb_compute_spline` 的 v3 分支）──
   // 公式出处与逐项对照见 .cpp；纯函数，可离线用同一组 EV 复算系数对拍。
   //
@@ -1221,6 +1227,7 @@ class FrameRenderer {
   float ae_p999_ = 0.0f;      // 本张 P99.9（线性；**诊断用**，判据是 P99.5）
   float ae_p995_ = 0.0f;      // 本张 P99.5（线性；高光判据 —— 允许 0.5% 像素裁切）
   int ae_why_ = 0;            // 0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid
+  float ae_sat_frac_ = 0.0f;  // v0.11.77：中央 2/3 区域的 RAW 裁切像素比例
   // 本张统计 + 决策。返回要**额外**加到 exposure_ev 上的 EV（0 = 不介入）。
   float passAutoExposure(GLuint src, const FilmParams& p);
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。

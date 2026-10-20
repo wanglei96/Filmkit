@@ -3236,14 +3236,18 @@ void main() {
             float i0 = sim[tt][0][by][bx];
             float accR = r0;
             float accI = i0;
-            float cs2 = uC * sig2 + 1e-12;
+            const float cs2_base = uC * sig2 + 1e-12;
             for (int zz = 1; zz < 4; ++zz) {
                 float rz = sre[tt][zz][by][bx];
                 float iz = sim[tt][zz][by][bx];
                 float dr = r0 - rz;
                 float di = i0 - iz;
                 float d2 = dr * dr + di * di;
-                float a = d2 / (d2 + cs2);
+                // 期 B bracket（设计 §3.3 路径 B）：短帧归一后噪声 ×ratio ⇒ σ² ×ratio²。
+                // 不缩放时短帧的噪声残差被当成"真实差异"，高光处会被判成不一致而回退。
+                float scl = (zz == 1) ? uFrameScale.y
+                            : (zz == 2 ? uFrameScale.z : uFrameScale.w);
+                float a = d2 / (d2 + cs2_base * scl * scl);
                 accR += rz + a * dr;
                 accI += iz + a * di;
             }
@@ -8839,7 +8843,8 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
                              "{\"err\":\"" + std::string(err) + "\"}");
     }
   });
-  const SceneStats st = measureSceneStats(src);
+  // 高光统计只取中央 2/3（PC centerFractionPerAxis = 2/3）：边缘高光不参与曝光决策。
+  const SceneStats st = measureSceneStats(src, 2.0f / 3.0f);
   if (!st.valid) {
     ae_why_ = 4;   // 统计失败：保持历史行为（不介入）
     return 0.0f;
@@ -8849,6 +8854,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   in.p_mid = st.p_mid;
   in.p_hi995 = st.p_hi995;
   in.user_ev = p.exposure_ev;
+  in.sat_frac = st.sat_frac;
   // 高光上限 = **当前引擎曲线的死白起点**（不是 RAW 饱和点，也不是 [38]）：
   // 引擎 1（sigmoid，默认）6.22 EV；引擎 0（filmic）随 [38] 平移 +0.34。
   // ⚠ [38] 在引擎 1 下被 EngineScope 归零 ⇒ 绝不能无条件读它（0.11.70 的教训）。
@@ -8860,6 +8866,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   ae_p50_ = st.p_mid;
   ae_p999_ = st.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
   ae_p995_ = st.p_hi995;
+  ae_sat_frac_ = st.sat_frac;
   ae_mid_ev_ = d.ev_mid;
   ae_hl_ev_ = d.ev_hl;
   ae_ev_ = d.ev;
@@ -12075,6 +12082,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"aeP995\":" + jnum(ae_p995_, 6);
   kv += ",\"aeP999\":" + jnum(ae_p999_, 6);
   kv += ",\"aeWhy\":" + std::to_string(ae_why_);
+  // v0.11.77：中央 2/3 区域的裁切比例（PC maximumClippedFraction 口径）
+  kv += ",\"aeSat\":" + jnum(ae_sat_frac_, 6);
   // 用户 WB 补偿的**原始值**（目标/估计增益比）：1,1 = 自动/中性。
   // 【第 2 期 S13】三条链实际消费的都是 G 归一后的 (wb_r/wb_g, 1, wb_b/wb_g)
   // —— RAW 链见 prepareRawCommon，预览 OES / YUV 静拍见 wbCompGNorm()。
@@ -14262,7 +14271,7 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
 bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
-                                 int stat_ch, int stat_mode) {
+                                 int stat_ch, int stat_mode, float center_frac) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   // v0.10.28：256×96 → 512×288。24K 采样点上 P99.99 = 前 2.5 名、max 采样对
   // 0.001% 级的小面积高光（水壶镜面/白壶身）几乎必然 miss——真机 162012 实证：
@@ -14282,8 +14291,18 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
-  for (size_t i = 0; i + 3 < px.size(); i += 4) {
-    ++out[px[i] * (n - 1) / 255];
+  // 中央区域门控（v0.11.77）：只统计中央 center_frac 宽高的区域，对齐 PC legacy
+  // matcher 的 centerFractionPerAxis=2/3 —— 画面边缘的高光不参与曝光决策。
+  const bool center_only = center_frac > 0.0f && center_frac < 1.0f;
+  const float half_w = hw * center_frac * 0.5f;
+  const float half_h = hh * center_frac * 0.5f;
+  for (int y = 0; y < hh; ++y) {
+    if (center_only && std::fabs(y + 0.5f - hh * 0.5f) > half_h) continue;
+    for (int x = 0; x < hw; ++x) {
+      if (center_only && std::fabs(x + 0.5f - hw * 0.5f) > half_w) continue;
+      const size_t i = (static_cast<size_t>(y) * hw + x) * 4;
+      ++out[px[i] * (n - 1) / 255];
+    }
   }
   return true;
 }
@@ -14309,14 +14328,15 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
 // 系统性偏低（luma ≤ max），算出的黑点/白点都会往里收。旁路 LUT：风格层不该改 EV 判据。
 // **一次直方图出三个分位**：P0.5 → black relative exposure，P50 → 诊断，P99.5 → white。
 // 统计失败返回 valid=false（调用方保持上一帧参数，不写 last_*）。
-FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
+FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
+                                                          float center_frac) {
   // v0.10.27：64 → 256 桶。对数域统计编码下 readback 的 256 级与桶一一对应
   // （px[i] ∈ [0,255] → out[px[i]]），每级 0.078EV；旧 64 桶会把这分辨率扔掉 3/4。
   constexpr int kN = 256;
   SceneStats st;
   int hist[kN];
   if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1,
-                     /*stat_mode=*/1)) return st;
+                     /*stat_mode=*/1, center_frac)) return st;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return st;
@@ -14345,6 +14365,14 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   // 对数编码与反折两处必须逐字一致，否则 linMid/pLo/pHi 与成片域错位、自动判据
   // 吃进失真值。
   const auto to_lin = [](float enc) { return std::exp2(enc * 20.0f - 12.0f); };
+  // v0.11.77：RAW 裁切像素比例（>= 0.98 白点）—— PC `maximumClippedFraction` 判据的量。
+  {
+    long sat = 0;
+    for (int i = 0; i < kN; ++i) {
+      if (to_lin(static_cast<float>(i) / static_cast<float>(kN - 1)) >= 0.98f) sat += hist[i];
+    }
+    st.sat_frac = total > 0 ? static_cast<float>(sat) / static_cast<float>(total) : 0.0f;
+  }
   st.p_lo = to_lin(pct(0.001));
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));

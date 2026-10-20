@@ -27,8 +27,14 @@ AeDecision decideAe(const AeInputs& in) {
   //    film pass 的 exposure_ev 里，所以这里要扣掉它，只返回"还差多少"。
   d.ev_mid = evOf(kAeMiddleGrey, in.p_mid) - in.user_ev;
   // ② 高光约束：P99.5 提亮后 ≤ 白点 − 余量（允许 0.5% 像素裁切）。写成 EV 差，与 ① 同单位。
-  d.ev_hl = (in.white_ev - kAeHighlightHeadroomEv) - evOf(in.p_hi995, kAeMiddleGrey) -
-            in.user_ev;
+  // v0.11.77（PC 口径）：裁切比例未超 0.5% ⇒ 高光不介入（ev_hl 视为无穷）；
+  // 超了才按 P99.5 反解"把第 0.5% 亮像素压到白点"的 EV。
+  if (in.sat_frac > kAeMaxClippedFrac) {
+    d.ev_hl = (in.white_ev - kAeHighlightHeadroomEv) -
+              evOf(in.p_hi995, kAeMiddleGrey) - in.user_ev;
+  } else {
+    d.ev_hl = kAeNoHighlightLimitEv;
+  }
   // ③ 高光优先：宁可画面偏暗，也不接受 RAW 已饱和的输入顶到显示白点。
   d.ev = std::min(d.ev_mid, d.ev_hl);
   d.why = (d.ev_hl < d.ev_mid) ? "highlight" : "mid";
@@ -65,6 +71,7 @@ bool aeMeteringSelfTest(char* err, int err_cap) {
     in.p_mid = 0.05f;  // 中灰偏暗（室内）
     in.p_hi995 = kAeMiddleGrey * std::exp2(4.085f);
     in.white_ev = kAeSigmoidDeadWhiteEv;   // 默认引擎 = sigmoid
+    in.sat_frac = 0.05f;                   // 5% 裁切 ⇒ 必须走高光分支
     const AeDecision d = decideAe(in);
     if (d.why[0] != 'h') return fail("highlight path", 0.0f, 1.0f);
     if (!near(d.ev, (kAeSigmoidDeadWhiteEv - kAeHighlightHeadroomEv) - 4.085f, 2e-3f)) {

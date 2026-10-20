@@ -2071,7 +2071,8 @@ class CameraController(private val context: Context, private val render: RenderC
         }.getOrDefault(true)
         // bracket（期 B）：开关默认关（第 4 步才转默认开）。开启时短帧自带高光余量，
         // 采集端高光保护必须同时旁路，否则"短帧 + 欠曝"又是一层双重压。
-        val bracketPref = expPrefs.getBoolean("bracket", false)
+        // 设计 §7 步骤 4：判据回归后转默认开（2026-10-20 0.11.77）
+        val bracketPref = expPrefs.getBoolean("bracket", true)
         val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn && !bracketPref
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设

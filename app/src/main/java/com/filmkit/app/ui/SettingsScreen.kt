@@ -409,7 +409,7 @@ private fun QualityDrawerContent() {
     )
     // bracket（期 B，docs/engine-bracket-design.md）：1 短 3 长采集。默认关 ——
     // 第 1 步只验证采集链路（融合仍用长帧），第 4 步判据回归后才转默认开。
-    var bracketOn by remember { mutableStateOf(prefs.getBoolean("bracket", false)) }
+    var bracketOn by remember { mutableStateOf(prefs.getBoolean("bracket", true)) }
     SettingSwitchRow(
         title = "多曝光 bracket（1 短 3 长）",
         subtitle = "帧 0 用 1/4 快门（保高光）、其余 3 帧长曝光（保暗部）。当前阶段只采集与记录，融合仍用长帧 —— 用来真机验证短帧是否真的没烧高光。仅 M 档 RAW + 多帧融合生效",
