@@ -12159,6 +12159,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"dirMs\":" + jnum(dir_ms, 6) +
           ",\"gMs\":" + jnum(g_ms, 6) +
           ",\"ccmMs\":" + jnum(ccm_ms, 6);
+    // 局部影调（tone equalizer）：开关状态（关 = 完全跳过，逐位不变）
+    kv += ",\"teq\":" + std::to_string(FrameRenderer::toneEq() ? 1 : 0);
     kv += ",\"rcdSplit\":" + std::to_string(dbg_rcd_split_);
     kv += ",\"rcdAMs\":" + jnum(dbg_rcd_a_ms_, 7);
     kv += ",\"rcdBMs\":" + jnum(dbg_rcd_b_ms_, 7);
