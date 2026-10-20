@@ -96,8 +96,8 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 417
-        versionName = "0.11.68"
+        versionCode = 418
+        versionName = "0.11.69"
         // 只打真机用的 arm64：CMake 有时会把 x86_64 也编进 jniLibs（产物不稳定），
         // 那会让 APK 平白多 5.4MB（v0.6.31 实测 33.6MB → 39.2MB）。
         ndk { abiFilters += "arm64-v8a" }

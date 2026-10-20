@@ -1982,6 +1982,10 @@ class CameraController(private val context: Context, private val render: RenderC
     // **第 1 步只采集 + 记录**：短帧不参与融合（融合用 3 长帧，出片零风险），
     // 归一与饱和感知权重在第 2 步落地（设计 §7 步骤 1/2）。
     private val BRACKET_DIV = 4L          // 2^k，k=2（设计 §3.1）
+    // 短帧在 burst 里的**唯一**索引来源（0.11.69：此前结果回调硬编码 secs[0]/secs[1]
+    // 读 ratio，短帧移到帧 3 后读到两个长帧 ⇒ ratio=1.0 ⇒ bracket 静默失效，
+    // 日志只剩 mfnr.bracket_fallback。改位置只改这一处 + 引擎的 frame_scale[3]）
+    private val BRACKET_SHORT_IDX = MFNR_FRAMES - 1
     private var burstBracketOn = false    // 本次 burst 是否采了短帧
     private var burstShortRatio = 1.0f    // 实际 长/短 曝光比（1 = 无短帧/回退）
 
@@ -2217,7 +2221,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val reqs = List(MFNR_FRAMES) { i ->
             if (i == 0) {
                 (refReq ?: altReq ?: b.build())
-            } else if (i == MFNR_FRAMES - 1 && bracketActive) {
+            } else if (i == BRACKET_SHORT_IDX && bracketActive) {
                 (shortReq ?: altReq ?: b.build())
             } else {
                 (altReq ?: b.build())
@@ -2995,8 +2999,8 @@ class CameraController(private val context: Context, private val render: RenderC
                         )
                         // bracket（期 B）：实际 ratio 以读回值为准（HAL 可能 clamp 短帧）
                         if (burstBracketOn) {
-                            val s = secs.getOrNull(0) ?: 0L
-                            val l = secs.getOrNull(1) ?: 0L
+                            val s = secs.getOrNull(BRACKET_SHORT_IDX) ?: 0L
+                            val l = secs.getOrNull(0) ?: 0L
                             val r = bracketRatio(s, l)
                             burstShortRatio = r
                             val ok = r >= 1.5f
@@ -3298,7 +3302,6 @@ class CameraController(private val context: Context, private val render: RenderC
             )
         }
         val canReplace = burstBracketOn && !bracketOn && buffers.size == MFNR_FRAMES
-        val si = MFNR_FRAMES - 1
         val fuseBufs = if (canReplace) {
             listOf(buffers[0], buffers[1], buffers[2], buffers[0])
         } else {
@@ -3310,8 +3313,7 @@ class CameraController(private val context: Context, private val render: RenderC
             strides
         }
         if (bracketOn) {
-            // 短帧在最后一帧
-            val si = MFNR_FRAMES - 1
+            val si = BRACKET_SHORT_IDX
             val st = rawSampleStats(buffers[si], refW, refH, strides[si], meta.whiteLevel)
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "bracket.short",
