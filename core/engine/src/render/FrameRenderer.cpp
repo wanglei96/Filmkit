@@ -6448,9 +6448,17 @@ void main() {
     float q = texture(uAB, vUV0).r * texture(uI, vUV0).r + texture(uAB, vUV0).g;
     // 映射到 [0,8]：0 = 黑（−8EV），8 = 白点（0EV）
     float x = clamp(q + 8.0, 0.0, 8.0);
-    int i0 = int(floor(x));
-    int i1 = min(i0 + 1, 8);
-    float g = mix(uCurve[i0], uCurve[i1], x - float(i0));
+    // 固定展开的线性插值（不用 uniform 数组的动态索引 —— 部分 ES 驱动对其支持
+    // 不一致，且这里只有 8 段，展开成本可忽略）
+    float g = uCurve[0];
+    g = mix(g, uCurve[1], clamp(x - 0.0, 0.0, 1.0));
+    g = mix(g, uCurve[2], clamp(x - 1.0, 0.0, 1.0));
+    g = mix(g, uCurve[3], clamp(x - 2.0, 0.0, 1.0));
+    g = mix(g, uCurve[4], clamp(x - 3.0, 0.0, 1.0));
+    g = mix(g, uCurve[5], clamp(x - 4.0, 0.0, 1.0));
+    g = mix(g, uCurve[6], clamp(x - 5.0, 0.0, 1.0));
+    g = mix(g, uCurve[7], clamp(x - 6.0, 0.0, 1.0));
+    g = mix(g, uCurve[8], clamp(x - 7.0, 0.0, 1.0));
     oColor = vec4(g, 0.0, 0.0, 1.0);
 })";
 
@@ -12160,7 +12168,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"gMs\":" + jnum(g_ms, 6) +
           ",\"ccmMs\":" + jnum(ccm_ms, 6);
     // 局部影调（tone equalizer）：开关状态（关 = 完全跳过，逐位不变）
-    kv += ",\"teq\":" + std::to_string(FrameRenderer::toneEq() ? 1 : 0);
+    kv += ",\"teq\":" + std::to_string(FrameRenderer::toneEq() ? 1 : 0) +
+          ",\"teqMs\":" + jnum(dbg_teq_ms_, 6);
     kv += ",\"rcdSplit\":" + std::to_string(dbg_rcd_split_);
     kv += ",\"rcdAMs\":" + jnum(dbg_rcd_a_ms_, 7);
     kv += ",\"rcdBMs\":" + jnum(dbg_rcd_b_ms_, 7);
@@ -12656,8 +12665,10 @@ bool FrameRenderer::ensureTeqTargets(int w, int h) {
 }
 
 GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
+  dbg_teq_ms_ = 0.0f;
   if (!toneEq() || src == 0 || w <= 0 || h <= 0)
     return src;
+  const auto teq_t0 = std::chrono::steady_clock::now();
   if (!ensureTeqTargets(w, h)) return src;
   const int tw = teq_w_, th = teq_h_;
   const int radius = std::max(3, std::min(tw, th) / 24);   // ≈ 画面短边的 4%
@@ -12726,6 +12737,10 @@ GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glActiveTexture(GL_TEXTURE0);
+  glFinish();
+  dbg_teq_ms_ = std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - teq_t0)
+                    .count();
   return tex_teq_out_;
 }
 

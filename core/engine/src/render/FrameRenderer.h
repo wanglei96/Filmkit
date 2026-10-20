@@ -917,6 +917,7 @@ class FrameRenderer {
   GLuint fbo_teq_i_ = 0, fbo_teq_mean_ = 0, fbo_teq_tmp_ = 0, fbo_teq_gain_ = 0,
          fbo_teq_out_ = 0;
   int teq_w_ = 0, teq_h_ = 0;
+  float dbg_teq_ms_ = 0.0f;   // 局部影调耗时（诊断）
   bool ensureTeqTargets(int w, int h);
   GLuint applyToneEq(int w, int h, GLuint src);
   int sat_fix_w_ = 0, sat_fix_h_ = 0;
