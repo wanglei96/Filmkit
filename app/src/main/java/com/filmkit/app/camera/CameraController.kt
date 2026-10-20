@@ -2037,7 +2037,18 @@ class CameraController(private val context: Context, private val render: RenderC
         // （2.438）0.58EV，"不欠曝"与"高光不爆"物理上不可兼得；而用户诉求是噪声小
         // （欠曝让全图光子 -25%~-45% ⇒ 相对噪声上升 ⇒ 红杯那类中高亮表面冒白斑）。
         // 需要高光保护时可在设置页打开（判据已改用成片域 sw999，比旧版准）。
-        val hlOn = expPrefs.getInt("hl_protect", 0) >= 1
+        //
+        // ⚠ v0.11.62：自动曝光（渲染端、本张统计）开启时，这一层必须**旁路**。
+        // 两层压的是同一件事：采集端欠曝（丢光子）→ 补偿 EV → 渲染端又按本张 P99.9
+        // 再压一次 = 双重欠曝。真机 2026-10-20 实证：同场景第一张（无统计，只有渲染
+        // 端）亮度可接受，第二张（采集欠 1.74EV + 渲染再压）明显更暗 —— 同场景两张
+        // 不一致，正是这层叠加造成的。
+        // 职责划分：ae_auto 开 ⇒ 采集不动（光子全收），曝光交给渲染端；
+        //           ae_auto 关 ⇒ 回到旧口径，采集端高光保护可用。
+        val aeAutoOn = runCatching {
+            context.getSharedPreferences("filmkit", 0).getBoolean("ae_auto", true)
+        }.getOrDefault(true)
+        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设
         // 那部分就会少算 EV，高光保护判据放行 → 成片高光裁切。
