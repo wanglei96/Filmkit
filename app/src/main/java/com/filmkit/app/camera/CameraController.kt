@@ -2209,8 +2209,19 @@ class CameraController(private val context: Context, private val render: RenderC
         } else {
             null
         }
+        // 短帧放**最后一帧**，长帧作参考帧（帧 0）。设计 §3.1 原写"短帧帧 0 作参考帧"，
+        // 2026-10-20 真机实测否定：短帧归一后噪声 ×ratio，而参考帧在两条融合路径里都是
+        // 基准（DFT 式 6/7 的 r0、mismatch 的权重恒 1）⇒ 暗部被短帧噪声主导（实测
+        // 0.11.67 暗部彩噪明显）。短帧作 alt 时物理上自洽：暗部 d² 大 ⇒ 向参考帧（长帧）
+        // 收缩，高光处短帧 SNR 高 ⇒ d² 小 ⇒ 采短帧。
         val reqs = List(MFNR_FRAMES) { i ->
-            if (i == 0) (shortReq ?: refReq ?: altReq ?: b.build()) else (altReq ?: b.build())
+            if (i == 0) {
+                (refReq ?: altReq ?: b.build())
+            } else if (i == MFNR_FRAMES - 1 && bracketActive) {
+                (shortReq ?: altReq ?: b.build())
+            } else {
+                (altReq ?: b.build())
+            }
         }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
@@ -2589,15 +2600,9 @@ class CameraController(private val context: Context, private val render: RenderC
                             if (burstImageCount < MFNR_FRAMES) {
                                 val idx = burstImageCount++
                                 if (idx == 0) {
-                                    // 帧 0 保留 Image（参考帧，DngCreator 只吃 Image）
+                                    // 帧 0 保留 Image（参考帧 = 长帧，DngCreator 只吃 Image）
                                     burstImages[0] = img
                                     burstStrides[0] = img.planes[0].rowStride / 2
-                                } else if (burstBracketOn && idx == 1) {
-                                    // bracket：帧 0 是短曝光 ⇒ DNG 底片用长帧（帧 1）。
-                                    // Image 留到 processRawBurst 写 DNG，**同时**拷 buffer
-                                    // 供融合（缺 buffer = 融合只有 3 帧，直接失败）
-                                    burstImages[1] = img
-                                    copyRaw(img, 1, close = false)
                                 } else {
                                     copyRawAndClose(img, idx)
                                 }
@@ -3228,14 +3233,11 @@ class CameraController(private val context: Context, private val render: RenderC
         val refResult = results[0]
         val refW = ref.width
         val refH = ref.height
-        // bracket（期 B）：帧 0 是短曝光 ⇒ DNG 底片与渲染元数据都用长帧（帧 1）。
-        // 底片像素必须与 ExposureTime 元数据同源，否则 DNG 暗 2EV 且无法解释。
-        // 注意 dngIdx 只看"采没采短帧"（burstBracketOn），不看 ratio 是否有效 ——
-        // ratio 读回异常时短帧照样是短曝光，底片仍然不能用它。
+        // 帧 0 恒为长帧（短帧放最后一帧，见 startBurst 的注释）⇒ DNG/元数据直接用帧 0。
         val bracketOn = burstBracketOn && burstShortRatio > 1.05f
-        val dngIdx = if (burstBracketOn) 1 else 0
-        val dngImg = images.getOrNull(dngIdx) ?: ref
-        val dngResult = results.getOrNull(dngIdx) ?: refResult
+        val dngIdx = 0
+        val dngImg = ref
+        val dngResult = refResult
         val meta = extractRawMeta(dngResult, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.capture",
@@ -3272,8 +3274,6 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         // 帧 0 拷贝并 close：此时 HAL 槽位全部释放，只剩 4 个 direct buffer
         copyRawAndClose(ref, 0)
-        // bracket 时帧 1（长帧）Image 也持有到此刻 —— DNG 已写，关闭释放槽位
-        if (burstBracketOn) runCatching { images.getOrNull(1)?.close() }
         burstImages.fill(null)
         EngineBridge.nativeFlushLogs()
         applyTonePref()
@@ -3298,18 +3298,21 @@ class CameraController(private val context: Context, private val render: RenderC
             )
         }
         val canReplace = burstBracketOn && !bracketOn && buffers.size == MFNR_FRAMES
+        val si = MFNR_FRAMES - 1
         val fuseBufs = if (canReplace) {
-            listOf(buffers[1], buffers[1], buffers[2], buffers[3])
+            listOf(buffers[0], buffers[1], buffers[2], buffers[0])
         } else {
             buffers
         }
         val fuseStrides = if (canReplace) {
-            intArrayOf(strides[1], strides[1], strides[2], strides[3])
+            intArrayOf(strides[0], strides[1], strides[2], strides[0])
         } else {
             strides
         }
         if (bracketOn) {
-            val st = rawSampleStats(buffers[0], refW, refH, strides[0], meta.whiteLevel)
+            // 短帧在最后一帧
+            val si = MFNR_FRAMES - 1
+            val st = rawSampleStats(buffers[si], refW, refH, strides[si], meta.whiteLevel)
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "bracket.short",
                 kv(

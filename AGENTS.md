@@ -21,6 +21,9 @@
     ./gradlew :app:assembleRelease -PfilmkitHdr=true -q
   apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android \
     --key-pass pass:android --ks-key-alias androiddebugkey \
+    --v4-signing-enabled false \
     --out filmkit-<version>-<TAG>.apk app/build/outputs/apk/release/app-release-unsigned.apk
   ```
+  `--v4-signing-enabled false`：否则每次签名都会在项目根目录留一个 386KB 的
+  `*.idsig`（v4 签名副产物，不是交付物，只在 adb incremental install 时有用）。
 - **打包后必须验证三件事**：签名（`apksigner verify`）、版本号（dex 里 `strings` 能查到）、关键 JNI 符号（`nm -D`）—— 尤其是带编译开关的功能（如 `FILMKIT_HDR`），缓存命中会导致符号静默缺失。

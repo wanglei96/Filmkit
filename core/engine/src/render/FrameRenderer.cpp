@@ -13430,10 +13430,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 期 B bracket（0.11.66）：帧 0 是短曝光帧时先归一到长帧域（长/短），再对齐/融合。
   // **必须归一**：不归一 SAD 残差被 4× 亮度差淹没（confMed 掉到 0，2026-09-29 的
   // alt 帧不守恒事故同型）。归一位于扣黑阶之后（各 pass 内），不是原始 u16 上乘。
+  // 短帧在**最后一帧**（帧 3）：长帧必须作参考帧（DFT 的 r0 / mismatch 的恒权基准），
+  // 短帧作参考会让暗部被其 4× 噪声主导（2026-10-20 真机实测，见 startBurst 注释）。
   float frame_scale[4] = {1.f, 1.f, 1.f, 1.f};
   const float short_ratio_ok =
       std::isfinite(short_ratio) ? std::min(std::max(short_ratio, 1.0f), 8.0f) : 1.0f;
-  frame_scale[0] = short_ratio_ok;
+  frame_scale[3] = short_ratio_ok;
   const bool bracket_on = short_ratio_ok > 1.01f;
   stage("pyr");
 
