@@ -2,7 +2,7 @@
 summary: HDR成片交付链落地与App内HDR显示
 created: 2026-10-20 09:29
 updated: 2026-10-20 09:29
-status: active
+status: absorbed
 ---
 
 # HDR成片交付链落地与App内HDR显示

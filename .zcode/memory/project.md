@@ -19,9 +19,10 @@ status: active
 - `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
 - `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
-## 进行中（2026-10-15，期 A 10bit HEIF 已定稿）
-- [2026-10-15] **期 B：公共工作空间切 Rec.2020 线性** | **待开工（用户已确认下一步做域空间）** | 方案 §5 的 8 面爆炸半径：filmic gamut primaries / CCM 链终点（`StdColorMatrix.kt:29-33`）/ OETF 5 处（4 处 shader `srgbEncode` + CPU `:14245`）/ LUT 域 / 预设重打标 / 输出映射 / 数值阈值 / 零回归基线 ⇒ **A 组守卫会整体变红，必须一次性重定基线**；⚠ 必须**单独一期** | docs/rec2020-heif-design.md §5 + handoffs/10bitHEIF交付链定稿与期A收官.memo.md
-- [2026-10-14] **阶段 3 真机验收** | 待用户执行 | 清单 `docs/reports/stage3-acceptance-CHECKLIST.md` 判据 0–7；**先验判据 0**（引擎 1 必须真的改变画面 / 日志 `tone=1.0`）；判据 ①（高光可分辨跨度）需**固定机位 + 画面里有真正过曝区**（用户现有样片 `≥250` 只占 0.001%）| 包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378 / 0.11.29，项目根目录）
+## 进行中（2026-10-20）
+
+- [2026-10-20] **bracket 采集 + 饱和感知融合** | **设计已定，待实施**（用户已拍板方向：1 短 3 长、短帧帧 0 作参考、k=2）| 设计 `docs/engine-bracket-design.md`（198 行，5 判据 / 4 步实施 / 风险清单）；下一窗口从"采集 + 传参 + 日志"开始，融合两条路径（`kFsMfnrFuse` / `kFsMfnrFft`）随后改 | 快照「自动曝光落地与bracket设计」
+- [2026-10-14] **阶段 3 真机验收** | 待用户执行 | 清单 `docs/reports/stage3-acceptance-CHECKLIST.md` 判据 0–7；**先验判据 0**（引擎 1 必须真的改变画面 / 日志 `tone=1.0`）；判据 ①（高光可分辨跨度）需**固定机位 + 画面里有真正过曝区** | 包 `filmkit-0.11.29-ENGINE-SWITCH-GLOBAL.apk`（378 / 0.11.29，项目根目录）
 
 ## 已收尾（2026-10-13，相册与预设）
 - [2026-10-13] **相册 / 预设面板（本窗口主线）** | 进行中 | 相册：切图转圈（PV-2）、上一张图闪现（PV-3）、缩放锚点（PV-4）已修；预设：横向预设条 + 一级页只给常用参数 + 完整参数二级页 + 返回键分层（PS-6a/6b/7/8/9/10），内置白点 2.5~2.7 → 4.0 修高光死白（R-2/R-3）。**待真机验收**：白杯子高光是否不再死白、亮部变暗幅度可否接受 | handoffs/相册切图闪修与预设面板重做至v0.11.26.memo.md
@@ -94,3 +95,12 @@ status: active
 - [2026-10-20] **真机验收通过**：系统相册正常显示 HDR；App 内查看页也通了（修掉 `ImageDecoder` 不解析 MPF、`context as? Activity` 拿不到、`isScreenHdr` 误判三个 bug）。查看页 HDR 面板支持开关 + **导出 SDR 版**（`nativeExtractSdrBase` 无损取 base）。
 - [2026-10-20] **已知差距（用户已定单独开期）**："高光顶白" = SDR base 平均亮度我们 **85.2/98.4** vs PC **50.7**、`>=240` 占比 **3.38%/2.22%** vs PC **0.37%**；而 **HDR 输出几乎相同** ⇒ 归因自动曝光策略，**gainmap 链路本身没问题**。
 - [2026-10-20] **出包纪律已固化进 `AGENTS.md`**：每个包必升版本号、只留"最新+上一稳定版"、禁用 `-fixN` 后缀、打包后必验签名/版本号/JNI 符号。
+
+## 自动曝光（10-20，渲染端本张统计）
+
+- [2026-10-20] **0.11.59 诊断包**：`sw999` 移到 still 链**无条件写**（此前只在 `auto_tone` 开时写 ⇒ 高光保护恒 NaN）；`stats.sw999` 改读 `g_renderer_still`；每张记 `photo.stats`（`sw999`/`mean`/`hi240`）。
+- [2026-10-20] **0.11.61 渲染端自动曝光**：`AeMetering`（纯函数 + 自测）——`ev_mid = log2(18.45%/P50)`、`ev_hl = (2.438−0.1) − log2(P99.5/18.45%)`，取 `min`（**高光优先**），限幅 ±2EV（与 gainmap `[0.25,4.0]` 对齐）。`passFilm` 前取本张统计并 `pe.exposure_ev += aeEv`；prefs `ae_auto` 默认开。
+- [2026-10-20] **0.11.62 双重欠曝修复**：`ae_auto` 开时采集端高光保护**旁路**（`hlOn = hl_protect && !aeAuto`）。此前两张的链路是：第二张拿第一张 `sw999` 压低采集 + 补偿 EV + 渲染端再压。
+- [2026-10-20] **0.11.63 P99.5 判据**：允许 0.5% 像素裁切（PC `maximumClippedFraction=0.005` 同口径）；`p_hi995` 新增，P99.9 仍留给 filmic 白点上探。
+- [2026-10-20] **0.11.64 MFNR 超时误杀**：`tryProcessBurst` 收满即 `cancelBurstTimeout()`；否则上一张的 5s 定时器会把下一张误判超时（`images:0 waitMs:278`）⇒ 回退单帧、无 HDR、明显更暗。
+- [2026-10-20] **实测（台灯+窗，0.11.64）**：两张 `aeEv −1.11 / −1.11`、`aeP50 0.0696`、`mean 44.8 / 45.2`、`gainmap:true` ×2。**仍压 1.11EV**（P99.5=2.03 超白点），离 PC 的 `mean 89` 还有约 1EV —— 这笔账只能靠 bracket 从物理上解决。
