@@ -926,13 +926,17 @@ Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
   const auto jf = [](float v) {
     return std::isfinite(v) ? std::to_string(v) : std::string("0.0");
   };
+  // v0.11.59：成片统计在**独立实例** g_renderer_still 上（拍照线程，prefs still_thread），
+  // 用 g_renderer 读会恒 0（同 2026-10-20 nativeReadGainmap 用错实例的坑）。
+  FrameRenderer* sr = g_renderer_still.load();
+  if (sr == nullptr) sr = g_renderer;
   return toJString(env, "{\"frames\":" + std::to_string(frames) +
                             ",\"w\":" + std::to_string(w) +
                             ",\"h\":" + std::to_string(h) +
                             ",\"w99\":" + jf(g_renderer ? g_renderer->sceneW99() : 0.0f) +
                             ",\"w999\":" + jf(g_renderer ? g_renderer->sceneW999() : 0.0f) +
                             // 成片链专用（预览域与 RAW 域不是一个尺度，见 stillW999 注释）
-                            ",\"sw999\":" + jf(g_renderer ? g_renderer->stillW999() : 0.0f) +
+                            ",\"sw999\":" + jf(sr ? sr->stillW999() : 0.0f) +
                             ",\"wmax\":" + jf(g_renderer ? g_renderer->sceneWMax() : 0.0f) +
                             ",\"clipB\":" + std::to_string(g_renderer ? g_renderer->highlightClipBlocks() : -1) + "}");
 }

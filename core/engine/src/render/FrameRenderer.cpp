@@ -14457,6 +14457,12 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   float w = user_white;
   float w99 = 0.0f, w999 = 0.0f, cp = 1.0f;
   const SceneStats st = measureSceneStats(src);  // 开关两边都统计（日志不留盲区）
+  // v0.11.59：曝光判据（sw999）与 auto_tone **解耦**。高光保护读的就是它，而默认
+  // [35]=0 ⇒ 此前恒 0 ⇒ sceneHighlightEv()=NaN ⇒ ExposurePlanner 永远不做高光约束，
+  // 采集侧一直用 HAL AE 的曝光。这里只在 still 链写，预览域不碰（两者不是一个尺度）。
+  if (still && st.valid) {
+    last_still_w999_ = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+  }
   if (st.valid && auto_on) {
     // v0.10.16/18：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
     // （apply_auto_black / apply_auto_white_point_source），取样统计量 = P0.1 / P99
@@ -14492,7 +14498,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     // 噪声尖峰由幅度闸与上限兜底。
     w99 = std::log2(std::max(st.p_hi, 1e-6f) / kGrey);
     w999 = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
-    if (still) last_still_w999_ = w999;   // 成片域专用（曝光判据只认它）
+    // last_still_w999_ 已在 auto_on 之外无条件写入（v0.11.59）
     const float w_max = std::log2(std::max(st.p_max, 1e-6f) / kGrey);
     if (white_hl > 0.5f) {
       // v0.10.111：上探幅度由 white_probe 控制（旧硬编码 1.5）。真机实测该闸每次都

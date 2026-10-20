@@ -2685,6 +2685,57 @@ class CameraController(private val context: Context, private val render: RenderC
         )
         if (tenBit) queueHeifSave(bytes, w, h, snap, fmt, "", gainmap)
         else queueJpegSave(bytes, w, h, snap, fmt, "", gainmap)
+        logStillStats(bytes, w, h, tenBit)
+    }
+
+    /** 成片亮度统计（v0.11.59 曝光归因）：一次拍照一条，直接回答"base 比 PC 亮多少"。
+     *  - `sw999`：成片域 P99.9（EV 前，log2 相对中灰）—— ExposurePlanner 的高光判据
+     *  - `mean`：BT.601 亮度均值（口径同 saveJpeg 的 16×16 诊断）
+     *  - `hi240`：亮度 ≥240 的像素占比（%）
+     *  采样 step=4（1/16 像素），12MP ≈ 76 万点；对 1% 量级占比的标准误 <0.03%，
+     *  足够区分"我们 3.38% vs PC 0.37%"。10bit packed 按 4B/px 解三通道是错的 ⇒ 只统计 8bit。 */
+    private fun logStillStats(bytes: ByteArray, w: Int, h: Int, tenBit: Boolean) {
+        val sw = try {
+            org.json.JSONObject(EngineBridge.nativeEngineGetStats() ?: "{}")
+                .optDouble("sw999", 0.0)
+        } catch (_: Throwable) {
+            0.0
+        }
+        var mean = -1.0
+        var hi = -1.0
+        if (!tenBit) {
+            val step = 4
+            var sum = 0L
+            var n = 0L
+            var hit = 0L
+            var y = 0
+            while (y < h) {
+                var x = 0
+                while (x < w) {
+                    val i = (y * w + x) * 4
+                    if (i + 2 < bytes.size) {
+                        val l = ((bytes[i].toInt() and 0xFF) * 299 +
+                            (bytes[i + 1].toInt() and 0xFF) * 587 +
+                            (bytes[i + 2].toInt() and 0xFF) * 114) / 1000
+                        sum += l
+                        if (l >= 240) hit++
+                        n++
+                    }
+                    x += step
+                }
+                y += step
+            }
+            if (n > 0) {
+                mean = sum.toDouble() / n
+                hi = 100.0 * hit / n
+            }
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.stats",
+            kv("sw999" to "%.3f".format(sw), "mean" to "%.1f".format(mean),
+                "hi240" to "%.2f".format(hi), "w" to w, "h" to h,
+                "bits" to if (tenBit) 10 else 8),
+        )
     }
 
     /** 单帧静拍统一收尾（YUV / 单帧 RAW 共用）：解锁 + 预览回升 + 落盘。

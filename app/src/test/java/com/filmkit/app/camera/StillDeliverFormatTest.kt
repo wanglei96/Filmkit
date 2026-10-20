@@ -237,8 +237,8 @@ class StillDeliverFormatTest {
         // deliverStill = 唯一分派点：它内部同时出现 queueHeifSave 与 queueJpegSave。
         val body = src.substringAfter("private fun deliverStill(")
             .substringBefore("\n    /** 单帧静拍统一收尾")
-        assertTrue("deliverStill 必须分派到 HEIF", body.contains("queueHeifSave(bytes, w, h, snap, fmt)"))
-        assertTrue("deliverStill 必须分派到 JPEG", body.contains("queueJpegSave(bytes, w, h, snap, fmt)"))
+        assertTrue("deliverStill 必须分派到 HEIF", body.contains("queueHeifSave(bytes, w, h, snap, fmt"))
+        assertTrue("deliverStill 必须分派到 JPEG", body.contains("queueJpegSave(bytes, w, h, snap, fmt"))
         assertTrue("deliverStill 必须留交付档日志", body.contains("\"photo.deliver\""))
         // 而且只能有这一处 `if (tenBit)` 分派。
         assertEquals("交付档分派必须唯一", 1, countOf("if (tenBit) queueHeifSave"))
@@ -255,7 +255,7 @@ class StillDeliverFormatTest {
         )
         assertTrue(
             "burst done 回调必须走唯一分派点 deliverStill",
-            done.contains("deliverStill(bytes, w, h, snap, tenBit)"),
+            done.contains("deliverStill(bytes, w, h, snap, tenBit"),
         )
     }
 
@@ -270,7 +270,7 @@ class StillDeliverFormatTest {
             4,
             countOf("queueJpegSave(") - 1,   // -1 = 函数声明自身
         )
-        assertTrue(src.contains("queueJpegSave(bytes, w, h, snap, fmt)"))
+        assertTrue(src.contains("queueJpegSave(bytes, w, h, snap, fmt"))
         assertTrue(src.contains("queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag)"))
         assertTrue(src.contains("queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8)"))
         assertTrue(src.contains("queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, \"_nn\")"))
