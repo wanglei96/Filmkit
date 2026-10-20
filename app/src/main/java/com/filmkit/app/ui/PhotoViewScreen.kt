@@ -519,19 +519,20 @@ fun PhotoViewScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
-    // ── HDR 查看开关（v0.11.50，用户要求对齐 PC：查看大图时能开/关 HDR）─────────
-    // 默认跟随全局设置 `hdr_screen`（MainActivity 已按它设窗口模式）；这里再给一个
-    // **页内开关**，让用户当场对比 HDR 与 SDR 的差别。
-    // 关掉时走普通 `BitmapFactory` 路径（gainmap 被 inSampleSize 丢掉 ⇒ 纯 SDR）；
-    // 打开时走 `ImageDecoder`（保留 gainmap）+ 窗口 COLOR_MODE_HDR。
-    // HDR **显示**能力（全局，因为 window.colorMode 是 Activity 级）
-    var hdrOn by rememberSaveable { mutableStateOf(prefs.getBoolean("view_hdr", true)) }
+    // ── HDR 查看开关（v0.11.60：**按单图**记忆）──────────────────────────────
+    // v0.11.50 曾把它做成全局 prefs（`view_hdr`），结果"关掉一张 = 全部关掉"——
+    // 用户 2026-10-20 明确纠正：这个开关属于**单张图片**，开关与否由用户对这张图决定。
+    // 现在每张图各自一个 key（`view_hdr:<uri>`），默认开；设置页的「HDR 成片」只决定
+    // **新拍**是否附带 gainmap，与查看已有图片完全无关（两件事不要互相污染）。
     // HDR **编辑**面板（单张图，用户 2026-10-20 定案：开关属于单张图片，不是全局）
     var showHdrPanel by remember { mutableStateOf(false) }
     var hdrExportMsg by remember { mutableStateOf<String?>(null) }
     var hdrExporting by remember { mutableStateOf(false) }
     val pageCount = uris.size
     val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
+    val hdrUri = uris.getOrNull(pagerState.settledPage)
+    val hdrKey = if (hdrUri != null) "view_hdr_$hdrUri" else "view_hdr"
+    var hdrOn by rememberSaveable(hdrKey) { mutableStateOf(prefs.getBoolean(hdrKey, true)) }
 
     // HDR 开关 → 窗口色彩模式（Android 14+ 且屏幕支持 HDR 才生效）。
     // 这是 HDR 显示的**前提**：窗口不在 HDR 模式时，即使 Bitmap 带 gainmap，
@@ -1199,12 +1200,19 @@ fun PhotoViewScreen(
                         checked = hdrOn,
                         onCheckedChange = {
                             hdrOn = it
-                            prefs.edit().putBoolean("view_hdr", it).apply()
+                            // 只写这张图的 key（v0.11.60：按单图记忆，不再一关全关）
+                            prefs.edit().putBoolean(hdrKey, it).apply()
                         },
                     )
                 }
                 Text(
-                    "不支持 HDR 的查看器自动回落 SDR",
+                    // 按单图提示（v0.11.60）：SDR 图即使开关开着也没有增益可显示，
+                    // 说清楚比让用户对着"开了却没变化"猜要好。
+                    if (android.os.Build.VERSION.SDK_INT >= 34 && bitmap?.hasGainmap() == true) {
+                        "这张图带 HDR 增益图 · 不支持 HDR 的查看器自动回落 SDR"
+                    } else {
+                        "这张图没有 HDR 数据（按 SDR 显示）"
+                    },
                     color = FilmTheme.CreamDim, fontSize = 11.sp,
                 )
                 Spacer(Modifier.height(10.dp))

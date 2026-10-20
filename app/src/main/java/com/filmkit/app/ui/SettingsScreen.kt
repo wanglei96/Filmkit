@@ -213,8 +213,9 @@ fun SettingsScreen(
             var hdrOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hdr_gainmap", false)) }
             SettingSwitchRow(
                 title = "HDR 成片（Ultra HDR / gainmap）",
-                subtitle = "在成片里附带 HDR 增益图：系统相册/Chrome 等支持 HDR 的查看器会显示更亮的高光，" +
-                    "不支持的环境自动回落 SDR。当前能力：" + HdrDelivery.capabilitySummary() +
+                subtitle = "只影响新拍的照片是否附带 HDR 增益图；相册里已有 HDR 图的显示由查看页" +
+                    "每张图自己的开关决定，与本开关无关。系统相册/Chrome 等支持 HDR 的查看器会显示" +
+                    "更亮的高光，不支持的环境自动回落 SDR。当前能力：" + HdrDelivery.capabilitySummary() +
                     "。需 Android 14+；失败自动回退普通成片",
                 checked = hdrOn,
                 onChecked = { on ->
