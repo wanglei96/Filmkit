@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -57,11 +58,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.FloatState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -98,6 +101,7 @@ import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.presetScopeNotice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 // ── 缩放 / 平移 / 手势仲裁的纯逻辑（E2-20；JVM 单测见 PhotoViewZoomTest）────────
@@ -515,8 +519,46 @@ fun PhotoViewScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+    // ── HDR 查看开关（v0.11.50，用户要求对齐 PC：查看大图时能开/关 HDR）─────────
+    // 默认跟随全局设置 `hdr_screen`（MainActivity 已按它设窗口模式）；这里再给一个
+    // **页内开关**，让用户当场对比 HDR 与 SDR 的差别。
+    // 关掉时走普通 `BitmapFactory` 路径（gainmap 被 inSampleSize 丢掉 ⇒ 纯 SDR）；
+    // 打开时走 `ImageDecoder`（保留 gainmap）+ 窗口 COLOR_MODE_HDR。
+    // HDR **显示**能力（全局，因为 window.colorMode 是 Activity 级）
+    var hdrOn by rememberSaveable { mutableStateOf(prefs.getBoolean("view_hdr", true)) }
+    // HDR **编辑**面板（单张图，用户 2026-10-20 定案：开关属于单张图片，不是全局）
+    var showHdrPanel by remember { mutableStateOf(false) }
+    var hdrExportMsg by remember { mutableStateOf<String?>(null) }
+    var hdrExporting by remember { mutableStateOf(false) }
     val pageCount = uris.size
     val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
+
+    // HDR 开关 → 窗口色彩模式（Android 14+ 且屏幕支持 HDR 才生效）。
+    // 这是 HDR 显示的**前提**：窗口不在 HDR 模式时，即使 Bitmap 带 gainmap，
+    // 系统也只会按 SDR 合成（用户实测"app相册还是sdr显示"就是这个原因之一）。
+    androidx.compose.runtime.LaunchedEffect(hdrOn) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // ⚠ 必须**解包 ContextWrapper**：Compose 的 LocalContext 常常不是 Activity
+            // 本身（ContextThemeWrapper / ContextWrapper 层层包着），`as? Activity` 会
+            // 直接拿到 null ⇒ 整段跳过 ⇒ 窗口永远停在 sRGB（真机"app 相册看不了 HDR"的
+            // 候选根因之一）。
+            val act = context.findActivity() ?: return@LaunchedEffect
+            runCatching {
+                // ⚠ **不要用 `configuration.isScreenHdr` 当条件**（v0.11.56 真机实测）：
+                // 它在用户这台设备上返回 **false**，而系统相册明明能显示 HDR ——
+                // 用它是硬条件 ⇒ 窗口永远停在 COLOR_MODE_DEFAULT（日志 `colorMode:0`），
+                // 整条 HDR 显示链被静默挡死。
+                // 官方文档/示例只按 **`bitmap.hasGainmap()`** 决定（见
+                // developer.android.com/media/grow/ultra-hdr/display）：设备不支持 HDR 时
+                // 系统自己会降级，不需要调用方预先判断。
+                act.window.colorMode = if (hdrOn) {
+                    android.content.pm.ActivityInfo.COLOR_MODE_HDR
+                } else {
+                    android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+                }
+            }
+        }
+    }
 
     // **只有"停稳"的那一页解大图**（settledPage：滚动动画结束后才更新）。E2-22 起按显示尺寸解
     // （12MP 只解 ≈3MP ≈12MB），但滑动过程中 Pager 仍会组合相邻页，按 currentPage 解码就会同时压两三张。
@@ -708,7 +750,7 @@ fun PhotoViewScreen(
     // 丢旧像素 + 上新像素"是**同一段没有挂起点的同步代码**（见下面的 `if (shownUri != u)` 块）。
     // 判据：**任何时刻都不存在"新页已选中但位图为 null"的可见帧** —— 命中预载就同步换上
     // 新页的预览档，未命中就同步置 null（配合 [SPINNER_DELAY_MS]，那一帧是纯黑底而不是转圈）。
-    LaunchedEffect(page, uris, hiRes, viewSize) {
+    LaunchedEffect(page, uris, hiRes, viewSize, hdrOn) {   // hdrOn：切换后必须重解（gainmap 在解码时决定）
         val u = uris.getOrNull(page) ?: return@LaunchedEffect
         val vw = viewSize.width
         val vh = viewSize.height
@@ -751,8 +793,11 @@ fun PhotoViewScreen(
             if (preview != null) bitmap = preview
         }
         // 目标档：Fit（12MP ⇒ 2000×1500 ≈12MB）或放大档（viewSize×2；12MP 上这档等价全分辨率）
+        // HDR 开 ⇒ ImageDecoder（保留 gainmap，主图与 gainmap 同步缩放）；
+        // HDR 关 ⇒ BitmapFactory（inSampleSize 会丢 gainmap ⇒ 纯 SDR，正是"关"要的效果）
         val b = withContext(Dispatchers.IO) {
-            decodeFit(context, parsed, vw * target, vh * target)
+            if (hdrOn) decodeFitHdr(context, parsed, vw * target, vh * target)
+            else decodeFit(context, parsed, vw * target, vh * target)
         }
         if (b != null) {
             // ★ PV-1 交叉淡入，三步顺序**不能换**（换了下场是"闪一帧全黑"）：
@@ -799,6 +844,34 @@ fun PhotoViewScreen(
     // MainActivity 的导航层接管；这里注册的是**内层**，Compose 的返回回调后进先出 ⇒ 面板打开
     // 时它优先，关闭后交还导航层（行为与 P-3 之前逐位一致）。
     BackHandler(enabled = showFilmPanel) { showFilmPanel = false }
+    BackHandler(enabled = showHdrPanel) { showHdrPanel = false }
+
+    // ── 「导出 SDR 版」（v0.11.54，用户 2026-10-20 定案）─────────────────
+    // HDR 开关本质是**单张图的编辑功能**：这张图带 gainmap（HDR），用户可能想要一张
+    // **纯 SDR** 的版本（发给不支持 HDR 的人 / 微信 / 老设备）。
+    // 走 `nativeExtractSdrBase` 从 JPEG/R 里**无损取出 base**，不是重新压缩 ——
+    // Bitmap.compress 会对 12MP 再压一次 JPEG（二次量化），而 base 本来就是完整 JPEG。
+    val hdrScope = androidx.compose.runtime.rememberCoroutineScope()
+    val exportSdr: () -> Unit = {
+        val u = currentUri
+        if (u != null && !hdrExporting) {
+            hdrExporting = true
+            hdrExportMsg = null
+            hdrScope.launch {
+                val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        val src = context.contentResolver.openInputStream(u)?.use { it.readBytes() }
+                            ?: return@runCatching false
+                        val sdr = com.filmkit.app.EngineBridge.nativeExtractSdrBase(src)
+                            ?: return@runCatching false
+                        saveSdrJpeg(context, sdr)
+                    }.getOrDefault(false)
+                }
+                hdrExporting = false
+                hdrExportMsg = if (ok) "已导出 SDR 版到相册" else "导出失败（这张可能不是 HDR 图）"
+            }
+        }
+    }
 
     Column(
         Modifier
@@ -836,6 +909,23 @@ fun PhotoViewScreen(
                 if (time.isNotEmpty()) {
                     Text(time, color = FilmTheme.CreamDim, fontSize = 12.sp)
                 }
+            }
+            // ── HDR 开关（v0.11.50）：对齐 PC 的查看页交互 ────────────────
+            // 文字按钮而非图标：HDR 是**状态**不是动作，文字 + 高亮比图标更明确
+            // （PC 也是这么做的，见其 GalleryDetailScreen 的 HDR 按钮）。
+            Box(
+                Modifier
+                    .height(48.dp)
+                    .clickable { showHdrPanel = true }
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "HDR",
+                    color = if (hdrOn) FilmTheme.Accent else FilmTheme.CreamDim,
+                    fontSize = 13.sp,
+                    fontWeight = if (hdrOn) FontWeight.Bold else FontWeight.Normal,
+                )
             }
             Box(
                 Modifier
@@ -1068,6 +1158,90 @@ fun PhotoViewScreen(
                 enabled,
                 tint = MaterialTheme.colorScheme.error,
             ) { confirmDelete = true }
+        }
+    }
+
+    // ── HDR 面板（v0.11.54）：单张图的显示 + 导出入口 ────────────────────
+    if (showHdrPanel) {
+        // ⚠ **遮罩必须全透明**（v0.11.58，用户实测要求）：面板打开时要能**实时**
+        // 看到图片在 HDR 开/关下的差别，半透明黑罩会把高光压暗、对比全失
+        //（0.55 alpha 时 HDR 与 SDR 几乎看不出区别）。
+        // 透明不影响"点外部关闭"：clickable 覆盖整屏，只吃 tap（不吃滑动），
+        // 面板自身有 FilmTheme.Panel 不透明背景，视觉上仍是一块浮窗。
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clickable(interactionSource = MutableInteractionSource(), indication = null) {
+                    showHdrPanel = false
+                },
+        ) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                    .background(FilmTheme.Panel)
+                    .clickable(interactionSource = MutableInteractionSource(), indication = null) {}
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            ) {
+                // 紧凑布局（v0.11.58）：说明文字压成一行、开关与按钮并排 ——
+                // 面板是全宽贴底，越高挡得越多；用户要"实时看图"，可视面积优先。
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "HDR 显示",
+                        color = FilmTheme.Cream, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    )
+                    Switch(
+                        checked = hdrOn,
+                        onCheckedChange = {
+                            hdrOn = it
+                            prefs.edit().putBoolean("view_hdr", it).apply()
+                        },
+                    )
+                }
+                Text(
+                    "不支持 HDR 的查看器自动回落 SDR",
+                    color = FilmTheme.CreamDim, fontSize = 11.sp,
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (hdrExporting) FilmTheme.ChipBg else FilmTheme.Accent)
+                            .clickable(enabled = !hdrExporting) { exportSdr() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            if (hdrExporting) "导出中…" else "导出 SDR 版",
+                            color = if (hdrExporting) FilmTheme.CreamDim else FilmTheme.OnAccent,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(FilmTheme.ChipBg)
+                            .clickable { showHdrPanel = false }
+                            .padding(horizontal = 18.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("关闭", color = FilmTheme.Cream, fontSize = 14.sp)
+                    }
+                }
+                hdrExportMsg?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text(it, color = FilmTheme.CreamDim, fontSize = 12.sp)
+                }
+            }
         }
     }
 
@@ -1513,4 +1687,14 @@ private fun Cursor.longOr0(column: String): Long {
 private fun Cursor.stringOrEmpty(column: String): String {
     val i = getColumnIndex(column)
     return if (i < 0 || isNull(i)) "" else getString(i).orEmpty()
+}
+
+/** 从任意 Context 解包出 Activity（Compose 的 LocalContext 可能被多层 ContextWrapper 包裹）。 */
+internal fun android.content.Context.findActivity(): android.app.Activity? {
+    var c: android.content.Context? = this
+    while (c is android.content.ContextWrapper) {
+        if (c is android.app.Activity) return c
+        c = c.baseContext
+    }
+    return null
 }

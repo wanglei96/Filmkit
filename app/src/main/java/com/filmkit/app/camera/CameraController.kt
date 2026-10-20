@@ -23,6 +23,8 @@ import android.view.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.filmkit.app.hdr.HdrDelivery
+import com.filmkit.app.hdr.PlatformGainmapWriter
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
 import com.filmkit.app.ui.CameraPresets
@@ -2610,16 +2612,79 @@ class CameraController(private val context: Context, private val render: RenderC
      * ⚠ [tenBit] 必须是**下发点冻结的局部值**（由调用方传参），不许在这里读成员 —— 见
      * [tenBitForCapture] 的注释。
      */
+    /**
+     * 本张是否尝试 HDR 交付（prefs `hdr_gainmap`，默认关）。
+     *
+     * 每张都读 prefs 而不是缓存成成员：设置页改动要**下一张立即生效**，
+     * 且拍照回调在 1~4s 后才跑，缓存值会与用户当时看到的不一致。
+     */
+    private fun hdrEnabled(): Boolean = runCatching {
+        context.getSharedPreferences("filmkit", 0).getBoolean("hdr_gainmap", false)
+    }.getOrDefault(false)
+
+    /**
+     * 在**渲染线程**读回本张的 gainmap（HDR 开启时）。失败返回 null ⇒ 该张回落普通 JPEG。
+     *
+     * 为什么必须在这个线程：`nativeReadGainmap` 读的是该线程 EGL 上下文里的
+     * `tex_gainmap_`。在别的线程调用会读到空/错的纹理（且不报错）。
+     */
+    private fun readGainmapSnapshot(): GainmapSnapshot? {
+        if (!HdrDelivery.jpegRSupported) return null
+        return runCatching {
+            val gw = EngineBridge.nativeGainmapWidth()
+            val gh = EngineBridge.nativeGainmapHeight()
+            if (gw <= 0 || gh <= 0) return null
+            val data = EngineBridge.nativeReadGainmap() ?: return null
+            if (data.size < gw * gh) return null
+            GainmapSnapshot(data, gw, gh)
+        }.onFailure {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "hdr.gainmap_read_failed",
+                kv("error" to (it.message ?: it.toString())),
+            )
+        }.getOrNull()
+    }
+
+    /**
+     * 按成片的裁剪区域同步裁 gainmap（1/2 坐标）。
+     *
+     * 越界/尺寸异常返回 null ⇒ 该张回落普通 JPEG（宁可没有 HDR，不可错位 HDR）。
+     */
+    private fun cropGainmap(
+        gm: GainmapSnapshot, srcW: Int, srcH: Int, dstW: Int, dstH: Int,
+    ): GainmapSnapshot? {
+        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return null
+        val gx0 = ((srcW - dstW) / 2) / 2
+        val gy0 = ((srcH - dstH) / 2) / 2
+        val gw = (dstW + 1) / 2
+        val gh = (dstH + 1) / 2
+        if (gx0 < 0 || gy0 < 0 || gx0 + gw > gm.w || gy0 + gh > gm.h) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "hdr.gainmap_crop_oob",
+                kv("gm" to "${gm.w}x${gm.h}", "crop" to "${gx0},${gy0} ${gw}x${gh}",
+                    "src" to "${srcW}x${srcH}", "dst" to "${dstW}x${dstH}"),
+            )
+            return null
+        }
+        val out = ByteArray(gw * gh)
+        for (y in 0 until gh) {
+            System.arraycopy(gm.data, (gy0 + y) * gm.w + gx0, out, y * gw, gw)
+        }
+        return GainmapSnapshot(out, gw, gh)
+    }
+
     private fun deliverStill(
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
+        gainmap: GainmapSnapshot? = null,
     ) {
         val fmt = DeliverFormat.of(tenBit)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.deliver",
             kv("bits" to fmt.bits, "path" to (if (tenBit) "heif" else "jpeg"),
-                "bytes" to bytes.size),
+                "bytes" to bytes.size, "gainmap" to (gainmap != null)),
         )
-        if (tenBit) queueHeifSave(bytes, w, h, snap, fmt) else queueJpegSave(bytes, w, h, snap, fmt)
+        if (tenBit) queueHeifSave(bytes, w, h, snap, fmt, "", gainmap)
+        else queueJpegSave(bytes, w, h, snap, fmt, "", gainmap)
     }
 
     /** 单帧静拍统一收尾（YUV / 单帧 RAW 共用）：解锁 + 预览回升 + 落盘。
@@ -3028,6 +3093,12 @@ class CameraController(private val context: Context, private val render: RenderC
         // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
         val tenBit = tenBitForCapture()
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
+            // ── HDR gainmap（v0.11.50）────────────────────────────────────
+            // **必须在渲染线程、且在下一次 submit 之前**读：它读的是该线程 EGL
+            // 上下文里的 tex_gainmap_，下一次拍照会把它覆盖。
+            // 本 lambda 就是拍照线程的 onDone（StillRenderClient 保证），
+            // 而渲染线程路径的回退（render.submitRawBurst）也是同一线程的 onDone。
+            val gainmap = if (bytes != null && hdrEnabled()) readGainmapSnapshot() else null
             rendersInFlight.decrementAndGet()
             capturePhase = 0
             // 合成结束（无论成败）：预览降载回升（v0.10.93）。capturing 已在下面
@@ -3039,7 +3110,7 @@ class CameraController(private val context: Context, private val render: RenderC
             // ⚠ 卡 FIX1（2026-10-14 P0）：此处在修复前**硬编码 queueJpegSave**，
             //   完全绕过交付档 ⇒ HEIF 档下 10bit packed 缓冲被 ARGB_8888 错读，
             //   真机废掉两张照片（37MB/43MB）。必须走唯一分派点 [deliverStill]。
-            if (bytes != null) deliverStill(bytes, w, h, snap, tenBit)
+            if (bytes != null) deliverStill(bytes, w, h, snap, tenBit, gainmap)
         }
         // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
         // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
@@ -3517,6 +3588,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun queueHeifSave(
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
         extraTag: String = "",
+        gainmap: GainmapSnapshot? = null,
     ) {
         if (!DeliverFormat.heifAccepts(fmt)) {
             EngineBridge.nativeAppendLog(
@@ -3536,7 +3608,7 @@ class CameraController(private val context: Context, private val render: RenderC
             kv("bytes" to bytes.size, "w" to w, "h" to h,
                 "chroma" to com.filmkit.app.heif.HeifChroma.CHROMA, "jpeg444Ignored" to true),
         )
-        saver.execute { saveHeif(bytes, w, h, iso, secNs, extraTag, snap) }
+        saver.execute { saveHeif(bytes, w, h, iso, secNs, extraTag, snap, gainmap) }
     }
 
     /**
@@ -3549,11 +3621,112 @@ class CameraController(private val context: Context, private val render: RenderC
      * 8bit HEIF 回退**本卡不做**（见报告 §5）：androidx `HeifWriter` 是另一条 API 与另一条
      * 验证路径，且它只能写 8bit（设计 §2.1）—— 在"默认 JPEG"的前提下没有收益。
      */
+    /**
+     * HEIC + HDR 落盘（v0.11.50）。
+     *
+     * 与常规 HEIF 落盘的区别：**不走** `HeifDeliverCheck` 自检 —— 那是为**自研容器**
+     * （`ftyp(heic) + meta(hdlr/pitm/iinf/iloc/iprp) + mdat`，含 hvcC 10bit 判据）写的，
+     * 而这里的数据来自平台 `HeifWriter`（容器结构不同，套用会误判失败）。
+     * 改为轻量校验：文件非空 + 前 12 字节是 `ftyp` box（HEIF/MP4 家族的标志）。
+     *
+     * @return true = 已落盘；false = 失败（调用方回落三级链，绝不丢照片）
+     */
+    private fun persistHdrHeic(bytes: ByteArray, extraTag: String): Boolean {
+        if (bytes.size < 12) return false
+        // ftyp：ISO BMFF 第一个 box（"ftyp" 在偏移 4..8）
+        if (bytes[4] != 'f'.code.toByte() || bytes[5] != 't'.code.toByte() ||
+            bytes[6] != 'y'.code.toByte() || bytes[7] != 'p'.code.toByte()
+        ) {
+            return false
+        }
+        val now = Date()
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$extraTag.heic"
+        var savedUri: android.net.Uri? = null
+        var savedFile: File? = null
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val cv = android.content.ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/heic")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                context.contentResolver
+                    .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                    ?.let { uri ->
+                        context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                        cv.clear()
+                        cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                        context.contentResolver.update(uri, cv, null, null)
+                        savedUri = uri
+                    }
+            } else {
+                val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
+                dir.mkdirs()
+                val f = File(dir, name)
+                f.outputStream().use { it.write(bytes) }
+                savedFile = f
+            }
+        } catch (t: Throwable) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "photo.heif_hdr_write_failed",
+                kv("error" to (t.message ?: t.toString())),
+            )
+            runCatching { savedUri?.let { context.contentResolver.delete(it, null, null) } }
+            runCatching { savedFile?.delete() }
+            return false
+        }
+        if (savedUri == null && savedFile == null) return false
+        savedUri?.let { lastPhotoUri = it }
+        runCatching { writeExif(savedUri, savedFile, now) }
+        return true
+    }
+
     private fun saveHeif(
         rgba10: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
         extraTag: String, snap: StillSnapshot,
+        gainmap: GainmapSnapshot? = null,
     ) {
         val t0 = System.currentTimeMillis()
+        // ── HEIC + HDR（v0.11.50，用户 2026-10-19 拍板：**接受 8bit 降位**）──────
+        // 走平台 HeifWriter（8bit + gainmap），对齐 PhotonCamera 的 HeicExportEncoder。
+        // 取舍已定：现有 HEIC 是自研 **10bit** 容器，开 HDR 会降到 8bit —— 用户判断
+        // "10bit 收益很低"（HEIC 的 4:2:0 色度损失是主导短板，10bit 的量化精度被稀释），
+        // 用可见的 HDR 动态范围换不可见的量化精度，划算。
+        // 失败 ⇒ 继续走下面的三级链（10bit → 8bit → JPEG），绝不丢照片。
+        if (gainmap != null && hdrEnabled() && HdrDelivery.platformGainmapSupported) {
+            val hdrBytes = runCatching {
+                val rgba8 = com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
+                val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
+                bmp.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(rgba8))
+                val gm = HdrDelivery.buildGainmap(gainmap.data, gainmap.w, gainmap.h)
+                val tmp = File(context.cacheDir, "hdr-heic$extraTag.heic")
+                try {
+                    if (gm != null &&
+                        PlatformGainmapWriter.writeHeic(bmp, gm, tmp.absolutePath, 100)
+                    ) {
+                        tmp.readBytes().takeIf { it.size > 64 }
+                    } else {
+                        null
+                    }
+                } finally {
+                    bmp.recycle()
+                    tmp.delete()
+                }
+            }.getOrNull()
+            if (hdrBytes != null && persistHdrHeic(hdrBytes, extraTag)) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "photo.heif_hdr",
+                    kv("ms" to (System.currentTimeMillis() - t0), "bytes" to hdrBytes.size,
+                        "w" to w, "h" to h, "bits" to 8, "gainmap" to "${gainmap.w}x${gainmap.h}"),
+                )
+                return
+            }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "camera", "photo.heif_hdr_failed",
+                kv("fallback" to "3-level", "ms" to (System.currentTimeMillis() - t0)),
+            )
+        }
         // 三级回退（卡 FIX2）：10bit 自研容器 → 8bit HEIF（平台 muxer）→ JPEG。
         // 顺序、逐级日志与"拿不准就往下落"的语义由 HeifDelivery 固化（纯 JVM 单测覆盖三条路径）。
         var spec = com.filmkit.app.heif.HeifDeliverCheck.Spec.TEN_BIT
@@ -3782,6 +3955,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun queueJpegSave(
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
         extraTag: String = "",
+        gainmap: GainmapSnapshot? = null,
     ) {
         // ── 交付格式断言（照片优先红线：宁可失败/降位，绝不静默交付错数据）──────────
         // JPEG 编码器只能吃 8bit RGBA（`EngineBridge.OUTPUT_BITMAP_CONFIG` = ARGB_8888）。
@@ -3805,7 +3979,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 )
                 return
             }
-            saver.execute { saveJpeg(rgba8, w, h, iso8, sec8, extraTag, snap) }
+            // 10bit 降位路径不接 HDR（gainmap 是按 8bit 成片算的，降位后像素已变）
+            saver.execute { saveJpeg(rgba8, w, h, iso8, sec8, extraTag, snap, null) }
             return
         }
         val iso = liveIso
@@ -3814,7 +3989,7 @@ class CameraController(private val context: Context, private val render: RenderC
             EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
             kv("bytes" to bytes.size),
         )
-        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap) }
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap, gainmap) }
     }
 
     /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。
@@ -3822,6 +3997,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun saveJpeg(
         rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
         extraTag: String = "", snap: StillSnapshot,
+        gainmap: GainmapSnapshot? = null,
     ) {
         val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
@@ -3863,6 +4039,16 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         val outW = outBmp.width
         val outH = outBmp.height
+        // ── gainmap 必须与成片**同步裁剪**（v0.11.50）───────────────────────
+        // 上面的画幅居中裁切会让成片小于渲染尺寸，而 gainmap 是按渲染尺寸算的
+        //（1/2 分辨率）⇒ 不裁就错位，HDR 显示时增益会落在错误的位置。
+        // 坐标换算：源像素 (x,y) ↔ gainmap (x/2, y/2)；裁剪起点同样除 2 取整。
+        // 取整误差 ≤1 个 gainmap 像素 = 2 个源像素，对低频增益图无可见影响。
+        val useGainmap = if (gainmap != null && (outW != w || outH != h)) {
+            cropGainmap(gainmap, w, h, outW, outH)
+        } else {
+            gainmap
+        }
         val now = Date()
         val prefs = context.getSharedPreferences("filmkit", 0)
         // 成像质量：设置页可选 95（标准）/ 100（极高），prefs jpeg_quality
@@ -3888,6 +4074,33 @@ class CameraController(private val context: Context, private val render: RenderC
         val encT0 = System.nanoTime()
         // runCatching 兜住 UnsatisfiedLinkError（老 .so 被缓存等极端情形）：任何失败都退
         // 回 Bitmap.compress，绝不让编码环节把成片整张丢掉。
+        // ── HDR 成片（v0.11.50）：优先走 JPEG/R（Ultra HDR）─────────────────
+        // 三条路径的优先级（用户 2026-10-19 拍板：4:2:0 / 4:4:4 / HEIC 都要能出 HDR）：
+        //   ① 4:4:4 开启 + 有 gainmap ⇒ **自研 JPEG/R**（base 仍是 4:4:4，保住质量红线）
+        //   ② 4:4:4 关闭 + 有 gainmap + Android 14+ ⇒ 平台 Gainmap（base 是 4:2:0）
+        //   ③ 其余 ⇒ 普通 SDR JPEG（原行为，一字不动）
+        // 任何一步失败都落回 ③ —— 照片优先红线。
+        var hdrBytes: ByteArray? = null
+        var hdrPath = "none"
+        if (useGainmap != null && jpeg444) {
+            hdrBytes = HdrDelivery.encodeJpegR(outBmp, useGainmap.data, useGainmap.w,
+                useGainmap.h, jpegQ)
+            hdrPath = if (hdrBytes != null) "jpegR444" else "jpegR_failed"
+        } else if (useGainmap != null && HdrDelivery.platformGainmapSupported) {
+            // 平台路径：base 4:2:0，但 HDR 信息完整（对齐 PC 的 UltraHdrWriter）
+            hdrBytes = runCatching {
+                val gm = HdrDelivery.buildGainmap(useGainmap.data, useGainmap.w,
+                    useGainmap.h)
+                    ?: return@runCatching null
+                val bos = java.io.ByteArrayOutputStream()
+                if (PlatformGainmapWriter.writeJpeg420(outBmp, gm, bos, jpegQ)) {
+                    bos.toByteArray().takeIf { it.isNotEmpty() }
+                } else {
+                    null
+                }
+            }.getOrNull()
+            hdrPath = if (hdrBytes != null) "platform420" else "platform420_failed"
+        }
         val native444: ByteArray? =
             if (jpeg444) runCatching {
                 EngineBridge.nativeEncodeJpeg444(outBmp, jpegQ)
@@ -3895,7 +4108,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // 卡 FIX2 可疑点：此前 4:2:0 分支的 `photo.encode{bytes:0,ms:0}` 是在 compress **之前**
         // 记录的、且只统计 native 分支 ⇒ 无法区分"444 关闭"/"native 失败"，也看不出 4:2:0 是否
         // 真编码。现在把 compress 提到日志之前，两条分支都在日志里报**真实字节数与耗时**。
-        var jpegBytes: ByteArray? = native444
+        // 优先级：HDR（自带 base，已是完整成片）> 普通 4:4:4 > Bitmap.compress 4:2:0
+        var jpegBytes: ByteArray? = hdrBytes ?: native444
         if (jpegBytes == null) {
             val bos = java.io.ByteArrayOutputStream()
             outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, bos)   // Android 恒 4:2:0
@@ -3907,7 +4121,8 @@ class CameraController(private val context: Context, private val render: RenderC
             kv("chroma" to (if (native444 != null) "444" else "420"),
                 "encoder" to (if (native444 != null) "native444" else "bitmap420"),
                 "jpeg444" to jpeg444, "nativeFail" to (jpeg444 && native444 == null),
-                "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0)),
+                "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0),
+                "hdr" to hdrPath),
         )
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
         // 未选 LUT 时无后缀。只保留字母/数字/下划线/连字符（中文名照常保留），避免非法路径字符。
@@ -4051,6 +4266,17 @@ class CameraController(private val context: Context, private val render: RenderC
         }
     }
 }
+
+/**
+ * HDR gainmap 快照（v0.11.50）。
+ *
+ * 为什么要单独一个类：gainmap 在**渲染线程**读出（读的是该线程 EGL 上下文里的
+ * `tex_gainmap_`），成片在 **saver 线程**落盘 —— 两者跨线程，必须把数据 + 尺寸
+ * 一起冻结传过去。不冻结的话，连拍时第二张的 gainmap 会覆盖第一张的。
+ *
+ * @param data 长度 = w*h 的单通道 8bit 归一化比值（0..255）
+ */
+internal class GainmapSnapshot(val data: ByteArray, val w: Int, val h: Int)
 
 /**
  * 成片交付缓冲的**显式格式**（卡 FIX1）。

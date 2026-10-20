@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.CAMERA" />
 
@@ -13,6 +14,14 @@
         android:maxSdkVersion="32" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <!-- androidx.heifwriter 声明 minSdk 28，本项目 minSdk 26 ⇒ 需要显式 override。
+         安全性依据：HeifWriter **只在 HDR 路径**用，而 HDR 全部入口都有
+         `Build.VERSION.SDK_INT >= UPSIDE_DOWN_CAKE(34)` 守卫（见 HdrDelivery /
+         PlatformGainmapWriter），Android 26/27 上永远走不到这些类 ⇒ 不会 NoClassDefFound。
+         不抬 minSdk 的理由：26/27 用户仍能用已验证的 JPEG/HEIF 链，不该为一个
+         他们用不到的功能抬高全应用门槛。 -->
+    <uses-sdk tools:overrideLibrary="androidx.heifwriter" />
 
     <!-- largeHeap（2026-10-01，v0.10.86）：连拍时 MFNR 每张在飞要持 4 帧
          direct buffer（4×25MB=100MB），而 Android 的 ByteBuffer.allocateDirect 走

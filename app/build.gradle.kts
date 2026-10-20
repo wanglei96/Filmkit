@@ -32,6 +32,11 @@ val engineCmakeBin = sequenceOf(
 ).firstOrNull { it.exists() }
     ?: throw GradleException("未找到 cmake")
 
+// HDR（Ultra HDR / JPEG-R）编译开关：默认关。
+// 打开后 native 侧会 vendor 编译 libjpeg-turbo（首次约 1~2 分钟），.so 增大约 1MB。
+// 用 -PfilmkitHdr=true 打开：`./gradlew assembleDebug -PfilmkitHdr=true`
+val engineHdr = (project.findProperty("filmkitHdr") as String?)?.toBoolean() ?: false
+
 val engineAbis = listOf("arm64-v8a", "x86_64")
 val engineSrcDir = rootProject.projectDir.resolve("core/engine")
 val engineBuildRoot = layout.buildDirectory.dir("filmengine")
@@ -42,6 +47,12 @@ val buildFilmEngine by tasks.registering {
     outputs.dir(libsOut)
     inputs.dir(engineSrcDir.resolve("src"))
     inputs.file(engineSrcDir.resolve("CMakeLists.txt"))
+    // ⚠ **必须把 HDR 开关纳入 inputs**（v0.11.50 事故）：它是 `-P` 属性，不在源码里，
+    // 不声明的话"先编 debug(带 HDR) 再编 release(不带)"会命中 up-to-date 缓存 ⇒
+    // release 包里 .so 缺 nativeEncodeUltraHdr，HDR 静默失效（真机表现为
+    // `photo.encode hdr=none`，且看不出任何报错）。
+    inputs.property("filmkitHdr", engineHdr)
+    inputs.dir(engineSrcDir.resolve("third_party/ultrahdr"))
 
     doLast {
         engineAbis.forEach { abi ->
@@ -55,6 +66,7 @@ val buildFilmEngine by tasks.registering {
                     "-DANDROID_ABI=$abi",
                     "-DANDROID_PLATFORM=android-26",
                     "-DCMAKE_BUILD_TYPE=Release",
+                    "-DFILMKIT_HDR=" + (if (engineHdr) "ON" else "OFF"),
                 )
             }
             exec {
@@ -84,8 +96,8 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 398
-        versionName = "0.11.49"
+        versionCode = 407
+        versionName = "0.11.58"
         // 只打真机用的 arm64：CMake 有时会把 x86_64 也编进 jniLibs（产物不稳定），
         // 那会让 APK 平白多 5.4MB（v0.6.31 实测 33.6MB → 39.2MB）。
         ndk { abiFilters += "arm64-v8a" }
@@ -132,6 +144,10 @@ dependencies {
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+    // HDR 交付（v0.11.50）：HEIC + gainmap 走平台 HeifWriter（对齐 PhotonCamera 的
+    // HeicExportEncoder）。**只在 HDR 路径用** —— 非 HDR 的 10bit HEIF 仍走项目自研容器
+    // （Heif10Pipeline/HeifContainerWriter），那条链已真机验收，不在此改动范围内。
+    implementation("androidx.heifwriter:heifwriter:1.1.0")
     // NN spike（v0.10.100）：TFLite 独立 runtime（不用 Play Services 版，验证包离线可用）
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")

@@ -138,6 +138,11 @@ class FrameRenderer {
   // 读回失败且破坏了渲染状态（成片全黑），已彻底删除。
   // 关闭时全链零额外开销（每个统计点一次 relaxed atomic load）。任意线程可调。
   static void setDiagStats(bool on);
+  // gainmap 数学版本（v0.11.50）：0 = PC 版（offset 1e-4）/ 1 = libultrahdr 官方版
+  // （offset 1e-7 + 暗部钳位）。供真机 A/B —— 离线对比用的是近似 SDR（Reinhard），
+  // 结论只在"两版相对行为"上成立，绝对效果必须真机实测。
+  static void setGainmapMath(int mode);
+  static int gainmapMath();
 
   // NN 推理回调注入（v0.10.102，见 NnInferFn 注释）。幂等，Bridge 在每次
   // submit 入口重设（顺带刷新其 JNIEnv 快照）。
@@ -213,6 +218,14 @@ class FrameRenderer {
   //                  nullptr 或尺寸 ≤1 = 恒等，即 LSC 关闭（A/B 对照））
   //   nn_dn —— v0.10.102：NN 降噪 pass（PMRID，融合后/RAW 域、去马赛克前）。
   //          true 时 P0 空域降噪被 NN 替代（直读展开）；NN 失败自动回退 P0 原链。
+  // ── HDR gainmap 读回（v0.11.50）────────────────────────────────────
+  // 成片链跑完后调用：把 1/2 分辨率的 8bit gainmap 读回 CPU。
+  // out 由调用方分配，长度 = gainmapW()*gainmapH()；返回 false = 未生成/读回失败。
+  // 只在 HDR 交付时调用（普通 JPEG 不走这条，零额外开销）。
+  bool readGainmap(std::vector<unsigned char>* out);
+  int gainmapWidth() const { return gainmap_w_; }
+  int gainmapHeight() const { return gainmap_h_; }
+
   bool submitRaw(const void* raw, int w, int h, int row_stride_px, int cfa,
                  const float black_phase[4], int white_level,
                  float neutral_r, float neutral_g, float neutral_b,
@@ -659,6 +672,10 @@ class FrameRenderer {
                       float user_white, float white_hl, float white_floor,
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
+  // HDR gainmap：tex_scene_（Rec.2020 线性）÷ tex_cap_（sRGB 8bit）→ 8bit 比值图
+  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex);
+  bool ensureGainmap(int w, int h);
+
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
                 bool hal_domain);
   void passFilm(int w, int h, const FilmParams& p);
@@ -770,7 +787,7 @@ class FrameRenderer {
          // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
          prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
          prog_df_apply_ = 0,
-         prog_cs_ = 0,
+         prog_cs_ = 0, prog_gainmap_ = 0,
          // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 全分辨率径向位移校正
          prog_ca_ds_ = 0, prog_ca_corr_ = 0,
          // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构入口/收口
@@ -1181,6 +1198,15 @@ class FrameRenderer {
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
   GLuint fbo_cap_ = 0, tex_cap_ = 0;      // 成片读回（8bit RGBA8 / 10bit GL_RGB10_A2）
+  // HDR gainmap（v0.11.50）：RGBA8、1/2 分辨率，R 通道 = 8bit 归一化比值。
+  // 为什么单独一张纹理：ES 3.0 只保证 8bit 读回（浮点读回真机没有），所以 gainmap
+  // 必须在 GPU 内算成 8bit 再读回 —— 见 kFsGainmap 的头注释。
+  GLuint fbo_gainmap_ = 0, tex_gainmap_ = 0;
+  int gainmap_w_ = 0, gainmap_h_ = 0;
+  int dbg_gainmap_ok_ = 0;   // 本帧 gainmap 是否生成成功（0 = 无/失败，供日志）
+  // gainmap 的实际数值分布（0..1 的 8bit 值）。**这是判断"HDR 有没有内容"的唯一依据**：
+  // 若 min≈max≈0.5，说明 HDR/SDR 比值恒 1 ⇒ 该场景没有可表达的动态范围。
+  float dbg_gm_min_ = 0.f, dbg_gm_max_ = 0.f, dbg_gm_mean_ = 0.f;
   int scene_w_ = 0, scene_h_ = 0;
   int cap_w_ = 0, cap_h_ = 0;
   // 卡 H2：tex_cap_ 当前所在的**交付档**（false = 8bit RGBA8 / true = 10bit GL_RGB10_A2）。
@@ -1296,6 +1322,10 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1, side_k = -1, chroma_min = -1, peak_k = -1;
   } u_cs_;
+  // HDR gainmap（v0.11.50）
+  struct {
+    GLint hdr = -1, sdr = -1, src_size = -1, math = -1;
+  } u_gainmap_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {
     GLint tex = -1, size = -1;

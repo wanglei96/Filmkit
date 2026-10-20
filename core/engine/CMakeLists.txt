@@ -31,4 +31,20 @@ find_library(log-lib log)
 find_library(jnigraphics-lib jnigraphics)
 target_link_libraries(filmengine PRIVATE GLESv3 EGL android ${log-lib} ${jnigraphics-lib})
 
+# ── HDR（JPEG/R Ultra HDR）—— 默认 OFF ─────────────────────────────────
+# 为什么做成开关：libultrahdr 要 vendor libjpeg-turbo（FetchContent，首次约 1~2 分钟），
+# 日常构建不该为一条还没接进交付链的新路径付这份成本；**接交付链时再打开**。
+# 打开后本目标多出 src/jni/UltraHdrEncoder.cpp（base 用我们的 stb 4:4:4，
+# libultrahdr 只做 gainmap 封装 —— 定案与实测见 third_party/ultrahdr/CMakeLists.txt 头注）。
+option(FILMKIT_HDR "Build Ultra HDR (JPEG/R) gainmap packaging" OFF)
+if(FILMKIT_HDR)
+    # ⚠ include() 而不是 add_subdirectory()：仓库路径含中文，add_subdirectory 出来的
+    # 深层作用域里 add_library 解析不了源文件路径（同 build.gradle.kts 的 CXX1400 坑）。
+    # include() 保持作用域在 core/engine，third_party/ultrahdr/CMakeLists.txt 内的相对路径稳定。
+    include(third_party/ultrahdr/CMakeLists.txt)
+    target_sources(filmengine PRIVATE src/jni/UltraHdrEncoder.cpp)
+    target_link_libraries(filmengine PRIVATE ultrahdr)
+    target_compile_definitions(filmengine PRIVATE FILMKIT_HDR=1)
+endif()
+
 target_compile_options(filmengine PRIVATE -Wall -Wextra -Wno-unused-parameter)

@@ -41,6 +41,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import com.filmkit.app.heif.HeifChroma
 import com.filmkit.app.heif.HeifJpeg444
 import com.filmkit.app.heif.PhotoFormat
+import com.filmkit.app.hdr.HdrDelivery
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -204,6 +205,57 @@ fun SettingsScreen(
                     )
                 },
             )
+            // ── HDR 成片（v0.11.50，用户 2026-10-19 要求：4:2:0 / 4:4:4 / HEIC 都能出 HDR）──
+            // 默认**关**：与 HEIF 同一条红线 —— 新路径必须先经真机验收，不能默认落在
+            // 未验证的链上。开启后：JPEG 4:4:4 走自研 libultrahdr 封装（保 4:4:4），
+            // JPEG 4:2:0 与 HEIC 走平台 Gainmap API（Android 14+）。任何一步失败都回退
+            // 普通 SDR 成片，绝不丢照片。
+            var hdrOn by rememberSaveable { mutableStateOf(prefs.getBoolean("hdr_gainmap", false)) }
+            SettingSwitchRow(
+                title = "HDR 成片（Ultra HDR / gainmap）",
+                subtitle = "在成片里附带 HDR 增益图：系统相册/Chrome 等支持 HDR 的查看器会显示更亮的高光，" +
+                    "不支持的环境自动回落 SDR。当前能力：" + HdrDelivery.capabilitySummary() +
+                    "。需 Android 14+；失败自动回退普通成片",
+                checked = hdrOn,
+                onChecked = { on ->
+                    hdrOn = on
+                    prefs.edit().putBoolean("hdr_gainmap", on).apply()
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "settings.hdr_gainmap",
+                        "{\"on\":$on,\"jpegR\":" + HdrDelivery.jpegRSupported +
+                            ",\"platform\":" + HdrDelivery.platformGainmapSupported + "}",
+                    )
+                },
+            )
+            // ── gainmap 数学版本（v0.11.50，真机 A/B 入口）──────────────────
+            // 只在 HDR 开启时有意义。两版**最终都归一化到固定 [0.25, 4.0]**，
+            // 差异只在 offset（1e-4 vs 1e-7）与暗部钳位方式。
+            if (hdrOn) {
+                var gmMath by rememberSaveable {
+                    mutableStateOf(prefs.getInt("gainmap_math", 0))
+                }
+                SettingValueRow(
+                    title = "gainmap 数学",
+                    subtitle = if (gmMath == 0) {
+                        "PhotonCamera 版：offset 1e-4，靠垫高分母抑制暗部噪声。" +
+                            "与 PC 成片同口径（默认）"
+                    } else {
+                        "libultrahdr 官方版：offset 1e-7 + 暗部 gain 钳 ≤2.3（硬钳位）。" +
+                            "暗部更容易放大噪声，但高光表达更贴近原始比值"
+                    },
+                    valueText = if (gmMath == 0) "PC" else "官方",
+                    onTap = {
+                        val v = if (gmMath == 0) 1 else 0
+                        gmMath = v
+                        prefs.edit().putInt("gainmap_math", v).apply()
+                        EngineBridge.nativeSetGainmapMath(v)
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "app", "settings.gainmap_math",
+                            "{\"mode\":$v,\"name\":\"" + (if (v == 0) "pc" else "official") + "\"}",
+                        )
+                    },
+                )
+            }
             SettingNavRow("镜头配置", "启停探测到的物理镜头") { onOpenLenses() }
             SettingNavRow("自定义焦段", "最多 3 个，与原生焦段同显于变焦条（总 ≤6）") { onOpenFocals() }
             SettingSwitchRow(

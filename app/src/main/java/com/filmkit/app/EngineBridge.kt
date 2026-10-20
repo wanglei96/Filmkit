@@ -228,4 +228,81 @@ object EngineBridge {
      * max 1.94 vs 49.17；真实成片侧证：同机同表的 PhotonCamera 成片为 4:4:4。
      */
     external fun nativeEncodeJpeg444(bitmap: android.graphics.Bitmap, quality: Int): ByteArray?
+
+    // ── HDR（JPEG/R Ultra HDR，v0.11.50）─────────────────────────────────
+    /**
+     * 成片 RGBA8 + 同尺寸场景线性 HDR（tone map 前）→ **JPEG/R 字节流**。
+     *
+     * 实现见 `core/engine/src/jni/UltraHdrEncoder.cpp`：base 用本项目 stb **4:4:4**
+     * 直编（保住质量红线），gainmap 按官方/PC 公式自算，libultrahdr 只做 MPF + XMP 封装。
+     *
+     * @param hdrLinear 长度 = w*h*3 的 float 数组（场景线性 RGB，值可 > 1）
+     * @return JPEG/R 字节流；null = 失败（调用方必须回退普通 JPEG）
+     */
+    external fun nativeEncodeUltraHdr(
+        bitmap: android.graphics.Bitmap,
+        gainmap: ByteArray,
+        gainmapW: Int,
+        gainmapH: Int,
+        quality: Int,
+    ): ByteArray?
+
+    /**
+     * 读回成片链刚算出的 8bit gainmap（1/2 分辨率单通道）。
+     * **必须在拍照渲染线程调用**（读的是该线程 EGL 上下文里的纹理），
+     * 且要在 `nativeEngineSubmitRaw*` 返回之后、下一次 submit 之前。
+     * 返回 null = 未生成（HDR 未开 / 10bit 档 / pass 失败）。
+     */
+    external fun nativeReadGainmap(): ByteArray?
+
+    /** gainmap 宽（px）；0 = 未生成。与 [nativeReadGainmap] 配套使用。 */
+    external fun nativeGainmapWidth(): Int
+
+    /** gainmap 高（px）；0 = 未生成。 */
+    external fun nativeGainmapHeight(): Int
+
+    /**
+     * 本 .so 是否带 HDR 能力（编译期 `FILMKIT_HDR=ON`）。
+     *
+     * 为什么要有这个：HDR 是 CMake 开关（默认 OFF，避免日常构建拉 libjpeg-turbo）。
+     * 调用方据此决定"能不能试"，而不是靠 `UnsatisfiedLinkError` 兜底 —— 后者在
+     * 老 .so 被缓存时也会触发，两者混在一起没法区分"没编译"和"真失败"。
+     */
+    external fun nativeHdrAvailable(): Boolean
+
+    /**
+     * gainmap 数学版本（v0.11.50，真机 A/B 用）：
+     * `0` = PhotonCamera 版（offset 1e-4，靠 offset 垫高分母抑制暗部）；
+     * `1` = libultrahdr 官方版（offset 1e-7 + 暗部 sdr<2/255 时钳 gain≤2.3）。
+     *
+     * 为什么留这个入口：离线 A/B（`tools/gainmap-math-ab.py`）的 SDR 是 Reinhard 近似，
+     * 不是项目真实胶片链的输出 —— 结论只在"两版相对行为"上成立，**绝对效果必须真机实测**。
+     * 切换后下一次拍照生效，两张图对比 `raw.render` 的 `gmMax/gmMean` 与肉眼观感。
+     */
+    external fun nativeSetGainmapMath(mode: Int)
+
+    external fun nativeGetGainmapMath(): Int
+
+    /**
+     * 从 JPEG/R 里**无损提取 SDR base**（去掉 gainmap，得到普通 JPEG）。
+     *
+     * 用途（用户 2026-10-20 定案）：HDR 开关是**单张图的编辑功能**，核心场景之一是
+     * "重新导出 SDR 版"。走原生提取而非重编 —— `Bitmap.compress` 会对 12MP 再压
+     * 一次 JPEG（二次量化，p99 色差上升），而 base 本来就是完整 JPEG，取出来零损失。
+     *
+     * @return 纯 JPEG 字节流；null = 不是 JPEG/R 或提取失败
+     */
+    external fun nativeExtractSdrBase(jpegR: ByteArray): ByteArray?
+
+    /**
+     * 本 .so 是否带 HDR 能力（缓存版，首次调用后不再跨 JNI）。
+     * `System.loadLibrary` 未完成时调 native 会抛 `UnsatisfiedLinkError`，
+     * 故这里先 `ensureLoaded()` 再问 native。
+     */
+    val hdrNativeAvailable: Boolean by lazy {
+        runCatching {
+            ensureLoaded()
+            nativeHdrAvailable()
+        }.getOrDefault(false)
+    }
 }

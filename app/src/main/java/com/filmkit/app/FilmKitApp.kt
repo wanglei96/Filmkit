@@ -26,6 +26,12 @@ class FilmKitApp : Application() {
         val dir = (getExternalFilesDir("logs") ?: File(filesDir, "logs")).absolutePath
         File(dir).mkdirs()
         EngineBridge.nativeInitLogger(dir)
+        // gainmap 数学版本（v0.11.50）：native 侧是进程级原子变量，重启后归 0，
+        // 必须按 prefs 恢复 —— 否则用户选了"官方"、重开 App 又变回 PC（静默行为漂移）。
+        runCatching {
+            val mode = getSharedPreferences("filmkit", 0).getInt("gainmap_math", 0)
+            EngineBridge.nativeSetGainmapMath(mode)
+        }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "app.start",
             kv("version" to VERSION, "logDir" to dir),

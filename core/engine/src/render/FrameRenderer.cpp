@@ -6390,6 +6390,9 @@ int cfaLutOf(int cfa) {
 //   · 任何一步失败（program 缺失、FBO 不完整、GL 错误、读回全零）⇒ 静默跳过，
 //     只写一条 diag.stats_fail，成片链一像素不改。
 std::atomic<bool> g_diag_stats{true};
+// gainmap 数学版本（0 = PC / 1 = 官方）。**进程级**而非实例级：预览与拍照是两个
+// FrameRenderer 实例，设置页改一次要两边同时生效（否则 A/B 会混进"实例不同"这个变量）。
+std::atomic<int> g_gainmap_math{0};   // 0 = PC 版（offset 1e-4），默认
 std::string g_diag_params;  // 本帧 kFsFilm 色度开关快照（split/look/sat…）
 bool g_diag_chain = false;  // 仅成片链（finishStillChain）内为 true
 int g_diag_seq = 0;         // 本帧序号（日志配对用）
@@ -6622,6 +6625,112 @@ void diagEndFrame() { g_diag_chain = false; }
 //   放匿名 namespace 内时 `nm FrameRenderer.o | grep kFsSigmoid` **零命中**且 clang 报
 //   "unused variable"；放这里后为 `D filmkit::kFsSigmoidDef` / `D filmkit::kFsSigmoidMain`
 //   （`EngineRegistry.o` 侧的 `U` 由它们满足）。**移动本块前先看这条注释。**
+// ── HDR gainmap（v0.11.50，Ultra HDR / JPEG-R 的辅助图）──────────────────────
+// 目的：算出"HDR 应比 SDR 亮多少"的 8bit 比值图，供 libultrahdr 封装成 JPEG/R。
+//
+// ## 为什么在 GPU 算、而不是把 HDR 读回 CPU
+// ES 3.0 **只保证** `glReadPixels(GL_RGBA, GL_UNSIGNED_BYTE)`，浮点图像读回需要扩展，
+// 而真机没有（2026-10-05 实测：`diag.dump_fail reason=readpixels`，且失败后还破坏了
+// 渲染状态导致成片全黑 —— 见 diagStatsTex 的注释）。所以 HDR 线性**不能**直接读回。
+// 本 pass 在 GPU 内完成"HDR/SDR 比值 → 8bit"，读回的只是 1/2 分辨率的单通道 8bit
+// 图（12MP 时约 3MB），走 ES 3.0 保证的路径。
+//
+// ## 域口径（**这是本 shader 唯一的坑，必须与 kFsOut 逐字一致**）
+// `uHdr` = tex_scene_（D4 场景线性，**Rec.2020**）—— 期 B 换域后的工作空间；
+// `uSdr` = tex_cap_（D5 显示域，sRGB **已编码** 8bit）。
+// 两边必须落到**同一域**才能相除：HDR 侧先 workToSrgb（与 kFsOut 同一矩阵），
+// SDR 侧先反 OETF 回 sRGB 线性，再各取 Rec.709 luma。
+// ⚠ 直接拿 Rec.2020 的 Y 系数去算 HDR luma 会得到"ACES 有色相优势"那类假结论
+//（D5 域口径 bug，2026-10-19 踩过）—— 故这里显式转 sRGB 再用 709 系数。
+//
+// ## 公式（= PhotonCamera RawGainmapMath，实测选定，见 UltraHdrEncoder.cpp 的 A/B 结论）
+//   ratio = clamp((hdrY + 1e-4) / (sdrY + 1e-4), 0.25, 4.0)
+//   v     = (ln(ratio) - ln(0.25)) / (ln(4.0) - ln(0.25))
+// 输出 v 到 R 通道（G/B 同值，便于肉眼调试时直接看灰度）。
+const char* kFsGainmap = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uHdr;    // tex_scene_：Rec.2020 线性（D4）
+uniform highp sampler2D uSdr;    // tex_cap_：sRGB 已编码（D5，RGBA8）
+uniform vec2 uSrcSize;           // 全分辨率尺寸（px）
+// gainmap 数学版本（v0.11.50，**运行时切换**，供真机 A/B）：
+//   0 = PhotonCamera 版（offset 1e-4，靠 offset 垫高分母抑制暗部）
+//   1 = libultrahdr 官方版（offset 1e-7 + 暗部 sdr<2/255 时钳 gain≤2.3）
+// 两版**最终都归一化到固定 [0.25, 4.0]**（官方"自适应范围"需要两遍扫描，本 pass 单遍
+// 做不到；且离线实测自适应范围在无高光场景会把 8bit 码值浪费在极窄区间）。
+// 差异只在 offset 与暗部钳位 —— 这正是离线 A/B 里唯一剩下的分歧点。
+uniform int uGainmapMath;
+const int kDS = 2;               // 下采样倍数（= PC RawGainmapMath.DOWNSAMPLE）
+const float kMin = 0.25;         // PC MIN_GAIN_RATIO
+const float kMax = 4.0;          // PC MAX_GAIN_RATIO
+const float kOff = 1e-4;         // PC OFFSET
+
+// 与 kFsOut 的 workToSrgb **逐字相同**（Rec.2020 线性 → sRGB 线性）
+vec3 workToSrgb(vec3 c) {
+    return vec3(dot(c, vec3(1.6604910021, -0.5876411388, -0.0728498633)),
+                dot(c, vec3(-0.1245504745, 1.1328998971, -0.0083494226)),
+                dot(c, vec3(-0.0181507634, -0.1005788980, 1.1187296614)));
+}
+float srgbInvOetf(float x) {
+    x = clamp(x, 0.0, 1.0);
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// PC 版：offset 1e-4（PhotonCamera hdr/RawGainmapMath.kt）
+float gainPc(float sdrLin, float hdrLin) {
+    float ratio = clamp((max(hdrLin, 0.0) + 1e-4) / (sdrLin + 1e-4), kMin, kMax);
+    return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
+}
+// 官方版：offset 1e-7 + 暗部钳位（libultrahdr lib/src/gainmapmath.cpp:790）
+float gainOfficial(float sdrLin, float hdrLin) {
+    float gain = log2((hdrLin + 1e-7) / (sdrLin + 1e-7));
+    if (sdrLin < 2.0 / 255.0) gain = min(gain, 2.3);
+    float ratio = clamp(exp2(gain), kMin, kMax);
+    return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
+}
+
+void main() {
+    // ⚠ **两张输入的方向相反**（v0.11.50 真机事故，症状 = HDR 增益上下错位/键盘鬼影）：
+    //   uHdr = tex_scene_  ← kFsFilm 用 `texture(uTex, vUV0)` 直接采样 ⇒ 方向 A
+    //   uSdr = tex_cap_    ← kFsOut 带 `uFlipY`（拍照读回 GL 底行在前）翻转输出 ⇒ 方向 B = flip(A)
+    // 用同一个 UV 采两者 = 拿"上方像素的 HDR"去除"下方像素的 SDR" ⇒ 增益整体上下颠倒。
+    // 真机实测：床面出现键盘的鬼影（下方真实键盘的增益被搬到上方）。
+    // 输出走**方向 B**（与 tex_cap_ / 最终 glReadPixels 的 base 同向），所以：
+    //   · uSdr 用 vUV0（B）
+    //   · uHdr 用 (x, 1-y)（转回 A）
+    // ⚠ **采样核 kK = kDS*2（步长仍是 kDS）⇒ 相邻 gainmap 像素的输入区重叠 50%，
+    // 等于隐式做了一次 2×2 盒式平滑**（v0.11.53 真机事故的修复）。
+    // 事故：2×2 无重叠采样时 gainmap 全是高频噪声点 —— 真机实测 1536×2040 的 gainmap
+    // JPEG 有 **570KB**（正常应几十 KB），且 >=0.90 的像素占 1.61%（约 5 万个高增益点
+    // 散布全图）；经 IDW 上采样后这些点连成环，把相邻的栏杆等暗部一起提亮
+    // ——用户原话"太阳 HDR 显影把栏杆覆盖了"。
+    // 重叠平均把孤立噪点摊薄，同时保留太阳区的整体高增益（offset 1e-7 的暗部抖动
+    // 是另一半根因，那部分靠默认用 PC 版 offset 1e-4 解决，见 setGainmapMath 注释）。
+    vec2 block = floor(vUV0 * uSrcSize / float(kDS)) * float(kDS);
+    const int kK = kDS * 2;
+    float hdrSum = 0.0, sdrSum = 0.0;
+    for (int y = 0; y < kK; ++y) {
+        for (int x = 0; x < kK; ++x) {
+            vec2 pxB = (block + vec2(float(x), float(y)) - float(kDS) * 0.5 + 0.5) / uSrcSize;
+            vec2 pxA = vec2(pxB.x, 1.0 - pxB.y);   // tex_scene_ 的方向
+            // HDR：Rec.2020 线性 → sRGB 线性 → 709 luma
+            hdrSum += luma709(workToSrgb(texture(uHdr, pxA).rgb));
+            // SDR：sRGB 编码 → sRGB 线性 → 709 luma
+            vec3 s = texture(uSdr, pxB).rgb;
+            sdrSum += luma709(vec3(srgbInvOetf(s.r), srgbInvOetf(s.g), srgbInvOetf(s.b)));
+        }
+    }
+    float n = float(kK * kK);
+    float hdrY = hdrSum / n;
+    // sdrY 是**线性** luma（上面已反过 OETF）—— 两版都吃线性域
+    float sdrY = sdrSum / n;
+    float v = (uGainmapMath == 0) ? gainPc(sdrY, hdrY) : gainOfficial(sdrY, hdrY);
+    oColor = vec4(v, v, v, 1.0);
+}
+)";
+
 const char* kFsSigmoidDef = R"(// ── 引擎 1 私有 uniforms（7 个；前 6 个 = PC 的 6 个 DT_SIGMOID_* 常量）──────
 uniform float uSigWhiteTarget;
 uniform float uSigBlackTarget;
@@ -7160,6 +7269,7 @@ bool FrameRenderer::init() {
   const GLuint fs_df_avg = compileShader(GL_FRAGMENT_SHADER, kFsDefringeAvg);
   const GLuint fs_df_apply = compileShader(GL_FRAGMENT_SHADER, kFsDefringeApply);
   const GLuint fs_cs = compileShader(GL_FRAGMENT_SHADER, kFsColorSmooth);
+  const GLuint fs_gainmap = compileShader(GL_FRAGMENT_SHADER, kFsGainmap);
   // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 径向位移校正
   const GLuint fs_ca_ds = compileShader(GL_FRAGMENT_SHADER, kFsCaDown);
   const GLuint fs_ca_corr = compileShader(GL_FRAGMENT_SHADER, kFsCaCorr);
@@ -7254,6 +7364,15 @@ bool FrameRenderer::init() {
   prog_df_avg_ = linkProgram(vs_plain_, fs_df_avg);
   prog_df_apply_ = linkProgram(vs_plain_, fs_df_apply);
   prog_cs_ = linkProgram(vs_plain_, fs_cs);
+  // HDR gainmap（v0.11.50）：**不进 init 的硬失败判据** —— 它是可选交付能力，
+  // 缺了只影响 HDR 成片（普通 JPEG 链零影响），不该让整个引擎起不来。
+  prog_gainmap_ = linkProgram(vs_plain_, fs_gainmap);
+  if (prog_gainmap_) {
+    u_gainmap_.hdr = glGetUniformLocation(prog_gainmap_, "uHdr");
+    u_gainmap_.sdr = glGetUniformLocation(prog_gainmap_, "uSdr");
+    u_gainmap_.src_size = glGetUniformLocation(prog_gainmap_, "uSrcSize");
+    u_gainmap_.math = glGetUniformLocation(prog_gainmap_, "uGainmapMath");
+  }
   // 横向色差校正（v0.10.170）
   prog_ca_ds_ = linkProgram(vs_plain_, fs_ca_ds);
   prog_ca_corr_ = linkProgram(vs_plain_, fs_ca_corr);
@@ -8079,6 +8198,12 @@ void FrameRenderer::release() {
   if (tex_scene_) glDeleteTextures(1, &tex_scene_);
   if (tex_work_) glDeleteTextures(1, &tex_work_);
   if (tex_cap_) glDeleteTextures(1, &tex_cap_);
+  if (tex_gainmap_) {
+    glDeleteTextures(1, &tex_gainmap_);
+    glDeleteFramebuffers(1, &fbo_gainmap_);
+    tex_gainmap_ = fbo_gainmap_ = 0;
+    gainmap_w_ = gainmap_h_ = 0;
+  }
   if (tex_dir_) glDeleteTextures(1, &tex_dir_);
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
@@ -8292,6 +8417,7 @@ void FrameRenderer::release() {
   releaseDiagTargets();              // v0.10.166：诊断统计纹理/FBO（已自带置 0）
   hist_w_ = hist_h_ = 0;
   tex_scene_ = tex_work_ = tex_cap_ = 0;
+  tex_gainmap_ = fbo_gainmap_ = 0;
   fbo_scene_ = fbo_work_ = fbo_cap_ = 0;
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
@@ -8582,6 +8708,12 @@ float FrameRenderer::previewScale() {
 // 诊断统计开关（v0.10.166，prefs `diag_stats`，**默认开**）：只置一个 atomic，其余
 // 见文件头的 diag 块。任意线程可调；关闭时全链零额外开销（每个统计点一次
 // relaxed atomic load）。
+void FrameRenderer::setGainmapMath(int mode) {
+  g_gainmap_math.store(mode == 1 ? 1 : 0);
+}
+
+int FrameRenderer::gainmapMath() { return g_gainmap_math.load(); }
+
 void FrameRenderer::setDiagStats(bool on) { g_diag_stats.store(on); }
 
 void FrameRenderer::setNnInferFn(NnInferFn fn) { nn_infer_slot() = fn; }
@@ -9985,6 +10117,104 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tm
   while (glGetError() != GL_NO_ERROR) {
   }
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  return true;
+}
+
+// ── HDR gainmap（v0.11.50）────────────────────────────────────────────
+bool FrameRenderer::ensureGainmap(int w, int h) {
+  // gainmap 是 base 的 1/2 边长（与 UltraHdrEncoder 的 kPcDownsample=2 同口径）
+  const int gw = (w + 1) / 2, gh = (h + 1) / 2;
+  if (gainmap_w_ == gw && gainmap_h_ == gh && tex_gainmap_ != 0) return true;
+  if (tex_gainmap_) {
+    glDeleteTextures(1, &tex_gainmap_);
+    glDeleteFramebuffers(1, &fbo_gainmap_);
+    tex_gainmap_ = fbo_gainmap_ = 0;
+  }
+  // RGBA8：ES 3.0 保证可渲染 + 可 readback（见 kFsGainmap 头注释）
+  makeTex(&tex_gainmap_, &fbo_gainmap_, GL_RGBA8, gw, gh);
+  if (tex_gainmap_ == 0) {
+    gainmap_w_ = gainmap_h_ = 0;
+    return false;
+  }
+  gainmap_w_ = gw;
+  gainmap_h_ = gh;
+  return true;
+}
+
+bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex) {
+  if (!prog_gainmap_ || hdr_tex == 0 || sdr_tex == 0) return false;
+  if (!ensureGainmap(w, h)) return false;
+  // ⚠ **必须保存/恢复 FBO 与 viewport**（v0.11.50 真机事故）：
+  // 调用点紧跟 `passOutput`，而 passOutput 把 fbo_cap_ 绑上后**故意不恢复** ——
+  // 后面的 `glReadPixels` 就从"当前绑定的 FBO"读成片。本函数若把绑定改成
+  // fbo_gainmap_ 再收尾成 0，glReadPixels 会去读**默认帧缓冲** ⇒ 成片全黑
+  //（真机实测：avgLuma=0、bytes 343KB 的纯黑 JPEG）。
+  GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glGetIntegerv(GL_VIEWPORT, prev_vp);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_gainmap_);
+  glViewport(0, 0, gainmap_w_, gainmap_h_);
+  glUseProgram(prog_gainmap_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, hdr_tex);
+  glUniform1i(u_gainmap_.hdr, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, sdr_tex);
+  glUniform1i(u_gainmap_.sdr, 1);
+  glUniform2f(u_gainmap_.src_size, static_cast<float>(w), static_cast<float>(h));
+  glUniform1i(u_gainmap_.math, g_gainmap_math.load());
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glActiveTexture(GL_TEXTURE0);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  // 恢复调用点的绑定（见函数头注释：不恢复会让成片读成默认帧缓冲 = 全黑）
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  return true;
+}
+
+bool FrameRenderer::readGainmap(std::vector<unsigned char>* out) {
+  if (!out || tex_gainmap_ == 0 || gainmap_w_ <= 0 || gainmap_h_ <= 0) return false;
+  const size_t n = static_cast<size_t>(gainmap_w_) * gainmap_h_;
+  out->assign(n, 0);
+  // 读 R 通道即可（shader 里 G/B 同值）；用 GL_RGBA 保证组合在所有驱动上都可用，
+  // 读回后再抽 R —— 直接 GL_RED 在某些 Mali 上不支持（项目既有结论：8bit 读回走 RGBA）。
+  std::vector<unsigned char> rgba(n * 4);
+  GLint prev_fbo = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_gainmap_);
+  glReadPixels(0, 0, gainmap_w_, gainmap_h_, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  const GLenum err = glGetError();
+  if (err != GL_NO_ERROR) {
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    return false;
+  }
+  for (size_t i = 0; i < n; ++i) (*out)[i] = rgba[i * 4];
+  // 统计（供 raw.render 日志）：min/max/mean 直接回答"gainmap 有没有内容"
+  double sum = 0.0;
+  unsigned char mn = 255, mx = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const unsigned char v = (*out)[i];
+    mn = std::min(mn, v);
+    mx = std::max(mx, v);
+    sum += v;
+  }
+  dbg_gm_min_ = static_cast<float>(mn) / 255.0f;
+  dbg_gm_max_ = static_cast<float>(mx) / 255.0f;
+  dbg_gm_mean_ = static_cast<float>(sum / static_cast<double>(n)) / 255.0f;
+  // ⚠ **必须在这里独立输出**（v0.11.53 教训）：`raw.render` 的日志在本函数**之前**就已经
+  // 输出了（native 侧先返回成片字节，Kotlin 才在回调里调 readGainmap），所以把统计塞进
+  // raw.render 只会得到全 0 —— 真机实测 `gmMax` 恒 0，完全辨别不出"场景没高光"还是"统计没生效"。
+  // 判据：`gmMax≈0.5` ⇒ HDR/SDR 比值恒 1（场景无内容）；`>0.9` ⇒ 接近 4 倍上限。
+  Logger::instance().log(LogLevel::kInfo, "engine", "gainmap.readback",
+                         "{\"gw\":" + std::to_string(gainmap_w_) +
+                             ",\"gh\":" + std::to_string(gainmap_h_) +
+                             ",\"gmMath\":" + std::to_string(g_gainmap_math.load()) +
+                             ",\"gmMin\":" + jnum(dbg_gm_min_, 4) +
+                             ",\"gmMax\":" + jnum(dbg_gm_max_, 4) +
+                             ",\"gmMean\":" + jnum(dbg_gm_mean_, 4) + "}");
   return true;
 }
 
@@ -11450,11 +11680,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   for (int i = 0; i < 9; ++i) hr_ccm_[i] = c.ccm[i];
   // 第 6 期（S12）：RAW 静拍链的输入本来就是**场景线性域** ⇒ hal_domain = false
   //（不做域比归一）。三条链的域标志至此齐全：预览=true、YUV 静拍=true、RAW 静拍=false。
-  passFilm(dst_w, dst_h, p,
-           pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
-                        : ((c.dn && mst_ok) ? tex_scene_
-                            : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_)),
-           /*still=*/true, /*hal_domain=*/false);
+  // 成片链的**实际**场景线性输入（降噪/去边之后的那张）。gainmap 必须用它 ——
+  // 用 tex_scene_（降噪前）会让 HDR 源与 SDR base 不是同一像素（defringe 改过色）。
+  const GLuint film_src =
+      pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
+                   : ((c.dn && mst_ok) ? tex_scene_
+                       : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_));
+  passFilm(dst_w, dst_h, p, film_src, /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
   // 放在 t2 之后，passMs 不受统计耗时污染。
@@ -11485,8 +11717,28 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
   // 成片：斑马纹绝不进成片；dither 除数按交付档重标（255 / 1023）
   passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+  // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
+  // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
+  // 在 glReadPixels **之前**（同一次 GL 提交里算完，省一次 flush）。
+  // 只在 8bit 档生成：10bit 档 tex_cap_ 是 GL_RGB10_A2，本 shader 按 sRGB 8bit 采样会错；
+  // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
+  if (!c.ten_bit) {
+    if (passGainmap(dst_w, dst_h, film_src, tex_cap_)) {
+      dbg_gainmap_ok_ = 1;
+    } else {
+      dbg_gainmap_ok_ = 0;
+    }
+  } else {
+    dbg_gainmap_ok_ = 0;
+  }
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
   glFinish();
+  // ⚠ **显式绑回 fbo_cap_**（v0.11.50 真机事故的保险）：原实现依赖"passOutput 把
+  // fbo_cap_ 绑上后一直不恢复"，而中间插入的 passGainmap 会切 FBO。哪怕它内部的
+  // 保存/恢复出任何纰漏，这里显式绑定都能保证成片从**正确的**附件读回 ——
+  // 否则 glReadPixels 读默认帧缓冲 ⇒ 全黑（真机实测 avgLuma=0）。
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
+  glViewport(0, 0, dst_w, dst_h);
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),
                outputReadTypeOf(c.ten_bit), out_rgba->data());
@@ -11845,6 +12097,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"nnTiles\":" + std::to_string(dbg_nn_tiles_);
     kv += ",\"nnGain\":" + jnum(dbg_nn_gain_, 6);
   }
+  kv += ",\"gainmapOk\":" + std::to_string(dbg_gainmap_ok_);
+  kv += ",\"gmMin\":" + jnum(dbg_gm_min_, 4) +
+        ",\"gmMax\":" + jnum(dbg_gm_max_, 4) +
+        ",\"gmMean\":" + jnum(dbg_gm_mean_, 4);
   kv += "}";
   Logger::instance().log(LogLevel::kInfo, "engine", "raw.render", kv);
   diagEndFrame();  // 诊断统计：逐阶段已即时上报，这里只清链标志

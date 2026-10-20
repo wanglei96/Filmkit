@@ -1,6 +1,12 @@
 #include <android/native_window_jni.h>
 #include <jni.h>
 
+#ifdef FILMKIT_HDR
+// HDR 相关 JNI（SDR base 提取）依赖 libultrahdr；FILMKIT_HDR=OFF 时整段不编译，
+// 否则默认构建会因找不到头文件而失败（third_party 不在 include path 里）。
+#include "ultrahdr_api.h"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -81,6 +87,14 @@ EglCore& stillEgl() {
 // 却在预览线程读（nativeEngineSetLut 下发 LUT）—— 非原子就是形式上的 data race。
 // 指针本身原子化即可：实例只创建、从不销毁，不存在"读到已释放实例"的窗口。
 std::atomic<FrameRenderer*> g_renderer_still{nullptr};
+
+// 本线程**最后一次** submit 用的是哪个实例（v0.11.50）。
+// 为什么需要：gainmap 读回必须在 submit 的**同一线程**紧接着调用，但拍照走的是
+// 独立实例 g_renderer_still（`use_still=true`）而不是 g_renderer。用错实例会读到
+// 空纹理 —— 真机实测：`nativeReadGainmap` 用 g_renderer 时 gainmap 恒为 null，
+// HDR 静默不生效（日志 `photo.encode hdr=none`，不报任何错）。
+// thread_local 而不是全局：预览线程与拍照线程各记各的，互不干扰。
+thread_local FrameRenderer* t_last_submit = nullptr;
 EGLSurface g_still_surface = EGL_NO_SURFACE;
 
 // 单帧 YUV 解码矩阵（0=BT.601 / 1=BT.709）：改成进程级快照后，设置页在主线程
@@ -631,6 +645,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitStill(
     r = g_renderer_still.load();
   }
   if (!r) return nullptr;
+  t_last_submit = r;   // 供本线程的 gainmap 读回定位实例
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
   const int64_t t0 = nowMs();
@@ -671,6 +686,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitDisplay(
     jint out_h, jfloatArray crop_uv, jint crop_rot, jdoubleArray film) {
   FrameRenderer* r = g_renderer;
   if (!r) return nullptr;
+  t_last_submit = r;   // 供本线程的 gainmap 读回定位实例
   const FilmParams p = paramsFromJava(env, film);
   float crop[4] = {0.0f, 0.0f, 1.0f, 1.0f};
   const float* crop_p = nullptr;  // nullptr = 全幅（引擎内 origin=(0,0) size=(1,1)）
@@ -734,6 +750,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     r = g_renderer_still.load();
   }
   if (!r || !raw_buf) return nullptr;
+  t_last_submit = r;
   float black4[4] = {0, 0, 0, 0};
   if (black_phase) {
     const jsize bn = env->GetArrayLength(black_phase);
@@ -818,6 +835,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     r = g_renderer_still.load();
   }
   if (!r || !frames || count <= 0) return nullptr;
+  t_last_submit = r;   // 供本线程的 nativeReadGainmap 定位实例
   std::vector<const void*> bufs(static_cast<size_t>(count), nullptr);
   for (int i = 0; i < count; ++i) {
     jobject buf = env->GetObjectArrayElement(frames, i);
@@ -917,4 +935,108 @@ Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
                             ",\"sw999\":" + jf(g_renderer ? g_renderer->stillW999() : 0.0f) +
                             ",\"wmax\":" + jf(g_renderer ? g_renderer->sceneWMax() : 0.0f) +
                             ",\"clipB\":" + std::to_string(g_renderer ? g_renderer->highlightClipBlocks() : -1) + "}");
+}
+
+#ifdef FILMKIT_HDR
+// ── JPEG/R → 纯 SDR base（v0.11.55）───────────────────────────────────────
+// 用户 2026-10-20 定案：HDR 开关本质是**单张图的编辑功能**，核心用途之一是
+// **重新导出 SDR 版**（去掉 gainmap 得到普通 JPEG，发给不支持 HDR 的人/微信）。
+//
+// 为什么走原生提取而不是重编：`Bitmap.compress` 会对 12MP **再压一次 JPEG 有损编码**
+//（二次量化），而 JPEG/R 的 base 本来就是一张完整、未经二次压缩的 JPEG —— 直接取出来
+// 另存是**零质量损失**。libultrahdr 的 `dec_get_base_image()` 给的就是重封装前的
+// 原始 base 字节。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeExtractSdrBase(JNIEnv* env, jclass,
+                                                       jbyteArray jpegR) {
+  if (!jpegR) return nullptr;
+  const jsize n = env->GetArrayLength(jpegR);
+  if (n <= 0) return nullptr;
+  std::vector<unsigned char> buf(static_cast<size_t>(n));
+  env->GetByteArrayRegion(jpegR, 0, n, reinterpret_cast<jbyte*>(buf.data()));
+  if (env->ExceptionCheck()) return nullptr;
+
+  uhdr_compressed_image_t in{};
+  in.data = buf.data();
+  in.data_sz = in.capacity = buf.size();
+  in.cg = UHDR_CG_UNSPECIFIED;
+  in.ct = UHDR_CT_UNSPECIFIED;
+  in.range = UHDR_CR_UNSPECIFIED;
+
+  uhdr_codec_private_t* dec = uhdr_create_decoder();
+  if (!dec) return nullptr;
+  jbyteArray out = nullptr;
+  do {
+    if (uhdr_dec_set_image(dec, &in).error_code != UHDR_CODEC_OK) break;
+    if (uhdr_dec_probe(dec).error_code != UHDR_CODEC_OK) break;
+    const uhdr_mem_block_t* base = uhdr_dec_get_base_image(dec);
+    if (!base || !base->data || base->data_sz == 0) break;
+    const jsize m = static_cast<jsize>(base->data_sz);
+    out = env->NewByteArray(m);
+    if (!out) break;
+    env->SetByteArrayRegion(out, 0, m, static_cast<const jbyte*>(base->data));
+    if (env->ExceptionCheck()) {
+      env->DeleteLocalRef(out);
+      out = nullptr;
+      break;
+    }
+  } while (false);
+  uhdr_release_decoder(dec);
+  return out;
+}
+#endif  // FILMKIT_HDR
+
+// ── gainmap 数学版本切换（v0.11.50，真机 A/B 用）──────────────────────
+// 0 = PhotonCamera 版（offset 1e-4）；1 = libultrahdr 官方版（offset 1e-7 + 暗部钳位）。
+// 任意线程可调（原子写）；下一次拍照生效。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetGainmapMath(JNIEnv*, jclass, jint mode) {
+  FrameRenderer::setGainmapMath(static_cast<int>(mode));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGetGainmapMath(JNIEnv*, jclass) {
+  return FrameRenderer::gainmapMath();
+}
+
+// ── HDR gainmap 读回（v0.11.50）─────────────────────────────────────
+// 成片链跑完后调用：把 GPU 算好的 1/2 分辨率 8bit gainmap 读回。
+// **必须与 nativeEngineSubmitRaw* 在同一个渲染线程**（读的是该线程 EGL 上下文里的纹理）。
+// 返回 null = 未生成（HDR 未开启 / 10bit 档 / pass 失败）—— 调用方回退普通 JPEG。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeReadGainmap(JNIEnv* env, jobject) {
+  // 用**本线程最后一次 submit 的实例**（拍照走 g_renderer_still，不是 g_renderer）
+  FrameRenderer* r = t_last_submit;
+  if (!r) return nullptr;
+  t_last_submit = r;   // 供本线程的 gainmap 读回定位实例
+  std::vector<unsigned char> gm;
+  if (!r->readGainmap(&gm) || gm.empty()) return nullptr;
+  const jsize n = static_cast<jsize>(gm.size());
+  jbyteArray out = env->NewByteArray(n);
+  if (!out) return nullptr;
+  env->SetByteArrayRegion(out, 0, n, reinterpret_cast<const jbyte*>(gm.data()));
+  return out;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGainmapWidth(JNIEnv*, jobject) {
+  return t_last_submit ? t_last_submit->gainmapWidth() : 0;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGainmapHeight(JNIEnv*, jobject) {
+  return t_last_submit ? t_last_submit->gainmapHeight() : 0;
+}
+
+// ── HDR 能力探测（v0.11.50）──────────────────────────────────────────
+// 编译期开关：CMake 的 FILMKIT_HDR=ON 才编进 UltraHdrEncoder.cpp 并 link libultrahdr。
+// Kotlin 侧用它区分「本 .so 没带 HDR」与「HDR 真的编码失败」—— 两者都返回 null
+// 时，日志里必须能分辨，否则排查方向会错。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeHdrAvailable(JNIEnv*, jclass) {
+#ifdef FILMKIT_HDR
+  return JNI_TRUE;
+#else
+  return JNI_FALSE;
+#endif
 }

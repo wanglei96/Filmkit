@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.os.Build
 import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
 
@@ -64,7 +65,81 @@ internal fun decodeOriented(
     return null
 }
 
-/** 读原图尺寸（IO 线程，只解析文件头不分配像素）。读不到 / 不是位图 / 格式不支持 ⇒ null。 */
+/**
+ * 查看页的 **HDR 解码**（v0.11.50）：按显示尺寸解码，且**保留 gainmap**。
+ *
+ * 为什么不能用 [decodeFit]：那条路径走 `BitmapFactory` + `inSampleSize`，而
+ * **`inSampleSize > 1` 时 gainmap 会被丢弃** —— 查看页 12MP 按 3MP 解码（sample=2），
+ * 于是 HDR 成片在 App 内看起来永远是 SDR（真机反馈"app相册貌似还是sdr显示"）。
+ *
+ * `ImageDecoder.setTargetSize` 会按比例缩放**主图与 gainmap**，两者保持对齐 ——
+ * 这是 Android 官方推荐的 HDR 解码路径（API 28+）。
+ *
+ * 方向：`ImageDecoder` **自己读 EXIF 方向**（与 `BitmapFactory` 相反），所以本函数
+ * **不再**走 [exifOrientationTransform]（再转一次会双旋）。
+ *
+ * 失败（API < 28 / 不是图片 / OOM）⇒ 回落 [decodeFit]（退化成 SDR，但不黑屏）。
+ *
+ * @param maxW/maxH 容器尺寸（px）；`<= 0` ⇒ 全尺寸解码
+ */
+internal fun decodeFitHdr(context: Context, uri: Uri, maxW: Int, maxH: Int): Bitmap? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        return decodeFit(context, uri, maxW, maxH)   // <14 无 gainmap 支持
+    }
+    // ⚠ **必须 inSampleSize = 1**：Android 的 BitmapFactory 在 inSampleSize > 1 时
+    // **丢弃 gainmap**（查看页 12MP ⇒ 3MP 会走 sample=2 ⇒ HDR 图永远显示成 SDR）。
+    // 真机实测（2026-10-20）：用户反馈"app相册还是没有 HDR 显示"就是这个。
+    //
+    // 为什么不用 ImageDecoder：它**不解析 MPF 多图**（Ultra HDR 的 gainmap 是第二张
+    // JPEG），只能解出 base —— 用 ImageDecoder 反而更彻底地丢 gainmap。
+    // BitmapFactory（API 34+）专门补了 MPF/gainmap 解析，这是唯一正确的 API。
+    //
+    // 内存代价：12MP × 4B = 48MB（+转正一份）。查看页单张、且项目开了 largeHeap，
+    // 可接受；OOM 时回落 [decodeFit]（丢 gainmap 但不黑屏）。
+    val resolver = context.contentResolver
+    val src = readBounds(resolver, uri)
+    val (rotation, flip) = exifOrientationTransform(readOrientation(resolver, uri))
+    try {
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = 1
+            // ⚠ **不设 inPreferredColorSpace**（v0.11.56 实测：设了 EXTENDED_SRGB 也没生效，
+            // 解出来仍是 sRGB）。Ultra HDR 的 base 本来就是 sRGB、HDR 增益由 gainmap 承担，
+            // 官方示例也只 `BitmapFactory.decodeStream` 不设色彩空间。
+            // 强制广色域反而可能让解码器做一次色彩转换（多一次拷贝且无益）。
+        }
+        val bmp = resolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, opts)
+        } ?: return decodeFit(context, uri, maxW, maxH)
+        // 诊断：确认 gainmap 真的解出来了（日志 `photo.view.hdr`）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // 诊断（v0.11.55）：把「解码出来的 HDR 能力」与「窗口的 HDR 能力」一起打出来，
+            // 才能把"gainmap 没解出来"和"解出来了但显示层不应用"分开。
+            // 真机实测（2026-10-20）：hasGainmap=True 但看不到效果 ⇒ 问题在显示层。
+            val act = context.findActivity()
+            val cfg = context.resources.configuration
+            com.filmkit.app.EngineBridge.nativeAppendLog(
+                com.filmkit.app.EngineBridge.LEVEL_INFO, "app", "photo.view.hdr",
+                "{\"hasGainmap\":" + bmp.hasGainmap() +
+                    ",\"w\":" + bmp.width + ",\"h\":" + bmp.height +
+                    ",\"sample\":1" +
+                    ",\"bmCs\":\"" + (bmp.colorSpace?.name ?: "?") + "\"" +
+                    ",\"bmExt\":" + (bmp.colorSpace?.isWideGamut ?: false) +
+                    // screenHdr 仅作参考 —— 它在用户设备上恒 false 但系统相册能显示 HDR，
+                    // 故**不作为**是否切彩色模式的条件（见 PhotoViewScreen 的注释）
+                    ",\"screenHdr\":" + (android.os.Build.VERSION.SDK_INT >= 34 && cfg.isScreenHdr) +
+                    ",\"colorMode\":" + (act?.window?.attributes?.colorMode ?: -999) + "}",
+            )
+        }
+        return orient(bmp, rotation, flip)
+    } catch (_: OutOfMemoryError) {
+        // 全尺寸解不出（12MP 48MB + 转正）：回落采样档，**丢 gainmap 但不黑屏**
+        return decodeFit(context, uri, maxW, maxH)
+    } catch (_: Throwable) {
+        return decodeFit(context, uri, maxW, maxH)
+    }
+}
+
+/** 读原图尺寸（IO 线程，只解析文件头不分配像素）。读不到 / 不是位图 / 格式不支持 ⇒ null。 *//** 读原图尺寸（IO 线程，只解析文件头不分配像素）。读不到 / 不是位图 / 格式不支持 ⇒ null。 */
 private fun readBounds(resolver: ContentResolver, uri: Uri): Pair<Int, Int>? {
     val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     return try {
@@ -196,4 +271,46 @@ private fun orient(src: Bitmap, rotationDegrees: Int, flip: Boolean): Bitmap {
     val out = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
     if (out !== src) src.recycle()
     return out
+}
+
+/**
+ * 把纯 SDR JPEG 字节落盘到相册（v0.11.54，「导出 SDR 版」的落点）。
+ *
+ * 为什么单独一个函数：导出发生在查看页（Compose），而 MediaStore 的 pending 流程
+ * 有固定套路（insert → IS_PENDING=1 → 写入 → IS_PENDING=0），写错了会在相册里留
+ * 半截文件或不可见。集中一处便于以后复用。
+ *
+ * @return true = 已落盘；false = 失败（调用方提示用户）
+ */
+internal fun saveSdrJpeg(context: Context, jpeg: ByteArray): Boolean {
+    if (jpeg.size < 4) return false
+    val name = "FILMKIT_${java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+        .format(java.util.Date())}_SDR.jpg"
+    return try {
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            val cv = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
+                put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv,
+            ) ?: return false
+            context.contentResolver.openOutputStream(uri)?.use { it.write(jpeg) }
+            cv.clear()
+            cv.put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
+            context.contentResolver.update(uri, cv, null, null)
+            true
+        } else {
+            val dir = java.io.File(
+                context.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES), "FilmKit",
+            )
+            dir.mkdirs()
+            java.io.File(dir, name).outputStream().use { it.write(jpeg) }
+            true
+        }
+    } catch (_: Throwable) {
+        false
+    }
 }

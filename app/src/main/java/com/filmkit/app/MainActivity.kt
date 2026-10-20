@@ -1,6 +1,8 @@
 package com.filmkit.app
 
+import android.content.pm.ActivityInfo
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
@@ -42,12 +44,37 @@ class MainActivity : ComponentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    /** 窗口 HDR 模式（相册 HDR 显示的前提）。失败静默 —— 不影响其他功能。 */
+    private fun applyWindowHdrMode(enabled: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+        runCatching {
+            // 同样**不检查 `isScreenHdr`**（理由见 PhotoViewScreen 的注释：该值在用户
+            // 这台设备上返回 false，而系统相册能正常显示 HDR ⇒ 它是不可靠的硬条件）。
+            window.colorMode = if (enabled) {
+                ActivityInfo.COLOR_MODE_HDR
+            } else {
+                ActivityInfo.COLOR_MODE_DEFAULT
+            }
+        }.onFailure {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "app", "hdr.window_mode_failed",
+                "{\"error\":\"" + (it.message ?: it.toString()).replace("\"", "'") + "\"}",
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         EngineBridge.ensureLoaded()
         // 强调色（设置-系统颜色）持久化载入，FilmTheme.Accent 为全局状态，改动即时生效
         val prefs = getSharedPreferences("filmkit", 0)
         FilmTheme.setAccent(Color(prefs.getInt("accent_argb", 0xFFE8842C.toInt())))
+        // 相册/查看页的 HDR 显示（v0.11.50，对齐 PhotonCamera 的 applyPreferredWindowColorMode）：
+        // 只有把窗口切到 COLOR_MODE_HDR，系统的 BitmapFactory / ImageDecoder 才会把
+        // gainmap 应用到显示 —— 否则 HDR 成片看起来与普通 SDR 一样（元数据在但不生效）。
+        // 条件与 PC 一致：Android 14+ 且屏幕本身支持 HDR（isScreenHdr）。
+        // 用户可关（prefs hdr_screen，默认开 —— 与 PC 的默认 true 一致）。
+        applyWindowHdrMode(prefs.getBoolean("hdr_screen", true))
         setContent {
             // 必须传 colorScheme：空 MaterialTheme 会用默认浅色，Material 组件（对话框 /
             // 输入框 / 按钮）会渲染成白底 —— 与胶片暗色风格冲突。
