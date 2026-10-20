@@ -2233,6 +2233,16 @@ class CameraController(private val context: Context, private val render: RenderC
         burstResults.fill(null)
         burstImageCount = 0
         burstResultCount = 0
+        cancelBurstTimeout()
+    }
+
+    /** 摘掉 burst 超时兜底。**必须在收满 4 帧时也调用**（v0.11.64）——
+     *  否则上一张的 5s 定时器会在下一张刚开拍时触发：`onBurstTimeout` 只看
+     *  `burstActive`（两张共用），会把**下一张**的 burst 误杀成单帧回退。
+     *  真机 2026-10-20 14:39 实证：第一张渲染 6.6s，第二张 45.26 开拍，第一张的
+     *  定时器 45.32 到期 ⇒ `mfnr.timeout images:0 waitMs:278` ⇒ 第二张走单帧、
+     *  无 MFNR/无 gainmap、画面明显更暗。 */
+    private fun cancelBurstTimeout() {
         burstTimeout?.let { r ->
             render.looper?.let { lo -> android.os.Handler(lo).removeCallbacks(r) }
         }
@@ -2246,6 +2256,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val imgs = burstImages.mapNotNull { it }
         val results = burstResults.mapNotNull { it }
         burstActive = false  // 摘标志：超时兜底不再触发；数组在 onDone 清引用
+        cancelBurstTimeout() // v0.11.64：收满即摘定时器，别让它误杀下一张
         capturePhase = 2
         processRawBurst(imgs, results)
     }
