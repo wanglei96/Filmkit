@@ -1012,6 +1012,12 @@ Java_com_filmkit_app_EngineBridge_nativeSetAutoExposure(JNIEnv*, jclass, jboolea
   FrameRenderer::setAutoExposure(on == JNI_TRUE);
 }
 
+// 局部影调（tone equalizer）开关：关 = 完全跳过（逐位不变）。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetToneEq(JNIEnv*, jclass, jboolean on) {
+  FrameRenderer::setToneEq(on == JNI_TRUE);
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeGetAutoExposure(JNIEnv*, jclass) {
   return FrameRenderer::autoExposure() ? JNI_TRUE : JNI_FALSE;

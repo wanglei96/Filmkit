@@ -957,6 +957,24 @@ private fun LowLightDrawerContent() {
             )
         },
     )
+    // 局部影调（tone equalizer，2026-10-20）：按引导 mask 的亮度分区做曝光补偿
+    // （darktable 口径）。解决"主体亮 + 天空蓝/高光有层次"在全局曲线下的互斥。
+    var toneEq by remember { mutableStateOf(prefs.getBoolean("tone_eq", true)) }
+    SettingSwitchRow(
+        title = "局部影调（分区曝光）",
+        subtitle = "按画面亮度分区做曝光补偿：高光区（天空/窗/灯）压暗约 0.6EV、暗部提亮约 0.3EV、" +
+            "中灰锁定。用曝光无关的引导滤波做 mask（darktable tone equalizer 口径），" +
+            "只改曝光不改局部对比。关 = 完全跳过（与之前逐位一致）。默认开",
+        checked = toneEq,
+        onChecked = { on ->
+            toneEq = on
+            prefs.edit().putBoolean("tone_eq", on).apply()
+            EngineBridge.nativeSetToneEq(on)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.tone_eq", "{\"on\":$on}",
+            )
+        },
+    )
 }
 
 /** 抽屉内容：实验与诊断（A/B 与专项实验开关，日常拍摄不动） */

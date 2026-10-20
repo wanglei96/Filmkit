@@ -82,6 +82,8 @@ object EngineBridge {
      */
     external fun nativeSetAutoExposure(on: Boolean)
     external fun nativeGetAutoExposure(): Boolean
+    /** 局部影调（tone equalizer）：按引导 mask 的亮度分区做曝光补偿。 */
+    external fun nativeSetToneEq(on: Boolean)
 
     /** 渲染一帧：OES 纹理（Kotlin 侧已 updateTexImage）→ 胶片链 → 上屏。 */
     external fun nativeEngineSubmitST(

@@ -149,6 +149,9 @@ class FrameRenderer {
   // 关 = 完全不介入（ev 恒 0，与 v0.11.60 行为逐位一致）。
   static void setAutoExposure(bool on);
   static bool autoExposure();
+  // 局部影调（tone equalizer）开关：关 = 完全跳过（逐位不变）
+  static void setToneEq(bool on);
+  static bool toneEq();
 
   // NN 推理回调注入（v0.10.102，见 NnInferFn 注释）。幂等，Bridge 在每次
   // submit 入口重设（顺带刷新其 JNIEnv 快照）。
@@ -901,10 +904,21 @@ class FrameRenderer {
          prog_raw_dn_fused_ = 0;
   GLuint prog_mfnr_mis_ = 0;  // 阶段二（v0.10.0）：mismatch map
   GLuint prog_mfnr_satfix_ = 0;  // 期 B bracket：参考帧饱和修复
+  // 局部影调（tone equalizer）：mask 生成 + 查表应用
+  GLuint prog_teq_down_ = 0, prog_teq_box_ = 0, prog_teq_coef_ = 0,
+         prog_teq_gain_ = 0, prog_teq_apply_ = 0;
   GLuint tex_mfnr_[3] = {0, 0, 0};  // R16UI，burst 帧 1..3（帧 0 复用 raw_tex_）
   // 期 B bracket（0.11.72）：参考帧饱和修复 —— 把短帧归一后的真实高光移植到
   // 参考帧的饱和像素上，再送进融合（否则长帧饱和处的短帧高光会被收缩/平均抹平）。
   GLuint tex_ref_fix_ = 0, fbo_ref_fix_ = 0;
+  // 局部影调：1/4 分辨率的 I/mask/gain + 全分辨率输出
+  GLuint tex_teq_i_ = 0, tex_teq_mean_ = 0, tex_teq_tmp_ = 0, tex_teq_gain_ = 0,
+         tex_teq_out_ = 0;
+  GLuint fbo_teq_i_ = 0, fbo_teq_mean_ = 0, fbo_teq_tmp_ = 0, fbo_teq_gain_ = 0,
+         fbo_teq_out_ = 0;
+  int teq_w_ = 0, teq_h_ = 0;
+  bool ensureTeqTargets(int w, int h);
+  GLuint applyToneEq(int w, int h, GLuint src);
   int sat_fix_w_ = 0, sat_fix_h_ = 0;
   // 本张融合用的参考帧纹理（默认 raw_tex_；bracket 时 = tex_ref_fix_）
   GLuint ref_fuse_tex_ = 0;
@@ -1346,6 +1360,12 @@ class FrameRenderer {
   struct {
     GLint ref = -1, shrt = -1, size = -1, black = -1, white = -1, scale = -1;
   } u_mfnr_satfix_;
+  // 局部影调（tone equalizer）
+  struct { GLint tex = -1, src_texel = -1; } u_teq_down_;
+  struct { GLint tex = -1, texel = -1, dir = -1, radius = -1; } u_teq_box_;
+  struct { GLint mean = -1, eps = -1; } u_teq_coef_;
+  struct { GLint i = -1, ab = -1; } u_teq_gain_;
+  struct { GLint tex = -1, gain = -1; } u_teq_apply_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1, mix = -1, moire = -1, moire_k = -1, cg_k = -1,

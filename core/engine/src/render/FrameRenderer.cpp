@@ -6373,6 +6373,111 @@ void main() {
     oColor = vec4(l, l, l, 1.0);
 })";
 
+// ── 局部影调（tone equalizer，2026-10-20，darktable 口径）──────────────────
+// 问题：全局曲线 + 全局 AE 下，"主体亮"与"天空蓝/高光有层次"互斥（真机
+// 170249/170748 反复验证）。业界做法是局部影调：按**引导 mask 的亮度分区**做
+// 曝光补偿（darktable `tone equalizer`）。
+//
+// 管线（全部在 scene 线性域、1/4 分辨率跑 mask）：
+//   ① kFsTeqDown    scene → I = log2(luma / 白点)（EV，曝光无关）
+//   ② kFsTeqBox×4   可分离盒式（H/V 各两次）：mean(I)、mean(I²) → 再平滑 a/b
+//   ③ kFsTeqCoef    自引导 guided filter 系数 a = var/(var+eps)、b = (1−a)·mean
+//   ④ kFsTeqGain    q = a·I + b（平滑后的曝光图）→ 9 分区曲线 → 增益（EV）
+//   ⑤ kFsTeqApply   全分辨率采样增益（双线性）→ rgb × 2^gain
+// mask 用**对数域**（I 是 EV）⇒ 天然曝光无关（darktable eigf 的动机）。
+const char* kFsTeqDown = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform vec2 uSrcTexel;
+void main() {
+    // 4×4 盒式下采样（1/4 分辨率），取 Rec.2020 线性 luma
+    float acc = 0.0;
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            vec2 o = (vec2(float(x), float(y)) - 1.5) * uSrcTexel;
+            vec3 c = texture(uTex, vUV0 + o).rgb;
+            acc += dot(c, vec3(0.2126, 0.7152, 0.0722));
+        }
+    }
+    float l = max(acc / 16.0, 1e-6);
+    float e = log2(l);                        // EV（相对 scene 白点 1.0）
+    oColor = vec4(e, e * e, 0.0, 1.0);        // (I, I²) —— box pass 直接平滑
+})";
+
+const char* kFsTeqBox = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;
+uniform vec2 uTexel;
+uniform int uDir;      // 0 = 水平，1 = 垂直
+uniform int uRadius;
+void main() {
+    vec2 d = (uDir == 0) ? vec2(uTexel.x, 0.0) : vec2(0.0, uTexel.y);
+    vec2 acc = vec2(0.0);
+    for (int i = -uRadius; i <= uRadius; ++i) {
+        acc += texture(uTex, vUV0 + d * float(i)).rg;
+    }
+    oColor = vec4(acc / float(2 * uRadius + 1), 0.0, 1.0);
+})";
+
+const char* kFsTeqCoef = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uMean;   // RG = mean(I), mean(I²)
+uniform float uEps;
+void main() {
+    vec2 m = texture(uMean, vUV0).rg;
+    float var = max(m.g - m.r * m.r, 0.0);
+    float a = var / (var + uEps);
+    oColor = vec4(a, (1.0 - a) * m.r, 0.0, 1.0);   // a, b（自引导）
+})";
+
+const char* kFsTeqGain = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uI;      // I = log2 luma（EV）
+uniform highp sampler2D uAB;     // 平滑后的 a, b
+uniform float uCurve[9];         // −8…0 EV 九分区的曝光补偿（EV）
+void main() {
+    // 曝光图 q = a·I + b（guided filter 输出，仍在 EV 域）
+    float q = texture(uAB, vUV0).r * texture(uI, vUV0).r + texture(uAB, vUV0).g;
+    // 映射到 [0,8]：0 = 黑（−8EV），8 = 白点（0EV）
+    float x = clamp(q + 8.0, 0.0, 8.0);
+    int i0 = int(floor(x));
+    int i1 = min(i0 + 1, 8);
+    float g = mix(uCurve[i0], uCurve[i1], x - float(i0));
+    oColor = vec4(g, 0.0, 0.0, 1.0);
+})";
+
+const char* kFsTeqApply = R"(#version 300 es
+precision highp float;
+in vec2 vUV0;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uTex;    // scene 线性（全分辨率）
+uniform highp sampler2D uGain;   // 1/4 分辨率增益（EV）
+uniform vec2 uGainSize;          // 增益图分辨率（手写双线性：RGBA16F 无硬件过滤）
+void main() {
+    vec3 c = texture(uTex, vUV0).rgb;
+    // 手写双线性上采样（X300 的 RGBA16F 只能 NEAREST，直接 texture() 会出 4×4 块）
+    vec2 p = vUV0 * uGainSize - 0.5;
+    vec2 p0 = floor(p);
+    vec2 f = p - p0;
+    ivec2 imax = ivec2(uGainSize) - 1;
+    ivec2 i0 = clamp(ivec2(p0), ivec2(0), imax);
+    ivec2 i1 = clamp(ivec2(p0) + ivec2(1), ivec2(0), imax);
+    float g00 = texelFetch(uGain, ivec2(i0.x, i0.y), 0).r;
+    float g10 = texelFetch(uGain, ivec2(i1.x, i0.y), 0).r;
+    float g01 = texelFetch(uGain, ivec2(i0.x, i1.y), 0).r;
+    float g11 = texelFetch(uGain, ivec2(i1.x, i1.y), 0).r;
+    float g = mix(mix(g00, g10, f.x), mix(g01, g11, f.x), f.y);
+    oColor = vec4(c * exp2(g), 1.0);
+})";
+
 GLuint compileShader(GLenum type, const char* src) {
   GLuint sh = glCreateShader(type);
   glShaderSource(sh, 1, &src, nullptr);
@@ -7486,6 +7591,16 @@ bool FrameRenderer::init() {
   prog_mfnr_fuse_ = linkProgram(vs_plain_, fs_mfnr_fuse);
   prog_mfnr_mis_ = linkProgram(vs_plain_, fs_mfnr_mis);
   prog_mfnr_satfix_ = linkProgram(vs_plain_, fs_mfnr_satfix);
+  const GLuint fs_teq_down = compileShader(GL_FRAGMENT_SHADER, kFsTeqDown);
+  const GLuint fs_teq_box = compileShader(GL_FRAGMENT_SHADER, kFsTeqBox);
+  const GLuint fs_teq_coef = compileShader(GL_FRAGMENT_SHADER, kFsTeqCoef);
+  const GLuint fs_teq_gain = compileShader(GL_FRAGMENT_SHADER, kFsTeqGain);
+  const GLuint fs_teq_apply = compileShader(GL_FRAGMENT_SHADER, kFsTeqApply);
+  prog_teq_down_ = linkProgram(vs_plain_, fs_teq_down);
+  prog_teq_box_ = linkProgram(vs_plain_, fs_teq_box);
+  prog_teq_coef_ = linkProgram(vs_plain_, fs_teq_coef);
+  prog_teq_gain_ = linkProgram(vs_plain_, fs_teq_gain);
+  prog_teq_apply_ = linkProgram(vs_plain_, fs_teq_apply);
   prog_raw_dn_fused_ = linkProgram(vs_plain_, fs_raw_dn_f);
   prog_raw_dn_ts_ = linkProgram(vs_plain_, fs_raw_dn_ts);
   prog_hl_mask_ = linkProgram(vs_plain_, fs_hl_mask);
@@ -7911,6 +8026,18 @@ bool FrameRenderer::init() {
   u_mfnr_satfix_.black = glGetUniformLocation(prog_mfnr_satfix_, "uBlack");
   u_mfnr_satfix_.white = glGetUniformLocation(prog_mfnr_satfix_, "uWhite");
   u_mfnr_satfix_.scale = glGetUniformLocation(prog_mfnr_satfix_, "uScale");
+  u_teq_down_.tex = glGetUniformLocation(prog_teq_down_, "uTex");
+  u_teq_down_.src_texel = glGetUniformLocation(prog_teq_down_, "uSrcTexel");
+  u_teq_box_.tex = glGetUniformLocation(prog_teq_box_, "uTex");
+  u_teq_box_.texel = glGetUniformLocation(prog_teq_box_, "uTexel");
+  u_teq_box_.dir = glGetUniformLocation(prog_teq_box_, "uDir");
+  u_teq_box_.radius = glGetUniformLocation(prog_teq_box_, "uRadius");
+  u_teq_coef_.mean = glGetUniformLocation(prog_teq_coef_, "uMean");
+  u_teq_coef_.eps = glGetUniformLocation(prog_teq_coef_, "uEps");
+  u_teq_gain_.i = glGetUniformLocation(prog_teq_gain_, "uI");
+  u_teq_gain_.ab = glGetUniformLocation(prog_teq_gain_, "uAB");
+  u_teq_apply_.tex = glGetUniformLocation(prog_teq_apply_, "uTex");
+  u_teq_apply_.gain = glGetUniformLocation(prog_teq_apply_, "uGain");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
@@ -8817,6 +8944,14 @@ void FrameRenderer::setGainmapMath(int mode) {
 int FrameRenderer::gainmapMath() { return g_gainmap_math.load(); }
 
 void FrameRenderer::setAutoExposure(bool on) { g_ae_auto.store(on); }
+
+// 局部影调开关（默认开）：用函数内 static 避免全局构造顺序问题
+static std::atomic<bool>& toneEqFlag() {
+  static std::atomic<bool> f{true};
+  return f;
+}
+void FrameRenderer::setToneEq(bool on) { toneEqFlag().store(on); }
+bool FrameRenderer::toneEq() { return toneEqFlag().load(std::memory_order_relaxed); }
 bool FrameRenderer::autoExposure() { return g_ae_auto.load(std::memory_order_relaxed); }
 
 // ── 自动曝光（v0.11.61）────────────────────────────────────────────────────
@@ -8932,7 +9067,9 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     passOES(rw, rh, st, rot, sx, sy, p);
     if (diag) logPassDiag("pass1_oes", fbo_scene_, GL_RGBA16F);
   }
-  passFilm(rw, rh, p, tex_scene_, /*still=*/false, /*hal_domain=*/true);
+  // 局部影调（tone equalizer）：在 film 曲线之前按 mask 分区做曝光补偿
+  const GLuint teq_src = applyToneEq(rw, rh, tex_scene_);
+  passFilm(rw, rh, p, teq_src, /*still=*/false, /*hal_domain=*/true);
   if (diag) logPassDiag("pass2_film", fbo_work_, GL_RGBA16F);
 
   if (scaled) {
@@ -8953,7 +9090,8 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     } else {
       passOES(dst_w, dst_h, st, rot, sx, sy, p);
     }
-    passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/false, /*hal_domain=*/true);
+    const GLuint teq_src = applyToneEq(dst_w, dst_h, tex_scene_);
+    passFilm(dst_w, dst_h, p, teq_src, /*still=*/false, /*hal_domain=*/true);
   }
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
@@ -9135,7 +9273,8 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
   passStill(dst_w, dst_h, effective_rot, p);
   // 第 6 期（S12）：YUV 静拍链的输入同样是 HAL 显示域 ⇒ 必须走域比归一。
   // 旧写法传 still=true 使它拿到 hal_domain=0，被当作场景线性域（亮度随 AWB 漂移）。
-  passFilm(dst_w, dst_h, p, tex_scene_, /*still=*/true, /*hal_domain=*/true);
+  const GLuint teq_src = applyToneEq(dst_w, dst_h, tex_scene_);
+  passFilm(dst_w, dst_h, p, teq_src, /*still=*/true, /*hal_domain=*/true);
 
   // 卡 H2：**交付档切换**（8bit RGBA8 ↔ 10bit GL_RGB10_A2）也要重建 —— 只按尺寸
   // 记账会让"同尺寸的 JPEG 与 HEIF 连拍"复用错档附件（readback 口径不匹配 ⇒ 整幅
@@ -12476,6 +12615,118 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // burst 4 帧汇集到 R16UI 2DArray（GPU-GPU copy）→ kFsMfnrFft compute 4 次
 // dispatch（tile 相位组串行化 overlap-add）→ per-tile neff 读回均值。
 // 输出写进 tex_fused_（与 fuse 路径同域同格式），后段 P0/RCD/胶片链零改动。
+// ── 局部影调（tone equalizer）：mask 生成 + 查表应用 ─────────────────────
+// 自动预设曲线：9 个分区 = −8…0 EV（相对 scene 白点 1.0）；中灰 −2.44 EV 落在
+// 第 5.56 格（≈ +0.03 EV，锁定）；高光 −0.6 EV；最暗 +0.3 EV。
+// 这是 darktable "compress shadows/highlights" 预设的口径，不是逐场景自适应。
+static const float kTeqCurve[9] = {0.30f, 0.28f, 0.24f, 0.18f,
+                                   0.12f, 0.06f, 0.02f, -0.35f, -0.60f};
+
+bool FrameRenderer::ensureTeqTargets(int w, int h) {
+  const int tw = (w + 3) / 4, th = (h + 3) / 4;
+  if (teq_w_ == tw && teq_h_ == th && tex_teq_out_ != 0) return true;
+  const auto del = [](GLuint* t, GLuint* f) {
+    if (*t) glDeleteTextures(1, t);
+    if (*f) glDeleteFramebuffers(1, f);
+    *t = *f = 0;
+  };
+  del(&tex_teq_i_, &fbo_teq_i_);
+  del(&tex_teq_mean_, &fbo_teq_mean_);
+  del(&tex_teq_tmp_, &fbo_teq_tmp_);
+  del(&tex_teq_gain_, &fbo_teq_gain_);
+  del(&tex_teq_out_, &fbo_teq_out_);
+  makeTex(&tex_teq_i_, &fbo_teq_i_, GL_RGBA16F, tw, th);
+  makeTex(&tex_teq_mean_, &fbo_teq_mean_, GL_RGBA16F, tw, th);
+  makeTex(&tex_teq_tmp_, &fbo_teq_tmp_, GL_RGBA16F, tw, th);
+  makeTex(&tex_teq_gain_, &fbo_teq_gain_, GL_RGBA16F, tw, th);
+  makeTex(&tex_teq_out_, &fbo_teq_out_, GL_RGBA16F, w, h);
+  teq_w_ = tw;
+  teq_h_ = th;
+  const bool ok = tex_teq_i_ && tex_teq_mean_ && tex_teq_tmp_ &&
+                  tex_teq_gain_ && tex_teq_out_;
+  if (!ok) {
+    Logger::instance().log(LogLevel::kError, "engine", "teq.alloc_failed",
+                           "{\"w\":" + std::to_string(w) +
+                               ",\"h\":" + std::to_string(h) + "}");
+    return false;
+  }
+  return true;
+}
+
+GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
+  if (!toneEq() || src == 0 || w <= 0 || h <= 0)
+    return src;
+  if (!ensureTeqTargets(w, h)) return src;
+  const int tw = teq_w_, th = teq_h_;
+  const int radius = std::max(3, std::min(tw, th) / 24);   // ≈ 画面短边的 4%
+  // ① scene → I = log2(luma), I²（1/4 分辨率）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_i_);
+  glViewport(0, 0, tw, th);
+  glUseProgram(prog_teq_down_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src);
+  glUniform1i(u_teq_down_.tex, 0);
+  glUniform2f(u_teq_down_.src_texel, 1.0f / static_cast<float>(w),
+              1.0f / static_cast<float>(h));
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ② 可分离盒式（H+V）：mean(I)、mean(I²)
+  const auto box = [&](GLuint in, GLuint out_fbo, int dir) {
+    glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
+    glViewport(0, 0, tw, th);
+    glUseProgram(prog_teq_box_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, in);
+    glUniform1i(u_teq_box_.tex, 0);
+    glUniform2f(u_teq_box_.texel, 1.0f / static_cast<float>(tw),
+                1.0f / static_cast<float>(th));
+    glUniform1i(u_teq_box_.dir, dir);
+    glUniform1i(u_teq_box_.radius, radius);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  };
+  box(tex_teq_i_, fbo_teq_mean_, 0);
+  box(tex_teq_mean_, fbo_teq_tmp_, 1);
+  // ③ guided filter 系数 a/b（自引导，log 域 ⇒ 曝光无关）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_mean_);
+  glViewport(0, 0, tw, th);
+  glUseProgram(prog_teq_coef_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_teq_tmp_);
+  glUniform1i(u_teq_coef_.mean, 0);
+  glUniform1f(u_teq_coef_.eps, 0.05f);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ④ 平滑 a/b（两个盒式）
+  box(tex_teq_mean_, fbo_teq_tmp_, 0);
+  box(tex_teq_tmp_, fbo_teq_mean_, 1);
+  // ⑤ 分区曲线 → 增益（EV）
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_gain_);
+  glViewport(0, 0, tw, th);
+  glUseProgram(prog_teq_gain_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_teq_i_);
+  glUniform1i(u_teq_gain_.i, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_teq_mean_);
+  glUniform1i(u_teq_gain_.ab, 1);
+  glUniform1fv(glGetUniformLocation(prog_teq_gain_, "uCurve"), 9, kTeqCurve);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ⑥ 全分辨率应用
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_out_);
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_teq_apply_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, src);
+  glUniform1i(u_teq_apply_.tex, 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_teq_gain_);
+  glUniform1i(u_teq_apply_.gain, 1);
+  glUniform2f(glGetUniformLocation(prog_teq_apply_, "uGainSize"),
+              static_cast<float>(tw), static_cast<float>(th));
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glActiveTexture(GL_TEXTURE0);
+  return tex_teq_out_;
+}
+
 // 期 B bracket（0.11.72）：参考帧饱和修复目标（R16UI，raw 尺寸，可复用）
 bool FrameRenderer::ensureSatFixTarget(int w, int h) {
   if (w <= 0 || h <= 0) return false;
