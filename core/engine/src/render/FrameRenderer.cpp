@@ -8843,18 +8843,23 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
                              "{\"err\":\"" + std::string(err) + "\"}");
     }
   });
-  // 高光统计只取中央 2/3（PC centerFractionPerAxis = 2/3）：边缘高光不参与曝光决策。
-  const SceneStats st = measureSceneStats(src, 2.0f / 3.0f);
-  if (!st.valid) {
+  // v0.11.78：两层统计各取所需 ——
+  //   中灰（主体亮度）用**中央 2/3**（PC centerFractionPerAxis）：画面主体通常在中
+  //     央，边缘的窗/天空不该决定主体亮度；
+  //   高光（防裁切）用**全图**：0.11.77 只用中央时，阳台/室内场景的中央没有天空，
+  //     AE 便一路提亮直接把蓝天顶成灰白（真机 170249：aeEv +1.25、hi240 9.55%）。
+  const SceneStats st_full = measureSceneStats(src, 0.0f);
+  const SceneStats st_center = measureSceneStats(src, 2.0f / 3.0f);
+  if (!st_full.valid || !st_center.valid) {
     ae_why_ = 4;   // 统计失败：保持历史行为（不介入）
     return 0.0f;
   }
   AeInputs in;
   in.valid = true;
-  in.p_mid = st.p_mid;
-  in.p_hi995 = st.p_hi995;
+  in.p_mid = st_center.p_mid;
+  in.p_hi995 = st_full.p_hi995;
   in.user_ev = p.exposure_ev;
-  in.sat_frac = st.sat_frac;
+  in.sat_frac = st_full.sat_frac;
   // 高光上限 = **当前引擎曲线的死白起点**（不是 RAW 饱和点，也不是 [38]）：
   // 引擎 1（sigmoid，默认）6.22 EV；引擎 0（filmic）随 [38] 平移 +0.34。
   // ⚠ [38] 在引擎 1 下被 EngineScope 归零 ⇒ 绝不能无条件读它（0.11.70 的教训）。
@@ -8863,10 +8868,10 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
                     ? kAeSigmoidDeadWhiteEv
                     : (p.filmic_white_ev + kAeFilmicWhiteOffsetEv);
   const AeDecision d = decideAe(in);
-  ae_p50_ = st.p_mid;
-  ae_p999_ = st.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
-  ae_p995_ = st.p_hi995;
-  ae_sat_frac_ = st.sat_frac;
+  ae_p50_ = st_center.p_mid;
+  ae_p999_ = st_full.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
+  ae_p995_ = st_full.p_hi995;
+  ae_sat_frac_ = st_full.sat_frac;
   ae_mid_ev_ = d.ev_mid;
   ae_hl_ev_ = d.ev_hl;
   ae_ev_ = d.ev;
