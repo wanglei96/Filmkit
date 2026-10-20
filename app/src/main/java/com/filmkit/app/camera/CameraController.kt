@@ -831,6 +831,15 @@ class CameraController(private val context: Context, private val render: RenderC
                 liveExposureNs >= MFNR_EXPOSURE_THRESHOLD_NS
         }
 
+        /** bracket 实际曝光比（长帧/短帧）。**必须用 CaptureResult 读回值**：HAL 可能
+         *  把短帧曝光 clamp 到下限，请求的 4× 不等于实际。返回 1.0 = 无短帧/无效
+         *  （调用方据此回退到同曝光路径，设计 §3.5）。 */
+        fun bracketRatio(shortNs: Long, longNs: Long): Float {
+            if (shortNs <= 0 || longNs <= 0 || longNs <= shortNs) return 1f
+            val r = longNs.toDouble() / shortNs
+            return if (r in 1.5..16.0) r.toFloat() else 1f
+        }
+
         /**
          * 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、
          * 2 = 2×σ）。含旧三档 prefs 的一次性迁移（level 0/1/2 → 0/1/2；旧 bool
@@ -1968,6 +1977,14 @@ class CameraController(private val context: Context, private val render: RenderC
     private var burstRefNoiseScale = 1.0f
     private val MFNR_REF_MAX_EXPOSURE_NS = 15_000_000L  // 快门锚 15ms（拖影减半）
 
+    // ── bracket（期 B，docs/engine-bracket-design.md）────────────────────
+    // 1 短 3 长：帧 0 = t_long / 2^k（ISO 与长帧相同，只改曝光时间），帧 1-3 = 长帧。
+    // **第 1 步只采集 + 记录**：短帧不参与融合（融合用 3 长帧，出片零风险），
+    // 归一与饱和感知权重在第 2 步落地（设计 §7 步骤 1/2）。
+    private val BRACKET_DIV = 4L          // 2^k，k=2（设计 §3.1）
+    private var burstBracketOn = false    // 本次 burst 是否采了短帧
+    private var burstShortRatio = 1.0f    // 实际 长/短 曝光比（1 = 无短帧/回退）
+
     // 曝光决策专项护栏：本次 burst 请求的曝光/ISO（供结果回调核对 HAL 是否 clamp）
     @Volatile
     private var expPlanSec = 0L
@@ -2048,7 +2065,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val aeAutoOn = runCatching {
             context.getSharedPreferences("filmkit", 0).getBoolean("ae_auto", true)
         }.getOrDefault(true)
-        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn
+        // bracket（期 B）：开关默认关（第 4 步才转默认开）。开启时短帧自带高光余量，
+        // 采集端高光保护必须同时旁路，否则"短帧 + 欠曝"又是一层双重压。
+        val bracketPref = expPrefs.getBoolean("bracket", false)
+        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn && !bracketPref
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设
         // 那部分就会少算 EV，高光保护判据放行 → 成片高光裁切。
@@ -2085,9 +2105,35 @@ class CameraController(private val context: Context, private val render: RenderC
         // 一起退化）；拖影风险已由运动预算统一约束（Night Sight：参考帧取最锐帧）。
         val longExposureOn = expPlan != null && expPlan.n > 1.0001
 
+        // ── bracket 决策（期 B §3.1）────────────────────────────────────
+        // 短帧 = t_long / 4，ISO 与长帧相同（曝光量只靠快门，噪声模型不动）。
+        // 短帧放帧 0：它是最锐的帧（参考帧候选）。bracket 开时停用"参考帧压短"
+        // （v0.10.1 的 isoRef 补偿）—— 两者都在改帧 0 的曝光，叠加会互相抵消。
+        // 闪光灯场景禁用（频闪下各帧亮度不一致，设计 §6）。
+        val expLower = curCharacteristics
+            ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?.lower ?: 0L
+        val shortSec = if (capSec > 0) maxOf(expLower, capSec / BRACKET_DIV) else 0L
+        val bracketActive = bracketPref && flashMode == 0 && capIso > 0 &&
+            shortSec > 0 && capSec >= shortSec * 3 / 2
+        burstBracketOn = bracketActive
+        burstShortRatio = 1.0f
+        if (bracketActive) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "mfnr.bracket",
+                kv(
+                    "on" to true,
+                    "sec" to "%.4f".format(capSec / 1e9f),
+                    "short" to "%.4f".format(shortSec / 1e9f),
+                    "reqRatio" to "%.3f".format(capSec.toDouble() / shortSec),
+                    "iso" to capIso, "k" to 2,
+                ),
+            )
+        }
+
         val isoTouchesTop = capIso >= isoUpperGate        // 触顶 = 暗光
         val isoHeadroomOk = capIso * 3 / 2 <= isoUpperGate  // isoRef 不会被 clamp
-        val canShorten = !longExposureOn && capIso > 0 && capSec > 0 &&
+        val canShorten = !bracketActive && !longExposureOn && capIso > 0 && capSec > 0 &&
             !isoTouchesTop && isoHeadroomOk
         val secRef = if (!canShorten) {
             capSec
@@ -2131,6 +2177,18 @@ class CameraController(private val context: Context, private val render: RenderC
         } else {
             null
         }
+        // bracket 短帧请求（帧 0）：AE_OFF + 长帧 ISO + t_long/4
+        val shortReq = if (bracketActive) {
+            camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(stillReader!!.surface)
+                applyControls(this, distort = true)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_SENSITIVITY, capIso)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, shortSec)
+            }.build()
+        } else {
+            null
+        }
         // v0.10.35（2026-09-29 真机取证）：**alt 帧同样固定 AE_OFF + 预览收敛的
         // ISO/曝光** —— 原实现帧 1-3 直接复用预览的 repeating 请求（AE AUTO），
         // HAL 在拍摄时重新收敛曝光：70MM 实测预期 1070 → 实际 1179（+10%），
@@ -2152,7 +2210,7 @@ class CameraController(private val context: Context, private val render: RenderC
             null
         }
         val reqs = List(MFNR_FRAMES) { i ->
-            if (i == 0) (refReq ?: altReq ?: b.build()) else (altReq ?: b.build())
+            if (i == 0) (shortReq ?: refReq ?: altReq ?: b.build()) else (altReq ?: b.build())
         }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.burst_submit",
@@ -2161,6 +2219,9 @@ class CameraController(private val context: Context, private val render: RenderC
                 "refIso" to isoRef, "refSec" to "%.4f".format(secRefFinal / 1e9f),
                 "altIso" to capIso, "altSec" to "%.4f".format(capSec / 1e9f),
                 "rn" to "%.3f".format(burstRefNoiseScale),
+                // bracket（期 B）：brk=1 时帧 0 是 t_long/4 短帧，brkSec = 请求短曝光
+                "brk" to (if (bracketActive) 1 else 0),
+                "brkSec" to "%.4f".format(shortSec / 1e9f),
                 // 曝光决策专项：规划结果 + 运动判据（expN=1 表示未启用/未生效）
                 "expN" to "%.2f".format(expPlan?.n ?: 1.0),
                 "expWhy" to (expPlan?.limitedBy ?: "off"),
@@ -2206,6 +2267,44 @@ class CameraController(private val context: Context, private val render: RenderC
         } finally {
             runCatching { img.close() }
         }
+    }
+
+    /** 短帧 RAW 抽样统计（归一化到白点）：[mean, P99.5, P99.9, 饱和占比]。
+     *  bracket 第 1 步的验证判据 —— 短帧的 P99.5 必须落回白点内（<1），否则说明
+     *  k=2 不够（设计 §0/§3.1）。stride=16 ⇒ 12MP 约 790k 次读取（~5ms）。 */
+    private fun rawSampleStats(
+        buf: java.nio.ByteBuffer, w: Int, h: Int, stridePx: Int, white: Int,
+    ): FloatArray {
+        val sb = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val wl = white.coerceAtLeast(1).toFloat()
+        val bins = IntArray(256)
+        var sum = 0.0
+        var n = 0
+        var y = 0
+        while (y < h) {
+            val row = y * stridePx
+            var x = 0
+            while (x < w) {
+                val v = (sb.get(row + x).toInt() and 0xFFFF) / wl
+                sum += v
+                bins[(v * 255f).toInt().coerceIn(0, 255)]++
+                n++
+                x += 16
+            }
+            y += 16
+        }
+        if (n == 0) return floatArrayOf(0f, 0f, 0f, 0f)
+        val quant = { f: Float ->
+            val target = (n * f).toInt()
+            var acc = 0
+            var b = 0
+            while (b < 256 && acc + bins[b] < target) {
+                acc += bins[b]
+                b++
+            }
+            b / 255f
+        }
+        return floatArrayOf(sum.toFloat() / n, quant(0.995f), quant(0.999f), bins[255].toFloat() / n)
     }
 
     private fun onBurstTimeout() {
@@ -2482,10 +2581,12 @@ class CameraController(private val context: Context, private val render: RenderC
                         if (burstActive) {
                             if (burstImageCount < MFNR_FRAMES) {
                                 val idx = burstImageCount++
-                                if (idx == 0) {
-                                    // 参考帧保留 Image（DngCreator 只吃 Image）
-                                    burstImages[0] = img
-                                    burstStrides[0] = img.planes[0].rowStride / 2
+                                if (idx == 0 || (burstBracketOn && idx == 1)) {
+                                    // 帧 0 保留 Image（参考帧，DngCreator 只吃 Image）。
+                                    // bracket 时帧 0 是短曝光 ⇒ DNG 底片必须用长帧（帧 1）
+                                    // 写出：底片像素与 ExposureTime 元数据必须同源。
+                                    burstImages[idx] = img
+                                    burstStrides[idx] = img.planes[0].rowStride / 2
                                 } else {
                                     copyRawAndClose(img, idx)
                                 }
@@ -2876,6 +2977,25 @@ class CameraController(private val context: Context, private val render: RenderC
                                 "reqIso" to expPlanIso,
                             ),
                         )
+                        // bracket（期 B）：实际 ratio 以读回值为准（HAL 可能 clamp 短帧）
+                        if (burstBracketOn) {
+                            val s = secs.getOrNull(0) ?: 0L
+                            val l = secs.getOrNull(1) ?: 0L
+                            val r = bracketRatio(s, l)
+                            burstShortRatio = r
+                            val ok = r >= 1.5f
+                            EngineBridge.nativeAppendLog(
+                                if (ok) EngineBridge.LEVEL_INFO else EngineBridge.LEVEL_WARN,
+                                "camera",
+                                if (ok) "mfnr.bracket_actual" else "mfnr.bracket_fallback",
+                                kv(
+                                    "shortSec" to "%.4f".format(s / 1e9f),
+                                    "longSec" to "%.4f".format(l / 1e9f),
+                                    "ratio" to "%.3f".format(r),
+                                    "n" to secs.size,
+                                ),
+                            )
+                        }
                     }
                     tryProcessBurst()
                 }
@@ -3097,7 +3217,13 @@ class CameraController(private val context: Context, private val render: RenderC
         val refResult = results[0]
         val refW = ref.width
         val refH = ref.height
-        val meta = extractRawMeta(refResult, ch)
+        // bracket（期 B）：帧 0 是短曝光 ⇒ DNG 底片与渲染元数据都用长帧（帧 1）。
+        // 底片像素必须与 ExposureTime 元数据同源，否则 DNG 暗 2EV 且无法解释。
+        val bracketOn = burstBracketOn && burstShortRatio > 1.05f
+        val dngIdx = if (bracketOn) 1 else 0
+        val dngImg = images.getOrNull(dngIdx) ?: ref
+        val dngResult = results.getOrNull(dngIdx) ?: refResult
+        val meta = extractRawMeta(dngResult, ch)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "mfnr.capture",
             kv(
@@ -3108,6 +3234,10 @@ class CameraController(private val context: Context, private val render: RenderC
                 },
                 "ms" to (android.os.SystemClock.elapsedRealtime() - burstStartMs),
                 "lens" to currentLensId,
+                // bracket：brk=1 表示帧 0 是短帧、融合用长帧（第 1 步）
+                "brk" to (if (bracketOn) 1 else 0),
+                "ratio" to "%.3f".format(burstShortRatio),
+                "dng" to dngIdx,
                 // 畸变校正探测（v0.10.109-exp7）：burst 首帧实际生效的模式
                 "distCorr" to (if (android.os.Build.VERSION.SDK_INT >= 28) {
                     results.firstOrNull()?.get(CaptureResult.DISTORTION_CORRECTION_MODE) ?: -1
@@ -3116,10 +3246,10 @@ class CameraController(private val context: Context, private val render: RenderC
                 }),
             ),
         )
-        logRawMeta(ref, refResult, meta)
+        logRawMeta(dngImg, dngResult, meta)
         if (dngOn && ch != null) {
             try {
-                saveDng(ref, refResult, ch)
+                saveDng(dngImg, dngResult, ch)
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_ERROR, "camera", "dng.save_failed",
@@ -3129,6 +3259,8 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         // 帧 0 拷贝并 close：此时 HAL 槽位全部释放，只剩 4 个 direct buffer
         copyRawAndClose(ref, 0)
+        // bracket 时帧 1（长帧）Image 也持有到此刻 —— DNG 已写，关闭释放槽位
+        if (dngIdx == 1) runCatching { images.getOrNull(1)?.close() }
         burstImages.fill(null)
         EngineBridge.nativeFlushLogs()
         applyTonePref()
@@ -3136,6 +3268,32 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLutStrengthPref()
         val buffers = burstBuffers.mapNotNull { it }
         val strides = burstStrides.copyOf()
+        // bracket 第 1 步（设计 §7 步骤 1）：**短帧不参与融合** —— 帧 0 位置用长帧
+        // （帧 1）顶替，融合看到的是 4 帧同曝光域，出片零风险。短帧只做统计，证明
+        // 它确实保住了高光；归一 + 饱和感知权重在第 2 步落地。
+        val fuseBufs = if (bracketOn) {
+            listOf(buffers[1], buffers[1], buffers[2], buffers[3])
+        } else {
+            buffers
+        }
+        val fuseStrides = if (bracketOn) {
+            intArrayOf(strides[1], strides[1], strides[2], strides[3])
+        } else {
+            strides
+        }
+        if (bracketOn) {
+            val st = rawSampleStats(buffers[0], refW, refH, strides[0], meta.whiteLevel)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "bracket.short",
+                kv(
+                    "mean" to "%.4f".format(st[0]),
+                    "p995" to "%.4f".format(st[1]),
+                    "p999" to "%.4f".format(st[2]),
+                    "sat" to "%.4f".format(st[3]),
+                    "ratio" to "%.3f".format(burstShortRatio),
+                ),
+            )
+        }
         // 降噪专项 A（2026-09-29）：prefs mfnr_dft = true 走 DFT 逐频收缩合并
         //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
         val useDft = prefs.getBoolean("mfnr_dft", false)
@@ -3193,15 +3351,15 @@ class CameraController(private val context: Context, private val render: RenderC
         // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
         val nnAb = false
         if (useStill && prefs.getBoolean("still_ab", false)) {
-            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/false, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
-            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/true, done)
         } else if (useStill) {
-            StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
+            StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, tenBit = tenBit) { bytes, w, h ->
                 if (bytes != null) {
@@ -3213,14 +3371,14 @@ class CameraController(private val context: Context, private val render: RenderC
                         EngineBridge.LEVEL_WARN, "camera", "render.still_fallback", "{}",
                     )
                     EngineBridge.nativeFlushLogs()
-                    render.submitRawBurst(buffers, strides, refW, refH, meta,
+                    render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
                         tenBit = tenBit, onDone = done)
                 }
             }
         } else {
-            render.submitRawBurst(buffers, strides, refW, refH, meta,
+            render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
                 tenBit = tenBit, onDone = done)
