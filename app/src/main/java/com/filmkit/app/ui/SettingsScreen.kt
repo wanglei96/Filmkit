@@ -923,6 +923,25 @@ private fun LowLightDrawerContent() {
             )
         },
     )
+    // 自动曝光（v0.11.61）：本张 RAW 统计 ⇒ 渲染端 EV。
+    // 用户 2026-10-20 定方案：高光不过曝、暗部有细节、亮度接近肉眼；这一层负责
+    // "亮度接近现实"（中灰锚定 18.45%）与"高光不撞 RAW 白点"（高光优先）。
+    var aeAuto by remember { mutableStateOf(prefs.getBoolean("ae_auto", true)) }
+    SettingSwitchRow(
+        title = "自动曝光（本张统计）",
+        subtitle = "按这张照片自己的 RAW 统计决定成片曝光：中灰锚定 18.45%（亮度接近肉眼），" +
+            "高光 P99.9 不撞 RAW 白点（高光优先）。与上面的「高光保护」是两层 —— " +
+            "那层改采集（少收光子、且只能拿上一张预测），这层只改渲染（光子全保留、第一张也有效）。默认开",
+        checked = aeAuto,
+        onChecked = { on ->
+            aeAuto = on
+            prefs.edit().putBoolean("ae_auto", on).apply()
+            EngineBridge.nativeSetAutoExposure(on)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.ae_auto", "{\"on\":$on}",
+            )
+        },
+    )
 }
 
 /** 抽屉内容：实验与诊断（A/B 与专项实验开关，日常拍摄不动） */

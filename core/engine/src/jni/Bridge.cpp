@@ -1003,6 +1003,19 @@ Java_com_filmkit_app_EngineBridge_nativeGetGainmapMath(JNIEnv*, jclass) {
   return FrameRenderer::gainmapMath();
 }
 
+// ── 自动曝光（v0.11.61）──────────────────────────────────────────────────
+// 渲染端 EV：本张 RAW 的 P50/P99.9 ⇒ 中灰锚定 + 高光约束（高光优先）。
+// 只影响 RAW 静拍链；关 = 与 v0.11.60 逐位一致。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetAutoExposure(JNIEnv*, jclass, jboolean on) {
+  FrameRenderer::setAutoExposure(on == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGetAutoExposure(JNIEnv*, jclass) {
+  return FrameRenderer::autoExposure() ? JNI_TRUE : JNI_FALSE;
+}
+
 // ── HDR gainmap 读回（v0.11.50）─────────────────────────────────────
 // 成片链跑完后调用：把 GPU 算好的 1/2 分辨率 8bit gainmap 读回。
 // **必须与 nativeEngineSubmitRaw* 在同一个渲染线程**（读的是该线程 EGL 上下文里的纹理）。

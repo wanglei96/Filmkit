@@ -144,6 +144,12 @@ class FrameRenderer {
   static void setGainmapMath(int mode);
   static int gainmapMath();
 
+  // 自动曝光（v0.11.61）：本张 RAW 的 P50/P99.9 ⇒ 渲染端 EV（中灰锚定 + 高光约束，
+  // 高光优先）。prefs `ae_auto`（默认开），进程级 static、任意线程可调。
+  // 关 = 完全不介入（ev 恒 0，与 v0.11.60 行为逐位一致）。
+  static void setAutoExposure(bool on);
+  static bool autoExposure();
+
   // NN 推理回调注入（v0.10.102，见 NnInferFn 注释）。幂等，Bridge 在每次
   // submit 入口重设（顺带刷新其 JNIEnv 快照）。
   static void setNnInferFn(NnInferFn fn);
@@ -1184,6 +1190,17 @@ class FrameRenderer {
   // v0.10.28：wmax = 采样 max 判据值（上探主驱动）。
   float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
   float last_still_w999_ = 0.0f;   // 成片链最后一次的 P99.9（EV 前，RAW 归一化域）
+  // ── 自动曝光（v0.11.61）─────────────────────────────────────────────────
+  // 本张 RAW 的 P50/P99.9 ⇒ 渲染端 EV（中灰锚定 + 高光约束，高光优先）。
+  // 只在 submitRawBurst 的 still 链跑；预览/YUV 不走（域不同，见 AeMetering.h）。
+  float ae_ev_ = 0.0f;        // 本次实际追加到 exposure_ev 的量
+  float ae_mid_ev_ = 0.0f;    // 中灰锚定要求的 EV（诊断）
+  float ae_hl_ev_ = 0.0f;     // 高光约束允许的 EV（诊断）
+  float ae_p50_ = 0.0f;       // 本张 P50（线性，max 通道）
+  float ae_p999_ = 0.0f;      // 本张 P99.9（线性，max 通道）
+  int ae_why_ = 0;            // 0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid
+  // 本张统计 + 决策。返回要**额外**加到 exposure_ev 上的 EV（0 = 不介入）。
+  float passAutoExposure(GLuint src, const FilmParams& p);
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。

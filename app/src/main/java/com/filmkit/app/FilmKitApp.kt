@@ -32,6 +32,11 @@ class FilmKitApp : Application() {
             val mode = getSharedPreferences("filmkit", 0).getInt("gainmap_math", 0)
             EngineBridge.nativeSetGainmapMath(mode)
         }
+        // 自动曝光（v0.11.61）：同样是进程级原子变量，按 prefs 恢复。默认开。
+        runCatching {
+            val on = getSharedPreferences("filmkit", 0).getBoolean("ae_auto", true)
+            EngineBridge.nativeSetAutoExposure(on)
+        }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "app.start",
             kv("version" to VERSION, "logDir" to dir),

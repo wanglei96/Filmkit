@@ -73,6 +73,16 @@ object EngineBridge {
     external fun nativeCreateOesTexture(): Int
     external fun nativeEngineGetStats(): String?
 
+    /**
+     * 自动曝光（v0.11.61）：以**本张 RAW** 的 P50/P99.9 决定渲染端 EV
+     * （中灰锚定 18.45% + 高光不撞 RAW 白点，高光优先）。
+     *
+     * 与「高光保护」（采集端预测）是两层：这层不改变采集曝光，只决定成片把 RAW 的
+     * 哪一段映射到显示；因此会话第一张也有保护，且不损失光子。关掉 = 与 0.11.60 逐位一致。
+     */
+    external fun nativeSetAutoExposure(on: Boolean)
+    external fun nativeGetAutoExposure(): Boolean
+
     /** 渲染一帧：OES 纹理（Kotlin 侧已 updateTexImage）→ 胶片链 → 上屏。 */
     external fun nativeEngineSubmitST(
         st: FloatArray, srcW: Int, srcH: Int, rotation: Int,

@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "../film/SigmoidParams.h"
 #include "Align.h"
 #include "AmazeDemosaic.h"
+#include "AeMetering.h"
 #include "GrainLut.h"
 #include "OutputBitDepth.h"
 
@@ -6393,6 +6396,9 @@ std::atomic<bool> g_diag_stats{true};
 // gainmap 数学版本（0 = PC / 1 = 官方）。**进程级**而非实例级：预览与拍照是两个
 // FrameRenderer 实例，设置页改一次要两边同时生效（否则 A/B 会混进"实例不同"这个变量）。
 std::atomic<int> g_gainmap_math{0};   // 0 = PC 版（offset 1e-4），默认
+// 自动曝光（v0.11.61）：渲染端 EV（中灰锚定 + 高光约束）。进程级 —— 与 gainmap
+// 数学同理，设置页改一次两个实例同时生效。默认开（用户 2026-10-20 要"真实记录"）。
+std::atomic<bool> g_ae_auto{true};
 std::string g_diag_params;  // 本帧 kFsFilm 色度开关快照（split/look/sat…）
 bool g_diag_chain = false;  // 仅成片链（finishStillChain）内为 true
 int g_diag_seq = 0;         // 本帧序号（日志配对用）
@@ -8713,6 +8719,61 @@ void FrameRenderer::setGainmapMath(int mode) {
 }
 
 int FrameRenderer::gainmapMath() { return g_gainmap_math.load(); }
+
+void FrameRenderer::setAutoExposure(bool on) { g_ae_auto.store(on); }
+bool FrameRenderer::autoExposure() { return g_ae_auto.load(std::memory_order_relaxed); }
+
+// ── 自动曝光（v0.11.61）────────────────────────────────────────────────────
+// 只跑 RAW 静拍链：`film_src` 是降噪/去边之后的 RAW 线性纹理（曝光前），从这里取
+// **本张**的 P50 / P99.9。为什么不用上一张的 sw999：那是采集端预测口径，会话第一张
+// 必然没有统计（真机日志 `hlEv:-99`），场景一变就用错；PC/MGC 是拍完再按本张统计
+// 决定 BaselineExposure，本函数即那一层。
+// 返回要追加到 exposure_ev 上的 EV；0 = 不介入（开关关 / 统计失败 / 曝光已正确）。
+float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
+  ae_ev_ = 0.0f;
+  ae_mid_ev_ = 0.0f;
+  ae_hl_ev_ = 0.0f;
+  ae_p50_ = 0.0f;
+  ae_p999_ = 0.0f;
+  ae_why_ = 0;
+  if (!autoExposure() || src == 0) return 0.0f;
+  // 决策公式的零依赖自测：每个进程跑一次，失败只打日志（诊断包可见），不中断出片。
+  static std::once_flag once;
+  std::call_once(once, [] {
+    char err[192] = {0};
+    if (!aeMeteringSelfTest(err, sizeof(err))) {
+      Logger::instance().log(LogLevel::kError, "engine", "ae.selftest_failed",
+                             "{\"err\":\"" + std::string(err) + "\"}");
+    }
+  });
+  const SceneStats st = measureSceneStats(src);
+  if (!st.valid) {
+    ae_why_ = 4;   // 统计失败：保持历史行为（不介入）
+    return 0.0f;
+  }
+  AeInputs in;
+  in.valid = true;
+  in.p_mid = st.p_mid;
+  in.p_hi999 = st.p_hi999;
+  in.user_ev = p.exposure_ev;
+  const AeDecision d = decideAe(in);
+  ae_p50_ = st.p_mid;
+  ae_p999_ = st.p_hi999;
+  ae_mid_ev_ = d.ev_mid;
+  ae_hl_ev_ = d.ev_hl;
+  ae_ev_ = d.ev;
+  // why → 数字（日志紧凑）：1 mid / 2 highlight / 3 clamped / 4 invalid / 0 none
+  if (d.why[0] == 'i') {
+    ae_why_ = 4;
+  } else if (std::strchr(d.why, '_') != nullptr) {
+    ae_why_ = 3;
+  } else if (d.why[0] == 'h') {
+    ae_why_ = 2;
+  } else if (d.why[0] == 'm') {
+    ae_why_ = 1;
+  }
+  return d.ev;
+}
 
 void FrameRenderer::setDiagStats(bool on) { g_diag_stats.store(on); }
 
@@ -11686,7 +11747,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
                    : ((c.dn && mst_ok) ? tex_scene_
                        : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_));
-  passFilm(dst_w, dst_h, p, film_src, /*still=*/true, /*hal_domain=*/false);
+  // ── 自动曝光（v0.11.61）──────────────────────────────────────────────
+  // 本张 RAW 统计 ⇒ 渲染端 EV。必须在 passFilm 之前：ev 要参与 filmic 的黑白点标定、
+  // HR 阈值与 uExposure 三处（它们都以 pe.exposure_ev 为唯一来源）。
+  // 只在 still 链追加；预览/YUV 静拍不受影响（域不同，见 AeMetering.h）。
+  FilmParams pe = p;
+  pe.exposure_ev += passAutoExposure(film_src, pe);
+  passFilm(dst_w, dst_h, pe, film_src, /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
   // 放在 t2 之后，passMs 不受统计耗时污染。
@@ -11897,6 +11964,15 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += ",\"tone\":" + jnum(p.tone_strength, 3);
   kv += ",\"ev\":" + jnum(p.exposure_ev, 5);
+  // v0.11.61 自动曝光（本张统计）：`aeEv` 是**追加**到 ev 上的量（实际生效 = ev + aeEv），
+  // 离线对拍务必把两者相加。aeWhy：0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid。
+  kv += ",\"aeOn\":" + std::to_string(autoExposure() ? 1 : 0);
+  kv += ",\"aeEv\":" + jnum(ae_ev_, 5);
+  kv += ",\"aeMid\":" + jnum(ae_mid_ev_, 5);
+  kv += ",\"aeHl\":" + jnum(ae_hl_ev_, 5);
+  kv += ",\"aeP50\":" + jnum(ae_p50_, 6);
+  kv += ",\"aeP999\":" + jnum(ae_p999_, 6);
+  kv += ",\"aeWhy\":" + std::to_string(ae_why_);
   // 用户 WB 补偿的**原始值**（目标/估计增益比）：1,1 = 自动/中性。
   // 【第 2 期 S13】三条链实际消费的都是 G 归一后的 (wb_r/wb_g, 1, wb_b/wb_g)
   // —— RAW 链见 prepareRawCommon，预览 OES / YUV 静拍见 wbCompGNorm()。
