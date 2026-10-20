@@ -2257,6 +2257,9 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// 期 B bracket（0.11.66）：短帧曝光归一（长/短）。1 = 未归一（帧 1-3 与无 bracket）。
+// 归一放在扣黑阶之后 —— 短帧的 (v−bl) 才是线性信号，直接乘原始 u16 会带进 3×黑阶偏差。
+uniform float uScale;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2266,7 +2269,7 @@ float raw0(ivec2 p) {
     p = clamp(p, ivec2(0), uSize - 1);
     float v = float(texelFetch(uRaw, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p)) * uScale;
 }
 void main() {
     ivec2 q = ivec2(gl_FragCoord.xy);
@@ -2320,6 +2323,14 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// 期 B bracket（0.11.66）：逐帧曝光归一（短帧 = 长/短，其余 1）。归一值 clamp 到
+// 白点 —— 第 1 步饱和权重未落地，不让 >1 的值进 P0/HR；第 2 步换成饱和感知权重。
+// scale == 1（无 bracket / 长帧）时**不 clamp**：既有管线本来就有 >1 的值（LSC
+// 增益），加 clamp 会改变无 bracket 档的输出（零回归红线）。
+uniform vec4 uFrameScale;
+float frameLin(float x, float sc) {
+    return min(x * sc, sc > 1.001 ? 1.0 : 1e6);
+}
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2391,7 +2402,7 @@ float linSub(highp usampler2D t, ivec2 p, vec2 d) {
 }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    float acc = linAt(uRaw0, p);
+    float acc = frameLin(linAt(uRaw0, p), uFrameScale.x);
     float wsum = 1.0;
     vec2 uv = (vec2(p) + 0.5) / (uTiles * uTileM);
     // 权重（v0.10.3）：独立权重图（32px cell，LINEAR 双线性过渡），与位移场解耦
@@ -2399,15 +2410,15 @@ void main() {
     vec4 wv = texture(uW, uv);
     vec3 f1 = off1At(uv);
     float w1 = wv.r;
-    acc += w1 * linSub(uRaw1, p, f1.xy);
+    acc += w1 * frameLin(linSub(uRaw1, p, f1.xy), uFrameScale.y);
     wsum += w1;
     vec3 f2 = off2At(uv);
     float w2 = wv.g;
-    acc += w2 * linSub(uRaw2, p, f2.xy);
+    acc += w2 * frameLin(linSub(uRaw2, p, f2.xy), uFrameScale.z);
     wsum += w2;
     vec3 f3 = off3At(uv);
     float w3 = wv.b;
-    acc += w3 * linSub(uRaw3, p, f3.xy);
+    acc += w3 * frameLin(linSub(uRaw3, p, f3.xy), uFrameScale.w);
     wsum += w3;
     float v = acc / max(wsum, 1e-4);
     oColor = vec4(v, v, v, 1.0);
@@ -2452,6 +2463,11 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// 期 B bracket（0.11.66）：逐帧曝光归一，与 kFsMfnrFuse 同口径（scale==1 不 clamp）。
+uniform vec4 uFrameScale;
+float frameLin(float x, float sc) {
+    return min(x * sc, sc > 1.001 ? 1.0 : 1e6);
+}
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -2538,10 +2554,10 @@ void main() {
             int ch = chanAt(p);
             float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
             float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
-            float r = linAt(uRaw0, p);
-            float a1 = linSub(uRaw1, p, o1);
-            float a2 = linSub(uRaw2, p, o2);
-            float a3 = linSub(uRaw3, p, o3);
+            float r = frameLin(linAt(uRaw0, p), uFrameScale.x);
+            float a1 = frameLin(linSub(uRaw1, p, o1), uFrameScale.y);
+            float a2 = frameLin(linSub(uRaw2, p, o2), uFrameScale.z);
+            float a3 = frameLin(linSub(uRaw3, p, o3), uFrameScale.w);
             float d1 = r - a1;
             float d2 = r - a2;
             float d3 = r - a3;
@@ -2916,6 +2932,8 @@ uniform int uTxMax;       // 平面 tile x 上限（ceil(pw/8)-1；ty 同理由 
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
+// 期 B bracket（0.11.66）：逐帧曝光归一（短帧 = 长/短），clamp 到白点。
+uniform vec4 uFrameScale;
 uniform vec4 uPlaneA;     // 平面 0..3 的 A 系数（按 cfaLut 展开，含强度 k²）
 uniform vec4 uPlaneB;
 uniform float uC;         // 收缩常数（256）
@@ -2953,7 +2971,11 @@ float linAt(int z, ivec2 p) {
         v = texelFetch(uRaw3, p, 0).r;
     }
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-    return max((float(v) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+    float sc = z == 0 ? uFrameScale.x : (z == 1 ? uFrameScale.y
+                       : (z == 2 ? uFrameScale.z : uFrameScale.w));
+    float lin = max((float(v) - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+    // scale == 1（无 bracket / 长帧）时不 clamp —— 与 kFsMfnrFuse 同口径（零回归）
+    return min(lin * sc, sc > 1.001 ? 1.0 : 1e6);
 }
 // 位移场双线性（与 kFsMfnrFuse 的 offNAt 同式；uOffTiles 为其网格）。
 vec2 offAt(highp sampler2D t, vec2 m) {
@@ -7775,6 +7797,7 @@ bool FrameRenderer::init() {
   u_mfnr_pyr_.black = glGetUniformLocation(prog_mfnr_pyr_, "uBlack");
   u_mfnr_pyr_.white = glGetUniformLocation(prog_mfnr_pyr_, "uWhite");
   u_mfnr_pyr_.gain = glGetUniformLocation(prog_mfnr_pyr_, "uGain");
+  u_mfnr_pyr_.scale = glGetUniformLocation(prog_mfnr_pyr_, "uScale");
 
   u_mfnr_down_.tex = glGetUniformLocation(prog_mfnr_down_, "uTex");
   u_mfnr_down_.size = glGetUniformLocation(prog_mfnr_down_, "uSize");
@@ -7795,6 +7818,8 @@ bool FrameRenderer::init() {
   u_mfnr_fuse_.black = glGetUniformLocation(prog_mfnr_fuse_, "uBlack");
   u_mfnr_fuse_.white = glGetUniformLocation(prog_mfnr_fuse_, "uWhite");
   u_mfnr_fuse_.gain = glGetUniformLocation(prog_mfnr_fuse_, "uGain");
+  u_mfnr_fuse_.frame_scale =
+      glGetUniformLocation(prog_mfnr_fuse_, "uFrameScale");
 
   for (int i = 0; i < 4; ++i) {
     u_mfnr_mis_.raw[i] =
@@ -7815,6 +7840,7 @@ bool FrameRenderer::init() {
   u_mfnr_mis_.black = glGetUniformLocation(prog_mfnr_mis_, "uBlack");
   u_mfnr_mis_.white = glGetUniformLocation(prog_mfnr_mis_, "uWhite");
   u_mfnr_mis_.gain = glGetUniformLocation(prog_mfnr_mis_, "uGain");
+  u_mfnr_mis_.frame_scale = glGetUniformLocation(prog_mfnr_mis_, "uFrameScale");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
@@ -12289,7 +12315,7 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
 
 void FrameRenderer::passMfnrPyr(GLuint raw_tex, int cfa,
                                 const float black_phase[4], float white_level,
-                                const float gains[3]) {
+                                const float gains[3], float frame_scale) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_pyr1_);
   glViewport(0, 0, pyr1_w_, pyr1_h_);
   glUseProgram(prog_mfnr_pyr_);
@@ -12302,6 +12328,7 @@ void FrameRenderer::passMfnrPyr(GLuint raw_tex, int cfa,
               black_phase[3]);
   glUniform1f(u_mfnr_pyr_.white, white_level);
   glUniform3f(u_mfnr_pyr_.gain, gains[0], gains[1], gains[2]);
+  if (u_mfnr_pyr_.scale >= 0) glUniform1f(u_mfnr_pyr_.scale, frame_scale);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -12318,7 +12345,8 @@ void FrameRenderer::passMfnrDown(GLuint src, GLuint fbo, int sw, int sh) {
 
 void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
                                  const float black_phase[4], float white_level,
-                                 const float gains[3]) {
+                                 const float gains[3],
+                                 const float frame_scale[4]) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_mfnr_fuse_);
@@ -12348,6 +12376,10 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(u_mfnr_fuse_.white, white_level);
   glUniform3f(u_mfnr_fuse_.gain, gains[0], gains[1], gains[2]);
+  if (u_mfnr_fuse_.frame_scale >= 0) {
+    glUniform4f(u_mfnr_fuse_.frame_scale, frame_scale[0], frame_scale[1],
+                frame_scale[2], frame_scale[3]);
+  }
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -12389,7 +12421,8 @@ bool FrameRenderer::ensureMfnrFftTargets(int w, int h) {
 bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const float plane_a[3],
-                                const float plane_b[3], float* out_neff,
+                                const float plane_b[3],
+                                const float frame_scale[4], float* out_neff,
                                 float* out_ms) {
   *out_neff = 0.f;
   if (burst_w_ != w || burst_h_ != h) return false;
@@ -12479,6 +12512,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   // 成片全绿（真机 dftProbe 2×2 = [0.089,0.049,0.051,0.098] 与 DNG 同点
   // [0.0479,0.0260,0.0271,0.0573] 之比四相位同为 1.85 = gains[0] 实锤）。
   glUniform1i(uni("uCfaLut"), lut);
+  glUniform4f(uni("uFrameScale"), frame_scale[0], frame_scale[1], frame_scale[2],
+              frame_scale[3]);
   glUniform4f(uni("uPlaneA"), pa[0], pa[1], pa[2], pa[3]);
   glUniform4f(uni("uPlaneB"), pb[0], pb[1], pb[2], pb[3]);
   glUniform1f(uni("uC"), 256.0f);
@@ -12600,7 +12635,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
 void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
                                      float white_level, const float gains[3],
                                      const float a[3], const float b[3],
-                                     float s_const) {
+                                     float s_const,
+                                     const float frame_scale[4]) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glViewport(0, 0, tiles_w_ * 4, tiles_h_ * 4);
   glUseProgram(prog_mfnr_mis_);
@@ -12635,6 +12671,10 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
               black_phase[3]);
   glUniform1f(u_mfnr_mis_.white, white_level);
   glUniform3f(u_mfnr_mis_.gain, gains[0], gains[1], gains[2]);
+  if (u_mfnr_mis_.frame_scale >= 0) {
+    glUniform4f(u_mfnr_mis_.frame_scale, frame_scale[0], frame_scale[1],
+                frame_scale[2], frame_scale[3]);
+  }
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -13349,7 +13389,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float noise_sigma,
                                    float ref_noise_scale, bool use_dft,
                                    bool align_l1, bool align_ab, bool p0_sub,
-                                   bool nn_dn,
+                                   bool nn_dn, float short_ratio,
                                    std::vector<uint8_t>* out_rgba, bool ten_bit) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -13387,6 +13427,14 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       prepareRawCommon(neutral_r, neutral_g, neutral_b, wb_tt[0], wb_tt[1],
                        wb_tt[2], ccm9, lsc, lsc_cols, lsc_rows);
   const float wl = static_cast<float>(white_level);
+  // 期 B bracket（0.11.66）：帧 0 是短曝光帧时先归一到长帧域（长/短），再对齐/融合。
+  // **必须归一**：不归一 SAD 残差被 4× 亮度差淹没（confMed 掉到 0，2026-09-29 的
+  // alt 帧不守恒事故同型）。归一位于扣黑阶之后（各 pass 内），不是原始 u16 上乘。
+  float frame_scale[4] = {1.f, 1.f, 1.f, 1.f};
+  const float short_ratio_ok =
+      std::isfinite(short_ratio) ? std::min(std::max(short_ratio, 1.0f), 8.0f) : 1.0f;
+  frame_scale[0] = short_ratio_ok;
+  const bool bracket_on = short_ratio_ok > 1.01f;
   stage("pyr");
 
   // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile kMfnrTile → tiles。
@@ -13398,8 +13446,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // readback 与 CPU SAD 分开计时（alignRbMs / alignCpuMs）—— 成本必须实测后
   // 交用户拍板，不能替用户决定（项目铁律）。
   float align_rb_ms = 0.f, align_cpu_ms = 0.f;
-  auto capturePyr = [&](GLuint raw_tex, MfnrPyramid* py) {
-    passMfnrPyr(raw_tex, cfa, black_phase, wl, rc.gains);
+  auto capturePyr = [&](GLuint raw_tex, MfnrPyramid* py, float scale) {
+    passMfnrPyr(raw_tex, cfa, black_phase, wl, rc.gains, scale);
     passMfnrDown(tex_pyr1_, fbo_pyr2_, pyr1_w_, pyr1_h_);
     passMfnrDown(tex_pyr2_, fbo_pyr3_, w2, h2);
     passMfnrDown(tex_pyr3_, fbo_pyr4_, w3, h3);
@@ -13432,7 +13480,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
   };
   MfnrPyramid ref;
-  capturePyr(raw_tex_, &ref);
+  capturePyr(raw_tex_, &ref, frame_scale[0]);
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
   float dx_med_max = 0.f, dx_p90_max = 0.f;
@@ -13465,7 +13513,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       std::vector<float>(static_cast<size_t>(n_tiles) * 2, 0.f));
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
-    capturePyr(tex_mfnr_[i - 1], &cur);
+    capturePyr(tex_mfnr_[i - 1], &cur, frame_scale[i]);
     const auto cpu0 = std::chrono::steady_clock::now();
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
     // 同帧 A/B 诊断：再算一遍**旧路径**（最细层 1/4 域）的位移场，上传到第二
@@ -13541,7 +13589,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     tf = std::chrono::steady_clock::now();
     if (!ensureMfnrFftTargets(w, h)) return false;
     dft_active = passMfnrFft(w, h, cfa, black_phase, wl, rc.gains, nc_single.p0a,
-                             nc_single.p0b, &neff_dft, dft_ms);
+                             nc_single.p0b, frame_scale, &neff_dft, dft_ms);
     if (dft_active) {
       glFinish();
       stage("chain");
@@ -13558,7 +13606,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
   passMfnrMismatch(cfa, black_phase, wl, rc.gains, nc_single.mma, nc_single.mmb,
-                   kMfnrMisS);
+                   kMfnrMisS, frame_scale);
   // v0.10.3：网格 = 4×tiles（32px cell）。权重独立成图（tex_w_，LINEAR），
   // 与位移场解耦 —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
   const int cw = tiles_w_ * 4, chh = tiles_h_ * 4;
@@ -13798,7 +13846,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 融合 → tex_fused_（R16F 线性 mosaic）
   tf = std::chrono::steady_clock::now();
   stage("fuse");
-  passMfnrFuse(w, h, cfa, black_phase, wl, rc.gains);
+  passMfnrFuse(w, h, cfa, black_phase, wl, rc.gains, frame_scale);
   glFinish();
   stage("chain");
   fuse_ms = std::chrono::duration<float, std::milli>(
@@ -13906,6 +13954,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"mP90\":" + f3(m_p90) +
               ",\"neff\":" + f3(neff) +
               ",\"rn\":" + f3(rn) +
+              ",\"brk\":" + (bracket_on ? "1" : "0") +
+              ",\"brkRatio\":" + f3(frame_scale[0]) +
               ",\"motMed\":" + f3(mot_med) +
               ",\"resFade\":" + f3(res_fade) +
               ",\"nsSng\":" + f3(ns_single) +

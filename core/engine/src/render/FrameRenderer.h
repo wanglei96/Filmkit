@@ -247,6 +247,8 @@ class FrameRenderer {
   //   frames[0] = 参考帧（DNG 底片同一帧）；count 必须 == 4（融合 shader 固定
   //   4 输入）。元数据统一取帧 0（burst 恒曝光，逐帧黑阶/WB 视为一致，
   //   mfnr.capture 日志可核对）。noise_model/noise_sigma/demosaic 语义同 submitRaw。
+  //   short_ratio（期 B bracket）：帧 0 是短曝光帧时传"长/短"曝光比（>1），
+  //   引擎在扣黑阶后把帧 0 归一到长帧域再对齐/融合；1 = 无短帧（零行为变化）。
   bool submitRawBurst(const void* const* frames, int count,
                       const int* row_strides_px, int w, int h, int cfa,
                       const float black_phase[4], int white_level,
@@ -257,6 +259,7 @@ class FrameRenderer {
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
                       bool align_ab, bool p0_sub, bool nn_dn,
+                      float short_ratio,
                       std::vector<uint8_t>* out_rgba, bool ten_bit = false);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
@@ -302,7 +305,7 @@ class FrameRenderer {
   GLuint ensureRawTex(int w, int h);
   // 金字塔 pass：raw → 1/2 灰度（kFsMfnrPyr，sqrt 预编码）；再逐层 2× box（kFsMfnrDown）
   void passMfnrPyr(GLuint raw_tex, int cfa, const float black_phase[4],
-                   float white_level, const float gains[3]);
+                   float white_level, const float gains[3], float frame_scale = 1.0f);
   void passMfnrDown(GLuint src, GLuint fbo, int sw, int sh);
   // 阶段二 robust merge（v0.10.0）：Night Sight 式 mismatch map —— per-tile
   // 对齐后残差 mean(d²) → m = d²/(d²+s·σ²)，渲染到 tex_mis_（RGBA8 tiles 网格，
@@ -311,10 +314,12 @@ class FrameRenderer {
   // 系数（NoiseCoef::mma/mmb —— legacy 回退也保证非零，见其注释）。
   void passMfnrMismatch(int cfa, const float black_phase[4], float white_level,
                         const float gains[3], const float a[3],
-                        const float b[3], float s_const);
+                        const float b[3], float s_const,
+                        const float frame_scale[4]);
   // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
-                    float white_level, const float gains[3]);
+                    float white_level, const float gains[3],
+                    const float frame_scale[4]);
   // P0 变体：从 tex_fused_（float mosaic，已线性化+WB）读入的同色 bilateral
   // off_tex = nullptr 时用正常位移场 tex_off_；A/B 诊断传 tex_off_ab_。
   // subpixel = true 走逐通道网格亚像素采样（uSub=1，v0.10.75 杠杆 B）。
@@ -344,7 +349,7 @@ class FrameRenderer {
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
-                   float* out_neff,
+                   const float frame_scale[4], float* out_neff,
                    float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
@@ -1301,7 +1306,8 @@ class FrameRenderer {
           wclamp = -1;   // v0.10.167：σ 的值域保护
   } u_raw_dn_ts_;
   struct {
-    GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1;
+    GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1,
+          scale = -1;   // 期 B bracket：短帧曝光归一（1 = 未归一）
   } u_mfnr_pyr_;
   struct {
     GLint tex = -1, size = -1;
@@ -1309,12 +1315,13 @@ class FrameRenderer {
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, w = -1,
           size = -1, tiles = -1, tile_m = -1, black = -1, white = -1,
-          gain = -1, cfalut = -1;
+          gain = -1, cfalut = -1, frame_scale = -1;   // 期 B bracket：逐帧归一
   } u_mfnr_fuse_;
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
           tiles = -1, off_tiles = -1, tile_m = -1, noise_a = -1, noise_b = -1,
-          s = -1, black = -1, white = -1, gain = -1, cfalut = -1;
+          s = -1, black = -1, white = -1, gain = -1, cfalut = -1,
+          frame_scale = -1;   // 期 B bracket：逐帧归一
   } u_mfnr_mis_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,

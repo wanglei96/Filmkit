@@ -185,6 +185,7 @@ object StillRenderClient {
         alignAb: Boolean,
         p0Sub: Boolean,
         nnDn: Boolean,
+        shortRatio: Float = 1f,
         tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
@@ -211,7 +212,8 @@ object StillRenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
-                    nnDn, film, useStill = true, tenBit = tenBit,
+                    nnDn, shortRatio = shortRatio, film = film, useStill = true,
+                    tenBit = tenBit,
                 )
                 if (bytes == null) {
                     // 合成失败先自愈再谈回退（v0.10.89）：真机 0.10.88 出现过
@@ -228,7 +230,8 @@ object StillRenderClient {
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
                             meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb,
-                            p0Sub, nnDn, film, useStill = true, tenBit = tenBit,
+                            p0Sub, nnDn, shortRatio = shortRatio, film = film,
+                            useStill = true, tenBit = tenBit,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",

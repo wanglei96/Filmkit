@@ -3268,19 +3268,10 @@ class CameraController(private val context: Context, private val render: RenderC
         applyLutStrengthPref()
         val buffers = burstBuffers.mapNotNull { it }
         val strides = burstStrides.copyOf()
-        // bracket 第 1 步（设计 §7 步骤 1）：**短帧不参与融合** —— 帧 0 位置用长帧
-        // （帧 1）顶替，融合看到的是 4 帧同曝光域，出片零风险。短帧只做统计，证明
-        // 它确实保住了高光；归一 + 饱和感知权重在第 2 步落地。
-        val fuseBufs = if (bracketOn) {
-            listOf(buffers[1], buffers[1], buffers[2], buffers[3])
-        } else {
-            buffers
-        }
-        val fuseStrides = if (bracketOn) {
-            intArrayOf(strides[1], strides[1], strides[2], strides[3])
-        } else {
-            strides
-        }
+        // bracket 第 1 步（设计 §7 步骤 1）：短帧**归一后参与融合**（引擎在扣黑阶后
+        // ×ratio 并 clamp 到白点，见 passMfnrPyr/Fuse/Mismatch/Fft 的 uScale/
+        // uFrameScale）；饱和感知权重（短帧暗部/饱和降权）在第 2 步落地。
+        val shortRatio = if (bracketOn) burstShortRatio else 1f
         if (bracketOn) {
             val st = rawSampleStats(buffers[0], refW, refH, strides[0], meta.whiteLevel)
             EngineBridge.nativeAppendLog(
@@ -3351,17 +3342,18 @@ class CameraController(private val context: Context, private val render: RenderC
         // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
         val nnAb = false
         if (useStill && prefs.getBoolean("still_ab", false)) {
-            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
-                useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/false, done)
+            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/false, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
-            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
-                useDft, alignL1, alignAb, p0Sub, nnDn, /*varyNn=*/true, done)
+            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/true, done)
         } else if (useStill) {
-            StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
+            StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
-                useDft, alignL1, alignAb, p0Sub, nnDn, tenBit = tenBit) { bytes, w, h ->
+                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio = shortRatio,
+                tenBit = tenBit) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -3371,17 +3363,17 @@ class CameraController(private val context: Context, private val render: RenderC
                         EngineBridge.LEVEL_WARN, "camera", "render.still_fallback", "{}",
                     )
                     EngineBridge.nativeFlushLogs()
-                    render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
+                    render.submitRawBurst(buffers, strides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
-                        tenBit = tenBit, onDone = done)
+                        shortRatio = shortRatio, tenBit = tenBit, onDone = done)
                 }
             }
         } else {
-            render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
+            render.submitRawBurst(buffers, strides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
-                tenBit = tenBit, onDone = done)
+                shortRatio = shortRatio, tenBit = tenBit, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -3415,6 +3407,7 @@ class CameraController(private val context: Context, private val render: RenderC
         alignAb: Boolean,
         p0Sub: Boolean,
         nnDn: Boolean,
+        shortRatio: Float,
         varyNn: Boolean,
         done: (ByteArray?, Int, Int) -> Unit,
     ) {
@@ -3430,11 +3423,11 @@ class CameraController(private val context: Context, private val render: RenderC
         val nn2 = if (varyNn) true else nnDn
         StillRenderClient.submitRawBurst(buffers, strides, width, height, meta,
             rot, film, demosaic, noiseStrength, rn,
-            useDft, alignL1, alignAb, p0Sub, nn1) { b1, w1, h1 ->
+            useDft, alignL1, alignAb, p0Sub, nn1, shortRatio = shortRatio) { b1, w1, h1 ->
             val d1 = if (b1 != null) outDigest(b1, w1, h1) else null
             render.submitRawBurst(buffers, strides, width, height, meta,
                 rot, film, demosaic, noiseStrength, rn,
-                useDft, alignL1, alignAb, p0Sub, nn2) { b2, w2, h2 ->
+                useDft, alignL1, alignAb, p0Sub, nn2, shortRatio = shortRatio) { b2, w2, h2 ->
                 val d2 = if (b2 != null) outDigest(b2, w2, h2) else null
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "camera",

@@ -189,7 +189,8 @@ object EngineBridge {
         rotation: Int, demosaic: Int,
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
-        alignAb: Boolean, p0Sub: Boolean, nnDn: Boolean, film: DoubleArray,
+        alignAb: Boolean, p0Sub: Boolean, nnDn: Boolean,
+        shortRatio: Float = 1f, film: DoubleArray,
         useStill: Boolean = false,
         tenBit: Boolean = false,
     ): ByteArray?
