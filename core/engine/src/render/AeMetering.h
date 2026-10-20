@@ -46,10 +46,10 @@ inline constexpr float kAeHighlightHeadroomEv = 0.1f;
 inline constexpr float kAeMaxUnderEv = 2.0f;
 inline constexpr float kAeMaxOverEv = 2.0f;
 
-/** 输入 = 本张 RAW 的统计（`FrameRenderer::measureSceneStats` 的 p_mid / p_hi999）。 */
+/** 输入 = 本张 RAW 的统计（`FrameRenderer::measureSceneStats` 的 p_mid / p_hi995）。 */
 struct AeInputs {
   float p_mid = 0.0f;      // 线性 P50（max 通道，与 filmic 同口径）
-  float p_hi999 = 0.0f;    // 线性 P99.9（max 通道）
+  float p_hi995 = 0.0f;    // 线性 P99.5（max 通道）—— 允许 0.5% 像素超白点
   float user_ev = 0.0f;    // 已经下发给 film pass 的 EV（基准 + 用户 + 采集欠曝补偿）
   bool valid = false;      // 统计失败 ⇒ 不介入（保持历史行为）
 };

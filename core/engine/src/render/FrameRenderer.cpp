@@ -8735,6 +8735,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   ae_hl_ev_ = 0.0f;
   ae_p50_ = 0.0f;
   ae_p999_ = 0.0f;
+  ae_p995_ = 0.0f;
   ae_why_ = 0;
   if (!autoExposure() || src == 0) return 0.0f;
   // 决策公式的零依赖自测：每个进程跑一次，失败只打日志（诊断包可见），不中断出片。
@@ -8754,11 +8755,12 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   AeInputs in;
   in.valid = true;
   in.p_mid = st.p_mid;
-  in.p_hi999 = st.p_hi999;
+  in.p_hi995 = st.p_hi995;
   in.user_ev = p.exposure_ev;
   const AeDecision d = decideAe(in);
   ae_p50_ = st.p_mid;
-  ae_p999_ = st.p_hi999;
+  ae_p999_ = st.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
+  ae_p995_ = st.p_hi995;
   ae_mid_ev_ = d.ev_mid;
   ae_hl_ev_ = d.ev_hl;
   ae_ev_ = d.ev;
@@ -11971,6 +11973,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"aeMid\":" + jnum(ae_mid_ev_, 5);
   kv += ",\"aeHl\":" + jnum(ae_hl_ev_, 5);
   kv += ",\"aeP50\":" + jnum(ae_p50_, 6);
+  kv += ",\"aeP995\":" + jnum(ae_p995_, 6);
   kv += ",\"aeP999\":" + jnum(ae_p999_, 6);
   kv += ",\"aeWhy\":" + std::to_string(ae_why_);
   // 用户 WB 补偿的**原始值**（目标/估计增益比）：1,1 = 自动/中性。
@@ -14149,6 +14152,9 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src) {
   st.p_mid = to_lin(pct(0.50));
   st.p_hi = to_lin(pct(0.99));
   st.p_hi999 = to_lin(pct(0.999));
+  // v0.11.63：自动曝光的高光判据 = P99.5（允许 0.5% 像素裁切，与 PC legacy matcher
+  // 的 maximumClippedFraction=0.005 同口径）。P99.9 留给 filmic 白点上探，不改其语义。
+  st.p_hi995 = to_lin(pct(0.995));
   // v0.10.28：p_max = **采样到的最高非空桶**（darktable autodetect 的 max 语义）。
   // 对数编码上限 2^8（= +8EV）后 max 不再被显示域 clamp 淹没——0.10.18 当时
   // 改用分位正是迫于此；现在分位保留（P99 驱动 black/基础判据），max 只驱动

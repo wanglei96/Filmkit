@@ -583,6 +583,10 @@ class FrameRenderer {
     // v0.10.27：P99.9（对数域统计才有分辨率，见 measureSceneStats）—— 高光感知
     // 白点判据的驱动量：占比 <1% 的窗/灯强光源 P99 看不见，P99.9 能。
     float p_hi999 = 0.0f;
+    // v0.11.63：P99.5 —— 自动曝光的高光判据。0.5% 的像素允许超白点，与 PhotonCamera
+    // legacy matcher 的 `maximumClippedFraction = 0.005`（raw_legacy_auto_exposure_solver）
+    // 同口径；用 P99.9 会为 0.1% 的像素压全图 ~2EV（真机 2026-10-20 实测）。
+    float p_hi995 = 0.0f;
     // v0.10.28：采样 max（最高非空桶，darktable autodetect 的 max 语义）——
     // 白点上探的主驱动量：小面积近饱和高光（白壶身镜面，占比 0.001% 级）
     // 任何分位都看不见，见 162012 真机定案。
@@ -1197,7 +1201,8 @@ class FrameRenderer {
   float ae_mid_ev_ = 0.0f;    // 中灰锚定要求的 EV（诊断）
   float ae_hl_ev_ = 0.0f;     // 高光约束允许的 EV（诊断）
   float ae_p50_ = 0.0f;       // 本张 P50（线性，max 通道）
-  float ae_p999_ = 0.0f;      // 本张 P99.9（线性，max 通道）
+  float ae_p999_ = 0.0f;      // 本张 P99.9（线性；**诊断用**，判据是 P99.5）
+  float ae_p995_ = 0.0f;      // 本张 P99.5（线性；高光判据 —— 允许 0.5% 像素裁切）
   int ae_why_ = 0;            // 0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid
   // 本张统计 + 决策。返回要**额外**加到 exposure_ev 上的 EV（0 = 不介入）。
   float passAutoExposure(GLuint src, const FilmParams& p);
