@@ -2255,6 +2255,13 @@ class CameraController(private val context: Context, private val render: RenderC
      *  rowStride 可能含对齐填充，整 capacity 拷贝（多拷 padding 无害），引擎侧按
      *  rowStride/2 跳行上传。 */
     private fun copyRawAndClose(img: Image, slot: Int) {
+        copyRaw(img, slot, close = true)
+    }
+
+    /** 拷 RAW plane 到 direct buffer；close=false 时保留 Image（DNG 底片帧要两样：
+     *  Image 给 DngCreator，buffer 给融合 —— 只保留 Image 会让融合少一帧，
+     *  0.11.66 真机"无成像"就是这条（frames.size=3 ⇒ submitRawBurst 入口直接失败）。 */
+    private fun copyRaw(img: Image, slot: Int, close: Boolean) {
         try {
             val p = img.planes[0]
             val buf = java.nio.ByteBuffer.allocateDirect(p.buffer.capacity())
@@ -2265,7 +2272,7 @@ class CameraController(private val context: Context, private val render: RenderC
             burstBuffers[slot] = buf
             burstStrides[slot] = p.rowStride / 2
         } finally {
-            runCatching { img.close() }
+            if (close) runCatching { img.close() }
         }
     }
 
@@ -2581,12 +2588,16 @@ class CameraController(private val context: Context, private val render: RenderC
                         if (burstActive) {
                             if (burstImageCount < MFNR_FRAMES) {
                                 val idx = burstImageCount++
-                                if (idx == 0 || (burstBracketOn && idx == 1)) {
-                                    // 帧 0 保留 Image（参考帧，DngCreator 只吃 Image）。
-                                    // bracket 时帧 0 是短曝光 ⇒ DNG 底片必须用长帧（帧 1）
-                                    // 写出：底片像素与 ExposureTime 元数据必须同源。
-                                    burstImages[idx] = img
-                                    burstStrides[idx] = img.planes[0].rowStride / 2
+                                if (idx == 0) {
+                                    // 帧 0 保留 Image（参考帧，DngCreator 只吃 Image）
+                                    burstImages[0] = img
+                                    burstStrides[0] = img.planes[0].rowStride / 2
+                                } else if (burstBracketOn && idx == 1) {
+                                    // bracket：帧 0 是短曝光 ⇒ DNG 底片用长帧（帧 1）。
+                                    // Image 留到 processRawBurst 写 DNG，**同时**拷 buffer
+                                    // 供融合（缺 buffer = 融合只有 3 帧，直接失败）
+                                    burstImages[1] = img
+                                    copyRaw(img, 1, close = false)
                                 } else {
                                     copyRawAndClose(img, idx)
                                 }
@@ -3219,8 +3230,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val refH = ref.height
         // bracket（期 B）：帧 0 是短曝光 ⇒ DNG 底片与渲染元数据都用长帧（帧 1）。
         // 底片像素必须与 ExposureTime 元数据同源，否则 DNG 暗 2EV 且无法解释。
+        // 注意 dngIdx 只看"采没采短帧"（burstBracketOn），不看 ratio 是否有效 ——
+        // ratio 读回异常时短帧照样是短曝光，底片仍然不能用它。
         val bracketOn = burstBracketOn && burstShortRatio > 1.05f
-        val dngIdx = if (bracketOn) 1 else 0
+        val dngIdx = if (burstBracketOn) 1 else 0
         val dngImg = images.getOrNull(dngIdx) ?: ref
         val dngResult = results.getOrNull(dngIdx) ?: refResult
         val meta = extractRawMeta(dngResult, ch)
@@ -3260,7 +3273,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 帧 0 拷贝并 close：此时 HAL 槽位全部释放，只剩 4 个 direct buffer
         copyRawAndClose(ref, 0)
         // bracket 时帧 1（长帧）Image 也持有到此刻 —— DNG 已写，关闭释放槽位
-        if (dngIdx == 1) runCatching { images.getOrNull(1)?.close() }
+        if (burstBracketOn) runCatching { images.getOrNull(1)?.close() }
         burstImages.fill(null)
         EngineBridge.nativeFlushLogs()
         applyTonePref()
@@ -3272,6 +3285,29 @@ class CameraController(private val context: Context, private val render: RenderC
         // ×ratio 并 clamp 到白点，见 passMfnrPyr/Fuse/Mismatch/Fft 的 uScale/
         // uFrameScale）；饱和感知权重（短帧暗部/饱和降权）在第 2 步落地。
         val shortRatio = if (bracketOn) burstShortRatio else 1f
+        // 回退（设计 §3.5）：ratio 读回无效时短帧不能按长帧参与（不归一 = 4× 亮度差
+        // 淹没 SAD）⇒ 用长帧（帧 1）顶替帧 0 位置，退回 4 帧同曝光域。
+        // 护栏（0.11.67）：帧数不足以前是**静默失败**（StillRenderClient 入口直接
+        // onDone(null)，日志只剩一条 render.still_fallback）—— 0.11.66 真机"无成像"
+        // 的现场就是这样。现在必须留痕。
+        if (buffers.size != MFNR_FRAMES) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_ERROR, "camera", "mfnr.buffers_missing",
+                kv("have" to buffers.size, "want" to MFNR_FRAMES,
+                   "brk" to (if (burstBracketOn) 1 else 0)),
+            )
+        }
+        val canReplace = burstBracketOn && !bracketOn && buffers.size == MFNR_FRAMES
+        val fuseBufs = if (canReplace) {
+            listOf(buffers[1], buffers[1], buffers[2], buffers[3])
+        } else {
+            buffers
+        }
+        val fuseStrides = if (canReplace) {
+            intArrayOf(strides[1], strides[1], strides[2], strides[3])
+        } else {
+            strides
+        }
         if (bracketOn) {
             val st = rawSampleStats(buffers[0], refW, refH, strides[0], meta.whiteLevel)
             EngineBridge.nativeAppendLog(
@@ -3342,15 +3378,15 @@ class CameraController(private val context: Context, private val render: RenderC
         // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
         val nnAb = false
         if (useStill && prefs.getBoolean("still_ab", false)) {
-            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/false, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
-            submitStillAb(buffers, strides, refW, refH, meta, demosaic, noiseStrength,
+            submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/true, done)
         } else if (useStill) {
-            StillRenderClient.submitRawBurst(buffers, strides, refW, refH, meta,
+            StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio = shortRatio,
                 tenBit = tenBit) { bytes, w, h ->
@@ -3360,17 +3396,18 @@ class CameraController(private val context: Context, private val render: RenderC
                     // 拍照线程合成失败（GL/OOM 等）：回退预览线程重跑一次 ——
                     // 用户红线：失败不以丢照片为代价（v0.10.83 就是这么丢的）
                     EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_WARN, "camera", "render.still_fallback", "{}",
+                        EngineBridge.LEVEL_WARN, "camera", "render.still_fallback",
+                        kv("kind" to "raw_burst"),
                     )
                     EngineBridge.nativeFlushLogs()
-                    render.submitRawBurst(buffers, strides, refW, refH, meta,
+                    render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
                         shortRatio = shortRatio, tenBit = tenBit, onDone = done)
                 }
             }
         } else {
-            render.submitRawBurst(buffers, strides, refW, refH, meta,
+            render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
                 shortRatio = shortRatio, tenBit = tenBit, onDone = done)
