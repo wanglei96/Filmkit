@@ -8783,8 +8783,13 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   in.p_mid = st.p_mid;
   in.p_hi995 = st.p_hi995;
   in.user_ev = p.exposure_ev;
-  // 高光上限跟 filmic 的实际白点走（[38]，预设可调）—— 而不是 RAW 饱和白点。
-  in.white_ev = p.filmic_white_ev;
+  // 高光上限 = **当前引擎曲线的死白起点**（不是 RAW 饱和点，也不是 [38]）：
+  // 引擎 1（sigmoid，默认）6.22 EV；引擎 0（filmic）随 [38] 平移 +0.34。
+  // ⚠ [38] 在引擎 1 下被 EngineScope 归零 ⇒ 绝不能无条件读它（0.11.70 的教训）。
+  const bool sigmoid_engine = static_cast<int>(p.engine_slot) == 1;
+  in.white_ev = sigmoid_engine
+                    ? kAeSigmoidDeadWhiteEv
+                    : (p.filmic_white_ev + kAeFilmicWhiteOffsetEv);
   const AeDecision d = decideAe(in);
   ae_p50_ = st.p_mid;
   ae_p999_ = st.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）

@@ -16,8 +16,9 @@
 //
 // 两条约束（HDR+ §4 + darktable autodetect 口径）
 // ------------------------------------------------
-// ① 高光：`P99.5` 提亮后不得撞**渲染白点**（filmic `white_ev` − 死白余量 0.45 EV）。
-//    物理含义：RAW 饱和只说明没有更多光子；真正决定"会不会死白"的是 filmic 的白点。
+// ① 高光：`P99.5` 提亮后不得撞**当前引擎的死白起点**（− 余量 0.5 EV）。
+//    物理含义：RAW 饱和只说明没有更多光子；决定"会不会死白"的是引擎曲线，
+//    而引擎 1（sigmoid）比引擎 0（filmic）多 1.7 EV 余量。
 // ② 中灰：`P50` 应落在显示中灰 18.45%（= sRGB 118/255）。
 //    物理含义：这就是"亮度接近肉眼"的可测量定义 —— 不是"平均亮度好看"。
 //
@@ -34,21 +35,26 @@ namespace filmkit {
 // ⚠ 这是**采集域**白点（RAW 饱和），不是 AE 该用的高光上限（见 kAeDeadWhiteMarginEv）。
 inline constexpr float kAeRawWhiteEv = 2.438307f;
 
-// 渲染域白点（filmic 的 `[38]` white_ev，运行时由 FilmParams 传入）。
-// **2026-10-20 修正**：AE 此前把高光压到 RAW 白点（2.438 EV），而 filmic 能容纳到
-// white_ev（默认 4.0/4.56）—— 等于白白多压 1.1~1.5 EV（真机 0.11.69 实测
-// aeEv -1.97、mean 27.6、窗外死白）。高光该压到的是"渲染会死白的位置"，
-// 不是"RAW 会饱和的位置"：RAW 饱和只说明没有更多光子，不代表不能再往白点推。
-inline constexpr float kAeRenderWhiteEv = 4.0f;
-
-// filmic 死白余量：R-3 实测 white_ev=4.0 时死白起点 3.55 EV ⇒ 0.45 EV。
-inline constexpr float kAeDeadWhiteMarginEv = 0.45f;
+// 渲染域白点 = **当前引擎曲线的死白起点**（量化后输出不再增长的位置），
+// 相对中灰 0.1845 的 EV。**2026-10-20 修正**：AE 此前压到 RAW 饱和白点
+// （2.438 EV），而曲线能容纳得更远 —— 等于白白多压 1.1~1.7 EV
+// （真机 0.11.69 实测 aeEv -1.97、mean 27.6、窗外死白）。
+//
+// 数值来源：`docs/reports/stage2-sigmoid-REPORT.md` §4.2（合成 EV 阶梯喂真实 shader，
+// 判定"量化后不再增长"）——**引擎 0 filmic 4.52 EV / 引擎 1 sigmoid 6.22 EV**。
+// ⚠ 引擎 1 是默认引擎，它的白点**不能**从 `[38]` 读：`[38]` 在 `EngineScope` 的
+// `FILMIC_OWNED_SLOTS` 里，引擎 1 下会被归零（0.11.70 的错误）。
+inline constexpr float kAeSigmoidDeadWhiteEv = 6.22f;
+inline constexpr float kAeFilmicDeadWhiteEv = 4.52f;
+// filmic 的 `[38]`（white_ev）可调时死白起点随之平移：white_ev 4.18 → 4.52（+0.34）。
+inline constexpr float kAeFilmicWhiteOffsetEv = 0.34f;
 
 // 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）。
 inline constexpr float kAeMiddleGrey = 0.1845f;
 
-// 高光余量：白点前留 0.1 EV，避免量化/舍入把 P99.9 推过白点。
-inline constexpr float kAeHighlightHeadroomEv = 0.1f;
+// 高光余量：死白起点前留 0.5 EV。死白点附近曲线已近平（<1 LSB/0.1 EV），
+// 贴太紧等于把高光压成一片 —— 0.5 EV 是"还看得出层次"的经验下限。
+inline constexpr float kAeHighlightHeadroomEv = 0.5f;
 
 // 自动 EV 的安全限幅：欠曝上限 = **2 EV**，与 gainmap 的 `[0.25, 4.0]`（±2 EV）对齐 ——
 // AE 把 base 压暗超过 2 EV 后，Ultra HDR 的增益图就表达不了（被截断 ⇒ 高光信息丢失），
@@ -62,8 +68,9 @@ struct AeInputs {
   float p_mid = 0.0f;      // 线性 P50（max 通道，与 filmic 同口径）
   float p_hi995 = 0.0f;    // 线性 P99.5（max 通道）—— 允许 0.5% 像素超白点
   float user_ev = 0.0f;    // 已经下发给 film pass 的 EV（基准 + 用户 + 采集欠曝补偿）
-  // 渲染白点（filmic white_ev，[38]）：高光上限 = white_ev − 死白余量。
-  float white_ev = kAeRenderWhiteEv;
+  // 渲染域死白起点（EV 相对中灰）：**按引擎填**（sigmoid 6.22 / filmic [38]+0.34）。
+  // 高光上限 = white_ev − kAeHighlightHeadroomEv。
+  float white_ev = kAeSigmoidDeadWhiteEv;
   bool valid = false;      // 统计失败 ⇒ 不介入（保持历史行为）
 };
 
