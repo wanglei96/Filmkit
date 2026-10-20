@@ -52,9 +52,11 @@ inline constexpr float kAeFilmicWhiteOffsetEv = 0.34f;
 // 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）。
 inline constexpr float kAeMiddleGrey = 0.1845f;
 
-// 高光余量：死白起点前留 0.5 EV。死白点附近曲线已近平（<1 LSB/0.1 EV），
-// 贴太紧等于把高光压成一片 —— 0.5 EV 是"还看得出层次"的经验下限。
-inline constexpr float kAeHighlightHeadroomEv = 0.5f;
+// 高光余量：死白起点前留 **1.5 EV**。死白点附近曲线已近平（<1 LSB/0.1 EV），
+// 0.5 EV 只留出约 15 个码值 ⇒ 窗外这类大面积高光会糊成一片（真机 0.11.72：
+// hi240 2.81%）。设计 §0 的目标态是 mean 70~90 + hi240 ≤0.5%，对应 ~1.5 EV 余量：
+// 高光落在曲线仍可分辨的区间（每 0.1 EV ≥1 LSB），中灰也还在合理亮度。
+inline constexpr float kAeHighlightHeadroomEv = 1.5f;
 
 // 自动 EV 的安全限幅：欠曝上限 = **2 EV**，与 gainmap 的 `[0.25, 4.0]`（±2 EV）对齐 ——
 // AE 把 base 压暗超过 2 EV 后，Ultra HDR 的增益图就表达不了（被截断 ⇒ 高光信息丢失），

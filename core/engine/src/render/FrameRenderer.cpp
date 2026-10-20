@@ -2354,10 +2354,12 @@ uniform int uCfaLut;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform vec3 uGain;
-// 期 B bracket：逐帧曝光归一（短帧 = 长/短，其余 1）。**不再 clamp 到白点**
-// （0.11.72）：参考帧饱和修复后，高光值本就 >1（真实 scene-referred 高光），
-// 交给 filmic/sigmoid 压进显示域；clamp 会把刚修好的高光又抹平。
+// 期 B bracket：逐帧曝光归一（短帧 = 长/短，其余 1）。**不 clamp**：高光值可 >1
+// （真实 scene-referred 高光），交给引擎曲线压进显示域。
 uniform vec4 uFrameScale;
+// 期 B bracket（设计 §3.3 路径 A）：饱和阈值（占白点比例）。本帧在该像素饱和
+// ⇒ 信息已丢，权重 0；短帧归一后暗部噪声 ×ratio，SNR 低 ⇒ 暗部权重压低。
+uniform float uSatK;
 float frameLin(float x, float sc) { return x * sc; }
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
@@ -2369,6 +2371,16 @@ float linAt(highp usampler2D t, ivec2 p) {
     float v = float(texelFetch(t, p, 0).r);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
     return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
+}
+// 饱和惩罚：lin 是 WB 后值。饱和点 = gain(chan)·white·frameScale —— 短帧归一后
+// 的白点也 ×scale（短帧饱和值 = scale·gain），不乘就会把整个短帧误判成饱和。
+float satW(float lin, int ch, float sc) {
+    float sat = gainAt(ch) * uSatK * sc;
+    return 1.0 - smoothstep(sat * 0.92, sat, lin);
+}
+// 短帧暗部惩罚：只在 scale > 1（短帧）时生效；0.02/0.08 是 3σ 噪声底附近（设计 §4）
+float darkW(float lin, float sc) {
+    return sc > 1.001 ? smoothstep(0.02, 0.08, lin) : 1.0;
 }
 vec3 off1At(vec2 uv) {
     vec2 px = uv * uTiles - 0.5;
@@ -2430,25 +2442,33 @@ float linSub(highp usampler2D t, ivec2 p, vec2 d) {
 }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    float acc = frameLin(linAt(uRaw0, p), uFrameScale.x);
-    float wsum = 1.0;
+    int ch = chanAt(p);
+    // 参考帧权重不再恒 1：饱和帧（信息已丢）权重 0，让未饱和的短帧接住高光
+    float r0 = frameLin(linAt(uRaw0, p), uFrameScale.x);
+    float wr0 = satW(r0, ch, uFrameScale.x) * darkW(r0, uFrameScale.x);
+    float acc = wr0 * r0;
+    float wsum = wr0;
     vec2 uv = (vec2(p) + 0.5) / (uTiles * uTileM);
     // 权重（v0.10.3）：独立权重图（32px cell，LINEAR 双线性过渡），与位移场解耦
     // —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
     vec4 wv = texture(uW, uv);
     vec3 f1 = off1At(uv);
-    float w1 = wv.r;
-    acc += w1 * frameLin(linSub(uRaw1, p, f1.xy), uFrameScale.y);
+    float l1 = frameLin(linSub(uRaw1, p, f1.xy), uFrameScale.y);
+    float w1 = wv.r * satW(l1, ch, uFrameScale.y) * darkW(l1, uFrameScale.y);
+    acc += w1 * l1;
     wsum += w1;
     vec3 f2 = off2At(uv);
-    float w2 = wv.g;
-    acc += w2 * frameLin(linSub(uRaw2, p, f2.xy), uFrameScale.z);
+    float l2 = frameLin(linSub(uRaw2, p, f2.xy), uFrameScale.z);
+    float w2 = wv.g * satW(l2, ch, uFrameScale.z) * darkW(l2, uFrameScale.z);
+    acc += w2 * l2;
     wsum += w2;
     vec3 f3 = off3At(uv);
-    float w3 = wv.b;
-    acc += w3 * frameLin(linSub(uRaw3, p, f3.xy), uFrameScale.w);
+    float l3 = frameLin(linSub(uRaw3, p, f3.xy), uFrameScale.w);
+    float w3 = wv.b * satW(l3, ch, uFrameScale.w) * darkW(l3, uFrameScale.w);
+    acc += w3 * l3;
     wsum += w3;
-    float v = acc / max(wsum, 1e-4);
+    // 全部饱和（长帧+短帧都烧了）⇒ 退回参考帧：如实记录裁切，不凭空造信息
+    float v = wsum > 1e-4 ? acc / wsum : r0;
     oColor = vec4(v, v, v, 1.0);
 })";
 
@@ -7848,6 +7868,7 @@ bool FrameRenderer::init() {
   u_mfnr_fuse_.gain = glGetUniformLocation(prog_mfnr_fuse_, "uGain");
   u_mfnr_fuse_.frame_scale =
       glGetUniformLocation(prog_mfnr_fuse_, "uFrameScale");
+  u_mfnr_fuse_.sat_k = glGetUniformLocation(prog_mfnr_fuse_, "uSatK");
 
   for (int i = 0; i < 4; ++i) {
     u_mfnr_mis_.raw[i] =
@@ -12422,6 +12443,7 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
     glUniform4f(u_mfnr_fuse_.frame_scale, frame_scale[0], frame_scale[1],
                 frame_scale[2], frame_scale[3]);
   }
+  if (u_mfnr_fuse_.sat_k >= 0) glUniform1f(u_mfnr_fuse_.sat_k, 0.98f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

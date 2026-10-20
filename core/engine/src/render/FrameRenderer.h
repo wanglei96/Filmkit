@@ -1327,7 +1327,8 @@ class FrameRenderer {
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, w = -1,
           size = -1, tiles = -1, tile_m = -1, black = -1, white = -1,
-          gain = -1, cfalut = -1, frame_scale = -1;   // 期 B bracket：逐帧归一
+          gain = -1, cfalut = -1, frame_scale = -1,   // 期 B bracket：逐帧归一
+          sat_k = -1;                                 // 期 B bracket：饱和阈值
   } u_mfnr_fuse_;
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
