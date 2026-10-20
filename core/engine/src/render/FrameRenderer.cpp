@@ -6752,14 +6752,18 @@ float srgbInvOetf(float x) {
 }
 float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
-// PC 版：offset 1e-4（PhotonCamera hdr/RawGainmapMath.kt）
+// **2026-10-20 修正（0.11.74）**：hdrLin 是**未 tone map 的 scene 线性**（白点 1.0），
+// sdrLin 是**已 tone map 的显示线性**（中灰 0.18）—— 直接相除，中灰 ratio ≈ 0.39
+// （−1.36 EV）⇒ 开 HDR 整张变暗/发灰（真机实测 gainmap 中位 −1.03 log2、base mean 111）。
+// Ultra HDR 的语义是"HDR 相对 base 只会更亮"：中灰及以下 ratio = 1（= base），
+// 只有 scene 超白点（>1）的部分才原样延伸成高光增益。
 float gainPc(float sdrLin, float hdrLin) {
-    float ratio = clamp((max(hdrLin, 0.0) + 1e-4) / (sdrLin + 1e-4), kMin, kMax);
+    float ratio = clamp(max(1.0, hdrLin), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
-// 官方版：offset 1e-7 + 暗部钳位（libultrahdr lib/src/gainmapmath.cpp:790）
+// 官方版：同样的语义（只保留高光扩展），暗部钳位保留（暗部 ratio 恒 1，实际不触发）
 float gainOfficial(float sdrLin, float hdrLin) {
-    float gain = log2((hdrLin + 1e-7) / (sdrLin + 1e-7));
+    float gain = log2(max(1.0, hdrLin));
     if (sdrLin < 2.0 / 255.0) gain = min(gain, 2.3);
     float ratio = clamp(exp2(gain), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
