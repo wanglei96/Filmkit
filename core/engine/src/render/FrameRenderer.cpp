@@ -6757,13 +6757,20 @@ float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // （−1.36 EV）⇒ 开 HDR 整张变暗/发灰（真机实测 gainmap 中位 −1.03 log2、base mean 111）。
 // Ultra HDR 的语义是"HDR 相对 base 只会更亮"：中灰及以下 ratio = 1（= base），
 // 只有 scene 超白点（>1）的部分才原样延伸成高光增益。
+// HDR 相对 base 的增益曲线：**中灰基线 1.1**（整体通透度，对齐 PC gainmap 实测
+// 中位 ≈1.1×），随后按 scene 亮度平滑升到 kMax（高光）。0.11.74 只给 max(1, scene)
+// 会让"高光面积小"的场景（日志 163517：aeP995 1.24）HDR 开关等于没有效果。
+float ratioFromScene(float sceneY) {
+    float t = clamp((sceneY - 0.2) / 0.8, 0.0, 1.0);
+    return mix(1.1, kMax, t * t);
+}
 float gainPc(float sdrLin, float hdrLin) {
-    float ratio = clamp(max(1.0, hdrLin), kMin, kMax);
+    float ratio = clamp(ratioFromScene(hdrLin), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
 // 官方版：同样的语义（只保留高光扩展），暗部钳位保留（暗部 ratio 恒 1，实际不触发）
 float gainOfficial(float sdrLin, float hdrLin) {
-    float gain = log2(max(1.0, hdrLin));
+    float gain = log2(ratioFromScene(hdrLin));
     if (sdrLin < 2.0 / 255.0) gain = min(gain, 2.3);
     float ratio = clamp(exp2(gain), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
