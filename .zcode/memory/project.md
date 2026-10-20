@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-10-14 15:10
+updated: 2026-10-20 09:45
 status: active
 ---
 
@@ -86,3 +86,11 @@ status: active
 - [2026-10-19] **Oklab L-only（C 方案）不做**：GLSL 已实现并离线跑通（Δh 4.43°→1.83°，高光不变），但 ΔE 3.69→5.42；变体（`a/b` 不缩放、`×0.8`）与混合 w=0.3~0.8 均无交点（ΔE≤3.7 且 Δh<2.5°）⇒ 回滚，`kFsSigmoid` 恢复 `0xfbab6a8c`。
 - [2026-10-19] **HDR 路线定案 = 按 PC 做**：PC 的 HDR JPEG = 自研 4:4:4 JPEG + gainmap JPEG + **libultrahdr** `packageJpegR`（vendored `libultrahdr`/`libjpeg-turbo`）；`Bitmap.compress` + `Gainmap` 是 4:2:0 的另一条。x300 成片无 HEIC；用户不喜欢 HEIC（4:2:0 色度差、亮度优势不明显、细节差）。**不做探针**（PC 已验证下游）。
 - [2026-10-19] **默认 AE 不读场景统计**：`sw999` 只在 `[35] auto_tone` 开启时写，默认 `[35]=0` 且引擎 1 归零 ⇒ 高光保护默认不参与，期 B 换域不影响默认 AE。
+
+## HDR 交付（10-20，已真机验收）
+
+- [2026-10-20] **三条 HDR 路径落地**：JPEG **4:4:4**（自研 stb base + libultrahdr `packageJpegR`，base 保住 4:4:4）+ **4:2:0** 与 **HEIC**（平台 Gainmap API）。开关 `-DFILMKIT_HDR`（默认 OFF）/ `-PfilmkitHdr=true`，`.so` 21MB、APK 46MB（+12MB）。
+- [2026-10-20] **gainmap 在 GPU 算**（`kFsGainmap`）：ES 3.0 读不回浮点纹理 ⇒ 只读回 1/2 分辨率 8bit（12MP ≈3MB）。数学两版可切（默认 **PC 版 offset 1e-4**；官方版 1e-7 + 暗部钳位作 A/B 档），都归一化到固定 `[0.25,4.0]`。
+- [2026-10-20] **真机验收通过**：系统相册正常显示 HDR；App 内查看页也通了（修掉 `ImageDecoder` 不解析 MPF、`context as? Activity` 拿不到、`isScreenHdr` 误判三个 bug）。查看页 HDR 面板支持开关 + **导出 SDR 版**（`nativeExtractSdrBase` 无损取 base）。
+- [2026-10-20] **已知差距（用户已定单独开期）**："高光顶白" = SDR base 平均亮度我们 **85.2/98.4** vs PC **50.7**、`>=240` 占比 **3.38%/2.22%** vs PC **0.37%**；而 **HDR 输出几乎相同** ⇒ 归因自动曝光策略，**gainmap 链路本身没问题**。
+- [2026-10-20] **出包纪律已固化进 `AGENTS.md`**：每个包必升版本号、只留"最新+上一稳定版"、禁用 `-fixN` 后缀、打包后必验签名/版本号/JNI 符号。

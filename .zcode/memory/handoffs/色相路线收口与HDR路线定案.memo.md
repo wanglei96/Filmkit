@@ -1,8 +1,8 @@
 ---
 summary: 色相路线收口与HDR路线定案
 created: 2026-10-19 17:20
-updated: 2026-10-19 17:20
-status: active
+updated: 2026-10-20 09:45
+status: absorbed
 ---
 
 # 色相路线收口与HDR路线定案
