@@ -911,6 +911,8 @@ class FrameRenderer {
   // 期 B bracket（0.11.72）：参考帧饱和修复 —— 把短帧归一后的真实高光移植到
   // 参考帧的饱和像素上，再送进融合（否则长帧饱和处的短帧高光会被收缩/平均抹平）。
   GLuint tex_ref_fix_ = 0, fbo_ref_fix_ = 0;
+  // HR 的条件重建标记（= sat-fix 输出纹理；0 = 不用，即普通 HR）
+  GLuint hr_fix_mark_ = 0;
   // 局部影调：1/4 分辨率的 I/mask/gain + 全分辨率输出
   GLuint tex_teq_i_ = 0, tex_teq_mean_ = 0, tex_teq_tmp_ = 0, tex_teq_gain_ = 0,
          tex_teq_out_ = 0;
@@ -1130,6 +1132,7 @@ class FrameRenderer {
   GLuint tex_hr_stat_ = 0, fbo_hr_stat_ = 0;    // R16F 64×48（裁剪统计 readback）
   int hr_w_ = 0, hr_h_ = 0;
   GLint u_hr_mask_ = -1, u_hr_mask_norm_ = -1, u_hr_mask_feather_ = -1;
+  GLint u_hr_mask_fixmark_ = -1, u_hr_mask_markon_ = -1;
   GLint u_hr_inp_tex_ = -1, u_hr_inp_mask_ = -1, u_hr_inp_noise_ = -1,
         u_hr_inp_thr_ = -1;
   GLint u_hr_blur_tex_ = -1, u_hr_blur_size_ = -1, u_hr_blur_mult_ = -1,

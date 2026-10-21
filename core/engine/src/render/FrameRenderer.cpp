@@ -2270,11 +2270,15 @@ void main() {
     float v = r;
     float s = float(texelFetch(uShort, p, 0).r);
     // 短帧未饱和才可信（短帧也饱和 ⇒ 那里确实没有更多光子）
+    uint used = 0u;
     if (r >= wl * 0.98 && s < wl * 0.98) {
         float sNorm = (s - bl) * uScale + bl;
-        if (sNorm > v) v = sNorm;
+        if (sNorm > v) {
+            v = sNorm;
+            used = 1u;   // G = 1：这个像素的高光由短帧救回（HR 不该重建它）
+        }
     }
-    oColor = uvec4(uint(clamp(v, 0.0, 65535.0) + 0.5), 0u, 0u, 1u);
+    oColor = uvec4(uint(clamp(v, 0.0, 65535.0) + 0.5), used, 0u, 1u);
 })";
 
 // kFsMfnrPyr：raw → 1/2 灰度（RGBA8）。sqrt 预编码：8bit 灰度域里暗部分辨率
@@ -3323,8 +3327,18 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform float uNormalize;  // feather / threshold
 uniform float uFeather;    // 2^(12/reconstruct_feather)
+// 期 B bracket（2026-10-21）：短帧饱和修复标记（sat-fix 的 G 通道）。
+// G=1 ⇒ 该像素高光已由短帧救回（真实值，不是饱和），HR 必须**跳过**它 ——
+// 否则 inpaint 会把有信息的高光填成灰块（0.11.74）；不跳过则饱和区色比失真
+// 成彩色斑块（0.11.85）。条件重建是同时消掉两者的唯一解。
+uniform highp usampler2D uFixMark;
+uniform int uMarkOn;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+    if (uMarkOn == 1 && texelFetch(uFixMark, p, 0).g == 1u) {
+        oColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
     vec3 c = max(texelFetch(uTex, p, 0).rgb, vec3(0.0));
     float pixMax = sqrt(dot(c, c));
     float arg = -pixMax * uNormalize + uFeather;
@@ -7943,6 +7957,8 @@ bool FrameRenderer::init() {
   u_hr_mask_ = glGetUniformLocation(prog_hr_mask_, "uTex");
   u_hr_mask_norm_ = glGetUniformLocation(prog_hr_mask_, "uNormalize");
   u_hr_mask_feather_ = glGetUniformLocation(prog_hr_mask_, "uFeather");
+  u_hr_mask_fixmark_ = glGetUniformLocation(prog_hr_mask_, "uFixMark");
+  u_hr_mask_markon_ = glGetUniformLocation(prog_hr_mask_, "uMarkOn");
   u_hr_inp_tex_ = glGetUniformLocation(prog_hr_inpaint_, "uTex");
   u_hr_inp_mask_ = glGetUniformLocation(prog_hr_inpaint_, "uMask");
   u_hr_inp_noise_ = glGetUniformLocation(prog_hr_inpaint_, "uNoiseLevel");
@@ -12762,7 +12778,7 @@ bool FrameRenderer::ensureSatFixTarget(int w, int h) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, w, h, 0, GL_RED_INTEGER,
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16UI, w, h, 0, GL_RG_INTEGER,
                GL_UNSIGNED_SHORT, nullptr);
   glGenFramebuffers(1, &fbo_ref_fix_);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_ref_fix_);
@@ -13634,6 +13650,16 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   glUniform1i(u_hr_mask_, 0);
   glUniform1f(u_hr_mask_norm_, normalize);
   glUniform1f(u_hr_mask_feather_, feather);
+  if (u_hr_mask_markon_ >= 0) {
+    const bool mark_on = hr_fix_mark_ != 0;
+    glUniform1i(u_hr_mask_markon_, mark_on ? 1 : 0);
+    if (mark_on) {
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, hr_fix_mark_);
+      glUniform1i(u_hr_mask_fixmark_, 1);
+      glActiveTexture(GL_TEXTURE0);
+    }
+  }
   glDrawArrays(GL_TRIANGLES, 0, 3);
   // ①b 裁剪统计（64×48 块内 max；> 1/17 ⇔ 存在 argument < 4 的像素）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_hr_stat_);
@@ -13912,6 +13938,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     passMfnrSatFix(raw_tex_, tex_mfnr_[2], w, h, black_phase, wl,
                    frame_scale[3]);
     ref_fuse_tex_ = tex_ref_fix_;
+    // HR 条件重建：G=1 的像素（短帧救回的高光）跳过 HR，避免灰块
+    hr_fix_mark_ = tex_ref_fix_;
+  } else {
+    hr_fix_mark_ = 0;
   }
   stage("align");
   float align_ms = 0.f, gx_sum = 0.f, gy_sum = 0.f, conf_sum = 0.f;
