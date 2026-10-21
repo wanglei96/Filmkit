@@ -25,7 +25,9 @@ AeDecision decideAe(const AeInputs& in) {
   }
   // ① 中灰锚定：最终渲染输入里 P50 必须落在 18.45%。`user_ev` 已经包含在
   //    film pass 的 exposure_ev 里，所以这里要扣掉它，只返回"还差多少"。
-  d.ev_mid = evOf(kAeMiddleGrey, in.p_mid) - in.user_ev;
+  // 2026-10-21 修正：ev_mid **不扣** user_ev —— 扣掉会让用户手动拉的 EV 被完全
+  // 抵消（真机"拉基础 EV 没效果"）。user_ev 仍在 ev_hl 里扣（它确实会推高高光）。
+  d.ev_mid = evOf(in.target_mid, in.p_mid);
   // ② 高光约束：P99.5 提亮后 ≤ 白点 − 余量（允许 0.5% 像素裁切）。写成 EV 差，与 ① 同单位。
   // v0.11.77（PC 口径）：裁切比例未超 0.5% ⇒ 高光不介入（ev_hl 视为无穷）；
   // 超了才按 P99.5 反解"把第 0.5% 亮像素压到白点"的 EV。
@@ -58,8 +60,8 @@ bool aeMeteringSelfTest(char* err, int err_cap) {
   {
     AeInputs in;
     in.valid = true;
-    in.p_mid = kAeMiddleGrey;
-    in.p_hi995 = 1.0f / std::exp2(kAeHighlightHeadroomEv);  // 2^(白点-余量) 对应线性
+    in.p_mid = kAeTargetMid;   // 中灰正好落在目标 ⇒ ev_mid = 0
+    in.p_hi995 = kAeMiddleGrey * std::exp2(kAeRawWhiteEv - kAeHighlightHeadroomEv);
     const AeDecision d = decideAe(in);
     if (!near(d.ev, 0.0f, 2e-3f)) return fail("baseline", d.ev, 0.0f);
   }

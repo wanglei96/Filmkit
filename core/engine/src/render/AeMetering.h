@@ -49,8 +49,14 @@ inline constexpr float kAeFilmicDeadWhiteEv = 4.52f;
 // filmic 的 `[38]`（white_ev）可调时死白起点随之平移：white_ev 4.18 → 4.52（+0.34）。
 inline constexpr float kAeFilmicWhiteOffsetEv = 0.34f;
 
-// 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）。
+// 显示中灰锚点：darktable `MIDDLE_GREY`（与 filmic 的 kGrey 同源）—— **EV 基准**，
+// 高光判据的"相对中灰"仍以它为分母（改它会移动 RAW 白点的 EV）。
 inline constexpr float kAeMiddleGrey = 0.1845f;
+
+// 中灰**目标**（线性）：中灰锚定要落到的显示亮度。
+// 2026-10-21 真机对比（同场景）：我们 mean 74.7 / p50 94，PC mean 147.1 / p50 188
+// ⇒ 18.45%（sRGB 118）比 PC 暗约 1.4 EV。默认取 0.45（sRGB ~180），对齐 PC 的观感。
+inline constexpr float kAeTargetMid = 0.45f;
 
 // 高光余量（相对 **RAW 白点**）：量化/舍入的安全边距。
 // 2026-10-20 定案：AE 的高光上限用 **RAW 白点 2.438 EV**（不是引擎死白点 6.22）。
@@ -83,6 +89,10 @@ struct AeInputs {
   // `maximumClippedFraction = 0.005` 判据的**量本身** —— 未超阈值时不压高光，
   // 哪怕分位很亮（此前用 P99.5 亮度当代理，会把"0.1% 像素很亮"误判成裁切）。
   float sat_frac = 0.0f;
+  // 目标中灰（线性）。darktable MIDDLE_GREY = 0.1845 是"中性正确"的锚；
+  // PhotonCamera 实测同场景中灰 ≈ 0.5（sRGB 188/255）—— 它匹配取景器，取景器更亮。
+  // 2026-10-21：默认对齐 PC（0.45），用户仍可用设置页"亮度偏好"调回标准。
+  float target_mid = kAeTargetMid;
   bool valid = false;      // 统计失败 ⇒ 不介入（保持历史行为）
 };
 
