@@ -13853,12 +13853,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       std::isfinite(short_ratio) ? std::min(std::max(short_ratio, 1.0f), 8.0f) : 1.0f;
   frame_scale[3] = short_ratio_ok;
   const bool bracket_on = short_ratio_ok > 1.01f;
-  // 期 B bracket：短帧已提供真实高光 ⇒ **关掉 HR 高光重建**（[45] hr_raw）。
-  // HR 是对"饱和无信息"像素的邻域 inpaint；bracket 下高光并不缺信息，重建反而
-  // 把窗玻璃这类大面积高光填成一块块灰色（真机 0.11.74 截图）。关 HR = 原链路
-  // 逐位不变（见 passHighlightRaw 的 A/B 红线），只是不跑那一趟。
+  // 期 B bracket：**保留 HR**（2026-10-21 修正）。
+  // 0.11.75 曾为消除"灰块"关掉 HR，结果饱和区失去色度重建 ⇒ RCD 在窗玻璃这类
+  // 大面积饱和处产生**粉/紫色斑块**（真机 20261021 逆光场景）。两害相权：
+  // HR 的 inpaint 灰块（大面积、低频）比 RCD 的彩色斑块（高频、扎眼）可接受，
+  // 且灰块可以靠"饱和标记 + 条件重建"在下一轮消掉（HR 只重建短帧也没救到的像素）。
   FilmParams p_burst = p;
-  if (bracket_on) p_burst.hr_raw = 0.f;
   stage("pyr");
 
   // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile kMfnrTile → tiles。
