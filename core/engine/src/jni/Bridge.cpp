@@ -18,6 +18,12 @@
 #include "../gl/Capabilities.h"
 #include "../gl/EglCore.h"
 #include "../log/Logger.h"
+// v0.12.24：native 崩溃取证。相册偶发闪退一直查不到，因为 Java 的
+// uncaughtExceptionHandler 抓不到信号级崩溃 —— SIGSEGV/SIGABRT 会直接杀掉进程，
+// 连 Logger 的 fwrite 缓冲都来不及刷（20261022(7) 的日志就停在半行）。
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
 #include "../render/FrameRenderer.h"
 #include "../spike/SpikeFftMerge.h"
 #include "../spike/SpikePass.h"
@@ -53,6 +59,60 @@ std::string toStd(JNIEnv* env, jstring s) {
 
 jstring toJString(JNIEnv* env, const std::string& s) {
   return env->NewStringUTF(s.c_str());
+}
+
+// ── native 崩溃取证（v0.12.24）──────────────────────────────────────────────
+// 只用 async-signal-safe 的 open/write/close + backtrace_symbols_fd；
+// 信号上下文里不能做任何分配（printf / Logger / std::string 都是禁忌）。
+static char g_crash_path[600] = {0};
+
+static void crashWriteLong(int fd, long v) {
+  char b[24];
+  int i = 0;
+  if (v < 0) { (void)!write(fd, "-", 1); v = -v; }
+  if (v == 0) { (void)!write(fd, "0", 1); return; }
+  while (v > 0 && i < 23) { b[i++] = static_cast<char>('0' + (v % 10)); v /= 10; }
+  while (i > 0) (void)!write(fd, &b[--i], 1);
+}
+
+static void crashSignalHandler(int sig, siginfo_t* info, void* /*uc*/) {
+  if (g_crash_path[0] != '\0') {
+    const int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+      const char* head = "{\"event\":\"app.native_crash\",\"signal\":";
+      (void)!write(fd, head, std::strlen(head));
+      crashWriteLong(fd, sig);
+      const char* mid = ",\"faultAddr\":";
+      (void)!write(fd, mid, std::strlen(mid));
+      crashWriteLong(fd, reinterpret_cast<long>(info ? info->si_addr : nullptr));
+      // ⚠ 不在这里取堆栈：Android NDK **没有** glibc 的 execinfo.h/backtrace()，
+      // `_Unwind_Backtrace` 又不是 async-signal-safe。信号号 + 故障地址已足以区分
+      // 崩溃类型（SIGSEGV=非法访存 / SIGABRT=断言或未捕获 C++ 异常 / SIGBUS=对齐或映射），
+      // 配合"崩在哪个操作上"就能把范围缩到具体模块，再单独加打印去精确定位。
+      const char* tail = "\n";
+      (void)!write(fd, tail, 1);
+      close(fd);
+    }
+  }
+  signal(sig, SIG_DFL);   // 交回默认处理，让系统照常产 tombstone
+  raise(sig);
+}
+
+static void installCrashHandler(const std::string& dir) {
+  if (!dir.empty()) {
+    const std::string path = dir + "/native-crash.txt";
+    if (path.size() < sizeof(g_crash_path)) {
+      std::memcpy(g_crash_path, path.c_str(), path.size() + 1);
+    }
+  }
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = crashSignalHandler;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  for (int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE}) {
+    sigaction(sig, &sa, nullptr);
+  }
 }
 
 // 引擎单实例（M1：单相机会话；多实例随多会话需求引入）
@@ -273,7 +333,10 @@ FilmParams paramsFromJava(JNIEnv* env, jdoubleArray film) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeInitLogger(JNIEnv* env, jobject,
                                                    jstring dir) {
-  return Logger::instance().init(toStd(env, dir)) ? JNI_TRUE : JNI_FALSE;
+  const std::string d = toStd(env, dir);
+  const bool ok = Logger::instance().init(d);
+  installCrashHandler(d);   // v0.12.24：native 崩溃取证（此时目录已确定）
+  return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL

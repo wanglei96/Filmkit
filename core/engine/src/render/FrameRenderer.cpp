@@ -9235,7 +9235,15 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
   // 按下快门前看到的那个亮度。取景器不可用（冷启动首帧 / 无预览）时退回 0.45。
   // clamp [0.12, 0.70] 防止预览统计异常（黑边、遮挡）把成片带飞。
   if (g_pv_geo_ema > 1e-4f) {
-    in.target_mid = std::clamp(g_pv_geo_ema, 0.12f, 0.70f);
+    // ── v0.12.23：**除以域比**（域混用修正，取景器/成片亮度差 1.6EV 的根因）──────
+    // `g_pv_geo_ema` 是**取景器的几何均值**，量级是 RAW 域的 `g_domain_ratio` 倍
+    // （在线 EMA，实测 1.7~3.9；真机 17:00:23 的两边值是 0.2053 / 0.0656 = 3.1）。
+    // 旧式直接把它当 **RAW 域**的期望亮度用 ⇒ target 被抬高 3.1 倍 ⇒ AE 额外提亮
+    // 1.645 EV ⇒ 成片整体比"A E 认为的正确曝光"亮 1.6EV，代价是 `hi240` 顶死 3~10%。
+    // 而预览的输入本就在 HAL 域、被 shader 里的 `uDomainRatio` 除回 RAW 等效域，
+    // 所以它拿到的是正确曝光 ⇒ **预览比成片暗 1.6EV**，这正是真机反馈的现象。
+    // 除以域比后：target 回到 RAW 域语义，预览与成片同曝光；顶死的高光也会自然消失。
+    in.target_mid = std::clamp(g_pv_geo_ema / std::max(g_domain_ratio, 1e-3f), 0.12f, 0.70f);
   }
   ae_target_mid_ = in.target_mid;
   in.p_hi995 = st_full.p_hi995;
