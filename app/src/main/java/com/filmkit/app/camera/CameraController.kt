@@ -2827,26 +2827,19 @@ class CameraController(private val context: Context, private val render: RenderC
      * 越界/尺寸异常返回 null ⇒ 该张回落普通 JPEG（宁可没有 HDR，不可错位 HDR）。
      */
     /**
-     * 本张成片还要不要按**数码变焦**裁切（v0.12.34）。
+     * 本张成片要按**数码变焦**裁多少（v0.12.34）：>1 = 裁，1 = 不裁。
      *
      * M 档 RAW 的静拍流不走 HAL 的 `CONTROL_ZOOM_RATIO`（见 [stillZoom]），所以非原生
      * 焦段必须在交付前自己裁；YUV 路径的 zoom 由 HAL 做，传进来的 zoom 恒 1。
      *
-     * 自愈判据：若 HAL 某天真的对 RAW 也做了裁切，输出宽度会掉到 `全幅/z` 附近 ——
-     * 这时再裁就是双裁（成片比预览还窄）。所以先比一次尺寸，宁可少裁不可双裁。
-     *
-     * @return >1 = 需要裁的倍率；1 = 不裁
+     * ⚠ **无法用输出尺寸反过来判断 HAL 有没有裁**：RAW 的输出尺寸由 session 配置固定，
+     * HAL 即便尊重 crop region 也不会改输出尺寸（RAW 不能插值）。所以这里不做"自愈判据"
+     * —— 一个必然误判 binning 尺寸的猜测，比没有更糟。真机实证（X300，2026-10-22）
+     * 是 HAL 完全不裁；万一将来变了，表现是成片视角比预览**更窄**（双裁），一眼可辨，
+     * 且 `photo.zoom_crop` 日志里有 z/from/to 可对照。
      */
-    private fun zoomCropFactor(w: Int, zoom: Float): Float {
+    private fun zoomCropFactor(zoom: Float): Float {
         if (!(zoom > 1.001f)) return 1f
-        val aw = activeArray.width().coerceAtLeast(1)
-        if (w <= (aw / zoom) * 1.05f) {
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "camera", "photo.zoom_hal_done",
-                kv("w" to w, "activeW" to aw, "z" to "%.2f".format(zoom)),
-            )
-            return 1f
-        }
         return zoom.coerceIn(1f, 8f)
     }
 
@@ -2862,7 +2855,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun cropForZoom(
         bytes: ByteArray, w: Int, h: Int, gainmap: GainmapSnapshot?, zoom: Float,
     ): ZoomCrop {
-        val z = zoomCropFactor(w, zoom)
+        val z = zoomCropFactor(zoom)
         if (z <= 1.001f) return ZoomCrop(bytes, w, h, gainmap)
         val cw = (w / z).toInt().coerceIn(16, w)
         val ch = (h / z).toInt().coerceIn(16, h)
@@ -4431,7 +4424,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // （两次居中裁 = 直接裁到更小的居中矩形），省一次全图拷贝。
         // 用**快门瞬间**的画幅快照（v0.10.110-fix）：渲染 3~4s 期间用户常把手机转回
         // 竖屏，读实时 captureAspect 会把横拍裁成竖幅（2026-10-03 真机实证）。
-        val zc = zoomCropFactor(w, zoom)
+        val zc = zoomCropFactor(zoom)
         val asp = if (stillAspect > 0f) stillAspect else captureAspect
         // 尺寸计算收在纯函数里（投递时取整 + 上下界都在那儿测，见 StillCropTest）
         val crop = stillCropSize(w, h, zc, asp)
