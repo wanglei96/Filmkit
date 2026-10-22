@@ -185,11 +185,15 @@ object CameraPresets {
         // 默认 2.0 = 离线标定值（详见 core/engine/src/film/FilmParams.h 与本槽注释）。
         // ⚠️ 本槽长度是**硬契约**：`CameraPresets.COUNT`（本文件顶部唯一维护点），数组越界会直接崩。
         this[48] = 2.0
-        // 49 = 高光重建·G 通道重建（v0.10.169）：1 = 开 = **现有行为**（kFsHlApply 的
-        // apply 支含自创的 G 三级池化比 + allSat 三通道同步改写两支）；0 = 关（apply
-        // 只留分支① 的 darktable opposed 外推 = PhotonCamera OpposedGL 口径）。
-        // 用途：真机同帧 A/B 判"过曝边缘品红"（离线高光区 B/G 1.0856→1.0217）。
-        // **默认必须 1.0**（不改变默认画质）；设置页开关写 prefs("hl_grecon")，
+        // 49 = 高光重建算法（v0.10.169 引入，v0.12.4 转正为**算法选择**）：
+        // 1 = **自创档**（G 三级池化比 + allSat 三通道同步改写）= 0.12.3 及以前的行为；
+        // 0 = **darktable 原版档**（`hlreconstruct/opposed.c` 口径：`MAX(inval, refavg)`
+        //     + 加性 chrominance 补偿，**只抬不压**）。
+        // v0.12.4 改默认为 0 的依据（一手源码 + 真机量化）：自创 allSat 按参考比**替换**
+        // 三通道、并用**满阱 luma** 当亮度锚 ⇒ 把 sat-fix 救回的真值（可达 4.0）压回满阱
+        // (≈1.27)，并把高光核色度抹平（真机 164553：亮核 chroma 2.17% vs 紧邻外圈
+        // 18.83%，同一束光差 8.7 倍）。而 opposed 的写出式 `MAX(inval, ref+chrominance)`
+        // 物理上不会压值。设置页开关写 prefs("hl_grecon")，
         // CameraController.applyHlGReconPref 是决定下发值的那一层。
         this[49] = 1.0
         // 50 = 镜头横向色差校正（v0.10.170）：0 = 关（A/B 通路，不跑任何 pass）；

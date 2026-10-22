@@ -165,6 +165,16 @@ void tempTintGain(float mired, float tint, float g[3]) {
 // ratio 长期钉在初值 2.0 不收敛。进程存活期间跨实例保持；App 冷启动回落
 // 初值、拍一张静拍即重新收敛（EMA α=0.3）。
 float g_pv_mid_ema = 0.0f;   // 预览统计中位的 EMA（0 = 未初始化）
+// v0.11.92：预览的**几何平均** EMA —— 成片 AE 的目标亮度直接用它（"对齐取景器"）。
+// 为什么不是 P50：P50 只说"一半像素比它暗"，对"半暗半亮"的构图会严重偏低（真机
+// 2147：P50 0.1076 → 锚到固定 0.45 要 +2.0EV → mean 184、hi240 2.67%）。预览的
+// 中位是厂商 AE 已经权衡过的结果（它做了区域测光），拿它当目标等于"成片与取景器
+// 一样亮"—— PhotonCamera 的 Huber 网格匹配在做的也是这件事。
+float g_pv_geo_ema = 0.0f;
+// v0.11.93：成片 AE 的 EMA —— 预览也叠上它，取景器才与成片同亮度。
+// 之前预览恒用 exposure_ev=0、成片 +0.6~1.7EV，用户看到的是"预览暗、成片亮"，
+// 而这恰好破坏了 v0.11.92 的取景器匹配前提（目标来自预览，预览却不是最终亮度）。
+float g_still_ae_ema = 0.0f;
 float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范围 1.70–3.87 的中位）
 
 // 预览降载（v0.10.93）：1.0 = 全分辨率。进程级 atomic —— 写方（Kotlin 的
@@ -2262,6 +2272,12 @@ uniform ivec2 uSize;
 uniform vec4 uBlack;
 uniform float uWhite;
 uniform float uScale;
+// v0.11.99：1/2 分辨率灰度（sqrt 编码，capturePyr 的产物）—— 用来判断"这个饱和像素
+// 周围有多大面积也饱和"。大面积饱和（天空/白墙）= 保守用长帧值；孤立饱和（反光点/
+// 灯芯）= 用短帧下界。0.11.98 只看单像素，把两者一刀切，于是"反光点修好了、
+// 天空被顶淡"（真机 161508）。面积信息在这里，不需要额外 pass。
+uniform highp sampler2D uSatMap;
+uniform ivec2 uSatSize;
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
@@ -2270,14 +2286,79 @@ void main() {
     float v = r;
     float s = float(texelFetch(uShort, p, 0).r);
     // 短帧未饱和才可信（短帧也饱和 ⇒ 那里确实没有更多光子）
-    uint used = 0u;
-    if (r >= wl * 0.98 && s < wl * 0.98) {
+    // v0.11.87：G 的语义 = **本像素的高光有没有可信信息**，HR 据此决定跳不跳过重建。
+    //   旧式只在"长帧饱和 + 短帧救回"时置 1 ⇒ 长帧**未饱和**、但融合值被短帧抬到
+    //   HR 阈值以上的像素被当成饱和去 inpaint，真机 4641 的窗玻璃灰块就是这一类
+    //   （hlCnt 27 万 = 2.9%，而短帧 p999 0.70 根本没饱和）。
+    // ── v0.12.5：标记改**三态**（面积估计仍留在本层，见下）────────────────────
+    // 0 = 短帧也饱和 ⇒ 真值未知，值是保守值/下界 ⇒ HL 用参考比给色度
+    // 1 = 短帧未饱和 ⇒ 有真值（sNorm）          ⇒ HL 只做 max，不动它
+    // 2 = 长帧本身没饱和 ⇒ 本来就是好值          ⇒ HL 跳过
+    uint used = (r < wl * 0.98) ? 2u : 0u;
+    // ── v0.12.18：进入条件 0.98 → **0.94**（与软过渡起点对齐）────────────────────
+    // 旧式：进入判据 `r >= 0.98·wl`，而里面的软过渡 `w` 是从 **0.94** 起算的
+    //       ⇒ 0.94~0.98 这段像素**根本不进分支**（保持原值），而 ≥0.98 的按 w 注入
+    //       短帧真值（≈3.6）。相邻像素 0.878 vs 3.6 = **2 EV 硬台阶**。
+    // 真机证据（160733 墙面阳光斑，RAW 直接量）：过曝块 64×64 内 **94.8% 像素饱和，
+    //   但 p5 = 0.878** —— 亮区内部本来就有 5% 未饱和的像素，它们正好落在 0.94~0.98
+    //   这段"被软过渡覆盖、却被进入条件挡在门外"的区间 ⇒ 灰块就在**亮区内部**。
+    // 改成 0.94 后：0.94 处 w=0（等价不处理）⇒ 与 0.878 的原值连续；1.0 处 w=1（全注入）。
+    // 软过渡第一次真正生效，台阶消失，且"有真值才注入"的语义不变。
+    if (r >= wl * 0.94) {
         float sNorm = (s - bl) * uScale + bl;
-        if (sNorm > v) {
-            v = sNorm;
-            used = 1u;   // G = 1：这个像素的高光由短帧救回（HR 不该重建它）
+        // ── 面积判断**保留**（v0.12.6 回退说明，勿再删）──────────────────────────
+        // v0.12.5 曾把这里改成"短帧饱和恒取 wl×uScale（= 4.0）"，理由是"物理下界"。
+        // 那是**重复 0.11.98 已验证失败的改动**：真机当时反馈"天空是淡蓝，但是太淡了"，
+        // 0.11.99 加 satFrac 把大面积拉回 1.0 才"蓝天回来了"。这条约束不能再动。
+        // 所以：大面积仍取保守值 wl，孤立点取 4.0 —— 由下面的 satFrac 决定。
+        // ── 本版唯一改动：把 satFrac 从**档位化**改为**连续**（治"零碎小片"）────
+        // 旧版 = 1/2 图 3×3 的**二值**统计（>=0.95 记 1）⇒ satFrac 只有 0/9…9/9
+        // 十档，而它插值的是 1.0 ↔ 4.0 这 **2 EV** ⇒ 每档 ≈ 0.4 EV 台阶，落在平滑
+        // 天空上就是硬边碎块。改两条：
+        //   ① 二值 → smoothstep(0.90, 0.99, g)：饱和程度本身连续；
+        //   ② 3×3 → 5×5 高斯窗（中心 1、距 1 0.84、距 √2 0.71、距 2 0.37），覆盖
+        //      10×10 全分辨率像素 ⇒ 面积估计不再随单像素翻转。
+        // 注意幅度（2 EV）没变、也不敢变：变的是"多少档"，不是"多少幅度"。
+        ivec2 q = clamp(p / 2, ivec2(0), uSatSize - 1);
+        float acc = 0.0;
+        float wsum = 0.0;
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                ivec2 cc = clamp(q + ivec2(dx, dy), ivec2(0), uSatSize - 1);
+                float g = texelFetch(uSatMap, cc, 0).r;
+                float wgt = exp2(-0.25 * float(dx * dx + dy * dy));
+                acc += smoothstep(0.90, 0.99, g) * wgt;
+                wsum += wgt;
+            }
         }
+        float satFrac = clamp(acc / max(wsum, 1e-4), 0.0, 1.0);
+        bool no_info = (s >= wl * 0.98);
+        // 孤立饱和点（satFrac≈0）→ 短帧白点 × ratio = 4.0（下界，白）
+        // 大面积饱和（satFrac≈1）→ 长帧饱和值 1.0（**已验证的必要保守值**，勿改）
+        //
+        // ── v0.12.15：**去掉硬判据，改成连续插值**（品红斑块的正解）─────────────
+        // 旧式 `no_info ? 保守值 : sNorm` 在 s = 0.98·wl 处有一个 **1 个 LSB 的硬跳**：
+        //   s = 0.9799 → sVal = sNorm = 3.92（真值，三通道都 ≈3.9 ⇒ **中性白**）
+        //   s = 0.9801 → sVal = mix(4.0, 1.0, satFrac)；大面积 satFrac≈1 ⇒ **1.0**，
+        //   而 1.0 经 max(v, ·) 对满阱比例 (1.898, 1.0, 1.643) 是空操作 ⇒ 保留**满阱比例**
+        //   ⇒ 两侧不仅差 **1.9 EV**，色度还从"中性白"跳成"品红"(R/G=1.9)。
+        // 真机 2630（开 bracket，`aeBrkSat 0.0179` = 短帧饱和 1.79%）窗格旁的品红斑块
+        // 就是这个边界；2641 关 bracket（`brkRatio 1.0`，无 sat-fix）没有斑，正好互证。
+        // 改法：sSat = smoothstep(0.95, 1.0, s/wl) 在 sNorm 与保守值之间**连续**插值。
+        //   · s ≤ 0.95·wl → sSat=0 ⇒ sVal = sNorm，与旧行为**逐位一致**（有真值区不受影响）
+        //   · s = 1.00·wl → sSat=1 ⇒ sVal = 保守值，与旧行为一致（大面积亮度不变）
+        //   · 中间连续 ⇒ 1.9EV 落差摊在 s∈[0.95,1] 上；三通道各自 mix ⇒ 色度也连续
+        // 起点取 0.95 而不是更宽：s∈[0.90,0.95] 的 sNorm 仍是可信真值，压它只会让
+        // "本来正好"的天空变暗（真机 2456 那个亮度）。0.95 以上才进入肩部。
+        float sSat = smoothstep(0.95, 1.0, s / max(wl, 1.0));
+        float sValCons = mix(wl * uScale, wl, satFrac);
+        float sVal = mix(sNorm, sValCons, sSat);
+        // 长帧侧的饱和边界软过渡（R/G/B 饱和点不同 ⇒ 硬边会出彩色条纹）
+        float w = clamp((r - wl * 0.94) / max(wl * 0.06, 1.0), 0.0, 1.0);
+        v = mix(v, max(v, sVal), w);
+        used = no_info ? 0u : 1u;
     }
+
     oColor = uvec4(uint(clamp(v, 0.0, 65535.0) + 0.5), used, 0u, 1u);
 })";
 
@@ -3240,7 +3321,11 @@ void main() {
             float i0 = sim[tt][0][by][bx];
             float accR = r0;
             float accI = i0;
-            const float cs2_base = uC * sig2 + 1e-12;
+            // v0.12.17：**去掉 const**。`uC` / `sig2` 是 uniform 与运行期量，不是常量
+            // 表达式，GLSL ES 3.0 不允许 `const` 这样初始化 ⇒ 整个 shader 编译失败
+            //（真机日志：`S0013: Initializer for const variable 'cs2_base' must be a
+            // constant expression` + `mfnr.fft.compile_fail`），MFNR 一直在走降级路径。
+            float cs2_base = uC * sig2 + 1e-12;
             for (int zz = 1; zz < 4; ++zz) {
                 float rz = sre[tt][zz][by][bx];
                 float iz = sim[tt][zz][by][bx];
@@ -3335,7 +3420,9 @@ uniform highp usampler2D uFixMark;
 uniform int uMarkOn;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    if (uMarkOn == 1 && texelFetch(uFixMark, p, 0).g == 1u) {
+    // v0.12.5：标记是三态（0 = 短帧也饱和、值只是下界；1 = 短帧真值；2 = 长帧未饱和）。
+    // 只有 0（真无信息）才需要 HR 重建；1/2 都有可信值 ⇒ 跳过。
+    if (uMarkOn == 1 && texelFetch(uFixMark, p, 0).g >= 1u) {
         oColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
@@ -3956,6 +4043,13 @@ uniform float uGCap;
 //     参考比反推替换（见 main() 内新分支注释）；0 = 该支不进（默认，旧行为逐位
 //     不变 —— 新分支不触发时不执行任何新计算路径）。
 uniform float uRbRecon;
+// v0.12.8：采集侧 sat-fix 的三态信息标记（R16UI 的 G 通道）：
+//   0 = 长帧与短帧**都**饱和 ⇒ 真值未知
+//   1 = 长帧饱和、短帧救回 ⇒ 有真值
+//   2 = 长帧本身未饱和      ⇒ 本来就是好值
+// 本 pass 用它做**重建判据**（替换 `v >= uHlClip`），见 main() 开头。
+uniform highp usampler2D uFixMark;
+uniform int uMarkOn;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -4023,6 +4117,24 @@ float neighborOfChan8(ivec2 p, int want) {
     }
     return -1.0;
 }
+// v0.12.9：读**标记纹理**里指定相位的通道标记（与 neighborOfChan8 同构，但读 uFixMark.g）。
+// 为什么需要它：重建判据必须按**整像素**决定，不能按单通道 —— 见 main() 里那段论证。
+// 取不到（边界外）时返回 2u = "有真值"，即保守地不重建。
+uint markOfChan(ivec2 p, int want) {
+    for (int k = 0; k < 8; ++k) {
+        ivec2 d = k == 0 ? ivec2(1, 0)
+                : (k == 1 ? ivec2(-1, 0)
+                : (k == 2 ? ivec2(0, 1)
+                : (k == 3 ? ivec2(0, -1)
+                : (k == 4 ? ivec2(1, 1)
+                : (k == 5 ? ivec2(-1, 1)
+                : (k == 6 ? ivec2(1, -1) : ivec2(-1, -1)))))));
+        ivec2 q = p + d;
+        if (q.x < 0 || q.y < 0 || q.x >= uSize.x || q.y >= uSize.y) continue;
+        if (chanAt(q) == want) return texelFetch(uFixMark, q, 0).g;
+    }
+    return 2u;
+}
 // 手写双线性（Mali 上 RGBA16F 的硬件 LINEAR 不可靠，项目既有结论）：参考场存的是
 // 加权分子 (mR·w, mG·w, mB·w, w)，必须对分子与分母一起插值、之后再相除 —— 直接插值
 // 比值会在 w=0 的无参考格处造出假值。
@@ -4079,6 +4191,42 @@ void main() {
     int c = chanAt(p);
     float v = mosAt(p);
     float outv = v;
+    // ── v0.12.8：重建判据从"值是否超过 clip"换成"信息是否存在" ────────────────
+    // 这是**判据的域错位**（bug），不是算法能力边界：
+    //   darktable 原版 `v >= clips[c]` 在**单帧**域里等价于"该通道信息已丢失"——
+    //   因为那时 v 就是被 clip 在满阱的值。
+    //   bracket 下 sat-fix 已经把真值写回来了，那些像素的 v 可能是 2.5，**同样
+    //   >= clips，但信息是完整的**。于是 opposed 对它们做 refavg 二次外推，把真值
+    //   改掉；refavg 是 3×3 的**立方均值**（cbrt→avg→cube，凸函数 ⇒ 放大差异），
+    //   在"真值 / 未修复原值"的交界处被放大，紧跟其后的 P0 bilateral 再把它糊成
+    //   几十像素的带。
+    // 真机 182707（绿袋镜面高光，短帧 sat 仅 0.02% ⇒ 几乎处处有真值）：实测过渡带
+    //   14~28 px，而高光本体只有 53×65 px —— 这个尺度远大于 refavg 的 3px，
+    //   正是"HL 造跳变 + P0 糊开"的特征。
+    // 修法：标记 >= 1（短帧救回 = 1 / 长帧未饱和 = 2）⇒ 信息可信 ⇒ **原样输出**，
+    //   连 max 都不做（max 也会改写"真值低于外推"的像素）。
+    //   只有标记 0（两帧都饱和、真值未知）才进下面 of opposed 重建。
+    // 与面积无关、与场景无关 ⇒ 不会再"修一个坏一个"。
+    // ── v0.12.10：**删除"有真值就跳过 HL"**（v0.12.8/0.12.9），它由真机否决 ───────
+    // 我把它当成"对真值做二次外推"，判断错了：`max(v, refavg + chroma)` 在这类场景里
+    // 起的是**色度平衡**作用 —— 本机满阱 R/G/B = 2.15 / 1.0 / 1.62，R/B 比 G 高，
+    // 所以 refavg 对 G 位算出的值天然高于 v，作用就是把偏低的 G 抬起来、把满阱比例
+    // 拉回中性。跳过它 ⇒ G 不被抬 ⇒ 三通道停在满阱比例 ⇒ **品红**。
+    // 真机 184216（绿袋镜面反光）实测：R≈247、B≈236、G≈207 —— R/B 顶到白点而 G
+    // 低 40，正是"G 没被抬"的指纹。
+    // 结论：refavg 对 sat-fix 修复过的像素**不是多余的**，必须继续跑。
+    // 于是重建判据回到 darktable 原版（`v >= uHlClip`），下面这行不再被拦截。
+    // ── v0.12.7：这里曾有一段"无真值区按三级参考比重新分配色度"（v0.12.5/0.12.6），
+    // 已由真机否决并删除。记录原因，避免以后再犯：
+    //   真机 181558（柜内 LED 灯珠，ISO 928，短帧 sat 0.17%）：灯珠约 3 万像素、短帧
+    //   饱和区约 2 万，两者几乎重合 ⇒ 出大片灰斑。两个错误：
+    //   ① 参考比是**大尺度**量（32 块 → 128×128 CFA → 全图），而灯珠周围是暗柜，
+    //      那些样本的色度与灯珠内部毫无关系；"参考比"只对**大面积、内部同色**的
+    //      饱和区（天空）成立；
+    //   ② 亮度锚 lv 取自 8 邻域，而邻域里混着"未重分配"的像素 ⇒ sc 在空间上不稳定。
+    //   而"大面积 vs 孤立小光源"这个区分在本层判不出来（灯珠 200px 在 3×3@1/2 的
+    //   窗口里同样 satFrac≈1）—— 任何用局部面积近似它的写法都会重演本 bug。
+    // 现状 = darktable opposed 原版（只抬不压 + 加性 chroma 补偿），与 0.12.4 一致。
     // ① darktable opposed 外推：**只抬不压**（PC tofloat.glsl:188 `max(hlVal, ...)`
     // 逐字口径）。判据 = 裁剪判据（0.987 × 中性白）：[中性白, 满阱) 这段过曝区必须
     // 纳入，否则被 P0 平滑拉到 1.0 以下的饱和 G 永远进不来。
@@ -4110,9 +4258,19 @@ void main() {
             // 1.617 vs 块比值 1.142），而 allSat 用全局池化落点 1.072/0.895（达标）。
             float rg = max(uRefGlobal.x, 1e-3);
             float bg = max(uRefGlobal.y, 1e-3);
-            float lc = 0.2126 * uSatClip.x + 0.7152 * uSatClip.y + 0.0722 * uSatClip.z;
+            // ── v0.12.14：亮度锚 **满阱 lc → 实测 lv**（灰斑的根因）──────────────
+            // 原式 lc = luma(满阱) 是个**与场景无关的常数**（本机 = 1.237）。用它当锚，
+            // 就把这个像素的亮度钉死在"满阱亮度"上 —— 哪怕它的真实亮度远高于此
+            //（bracket + sat-fix 下可达 4.0）⇒ 值被压、显示成灰。
+            // 改成实测 lv = luma(Rv, Gv, Bv)：三通道全饱和时它恰好等于 lc（与旧行为
+            // 一致，天空不变），而短帧救回过或部分通道未饱和时它反映真实亮度（不压暗）。
+            // 依据（灯面，真机 215028/215030）：RAW 三通道都饱和到同一数字 ⇒ WB 后
+            // 必然是 (2.22, 1.0, 1.68) 的伪彩；opposed 的 refavg 只能把 G 抬到 1.936
+            //（R/G 仍 1.147）⇒ 淡品红修不掉。而"三通道都饱和"时真实色度**不可知**，
+            // 唯一不骗人的表示是**中性白 + 真实亮度**，正是本支 + lv 锚给出的结果。
+            float lv = 0.2126 * Rv + 0.7152 * Gv + 0.0722 * Bv;
             float den = 0.2126 * rg + 0.7152 + 0.0722 * bg;
-            float sc = lc / max(den, 1e-3);
+            float sc = lv / max(den, 1e-3);
             // ⚠ v0.10.161 **故意不改成 max(v, 估计值)**（与任务书 ① 的字面口径的
             // 唯一偏离，离线数据驱动）：本支的前提是"三个锚点全是裁剪值"，即
             // 本通道原值 = 满阱 = 不含场景信息。此处"保留原值"保留的是**满阱比例**
@@ -6481,22 +6639,57 @@ precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;    // scene 线性（全分辨率）
-uniform highp sampler2D uGain;   // 1/4 分辨率增益（EV）
-uniform vec2 uGainSize;          // 增益图分辨率（手写双线性：RGBA16F 无硬件过滤）
+uniform highp sampler2D uAB;     // 1/4 分辨率 guided 系数（a, b）
+uniform vec2 uGainSize;          // AB 图分辨率（手写双线性：RGBA16F 无硬件过滤）
+uniform float uCurve[9];         // −8…0 EV 九分区的曝光补偿（EV）
+// ── v0.11.95：**guided upsample**（原来是"1/4 算 gain 再双线性上采样 gain"）──
+// 旧做法把"分区的结论"（标量 gain）上采样，边缘信息在 1/4 分辨率就被抹平了 ——
+// 杯口/窗框这类高对比边缘会留下一条几十像素的**灰带/光晕**（darktable tone equalizer
+// 的文档里明确说过：mask 必须上采样 a/b 而不是结果）。
+// 新做法：a/b 上采样，q = a·I_full + b 用**全分辨率**的 I 算 ⇒ 边缘由原图决定。
+float luma(vec3 c) { return dot(c, vec3(0.2627, 0.6780, 0.0593)); }
+float curveAt(float q) {
+    float x = clamp(q + 8.0, 0.0, 8.0);
+    float g = uCurve[0];
+    g = mix(g, uCurve[1], clamp(x - 0.0, 0.0, 1.0));
+    g = mix(g, uCurve[2], clamp(x - 1.0, 0.0, 1.0));
+    g = mix(g, uCurve[3], clamp(x - 2.0, 0.0, 1.0));
+    g = mix(g, uCurve[4], clamp(x - 3.0, 0.0, 1.0));
+    g = mix(g, uCurve[5], clamp(x - 4.0, 0.0, 1.0));
+    g = mix(g, uCurve[6], clamp(x - 5.0, 0.0, 1.0));
+    g = mix(g, uCurve[7], clamp(x - 6.0, 0.0, 1.0));
+    g = mix(g, uCurve[8], clamp(x - 7.0, 0.0, 1.0));
+    return g;
+}
 void main() {
     vec3 c = texture(uTex, vUV0).rgb;
-    // 手写双线性上采样（X300 的 RGBA16F 只能 NEAREST，直接 texture() 会出 4×4 块）
+    // 手写双线性（X300 的 RGBA16F 只能 NEAREST，直接 texture() 会出 4×4 块）
     vec2 p = vUV0 * uGainSize - 0.5;
     vec2 p0 = floor(p);
     vec2 f = p - p0;
     ivec2 imax = ivec2(uGainSize) - 1;
     ivec2 i0 = clamp(ivec2(p0), ivec2(0), imax);
     ivec2 i1 = clamp(ivec2(p0) + ivec2(1), ivec2(0), imax);
-    float g00 = texelFetch(uGain, ivec2(i0.x, i0.y), 0).r;
-    float g10 = texelFetch(uGain, ivec2(i1.x, i0.y), 0).r;
-    float g01 = texelFetch(uGain, ivec2(i0.x, i1.y), 0).r;
-    float g11 = texelFetch(uGain, ivec2(i1.x, i1.y), 0).r;
-    float g = mix(mix(g00, g10, f.x), mix(g01, g11, f.x), f.y);
+    vec2 ab00 = texelFetch(uAB, ivec2(i0.x, i0.y), 0).rg;
+    vec2 ab10 = texelFetch(uAB, ivec2(i1.x, i0.y), 0).rg;
+    vec2 ab01 = texelFetch(uAB, ivec2(i0.x, i1.y), 0).rg;
+    vec2 ab11 = texelFetch(uAB, ivec2(i1.x, i1.y), 0).rg;
+    vec2 ab = mix(mix(ab00, ab10, f.x), mix(ab01, ab11, f.x), f.y);
+    // q 用**全分辨率**的 luma 算 ⇒ 高对比边缘不会被 1/4 分辨率抹平
+    float I = log2(max(luma(c), 1e-6));
+    float q = ab.x * I + ab.y;
+    // ── v0.12.13：**接近白点的分区不压**（灰带的正确解法）──────────────────
+    // v0.12.11 试过"按相对局部均值的偏离（I − q）减免"，实测无效：反光块尺寸从
+    // 30px（灯珠）到 500px（窗）不等，而 q 的窗口是固定的 64px ⇒ 块内部 q ≡ I ⇒
+    // excess 恒 ≈ 0。**这个判据依赖尺度，而尺度随场景变，固定半径不可能通用**。
+    // v0.12.13 换成不依赖尺度的物理判据：**该分区是否已经接近白点**。
+    // ── v0.12.20：这里曾经叠了三层"事后开关"（v0.12.13 wTop → v0.12.17 让路 →
+    //    v0.12.19 拐点下移），全部删除。原因：**压深放错了 EV 分区**，而事后开关
+    //    只是在补那个错位 —— 每补一次就把另一类高光弄坏（反光点 → 绿植背景 → 白云）。
+    // 正位：云/镜面反光的 q ≈ −0.5（落在白点档），天空主体 q ≈ −2.0（落在第 6 档）。
+    //    压深只要给第 6 档，白点档保持 0，就**天然**满足"云不压、天空压"，
+    //    不需要任何权重函数。见 setTeqCurveFromAe 的 v0.12.20 段。
+    float g = curveAt(q);          // ← v0.12.21 补回：v0.12.20 换注释段时被误删
     oColor = vec4(c * exp2(g), 1.0);
 })";
 
@@ -6891,9 +7084,15 @@ float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // HDR 相对 base 的增益曲线：**中灰基线 1.1**（整体通透度，对齐 PC gainmap 实测
 // 中位 ≈1.1×），随后按 scene 亮度平滑升到 kMax（高光）。0.11.74 只给 max(1, scene)
 // 会让"高光面积小"的场景（日志 163517：aeP995 1.24）HDR 开关等于没有效果。
+// v0.11.90：**按真实 scene 倍数延伸，不再用归一化 t²**。
+// 旧式 `t = clamp((sceneY-0.2)/0.8)` 把"scene ≥1.0"全部压成 t=1 ⇒ 一律 4×。天空的
+// scene 只有 1.38，却被给了 4×：base 190 → HDR 760，超出手机屏幕的可用 headroom，
+// 系统 tonemap 压回来时丢色度 —— 真机 5619 的"SDR 天空有淡蓝、开 HDR 变灰白"。
+// 新式：中灰及以下给 1.1（整体通透，对齐 PC gainmap 中位），白点以上按真实倍数
+// （scene 1.38 ⇒ 1.38×1.6 = 2.2×），封顶 2.5 —— 在 1000nits 屏上约 0.4 峰值，
+// 既看得出 HDR，又不会被 clip 成白。
 float ratioFromScene(float sceneY) {
-    float t = clamp((sceneY - 0.2) / 0.8, 0.0, 1.0);
-    return mix(1.1, kMax, t * t);
+    return clamp(max(1.1, sceneY * 1.6), 1.1, 2.5);
 }
 float gainPc(float sdrLin, float hdrLin) {
     float ratio = clamp(ratioFromScene(hdrLin), kMin, kMax);
@@ -7922,6 +8121,9 @@ bool FrameRenderer::init() {
   u_hl_refdown_.refsize = glGetUniformLocation(prog_hl_refdown_, "uRefSize");
   u_hl_apply_.ref2 = glGetUniformLocation(prog_hl_apply_, "uRef2");
   u_hl_apply_.ref2size = glGetUniformLocation(prog_hl_apply_, "uRef2Size");
+  // v0.12.8：采集侧三态信息标记（重建判据）
+  u_hl_apply_.fixmark = glGetUniformLocation(prog_hl_apply_, "uFixMark");
+  u_hl_apply_.markon = glGetUniformLocation(prog_hl_apply_, "uMarkOn");
 
   u_nn_pack_.fused = glGetUniformLocation(prog_nn_pack_, "uFused");
   u_nn_pack_.raw = glGetUniformLocation(prog_nn_pack_, "uRaw");
@@ -8050,6 +8252,8 @@ bool FrameRenderer::init() {
   u_mfnr_satfix_.black = glGetUniformLocation(prog_mfnr_satfix_, "uBlack");
   u_mfnr_satfix_.white = glGetUniformLocation(prog_mfnr_satfix_, "uWhite");
   u_mfnr_satfix_.scale = glGetUniformLocation(prog_mfnr_satfix_, "uScale");
+  u_mfnr_satfix_.satmap = glGetUniformLocation(prog_mfnr_satfix_, "uSatMap");
+  u_mfnr_satfix_.satsize = glGetUniformLocation(prog_mfnr_satfix_, "uSatSize");
   u_teq_down_.tex = glGetUniformLocation(prog_teq_down_, "uTex");
   u_teq_down_.src_texel = glGetUniformLocation(prog_teq_down_, "uSrcTexel");
   u_teq_box_.tex = glGetUniformLocation(prog_teq_box_, "uTex");
@@ -8061,7 +8265,7 @@ bool FrameRenderer::init() {
   u_teq_gain_.i = glGetUniformLocation(prog_teq_gain_, "uI");
   u_teq_gain_.ab = glGetUniformLocation(prog_teq_gain_, "uAB");
   u_teq_apply_.tex = glGetUniformLocation(prog_teq_apply_, "uTex");
-  u_teq_apply_.gain = glGetUniformLocation(prog_teq_apply_, "uGain");
+  u_teq_apply_.gain = glGetUniformLocation(prog_teq_apply_, "uAB");
 
   u_chroma_dn_.tex = glGetUniformLocation(prog_chroma_dn_, "uTex");
   u_chroma_dn_.size = glGetUniformLocation(prog_chroma_dn_, "uSize");
@@ -8984,7 +9188,8 @@ bool FrameRenderer::autoExposure() { return g_ae_auto.load(std::memory_order_rel
 // 必然没有统计（真机日志 `hlEv:-99`），场景一变就用错；PC/MGC 是拍完再按本张统计
 // 决定 BaselineExposure，本函数即那一层。
 // 返回要追加到 exposure_ev 上的 EV；0 = 不介入（开关关 / 统计失败 / 曝光已正确）。
-float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
+float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
+                                      float short_sat) {
   ae_ev_ = 0.0f;
   ae_mid_ev_ = 0.0f;
   ae_hl_ev_ = 0.0f;
@@ -8992,6 +9197,10 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   ae_p999_ = 0.0f;
   ae_p995_ = 0.0f;
   ae_why_ = 0;
+  ae_p_geo_ = 0.0f;
+  ae_target_mid_ = kAeTargetMid;
+  ae_white_ev_ = kAeRawWhiteEv;
+  ae_brk_sat_ = short_sat;
   if (!autoExposure() || src == 0) return 0.0f;
   // 决策公式的零依赖自测：每个进程跑一次，失败只打日志（诊断包可见），不中断出片。
   static std::once_flag once;
@@ -9015,19 +9224,51 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   }
   AeInputs in;
   in.valid = true;
-  in.p_mid = st_center.p_mid;
+  // v0.11.91：中灰锚点用**几何平均**（感知亮度），不再用 P50。
+  // P50 对"一半暗部 + 一半亮部"的构图会严重偏低，AE 于是把整张提亮到过曝
+  // （真机 2147：P50 0.1076 → +2.0EV → mean 184；同场景几何平均约 0.19 → +1.2EV）。
+  // 统计仍取中央 2/3（主体在中心）。geo 无效（空直方图）时退回 P50。
+  in.p_mid = st_center.p_geo > 1e-6f ? st_center.p_geo : st_center.p_mid;
+  ae_p_geo_ = in.p_mid;
+  // v0.11.92：**目标亮度 = 取景器**（预览的几何平均），不再用固定常量。
+  // 这是"对齐取景器"的落地：厂商 AE 已经做了区域测光/场景识别，预览就是用户
+  // 按下快门前看到的那个亮度。取景器不可用（冷启动首帧 / 无预览）时退回 0.45。
+  // clamp [0.12, 0.70] 防止预览统计异常（黑边、遮挡）把成片带飞。
+  if (g_pv_geo_ema > 1e-4f) {
+    in.target_mid = std::clamp(g_pv_geo_ema, 0.12f, 0.70f);
+  }
+  ae_target_mid_ = in.target_mid;
   in.p_hi995 = st_full.p_hi995;
   in.user_ev = p.exposure_ev;
-  in.sat_frac = st_full.sat_frac;
-  // 高光上限 = **RAW 白点**（2.438 EV，`log2(1.0/0.1845)`）：光子还能区分的上限。
-  // 不用引擎死白点（6.22 EV）—— 那是"曲线彻底压平"的位置，把高光推到那里只会得到
-  // 一片死白（真机 0.11.81 hi240 18.89%）。亮度靠局部影调补，不靠 AE 放宽高光。
-  in.white_ev = kAeRawWhiteEv;
+  // ── v0.11.87：高光判据的两处语义修正 ──────────────────────────────
+  // ① 裁切比例：bracket 下"融合后 ≥0.98 白点"不是裁切，短帧救回的高光也算进去了
+  //    （真机 4641：13%，而短帧 sat 0.0% ⇒ 信息其实都在）。有 bracket 时改用采集端
+  //    实测的**短帧裁切比例**（= 真丢信息的比例，长帧饱和 ∩ 短帧饱和 ⊆ 短帧饱和）。
+  // ② 高光上限：有信息时才允许用"显示域 243 LSB"（kAeDisplayClipEv 4.8EV）；短帧也
+  //    饱和（≥0.5%）说明那里确实没信息，退回 RAW 白点保守处理。
+  const bool bracket_metering = short_sat >= 0.0f;
+  in.sat_frac = bracket_metering ? short_sat : st_full.sat_frac;
+  // v0.11.88：白点**统一** 4.8（不再因短帧 sat 大就退回 RAW 白点 2.438）——
+  // 压到 2.438 只是把"死白"变成"灰白"，还把整张压暗 2.4EV（真机 2733/2751：
+  // 短帧 sat 1.1% ⇒ 退回 2.438 ⇒ aeEv −2.0、mean 34）。真裁切的比例只进日志。
+  // v0.11.90：**统一** 4.8（非 bracket 也一样）。旧式非 bracket 用 RAW 白点 2.438，
+  // 真机 5517（关 bracket）因此压到 −2.21EV、mean 31.3 —— 而这场景的 P99.5 是 4.34，
+  // 压到 2.438 只是把图压暗，长帧饱和处的信息一点也救不回来。真正兜底的是 teq 的
+  // 高光压缩（−1.1 / −2.2），不是把中灰压到死。
+  in.white_ev = kAeDisplayClipEv;
+  // v0.11.88：bracket 下**永远**跑高光约束 —— 旧逻辑在"真裁切 0"时把整条判据关掉，
+  // 于是 aeEv 一路冲到 +2.0 限幅、白墙/窗外撞白（真机 2712：hi240 3.97%）。
+  in.force_hl = bracket_metering;
+  in.p_hi95 = st_full.p_hi95;
+  ae_white_ev_ = in.white_ev;
+  ae_sat_raw_ = st_full.sat_frac;
   const AeDecision d = decideAe(in);
   ae_p50_ = st_center.p_mid;
   ae_p999_ = st_full.p_hi999;   // 诊断：P99.9 仍记录（判据用的是 P99.5）
   ae_p995_ = st_full.p_hi995;
-  ae_sat_frac_ = st_full.sat_frac;
+  ae_p95_ = st_full.p_hi95;
+  ae_sat_frac_ = in.sat_frac;
+  ae_hl_soft_ev_ = d.ev_hl_soft;
   ae_mid_ev_ = d.ev_mid;
   ae_hl_ev_ = d.ev_hl;
   ae_ev_ = d.ev;
@@ -9041,6 +9282,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p) {
   } else if (d.why[0] == 'm') {
     ae_why_ = 1;
   }
+  g_still_ae_ema = g_still_ae_ema * 0.7f + d.ev * 0.3f;
   return d.ev;
 }
 
@@ -9090,7 +9332,12 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   }
   // 局部影调（tone equalizer）：在 film 曲线之前按 mask 分区做曝光补偿
   const GLuint teq_src = applyToneEq(rw, rh, tex_scene_);
-  passFilm(rw, rh, p, teq_src, /*still=*/false, /*hal_domain=*/true);
+  {
+    // v0.11.93：预览叠上成片 AE 的 EMA ⇒ 取景器看到的亮度就是成片亮度（WYSIWYG）
+    FilmParams pv = p;
+    pv.exposure_ev += g_still_ae_ema;
+    passFilm(rw, rh, pv, teq_src, /*still=*/false, /*hal_domain=*/true);
+  }
   if (diag) logPassDiag("pass2_film", fbo_work_, GL_RGBA16F);
 
   if (scaled) {
@@ -9112,7 +9359,11 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
       passOES(dst_w, dst_h, st, rot, sx, sy, p);
     }
     const GLuint teq_src = applyToneEq(dst_w, dst_h, tex_scene_);
-    passFilm(dst_w, dst_h, p, teq_src, /*still=*/false, /*hal_domain=*/true);
+    {
+      FilmParams pv = p;
+      pv.exposure_ev += g_still_ae_ema;
+      passFilm(dst_w, dst_h, pv, teq_src, /*still=*/false, /*hal_domain=*/true);
+    }
   }
 
   // 必须显式绑回窗口默认帧缓冲：上一 pass 留下的绑定是 fbo_work_
@@ -10055,7 +10306,7 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
                                             const float gains[3], GLuint src,
                                             GLuint stat_src, int stat_raw,
                                             int mono_src, int grecon,
-                                            int rbrecon) {
+                                            int rbrecon, GLuint fix_mark) {
   HlRawResult r;
   // v0.10.169：记录实际下发给 kFsHlApply 的 uGRecon（0/1），进 raw.render 的 hlGRecon。
   r.grecon = grecon ? 1 : 0;
@@ -10319,7 +10570,20 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   // 0.007 —— 即该补偿只在"G 大量饱和"的逆光场景起作用，而那里它是有害的。
   // r.chroma 仍照常统计并写日志（hlChroma），便于日后换更正确的口径时对照。
   static const float kHlChromaOff[3] = {0.f, 0.f, 0.f};
-  glUniform3f(u_hl_apply_.chroma, kHlChromaOff[0], kHlChromaOff[1], kHlChromaOff[2]);
+  // v0.12.4：**按算法档位决定是否启用 chroma 补偿**（"回到 darktable 原版"的关键一环）。
+  // 一手依据 = darktable `src/iop/hlreconstruct/opposed.c` 的写出式：
+  //   `output[c] = (inval >= clips[c]) ? MAX(inval, ref + chrominance[c]) : inval;`
+  // 即 opposed **永远只抬不压**，色比失衡由**加性** chrominance 补偿（不是替换三通道）。
+  // 对比本文件的自创 allSat 分支（uGRecon=1）：它按参考比**替换**三通道、并用满阱 luma
+  // 当亮度锚 ⇒ 把 sat-fix 救回的真值（可达 4.0）压回满阱（≈1.27），并把高光核色度抹平
+  //（真机 164553 量化：亮核 chroma 2.17% vs 紧邻外圈 18.83%，同一束光差 8.7 倍）。
+  // 因此：
+  //   uGRecon = 1（自创档）→ chroma 保持 0（v0.10.124 真机结论：MFNR+P0 平滑后 refavg 偏负，
+  //                        启用会把高光推离中性；防彩斑职责由 allSat 承担）
+  //   uGRecon = 0（原版档）→ 启用 ③ 已统计出的 chrominance，补上"只抬 G 造成的色比失衡"
+  //                        —— 0.12.2 关掉自创分支后仍出彩斑/绿天，缺的正是这一段。
+  const float* hl_chroma = grecon ? kHlChromaOff : r.chroma;
+  glUniform3f(u_hl_apply_.chroma, hl_chroma[0], hl_chroma[1], hl_chroma[2]);
   // G 通道色度重建（RAW 域，uGRecon=0 时 shader 内整段跳过 = 改动前行为逐位一致）。
   // uGCap 是重建值的上界（场景参考域，防参考色度场噪声把值推爆）。
   glActiveTexture(GL_TEXTURE2);
@@ -10328,7 +10592,19 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   glActiveTexture(GL_TEXTURE3);
   glBindTexture(GL_TEXTURE_2D, tex_hl_ref2_);   // 中尺度兜底（三级参考的第 2 级）
   glUniform1i(u_hl_apply_.ref2, 3);
-  glActiveTexture(GL_TEXTURE0);
+  // v0.12.8：三态信息标记（纹理单元 4，R16UI 的 G 通道），用作**重建判据**：
+  // 标记 >= 1（有真值）⇒ shader 原样输出、不进 opposed；只有 0 才重建。
+  // 未绑（非 bracket / 无 sat-fix 输出）时 uMarkOn = 0 ⇒ 逐位回到改动前行为。
+  const bool mark_on_hl = (fix_mark != 0);
+  // v0.12.9：这个诊断字段由 HL 自己写。v0.12.7 撤回时删过这一行，结果 0.12.8 的日志
+  // 显示 hlMarkOn 0 —— 而它其实只是"HR 没跑、字段没更新"，让人误以为标记没绑上。
+  // 诊断字段必须由真正消费它的那一步写，否则它会稳定地骗人。
+  dbg_hl_mark_on_ = mark_on_hl ? 1 : 0;
+  glActiveTexture(GL_TEXTURE4);
+  glBindTexture(GL_TEXTURE_2D, mark_on_hl ? fix_mark : 0);
+  glUniform1i(u_hl_apply_.fixmark, 4);
+  glUniform1i(u_hl_apply_.markon, mark_on_hl ? 1 : 0);
+  glActiveTexture(GL_TEXTURE0);   // 回到单元 0（后续若有 glBindTexture 才不会错绑）
   // uGRecon（v0.10.169，来自 FilmParams[49] hl_grecon）：kFsHlApply 内"自创机制"两支
   // （G 三级池化比 + allSat 三通道同步改写）的总开关。
   //   1 = **现有行为逐位不变**（默认值，故本改动不改变默认画质）；
@@ -11722,7 +11998,21 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       dbg_hl_cnt3_[k] = 0.f;
     }
 
-    const bool hr_on = p.hr_raw > 0.5f;
+    // v0.11.89：bracket 下"信息没丢"就不跑 HR。两个理由：
+    //   ① 少数"长帧+短帧都饱和"的像素（真机 4217：短帧 sat 0、clipB 64）会把整块
+    //      64×64 送进 wavelet inpaint，而周围像素其实有信息 —— 视觉就是窗玻璃上的灰块；
+    //   ② sat-fix 已经把"长帧饱和但短帧有值"的像素换成真实值，HR 没有可救的东西。
+    // 判据用采集端实测的短帧裁切比例（真丢信息的比例）：<0.2% ⇒ 关。非 bracket 不受影响。
+    const bool bracket_info_ok = ae_brk_sat_ >= 0.0f && ae_brk_sat_ < 0.002f;
+    // v0.12.2：**HL 必须开**（0.12.1 强制关掉后，饱和区立刻出现大面积粉紫彩斑 ——
+    // RCD 在 R/B 先饱和、G 未饱和处的色比外推失真，这正是 HL 存在的理由）。
+    // 但灰斑也确实是 HL 造成的 —— 区别在**它重建了什么**：
+    //   · 色度校正（rg/bg 比例）→ 必需，不碰亮度，结构保留
+    //   · **G 通道 / 亮度重建（hl_grecon）→ 抹结构**，镜面高光上的阴影条纹被
+    //     邻域池化比替换成灰块 —— 这就是"灰斑"的直接来源
+    // 所以：HL 开、G 重建关。这个组合以前从未在真机上跑过（前四版的 pe 门控全部
+    // 没到达这里，详见下面对 grecon 的直接改写）。
+    const bool hr_on = p.hr_raw > 0.5f && !bracket_info_ok;
     // ① P0 前的 mosaic（HR 的输入域）
     //    MFNR：tex_fused_（融合后 R16F 单通道，已扣黑阶+WB）
     //    单帧：无现成中间纹理 ⇒ 先用 kNoDn 的 P0 做一趟纯线性化+WB 展开（无邻域
@@ -11752,8 +12042,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 日志 hlGRecon 回读 pass 的 hl.grecon（= 那次 glUniform 的实际值），不另算一份。
       const HlRawResult hl = passHighlightRaw(w, h, c.cfa, c.gains, p0_pre, p0_pre,
                                               0, p0_pre_mono,
+                                              // v0.12.5：0 = darktable 原版档（默认，只抬不压 +
+                                              // 加性 chroma 补偿）；1 = 自创档（allSat 三通道替换，
+                                              // 满阱 luma 锚 ⇒ 会把真值压暗并去色）。设置页可切。
                                               p.hl_grecon > 0.5f ? 1 : 0,
-                                              p.hl_rb_recon > 0.5f ? 1 : 0);
+                                              p.hl_rb_recon > 0.5f ? 1 : 0,
+                                              // v0.12.10：**不传标记**。v0.12.8/0.12.9 用它做
+                                              // "有真值就跳过 HL"的判据，真机证明会造成品红
+                                              //（G 不再被 refavg 抬起）。HL 回到 darktable 原版
+                                              // 判据 `v >= uHlClip`；标记仍由 HR 侧使用。
+                                              /* fix_mark = */ 0);
       dbg_hl_ok_ = hl.ok ? 1 : 0;
       dbg_hl_grecon_ = hl.grecon;
       dbg_hl_rbrecon_ = hl.rbrecon;
@@ -12025,13 +12323,66 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // HR 阈值与 uExposure 三处（它们都以 pe.exposure_ev 为唯一来源）。
   // 只在 still 链追加；预览/YUV 静拍不受影响（域不同，见 AeMetering.h）。
   // ── 局部影调（tone equalizer）────────────────────────────────────────
-  // **必须在 passAutoExposure 之前**：teq 按 scene 绝对亮度分区（压高光/提暗部），
-  // 之后 AE 统计 teq 后的图再把中灰锚到 18.45% —— 中灰锁定由 AE 负责，teq 只做
-  // 分区曝光。反过来（先 AE 后 teq）会让 teq 的 +0.11EV（中灰 −3.85EV 处）叠加
-  // 在 AE 的计算外，中灰漂移无法收敛。
-  const GLuint teq_src = applyToneEq(dst_w, dst_h, film_src);
+  // v0.11.87 **顺序反转**（旧注释"teq 必须在 AE 之前"已被真机否掉）：
+  // 旧链路 teq → AE 有个耦合病 —— teq 把高光压了 0.6EV，AE 随后又按压过的 P99.5
+  // 提亮，两者都是乘性增益 ⇒ teq 的压缩被原样还回去（真机 10:00:29：teq 压完
+  // aeEv +2.0，hi240 反而 10.03%）。现在 AE 先按原始 film_src 决策，teq 再按
+  // "AE 为保高光放弃了多少中灰"算分区曲线，压缩真正落在 film 的输入上。
+  // 旧顺序（teq → AE）有致命耦合：teq 压了高光，AE 随后又按压过的 P99.5 提亮，
+  // 把 teq 的压缩原样还回去（真机 10:00:29：teq −0.6EV 后 aeEv +2.0，hi240 10.03%）。
+  // 反过来以后 teq 的压缩才真正作用在 film 的输入上，且中灰由 AE 负责、teq 只补
+  // 暗部，职责不重叠。
   FilmParams pe = p;
-  pe.exposure_ev += passAutoExposure(teq_src, pe);
+  // v0.11.94：**在成片链入口**按"短帧有没有真丢信息"决定要不要跑高光重建（HR + HL 色度）。
+  // bracket 且短帧裁切 <0.5% ⇒ 高光信息都在（sat-fix 已给真实值），重建只会把它抹成
+  // 灰块/斑块（真机 144940 杯口：hlCnt 9205、hlGRecon 1，而短帧 sat 只有 0.06%）。
+  // 为什么不只依赖 passFilm 里的同判据：真机日志出现 `aeSat 0.0006` 与 `hlOk 1`
+  // 自相矛盾（门控没生效），这里在**传参前**改掉，不依赖成员变量时序。
+  // v0.12.0：判据改用 `c.bracket`（采集侧确定，brkRatio 4.0 即真），不再依赖
+  // short_sat 的符号/数值。
+  // v0.12.4 修正这里的结论（上一版引用有误，已按一手源码核对）：
+  //   · darktable 官方对 opposed 的说法是"对小反光点和大面积都基本够用"
+  //     （hlreconstruct/opposed.c 顶部注释），并没有"大面积必须 clip"；
+  //   · clip 在 darktable 里是**非 RAW / 4bayer 的强制兜底**，不是大面积策略；
+  //   · 大面积全饱和的专门方案是 segmentation based + recovery。
+  // 这一段现在只关**小波 HR**（[41]/[45]）：它在 film 域修影调，与 RAW 域 HL 是两件事，
+  // bracket 下短帧已给真值，film 域再重建只会把结构抹平。
+  // ⚠ 不再在这里强制 `hl_grecon = 0`：那是**算法选择**（FilmParams[49]，设置页可切），
+  // 强制它会让用户永远切不到自创档做 A/B —— 0.11.94~0.12.2 的"门控生效但画面没变"
+  // 就有这一层的原因。
+  if (c.bracket) {
+    pe.hr_raw = 0.f;
+  }
+  const float ae = passAutoExposure(film_src, pe, c.short_sat);
+  pe.exposure_ev += ae;
+  // v0.11.91：teq 的"大面积高光"判据从"软约束是否主导"改为**绝对亮度**：
+  // P95 必须真的亮到白点以上（>2.0EV），且 P99.5 不比它高太多（<1.5×，说明是
+  // 平坦大面积而非孤立亮点）。旧判据在"室内窗景"上也会触发 −2.2EV，把窗外压成
+  // 灰块（真机 2011，与 2855 同场景 —— 正是"修一个场景搞坏另一个"）。
+  const float p95_ev = ae_p95_ > 1e-9f ? std::log2(ae_p95_ / 0.1845f) : -99.0f;
+  const float hl_ratio = (ae_p95_ > 1e-9f) ? ae_p995_ / ae_p95_ : 99.0f;
+  // ── v0.12.16：判据改用 **AE 之后**的 P95（域错位修正）────────────────────────
+  // `ae_p95_` 是**融合后、AE 之前**的分位，而 teq 作用在 `pe.exposure_ev += ae`
+  // **之后**的图上。拿提亮前的亮度去决定"要不要压提亮后的高光"，两边不是同一张图。
+  // 真机对照（同一片天空，`aeP95` 几乎相同、结论完全不同）：
+  //   2456  aeP95 0.6473  aeEv −0.05  ⇒ 1.81 EV（提亮前）→ 1.76（提亮后）不触发 ⇒ 用户"正好"
+  //   2426  aeP95 0.6473  aeEv +1.42  ⇒ 1.81 → **3.23** 用户"天空偏淡"
+  //   4609  aeP95 0.6834  aeEv +1.62  ⇒ 1.89 → **3.51** 用户"天空偏灰"
+  // 即：偏淡/偏灰那两个，正是"AE 把天空推过白点、而 teq 因为看着提亮前的值没接管"。
+  // 判据改到提亮后 ⇒ 它们触发 −2.2EV，2456 仍然不触发（差 1.5 EV，容错够）。
+  const float p95_ev_after = p95_ev + ae;
+  // v0.12.16：`hl_ratio < 1.5` → `< 2.2`。这道门是 v0.11.91 为"室内窗景不误压"加的，
+  // 但那个场景 P95 只有 1.57 EV、已经被亮度门挡住 ⇒ 这道门是冗余的；而它会误伤
+  // "平坦天空 + 少量窗格高光"（4609 的 P99.5/P95 = 1.72 被挡在 1.5 外）。
+  // 放宽到 2.2 后 4609 能进；孤立亮点的尾部比值通常 > 3，仍被挡在外面。
+  const bool hl_dominant = p95_ev_after > 2.0f && hl_ratio < 2.2f;
+  // v0.12.19：大面积高光的压深不再是固定 −2.2，而是**按"AE 后 P95 超出白点多少"**算：
+  // 目标把 P95 拉回白点下方 0.6 EV。白点 = log2(1/0.1845) = 2.44 EV（相对中灰）。
+  //   161952（云）：P95_after 3.52 → 超出 1.08 EV → 压 1.68 EV（旧固定 −2.2 过深 0.5）
+  //   0.11.89 的天空（P95 4.0 EV）：超出 1.56 → 压 2.16 EV ≈ 旧 −2.2（与该场景标定吻合）
+  const float p95_rel_white = p95_ev_after - std::log2(1.0f / 0.1845f);
+  setTeqCurveFromAe(std::max(ae_mid_ev_ - ae, 0.0f), hl_dominant, p95_rel_white);
+  const GLuint teq_src = applyToneEq(dst_w, dst_h, film_src, hl_dominant);
   passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
   const auto t2 = std::chrono::steady_clock::now();
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
@@ -12150,6 +12501,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // 位数 —— 样本数是整数，用 to_string 输出，否则 40077 会被截成 "4"
       //（2026-10-03 真机据此误判"样本只有 4 个、highlights 没生效"）。
       ",\"hlCnt\":" + std::to_string(static_cast<int>(dbg_hl_cnt_ + 0.5f)) +
+      ",\"hlMarkOn\":" + std::to_string(dbg_hl_mark_on_) +
       ",\"hlChroma\":[" + jnum(dbg_hl_chroma_[0], 6) + "," +
       jnum(dbg_hl_chroma_[1], 6) + "," + jnum(dbg_hl_chroma_[2], 6) + "]" +
       // 全局兜底比例（v0.10.143 起为**池化比** mR/mG、mB/mG，不再是块比值加权）与
@@ -12188,7 +12540,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
           ",\"ccmMs\":" + jnum(ccm_ms, 6);
     // 局部影调（tone equalizer）：开关状态（关 = 完全跳过，逐位不变）
     kv += ",\"teq\":" + std::to_string(FrameRenderer::toneEq() ? 1 : 0) +
-          ",\"teqMs\":" + jnum(dbg_teq_ms_, 6);
+          ",\"teqMs\":" + jnum(dbg_teq_ms_, 6) +
+          ",\"teqHl\":" + jnum(dbg_teq_hl_, 9) +
+          ",\"teqSh\":" + jnum(dbg_teq_sh_, 9);
     kv += ",\"rcdSplit\":" + std::to_string(dbg_rcd_split_);
     kv += ",\"rcdAMs\":" + jnum(dbg_rcd_a_ms_, 7);
     kv += ",\"rcdBMs\":" + jnum(dbg_rcd_b_ms_, 7);
@@ -12253,11 +12607,22 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"aeMid\":" + jnum(ae_mid_ev_, 5);
   kv += ",\"aeHl\":" + jnum(ae_hl_ev_, 5);
   kv += ",\"aeP50\":" + jnum(ae_p50_, 6);
+  // v0.11.91：中灰锚点（几何平均）—— 与 aeP50 对比可看出"P50 低估了多少"
+  kv += ",\"aeGeo\":" + jnum(ae_p_geo_, 8);
+  kv += ",\"aeTarget\":" + jnum(ae_target_mid_, 8);
   kv += ",\"aeP995\":" + jnum(ae_p995_, 6);
   kv += ",\"aeP999\":" + jnum(ae_p999_, 6);
   kv += ",\"aeWhy\":" + std::to_string(ae_why_);
-  // v0.11.77：中央 2/3 区域的裁切比例（PC maximumClippedFraction 口径）
+  // v0.11.77：裁切比例（PC maximumClippedFraction 口径）。v0.11.87 起 bracket 时
+  // = 采集端短帧实测（真丢信息的比例），非 bracket = 融合后 >=0.98 白点的比例。
   kv += ",\"aeSat\":" + jnum(ae_sat_frac_, 6);
+  // v0.11.87：高光判据的输入域 —— 白点（2.438 RAW / 4.8 显示）与短帧裁切比例。
+  kv += ",\"aeWhiteEv\":" + jnum(ae_white_ev_, 4);
+  kv += ",\"aeBrkSat\":" + jnum(ae_brk_sat_, 6);
+  // v0.11.88：融合后 >=0.98 白点的占比（"大面积高光"的直接证据）与 P95 软约束
+  kv += ",\"aeSatRaw\":" + jnum(ae_sat_raw_, 6);
+  kv += ",\"aeHlSoft\":" + jnum(ae_hl_soft_ev_, 5);
+  kv += ",\"aeP95\":" + jnum(ae_p95_, 6);
   // 用户 WB 补偿的**原始值**（目标/估计增益比）：1,1 = 自动/中性。
   // 【第 2 期 S13】三条链实际消费的都是 G 归一后的 (wb_r/wb_g, 1, wb_b/wb_g)
   // —— RAW 链见 prepareRawCommon，预览 OES / YUV 静拍见 wbCompGNorm()。
@@ -12648,9 +13013,41 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
 // ── 局部影调（tone equalizer）：mask 生成 + 查表应用 ─────────────────────
 // 自动预设曲线：9 个分区 = −8…0 EV（相对 scene 白点 1.0）；中灰 −2.44 EV 落在
 // 第 5.56 格（≈ +0.03 EV，锁定）；高光 −0.6 EV；最暗 +0.3 EV。
-// 这是 darktable "compress shadows/highlights" 预设的口径，不是逐场景自适应。
-static const float kTeqCurve[9] = {0.30f, 0.28f, 0.24f, 0.18f,
-                                   0.12f, 0.06f, 0.02f, -0.35f, -0.60f};
+// 这是 darktable "compress shadows/highlights" 预设的口径。
+// v0.11.87：改成按本张 AE 的缺口自适应（见 setTeqCurveFromAe）—— 固定 −0.6/+0.3
+// 只能压 2/3 档，而真机高光场景的缺口是 1.5~3 EV（真机 4641：aeMid +1.59、aeEv -1.74）。
+void FrameRenderer::setTeqCurveFromAe(float gap_ev, bool hl_dominant,
+                                   float p95_rel_white) {
+  // gap = 中灰想要 − 实际给到（>=0 表示"为保高光把中灰压暗了多少"）。
+  const float t = std::clamp(gap_ev / 1.5f, 0.0f, 1.0f);
+  // 高光：AE 已经把中灰压了 ⇒ 高光更需要局部压，给曲线留余量。
+  // v0.11.89：**大面积高光**（天空/白墙 ≥30% 画面）压到 −2.2EV —— 真机 4254 的天空
+  // 在 teq 前 4.0EV（~219 LSB），−1.1 只压到 2.9EV（~219？表值）仍是灰白；压到 1.8EV
+  // 才落回曲线的线性段，蓝色才回得来。判据由 AE 给（P95 软约束是否比 P99.5 更严）。
+  // 大面积高光：按"超出白点多少"算（见调用点 v0.12.19 注释），不再固定 −2.2
+  const float hl = hl_dominant ? -std::max(0.0f, p95_rel_white + 0.6f)
+                               : (-0.60f - 0.50f * t);
+  // 暗部：AE 压掉多少中灰，就在暗部补回 0.25~0.75 倍（全补会发灰）。
+  const float sh = 0.30f + 0.55f * t;    // +0.30 … +0.85
+  dbg_teq_hl_ = hl;
+  dbg_teq_sh_ = sh;
+  // 9 点：0..6 是暗部→中灰（线性过渡），7 = 高光过渡，8 = 白点。
+  // 中灰点（5.56 格）保持 0：teq 不改中灰是硬约束（AE 的锚点不能漂）。
+  static const float kBase[7] = {1.00f, 0.93f, 0.80f, 0.60f,
+                                 0.40f, 0.20f, 0.07f};
+  for (int i = 0; i < 7; ++i) teq_curve_[i] = sh * kBase[i];
+  // ── v0.12.20：**压深只给第 6 档（q = −2 EV），白点档恒 0** ─────────────────
+  // 9 档曲线覆盖 q ∈ [−8, 0] EV，第 i 档对应 q = i−8：
+  //   第 6 档 → q = −2 EV：天空主体、白墙、大面积高光在这里 ⇒ 全部压深放这
+  //   第 7 档 → q = −1 EV：天空上沿 / 窗框，压 30% 作过渡
+  //   第 8 档 → q =  0 EV：**云、镜面反光、阳光过曝斑**在这里 ⇒ 恒 0，不压
+  // 旧版把压深放在第 8 档（`teq_curve_[8] = hl`），于是"本来就该白"的东西全被压
+  // 暗：161952 的白云被压 2.2 EV 成了乌云。而真正该压的天空在第 6 档只拿到
+  // +0.06（提亮）⇒ 顶死成灰白。整整四轮 wTop 都在补这个错位。
+  teq_curve_[6] += hl;        // hl 为负（−0.6 ~ −2.2），相加即压暗
+  teq_curve_[7] = hl * 0.30f; // 过渡档只压 30%：云的 q≈−0.5 落在这里与第 8 档之间
+  teq_curve_[8] = 0.0f;       // 白点档：云 / 反光点 / 过曝斑一律不压
+}
 
 bool FrameRenderer::ensureTeqTargets(int w, int h) {
   const int tw = (w + 3) / 4, th = (h + 3) / 4;
@@ -12683,14 +13080,22 @@ bool FrameRenderer::ensureTeqTargets(int w, int h) {
   return true;
 }
 
-GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
+GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src, bool hl_dominant) {
   dbg_teq_ms_ = 0.0f;
   if (!toneEq() || src == 0 || w <= 0 || h <= 0)
     return src;
   const auto teq_t0 = std::chrono::steady_clock::now();
   if (!ensureTeqTargets(w, h)) return src;
   const int tw = teq_w_, th = teq_h_;
-  const int radius = std::max(3, std::min(tw, th) / 24);   // ≈ 画面短边的 4%
+  // ── v0.12.12：mask 半径 /24 → /12（≈ 画面短边的 8%）─────────────────────
+  // 原来的 4% 在 1/4 图上只有 8 px = 全分辨率 32 px。而真实场景里的"镜面反光块"
+  // 通常是 60~150 px（真机绿袋反光约 100 px = 1/4 图的 25 px）⇒ 反光块**内部**
+  // 的窗口完全被自己填满 ⇒ q ≡ I ⇒ mask 没有"分区"，teq 退化成一个逐像素的
+  // 亮度曲线。这正是"局部影调"把反光压成脏灰、而天空该压的地方又压不准的原因。
+  // 半径 ×2 后（1/4 图 16 px = 全分辨率 64 px），反光块的整体轮廓能进窗口 ⇒
+  // q 才真的低于 I ⇒ v0.12.11 的 excess 判据才有区分度。
+  // 代价：分区更"粗"，大面积高光的压缩边界会更平缓（这正是 guided filter 该有的行为）。
+  const int radius = std::max(3, std::min(tw, th) / 12);
   // ① scene → I = log2(luma), I²（1/4 分辨率）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_i_);
   glViewport(0, 0, tw, th);
@@ -12724,24 +13129,26 @@ GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, tex_teq_tmp_);
   glUniform1i(u_teq_coef_.mean, 0);
-  glUniform1f(u_teq_coef_.eps, 0.05f);
+  // ── v0.12.12：uEps 0.05 → 0.35（**这一步才让 teq 真正"分区"**）──────────────
+  // uEps 是 a = var/(var+eps) 里的方差阈值，单位 = (log2 EV)²。
+  // 0.05 ⇒ std ≈ 0.22 EV —— 比场景里任何正常亮度过渡都小 ⇒ var >> eps ⇒ a ≈ 1
+  // ⇒ q = a·I + b ≈ I：mask 退化成了**逐像素亮度曲线**，"分区"根本没发生。
+  // 后果：teq 的高光压缩对"镜面反光点"和"天空"一视同仁地压 0.6 EV —— 真机把反光
+  // 压成脏灰（185008：RAW 最亮通道 0.63 → 我们 233 / rawpy 250，差 20 LSB ≈ 0.6 EV）。
+  // 0.35 ⇒ std ≈ 0.59 EV：比局部亮度起伏大、比跨区域亮度差小 ⇒ a 落在 0.3~0.7，
+  // q 才真的是"局部均值 EV"。此时 v0.12.11 的 excess = I − q 判据才有区分度：
+  //   反光点（局部均值被暗区拉低）⇒ excess > 1 EV ⇒ 不压
+  //   天空（自身即局部均值）      ⇒ excess ≈ 0   ⇒ 照压
+  // v0.12.11 加了这个判据却没生效，正是因为 eps 让 q ≡ I、excess 恒为 0。
+  glUniform1f(u_teq_coef_.eps, 0.35f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   // ④ 平滑 a/b（两个盒式）
   box(tex_teq_mean_, fbo_teq_tmp_, 0);
   box(tex_teq_tmp_, fbo_teq_mean_, 1);
-  // ⑤ 分区曲线 → 增益（EV）
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_gain_);
-  glViewport(0, 0, tw, th);
-  glUseProgram(prog_teq_gain_);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, tex_teq_i_);
-  glUniform1i(u_teq_gain_.i, 0);
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_teq_mean_);
-  glUniform1i(u_teq_gain_.ab, 1);
-  glUniform1fv(glGetUniformLocation(prog_teq_gain_, "uCurve"), 9, kTeqCurve);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
-  // ⑥ 全分辨率应用
+  // ⑤（v0.11.95 删除）原来这里在 1/4 分辨率上算 gain，再由 apply 双线性上采样 ——
+  // 上采样的是"结论"而不是"系数"，边缘在 1/4 就被抹平 ⇒ 高对比边缘出现灰带/光晕。
+  // 现在直接进 ⑥：apply 上采样 a/b，用**全分辨率**的 I 算 q（guided upsample）。
+  // ⑥ 全分辨率应用（guided upsample + 分区曲线）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_teq_out_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_teq_apply_);
@@ -12749,10 +13156,11 @@ GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src) {
   glBindTexture(GL_TEXTURE_2D, src);
   glUniform1i(u_teq_apply_.tex, 0);
   glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_teq_gain_);
+  glBindTexture(GL_TEXTURE_2D, tex_teq_mean_);
   glUniform1i(u_teq_apply_.gain, 1);
   glUniform2f(glGetUniformLocation(prog_teq_apply_, "uGainSize"),
               static_cast<float>(tw), static_cast<float>(th));
+  glUniform1fv(glGetUniformLocation(prog_teq_apply_, "uCurve"), 9, teq_curve_);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -12798,7 +13206,8 @@ bool FrameRenderer::ensureSatFixTarget(int w, int h) {
 
 void FrameRenderer::passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int h,
                                    const float black_phase[4], float white_level,
-                                   float short_scale) {
+                                   float short_scale, GLuint sat_map, int sat_w,
+                                   int sat_h) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_ref_fix_);
   glViewport(0, 0, w, h);
   glUseProgram(prog_mfnr_satfix_);
@@ -12808,8 +13217,12 @@ void FrameRenderer::passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int 
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, short_tex);
   glUniform1i(u_mfnr_satfix_.shrt, 1);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, sat_map);
+  glUniform1i(u_mfnr_satfix_.satmap, 2);
   glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_mfnr_satfix_.size, w, h);
+  glUniform2i(u_mfnr_satfix_.satsize, sat_w, sat_h);
   glUniform4f(u_mfnr_satfix_.black, black_phase[0], black_phase[1],
               black_phase[2], black_phase[3]);
   glUniform1f(u_mfnr_satfix_.white, white_level);
@@ -13652,6 +14065,7 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   glUniform1f(u_hr_mask_feather_, feather);
   if (u_hr_mask_markon_ >= 0) {
     const bool mark_on = hr_fix_mark_ != 0;
+    dbg_hl_mark_on_ = mark_on ? 1 : 0;
     glUniform1i(u_hr_mask_markon_, mark_on ? 1 : 0);
     if (mark_on) {
       glActiveTexture(GL_TEXTURE1);
@@ -13832,7 +14246,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float ref_noise_scale, bool use_dft,
                                    bool align_l1, bool align_ab, bool p0_sub,
                                    bool nn_dn, float short_ratio,
-                                   std::vector<uint8_t>* out_rgba, bool ten_bit) {
+                                   float short_sat, std::vector<uint8_t>* out_rgba,
+                                   bool ten_bit) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
   // 卡 H2：同 submitStill / submitRaw —— 自检未通过就拒绝 10bit 交付（fail-closed）
@@ -13936,7 +14351,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   if (bracket_on) {
     if (!ensureSatFixTarget(w, h)) return false;
     passMfnrSatFix(raw_tex_, tex_mfnr_[2], w, h, black_phase, wl,
-                   frame_scale[3]);
+                   frame_scale[3], tex_pyr1_, pyr1_w_, pyr1_h_);
     ref_fuse_tex_ = tex_ref_fix_;
     // HR 条件重建：G=1 的像素（短帧救回的高光）跳过 HR，避免灰块
     hr_fix_mark_ = tex_ref_fix_;
@@ -14383,6 +14798,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.lsc_rows = lsc_rows;
   c.upload_ms = std::chrono::duration<float, std::milli>(tf - t0).count();
   c.mfnr_fused = true;
+  // v0.11.87：短帧裁切比例透传给 AE（bracket 关时 -1 ⇒ AE 退回旧判据）
+  c.short_sat = bracket_on ? short_sat : -1.0f;
+  c.bracket = bracket_on;
   c.nn = nn_dn;
   // 卡 H2：交付档（10bit HEIF）—— 同 submitRaw
   c.ten_bit = ten_bit;
@@ -14417,7 +14835,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"neff\":" + f3(neff) +
               ",\"rn\":" + f3(rn) +
               ",\"brk\":" + (bracket_on ? "1" : "0") +
-              ",\"brkRatio\":" + f3(frame_scale[0]) +
+              // v0.11.87：**修诊断字段错位** —— 旧式记的是 frame_scale[0]（参考帧恒 1.0），
+              // 连续四轮把"归一是否生效"看成"没生效"。短帧索引恒为 3（BRACKET_SHORT_IDX）。
+              ",\"brkRatio\":" + f3(frame_scale[3]) +
               ",\"motMed\":" + f3(mot_med) +
               ",\"resFade\":" + f3(res_fade) +
               ",\"nsSng\":" + f3(ns_single) +
@@ -14686,6 +15106,21 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
   // v0.11.63：自动曝光的高光判据 = P99.5（允许 0.5% 像素裁切，与 PC legacy matcher
   // 的 maximumClippedFraction=0.005 同口径）。P99.9 留给 filmic 白点上探，不改其语义。
   st.p_hi995 = to_lin(pct(0.995));
+  // v0.11.88：P95 = **大面积高光**的判据（见 SceneStats 注释）。同一张直方图，零成本。
+  st.p_hi95 = to_lin(pct(0.95));
+  // v0.11.91：几何平均（对数域直方图的加权平均再折回）—— 感知亮度的稳健代理。
+  // 空桶跳过（to_lin 在最低桶会给出 2^-12 的截断值，直接参与平均会把 geo 拉塌）。
+  {
+    double acc = 0.0;
+    long n = 0;
+    for (int i = 0; i < kN; ++i) {
+      if (hist[i] <= 0) continue;
+      acc += static_cast<double>(hist[i]) * std::log(static_cast<double>(to_lin(
+                 static_cast<float>(i) / static_cast<float>(kN - 1))));
+      n += hist[i];
+    }
+    st.p_geo = n > 0 ? static_cast<float>(std::exp(acc / static_cast<double>(n))) : 0.0f;
+  }
   // v0.10.28：p_max = **采样到的最高非空桶**（darktable autodetect 的 max 语义）。
   // 对数编码上限 2^8（= +8EV）后 max 不再被显示域 clamp 淹没——0.10.18 当时
   // 改用分位正是迫于此；现在分位保留（P99 驱动 black/基础判据），max 只驱动
@@ -14698,6 +15133,7 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
   }
   st.valid = true;
   last_lin_mid_ = st.p_mid;  // 诊断字段（raw.render / preview.filmic）
+  last_lin_geo_ = st.p_geo;  // v0.11.92：预览几何平均（成片 AE 的目标亮度）
   last_p_lo_ = st.p_lo;
   last_p_hi_ = st.p_hi;
   return st;
@@ -15302,6 +15738,11 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   } else {
     g_pv_mid_ema = g_pv_mid_ema > 1e-4f ? g_pv_mid_ema * 0.7f + last_lin_mid_ * 0.3f
                                         : last_lin_mid_;
+    if (last_lin_geo_ > 1e-5f) {
+      g_pv_geo_ema = g_pv_geo_ema > 1e-5f
+                         ? g_pv_geo_ema * 0.7f + last_lin_geo_ * 0.3f
+                         : last_lin_geo_;
+    }
   }
   // M4-7 局部色调映射：低频亮度图，与直方图同源（kFsLocal 的 8×8 盒式平均）。
   // 必须与 updateAutoGain 一样先于 fbo_work_ 绑定（renderLuma 会切 FBO/viewport）。

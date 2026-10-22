@@ -31,15 +31,21 @@ AeDecision decideAe(const AeInputs& in) {
   // ② 高光约束：P99.5 提亮后 ≤ 白点 − 余量（允许 0.5% 像素裁切）。写成 EV 差，与 ① 同单位。
   // v0.11.77（PC 口径）：裁切比例未超 0.5% ⇒ 高光不介入（ev_hl 视为无穷）；
   // 超了才按 P99.5 反解"把第 0.5% 亮像素压到白点"的 EV。
-  if (in.sat_frac > kAeMaxClippedFrac) {
+  if (in.force_hl || in.sat_frac > kAeMaxClippedFrac) {
     d.ev_hl = (in.white_ev - kAeHighlightHeadroomEv) -
               evOf(in.p_hi995, kAeMiddleGrey) - in.user_ev;
   } else {
     d.ev_hl = kAeNoHighlightLimitEv;
   }
+  // ③' v0.11.88 大面积高光软约束：P99.5 只管尾部 0.5%，P95 才管"画面有多少在接近白"。
+  //     取更严的那个 —— 天空/白墙由此被压回可分辨段（代价是中灰偏暗，由 teq 补）。
+  d.ev_hl_soft = (in.p_hi95 > 1e-9f)
+                     ? (in.soft_ev - evOf(in.p_hi95, kAeMiddleGrey) - in.user_ev)
+                     : kAeNoHighlightLimitEv;
   // ③ 高光优先：宁可画面偏暗，也不接受 RAW 已饱和的输入顶到显示白点。
-  d.ev = std::min(d.ev_mid, d.ev_hl);
-  d.why = (d.ev_hl < d.ev_mid) ? "highlight" : "mid";
+  const float hl = std::min(d.ev_hl, d.ev_hl_soft);
+  d.ev = std::min(d.ev_mid, hl);
+  d.why = (hl < d.ev_mid) ? "highlight" : "mid";
   // ④ 安全限幅：欠曝超过 4 EV 等于为 0.1% 像素牺牲全图（本项目 2026-10-03 教训）；
   //    提亮超过 2 EV 是在用 EV 拉噪声，应该交给多帧/降噪。
   const float clamped = std::clamp(d.ev, -kAeMaxUnderEv, kAeMaxOverEv);

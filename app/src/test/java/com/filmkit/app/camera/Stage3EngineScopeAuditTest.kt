@@ -324,6 +324,7 @@ class Stage3EngineScopeAuditTest {
             28 to "tone_strength", 20 to "sat_shadow", 21 to "sat_mid", 22 to "sat_high",
             36 to "local_tone", 35 to "auto_tone",
             37 to "filmic_black_ev", 38 to "filmic_white_ev",
+            41 to "hr_wavelet",   // v0.11.96：filmic 原生高光重建（恒等 = 默认 0）
         )
         val diverging = EngineScope.NEUTRALIZE.filter { (slot, v) ->
             val default = if (slot in 5..10) defaultOfArray3("shoulder") else defaultOf(fieldOf.getValue(slot))
@@ -352,12 +353,13 @@ class Stage3EngineScopeAuditTest {
             5 to 0.01f.toDouble(), 6 to 0.01f.toDouble(), 7 to 0.01f.toDouble(),   // latitude shoulder
             8 to 0.01f.toDouble(), 9 to 0.01f.toDouble(), 10 to 0.01f.toDouble(),  // latitude toe
             37 to (-7.65f).toDouble(), 38 to 4.56f.toDouble(),                     // 黑白点端点
+            41 to 0.0,                                  // filmic 原生高光重建（v0.11.96，恒等 = 默认 0）
         )
         assertEquals("NEUTRALIZE 表与 §8.1 B2 不一致（多/少/改了槽位）", b2.keys, EngineScope.NEUTRALIZE.keys)
         for ((slot, v) in b2) {
             assertEquals("[$slot] 恒等值与 §8.1 B2 不符", v, EngineScope.NEUTRALIZE[slot]!!, 0.0)
         }
-        assertEquals("表应为 14 槽（6 公共段 + 6 latitude + 2 黑白点）", 14, EngineScope.NEUTRALIZE.size)
+        assertEquals("表应为 15 槽（6 公共段 + 6 latitude + 2 黑白点 + 1 filmic 原生高光重建）", 15, EngineScope.NEUTRALIZE.size)
     }
 
     @Test

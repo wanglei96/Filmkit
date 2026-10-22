@@ -65,6 +65,19 @@ inline constexpr float kAeTargetMid = 0.45f;
 // 之内的高光必然有层次；亮度损失由局部影调（tone equalizer）的暗部 +0.3EV 补回。
 inline constexpr float kAeHighlightHeadroomEv = 0.1f;
 
+// v0.11.87：**有 bracket 信息时**的高光上限 = 显示域 ~243 LSB 的位置（4.8 EV）。
+// 为什么不再用 RAW 白点 2.438：融合后 >1.0 的高光是短帧带回来的**真实信息**，
+// 不是 RAW 裁切。把它压回白点等于把 bracket 的收益扔掉（真机 4641：aeP995 4.08EV，
+// 压 1.74EV ⇒ 中灰掉到 sRGB 60，室内全黑）。
+//
+// 为什么也不用到死白点 6.22：曲线在 6.22 前 1.5 EV 只有 ~10 LSB（阶段 2 报告 §4.2：
+// 5.0EV→247.35、6.0EV→251.52），推到那里等于"有值但看不出层次"。4.8 EV ≈ 243 LSB
+// 是"还能分辨"的上限，与 kAeMaxClippedFrac=0.5% 的裁切口径配套。
+//
+// 用法（FrameRenderer::passAutoExposure）：仅当 bracket 短帧的裁切比例 < 0.5% 时
+// 才允许放宽到这个值；短帧也饱和（信息真的没了）时退回 kAeRawWhiteEv。
+inline constexpr float kAeDisplayClipEv = 4.8f;
+
 // 允许裁切的像素比例（PhotonCamera `maximumClippedFraction`，同值 0.005）。
 inline constexpr float kAeMaxClippedFrac = 0.005f;
 // 未超裁切阈值时的高光约束 = 无穷（不介入）。
@@ -89,6 +102,14 @@ struct AeInputs {
   // `maximumClippedFraction = 0.005` 判据的**量本身** —— 未超阈值时不压高光，
   // 哪怕分位很亮（此前用 P99.5 亮度当代理，会把"0.1% 像素很亮"误判成裁切）。
   float sat_frac = 0.0f;
+  // v0.11.88：**强制启用高光约束**。旧逻辑"裁切比例 ≤0.5% ⇒ 不约束"在 bracket 下是
+  // 灾难：真裁切 0 ⇒ 高光判据整个关掉 ⇒ 提亮到限幅、白墙/窗外撞白（真机 2712：
+  // aeEv +2.0、hi240 3.97%）。裁切比例只该决定"白点用哪个"，不该决定"要不要约束"。
+  bool force_hl = false;
+  // v0.11.88：**大面积高光软约束**。P95 提亮后不得越过 soft_ev（230 LSB 附近）——
+  // 管的是"天空/白墙占画面 30-40%"这类 P99.5 看不见的过亮（真机 2815 天空灰白）。
+  float p_hi95 = 0.0f;
+  float soft_ev = 4.0f;
   // 目标中灰（线性）。darktable MIDDLE_GREY = 0.1845 是"中性正确"的锚；
   // PhotonCamera 实测同场景中灰 ≈ 0.5（sRGB 188/255）—— 它匹配取景器，取景器更亮。
   // 2026-10-21：默认对齐 PC（0.45），用户仍可用设置页"亮度偏好"调回标准。
@@ -100,6 +121,7 @@ struct AeInputs {
 struct AeDecision {
   float ev_mid = 0.0f;      // 中灰锚定要求的 EV（已扣 user_ev）
   float ev_hl = 0.0f;       // 高光约束允许的 EV（已扣 user_ev）
+  float ev_hl_soft = 0.0f;  // v0.11.88：大面积高光（P95）允许的 EV
   float ev = 0.0f;          // 最终采用（clamp 后）
   const char* why = "none"; // none / invalid / mid / highlight
   bool active() const { return why[0] != 'n' && why[0] != 'i'; }

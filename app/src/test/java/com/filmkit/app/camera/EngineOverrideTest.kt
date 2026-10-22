@@ -47,6 +47,7 @@ class EngineOverrideTest {
         5 to 0.6, 6 to 0.6, 7 to 0.6, 8 to 0.6, 9 to 0.6, 10 to 0.6,   // 恒等 0.01
         37 to -3.0,   // 恒等 -7.65
         38 to 2.0,    // 恒等 4.56
+        41 to 1.0,    // 恒等 0.0（v0.11.96：filmic 原生高光重建）
     )
 
     /** 阶段 2 基线（[CameraPresets.standard] = 全恒等）+ 指定的预设引擎槽位。 */

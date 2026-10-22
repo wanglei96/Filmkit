@@ -215,7 +215,8 @@ class EngineSlotUiTest {
         //（真源表本就含 40），只是设置页当初漏了 gate ⇒ 引擎 1 下"显示但完全无效"：
         // `uGamut` 只被 filmic 段消费，引擎 1 的 program 里没有它 ⇒ location = −1 ⇒ 下发落空。
         // 用户实测"剩余开关全关了没影响"抓到的正是它。
-        assertEquals(listOf(28, 20, 37, 38, 36, 40), gated)
+        // v0.11.96：+ [41] hr_wavelet（filmic 原生高光重建，引擎 1 下参数被归零）
+        assertEquals(listOf(28, 20, 37, 38, 36, 40, 41), gated)
         // ⚠「基准曝光」[0] 必须**不在** gate 里（通用能力，架构师定案 §8.1 的"保留"一条）：
         // 上面那条"恰好六项"就是它的机器判据（多挂一项就红），这里再钉一次槽位号不在列表里
         assertFalse("基准曝光 [0] 不许被 gate", 0 in gated)
@@ -293,7 +294,11 @@ class EngineSlotUiTest {
                 presetDetailRowOf(ENGINE_SLOT, slot.toDouble()).value,
                 EngineSlotParam.format(EngineSlotParam.read(film)),
             )
-            assertTrue(EngineSlotParam.format(slot.toFloat()).startsWith("引擎 "))
+            // v0.11.96：读数直接是引擎名（filmic / sigmoid），不再写"引擎 N"
+            assertEquals(
+                EngineScope.engineName(slot),
+                EngineSlotParam.format(slot.toFloat()),
+            )
         }
         assertEquals("引擎插槽", EngineSlotParam.label)
         assertEquals(98, ENGINE_SLOT)

@@ -262,7 +262,7 @@ class FrameRenderer {
                       const float* noise_model, float noise_sigma,
                       float ref_noise_scale, bool use_dft, bool align_l1,
                       bool align_ab, bool p0_sub, bool nn_dn,
-                      float short_ratio,
+                      float short_ratio, float short_sat,
                       std::vector<uint8_t>* out_rgba, bool ten_bit = false);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
@@ -350,7 +350,7 @@ class FrameRenderer {
   bool ensureSatFixTarget(int w, int h);
   void passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int h,
                       const float black_phase[4], float white_level,
-                      float short_scale);
+                      float short_scale, GLuint sat_map, int sat_w, int sat_h);
   bool ensureMfnrFftTargets(int w, int h);
   // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
   // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
@@ -390,6 +390,12 @@ class FrameRenderer {
     int lsc_cols = 0, lsc_rows = 0;
     float upload_ms = 0.f;  // t0 → 传参时刻（MFNR 时含上传+对齐+融合）
     bool mfnr_fused = false;
+    // v0.11.87：bracket 短帧的裁切比例（采集端 bracket.short sat 透传）。
+    // ≥0 = 有 bracket 信息，AE 用它替代"融合后 ≥0.98 白点"的假裁切判据；<0 = 非 bracket。
+    float short_sat = -1.f;
+    // v0.12.0：bracket 是否真的跑了（不看 short_sat 的符号 —— 真机出现
+    // "short_sat=0 但 HL 仍在跑"的矛盾，怀疑符号被非 bracket 路径复用）。
+    bool bracket = false;
     // MFNR 等效帧数（噪声方差折减 ÷neff）。NN 输入增益要按**实际输入**的噪声
     // 标定：融合路径喂的是 tex_fused_（方差已折减），与 P0/P4 系数同口径。
     float neff = 1.f;
@@ -567,9 +573,13 @@ class FrameRenderer {
   // rbrecon（v0.10.179）：clip 过渡带 R/B 满阱比例反推支的总开关，来自 FilmParams[57]
   //   hl_rb_recon。1 = 启用（替换语义，见 kFsHlApply 新分支注释）；0 = 默认，旧行为
   //   逐位不变。
+  // fix_mark（v0.12.8）：采集侧 sat-fix 输出（R16UI，G 通道 = 三态信息标记）。
+  // 作为**重建判据**：>= 1（有真值）⇒ 原样输出；0（两帧都饱和）⇒ opposed 重建。
+  // 0 = 未绑 ⇒ uMarkOn = 0，逐位回到改动前行为。
   HlRawResult passHighlightRaw(int w, int h, int cfa, const float gains[3],
                                GLuint src, GLuint stat_src, int stat_raw,
-                               int mono_src = 0, int grecon = 1, int rbrecon = 0);
+                               int mono_src = 0, int grecon = 1, int rbrecon = 0,
+                               GLuint fix_mark = 0);
   // M4-7 局部低频图：尺寸变化时重建（RGBA8 + LINEAR）。返回是否可用。
   bool ensureLocalTarget(int w, int h);
   // v0.10.93 预览降载：降档输出的 RGBA8 中间目标（LINEAR，供 blit 升采）。
@@ -603,6 +613,15 @@ class FrameRenderer {
     // legacy matcher 的 `maximumClippedFraction = 0.005`（raw_legacy_auto_exposure_solver）
     // 同口径；用 P99.9 会为 0.1% 的像素压全图 ~2EV（真机 2026-10-20 实测）。
     float p_hi995 = 0.0f;
+    // v0.11.88：P95 —— **大面积高光**的判据。P99.5 只看尾部 0.5%，对"天空/白墙占
+    // 画面 30-40%"的场景失明（真机 2815：P99.5 2.44EV、提亮 2EV 后天空 237 LSB 灰白，
+    // 而 hi240 只有 0.22% —— 它根本没进 P99.5）。P95 才是"有多少画面在接近白"。
+    float p_hi95 = 0.0f;
+    // v0.11.91：**几何平均**（exp(mean(log))）—— 感知亮度的比中位数更稳的代理。
+    // P50 只说"一半像素比它暗"，对"室内白墙 + 窗外亮"的构图会严重偏低（真机 2147：
+    // P50 0.1076 → 锚到 0.45 要 +2.0EV → mean 184、hi240 2.67%）。几何平均被亮部
+    // 拉高，同一构图的 ev 会小 0.6~0.9EV。直方图已有，零额外成本。
+    float p_geo = 0.0f;
     // v0.10.28：采样 max（最高非空桶，darktable autodetect 的 max 语义）——
     // 白点上探的主驱动量：小面积近饱和高光（白壶身镜面，占比 0.001% 级）
     // 任何分位都看不见，见 162012 真机定案。
@@ -920,8 +939,21 @@ class FrameRenderer {
          fbo_teq_out_ = 0;
   int teq_w_ = 0, teq_h_ = 0;
   float dbg_teq_ms_ = 0.0f;   // 局部影调耗时（诊断）
+  // v0.11.87：分区曲线从编译期常量改为成员 —— 由本张 AE 的"高光 ↔ 中灰"缺口算出来。
+  // 默认 = 原 darktable "compress shadows/highlights" 预设口径（关 AE 也逐位不变）。
+  float teq_curve_[9] = {0.30f, 0.28f, 0.24f, 0.18f, 0.12f,
+                         0.06f, 0.02f, -0.35f, -0.60f};
+  float dbg_teq_hl_ = 0.0f, dbg_teq_sh_ = 0.0f;   // 本张曲线的高光/暗部幅度（诊断）
+  // 由 AE 结果设定曲线：gap = ev_mid − ev（AE 为保高光放弃的中灰 EV）。
+  // hl_dominant = "大面积高光主导"（P95 软约束比 P99.5 硬约束更严）：此时高光段要
+  // 压得更深（天空/白墙占画面 1/3 的场景，−1.1EV 压不出蓝色，见 v0.11.89）。
+  // p95_rel_white（v0.12.19）：AE 后 P95 相对**白点**的 EV（白点 = log2(1/0.1845)=2.44）。
+  // hl_dominant 时压深 = -(p95_rel_white + 0.6)，把 P95 拉回白点下方 0.6 EV。
+  void setTeqCurveFromAe(float gap_ev, bool hl_dominant, float p95_rel_white = 0.0f);
   bool ensureTeqTargets(int w, int h);
-  GLuint applyToneEq(int w, int h, GLuint src);
+  // hl_dominant（v0.12.17）：true ⇒ 本题有大面积高光要压，wTop 让路（全压）；
+  // false ⇒ wTop 保护局部亮点（镜面反光不该被压成灰）。预览/编辑器恒用默认 false。
+  GLuint applyToneEq(int w, int h, GLuint src, bool hl_dominant = false);
   int sat_fix_w_ = 0, sat_fix_h_ = 0;
   // 本张融合用的参考帧纹理（默认 raw_tex_；bracket 时 = tex_ref_fix_）
   GLuint ref_fuse_tex_ = 0;
@@ -1063,6 +1095,7 @@ class FrameRenderer {
   // RAW 域高光重建（darktable highlights）生效性：照 p0s/nnOk 的教训，必须由
   // finishStillChain 在日志组装前读取。
   int dbg_hl_ok_ = 0;        // 1 = 执行成功（下游改用 tex_hl_）；0 = 未启用/失败
+  int dbg_hl_mark_on_ = 0;   // v0.11.87：HR 条件重建的标记是否真绑上（0 = 没生效）
   float dbg_hl_cnt_ = 0.f;   // 色度统计样本数（G 通道；darktable 的 100 样本闸）
   float dbg_hl_chroma_[3] = {0.f, 0.f, 0.f};  // 色度校正量
   double dbg_hl_sum_[3] = {0.0, 0.0, 0.0};    // Σ(实测−对立外推)，chroma 的分子
@@ -1229,6 +1262,7 @@ class FrameRenderer {
   // 排查"预览过曝 vs 成片正常"：预览统计 OES 预览流(passOES)、静拍统计 RAW/YUV 链，
   // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
   float last_lin_mid_ = 0.0f;   // 场景中位（线性）
+  float last_lin_geo_ = 0.0f;   // 场景几何平均（v0.11.92：取景器目标亮度的来源）
   float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
   // v0.10.27：白点判据的诊断量（EV，相对中灰）——w99/w999 = P99/P99.9 的 raw 判据值，
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。
@@ -1244,10 +1278,18 @@ class FrameRenderer {
   float ae_p50_ = 0.0f;       // 本张 P50（线性，max 通道）
   float ae_p999_ = 0.0f;      // 本张 P99.9（线性；**诊断用**，判据是 P99.5）
   float ae_p995_ = 0.0f;      // 本张 P99.5（线性；高光判据 —— 允许 0.5% 像素裁切）
+  float ae_p95_ = 0.0f;       // 本张 P95（线性；v0.11.88 大面积高光软约束）
+  float ae_p_geo_ = 0.0f;     // 本张几何平均（v0.11.91 中灰锚点）
+  float ae_target_mid_ = 0.0f;  // 本张目标亮度（v0.11.92 = 取景器几何平均）
   int ae_why_ = 0;            // 0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid
-  float ae_sat_frac_ = 0.0f;  // v0.11.77：中央 2/3 区域的 RAW 裁切像素比例
+  float ae_sat_frac_ = 0.0f;  // 高光判据用的裁切比例（bracket 时 = 短帧实测值）
+  float ae_white_ev_ = 0.0f;  // 本张实际用的高光上限（诊断：2.438 / 4.8）
+  float ae_brk_sat_ = -1.0f;  // 采集端短帧裁切比例；<0 = 非 bracket（诊断）
+  float ae_sat_raw_ = 0.0f;   // 融合后 >=0.98 白点的占比（诊断：判断"大面积高光"）
+  float ae_hl_soft_ev_ = 0.0f; // P95 软约束允许的 EV（诊断）
   // 本张统计 + 决策。返回要**额外**加到 exposure_ev 上的 EV（0 = 不介入）。
-  float passAutoExposure(GLuint src, const FilmParams& p);
+  // short_sat：bracket 短帧的裁切比例（≥0 = 有 bracket 信息；<0 = 非 bracket）。
+  float passAutoExposure(GLuint src, const FilmParams& p, float short_sat = -1.0f);
   // 预览域映射（v0.8.0）：HAL OES 域与 RAW 链域的线性中位比，在线估计。
   // pv_mid_ema_ = 预览统计中位的 EMA；静拍时 ratio_new = pv_mid_ema_ / RAW 中位，
   // domain_ratio_ 对其 EMA（clamp 1.2–4.5，v0.6.48 实测范围 1.70–3.87）。
@@ -1363,13 +1405,16 @@ class FrameRenderer {
   } u_mfnr_mis_;
   struct {
     GLint ref = -1, shrt = -1, size = -1, black = -1, white = -1, scale = -1;
+    GLint satmap = -1, satsize = -1;   // v0.11.99：邻域饱和面积（1/2 灰度图）
   } u_mfnr_satfix_;
   // 局部影调（tone equalizer）
   struct { GLint tex = -1, src_texel = -1; } u_teq_down_;
   struct { GLint tex = -1, texel = -1, dir = -1, radius = -1; } u_teq_box_;
   struct { GLint mean = -1, eps = -1; } u_teq_coef_;
   struct { GLint i = -1, ab = -1; } u_teq_gain_;
-  struct { GLint tex = -1, gain = -1; } u_teq_apply_;
+  // v0.12.17：hldom = "本题大面积高光主导"（与 teq 曲线的 -2.2 档同一判据），
+  // 供 kFsTeqApply 决定 wTop 是否让路。
+  struct { GLint tex = -1, gain = -1, hldom = -1; } u_teq_apply_;
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1, mix = -1, moire = -1, moire_k = -1, cg_k = -1,
@@ -1454,7 +1499,9 @@ class FrameRenderer {
     // v0.10.161 —— 与满阱解耦，理由见 passHighlightRaw 的域核实注释）
     GLint mos = -1, stat = -1, statraw = -1, mono = -1, size = -1, cfalut = -1,
           clips = -1, hlclip = -1, chroma = -1, ref = -1, grecon = -1, gcap = -1,
-          rbrecon = -1, refglobal = -1, refsize = -1, ref2 = -1, ref2size = -1;
+          rbrecon = -1, refglobal = -1, refsize = -1, ref2 = -1, ref2size = -1,
+          // v0.12.8：三态信息标记（重建判据）
+          fixmark = -1, markon = -1;
   } u_hl_apply_;
   struct {
     // v0.10.167：mono = 源布局（本 pass 仍读 uMos；前置后 uMos 即 P0 前的 mosaic）

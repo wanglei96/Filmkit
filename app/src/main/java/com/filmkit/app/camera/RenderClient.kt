@@ -361,6 +361,7 @@ class RenderClient {
         p0Sub: Boolean,
         nnDn: Boolean,
         shortRatio: Float = 1f,
+        shortSat: Float = -1f,
         tenBit: Boolean = false,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
@@ -385,7 +386,8 @@ class RenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
-                    nnDn, shortRatio = shortRatio, film = film, tenBit = tenBit,
+                    nnDn, shortRatio = shortRatio, shortSat = shortSat,
+                    film = film, tenBit = tenBit,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

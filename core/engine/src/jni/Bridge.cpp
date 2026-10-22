@@ -814,7 +814,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
     jboolean align_ab, jboolean p0_sub, jboolean nn_dn, jfloat short_ratio,
-    jdoubleArray film, jboolean use_still, jboolean ten_bit) {
+    jfloat short_sat, jdoubleArray film, jboolean use_still, jboolean ten_bit) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -884,7 +884,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
       lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale,
       use_dft == JNI_TRUE, align_l1 == JNI_TRUE, align_ab == JNI_TRUE,
-      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, short_ratio, &rgba,
+      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, short_ratio, short_sat, &rgba,
       ten_bit == JNI_TRUE);
   // 每次 burst 落一条路径/耗时/结果记录（v0.10.85 审查 P2）：raw.render 不区分实例，
   // 靠这条把"哪条路、第几张、多久、成没成"钉住；失败也必须留痕。

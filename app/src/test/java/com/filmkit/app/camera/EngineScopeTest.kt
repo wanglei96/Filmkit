@@ -46,7 +46,7 @@ class EngineScopeTest {
      * **逐槽硬编码**：表被误删一行 / 误加一行同样是静默漂移，必须让测试红。
      */
     private val expectedNeutralized: Set<Int> =
-        setOf(28, 20, 21, 22, 36, 35, 5, 6, 7, 8, 9, 10, 37, 38)
+        setOf(28, 20, 21, 22, 36, 41, 35, 5, 6, 7, 8, 9, 10, 37, 38)
 
     /**
      * 判据 3 的"通用槽位"（引擎 1 下必须**保留用户值**）：曝光 / 外观层 / 单色 / 影调分区。
@@ -183,18 +183,18 @@ class EngineScopeTest {
         // 全表对拍：**逐槽硬编码**的预期集合（不是拿 NEUTRALIZE 自证）—— 表被误删/误加
         // 一行同样是静默漂移，本用例负责把它变成红。
         assertEquals(
-            "NEUTRALIZE 的槽位集合必须逐槽等于阶段 3 定案" +
-                "（14 槽：28/20/21/22/36/35 + 5..10 + 37/38）",
+            "NEUTRALIZE 的槽位集合必须逐槽等于定案" +
+                "（15 槽：28/20/21/22/36/41/35 + 5..10 + 37/38）",
             expectedNeutralized, EngineScope.NEUTRALIZE.keys,
         )
-        assertEquals("阶段 3 定案 = 14 槽", 14, EngineScope.NEUTRALIZE.size)
+        assertEquals("阶段 3 定案 = 15 槽（v0.11.96 增 [41]）", 15, EngineScope.NEUTRALIZE.size)
 
         val p = baseline(1)
         for (s in expectedNeutralized) p[s] = 777.0
-        // 表外的相邻槽一并写成非恒等值：归零不得外溢（[34]/[39]/[41] 是 LUT/斑马纹/HR 的手动开关）
+        // 表外的相邻槽一并写成非恒等值：归零不得外溢（[34]/[39] 是 LUT/斑马纹的手动开关）
+        // v0.11.96：[41] 已进表（filmic 原生高光重建），不再是"表外"槽。
         p[34] = 777.0
         p[39] = 777.0
-        p[41] = 777.0
 
         val out = engineScoped(p)
 
@@ -202,7 +202,7 @@ class EngineScopeTest {
             assertTrue("探针 777.0 恰好等于 [$slot] 的恒等值 ⇒ 本用例对该槽假绿", 777.0 != v)
             assertEquals("[$slot] 必须等于 NEUTRALIZE 表里的恒等值", v, out[slot], 0.0)
         }
-        for (s in intArrayOf(34, 39, 41)) {
+        for (s in intArrayOf(34, 39)) {
             assertEquals("[$s] 不在表内 ⇒ 不得被归零（归零外溢 = 误旁路）", 777.0, out[s], 0.0)
         }
     }

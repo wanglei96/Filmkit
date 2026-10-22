@@ -192,7 +192,7 @@ object EngineBridge {
         noiseStrength: Float, noiseModel: FloatArray?, noiseSigma: Float,
         refNoiseScale: Float, useDft: Boolean, alignL1: Boolean,
         alignAb: Boolean, p0Sub: Boolean, nnDn: Boolean,
-        shortRatio: Float = 1f, film: DoubleArray,
+        shortRatio: Float = 1f, shortSat: Float = -1f, film: DoubleArray,
         useStill: Boolean = false,
         tenBit: Boolean = false,
     ): ByteArray?

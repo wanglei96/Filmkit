@@ -178,7 +178,7 @@ class EngineOverrideUiTest {
         // + `[40]` 色域映射（它本就在 `EngineScope.FILMIC_OWNED_SLOTS` 里，属设置页漏挂 ⇒
         // 引擎 1 下显示却完全无效；补挂见 EngineSlotUiTest 的同名判据）。
         assertEquals(
-            listOf(28, 20, 37, 38, 36, 40),
+            listOf(28, 20, 37, 38, 36, 40, 41),
             Regex("""slotActiveInEngine\((\d+),""").findAll(settings).map { it.groupValues[1].toInt() }.toList(),
         )
     }

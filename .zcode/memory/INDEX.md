@@ -9,9 +9,10 @@ status: active
 
 > 本文件是记忆库唯一入口,≤80 行。只放指针与状态,细节在分层文件与快照里。
 
-## 活跃任务（2026-10-20）
+## 活跃任务（2026-10-22）
 
-- [2026-10-20] **bracket 采集 + 饱和感知融合** | 设计已定,待实施 | 1 短 3 长、短帧帧 0 作参考、k=2；两条融合路径都要改。用户已拍板方向，下一窗口从第 1 步开始 | docs/engine-bracket-design.md · 快照「自动曝光落地与bracket设计」
+- [2026-10-22] **高光链路：天空复验** | 待晴天 | 0.12.14 把 `allSat` 亮度锚改成实测 luma（灰块已由用户确认"彻底解决"），但天空同属"大面积饱和"，需确认没被带偏。判据：天空蓝 + `hlGRecon 1` + `teqHl -2.2` + `hi240 ≤ 0.5%` | docs/reports/highlight-chain-CHECKLIST.md
+- [2026-10-20] **bracket 采集 + 饱和感知融合** | **已落地**（1 短 3 长、动态 k、sat-fix 三态标记）| 遗留：短帧也饱和区的色度仍靠 sat-fix 插值 | docs/engine-bracket-design.md · 快照「自动曝光落地与bracket设计」
 - [2026-10-20] **HDR 剩余真机验证** | 待用户执行 | ① HEIC + HDR（8bit 降位）② JPEG 4:2:0 + HDR ③ 导出 SDR 版 ④ gainmap 数学 PC/官方双档 | docs/reports/hdr-acceptance-CHECKLIST.md
 - [2026-10-19] **HEIC UI 决策** | 待拍板 | 用户明确不喜欢 HEIC（4:2:0 色度差、亮度优势不明显、细节差）；默认已是 JPEG。待定：加提示（推荐）或移除选项 | 快照「HDR成片交付链落地与App内HDR显示」
 - [2026-10-19] **待重标 5 项（除预设）** | 待重估 | 分离色调/黑白 `[23][24][25]`、分区饱和度 `[20..22]`、光晕 `[62..65]`、场景统计/自动 EV `kFsHist`、局部色调映射 `kFsLocal` | docs/reports/phaseB-old-domain-baseline-ARCHIVE.md §7

@@ -241,18 +241,21 @@ struct FilmParams {
   // 把 σ 放大 (1+moire·k) 倍（倍率式），不可按数值对标。
   // cap 恒 4·sc ⇒ [48] ≤ 3 时封顶永不触发（σ 放大 ≤ 1+[48]）。
   float moire = 2.0f;          // 48
-  // 49：G 通道重建（RAW 域高光重建 kFsHlApply 内"自创机制"两支的总开关，v0.10.169）。
-  // 1 = 开 = **现有行为逐位不变**（含 G 三级池化比 + allSat 三通道同步改写两支）；
-  // 0 = 关 ⇒ shader 内 `if (uGRecon > 0.5)` 整段跳过，apply 支只剩分支①
-  //（darktable opposed 外推 `max(v, refavg+chroma)`），即回到 PhotonCamera
-  // OpposedGL 口径。
-  // 依据（离线逐位仿真 + 与 PhotonCamera 逐行对照审计）：高光区 B/G 1.0856 →
-  // 1.0217、R/G 0.9773 → 1.0051；这两支自创机制贡献"过曝边缘品红"B/G 偏差的 71%
-  //（G 三级池化比 +0.0384 / allSat 改写 +0.0255，chroma 强制 0 反向抵消 −0.0218）。
-  // 反证（勿轻改）：① allSat 改"只抬不压"离线最差（全图 R−G +0.00381 更红）；
-  // ② 单独恢复 chroma 无效（被 allSat 支屏蔽）；③ 普通 G 支改 max 过冲 3×。
-  // ⚠ 风险：allSat 在本片占 G 饱和像素 44.15%，台灯类场景可能退化 ⇒
-  // **默认必须保持 1.0（不改变默认画质）**，仅作真机同帧 A/B 开关。prefs("hl_grecon")。
+  // 49：高光重建**算法选择**（RAW 域高光重建 kFsHlApply，v0.10.169 引入，v0.12.4 转正）。
+  // 0 = **darktable 原版档（默认）**：`hlreconstruct/opposed.c` 口径
+  //     `output = MAX(inval, refavg + chrominance)` —— **只抬不压**，色比失衡由
+  //     加性 chrominance 补偿（v0.12.4 起 uGRecon=0 时 chroma 补偿真正下发，
+  //     此前它恒为 0 = 只抬 G、欠补偿）。
+  // 1 = **自创档**：G 三级池化比 + allSat 三通道同步改写（0.12.3 及以前的行为）。
+  // v0.12.4 改默认为 0 的依据（一手源码 + 真机量化）：
+  //   · 自创 allSat 是**唯一会压低已有值的支路**（opposed 的 MAX 语义不会），它用
+  //     **满阱 luma** 当亮度锚、按参考比替换三通道 ⇒ 把 sat-fix 救回的真值（可达 4.0）
+  //     压回满阱（≈1.27），并把高光核色度抹平；
+  //   · 真机 164553 量化：光带亮核 chroma 2.17%（Y 237）vs 紧邻外圈 18.83%（Y 215）
+  //     —— 同一束光亮度只差 10%、色度差 8.7 倍，物理上不可能，是算法去色。
+  // 旧结论（v0.10.124）"chroma 必须为 0"的前提是**输入经 MFNR+P0 平滑**（refavg 偏负）；
+  // bracket 下 sat-fix 改了输入域，该前提不再成立，故本档位重新启用补偿。
+  // 设置页开关写 prefs("hl_grecon")；日志 raw.render.hlGRecon = 实际下发值。
   float hl_grecon = 1.0f;      // 49
   // 50：镜头横向色差校正（lateral CA，v0.10.170）。作用在 **D3（RCD 去马赛克后 /
   // passCcm 前）** 的相机 RGB 域：色差是纯几何位移，此域通道尚未被色彩矩阵混合，

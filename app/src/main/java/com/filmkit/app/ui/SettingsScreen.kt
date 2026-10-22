@@ -640,7 +640,8 @@ private fun ToneColorDrawerContent() {
     SettingValueRow(
         title = "引擎插槽",
         subtitle = "跟随预设 = 每条预设用自己存的引擎（在「完整参数」页改）；强制 = 全局覆盖，" +
-            "只作用于拍照链路（编辑器仍按照片拍摄时的引擎）。引擎 0 = filmic，引擎 1 = sigmoid",
+            "只作用于拍照链路（编辑器仍按照片拍摄时的引擎）。filmic（胶片曲线）与 sigmoid" +
+            "（暗table 对数逻辑）是两条不同的影调曲线",
         valueText = engineOverrideLabel(engineOverride),
         onTap = {
             val v = nextEngineOverride(engineOverride)
@@ -807,8 +808,10 @@ private fun ToneColorDrawerContent() {
     // mask/inpaint/两轮重建全链），治部分通道裁剪高光的品红残留。关 = A/B。
     // v0.10.162：默认关（与 CameraController.applyHrWaveletPref 的 prefs 默认值
     // 必须一致，否则 UI 显示"开"而引擎实际"关"）。
+    // v0.11.96：本项是 **filmic 原生**模块（白点判据吃 filmic 的 ev_white_），
+    // 引擎 != 0 时参数被 EngineScope 归零 ⇒ 留在界面上就是"拖了没反应"的假控件。
     var hrWaveletOn by remember { mutableStateOf(prefs.getBoolean("hr_wavelet", false)) }
-    SettingSwitchRow(
+    if (slotActiveInEngine(41, engineSlot)) SettingSwitchRow(
         title = "高光重建·小波",
         subtitle = "darktable filmic 原生高光重建（à trous 小波，全分辨率），治过曝边缘品红残留；默认关（v0.10.162，与 RAW 域高光重建职责重叠）；开 = A/B 对照",
         checked = hrWaveletOn,
@@ -843,8 +846,13 @@ private fun ToneColorDrawerContent() {
     // RAW 域高光重建（v0.10.115）：darktable highlights 模块 "inpaint opposed"
     // —— 去马赛克**前**在 3×3 photosite 块上对被裁剪通道做对立外推 + 全图
     // 色度校正。补"小波"够不到的一环（film 域修不了 RAW 饱和丢掉的通道信息）。
+    // v0.11.96（用户 2026-10-21）：bracket 默认开时，这两项**已经不参与成像** ——
+    // 成片链在入口按"短帧有没有真丢信息"判据直接置 0（FrameRenderer::finishStillChain），
+    // 高光由短帧的真实值接管。留在界面上只会让人以为"关掉它能改变画面"。
+    // 判据与采集侧同一个 prefs 键（"bracket"，默认 true）。
+    val bracketOn = remember { prefs.getBoolean("bracket", true) }
     var hrRawOn by remember { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
-    SettingSwitchRow(
+    if (!bracketOn) SettingSwitchRow(
         title = "高光重建·RAW 域",
         subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
         checked = hrRawOn,
@@ -857,14 +865,17 @@ private fun ToneColorDrawerContent() {
             )
         },
     )
-    // 高光重建·G 通道重建（v0.10.169）：RAW 域高光重建 apply 支里**自创机制**两支
-    // （普通 G 的三级池化比 + allSat 三通道同步改写）的总开关。默认开 = 现有行为；
-    // 关 = apply 只留分支① 的 darktable opposed 外推（= PhotonCamera OpposedGL 口径）。
-    // 仅供真机同光线同场景 A/B：日志 raw.render.hlGRecon 应显示 1 / 0。
+    // 高光重建算法（v0.10.169 引入，v0.12.4 转正为**算法选择**）：RAW 域高光重建
+    // apply 支走哪条路。默认 = darktable 原版（opposed.c 的 `MAX(inval, refavg+chroma)`，
+    // **只抬不压** + 加性 chroma 补偿）；开 = 自创档（allSat 三通道替换，用满阱 luma
+    // 当锚，0.12.3 及以前的行为）。
+    // v0.12.4 起**不再随 bracket 隐藏**：这正是 bracket 场景下要 A/B 的开关（灰斑来自
+    // 自创档压低 sat-fix 真值 + 去色，与 bracket 本身无关）。
+    // 日志 raw.render.hlGRecon 显示 1（自创）/ 0（原版）。
     var hlGReconOn by remember { mutableStateOf(prefs.getBoolean("hl_grecon", true)) }
     SettingSwitchRow(
-        title = "高光重建·G 通道重建",
-        subtitle = "开 = 当前默认（含自创的 G 池化比，过曝边缘品红较多）；关 = 更接近标准 opposed 口径，离线实测高光区 B/G 从 1.086 降到 1.022，但台灯类场景可能退化，请同场景 A/B",
+        title = "高光重建·自创 allSat 档",
+        subtitle = "关（默认）= darktable 原版 opposed：只抬不压 + 加性色度补偿；开 = 自创档（按参考比替换三通道、用满阱亮度当锚），过曝高光会被压暗并去色。同场景 A/B 看高光带是否还有灰斑",
         checked = hlGReconOn,
         onChecked = { v ->
             hlGReconOn = v

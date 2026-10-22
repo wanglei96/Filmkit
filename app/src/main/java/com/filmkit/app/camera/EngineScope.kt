@@ -53,7 +53,21 @@ internal object EngineScope {
         35,
         37, 38,
         40,
+        // [41] hr_wavelet（v0.11.96）：darktable **filmic 原生**的高光重建（à trous 小波），
+        // 白点判据直接吃 filmic 的 `ev_white_`。sigmoid 下这条曲线不存在，跑它等于用
+        // filmic 的白点去裁 sigmoid 的输入 —— 技术上"能跑"但语义错。归零 + UI 隐藏。
+        41,
     )
+
+    /**
+     * 引擎的**显示名**（用户 2026-10-21 要求：UI 不写"引擎 0 / 引擎 1"，直接写引擎名）。
+     * 单一真源 —— 预设详情、设置页三档控件、各处提示都读它，不许各自写一份字面量。
+     */
+    fun engineName(slot: Int): String = when (slot) {
+        0 -> "filmic"
+        1 -> "sigmoid"
+        else -> "engine$slot"
+    }
 
     /** 引擎 1（sigmoid）独占的槽位：阶段 3 **无 UI 参数**（固定默认 `contrast=1.2`）⇒ 空。 */
     val SIGMOID_OWNED_SLOTS: Set<Int> = emptySet()
@@ -104,6 +118,9 @@ internal object EngineScope {
         put(22, 1.0)
         // [36] local_tone → uLocalStrength（FrameRenderer.cpp:4096 "0 = 关（A/B 通路）"）
         put(36, 0.0)
+        // [41] hr_wavelet（v0.11.96）：filmic 原生高光重建，白点吃 filmic 的 ev_white_。
+        // 恒等 = 0（关），与 FilmParams 默认一致。
+        put(41, 0.0)
         // [35] auto_tone —— **卡 A 2026-10-14 审计抓到的漏径**：它不靠 uniform 生效，靠
         //      **成员变量副作用**：updateFilmicEV 在 passFilm 里**无条件调用**（:14014，
         //      只有 program 重建在 if 分支里）⇒ 引擎 1 下 uniform 落 −1 但

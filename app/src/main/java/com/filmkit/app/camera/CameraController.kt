@@ -1216,9 +1216,10 @@ class CameraController(private val context: Context, private val render: RenderC
     private val RCD_G_ORIG = 1.0
     // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）
     private val DEFRINGE = 1.0
-    // v0.10.169：高光重建·G 通道重建（FilmParams[49]）。1 = 开 = 现有行为
-    // （kFsHlApply 的 apply 支含自创的 G 三级池化比 + allSat 三通道改写）；
-    // 0 = 关（apply 只留分支① 的 darktable opposed 外推 = PhotonCamera 口径）。
+    // v0.10.169 引入，v0.12.4 转正为**算法选择**（FilmParams[49]）。
+    // 1 = 自创档（kFsHlApply 的 G 三级池化比 + allSat 三通道改写，用满阱 luma 当锚）；
+    // 0 = darktable 原版档（`MAX(inval, refavg + chrominance)`，只抬不压）。
+    // 默认 0，见 applyHlGReconPref 的依据说明。
     private val HL_GRECON = 1.0
     // v0.10.179：高光重建·R/B 满阱反推（FilmParams[57]）。1 = 启用 kFsHlApply 内
     // 新支 —— clip 过渡带"本通道（R/B）满阱、其余未满"的 photosite（allSat 与
@@ -1596,17 +1597,16 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /**
-     * 高光重建·G 通道重建开关（v0.10.169）：写 FilmParams[49]。
-     * kFsHlApply（RAW 域高光重建的 apply 支）里"自创机制"两支的总开关 ——
-     * ① 普通 G 的三级池化比重建（`else if (v >= uHlClip && c == 1)`）；
-     * ② allSat 三通道同步改写。与 PhotonCamera 的 OpposedGL 逐行对照后，这两支
-     * 贡献了"过曝边缘品红"B/G 偏差的 71%（离线逐位仿真：G 池化比 +0.0384、
-     * allSat 改写 +0.0255；被强制 0 的 chroma 反向抵消 −0.0218）。
-     * 0 = 关 ⇒ shader 内 `if (uGRecon > 0.5)` 整段跳过，apply 支只剩分支① 的
-     * opposed 外推（= PhotonCamera OpposedGL 口径；离线高光区 B/G 1.0856 → 1.0217、
-     * R/G 0.9773 → 1.0051）。
-     * ⚠ 默认 1.0（**不改变默认画质**）：allSat 在基准片占 G 饱和像素 44.15%，
-     * 台灯类场景可能退化 ⇒ 仅供真机同帧 A/B，改默认前必须真机数据说话。
+     * 高光重建算法选择（v0.10.169 引入，v0.12.4 转正）：写 FilmParams[49]。
+     * 0 = **darktable 原版档（默认）**：`hlreconstruct/opposed.c` 口径
+     *     `output = MAX(inval, refavg + chrominance)` —— **只抬不压**，
+     *     色比失衡由 ③ 统计出的加性 chrominance 补偿。
+     * 1 = **自创档**（0.12.3 及以前的行为）：kFsHlApply 内 G 三级池化比 +
+     *     allSat 三通道同步改写，用**满阱 luma** 当亮度锚。
+     * v0.12.4 改默认为 0 的依据：真机 164553 量化光带亮核 chroma 2.17% vs 紧邻
+     * 外圈 18.83%（同一束光差 8.7 倍），而自创 allSat 是唯一会**压低**已有值的支路
+     *（opposed 的 MAX 语义不会）⇒ 灰斑 = 自创分支把 sat-fix 真值（可达 4.0）压回
+     * 满阱（≈1.27）并去色。设置页开关写 prefs("hl_grecon")。
      */
     private fun applyHlGReconPref() {
         val v = if (appPrefs.getBoolean("hl_grecon", true)) HL_GRECON else 0.0
@@ -1981,7 +1981,13 @@ class CameraController(private val context: Context, private val render: RenderC
     // 1 短 3 长：帧 0 = t_long / 2^k（ISO 与长帧相同，只改曝光时间），帧 1-3 = 长帧。
     // **第 1 步只采集 + 记录**：短帧不参与融合（融合用 3 长帧，出片零风险），
     // 归一与饱和感知权重在第 2 步落地（设计 §7 步骤 1/2）。
-    private val BRACKET_DIV = 4L          // 2^k，k=2（设计 §3.1）
+    // 2^k，k=2（设计 §3.1）。v0.11.87：改成**按场景自适应**（见 updateBracketDiv）——
+    // 真机实测短帧在多个明亮场景里自己也饱和（08:27:35 p999 1.00、10:00:01 p995 1.00），
+    // 那时 k=2 已经采不到更多高光，再融合只是猜。反馈来自上一张的 bracket.short p999。
+    private val BRACKET_DIV_BASE = 4.0f
+    private val BRACKET_DIV_MIN = 2.0f
+    private val BRACKET_DIV_MAX = 8.0f
+    @Volatile private var bracketDiv = BRACKET_DIV_BASE
     // 短帧在 burst 里的**唯一**索引来源（0.11.69：此前结果回调硬编码 secs[0]/secs[1]
     // 读 ratio，短帧移到帧 3 后读到两个长帧 ⇒ ratio=1.0 ⇒ bracket 静默失效，
     // 日志只剩 mfnr.bracket_fallback。改位置只改这一处 + 引擎的 frame_scale[3]）
@@ -2118,7 +2124,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val expLower = curCharacteristics
             ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             ?.lower ?: 0L
-        val shortSec = if (capSec > 0) maxOf(expLower, capSec / BRACKET_DIV) else 0L
+        val shortSec = if (capSec > 0) maxOf(expLower, (capSec / bracketDiv).toLong()) else 0L
         val bracketActive = bracketPref && flashMode == 0 && capIso > 0 &&
             shortSec > 0 && capSec >= shortSec * 3 / 2
         burstBracketOn = bracketActive
@@ -2131,7 +2137,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     "sec" to "%.4f".format(capSec / 1e9f),
                     "short" to "%.4f".format(shortSec / 1e9f),
                     "reqRatio" to "%.3f".format(capSec.toDouble() / shortSec),
-                    "iso" to capIso, "k" to 2,
+                    "iso" to capIso, "k" to bracketDiv,
+            "div" to "%.2f".format(bracketDiv),
                 ),
             )
         }
@@ -3313,9 +3320,14 @@ class CameraController(private val context: Context, private val render: RenderC
         } else {
             strides
         }
+        // v0.11.87：短帧裁切比例透传给引擎的 AE —— bracket 下"融合后 >=0.98 白点"
+        // 不是裁切（短帧救回的高光也算进去了），真丢信息的比例只有短帧自己的 sat
+        // 能回答（长帧饱和 ∩ 短帧饱和 ⊆ 短帧饱和）。
+        var shortSatFrac = -1f
         if (bracketOn) {
             val si = BRACKET_SHORT_IDX
             val st = rawSampleStats(buffers[si], refW, refH, strides[si], meta.whiteLevel)
+            shortSatFrac = st[3]
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "bracket.short",
                 kv(
@@ -3326,6 +3338,32 @@ class CameraController(private val context: Context, private val render: RenderC
                     "ratio" to "%.3f".format(burstShortRatio),
                 ),
             )
+            // v0.11.87 动态 k：上一张短帧的 P99.9 是"k 够不够"的直接证据。
+            //   p999 > 0.85 ⇒ 短帧自己都快撞白，加大 div（短帧更短）再升 1.35×；
+            //   p999 < 0.50 ⇒ 短帧余量很大，收回来（短帧更亮、SNR 更好），降 1.2×。
+            // 夹在 [2, 8]（k ∈ [1, 3]）：再小短帧就失去意义，再大短帧只剩噪声。
+            if (prefs.getBoolean("bracket_adaptive_k", true)) {
+                // v0.11.95：**加死区 + 降步长**。真机 3118/3119（同场景连拍）实测
+                // p999 恒 1.0 ⇒ 每张都 ×1.35，两张之间 div 从 4.0 跳到 5.4，短帧曝光
+                // 差 0.44EV；虽然 AE 把亮度补平（mean 92.3 vs 91.7），但融合的高光
+                // 信息量在连拍间不一致。现在：阈值 0.92、步长 1.2、上限 6.0 ——
+                // 单张最多变 20%（0.26EV），且不会把短帧压到只剩噪声。
+                val p999 = st[2]
+                val next = when {
+                    p999 > 0.92f -> bracketDiv * 1.20f
+                    p999 < 0.45f -> bracketDiv / 1.15f
+                    else -> bracketDiv
+                }.coerceIn(BRACKET_DIV_MIN, 6.0f)
+                if (next != bracketDiv) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "camera", "bracket.k",
+                        kv("p999" to "%.4f".format(p999),
+                           "from" to "%.2f".format(bracketDiv),
+                           "to" to "%.2f".format(next)),
+                    )
+                    bracketDiv = next
+                }
+            }
         }
         // 降噪专项 A（2026-09-29）：prefs mfnr_dft = true 走 DFT 逐频收缩合并
         //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
@@ -3385,17 +3423,19 @@ class CameraController(private val context: Context, private val render: RenderC
         val nnAb = false
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
-                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/false, done)
+                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
+                /*varyNn=*/false, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
-                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, /*varyNn=*/true, done)
+                useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
+                /*varyNn=*/true, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio = shortRatio,
-                tenBit = tenBit) { bytes, w, h ->
+                shortSat = shortSatFrac, tenBit = tenBit) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -3409,14 +3449,16 @@ class CameraController(private val context: Context, private val render: RenderC
                     render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
-                        shortRatio = shortRatio, tenBit = tenBit, onDone = done)
+                        shortRatio = shortRatio, shortSat = shortSatFrac,
+                        tenBit = tenBit, onDone = done)
                 }
             }
         } else {
             render.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
-                shortRatio = shortRatio, tenBit = tenBit, onDone = done)
+                shortRatio = shortRatio, shortSat = shortSatFrac,
+                tenBit = tenBit, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -3451,6 +3493,7 @@ class CameraController(private val context: Context, private val render: RenderC
         p0Sub: Boolean,
         nnDn: Boolean,
         shortRatio: Float,
+        shortSat: Float,
         varyNn: Boolean,
         done: (ByteArray?, Int, Int) -> Unit,
     ) {
@@ -3466,11 +3509,13 @@ class CameraController(private val context: Context, private val render: RenderC
         val nn2 = if (varyNn) true else nnDn
         StillRenderClient.submitRawBurst(buffers, strides, width, height, meta,
             rot, film, demosaic, noiseStrength, rn,
-            useDft, alignL1, alignAb, p0Sub, nn1, shortRatio = shortRatio) { b1, w1, h1 ->
+            useDft, alignL1, alignAb, p0Sub, nn1, shortRatio = shortRatio,
+            shortSat = shortSat) { b1, w1, h1 ->
             val d1 = if (b1 != null) outDigest(b1, w1, h1) else null
             render.submitRawBurst(buffers, strides, width, height, meta,
                 rot, film, demosaic, noiseStrength, rn,
-                useDft, alignL1, alignAb, p0Sub, nn2, shortRatio = shortRatio) { b2, w2, h2 ->
+                useDft, alignL1, alignAb, p0Sub, nn2, shortRatio = shortRatio,
+                shortSat = shortSat) { b2, w2, h2 ->
                 val d2 = if (b2 != null) outDigest(b2, w2, h2) else null
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "camera",

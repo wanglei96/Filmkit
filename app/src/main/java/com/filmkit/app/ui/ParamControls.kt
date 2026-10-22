@@ -753,7 +753,7 @@ internal val ENGINE_OVERRIDE_CHOICES: List<Int> =
  * ⚠ 未注册值的收敛必须在这里：否则手改 prefs 成 `7` 会显示成「引擎 7」= 假读数。
  */
 internal fun engineOverrideLabel(override: Int): String =
-    if (override in ENGINE_SLOT_CHOICES) presetDetailRowOf(ENGINE_SLOT, override.toDouble()).value
+    if (override in ENGINE_SLOT_CHOICES) EngineScope.engineName(override)
     else "跟随预设"
 
 /** 读 prefs 的全局覆盖档（缺省 = [ENGINE_OVERRIDE_FOLLOW_PRESET]，与渲染侧同一常量）。 */

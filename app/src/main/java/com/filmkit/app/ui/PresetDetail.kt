@@ -1,6 +1,7 @@
 package com.filmkit.app.ui
 
 import com.filmkit.app.camera.EditorPreset
+import com.filmkit.app.camera.EngineScope
 import com.filmkit.app.camera.FilmParamKeys
 import com.filmkit.app.camera.GLOW_RADIUS_UI_PIVOT
 import com.filmkit.app.camera.GLOW_THRESHOLD_UI_PIVOT
@@ -140,7 +141,9 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     // `engine_slot`），与 P-5 提示里的「引擎插槽」不一致
     //（`PresetDetailTest.detailLabelsMatchScopeNoticeWording` 直接抓这一条）。
     // 读数 = 槽位值本身（0 = 内置 filmic；阶段 3 起由**引擎选择面**写入）。
-    meta(98, SEC_BASE, "引擎插槽") { "引擎 ${it.toInt()}" }
+    // v0.11.96：读数直接给**引擎名**（filmic / sigmoid），不再写"引擎 0/1"——
+    // 用户 2026-10-21 拍板。名字的唯一真源是 EngineScope.engineName()。
+    meta(98, SEC_BASE, "引擎插槽") { EngineScope.engineName(it.toInt()) }
     // [88..93] 面板「调整」组（E2-15 / E2-14）；[88] 槽位是 mired 偏移 ⇒ 必须过 tempUi 才是 K
     meta(88, SEC_BASE, "色温") { formatKelvin(tempUi(it)) }
     meta(89, SEC_BASE, "色调") { formatOffset100(tintUi(it), 0f) }
