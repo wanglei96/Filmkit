@@ -2516,6 +2516,17 @@ class CameraController(private val context: Context, private val render: RenderC
                 cm, context.getSharedPreferences("filmkit", 0),
             )
         }
+        // 镜头表落日志（v0.12.41）：确认我们的发现逻辑拿到了哪些 id / 等效焦距 ——
+        // 若 ISZ 虚拟镜头真的以隐藏 id 存在，这里会先暴露出来（例如主摄 24mm 旁边多一个 46mm）。
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "camera.lens_list",
+            kv(
+                "n" to backLenses.size,
+                "list" to backLenses.joinToString("|") { l ->
+                    "${l.id}:${"%.1f".format(l.equivMm)}mm/f${"%.2f".format(l.focalMm)}/raw=${l.rawSupported}"
+                },
+            ),
+        )
         val lens = forcedId?.let { id -> backLenses.firstOrNull { it.id == id && it.enabled } }
             ?: enabledLenses().minByOrNull { kotlin.math.abs(it.equivMm - 24f) } // 主摄 = 等效最接近 24mm
         if (lens == null) {
@@ -2557,8 +2568,12 @@ class CameraController(private val context: Context, private val render: RenderC
         try {
             val mgr = context.getSystemService(android.content.Context.CAMERA_SERVICE)
                 as android.hardware.camera2.CameraManager
-            for (cid in mgr.cameraIdList) {
-                val c = mgr.getCameraCharacteristics(cid)
+            // v0.12.41：**遍历 0..10**（不只 cameraIdList）—— vivo 常把 ISZ / 多摄虚拟镜头
+            // 藏成非公开 id，公开列表只给 2 个。MotionCam 在 X300 Ultra 上能用 ISZ 拍 RAW，
+            // 很可能就是拿到了这种隐藏 id；这里一次性把每个 id 的焦距/RAW 尺寸/ISZ 支持打全。
+            for (n in 0..10) {
+                val cid = n.toString()
+                val c = runCatching { mgr.getCameraCharacteristics(cid) }.getOrNull() ?: continue
                 val r = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 val m = c.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY)
                 val b = c.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
@@ -3383,10 +3398,27 @@ class CameraController(private val context: Context, private val render: RenderC
                     l.contains("zoom")
             }.take(16)
         }.getOrDefault(emptyList()).joinToString("|").ifEmpty { "none" }
+        val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: -1f
+        val phys = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val equiv = if (phys != null && phys.width > 0f && phys.height > 0f) {
+            val diag = kotlin.math.sqrt(phys.width * phys.width + phys.height * phys.height)
+            focal * 43.27f / diag
+        } else {
+            -1f
+        }
+        val facing = c.get(CameraCharacteristics.LENS_FACING) ?: -1
+        val caps = runCatching {
+            c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.joinToString(",") ?: "none"
+        }.getOrDefault("none")
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "camera.isz_probe",
             kv(
                 "id" to cid,
+                "facing" to facing,
+                "focal" to "%.2f".format(focal),
+                "equiv" to "%.1f".format(equiv),
+                "caps" to caps,
                 "rawSizes" to rawSizes,
                 "physicalIds" to pids,
                 "maxZoom" to (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: -1f),
