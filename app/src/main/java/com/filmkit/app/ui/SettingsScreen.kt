@@ -750,7 +750,8 @@ private fun ToneColorDrawerContent() {
         }
     }
     if (slotActiveInEngine(36, engineSlot)) {
-        var localToneOn by remember { mutableStateOf(prefs.getBoolean("local_tone", true)) }
+        // v0.12.28：默认关（与 PC 的 ShadowsHighlightsParams(0,0) 对齐；它是暗部过亮的元凶）
+        var localToneOn by remember { mutableStateOf(prefs.getBoolean("local_tone", false)) }
         SettingSwitchRow(
             title = "局部色调映射",
             subtitle = "只提亮暗部：按画面局部亮度补光，亮区/高光强度归零。治「边缘有高光时中央被压暗」—— 全局曲线在逆光下两难",

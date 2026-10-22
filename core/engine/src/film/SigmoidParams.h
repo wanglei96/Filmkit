@@ -65,6 +65,15 @@ SigmoidParams computeSigmoidParams(float middle_grey_contrast,
 //     （各引擎用自己的标准参数），"切引擎观感差异明显"正是这么来的。
 //   · 历史：c=1.2 是 2026-10-13 为「判据 ① 同白纸口径可比」人为取的值（白纸 203.60
 //     LSB ≈ 引擎 0 的 204），2026-10-14 用户拍板与 PC 一致 ⇒ **该人为约束作废**。
+// ── **不要动这个值**（2026-10-22 用 PC 源码核对后更正）──────────────────────────
+// 曾一度想把它从 1.5 提到 1.8 来压暗部，理由是"与 PC 暗部不一致"。**那是错的**：
+// PC 源码（bjzhou/PhotonCamera, raw/DarktableSigmoidToneAlgorithm.kt）里写死的
+// 参数与我们的派生结果**几乎逐位相同**：
+//   PC: DT_SIGMOID_PAPER_EXPOSURE 0.354355423 / FILM_FOG 0.00142637086 / FILM_POWER 1.5
+//   我们(日志 sig_pe/sig_ff/sig_fp):  0.359695 / 0.001384 / 1.490909
+// 即**两边是同一条 darktable sigmoid**，暗部差异不在这里。真凶是下面这一层：
+// 我们默认开着 local_tone（局部色调映射，暗部线性提亮 25%），而 PC 的
+// ShadowsHighlightsParams 默认是 (highlights=0, shadows=0) —— 它那层是关的。
 inline constexpr float kSigmoidDefaultContrast = 1.5f;
 inline constexpr float kSigmoidDefaultSkew = 0.0f;
 inline constexpr float kSigmoidDefaultWhiteTarget = 100.0f;

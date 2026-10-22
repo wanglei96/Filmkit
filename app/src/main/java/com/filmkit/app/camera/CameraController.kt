@@ -1421,7 +1421,14 @@ class CameraController(private val context: Context, private val render: RenderC
      * 0.0 = 关（A/B 通路）。只让暗区吃到提亮、亮区强度归零，故与自适应影调不冲突。
      */
     private fun applyLocalTonePref() {
-        val v = if (appPrefs.getBoolean("local_tone", true)) LOCAL_TONE else 0.0
+        // ── v0.12.28：**默认关**（暗部过亮的元凶，已用 PC 源码核对）──────────────
+        // 我们这一层是"暗部线性提亮 25%"，而 PC 的对应机制 ShadowsHighlightsParams
+        // 默认是 (highlights=0, shadows=0)，即**它默认不做局部提亮**。
+        // 真机同机位对比（185405 vs PC 184508）：两边 sigmoid 参数几乎逐位相同
+        //（0.3597/0.00138/1.4909 vs 0.3544/0.00143/1.5），但暗部差 1.5~2EV
+        //（p1 14.4 vs 3.6、p5 40.0 vs 26.9）—— 差异就在这层。
+        // 想恢复旧观感可在设置里打开；默认跟 PC 一致。
+        val v = if (appPrefs.getBoolean("local_tone", false)) LOCAL_TONE else 0.0
         if (v != localTonePref) {
             localTonePref = v
             filmParams[36] = v
