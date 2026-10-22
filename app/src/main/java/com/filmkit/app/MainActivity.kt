@@ -192,11 +192,19 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                 editorPresetId = presetId
                 screen = "editor"
             },
-            onDeleted = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
-            // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口
+            onDeleted = {
+                // ★ v0.12.37：删除成功后清空查看页列表 —— 否则路由里残留的 URI 还会把
+                // 这张**已删除**的图弹回大图（用户报"相册返回事件跳回已删的图片"）。
+                viewerUris = emptyList()
+                viewerIndex = 0
+                screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom)
+            },
+            // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口。
+            // ⚠ v0.12.37：这里**不能**把 galleryFrom 设成 "viewer" —— 那样相册页的返回
+            // 键会回到查看页（用户要求："相册返回直接回拍照页，不要回上一次打开的大图"）。
             onOpenGallery = if (viewerFrom == "camera") {
                 {
-                    galleryFrom = "viewer"
+                    galleryFrom = "camera"
                     screen = "gallery"
                 }
             } else {
