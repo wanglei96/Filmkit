@@ -2526,6 +2526,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 //   ② YUV 链若本机支持，本来就已经在校正（默认 ON）。
                 // distModes 空 = HAL 未声明畸变校正能力；lensDistortion 有值 = HAL 带标定
                 // 系数（可直接喂我们自己的 GPU 反向映射，省掉自拍棋盘格标定）。
+                logIszProbe(cid, c)
                 if (android.os.Build.VERSION.SDK_INT >= 28) {
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "camera", "camera.geom_caps_id",
@@ -3237,6 +3238,57 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /** raw.meta / raw.calib 日志（单帧与 MFNR burst 共用；原 processRaw 内联块抽出） */
+    /**
+     * ISZ / in-sensor-zoom 能力探测（v0.12.38，2026-10-22）。
+     *
+     * 要回答的问题：X300 在主摄的非原生焦段上，HAL 会不会走"传感器内变焦"（remosaic
+     * 裁剪，输出仍是该模式的**全分辨率** Bayer）。如果会，那我们的数码变焦裁切就是
+     * "真像素"而不是插值放大 —— 也就根本不需要做"保持原分辨率"。
+     *
+     * 判据分两层：
+     *  ① **行为层**（确定性的）：2x 变焦拍一张 RAW，看 `raw.meta.in` 的尺寸。
+     *     仍等于 activeArray ⇒ HAL 完全忽略 zoom（当前实测即如此）；
+     *     掉到约 1/z ⇒ HAL 真的裁了（这时必须去掉我们自己的裁切，否则双裁）。
+     *  ② **能力层**（本函数）：把每个 cameraId 的 RAW 输出尺寸清单、逻辑相机的物理
+     *     id 列表、以及所有名字里带 zoom/isz/remosaic/crop 的 tag 打出来 —— 如果 vivo
+     *     暴露了 ISZ 开关（vendor tag），这里会露头，不用靠猜。
+     */
+    private fun logIszProbe(cid: String, c: CameraCharacteristics) {
+        val rawSizes = runCatching {
+            c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.RAW_SENSOR)
+                ?.joinToString(",") { "${it.width}x${it.height}" }
+        }.getOrNull() ?: "none"
+        // 物理 id 用字符串 key 读（LOGICAL_MULTI_CAMERA_PHYSICAL_IDS 在部分 SDK 上取不到）
+        @Suppress("UNCHECKED_CAST")
+        val pids = runCatching {
+            val k = CameraCharacteristics.Key(
+                "android.logicalMultiCamera.physicalIds", ByteArray::class.java,
+            )
+            (c.get(k) as? Array<ByteArray>)
+                ?.joinToString(",") { String(it, Charsets.UTF_8) }
+        }.getOrNull() ?: "none"
+        // tag 只打**名字**（值类型五花八门，star projection 下 get() 推不出类型）；
+        // 名字命中就说明 vivo 暴露了该开关，需要时再针对具体 key 补取值。
+        val interesting = runCatching {
+            c.keys.map { it.name }.filter { n ->
+                val l = n.lowercase()
+                l.contains("zoom") || l.contains("isz") || l.contains("remosaic") ||
+                    l.contains("crop") || l.contains("digital")
+            }.take(24).joinToString("|")
+        }.getOrNull() ?: ""
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "camera.isz_probe",
+            kv(
+                "id" to cid,
+                "rawSizes" to rawSizes,
+                "physicalIds" to pids,
+                "maxZoom" to (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: -1f),
+                "tags" to interesting.ifEmpty { "none" },
+            ),
+        )
+    }
+
     private fun logRawMeta(img: Image, result: TotalCaptureResult, meta: RenderClient.RawFrameMeta) {
         val ch = curCharacteristics
         EngineBridge.nativeAppendLog(
@@ -3276,6 +3328,19 @@ class CameraController(private val context: Context, private val render: RenderC
                 } else {
                     -1
                 }),
+                // ── ISZ / remosaic 探测（v0.12.38，2026-10-22）───────────────────
+                // 问题：X300 在非原生焦段是否走"传感器内变焦"（remosaic 裁剪后仍是
+                // 全分辨率 Bayer）？若走，RAW 输出尺寸会小于 activeArray（`in` 字段
+                // 直接能看出来），我们就**不需要**插值放大；若不小于，说明 HAL 把 zoom
+                // 全忽略了（当前既定事实）。
+                // `zoom` 是 HAL 回报的实际值（我们在 applyControls 下发的是同一个），
+                // `crop` 是 SCALER_CROP_REGION（CONTROL_ZOOM_RATIO 生效时 HAL 通常把它
+                // 保持为 activeArray 大小，所以**只有 in 尺寸能说明问题**）。
+                "zoom" to "%.3f".format(result.get(CaptureResult.CONTROL_ZOOM_RATIO) ?: -1f),
+                "crop" to (result.get(CaptureResult.SCALER_CROP_REGION)?.let {
+                    "${it.left},${it.top},${it.width()}x${it.height()}"
+                } ?: "null"),
+                "active" to "${activeArray.width()}x${activeArray.height()}",
             ),
         )
         // DNG 标准链探针（P2）：标定矩阵是 **CameraCharacteristics 静态键**（不在
