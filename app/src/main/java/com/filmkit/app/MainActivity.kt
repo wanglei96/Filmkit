@@ -13,9 +13,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import com.filmkit.app.ui.AccentColorScreen
 import com.filmkit.app.ui.CameraScreen
 import com.filmkit.app.ui.EditorScreen
@@ -27,6 +29,11 @@ import com.filmkit.app.ui.PhotoViewScreen
 import com.filmkit.app.ui.SettingsScreen
 import com.filmkit.app.ui.SpikeScreen
 import com.filmkit.app.ui.backTarget
+import com.filmkit.app.ui.hasImagePermission
+import com.filmkit.app.ui.queryPhotos
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -112,6 +119,8 @@ class MainActivity : ComponentActivity() {
  */
 @Composable
 private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var screen by rememberSaveable { mutableStateOf("camera") }
     // 编辑器当前打开的成片。Uri 是 Parcelable，rememberSaveable 能跨进程重建保住；
     // 万一恢复后 URI 已失效，EditorScreen 自己会显示"图片已失效"，不会白屏。
@@ -184,6 +193,15 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                 screen = "editor"
             },
             onDeleted = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
+            // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口
+            onOpenGallery = if (viewerFrom == "camera") {
+                {
+                    galleryFrom = "viewer"
+                    screen = "gallery"
+                }
+            } else {
+                null
+            },
         )
         // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
         "editor" -> EditorScreen(
@@ -201,13 +219,23 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                 galleryFrom = "camera"
                 screen = "gallery"
             },
-            // 胶卷位：有最近成片 ⇒ 直接看这张大图（单张列表；左右滑动没有邻居，
-            // 那是相册入口的语义）；返回回相机。
+            // 胶卷位：有最近成片 ⇒ 直接看这张大图，返回回相机。
+            // ★ v0.12.35：还要能左右切图 —— 先把相册（与相册页同一条查询口径）查出来，
+            // 把这张定位到它的索引上；查不到（未授权且不在本应用目录 / 刚被删）才退化成
+            // 单张列表。查询在 IO 线程，本地 MediaStore 通常 <100ms。
             onOpenLastPhoto = { uri ->
-                viewerUris = listOf(uri)
-                viewerIndex = 0
-                viewerFrom = "camera"
-                screen = "viewer"
+                scope.launch {
+                    val list = withContext(Dispatchers.IO) {
+                        runCatching {
+                            queryPhotos(context, hasImagePermission(context)).first
+                        }.getOrDefault(emptyList()).map { it.uri }
+                    }
+                    val i = list.indexOf(uri)
+                    viewerUris = if (i >= 0) list else listOf(uri)
+                    viewerIndex = if (i >= 0) i else 0
+                    viewerFrom = "camera"
+                    screen = "viewer"
+                }
             },
             onRegisterVolume = onRegisterVolume,
         )

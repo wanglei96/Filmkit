@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PhotoFilter
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -95,10 +96,12 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
+import com.filmkit.app.EngineBridge
 import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetScene
 import com.filmkit.app.camera.presetScopeNotice
+import com.filmkit.app.kv
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -506,6 +509,8 @@ internal fun <B> visibleBitmapFor(
  * @param onEditWithPreset 点「胶片」选中的预设 → 同样进编辑器，但**带上预设 id**（P-3）；
  *   语义与 [onEdit] 完全一致（同一张照片、退出回本页），只是编辑器会先套用这条预设。
  * @param onDeleted 删除成功 → 回相册（那张已不存在，留在本页只会看到失效图）。
+ * @param onOpenGallery 顶栏「相册」入口；**非空才显示**。只在"从相机页直接看大图"时传
+ *   （v0.12.35 用户反馈：那样进来后返回是回相机，就再也没有去相册的路了）。
  */
 @Composable
 fun PhotoViewScreen(
@@ -516,6 +521,7 @@ fun PhotoViewScreen(
     onEdit: (Uri) -> Unit = {},
     onEditWithPreset: (Uri, String) -> Unit = { _, _ -> },
     onDeleted: () -> Unit = {},
+    onOpenGallery: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
@@ -634,11 +640,37 @@ fun PhotoViewScreen(
     val key = currentUri?.toString()
     val favorite = key != null && key in favorites
 
-    // 系统删除确认弹窗（API 30+）的返回：OK = 已删除；其余（用户取消 / 系统拒绝）如实说一句
+    // 系统删除确认弹窗（API 30+）的返回。
+    // ★ v0.12.35：`RESULT_OK` 只代表"用户点了同意"，**不代表 MediaProvider 真的执行了**
+    // （真机反馈"删除后照片还在"）。所以必须用一次单条查询核实；只有确认查不到才 onDeleted。
+    val deleteScope = androidx.compose.runtime.rememberCoroutineScope()
+    var deleteTarget by remember { mutableStateOf<Uri?>(null) }
     val deleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) onDeleted() else status = "已取消删除"
+        if (result.resultCode == Activity.RESULT_OK) {
+            val target = deleteTarget
+            if (target == null) {
+                onDeleted()
+            } else {
+                deleteScope.launch {
+                    val gone = withContext(Dispatchers.IO) { !mediaStillExists(context, target) }
+                    EngineBridge.nativeAppendLog(
+                        if (gone) EngineBridge.LEVEL_INFO else EngineBridge.LEVEL_WARN,
+                        "camera", "photo.trash_result",
+                        kv("gone" to gone, "uri" to target.toString()),
+                    )
+                    if (gone) {
+                        dropLastPhotoUri(context, listOf(target.toString()))
+                        onDeleted()
+                    } else {
+                        status = "系统没有删除这张照片（可重试）"
+                    }
+                }
+            }
+        } else {
+            status = "已取消删除"
+        }
     }
 
     /**
@@ -654,6 +686,11 @@ fun PhotoViewScreen(
      */
     fun deletePhoto() {
         val u = currentUri ?: return
+        deleteTarget = u
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.trash_request",
+            kv("count" to 1, "api" to Build.VERSION.SDK_INT),
+        )
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
                 val req = MediaStore.createTrashRequest(context.contentResolver, listOf(u), true)
@@ -932,6 +969,23 @@ fun PhotoViewScreen(
                     fontSize = 13.sp,
                     fontWeight = if (hdrOn) FontWeight.Bold else FontWeight.Normal,
                 )
+            }
+            // ── 「相册」入口（v0.12.35）：从相机页直接看大图时，这是唯一去相册的路 ──
+            if (onOpenGallery != null) {
+                Box(
+                    Modifier
+                        .height(48.dp)
+                        .clickable { onOpenGallery() }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.PhotoLibrary,
+                        contentDescription = "相册",
+                        tint = FilmTheme.Cream,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
             }
             Box(
                 Modifier

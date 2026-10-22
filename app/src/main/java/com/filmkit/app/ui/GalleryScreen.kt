@@ -61,6 +61,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.filmkit.app.EngineBridge
+import com.filmkit.app.kv
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -135,21 +137,38 @@ fun GalleryScreen(
     var doomed by remember { mutableStateOf(emptyList<String>()) }
     val scope = rememberCoroutineScope()
 
-    // API 30+：系统弹一次确认后批量删除（与查看页单张删除同一套 API，权限模型一致）
+    // API 30+：系统弹一次确认后批量删除（与查看页单张删除同一套 API，权限模型一致）。
+    // ★ v0.12.35：RESULT_OK 只代表"用户点了同意"，**不代表真的删掉了** —— 必须核实。
     val deleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            val gone = doomed.toSet()
-            photos = photos?.filterNot { it.uri in gone }
-            doomed = emptyList()
-            selected = emptySet()
-            selecting = false
-            // API 30+ 是"移入最近删除"（可恢复），低版本是真删 —— 文案不能撒谎
-            status = if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
-                "已移入「最近删除」，可在系统相册中恢复"
-            } else {
-                ""
+            val requested = doomed
+            scope.launch {
+                val goneSet = withContext(Dispatchers.IO) {
+                    requested.filterNot { mediaStillExists(context, Uri.parse(it)) }
+                }.toSet()
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "photo.trash_result",
+                    kv("gone" to goneSet.size, "requested" to requested.size),
+                )
+                photos = photos?.filterNot { it.uri in goneSet }
+                doomed = emptyList()
+                if (goneSet.size == requested.size && requested.isNotEmpty()) {
+                    selected = emptySet()
+                    selecting = false
+                    dropLastPhotoUri(context, goneSet)
+                    // API 30+ 是"移入最近删除"（可恢复），低版本是真删 —— 文案不能撒谎
+                    status = if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
+                        "已移入「最近删除」，可在系统相册中恢复"
+                    } else {
+                        ""
+                    }
+                } else {
+                    // 部分/全部没删掉：留在列表里，别让用户以为删干净了
+                    selected = selected.filterNot { it in goneSet }.toSet()
+                    status = "${requested.size - goneSet.size} 张没有删除成功（可重试）"
+                }
             }
         } else {
             status = "已取消删除"
@@ -173,6 +192,10 @@ fun GalleryScreen(
         val uris = selected.toList()
         if (uris.isEmpty()) return
         doomed = uris
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.trash_request",
+            kv("count" to uris.size, "api" to Build.VERSION.SDK_INT),
+        )
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
                 val req = MediaStore.createTrashRequest(
@@ -522,6 +545,46 @@ private fun ThumbCell(
 }
 
 /**
+ * URI 指向的照片是否**仍然存在**（v0.12.35）。
+ *
+ * 为什么要这一步：`createTrashRequest` 的系统弹窗返回 `RESULT_OK` **只代表用户同意了**，
+ * 不代表 MediaProvider 真的执行了（真机反馈"删除了但照片还在"）。删除成功后必须用一次
+ * 单条查询核实 —— `contentResolver.query(uri, ...)` 在媒体已移入回收站/被删后返回 0 行。
+ *
+ * 查询抛异常（FileNotFoundException / SecurityException）同样按"已不存在"处理：
+ * provider 连这条记录都拿不出来，用户也就看不到它了。
+ */
+internal fun mediaStillExists(context: Context, uri: Uri): Boolean = try {
+    val cols = if (Build.VERSION.SDK_INT >= 30) {
+        arrayOf(MediaStore.Images.Media._ID, "is_trashed")
+    } else {
+        arrayOf(MediaStore.Images.Media._ID)
+    }
+    context.contentResolver.query(uri, cols, null, null, null)?.use { c ->
+        if (!c.moveToFirst()) {
+            false
+        } else {
+            // API 30+：进了回收站的记录**可能仍在**（某些 ROM 不过滤单条查询）⇒ 读列判断
+            val ti = if (Build.VERSION.SDK_INT >= 30) c.getColumnIndex("is_trashed") else -1
+            !(ti >= 0 && c.getInt(ti) == 1)
+        }
+    } ?: false
+} catch (t: Throwable) {
+    // provider 连这条记录都拿不出来（FileNotFound / Security）⇒ 用户也看不到它了
+    false
+}
+
+/**
+ * 删掉（含移入回收站）的正是胶卷位那张 ⇒ 清掉 prefs 里的 `last_photo_uri`，
+ * 否则相机页下次冷启动会拿一个已失效的 URI 去解码、缩略图只能显示占位。
+ */
+internal fun dropLastPhotoUri(context: Context, gone: Collection<String>) {
+    val p = context.getSharedPreferences("filmkit", 0)
+    val cur = p.getString("last_photo_uri", null) ?: return
+    if (gone.contains(cur)) p.edit().remove("last_photo_uri").apply()
+}
+
+/**
  * 读一张缩略图（IO 线程）：**自解码 + EXIF 方向转正**（[decodeOriented]）。
  *
  * E2-18a 由平台 API（API 29+ `loadThumbnail` / API 26-28 `Thumbnails.getThumbnail`）改过来：
@@ -547,7 +610,7 @@ private fun loadThumb(
  * 查 MediaStore（IO 线程，见 [gallerySelection] 的口径）。返回 (列表, 错误文案)：
  * 任何异常都退化成空列表 + 一行提示，绝不向上抛（相册页不允许因为查询失败而白屏/崩）。
  */
-private fun queryPhotos(context: Context, granted: Boolean): Pair<List<GalleryPhoto>, String> {
+internal fun queryPhotos(context: Context, granted: Boolean): Pair<List<GalleryPhoto>, String> {
     val selection = gallerySelection(granted, Build.VERSION.SDK_INT)
     val projection = arrayOf(
         MediaStore.Images.Media._ID,
@@ -587,6 +650,6 @@ private fun imageReadPermission(): String =
         Manifest.permission.READ_EXTERNAL_STORAGE
     }
 
-private fun hasImagePermission(context: Context): Boolean =
+internal fun hasImagePermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, imageReadPermission()) ==
         PackageManager.PERMISSION_GRANTED
