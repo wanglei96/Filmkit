@@ -12550,7 +12550,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"teq\":" + std::to_string(FrameRenderer::toneEq() ? 1 : 0) +
           ",\"teqMs\":" + jnum(dbg_teq_ms_, 6) +
           ",\"teqHl\":" + jnum(dbg_teq_hl_, 9) +
-          ",\"teqSh\":" + jnum(dbg_teq_sh_, 9);
+          ",\"teqSh\":" + jnum(dbg_teq_sh_, 9) +
+          // v0.12.31：**local_tone 的实际下发值**（诊断）。它是暗部线性提亮比例，
+          // 默认 0.25（标定旋钮，见 Stage3EngineScopeAuditTest），但预设/编辑器
+          // 可以把它外推到 0.475 甚至更高（EditorPresetAmountTest 的"无 UI 上界"）。
+          // 之前日志里没有这个字段 ⇒ 无法判断"暗部偏亮"里它占多少。
+          ",\"lt\":" + jnum(pe.local_tone, 6);
     kv += ",\"rcdSplit\":" + std::to_string(dbg_rcd_split_);
     kv += ",\"rcdAMs\":" + jnum(dbg_rcd_a_ms_, 7);
     kv += ",\"rcdBMs\":" + jnum(dbg_rcd_b_ms_, 7);
