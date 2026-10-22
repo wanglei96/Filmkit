@@ -1427,8 +1427,11 @@ class CameraController(private val context: Context, private val render: RenderC
         // 真机同机位对比（185405 vs PC 184508）：两边 sigmoid 参数几乎逐位相同
         //（0.3597/0.00138/1.4909 vs 0.3544/0.00143/1.5），但暗部差 1.5~2EV
         //（p1 14.4 vs 3.6、p5 40.0 vs 26.9）—— 差异就在这层。
-        // 想恢复旧观感可在设置里打开；默认跟 PC 一致。
-        val v = if (appPrefs.getBoolean("local_tone", false)) LOCAL_TONE else 0.0
+        // ⚠ 设置页开关已移除 ⇒ 本函数现在**恒写 0**（见下面 v0.12.30）。
+        // v0.12.30：**强制 0**。设置页开关已移除 ⇒ 没人能关它；而旧 prefs 里若存过
+        // true，这里就还在悄悄提亮暗部（这正是"改了没变化"的原因）。
+        // 想恢复该功能必须先把它加回设置页，而不是靠默认值。
+        val v = 0.0
         if (v != localTonePref) {
             localTonePref = v
             filmParams[36] = v
