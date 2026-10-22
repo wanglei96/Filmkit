@@ -3367,7 +3367,9 @@ class CameraController(private val context: Context, private val render: RenderC
         }
         // 降噪专项 A（2026-09-29）：prefs mfnr_dft = true 走 DFT 逐频收缩合并
         //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
-        val useDft = prefs.getBoolean("mfnr_dft", false)
+        // 2026-10-22：默认改为 true —— 频域合并的细节明显优于空域（真机实拍对比），
+        // 代价是亮部噪声略高；按"质量优先"取细节。设置页仍可关掉做 A/B。
+        val useDft = prefs.getBoolean("mfnr_dft", true)
         // D-2 对齐精度 A/B（2026-09-30）：prefs align_l1 = true 时最细对齐层用
         // 1/2 域（新，需 readback 1/2 域），false 退回 1/4 域旧路径
         val alignL1 = prefs.getBoolean("align_l1", true)
