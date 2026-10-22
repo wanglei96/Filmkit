@@ -131,11 +131,29 @@ internal fun decodeFitHdr(context: Context, uri: Uri, maxW: Int, maxH: Int): Bit
             )
         }
         return orient(bmp, rotation, flip)
-    } catch (_: OutOfMemoryError) {
-        // 全尺寸解不出（12MP 48MB + 转正）：回落采样档，**丢 gainmap 但不黑屏**
-        return decodeFit(context, uri, maxW, maxH)
-    } catch (_: Throwable) {
-        return decodeFit(context, uri, maxW, maxH)
+    } catch (e: OutOfMemoryError) {
+        // ── v0.12.22：**catch 里不再二次解码**（相册滑动偶发闪退的根因）─────────────
+        // 旧实现 catch 到 OOM 后又调 `decodeFit` 再解一次，而那一刻堆恰好见底：
+        // 12MP 全尺寸 48MB + `orient` 的转正副本 48MB = 96MB，第一次 OOM 说明已经到顶，
+        // 紧接着的 decodeFit 必然二次 OOM —— 而它在 catch 块里，**没有任何捕获** ⇒ 闪退。
+        // 真机现象："相册左右滑动偶发闪退、日志里什么都没有"，与这条完全吻合。
+        // 现在：记录日志 + 用小尺寸重试一次；仍失败则返回 null（查看页走占位）。
+        com.filmkit.app.EngineBridge.nativeAppendLog(
+            com.filmkit.app.EngineBridge.LEVEL_ERROR, "app", "photo.view.oom",
+            "{\"w\":" + (maxW) + ",\"h\":" + (maxH) +
+                ",\"detail\":\"" + (e.message ?: "oom") + "\"}",
+        )
+        // 用**小得多的目标尺寸**重试一次（1080×1920 ⇒ 2MP ≈ 8MB，而不是 12MP 的 48MB），
+        // 并且用 runCatching 兜住一切（含再次 OOM）—— 保证这个 catch 里不会再有异常逃逸。
+        // 代价：这一张失去 gainmap（显示 SDR），但**不闪退**。
+        return runCatching { decodeFit(context, uri, 1080, 1920) }.getOrNull()
+    } catch (e: Throwable) {
+        // 同一条理由：catch 里不再做任何可能分配的动作。
+        com.filmkit.app.EngineBridge.nativeAppendLog(
+            com.filmkit.app.EngineBridge.LEVEL_ERROR, "app", "photo.view.decode_failed",
+            "{\"error\":\"" + (e.message ?: e.toString()).replace("\"", "'") + "\"}",
+        )
+        return null
     }
 }
 
