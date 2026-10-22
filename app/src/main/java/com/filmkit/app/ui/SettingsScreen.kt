@@ -388,23 +388,6 @@ private fun QualityDrawerContent() {
             )
         },
     )
-    // ISZ 实验开关（v0.12.40）：默认关。X300 真机探测显示 MTK 平台支持 insensorzoom
-    // 且相关 key 可下发，打开后静拍会尝试 remosaicenable —— 若 HAL 照做，2x 变焦的
-    // RAW 会变成中心裁剪后的全分辨率 Bayer（真无损），我们就不用插值放大。
-    var iszProbe by remember { mutableStateOf(prefs.getBoolean("isz_probe", false)) }
-    SettingValueRow(
-        title = "ISZ 传感器内变焦（实验）",
-        subtitle = "打开后 M 档拍照会向 HAL 试下发 MTK/vivo 的 remosaic 开关；生效时 2x 的 RAW 会变成中心裁剪的全分辨率 Bayer（日志 raw.meta 的 in 尺寸变小）。默认关：未知 vendor 参数可能让拍照失败",
-        valueText = if (iszProbe) "开" else "关",
-        onTap = {
-            iszProbe = !iszProbe
-            prefs.edit().putBoolean("isz_probe", iszProbe).apply()
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.isz_probe",
-                "{\"on\":$iszProbe}",
-            )
-        },
-    )
     var mfnrMode by remember { mutableStateOf(prefs.getInt("mfnr", 1)) }
     SettingValueRow(
         title = "多帧融合",
