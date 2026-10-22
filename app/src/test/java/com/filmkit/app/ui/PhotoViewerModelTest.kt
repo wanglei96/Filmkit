@@ -214,6 +214,14 @@ class PhotoViewerModelTest {
     }
 
     @Test
+    fun viewerReturnsToCameraWhenOpenedFromCameraThumbnail() {
+        // v0.12.34：相机页胶卷位直接看大图 ⇒ 返回必须回相机，不能半路进相册
+        assertEquals("camera", backTarget("viewer", "camera", "camera", "camera"))
+        // 从相册进的那条路不受影响
+        assertEquals("gallery", backTarget("viewer", "camera", "camera", "gallery"))
+    }
+
+    @Test
     fun galleryReturnsToItsSource() {
         assertEquals("camera", backTarget("gallery", "camera", "camera"))
         assertEquals("editor", backTarget("gallery", "viewer", "editor"))

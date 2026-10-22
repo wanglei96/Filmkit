@@ -261,7 +261,7 @@ class StillDeliverFormatTest {
 
     @Test
     fun queueJpegSave_callSites_areWhitelisted() {
-        // 允许的调用点（全部显式声明格式）：
+        // 允许的调用点（全部显式声明格式；v0.12.34 起还要带上本张的数码变焦倍率）：
         //   · deliverStill（8bit 档，传 fmt）
         //   · queueHeifSave（格式不匹配时改走 8bit —— 数据本来就是 8bit）
         //   · submitStillAb 的两条 A/B 诊断路径（下发时不带 tenBit ⇒ 恒 8bit）
@@ -271,9 +271,15 @@ class StillDeliverFormatTest {
             countOf("queueJpegSave(") - 1,   // -1 = 函数声明自身
         )
         assertTrue(src.contains("queueJpegSave(bytes, w, h, snap, fmt"))
-        assertTrue(src.contains("queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag)"))
-        assertTrue(src.contains("queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8)"))
-        assertTrue(src.contains("queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, \"_nn\")"))
+        assertTrue(
+            src.contains("queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag, null, zoom)"),
+        )
+        assertTrue(
+            src.contains("queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8, \"\", null, zoom)"),
+        )
+        assertTrue(
+            src.contains("queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, \"_nn\", null, zoom)"),
+        )
     }
 
     @Test

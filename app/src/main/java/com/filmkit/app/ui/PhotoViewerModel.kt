@@ -173,14 +173,20 @@ val SETTINGS_SUB_PAGES = setOf("logs", "spike", "lens", "accent", "focals")
  * 系统返回键的目标页。各层归属：
  * - `editor` → 它进来的那一页 [editorFrom]（本卡的关键：从查看页进来就**回查看页**，
  *   而不是掉回相册网格 —— 用户 2026-10-09 明确要求）；
- * - `viewer` → 相册网格（查看页目前只有相册一个入口）；
+ * - `viewer` → 它进来的那一页 [viewerFrom]（默认相册网格；v0.12.34 起相机页的胶卷位
+ *   也能直接进查看页，那时返回必须回相机，不能半路跳出相册）；
  * - `gallery` → 它进来的那一页 [galleryFrom]（相机页或编辑器）；
  * - 设置子页 → 设置；其余 → 相机。
  */
-fun backTarget(screen: String, editorFrom: String, galleryFrom: String): String = when (screen) {
+fun backTarget(
+    screen: String,
+    editorFrom: String,
+    galleryFrom: String,
+    viewerFrom: String = "gallery",
+): String = when (screen) {
     "editor" -> editorFrom
     "gallery" -> galleryFrom
-    "viewer" -> "gallery"
+    "viewer" -> viewerFrom
     in SETTINGS_SUB_PAGES -> "settings"
     else -> "camera"
 }

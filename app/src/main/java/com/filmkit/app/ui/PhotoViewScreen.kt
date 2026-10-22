@@ -642,16 +642,21 @@ fun PhotoViewScreen(
     }
 
     /**
-     * 删除（安全红线：绝不能误删）。**两道闸**：
-     * ① 本对话框（二次确认，两档都有）；② API 30+ 再叠一层系统确认弹窗。
-     * 低版本（26-29）没有系统弹窗，只能 `contentResolver.delete` —— 此时失败必须如实报，
-     * 不许静默（删没删掉用户必须知道）。
+     * 删除（安全红线：绝不能误删，而且要能反悔）。
+     *
+     * v0.12.34 起 API 30+ 改走 [MediaStore.createTrashRequest]：照片进系统「最近删除」，
+     * 可在系统相册里恢复 —— 与相册页的批量删除同一口径（用户 2026-10-22 要求
+     * "删除要和系统相册一样放入最近删除"）。
+     *
+     * **两道闸**：① 本对话框（二次确认，两档都有）；② API 30+ 再叠一层系统确认弹窗，
+     * 之后还有回收站兜底。低版本（26-29）没有系统弹窗、也没有回收站，只能
+     * `contentResolver.delete` —— 此时失败必须如实报，不许静默（删没删掉用户必须知道）。
      */
     fun deletePhoto() {
         val u = currentUri ?: return
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
-                val req = MediaStore.createDeleteRequest(context.contentResolver, listOf(u))
+                val req = MediaStore.createTrashRequest(context.contentResolver, listOf(u), true)
                 deleteLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
             } catch (t: Throwable) {
                 status = "删除失败：${t.message?.take(60) ?: "系统拒绝了删除请求"}"
@@ -1300,13 +1305,20 @@ fun PhotoViewScreen(
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             shape = RoundedCornerShape(18.dp),
-            title = { Text("删除这张照片？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif) },
+            title = {
+                Text(
+                    if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) "移入最近删除？"
+                    else "删除这张照片？",
+                    color = FilmTheme.Cream,
+                    fontFamily = FilmTheme.Serif,
+                )
+            },
             text = {
                 Text(
                     if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
-                        "删除后无法恢复。系统还会再弹一次确认。"
+                        "移入后可在系统相册的「最近删除」里恢复（30 天后自动清除）。系统还会再弹一次确认。"
                     } else {
-                        "删除后无法恢复。此操作不可撤销。"
+                        "此设备不支持「最近删除」，删除后无法恢复。"
                     },
                     color = FilmTheme.CreamDim,
                     fontSize = 13.sp,
@@ -1318,7 +1330,13 @@ fun PhotoViewScreen(
                         confirmDelete = false
                         deletePhoto()
                     },
-                ) { Text("删除", color = MaterialTheme.colorScheme.error, fontFamily = FilmTheme.Mono) }
+                ) {
+                    Text(
+                        if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) "移入最近删除" else "删除",
+                        color = MaterialTheme.colorScheme.error,
+                        fontFamily = FilmTheme.Mono,
+                    )
+                }
             },
             dismissButton = {
                 TextButton(onClick = { confirmDelete = false }) {

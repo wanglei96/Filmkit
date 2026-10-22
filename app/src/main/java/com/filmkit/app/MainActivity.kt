@@ -129,9 +129,12 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     // （initialPage = 这个索引），不带索引就会回到第一张 —— 本卡最容易漏的一条。
     var viewerUris by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
     var viewerIndex by rememberSaveable { mutableIntStateOf(0) }
+    // 查看页的来源页（v0.12.34）：相册网格 or 相机页的胶卷位。
+    // 从相机直接看大图时返回必须回相机 —— 不能半路掉进相册（用户没去过那里）。
+    var viewerFrom by rememberSaveable { mutableStateOf("gallery") }
 
     BackHandler(enabled = screen != "camera") {
-        screen = backTarget(screen, editorFrom, galleryFrom)
+        screen = backTarget(screen, editorFrom, galleryFrom, viewerFrom)
     }
 
     when (screen) {
@@ -155,6 +158,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             onOpenPhoto = { uris, index ->
                 viewerUris = uris
                 viewerIndex = index
+                viewerFrom = "gallery"
                 screen = "viewer"
             },
         )
@@ -166,7 +170,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             uris = viewerUris,
             index = viewerIndex,
             onIndexChange = { viewerIndex = it }, // 滑到新的一张 ⇒ 路由层跟着走（编辑器回同一张）
-            onBack = { screen = backTarget("viewer", editorFrom, galleryFrom) },
+            onBack = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
             onEdit = { uri ->
                 editorUri = uri
                 editorFrom = "viewer"
@@ -179,7 +183,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                 editorPresetId = presetId
                 screen = "editor"
             },
-            onDeleted = { screen = backTarget("viewer", editorFrom, galleryFrom) },
+            onDeleted = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
         )
         // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
         "editor" -> EditorScreen(
@@ -196,6 +200,14 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             onOpenGallery = {
                 galleryFrom = "camera"
                 screen = "gallery"
+            },
+            // 胶卷位：有最近成片 ⇒ 直接看这张大图（单张列表；左右滑动没有邻居，
+            // 那是相册入口的语义）；返回回相机。
+            onOpenLastPhoto = { uri ->
+                viewerUris = listOf(uri)
+                viewerIndex = 0
+                viewerFrom = "camera"
+                screen = "viewer"
             },
             onRegisterVolume = onRegisterVolume,
         )

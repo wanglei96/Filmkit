@@ -486,6 +486,18 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile private var stillRot = 0
     @Volatile private var stillAspect = 0f
     /**
+     * 拍照瞬间的**数码变焦**快照（1 = 不裁）。
+     *
+     * 为什么需要我们自己裁：M 档（`raw_mode`）的静拍流是 **RAW_SENSOR**，X300 的 HAL
+     * 对 RAW 流不执行 `CONTROL_ZOOM_RATIO`（预览/YUV 都执行）⇒ 非原生焦段（例如 24mm
+     * 镜头拍 46mm）预览是裁过的、成片却是传感器全幅 —— 用户 2026-10-22 报"非原生焦段
+     * 裁切在 M 档从没生效过"。交付前按中心裁 `1/z` 补上，与预览视角对齐。
+     *
+     * 只在 RAW 路径生效（YUV 路径 HAL 已裁，再裁就是双裁）。
+     * 与 [stillRot]/[stillAspect] 同型：渲染要 3~4s，用户期间改焦段不能影响已在飞的那张。
+     */
+    @Volatile private var stillZoom = 1f
+    /**
      * 交付档的读取点（唯一）：prefs `photo_format`，缺失/脏值 = JPEG（默认档）。
      *
      * ⚠ 卡 FIX1（2026-10-14 P0）：调用方必须在**下发点**把返回值存进**局部 val**，并把它
@@ -1873,6 +1885,8 @@ class CameraController(private val context: Context, private val render: RenderC
             stillRot % 2 == 0 -> if (ca > 1f) 1f / ca else ca
             else -> if (ca < 1f) 1f / ca else ca
         }
+        // 数码变焦快照（见 stillZoom 注释）：只有 RAW 路径需要我们补裁
+        stillZoom = if (rawMode) zoomRatio else 1f
         if (capturing) {
             // v0.10.107：原来这里是**静默 return** —— 真机实测（2026-10-02 日志）
             // MFNR 渲染 ~4.3s，用户在渲染期按快门"没反应"却无任何记录，表现为
@@ -2812,6 +2826,59 @@ class CameraController(private val context: Context, private val render: RenderC
      *
      * 越界/尺寸异常返回 null ⇒ 该张回落普通 JPEG（宁可没有 HDR，不可错位 HDR）。
      */
+    /**
+     * 本张成片还要不要按**数码变焦**裁切（v0.12.34）。
+     *
+     * M 档 RAW 的静拍流不走 HAL 的 `CONTROL_ZOOM_RATIO`（见 [stillZoom]），所以非原生
+     * 焦段必须在交付前自己裁；YUV 路径的 zoom 由 HAL 做，传进来的 zoom 恒 1。
+     *
+     * 自愈判据：若 HAL 某天真的对 RAW 也做了裁切，输出宽度会掉到 `全幅/z` 附近 ——
+     * 这时再裁就是双裁（成片比预览还窄）。所以先比一次尺寸，宁可少裁不可双裁。
+     *
+     * @return >1 = 需要裁的倍率；1 = 不裁
+     */
+    private fun zoomCropFactor(w: Int, zoom: Float): Float {
+        if (!(zoom > 1.001f)) return 1f
+        val aw = activeArray.width().coerceAtLeast(1)
+        if (w <= (aw / zoom) * 1.05f) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "photo.zoom_hal_done",
+                kv("w" to w, "activeW" to aw, "z" to "%.2f".format(zoom)),
+            )
+            return 1f
+        }
+        return zoom.coerceIn(1f, 8f)
+    }
+
+    /** [cropForZoom] 的产物（后台线程用，避免在渲染回调里拷全图）。 */
+    private class ZoomCrop(
+        val bytes: ByteArray, val w: Int, val h: Int, val gainmap: GainmapSnapshot?,
+    )
+
+    /**
+     * 居中裁到 `1/z`，并**同步裁 gainmap**（两者都是居中裁 ⇒ 同一矩形）。
+     * z <= 1 或 HAL 已裁时原样返回（零拷贝）。每像素恒 4B（8bit RGBA 与 10bit packed 同）。
+     */
+    private fun cropForZoom(
+        bytes: ByteArray, w: Int, h: Int, gainmap: GainmapSnapshot?, zoom: Float,
+    ): ZoomCrop {
+        val z = zoomCropFactor(w, zoom)
+        if (z <= 1.001f) return ZoomCrop(bytes, w, h, gainmap)
+        val cw = (w / z).toInt().coerceIn(16, w)
+        val ch = (h / z).toInt().coerceIn(16, h)
+        val out = ByteArray(cw * ch * 4)
+        val x0 = (w - cw) / 2
+        val y0 = (h - ch) / 2
+        for (y in 0 until ch) {
+            System.arraycopy(bytes, ((y0 + y) * w + x0) * 4, out, y * cw * 4, cw * 4)
+        }
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "photo.zoom_crop",
+            kv("z" to "%.2f".format(z), "from" to "${w}x${h}", "to" to "${cw}x${ch}"),
+        )
+        return ZoomCrop(out, cw, ch, gainmap?.let { cropGainmap(it, w, h, cw, ch) })
+    }
+
     private fun cropGainmap(
         gm: GainmapSnapshot, srcW: Int, srcH: Int, dstW: Int, dstH: Int,
     ): GainmapSnapshot? {
@@ -2838,6 +2905,7 @@ class CameraController(private val context: Context, private val render: RenderC
     private fun deliverStill(
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
         gainmap: GainmapSnapshot? = null,
+        zoom: Float = 1f,
     ) {
         val fmt = DeliverFormat.of(tenBit)
         EngineBridge.nativeAppendLog(
@@ -2845,8 +2913,8 @@ class CameraController(private val context: Context, private val render: RenderC
             kv("bits" to fmt.bits, "path" to (if (tenBit) "heif" else "jpeg"),
                 "bytes" to bytes.size, "gainmap" to (gainmap != null)),
         )
-        if (tenBit) queueHeifSave(bytes, w, h, snap, fmt, "", gainmap)
-        else queueJpegSave(bytes, w, h, snap, fmt, "", gainmap)
+        if (tenBit) queueHeifSave(bytes, w, h, snap, fmt, "", gainmap, zoom)
+        else queueJpegSave(bytes, w, h, snap, fmt, "", gainmap, zoom)
         logStillStats(bytes, w, h, tenBit)
     }
 
@@ -2907,6 +2975,7 @@ class CameraController(private val context: Context, private val render: RenderC
      *  线程上（1~4s 后），不能再去读成员 filmParams（E1-2）/ 交付档（FIX1）。 */
     private fun finishStillCapture(
         bytes: ByteArray?, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
+        zoom: Float,
     ) {
         capturing = false
         capturePhase = 0
@@ -2914,13 +2983,15 @@ class CameraController(private val context: Context, private val render: RenderC
         if (bytes != null) {
             // 卡 H2：按**冻结的交付档**分派 —— 10bit 流走 HEIF（失败回退 JPEG），
             // 8bit 流走原 JPEG 链（一字不动）。卡 FIX1：分派收口到 [deliverStill]。
-            deliverStill(bytes, w, h, snap, tenBit)
+            deliverStill(bytes, w, h, snap, tenBit, zoom = zoom)
         }
     }
 
     private fun submitStill(img: Image) {
         // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
         val tenBit = tenBitForCapture()
+        // 数码变焦裁切倍率同样在**下发点**冻结（见 stillZoom 注释）
+        val zoom = stillZoom
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
@@ -2964,7 +3035,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 tenBit = tenBit,
             ) { bytes, rw, rh ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, rw, rh, snap, tenBit)
+                    finishStillCapture(bytes, rw, rh, snap, tenBit, zoom)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -2975,14 +3046,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     render.submitStillBuf(
                         y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
                         tenBit = tenBit,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit) }
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit, zoom) }
                 }
             }
         } else {
             render.submitStillBuf(
                 y, u, v, w, h, yStride, uvStride, uvPix, rot, film,
                 tenBit = tenBit,
-            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap, tenBit) }
+            ) { bytes, rw, rh -> finishStillCapture(bytes, rw, rh, snap, tenBit, zoom) }
         }
     }
 
@@ -3093,6 +3164,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val nnDn = false
         // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
         val tenBit = tenBitForCapture()
+        // 数码变焦裁切倍率同样在**下发点**冻结（见 stillZoom 注释）
+        val zoom = stillZoom
         val meta = extractRawMeta(result, ch)
         logRawMeta(img, result, meta)
         if (dngOn && ch != null) {
@@ -3135,7 +3208,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 demosaic, noiseStrength, nnDn, tenBit = tenBit,
             ) { bytes, w, h ->
                 if (bytes != null) {
-                    finishStillCapture(bytes, w, h, snap, tenBit)
+                    finishStillCapture(bytes, w, h, snap, tenBit, zoom)
                 } else {
                     // 拍照线程失败：回退预览线程重放（红线：失败不以丢照片为代价）
                     EngineBridge.nativeAppendLog(
@@ -3146,14 +3219,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
                         film, demosaic, noiseStrength, nnDn, tenBit = tenBit,
-                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit) }
+                    ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit, zoom) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
                 demosaic, noiseStrength, nnDn, tenBit = tenBit,
-            ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap, tenBit) }
+            ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap, tenBit, zoom) }
         }
     }
 
@@ -3407,6 +3480,8 @@ class CameraController(private val context: Context, private val render: RenderC
         val snap = snapshotOf(filmStill)
         // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
         val tenBit = tenBitForCapture()
+        // 数码变焦裁切倍率同样在**下发点**冻结（见 stillZoom 注释）
+        val zoom = stillZoom
         val done: (ByteArray?, Int, Int) -> Unit = { bytes, w, h ->
             // ── HDR gainmap（v0.11.50）────────────────────────────────────
             // **必须在渲染线程、且在下一次 submit 之前**读：它读的是该线程 EGL
@@ -3425,7 +3500,7 @@ class CameraController(private val context: Context, private val render: RenderC
             // ⚠ 卡 FIX1（2026-10-14 P0）：此处在修复前**硬编码 queueJpegSave**，
             //   完全绕过交付档 ⇒ HEIF 档下 10bit packed 缓冲被 ARGB_8888 错读，
             //   真机废掉两张照片（37MB/43MB）。必须走唯一分派点 [deliverStill]。
-            if (bytes != null) deliverStill(bytes, w, h, snap, tenBit, gainmap)
+            if (bytes != null) deliverStill(bytes, w, h, snap, tenBit, gainmap, zoom)
         }
         // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
         // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
@@ -3437,13 +3512,13 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
-                /*varyNn=*/false, done)
+                /*varyNn=*/false, zoom, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
-                /*varyNn=*/true, done)
+                /*varyNn=*/true, zoom, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
@@ -3508,6 +3583,7 @@ class CameraController(private val context: Context, private val render: RenderC
         shortRatio: Float,
         shortSat: Float,
         varyNn: Boolean,
+        zoom: Float,
         done: (ByteArray?, Int, Int) -> Unit,
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
@@ -3552,9 +3628,9 @@ class CameraController(private val context: Context, private val render: RenderC
                     // 三张重复：b1 + b2 + done(b2)）
                     // 这两条 A/B 诊断路径（still_ab / nn_ab）下发时**不带 tenBit**
                     // （submitRawBurst 默认 false）⇒ native 交付的恒是 8bit RGBA。
-                    if (b1 != null) queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8)
+                    if (b1 != null) queueJpegSave(b1, w1, h1, snap, DeliverFormat.RGBA8, "", null, zoom)
                     if (b2 != null) {
-                        queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, "_nn")
+                        queueJpegSave(b2, w2, h2, snap, DeliverFormat.RGBA8, "_nn", null, zoom)
                     }
                     done(null, 0, 0)
                 } else {
@@ -3914,6 +3990,7 @@ class CameraController(private val context: Context, private val render: RenderC
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
         extraTag: String = "",
         gainmap: GainmapSnapshot? = null,
+        zoom: Float = 1f,
     ) {
         if (!DeliverFormat.heifAccepts(fmt)) {
             EngineBridge.nativeAppendLog(
@@ -3921,7 +3998,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 kv("path" to "heif", "expectBits" to DeliverFormat.RGB10A2_PACKED.bits,
                     "gotBits" to fmt.bits, "w" to w, "h" to h, "bytes" to bytes.size),
             )
-            queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag)
+            queueJpegSave(bytes, w, h, snap, DeliverFormat.RGBA8, extraTag, null, zoom)
             return
         }
         val iso = liveIso
@@ -3933,7 +4010,12 @@ class CameraController(private val context: Context, private val render: RenderC
             kv("bytes" to bytes.size, "w" to w, "h" to h,
                 "chroma" to com.filmkit.app.heif.HeifChroma.CHROMA, "jpeg444Ignored" to true),
         )
-        saver.execute { saveHeif(bytes, w, h, iso, secNs, extraTag, snap, gainmap) }
+        saver.execute {
+            // 数码变焦裁切（v0.12.34）：HEIF 路径不复用 saveJpeg 的画幅裁切，zoom 必须
+            // 在这里补一次，否则 HEIC 成片仍是传感器全幅（与预览视角不符）。
+            val c = cropForZoom(bytes, w, h, gainmap, zoom)
+            saveHeif(c.bytes, c.w, c.h, iso, secNs, extraTag, snap, c.gainmap)
+        }
     }
 
     /**
@@ -4281,6 +4363,7 @@ class CameraController(private val context: Context, private val render: RenderC
         bytes: ByteArray, w: Int, h: Int, snap: StillSnapshot, fmt: DeliverFormat,
         extraTag: String = "",
         gainmap: GainmapSnapshot? = null,
+        zoom: Float = 1f,
     ) {
         // ── 交付格式断言（照片优先红线：宁可失败/降位，绝不静默交付错数据）──────────
         // JPEG 编码器只能吃 8bit RGBA（`EngineBridge.OUTPUT_BITMAP_CONFIG` = ARGB_8888）。
@@ -4305,7 +4388,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 return
             }
             // 10bit 降位路径不接 HDR（gainmap 是按 8bit 成片算的，降位后像素已变）
-            saver.execute { saveJpeg(rgba8, w, h, iso8, sec8, extraTag, snap, null) }
+            saver.execute { saveJpeg(rgba8, w, h, iso8, sec8, extraTag, snap, null, zoom) }
             return
         }
         val iso = liveIso
@@ -4314,7 +4397,7 @@ class CameraController(private val context: Context, private val render: RenderC
             EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
             kv("bytes" to bytes.size),
         )
-        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap, gainmap) }
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap, gainmap, zoom) }
     }
 
     /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。
@@ -4323,6 +4406,7 @@ class CameraController(private val context: Context, private val render: RenderC
         rgba: ByteArray, w: Int, h: Int, iso: Int, secNs: Long,
         extraTag: String = "", snap: StillSnapshot,
         gainmap: GainmapSnapshot? = null,
+        zoom: Float = 1f,
     ) {
         val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
@@ -4343,24 +4427,25 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             yy += step
         }
-        // 成片按画幅居中裁切（与取景窗口一致，WYSIWYG）
-        var outBmp = bmp
+        // 成片居中裁切：**数码变焦**（v0.12.34）与**画幅**两步都是居中的 ⇒ 合成一次
+        // （两次居中裁 = 直接裁到更小的居中矩形），省一次全图拷贝。
         // 用**快门瞬间**的画幅快照（v0.10.110-fix）：渲染 3~4s 期间用户常把手机转回
         // 竖屏，读实时 captureAspect 会把横拍裁成竖幅（2026-10-03 真机实证）。
+        val zc = zoomCropFactor(w, zoom)
         val asp = if (stillAspect > 0f) stillAspect else captureAspect
-        if (asp > 0f) {
-            val curA = w.toFloat() / h.toFloat()
-            if (Math.abs(curA - asp) > 0.01f) {
-                val cw = if (curA > asp) (h * asp).toInt() else w
-                val ch = if (curA > asp) h else (w / asp).toInt()
-                outBmp = Bitmap.createBitmap(bmp, (w - cw) / 2, (h - ch) / 2, cw, ch)
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "photo.crop",
-                    kv("srcA" to "%.3f".format(curA), "dstA" to "%.3f".format(asp),
-                        "out" to "${outBmp.width}x${outBmp.height}",
-                        "snap" to (stillAspect > 0f), "rot" to stillRot),
-                )
-            }
+        // 尺寸计算收在纯函数里（投递时取整 + 上下界都在那儿测，见 StillCropTest）
+        val crop = stillCropSize(w, h, zc, asp)
+        val cw = crop[0]
+        val ch = crop[1]
+        var outBmp = bmp
+        if (cw != w || ch != h) {
+            outBmp = Bitmap.createBitmap(bmp, (w - cw) / 2, (h - ch) / 2, cw, ch)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "photo.crop",
+                kv("srcA" to "%.3f".format(w.toFloat() / h.toFloat()), "dstA" to "%.3f".format(asp),
+                    "out" to "${outBmp.width}x${outBmp.height}",
+                    "zoom" to "%.2f".format(zc), "snap" to (stillAspect > 0f), "rot" to stillRot),
+            )
         }
         val outW = outBmp.width
         val outH = outBmp.height
@@ -4477,17 +4562,6 @@ class CameraController(private val context: Context, private val render: RenderC
                 context.contentResolver
                     .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                     ?.let { uri ->
-                        lastPhotoUri = uri
-                        // E1-2 补丁：URI 持久化（冷启动胶卷位/编辑器入口用，见 lastPhotoUri
-                        // 注释）。写 prefs 失败只记日志 —— 不能影响照片落盘（用户红线）。
-                        runCatching {
-                            appPrefs.edit().putString("last_photo_uri", uri.toString()).apply()
-                        }.onFailure {
-                            EngineBridge.nativeAppendLog(
-                                EngineBridge.LEVEL_WARN, "camera", "photo.uri_persist_failed",
-                                kv("error" to (it.message ?: it.toString())),
-                            )
-                        }
                         context.contentResolver.openOutputStream(uri)?.use {
                             writeJpeg(it)
                         }
@@ -4506,6 +4580,22 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             // Bitmap.compress 不写任何元数据——用 ExifInterface 补写拍摄参数
             writeExif(savedUri, savedFile, now)
+            // ── 胶卷位 URI **写完才发布**（v0.12.34，用户报"左下角缩略图有概率丢失"）──
+            // 原来在 `insert` 之后、写字节之前就赋值 ⇒ UI 的 400ms 轮询可能正好在文件
+            // 还是空的时候拿到新 URI，decode 失败一次就再也不会重试（LaunchedEffect 只在
+            // URI 变化时跑）⇒ 缩略图永久空白。EXIF 也写完之后才发布，避免又一次"读到
+            // 一半的文件"。写 prefs 失败只记日志 —— 不能影响照片落盘（用户红线）。
+            savedUri?.let { uri ->
+                lastPhotoUri = uri
+                runCatching {
+                    appPrefs.edit().putString("last_photo_uri", uri.toString()).apply()
+                }.onFailure {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_WARN, "camera", "photo.uri_persist_failed",
+                        kv("error" to (it.message ?: it.toString())),
+                    )
+                }
+            }
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "camera", "photo.saved",
                 kv(

@@ -182,6 +182,11 @@ fun CameraScreen(
      * **恒可点**：没拍过照时也要能进相册看设备里的照片（用户报的第 6 点）。
      */
     onOpenGallery: () -> Unit = {},
+    /**
+     * 胶卷位点击（已有成片时）→ 直接打开**这张的大图**（v0.12.34，用户要求）。
+     * 没有成片时才退回相册页 —— 见胶卷位的点击分支。
+     */
+    onOpenLastPhoto: (String) -> Unit = {},
     onRegisterVolume: ((() -> Unit)?) -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -960,13 +965,28 @@ fun CameraScreen(
     // 最近成片缩略图（保存完成后 lastPhotoUri 才会更新，此时文件已就绪）
     LaunchedEffect(photoUri) {
         val uri = photoUri ?: return@LaunchedEffect
-        val bmp = withContext(Dispatchers.IO) {
-            // E2-18b：平台 loadThumbnail 对 DNG 的 EXIF 方向不可靠（与 E2-18a 相册网格
-            // 同款根因），改走统一的 decodeOriented 按方向转正。请求 128px，采样率由
-            // sampleSizeFor 算（结果不小于目标，宁多解一点不糊）。
-            decodeOriented(context, uri, 128, 128)
+        // 失败重试（v0.12.34，用户报"左下角缩略图有概率丢失"）：
+        // 一次解码失败就永久空白的原因有两个 —— ① 此前 lastPhotoUri 在写字节**之前**
+        // 就发布（已修，见 CameraController.saveJpeg）；② MediaStore 刚插入的条目在
+        // 某些 ROM 上会短暂读不到（扫描/权限缓存）。所以这里退避重试 3 次，仍失败才
+        // 落占位并**记一条日志**（此前完全静默，没法排查）。
+        repeat(3) { attempt ->
+            val bmp = withContext(Dispatchers.IO) {
+                // E2-18b：平台 loadThumbnail 对 DNG 的 EXIF 方向不可靠（与 E2-18a 相册网格
+                // 同款根因），改走统一的 decodeOriented 按方向转正。请求 128px，采样率由
+                // sampleSizeFor 算（结果不小于目标，宁多解一点不糊）。
+                decodeOriented(context, uri, 128, 128)
+            }
+            if (bmp != null) {
+                thumb = bmp.asImageBitmap()
+                return@LaunchedEffect
+            }
+            delay(300L * (attempt + 1))
         }
-        thumb = bmp?.asImageBitmap()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_WARN, "app", "camera.thumb_failed",
+            kv("uri" to uri.toString()),
+        )
     }
 
     fun secText(ns: Long): String =
@@ -1671,11 +1691,14 @@ fun CameraScreen(
                     .clip(RoundedCornerShape(10.dp))
                     .background(FilmTheme.ChipBg)
                     .alpha(if (t == null) 0.5f else 1f)
-                    // 胶卷位**恒可点** → 相册页（用户报的第 6 点）：此前是
-                    // clickable(enabled = photoUri != null)，装包后没拍过照的用户点它
-                    // 毫无反应。灰态（alpha 0.5）继续表示"还没有成片"，但点击一律进相册
-                    //（传统相册入口），不再直接进编辑器。
-                    .clickable { onOpenGallery() },
+                    // 胶卷位**恒可点**（用户报的第 6 点）：没拍过照时点它毫无反应的
+                    // 老问题已修。v0.12.34 起语义分成两支：有最近成片 ⇒ **直接打开这张
+                    // 大图**（用户要求）；没有 ⇒ 进相册页（传统入口）。灰态（alpha 0.5）
+                    // 继续表示"还没有成片"。
+                    .clickable {
+                        val u = photoUri
+                        if (u != null) onOpenLastPhoto(u.toString()) else onOpenGallery()
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 if (t != null) {

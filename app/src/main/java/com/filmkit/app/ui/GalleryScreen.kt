@@ -1,6 +1,7 @@
 package com.filmkit.app.ui
 
 import android.Manifest
+import android.app.Activity
 import android.content.ContentUris
 import android.content.Context
 import android.content.pm.PackageManager
@@ -9,10 +10,11 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,13 +25,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -38,11 +44,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -55,6 +63,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -117,6 +126,90 @@ fun GalleryScreen(
         error = res.second
     }
 
+    // ── 多选 / 批量删除（v0.12.34，用户要求："相册新增多选功能（批量删除），可按日期全选"）──
+    var selecting by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(emptySet<String>()) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+    // 已提交给系统删除请求的那批（回调里要知道该从列表移除哪些）
+    var doomed by remember { mutableStateOf(emptyList<String>()) }
+    val scope = rememberCoroutineScope()
+
+    // API 30+：系统弹一次确认后批量删除（与查看页单张删除同一套 API，权限模型一致）
+    val deleteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val gone = doomed.toSet()
+            photos = photos?.filterNot { it.uri in gone }
+            doomed = emptyList()
+            selected = emptySet()
+            selecting = false
+            // API 30+ 是"移入最近删除"（可恢复），低版本是真删 —— 文案不能撒谎
+            status = if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
+                "已移入「最近删除」，可在系统相册中恢复"
+            } else {
+                ""
+            }
+        } else {
+            status = "已取消删除"
+        }
+    }
+
+    /**
+     * 批量删除（安全红线：绝不能误删**且要能反悔**）。
+     *
+     * ★ v0.12.34：API 30+ 一律走 [MediaStore.createTrashRequest] —— 照片进系统
+     * 「最近删除」（MediaProvider 的 trash，30 天后自动清理），用户可在系统相册里
+     * 一键恢复。这正是"和系统相册一样"的做法，比自建回收站省一整套代码（也省了
+     * 私有目录的空间与恢复入口）。
+     *
+     * 三道闸：① 本页二次确认（写清张数、是否全库、能否恢复）；
+     * ② 系统确认弹窗（API 30+）；③ 回收站本身（30 天内可撤销）。
+     * API 26-29 没有 trash 与系统弹窗 ⇒ 只有 ①，此时文案明说"不可恢复"，
+     * 删除失败必须如实报（不许静默）。
+     */
+    fun deleteSelected() {
+        val uris = selected.toList()
+        if (uris.isEmpty()) return
+        doomed = uris
+        if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
+            try {
+                val req = MediaStore.createTrashRequest(
+                    context.contentResolver, uris.map { Uri.parse(it) }, true,
+                )
+                deleteLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
+            } catch (t: Throwable) {
+                status = "删除失败：${t.message?.take(60) ?: "系统拒绝了删除请求"}"
+            }
+        } else {
+            scope.launch {
+                var deleted = 0
+                var err = ""
+                withContext(Dispatchers.IO) {
+                    for (u in uris) {
+                        val n = try {
+                            context.contentResolver.delete(Uri.parse(u), null, null)
+                        } catch (t: Throwable) {
+                            err = t.message?.take(60) ?: "无权限或该照片不可删除"
+                            0
+                        }
+                        if (n > 0) deleted++ else if (err.isEmpty()) err = "系统没有删除这张照片"
+                    }
+                }
+                if (deleted > 0) {
+                    val gone = uris.toSet()
+                    photos = photos?.filterNot { it.uri in gone }
+                    selected = emptySet()
+                    selecting = false
+                    status = if (deleted == uris.size) "" else "部分照片删除失败：$err"
+                } else {
+                    status = "删除失败：$err"
+                }
+            }
+        }
+    }
+
     // 离页即释放缓存（只丢引用，见 ThumbCache.clear 的 KDoc）。不做进程级常驻：
     // 相册页退出后没人再看这些缩略图，留着只是白占内存。
     val thumbs = remember {
@@ -144,7 +237,54 @@ fun GalleryScreen(
             .statusBarsPadding()
             .navigationBarsPadding(),
     ) {
-        SubPageTopBar("相册", onBack)
+        if (selecting) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = {
+                    selecting = false
+                    selected = emptySet()
+                }) { Text("取消", color = FilmTheme.Cream, fontSize = 13.sp) }
+                Text(
+                    if (selected.isEmpty()) "选择照片" else "已选 ${selected.size} 张",
+                    color = FilmTheme.Cream,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = {
+                    selected = if (selected.size == flatUris.size) emptySet() else flatUris.toSet()
+                }) {
+                    Text(
+                        if (selected.size == flatUris.size && flatUris.isNotEmpty()) "取消全选" else "全选",
+                        color = FilmTheme.Accent,
+                        fontSize = 13.sp,
+                    )
+                }
+                TextButton(
+                    onClick = { if (selected.isNotEmpty()) confirmDelete = true },
+                    enabled = selected.isNotEmpty(),
+                ) {
+                    Text(
+                        "删除",
+                        color = if (selected.isEmpty()) FilmTheme.CreamDim else Color(0xFFE05B4B),
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f)) { SubPageTopBar("相册", onBack) }
+                TextButton(onClick = {
+                    selecting = true
+                    status = ""
+                }) { Text("选择", color = FilmTheme.Accent, fontSize = 13.sp) }
+            }
+        }
 
         // 降级提示（仅未授权时）：既解释为什么照片少，也给回授权的入口
         if (!granted) {
@@ -173,6 +313,14 @@ fun GalleryScreen(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
             )
         }
+        if (status.isNotEmpty()) {
+            Text(
+                status,
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+            )
+        }
 
         when {
             photos == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -195,13 +343,34 @@ fun GalleryScreen(
             ) {
                 days.forEach { day ->
                     item(key = "day-${day.date}", span = { GridItemSpan(maxLineSpan) }) {
-                        Text(
-                            dayLabel(day.date),
-                            color = FilmTheme.Cream,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(start = 6.dp, top = 10.dp, bottom = 4.dp),
-                        )
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(start = 6.dp, end = 6.dp, top = 10.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                dayLabel(day.date),
+                                color = FilmTheme.Cream,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (selecting) {
+                                val dayUris = day.photos.map { it.uri }
+                                val allOn = dayUris.all { it in selected }
+                                TextButton(onClick = {
+                                    selected = if (allOn) selected - dayUris.toSet()
+                                    else selected + dayUris
+                                }) {
+                                    Text(
+                                        if (allOn) "取消本日" else "全选本日",
+                                        color = FilmTheme.Accent,
+                                        fontSize = 11.sp,
+                                    )
+                                }
+                            }
+                        }
                     }
                     items(day.photos, key = { it.uri }) { photo ->
                         val uri = remember(photo.uri) { Uri.parse(photo.uri) }
@@ -209,16 +378,80 @@ fun GalleryScreen(
                             uri = uri,
                             px = thumbPx,
                             cache = thumbs,
+                            selecting = selecting,
+                            selected = photo.uri in selected,
                             onClick = {
-                                // 索引在**扁平列表**里取（与查看页的 Pager 同一口径）
-                                val i = flatUris.indexOf(photo.uri)
-                                if (i >= 0) onOpenPhoto(flatUris, i)
+                                if (selecting) {
+                                    selected = if (photo.uri in selected) selected - photo.uri
+                                    else selected + photo.uri
+                                } else {
+                                    // 索引在**扁平列表**里取（与查看页的 Pager 同一口径）
+                                    val i = flatUris.indexOf(photo.uri)
+                                    if (i >= 0) onOpenPhoto(flatUris, i)
+                                }
+                            },
+                            // 长按进入多选并选中这一张（与系统相册一致）
+                            onLongClick = {
+                                if (!selecting) selecting = true
+                                selected = selected + photo.uri
                             },
                         )
                     }
                 }
             }
         }
+    }
+
+    // 删除的第一道闸（第二道是 API 30+ 的系统弹窗，见 [deleteSelected]）。
+    // 文案必须**如实**区分两条路：30+ 是移入回收站（可恢复），26-29 是真删（不可恢复）。
+    if (confirmDelete) {
+        val n = selected.size
+        val trash = Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API
+        // 全库一次性清空的场景单独说一句 —— 用户最怕的就是这个（2026-10-22 特别叮嘱）
+        val wholeLibrary = n > 0 && n == flatUris.size
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = {
+                Text(
+                    (if (trash) "移入最近删除 $n 张照片？" else "删除 $n 张照片？"),
+                    color = FilmTheme.Cream,
+                    fontFamily = FilmTheme.Serif,
+                )
+            },
+            text = {
+                Text(
+                    buildString {
+                        if (wholeLibrary) append("这会清空相册当前显示的全部照片。\n")
+                        if (trash) {
+                            append("系统还会再弹一次确认。移入后可在系统相册的「最近删除」里恢复")
+                            append("（30 天后自动清除）。")
+                        } else {
+                            append("此设备不支持「最近删除」，删除后无法恢复。")
+                        }
+                    },
+                    color = FilmTheme.CreamDim,
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    deleteSelected()
+                }) {
+                    Text(
+                        if (trash) "移入最近删除" else "删除",
+                        color = MaterialTheme.colorScheme.error,
+                        fontFamily = FilmTheme.Mono,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) {
+                    Text("取消", color = FilmTheme.CreamDim)
+                }
+            },
+            containerColor = FilmTheme.ChipBg,
+        )
     }
 }
 
@@ -228,7 +461,10 @@ private fun ThumbCell(
     uri: Uri,
     px: Int,
     cache: ThumbCache<String, Bitmap>,
+    selecting: Boolean = false,
+    selected: Boolean = false,
     onClick: () -> Unit,
+    onLongClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val key = uri.toString()
@@ -245,7 +481,7 @@ private fun ThumbCell(
             .aspectRatio(1f)
             .clip(RoundedCornerShape(4.dp))
             .background(FilmTheme.ChipBg)
-            .clickable { onClick() },
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
         contentAlignment = Alignment.Center,
     ) {
         val b = bmp
@@ -259,6 +495,28 @@ private fun ThumbCell(
         } else {
             // 加载中与加载失败（如 DNG 这类解不开的格式）共用占位：不闪、不崩
             Text("▦", color = FilmTheme.CreamDim, fontSize = 18.sp)
+        }
+        // 多选态：选中蒙层 + 右上角勾选圈（未选中画空心圈，让"长按可多选"有可点暗示）
+        if (selecting) {
+            if (selected) {
+                Box(Modifier.fillMaxSize().background(Color(0x33120E0A)))
+            }
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(if (selected) FilmTheme.Accent else Color(0x66000000)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (selected) "✓" else "",
+                    color = Color.Black,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
     }
 }
