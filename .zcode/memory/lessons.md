@@ -10,13 +10,9 @@ status: active
 <!-- 踩过的坑:现象 → 根因 → 规避。未经验证的猜测不写。2026-10-05 d3 整理:单行化压缩、合并同类、事实未删。 -->
 
 ## 环境与构建（常青）
-- [2026-09-18] **中文路径 AGP externalNativeBuild 报 CXX1400** ⇒ 自定义 CMake Exec 直驱 NDK；构建 `JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`（系统默认 Java 8 跑不动 AGP 8.13）
-- [2026-09-20] **shader 改动构建全绿仍可能设备端全黑**（设备运行时编译）——铁律：必须过 `tools/validate-shaders.sh` 且真机验证后才发版
 - [2026-09-23/30] **出包与日志三坑**：增量打包残留旧 so（33.7MB vs 28.2MB、zip 条目空洞）⇒ 出包前 `rm -rf app/build/outputs/apk`；shell 管道吞退出码 ⇒ 校验类命令必须 `RC=$?` 判真实退出码（**累计四犯**）；Logger fwrite 缓冲在崩溃时吞关键记录 ⇒ 关键路径主动 `nativeFlushLogs()`，**"日志里没有"≠"没发生"**
-- [2026-10-02] **native 改动必须核对进包**：比对 APK 内 `libfilmengine.so` 的 md5 + 构建日志有无重编 `FrameRenderer.cpp.o`；macOS **没有 `timeout` 命令**（两犯）
 
 ## GL / Mali 驱动（X300 实测）
-- [2026-09-22] **sampler 必须始终有合法绑定**（全黑根因）：关闭态提前 return 不绑纹理 → Mali 预测执行分支里的 texelFetch → pass3_out glErr=1282 整帧丢弃。修法：init 建 1×1 恒等纹理、**无论开关都绑定并下发全部 uniform**（sampler3D 未绑定同理，v0.6.0 全黑）
 - [2026-09-30] **Mali 拒绝混链 GLSL 版本**（vs 300 es + fs 310 es → "Shader languages do not match" → init 失败整链黑屏）；**glslang ES profile 的 image 格式只放行 r32f**（compute 校验用 430 core 转换，有 ESSL 严格性盲区）
 
 ## Camera2 / HAL（X300）
@@ -117,3 +113,8 @@ status: active
 - [2026-10-20] **超时定时器必须与当前 burst 绑定**：`burstActive` 是共享标志，上一张的 5s 定时器会把下一张误杀（`mfnr.timeout images:0`）⇒ 回退单帧、无 MFNR、无 gainmap。**收满即摘定时器**，且超时日志要打"收到几帧"。
 - [2026-10-20] **并发拍照时"本张状态"不能用共享成员/最后提交的实例**：`nativeEngineGetStats` 读 `g_renderer` 而拍照走 `g_renderer_still` ⇒ 字段恒 0；gainmap 读回同理。**读多实例状态前先确认"我读的是不是这张的实例"**。
 - [2026-10-20] **全局 prefs 冒充单图状态会被用户一眼看穿**：查看页 HDR 开关存成全局 `view_hdr`，"关一张 = 全部关"；改成 `view_hdr:<uri>` 才对。UI 上的"单张"语义必须落到 per-item key。
+- [2026-10-22] **`脚本 | tail -2 && build` 会吞掉脚本退出码**：`tail` 成功即 `&&` 放行，于是 `validate-shaders.sh` 明明报了“禁止发版”构建照跑。0.12.20 的黑屏（GLSL `Undeclared variable g`）就是这么漏出去的。**校验脚本一律 `> log 2>&1; RC=$?`**，不接管道。
+- [2026-10-22] **按起止锚点整段替换注释会连代码一起删**：换 teq 注释时把夹在两段注释中间的 `float g = curveAt(q);` 清掉了 ⇒ shader 编译失败 ⇒ 预览黑屏。**只删注释行，不要切片**；改完必须单独 glslang 校验那个 shader。
+- [2026-10-22] **全图分位 ≠ 同区域对比**：拿 p1/p5 比两张图得出“暗部差 2EV”是假象（各自最暗 1% 不是同一个东西）。同区域实测只差 0.1~0.3EV。**跨图比较必须同区域、同尺寸**。
+- [2026-10-22] **测试是设计意图的文档**：`local_tone` 那条断言（“默认值必须仍是 0.25（标定旋钮）”）比任何注释都直接。**改默认值前先搜测试**——那次改错被单测当场抓出。
+- [2026-10-22] **“参数相同”不等于“输出相同”**：核对 PC 源码后两边 sigmoid 参数逐位相同（0.3544/0.00143/1.5 vs 0.3597/0.00138/1.491），但 PC 局部对比度仍高 6.5 个百分点 ⇒ 差异在链路别处（demosaic/锐化），不在曲线。**别在相同的参数上反复调**。

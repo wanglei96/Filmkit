@@ -2,7 +2,7 @@
 summary: 自动曝光落地与bracket设计
 created: 2026-10-20 14:58
 updated: 2026-10-20 14:58
-status: active
+status: absorbed
 ---
 
 # 自动曝光落地与 bracket 设计

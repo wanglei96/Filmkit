@@ -1,7 +1,7 @@
 ---
 summary: 记忆库索引,活跃任务与最近快照指针
 created: 2026-09-18 10:20
-updated: 2026-10-20 14:58
+updated: 2026-10-22 21:00
 status: active
 ---
 
@@ -11,27 +11,26 @@ status: active
 
 ## 活跃任务（2026-10-22）
 
-- [2026-10-22] **高光链路：天空复验** | 待晴天 | 0.12.14 把 `allSat` 亮度锚改成实测 luma（灰块已由用户确认"彻底解决"），但天空同属"大面积饱和"，需确认没被带偏。判据：天空蓝 + `hlGRecon 1` + `teqHl -2.2` + `hi240 ≤ 0.5%` | docs/reports/highlight-chain-CHECKLIST.md
-- [2026-10-20] **bracket 采集 + 饱和感知融合** | **已落地**（1 短 3 长、动态 k、sat-fix 三态标记）| 遗留：短帧也饱和区的色度仍靠 sat-fix 插值 | docs/engine-bracket-design.md · 快照「自动曝光落地与bracket设计」
+- [2026-10-22] **暗部局部对比度偏低** | 待验证 | 同区域实测相对对比度：rawpy 单帧 19.4% / 我们 17.6% / **PC 25.9%**。我们只比"完全不处理"低 1.8 个百分点（降噪/融合不是主因），**PC 高出 6.5 个点** ⇒ 它在链路里增加了细节。候选：去马赛克档（我们 RCD、PC 为 AMaZE 系）。验证法：设置→画质→去马赛克切非 RCD 档，同场景拍，量对比度。用户暂定"留到预设里调对比度" | 快照「高光链路收口与暗部对比度定位」
+- [2026-10-22] **天空复验** | 待晴天 | `allSat` 亮度锚改实测 luma 后，天空同属"大面积饱和"，需确认没被带偏。判据：天空蓝 + `hlGRecon 1` + `teqHl -2.2` + `hi240 ≤ 0.5%` | docs/reports/highlight-chain-CHECKLIST.md
+- [2026-10-22] **PC HEIC HDR 死链**（审查发现，未修）| `passGainmap` 只在 `!c.ten_bit` 时跑，而 HEIF 档恒 `ten_bit=true` ⇒ HEIC 永远拿不到本帧 gainmap；先拍过 JPEG-HDR 再切 HEIF 会读到上一张的（stale）。C++ 注释"HEIC 走平台 HeifWriter"与 Kotlin 用法矛盾 | 待定：修链路或移除 HEIC 选项
 - [2026-10-20] **HDR 剩余真机验证** | 待用户执行 | ① HEIC + HDR（8bit 降位）② JPEG 4:2:0 + HDR ③ 导出 SDR 版 ④ gainmap 数学 PC/官方双档 | docs/reports/hdr-acceptance-CHECKLIST.md
-- [2026-10-19] **HEIC UI 决策** | 待拍板 | 用户明确不喜欢 HEIC（4:2:0 色度差、亮度优势不明显、细节差）；默认已是 JPEG。待定：加提示（推荐）或移除选项 | 快照「HDR成片交付链落地与App内HDR显示」
 - [2026-10-19] **待重标 5 项（除预设）** | 待重估 | 分离色调/黑白 `[23][24][25]`、分区饱和度 `[20..22]`、光晕 `[62..65]`、场景统计/自动 EV `kFsHist`、局部色调映射 `kFsLocal` | docs/reports/phaseB-old-domain-baseline-ARCHIVE.md §7
-- [2026-10-14] **阶段 3 真机验收** | 待用户执行 | 判据 0–7；**先验判据 0**（引擎 1 必须真的改变画面 / 日志 `tone=1.0`）| docs/reports/stage3-acceptance-CHECKLIST.md
 
 ## 下一步
 
-1. **bracket 第 1 步**：采集 1 短 3 长 + `shortRatio` 透传 + 日志；融合仍同曝光，先验采集与回退。
-2. **HDR 剩余验证**：HEIC + 4:2:0 + 导出 SDR 三条路径，以及 gainmap 数学双档 A/B。
-3. **待重标 5 项 / HEIC UI**：先做默认参数 A/B 量化，再决定是否动预设与选项。
+1. **去马赛克档 A/B**：同场景拍 RCD 与 AMaZE/AHD，量局部对比度是否接近 PC 的 25.9%。这是暗部"平"唯一还在台面上的候选。
+2. **天空复验**（等晴天）：判据见上，重点看 `teqHl` 是否 −2.2、天空是否蓝。
+3. **HEIC HDR 死链**：决定修链路（把 gainmap 也产给 ten_bit）还是直接移除 HEIC 选项（用户本就不喜欢 HEIC）。
 
 ## 最近快照
 
-- [2026-10-20 14:58] handoffs/自动曝光落地与bracket设计.memo.md — active
+- [2026-10-22 20:35] handoffs/高光链路收口与暗部对比度定位.memo.md — active
+- [2026-10-20 14:58] handoffs/自动曝光落地与bracket设计.memo.md — absorbed
 - [2026-10-20 09:29] handoffs/HDR成片交付链落地与App内HDR显示.memo.md — absorbed
 - [2026-10-19 17:20] handoffs/色相路线收口与HDR路线定案.memo.md — absorbed
 - [2026-10-19 15:55] handoffs/期B域切换落地与域错配修复.memo.md — absorbed
-- [2026-10-15 22:05] handoffs/10bitHEIF交付链定稿与期A收官.memo.md — absorbed
 
-> **本次交接（s2 × d3，2026-10-20）**：新建快照 1 份（自动曝光落地与bracket设计）；四个分层全量吸收 + 压行
-> （project 98 行 · facts 119 行 · decisions 119 行 · lessons 119 行，均 ≤120）；旧 active 快照
-> 「HDR成片交付链…」标 `absorbed`；10 份快照全部 ≤14 天，本次归档 0 份（archive 43 份不变）。
+> **本次交接（s2 × d3，2026-10-22）**：新建快照 1 份（高光链路收口与暗部对比度定位）；四个分层全量吸收 + 压行
+> （decisions／facts／lessons 各 120 行、project 112 行，均 ≤120）；11 份旧 active 快照标 `absorbed`；
+> 「品红带机理闭环与替换档转正」created 超 14 天 ⇒ 归档（archive 44 份）。工作区已提交并打 tag `contrast1.5`。
