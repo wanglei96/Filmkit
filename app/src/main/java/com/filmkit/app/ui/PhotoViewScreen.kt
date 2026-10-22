@@ -657,7 +657,7 @@ fun PhotoViewScreen(
                     val gone = withContext(Dispatchers.IO) { !mediaStillExists(context, target) }
                     EngineBridge.nativeAppendLog(
                         if (gone) EngineBridge.LEVEL_INFO else EngineBridge.LEVEL_WARN,
-                        "camera", "photo.trash_result",
+                        "camera", "photo.delete_result",
                         kv("gone" to gone, "uri" to target.toString()),
                     )
                     if (gone) {
@@ -674,26 +674,26 @@ fun PhotoViewScreen(
     }
 
     /**
-     * 删除（安全红线：绝不能误删，而且要能反悔）。
+     * 删除（安全红线：绝不能误删）。
      *
-     * v0.12.34 起 API 30+ 改走 [MediaStore.createTrashRequest]：照片进系统「最近删除」，
-     * 可在系统相册里恢复 —— 与相册页的批量删除同一口径（用户 2026-10-22 要求
-     * "删除要和系统相册一样放入最近删除"）。
+     * v0.12.36：回到 [MediaStore.createDeleteRequest]，**不承诺回收站** —— 曾试
+     * `createTrashRequest` 想让照片进系统「最近删除」，vivo OriginOS 实测被直接落成真删，
+     * 用户拍板"那就不做恢复、也不自建回收站"。所以文案统一为"删除后无法恢复"。
      *
-     * **两道闸**：① 本对话框（二次确认，两档都有）；② API 30+ 再叠一层系统确认弹窗，
-     * 之后还有回收站兜底。低版本（26-29）没有系统弹窗、也没有回收站，只能
-     * `contentResolver.delete` —— 此时失败必须如实报，不许静默（删没删掉用户必须知道）。
+     * **两道闸**：① 本对话框（二次确认，两档都有）；② API 30+ 再叠一层系统确认弹窗。
+     * 低版本（26-29）没有系统弹窗，只能 `contentResolver.delete` —— 此时失败必须如实报，
+     * 不许静默（删没删掉用户必须知道）。删完都会**核实**（RESULT_OK ≠ 已删）。
      */
     fun deletePhoto() {
         val u = currentUri ?: return
         deleteTarget = u
         EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "camera", "photo.trash_request",
+            EngineBridge.LEVEL_INFO, "camera", "photo.delete_request",
             kv("count" to 1, "api" to Build.VERSION.SDK_INT),
         )
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
-                val req = MediaStore.createTrashRequest(context.contentResolver, listOf(u), true)
+                val req = MediaStore.createDeleteRequest(context.contentResolver, listOf(u))
                 deleteLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
             } catch (t: Throwable) {
                 status = "删除失败：${t.message?.take(60) ?: "系统拒绝了删除请求"}"
@@ -924,10 +924,12 @@ fun PhotoViewScreen(
             .navigationBarsPadding(),
     ) {
         // ── ① 顶栏：返回 ｜ 日期 + 时间（居中两行）｜ 收藏 ──────────────────
+        // 布局用 Box 叠层：左右按钮各自靠边，日期用 align(Center) **严格居中**
+        // （v0.12.36 用户要求："按钮靠左在返回箭头右边，日期还是居中"）。
+        // 用 Row + weight 做不到 —— 两侧按钮宽度不等时日期会偏。
+        Box(Modifier.fillMaxWidth().height(56.dp)) {
         Row(
-            Modifier
-                .fillMaxWidth()
-                .height(56.dp),
+            Modifier.fillMaxSize(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -943,16 +945,23 @@ fun PhotoViewScreen(
                     modifier = Modifier.size(22.dp),
                 )
             }
-            Column(
-                Modifier.weight(1f),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(photoDateLabel(meta.takenAtSec), color = FilmTheme.Cream, fontSize = 13.sp)
-                val time = photoTimeLabel(meta.takenAtSec)
-                if (time.isNotEmpty()) {
-                    Text(time, color = FilmTheme.CreamDim, fontSize = 12.sp)
+            // ── 「相册」入口（v0.12.35）：紧挨返回键，只有"从相机直接看大图"时才出现 ──
+            if (onOpenGallery != null) {
+                Box(
+                    Modifier
+                        .size(44.dp)
+                        .clickable { onOpenGallery() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.PhotoLibrary,
+                        contentDescription = "相册",
+                        tint = FilmTheme.Cream,
+                        modifier = Modifier.size(21.dp),
+                    )
                 }
             }
+            Spacer(Modifier.weight(1f))
             // ── HDR 开关（v0.11.50）：对齐 PC 的查看页交互 ────────────────
             // 文字按钮而非图标：HDR 是**状态**不是动作，文字 + 高亮比图标更明确
             // （PC 也是这么做的，见其 GalleryDetailScreen 的 HDR 按钮）。
@@ -969,23 +978,6 @@ fun PhotoViewScreen(
                     fontSize = 13.sp,
                     fontWeight = if (hdrOn) FontWeight.Bold else FontWeight.Normal,
                 )
-            }
-            // ── 「相册」入口（v0.12.35）：从相机页直接看大图时，这是唯一去相册的路 ──
-            if (onOpenGallery != null) {
-                Box(
-                    Modifier
-                        .height(48.dp)
-                        .clickable { onOpenGallery() }
-                        .padding(horizontal = 10.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.Filled.PhotoLibrary,
-                        contentDescription = "相册",
-                        tint = FilmTheme.Cream,
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
             }
             Box(
                 Modifier
@@ -1004,6 +996,18 @@ fun PhotoViewScreen(
                     tint = if (favorite) FilmTheme.Accent else FilmTheme.Cream,
                     modifier = Modifier.size(22.dp),
                 )
+            }
+        }
+            // 日期 + 时间：叠在中间，严格水平居中
+            Column(
+                Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(photoDateLabel(meta.takenAtSec), color = FilmTheme.Cream, fontSize = 13.sp)
+                val time = photoTimeLabel(meta.takenAtSec)
+                if (time.isNotEmpty()) {
+                    Text(time, color = FilmTheme.CreamDim, fontSize = 12.sp)
+                }
             }
         }
 
@@ -1360,19 +1364,14 @@ fun PhotoViewScreen(
             onDismissRequest = { confirmDelete = false },
             shape = RoundedCornerShape(18.dp),
             title = {
-                Text(
-                    if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) "移入最近删除？"
-                    else "删除这张照片？",
-                    color = FilmTheme.Cream,
-                    fontFamily = FilmTheme.Serif,
-                )
+                Text("删除这张照片？", color = FilmTheme.Cream, fontFamily = FilmTheme.Serif)
             },
             text = {
                 Text(
                     if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
-                        "移入后可在系统相册的「最近删除」里恢复（30 天后自动清除）。系统还会再弹一次确认。"
+                        "删除后无法恢复。系统还会再弹一次确认。"
                     } else {
-                        "此设备不支持「最近删除」，删除后无法恢复。"
+                        "删除后无法恢复。此操作不可撤销。"
                     },
                     color = FilmTheme.CreamDim,
                     fontSize = 13.sp,
@@ -1385,11 +1384,7 @@ fun PhotoViewScreen(
                         deletePhoto()
                     },
                 ) {
-                    Text(
-                        if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) "移入最近删除" else "删除",
-                        color = MaterialTheme.colorScheme.error,
-                        fontFamily = FilmTheme.Mono,
-                    )
+                    Text("删除", color = MaterialTheme.colorScheme.error, fontFamily = FilmTheme.Mono)
                 }
             },
             dismissButton = {

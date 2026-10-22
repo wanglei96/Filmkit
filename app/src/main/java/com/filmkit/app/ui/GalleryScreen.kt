@@ -149,7 +149,7 @@ fun GalleryScreen(
                     requested.filterNot { mediaStillExists(context, Uri.parse(it)) }
                 }.toSet()
                 EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_INFO, "camera", "photo.trash_result",
+                    EngineBridge.LEVEL_INFO, "camera", "photo.delete_result",
                     kv("gone" to goneSet.size, "requested" to requested.size),
                 )
                 photos = photos?.filterNot { it.uri in goneSet }
@@ -158,12 +158,9 @@ fun GalleryScreen(
                     selected = emptySet()
                     selecting = false
                     dropLastPhotoUri(context, goneSet)
-                    // API 30+ 是"移入最近删除"（可恢复），低版本是真删 —— 文案不能撒谎
-                    status = if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
-                        "已移入「最近删除」，可在系统相册中恢复"
-                    } else {
-                        ""
-                    }
+                    // 删除成功不给"可恢复"的承诺：真机实测（vivo OriginOS）系统删除请求
+                    // 直接落成真删，系统「最近删除」里也没有 —— 文案不能撒谎。
+                    status = ""
                 } else {
                     // 部分/全部没删掉：留在列表里，别让用户以为删干净了
                     selected = selected.filterNot { it in goneSet }.toSet()
@@ -178,28 +175,26 @@ fun GalleryScreen(
     /**
      * 批量删除（安全红线：绝不能误删**且要能反悔**）。
      *
-     * ★ v0.12.34：API 30+ 一律走 [MediaStore.createTrashRequest] —— 照片进系统
-     * 「最近删除」（MediaProvider 的 trash，30 天后自动清理），用户可在系统相册里
-     * 一键恢复。这正是"和系统相册一样"的做法，比自建回收站省一整套代码（也省了
-     * 私有目录的空间与恢复入口）。
+     * v0.12.36：回到 [MediaStore.createDeleteRequest]（系统删除确认），**不承诺回收站**。
+     * 曾试过 `createTrashRequest` 想让照片进系统「最近删除」，但真机（vivo OriginOS）
+     * 实测系统把 trash 请求直接落成真删、回收站里也没有 —— 用户明确表示那就不做恢复，
+     * 也不自建回收站。既然不可恢复，文案就必须说"删除后无法恢复"。
      *
-     * 三道闸：① 本页二次确认（写清张数、是否全库、能否恢复）；
-     * ② 系统确认弹窗（API 30+）；③ 回收站本身（30 天内可撤销）。
-     * API 26-29 没有 trash 与系统弹窗 ⇒ 只有 ①，此时文案明说"不可恢复"，
-     * 删除失败必须如实报（不许静默）。
+     * 防误删靠三道闸而不是撤销：① 本页二次确认（写清张数；选中全部时单独警示）；
+     * ② 系统确认弹窗（API 30+）；③ 删除后**核实**真的删掉了（RESULT_OK ≠ 已删）。
      */
     fun deleteSelected() {
         val uris = selected.toList()
         if (uris.isEmpty()) return
         doomed = uris
         EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "camera", "photo.trash_request",
+            EngineBridge.LEVEL_INFO, "camera", "photo.delete_request",
             kv("count" to uris.size, "api" to Build.VERSION.SDK_INT),
         )
         if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
             try {
-                val req = MediaStore.createTrashRequest(
-                    context.contentResolver, uris.map { Uri.parse(it) }, true,
+                val req = MediaStore.createDeleteRequest(
+                    context.contentResolver, uris.map { Uri.parse(it) },
                 )
                 deleteLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
             } catch (t: Throwable) {
@@ -429,15 +424,14 @@ fun GalleryScreen(
     // 文案必须**如实**区分两条路：30+ 是移入回收站（可恢复），26-29 是真删（不可恢复）。
     if (confirmDelete) {
         val n = selected.size
-        val trash = Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API
         // 全库一次性清空的场景单独说一句 —— 用户最怕的就是这个（2026-10-22 特别叮嘱）
         val wholeLibrary = n > 0 && n == flatUris.size
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = {
                 Text(
-                    (if (trash) "移入最近删除 $n 张照片？" else "删除 $n 张照片？"),
-                    color = FilmTheme.Cream,
+                    if (wholeLibrary) "删除全部 $n 张照片？" else "删除 $n 张照片？",
+                    color = if (wholeLibrary) MaterialTheme.colorScheme.error else FilmTheme.Cream,
                     fontFamily = FilmTheme.Serif,
                 )
             },
@@ -445,12 +439,11 @@ fun GalleryScreen(
                 Text(
                     buildString {
                         if (wholeLibrary) append("这会清空相册当前显示的全部照片。\n")
-                        if (trash) {
-                            append("系统还会再弹一次确认。移入后可在系统相册的「最近删除」里恢复")
-                            append("（30 天后自动清除）。")
-                        } else {
-                            append("此设备不支持「最近删除」，删除后无法恢复。")
+                        append("删除后无法恢复")
+                        if (Build.VERSION.SDK_INT >= SYSTEM_DELETE_REQUEST_API) {
+                            append("。系统还会再弹一次确认")
                         }
+                        append("。")
                     },
                     color = FilmTheme.CreamDim,
                     fontSize = 13.sp,
@@ -462,7 +455,7 @@ fun GalleryScreen(
                     deleteSelected()
                 }) {
                     Text(
-                        if (trash) "移入最近删除" else "删除",
+                        if (wholeLibrary) "全部删除" else "删除",
                         color = MaterialTheme.colorScheme.error,
                         fontFamily = FilmTheme.Mono,
                     )
@@ -547,9 +540,9 @@ private fun ThumbCell(
 /**
  * URI 指向的照片是否**仍然存在**（v0.12.35）。
  *
- * 为什么要这一步：`createTrashRequest` 的系统弹窗返回 `RESULT_OK` **只代表用户同意了**，
- * 不代表 MediaProvider 真的执行了（真机反馈"删除了但照片还在"）。删除成功后必须用一次
- * 单条查询核实 —— `contentResolver.query(uri, ...)` 在媒体已移入回收站/被删后返回 0 行。
+ * 为什么要这一步：系统删除请求返回的 `RESULT_OK` **只代表用户同意了**，不代表
+ * MediaProvider 真的执行了（真机反馈"删除了但照片还在"）。删除成功后必须用一次单条
+ * 查询核实 —— 记录真的没了才算删掉。
  *
  * 查询抛异常（FileNotFoundException / SecurityException）同样按"已不存在"处理：
  * provider 连这条记录都拿不出来，用户也就看不到它了。

@@ -377,6 +377,9 @@ fun CameraScreen(
         mutableStateOf(prefs.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) })
     }
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    // 胶卷位**真正显示**的那张（v0.12.36）：有最近成片就用它；没有（没拍过 / 刚被删）
+    // 就回落到相册里最新的一张 —— 用户要求"不要显示空占位"。
+    var thumbUri by remember { mutableStateOf<android.net.Uri?>(null) }
 
     fun doCapture() {
         androidView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -964,7 +967,18 @@ fun CameraScreen(
 
     // 最近成片缩略图（保存完成后 lastPhotoUri 才会更新，此时文件已就绪）
     LaunchedEffect(photoUri) {
-        val uri = photoUri ?: return@LaunchedEffect
+        // 没有最近成片（从没拍过 / 刚在查看页删掉）⇒ 回落到相册最新一张，
+        // 而不是显示 ▦ 空占位（v0.12.36 用户要求）。未授权时 queryPhotos 自动
+        // 降级为本 App 目录，所以这条回落不会因为权限而失效。
+        val target = photoUri ?: withContext(Dispatchers.IO) {
+            queryPhotos(context, hasImagePermission(context)).first.firstOrNull()
+                ?.let { android.net.Uri.parse(it.uri) }
+        }
+        thumbUri = target
+        if (target == null) {
+            thumb = null
+            return@LaunchedEffect
+        }
         // 失败重试（v0.12.34，用户报"左下角缩略图有概率丢失"）：
         // 一次解码失败就永久空白的原因有两个 —— ① 此前 lastPhotoUri 在写字节**之前**
         // 就发布（已修，见 CameraController.saveJpeg）；② MediaStore 刚插入的条目在
@@ -975,7 +989,7 @@ fun CameraScreen(
                 // E2-18b：平台 loadThumbnail 对 DNG 的 EXIF 方向不可靠（与 E2-18a 相册网格
                 // 同款根因），改走统一的 decodeOriented 按方向转正。请求 128px，采样率由
                 // sampleSizeFor 算（结果不小于目标，宁多解一点不糊）。
-                decodeOriented(context, uri, 128, 128)
+                decodeOriented(context, target, 128, 128)
             }
             if (bmp != null) {
                 thumb = bmp.asImageBitmap()
@@ -985,7 +999,7 @@ fun CameraScreen(
         }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_WARN, "app", "camera.thumb_failed",
-            kv("uri" to uri.toString()),
+            kv("uri" to target.toString()),
         )
     }
 
@@ -1696,7 +1710,7 @@ fun CameraScreen(
                     // 大图**（用户要求）；没有 ⇒ 进相册页（传统入口）。灰态（alpha 0.5）
                     // 继续表示"还没有成片"。
                     .clickable {
-                        val u = photoUri
+                        val u = thumbUri
                         if (u != null) onOpenLastPhoto(u.toString()) else onOpenGallery()
                     },
                 contentAlignment = Alignment.Center,
