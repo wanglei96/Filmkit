@@ -74,6 +74,22 @@ SigmoidParams computeSigmoidParams(float middle_grey_contrast,
 // 即**两边是同一条 darktable sigmoid**，暗部差异不在这里。真凶是下面这一层：
 // 我们默认开着 local_tone（局部色调映射，暗部线性提亮 25%），而 PC 的
 // ShadowsHighlightsParams 默认是 (highlights=0, shadows=0) —— 它那层是关的。
+// ── **保持 1.5：与 PC 的暗房曲线逐位一致，不要动**（2026-10-22 定案）──────────
+// PC 源码（bjzhou/PhotonCamera, raw/DarktableSigmoidToneAlgorithm.kt）写死的参数：
+//   PAPER_EXPOSURE 0.354355423 / FILM_FOG 0.00142637086 / FILM_POWER 1.5
+// 我们 computeSigmoidParams(1.5) 的派生结果：0.359695 / 0.001384 / 1.490909 —— 同一条曲线。
+//
+// 曾两次试图把它提到 1.7/1.8 来"补暗部对比度"，两次都回退：
+//   · 实测副作用（用引擎真实代码算）：白纸 218.84 → 226.52（+7.7 LSB），
+//     而 PC 白纸是 219.24 ⇒ 会破坏"与 PC 白纸一致"的标定；+4EV 也从 247.4 → 250.4，
+//     高光更早 clip。中灰恒 119.01 不动，所以只有高光端受损。
+//   · 用户决定：**不在引擎里改，留到预设里自己调对比度**。
+//
+// 暗部"平"的真实来源（同区域实测，1777×2360）：
+//   rawpy 单帧(无融合/降噪/锐化) 相对对比度 19.4% / 我们 17.6% / PC 25.9%
+//   ⇒ 我们的链路只抹了 1.8 个百分点（不是主因），**PC 反而比"完全不处理"高 6.5 个点**，
+//   说明它在链路里增加了细节。候选：去马赛克档（我们 RCD、它 AMaZE 系）。
+//   未定论，留待后续。
 inline constexpr float kSigmoidDefaultContrast = 1.5f;
 inline constexpr float kSigmoidDefaultSkew = 0.0f;
 inline constexpr float kSigmoidDefaultWhiteTarget = 100.0f;

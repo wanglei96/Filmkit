@@ -750,6 +750,10 @@ class CameraController(private val context: Context, private val render: RenderC
                     "iso" to iso, "sec" to "%.4f".format(exposureNs / 1e9f),
                     "wb" to "AUTO+eng",
                     "zoom" to "%.2f".format(zoomRatio), "focus" to (focusSig != "null"),
+                    // v0.12.32：**基础曝光补偿**（全局设置，默认 0.7，与预设/界面 EV 都无关）。
+                    // 此前日志里没有它 ⇒ "暗部偏亮"排查时无法区分"引擎提亮"与"用户基线"，
+                    // 只能靠推断。它与 aeEv 是**相加**关系：实际提亮 = base_ev + 界面EV + AE。
+                    "baseEv" to "%.2f".format(baseEvPref),
                 ),
             )
         } catch (t: Throwable) {
