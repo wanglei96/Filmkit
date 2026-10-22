@@ -3253,6 +3253,45 @@ class CameraController(private val context: Context, private val render: RenderC
      *     id 列表、以及所有名字里带 zoom/isz/remosaic/crop 的 tag 打出来 —— 如果 vivo
      *     暴露了 ISZ 开关（vendor tag），这里会露头，不用靠猜。
      */
+    /**
+     * 按 tag 名读 CameraCharacteristics 的值（v0.12.39）。
+     *
+     * vendor tag 的类型不可预知（int / float / boolean / 各种数组），`Key<T>` 又必须带
+     * 类型构造、类型不符会抛 IllegalArgumentException。所以逐个候选类型试，先命中先返回；
+     * 全不中返回 "?"（说明该 tag 存在但类型不在候选里，需要时再加）。
+     */
+    private fun probeCharValue(c: CameraCharacteristics, name: String): String {
+        fun fmt(v: Any?): String? = when (v) {
+            null -> null
+            is IntArray -> v.joinToString(",")
+            is FloatArray -> v.joinToString(",") { "%.4f".format(it) }
+            is ByteArray -> v.joinToString(",") { it.toString() }
+            is LongArray -> v.joinToString(",")
+            else -> v.toString().take(80)
+        }
+        runCatching { c.get(CameraCharacteristics.Key(name, Int::class.java)) }
+            .getOrNull()?.let { return it.toString() }
+        runCatching { c.get(CameraCharacteristics.Key(name, Float::class.java)) }
+            .getOrNull()?.let { return "%.4f".format(it) }
+        runCatching { c.get(CameraCharacteristics.Key(name, Long::class.java)) }
+            .getOrNull()?.let { return it.toString() }
+        runCatching { c.get(CameraCharacteristics.Key(name, Boolean::class.java)) }
+            .getOrNull()?.let { return it.toString() }
+        runCatching { c.get(CameraCharacteristics.Key(name, String::class.java)) }
+            .getOrNull()?.let { return it.take(80) }
+        runCatching { c.get(CameraCharacteristics.Key(name, Byte::class.java)) }
+            .getOrNull()?.let { return it.toString() }
+        runCatching { c.get(CameraCharacteristics.Key(name, IntArray::class.java)) }
+            .getOrNull()?.let { return fmt(it) ?: "?" }
+        runCatching { c.get(CameraCharacteristics.Key(name, FloatArray::class.java)) }
+            .getOrNull()?.let { return fmt(it) ?: "?" }
+        runCatching { c.get(CameraCharacteristics.Key(name, ByteArray::class.java)) }
+            .getOrNull()?.let { return fmt(it) ?: "?" }
+        runCatching { c.get(CameraCharacteristics.Key(name, LongArray::class.java)) }
+            .getOrNull()?.let { return fmt(it) ?: "?" }
+        return "?"
+    }
+
     private fun logIszProbe(cid: String, c: CameraCharacteristics) {
         val rawSizes = runCatching {
             c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -3268,15 +3307,27 @@ class CameraController(private val context: Context, private val render: RenderC
             (c.get(k) as? Array<ByteArray>)
                 ?.joinToString(",") { String(it, Charsets.UTF_8) }
         }.getOrNull() ?: "none"
-        // tag 只打**名字**（值类型五花八门，star projection 下 get() 推不出类型）；
-        // 名字命中就说明 vivo 暴露了该开关，需要时再针对具体 key 补取值。
-        val interesting = runCatching {
+        // v0.12.39：不只打名字，还**读值** —— MTK/vivo 的 ISZ 是否真支持、光学变焦档位
+        // 是多少、以及这些开关能不能由第三方下发，全在值里（X300 实测 tag 名已确认存在：
+        // com.mediatek.insensorzoomfeature.insensorzoomPlatformSupport /
+        // com.mediatek.vsdoffeature.vsdofFeatureISZSupport / com.vivo.SupportSATRemosaic）。
+        val names = runCatching {
             c.keys.map { it.name }.filter { n ->
                 val l = n.lowercase()
                 l.contains("zoom") || l.contains("isz") || l.contains("remosaic") ||
                     l.contains("crop") || l.contains("digital")
-            }.take(24).joinToString("|")
-        }.getOrNull() ?: ""
+            }.take(16)
+        }.getOrDefault(emptyList())
+        val interesting = names.joinToString("|") { "$it=${probeCharValue(c, it)}" }
+        // 关键：这些 tag 里哪些是**可下发的**（availableCaptureRequestKeys）。ISZ 只有在
+        // 这里有对应的 enable 开关时，第三方才有机会主动打开；否则纯属 HAL/vivo 相机内部。
+        val reqIsz = runCatching {
+            c.availableCaptureRequestKeys.map { it.name }.filter { n ->
+                val l = n.lowercase()
+                l.contains("isz") || l.contains("insensor") || l.contains("remosaic") ||
+                    l.contains("zoom")
+            }.take(16)
+        }.getOrDefault(emptyList()).joinToString("|").ifEmpty { "none" }
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "camera.isz_probe",
             kv(
@@ -3285,6 +3336,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 "physicalIds" to pids,
                 "maxZoom" to (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: -1f),
                 "tags" to interesting.ifEmpty { "none" },
+                "reqKeys" to reqIsz,
             ),
         )
     }
