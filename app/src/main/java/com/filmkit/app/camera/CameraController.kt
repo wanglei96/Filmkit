@@ -1058,6 +1058,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 android.graphics.Rect(r.left + (r.width() - w) / 2, r.top + (r.height() - hgt) / 2,
                     r.left + (r.width() + w) / 2, r.top + (r.height() + hgt) / 2))
         }
+        // ISZ 实验开关（v0.12.40）：只在静拍请求上试下发，绝不污染预览链路
+        if (distort) applyIszProbe(b)
         // ── 畸变校正探测（v0.10.109-exp7）────────────────────────────────
         // 只下发给**静拍**请求（distort=true）：若对预览下发而 HAL 只对 YUV 生效，
         // 会出现"预览被校正、成片(RAW)未校正"的 WYSIWYG 破坏。
@@ -1071,6 +1073,59 @@ class CameraController(private val context: Context, private val render: RenderC
                 android.hardware.camera2.CameraMetadata.DISTORTION_CORRECTION_MODE_HIGH_QUALITY,
             )
         }
+    }
+
+    /**
+     * ISZ / remosaic 主动下发（v0.12.40，实验开关 prefs `isz_probe`，**默认关**）。
+     *
+     * 背景（2026-10-22 真机探测）：X300 是 MTK 平台，`camera.isz_probe` 显示
+     * `insensorzoomPlatformSupport=1`、`vsdofFeatureISZSupport=1`，且这些 key 出现在
+     * `availableCaptureRequestKeys` 里 ⇒ **第三方有机会主动打开**：
+     *   · com.mediatek.control.capture.remosaicenable
+     *   · com.mediatek.control.capture.seamless.remosaicenable
+     *   · com.mediatek.insensorzoomfeature.insensorzoomIsInternalAP
+     *   · vivo.control.seamless.roiRemosaic / vivo.control.seamless.remosaic.enable
+     *
+     * 若 HAL 照做，2x 变焦的 RAW 会变成"中心裁剪后的全分辨率 Bayer"（`raw.meta.in`
+     * 会从 4080×3072 掉到约 2040×1536）—— 那就是真无损的传感器内变焦，我们连插值
+     * 都不用做。若尺寸不变，说明 HAL 只对 YUV/JPEG 生效，此路不通。
+     *
+     * ⚠ 类型不确定（MTK 的开关常见 byte，也有 int）：两种都试，先命中先用。
+     * ⚠ 只有用户显式打开开关才下发：未知 vendor 参数有让 HAL 拒绝整条请求的风险
+     * （拍照直接失败），默认必须关。
+     */
+    private fun applyIszProbe(b: CaptureRequest.Builder) {
+        val prefs = context.getSharedPreferences("filmkit", 0)
+        if (!prefs.getBoolean("isz_probe", false)) return
+        val applied = ArrayList<String>()
+        fun trySet(name: String, byteValue: Byte = 1, intValue: Int = 1): Boolean {
+            runCatching { b.set(CaptureRequest.Key(name, Byte::class.java), byteValue) }
+                .onSuccess {
+                    applied += "$name=byte:$byteValue"
+                    return true
+                }
+            runCatching { b.set(CaptureRequest.Key(name, Int::class.java), intValue) }
+                .onSuccess {
+                    applied += "$name=int:$intValue"
+                    return true
+                }
+            applied += "$name=REJECTED"
+            return false
+        }
+        trySet("com.mediatek.control.capture.remosaicenable")
+        trySet("com.mediatek.control.capture.seamless.remosaicenable")
+        trySet("com.mediatek.insensorzoomfeature.insensorzoomIsInternalAP")
+        trySet("vivo.control.seamless.roiRemosaic")
+        trySet("vivo.control.seamless.remosaic.enable")
+        // MTK 的 zoomMethod：先试 2（各平台语义不一，值不可用也只是被忽略）
+        val zm = runCatching {
+            b.set(CaptureRequest.Key("android.control.zoomMethod", Byte::class.java), 2.toByte())
+        }.isSuccess
+        if (zm) applied += "zoomMethod=byte:2"
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "camera.isz_apply",
+            kv("zoom" to "%.2f".format(zoomRatio), "applied" to applied.joinToString(",")),
+        )
     }
 
     /** 切镜头的待重开镜头 ID（onClosed 里消费；跨线程访问，volatile） */
