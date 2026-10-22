@@ -1,7 +1,7 @@
 ---
 summary: 踩坑记录:现象、根因与规避方式
 created: 2026-09-18 10:20
-updated: 2026-10-20 09:45
+updated: 2026-10-22 22:20
 status: active
 ---
 
@@ -98,13 +98,6 @@ status: active
 - [2026-10-20] **GL 状态破坏会静默毁掉成片**：`passOutput` 绑 `fbo_cap_` 后**故意不恢复**、`glReadPixels` 靠"当前 FBO"读成片；我插入的 pass 结尾 `glBindFramebuffer(0)` ⇒ 读默认帧缓冲 ⇒ 成片**全黑**（`avgLuma=0` 但 JPEG 仍有 343KB，看字节数发现不了）。**新 pass 必须保存/恢复 FBO+viewport，并在读回前显式绑回目标**。
 - [2026-10-20] **同进程两套引擎实例**：拍照走 `g_renderer_still`（`use_still=true`）、预览走 `g_renderer`。新 JNI 用错实例 ⇒ 读到空纹理、返回 null、**不报错**（日志只有 `hdr:"none"`）。判据 = `thread_local` 记"本线程最后一次 submit 的实例"。
 - [2026-10-20] **多张既有纹理的 Y 方向可能相反**：`kFsFilm` 用 `vUV0` 直采 `tex_scene_`、`kFsOut` 带 `uFlipY=1.0` 翻转输出到 `tex_cap_` ⇒ 差一个 flip。同 UV 采样 = 上方 HDR 除下方 SDR ⇒ 增益上下颠倒（真机症状：**键盘鬼影**）。**读多纹理前先确认方向一致**。
-- [2026-10-20] **诊断字段要打在正确时机**：`raw.render` 在 native 返回前就输出，而 gainmap 统计在 Kotlin 回调的 `readGainmap()` 里 ⇒ 字段恒 0，无法区分"场景无高光"与"统计没生效"。**统计与日志必须同一次调用内完成**。
-- [2026-10-20] **gradle 编译开关必须进 task inputs**：`-PfilmkitHdr` 不在 inputs ⇒ 先编 debug(带) 再编 release(不带) 命中缓存，产出**缺 JNI 符号**的包（`.so` 9.2MB vs 21MB）。**打包后必须 `nm -D` 核关键符号**。
-- [2026-10-20] **中文路径下 `add_subdirectory` 丢源文件**（`file(GLOB)`/`add_library` 报 `No SOURCES`、`file(RENAME)` 失败）⇒ 主 CMakeLists 用 **`include()`**（作用域留在 `core/engine`）+ 全相对路径。
-- [2026-10-20] **`BitmapFactory` 的 `inSampleSize > 1` 丢 gainmap，`ImageDecoder` 不解析 MPF 多图**（Ultra HDR 的 gainmap 是第二张 JPEG）⇒ 应用内看 HDR 必须 `inSampleSize = 1`。**"解出来"（`hasGainmap=true`）与"显示出来"是两件事**，要分别验证。
-- [2026-10-20] **Compose 的 `context as? Activity` 常拿不到**（被 `ContextThemeWrapper` 包裹）⇒ 静默跳过整段。用逐层解包 `ContextWrapper` 的 `findActivity()`。
-- [2026-10-20] **`Configuration.isScreenHdr` 不可靠**：X300 上恒 `false` 而系统相册能显示 HDR；官方文档/示例**不检查它**（只按 `hasGainmap()`）。拿它当 gate ⇒ HDR 显示链静默失效。
-- [2026-10-20] **A/B 脚本必须统一口径再比大小**：未归一化的 `log2(gain)` 与归一化的 `[0,1]` gainmap 值不能直接比（差 `log2(max/min)` 因子）—— 首版 `gainmap-math-ab.py` 就这么错了，结论完全带偏。同型于 D5 域口径坑。
 
 ## 自动曝光（10-20）
 
@@ -112,9 +105,16 @@ status: active
 - [2026-10-20] **两层保护压同一件事 = 双重欠曝**：采集端按上一张 `sw999` 欠 1.98EV，渲染端再按本张压 2EV，同场景两张亮度不一致。**加第二层保护前先问"它和现有那层是什么关系"**，并让它们互斥。
 - [2026-10-20] **超时定时器必须与当前 burst 绑定**：`burstActive` 是共享标志，上一张的 5s 定时器会把下一张误杀（`mfnr.timeout images:0`）⇒ 回退单帧、无 MFNR、无 gainmap。**收满即摘定时器**，且超时日志要打"收到几帧"。
 - [2026-10-20] **并发拍照时"本张状态"不能用共享成员/最后提交的实例**：`nativeEngineGetStats` 读 `g_renderer` 而拍照走 `g_renderer_still` ⇒ 字段恒 0；gainmap 读回同理。**读多实例状态前先确认"我读的是不是这张的实例"**。
-- [2026-10-20] **全局 prefs 冒充单图状态会被用户一眼看穿**：查看页 HDR 开关存成全局 `view_hdr`，"关一张 = 全部关"；改成 `view_hdr:<uri>` 才对。UI 上的"单张"语义必须落到 per-item key。
 - [2026-10-22] **`脚本 | tail -2 && build` 会吞掉脚本退出码**：`tail` 成功即 `&&` 放行，于是 `validate-shaders.sh` 明明报了“禁止发版”构建照跑。0.12.20 的黑屏（GLSL `Undeclared variable g`）就是这么漏出去的。**校验脚本一律 `> log 2>&1; RC=$?`**，不接管道。
 - [2026-10-22] **按起止锚点整段替换注释会连代码一起删**：换 teq 注释时把夹在两段注释中间的 `float g = curveAt(q);` 清掉了 ⇒ shader 编译失败 ⇒ 预览黑屏。**只删注释行，不要切片**；改完必须单独 glslang 校验那个 shader。
 - [2026-10-22] **全图分位 ≠ 同区域对比**：拿 p1/p5 比两张图得出“暗部差 2EV”是假象（各自最暗 1% 不是同一个东西）。同区域实测只差 0.1~0.3EV。**跨图比较必须同区域、同尺寸**。
 - [2026-10-22] **测试是设计意图的文档**：`local_tone` 那条断言（“默认值必须仍是 0.25（标定旋钮）”）比任何注释都直接。**改默认值前先搜测试**——那次改错被单测当场抓出。
 - [2026-10-22] **“参数相同”不等于“输出相同”**：核对 PC 源码后两边 sigmoid 参数逐位相同（0.3544/0.00143/1.5 vs 0.3597/0.00138/1.491），但 PC 局部对比度仍高 6.5 个百分点 ⇒ 差异在链路别处（demosaic/锐化），不在曲线。**别在相同的参数上反复调**。
+
+## 交付层与原生能力探测（10-22 晚）
+
+- [2026-10-22] **系统删除请求的 `RESULT_OK` 只代表"用户同意"**：不代表 MediaProvider 执行了（真机"删了但照片还在"）⇒ 删完必须单条查询核实；API 30+ 还要读 `is_trashed` 列（有些 ROM 单条查询不过滤回收站条目，只看"行是否存在"会误判）。
+- [2026-10-22] **vendor tag 读值要按类型逐个试**：`CameraCharacteristics.Key<T>` 构造带类型、类型不符抛 `IllegalArgumentException`，而 `c.keys` 的 star projection 推不出 T。写 `probeCharValue` 依次试 Int/Float/Long/Boolean/String/Byte/各数组，先命中先返回。
+- [2026-10-22] **RAW 输出尺寸恒定 ⇒ 不能从尺寸反推 HAL 有没有裁**：我一度加过"w ≈ active/z 就当 HAL 已裁"的自愈判据，但 binning 尺寸同样落进该区间 ⇒ 必然误判（已删）。判据只能来自真机行为（成片视角）。
+- [2026-10-22] **逻辑相机与物理相机不能混在一张镜头表里**：等效焦距完全相同 ⇒ 去重与选择都不确定，且不同 id 的变焦范围差别巨大（0.67–10 vs 0.6–100）。
+- [2026-10-22] **先确认"授权点"再写实现**：想做"进系统最近删除"时我先动手写了自建回收站（已删）；正确顺序是先验证系统能力（回收站目录第三方不可写 ⇒ 方案不成立）再决定实现。

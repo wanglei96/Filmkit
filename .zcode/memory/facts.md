@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-20 09:45
+updated: 2026-10-22 22:20
 status: active
 ---
 
@@ -31,7 +31,6 @@ status: active
 - [2026-09-27] **管线顺序（定稿）**：多帧融合(Bayer) → 黑阶+WB → 去拜耳 → LSC → 高光重建 → CCM → 局部色调映射(可选) → filmic/AgX → 基准曝光+EV → 高光滚降 → 锐化 → OETF → 3D LUT → 颗粒 → JPEG；硬约束 LUT 必须在 OETF 后
 - [2026-10-13] **FilmParams 契约 kCount=99**（`film/FilmParams.h:41`，阶段 0 引擎插槽起；旧记忆的 36/43/48/56/59/**98** 均已过时）：[0] exposure_ev、[1..3] wb、[29] 空槽不复用、[31..34] 外观层/LUT 强度、[35] auto_tone（默认 0）、[37] filmic_black_ev / [38] filmic_white_ev、[42] white_hl=1、[43] white_floor、[44] white_probe=0.5、[45] hr_raw、[46] rcd_cdfix=1、[47] defringe、[48] moire、[49] hl_grecon、[50] ca_corr、[51] chroma_gate=2.0、[52] cg_scope=1.0、[53] df_gate=0.0、[54] **pc3d=1（替换档默认）**、[55] pc3d_msize=0、[56] rcd_g_orig=0、[57] hl_rb_recon=0、[58] rcd_p3_split=0、[59] color_smooth、[88]/[89] 色温色调（相对量）、[90..94] 高光/阴影/白/黑/褪色、[95..97] 柔光（默认 0.0/0.35/0.70）、**[98] engine_slot**（阶段 0，0 = 内置 filmic、默认）；**按实际长度读取（下限 26）**；⚠️ 下发数组必须按 **99**，且**六处同步**：`FilmParams.h` 的 `kCount` / 同文件字段声明行 `float <名> = …; // <槽位>`（机器可读，`FilmParamKeysTest` 正则抽取）/ `fromDoubles` 防呆 / Kotlin `CameraPresets.neutral()` 与 `COUNT` / Kotlin `FilmParamKeys.bySlot`（v0.10.196 只改 C++ ⇒ 启动崩）。**契约守卫**：`python3 tools/check-filmparams-contract.py`（2026-10-13 新增，四路对拍，补"C++ kCount 单独漂移"这条既有测试不覆盖的缝）
 - [2026-10-13] **`kFsFilm` = 公共模板三段 + 引擎注入段**（阶段 1）：`filmSlices()` 用四个锚点切分、`filmSource(slot)` 拼接、`init()` 编译拼接结果；**单真源 + 运行时切片**（避免人为接缝）。锚点缺失 ⇒ 退回整体字面量 + kError。**期 B 后新基线**（旧值已作废）：`kFsFilm` chars 25887 / bytes 36587 / crc32 `0x235cf3f5`；`kFsSigmoid` 16175 / 24028 / `0xfbab6a8c`；`film_d5` `0xf891c297`、`film_d5_sigmoid` `0x7c2646ef`。⚠ `FILM_SRC_BASELINE` 尚未写入守卫脚本，`--splice-selftest` 会误报。
-- [2026-10-13] **离线执行器覆盖 = P0→RCD→CCM→FILM（+PC3D）**（`tools/engine-shader-offline.py`）：产物 `p0/rcd_g/rcd_d3/ccm_d4/**film_d5**.npy`；**FILM 段 2026-10-13 补齐**（此前文件头声称已接入而实现没有 ⇒ 阶段 1 判据曾无法执行，用户拍板 A 方案先补链），配套 `tools/filmic-spline-ref.py`（`computeFilmicSpline` 逐行对照）+ `tools/check-film-offline.py`（自检：solve5 对拍 numpy / CPU 复现 vs GPU 实跑差 2.44e-04）+ `tools/film-offline-REPORT.md`。**基线**（`docs/reports/stage0-engine-slot-BASELINE.md` §3.3）：`film_d5` 默认口径 `crc32=0x589f8364`、白点 4.0 口径 `0xd46d7b5e`。**仍不在链内**：HR 高光重建（真机 FILM 的输入是它 ⇒ 离线基线不能判成片观感）/ `uLocal*` / PC3D 的 LSC 与噪声标定 / `kFsOut` / MFNR / 同帧成片 CRC32（需真机 adb）
 - [2026-10-13] **filmic 黑白点默认值两层口径（别混）**：**代码默认** `[37]/[38]` = **−7.65 / +4.56**（`FilmParams.h:161-162` + `CameraPresets.kt:122-123`，darktable/PC 固化值）；**2026-10-13 真机定档**白点 = **4.0**（经 prefs 覆盖，死白起点 3.55 EV）
 - [2026-09-27] **MFNR 采集**：maxImages 4 + 帧 1-3 拷贝即 close（maxImages 5+4 全程持有致 HAL 预配 125MB 闪退）；prefs `mfnr` 三档（0 关 / 1 自动暗光 ISO≥600 或 ≥25ms / 2 强制）
 - [2026-09-30] **MFNR 对齐（0.10.70 起）**：最细精化层 = **1/2 域**（2×2 Bayer 平均灰度，HDR+ §4 原版），tile 64@1/2 域、金字塔 L4→L1；位移量化 2 mosaic px；`allow_l1=false` 走旧 1/4 域（A/B）；日志 `alignL1`
@@ -73,7 +72,6 @@ status: active
 - [2026-10-13] **引擎插槽方案 `docs/engine-slots-design.md`**：`kFsFilm:4046`（曝光/局部色调映射/filmic/gamut/外观层混在一个 pass）拆三段 —— 公共前段（`uExposure`、`uLocal*`、`uHalDomainMap`/`uDomainRatio`）/ **引擎段（影调曲线 + darktable filmic v5 gamut）** / 公共后段（`uSat`/`uSplit`/`uMono`/`uLook*` + 黑白电平）；**保持单 pass**（初始化期字符串拼接）；`kFsOut:4544`（编码+颗粒+LUT+暗角+柔光+锐化）与 `kFsStyle:5014`（编辑器链）不动。
 - [2026-10-13] **引擎契约 5 项 + 参数面**：域（`workingColorSpace` + 到 D4 的 mat3）/ 曝光补偿域（Linear/Curve + defaultEV）/ **私有参数走独立有序 KV（绝不进 FilmParams）** / 资产 manifest 全量哈希 / 失败严格（绝不 identity 伪装，回落引擎 0）。只加 **`[98] engine_slot`**（0 = 内置 filmic）；阶段 0–1 硬判据 = **`[98]=0` 时同帧 CRC32 逐字节等价**。
 - [2026-10-13] **PC 引擎插槽一手事实**（`/tmp/pc-tone` @ `b9cf590`）：**9 个引擎**（`RawRenderingEngine.kt:10-74`：AdobeCurve 0 / **AgX 1** / Spektrafilm 2 / **DarktableSigmoid 3** / DarktableFilmic 4 / Hncs 6 / Lumix 7 / Canon 8 / Leica 10；5 与 9 空缺，Fuji 于 `56d33aa` 移除）；公共模板 `RawEngineTonePass.kt:417-505`（引擎只注入 uniforms/profile/functions 四段，**输出契约线性 RGB**，OETF 只做一次）；`DarktableSigmoidToneAlgorithm.kt` 有可逐行对照的 sigmoid GLSL（`paper_exposure=0.354355423`、`film_fog=0.00142637086`、`film_power=1.5`、`paper_power=1.0`）。
-- [2026-10-13] **HDRNet PGTM 形态（Google，PC 复刻）**：输入 `[1,192,256,4]`（第 4 通道引导 = `min(short BT601 luma×hdrRatio,12)`）→ 输出 `[1,12,16,8,1,2]` bilateral grid 系数 → gain 钳 `[0.03,30]` → **烘焙 DNG `ProfileGainTableMap2`（64×48 × ≥257）⇒ 成片路径零 NN**；推理 = **CPU XNNPACK**（非 NNAPI/GPU）；**权重 = 逆向提取的 Google 专有资产（`guide_coeffs.pb` MD5 `046e9e01…`、`uGainLimits`），不可复制、只能自训练**；`MGC` = **魔改 GCam**（`libgcastartup.so` + `libgcam` 标签）。
 
 ## 引擎插槽阶段 2/3 与全局开关（10-14）
 - [2026-10-14] **阶段 3 契约 `EngineScope.kt`**（`app/src/main/java/com/filmkit/app/camera/`，架构师落、三卡共用）：`FILMIC_OWNED_SLOTS` = {5..10, 35, 37, 38, 40}；`NEUTRALIZE` **14 槽** = `28`=1.0 / `20`,`21`,`22`=1.0 / `36`=0.0 / `35`=0.0 / `5..10`=`LATITUDE_UI_PIVOT`(0.01) / `37`,`38`=`FILMIC_BLACK/WHITE_EV_PIVOT`(−7.65/+4.56)；`KNOWN_ENGINE_SLOTS`={0,1}；`applyEngineScope(p, slot)`（slot∈{0,未注册} ⇒ **返回同一实例**，零回归）；`effectiveEngineSlot(presetSlot, override)`。
@@ -83,8 +81,6 @@ status: active
 
 - [2026-10-15] **编码器能力（`c2.mtk.hevc.encoder`，真机 `photo.heif_enc_caps`）**：`bitrateMin/Max` = 1 / **100 Mbps**；`fpsMin/Max` = 0.0016 / 79.4（⇒ `frame-rate=1` 合法）；`cqSupported` / `cbrSupported` / `vbrSupported` 全 true；`qualityRange` = **0..100**（不是 HEVC QP 0..51）。
 - [2026-10-15] **QP–体积曲线（12MP 10bit，真机 `photo.heif_try`）**：QP 16 ⇒ 0.85 MB · 12 ⇒ 1.65 · 10 ⇒ 2.05 · **4 ⇒ 3.13（iso708）/ 4.34（iso1191）** · 0 ⇒ 4.62 / 5.92 MB。**画质在 QP≈4 饱和**（QP4 ↔ QP0 同场景逐像素 p50 0.33 / p90 0.67 / **p99 1.00** / max 2.3 LSB，体积 +36%）。
-- [2026-10-15] **自研 HEIF 容器结构**：`ftyp(heic) + meta(hdlr/pitm/iinf/iloc/iprp(ipco(hvcC/ispe/pixi/colr)/ipma)) + mdat`；`colr/nclx` = 1/13/1/1。`hvcC` 必须**自己**从 Annex-B 转（编码器给的是 `00 00 00 01` + VPS/SPS/PPS 约 80 B；此前所谓"106 B hvcC"是 `MediaMuxer` 的产物）；`lengthSizeMinusOne` 由 hvcC 自己声明（**不许硬断言 3**）。
-- [2026-10-15] **位深链路（真机自检口径）**：成片 target `GL_RGB10_A2` + readback `GL_UNSIGNED_INT_2_10_10_10_REV`（LSB-first：bit0-9 R / 10-19 G / 20-29 B）；`heif10.selfcheck` 六用例全过。真源 `core/engine/src/render/OutputBitDepth.h`（`kOutput10*` 一组），守卫 `tools/check-bitdepth-single-source.py`（PASS）。
 - [2026-10-15] **交付档实机表现**：12MP 10bit HEIC 定稿后约 **3.1~4.4 MB**（同场景 JPEG q100 4:4:4 约 5.1~6.9 MB），单次编码 1.2~1.5 s。`colr` 已由 macOS 原生解码器 + 微信 + 系统相册 + Windows 四端确认正常（**判据 F 全过**）。
 
 ## 期 B 域空间（10-19）
@@ -96,11 +92,8 @@ status: active
 ## 色相路线与 HDR（10-19）
 
 - [2026-10-19] **红杯 ROI 的色相/色差（修正 D5 域口径后）**：sigmoid ΔE 3.69 / Δh 4.43° · filmic 2.11 / 1.50° · ACES 原生 11.71 / 3.44° · ACES 重锚（×1.7919）4.69 / 1.58° · Oklab L-only 5.42 / 1.83°。⇒ ACES 无优势；Oklab 用 ΔE 换 Δh。
-- [2026-10-19] **Oklab L-only 的 GLSL 实现**（已回滚，仅存档）：`kFsSigmoidDef` 内 `sigmoidOklabTone`，矩阵 = Oklab M1·inv(sRGB→XYZ)·Rec.2020→XYZ（预乘），`L' = cbrt(sigmoid(Y))`，`a/b` 按 `L'/L` 缩放；`uSigHuePreservation` 控制与 per-channel 的 mix（1.0 = Oklab）。回滚后 `kFsSigmoid` 恢复 `0xfbab6a8c`。
 - [2026-10-19] **PC 的 HDR JPEG 实现（一手源码）**：`gallery/Jpeg444ExportEncoder.kt` = 自研 4:4:4 JPEG（native `writeNative`）+ gainmap JPEG（`encodeGainmapNative`）+ **libultrahdr `packageJpegR`**（`cpp/jpeg_r_encoder.cpp`，vendored `libultrahdr`/`libjpeg-turbo`）；元数据 `ratioMin/Max` 0.25~4.0、`gamma`、`epsilonSdr/Hdr`、`displayRatioSdr/Hdr`。`hdr/UltraHdrWriter.kt`（`Bitmap.compress` + `Gainmap`）是 **4:2:0** 的另一条。
 - [2026-10-19] **PC 的 gainmap 数学**：`hdr/RawGainmapMath.kt` —— `ln((HDR+1e-4)/(SDR+1e-4))` 归一化到 `[ln(0.25), ln(4.0)]`，`DOWNSAMPLE=2`，SDR/HDR 都是 linear sRGB 亮度。
-- [2026-10-19] **默认 AE 不读场景统计**：`sw999` 只在 `updateFilmicEV` 的 `if (st.valid && auto_on)` 内写（`FrameRenderer.cpp:14204-14239`）；默认 `[35]=0`、引擎 1 下 `EngineScope` 再归零 ⇒ `sceneHighlightEv()` 返回 NaN ⇒ `ExposurePlanner` 的高光保护不参与。期 B 换域不影响默认 AE；开启自动影调后才需重调。
-- [2026-10-19] **工具**：`tools/aces2-offline-eval.py`（ACES/Oklab vs filmic/sigmoid，含 D5→sRGB 修正、ΔE2000/Δh、同白纸对齐）· `tools/hdr-probe.py`（adb 显示/编码/属性探针，无设备时输出待办清单）。
 
 ## HDR 交付（10-20）
 
@@ -118,3 +111,10 @@ status: active
 - [2026-10-20] **实测基线（0.11.64，台灯+窗，同场景两张）**：`aeEv −1.11 / −1.11`、`aeP50 0.0696`、`aeP995 2.0273`、`mean 44.8 / 45.2`、`hi240 0.00%`、`gainmap:true` ×2。对照 PC 同场景 `mean 89.6` / `hi240 0.08%` ⇒ 仍有约 1EV 要靠 bracket 补。
 - [2026-10-22] **teq 9 档曲线的档位映射**（`setTeqCurveFromAe`）：第 i 档对应 `q = i−8` EV。云/镜面反光 q≈−0.5（落 `curve[8]` 白点档）、天空主体 q≈−2.0（落 `curve[6]`）。**压深只能给第 6 档**，第 8 档必须为 0（否则白云被压成乌云）。大面积高光压深 = `-(p95_rel_white + 0)`，其中 `p95_rel_white = log2(aeP95/0.1845) + aeEv − log2(1/0.1845)`。
 - [2026-10-22] **局部对比度实测基线**（1777×2360，同区域柜门区）：rawpy 单帧（无融合/降噪/锐化）**19.4%** / 我们成片 **17.6%** / PC **25.9%**（绝对值 σ 7.59 / 13.52 / 20.61；亮度 Y 39.1 / 76.9 / 79.5）。⇒ 我们的链路只比“完全不处理”低 1.8 个百分点，**PC 高出 6.5 个百分点**（它在链路里增加了细节）。
+
+## X300 相机 id 与 ISZ（10-22 晚实测）
+
+- [2026-10-22] **X300 后置 camera id 结构**（遍历 0..10）：0 = 逻辑相机（0.67–10x）、**2 = 物理主摄**（6.25mm/23.6mm，RAW 4080×3072，`SupportSATRemosaic=1`、`cfaRemosaicType=4`）、6 = 逻辑相机（0.6–100x）、3 = 物理长焦（13.3mm/70.3mm，RAW 4096×3072）、5 = 物理潜望（31.25mm/165mm）、4 = 物理超广（2.32mm/15.4mm，RAW 4080×3060）、1 = 前置。**三个 23.6mm = id 0/2/6**。
+- [2026-10-22] **ISZ 可下发的 vendor key（X300，set 全成功）**：`com.mediatek.control.capture.remosaicenable`、`…capture.seamless.remosaicenable`、`…insensorzoomfeature.insensorzoomIsInternalAP`、`vivo.control.seamless.roiRemosaic`、`vivo.control.seamless.remosaic.enable`、`android.control.zoomMethod`；但 2.115x 时 `raw.meta` 仍 `in=4080x3072 crop=0,0,4080x3072`，且 `vsdofFeatureOpticalZoomSets=0`（无档位暴露）。
+- [2026-10-22] **PC 的「保持原分辨率」实现**（`/tmp/pc-bjzhou` @ 27d4f78）：`raw/RawDigitalZoomResampling.kt` 拍摄时按 `activeSourceBounds` 记 `rawPhysicalOutputWidth/Height`；`RawDemosaicProcessor` 以该尺寸为 reference 建 `RawOutputGeometry` ⇒ 输出 = 物理尺寸 × outputScale；重采样 = Lanczos-3（6×6 tap，`processor/GlesLanczosResampling.kt`）或 MGC RAISR（只支持整数 2x，选中即锁 2x）；`MgcFinishResolution` 另按 output/crop 比值做 downsample→guided upsample。**设置默认关**。
+- [2026-10-22] **相册/删除/缩略图事实**：`MediaStore.createDeleteRequest` / `createTrashRequest` 均 API 30+，vivo 上 trash 落成真删；`mediaStillExists` = 单条 URI query + `is_trashed` 列；`saveJpeg` 现在在写盘 + `IS_PENDING=0` + EXIF 全完成**之后**才发布 `lastPhotoUri`（原先 insert 后就发 ⇒ 缩略图偶发永久空白）；`ThumbCache` 全方法 `@Synchronized`。

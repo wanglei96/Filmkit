@@ -1,7 +1,7 @@
 ---
 summary: 记忆库索引,活跃任务与最近快照指针
 created: 2026-09-18 10:20
-updated: 2026-10-22 21:00
+updated: 2026-10-22 22:20
 status: active
 ---
 
@@ -11,26 +11,27 @@ status: active
 
 ## 活跃任务（2026-10-22）
 
-- [2026-10-22] **暗部局部对比度偏低** | 待验证 | 同区域实测相对对比度：rawpy 单帧 19.4% / 我们 17.6% / **PC 25.9%**。我们只比"完全不处理"低 1.8 个百分点（降噪/融合不是主因），**PC 高出 6.5 个点** ⇒ 它在链路里增加了细节。候选：去马赛克档（我们 RCD、PC 为 AMaZE 系）。验证法：设置→画质→去马赛克切非 RCD 档，同场景拍，量对比度。用户暂定"留到预设里调对比度" | 快照「高光链路收口与暗部对比度定位」
+- [2026-10-22] **镜头去重后真机验证** | 待用户 | 0.12.42 把镜头表按等效焦距去重（物理优先），默认主摄从逻辑 id 0 换成物理 id 2。要确认：镜头配置只剩 4 个（15.4 / 23.6 / 70.3 / 165.1）、3x 以上仍能自动切长焦（原先靠逻辑相机代劳） | 快照「M档裁切、相册多选与ISZ收口」
+- [2026-10-22] **暗部局部对比度偏低** | 待验证 | 同区域相对对比度 rawpy 19.4% / 我们 17.6% / **PC 25.9%**；我们只比"不处理"低 1.8 点，PC 高 6.5 点 ⇒ 它在链路里增加了细节。候选 = 去马赛克档（我们 RCD、PC 为 AMaZE 系）。用户暂定"留到预设里调对比度" | 快照「高光链路收口与暗部对比度定位」
 - [2026-10-22] **天空复验** | 待晴天 | `allSat` 亮度锚改实测 luma 后，天空同属"大面积饱和"，需确认没被带偏。判据：天空蓝 + `hlGRecon 1` + `teqHl -2.2` + `hi240 ≤ 0.5%` | docs/reports/highlight-chain-CHECKLIST.md
-- [2026-10-22] **PC HEIC HDR 死链**（审查发现，未修）| `passGainmap` 只在 `!c.ten_bit` 时跑，而 HEIF 档恒 `ten_bit=true` ⇒ HEIC 永远拿不到本帧 gainmap；先拍过 JPEG-HDR 再切 HEIF 会读到上一张的（stale）。C++ 注释"HEIC 走平台 HeifWriter"与 Kotlin 用法矛盾 | 待定：修链路或移除 HEIC 选项
+- [2026-10-22] **PC HEIC HDR 死链** | 待定 | `passGainmap` 只在 `!c.ten_bit` 时跑，HEIF 档恒 `ten_bit=true` ⇒ HEIC 永远拿不到本帧 gainmap（会读到上一张的 stale）。决定：修链路还是移除 HEIC 选项 | 快照「M档裁切、相册多选与ISZ收口」
 - [2026-10-20] **HDR 剩余真机验证** | 待用户执行 | ① HEIC + HDR（8bit 降位）② JPEG 4:2:0 + HDR ③ 导出 SDR 版 ④ gainmap 数学 PC/官方双档 | docs/reports/hdr-acceptance-CHECKLIST.md
-- [2026-10-19] **待重标 5 项（除预设）** | 待重估 | 分离色调/黑白 `[23][24][25]`、分区饱和度 `[20..22]`、光晕 `[62..65]`、场景统计/自动 EV `kFsHist`、局部色调映射 `kFsLocal` | docs/reports/phaseB-old-domain-baseline-ARCHIVE.md §7
 
 ## 下一步
 
-1. **去马赛克档 A/B**：同场景拍 RCD 与 AMaZE/AHD，量局部对比度是否接近 PC 的 25.9%。这是暗部"平"唯一还在台面上的候选。
-2. **天空复验**（等晴天）：判据见上，重点看 `teqHl` 是否 −2.2、天空是否蓝。
-3. **HEIC HDR 死链**：决定修链路（把 gainmap 也产给 ten_bit）还是直接移除 HEIC 选项（用户本就不喜欢 HEIC）。
+1. **真机验 0.12.42**：镜头表 4 个 + 3x 以上长焦切换（本轮唯一可能回归的点）。
+2. **去马赛克档 A/B**：RCD vs AMaZE，量暗部同区域局部对比度能否接近 PC 的 25.9%。
+3. **天空复验**（等晴天）：判据见上，重点看 `teqHl` 是否 −2.2、天空是否蓝。
 
 ## 最近快照
 
-- [2026-10-22 20:35] handoffs/高光链路收口与暗部对比度定位.memo.md — active
+- [2026-10-22 22:15] handoffs/M档裁切、相册多选与ISZ收口.memo.md — active
+- [2026-10-22 20:35] handoffs/高光链路收口与暗部对比度定位.memo.md — absorbed
 - [2026-10-20 14:58] handoffs/自动曝光落地与bracket设计.memo.md — absorbed
 - [2026-10-20 09:29] handoffs/HDR成片交付链落地与App内HDR显示.memo.md — absorbed
 - [2026-10-19 17:20] handoffs/色相路线收口与HDR路线定案.memo.md — absorbed
-- [2026-10-19 15:55] handoffs/期B域切换落地与域错配修复.memo.md — absorbed
 
-> **本次交接（s2 × d3，2026-10-22）**：新建快照 1 份（高光链路收口与暗部对比度定位）；四个分层全量吸收 + 压行
-> （decisions／facts／lessons 各 120 行、project 112 行，均 ≤120）；11 份旧 active 快照标 `absorbed`；
-> 「品红带机理闭环与替换档转正」created 超 14 天 ⇒ 归档（archive 44 份）。工作区已提交并打 tag `contrast1.5`。
+> **本次交接（s2 × d2，2026-10-22 晚）**：新建快照 1 份（M档裁切、相册多选与ISZ收口）；
+> project 追加「拍照/相册收口与 ISZ」一节，decisions / lessons / facts 各追加本轮条目并压缩旧条目到 120 行上限；
+> 「高光链路收口与暗部对比度定位」标 absorbed；「边缘彩边专项收尾与v0.11.0发布」created 超 14 天 ⇒ 归档。
+> 活跃任务移除「待重标 5 项（除预设）」（两个周期未动，依据留在 docs/reports/phaseB-old-domain-baseline-ARCHIVE.md §7）。
