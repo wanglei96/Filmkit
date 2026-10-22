@@ -75,11 +75,27 @@ class ThumbCache<K, V>(
     private val map = LinkedHashMap<K, V>(0, 0.75f, true)
     private var bytes = 0L
 
-    val count: Int get() = map.size
-    val usedBytes: Long get() = bytes
+    // ── v0.12.26：**整个类必须同步**（相册闪退的根因）────────────────────────────
+    // 相册页并发加载多张缩略图（IO 线程池），多个线程同时进 put/get。而：
+    //   ① accessOrder=true 的 LinkedHashMap 连 `get` 都会重排链表结构；
+    //   ② put 的淘汰循环持有 `map.entries.iterator()`，另一个线程一改 map 迭代器即失效。
+    // 真机堆栈（20261022(8)，两次，主线程）：
+    //   java.util.NoSuchElementException
+    //     at java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1063)
+    //     at com.filmkit.app.ui.ThumbCache.put(GalleryModel.kt:89)
+    //     at com.filmkit.app.ui.GalleryScreenKt.load...
+    // 另有一次 ConcurrentModificationException（同一原因，表现不同）。
+    // 全部方法加 @Synchronized：粒度是单次 get/put（微秒级），不构成瓶颈；
+    // 绝不能只同步 put —— get 改 accessOrder 同样会破坏正在进行的迭代。
+    val count: Int
+        @Synchronized get() = map.size
+    val usedBytes: Long
+        @Synchronized get() = bytes
 
+    @Synchronized
     fun get(key: K): V? = map[key]
 
+    @Synchronized
     fun put(key: K, value: V) {
         map.remove(key)?.let { bytes -= sizeOf(it) }
         map[key] = value
@@ -96,6 +112,7 @@ class ThumbCache<K, V>(
      * 淘汰刚好命中可见项），recycle 会直接 "Canvas: trying to use a recycled bitmap" 崩掉。
      * 交回 GC 即可（Android 8+ 位图像素在 native 堆，GC 同样会回收）。
      */
+    @Synchronized
     fun clear() {
         map.clear()
         bytes = 0

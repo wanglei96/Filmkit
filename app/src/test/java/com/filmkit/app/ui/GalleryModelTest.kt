@@ -7,6 +7,7 @@ import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -153,5 +154,46 @@ class GalleryModelTest {
         assertEquals(0, c.count)
         assertEquals(0L, c.usedBytes)
         assertNull(c.get("a"))
+    }
+
+    /**
+     * v0.12.26 回归：相册并发加载缩略图时必须不崩。
+     *
+     * 真机堆栈（20261022(8)，两次崩在主线程）：
+     *   java.util.NoSuchElementException
+     *     at java.util.LinkedHashMap$LinkedHashIterator.nextNode
+     *     at com.filmkit.app.ui.ThumbCache.put(GalleryModel.kt:89)
+     * 成因：LinkedHashMap(accessOrder=true) 连 get 都会改结构，而 put 的淘汰循环
+     * 持有 entries.iterator() —— 别的线程一改，迭代器就失效。
+     *
+     * 修法是把 get/put/count/clear 全部 @Synchronized。这个测试用多线程反复
+     * 触发淘汰（maxCount 故意设小），未加锁时几乎必然抛异常。
+     */
+    @Test
+    fun concurrentPutAndGetDoNotThrow() {
+        val c = cache(maxBytes = 64L * 1024, maxCount = 8)
+        val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val threads = (0 until 8).map { t ->
+            Thread {
+                try {
+                    repeat(3000) { i ->
+                        c.put("k${(i + t) % 64}", "v".repeat(1000))
+                        c.get("k${i % 64}")
+                        c.count
+                        c.usedBytes
+                    }
+                } catch (e: Throwable) {
+                    errors.add(e)
+                }
+            }
+        }
+        threads.forEach { it.start() }
+        // 超时 join：未加锁时不仅是抛异常，还可能在 put 的淘汰循环里**死循环**
+        // （负向自检实测：去掉 @Synchronized 后测试不报错而是卡住）。所以这里必须
+        // 断言"所有线程都退出了"，否则 CI 会静默挂死而不是失败。
+        threads.forEach { it.join(15_000) }
+        assertTrue("并发访问超时（疑似淘汰循环死锁）", threads.none { it.isAlive })
+        assertTrue("并发访问抛了异常: ${errors.firstOrNull()}", errors.isEmpty())
+        assertTrue("淘汰后条数应受 maxCount 约束", c.count <= 8)
     }
 }
