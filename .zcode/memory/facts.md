@@ -15,7 +15,6 @@ status: active
 - [2026-09-18] 项目路径含中文（Downloads/胶片相机）：AGP externalNativeBuild 丢中文段（CXX1400），已改自定义 CMake Exec 直驱 NDK
 - [2026-09-23] 构建命令（本机已验证）：`JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`（系统默认 Java 8 跑不动 AGP 8.13）
 - [2026-09-18] X300：Android 16/OriginOS 6，Mali-G1-Ultra MC12，GL ES 3.2，7 相机（0=逻辑主摄、1=前置、2-5 隐藏物理、6=第二逻辑组）；主摄 RAW 4080×3072、CFA=GRBG、黑阶 64、白阶 1023、maxISO 3200；RGBA16F 无线性过滤
-- [2026-09-29] X300 compute 能力（caps.detected 实测）：maxComputeSharedMemory 32768、maxComputeInvocations 1024、image units 21、GPU timer 可用；RGBA16F + GL_FLOAT readPixels 可用
 - [2026-09-21] adb 安装：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`；手机存储 Mac 直读 `~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/`
 - [2026-09-18] 日志/审计导出：`/storage/emulated/0/Android/data/com.filmkit.app/files/{logs,audit}`（vivo 办公套件回传，落点 `~/Downloads/vivo办公套件/`）；未捕获异常写 `logs/crash-latest.txt` + JSONL `app.crash`
 - [2026-09-21] 离线工具链：python3 + numpy + PIL + rawpy 0.27（`postprocess(use_camera_wb=True, no_auto_bright=True, gamma=(2.222,4.5))`）；mimosa 插件已禁用（`~/.zcode/cli/config.json`）；调参脚本 `tools/tuning/`
@@ -43,15 +42,10 @@ status: active
 ## PhotonCamera 参照事实（/tmp/photoncamera，hinnka 版）
 - [2026-09-28] **PC 降噪实现**：Spatial merge 空间域 RBF（`GlesMgcRawSpatialShaders.kt:1654`）+ Sabre 结构张量各向异性核（`GlesMgcRawSabreShaders.kt:139`）+ FullResolutionDenoise 五级金字塔（`raw/MgcFullResolutionDenoise.kt`）；噪声模型 = 128-bin 半 bin 居中功率谱；去马赛克噪声传播标定 `DemosaicNoisePropagationCalibrator.kt`
 - [2026-09-30] **PC 的"快门即撒手"架构**：`isCapturing` 只锁采集窗口；帧存 per-shot `PhotoCaptureContext`（`CapturedPhotoFrame(SafeImage)`，零拷贝持有 Image）；`resolveImageReaderMaxImages()` 按需放大；处理完才 close
-- [2026-09-30] **PC 的线程/context 模型**：预览在 `CameraGLSurfaceView`（GLSurfaceView 自有 GL 线程）；各后处理器**各自 `eglCreateContext`**（`GlesMgcRawSpatialStacker:9537`、`GlesMgcRawBaseFrameSelector:708`、`OglBokehProcessor:1796`）——这是它拍完不卡预览的原因
-- [2026-09-24] 我们的 DNG 未写 BaselineExposure（vivo DngCreator 不写该 tag）；DNG 无 ForwardMatrix1/2（CameraCharacteristics 给全）；`.hcurve`（哈苏，不可复制）= 68B 头 + 65536×uint16 LE
 - [2026-10-03] **PC 色度降噪架构**：`RawToYuv` → `MeasureMoire`（输入 Y 平面，输出 **1/4 分辨率 3 通道强度图**）→ 该图**替换**送给 `ChromaDenoise` 的强度（`mgc_full_resolution_denoise_jni.cpp:1021-1064`）；`ChromaDenoise` = 四级色度金字塔 + 4 level × 3 通道 × 2 branch 独立 shot/quadratic/read 表；`MeasureMoire` 本体是编译好的 Halide capsule（`mgc_demoire_capsule.bin`），公式不可读
-- [2026-10-05] **PC ESD3D2（PC3D）**：核尺寸由噪声模型算 `min(7+(int)ks−(int)ks%2, 21)`（本机 ⇒ 11），两趟 + 引导上采样（`esd3d2_steered.glsl` / `ESD3D2.java` / `convdiff.glsl` / `guidedupsample.glsl` / `GLUtils.gaussdown`）；**`cap=0.2` 在 PC 里从不触发（实测吃满率 0.00%）**；**PC 成片本身也是 4:2:0**；PC 的 `CorrectingFlow` 只对 OnePlus 生效（样片 vivo 走 passthrough）
 
 ## 工具与脚本
 - [2026-10-01] `tools/still-thread-verify.py` + `still-thread-run.sh`（拍照线程验收：预览停更/burst 耗时/CRC 等价/落盘计数/帧率曲线）；`align-bench.cpp`+`align-bench-gen.py`（对齐离线基准）、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**，六点核对 compile/link/zero/uniforms/use/delete）
-- [2026-09-30] 其余 `tools/`：validate-shaders.sh、check-fft-tile-cover、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、ab-100pct、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
-- [2026-09-22] 内置 LUT 资产 42 个 `.lut`（uint8、33³、4.3MB）与 `~/Downloads/LUT/滤镜.cube/` 逐点一致；`docs/research/` = 12 个编号调研（00 活入口 / 01–08 冻结证据附录 / 09 频域降噪 / 10 ARRI 引擎计划 + 内建编辑器与预设）+ filmulator 专题 + README + `90-工作流原始转储`（勿删，含独有内容）
 
 ## 对标数据与测量口径（10-03 → 10-05）
 - [2026-10-08] **GLSL/Mali 铁律（v0.10.197-201）**：① **FilmParams 加槽位必须四处同改**（C++ `kCount` / Kotlin `DoubleArray(N)` / `CameraPresets.neutral()` / `FilmParamKeys`）+ 下发点 size 兜底 —— 只改 C++ 会 `ArrayIndexOutOfBoundsException` 装包即崩。② **`float m[9]` 数组参数与动态索引在 Mali 编不过**（`prog_=0` ⇒ 静默 return）；**多行宏 `#define` + 反斜杠同样不生效** ⇒ 定案写法 = **完全内联**。**新 pass 没效果先查 `prog_ != 0`**，并把 `X K`=下发 / `X Ok`=链接 / `X On`=执行 三字段写进日志。③ 中值对**宽色带无效**（邻域异常 >50%），只能迭代扩窗。
@@ -59,10 +53,6 @@ status: active
 - [2026-10-06] **紫边真机基线（1777 尺度，跨场景不可混用，每场景以同场景 PC 为基准）**：台灯逆光 PC 超额 ≈0 / 叠加 +2.84 / 关闭 +2.34 / 替换 +4.24；红笔亮场景：基线 +1.89 / κ0 +1.15 / defringe 关 +0.80 / **锐化关 +0.12≈PC** / 多尺度关 +0.87；**色散 = 成片域 dRG +0.9~1.0px 而 RAW 域三通道对齐 ⇒ 管线产生**。
 
 ## 相机能力与标定（仍有效）
-- [2026-10-03] **X300 畸变/几何能力（exp7 真机，4 次会话 × 2 cameraId 全一致）**：`DISTORTION_CORRECTION_AVAILABLE_MODES` = **none**、`LENS_DISTORTION` = `0.001,0,0,0,0`（AOSP 占位）、`LENS_RADIAL_DISTORTION` 空、`PRE_CORRECTION_ACTIVE_ARRAY == ACTIVE_ARRAY`；`LENS_INTRINSIC_CALIBRATION` fx=fy=**2790.18**（主摄）/ **2414.06**（超广）；AOSP 原文：校正 *"not applied to any RAW output"* 且该控制 *"on by default"* ⇒ 连 YUV 也未校正；超广桶形畸变实测幅度 **5.7%**（未校正）
-- [2026-10-03] **预览域 vs 成片域**：同场景 `w999`（EV 前 P99.9）预览 **2.09** / 成片 **2.674**（另一组 2.4383/2.674）⇒ 差 0.24~0.58EV 且逐次不同；预览走 OES（ISP 已 tonemap），成片是 RAW 归一化域 ⇒ 曝光判据只认成片域 `sw999`
-- [2026-09-29] **X300 三摄噪声事实**：HAL 对隐藏物理镜头返回主摄模型（pairs 逐位相同，可作为继承指纹）；实测 70MM=3.56×、15MM=2.16×；内置标定 `assets/noise_models/x300_{70mm,15mm}.c` 按"V2509A+等效焦距"匹配；同刻三镜头 A/B 残余噪声 1.22×/1.45×
-- [2026-10-02] **曝光 ×N + ISO ÷N 纯赚 SNR**：离线解析收益 √N 与物理上限逐位吻合（N=8.66 → 2.95×）；约束三条 = ISO 下限 / 快门上限 / 运动预算；纹理预算维持**细节优先 2.2px**；真机 250ms 档 `expCap:"250ms" expN:"8.33" altIso:167`，nzPreMed 0.005219→0.001688（**1/3.1**）；ISO167 = Filmix 的 ISO166
 ## 相册与预设（10-11 → 10-13）
 - [2026-10-13] **参数表单一来源 = `app/src/main/java/com/filmkit/app/ui/ParamControls.kt`**（`EditorParam` / `AdjustParams` / `ColorParams` / `TextureParams` / `LutStrengthParam` / `EditorSlider` / `CAMERA_NO_SLIDER_SLOTS` / `CAMERA_TUNABLE_SLOT_PARAM`）；由 PS-3 从 `EditorScreen.kt` **逐字搬移**（−429 行纯删除、零新增），拍照界面与编辑器共用 ⇒ 两页读数不可能漂移
 - [2026-10-13] **相册查看页关键纯函数**（`PhotoViewScreen.kt`）：`frameAfterPageChange`（切页原子替换）、`pageAlphaAt(isSettledPage, fading, fade)`（alpha 与 zoom/pan 同一道闸）、`bitmapBelongsToPage` + `visibleBitmapFor`（归属校验，防旧页像素画到新页）、`zoomAboutCentroid(pan, centroid, center, z1, z2)`（两指中心缩放）、`previewRequestFor`（预览档 = 容器一半）、`PRELOAD_RADIUS=2`、`SPINNER_DELAY_MS=150`
@@ -93,7 +83,6 @@ status: active
 
 - [2026-10-19] **红杯 ROI 的色相/色差（修正 D5 域口径后）**：sigmoid ΔE 3.69 / Δh 4.43° · filmic 2.11 / 1.50° · ACES 原生 11.71 / 3.44° · ACES 重锚（×1.7919）4.69 / 1.58° · Oklab L-only 5.42 / 1.83°。⇒ ACES 无优势；Oklab 用 ΔE 换 Δh。
 - [2026-10-19] **PC 的 HDR JPEG 实现（一手源码）**：`gallery/Jpeg444ExportEncoder.kt` = 自研 4:4:4 JPEG（native `writeNative`）+ gainmap JPEG（`encodeGainmapNative`）+ **libultrahdr `packageJpegR`**（`cpp/jpeg_r_encoder.cpp`，vendored `libultrahdr`/`libjpeg-turbo`）；元数据 `ratioMin/Max` 0.25~4.0、`gamma`、`epsilonSdr/Hdr`、`displayRatioSdr/Hdr`。`hdr/UltraHdrWriter.kt`（`Bitmap.compress` + `Gainmap`）是 **4:2:0** 的另一条。
-- [2026-10-19] **PC 的 gainmap 数学**：`hdr/RawGainmapMath.kt` —— `ln((HDR+1e-4)/(SDR+1e-4))` 归一化到 `[ln(0.25), ln(4.0)]`，`DOWNSAMPLE=2`，SDR/HDR 都是 linear sRGB 亮度。
 
 ## HDR 交付（10-20）
 
@@ -118,3 +107,13 @@ status: active
 - [2026-10-22] **ISZ 可下发的 vendor key（X300，set 全成功）**：`com.mediatek.control.capture.remosaicenable`、`…capture.seamless.remosaicenable`、`…insensorzoomfeature.insensorzoomIsInternalAP`、`vivo.control.seamless.roiRemosaic`、`vivo.control.seamless.remosaic.enable`、`android.control.zoomMethod`；但 2.115x 时 `raw.meta` 仍 `in=4080x3072 crop=0,0,4080x3072`，且 `vsdofFeatureOpticalZoomSets=0`（无档位暴露）。
 - [2026-10-22] **PC 的「保持原分辨率」实现**（`/tmp/pc-bjzhou` @ 27d4f78）：`raw/RawDigitalZoomResampling.kt` 拍摄时按 `activeSourceBounds` 记 `rawPhysicalOutputWidth/Height`；`RawDemosaicProcessor` 以该尺寸为 reference 建 `RawOutputGeometry` ⇒ 输出 = 物理尺寸 × outputScale；重采样 = Lanczos-3（6×6 tap，`processor/GlesLanczosResampling.kt`）或 MGC RAISR（只支持整数 2x，选中即锁 2x）；`MgcFinishResolution` 另按 output/crop 比值做 downsample→guided upsample。**设置默认关**。
 - [2026-10-22] **相册/删除/缩略图事实**：`MediaStore.createDeleteRequest` / `createTrashRequest` 均 API 30+，vivo 上 trash 落成真删；`mediaStillExists` = 单条 URI query + `is_trashed` 列；`saveJpeg` 现在在写盘 + `IS_PENDING=0` + EXIF 全完成**之后**才发布 `lastPhotoUri`（原先 insert 后就发 ⇒ 缩略图偶发永久空白）；`ThumbCache` 全方法 `@Synchronized`。
+
+## AE 实测与定性（10-23）
+
+- [2026-10-23] **EV 补偿在 X300 生效**（`ae.probe` 诊断包）：+1EV ⇒ ISO 490→931、+2EV ⇒ sec 0.010→0.030 + ISO 802→1630、−1EV ⇒ ISO 490→242；回读 `resSteps` 与请求一致（个别帧滞后一次）。v0.7.8 的"几乎不执行"只对静拍 `AE_MODE_OFF` 成立。
+- [2026-10-23] **同机位 EXIF 对拍**（`152436` vs `PhotonCamera_152446.无`）：快门 2.20 vs 2.02 ms、ISO 50 vs 50、f/1.7 vs 1.7 ⇒ **采集一致**；成片 p5/p25/p50/p75/p95 = 7.2/34.3/98.7/174/195 vs 12.2/65.6/171.4/230/232 ⇒ PC 是"中暗部整段提起"，属 tone mapping。
+- [2026-10-23] **提亮对天空饱和的量化**：baseEv 0→0.7 时天空 L* 75.1→84.0、蓝天 C* p90 9.7→7.1；PC 同 L* 84 时 p90 15.8（其输入色度更高，不能据此断定我们压缩过强）。
+- [2026-10-23] **鲁棒中灰 vs 几何均值**（186 样本）：`rob/geo` 中位 +0.16EV、p25 −0.05、p75 +0.33、范围 −0.60~+0.51，68% 场景 robust 更高（⇒ AE 更暗）。这是"不接鲁棒测光"的量化依据。
+- [2026-10-23] **PC 的 sigmoid 与我们的实现逐行一致**（`DarktableSigmoidToneAlgorithm.kt:80-127` vs `FrameRenderer.cpp:7243-7291`，含 `preserveSigmoidHueAndEnergy`、通道排序、energyTarget 两支求解）；`uSigWhiteTarget` 两边都是 1.0 ⇒ 差异不在曲线，在输入色度/CCM。
+- [2026-10-23] **PC 默认渲染引擎是 AdobeCurve**（`UserPreferencesRepository.kt:144`），sigmoid 只是选项 —— 但用户实拍时手动切成了 sigmoid，所以此条**不是**本轮差异的解释。
+- [2026-10-23] **相册编辑器饱和度失效根因**：`EditorEngineSession` 出口调 `engineScoped` ⇒ `applyEngineScope` 把公共段 `[20]/[21]/[22]` 置 1.0。修复 = `applyEngineScopeForEditor`（跳过公共段）。
