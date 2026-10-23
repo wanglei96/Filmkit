@@ -176,6 +176,13 @@ float g_pv_geo_ema = 0.0f;
 // 而这恰好破坏了 v0.11.92 的取景器匹配前提（目标来自预览，预览却不是最终亮度）。
 float g_still_ae_ema = 0.0f;
 float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范围 1.70–3.87 的中位）
+// 0.12.51：**显示域**中位（sRGB 编码 0..1）的预览 EMA —— 显示域 AE 闭环的实测值。
+// 为什么必须用显示域：`p_robust` 是 RAW 域的统计，而"够不够亮"是显示域的观感；
+// 两者之间隔着 sigmoid 肩部/teq/LUT，映射不恒定（真机 132502 输入 0.18 → mean 91，
+// 0601 输入 0.17 → mean 115）。PC 的 `MeteringSystem.DISPLAY_TARGET_LUMA = 0.18`
+// 也是显示域（sRGB 缩略图线性化后的 luma）—— 这一层对齐后才能跨场景用同一个目标。
+float g_pv_disp_p50 = 0.0f;
+float g_disp_ae_ev = 0.0f;   // 显示域闭环累计 EV（诊断）
 
 // 预览降载（v0.10.93）：1.0 = 全分辨率。进程级 atomic —— 写方（Kotlin 的
 // capture 入口/完成回调，任意线程）与读方（渲染线程 submitFrame 每帧开头）
@@ -9171,6 +9178,11 @@ void FrameRenderer::setGainmapMath(int mode) {
 
 int FrameRenderer::gainmapMath() { return g_gainmap_math.load(); }
 
+void FrameRenderer::previewMetering(float* geo, float* ratio) {
+  if (geo) *geo = g_pv_geo_ema;
+  if (ratio) *ratio = g_domain_ratio;
+}
+
 void FrameRenderer::setAutoExposure(bool on) { g_ae_auto.store(on); }
 
 // 局部影调开关（默认开）：用函数内 static 避免全局构造顺序问题
@@ -9181,6 +9193,65 @@ static std::atomic<bool>& toneEqFlag() {
 void FrameRenderer::setToneEq(bool on) { toneEqFlag().store(on); }
 bool FrameRenderer::toneEq() { return toneEqFlag().load(std::memory_order_relaxed); }
 bool FrameRenderer::autoExposure() { return g_ae_auto.load(std::memory_order_relaxed); }
+
+static std::atomic<bool>& aeRobustFlag() {
+  static std::atomic<bool> f{false};
+  return f;
+}
+void FrameRenderer::setAeRobust(bool on) { aeRobustFlag().store(on); }
+bool FrameRenderer::aeRobust() { return aeRobustFlag().load(std::memory_order_relaxed); }
+
+static std::atomic<bool>& aeDisplayFlag() {
+  // 0.12.55：**默认关**。0.12.51~54 把显示域闭环做在**预览链**上，等于和 HAL 的 AE
+  // 打擂台：HAL 在 30fps 内实时收敛，我们的外环再用滞后的读数推 EV ⇒ 双回路互相激发，
+  // 室内表现为"忽暗忽亮"（真机 14:36），成片还因为走 hl 约束而与取景器不一致。
+  // 预览/成片一致性只能靠**同一次曝光**保证（PC 的做法），不能在渲染端各算一套。
+  // 正确落点 = HAL 的 `CONTROL_AE_EXPOSURE_COMPENSATION`（见 CameraController），
+  // 这条渲染端通路保留代码但默认不启用（A/B 与离线复现用）。
+  static std::atomic<bool> f{false};
+  return f;
+}
+void FrameRenderer::setAeDisplay(bool on) { aeDisplayFlag().store(on); }
+bool FrameRenderer::aeDisplay() { return aeDisplayFlag().load(std::memory_order_relaxed); }
+
+static std::atomic<bool>& aeHalFlag() {
+  // 0.12.58：**默认关**。固定目标（0.18）闭环 = 把每个场景的平均亮度都拉到 0.18，
+  // 室内平均反射率低 ⇒ 必然过曝（真机 0.12.57 当场拉爆）。这不是参数问题，是
+  // "用固定目标闭环"本身的数学性质：暗场景永远会被拉爆，亮场景永远会被压暗。
+  // 保留开关供 A/B，默认回到 HAL 自己的 AE。
+  static std::atomic<bool> f{false};
+  return f;
+}
+void FrameRenderer::setAeHal(bool on) {
+  aeHalFlag().store(on);
+  if (on) {
+    // 清掉历史闭环残留，避免旧值继续叠加到预览曝光上。
+    g_still_ae_ema = 0.0f;
+    g_disp_ae_ev = 0.0f;
+  }
+}
+bool FrameRenderer::aeHal() { return aeHalFlag().load(std::memory_order_relaxed); }
+float FrameRenderer::displayP50() { return g_pv_disp_p50; }
+
+// 显示域中位（sRGB 编码 0..1）。kFsHist 的 stat_mode=0 输出显示域 luma，直接取中位。
+float FrameRenderer::measureDisplayP50(GLuint src) {
+  constexpr int kN = 256;
+  int hist[kN];
+  if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/0,
+                     /*stat_mode=*/0, /*center_frac=*/0.0f, nullptr)) {
+    return 0.0f;
+  }
+  long total = 0;
+  for (int i = 0; i < kN; ++i) total += hist[i];
+  if (total <= 0) return 0.0f;
+  const long want = total / 2;
+  long acc = 0;
+  for (int i = 0; i < kN; ++i) {
+    acc += hist[i];
+    if (acc >= want) return (static_cast<float>(i) + 0.5f) / static_cast<float>(kN);
+  }
+  return 1.0f;
+}
 
 // ── 自动曝光（v0.11.61）────────────────────────────────────────────────────
 // 只跑 RAW 静拍链：`film_src` 是降噪/去边之后的 RAW 线性纹理（曝光前），从这里取
@@ -9198,6 +9269,14 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
   ae_p995_ = 0.0f;
   ae_why_ = 0;
   ae_p_geo_ = 0.0f;
+  // 0.12.56：HAL-AE 模式 —— 渲染端 AE 完全退出（额外 EV 恒 0）。
+  // 为什么必须彻底退出：渲染端与 HAL 是两条独立回路，同时改 EV 必然互相激发
+  // （0.12.51~54 真机：室内忽暗忽亮、成片与取景器亮度不一致）。
+  if (aeHal()) {
+    ae_ev_ = 0.0f;
+    ae_why_ = 6;   // 6 = hal（诊断）
+    return 0.0f;
+  }
   ae_target_mid_ = kAeTargetMid;
   ae_white_ev_ = kAeRawWhiteEv;
   ae_brk_sat_ = short_sat;
@@ -9245,7 +9324,9 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
     // 除以域比后：target 回到 RAW 域语义，预览与成片同曝光；顶死的高光也会自然消失。
     in.target_mid = std::clamp(g_pv_geo_ema / std::max(g_domain_ratio, 1e-3f), 0.12f, 0.70f);
   }
-  ae_target_mid_ = in.target_mid;
+  // 诊断字段必须在 in.robust/in.p_robust 赋值**之后**再取（0.12.47 把它写在这里，
+  // 那时 in.robust 还是默认 false ⇒ 日志恒显示 0.12，真机 10:36 实测复现）。
+  ae_target_mid_ = (aeRobust() && st_full.p_robust > 1e-9f) ? in.target_robust : in.target_mid;
   in.p_hi995 = st_full.p_hi995;
   in.user_ev = p.exposure_ev;
   // ── v0.11.87：高光判据的两处语义修正 ──────────────────────────────
@@ -9263,11 +9344,27 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
   // 真机 5517（关 bracket）因此压到 −2.21EV、mean 31.3 —— 而这场景的 P99.5 是 4.34，
   // 压到 2.438 只是把图压暗，长帧饱和处的信息一点也救不回来。真正兜底的是 teq 的
   // 高光压缩（−1.1 / −2.2），不是把中灰压到死。
-  in.white_ev = kAeDisplayClipEv;
+  // ── 0.12.49：**短帧有余量时，长帧不该再被高光压死** ────────────────────────
+  // 真机 2026-10-23 10:36:46（逆光窗）：`aeBrkSat 0.0`（短帧 RAW 零饱和 ⇒ 高光
+  // 信息全在），但 `force_hl` 仍按 4.8EV 白点把长帧压到 1.87EV，而中灰想要 2.52EV
+  // ⇒ **整体偏暗 0.65EV**。这正是用户报的"带天空场景整体偏暗"。
+  // 语义（HDR+ §4 / MGC ComputeAeResults）：短帧存在的意义就是把高光信息带回来，
+  // 长帧因此可以按中灰给足；只有短帧本身也饱和（真丢信息）时才退回保守白点。
+  // 白点用**曲线死白点 6.22EV**（阶段 2 报告 §4.2：sigmoid 量化到 6.22EV 才不再增长），
+  // 不是"不约束"——v0.11.88 的 2712 事故是"完全不约束 ⇒ aeEv 冲 +2.0"，不是放宽白点。
+  const bool bracket_has_headroom =
+      bracket_metering && short_sat >= 0.0f && short_sat < kAeMaxClippedFrac;
+  in.white_ev = bracket_has_headroom ? kAeSigmoidDeadWhiteEv : kAeDisplayClipEv;
   // v0.11.88：bracket 下**永远**跑高光约束 —— 旧逻辑在"真裁切 0"时把整条判据关掉，
   // 于是 aeEv 一路冲到 +2.0 限幅、白墙/窗外撞白（真机 2712：hi240 3.97%）。
   in.force_hl = bracket_metering;
   in.p_hi95 = st_full.p_hi95;
+  // 0.12.52：BLOCK「一套」——RAW 域鲁棒档不再参与决策（显示域闭环是唯一来源）。
+  // `p_robust` 仍算、仍进日志，供离线核对统计量，但不影响 EV。
+  in.p_robust = st_full.p_robust;
+  in.robust = false;
+  ae_p_robust_ = st_full.p_robust;
+  ae_robust_on_ = in.robust;
   ae_white_ev_ = in.white_ev;
   ae_sat_raw_ = st_full.sat_frac;
   const AeDecision d = decideAe(in);
@@ -9289,6 +9386,17 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
     ae_why_ = 2;
   } else if (d.why[0] == 'm') {
     ae_why_ = 1;
+  }
+  // ── 0.12.51：显示域闭环优先 ────────────────────────────────────────────
+  // 预览侧已经按**显示域中位 → 目标 0.18** 把 EV 积分收敛（见 submitFrame 末尾），
+  // 预览与成片共用这个 EMA ⇒ 成片第一张就拿到正确值。这里只叠高光兜底，
+  // 不再用 RAW 域 ev_mid 覆盖（两套目标会互相拉扯，正是此前反复调 target 的原因）。
+  if (aeDisplay() && g_pv_disp_p50 > 0.005f) {
+    const float hl = std::min(d.ev_hl, d.ev_hl_soft);
+    const float ev = std::min(g_disp_ae_ev, hl);
+    ae_ev_ = ev;
+    ae_why_ = 5;   // 5 = display（显示域闭环）
+    return ev;
   }
   g_still_ae_ema = g_still_ae_ema * 0.7f + d.ev * 0.3f;
   return d.ev;
@@ -9378,6 +9486,71 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   passOutput(dst_w, dst_h, p, false, true);  // 预览：允许过曝斑马纹
   if (diag) logPassDiag("pass3_out", 0, kOutputGlInternalFormat);
+  // ── 0.12.51：显示域 AE 闭环（首张生效的关键）────────────────────────────
+  // 预览每 10 帧量一次**最终显示输出**（tex_cap_，sRGB 编码）的中位，按目标 0.18
+  // （线性）积分 EV 到 g_still_ae_ema。预览与成片共用这个 EMA（见 passFilm 的
+  // `pv.exposure_ev += g_still_ae_ema`）⇒ 用户构图时闭环已经收敛，按下快门那一刻
+  // 成片拿到的就是收敛后的 EV，**第一张就是对的**，不需要"拍完再修正"。
+  if (aeHal()) {
+    // ⚠ 0.12.52：预览的 passOutput 直接画到默认帧缓冲（屏幕），**没有中间纹理**；
+    // 0.12.51 去读 tex_cap_ 读到的是空内容 ⇒ `aeDispP50` 恒 0、闭环从未生效。
+    // 改法 = 直接读屏幕中心 64×64（所见即所得，也就是用户看到的那块画面）。
+    // 0.12.53：节流 15 帧 → **5 帧**（@60fps ≈ 80ms/步）。15 帧 + 0.15 步长要从 0 爬到
+    // 2EV 需要 3~5 秒，用户当场质疑"PC 也要这么久吗"——不应该，HAL 的 AE 是几百毫秒
+    // 级收敛。这里把采样加密、增益提到 0.7，典型 1.2EV 缺口 3 步内到位（≈0.25s）。
+    if ((++disp_tick_ % 5) == 0 && dst_w >= 64 && dst_h >= 64) {
+      unsigned char px[64 * 64 * 4];
+      glReadPixels(dst_w / 2 - 32, dst_h / 2 - 32, 64, 64, GL_RGBA,
+                   GL_UNSIGNED_BYTE, px);
+      if (glGetError() == GL_NO_ERROR) {
+        // 加权对数域直方图 + 截尾 25%~75%：与 PhotonCamera `MeteringSystem` 的
+        // `robustMidToneLinearLuma` 同口径（MIDTONE_TRIM 0.25/0.75 + 中心高斯权重）。
+        // 这才是"一套"：统计对象是**显示域**，统计方式是**鲁棒中灰**，目标是 0.18。
+        constexpr int kBins = 64;
+        double bins[kBins] = {0.0};
+        double wsum = 0.0;
+        for (int y = 0; y < 64; ++y) {
+          for (int x = 0; x < 64; ++x) {
+            const size_t i = (static_cast<size_t>(y) * 64 + x) * 4;
+            const float sr = px[i] / 255.0f, sg = px[i + 1] / 255.0f, sb = px[i + 2] / 255.0f;
+            const float luma = 0.2126f * sr + 0.7152f * sg + 0.0722f * sb;
+            const float lin = luma <= 0.04045f ? luma / 12.92f
+                                               : std::pow((luma + 0.055f) / 1.055f, 2.4f);
+            const float dx = (x + 0.5f - 32.0f) / 32.0f;
+            const float dy = (y + 0.5f - 32.0f) / 32.0f;
+            const float w = 0.35f + 0.65f * std::exp(-0.5f * (dx * dx + dy * dy) / 0.1024f);
+            // 对数域 [-12, 8] → [0, kBins-1]（与 measureSceneStats 的编码同区间）
+            const float enc = (std::log2(std::max(lin, 1e-4f)) + 12.0f) / 20.0f;
+            const int bi = std::clamp(static_cast<int>(enc * (kBins - 1)), 0, kBins - 1);
+            bins[bi] += w;
+            wsum += w;
+          }
+        }
+        if (wsum > 0.0) {
+          const double lo = wsum * 0.25, hi = wsum * 0.75;
+          double cum = 0.0, acc = 0.0, n = 0.0;
+          for (int i = 0; i < kBins; ++i) {
+            if (bins[i] <= 0.0) continue;
+            const double a = cum, b = cum + bins[i];
+            cum = b;
+            const double s = std::max(a, lo), e = std::min(b, hi);
+            if (e <= s) continue;
+            acc += (e - s) * (static_cast<double>(i) / (kBins - 1) * 20.0 - 12.0);
+            n += e - s;
+          }
+          const float mid = n > 0.0 ? std::exp2(static_cast<float>(acc / n)) : 0.0f;
+          // 0.12.54：EMA 0.7/0.3 → 0.85/0.15。旧 EMA 让读数滞后约 3 步，而增益是 0.7
+          // —— "用旧读数猛推"必然过冲（真机室内 14:36~14:37：p50 卡在 0.17 而 ev
+          // 一路涨到 2.0、mean 185）。测量滞后是振荡的根因，不是增益本身。
+          g_pv_disp_p50 = g_pv_disp_p50 > 0.001f
+                              ? g_pv_disp_p50 * 0.85f + mid * 0.15f
+                              : mid;
+          // 0.12.56：**这里不再改 EV**。统计值只供 Kotlin 外环读取（1Hz、0.3EV 步长、
+          // 下发 HAL 的 EV 补偿）。渲染端碰 EV = 和 HAL 打架，这是已证明的结论。
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -12622,6 +12795,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"aeP50\":" + jnum(ae_p50_, 6);
   // v0.11.91：中灰锚点（几何平均）—— 与 aeP50 对比可看出"P50 低估了多少"
   kv += ",\"aeGeo\":" + jnum(ae_p_geo_, 8);
+  kv += ",\"aeRobust\":" + std::string(ae_robust_on_ ? "1" : "0");
+  kv += ",\"aePRobust\":" + jnum(ae_p_robust_, 8);
+  kv += ",\"aeTargetMode\":" + std::string(ae_robust_on_ ? "\"robust\"" : "\"pv\"");
+  kv += ",\"aeDispP50\":" + jnum(g_pv_disp_p50, 5);
+  kv += ",\"aeDispEv\":" + jnum(g_disp_ae_ev, 4);
   kv += ",\"aeTarget\":" + jnum(ae_target_mid_, 8);
   kv += ",\"aeP995\":" + jnum(ae_p995_, 6);
   kv += ",\"aeP999\":" + jnum(ae_p999_, 6);
@@ -15026,7 +15204,8 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 // 而 UI 直方图仍看 film 输出（tex_work_），两者共用 kFsHist 同一实现。
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
 bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
-                                 int stat_ch, int stat_mode, float center_frac) {
+                                 int stat_ch, int stat_mode, float center_frac,
+                                 double* weighted_out) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   // v0.10.28：256×96 → 512×288。24K 采样点上 P99.99 = 前 2.5 名、max 采样对
   // 0.001% 级的小面积高光（水壶镜面/白壶身）几乎必然 miss——真机 162012 实证：
@@ -15046,6 +15225,17 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
   std::vector<uint8_t> px(static_cast<size_t>(hw) * hh * 4);
   glReadPixels(0, 0, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   for (int i = 0; i < n; ++i) out[i] = 0;
+  if (weighted_out != nullptr) {
+    for (int i = 0; i < n; ++i) weighted_out[i] = 0.0;
+  }
+  // 中心高斯权重（0.12.50，PhotonCamera MeteringSystem.centerWeight 同款）：
+  // dx/dy 归一化到 [-1,1]，σ=0.32，w = 0.35 + 0.65·exp(−0.5·(dx²+dy²)/σ²)。
+  // 为什么需要：截尾挡不住"天空占 40~45%"——真机 105249/105338（阴天天空占近半）
+  // 的截尾中灰仍被天空抬到 0.19~0.20（> 目标 0.18）⇒ AE 判定"够亮"不提亮。
+  // 中心权重让画面中央（主体/楼体）主导统计，边缘天空权重降到 ~0.6。
+  const float cx = hw * 0.5f, cy = hh * 0.5f;
+  const float inv_hw2 = 1.0f / (hw * 0.5f), inv_hh2 = 1.0f / (hh * 0.5f);
+  constexpr float kSigma = 0.32f;
   // 中央区域门控（v0.11.77）：只统计中央 center_frac 宽高的区域，对齐 PC legacy
   // matcher 的 centerFractionPerAxis=2/3 —— 画面边缘的高光不参与曝光决策。
   const bool center_only = center_frac > 0.0f && center_frac < 1.0f;
@@ -15056,7 +15246,14 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
     for (int x = 0; x < hw; ++x) {
       if (center_only && std::fabs(x + 0.5f - hw * 0.5f) > half_w) continue;
       const size_t i = (static_cast<size_t>(y) * hw + x) * 4;
-      ++out[px[i] * (n - 1) / 255];
+      const int bin = px[i] * (n - 1) / 255;
+      ++out[bin];
+      if (weighted_out != nullptr) {
+        const float dx = (x + 0.5f - cx) * inv_hw2;
+        const float dy = (y + 0.5f - cy) * inv_hh2;
+        const float g = std::exp(-0.5f * (dx * dx + dy * dy) / (kSigma * kSigma));
+        weighted_out[bin] += static_cast<double>(0.35f + 0.65f * g);
+      }
     }
   }
   return true;
@@ -15090,8 +15287,9 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
   constexpr int kN = 256;
   SceneStats st;
   int hist[kN];
+  double wh[kN];
   if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1,
-                     /*stat_mode=*/1, center_frac)) return st;
+                     /*stat_mode=*/1, center_frac, wh)) return st;
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return st;
@@ -15150,6 +15348,29 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
     }
     st.p_geo = n > 0 ? static_cast<float>(std::exp(acc / static_cast<double>(n))) : 0.0f;
   }
+  // v0.12.46：鲁棒中灰（截尾 25%~75% 的 log 域均值）。直方图已在手，零额外成本。
+  // 只在截尾区间内累加 log(线性值)，权重 = 落入该区间的桶计数。
+  // 为什么要截尾：p_geo 把最亮 25% 也算进去，天空/白墙占 30~40% 时被抬高 ⇒ AE 少提亮。
+  // 0.12.50：改用**中心高斯加权**直方图（PC MeteringSystem 同口径）。
+  // 旧实现用全图未加权直方图，天空占 40%+ 时截尾仍被抬高中灰（真机 105249/105338）。
+  {
+    double wtotal = 0.0;
+    for (int i = 0; i < kN; ++i) wtotal += wh[i];
+    const double lo = wtotal * 0.25, hi = wtotal * 0.75;
+    double cum = 0.0, acc = 0.0, n = 0.0;
+    for (int i = 0; i < kN; ++i) {
+      if (wh[i] <= 0.0) continue;
+      const double a = cum, b = cum + wh[i];
+      cum = b;
+      const double s = std::max(a, lo), e = std::min(b, hi);
+      if (e <= s) continue;
+      acc += (e - s) *
+             std::log(static_cast<double>(to_lin(static_cast<float>(i) / static_cast<float>(kN - 1))));
+      n += e - s;
+    }
+    st.p_robust = n > 0.0 ? static_cast<float>(std::exp(acc / n)) : 0.0f;
+  }
+  last_p_robust_ = st.p_robust;
   // v0.10.28：p_max = **采样到的最高非空桶**（darktable autodetect 的 max 语义）。
   // 对数编码上限 2^8（= +8EV）后 max 不再被显示域 clamp 淹没——0.10.18 当时
   // 改用分位正是迫于此；现在分位保留（P99 驱动 black/基础判据），max 只驱动

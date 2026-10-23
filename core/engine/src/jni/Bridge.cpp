@@ -1086,6 +1086,45 @@ Java_com_filmkit_app_EngineBridge_nativeGetAutoExposure(JNIEnv*, jclass) {
   return FrameRenderer::autoExposure() ? JNI_TRUE : JNI_FALSE;
 }
 
+// v0.12.46 鲁棒测光 A/B（默认关）。开 = 截尾中灰 + 固定目标 0.17；关 = 旧口径。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetAeRobust(JNIEnv*, jclass, jboolean on) {
+  FrameRenderer::setAeRobust(on == JNI_TRUE);
+}
+
+// 0.12.51 显示域 AE 闭环（默认开）。开 = 预览按显示域中位闭环、成片继承同一 EV。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetAeDisplay(JNIEnv*, jclass, jboolean on) {
+  FrameRenderer::setAeDisplay(on == JNI_TRUE);
+}
+
+// 0.12.56 HAL-AE 模式：渲染端 AE 退出，只保留统计。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetAeHal(JNIEnv*, jclass, jboolean on) {
+  FrameRenderer::setAeHal(on == JNI_TRUE);
+}
+
+// 显示域中位（sRGB 编码 0..1，预览 EMA）。Kotlin 外环每 1s 读一次。
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGetDisplayP50(JNIEnv*, jclass) {
+  return FrameRenderer::displayP50();
+}
+
+// ── 预览测光快照（0.12.44）──────────────────────────────────────────────
+// 返回 {取景器几何均值 EMA, HAL/RAW 域比}。Kotlin 侧用它算 AE 补偿闭环：
+// pvRaw = geo / ratio ⇒ delta = log2(target / pvRaw) ⇒ 累加后下发 HAL。
+// 只读进程级全局量（渲染线程写、任意线程读，float 单写单读无需加锁）。
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGetPreviewMetering(JNIEnv* env, jclass) {
+  float geo = 0.f, ratio = 0.f;
+  FrameRenderer::previewMetering(&geo, &ratio);
+  jfloat v[2] = {geo, ratio};
+  jfloatArray a = env->NewFloatArray(2);
+  if (!a) return nullptr;
+  env->SetFloatArrayRegion(a, 0, 2, v);
+  return a;
+}
+
 // ── HDR gainmap 读回（v0.11.50）─────────────────────────────────────
 // 成片链跑完后调用：把 GPU 算好的 1/2 分辨率 8bit gainmap 读回。
 // **必须与 nativeEngineSubmitRaw* 在同一个渲染线程**（读的是该线程 EGL 上下文里的纹理）。

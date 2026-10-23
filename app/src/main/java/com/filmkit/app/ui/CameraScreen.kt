@@ -858,6 +858,7 @@ fun CameraScreen(
         controller.setFilmParams(cameraPresetParams(selectedPreset), presetEvOffset(selectedPreset.slots))
         controller.setShutterSound(soundOn)
         if (!evAuto) controller.setEv(ev)
+        // 0.12.46：鲁棒测光开关是引擎侧 atomic，冷启动必须补一次（prefs 是唯一真源）。
         if (!aeAuto) {
             controller.setManualExposure(true)
             controller.setIso(iso)

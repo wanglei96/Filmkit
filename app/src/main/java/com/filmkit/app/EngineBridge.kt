@@ -82,6 +82,36 @@ object EngineBridge {
      */
     external fun nativeSetAutoExposure(on: Boolean)
     external fun nativeGetAutoExposure(): Boolean
+
+    /**
+     * 鲁棒测光 A/B（0.12.46，默认关）。开 = 截尾中灰（log 域 25%~75%）+ 固定目标 0.17，
+     * 不再用取景器折算值当目标；关 = 旧口径（p_geo + 取景器目标）。
+     * 诊断字段：`raw.render` 的 `aeRobust` / `aePRobust` / `aeTargetMode`。
+     */
+    external fun nativeSetAeRobust(on: Boolean)
+
+    /**
+     * 显示域 AE 闭环（0.12.51，默认开）。
+     *
+     * 预览每 10 帧统计**最终显示输出**的中位亮度（sRGB 编码），与目标 0.18（线性，
+     * 与 PhotonCamera `DISPLAY_TARGET_LUMA` 同源）比较并积分 EV；预览与成片共用这个
+     * EV ⇒ **首张成片即生效**（构图时闭环已收敛）。
+     * 关 = 回到 RAW 域鲁棒测光（`ae_robust`）。
+     */
+    external fun nativeSetAeDisplay(on: Boolean)
+
+    /**
+     * HAL-AE 模式（0.12.56，默认开）：渲染端 AE 完全退出，曝光只由 HAL 的
+     * `CONTROL_AE_EXPOSURE_COMPENSATION` 决定。预览与成片因此是同一次曝光。
+     */
+    external fun nativeSetAeHal(on: Boolean)
+
+    /**
+     * 显示域中位（sRGB 编码 0..1，预览 EMA）。0 = 尚未统计。
+     * 统计口径 = 屏幕中心 64×64、中心高斯权重、对数域截尾 25%~75%（PC `MeteringSystem` 同源）。
+     * 由 Kotlin 侧 1Hz 外环读取 → 算偏差 → 下发 HAL 曝光补偿。
+     */
+    external fun nativeGetDisplayP50(): Float
     /** 局部影调（tone equalizer）：按引导 mask 的亮度分区做曝光补偿。 */
     external fun nativeSetToneEq(on: Boolean)
 
@@ -295,6 +325,17 @@ object EngineBridge {
     external fun nativeSetGainmapMath(mode: Int)
 
     external fun nativeGetGainmapMath(): Int
+
+    /**
+     * 预览测光快照（0.12.44）：`[取景器几何均值 EMA, HAL/RAW 域比]`。
+     *
+     * 用途 = AE 补偿闭环：`pvRaw = geo / ratio` 是取景器亮度折算回 RAW 域的等效中灰，
+     * Kotlin 按 `log2(target / pvRaw)` 算偏差、累加后下发
+     * `CONTROL_AE_EXPOSURE_COMPENSATION`，让 HAL 把取景器与采集一起提亮。
+     *
+     * 返回 null 或 `geo <= 0` = 预览尚未统计（冷启动/预览未开）⇒ 调用方必须跳过。
+     */
+    external fun nativeGetPreviewMetering(): FloatArray?
 
     /**
      * 从 JPEG/R 里**无损提取 SDR base**（去掉 gainmap，得到普通 JPEG）。

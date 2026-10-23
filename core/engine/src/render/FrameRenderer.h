@@ -144,11 +144,35 @@ class FrameRenderer {
   static void setGainmapMath(int mode);
   static int gainmapMath();
 
+  // 预览测光快照（0.12.44）：{取景器几何均值 EMA, HAL/RAW 域比}。
+  // 供 Kotlin 侧做 **AE 补偿闭环** —— 把"目标中灰"的判断从渲染端搬回采集端：
+  // HAL 的 AE 决定取景器亮度，Kotlin 按偏差下发 CONTROL_AE_EXPOSURE_COMPENSATION，
+  // 取景器、RAW 采集、成片三者因此同源（PhotonCamera 的 EV 通道同型）。
+  // 任一值为 0 表示预览尚未统计（冷启动/无预览）⇒ 调用方必须跳过，不得当 0 用。
+  static void previewMetering(float* geo, float* ratio);
+
   // 自动曝光（v0.11.61）：本张 RAW 的 P50/P99.9 ⇒ 渲染端 EV（中灰锚定 + 高光约束，
   // 高光优先）。prefs `ae_auto`（默认开），进程级 static、任意线程可调。
   // 关 = 完全不介入（ev 恒 0，与 v0.11.60 行为逐位一致）。
   static void setAutoExposure(bool on);
   static bool autoExposure();
+  // v0.12.46：鲁棒测光 A/B（截尾中灰 + 固定目标）。默认关；稳定后删除开关。
+  static void setAeRobust(bool on);
+  static bool aeRobust();
+  // 0.12.51：显示域 AE 闭环（默认开）。预览侧统计显示域 p50、按目标 0.18 积分 EV；
+  // 成片继承同一个 EV ⇒ 首张即生效。关 = 回到 RAW 域鲁棒测光。
+  static void setAeDisplay(bool on);
+  static bool aeDisplay();
+  // 0.12.56：**HAL-AE 模式**（唯一一套 AE）。开 = 渲染端 AE 完全退出（返回 0），
+  // 曝光由 HAL 的 `CONTROL_AE_EXPOSURE_COMPENSATION` 决定；本类只负责统计显示域中位
+  // 供 Kotlin 外环读取。预览与成片因此是**同一次曝光**（成片的 planner base 继承
+  // 预览回读的 liveIso/liveExposureNs），不再各算一套。
+  static void setAeHal(bool on);
+  static bool aeHal();
+  // 显示域 p50（sRGB 编码 0..1，预览 EMA）—— 0 = 尚未统计。
+  static float displayP50();
+  // 对**显示域纹理**（passOutput 的输出，sRGB 编码）取中位亮度（0..1）。
+  float measureDisplayP50(GLuint src);
   // 局部影调（tone equalizer）开关：关 = 完全跳过（逐位不变）
   static void setToneEq(bool on);
   static bool toneEq();
@@ -593,7 +617,11 @@ class FrameRenderer {
   // centerFractionPerAxis 默认值 2/3）—— 高光约束只看中央，边缘高光不参与。
   bool histogramFrom(GLuint src, int* out, int n, bool bypass_lut = false,
                      int stat_ch = 0, int stat_mode = 0,
-                      float center_frac = 0.0f);
+                      float center_frac = 0.0f,
+                      // 0.12.50：可选的**中心高斯加权**直方图（PC `MeteringSystem.centerWeight`
+                      // 同款：σ=0.32、底权重 0.35）。只有 p_robust 用它；其余分位仍走未加权
+                      // 计数，避免连带改变 sigmoid 引擎的白点/黑点判据。
+                      double* weighted_out = nullptr);
   // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
   // box_filter=false → kFsHist 单点采样（直方图统计用）；
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
@@ -629,6 +657,13 @@ class FrameRenderer {
     // v0.11.77：**RAW 裁切像素比例**（>= 0.98 白点的占比）—— PC legacy matcher 的
     // `maximumClippedFraction = 0.005` 判据的量本身（此前用 P99.5 亮度当代理）。
     float sat_frac = 0.0f;
+    // v0.12.46：**鲁棒中灰** —— log 域截尾 25%~75% 后的几何均值（PhotonCamera
+    // `MeteringSystem.robustMidToneLinearLuma` 的口径：MIDTONE_TRIM 0.25/0.75）。
+    // 为什么需要：几何平均/中位都怕"大面积天空或白墙"—— 亮部占 25~40% 时 p_geo
+    // 被抬高，AE 因此少提亮（真机 0623：p_geo 0.0967 → 只提 0.31EV，成片发暗）。
+    // 截尾先切掉最亮的 25%，再用剩下的 log 均值 ⇒ 高光不再参与中灰估计。
+    // 与 p_geo 并存，A/B 用（prefs `ae_robust`）。
+    float p_robust = 0.0f;
     bool valid = false;
   };
   SceneStats measureSceneStats(GLuint src, float center_frac = 0.0f);
@@ -1263,6 +1298,10 @@ class FrameRenderer {
   // **两条源的线性亮度标定未必一致** —— 记录判据输入供对比（preview.ag / raw.render.linMid）。
   float last_lin_mid_ = 0.0f;   // 场景中位（线性）
   float last_lin_geo_ = 0.0f;   // 场景几何平均（v0.11.92：取景器目标亮度的来源）
+  float last_p_robust_ = 0.0f;  // 鲁棒中灰（v0.12.46：截尾 log 均值，A/B 用）
+  float ae_p_robust_ = 0.0f;    // 本张鲁棒中灰（诊断）
+  bool ae_robust_on_ = false;   // 本张是否走鲁棒档（诊断）
+  int disp_tick_ = 0;           // 显示域统计节流（每 10 帧一次）
   float last_p_lo_ = 0.0f, last_p_hi_ = 0.0f;  // 场景暗/亮分位（线性，自动 EV 的输入）
   // v0.10.27：白点判据的诊断量（EV，相对中灰）——w99/w999 = P99/P99.9 的 raw 判据值，
   // cp = 高光上探的 contrast_param 补偿（1 = 未上探）。raw.render / preview.filmic 输出。

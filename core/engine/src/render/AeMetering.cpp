@@ -27,7 +27,17 @@ AeDecision decideAe(const AeInputs& in) {
   //    film pass 的 exposure_ev 里，所以这里要扣掉它，只返回"还差多少"。
   // 2026-10-21 修正：ev_mid **不扣** user_ev —— 扣掉会让用户手动拉的 EV 被完全
   // 抵消（真机"拉基础 EV 没效果"）。user_ev 仍在 ev_hl 里扣（它确实会推高高光）。
-  d.ev_mid = evOf(in.target_mid, in.p_mid);
+  // v0.12.46：鲁棒档用截尾中灰 + 固定目标（A/B，prefs `ae_robust`）。
+  const float mid = (in.robust && in.p_robust > 1e-9f) ? in.p_robust : in.p_mid;
+  const float tgt = (in.robust && in.p_robust > 1e-9f) ? in.target_robust : in.target_mid;
+  d.ev_mid = evOf(tgt, mid);
+  // ── 0.12.60：中灰锚**只提亮、不压暗** ────────────────────────────────────
+  // 为什么：HAL 的 AE 已经按它自己的场景判断给了一次曝光（含可能的天空压制），
+  // 渲染端再按"取景器亮度"压一次 = **双重欠曝**（v0.11.62 修过的同型问题，因为
+  // target 取自景器又复活）。真机 152436：HAL 给 2.2ms，我们渲染再压 −0.54EV，
+  // 而成片比 PC 暗 1.7EV。
+  // 压暗这件事只该由**高光约束**做（P99.5 撞白点才压），中灰锚只负责补暗。
+  if (d.ev_mid < 0.0f) d.ev_mid = 0.0f;
   // ② 高光约束：P99.5 提亮后 ≤ 白点 − 余量（允许 0.5% 像素裁切）。写成 EV 差，与 ① 同单位。
   // v0.11.77（PC 口径）：裁切比例未超 0.5% ⇒ 高光不介入（ev_hl 视为无穷）；
   // 超了才按 P99.5 反解"把第 0.5% 亮像素压到白点"的 EV。
