@@ -176,6 +176,30 @@ internal object EngineScope {
      */
     val KNOWN_ENGINE_SLOTS: Set<Int> = setOf(0, 1)
 
+    /**
+     * **编辑器专用**作用域（0.12.61，修「相册饱和度旋钮失效」）。
+     *
+     * 与 [applyEngineScope] 的唯一区别：**不归零公共段的 `[20]/[21]/[22]`（饱和度）**。
+     *
+     * 为什么拍照链要归零、编辑器不能：这三个槽在 `kFsFilm`/`kFsOut` 的公共段，**两个
+     * 引擎共用**。拍照链归零是为了"切引擎时观感不跳"（模拟 filmic 时代的默认值），
+     * 属于**兼容策略**；而编辑器的职责就是让用户调这些参数 —— 归零等于旋钮失效
+     * （真机复现：相册编辑里拖饱和度，画面不动）。
+     *
+     * 其余 filmic 专属槽（`[5..10]`/`[35]`/`[37]`/`[38]`/`[40]`）照旧旁路：引擎 1
+     * 不吃它们，留着只会产生"参数有值但不生效"的第三态。
+     */
+    fun applyEngineScopeForEditor(slots: DoubleArray, engineSlot: Int): DoubleArray {
+        val effective = if (engineSlot in KNOWN_ENGINE_SLOTS) engineSlot else 0
+        if (effective == 0) return slots
+        val out = slots.copyOf()
+        for ((slot, v) in NEUTRALIZE) {
+            if (slot in 20..22) continue   // 公共段：编辑器必须让用户调得动
+            if (slot in out.indices) out[slot] = v
+        }
+        return out
+    }
+
     fun applyEngineScope(slots: DoubleArray, engineSlot: Int): DoubleArray {
         // 未注册的 engine_slot ⇒ **按 0 处理、不旁路**，与 C++ 侧的降级语义一致
         // （`FrameRenderer.cpp` 的 `warnEngineSlotUnavailable`：降级到引擎 0 + 记 WARN）。

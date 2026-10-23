@@ -8,6 +8,7 @@ import android.view.Surface
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
 import com.filmkit.app.lut.CubeLut
+import com.filmkit.app.ui.CameraPresets
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -263,11 +264,14 @@ internal class EditorEngineSession {
         val bytes = try {
             // ★ E2-12c：下发的 rot 必须与 outputSize 用**同一个**归一化值 —— 否则
             // outputSize 交换了宽高、引擎却按 rot=0 分支渲染 ⇒ 尺寸与内容对不上。
-            // ★ 阶段 3：参数出口归零（`[98] != 0` ⇒ 按 EngineScope 置恒等值）——
-            // 预览（requestPreview）与导出（requestFull）都经本函数，是编辑器链唯一出口。
+            // ★ 阶段 3：参数出口按引擎旁路 —— **但公共段的饱和度（[20]/[21]/[22]）不旁路**。
+            // 0.12.61 修：此前直接用 `engineScoped`（拍照链的兼容策略），它会把饱和度
+            // 三槽置 1.0 ⇒ 相册编辑里拖饱和度旋钮画面不动。拍照链那份归零是为了
+            // "切引擎观感不跳"，编辑器不能沿用。
+            val slotForEditor = if (film.size > 98) film[98].toInt() else CameraPresets.DEFAULT_ENGINE_SLOT
             EngineBridge.nativeEngineSubmitDisplay(
                 rgba, w, h, outW, outH, crop.uvOrNull(), normalizeRot(crop.rot),
-                engineScoped(film),
+                EngineScope.applyEngineScopeForEditor(film, slotForEditor),
             )
         } catch (t: Throwable) {
             // UnsatisfiedLinkError / 引擎内部异常都算失败：宁可显示原图，不许崩
