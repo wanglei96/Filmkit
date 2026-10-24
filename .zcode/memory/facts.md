@@ -69,19 +69,13 @@ status: active
 
 ## 10bit HEIF 交付链（10-15）
 
-- [2026-10-15] **编码器能力（`c2.mtk.hevc.encoder`，真机 `photo.heif_enc_caps`）**：`bitrateMin/Max` = 1 / **100 Mbps**；`fpsMin/Max` = 0.0016 / 79.4（⇒ `frame-rate=1` 合法）；`cqSupported` / `cbrSupported` / `vbrSupported` 全 true；`qualityRange` = **0..100**（不是 HEVC QP 0..51）。
-- [2026-10-15] **QP–体积曲线（12MP 10bit，真机 `photo.heif_try`）**：QP 16 ⇒ 0.85 MB · 12 ⇒ 1.65 · 10 ⇒ 2.05 · **4 ⇒ 3.13（iso708）/ 4.34（iso1191）** · 0 ⇒ 4.62 / 5.92 MB。**画质在 QP≈4 饱和**（QP4 ↔ QP0 同场景逐像素 p50 0.33 / p90 0.67 / **p99 1.00** / max 2.3 LSB，体积 +36%）。
-- [2026-10-15] **交付档实机表现**：12MP 10bit HEIC 定稿后约 **3.1~4.4 MB**（同场景 JPEG q100 4:4:4 约 5.1~6.9 MB），单次编码 1.2~1.5 s。`colr` 已由 macOS 原生解码器 + 微信 + 系统相册 + Windows 四端确认正常（**判据 F 全过**）。
 
 ## 期 B 域空间（10-19）
 
-- [2026-10-19] **域矩阵真源** `tools/rec2020-domain-matrices.py`：构造法（`outputFromXyz(D50)·xyzFromWorking(D50)`，**非硬编码**）+ 三重对拍 —— 内部（sRGB→LMS 2.22e-16 / XYZ(D50)→sRGB 3.38e-04）+ 跨实现（PhotonCamera `DarktableFilmicToneAlgorithm.kt:14-19` 的 **BT2020 版** LMS 9.8e-11、逆 5.8e-09、`PreviewColorShaderModules.kt:341` 的 sRGB→BT2020 4.4e-07）。阶段 4（AP0/D60）只需再用它换一组。
-- [2026-10-19] **PC 的引擎工作空间（一手源码 `/tmp/pc-tone`）**：`RawRenderingEngine.kt:10-74` —— AgX / DarktableSigmoid / **DarktableFilmic** 跑 **BT2020**，Spektrafilm/AdobeCurve 跑 ProPhoto，Lumix/Canon/Leica 跑 SRGB，Hncs 跑 HNCS。输出统一 `computeWorkingToOutputTransform(…, ColorSpace.SRGB)`（`RawDemosaicProcessor.kt:7105`）⇒ **PC 是"内部大盘子、输出小盘子"**；其 RAW 引擎显式 `includeShadowsHighlights = false`（阴影高光类调整在 LUT 阶段、Lab 域做，且**只有一处实现**）。
 - [2026-10-19] **引擎 1 的 7 个 `uSig*` 全是曲线形状常量**（`uSigWhiteTarget` / `uSigBlackTarget` / `uSigPaperExposure` / `uSigFilmFog` / `uSigFilmPower` / `uSigPaperPower` / `uSigHuePreservation`，来自 PC 的 `DT_SIGMOID_*`）—— **里面没有"对比度"** ⇒ 引擎 1 此前完全没有对比度实现（滑杆无效的真因）。
 
 ## 色相路线与 HDR（10-19）
 
-- [2026-10-19] **红杯 ROI 的色相/色差（修正 D5 域口径后）**：sigmoid ΔE 3.69 / Δh 4.43° · filmic 2.11 / 1.50° · ACES 原生 11.71 / 3.44° · ACES 重锚（×1.7919）4.69 / 1.58° · Oklab L-only 5.42 / 1.83°。⇒ ACES 无优势；Oklab 用 ΔE 换 Δh。
 
 ## HDR 交付（10-20）
 
@@ -93,8 +87,6 @@ status: active
 ## 自动曝光（10-20，渲染端本张统计）
 
 - [2026-10-20] **AE 判据与常量**（`core/engine/src/render/AeMetering.h`）：`kAeRawWhiteEv 2.438307`（= Kotlin `ExposurePlanner.WHITE_POINT_EV`，两处必须同改）· `kAeMiddleGrey 0.1845` · headroom `0.1` · 限幅 ±2EV（欠曝上限与 gainmap `[0.25,4.0]` 对齐）· 高光判据 = **P99.5**（0.5% 裁切，PC legacy matcher 口径）。决策 `min(ev_mid, ev_hl)`，高光优先。
-- [2026-10-20] **AE 日志字段**（`raw.render`）：`aeOn` / `aeEv`（**追加**到 `ev` 上，实际生效 = ev + aeEv）/ `aeMid` / `aeHl` / `aeP50` / `aeP995` / `aeP999` / `aeWhy`（0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid）；`photo.stats` = `sw999` / `mean`（BT.601, step 4）/ `hi240`（%）。
-- [2026-10-20] **实测基线（0.11.64，台灯+窗，同场景两张）**：`aeEv −1.11 / −1.11`、`aeP50 0.0696`、`aeP995 2.0273`、`mean 44.8 / 45.2`、`hi240 0.00%`、`gainmap:true` ×2。对照 PC 同场景 `mean 89.6` / `hi240 0.08%` ⇒ 仍有约 1EV 要靠 bracket 补。
 - [2026-10-22] **teq 9 档曲线的档位映射**（`setTeqCurveFromAe`）：第 i 档对应 `q = i−8` EV。云/镜面反光 q≈−0.5（落 `curve[8]` 白点档）、天空主体 q≈−2.0（落 `curve[6]`）。**压深只能给第 6 档**，第 8 档必须为 0（否则白云被压成乌云）。大面积高光压深 = `-(p95_rel_white + 0)`，其中 `p95_rel_white = log2(aeP95/0.1845) + aeEv − log2(1/0.1845)`。
 - [2026-10-22] **局部对比度实测基线**（1777×2360，同区域柜门区）：rawpy 单帧（无融合/降噪/锐化）**19.4%** / 我们成片 **17.6%** / PC **25.9%**（绝对值 σ 7.59 / 13.52 / 20.61；亮度 Y 39.1 / 76.9 / 79.5）。⇒ 我们的链路只比“完全不处理”低 1.8 个百分点，**PC 高出 6.5 个百分点**（它在链路里增加了细节）。
 
@@ -117,3 +109,12 @@ status: active
 - [2026-10-24] **阴天过曝实测**（`090816`，baseEv 0.3）：`aeP50 0.52`、`aeSatRaw 41%`、`aeBrkSat 0%`、`aeEv 0`、`hi240 35.9%`、`teqHl −1.41`。成因 = 0.12.63 的长帧过曝放宽在 ISO 贴底时对阴天同样生效；短帧虽未饱和，但长帧过曝幅度超出其覆盖能力。
 - [2026-10-24] **bracket 短帧 −3EV 的噪声代价**：短帧 `ratio 8` ⇒ 归一化 ×8、噪声 ×8，高光区（长帧饱和处）明显；收到 `ratio 6` 后消失。
 - [2026-10-24] **白点 4.8 与 6.22 的差别**（夕阳窗景 `173032`）：6.22 时 `aeEv` 冲到 2.0、天空 p95 246、`>240` 占 8.6%；4.8 时 `aeEv` 落到 ~1.0、p95 回到 ~210。
+
+## 测光与 HDR 对标（10-24）
+
+- [2026-10-24] **逆光同机位实测**（17:19，点测光生效）：我们 ISO 65 / 0.010s，天空 RGB **227/221/216**、`aeP995 3.49`（= 4.24EV，白点 4.56 的 93%）、`aeHl 0.005`、`hi240 3.35%`、mean 51.6；PC 同机位天空 **196/187/183**、`hi240 0.22%`、mean 62.2、B/G 0.976（我们 0.978）。⇒ 白平衡不是主因，亮度（曲线肩部位置）是。
+- [2026-10-24] **PC sigmoid 白点 = 1.0**（`DarktableSigmoidToneAlgorithm.kt:5` `DT_SIGMOID_WHITE_TARGET = 1.0`），与我们 `sig_wt = 1.0` 一致 ⇒ 白点不是差异来源。
+- [2026-10-24] **PC HDR bracket**：`HdrBracketConfig.kt:8-9` 长帧 `+2.2EV` / 短帧 `−1.5EV`；总帧数 = 0EV 帧数 + 2（`CameraViewModel.kt:3680`），范围 3~20（`MultiFrameConfig.kt` 默认 5）。**0EV 全部堆叠成 1 张**（`accumulateFrame`），长/短帧各 1 张，最后 Mertens 融合 3 张 ⇒ 帧数只提升降噪、不扩大曝光跨度。
+- [2026-10-24] **PC Mertens 门控**（`GlesYuvStacker.kt:3451`）：`highlightValidity = 1 − smoothstep(0.960, 0.995, max3(rgb))`（任一通道 >0.96 ⇒ 该帧在此像素权重归零，高光交给短帧）；`deghostValidity` 黑门 0.055~0.145 + 白门 0.865~0.975；另有 3×3 census mismatch。**没有场景识别/分区。**
+- [2026-10-24] **我们的 gainmap 中灰基线 1.1**（`FrameRenderer.cpp:7094`）：从已渲染的 SDR base 反推，没有长帧参考；PC 的 gainmap 里是真实 +2.2EV 数据。
+- [2026-10-24] **测光实现位置**：`app/.../camera/MeteringTargets.kt`（显示↔传感器坐标，5 条单测）；`CameraController.setMeteringMode/setAeLock/currentMeteringRect/setHighlightMeterPoint`；`Bridge.cpp` 的 `g_meter_manual`/`g_meter_focus_x/y` 进程快照；常量 `SPOT_AE_FRACTION = 0.06`、`HIGHLIGHT_AE_FRACTION = 0.16`；高光点来自 `FrameRenderer::histogramFrom` 的 32×32 网格（PC 算法移植）。
