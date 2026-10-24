@@ -147,6 +147,11 @@ EglCore& stillEgl() {
 // 却在预览线程读（nativeEngineSetLut 下发 LUT）—— 非原子就是形式上的 data race。
 // 指针本身原子化即可：实例只创建、从不销毁，不存在"读到已释放实例"的窗口。
 std::atomic<FrameRenderer*> g_renderer_still{nullptr};
+// v0.12.70：测光接管快照 —— 静拍实例是懒创建的，只设「当前存在」的实例会让
+// 后建实例回默认 false（真机实证：点测光下 aeEv 仍 0.22/1.268，成片被补回默认观感）。
+std::atomic<bool> g_meter_manual{false};
+std::atomic<float> g_meter_focus_x{-1.0f};
+std::atomic<float> g_meter_focus_y{-1.0f};
 
 // 本线程**最后一次** submit 用的是哪个实例（v0.11.50）。
 // 为什么需要：gainmap 读回必须在 submit 的**同一线程**紧接着调用，但拍照走的是
@@ -396,6 +401,9 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStart(JNIEnv* env, jobject,
 
   if (g_renderer == nullptr) {
     g_renderer = new FrameRenderer();
+    // v0.12.70：新建预览实例补齐测光快照（切镜头/重建后不丢状态）
+    g_renderer->setMeterManual(g_meter_manual.load());
+    g_renderer->setMeterFocusPoint(g_meter_focus_x.load(), g_meter_focus_y.load());
   }
   if (g_window) {
     ANativeWindow_release(g_window);
@@ -482,6 +490,10 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
     // YUV 解码矩阵同理（v0.10.93 补齐）：快照在 nativeEngineSetYuvMatrix 里写，
     // 这里不下发的话 BT.709 视频会被按 BT.601 解码（色偏）。幂等，每次 start 都补。
     g_renderer_still.load()->setYuvMatrix(g_yuv_matrix.load());
+    // v0.12.70：测光接管 + 高光优先的焦点偏置也走快照（后建实例默认 false/-1）
+    g_renderer_still.load()->setMeterManual(g_meter_manual.load());
+    g_renderer_still.load()->setMeterFocusPoint(g_meter_focus_x.load(),
+                                                g_meter_focus_y.load());
     Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
                            "{\"fresh\":true}");
   } else {
@@ -1166,4 +1178,40 @@ Java_com_filmkit_app_EngineBridge_nativeHdrAvailable(JNIEnv*, jclass) {
 #else
   return JNI_FALSE;
 #endif
+}
+
+// ── v0.12.67：测光模式接管（点测 / 高光优先 / 长按 AE-L）───────────────────
+// manual=true ⇒ 渲染端 AE 不再补中灰（只留高光约束），成片亮度 = 采集曝光；
+// 否则两套 AE 打架：HAL 按用户测光点给光，渲染端又补回统一亮度。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetMeterManual(JNIEnv*, jobject, jboolean manual) {
+  g_meter_manual.store(manual == JNI_TRUE);
+  FrameRenderer* r = g_renderer;
+  if (r != nullptr) r->setMeterManual(manual == JNI_TRUE);
+  FrameRenderer* rs = g_renderer_still.load();
+  if (rs != nullptr && rs != r) rs->setMeterManual(manual == JNI_TRUE);
+}
+
+// 高光优先的对焦点偏置（显示归一化坐标；<0 = 无焦点）。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSetMeterFocusPoint(JNIEnv*, jobject, jfloat x,
+                                                           jfloat y) {
+  g_meter_focus_x.store(x);
+  g_meter_focus_y.store(y);
+  FrameRenderer* r = g_renderer;
+  if (r != nullptr) r->setMeterFocusPoint(x, y);
+  FrameRenderer* rs = g_renderer_still.load();
+  if (rs != nullptr && rs != r) rs->setMeterFocusPoint(x, y);
+}
+
+// 读最近一帧算出的高光簇中心（显示归一化，y 向上）；false = 尚未算出。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeGetAeHighlightPoint(JNIEnv* env, jobject,
+                                                            jfloatArray out) {
+  FrameRenderer* r = g_renderer;
+  if (r == nullptr || out == nullptr || env->GetArrayLength(out) < 2) return JNI_FALSE;
+  float xy[2] = {0.5f, 0.5f};
+  if (!r->getAeHighlightPoint(xy)) return JNI_FALSE;
+  env->SetFloatArrayRegion(out, 0, 2, xy);
+  return JNI_TRUE;
 }

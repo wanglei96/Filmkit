@@ -10,9 +10,11 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -32,6 +34,7 @@ import com.filmkit.app.ui.backTarget
 import com.filmkit.app.ui.hasImagePermission
 import com.filmkit.app.ui.queryPhotos
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -82,7 +85,7 @@ class MainActivity : ComponentActivity() {
         // 条件与 PC 一致：Android 14+ 且屏幕本身支持 HDR（isScreenHdr）。
         // 用户可关（prefs hdr_screen，默认开 —— 与 PC 的默认 true 一致）。
         applyWindowHdrMode(prefs.getBoolean("hdr_screen", true))
-        setContent {
+    setContent {
             // 必须传 colorScheme：空 MaterialTheme 会用默认浅色，Material 组件（对话框 /
             // 输入框 / 按钮）会渲染成白底 —— 与胶片暗色风格冲突。
             MaterialTheme(colorScheme = FilmTheme.colorScheme()) {
@@ -141,6 +144,31 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
     // 查看页的来源页（v0.12.34）：相册网格 or 相机页的胶卷位。
     // 从相机直接看大图时返回必须回相机 —— 不能半路掉进相册（用户没去过那里）。
     var viewerFrom by rememberSaveable { mutableStateOf("gallery") }
+    // v0.12.74：查看页"处理中"态 —— 按快门后点左下角占位进来，等成片落盘原地变图。
+    // 不阻塞相机：进的是独立页面，返回后可以继续构图。
+    var viewerPending by rememberSaveable { mutableStateOf(false) }
+    // 进入处理中时的 last_photo_uri 基线：只有**变化**才采纳，避免立刻显示上一张
+    var viewerPendingBase by remember { mutableStateOf<String?>(null) }
+    // 处理中 → 完成后原地变图：轮询 CameraController 写的 prefs（跨页面唯一可靠通道）。
+    // 进的是独立页面，不阻塞相机；30s 超时退回相机。
+    val navPrefs = context.getSharedPreferences("filmkit", 0)
+    LaunchedEffect(screen, viewerPending) {
+        if (screen != "viewer" || !viewerPending) return@LaunchedEffect
+        var waited = 0L
+        while (waited < 30_000L) {
+            val u = navPrefs.getString("last_photo_uri", null)
+            if (!u.isNullOrBlank() && u != viewerPendingBase) {
+                viewerUris = listOf(u)
+                viewerIndex = 0
+                viewerPending = false
+                return@LaunchedEffect
+            }
+            delay(200)
+            waited += 200
+        }
+        viewerPending = false
+        screen = "camera"
+    }
 
     BackHandler(enabled = screen != "camera") {
         screen = backTarget(screen, editorFrom, galleryFrom, viewerFrom)
@@ -177,6 +205,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         // 不是保存副本 —— 用户 2026-10-11 拍板）。两条入口的返回语义完全一致（回本页同一张）。
         "viewer" -> PhotoViewScreen(
             uris = viewerUris,
+            pending = viewerPending,
             index = viewerIndex,
             onIndexChange = { viewerIndex = it }, // 滑到新的一张 ⇒ 路由层跟着走（编辑器回同一张）
             onBack = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
@@ -231,6 +260,15 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
             // ★ v0.12.35：还要能左右切图 —— 先把相册（与相册页同一条查询口径）查出来，
             // 把这张定位到它的索引上；查不到（未授权且不在本应用目录 / 刚被删）才退化成
             // 单张列表。查询在 IO 线程，本地 MediaStore 通常 <100ms。
+            onOpenPendingPhoto = {
+                viewerPendingBase = context.getSharedPreferences("filmkit", 0)
+                    .getString("last_photo_uri", null)
+                viewerPending = true
+                viewerUris = emptyList()
+                viewerIndex = 0
+                viewerFrom = "camera"
+                screen = "viewer"
+            },
             onOpenLastPhoto = { uri ->
                 scope.launch {
                     val list = withContext(Dispatchers.IO) {
@@ -242,6 +280,7 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                     viewerUris = if (i >= 0) list else listOf(uri)
                     viewerIndex = if (i >= 0) i else 0
                     viewerFrom = "camera"
+                    viewerPending = false
                     screen = "viewer"
                 }
             },

@@ -195,6 +195,21 @@ class FrameRenderer {
   //   size ≤ 1 或 data 为空 = 关闭（A/B 通路）；dmin/dmax = .cube 的 DOMAIN
   void setLut(const float* data, int size, const float dmin[3], const float dmax[3]);
 
+  // ── v0.12.67：测光模式（0 系统 / 1 点测 / 2 高光优先 + AE-L）──────────────
+  // manual=true ⇒ 用户已接管测光（HAL 按用户指定区域给光），渲染端 AE **不再补中灰**，
+  // 只保留高光约束；否则成片会被补回统一亮度（"点测光没用"的直接原因）。
+  void setMeterManual(bool manual) { meter_manual_ = manual; }
+  // 高光优先的对焦点偏置（PC `calculateMeteringResults` 的 `bias` 用焦点）：
+  // 显示归一化坐标；<0 = 无焦点，不偏置。
+  void setMeterFocusPoint(float x, float y) { hl_focus_x_ = x; hl_focus_y_ = y; }
+  // 读最近一帧算出的高光簇中心（显示归一化，y 向上）；false = 尚未算出。
+  bool getAeHighlightPoint(float* out) const {
+    if (out == nullptr || !hl_valid_) return false;
+    out[0] = hl_x_;
+    out[1] = hl_y_;
+    return true;
+  }
+
   // 预览帧：OES 纹理（Kotlin 侧已 updateTexImage）→ 渲染到当前窗口面。
   //   st      —— SurfaceTexture.getTransformMatrix()（列主序 16 float）
   //   rot     —— 传感器旋转 90° 步进（0..3）
@@ -622,7 +637,12 @@ class FrameRenderer {
                       // 0.12.50：可选的**中心高斯加权**直方图（PC `MeteringSystem.centerWeight`
                       // 同款：σ=0.32、底权重 0.35）。只有 p_robust 用它；其余分位仍走未加权
                       // 计数，避免连带改变 sigmoid 引擎的白点/黑点判据。
-                      double* weighted_out = nullptr);
+                      double* weighted_out = nullptr,
+                      // v0.12.67：可选输出**画面最亮簇中心**（显示归一化 x/y，y 向上）——
+                      // 移植 PhotonCamera `LutRenderer.calculateMeteringResults` 的
+                      // HIGHLIGHT_PRIORITY 分支（32×32 luma 网格 + top2% 动态阈值 + 5×5 簇
+                      // + 焦点/历史偏置）。null = 不算。
+                      float* bright_xy = nullptr);
   // 把 src 的"显示域亮度图"（OETF 同 kFsOut）渲染到 fbo（w×h）。
   // box_filter=false → kFsHist 单点采样（直方图统计用）；
   // box_filter=true  → kFsLocal 8×8 盒式平均（局部色调映射的低频图，见其注释）。
@@ -1327,6 +1347,12 @@ class FrameRenderer {
   float ae_brk_sat_ = -1.0f;  // 采集端短帧裁切比例；<0 = 非 bracket（诊断）
   float ae_sat_raw_ = 0.0f;   // 融合后 >=0.98 白点的占比（诊断：判断"大面积高光"）
   float ae_hl_soft_ev_ = 0.0f; // P95 软约束允许的 EV（诊断）
+  // v0.12.67：测光接管 + 高光簇中心（PC LutRenderer 的 HIGHLIGHT_PRIORITY 移植）
+  bool meter_manual_ = false;
+  float hl_x_ = 0.5f, hl_y_ = 0.5f;
+  bool hl_valid_ = false;
+  int hl_best_x_ = -1, hl_best_y_ = -1;   // 上一帧的高光格（历史偏置用）
+  float hl_focus_x_ = -1.0f, hl_focus_y_ = -1.0f;
   // 本张统计 + 决策。返回要**额外**加到 exposure_ev 上的 EV（0 = 不介入）。
   // short_sat：bracket 短帧的裁切比例（≥0 = 有 bracket 信息；<0 = 非 bracket）。
   float passAutoExposure(GLuint src, const FilmParams& p, float short_sat = -1.0f);

@@ -515,6 +515,8 @@ internal fun <B> visibleBitmapFor(
 @Composable
 fun PhotoViewScreen(
     uris: List<String>,
+    /** v0.12.74：处理中态（按快门后点占位进来）。uris 为空时显示占位，完成后由上层替换。 */
+    pending: Boolean = false,
     index: Int = 0,
     onIndexChange: (Int) -> Unit = {},
     onBack: () -> Unit = {},
@@ -534,6 +536,28 @@ fun PhotoViewScreen(
     var showHdrPanel by remember { mutableStateOf(false) }
     var hdrExportMsg by remember { mutableStateOf<String?>(null) }
     var hdrExporting by remember { mutableStateOf(false) }
+    if (uris.isEmpty() && pending) {
+        // 处理中占位：不初始化 Pager（pageCount=0 会让分页器处于未定义状态）
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(androidx.compose.ui.graphics.Color.Black),
+            contentAlignment = androidx.compose.ui.Alignment.Center,
+        ) {
+            Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = androidx.compose.ui.graphics.Color.White,
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "正在处理照片…",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                )
+            }
+        }
+        return
+    }
     val pageCount = uris.size
     val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
     val hdrUri = uris.getOrNull(pagerState.settledPage)

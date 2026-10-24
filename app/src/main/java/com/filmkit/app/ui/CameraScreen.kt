@@ -65,6 +65,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
@@ -187,6 +188,8 @@ fun CameraScreen(
      * 没有成片时才退回相册页 —— 见胶卷位的点击分支。
      */
     onOpenLastPhoto: (String) -> Unit = {},
+    /** 点「处理中」占位：进查看页显示处理中，完成后原地变图 */
+    onOpenPendingPhoto: () -> Unit = {},
     onRegisterVolume: ((() -> Unit)?) -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -297,9 +300,17 @@ fun CameraScreen(
             hist = null
             return@LaunchedEffect
         }
+        var hlTick = 0
         while (true) {
             val a = withContext(Dispatchers.IO) { controller.pollHistogram() }
             if (a != null) hist = a
+            // 高光优先：每 3 拍（~450ms）把 native 算出的最亮簇中心喂给 AE（PC 同款外环）
+            if (++hlTick >= 3) {
+                hlTick = 0
+                controller.pollHighlightPoint()?.let {
+                    withContext(Dispatchers.Main) { controller.setHighlightMeterPoint(it[0], it[1]) }
+                }
+            }
             delay(150)
         }
     }
@@ -307,6 +318,11 @@ fun CameraScreen(
     var levelOn by rememberSaveable { mutableStateOf(prefs.getBoolean("level", false)) }
     // 过曝提示（斑马纹）：拍摄相关开关，按约定放快捷设置（不进设置页）
     var zebraOn by rememberSaveable { mutableStateOf(prefs.getBoolean("zebra", true)) }
+    // 测光模式（0=系统 1=点测 2=高光优先）+ AE 锁定（锁定只在本会话有效）
+    var meteringMode by rememberSaveable { mutableIntStateOf(prefs.getInt("metering_mode", 0)) }
+    var aeLocked by remember { mutableStateOf(false) }
+    var downAt by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) { controller.setMeteringMode(meteringMode) }
     // 水平仪显示角（重力方向相对屏幕下方，-180..180 连续，低通平滑后）
     var levelRoll by remember { mutableFloatStateOf(0f) }
     var levelAligned by remember { mutableStateOf(false) } // 模 90° 任一轴水平即对齐（横竖屏均可）
@@ -330,6 +346,8 @@ fun CameraScreen(
     var mfOn by rememberSaveable { mutableStateOf(false) } // 手动对焦（会话内）
     var mfDiopter by rememberSaveable { mutableFloatStateOf(0f) }
     var focusMark by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    var focusLocked by remember { mutableStateOf(false) }
+    var showLockHint by remember { mutableStateOf(false) }
     var liveIso by remember { mutableIntStateOf(0) }
     var liveNs by remember { mutableLongStateOf(0L) }
     var liveK by remember { mutableIntStateOf(0) }
@@ -380,10 +398,16 @@ fun CameraScreen(
     // 胶卷位**真正显示**的那张（v0.12.36）：有最近成片就用它；没有（没拍过 / 刚被删）
     // 就回落到相册里最新的一张 —— 用户要求"不要显示空占位"。
     var thumbUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    // v0.12.73：快门按下后立刻给左下角一个"处理中"占位（PC 同款），
+    // 占位期间点开只显示提示，成片落盘后才允许看/编辑。
+    var shotPending by remember { mutableStateOf(false) }
+    var pendingBaseUri by remember { mutableStateOf<android.net.Uri?>(null) }
 
     fun doCapture() {
         androidView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         captureTick++
+        pendingBaseUri = photoUri
+        shotPending = true
         controller.capture()
     }
 
@@ -966,6 +990,21 @@ fun CameraScreen(
         shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f))
     }
 
+    // 占位结束：**photoUri 相对按下快门时发生变化**（保存完成）即清；20s 兜底防卡死
+    LaunchedEffect(shotPending, photoUri) {
+        if (!shotPending) return@LaunchedEffect
+        if (photoUri != null && photoUri != pendingBaseUri) {
+            shotPending = false
+        }
+    }
+    LaunchedEffect(shotPending) {
+        if (!shotPending) return@LaunchedEffect
+        delay(20_000)
+        if (shotPending) {
+            shotPending = false
+        }
+    }
+
     // 最近成片缩略图（保存完成后 lastPhotoUri 才会更新，此时文件已就绪）
     LaunchedEffect(photoUri) {
         // 没有最近成片（从没拍过 / 刚在查看页删掉）⇒ 回落到相册最新一张，
@@ -1155,6 +1194,7 @@ fun CameraScreen(
                             setOnTouchListener { v, e ->
                                 pinch.onTouchEvent(e)
                                 when (e.actionMasked) {
+                                    MotionEvent.ACTION_DOWN -> downAt = SystemClock.uptimeMillis()
                                     MotionEvent.ACTION_POINTER_DOWN -> pinching = true
                                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                         val wasPinching = pinching
@@ -1162,9 +1202,36 @@ fun CameraScreen(
                                         if (e.actionMasked == MotionEvent.ACTION_UP && !wasPinching) {
                                             val nx = (e.x / width).coerceIn(0f, 1f)
                                             val ny = (e.y / height).coerceIn(0f, 1f)
-                                            controller.focusAt(nx, ny)
-                                            focusMark = nx to ny
-                                            v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                            // 长按（>450ms）= 对焦 + 曝光一起锁（黄框常驻）；
+                                            // 短按 = 对焦并自动解锁（相机标准交互）
+                                            if (SystemClock.uptimeMillis() - downAt > 450L) {
+                                                controller.focusAt(nx, ny)
+                                                focusMark = nx to ny
+                                                focusLocked = true
+                                                showLockHint = true
+                                                if (!aeLocked) {
+                                                    aeLocked = true
+                                                    controller.setAeLock(true)
+                                                }
+                                                EngineBridge.nativeAppendLog(
+                                                    EngineBridge.LEVEL_INFO, "app", "quick.aef_lock",
+                                                    "{\"on\":true,\"by\":\"longpress\"}",
+                                                )
+                                                v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                            } else {
+                                                focusLocked = false
+                                                if (aeLocked) {
+                                                    aeLocked = false
+                                                    controller.setAeLock(false)
+                                                    EngineBridge.nativeAppendLog(
+                                                        EngineBridge.LEVEL_INFO, "app", "quick.ae_lock",
+                                                        "{\"on\":false,\"by\":\"tap\"}",
+                                                    )
+                                                }
+                                                controller.focusAt(nx, ny)
+                                                focusMark = nx to ny
+                                                v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                            }
                                         }
                                     }
                                 }
@@ -1329,9 +1396,11 @@ fun CameraScreen(
 
                 // 对焦指示框（按预览比例定位；半径用 dp→px 换算，硬编码像素会让圆心偏离点击点）
                 focusMark?.let { (fx, fy) ->
-                    LaunchedEffect(fx, fy) {
-                        delay(700)
-                        focusMark = null
+                    LaunchedEffect(fx, fy, focusLocked) {
+                        if (!focusLocked) {
+                            delay(700)
+                            focusMark = null
+                        }
                     }
                     Box(
                         Modifier
@@ -1342,9 +1411,38 @@ fun CameraScreen(
                                 )
                             }
                             .size(56.dp)
-                            .border(1.5.dp, Color.White, CircleShape),
+                            // 锁定 AE/AF = 黄色强调框（相机惯例），普通对焦 = 白框
+                            .border(
+                                if (focusLocked) 2.dp else 1.5.dp,
+                                if (focusLocked) Color(0xFFFFD400) else Color.White,
+                                CircleShape,
+                            ),
                     )
                 }
+                // 锁定提示：取景器顶部居中，1 秒后自动消失（黄框常驻表示锁定中）
+                if (showLockHint) {
+                    LaunchedEffect(Unit) {
+                        delay(1000)
+                        showLockHint = false
+                    }
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(top = 12.dp),
+                        contentAlignment = Alignment.TopCenter,
+                    ) {
+                        Text(
+                            "对焦和曝光已锁定",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .background(Color(0xCC3A3A3A), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 10.dp, vertical = 5.dp),
+                        )
+                    }
+                }
+
 
                 // 变焦刻度 + ✦ LUT 入口：透明底叠预览下缘；长按弹轮盘变焦（设置可关）
                 Row(
@@ -1711,12 +1809,30 @@ fun CameraScreen(
                     // 大图**（用户要求）；没有 ⇒ 进相册页（传统入口）。灰态（alpha 0.5）
                     // 继续表示"还没有成片"。
                     .clickable {
-                        val u = thumbUri
-                        if (u != null) onOpenLastPhoto(u.toString()) else onOpenGallery()
+                        if (shotPending) {
+                            onOpenPendingPhoto()
+                        } else {
+                            val u = thumbUri
+                            if (u != null) onOpenLastPhoto(u.toString()) else onOpenGallery()
+                        }
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                if (t != null) {
+                if (shotPending) {
+                    // 处理中占位：胶片位立刻有反馈；点开只给提示
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(FilmTheme.ChipBg),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = FilmTheme.Accent,
+                        )
+                    }
+                } else if (t != null) {
                     Image(
                         bitmap = t,
                         contentDescription = "最近样张",
@@ -1922,6 +2038,16 @@ fun CameraScreen(
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "app", "quick.zebra",
                         "{\"on\":$zebraOn}",
+                    )
+                },
+                meteringMode = meteringMode,
+                onMetering = { m ->
+                    meteringMode = m
+                    prefs.edit().putInt("metering_mode", m).apply()
+                    controller.setMeteringMode(m)
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "quick.metering",
+                        "{\"mode\":$m}",
                     )
                 },
                 onMoreSettings = {
@@ -3091,6 +3217,8 @@ private fun QuickDropdown(
     onLevel: () -> Unit,
     zebraOn: Boolean,
     onZebra: () -> Unit,
+    meteringMode: Int,
+    onMetering: (Int) -> Unit,
     onMoreSettings: () -> Unit,
 ) {
     Column(
@@ -3114,6 +3242,13 @@ private fun QuickDropdown(
                 QuickTile("三分线", on = gridOn, onTap = onGrid)
                 QuickTile("水平仪", on = levelOn, onTap = onLevel)
                 QuickTile("斑马纹", on = zebraOn, onTap = onZebra)
+            }
+            Spacer(Modifier.height(12.dp))
+            QuickSectionLabel("测光")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                QuickTile("系统", on = meteringMode == 0) { onMetering(0) }
+                QuickTile("点测", on = meteringMode == 1) { onMetering(1) }
+                QuickTile("高光", on = meteringMode == 2) { onMetering(2) }
             }
             Spacer(Modifier.height(12.dp))
             QuickSectionLabel("焦段条显示")

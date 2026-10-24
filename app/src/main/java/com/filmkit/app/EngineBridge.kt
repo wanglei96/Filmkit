@@ -261,6 +261,18 @@ object EngineBridge {
     external fun nativeEngineSetLut(size: Int, data: FloatArray?, domainMin: FloatArray, domainMax: FloatArray)
 
     /**
+     * v0.12.67：测光接管。`manual = true`（点测 / 高光优先 / 长按 AE-L）时渲染端 AE
+     * **不再补中灰**，成片亮度 = 采集曝光；否则 HAL 按测光点给的光会被补回统一亮度。
+     */
+    external fun nativeSetMeterManual(manual: Boolean)
+
+    /** 高光优先的对焦点偏置（显示归一化坐标；<0 = 无焦点）。 */
+    external fun nativeSetMeterFocusPoint(x: Float, y: Float)
+
+    /** 读最近一帧的高光簇中心（显示归一化，y 向上）；false = 尚未算出。 */
+    external fun nativeGetAeHighlightPoint(out: FloatArray): Boolean
+
+    /**
      * 成片 JPEG 4:4:4 编码（v0.10.171）。bitmap 必须是 ARGB_8888 软件位图；
      * quality < 91 会被钳到 91（编码器在 ≤90 时退回 4:2:0，本函数承诺 4:4:4）。
      * 返回编码后的 JPEG 字节流；**null = 编码失败，调用方必须回退 Bitmap.compress**

@@ -42,6 +42,10 @@ import kotlin.math.roundToInt
  * 拍照走 YUV_420_888 最大分辨率（X300 主摄 4096×3072）→ CPU 转 RGB →
  * 同一胶片链全分辨率渲染 → JPEG（MediaStore Pictures/FilmKit）。
  */
+/** PhotonCamera `SPOT_AE_REGION_FRACTION` / `HIGHLIGHT_AE_REGION_FRACTION`（v0.12.67）。 */
+private const val SPOT_AE_FRACTION = 0.06f
+private const val HIGHLIGHT_AE_FRACTION = 0.16f
+
 class CameraController(private val context: Context, private val render: RenderClient) {
 
     private var camera: CameraDevice? = null
@@ -419,6 +423,26 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var focusRect: android.hardware.camera2.params.MeteringRectangle? = null
 
+    // ── 测光模式（v0.12.67）：0 = 系统默认，1 = 点测光，2 = 高光优先 ──────────
+    // 对焦与测光分离：focusRect 只喂 AF_REGIONS；AE_REGIONS 由本模式单独决定。
+    //  - 0：不设 AE 区域，交给 HAL 评价测光（点按只对焦）
+    //  - 1：点按位置 = 测光点（点测光语义，仍联动）
+    //  - 2：固定画面顶部中央（天空/高光源），点按只对焦
+    @Volatile
+    private var meteringMode = 0
+
+    /** 点测光的测光区域（点按位置）；切走点测光模式即清空。 */
+    @Volatile
+    private var spotMeteringRect: android.hardware.camera2.params.MeteringRectangle? = null
+
+    /** AE 锁定：HAL 冻结当前曝光（预览与成片同一次曝光，planner 继承预览值）。 */
+    @Volatile
+    private var aeLocked = false
+
+    /** 高光优先的测光区域（最近一帧最亮簇中心，16% 框）。 */
+    @Volatile
+    private var highlightMeterRect: android.hardware.camera2.params.MeteringRectangle? = null
+
     // ── 手动曝光 / 手动白平衡（M 档专业参数，§0-D6 扩展）──
     @Volatile
     private var manualExposure = false
@@ -715,6 +739,41 @@ class CameraController(private val context: Context, private val render: RenderC
         rebuildRepeating()
     }
 
+    /**
+     * 测光模式：0 = 系统默认（HAL 评价测光），1 = 点测光，2 = 高光优先（顶部中央）。
+     * 只改 AE_REGIONS，不动 AF——点按永远只对焦。
+     */
+    fun setMeteringMode(mode: Int) {
+        val m = mode.coerceIn(0, 2)
+        if (m == meteringMode) return
+        meteringMode = m
+        if (m != 1) spotMeteringRect = null
+        EngineBridge.nativeSetMeterManual(m != 0 || aeLocked)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "metering.set",
+            kv("mode" to m),
+        )
+        rebuildRepeating()
+    }
+
+    /** AE 锁定：冻结 HAL 当前曝光；AF 仍可继续点按。 */
+    /** 读最近一帧的高光簇中心（显示归一化，y 向上）；null = 尚未算出。 */
+    fun pollHighlightPoint(): FloatArray? {
+        val out = FloatArray(2)
+        return if (EngineBridge.nativeGetAeHighlightPoint(out)) out else null
+    }
+
+    fun setAeLock(on: Boolean) {
+        if (on == aeLocked) return
+        aeLocked = on
+        EngineBridge.nativeSetMeterManual(meteringMode != 0 || on)
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "ae.lock",
+            kv("on" to on),
+        )
+        rebuildRepeating()
+    }
+
     /** 触屏对焦：视图归一化坐标 → 传感器 active array 测光/对焦区域。
      *  传感器是横向的（如 X300 sensorOrientation=90），显示图 = 传感器顺时针旋转；
      *  视图坐标必须按总旋转（传感器方向 + 界面方向步进）反推回传感器坐标，
@@ -722,12 +781,7 @@ class CameraController(private val context: Context, private val render: RenderC
     fun focusAt(nx: Float, ny: Float) {
         val r = activeArray
         val k = (sensorOrientation / 90 + orientationStep) % 4
-        val (snx, sny) = when (k) {
-            1 -> ny to 1f - nx
-            2 -> 1f - nx to 1f - ny
-            3 -> 1f - ny to nx
-            else -> nx to ny
-        }
+        val (snx, sny) = MeteringTargets.viewToSensor(nx, ny, k)
         val cx = r.left + (snx.coerceIn(0f, 1f) * r.width()).toInt()
         val cy = r.top + (sny.coerceIn(0f, 1f) * r.height()).toInt()
         val half = (minOf(r.width(), r.height()) * 0.15f).toInt().coerceAtLeast(32)
@@ -735,6 +789,11 @@ class CameraController(private val context: Context, private val render: RenderC
             (cx - half).coerceAtLeast(r.left), (cy - half).coerceAtLeast(r.top),
             half * 2, half * 2, 1000,
         )
+        // 点测光：AE 区域 = 点按位置，边长 6%（PhotonCamera SPOT_AE_REGION_FRACTION），
+        // 与对焦框 15% 无关。其它模式点按只对焦（测光区域独立）。
+        if (meteringMode == 1) spotMeteringRect = rectAt(nx, ny, SPOT_AE_FRACTION)
+        // 高光优先的焦点偏置（PC calculateMeteringResults 的 bias）
+        EngineBridge.nativeSetMeterFocusPoint(nx, ny)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "focus.set",
             kv(
@@ -742,6 +801,58 @@ class CameraController(private val context: Context, private val render: RenderC
                 "rot" to k, "sx" to "%.2f".format(snx), "sy" to "%.2f".format(sny),
             ),
         )
+        rebuildRepeating()
+    }
+
+    /**
+     * 当前测光模式对应的 AE 区域；null = 不设（交 HAL 评价测光）。
+     * 高光优先取画面顶部中央（天空/高光源），按显示方向反推回传感器坐标。
+     */
+    private fun currentMeteringRect(): android.hardware.camera2.params.MeteringRectangle? {
+        when (meteringMode) {
+            1 -> return spotMeteringRect
+            // 高光优先：PC 的 HIGHLIGHT_AE_REGION_FRACTION = 0.16，位置 = 最近一帧的
+            // 最亮簇中心（native 算出）；尚未算出时用画面中心（PC 的 (0.5,0.5) 兜底）。
+            2 -> return highlightMeterRect ?: rectAt(0.5f, 0.5f, HIGHLIGHT_AE_FRACTION)
+            else -> return null
+        }
+    }
+
+    /**
+     * 以显示归一化坐标 (nx, ny, y 向下) 为中心、边长 = min(w,h)×fraction 的 AE 区域。
+     * 语义同 PhotonCamera `PreviewMeteringMapper.buildCenteredRegion`。
+     */
+    private fun rectAt(nx: Float, ny: Float, fraction: Float): android.hardware.camera2.params.MeteringRectangle {
+        val r = activeArray
+        val k = (sensorOrientation / 90 + orientationStep) % 4
+        val (sx, sy) = MeteringTargets.viewToSensor(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f), k)
+        val cx = r.left + sx * r.width()
+        val cy = r.top + sy * r.height()
+        val half = (minOf(r.width(), r.height()) * fraction * 0.5f).toInt().coerceAtLeast(16)
+        val x0 = (cx.toInt() - half).coerceIn(r.left, r.right - 2)
+        val y0 = (cy.toInt() - half).coerceIn(r.top, r.bottom - 2)
+        val x1 = (cx.toInt() + half).coerceIn(x0 + 2, r.right)
+        val y1 = (cy.toInt() + half).coerceIn(y0 + 2, r.bottom)
+        return android.hardware.camera2.params.MeteringRectangle(
+            x0, y0, x1 - x0, y1 - y0,
+            android.hardware.camera2.params.MeteringRectangle.METERING_WEIGHT_MAX,
+        )
+    }
+
+    /**
+     * 高光优先的测光点更新（由预览循环按屏显归一化坐标喂入，y 向上，同 PC）。
+     * PC 的 8% 位移门限：微抖不重算（`updateHighlightPoint`）。
+     */
+    fun setHighlightMeterPoint(nx: Float, ny: Float) {
+        if (meteringMode != 2) return
+        val last = highlightMeterRect
+        val nyView = (1f - ny).coerceIn(0f, 1f)  // native 输出 y 向上 → 视图 y 向下
+        if (last != null) {
+            val cx = (last.rect.left + last.rect.width() * 0.5f) / activeArray.width()
+            val cy = (last.rect.top + last.rect.height() * 0.5f) / activeArray.height()
+            if (Math.hypot((nx - cx).toDouble(), (nyView - cy).toDouble()) < 0.08) return
+        }
+        highlightMeterRect = rectAt(nx, nyView, HIGHLIGHT_AE_FRACTION)
         rebuildRepeating()
     }
 
@@ -753,7 +864,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 对焦区域要含坐标——否则第二次点击不同位置会被当作未变化而跳过
         val fr = focusRect
         val focusSig = if (fr != null) "${fr.x},${fr.y},${fr.width}" else "null"
-        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}|${flashMode}"
+        val sig = "${evSteps}|${manualExposure}|${iso}|${exposureNs}|${wbMode}|${wbK}|${zoomRatio}|${manualFocus}|${focusDiopter}|${focusSig}|${flashMode}|${meteringMode}|${aeLocked}"
         if (sig == lastApplied) return
         lastApplied = sig
         try {
@@ -775,6 +886,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     // 此前日志里没有它 ⇒ "暗部偏亮"排查时无法区分"引擎提亮"与"用户基线"，
                     // 只能靠推断。它与 aeEv 是**相加**关系：实际提亮 = base_ev + 界面EV + AE。
                     "baseEv" to "%.2f".format(baseEvPref),
+                    "meter" to meteringMode, "aeLock" to aeLocked,
                 ),
             )
         } catch (t: Throwable) {
@@ -1052,10 +1164,12 @@ class CameraController(private val context: Context, private val render: RenderC
         if (oisSupported) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
-        focusRect?.let {
-            b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it))
-            b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it))
-        }
+        focusRect?.let { b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it)) }
+        // 测光与对焦分离：AE 区域由测光模式单独决定，点按只改 AF。
+        val mr = currentMeteringRect()
+        if (mr != null) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(mr))
+        else b.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+        if (!manualExposure) b.set(CaptureRequest.CONTROL_AE_LOCK, aeLocked)
         if (Build.VERSION.SDK_INT >= 30) {
             b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
         } else {

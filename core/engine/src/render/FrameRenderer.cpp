@@ -174,7 +174,8 @@ float g_pv_geo_ema = 0.0f;
 // v0.11.93：成片 AE 的 EMA —— 预览也叠上它，取景器才与成片同亮度。
 // 之前预览恒用 exposure_ev=0、成片 +0.6~1.7EV，用户看到的是"预览暗、成片亮"，
 // 而这恰好破坏了 v0.11.92 的取景器匹配前提（目标来自预览，预览却不是最终亮度）。
-float g_still_ae_ema = 0.0f;
+// v0.12.71：g_still_ae_ema **已删除** —— 跨张状态（上一张的 aeEv EMA）会让
+// 取景器和成片不一致、且"换场景后一张滞后"。曝光只由 HAL + planner + baseEv 决定。
 float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范围 1.70–3.87 的中位）
 // 0.12.51：**显示域**中位（sRGB 编码 0..1）的预览 EMA —— 显示域 AE 闭环的实测值。
 // 为什么必须用显示域：`p_robust` 是 RAW 域的统计，而"够不够亮"是显示域的观感；
@@ -9228,7 +9229,7 @@ void FrameRenderer::setAeHal(bool on) {
   aeHalFlag().store(on);
   if (on) {
     // 清掉历史闭环残留，避免旧值继续叠加到预览曝光上。
-    g_still_ae_ema = 0.0f;
+
     g_disp_ae_ev = 0.0f;
   }
 }
@@ -9365,6 +9366,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
   // v0.11.88：bracket 下**永远**跑高光约束 —— 旧逻辑在"真裁切 0"时把整条判据关掉，
   // 于是 aeEv 一路冲到 +2.0 限幅、白墙/窗外撞白（真机 2712：hi240 3.97%）。
   in.force_hl = bracket_metering;
+  in.manual_meter = meter_manual_;  // v0.12.67：用户接管测光 ⇒ 渲染端不补中灰
   in.p_hi95 = st_full.p_hi95;
   // 0.12.52：BLOCK「一套」——RAW 域鲁棒档不再参与决策（显示域闭环是唯一来源）。
   // `p_robust` 仍算、仍进日志，供离线核对统计量，但不影响 EV。
@@ -9405,7 +9407,6 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
     ae_why_ = 5;   // 5 = display（显示域闭环）
     return ev;
   }
-  g_still_ae_ema = g_still_ae_ema * 0.7f + d.ev * 0.3f;
   return d.ev;
 }
 
@@ -9458,7 +9459,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   {
     // v0.11.93：预览叠上成片 AE 的 EMA ⇒ 取景器看到的亮度就是成片亮度（WYSIWYG）
     FilmParams pv = p;
-    pv.exposure_ev += g_still_ae_ema;
+    // v0.12.71：同上，预览不叠渲染端 AE。
     passFilm(rw, rh, pv, teq_src, /*still=*/false, /*hal_domain=*/true);
   }
   if (diag) logPassDiag("pass2_film", fbo_work_, GL_RGBA16F);
@@ -9484,7 +9485,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
     const GLuint teq_src = applyToneEq(dst_w, dst_h, tex_scene_);
     {
       FilmParams pv = p;
-      pv.exposure_ev += g_still_ae_ema;
+      // v0.12.71：预览不叠任何渲染端 AE —— 曝光 = HAL + planner + baseEv，取景器即成片。
       passFilm(dst_w, dst_h, pv, teq_src, /*still=*/false, /*hal_domain=*/true);
     }
   }
@@ -12541,8 +12542,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   if (c.bracket) {
     pe.hr_raw = 0.f;
   }
+  // v0.12.71（PC 架构，用户拍板）：渲染端 AE **只诊断、不参与曝光**。
+  // 曝光 = HAL 的 AE + planner + baseEv + 用户 EV；预览和成片同一次曝光，逐张独立。
+  // 旧行为 `pe.exposure_ev += ae` 是自研的第二套 AE（补中灰/压高光），与 HAL 打架。
   const float ae = passAutoExposure(film_src, pe, c.short_sat);
-  pe.exposure_ev += ae;
+  (void)ae;
   // v0.11.91：teq 的"大面积高光"判据从"软约束是否主导"改为**绝对亮度**：
   // P95 必须真的亮到白点以上（>2.0EV），且 P99.5 不比它高太多（<1.5×，说明是
   // 平坦大面积而非孤立亮点）。旧判据在"室内窗景"上也会触发 −2.2EV，把窗外压成
@@ -15212,7 +15216,7 @@ void FrameRenderer::renderLuma(GLuint src, GLuint fbo, int w, int h,
 // v0.6.24：加 bypass_lut —— 风格 LUT 不该改曝光（默认参数下行为与旧版逐位一致）。
 bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
                                  int stat_ch, int stat_mode, float center_frac,
-                                 double* weighted_out) {
+                                 double* weighted_out, float* bright_xy) {
   if (out == nullptr || n < 2 || src == 0 || scene_w_ <= 0) return false;
   // v0.10.28：256×96 → 512×288。24K 采样点上 P99.99 = 前 2.5 名、max 采样对
   // 0.001% 级的小面积高光（水壶镜面/白壶身）几乎必然 miss——真机 162012 实证：
@@ -15263,6 +15267,78 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
       }
     }
   }
+
+  // ── v0.12.67：高光簇中心 —— 逐行移植 PhotonCamera `LutRenderer.calculateMeteringResults`
+  // 的 HIGHLIGHT_PRIORITY 分支（不是自创）：32×32 luma 网格 → top2% 动态阈值
+  // （且 ≥128 显示 / 对应编码 140）→ 5×5 簇求和 → 焦点偏置 1/(1+d·0.05) →
+  // 历史偏置（距上一帧 <2 格 ×1.2）→ 归一化坐标（GL y 向上翻转）。
+  // 本 FBO 512×288，每格 16×9 像素平均，等价于 PC 的 32×32 metering FBO。
+  if (bright_xy != nullptr) {
+    constexpr int G = 32;
+    double grid[G * G] = {0.0};
+    int cnt[G * G] = {0};
+    for (int y = 0; y < hh; ++y) {
+      const int gy = y * G / hh;
+      for (int x = 0; x < hw; ++x) {
+        const size_t i = (static_cast<size_t>(y) * hw + x) * 4;
+        const int gx = x * G / hw;
+        grid[gy * G + gx] += px[i];
+        ++cnt[gy * G + gx];
+      }
+    }
+    for (int i = 0; i < G * G; ++i) {
+      grid[i] = cnt[i] > 0 ? grid[i] / cnt[i] : 0.0;
+    }
+    int hist_g[256] = {0};
+    for (int i = 0; i < G * G; ++i) {
+      int v = static_cast<int>(grid[i]);
+      hist_g[v < 0 ? 0 : (v > 255 ? 255 : v)]++;
+    }
+    int acc_g = 0, thr = 140;
+    for (int v = 255; v >= 0; --v) {
+      acc_g += hist_g[v];
+      if (acc_g >= 20) {
+        thr = v > 140 ? v : 140;
+        break;
+      }
+    }
+    double best = -1.0;
+    int bx = -1, by = -1;
+    for (int y = 2; y < G - 2; ++y) {
+      for (int x = 2; x < G - 2; ++x) {
+        if (grid[y * G + x] < thr) continue;
+        double sum = 0.0;
+        for (int ky = -2; ky <= 2; ++ky) {
+          for (int kx = -2; kx <= 2; ++kx) {
+            sum += grid[(y + ky) * G + (x + kx)];
+          }
+        }
+        double bias = 1.0;
+        if (hl_focus_x_ >= 0.0f) {
+          const double fx = hl_focus_x_ * G;
+          const double fy = (1.0 - hl_focus_y_) * G;
+          bias = 1.0 / (1.0 + std::hypot(x - fx, y - fy) * 0.05);
+        }
+        double hb = 1.0;
+        if (hl_best_x_ >= 0) {
+          const double dx = x - hl_best_x_, dy = y - hl_best_y_;
+          if (dx * dx + dy * dy < 4.0) hb = 1.2;
+        }
+        const double score = sum * bias * hb;
+        if (score > best) {
+          best = score;
+          bx = x;
+          by = y;
+        }
+      }
+    }
+    if (bx >= 0) {
+      hl_best_x_ = bx;
+      hl_best_y_ = by;
+      bright_xy[0] = (static_cast<float>(bx) + 0.5f) / static_cast<float>(G);
+      bright_xy[1] = 1.0f - (static_cast<float>(by) + 0.5f) / static_cast<float>(G);
+    }
+  }
   return true;
 }
 
@@ -15295,8 +15371,15 @@ FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
   SceneStats st;
   int hist[kN];
   double wh[kN];
+  float bx = -1.0f, by = -1.0f;
   if (!histogramFrom(src, hist, kN, /*bypass_lut=*/true, /*stat_ch=*/1,
-                     /*stat_mode=*/1, center_frac, wh)) return st;
+                     /*stat_mode=*/1, center_frac, wh,
+                     center_frac <= 0.0f ? &bx : nullptr)) return st;
+  if (bx >= 0.0f) {
+    hl_x_ = bx;
+    hl_y_ = by;
+    hl_valid_ = true;
+  }
   long total = 0;
   for (int i = 0; i < kN; ++i) total += hist[i];
   if (total <= 0) return st;
