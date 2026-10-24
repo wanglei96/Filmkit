@@ -82,12 +82,9 @@ status: active
 ## 色相路线与 HDR（10-19）
 
 - [2026-10-19] **红杯 ROI 的色相/色差（修正 D5 域口径后）**：sigmoid ΔE 3.69 / Δh 4.43° · filmic 2.11 / 1.50° · ACES 原生 11.71 / 3.44° · ACES 重锚（×1.7919）4.69 / 1.58° · Oklab L-only 5.42 / 1.83°。⇒ ACES 无优势；Oklab 用 ΔE 换 Δh。
-- [2026-10-19] **PC 的 HDR JPEG 实现（一手源码）**：`gallery/Jpeg444ExportEncoder.kt` = 自研 4:4:4 JPEG（native `writeNative`）+ gainmap JPEG（`encodeGainmapNative`）+ **libultrahdr `packageJpegR`**（`cpp/jpeg_r_encoder.cpp`，vendored `libultrahdr`/`libjpeg-turbo`）；元数据 `ratioMin/Max` 0.25~4.0、`gamma`、`epsilonSdr/Hdr`、`displayRatioSdr/Hdr`。`hdr/UltraHdrWriter.kt`（`Bitmap.compress` + `Gainmap`）是 **4:2:0** 的另一条。
 
 ## HDR 交付（10-20）
 
-- [2026-10-20] **HDR 三条路径**：JPEG **4:4:4** = 自研 stb base + libultrahdr `packageJpegR`（`set_compressed_image(BASE)` → `set_gainmap_image` → `set_output_format(JPG)` → `is_uhdr_image` 自检，base 保住 4:4:4）；JPEG **4:2:0** 与 **HEIC** = 平台 `Bitmap.setGainmap` + `compress` / `HeifWriter`。开关 `-DFILMKIT_HDR`（默认 OFF）+ `-PfilmkitHdr=true`；`.so` 21MB、APK 46MB（+12MB）。
-- [2026-10-20] **gainmap 必须在 GPU 算**（`kFsGainmap`）：ES 3.0 只保证 `GL_RGBA+UNSIGNED_BYTE` 读回（浮点读回真机不可用）⇒ 只读回 1/2 分辨率 8bit（12MP ≈3MB）。采样核 **4×4 步长 2**（重叠 50% 隐式平滑）。域口径：HDR 侧 `workToSrgb`、SDR 侧反 OETF，各取 Rec.709 luma。**两张输入方向相反**（`kFsOut` 带 `uFlipY=1.0`）⇒ HDR 侧采样用 `(x, 1-y)`。
 - [2026-10-20] **gainmap 数学两版可切**（`setGainmapMath`，prefs `gainmap_math`）：0 = PC（offset **1e-4**，默认）/ 1 = 官方（offset **1e-7** + 暗部 `sdr<2/255` 钳 gain≤2.3）。都归一化到固定 `[0.25, 4.0]`。真机证据：官方版 gainmap JPEG **570KB**（正常几十 KB）、`>=0.90` 像素 **1.61%** 散布 ⇒ "太阳把栏杆覆盖"。
 - [2026-10-20] **App 内 HDR 显示三条件**：① `BitmapFactory` + **`inSampleSize=1`**（>1 丢 gainmap；`ImageDecoder` **不解析 MPF 多图**）② **`context.findActivity()`** 逐层解包（`as? Activity` 在 Compose 里拿不到）③ `window.colorMode = COLOR_MODE_HDR`，**不检查 `configuration.isScreenHdr`**（该值在 X300 上恒 false 而系统相册能显示 HDR）。
 - [2026-10-20] **导出 SDR 版**：`nativeExtractSdrBase` 用 `uhdr_dec_get_base_image` **无损取 base**（不重压）⇒ 落盘 `…_SDR.jpg`。
@@ -117,3 +114,6 @@ status: active
 - [2026-10-23] **PC 的 sigmoid 与我们的实现逐行一致**（`DarktableSigmoidToneAlgorithm.kt:80-127` vs `FrameRenderer.cpp:7243-7291`，含 `preserveSigmoidHueAndEnergy`、通道排序、energyTarget 两支求解）；`uSigWhiteTarget` 两边都是 1.0 ⇒ 差异不在曲线，在输入色度/CCM。
 - [2026-10-23] **PC 默认渲染引擎是 AdobeCurve**（`UserPreferencesRepository.kt:144`），sigmoid 只是选项 —— 但用户实拍时手动切成了 sigmoid，所以此条**不是**本轮差异的解释。
 - [2026-10-23] **相册编辑器饱和度失效根因**：`EditorEngineSession` 出口调 `engineScoped` ⇒ `applyEngineScope` 把公共段 `[20]/[21]/[22]` 置 1.0。修复 = `applyEngineScopeForEditor`（跳过公共段）。
+- [2026-10-24] **阴天过曝实测**（`090816`，baseEv 0.3）：`aeP50 0.52`、`aeSatRaw 41%`、`aeBrkSat 0%`、`aeEv 0`、`hi240 35.9%`、`teqHl −1.41`。成因 = 0.12.63 的长帧过曝放宽在 ISO 贴底时对阴天同样生效；短帧虽未饱和，但长帧过曝幅度超出其覆盖能力。
+- [2026-10-24] **bracket 短帧 −3EV 的噪声代价**：短帧 `ratio 8` ⇒ 归一化 ×8、噪声 ×8，高光区（长帧饱和处）明显；收到 `ratio 6` 后消失。
+- [2026-10-24] **白点 4.8 与 6.22 的差别**（夕阳窗景 `173032`）：6.22 时 `aeEv` 冲到 2.0、天空 p95 246、`>240` 占 8.6%；4.8 时 `aeEv` 落到 ~1.0、p95 回到 ~210。

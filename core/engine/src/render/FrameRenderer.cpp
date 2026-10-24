@@ -182,6 +182,8 @@ float g_domain_ratio = 2.0f; // HAL 域 / RAW 域 中位比（初值 = 实测范
 // 0601 输入 0.17 → mean 115）。PC 的 `MeteringSystem.DISPLAY_TARGET_LUMA = 0.18`
 // 也是显示域（sRGB 缩略图线性化后的 luma）—— 这一层对齐后才能跨场景用同一个目标。
 float g_pv_disp_p50 = 0.0f;
+// 0.12.66：最近一张的 RAW 中灰（`ae_p50_` 的跨线程快照）—— Kotlin 侧用它决定
+// "是否允许长帧过曝"（阴天/白墙这类场景必须排除）。
 float g_disp_ae_ev = 0.0f;   // 显示域闭环累计 EV（诊断）
 
 // 预览降载（v0.10.93）：1.0 = 全分辨率。进程级 atomic —— 写方（Kotlin 的
@@ -9354,7 +9356,12 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
   // 不是"不约束"——v0.11.88 的 2712 事故是"完全不约束 ⇒ aeEv 冲 +2.0"，不是放宽白点。
   const bool bracket_has_headroom =
       bracket_metering && short_sat >= 0.0f && short_sat < kAeMaxClippedFrac;
-  in.white_ev = bracket_has_headroom ? kAeSigmoidDeadWhiteEv : kAeDisplayClipEv;
+  // 0.12.64：短帧有余量时也**不再放到曲线死白点（6.22）** —— 那是"彻底无层次"的位置，
+  // 真机 10-23 17:32（夕阳逆光窗）实证：白点 6.22 时 `aeEv` 冲到 2.0、天空 p95 246
+  // （8.6% 平顶）；同日落另一张（17:31）`aeEv` 0.55、p95 216（0% 平顶）。
+  // 4.8EV ≈ 243 LSB 才是"还能分辨"的上限。楼暗由长帧过曝补（0.12.63），不靠这里。
+  (void)bracket_has_headroom;
+  in.white_ev = kAeDisplayClipEv;
   // v0.11.88：bracket 下**永远**跑高光约束 —— 旧逻辑在"真裁切 0"时把整条判据关掉，
   // 于是 aeEv 一路冲到 +2.0 限幅、白墙/窗外撞白（真机 2712：hi240 3.97%）。
   in.force_hl = bracket_metering;

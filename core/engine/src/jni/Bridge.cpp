@@ -1110,6 +1110,7 @@ Java_com_filmkit_app_EngineBridge_nativeGetDisplayP50(JNIEnv*, jclass) {
   return FrameRenderer::displayP50();
 }
 
+
 // ── 预览测光快照（0.12.44）──────────────────────────────────────────────
 // 返回 {取景器几何均值 EMA, HAL/RAW 域比}。Kotlin 侧用它算 AE 补偿闭环：
 // pvRaw = geo / ratio ⇒ delta = log2(target / pvRaw) ⇒ 累加后下发 HAL。

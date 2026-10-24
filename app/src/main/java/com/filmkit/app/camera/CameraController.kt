@@ -2018,9 +2018,16 @@ class CameraController(private val context: Context, private val render: RenderC
     // 2^k，k=2（设计 §3.1）。v0.11.87：改成**按场景自适应**（见 updateBracketDiv）——
     // 真机实测短帧在多个明亮场景里自己也饱和（08:27:35 p999 1.00、10:00:01 p995 1.00），
     // 那时 k=2 已经采不到更多高光，再融合只是猜。反馈来自上一张的 bracket.short p999。
-    private val BRACKET_DIV_BASE = 4.0f
+    // 0.12.62：4.0 → **8.0**（短帧 −3EV）。真机 2026-10-23 日落实测：`aeBrkSat` 只剩
+    // 0.1~0.55%（短帧也快饱和）、融合后 p99.5 仍 3.1~5.4（白点 2.44，超出 1~2.2EV）
+    // ⇒ 天空最高段在短帧里就没了，渲染端只能靠 teq 压成灰白。长帧不动（楼的亮度
+    // 不损失），只把短帧进一步压短，让天空整段落进可分辨范围。
+    // 0.12.65：8.0 → **6.0**（短帧 −2.6EV）。8.0 时短帧归一化 ×8、噪声同样 ×8，
+    // 叠加 0.12.63 的长帧过曝（更多像素转由短帧提供）⇒ 成片噪点明显（真机 10-23 反馈）。
+    // 6.0 让噪声回到 ×6（−0.4EV），天空仍比最初的 −2EV 宽。
+    private val BRACKET_DIV_BASE = 6.0f
     private val BRACKET_DIV_MIN = 2.0f
-    private val BRACKET_DIV_MAX = 8.0f
+    private val BRACKET_DIV_MAX = 16.0f
     @Volatile private var bracketDiv = BRACKET_DIV_BASE
     // 短帧在 burst 里的**唯一**索引来源（0.11.69：此前结果回调硬编码 secs[0]/secs[1]
     // 读 ratio，短帧移到帧 3 后读到两个长帧 ⇒ ratio=1.0 ⇒ bracket 静默失效，
@@ -2137,6 +2144,9 @@ class CameraController(private val context: Context, private val render: RenderC
                 // 高光保护：提亮后高光必须留余量（NaN = 无统计 ⇒ 不介入，与历史一致）
                 sceneHighlightEv = hlSceneEv,
                 exposureCompEv = hlCompEv,
+                // 0.12.66：**回退 0.12.63 的长帧过曝放宽**。它在阴天/白墙场景同样生效
+                // （ISO 贴底是常见状态）⇒ 长帧 41% 饱和、成片 hi240 35.9%。
+                // 只对"场景本身暗"放宽需要上一张统计，而跨张依赖已被否决 ⇒ 直接不做。
             )
             expPlan = p
             capIso = p.iso
@@ -3588,7 +3598,7 @@ class CameraController(private val context: Context, private val render: RenderC
                     p999 > 0.92f -> bracketDiv * 1.20f
                     p999 < 0.45f -> bracketDiv / 1.15f
                     else -> bracketDiv
-                }.coerceIn(BRACKET_DIV_MIN, 6.0f)
+                }.coerceIn(BRACKET_DIV_MIN, BRACKET_DIV_MAX)
                 if (next != bracketDiv) {
                     EngineBridge.nativeAppendLog(
                         EngineBridge.LEVEL_INFO, "camera", "bracket.k",

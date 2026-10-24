@@ -112,6 +112,7 @@ object EngineBridge {
      * 由 Kotlin 侧 1Hz 外环读取 → 算偏差 → 下发 HAL 曝光补偿。
      */
     external fun nativeGetDisplayP50(): Float
+
     /** 局部影调（tone equalizer）：按引导 mask 的亮度分区做曝光补偿。 */
     external fun nativeSetToneEq(on: Boolean)
 

@@ -169,6 +169,7 @@ class FrameRenderer {
   // 预览回读的 liveIso/liveExposureNs），不再各算一套。
   static void setAeHal(bool on);
   static bool aeHal();
+
   // 显示域 p50（sRGB 编码 0..1，预览 EMA）—— 0 = 尚未统计。
   static float displayP50();
   // 对**显示域纹理**（passOutput 的输出，sRGB 编码）取中位亮度（0..1）。

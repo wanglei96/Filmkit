@@ -91,13 +91,32 @@ object ExposurePlanner {
         highlightHeadroomEv: Double = 0.1,
         exposureCompEv: Double = 0.0,
         whitePointEv: Double = WHITE_POINT_EV,
+        // 0.12.63：**bracket 开启时允许长帧故意过曝**。
+        // 为什么：`nIso` 约束的语义是"拉长必须降 ISO 保持亮度"（纯赚 SNR）。但 ISO
+        // 一旦落到底限（X300 = 50），这条约束就把长帧彻底锁死 —— 真机 10-23 日落场景：
+        // 长帧 13.2ms/ISO50，楼暗，而想延长只会过曝；可此时短帧（−3EV）本来就是为
+        // 高光兜底而拍的，长帧过曝正是它存在的理由（HDR+ 的做法）。
+        // `bracketExposureHeadroomEv` = 允许长帧超出"亮度守恒"多少 EV（0 = 旧行为）。
+        bracketExposureHeadroomEv: Double = 0.0,
     ): Plan {
         if (baseIso <= 0 || baseExposureNs <= 0L || exposureUpperNs <= 0L) {
             return Plan(baseIso.coerceAtLeast(1), baseExposureNs, 1.0, "invalid", 0L, 0.0, 0.0)
         }
         val nTarget = targetExposureNs.toDouble() / baseExposureNs
         // ① ISO 下限：降 ISO 保持亮度 ⇒ N ≤ baseIso / isoLower
-        val nIso = if (isoLower > 0) baseIso.toDouble() / isoLower else Double.MAX_VALUE
+        // 0.12.63：有短帧兜底时，ISO 下限这条约束可放宽到 2^headroom（过曝由短帧恢复）。
+        val nIso = if (isoLower > 0) {
+            val base = baseIso.toDouble() / isoLower
+            // ⚠ 只在 **ISO 已经贴底**时放宽（`baseIso <= isoLower×1.1`）。
+            // 否则室内这类"HAL 已用 ISO 400"的场景会被一并提亮 2EV —— 那就成了
+            // "改一个场景毁另一个"。ISO 到底 ⇒ 说明场景只差快门，这时短帧才有意义。
+            val isoAtFloor = baseIso <= isoLower * 1.1
+            if (bracketExposureHeadroomEv > 0.0 && isoAtFloor) {
+                base * Math.pow(2.0, bracketExposureHeadroomEv.coerceIn(0.0, 3.0))
+            } else {
+                base
+            }
+        } else Double.MAX_VALUE
         // ② 快门上限
         val nShutter = exposureUpperNs.toDouble() / baseExposureNs
         // ③ 运动预算：曝光窗口内转动 ≤ budget·RAD_PER_PX ⇒ t ≤ budget·RAD_PER_PX / ω
