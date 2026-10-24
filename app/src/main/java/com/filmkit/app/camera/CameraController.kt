@@ -977,6 +977,91 @@ class CameraController(private val context: Context, private val render: RenderC
             return if (r in 1.5..16.0) r.toFloat() else 1f
         }
 
+        // ── HDR 曝光融合（docs/engine-hdr-exposure-fusion-design.md，0.12.76 P1）──
+        // 常量与规划算法**照抄 PC**（/tmp/pc-full HdrBracketConfig.kt：YUV_LONG_EV
+        // 2.2 / YUV_SHORT_EV −1.5 / YUV_LONG_MAX_SHUTTER_NS 10ms + planManualExposure）。
+        const val HDR_LONG_EV = 2.2f
+        const val HDR_SHORT_EV = -1.5f
+        const val HDR_LONG_MAX_SHUTTER_NS = 10_000_000L
+
+        /** HDR bracket 单帧曝光规划（照抄 PC planManualExposure 语义，不自创）：
+         *  ① 先动快门（base×2^ev）；正 EV 的快门上限 = min(range 顶, 10ms)
+         *  （长帧不拖影）；负 EV 不设 10ms 上限（只有 range 本身）。
+         *  ② 快门被钳后 ISO 补偿（乘积守恒 targetProduct = base乘积×2^ev）；
+         *  ③ ISO 也被钳后再反算快门（尽量精确到目标乘积；双贴顶时返回实际可达值，
+         *  实测 EV 由 bracket.actual 日志核对，合成端只用实测值）。 */
+        fun planBracketExposure(
+            baseIso: Int, baseShutterNs: Long, evOffset: Float,
+            isoLower: Int, isoUpper: Int,
+            shutterLowerNs: Long, shutterUpperNs: Long,
+        ): Pair<Int, Long> {
+            val multiplier = Math.pow(2.0, evOffset.toDouble())
+            val targetProduct = baseIso.toDouble() * baseShutterNs.toDouble() * multiplier
+            val effectiveShutterUpperNs = if (evOffset > 0f) {
+                minOf(shutterUpperNs, HDR_LONG_MAX_SHUTTER_NS).coerceAtLeast(shutterLowerNs)
+            } else {
+                shutterUpperNs
+            }
+            val shutterFirst = Math.round(baseShutterNs.toDouble() * multiplier)
+                .coerceIn(shutterLowerNs, effectiveShutterUpperNs)
+            val isoForShutter = Math.round(targetProduct / shutterFirst.toDouble())
+                .toInt().coerceIn(isoLower, isoUpper)
+            val shutterForIso = Math.round(targetProduct / isoForShutter.toDouble())
+                .coerceIn(shutterLowerNs, effectiveShutterUpperNs)
+            return Pair(isoForShutter, shutterForIso)
+        }
+
+        /** 每帧相对参考帧（帧 0）的实测 EV 偏移 = log2(sec·iso / sec0·iso0)。
+         *  HDR 融合 P0（docs/engine-hdr-exposure-fusion-design.md §6）：合成端用
+         *  **实测** EV（PC 的 exposureProduct 语义 = iso×shutter，scale = 本帧/参考帧），
+         *  不用请求值 —— HAL 可能 clamp 快门/ISO。任一输入无效返回 NaN（日志记 -99）。 */
+        fun evOffsetSecIso(secNs: Long, iso: Int, refSecNs: Long, refIso: Int): Float {
+            if (secNs <= 0 || iso <= 0 || refSecNs <= 0 || refIso <= 0) return Float.NaN
+            val p = secNs.toDouble() * iso
+            val p0 = refSecNs.toDouble() * refIso
+            return kotlin.math.log2(p / p0).toFloat()
+        }
+
+        /** 短帧 RAW 抽样统计（归一化到白点）：[mean, P99.5, P99.9, 饱和占比]。
+         *  bracket 第 1 步的验证判据 —— 短帧的 P99.5 必须落回白点内（<1），否则说明
+         *  k=2 不够（设计 §0/§3.1）。stride=16 ⇒ 12MP 约 790k 次读取（~5ms）。
+         *  v0.12.75（HDR 融合 P0）：从成员挪进 companion 供单测 —— 逐帧饱和率
+         *  （bracket.actual）与短帧判据（bracket.short）共用同一实现。 */
+        fun rawSampleStats(
+            buf: java.nio.ByteBuffer, w: Int, h: Int, stridePx: Int, white: Int,
+        ): FloatArray {
+            val sb = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+            val wl = white.coerceAtLeast(1).toFloat()
+            val bins = IntArray(256)
+            var sum = 0.0
+            var n = 0
+            var y = 0
+            while (y < h) {
+                val row = y * stridePx
+                var x = 0
+                while (x < w) {
+                    val v = (sb.get(row + x).toInt() and 0xFFFF) / wl
+                    sum += v
+                    bins[(v * 255f).toInt().coerceIn(0, 255)]++
+                    n++
+                    x += 16
+                }
+                y += 16
+            }
+            if (n == 0) return floatArrayOf(0f, 0f, 0f, 0f)
+            val quant = { f: Float ->
+                val target = (n * f).toInt()
+                var acc = 0
+                var b = 0
+                while (b < 256 && acc + bins[b] < target) {
+                    acc += bins[b]
+                    b++
+                }
+                b / 255f
+            }
+            return floatArrayOf(sum.toFloat() / n, quant(0.995f), quant(0.999f), bins[255].toFloat() / n)
+        }
+
         /**
          * 降噪强度（C 专项 2026-09-29：滑杆 0–2、步长 0.01；0 = 关、1 = 真实 σ、
          * 2 = 2×σ）。含旧三档 prefs 的一次性迁移（level 0/1/2 → 0/1/2；旧 bool
@@ -2149,6 +2234,12 @@ class CameraController(private val context: Context, private val render: RenderC
     private val BRACKET_SHORT_IDX = MFNR_FRAMES - 1
     private var burstBracketOn = false    // 本次 burst 是否采了短帧
     private var burstShortRatio = 1.0f    // 实际 长/短 曝光比（1 = 无短帧/回退）
+    // HDR 融合 bracket（0.12.76 P1）：本次 burst 是否为 0/0/+2.2/−1.5 帧序。
+    // startBurst 冻结、processRawBurst 消费（快门瞬间快照，不重读 prefs）。
+    // burstHdrMode = 冻结的 prefs hdr_fusion（0/1）：0 = 纯同曝光 MFNR、
+    // 1 = HDR+ 包围曝光（0.12.84 两档化：P1 采集档随 Mertens 架构退役）。
+    @Volatile private var burstHdrBrackets = false
+    @Volatile private var burstHdrMode = 0
 
     // 曝光决策专项护栏：本次 burst 请求的曝光/ISO（供结果回调核对 HAL 是否 clamp）
     @Volatile
@@ -2233,8 +2324,18 @@ class CameraController(private val context: Context, private val render: RenderC
         // bracket（期 B）：开关默认关（第 4 步才转默认开）。开启时短帧自带高光余量，
         // 采集端高光保护必须同时旁路，否则"短帧 + 欠曝"又是一层双重压。
         // 设计 §7 步骤 4：判据回归后转默认开（2026-10-20 0.11.77）
-        val bracketPref = expPrefs.getBoolean("bracket", true)
-        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn && !bracketPref
+        // 旧 bracket（1 短 3 长 + bracketDiv 跨张反馈环）0.12.84 退役：短帧保高光
+        // 的职责由 HDR+ 包围曝光接管（短帧 −1.5EV 参与跨曝光堆叠，固定跨度、
+        // 每张独立）。代码路径保留（bracketPref 恒 false ⇒ bracketActive 恒
+        // false），prefs「bracket」不再读取（开关已删）。
+        val bracketRetired = true
+        val bracketPref = !bracketRetired && expPrefs.getBoolean("bracket", true)
+        // HDR+ 包围曝光（0.12.76 P1 → 0.12.84 两档化）：prefs hdr_fusion
+        // 0=关（纯同曝光 MFNR）/ 1=开（0/0/+2.2/−1.5 跨曝光堆叠）。默认**开**
+        //（多帧融合触发即自动走包围曝光；用户 2026-10-24 拍板）。旧 prefs 的
+        // 2（融合档）归一为 1（P1 采集档随直通架构退役）。
+        val hdrFusion = if (expPrefs.getInt("hdr_fusion", 1) >= 1) 1 else 0
+        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn && !bracketPref && hdrFusion <= 0
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设
         // 那部分就会少算 EV，高光保护判据放行 → 成片高光裁切。
@@ -2282,9 +2383,61 @@ class CameraController(private val context: Context, private val render: RenderC
         val expLower = curCharacteristics
             ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             ?.lower ?: 0L
+        val expUpper = curCharacteristics
+            ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?.upper ?: 1_000_000_000L
+        val isoLower = curCharacteristics
+            ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?.lower ?: 50
+
+        // ── HDR 融合 bracket（0.12.76 P1，设计 §4.1）─────────────────────
+        // 帧序 0/0/+2.2/−1.5（PC Camera2Controller.buildHdrBracketEvOffsets 同款：
+        // 参考帧固定第 0 张，侧帧各 1 张）。**与旧 bracket 互斥（hdr 优先）**：
+        // 旧 bracketDiv 反馈环是跨张状态（用户红线"每张独立"），新架构照抄 PC
+        // 固定跨度；侧帧曝光规划走 planBracketExposure（PC planManualExposure）。
+        // hdr 状态在 startBurst 冻结进成员（快门瞬间快照纪律），processRawBurst
+        // 读 burstHdrBrackets、不再读 prefs。
+        // HDR 侧帧 ISO 顶 = **模拟增益顶**（v0.10.4 纪律：数字增益区 = 光子不增 +
+        // 纯数字放大，噪声双重恶化 —— 0.12.78 真机实锤：暗场长帧 ISO 14336 进数字
+        // 区，+2.2EV 全是数字放大、读噪声 ×46 增益，Mertens 又把暗部权重给它 ⇒
+        // 噪点爆炸 + J6 违约）。钳到模拟顶后长帧照采照融合（**不退化**，PC 无此
+        // 机制）：暗场下长帧实际 EV 自然变低（bracket.actual 如实记录），归一化
+        // 亮度与 zero 接近 ⇒ Mertens 权重自动均衡，成片亮度回 J6 内。
+        val hdrAnalogTop = curCharacteristics
+            ?.get(android.hardware.camera2.CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY)
+            ?.coerceAtMost(isoUpperGate) ?: isoUpperGate
+        val hdrBracketsActive = hdrFusion >= 1 && flashMode == 0 && capIso > 0 && capSec > 0
+        if (hdrBracketsActive) {
+            val (longIso, longSec) = planBracketExposure(
+                capIso, capSec, HDR_LONG_EV, isoLower, hdrAnalogTop, expLower, expUpper)
+            val (shortIso, shortSecPlanned) = planBracketExposure(
+                capIso, capSec, HDR_SHORT_EV, isoLower, hdrAnalogTop, expLower, expUpper)
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "hdr.bracket",
+                kv(
+                    "mode" to hdrFusion,
+                    "baseIso" to capIso, "baseSec" to "%.4f".format(capSec / 1e9f),
+                    "longIso" to longIso, "longSec" to "%.4f".format(longSec / 1e9f),
+                    "shortIso" to shortIso,
+                    "shortSec" to "%.4f".format(shortSecPlanned / 1e9f),
+                    "longEvReq" to HDR_LONG_EV, "shortEvReq" to HDR_SHORT_EV,
+                    // ISO 钳模拟顶后长帧实际 EV 可能远低于请求值（暗场快门 10ms 顶 +
+                    // 模拟 ISO 顶），实测核对走 bracket.actual（P0 日志，无条件记）。
+                    "longEvAct" to "%.3f".format(
+                        evOffsetSecIso(longSec, longIso, capSec, capIso)
+                            .let { if (it.isFinite()) it else -99f }),
+                    "shortEvAct" to "%.3f".format(
+                        evOffsetSecIso(shortSecPlanned, shortIso, capSec, capIso)
+                            .let { if (it.isFinite()) it else -99f }),
+                ),
+            )
+        }
+        burstHdrBrackets = hdrBracketsActive
+        burstHdrMode = if (hdrBracketsActive) 1 else 0
+
         val shortSec = if (capSec > 0) maxOf(expLower, (capSec / bracketDiv).toLong()) else 0L
         val bracketActive = bracketPref && flashMode == 0 && capIso > 0 &&
-            shortSec > 0 && capSec >= shortSec * 3 / 2
+            shortSec > 0 && capSec >= shortSec * 3 / 2 && hdrFusion <= 0
         burstBracketOn = bracketActive
         burstShortRatio = 1.0f
         if (bracketActive) {
@@ -2303,8 +2456,10 @@ class CameraController(private val context: Context, private val render: RenderC
 
         val isoTouchesTop = capIso >= isoUpperGate        // 触顶 = 暗光
         val isoHeadroomOk = capIso * 3 / 2 <= isoUpperGate  // isoRef 不会被 clamp
-        val canShorten = !bracketActive && !longExposureOn && capIso > 0 && capSec > 0 &&
-            !isoTouchesTop && isoHeadroomOk
+        // HDR bracket 开时也停用参考帧压短：0EV 两帧必须同曝光（zero 堆叠域一致），
+        // 压短只对帧 0 生效会让帧 0 ≠ 帧 1。
+        val canShorten = !bracketActive && !hdrBracketsActive && !longExposureOn &&
+            capIso > 0 && capSec > 0 && !isoTouchesTop && isoHeadroomOk
         val secRef = if (!canShorten) {
             capSec
         } else {
@@ -2359,6 +2514,24 @@ class CameraController(private val context: Context, private val render: RenderC
         } else {
             null
         }
+        // HDR 融合侧帧（0.12.76 P1）：帧 2 = +2.2EV（捞暗部）、帧 3 = −1.5EV（保高光），
+        // 各 1 张不堆叠（PC 同款）。AE_OFF 手动下发，与 altReq 同一路径 —— burst 所有
+        // 帧 AE 全锁（2026-09-29 教训：只锁参考帧会让 HAL 拍摄瞬间重收敛）。
+        val hdrSideReq = if (hdrBracketsActive) { ev: Float ->
+            val (iso, sec) = planBracketExposure(
+                capIso, capSec, ev, isoLower, hdrAnalogTop, expLower, expUpper)
+            camera!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(stillReader!!.surface)
+                applyControls(this, distort = true)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, sec)
+            }.build()
+        } else {
+            null
+        }
+        val hdrLongReq = hdrSideReq?.invoke(HDR_LONG_EV)
+        val hdrShortReq = hdrSideReq?.invoke(HDR_SHORT_EV)
         // v0.10.35（2026-09-29 真机取证）：**alt 帧同样固定 AE_OFF + 预览收敛的
         // ISO/曝光** —— 原实现帧 1-3 直接复用预览的 repeating 请求（AE AUTO），
         // HAL 在拍摄时重新收敛曝光：70MM 实测预期 1070 → 实际 1179（+10%），
@@ -2384,13 +2557,25 @@ class CameraController(private val context: Context, private val render: RenderC
         // 基准（DFT 式 6/7 的 r0、mismatch 的权重恒 1）⇒ 暗部被短帧噪声主导（实测
         // 0.11.67 暗部彩噪明显）。短帧作 alt 时物理上自洽：暗部 d² 大 ⇒ 向参考帧（长帧）
         // 收缩，高光处短帧 SNR 高 ⇒ d² 小 ⇒ 采短帧。
-        val reqs = List(MFNR_FRAMES) { i ->
-            if (i == 0) {
-                (refReq ?: altReq ?: b.build())
-            } else if (i == BRACKET_SHORT_IDX && bracketActive) {
-                (shortReq ?: altReq ?: b.build())
-            } else {
-                (altReq ?: b.build())
+        val reqs = if (hdrBracketsActive) {
+            // HDR 融合（P1）：帧 0/1 = 0EV（帧 0 参考帧 + DNG 底片）、帧 2 = +2.2、
+            // 帧 3 = −1.5（BRACKET_SHORT_IDX 位置约定不变：帧 3 恒为短帧位）。
+            List(MFNR_FRAMES) { i ->
+                when (i) {
+                    2 -> hdrLongReq ?: altReq ?: b.build()
+                    3 -> hdrShortReq ?: altReq ?: b.build()
+                    else -> altReq ?: b.build()
+                }
+            }
+        } else {
+            List(MFNR_FRAMES) { i ->
+                if (i == 0) {
+                    (refReq ?: altReq ?: b.build())
+                } else if (i == BRACKET_SHORT_IDX && bracketActive) {
+                    (shortReq ?: altReq ?: b.build())
+                } else {
+                    (altReq ?: b.build())
+                }
             }
         }
         EngineBridge.nativeAppendLog(
@@ -2455,44 +2640,6 @@ class CameraController(private val context: Context, private val render: RenderC
         } finally {
             if (close) runCatching { img.close() }
         }
-    }
-
-    /** 短帧 RAW 抽样统计（归一化到白点）：[mean, P99.5, P99.9, 饱和占比]。
-     *  bracket 第 1 步的验证判据 —— 短帧的 P99.5 必须落回白点内（<1），否则说明
-     *  k=2 不够（设计 §0/§3.1）。stride=16 ⇒ 12MP 约 790k 次读取（~5ms）。 */
-    private fun rawSampleStats(
-        buf: java.nio.ByteBuffer, w: Int, h: Int, stridePx: Int, white: Int,
-    ): FloatArray {
-        val sb = buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-        val wl = white.coerceAtLeast(1).toFloat()
-        val bins = IntArray(256)
-        var sum = 0.0
-        var n = 0
-        var y = 0
-        while (y < h) {
-            val row = y * stridePx
-            var x = 0
-            while (x < w) {
-                val v = (sb.get(row + x).toInt() and 0xFFFF) / wl
-                sum += v
-                bins[(v * 255f).toInt().coerceIn(0, 255)]++
-                n++
-                x += 16
-            }
-            y += 16
-        }
-        if (n == 0) return floatArrayOf(0f, 0f, 0f, 0f)
-        val quant = { f: Float ->
-            val target = (n * f).toInt()
-            var acc = 0
-            var b = 0
-            while (b < 256 && acc + bins[b] < target) {
-                acc += bins[b]
-                b++
-            }
-            b / 255f
-        }
-        return floatArrayOf(sum.toFloat() / n, quant(0.995f), quant(0.999f), bins[255].toFloat() / n)
     }
 
     private fun onBurstTimeout() {
@@ -3668,16 +3815,72 @@ class CameraController(private val context: Context, private val render: RenderC
                    "brk" to (if (burstBracketOn) 1 else 0)),
             )
         }
-        val canReplace = burstBracketOn && !bracketOn && buffers.size == MFNR_FRAMES
-        val fuseBufs = if (canReplace) {
-            listOf(buffers[0], buffers[1], buffers[2], buffers[0])
-        } else {
-            buffers
+        // HDR 融合 P0（v0.12.75，设计 §6）：每帧**实测** EV 偏移（相对帧 0，
+        // log2(sec·iso/帧0)）+ RAW 抽样统计（mean/p995/饱和率），无条件记 ——
+        // P1 采集（0/0/+2.2/−1.5）的跨度与饱和依据全部来自这里。stride16 抽样
+        // 4 帧 ~20ms（拍照线程，链路 2~4s 可承受）。
+        val evs = FloatArray(buffers.size) { Float.NaN }
+        val hdrMeans = FloatArray(buffers.size)
+        val hdrP995 = FloatArray(buffers.size)
+        val hdrSats = FloatArray(buffers.size)
+        val refSec = results.getOrNull(0)?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+        val refIso = results.getOrNull(0)?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+        for (i in buffers.indices) {
+            val sec = results.getOrNull(i)?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val iso = results.getOrNull(i)?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            evs[i] = evOffsetSecIso(sec, iso, refSec, refIso)
+            val st = rawSampleStats(buffers[i], refW, refH, strides[i], meta.whiteLevel)
+            hdrMeans[i] = st[0]; hdrP995[i] = st[1]; hdrSats[i] = st[3]
         }
-        val fuseStrides = if (canReplace) {
-            intArrayOf(strides[0], strides[1], strides[2], strides[0])
-        } else {
-            strides
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "bracket.actual",
+            kv(
+                "n" to buffers.size,
+                "ev" to evs.joinToString(",") { if (it.isFinite()) "%.3f".format(it) else "-99" },
+                "mean" to hdrMeans.joinToString(",") { "%.3f".format(it) },
+                "p995" to hdrP995.joinToString(",") { "%.3f".format(it) },
+                "sat" to hdrSats.joinToString(",") { "%.4f".format(it) },
+            ),
+        )
+        val canReplace = burstBracketOn && !bracketOn && buffers.size == MFNR_FRAMES
+        // HDR+ 包围曝光（0.12.84 两档化）：burstHdrMode（startBurst 冻结）=1 时
+        // 4 帧（0EV×2 + 长帧 + 短帧）原样交引擎 + 实测 EV 数组（hdrEv）⇒ 跨曝光
+        // 对齐堆叠（P3 架构，PC RAW 同构）。mode 0 / 非 hdr burst = 同曝光 MFNR。
+        val hdrFull = burstHdrBrackets && buffers.size == MFNR_FRAMES
+        val hdrP2 = hdrFull && burstHdrMode >= 1
+        var hdrEvArr: FloatArray? = null
+        // per-frame 增益比（0.12.83）：gr[i] = iso_i/iso_0，DFT/mismatch 的读噪声
+        // 项 B×(gr·s)² 用 —— σ²=A·x+B 的读噪声 ∝ gain²，散粒项 A 只需 ×s
+        //（σ_shot 归一域 = A·s·x'）。长帧 ISO 3200 的 gr≈9.3，不修则其 σ 被低估
+        // ~86×、残差被判"运动"整帧回退参考帧（暗部 SNR 收益丢失）。
+        var hdrGainArr: FloatArray? = null
+        val hdrHighIdx = if (hdrP2) 2 else -1
+        if (hdrP2) {
+            val refSec2 = results.getOrNull(0)?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val refIso2 = results.getOrNull(0)?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            hdrEvArr = FloatArray(buffers.size) { i ->
+                evOffsetSecIso(
+                    results.getOrNull(i)?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+                    results.getOrNull(i)?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
+                    refSec2, refIso2)
+            }
+            if (refIso2 > 0) {
+                hdrGainArr = FloatArray(buffers.size) { i ->
+                    val iso = results.getOrNull(i)?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+                    if (iso > 0) (iso.toFloat() / refIso2.toFloat()).coerceIn(0.25f, 64f)
+                    else 1f
+                }
+            }
+        }
+        val fuseBufs = when {
+            hdrP2 -> buffers
+            canReplace -> listOf(buffers[0], buffers[1], buffers[2], buffers[0])
+            else -> buffers
+        }
+        val fuseStrides = when {
+            hdrP2 -> strides
+            canReplace -> intArrayOf(strides[0], strides[1], strides[2], strides[0])
+            else -> strides
         }
         // v0.11.87：短帧裁切比例透传给引擎的 AE —— bracket 下"融合后 >=0.98 白点"
         // 不是裁切（短帧救回的高光也算进去了），真丢信息的比例只有短帧自己的 sat
@@ -3787,18 +3990,21 @@ class CameraController(private val context: Context, private val render: RenderC
         if (useStill && prefs.getBoolean("still_ab", false)) {
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
-                /*varyNn=*/false, zoom, done)
+                /*varyNn=*/false, zoom, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
+                hdrHighIdx = hdrHighIdx, done)
         } else if (nnAb) {
             // NN 同帧 A/B（v0.10.102）：第一遍 nn off（P0 基线）、第二遍 nn on，
             // 两张成片都落盘供离线对比（时间戳天然区分）
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
-                /*varyNn=*/true, zoom, done)
+                /*varyNn=*/true, zoom, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
+                hdrHighIdx = hdrHighIdx, done)
         } else if (useStill) {
             StillRenderClient.submitRawBurst(fuseBufs, fuseStrides, refW, refH, meta,
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio = shortRatio,
-                shortSat = shortSatFrac, tenBit = tenBit) { bytes, w, h ->
+                shortSat = shortSatFrac, tenBit = tenBit, hdrEv = hdrEvArr,
+                hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -3813,7 +4019,8 @@ class CameraController(private val context: Context, private val render: RenderC
                         stillRot, filmStill, demosaic, noiseStrength,
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
                         shortRatio = shortRatio, shortSat = shortSatFrac,
-                        tenBit = tenBit, onDone = done)
+                        tenBit = tenBit, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
+                        hdrHighIdx = hdrHighIdx, onDone = done)
                 }
             }
         } else {
@@ -3821,7 +4028,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn,
                 shortRatio = shortRatio, shortSat = shortSatFrac,
-                tenBit = tenBit, onDone = done)
+                tenBit = tenBit, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
+                hdrHighIdx = hdrHighIdx, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -3859,6 +4067,9 @@ class CameraController(private val context: Context, private val render: RenderC
         shortSat: Float,
         varyNn: Boolean,
         zoom: Float,
+        hdrEv: FloatArray? = null,
+        hdrGainArr: FloatArray? = null,
+        hdrHighIdx: Int = -1,
         done: (ByteArray?, Int, Int) -> Unit,
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
@@ -3874,12 +4085,14 @@ class CameraController(private val context: Context, private val render: RenderC
         StillRenderClient.submitRawBurst(buffers, strides, width, height, meta,
             rot, film, demosaic, noiseStrength, rn,
             useDft, alignL1, alignAb, p0Sub, nn1, shortRatio = shortRatio,
-            shortSat = shortSat) { b1, w1, h1 ->
+            shortSat = shortSat, hdrEv = hdrEv, hdrGainArr = hdrGainArr,
+            hdrHighIdx = hdrHighIdx) { b1, w1, h1 ->
             val d1 = if (b1 != null) outDigest(b1, w1, h1) else null
             render.submitRawBurst(buffers, strides, width, height, meta,
                 rot, film, demosaic, noiseStrength, rn,
                 useDft, alignL1, alignAb, p0Sub, nn2, shortRatio = shortRatio,
-                shortSat = shortSat) { b2, w2, h2 ->
+                shortSat = shortSat, hdrEv = hdrEv, hdrGainArr = hdrGainArr,
+                hdrHighIdx = hdrHighIdx) { b2, w2, h2 ->
                 val d2 = if (b2 != null) outDigest(b2, w2, h2) else null
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "camera",

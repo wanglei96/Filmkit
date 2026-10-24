@@ -363,6 +363,9 @@ class RenderClient {
         shortRatio: Float = 1f,
         shortSat: Float = -1f,
         tenBit: Boolean = false,
+        hdrEv: FloatArray? = null,
+        hdrGainArr: FloatArray? = null,
+        hdrHighIdx: Int = -1,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -387,7 +390,8 @@ class RenderClient {
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
                     nnDn, shortRatio = shortRatio, shortSat = shortSat,
-                    film = film, tenBit = tenBit,
+                    film = film, tenBit = tenBit, hdrEv = hdrEv,
+                    hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(

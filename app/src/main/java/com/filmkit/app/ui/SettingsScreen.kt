@@ -407,18 +407,22 @@ private fun QualityDrawerContent() {
             )
         },
     )
-    // bracket（期 B，docs/engine-bracket-design.md）：1 短 3 长采集。默认关 ——
-    // 第 1 步只验证采集链路（融合仍用长帧），第 4 步判据回归后才转默认开。
-    var bracketOn by remember { mutableStateOf(prefs.getBoolean("bracket", true)) }
+    // HDR+ 包围曝光（0.12.84 两档化；0.12.76 立项 → P3 架构对齐 PC RAW）：
+    // 帧序 0/0/+2.2EV/−1.5EV，全部帧进跨曝光对齐+降噪堆叠（包围曝光采集 +
+    // HDR 合成）。默认**开**（多帧融合触发即自动走包围曝光；用户拍板）。
+    // 关 = 纯同曝光 MFNR。旧「多曝光 bracket（1 短 3 长）」开关已删——短帧保
+    // 高光由本功能的 −1.5EV 帧接管（固定跨度、每张独立，bracketDiv 跨张反馈
+    // 环退役）。prefs 旧值 2（融合档）归一为 1。
+    var hdrBracketOn by remember { mutableStateOf(prefs.getInt("hdr_fusion", 1) >= 1) }
     SettingSwitchRow(
-        title = "多曝光 bracket（1 短 3 长）",
-        subtitle = "帧 0 用 1/4 快门（保高光）、其余 3 帧长曝光（保暗部）。当前阶段只采集与记录，融合仍用长帧 —— 用来真机验证短帧是否真的没烧高光。仅 M 档 RAW + 多帧融合生效",
-        checked = bracketOn,
+        title = "HDR+ 包围曝光",
+        subtitle = "多帧融合触发时自动改拍 0/−1.5/+2.2EV 三档曝光（包围曝光），全部帧参与对齐与降噪堆叠：短帧保高光、长帧提暗部信噪比。关 = 纯同曝光多帧融合。仅 M 档 RAW + 多帧融合生效",
+        checked = hdrBracketOn,
         onChecked = { v ->
-            bracketOn = v
-            prefs.edit().putBoolean("bracket", v).apply()
+            hdrBracketOn = v
+            prefs.edit().putInt("hdr_fusion", if (v) 1 else 0).apply()
             EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.bracket", "{\"on\":$v}",
+                EngineBridge.LEVEL_INFO, "app", "settings.hdr_fusion", "{\"mode\":${if (v) 1 else 0}}",
             )
         },
     )

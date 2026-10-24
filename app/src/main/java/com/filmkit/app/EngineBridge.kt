@@ -226,6 +226,19 @@ object EngineBridge {
         shortRatio: Float = 1f, shortSat: Float = -1f, film: DoubleArray,
         useStill: Boolean = false,
         tenBit: Boolean = false,
+        /** HDR 融合 P2（0.12.77）：每帧实测 EV 偏移（相对帧 0，count 个）。
+         *  null = 关闭（链路 = 0.12.76）；ev>0.3 高帧（Mertens 侧帧）、
+         *  ev<−0.3 低帧（P3 消费）、其余 zero（融合槽位由引擎用 zero 帧填充）。 */
+        hdrEv: FloatArray? = null,
+        /** HDR 融合（0.12.83）：每帧/zero 的 ISO 增益比（count 个）。DFT/mismatch
+         *  的读噪声项 σ²=A·x+B 中 B×(gr·s)²（s = frame_scale）；散粒项 A×s。
+         *  null = 全 1（旧 bracket/零回归）。 */
+        hdrGainArr: FloatArray? = null,
+        /** HDR 融合（0.12.80）：高帧索引（**请求角色**，PC setTag 同构 —— 帧序 0/0/
+         *  +2.2/−1.5 的帧 2 恒为高帧，无论实测 EV 多少；0.12.79 按"实测 EV>0.3"
+         *  推断角色是自创，暗场长帧 −0.1EV 时误判关闭，真机 203750 实锤）。
+         *  <0 = 无高帧（关闭）。hdrEv 仍须传（deghost 的曝光比 scale=2^ev 用）。 */
+        hdrHighIdx: Int = -1,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

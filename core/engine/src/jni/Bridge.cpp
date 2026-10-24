@@ -889,7 +889,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jint rotation, jint demosaic, jfloat noise_strength, jfloatArray noise_model,
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
     jboolean align_ab, jboolean p0_sub, jboolean nn_dn, jfloat short_ratio,
-    jfloat short_sat, jdoubleArray film, jboolean use_still, jboolean ten_bit) {
+    jfloat short_sat, jdoubleArray film, jboolean use_still, jboolean ten_bit,
+    jfloatArray hdr_ev, jfloatArray hdr_gain_arr, jint hdr_high_idx) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -951,6 +952,23 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     }
   }
   const FilmParams p = paramsFromJava(env, film);
+  // HDR 融合 P3（0.12.82）：每帧实测 EV 偏移（相对帧 0，count 个；null/长度不足
+  // = 关闭，链路 = 旧 bracket 行为）。frame_scale[i] = 2^(−ev[i]) 引擎内派生。
+  float hdr_ev4[4] = {0, 0, 0, 0};
+  const float* hdr_ev_ptr = nullptr;
+  if (hdr_ev != nullptr && env->GetArrayLength(hdr_ev) >= count && count <= 4) {
+    env->GetFloatArrayRegion(hdr_ev, 0, count, hdr_ev4);
+    hdr_ev_ptr = hdr_ev4;
+  }
+  // HDR 融合 P3（0.12.83）：每帧/zero 的 ISO 增益比（DFT/mismatch 读噪声项
+  // B×(gr·s)²；null = 全 1）。旧 bracket 路径不传（零回归）。
+  float hdr_gain4[4] = {1, 1, 1, 1};
+  const float* hdr_gain_ptr = nullptr;
+  if (hdr_gain_arr != nullptr && env->GetArrayLength(hdr_gain_arr) >= count &&
+      count <= 4) {
+    env->GetFloatArrayRegion(hdr_gain_arr, 0, count, hdr_gain4);
+    hdr_gain_ptr = hdr_gain4;
+  }
   std::vector<uint8_t> rgba;
   const int64_t t0 = nowMs();
   const bool ok = r->submitRawBurst(
@@ -959,8 +977,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
       lsc_rows, rotation, p, demosaic, noise_strength,
       model_ok ? model6 : nullptr, noise_sigma, ref_noise_scale,
       use_dft == JNI_TRUE, align_l1 == JNI_TRUE, align_ab == JNI_TRUE,
-      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, short_ratio, short_sat, &rgba,
-      ten_bit == JNI_TRUE);
+      p0_sub == JNI_TRUE, nn_dn == JNI_TRUE, short_ratio, short_sat,
+      hdr_ev_ptr, hdr_gain_ptr, hdr_high_idx, &rgba, ten_bit == JNI_TRUE);
   // 每次 burst 落一条路径/耗时/结果记录（v0.10.85 审查 P2）：raw.render 不区分实例，
   // 靠这条把"哪条路、第几张、多久、成没成"钉住；失败也必须留痕。
   Logger::instance().log(

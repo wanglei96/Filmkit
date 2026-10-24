@@ -188,6 +188,9 @@ object StillRenderClient {
         shortRatio: Float = 1f,
         shortSat: Float = -1f,
         tenBit: Boolean = false,
+        hdrEv: FloatArray? = null,
+        hdrGainArr: FloatArray? = null,
+        hdrHighIdx: Int = -1,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -215,6 +218,7 @@ object StillRenderClient {
                     meta.noiseSigma, refNoiseScale, useDft, alignL1, alignAb, p0Sub,
                     nnDn, shortRatio = shortRatio, shortSat = shortSat,
                     film = film, useStill = true, tenBit = tenBit,
+                    hdrEv = hdrEv, hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx,
                 )
                 if (bytes == null) {
                     // 合成失败先自愈再谈回退（v0.10.89）：真机 0.10.88 出现过
@@ -234,6 +238,8 @@ object StillRenderClient {
                             p0Sub, nnDn, shortRatio = shortRatio,
                             shortSat = shortSat, film = film,
                             useStill = true, tenBit = tenBit,
+                            hdrEv = hdrEv, hdrGainArr = hdrGainArr,
+                            hdrHighIdx = hdrHighIdx,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",

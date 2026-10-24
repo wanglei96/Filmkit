@@ -1078,6 +1078,169 @@ void main() {
     oColor = vec4(clamp(rgb, vec3(0.0), vec3(64.0)), 1.0);
 })";
 
+// ── HDR 曝光融合 P2（0.12.77，docs/engine-hdr-exposure-fusion-design.md §4.2）──
+// Mertens 曝光融合的 P2 形态：zero（0EV 堆叠 + 前链的 D4）与侧帧（+2.2EV 前链
+// 的 D4）两张，逐像素加权融合写回 tex_scene_（passCcm 之后、P4/PC3D 之前）。
+// 权重公式**照抄 PC**（GlesYuvStacker.kt:3451 MERTENS_WEIGHT_FRAGMENT_SHADER）：
+//   contrast = |4 邻域拉普拉斯|（luma 权重 0.299/0.587/0.114，reflect101 边界）
+//   saturation = RGB 相对均值的标准差
+//   wellExposedness = ∏c exp(−(c−0.5)²/0.08)
+//   admissibility = highlightValidity：任一通道进 0.960~0.995 平滑带 ⇒ 该曝光
+//     的色度不可信，权重归零（高光交给更短曝光）
+// 归一照抄 PC 的三级回退（MERTENS_NORMALIZE）：primary（质量权重）→ fallback
+// （wellExposed，平坦/无色区）→ admissibility → 全拒时**保 zero**（不与裁切
+// 侧帧均分）。wc/ws/we = PC DEFAULT_MERTENS_* = 1.0（uWc/uWs/uWe 留 A/B 口）。
+// deghost（census/log/linear 残差门 + referenceStructure）与 pyramid 融合是 P3
+// （设计 §6）；PC 的 uExposureScale 只进 deghost，P2 无消费。
+// ponytail: P2 临时形态 —— 逐像素直接加权在高反差边界可能出接缝（设计 §4.2
+// 已知并允许），P3 的 Laplacian/Gaussian pyramid（PC PYR_DOWN/LAPLACIAN/
+// RECONSTRUCT 全 texelFetch，天然兼容我们的 RGBA16F 无线性过滤约束）解决。
+// 域 = D4 场景线性（Rec.2020 线性，与 film 输入同域 —— 设计 §4.2 定案）。
+// 0.96/0.995 阈值照抄 PC（其语义来自显示域）；线性域下的阈值适配由真机 J 判据
+// 评估后再定，不在 P2 预调（铁律：先原版跑通、实测数据说话）。
+const char* kFsHdrMertens = R"(#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) out vec4 oColor;
+uniform highp sampler2D uZero;  // zero 帧 D4（tex_hdr_zero_，读）
+uniform highp sampler2D uSide;  // 侧帧 D4（tex_hdr_side_，+2.2EV）
+uniform ivec2 uSize;            // 成片几何（dst_w, dst_h）
+uniform float uWc;              // contrast 指数（PC DEFAULT 1.0）
+uniform float uWs;              // saturation 指数（1.0）
+uniform float uWe;              // wellExposed 指数（1.0）
+uniform float uSideScale;       // 侧帧/zero 曝光乘积比（PC uExposureScale 语义）
+// 0.12.79：升级为 PC MERTENS_WEIGHT_FRAGMENT_SHADER 完整版（GlesYuvStacker.kt:3451）——
+// 0.12.78 真机（201852）高光斑块：侧帧肩部（0.5~0.96）脏数据（ISO14336 无 HR 无降噪
+// + RCD 饱和边缘外推）被 highlightValidity 放行、权重独大；手持微动在高 contrast
+// 高光边缘无 deghost 检测。修复 = 侧帧链补 HR/P0（C++ 侧）+ 本 shader 照抄 PC 的
+// deghostValidity / censusMismatch / referenceStructure / deghostScoreAt 全套。
+// pyramid 融合仍留 P3（接缝是另一症状，本轮验收后再定）。
+int reflect101(int p, int size) {
+    if (size <= 1) return 0;
+    int period = size * 2 - 2;
+    int m = p;
+    if (m < 0) m = -m;
+    m = m - (m / period) * period;
+    return m >= size ? period - m : m;
+}
+float luma(vec3 rgb) { return dot(rgb, vec3(0.299, 0.587, 0.114)); }
+float max3(vec3 v) { return max(max(v.r, v.g), v.b); }
+float grayAt(sampler2D t, ivec2 coord) {
+    ivec2 c = ivec2(reflect101(coord.x, uSize.x), reflect101(coord.y, uSize.y));
+    return luma(texelFetch(t, c, 0).rgb);
+}
+float highlightValidity(vec3 rgb) {
+    return 1.0 - smoothstep(0.960, 0.995, max3(rgb));
+}
+// ── deghost（照抄 PC）─────────────────────────────────────────────────
+float deghostValidity(vec3 rgb) {
+    float y = luma(rgb);
+    float blackGate = smoothstep(0.055, 0.145, y);
+    float whiteGate = 1.0 - smoothstep(0.865, 0.975, max3(rgb));
+    return clamp(blackGate * whiteGate, 0.0, 1.0);
+}
+float referenceStructure(ivec2 coord) {
+    float c = luma(texelFetch(uZero, coord, 0).rgb);
+    float l = luma(texelFetch(uZero, ivec2(reflect101(coord.x - 1, uSize.x), coord.y), 0).rgb);
+    float r = luma(texelFetch(uZero, ivec2(reflect101(coord.x + 1, uSize.x), coord.y), 0).rgb);
+    float u = luma(texelFetch(uZero, ivec2(coord.x, reflect101(coord.y - 1, uSize.y)), 0).rgb);
+    float d = luma(texelFetch(uZero, ivec2(coord.x, reflect101(coord.y + 1, uSize.y)), 0).rgb);
+    float gradient = abs(r - l) + abs(d - u);
+    float laplacian = abs(l + r + u + d - 4.0 * c);
+    return smoothstep(0.030, 0.095, gradient + 0.5 * laplacian);
+}
+float censusMismatch(ivec2 coord, float refCenter, float sideCenter) {
+    float mismatch = 0.0;
+    float count = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
+            ivec2 p = ivec2(reflect101(coord.x + x, uSize.x), reflect101(coord.y + y, uSize.y));
+            float refNeighbor = luma(texelFetch(uZero, p, 0).rgb);
+            float sideNeighbor = luma(texelFetch(uSide, p, 0).rgb);
+            float refRank = refNeighbor > refCenter ? 1.0 : 0.0;
+            float sideRank = sideNeighbor > sideCenter ? 1.0 : 0.0;
+            mismatch += abs(refRank - sideRank);
+            count += 1.0;
+        }
+    }
+    return mismatch / max(count, 1.0);
+}
+float deghostScoreAt(ivec2 coord) {
+    int x = reflect101(coord.x, uSize.x);
+    int y = reflect101(coord.y, uSize.y);
+    vec3 side = texelFetch(uSide, ivec2(x, y), 0).rgb;
+    vec3 reference = texelFetch(uZero, ivec2(x, y), 0).rgb;
+    float scale = clamp(uSideScale, 0.03125, 32.0);
+    float sideLuma = luma(side);
+    float referenceLuma = luma(reference);
+    float comparable = deghostValidity(side) * deghostValidity(reference) *
+                       referenceStructure(ivec2(x, y));
+    if (comparable <= 0.001) return 0.0;
+    float exposureGap = abs(log2(scale));
+    float logResidual = abs(log(max(sideLuma, 1e-4)) - log(max(referenceLuma, 1e-4)) - log(scale));
+    float logMotion = smoothstep(0.28 + 0.04 * min(exposureGap, 3.0), 0.72, logResidual);
+    float expectedSide = referenceLuma * scale;
+    float linearResidual = abs(sideLuma - expectedSide) / max(max(sideLuma, expectedSide), 1e-4);
+    float linearMotion = smoothstep(0.12, 0.42, linearResidual);
+    float rankMotion = smoothstep(0.32, 0.68, censusMismatch(ivec2(x, y), referenceLuma, sideLuma));
+    float score = max(max(linearMotion, logMotion), rankMotion);
+    return comparable * score;
+}
+float computeDeghostAlpha(ivec2 coord) {
+    float score = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            score = max(score, deghostScoreAt(coord + ivec2(x, y)));
+        }
+    }
+    float reject = smoothstep(0.36, 0.76, score);
+    return mix(1.0, 0.0, reject);
+}
+// 三元组权重（PC 的 vec4 打包拆成 vec3：primary / fallback / admissibility）。
+// zero 恒 uUseDeghostMask=0（alpha=1，参考帧不被拒绝——PC 同语义）；side 过 deghost。
+vec3 weightOf(sampler2D t, ivec2 coord, float alpha) {
+    vec3 rgb = texelFetch(t, coord, 0).rgb;
+    float center = luma(rgb);
+    float contrast = abs(
+        grayAt(t, coord + ivec2(-1, 0)) + grayAt(t, coord + ivec2(1, 0)) +
+        grayAt(t, coord + ivec2(0, -1)) + grayAt(t, coord + ivec2(0, 1)) -
+        center * 4.0);
+    float mean = (rgb.r + rgb.g + rgb.b) / 3.0;
+    vec3 dev = rgb - vec3(mean);
+    float saturation = sqrt(dot(dev, dev));
+    vec3 d = rgb - vec3(0.5);
+    vec3 expo = exp(-(d * d) / 0.08);
+    float well = expo.r * expo.g * expo.b;
+    float adm = highlightValidity(rgb) * alpha;
+    return vec3(
+        pow(max(contrast, 0.0), uWc) * pow(max(saturation, 0.0), uWs) *
+            pow(max(well, 0.0), uWe) * adm,
+        well * adm,
+        adm);
+}
+void main() {
+    ivec2 coord = ivec2(gl_FragCoord.xy);
+    vec3 w0 = weightOf(uZero, coord, 1.0);
+    vec3 w1 = weightOf(uSide, coord, computeDeghostAlpha(coord));
+    float ps = w0.x + w1.x;
+    float fs = w0.y + w1.y;
+    float as = w0.z + w1.z;
+    float wz, ws;
+    if (ps > 1e-6) {
+        wz = w0.x / ps; ws = w1.x / ps;
+    } else if (fs > 1e-6) {
+        wz = w0.y / fs; ws = w1.y / fs;
+    } else if (as > 1e-6) {
+        wz = w0.z / as; ws = w1.z / as;
+    } else {
+        wz = 1.0; ws = 0.0;  // 全拒：保 zero（PC 同款，不与裁切侧帧均分）
+    }
+    vec3 z = texelFetch(uZero, coord, 0).rgb;
+    vec3 s = texelFetch(uSide, coord, 0).rgb;
+    oColor = vec4(z * wz + s * ws, 1.0);
+})";
+
 // ── AMaZE 档（v0.10.172）─────────────────────────────────────────────
 // 算法出处：Emil Martinec 的 AMaZE（2008-2010，Ingo Weyrich 优化版），参考实现
 // RawTherapee `rtengine/amaze_demosaic_RT.cc`。**本项目的 AMaZE 在 CPU 侧跑**
@@ -2601,6 +2764,7 @@ uniform float uTileM;   // cell 尺寸（mosaic px，= kMfnrTile/2）
 // 随信号空间变化（暗部小、亮部大）——比旧的全局 ns_raw² 更贴合真实。
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform vec4 uGainRatio;  // 0.12.83：per-frame 增益比（读噪声 B×(gr·s)²）
 uniform float uS;      // mismatch 的 σ 缩放常数（标定旋钮）
 uniform int uCfaLut;
 uniform vec4 uBlack;
@@ -2705,10 +2869,19 @@ void main() {
             s1 += d1 * d1;
             s2 += d2 * d2;
             s3 += d3 * d3;
-            // var(r)+var(a) = A·r+B + A·a+B = A·(r+a) + 2B（同域同模型）
-            va1 += av * (r + a1) + 2.0 * bv;
-            va2 += av * (r + a2) + 2.0 * bv;
-            va3 += av * (r + a3) + 2.0 * bv;
+            // var(r)+var(a_z) = A·r'+B·(gr0·s0)² + A·a'+B·(gr_z·s_z)²
+            // （σ²=A·x_raw+B 归一 ×s 后的展开；r'/a' 已是归一域值）。
+            // 0.12.83：旧式 A·(r+a)+2B 是 s=1/gr=1 特例 —— 长帧（gr≈9.3）的
+            // 读噪声低估 → 残差被判"运动"整帧回退。与 DFT 同一公式。
+            float g0 = uGainRatio.x;
+            float sr0 = uFrameScale.x;
+            float b0t = bv * g0 * g0 * sr0 * sr0;
+            float g1 = uGainRatio.y, s1s = uFrameScale.y;
+            float g2 = uGainRatio.z, s2s = uFrameScale.z;
+            float g3 = uGainRatio.w, s3s = uFrameScale.w;
+            va1 += av * (r * sr0 + a1 * s1s) + b0t + bv * g1 * g1 * s1s * s1s;
+            va2 += av * (r * sr0 + a2 * s2s) + b0t + bv * g2 * g2 * s2s * s2s;
+            va3 += av * (r * sr0 + a3 * s3s) + b0t + bv * g3 * g3 * s3s * s3s;
             n += 1.0;
         }
     }
@@ -3075,6 +3248,7 @@ uniform float uWhite;
 uniform vec3 uGain;
 // 期 B bracket（0.11.66）：逐帧曝光归一（短帧 = 长/短），clamp 到白点。
 uniform vec4 uFrameScale;
+uniform vec4 uGainRatio;  // 0.12.83：per-frame 增益比（读噪声 B×(gr·s)²）
 uniform vec4 uPlaneA;     // 平面 0..3 的 A 系数（按 cfaLut 展开，含强度 k²）
 uniform vec4 uPlaneB;
 uniform float uC;         // 收缩常数（256）
@@ -3319,6 +3493,10 @@ void main() {
     barrier();
 
     // 式 6/7 收缩合并（spike 同构）+ per-bin 方差折减
+    // 0.12.83：per-frame σ² = A·s·x' + B·(gr·s)²（σ²=A·x_raw+B 归一 ×s 后的
+    // 展开；gr = ISO_i/ISO_0 的增益比，读噪声 ∝ gain²）。0.12.82 只做了 s²
+    //（短帧正确），长帧（gr≈9.3）的读噪声低估 ~86× → 残差被判"运动"整帧
+    // 回退参考帧，暗部 SNR 收益丢失 —— 本版补齐。
     float sig2 = uPlaneA[plane] * sRms[tid >> 7] + uPlaneB[plane];
     for (int rep = 0; rep < 2; ++rep) {
         int idx = tid * 2 + rep;
@@ -3335,7 +3513,7 @@ void main() {
             // 表达式，GLSL ES 3.0 不允许 `const` 这样初始化 ⇒ 整个 shader 编译失败
             //（真机日志：`S0013: Initializer for const variable 'cs2_base' must be a
             // constant expression` + `mfnr.fft.compile_fail`），MFNR 一直在走降级路径。
-            float cs2_base = uC * sig2 + 1e-12;
+            float cs2_base = uC * sig2 + 1e-12;  // 0.12.83 起弃用（见下 cs2）
             for (int zz = 1; zz < 4; ++zz) {
                 float rz = sre[tt][zz][by][bx];
                 float iz = sim[tt][zz][by][bx];
@@ -3346,7 +3524,16 @@ void main() {
                 // 不缩放时短帧的噪声残差被当成"真实差异"，高光处会被判成不一致而回退。
                 float scl = (zz == 1) ? uFrameScale.y
                             : (zz == 2 ? uFrameScale.z : uFrameScale.w);
-                float a = d2 / (d2 + cs2_base * scl * scl);
+                float gr = (zz == 1) ? uGainRatio.y
+                           : (zz == 2 ? uGainRatio.z : uGainRatio.w);
+                // σ²_i(x') = A·s·x' + B·(gr·s)²：A 项 = A·sRms·s²（sRms 是 x' 域
+                // 统计，线性缩放）；B 项乘 (gr·s)²。scl² 在分母里已经乘了 s²，
+                // 这里只需把 B 的 gr² 补进 cs2_base。
+                float cs2 = uC * (uPlaneA[plane] * sRms[tid >> 7] +
+                                  uPlaneB[plane] * gr * gr) *
+                                scl * scl +
+                            1e-12;
+                float a = d2 / (d2 + cs2);
                 accR += rz + a * dr;
                 accI += iz + a * di;
             }
@@ -7667,6 +7854,9 @@ bool FrameRenderer::init() {
   const GLuint fs_rcd_chroma_b = compileShader(GL_FRAGMENT_SHADER, kFsRcdChromaB);
   // 第 4a 期（S14）：D3→D4 独立 CCM pass
   const GLuint fs_ccm = compileShader(GL_FRAGMENT_SHADER, kFsCcm);
+  // HDR 曝光融合 P2（0.12.77）：可选能力（prefs hdr_fusion=2 才走），编译失败
+  // 只禁用 Mertens（成片回退 zero 链），不进 init 硬失败判据（照 gainmap 处理）
+  const GLuint fs_hdr_mertens = compileShader(GL_FRAGMENT_SHADER, kFsHdrMertens);
   const GLuint fs_amaze_up = compileShader(GL_FRAGMENT_SHADER, kFsAmazeUp);
   const GLuint fs_raw_dn = compileShader(GL_FRAGMENT_SHADER, kFsRawDenoise);
   const GLuint fs_chroma_dn = compileShader(GL_FRAGMENT_SHADER, kFsChromaDenoise);
@@ -7799,6 +7989,21 @@ bool FrameRenderer::init() {
     u_gainmap_.src_size = glGetUniformLocation(prog_gainmap_, "uSrcSize");
     u_gainmap_.math = glGetUniformLocation(prog_gainmap_, "uGainmapMath");
   }
+  // HDR 曝光融合 P2（0.12.77）：同 gainmap 的可选处理 —— link/编译失败只记日志
+  // 置 0，passHdrMertens 直接返回（成片 = zero 链，J10 语义），不拖死引擎。
+  if (fs_hdr_mertens) prog_hdr_mertens_ = linkProgram(vs_plain_, fs_hdr_mertens);
+  if (prog_hdr_mertens_) {
+    u_hdr_mertens_.zero = glGetUniformLocation(prog_hdr_mertens_, "uZero");
+    u_hdr_mertens_.side = glGetUniformLocation(prog_hdr_mertens_, "uSide");
+    u_hdr_mertens_.size = glGetUniformLocation(prog_hdr_mertens_, "uSize");
+    u_hdr_mertens_.wc = glGetUniformLocation(prog_hdr_mertens_, "uWc");
+    u_hdr_mertens_.ws = glGetUniformLocation(prog_hdr_mertens_, "uWs");
+    u_hdr_mertens_.we = glGetUniformLocation(prog_hdr_mertens_, "uWe");
+    u_hdr_mertens_.scale = glGetUniformLocation(prog_hdr_mertens_, "uSideScale");
+  } else {
+    Logger::instance().log(LogLevel::kError, "engine", "hdr_mertens.compile_fail",
+                           "{\"stage\":\"init\"}");
+  }
   // 横向色差校正（v0.10.170）
   prog_ca_ds_ = linkProgram(vs_plain_, fs_ca_ds);
   prog_ca_corr_ = linkProgram(vs_plain_, fs_ca_corr);
@@ -7876,6 +8081,7 @@ bool FrameRenderer::init() {
   glDeleteShader(fs_rcd_g);
   glDeleteShader(fs_rcd_chroma);
   glDeleteShader(fs_ccm);
+  glDeleteShader(fs_hdr_mertens);  // HDR 融合 P2（0=编译失败，Delete(0) 合法无操作）
   glDeleteShader(fs_amaze_up);
   glDeleteShader(fs_raw_dn);
   glDeleteShader(fs_chroma_dn);
@@ -8256,6 +8462,7 @@ bool FrameRenderer::init() {
   u_mfnr_mis_.white = glGetUniformLocation(prog_mfnr_mis_, "uWhite");
   u_mfnr_mis_.gain = glGetUniformLocation(prog_mfnr_mis_, "uGain");
   u_mfnr_mis_.frame_scale = glGetUniformLocation(prog_mfnr_mis_, "uFrameScale");
+  u_mfnr_mis_.gain_ratio = glGetUniformLocation(prog_mfnr_mis_, "uGainRatio");
   u_mfnr_satfix_.ref = glGetUniformLocation(prog_mfnr_satfix_, "uRef");
   u_mfnr_satfix_.shrt = glGetUniformLocation(prog_mfnr_satfix_, "uShort");
   u_mfnr_satfix_.size = glGetUniformLocation(prog_mfnr_satfix_, "uSize");
@@ -8671,6 +8878,11 @@ void FrameRenderer::release() {
     tex_gainmap_ = fbo_gainmap_ = 0;
     gainmap_w_ = gainmap_h_ = 0;
   }
+  // HDR 曝光融合 P2（0.12.77）：侧帧 Bayer 与 D4 保存纹理（惰性建，拍照用）
+  if (tex_hdr_side_) glDeleteTextures(1, &tex_hdr_side_);
+  if (tex_hdr_zero_) glDeleteTextures(1, &tex_hdr_zero_);
+  tex_hdr_side_ = tex_hdr_zero_ = 0;
+  hdr_side_dst_w_ = hdr_side_dst_h_ = 0;
   if (tex_dir_) glDeleteTextures(1, &tex_dir_);
   if (tex_g_) glDeleteTextures(1, &tex_g_);
   if (tex_mos_) glDeleteTextures(1, &tex_mos_);
@@ -8889,6 +9101,7 @@ void FrameRenderer::release() {
   prog_oes_ = prog_still_ = prog_film_ = prog_out_ = prog_fill_ = prog_raw_ = 0;
   prog_rcd_dir_ = prog_rcd_g_ = prog_rcd_chroma_ = 0;
   prog_ccm_ = 0;
+  prog_hdr_mertens_ = 0;  // HDR 融合 P2
   prog_raw_dn_ = prog_chroma_dn_ = prog_moire_stat_ = 0;
   prog_diag_down_ = prog_diag_pack_ = 0;   // 诊断统计（v0.10.166）
   prog_chroma_down_ = prog_chroma_at_ = prog_chroma_apply_ = 0;
@@ -11746,6 +11959,73 @@ void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) 
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+// ── HDR 曝光融合 P2（0.12.77）──────────────────────────────────────────
+bool FrameRenderer::ensureHdrSideTargets(int dst_w, int dst_h) {
+  if (dst_w <= 0 || dst_h <= 0) return false;
+  if (hdr_side_dst_w_ == dst_w && hdr_side_dst_h_ == dst_h) return true;
+  if (tex_hdr_side_) glDeleteTextures(1, &tex_hdr_side_);
+  if (tex_hdr_zero_) glDeleteTextures(1, &tex_hdr_zero_);
+  tex_hdr_side_ = tex_hdr_zero_ = 0;
+  // 侧帧 D4 与 zero D4 拷贝：RGBA16F、成片几何（与 tex_scene_ 同规格 ×2）
+  const auto mkD4 = [&](GLuint* tex) {
+    glGenTextures(1, tex);
+    glBindTexture(GL_TEXTURE_2D, *tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, dst_w, dst_h, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+  };
+  mkD4(&tex_hdr_side_);
+  mkD4(&tex_hdr_zero_);
+  hdr_side_dst_w_ = dst_w;
+  hdr_side_dst_h_ = dst_h;
+  return true;
+}
+
+void FrameRenderer::passHdrMertens(int dst_w, int dst_h, float ev_side) {
+  // prog 编译/link 失败（可选能力）：直接返回，成片 = zero 链（J10 语义）。
+  // zero 的 D4 拷贝（tex_hdr_zero_）由 finishStillChain 的调用序列完成 ——
+  // Mertens 的输入必须与渲染目标（fbo_scene_ = tex_scene_）分离，同纹理既采样
+  // 又当 attachment 是 feedback loop（GL 未定义行为；PC 同构全独立）。
+  if (!prog_hdr_mertens_ || !tex_hdr_side_ || !tex_hdr_zero_) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  // 融合：读 tex_hdr_zero_（zero）+ tex_hdr_side_（侧帧）→ 写 fbo_scene_。
+  // GL 状态纪律（2026-10-20 教训）：本 pass 是链中间件 —— 自己绑 fbo_scene_
+  // 画完**不乱动**（后续 P4/PC3D 各自绑自己的目标），viewport 必须设全
+  // （passCcm 用的同一视口）。
+  glViewport(0, 0, dst_w, dst_h);
+  glUseProgram(prog_hdr_mertens_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex_hdr_zero_);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_hdr_side_);
+  if (u_hdr_mertens_.zero >= 0) glUniform1i(u_hdr_mertens_.zero, 0);
+  if (u_hdr_mertens_.side >= 0) glUniform1i(u_hdr_mertens_.side, 1);
+  if (u_hdr_mertens_.size >= 0)
+    glUniform2i(u_hdr_mertens_.size, dst_w, dst_h);
+  // PC DEFAULT_MERTENS_CONTRAST/SATURATION/EXPOSURE_WEIGHT = 1.0（A/B 口留）
+  if (u_hdr_mertens_.wc >= 0) glUniform1f(u_hdr_mertens_.wc, 1.0f);
+  if (u_hdr_mertens_.ws >= 0) glUniform1f(u_hdr_mertens_.ws, 1.0f);
+  if (u_hdr_mertens_.we >= 0) glUniform1f(u_hdr_mertens_.we, 1.0f);
+  // PC uExposureScale 语义：侧帧/zero 的曝光乘积比（normalizeMertensExposureProducts
+  // 的 [1/32,32] 钳制在 shader 内 clamp）—— deghostScoreAt 用它算期望亮度。
+  if (u_hdr_mertens_.scale >= 0)
+    glUniform1f(u_hdr_mertens_.scale, std::pow(2.0f, ev_side));
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 纹理单元复位（后续 pass 从 unit 0 起绑，不复位会撞已有绑定）
+  glActiveTexture(GL_TEXTURE0);
+  const float ms = std::chrono::duration<float, std::milli>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+  Logger::instance().log(
+      LogLevel::kInfo, "engine", "hdr.mertens",
+      "{\"evSide\":" + std::to_string(ev_side) + ",\"ms\":" +
+          std::to_string(ms) + ",\"w\":" + std::to_string(dst_w) +
+          ",\"h\":" + std::to_string(dst_h) + "}");
+}
+
 // ── AMaZE 档（v0.10.172）───────────────────────────────────────────────
 // CPU 侧跑 AMaZE 并把结果搬到 GPU。三段：① u16 RAW → 线性化 + WB（与
 // kFsRaw/kFsRcd 的 s() 逐字同口径）→ ② AmazeDemosaic（多线程 tile 并行）→
@@ -12397,6 +12677,149 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                  std::chrono::steady_clock::now() - d3).count();
     // 诊断统计 D4（CCM 后 / P4 前，场景线性）
     diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
+    // ── HDR 融合 P2（0.12.78）：侧帧前链 + zero/侧帧 Mertens 融合 ────────
+    // 位置 = D4 之后、P4/PC3D/defringe 之前（设计 §4.3：融合后的整图再统一
+    // 降噪/伪彩处理）。ponytail: 逐像素加权（接缝风险已知，P3 pyramid 解决）。
+    // 序列：① zero 的 D4 存走（tex_hdr_zero_）→ ② high 重传 raw_tex_
+    //（passRawDenoise/RCD 的固定输入是 raw_tex_ —— 0.12.77 的独立 Bayer 纹理
+    // 方案让侧帧链跑在 zero 数据上，D4-hdr≈D4-scene，已废）→ ③ 侧帧前链
+    //（展开 kNoDn → RCD 三段 → CCM）→ ④ side 的 D4 存走 → ⑤ Mertens 写回
+    // tex_scene_。任何一步失败：留痕并跳过融合（成片 = zero 链，照片优先）。
+    if (c.hdr_mertens && c.hdr_side_raw != nullptr) {
+      const auto hs0 = std::chrono::steady_clock::now();
+      bool hdr_ok = ensureHdrSideTargets(dst_w, dst_h);
+      const auto hdrFail = [&](const char* why) {
+        Logger::instance().log(LogLevel::kWarn, "engine", "hdr.side_fail",
+                               std::string("{\"why\":\"") + why + "\"}");
+        hdr_ok = false;
+      };
+      // ① zero 的 D4 存走（fbo_scene_ 为 READ FB）
+      if (hdr_ok) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+        glBindTexture(GL_TEXTURE_2D, tex_hdr_zero_);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dst_w, dst_h);
+        if (glGetError() != GL_NO_ERROR) hdrFail("zero_copy");
+      }
+      // ② high 重传 raw_tex_（zero 主链此时已不再消费它）
+      if (hdr_ok && !uploadRawTex(raw_tex_, c.hdr_side_raw, w, h,
+                                  c.hdr_side_stride)) {
+        hdrFail("upload");
+      }
+      // ③ 侧帧前链：与 zero 同域同分支（[58] 拆分档照跑）；不跑 HR/P0 时域/CA
+      //（HR 修复的饱和区正是 highlightValidity 要拒绝的区域；PC 侧帧同构）
+      if (hdr_ok) {
+        // 侧帧前链（0.12.79，与主链 v0.10.167 前置结构同构）：
+        // ① kNoDn 展开（raw_tex_ → tex_mos_，HR 的统计/判定输入）
+        // ② HR 前置（0.12.78 缺失 ⇒ 侧帧饱和边缘的 RCD 色度外推误差在 0.5~0.96
+        //    肩部被 highlightValidity 放行、权重独大 = 高光斑块根因之一）
+        // ③ P0（输入 = HR 输出；σ 按侧帧实际增益重标：GCam 模型 σ²=A·x+B 的
+        //    读噪声项 B∝gain²，散粒项 A 归一化域不变；strength 跟随主链 c.dn）
+        // ④ RCD 三段 → CCM（原样）。
+        // ⚠ 侧帧 HR 会覆盖 dbg_hl_* 诊断成员（主链已写完、raw.render 还没读）
+        // ⇒ 全套保存/恢复。
+        static const NoiseCoef kNoDnSide{};
+        passRawDenoise(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                       kNoDnSide);
+        GLuint side_hl = 0;
+        int sv_ok = dbg_hl_ok_, sv_pre = dbg_hl_pre_, sv_grecon = dbg_hl_grecon_,
+            sv_rbrecon = dbg_hl_rbrecon_, sv_stat_src = 0;
+        float sv_cnt = dbg_hl_cnt_, sv_ms = dbg_hl_ms_, sv_rgg = dbg_hl_rgg_,
+              sv_bgg = dbg_hl_bgg_, sv_refw = dbg_hl_refw_,
+              sv_r2 = dbg_hl_r2hit_, sv_rg = dbg_hl_rghit_,
+              sv_wclamp = dbg_hl_wclamp_;
+        const char* sv_stat = dbg_hl_stat_src_;
+        const char* sv_dec = dbg_hl_decide_src_;
+        float sv_chroma[3], sv_sum[3], sv_cnt3[3];
+        for (int k = 0; k < 3; ++k) {
+          sv_chroma[k] = dbg_hl_chroma_[k];
+          sv_sum[k] = dbg_hl_sum_[k];
+          sv_cnt3[k] = dbg_hl_cnt3_[k];
+        }
+        const bool hr_side_on = p.hr_raw > 0.5f;
+        if (hr_side_on) {
+          hr_stat_raw_ = 0;
+          const HlRawResult hl = passHighlightRaw(
+              w, h, c.cfa, c.gains, tex_mos_, tex_mos_, 0, 0,
+              p.hl_grecon > 0.5f ? 1 : 0, p.hl_rb_recon > 0.5f ? 1 : 0,
+              /*fix_mark=*/0);
+          if (hl.ok) side_hl = tex_hl_;
+        }
+        dbg_hl_ok_ = sv_ok; dbg_hl_pre_ = sv_pre;
+        dbg_hl_grecon_ = sv_grecon; dbg_hl_rbrecon_ = sv_rbrecon;
+        dbg_hl_cnt_ = sv_cnt; dbg_hl_ms_ = sv_ms;
+        dbg_hl_rgg_ = sv_rgg; dbg_hl_bgg_ = sv_bgg;
+        dbg_hl_refw_ = sv_refw; dbg_hl_r2hit_ = sv_r2; dbg_hl_rghit_ = sv_rg;
+        dbg_hl_wclamp_ = sv_wclamp;
+        dbg_hl_stat_src_ = sv_stat; dbg_hl_decide_src_ = sv_dec;
+        for (int k = 0; k < 3; ++k) {
+          dbg_hl_chroma_[k] = sv_chroma[k];
+          dbg_hl_sum_[k] = sv_sum[k];
+          dbg_hl_cnt3_[k] = sv_cnt3[k];
+        }
+        (void)sv_stat_src;
+        // ③ P0（σ 对齐 zero 链等效噪声；HR 输出直读时 wclamp=true，与主链单帧
+        // 前置同构）
+        // 0.12.81：侧帧 P0 只做"σ 真值"降噪时，残余噪声仍是 zero 链的 ~10×
+        //（单帧 ISO 3200 读噪声 = zero 的 10×，且 zero 另有 2 帧时域堆叠；
+        // 真机 204721 实锤：融合档高频能量 = 采集档 ×3，Mertens 的 contrast
+        // 因子对 σ 响应 ∝ 噪声 —— 权重选中的是侧帧噪声不是细节 = 高光斑块）。
+        // 修法 = HDR+ §5 的既定原则"按实际合并更新噪声方差"：把侧帧 P0 的
+        // σ ×2（等效 strength 2，项目降噪强度档语义），使其残余对齐 zero 链
+        //（2 帧堆叠 + P0@真值）。实现 = σ² 系数 ×4：A×4（散粒 σ_shot×2）、
+        // B×(gr2×4)（读噪声 = 增益标定 ×gr2 与降噪 ×4 的合并）。zero 链与
+        // 关档零影响。
+        const GLuint side_p0_in = side_hl != 0 ? side_hl : tex_mos_;
+        if (c.dn) {
+          NoiseCoef nc_side = c.nc;
+          const float gr2 = c.hdr_side_gain * c.hdr_side_gain;
+          for (int k = 0; k < 3; ++k) {
+            nc_side.p0a[k] *= 4.f;
+            nc_side.p0b[k] *= gr2 * 4.f;
+            nc_side.mma[k] *= gr2;
+            nc_side.mmb[k] *= gr2;
+          }
+          passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                              c.gains, nc_side, nullptr, /*subpixel=*/false,
+                              side_p0_in, /*allow_ts=*/false,
+                              /*wclamp=*/side_hl != 0);
+        } else {
+          passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
+                              c.gains, kNoDnSide, nullptr, /*subpixel=*/false,
+                              side_p0_in, /*allow_ts=*/false,
+                              /*wclamp=*/side_hl != 0);
+        }
+        passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
+        passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
+                 p.rcd_g_orig);
+        if (p.rcd_p3_split > 0.5f) {
+          passRcdChromaA(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+                         true, p.rcd_cdfix);
+          passRcdChromaB(dst_w, dst_h, c.effective_rot, c.cfa, c.gains);
+        } else {
+          passRcdChroma(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase,
+                        c.white_level, c.gains, c.ccm, true, p.rcd_cdfix,
+                        p.rcd_g_orig);
+        }
+        passCcm(dst_w, dst_h, c.ccm, tex_work_);
+        // ④ side 的 D4 存走
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+        glBindTexture(GL_TEXTURE_2D, tex_hdr_side_);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dst_w, dst_h);
+        if (glGetError() != GL_NO_ERROR) hdrFail("side_copy");
+      }
+      // ⑤ Mertens 融合写回 tex_scene_ + 诊断
+      if (hdr_ok) {
+        passHdrMertens(dst_w, dst_h, c.hdr_ev_side);
+        diagStatsTex("D4-hdr", tex_scene_, dst_w, dst_h, &p);
+        Logger::instance().log(
+            LogLevel::kInfo, "engine", "hdr.side",
+            "{\"ev\":" + std::to_string(c.hdr_ev_side) + ",\"ms\":" +
+                std::to_string(std::chrono::duration<float, std::milli>(
+                                   std::chrono::steady_clock::now() - hs0)
+                                   .count()) +
+                "}");
+      }
+    }
   } else {
     passRaw(dst_w, dst_h, c.effective_rot, c.cfa, c.black_phase, c.white_level,
             c.gains, c.ccm, p);
@@ -13484,7 +13907,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const float plane_a[3],
                                 const float plane_b[3],
-                                const float frame_scale[4], float* out_neff,
+                                const float frame_scale[4],
+                                const float gain_ratio[4], float* out_neff,
                                 float* out_ms) {
   *out_neff = 0.f;
   if (burst_w_ != w || burst_h_ != h) return false;
@@ -13576,6 +14000,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   glUniform1i(uni("uCfaLut"), lut);
   glUniform4f(uni("uFrameScale"), frame_scale[0], frame_scale[1], frame_scale[2],
               frame_scale[3]);
+  glUniform4f(uni("uGainRatio"), gain_ratio[0], gain_ratio[1], gain_ratio[2],
+              gain_ratio[3]);
   glUniform4f(uni("uPlaneA"), pa[0], pa[1], pa[2], pa[3]);
   glUniform4f(uni("uPlaneB"), pb[0], pb[1], pb[2], pb[3]);
   glUniform1f(uni("uC"), 256.0f);
@@ -13697,8 +14123,8 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
 void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
                                      float white_level, const float gains[3],
                                      const float a[3], const float b[3],
-                                     float s_const,
-                                     const float frame_scale[4]) {
+                                     float s_const, const float frame_scale[4],
+                                     const float gain_ratio[4]) {
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_mis_);
   glViewport(0, 0, tiles_w_ * 4, tiles_h_ * 4);
   glUseProgram(prog_mfnr_mis_);
@@ -13737,6 +14163,10 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   if (u_mfnr_mis_.frame_scale >= 0) {
     glUniform4f(u_mfnr_mis_.frame_scale, frame_scale[0], frame_scale[1],
                 frame_scale[2], frame_scale[3]);
+  }
+  if (u_mfnr_mis_.gain_ratio >= 0) {
+    glUniform4f(u_mfnr_mis_.gain_ratio, gain_ratio[0], gain_ratio[1],
+                gain_ratio[2], gain_ratio[3]);
   }
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -14464,7 +14894,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                                    float ref_noise_scale, bool use_dft,
                                    bool align_l1, bool align_ab, bool p0_sub,
                                    bool nn_dn, float short_ratio,
-                                   float short_sat, std::vector<uint8_t>* out_rgba,
+                                   float short_sat, const float* hdr_ev,
+                                   const float* hdr_gain, int hdr_high_idx_arg,
+                                   std::vector<uint8_t>* out_rgba,
                                    bool ten_bit) {
   if (w <= 0 || h <= 0 || !frames || !black_phase || !row_strides_px)
     return false;
@@ -14487,7 +14919,33 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   };
   stage("upload");
 
-  // 上传：帧 0 → raw_tex_（参考帧），帧 1..3 → tex_mfnr_
+  // ── HDR 融合 P2（0.12.77）：帧角色解析 ──────────────────────────────
+  // hdr_ev[0..3] = 各帧相对帧 0 的实测 EV（采集端由 CaptureResult 算好下发）。
+  // ev > 0.3 = 高帧（+2.2EV，Mertens 侧帧）；ev < −0.3 = 低帧（P3 才消费）；
+  // 其余 = zero 帧。P2 恰好消费 1 张高帧；找不到 ⇒ hdr 关闭（= P1/0.12.76 行为）。
+  // 失败永不丢照片（红线）：侧帧链任何一步失败都只是 hdr_active 置 false
+  // + 日志留痕，成片回退 zero 链。
+  // ── P3 架构对齐（0.12.82，对齐 PC RAW：MultiFrameStacker.processBurstRaw +
+  // RawmaxExposurePlanner + GlesMgcRawSpatialStacker.processFrames）──────────
+  // 侧帧**不再单帧直通**（0.12.77-81 的 YUV bracket 架构在 RAW 路径质量不成立：
+  // 单帧 ISO 3200 读噪声 10×zero 且无时域，contrast 权重选噪声 = 高光斑块，
+  // 真机 201852/204721 两轮实锤）。改为 PC RAW 同构：**4 帧（含跨曝光侧帧）
+  // 全部进既有的对齐 + DFT/mismatch 融合**，每帧按实测 EV 归一
+  // frame_scale[i] = 2^(−ev[i])（旧 bracket 短帧归一的通用化 —— 机制已真机
+  // 验证：satW 饱和权重让长帧裁切像素退出、短帧归一后接管高光，暗部长帧
+  // 以更高 SNR 参与平均）。侧帧因此获得与 zero 同等的对齐/降噪待遇。
+  bool hdr_active = hdr_ev != nullptr;
+  // frame_scale 派生（放在上传前，供 capturePyr 逐帧归一）：
+  float hdr_frame_scale[4] = {1.f, 1.f, 1.f, 1.f};
+  if (hdr_active) {
+    for (int i = 0; i < count && i < 4; ++i) {
+      const float ev = std::isfinite(hdr_ev[i]) ? hdr_ev[i] : 0.f;
+      hdr_frame_scale[i] = std::exp2(std::min(std::max(-ev, -8.0f), 8.0f));
+    }
+  }
+
+  // 上传：帧 0 → raw_tex_（参考帧），帧 1..3 → tex_mfnr_（hdr 时 4 帧原样，
+  // 含跨曝光侧帧 —— 归一在各 pass 内做）
   if (ensureRawTex(w, h) == 0) return false;
   if (!uploadRawTex(raw_tex_, frames[0], w, h, row_strides_px[0])) return false;
   if (!ensureMfnrTargets(w, h)) return false;
@@ -14502,6 +14960,12 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       prepareRawCommon(neutral_r, neutral_g, neutral_b, wb_tt[0], wb_tt[1],
                        wb_tt[2], ccm9, lsc, lsc_cols, lsc_rows);
   const float wl = static_cast<float>(white_level);
+
+  // ── HDR 融合 P2（0.12.78）：侧帧数据只在此登记（ChainCtx），前链挪到
+  // finishStillChain 里 zero 的 passCcm 之后跑 —— passRawDenoise/RCD 读的是
+  // raw_tex_，侧帧必须重传它（0.12.77 的独立 Bayer 纹理方案让侧帧链跑在
+  // zero 数据上：真机 D4-hdr ≈ D4-scene，Mertens 变成 (zero,zero)→zero）。
+
   // 期 B bracket（0.11.66）：帧 0 是短曝光帧时先归一到长帧域（长/短），再对齐/融合。
   // **必须归一**：不归一 SAD 残差被 4× 亮度差淹没（confMed 掉到 0，2026-09-29 的
   // alt 帧不守恒事故同型）。归一位于扣黑阶之后（各 pass 内），不是原始 u16 上乘。
@@ -14510,7 +14974,21 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   float frame_scale[4] = {1.f, 1.f, 1.f, 1.f};
   const float short_ratio_ok =
       std::isfinite(short_ratio) ? std::min(std::max(short_ratio, 1.0f), 8.0f) : 1.0f;
-  frame_scale[3] = short_ratio_ok;
+  // P3（0.12.82）：hdr 模式 frame_scale 从实测 EV 派生（2^−ev，帧 0 参考恒 1）；
+  // 旧 bracket（short_ratio）路径照旧。两者互斥（采集端 hdr 时 brk=0）。
+  if (hdr_active) {
+    for (int i = 0; i < 4; ++i) frame_scale[i] = hdr_frame_scale[i];
+  } else {
+    frame_scale[3] = short_ratio_ok;
+  }
+  // per-frame 增益比（0.12.83）：hdr 传数组，旧路径全 1（B 项不变 = 零回归）
+  float hdr_gain_4[4] = {1.f, 1.f, 1.f, 1.f};
+  if (hdr_active && hdr_gain != nullptr) {
+    for (int i = 0; i < 4; ++i) {
+      const float g = hdr_gain[i];
+      hdr_gain_4[i] = std::isfinite(g) && g > 0.f ? std::min(std::max(g, 0.25f), 64.f) : 1.f;
+    }
+  }
   const bool bracket_on = short_ratio_ok > 1.01f;
   // 期 B bracket：**保留 HR**（2026-10-21 修正）。
   // 0.11.75 曾为消除"灰块"关掉 HR，结果饱和区失去色度重建 ⇒ RCD 在窗玻璃这类
@@ -14684,7 +15162,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     tf = std::chrono::steady_clock::now();
     if (!ensureMfnrFftTargets(w, h)) return false;
     dft_active = passMfnrFft(w, h, cfa, black_phase, wl, rc.gains, nc_single.p0a,
-                             nc_single.p0b, frame_scale, &neff_dft, dft_ms);
+                             nc_single.p0b, frame_scale, hdr_gain_4,
+                             &neff_dft, dft_ms);
     if (dft_active) {
       glFinish();
       stage("chain");
@@ -14701,7 +15180,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   stage("mismatch");
   const auto tmis = std::chrono::steady_clock::now();
   passMfnrMismatch(cfa, black_phase, wl, rc.gains, nc_single.mma, nc_single.mmb,
-                   kMfnrMisS, frame_scale);
+                   kMfnrMisS, frame_scale, hdr_gain_4);
   // v0.10.3：网格 = 4×tiles（32px cell）。权重独立成图（tex_w_，LINEAR），
   // 与位移场解耦 —— 128px tile 级权重对叶缘带局部运动分辨率不足（重影残留）。
   const int cw = tiles_w_ * 4, chh = tiles_h_ * 4;
@@ -15066,6 +15545,22 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
               ",\"dMed\":" + f3(dx_med_max) +
               ",\"dP90\":" + f3(dx_p90_max) +
               ",\"tiles\":" + std::to_string(tiles_w_ * tiles_h_);
+  // HDR 融合 P2（0.12.77）：侧帧 D4 已存 tex_hdr_side_（失败时 hdr_active=false，
+  // 下游 passHdrMertens 不跑 = zero 链，成片不丢）。ev 数组进日志供离线核对。
+  // P3（0.12.82）：侧帧直通 + Mertens 架构退场（不再跑 finishStillChain 的
+  // hdr 分支；代码保留，hdr_mertens 恒 false —— 回退通路仍在）。SDR base =
+  // 跨曝光堆叠融合输出（PC RAW 同构）；HDR 参考（gainmap 改造）是 P4。
+  c.hdr_mertens = false;
+  c.hdr_ev_side = 0.f;
+  if (hdr_ev != nullptr) {
+    std::string evs, fss;
+    for (int i = 0; i < count && i < 4; ++i) {
+      if (i) { evs += ","; fss += ","; }
+      evs += jnum(hdr_ev[i], 3);
+      fss += jnum(frame_scale[i], 4);
+    }
+    c.mfnr_kv += ",\"hdrEv\":[" + evs + "],\"hdrFs\":[" + fss + "]";
+  }
   finishStillChain(c, t0, out_rgba);
   return true;
 }

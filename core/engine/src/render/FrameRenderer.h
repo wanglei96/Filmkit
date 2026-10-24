@@ -303,6 +303,8 @@ class FrameRenderer {
                       float ref_noise_scale, bool use_dft, bool align_l1,
                       bool align_ab, bool p0_sub, bool nn_dn,
                       float short_ratio, float short_sat,
+                      const float* hdr_ev, const float* hdr_gain,
+                      int hdr_high_idx,
                       std::vector<uint8_t>* out_rgba, bool ten_bit = false);
 
   // 预览实时直方图（M3）：胶片输出纹理 → 显示域亮度（OETF 同 kFsOut）→ 256×96
@@ -358,7 +360,8 @@ class FrameRenderer {
   void passMfnrMismatch(int cfa, const float black_phase[4], float white_level,
                         const float gains[3], const float a[3],
                         const float b[3], float s_const,
-                        const float frame_scale[4]);
+                        const float frame_scale[4],
+                        const float gain_ratio[4]);
   // 位移场 + 4 帧 → 置信度加权均值 → tex_fused_（R16F mosaic，线性化+WB 域）
   void passMfnrFuse(int w, int h, int cfa, const float black_phase[4],
                     float white_level, const float gains[3],
@@ -397,8 +400,8 @@ class FrameRenderer {
   bool passMfnrFft(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const float plane_a[3], const float plane_b[3],
-                   const float frame_scale[4], float* out_neff,
-                   float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
+                   const float frame_scale[4], const float gain_ratio[4],
+                   float* out_neff, float* out_ms);  // out_ms = {直传, dispatch, 收口+读回, GPU} 分段 ms
   // ── submitRaw / submitRawBurst 共享的成片链（P0 → RCD/bilinear → P4 →
   // filmic → 输出读回 → raw.render 日志）。P0/RCD 的输入域由 mfnr_fused 决定。
   struct ChainCtx {
@@ -456,6 +459,22 @@ class FrameRenderer {
     // GL_UNSIGNED_INT_2_10_10_10_REV、dither 除数 1023（三处同源，见 OutputBitDepth.h）。
     // 由 submitRaw / submitRawBurst 的 ten_bit 参数填充；submitStill 不走本结构。
     bool ten_bit = false;
+    // ── HDR 曝光融合 P2（docs/engine-hdr-exposure-fusion-design.md §4.2）──
+    // true = passCcm 之后、P4/PC3D 之前跑 kFsHdrMertens（zero 与侧帧的逐像素
+    // 加权融合，写回 tex_scene_）。ev_side = 侧帧相对 zero 的实测 EV（日志用；
+    // P2 权重不消费它，deghost 是 P3）。默认 false ⇒ 整条链逐位不变（J10）。
+    bool hdr_mertens = false;
+    float hdr_ev_side = 0.f;
+    // 侧帧原始数据（submitRawBurst 填充；finishStillChain 里把 high 重传进
+    // raw_tex_ 再跑侧帧前链 —— passRawDenoise/RCD 读的是 raw_tex_，侧帧必须
+    // 走这条主 texture，不能另开一张，否则整条链跑在 zero 数据上（0.12.77
+    // 真机实测的 D4-hdr ≈ D4-scene 事故）。
+    const void* hdr_side_raw = nullptr;
+    int hdr_side_stride = 0;
+    // 侧帧/zero 的 ISO 增益比（0.12.79）：侧帧链 P0 降噪的读噪声缩放
+    // B×ratio²（GCam 模型 σ²=A·x+B 的 B∝gain²；散粒项 A 归一化后不变）。
+    // 1.0 = 同增益（零行为变化）。clamp [1, 64] 防呆。
+    float hdr_side_gain = 1.f;
   };
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
@@ -1370,6 +1389,28 @@ class FrameRenderer {
   GLuint fbo_scene_ = 0, tex_scene_ = 0;  // RGBA16F 场景线性
   GLuint fbo_work_ = 0, tex_work_ = 0;    // RGBA16F 胶片输出
   GLuint fbo_cap_ = 0, tex_cap_ = 0;      // 成片读回（8bit RGBA8 / 10bit GL_RGB10_A2）
+  // ── HDR 曝光融合 P2（0.12.78）──────────────────────────────────────────
+  // tex_hdr_zero_ = zero 主链 D4 的拷贝；tex_hdr_side_ = 侧帧（+2.2EV）过完
+  // "展开→RCD→CCM"前链后的 D4。两张 RGBA16F、成片几何、惰性建（仅 hdr_fusion=2
+  // 的拍照用）。**侧帧数据不设独立 Bayer 纹理**：passRawDenoise/RCD 读的是
+  // raw_tex_，侧帧链在 zero 主链的 passCcm 之后跑（此时 zero 的 D4 已拷走、
+  // raw_tex_ 已无人消费），high 直接重传 raw_tex_ —— 0.12.77 的独立纹理方案
+  // 让侧帧链跑在 zero 数据上（D4-hdr ≈ D4-scene），已废。
+  GLuint tex_hdr_side_ = 0, tex_hdr_zero_ = 0;
+  int hdr_side_dst_w_ = 0, hdr_side_dst_h_ = 0;
+  GLuint prog_hdr_mertens_ = 0;
+  struct {
+    GLint zero = -1, side = -1, size = -1;
+    GLint wc = -1, ws = -1, we = -1;
+    GLint scale = -1;
+  } u_hdr_mertens_;
+  bool ensureHdrSideTargets(int dst_w, int dst_h);
+  // kFsHdrMertens：zero（tex_hdr_zero_，读）与侧帧（tex_hdr_side_，读）逐像素
+  // 加权融合 → 写回 fbo_scene_。权重/归一公式照抄 PC（MERTENS_WEIGHT/NORMALIZE，
+  // GlesYuvStacker.kt:3451/3612），ponytail: P2 临时形态（无 pyramid/deghost）。
+  // zero 的 D4 拷贝与侧帧前链由 finishStillChain 的调用序列负责（见
+  // finishStillChain 里 hdr_mertens 分支）。
+  void passHdrMertens(int dst_w, int dst_h, float ev_side);
   // HDR gainmap（v0.11.50）：RGBA8、1/2 分辨率，R 通道 = 8bit 归一化比值。
   // 为什么单独一张纹理：ES 3.0 只保证 8bit 读回（浮点读回真机没有），所以 gainmap
   // 必须在 GPU 内算成 8bit 再读回 —— 见 kFsGainmap 的头注释。
@@ -1467,7 +1508,8 @@ class FrameRenderer {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, size = -1,
           tiles = -1, off_tiles = -1, tile_m = -1, noise_a = -1, noise_b = -1,
           s = -1, black = -1, white = -1, gain = -1, cfalut = -1,
-          frame_scale = -1;   // 期 B bracket：逐帧归一
+          frame_scale = -1,  // 期 B bracket：逐帧归一
+          gain_ratio = -1;   // 0.12.83：per-frame 增益比（读噪声 B×(gr·s)²）
   } u_mfnr_mis_;
   struct {
     GLint ref = -1, shrt = -1, size = -1, black = -1, white = -1, scale = -1;
