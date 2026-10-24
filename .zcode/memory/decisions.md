@@ -113,8 +113,9 @@ status: active
 
 ## 测光、AE 架构与 HDR（10-24）
 
-- [2026-10-24] **渲染端 AE 全删，回到 PC 架构（用户拍板）**：曝光 = HAL AE + planner + baseEv + 用户 EV；`g_still_ae_ema` 与 `pe.exposure_ev += ae` 一起删除，`decideAe` 只留诊断。理由：渲染端 AE 是自研的第二套，与 HAL 打架（点测光下把成片补回统一亮度），且跨张 EMA 违反"每张独立"。
-- [2026-10-24] **测光三档 + 对焦/测光分离**：系统默认 / 点测（6% 框，PC `SPOT_AE_REGION_FRACTION`）/ 高光优先（PC 的最亮簇 + 16% 框）；`AF_REGIONS` 与 `AE_REGIONS` 分离，点按永远只对焦；长按 = 对焦+曝光一起锁 + 黄框，点按对焦自动解锁。
-- [2026-10-24] **测光算法不许自创**（用户明确）：高光优先第一版"固定顶部中央"被否决；正解 = 逐像素/网格找最亮簇（PC `calculateMeteringResults`），点测区域大小也必须用 PC 常量。
-- [2026-10-24] **DCP 生态不做，AdobeCurve 降 P2**：DCP 是相机原厂色彩身份、不是胶片 stock；跨相机套 HueSatMap = 二次校正；破坏 D8/D9"基准中性 + 风格 LUT"分工；Adobe camera matching 版权不可随包分发。AdobeCurve 的价值在 hue-preserving + over-range，与 DCP 无关，只作可选实验。
-- [2026-10-24] **HDR 曝光融合立项（独立专项）**：采集 0/0/+2.2/−1.5 + Mertens 逐像素融合（`highlightValidity` >0.96 拒绝、deghost 黑白门、census mismatch）；4 帧起步、6 帧封顶，不抄 PC 的 20 帧（它是 YUV 路径、我们是 RAW burst）；开关默认关，关掉必须与 0.12.74 逐字节一致。
+- [2026-10-24] **渲染端 AE 全删（用户拍板）**：曝光 = HAL AE + planner + baseEv + 用户 EV，逐张独立；`decideAe` 留诊断。测光三档（系统/点测 6%/高光优先 PC 最亮簇）+ AF/AE 分离 + 长按锁定落地；**测光算法不许自创**（固定顶部中央被否决）。
+- [2026-10-24] **DCP 生态不做，AdobeCurve 降 P2**：DCP 是相机原厂色彩身份；破坏 D8/D9 分工；camera matching 不可分发。
+- [2026-10-24] **HDR 曝光融合立项**：采集 0/0/+2.2/−1.5；4 帧起步、6 帧封顶；`planBracketExposure` 逐行照抄 PC planManualExposure。
+- [2026-10-24] **P3 架构对齐 PC RAW（定稿，取代 Mertens 直通）**：PC 的 `shouldUseJpgMaxHdrCapture` 有 `!isRawCapture` 门槛（YUV bracket 只在非 RAW 走）；RAW 模式 = RawmaxExposurePlanner + 全帧进 MGC 融合 ⇒ 我们的跨曝光帧全部进对齐+DFT 堆叠（frame_scale=2^−ev 归一）。**帧角色由采集端显式指定**（PC setTag 同构），按实测 EV 推断是自创（暗场长帧 −0.1EV 误判关闭，真机实锤）。
+- [2026-10-24] **侧帧 ISO 钳模拟增益顶 3200**（v0.10.4 纪律）：range 顶 19200 让暗场长帧进数字增益区 = 假 +2.2EV（光子不增、读噪声 ×46）。**不自动退化**（用户否决）：长帧无增益也照采照融合。
+- [2026-10-24] **per-frame σ = HDR+ "按实际合并更新噪声方差"**：DFT/mismatch 的 σ²=A·s·x′+B·(gr·s)²（gr=ISO_i/ISO_0；不修则长帧读噪声低估 86×、整帧回退参考帧）。

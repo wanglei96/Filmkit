@@ -112,9 +112,8 @@ status: active
 
 ## 测光与 HDR 对标（10-24）
 
-- [2026-10-24] **逆光同机位实测**（17:19，点测光生效）：我们 ISO 65 / 0.010s，天空 RGB **227/221/216**、`aeP995 3.49`（= 4.24EV，白点 4.56 的 93%）、`aeHl 0.005`、`hi240 3.35%`、mean 51.6；PC 同机位天空 **196/187/183**、`hi240 0.22%`、mean 62.2、B/G 0.976（我们 0.978）。⇒ 白平衡不是主因，亮度（曲线肩部位置）是。
-- [2026-10-24] **PC sigmoid 白点 = 1.0**（`DarktableSigmoidToneAlgorithm.kt:5` `DT_SIGMOID_WHITE_TARGET = 1.0`），与我们 `sig_wt = 1.0` 一致 ⇒ 白点不是差异来源。
-- [2026-10-24] **PC HDR bracket**：`HdrBracketConfig.kt:8-9` 长帧 `+2.2EV` / 短帧 `−1.5EV`；总帧数 = 0EV 帧数 + 2（`CameraViewModel.kt:3680`），范围 3~20（`MultiFrameConfig.kt` 默认 5）。**0EV 全部堆叠成 1 张**（`accumulateFrame`），长/短帧各 1 张，最后 Mertens 融合 3 张 ⇒ 帧数只提升降噪、不扩大曝光跨度。
-- [2026-10-24] **PC Mertens 门控**（`GlesYuvStacker.kt:3451`）：`highlightValidity = 1 − smoothstep(0.960, 0.995, max3(rgb))`（任一通道 >0.96 ⇒ 该帧在此像素权重归零，高光交给短帧）；`deghostValidity` 黑门 0.055~0.145 + 白门 0.865~0.975；另有 3×3 census mismatch。**没有场景识别/分区。**
-- [2026-10-24] **我们的 gainmap 中灰基线 1.1**（`FrameRenderer.cpp:7094`）：从已渲染的 SDR base 反推，没有长帧参考；PC 的 gainmap 里是真实 +2.2EV 数据。
-- [2026-10-24] **测光实现位置**：`app/.../camera/MeteringTargets.kt`（显示↔传感器坐标，5 条单测）；`CameraController.setMeteringMode/setAeLock/currentMeteringRect/setHighlightMeterPoint`；`Bridge.cpp` 的 `g_meter_manual`/`g_meter_focus_x/y` 进程快照；常量 `SPOT_AE_FRACTION = 0.06`、`HIGHLIGHT_AE_FRACTION = 0.16`；高光点来自 `FrameRenderer::histogramFrom` 的 32×32 网格（PC 算法移植）。
+- [2026-10-24] **逆光同机位实测**（17:19，点测光）：我们天空 227/221/216、`hi240 3.35%`、mean 51.6；PC 天空 196/187/183、`hi240 0.22%`、mean 62.2、B/G 0.976 vs 0.978 ⇒ 白平衡不是主因，**单帧装不下 12EV（室内 5 + 天空 7），是 bracket 问题**。
+- [2026-10-24] **测光实现位置**：`MeteringTargets.kt`（5 单测）；`CameraController.setMeteringMode/setAeLock/setHighlightMeterPoint`；`Bridge.cpp` `g_meter_manual`/`g_meter_focus_x/y` 进程快照；`SPOT_AE_FRACTION=0.06`、`HIGHLIGHT_AE_FRACTION=0.16`；高光点来自 `histogramFrom` 32×32 网格。
+- [2026-10-24] **PC HDR 两套体系（10-24 晚重查）**：YUV bracket（`shouldUseJpgMaxHdrCapture` 有 `!isRawCapture` 门槛）= 0EV×N 堆叠 + 侧帧各 1 直通 + Mertens（`GlesYuvStacker.kt:3451`：highlightValidity 0.960/0.995、deghost 黑门 0.055~0.145 白门 0.865~0.975、census、referenceStructure；三级归一回退）；**RAW 模式** = `RawmaxExposurePlanner`（实测曝光中位数分组 base/normal/short/long）+ `processBurstRaw` 全帧进 MGC 融合（`enableHdrFusion`、`supportsBracketExposure`）+ HDR 参考场（RawHdrReferencePass，HDR/SDR 比值）。**帧数 = 多帧设置数 + 2**（`resolveHdrBracketZeroEvFrameCount`），提帧数只提 0EV 降噪。
+- [2026-10-24] **我们的 HDR+ 包围曝光（P3 定稿）**：帧序 0/0/+2.2/−1.5（`HdrBracketConfig` 常量 HDR_LONG_EV=2.2/HDR_SHORT_EV=−1.5/HDR_LONG_MAX_SHUTTER_NS=10ms）；`planBracketExposure` 照抄 PC planManualExposure；**侧帧 ISO 钳模拟顶 3200**；引擎 frame_scale[i]=2^−ev[i] 全帧进对齐+DFT（satW 饱和权重接管高光、mismatch 拒运动）；per-frame σ²=A·s·x′+B·(gr·s)²；日志 `hdrFs[]`（归一系数）/`bracket.actual`（实测 EV+sat）；JNI `hdrEv/hdrGainArr/hdrHighIdx`。0.12.84 UI 两档化默认开，旧 bracket 退役。
+- [2026-10-24] **gainmap 中灰基线 1.1**（`FrameRenderer.cpp:7094`）从 SDR base 反推、无长帧参考；PC gainmap 是真实 +2.2EV 数据 ⇒ P4 改造点。

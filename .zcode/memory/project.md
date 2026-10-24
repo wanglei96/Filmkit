@@ -81,14 +81,9 @@ status: active
 - [2026-10-20] **已知差距（用户已定单独开期）**："高光顶白" = SDR base 平均亮度我们 **85.2/98.4** vs PC **50.7**、`>=240` 占比 **3.38%/2.22%** vs PC **0.37%**；而 **HDR 输出几乎相同** ⇒ 归因自动曝光策略，**gainmap 链路本身没问题**。
 - [2026-10-20] **出包纪律已固化进 `AGENTS.md`**：每个包必升版本号、只留"最新+上一稳定版"、禁用 `-fixN` 后缀、打包后必验签名/版本号/JNI 符号。
 
-## 自动曝光（10-20，渲染端本张统计）
+## 自动曝光（10-20，已退役）
 
-- [2026-10-20] **0.11.59 诊断包**：`sw999` 移到 still 链**无条件写**（此前只在 `auto_tone` 开时写 ⇒ 高光保护恒 NaN）；`stats.sw999` 改读 `g_renderer_still`；每张记 `photo.stats`（`sw999`/`mean`/`hi240`）。
-- [2026-10-20] **0.11.61 渲染端自动曝光**：`AeMetering`（纯函数 + 自测）——`ev_mid = log2(18.45%/P50)`、`ev_hl = (2.438−0.1) − log2(P99.5/18.45%)`，取 `min`（**高光优先**），限幅 ±2EV（与 gainmap `[0.25,4.0]` 对齐）。`passFilm` 前取本张统计并 `pe.exposure_ev += aeEv`；prefs `ae_auto` 默认开。
-- [2026-10-20] **0.11.62 双重欠曝修复**：`ae_auto` 开时采集端高光保护**旁路**（`hlOn = hl_protect && !aeAuto`）。此前两张的链路是：第二张拿第一张 `sw999` 压低采集 + 补偿 EV + 渲染端再压。
-- [2026-10-20] **0.11.63 P99.5 判据**：允许 0.5% 像素裁切（PC `maximumClippedFraction=0.005` 同口径）；`p_hi995` 新增，P99.9 仍留给 filmic 白点上探。
-- [2026-10-20] **0.11.64 MFNR 超时误杀**：`tryProcessBurst` 收满即 `cancelBurstTimeout()`；否则上一张的 5s 定时器会把下一张误判超时（`images:0 waitMs:278`）⇒ 回退单帧、无 HDR、明显更暗。
-- [2026-10-20] **实测（台灯+窗，0.11.64）**：两张 `aeEv −1.11 / −1.11`、`aeP50 0.0696`、`mean 44.8 / 45.2`、`gainmap:true` ×2。**仍压 1.11EV**（P99.5=2.03 超白点），离 PC 的 `mean 89` 还有约 1EV —— 这笔账只能靠 bracket 从物理上解决。
+- [2026-10-20/24] **渲染端 AE 全链退役**：0.11.59-64 的 `AeMetering`（P99.5 高光优先、限幅 ±2EV）与 `g_still_ae_ema` 在 0.12.71 全删（`decideAe` 留诊断）⇒ 曝光 = HAL + planner + baseEv + 用户 EV，逐张独立。0.11.64 修的「burst 超时误杀」保留（收满即摘定时器）。
 
 ## 高光链路收口（10-22，用户已真机验收）
 
@@ -118,3 +113,9 @@ status: active
 - [2026-10-24] **DCP 调研评估 = 不做**：DCP 是相机原厂色彩身份、不是胶片 stock；跨相机套 HueSatMap 是二次校正；破坏 D8/D9 分工；Adobe camera matching 不可分发。AdobeCurve 降级为 P2 可选实验（hue-preserving + over-range 是它真正的价值，与 DCP 无关）。
 - [2026-10-24] **HDR 曝光融合专项立项**：采集改 0/0/+2.2/−1.5 + Mertens 逐像素融合（PC 同款：`highlightValidity` >0.96 拒绝、deghost 黑白门、census mismatch），4 帧起步 6 帧封顶；设计 `docs/engine-hdr-exposure-fusion-design.md`，P0 从 0.12.75 起，开关默认关。
 - [2026-10-24] **单次高光斑块（5902）不定案**：短帧满阱（`p999 1.0`）+ 手动压 EV −0.54 + `hlChroma B −0.318` 的重建边界；同参数 0612 正常。按纪律等复现，不改算法。
+
+## HDR+ 包围曝光（10-24 晚，0.12.75-84）
+
+- [2026-10-24] **P0-P1 诊断与采集**：`bracket.actual`（每帧实测 EV + RAW 抽样统计）；帧序 0/0/+2.2/−1.5（PC buildHdrBracketEvOffsets 同构、参考帧恒帧 0、AE 全帧锁）；`planBracketExposure` 照抄 PC planManualExposure（正 EV 快门 10ms 顶、钳后 ISO 补偿）。
+- [2026-10-24] **P2 迭代后退役**：Mertens 侧帧直通（独立前链→D4→kFsHdrMertens，权重照抄 PC）三轮真机四坑（侧帧链跑 zero 数据、ISO 14336 数字增益、角色自创判定、高光斑块）→ 结构性不足（单帧 ISO 3200 读噪声 10×zero 且无时域）。
+- [2026-10-24] **P3 架构对齐 PC RAW（定稿）**：4 帧原样进引擎，frame_scale[i]=2^−ev[i] 归一，全部进对齐+DFT 跨曝光堆叠（复用 satW 饱和权重/mismatch；零新 shader）；0.12.83 per-frame σ（B×(gr·s)²，长帧 gr≈9.3 不修则整帧回退）；0.12.84 UI 两档化（旧 bracket 开关删除、改名「HDR+ 包围曝光」默认开）。真机确认：hdrFs/confMed 0.833/brkRatio 2.83。

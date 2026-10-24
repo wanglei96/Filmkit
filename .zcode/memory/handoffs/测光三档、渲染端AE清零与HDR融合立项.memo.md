@@ -1,8 +1,8 @@
 ---
 summary: 测光三档、渲染端AE清零与HDR融合立项
 created: 2026-10-24 19:05
-updated: 2026-10-24 19:05
-status: active
+updated: 2026-10-24 22:00
+status: absorbed
 ---
 
 # 测光三档、渲染端 AE 清零与 HDR 融合立项
