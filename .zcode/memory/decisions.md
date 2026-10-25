@@ -119,3 +119,11 @@ status: active
 - [2026-10-24] **P3 架构对齐 PC RAW（定稿，取代 Mertens 直通）**：PC 的 `shouldUseJpgMaxHdrCapture` 有 `!isRawCapture` 门槛（YUV bracket 只在非 RAW 走）；RAW 模式 = RawmaxExposurePlanner + 全帧进 MGC 融合 ⇒ 我们的跨曝光帧全部进对齐+DFT 堆叠（frame_scale=2^−ev 归一）。**帧角色由采集端显式指定**（PC setTag 同构），按实测 EV 推断是自创（暗场长帧 −0.1EV 误判关闭，真机实锤）。
 - [2026-10-24] **侧帧 ISO 钳模拟增益顶 3200**（v0.10.4 纪律）：range 顶 19200 让暗场长帧进数字增益区 = 假 +2.2EV（光子不增、读噪声 ×46）。**不自动退化**（用户否决）：长帧无增益也照采照融合。
 - [2026-10-24] **per-frame σ = HDR+ "按实际合并更新噪声方差"**：DFT/mismatch 的 σ²=A·s·x′+B·(gr·s)²（gr=ISO_i/ISO_0；不修则长帧读噪声低估 86×、整帧回退参考帧）。
+
+## P4 真实 gainmap 与徕卡一瞬（10-25）
+
+- [2026-10-25] **gainTrue 中灰自锚定**：scene 锚 = ae_p50_（与 uHdr 同一 film_src 测得、随曝光自适应、不写死域常量），display 锚 = 0.1845；ratio clamp [1,4]——下限 1 = 暗部零放大（UltraHDR 语义），上限 4 = 元数据全量程（PC 同款）。
+- [2026-10-25] **上限 4.0 不预防 5619**：真实比值下天空 ratio 连续 1~4x（随 ae_p50_ 自适应），与旧版 t² 一刀切机理不同；不拍脑袋保证——A/B 档保留 + 预案 kHdrCeil 软限（HDR 亮度 ≤2×SDR 白按 sdrY 收，不全局砍）。
+- [2026-10-25] **样片代表性**：旧样片对 gainmap 指纹有效（shader 未改的 git 证据 + ratio 只依赖 sceneY）；对 base 曝光账目无效（AE 删除 0.12.71 分界）——两类判据分开算。
+- [2026-10-25] **徕卡一瞬路线**：现有引擎 + 烘焙 LUT（PC 配方分支矩阵 → 64³ 纯色彩 display 域 LUT，只烘矩阵不烘曲线——曲线域语义不明且影调归 filmic latitude）；新引擎为备选；原 leica_m9.lut 降级 A/B 对照；旧 builtin 预设仅参考不作起点（用户明示重新标定）。
+- [2026-10-25] **判据双轨**：管线正确性 = PC 配方数学本体逐位对照（不依赖小米样张）；风格锚点 = 网络样张集指纹表（用户无小米实机）。

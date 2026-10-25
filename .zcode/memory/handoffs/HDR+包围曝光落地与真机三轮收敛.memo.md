@@ -2,7 +2,7 @@
 summary: HDR+包围曝光落地与真机三轮收敛
 created: 2026-10-24 22:00
 updated: 2026-10-24 22:00
-status: active
+status: absorbed
 ---
 
 # HDR+ 包围曝光落地与真机三轮收敛

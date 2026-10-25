@@ -117,3 +117,12 @@ status: active
 - [2026-10-24] **PC HDR 两套体系（10-24 晚重查）**：YUV bracket（`shouldUseJpgMaxHdrCapture` 有 `!isRawCapture` 门槛）= 0EV×N 堆叠 + 侧帧各 1 直通 + Mertens（`GlesYuvStacker.kt:3451`：highlightValidity 0.960/0.995、deghost 黑门 0.055~0.145 白门 0.865~0.975、census、referenceStructure；三级归一回退）；**RAW 模式** = `RawmaxExposurePlanner`（实测曝光中位数分组 base/normal/short/long）+ `processBurstRaw` 全帧进 MGC 融合（`enableHdrFusion`、`supportsBracketExposure`）+ HDR 参考场（RawHdrReferencePass，HDR/SDR 比值）。**帧数 = 多帧设置数 + 2**（`resolveHdrBracketZeroEvFrameCount`），提帧数只提 0EV 降噪。
 - [2026-10-24] **我们的 HDR+ 包围曝光（P3 定稿）**：帧序 0/0/+2.2/−1.5（`HdrBracketConfig` 常量 HDR_LONG_EV=2.2/HDR_SHORT_EV=−1.5/HDR_LONG_MAX_SHUTTER_NS=10ms）；`planBracketExposure` 照抄 PC planManualExposure；**侧帧 ISO 钳模拟顶 3200**；引擎 frame_scale[i]=2^−ev[i] 全帧进对齐+DFT（satW 饱和权重接管高光、mismatch 拒运动）；per-frame σ²=A·s·x′+B·(gr·s)²；日志 `hdrFs[]`（归一系数）/`bracket.actual`（实测 EV+sat）；JNI `hdrEv/hdrGainArr/hdrHighIdx`。0.12.84 UI 两档化默认开，旧 bracket 退役。
 - [2026-10-24] **gainmap 中灰基线 1.1**（`FrameRenderer.cpp:7094`）从 SDR base 反推、无长帧参考；PC gainmap 是真实 +2.2EV 数据 ⇒ P4 改造点。
+
+## P4 基线与徕卡调研（10-25）
+
+- [2026-10-25] **`tools/hdr-baseline-eval.py`**：JPEG/R 无损解析（MPF 对照 vendored libultrahdr）+ base/gainmap/HDR 重建统计（重建 = 官方 applyGain，gamma=1、W=1 满档）；`--json` 可复跑。报告 `docs/reports/hdr-baseline-20261025-REPORT.md` + json。
+- [2026-10-25] **P4 现状（0.12.85+）**：`kFsGainmap` 三档（0=真实比值默认 / 1=旧 sceneY 塑形 / 2=官方公式）；`gainTrue` = hdrY×(0.1845/ae_p50_) ÷ sdrY，clamp[1,4]；新 uniform `uSceneMid`（ae_p50_ 同 submit 下发）；prefs `gainmap_math` 三档循环（迁移 1→2）。
+- [2026-10-25] **旧版 gainmap 指纹（已被取代）**：`ratioFromScene = clamp(max(1.1, sceneY×1.6), 1.1, 2.5)`（SDR base 不参与）；码值 136 针 96.5%、212 针 2.5 封顶；0.12.85 后 = 128 针（ratio=1）、255 针（4x 顶格）。
+- [2026-10-25] **PC M9 配方（徕卡一瞬对标的一手）**：`/tmp/pc-full/app/src/main/assets/leica/m9/`（m9-1_216.upd 固件提取，manifest 审计链 + SHA256）；`PROCESS/LUTS.bin` 427KB = 20×2048 曲线 + R≥G 分支双 3×3 矩阵（行和=1，matrixIndex=cs×5+sat）+ 双光源标定（illum 17/21）；实现 `LeicaProfile.kt`。矩阵已解码，**曲线域语义不明**。
+- [2026-10-25] **M9 彩色指纹库**：`docs/research/leica-m9-samples/`（11 彩色 + 8 黑白，IT之家/爱范儿网络样张）；指纹 = p25≈21、p95 中位 165、≥240 中位 0.1%、色彩像素 C*P90 中位 24.5（暗部也带色）、色相双向（30~90° 暖 + 240~270° 青蓝）。
+- [2026-10-25] **方向锁**：MainActivity `screenOrientation="portrait"`（0.12.86 起）；UI autoRotate（PhotonCamera 式）未立项前窗口恒竖。
