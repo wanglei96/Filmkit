@@ -6,7 +6,7 @@
     "group": "徕卡",
     "favorite": false,
     "source": "builtin",
-    "note": "Leica M9 CCD 风格 · 高对比正片感 · 细颗粒",
+    "note": "Leica M9 CCD 风格 · 固件配方色彩矩阵 LUT · 影调待逐槽重标",
     "params": {
       "contrast": 1.03,
       "shoulder[0]": 0.5278,
@@ -27,7 +27,7 @@
       "vignette_radius": 85.0,
       "vignette_feather": 55.0
     },
-    "lut": { "id": "leica_m9", "strength": 0.3085 }
+    "lut": { "id": "leica_m9_ccd", "strength": 1.0 }
   },
   {
     "schema": 2,

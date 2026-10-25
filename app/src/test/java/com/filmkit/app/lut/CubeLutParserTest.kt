@@ -179,8 +179,10 @@ class CubeLutParserTest {
         for (f in files) {
             val bytes = f.readBytes()
             val l = CubeLutParser.parseBinary(bytes, f.name)
-            assertEquals(f.name, 33, l.size)
-            assertEquals(f.name, 33 * 33 * 33 * 3, l.data.size)
+            // 33³ 为主；leica_m9_ccd 是首个 64³ 资产（调研 19 号定案，2026-10-25）
+            val expectedSize = if (f.name == "leica_m9_ccd.lut") 64 else 33
+            assertEquals(f.name, expectedSize, l.size)
+            assertEquals(f.name, expectedSize * expectedSize * expectedSize * 3, l.data.size)
             // 只做"资产没坏"的通用检查：端点阈值本质是风格假设，会误报
             // （Fuji-ACROS 白点 0.835、Kodak-5203 首点 R 0.118 = 电影负片抬黑）。
             // "不是常数"足以抓住全零/截断的坏文件。

@@ -93,7 +93,8 @@ class BuiltinPresetsTest {
         val m9 = preset("builtin_leica_m9")
         assertEquals("徕卡一瞬", m9.name)
         assertEquals("徕卡", m9.group)
-        assertEquals("leica_m9", m9.lutId)
+        // 2026-10-25 徕卡一瞬一期：固件配方烘焙 LUT（tools/bake-m9-lut.py）
+        assertEquals("leica_m9_ccd", m9.lutId)
 
         val ricoh = preset("builtin_ricoh_negative")
         assertEquals("理光负片", ricoh.name)
@@ -106,13 +107,13 @@ class BuiltinPresetsTest {
         assertEquals("leica_b_w_hc", bw.lutId)
 
         // ★ R-3：白点提到 4.0（死白起点 3.55EV）+ 在 `--hi-floor 3.5` 约束下重拟合。
-        //   LUT 强度仍是**拟合的自由维度**，但受 R-1c 裁决 1 的下限 0.30 约束（不接受 0）：
-        //   理由：`lut_strength = 0` 意味着这条预设只剩**影调**，而 M9 的色彩特征（红色浓、
-        //   蓝绿偏青、品红倾向）是**色相选择性**的偏移 —— 只有 3D LUT 能表达，
-        //   `saturation` / `split` / `tint` / WB 增益都做不到。归零 ⇒ 预设名不副实。
+        //   R-1c 裁决 1（LUT 不许归零）的本意仍然成立：色彩特征只有 3D LUT 能表达。
+        //   ★ 2026-10-25 徕卡一瞬一期：M9 换固件配方烘焙 LUT leica_m9_ccd —— 纯色彩
+        //   矩阵（行和=1 中性恒等、影调归 filmic），满强度 = 配方原意；旧 leica_m9 的
+        //   0.3085 是"影调斜率 1.19 与 filmic 抢职责、只能低强度混合"的旧账，不再适用。
         //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
         //   "不死白 vs 高光软肩"两套方案的数据）。
-        assertEquals("builtin_leica_m9 的 LUT 强度（贴下限）", 0.3085, preset("builtin_leica_m9").lutStrength, 0.0)
+        assertEquals("builtin_leica_m9 的 LUT 强度（色彩 LUT 满强度）", 1.0, preset("builtin_leica_m9").lutStrength, 0.0)
         assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
             "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
@@ -218,11 +219,14 @@ class BuiltinPresetsTest {
     fun everyReferencedLutAssetExistsAndIsReadable() {
         val expectedTitle = mapOf(
             "leica_m9" to "徕卡 M9",
+            // 2026-10-25 徕卡一瞬一期重标：固件配方烘焙 LUT（tools/bake-m9-lut.py）
+            "leica_m9_ccd" to "徕卡 M9 CCD",
             "ricoh_negative" to "理光 负片",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
             "leica_m9" to "徕卡",
+            "leica_m9_ccd" to "徕卡",
             "ricoh_negative" to "理光",
             "leica_b_w_hc" to "徕卡",
         )
@@ -234,7 +238,9 @@ class BuiltinPresetsTest {
 
             val lut = CubeLutParser.parseBinary(bytes, fallbackTitle = lutId)
             assertEquals("$lutId 的 TITLE", expectedTitle[lutId], lut.title)
-            assertEquals("$lutId 的 LUT_3D_SIZE", 33, lut.size)
+            // 33³ 为主；leica_m9_ccd 是首个 64³ 资产（调研 19 号定案：分支矩阵色彩
+            // 映射在暖肤色/饱和区 64³ 更稳，引擎 MAX_SIZE=128 支持）
+            assertEquals("$lutId 的 LUT_3D_SIZE", if (lutId == "leica_m9_ccd") 64 else 33, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF
