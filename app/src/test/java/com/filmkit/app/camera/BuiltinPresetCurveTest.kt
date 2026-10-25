@@ -60,8 +60,10 @@ class BuiltinPresetCurveTest {
 
     // ──────────────────────────────────────────────── 目标曲线（★ 唯一维护点）
     private val targets: Map<String, List<Pair<Int, Double>>> = mapOf(
+        // 2026-10-25 二版：暗部保 M9（黑位紧），中高段回 0.12.87 前拍照链输出
+        // （真机"太亮"反馈，p50 +9.3 由 M9 中高段提亮所致）
         "builtin_leica_m9" to listOf(
-            52 to 28.6, 85 to 71.8, 122 to 122.1, 160 to 169.2, 200 to 205.9, 243 to 233.4,
+            52 to 28.6, 85 to 71.8, 122 to 122.1, 160 to 157.9, 200 to 191.3, 243 to 219.5,
         ),
         "builtin_ricoh_negative" to listOf(
             40 to 42.7, 60 to 64.8, 80 to 86.4, 100 to 109.1, 120 to 131.1, 145 to 157.8,
@@ -128,7 +130,8 @@ class BuiltinPresetCurveTest {
         //   代价 = 编辑器链 21.5（高光段双重影调口径的已知偏差）。死白起点判据
         //   （EV∈[3.5,white] 需 >1 LSB 层次）与 M9 目标曲线"高光压缩狠"直接冲突，
         //   以真机指纹为准：≥240 占比 0.02%（无死白），探针冲突记账不阻塞。
-        "builtin_leica_m9" to 21.7,
+        // 二版：编辑器链 35.4（双重影调口径记账），拍照链 3.13
+        "builtin_leica_m9" to 35.6,
         "builtin_ricoh_negative" to 17.8,
         "builtin_leica_bw" to 13.1,
     )
