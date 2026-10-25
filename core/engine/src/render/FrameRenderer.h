@@ -1551,9 +1551,9 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1, side_k = -1, chroma_min = -1, peak_k = -1;
   } u_cs_;
-  // HDR gainmap（v0.11.50）
+  // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid）
   struct {
-    GLint hdr = -1, sdr = -1, src_size = -1, math = -1;
+    GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1;
   } u_gainmap_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {

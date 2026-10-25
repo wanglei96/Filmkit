@@ -228,31 +228,32 @@ fun SettingsScreen(
                     )
                 },
             )
-            // ── gainmap 数学版本（v0.11.50，真机 A/B 入口）──────────────────
-            // 只在 HDR 开启时有意义。两版**最终都归一化到固定 [0.25, 4.0]**，
-            // 差异只在 offset（1e-4 vs 1e-7）与暗部钳位方式。
+            // ── gainmap 数学版本（v0.11.50 建档；v0.12.85 起 P4 三档，真机 A/B 入口）──
+            // 只在 HDR 开启时有意义。都归一化到固定 [0.25, 4.0] 的 8bit 码值。
             if (hdrOn) {
                 var gmMath by rememberSaveable {
                     mutableStateOf(prefs.getInt("gainmap_math", 0))
                 }
                 SettingValueRow(
                     title = "gainmap 数学",
-                    subtitle = if (gmMath == 0) {
-                        "PhotonCamera 版：offset 1e-4，靠垫高分母抑制暗部噪声。" +
-                            "与 PC 成片同口径（默认）"
-                    } else {
-                        "libultrahdr 官方版：offset 1e-7 + 暗部 gain 钳 ≤2.3（硬钳位）。" +
-                            "暗部更容易放大噪声，但高光表达更贴近原始比值"
+                    subtitle = when (gmMath) {
+                        0 -> "真实跨曝光比值：融合参考（含 +2.2EV 长帧）÷ SDR base，" +
+                            "中灰自锚定恒 1、高光顶格 4x（PC 同款语义，默认）"
+                        1 -> "旧 sceneY 塑形：中灰 1.1 平台 + ×1.6、封顶 2.5（0.12.21 形态，" +
+                            "A/B 对照用）"
+                        else -> "官方公式（同塑形 + 暗部钳 2.3）：从未默认，留作对照"
                     },
-                    valueText = if (gmMath == 0) "PC" else "官方",
+                    valueText = if (gmMath == 0) "真实" else if (gmMath == 1) "旧版" else "官方",
                     onTap = {
-                        val v = if (gmMath == 0) 1 else 0
+                        val v = (gmMath + 1) % 3
                         gmMath = v
                         prefs.edit().putInt("gainmap_math", v).apply()
                         EngineBridge.nativeSetGainmapMath(v)
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_INFO, "app", "settings.gainmap_math",
-                            "{\"mode\":$v,\"name\":\"" + (if (v == 0) "pc" else "official") + "\"}",
+                            "{\"mode\":$v,\"name\":\"" +
+                                (if (v == 0) "true" else if (v == 1) "legacy" else "official") +
+                                "\"}",
                         )
                     },
                 )

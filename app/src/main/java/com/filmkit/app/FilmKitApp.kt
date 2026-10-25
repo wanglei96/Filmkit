@@ -26,10 +26,17 @@ class FilmKitApp : Application() {
         val dir = (getExternalFilesDir("logs") ?: File(filesDir, "logs")).absolutePath
         File(dir).mkdirs()
         EngineBridge.nativeInitLogger(dir)
-        // gainmap 数学版本（v0.11.50）：native 侧是进程级原子变量，重启后归 0，
-        // 必须按 prefs 恢复 —— 否则用户选了"官方"、重开 App 又变回 PC（静默行为漂移）。
+        // gainmap 数学版本（v0.11.50 建档）：native 侧是进程级原子变量，重启后归 0，
+        // 必须按 prefs 恢复 —— 否则用户选了非默认档、重开 App 又变回默认（静默行为漂移）。
+        // v0.12.85 起 0=真实比值 / 1=旧 sceneY 塑形 / 2=官方公式；旧 prefs 里存过 1 的
+        //（=旧"官方"档）迁移到 2，避免落在语义已变的"旧塑形"档上。
         runCatching {
-            val mode = getSharedPreferences("filmkit", 0).getInt("gainmap_math", 0)
+            val prefsGm = getSharedPreferences("filmkit", 0)
+            var mode = prefsGm.getInt("gainmap_math", 0)
+            if (!prefsGm.getBoolean("gainmap_math_v2", false) && mode == 1) {
+                mode = 2
+                prefsGm.edit().putInt("gainmap_math", mode).putBoolean("gainmap_math_v2", true).apply()
+            }
             EngineBridge.nativeSetGainmapMath(mode)
         }
         // 自动曝光（v0.11.61）：同样是进程级原子变量，按 prefs 恢复。默认开。

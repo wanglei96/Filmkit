@@ -7249,13 +7249,17 @@ layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uHdr;    // tex_scene_：Rec.2020 线性（D4）
 uniform highp sampler2D uSdr;    // tex_cap_：sRGB 已编码（D5，RGBA8）
 uniform vec2 uSrcSize;           // 全分辨率尺寸（px）
-// gainmap 数学版本（v0.11.50，**运行时切换**，供真机 A/B）：
-//   0 = PhotonCamera 版（offset 1e-4，靠 offset 垫高分母抑制暗部）
-//   1 = libultrahdr 官方版（offset 1e-7 + 暗部 sdr<2/255 时钳 gain≤2.3）
-// 两版**最终都归一化到固定 [0.25, 4.0]**（官方"自适应范围"需要两遍扫描，本 pass 单遍
-// 做不到；且离线实测自适应范围在无高光场景会把 8bit 码值浪费在极窄区间）。
-// 差异只在 offset 与暗部钳位 —— 这正是离线 A/B 里唯一剩下的分歧点。
+// gainmap 数学版本（v0.12.85 起 **三档**，运行时切换）：
+//   0 = **P4 真实跨曝光比值**（新默认）：hdrAligned/sdrY，中灰自锚定（见 gainTrue 注释）
+//   1 = 旧 PhotonCamera 塑形版（0.11.90→0.12.21 的 sceneY 纯函数：中灰 1.1 + ×1.6 + 2.5 封顶）
+//   2 = libultrahdr 官方版公式（同旧版塑形 + 暗部 sdr<2/255 钳 2.3；从未默认过，留作对照）
+// 基线证据（docs/reports/hdr-baseline-20261025-REPORT.md）：旧版 gainmap p90 恒 0.533
+//（=1.10x 中灰平台）、8bit 码值 136 占 96.5%、码值 212 钉死 2.5 封顶 —— 8bit 码值空间
+// 浪费 ~70%，且高光增益到不了元数据声称的 4.0；PC 是真实比值（p90 顶格 4x）。
+// 两版旧数学**最终都归一化到固定 [0.25, 4.0]**（官方"自适应范围"需要两遍扫描，本 pass
+// 单遍做不到；且离线实测自适应范围在无高光场景会把 8bit 码值浪费在极窄区间）。
 uniform int uGainmapMath;
+uniform float uSceneMid;         // P4：本张 scene 域中灰实测（ae_p50_，与 uHdr 同一 film_src 测得）
 const int kDS = 2;               // 下采样倍数（= PC RawGainmapMath.DOWNSAMPLE）
 const float kMin = 0.25;         // PC MIN_GAIN_RATIO
 const float kMax = 4.0;          // PC MAX_GAIN_RATIO
@@ -7290,6 +7294,27 @@ float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // 既看得出 HDR，又不会被 clip 成白。
 float ratioFromScene(float sceneY) {
     return clamp(max(1.1, sceneY * 1.6), 1.1, 2.5);
+}
+// ── P4（0.12.85）：真实跨曝光比值 ─────────────────────────────────────────────
+// 旧版（=1/2 档）的 ratio 是 sceneY 的纯函数，SDR base 不参与 —— 基线实测
+//（docs/reports/hdr-baseline-20261025-REPORT.md）：p90 恒 0.533（1.10x 平台）、
+// 码值 136 占 96.5%、码值 212 钉死 2.5 封顶；PC 是真实比值（p90 顶格 4x）。
+// 关键是**中灰自锚定**（0.11.74 的教训：uHdr 域中灰 ≈0.072 与显示域 0.1845 差
+// −1.36EV，直接相除全图 ratio×0.39 → 整张发灰）：uSceneMid = 本张 ae_p50_（与
+// uHdr 同一 film_src 测得、随曝光自适应），把 scene 域按它折到显示域尺度后相除，
+// 中灰像素 ratio 恒 = 1，锚定不随曝光策略漂。
+// 边界：clamp [1.0, 4.0] —— 下限 1 = UltraHDR 语义"HDR 相对 base 只会更亮"（暗部
+// 零放大，旧版 offset 暗部陷阱一并消失）；上限 4 = 元数据 kMax（PC 同款顶格）。
+// ⚠ 上限 4 与 5619"天空灰白"：真实比值下 4x 只在小面积高光核心顶格（天空 ratio
+// 连续 1~4x，随 ae_p50_ 自适应），且 base 比 0.11.90 时代暗 —— 但未真机证实前不算
+// 数：A/B 档（=1）保留，若复现预案 = kHdrCeil 软限（HDR 亮度 ≤ 2×SDR 白，按 sdrY
+// 收上限，不全局砍）。
+float gainTrue(float sdrLin, float hdrLin) {
+    const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
+    float mid = max(uSceneMid, 1e-4);
+    float hdrAligned = hdrLin * (kDispMid / mid);
+    float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), 1.0, kMax);
+    return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
 float gainPc(float sdrLin, float hdrLin) {
     float ratio = clamp(ratioFromScene(hdrLin), kMin, kMax);
@@ -7338,7 +7363,9 @@ void main() {
     float hdrY = hdrSum / n;
     // sdrY 是**线性** luma（上面已反过 OETF）—— 两版都吃线性域
     float sdrY = sdrSum / n;
-    float v = (uGainmapMath == 0) ? gainPc(sdrY, hdrY) : gainOfficial(sdrY, hdrY);
+    float v = (uGainmapMath == 0) ? gainTrue(sdrY, hdrY)
+            : (uGainmapMath == 1) ? gainPc(sdrY, hdrY)
+                                  : gainOfficial(sdrY, hdrY);
     oColor = vec4(v, v, v, 1.0);
 }
 )";
@@ -7988,6 +8015,7 @@ bool FrameRenderer::init() {
     u_gainmap_.sdr = glGetUniformLocation(prog_gainmap_, "uSdr");
     u_gainmap_.src_size = glGetUniformLocation(prog_gainmap_, "uSrcSize");
     u_gainmap_.math = glGetUniformLocation(prog_gainmap_, "uGainmapMath");
+    u_gainmap_.scene_mid = glGetUniformLocation(prog_gainmap_, "uSceneMid");
   }
   // HDR 曝光融合 P2（0.12.77）：同 gainmap 的可选处理 —— link/编译失败只记日志
   // 置 0，passHdrMertens 直接返回（成片 = zero 链，J10 语义），不拖死引擎。
@@ -11175,6 +11203,10 @@ bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex) {
   glUniform1i(u_gainmap_.sdr, 1);
   glUniform2f(u_gainmap_.src_size, static_cast<float>(w), static_cast<float>(h));
   glUniform1i(u_gainmap_.math, g_gainmap_math.load());
+  // P4：scene 域中灰锚（本张 ae_p50_，与 uHdr=同一 film_src 测得；9593 在 passFilm 前赋值、
+  // 这里在其后使用 ⇒ 同一次 submit 内先写后读，无跨张时序）。预览链不跑 gainmap，
+  // ae_p50_ 恒 0 的路径不存在；兜底钳到 1e-4（纯黑场景）。
+  glUniform1f(u_gainmap_.scene_mid, std::max(ae_p50_, 1e-4f));
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
