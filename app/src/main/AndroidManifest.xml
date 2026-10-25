@@ -39,11 +39,16 @@
         android:largeHeap="true"
         android:supportsRtl="true">
 
-        <!-- configChanges：窗口方向由相机页按**设备物理姿态**主动设置（见 CameraScreen 的
-             requestedOrientation）。必须自行处理方向变化，否则每次横竖切换都会重建 Activity
-             → 相机 session 被拆掉重开（黑屏/卡顿）。 -->
+        <!-- 锁竖窗（0.12.86）：v0.6.44 定案"窗口不主动转"——GL 渲染器收设备旋转、
+             成片方向跟 orientationStep，但该设计一直依赖"窗口恒竖"的隐式前提：
+             此前既无 requestedOrientation 也无 screenOrientation，系统"自动旋转"
+             开启时窗口被转横 ⇒ 取景框跟随 LocalConfiguration 翻成横 4:3、而整条
+             渲染链（STMatrix/dstW/dstH/预览变换）按竖窗设计 ⇒ 预览压扁变形
+            （0.12.85 真机实锤）。UI autoRotate 方案（照抄 PhotonCamera）落地前，
+             窗口必须锁死。configChanges 保留：锁死后方向 config 不再变化，无害。 -->
         <activity
             android:name=".MainActivity"
+            android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true">
             <intent-filter>
