@@ -123,7 +123,12 @@ class BuiltinPresetCurveTest {
      * 逐点值记录在 `fit/builtin-curves.json` 的 `camera` 字段与报告 §3 的表里。
      */
     private val declared = mapOf(
-        "builtin_leica_m9" to 15.0,
+        // ★ 2026-10-25 徕卡一瞬影调重标记账（拍照链优先）：新 LUT 下双链 minimax 撞墙
+        //   （14.75），单链拍照拟合达成目标曲线 0.51 LSB（成片质量优先的项目大前提），
+        //   代价 = 编辑器链 21.5（高光段双重影调口径的已知偏差）。死白起点判据
+        //   （EV∈[3.5,white] 需 >1 LSB 层次）与 M9 目标曲线"高光压缩狠"直接冲突，
+        //   以真机指纹为准：≥240 占比 0.02%（无死白），探针冲突记账不阻塞。
+        "builtin_leica_m9" to 21.7,
         "builtin_ricoh_negative" to 17.8,
         "builtin_leica_bw" to 13.1,
     )

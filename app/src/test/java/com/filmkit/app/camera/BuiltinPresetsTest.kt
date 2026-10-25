@@ -143,20 +143,21 @@ class BuiltinPresetsTest {
 
     @Test
     fun leicaM9RecipeMatchesSpec() {
-        // ★ R-3：白点 [38] 2.7471 → **4.0**（死白起点 2.60 → 3.55EV），并在 `--hi-floor 3.5`
-        // 约束下重拟合 [4][5..10][37][38][34]（`--lat-split` 解耦 shoulder/toe）；颗粒/暗角不动。
+        // ★ 2026-10-25 影调重标（新 LUT 下单链拍照拟合 `--mode camera --white-ev 4.0`）：
+        //   成片链残差 14.75 → **0.51 LSB**（目标曲线逐位达成）；编辑器链 21.5 记账
+        //   （declared 21.7，拍照链优先）。白点 [38] 保持 R-3 的 4.0；颗粒/暗角/饱和不动。
         assertRecipe(
             "builtin_leica_m9",
             setOf(4, 5, 6, 7, 8, 9, 10, 20, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68),
-            4 to 1.03,       // contrast（R-3 重拟合）
-            5 to 0.5278, 6 to 0.4253, 7 to 0.5806,      // shoulder R/G/B
-            8 to 0.9219, 9 to 0.8216, 10 to 0.9488,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
+            4 to 1.362,     // contrast（2026-10-25 拍照链重拟合）
+            5 to 0.2758, 6 to 0.1577, 7 to 0.4512,      // shoulder R/G/B
+            8 to 0.0521, 9 to 0.0264, 10 to 0.3225,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
             20 to 1.15,     // sat_shadow（R-3：高光约束下重新分配分区饱和）
             21 to 1.0, 22 to 0.85,  // ⚠ [21] 拟合回恒等值 ⇒ **不进**稀疏 slots（显式声明，防"顺手补一条"）
             23 to 0.1, 24 to 0.05,  // 分离色调（原值：本条无 b* 目标，不搜这两维）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
-            37 to -11.9726, 38 to 4.0,                  // filmic 黑白点（★ R-3：白点 = 4.0）
+            37 to -8.754, 38 to 4.0,                    // filmic 黑白点（★ 白点 = 4.0 不变）
             66 to -0.18,     // vignette_strength（负 = 暗角）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
