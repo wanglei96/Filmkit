@@ -16,11 +16,8 @@ status: active
 - `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染线程）+ StillRenderClient（拍照渲染线程，v0.10.85）+ CameraAudit + `camera/StdColorMatrix.kt`（DNG 标准链）+ `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=99**）
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/（EglCore/Capabilities）、spike/（SpikeFftMerge）、log/（JSONL+GPU 计时）、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`（阶段 0 骨架）
 - `docs/`：开发计划（§0 需求基线 D1–D13）、x300-能力审计.md、research/（12 个编号调研：PhotonCamera 管线 / darktable / RawTherapee / Blender AgX / ACES-libplacebo / 相机外观引擎 / filmulator / ISP 标准链与 AE·MFNR / 09=频域降噪 / 10=ARRI 引擎计划 + 内建编辑器与预设）
-- `app/src/main/assets/`：`luts/` 42 个内置 .lut（uint8、33³、4.3MB，格式 `[size][titleLen][title][catLen][category][data]`）+ `noise_models/` 三摄标定（GCam .c 格式）
-- `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
-
-## 进行中（2026-10-20）
-
+- `app/src/main/assets/`：`luts/` 43 个内置 .lut（42 个 33³ + 首个 64³ `leica_m9_ccd`）+ `noise_models/` 三摄标定（GCam .c 格式）
+- `tools/`：validate-shaders.sh、check-diag-fields.py（出包前必跑）、check-log-json.py（分析前先跑）、still-thread-verify.py+run.sh、align-bench、p0-subpixel-eval、ab-100pct、chroma-scale-eval、texture-fidelity-eval、denoise-strength-eval、check-fft-tile-cover、chroma-denoise-eval、tone-scan、gen-lut-assets、bake-m9-lut.py（M9 配方→LUT）、hdr-baseline-eval.py、dng-color-dump、color-metrics、ccm-chain-ab、check-srgb-oetf、check-lsc-mapping、lut-audit、tuning/
 
 ## 已收尾（10-13，相册与预设，详见快照）
 
@@ -38,7 +35,7 @@ status: active
 
 - [2026-10-13] **v0.11.15–0.11.26（10-11~10-13，相册 + 预设）**：相册 PV-1/2/3/4（切图转圈 → 上一张图闪现 → 缩放锚点）、预设 PS-3→PS-10 + PR-2 调研 + R-2/R-3 白点；`ParamControls.kt` 成为参数表单一来源；`CameraPresetFullEdit.kt` 新增二级页；全量 595 用例 0 失败；包 `filmkit-0.11.26.apk`（375）。**交互方向全部来自四家开源调研，不再自拟**
 
-- [2026-10-08] **v0.10.182–209（10-08，边缘彩边专项）**：`[59]` color_smooth（darktable color_smoothing 移植：色差域中值 → 后演化为"多尺度两侧一致性 + 局部色度峰 + 去饱和"）、前置到 PC3D 之前（v0.10.205）、判据定案 peakK=1.05/sideK=0.5/尺度[3,6,12]（v0.10.206/209）、替换策略去饱和（v0.10.209，修 208 的"搬背景色"）；kCount 60；**v0.10.196/197 事故**：FilmParams 数组长度 59→60 未同步 Kotlin ⇒ 启动崩溃；**v0.10.198**：GLSL 多行宏续行不生效 ⇒ 静默失效，改完全内联；**v0.10.200**：梯度门 20/50 致紫边大面积回归（真机判死）；提交 8577cd9 等，包 `filmkit-0.11.0.apk`
+- [2026-10-08] **边缘彩边专项（v0.10.182–209）**：`[59]` color_smooth 移植（判据 peakK=1.05/sideK=0.5/尺度[3,6,12]）；事故链见 lessons（数组长度未同步崩溃 / 多行宏失效 / 梯度门判死）；包 0.11.0。
 - [2026-10-07] **v0.10.178–181（10-06/07）**：`[56]` rcd_g_orig（P2/G 位回归原版开关）、`[57]` hl_rb_recon（HR 部分满阱反推）、`[58]` rcd_p3_split（P3 拆双 pass + 满阱钳）、`[54]` **替换档转正（默认 1）**；kCount 59；`docs/research/11-专项调研-紫边修复方案检索.md`；提交 2a67c42 / c7fef2d，包 `filmkit-0.10.181.apk`（320）
 - [2026-10-02/03] **曝光决策 + 降噪链 + 影调固定**：离线证明曝光 ×N 收益 = √N（真机 250ms 档 ISO167，噪声降到 1/3.1）；σ 恒真值 + 强度<1 走输出 mix（修"亮部降噪近似归零"）；三摄 GCam 标定接入；NN 路线判死转 HDR+；高光保护（clipB 890→163）；影调白点 4 个互相干扰的旋钮全撤（标准模式唯一、固定 darktable 默认 −8/+4 EV）；曝光判据改用成片域 `sw999`
 - [2026-09-30] **对齐/P0 亚像素 + 性能收口**：最细对齐层 1/4→1/2 域 + 逐通道网格亚像素（同帧降噪 +43.7%/+46.5%，两者协同而非叠加）；A 专项 DFT 合并验收（根因 = imageStore 目标必须 `glTexStorage2D`）+ D-1 色度多尺度超 PC；快门间隔 2.5s→0.54s；拍照独立线程落地（同帧 A/B CRC32 逐字节等价）
@@ -47,25 +44,16 @@ status: active
 - [2026-09-18/20] **M0–M2 前半**：YUV 全链路（SurfaceTexture+OES 预览、全分辨率静拍）、M 档专业 UI、镜头发现与设置页、手动 WB = HAL 恒 AWB + 引擎侧补偿、变焦画质优先（±3% 迟滞）
 
 ## 品红/紫边与曝光（10-04 → 10-06，压缩）
-- [2026-10-06] **机理闭环**：品红带 = B−G 边缘过渡错位（RAW 干净、融合赦免、P0 缓解、RCD 类固有）；紫边 A 窄峰/B 台灯品红分治；`[54]` pc3d 替换档转正、`[56][57][58]` 默认关存档；`tools/purple-fringe-kpi.py` 落地 | handoffs/品红带机理闭环与替换档转正.memo.md
-- [2026-10-04] **曝光给足事故**：无饱和预算的给足在逆光窗 = RAW 饱和 4.2% + HR 品红洪水 + 白点失控——"曝光给足"类规则必须有饱和预算。
+- [2026-10-06] **机理闭环**：品红带 = B−G 边缘过渡错位（RCD 类固有）；紫边 A/B 分治、`[54]` 替换档转正、`[56][57][58]` 默认关；**"曝光给足"类规则必须有饱和预算**（逆光窗事故）。
 
 ## 期 B：公共工作空间切 Rec.2020（10-19，压缩）
-- [2026-10-19] **期 B 落地 + 三处域错配修复**（`3fa65af`→`a3aedfe`，包 0.11.47~49）：filmic LMS 整组 + CCM 终点切 Rec.2020；输出端域收口；预览/静拍输入补 `srgbToWork`。16 个守卫全绿。
-- [2026-10-19] **真机验收通过②④**（饱和修正/[40] 隐藏/对比度）；**预览 vs 成片架构性差距不再挖**（根因 = 预览走厂商 ISP）。
-- [2026-10-19] **HEIC 编辑器显示异常未复现**（"一坨五颜六色" = 0.11.34 同款霓虹伪彩；`ui/ImageDecode.kt` 对 HEIC 无特判已排查），用户"有出现再说"。
-
-## 色相路线评估与 HDR 路线（10-19，压缩）
-- [2026-10-19] **ACES 2.0 与 Oklab L-only 均不做**（D5 域口径修正后无色相优势 / ΔE 恶化）；sigmoid 回滚。
-- [2026-10-19] **HDR 路线定案 = 按 PC 做**（libultrahdr `packageJpegR`，4:4:4 + gainmap；不做探针）。
+- [2026-10-19] **期 B 落地 + 三处域错配修复**（包 0.11.47~49）；真机验收通过②④；预览 vs 成片差距不再挖（预览走厂商 ISP）；HEIC 编辑器伪彩未复现（"有出现再说"）。
 
 ## HDR 交付（10-20，已真机验收，压缩）
-- [2026-10-20] **三条 HDR 路径落地**：JPEG 4:4:4（自研 stb base + libultrahdr）+ 4:2:0 与 HEIC（平台 API）；开关 `-DFILMKIT_HDR`；gainmap GPU 算（`kFsGainmap`，1/2 分辨率 8bit）。
-- [2026-10-20] **真机验收通过**（系统相册 + App 内查看 + 导出 SDR 版 `nativeExtractSdrBase`）。
-- [2026-10-20] **"高光顶白"归因自动曝光策略**（base 亮度 1.7~1.9×、≥240 6~9×，HDR 输出几乎相同）⇒ 单独开期（即后来的 P4）。
+- [2026-10-20] **三条路径落地 + 真机验收**（4:4:4/4:2:0/HEIC、`-DFILMKIT_HDR`、gainmap GPU 1/2 分辨率）；"高光顶白"归因自动曝光 ⇒ 后来的 P4。
 
-## 自动曝光（10-20 → 10-24 退役，压缩）
-- [2026-10-24] **渲染端 AE 全链退役**：0.11.59-64 的 `AeMetering` 与 `g_still_ae_ema` 在 0.12.71 全删 ⇒ 曝光 = HAL + planner + baseEv + 用户 EV，逐张独立；0.11.64 的「burst 超时误杀」修复保留。
+## 自动曝光退役（10-20 → 10-24，压缩）
+- [2026-10-24] **渲染端 AE 全链退役**（0.12.71 全删）⇒ 曝光 = HAL + planner + baseEv + 用户 EV；测光三档 + AF/AE 分离 + 长按锁定。细节见 decisions/facts。
 
 ## 高光链路收口（10-22，用户已真机验收）
 
@@ -117,3 +105,16 @@ status: active
 - [2026-10-24] **P0-P1 诊断与采集**：`bracket.actual`（每帧实测 EV + RAW 抽样统计）；帧序 0/0/+2.2/−1.5（PC buildHdrBracketEvOffsets 同构、参考帧恒帧 0、AE 全帧锁）；`planBracketExposure` 照抄 PC planManualExposure（正 EV 快门 10ms 顶、钳后 ISO 补偿）。
 - [2026-10-24] **P2 迭代后退役**：Mertens 侧帧直通（独立前链→D4→kFsHdrMertens，权重照抄 PC）三轮真机四坑（侧帧链跑 zero 数据、ISO 14336 数字增益、角色自创判定、高光斑块）→ 结构性不足（单帧 ISO 3200 读噪声 10×zero 且无时域）。
 - [2026-10-24] **P3 架构对齐 PC RAW（定稿）**：4 帧原样进引擎，frame_scale[i]=2^−ev[i] 归一，全部进对齐+DFT 跨曝光堆叠（复用 satW 饱和权重/mismatch；零新 shader）；0.12.83 per-frame σ（B×(gr·s)²，长帧 gr≈9.3 不修则整帧回退）；0.12.84 UI 两档化（旧 bracket 开关删除、改名「HDR+ 包围曝光」默认开）。真机确认：hdrFs/confMed 0.833/brkRatio 2.83。
+
+## 徕卡一瞬标定（10-25/26）
+
+- [2026-10-25] **一期色彩（0.12.87）**：`tools/bake-m9-lut.py` 把 PC 固件 M9 配方分支矩阵
+  烘焙为 64³ 纯色彩 LUT `leica_m9_ccd`（矩阵 Q13 行和=1 中性恒等；曲线不烘、影调归
+  filmic），预设换 LUT 满强度——真机验收通过（浓郁、无色带、C*P90 33 vs M9 ≈29）。
+- [2026-10-25] **影调重标三版**：双链 minimax 撞墙 14.75 → 单链拍照拟合 0.51（0.12.88）
+  → 真机"太亮/彩噪"（p50 +9.3）→ 目标改"暗部保 M9、中高段回旧观感"，重拟合 3.13 且
+  死白判据达标（0.12.89）；sat_shadow 回 1.0；编辑器链残差记账（declared 35.6）。
+- [2026-10-25] **发黄定性**：不是链路偏色（标准预设白墙中性），是 AWB 逐张波动 ±5~15
+  被 LUT 色度放大 ~2× 放大；色温槽 6500K = 恒等点（不锁 WB）。**治本 = WB 锁定机制
+  立项**（待拍板）；B 方案（曲线烘进 LUT）已被用户否决（不为预设改引擎）。
+- [2026-10-25] **待真机验收 0.12.89**：中间调亮度 / 黑位紧度 / 暗光彩噪三项。
