@@ -147,6 +147,7 @@ import com.filmkit.app.camera.effectivePresetEvOffset
 import com.filmkit.app.camera.mergePresets
 import com.filmkit.app.camera.presetDeletable
 import com.filmkit.app.camera.presetEvOffset
+import com.filmkit.app.camera.presetFilmicEvOf
 import com.filmkit.app.camera.presetLutAction
 import com.filmkit.app.camera.presetSlotsText
 import com.filmkit.app.camera.resolveCameraPreset
@@ -589,7 +590,7 @@ fun CameraScreen(
         // 判据读枚举属性（[PresetLutAction.clearsCurrentLut]），不在 UI 里重写一遍 —— 单测
         // 断言该属性就等于断言这里的行为。
         if (action.clearsCurrentLut) clearCameraLut()
-        controller.setFilmParams(cameraPresetParams(p), evOffset)
+        controller.setFilmParams(cameraPresetParams(p), evOffset, presetFilmicEvOf(p.slots))
         when (action) {
             PresetLutAction.APPLY -> lutEntry?.let { lutPending = it }
             // 裁决 ②：清空 + 明确提示。文案必须说清"当前 LUT 已被清掉"—— 只说"已不在库中"
@@ -619,6 +620,9 @@ fun CameraScreen(
                 "id" to p.id, "name" to p.name, "slots" to p.slots.size,
                 "slotsText" to presetSlotsText(p),
                 "evOffset" to evOffset,   // U-7：真机证据 —— 预设曝光偏移（叠加在用户 EV 上）
+                // 0.12.90：影调黑白点单独记 —— slotsText 只打前 8 个槽，验收时看不到
+                // [37]/[38]；冷启动丢参数那次就是靠这两行日志才定位到的。
+                "filmic" to "${p.slots[37]}/${p.slots[38]}",
                 "lut" to (p.lutId ?: ""), "lutAction" to action.name,
             ),
         )
@@ -660,6 +664,7 @@ fun CameraScreen(
         controller.setFilmParams(
             cameraPresetParams(selectedPreset, values, removed),
             effectivePresetEvOffset(selectedPreset.slots, values, removed),
+            presetFilmicEvOf(selectedPreset.slots, values, removed),
         )
     }
 
@@ -879,7 +884,11 @@ fun CameraScreen(
         // U-7：**冷启动偏移的恢复点** —— selectedPreset 由 prefs `camera_preset_id` 反查
         //（[resolveCameraPreset]：悬空 id 回退「标准」），偏移从它的 slots 重算 ⇒ 偏移与预设
         // 同生共死，**不需要第二个 prefs key**（预设被删 ⇒ 回退标准 ⇒ 偏移 0，不残留脏值）。
-        controller.setFilmParams(cameraPresetParams(selectedPreset), presetEvOffset(selectedPreset.slots))
+        controller.setFilmParams(
+            cameraPresetParams(selectedPreset),
+            presetEvOffset(selectedPreset.slots),
+            presetFilmicEvOf(selectedPreset.slots),
+        )
         controller.setShutterSound(soundOn)
         if (!evAuto) controller.setEv(ev)
         // 0.12.46：鲁棒测光开关是引擎侧 atomic，冷启动必须补一次（prefs 是唯一真源）。

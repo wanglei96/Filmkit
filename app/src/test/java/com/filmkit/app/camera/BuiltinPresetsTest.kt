@@ -113,7 +113,7 @@ class BuiltinPresetsTest {
         //   0.3085 是"影调斜率 1.19 与 filmic 抢职责、只能低强度混合"的旧账，不再适用。
         //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
         //   "不死白 vs 高光软肩"两套方案的数据）。
-        assertEquals("builtin_leica_m9 的 LUT 强度（色彩 LUT 满强度）", 1.0, preset("builtin_leica_m9").lutStrength, 0.0)
+        assertEquals("builtin_leica_m9 的 LUT 强度（0.12.90：高光层次约束下收到 0.9466）", 0.9466, preset("builtin_leica_m9").lutStrength, 0.0)
         assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
             "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
@@ -143,25 +143,27 @@ class BuiltinPresetsTest {
 
     @Test
     fun leicaM9RecipeMatchesSpec() {
-        // ★ 2026-10-25 影调重标二版（真机"太亮"反馈）：暗部两点保 M9、中高段三点回
-        //   0.12.87 前拍照链输出（157.9/191.3/219.5），单链拍照拟合残差 3.13 LSB，
-        //   死白起点判据同时达标（高光层次 1.56 > 1.0）。sat_shadow 回恒等 1.0
-        //   （暗部彩噪，真机 0.12.88 反馈）⇒ [20] 退出稀疏 slots。
+        // ★ 0.12.90 三版（真机"艳俗/不油润"反馈）：白点 4.0 → 4.2 + 高光层次判据
+        //   1.0 → 1.5 LSB（实测 8.80 LSB，修"高光发平"），黑点 −4.879 → −5.1725
+        //   （暗部更透气），单链拍照残差 3.06 LSB。分区饱和按拟合器的色度实测
+        //   （LUT 增益 1.53×）压到 暗 0.7 / 中 0.6 / 高 0.7；新增 sat_mid[21] /
+        //   temp_mired[88] / fade[94]（暖调 + 褪色 = "油润厚重"的低对比层）。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(4, 5, 6, 7, 8, 9, 10, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68),
-            4 to 1.188,     // contrast（2026-10-25 拍照链重拟合二版）
-            5 to 0.0256, 6 to 0.0132, 7 to 0.2632,      // shoulder R/G/B
-            8 to 0.227, 9 to 0.1371, 10 to 0.7798,      // toe R/G/B（★ R-3 起与 shoulder **解耦**）
-            20 to 1.0,      // ⚠ sat_shadow 回恒等 ⇒ **不进**稀疏 slots（暗部彩噪，真机拍板）
-            21 to 1.0, 22 to 0.85,  // ⚠ [21] 拟合回恒等值 ⇒ **不进**稀疏 slots（显式声明，防"顺手补一条"）
-            23 to 0.1, 24 to 0.05,  // 分离色调（原值：本条无 b* 目标，不搜这两维）
+            setOf(4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94),
+            4 to 1.1974,    // contrast（0.12.90 三版）
+            5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
+            8 to 0.2286, 9 to 0.1519, 10 to 0.7734,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
+            20 to 0.7, 21 to 0.6, 22 to 0.7,            // 分区饱和（0.12.90：LUT 色度增益 1.53× ⇒ 压回 1.0）
+            23 to 0.12, 24 to 0.04,     // 分离色调（暖调稍强）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
-            37 to -4.879, 38 to 4.0,                    // filmic 黑白点（★ 白点 = 4.0 不变）
-            66 to -0.18,     // vignette_strength（负 = 暗角）
+            37 to -5.1725, 38 to 4.2,                   // filmic 黑白点（★ 白点 4.0 → 4.2）
+            66 to -0.21,     // vignette_strength（负 = 暗角，略强）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
+            88 to 1.2,       // temp_mired（+1.2 mired，轻微暖偏色）
+            94 to 0.04,      // fade（提黑位，油润感）
         )
     }
 
@@ -289,7 +291,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("三条预设的参数键总数（R-3 拟合后：18 + 18 + 14）", 50, names.size)
+        assertEquals("三条预设的参数键总数（0.12.90 后：21 + 18 + 14）", 53, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

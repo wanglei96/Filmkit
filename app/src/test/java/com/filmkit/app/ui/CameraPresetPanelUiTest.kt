@@ -98,16 +98,16 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfLeicaMomentIsExact() {
         val p = builtin("徕卡一瞬")
-        assertEquals(17, p.slots.size)  // sat_shadow 回恒等 1.0（暗部彩噪）⇒ 退出稀疏 slots
+        assertEquals(21, p.slots.size)  // 0.12.90：新增 sat_mid / temp_mired / fade
         assertEquals(
-            // 2026-10-25 影调重标二版：sat_shadow 恒等退出，中高段回旧观感
-            "对比度 +19 · 饱和度 · 高光 -15 · 胶片曲线 · 肩部 红 0.03 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 100",
+            // 0.12.90 三版：分区饱和回到"不艳"（暗 -30/中 -40/高 -30）、暖调、LUT 95
+            "对比度 +20 · 饱和度 · 暗部 -30 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 95",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）
         assertTrue(
             "LUT 中文名要能替换掉 id",
-            presetSummaryText(p, lutLabel = "徕卡 M9 CCD").endsWith("LUT 徕卡 M9 CCD 100"),
+            presetSummaryText(p, lutLabel = "徕卡 M9 CCD").endsWith("LUT 徕卡 M9 CCD 95"),
         )
     }
 

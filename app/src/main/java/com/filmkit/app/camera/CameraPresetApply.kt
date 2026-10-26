@@ -174,6 +174,30 @@ internal fun effectivePresetEvOffset(
 ): Double = overrides[0] ?: if (0 in removed) 0.0 else presetEvOffset(slots)
 
 /**
+ * 0.12.90：预设**显式携带**的 filmic 黑白点（`[37]` 黑点 / `[38]` 白点）—— 供
+ * [com.filmkit.app.camera.CameraController.setFilmParams] 在冷启动/快门/burst 路径上保护
+ * 预设影调不被设置页 prefs 冲掉。
+ *
+ * 语义与 [effectivePresetEvOffset] 对齐：**overrides 优先**（拖动中的值），`removed` 视同
+ * "预设不含该字段"。任一缺失 ⇒ `null`（整对走设置页 prefs，不做"半套覆盖"—— 半套会让
+ * 黑点来自预设、白点来自 prefs，曲线形状无法解释）。
+ */
+internal fun presetFilmicEvOf(
+    slots: Map<Int, Double>,
+    overrides: Map<Int, Double> = emptyMap(),
+    removed: Set<Int> = emptySet(),
+): Pair<Double, Double>? {
+    fun pick(slot: Int): Double? = when {
+        overrides.containsKey(slot) -> overrides[slot]
+        slot in removed -> null
+        else -> slots[slot]
+    }
+    val b = pick(37) ?: return null
+    val w = pick(38) ?: return null
+    return b to w
+}
+
+/**
  * U-7：拍照侧 `[0]` 的**唯一算法** = 基准曝光 + 用户 EV + 预设偏移（方案 B 的"叠加而非覆盖"）。
  *
  * [CameraController] 的三处 `[0]` 计算全部走这里，一处都不能漏：

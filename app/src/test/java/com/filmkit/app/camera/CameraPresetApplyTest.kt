@@ -246,4 +246,34 @@ class CameraPresetApplyTest {
         assertEquals(0.4, effectiveExposureEv(0.7, -0.3, 0.0), 1e-12)
         assertEquals(0.0, effectiveExposureEv(0.0, 0.0, 0.0), 1e-12)
     }
+
+    // ── ⑧ 0.12.90：预设影调（`[37]/[38]` 黑白点）必须随预设存活 ──────────────
+    //
+    // 背景：`applyFilmicRangePrefs` 原来无条件以设置页 prefs 覆盖 `[37]/[38]` ⇒ 冷启动
+    // （相机重建 / Activity 重建）路径上会把预设的紧黑位冲回默认 —— 0.12.89 真机 3/4 张
+    // 就是这样跑错了影调（日志 `blackEv -7.80` 而非预设的 −4.879）。
+    // 本组钉"从预设提取黑白点"的口径；控制器侧的优先级由 `setFilmParams` 第三个实参承载。
+
+    @Test
+    fun presetWithBothFilmicEndpointsYieldsThePair() {
+        val ev = presetFilmicEvOf(mapOf(37 to -4.879, 38 to 4.0, 4 to 1.188))
+        assertEquals(-4.879, ev!!.first, 0.0)
+        assertEquals(4.0, ev.second, 0.0)
+    }
+
+    @Test
+    fun missingOneFilmicEndpointYieldsNull() {
+        assertNull("只有黑点 ⇒ 不做半套覆盖", presetFilmicEvOf(mapOf(37 to -4.879)))
+        assertNull("只有白点 ⇒ 同上", presetFilmicEvOf(mapOf(38 to 4.0)))
+        assertNull("标准 / 空 slots ⇒ null（走设置页 prefs）", presetFilmicEvOf(emptyMap()))
+    }
+
+    @Test
+    fun filmicOverridesBeatPresetAndRemovedMeansAbsent() {
+        val slots = mapOf(37 to -4.879, 38 to 4.0)
+        val dragged = presetFilmicEvOf(slots, overrides = mapOf(37 to -6.0, 38 to 4.8))
+        assertEquals(-6.0, dragged!!.first, 0.0)
+        assertEquals(4.8, dragged.second, 0.0)
+        assertNull("取消勾选白点 ⇒ 整对视为缺失", presetFilmicEvOf(slots, removed = setOf(38)))
+    }
 }

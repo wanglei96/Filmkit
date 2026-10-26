@@ -1321,7 +1321,13 @@ class CameraController(private val context: Context, private val render: RenderC
      *   套用把上次算出的绝对值当成新偏移 = 曝光翻倍）。显式参数让来源只有一个。
      *   ⚠ **无默认值**是有意的：漏传 = 编译错误，而不是静默丢掉预设曝光。
      */
-    fun setFilmParams(p: DoubleArray, evOffset: Double) {
+    /**
+     * @param presetFilmicEv 0.12.90：预设**显式携带**的 `[37]/[38]`（黑白点）。非 null 时
+     *   优先于设置页 prefs —— 否则冷启动路径上 [applyZebraPref] 里首次读取 prefs 会把预设
+     *   刚写进 `filmParams` 的紧黑位冲回默认值（0.12.89 真机 3/4 张因此跑错影调）。
+     *   预设不含黑白点时传 null（走 prefs）。
+     */
+    fun setFilmParams(p: DoubleArray, evOffset: Double, presetFilmicEv: Pair<Double, Double>? = null) {
         // E4-1 长度兜底（契约第四处，ADR-1）：短于 kCount 的数组**拒绝并记日志**，
         // 不抛异常 —— 本函数由预设切换（CameraScreen）直接调用，抛异常 = 相机页崩溃；
         // 保持旧参数只是"这次预设没生效"，可恢复（用户红线：失败不以丢照片为代价）。
@@ -1337,6 +1343,8 @@ class CameraController(private val context: Context, private val render: RenderC
         // U-7：**无条件覆盖**（不是"有值才更新"）⇒ 切到不含曝光的预设或「标准」时偏移
         // 必然归零，不会残留上一条预设的曝光（evOffset 已由 presetEvOffset 归一为 0.0）。
         presetEvOffset = evOffset
+        this.presetFilmicEv = presetFilmicEv
+        rangeApplyInited = false // 下一次 applyFilmicRangePrefs 用预设值（而非 prefs）
         filmParams = p
         // [0] = 基准曝光 + 用户 EV + 预设偏移：预设基线里是 0，换数组后必须回填，否则初始化
         // 序列会把曝光静默清零（v0.7.8 教训）。applyBaseEvPref 先把 prefs 的基准值灌进
@@ -1379,6 +1387,15 @@ class CameraController(private val context: Context, private val render: RenderC
     // filmic 黑白点（v0.7.6）：哨兵 = 未初始化（用户可配，默认 −7.65/+4.56 EV）
     private var filmicBlackPref = -999.0
     private var filmicWhitePref = -999.0
+    // 0.12.90：**预设携带的黑白点**（`[37]/[38]`）优先于设置页 prefs —— 预设的影调配方
+    // （如徕卡一瞬的紧黑位）必须冷启动后仍然生效。0.12.89 真机 3/4 张跑错影调就是这里：
+    // 引擎重建后 [applyZebraPref] 首次读 prefs，把预设刚写进 filmParams 的 −4.879/4.0
+    // 冲回 −7.80/4.56。用户改设置页滑杆（prefs 变化）时清除，回到"设置页覆盖"语义；
+    // 重新套用预设时由 [setFilmParams] 重新写入。
+    private var presetFilmicEv: Pair<Double, Double>? = null
+    private var prefsBlackSeen = Float.NaN
+    private var prefsWhiteSeen = Float.NaN
+    private var rangeApplyInited = false
     // 基准曝光偏置（v0.8.1，FilmParams[0] 的常量部分）：校正机型 AE 基准差。
     // 实测本机（X300）HAL 的 AE 比 PhotonCamera 策略暗 0.5–0.9 EV（室外 0.67 / 室内
     // 逆光 ~0.9）—— 影调引擎（filmic）只做映射、不产生曝光，这个差只能在校准层补。
@@ -1604,8 +1621,24 @@ class CameraController(private val context: Context, private val render: RenderC
         // 旧实现（v0.10.113 起）在标准模式下把两者硬编码成常量，设置页的「白点（多亮
         // 算白）」滑杆写了 prefs 却永远进不了引擎 —— 2026-10-03 真机 A/B 因此把
         // "影调层无影响"当成了结论（日志 whiteEv 恒 4.0，与滑杆值无关）。
-        val b = appPrefs.getFloat("filmic_black_ev", -8.0f).toDouble()
-        val w = appPrefs.getFloat("filmic_white_ev", 4.0f).toDouble()
+        //
+        // 0.12.90：**预设携带的 [37]/[38] 优先**（presetFilmicEv）。优先级：
+        //   ① 刚套用预设（rangeApplyInited=false）⇒ 用预设值；
+        //   ② 之后 prefs 没变 ⇒ 继续用预设值（相机重建 / 快门 / burst 反复调用都不丢）；
+        //   ③ 用户改了设置页滑杆（prefs 变化）⇒ 判为显式覆盖，清除预设值、改用 prefs。
+        val pb = appPrefs.getFloat("filmic_black_ev", -8.0f)
+        val pw = appPrefs.getFloat("filmic_white_ev", 4.0f)
+        val prefsChanged = pb != prefsBlackSeen || pw != prefsWhiteSeen
+        prefsBlackSeen = pb
+        prefsWhiteSeen = pw
+        val preset = presetFilmicEv
+        if (preset != null && rangeApplyInited && prefsChanged) {
+            presetFilmicEv = null // 用户显式改设置页 ⇒ 让设置页赢
+        }
+        val usePreset = preset != null && (!rangeApplyInited || !prefsChanged)
+        rangeApplyInited = true
+        val b = if (usePreset) preset!!.first else pb.toDouble()
+        val w = if (usePreset) preset!!.second else pw.toDouble()
         if (b != filmicBlackPref) {
             filmicBlackPref = b
             filmParams[37] = b
