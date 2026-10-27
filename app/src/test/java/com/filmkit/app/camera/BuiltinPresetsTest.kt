@@ -150,7 +150,7 @@ class BuiltinPresetsTest {
         //   temp_mired[88] / fade[94]（暖调 + 褪色 = "油润厚重"的低对比层）。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 62, 63, 64, 65, 66, 67, 68, 88, 94),
+            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94),
             0 to -0.3,       // ★ 0.12.92：M9 适度压暗（相对用户 EV 的偏移）
             4 to 1.1974,    // contrast（0.12.90 三版）
             5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
@@ -160,8 +160,7 @@ class BuiltinPresetsTest {
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
             37 to -5.1725, 38 to 4.2,                   // filmic 黑白点（★ 白点 4.0 → 4.2）
-            62 to 0.05, 63 to 0.85, 64 to 0.5, 65 to 0.55, // halation（0.12.95：减半，16:07 花色发淡）
-            66 to -0.24,     // vignette_strength（负 = 暗角，0.12.94 加深）
+            66 to -0.24,     // vignette_strength（负 = 暗角，0.12.94 质感层保留）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
             88 to 1.5,       // temp_mired（+1.5 mired，轻微暖偏色）
@@ -293,7 +292,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("三条预设的参数键总数（0.12.94 后：26 + 18 + 14）", 58, names.size)
+        assertEquals("三条预设的参数键总数（0.12.92 后：22 + 18 + 14）", 54, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",
