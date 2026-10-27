@@ -849,7 +849,19 @@ fun EditorScreen(
      * 「放弃本次修改？」（E2-24）—— 两条都是既有判据自动生效，本卡一行没改。
      */
     fun applyPreset(p: EditorPreset) {
-        val film = params ?: return
+        // ★ 0.12.91：**图片未就绪时不静默返回** —— `params == null` 时套用什么都不做，但详情页的
+        //   「套用」按钮有按压反馈 ⇒ 用户看到的是"表面成功"（真机 2026-10-27："相册图片还没
+        //   处理完时切换预设会失败"）。这里给出明确提示 + 一条 WARN 日志；UI 侧同时把按钮置灰
+        //   （[PresetDetailPanel] 的 applyEnabled = canSave）。
+        val film = params
+        if (film == null) {
+            status = "图片还在加载，请稍后再套用"
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_WARN, "app", "preset.apply.blocked",
+                kv("id" to p.id, "why" to "params_null"),
+            )
+            return
+        }
         val base = film.copyOf()          // ★ E3-1c：套用前快照（强度滑杆从它重算）
         val entry = p.lutId?.let { LutLibrary.byId(context, it) }
         // 记录"当前生效的预设"（强度滑杆的数据源）：①② 两个同步分支直接记；③ 带 LUT 的分支
@@ -3208,6 +3220,8 @@ private fun PresetPanel(
                 p = detail,
                 onBack = { detailId = null },
                 onApply = { onApply(detail) },
+                // ★ 0.12.91：图片未加载完（canSave=false）时「套用」置灰，不再"点了才静默失败"
+                applyEnabled = canSave,
                 // ★ PS-2b：删除保留（用户："可以删除"）；内置预设那枚按钮**不渲染**（P-2c 的纪律：
                 // 不做"点了才报错"），换成一句"内置预设 · 只读"。
                 onDelete = { pendingDelete = detail },
@@ -3641,6 +3655,8 @@ private fun PresetDetailPanel(
     onBack: () -> Unit,
     onApply: () -> Unit,
     onDelete: () -> Unit,
+    /** ★ 0.12.91：图片参数是否就绪（false ⇒ 「套用」置灰 + 文案，不静默失败） */
+    applyEnabled: Boolean = true,
 ) {
     val lut = presetLutLine(p)
     Column(
@@ -3701,15 +3717,19 @@ private fun PresetDetailPanel(
         ) {
             Text(
                 "套用",
-                color = FilmTheme.OnAccent,
+                color = if (applyEnabled) FilmTheme.OnAccent else DisabledInk,
                 fontSize = 12.sp,
                 maxLines = 1,
                 modifier = Modifier
                     .clip(RoundedCornerShape(9.dp))
-                    .background(FilmTheme.Accent)
-                    .pressScale(pressedScale = 0.94f, onTap = onApply)
+                    .background(if (applyEnabled) FilmTheme.Accent else FilmTheme.ChipBorder)
+                    .pressScale(pressedScale = 0.94f, enabled = applyEnabled, onTap = onApply)
                     .padding(horizontal = 12.dp, vertical = 6.dp),
             )
+            if (!applyEnabled) {
+                Spacer(Modifier.width(8.dp))
+                Text("图片加载中…", color = DisabledInk, fontSize = 11.sp, maxLines = 1)
+            }
             // ★ 只对 user 预设：判据复用 presetDeletable（内置只读）—— 内置详情里那枚按钮
             //   根本不渲染（与 PresetRow 的「内置」标记同一条纪律：不做"点了才报错"）
             if (presetDeletable(p)) {

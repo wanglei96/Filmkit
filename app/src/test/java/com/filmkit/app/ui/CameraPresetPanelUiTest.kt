@@ -100,8 +100,8 @@ class CameraPresetPanelUiTest {
         val p = builtin("徕卡一瞬")
         assertEquals(21, p.slots.size)  // 0.12.90：新增 sat_mid / temp_mired / fade
         assertEquals(
-            // 0.12.90 三版：分区饱和回到"不艳"（暗 -30/中 -40/高 -30）、暖调、LUT 95
-            "对比度 +20 · 饱和度 · 暗部 -30 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 95",
+            // 0.12.91：大晴天"不够浓"回归（暗 -22/中 -20/高 -18）、暖调、LUT 95
+            "对比度 +20 · 饱和度 · 暗部 -22 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 95",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）

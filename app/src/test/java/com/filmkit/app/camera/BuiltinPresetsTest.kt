@@ -154,7 +154,7 @@ class BuiltinPresetsTest {
             4 to 1.1974,    // contrast（0.12.90 三版）
             5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
             8 to 0.2286, 9 to 0.1519, 10 to 0.7734,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
-            20 to 0.7, 21 to 0.6, 22 to 0.7,            // 分区饱和（0.12.90：LUT 色度增益 1.53× ⇒ 压回 1.0）
+            20 to 0.78, 21 to 0.8, 22 to 0.82,          // 分区饱和（0.12.91：大晴天"不够浓"回归，中间调 0.6→0.8）
             23 to 0.12, 24 to 0.04,     // 分离色调（暖调稍强）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
