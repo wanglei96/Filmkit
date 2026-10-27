@@ -11013,16 +11013,7 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   //   uGRecon = 0（原版档）→ 启用 ③ 已统计出的 chrominance，补上"只抬 G 造成的色比失衡"
   //                        —— 0.12.2 关掉自创分支后仍出彩斑/绿天，缺的正是这一段。
   const float* hl_chroma = grecon ? kHlChromaOff : r.chroma;
-  // v0.12.97：**钳制加性色度补偿的幅度**。红色花瓣逆光高光实测 chroma R +0.2646 / B −0.258
-  //（2026-10-27 16:37 真机）—— 这是"全图池化比"算出的单一向量，在单色大面积高光上会
-  // 过度外推；配合 opposed 的 `max(v, ref + chroma)` 在花瓣纹理边缘留下灰/蓝色小点。
-  // 上限 0.12：保留"抬 G / 补色比"的作用，但不再把高光推到色相极端。
-  // 依据（同型历史）：0.12.14 的灰块就是"全局常数锚"在局部失效；这里同理限幅。
-  constexpr float kHlChromaMax = 0.12f;
-  const float hlc0 = std::clamp(hl_chroma[0], -kHlChromaMax, kHlChromaMax);
-  const float hlc1 = std::clamp(hl_chroma[1], -kHlChromaMax, kHlChromaMax);
-  const float hlc2 = std::clamp(hl_chroma[2], -kHlChromaMax, kHlChromaMax);
-  glUniform3f(u_hl_apply_.chroma, hlc0, hlc1, hlc2);
+  glUniform3f(u_hl_apply_.chroma, hl_chroma[0], hl_chroma[1], hl_chroma[2]);
   // G 通道色度重建（RAW 域，uGRecon=0 时 shader 内整段跳过 = 改动前行为逐位一致）。
   // uGCap 是重建值的上界（场景参考域，防参考色度场噪声把值推爆）。
   glActiveTexture(GL_TEXTURE2);
