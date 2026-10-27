@@ -113,7 +113,7 @@ class BuiltinPresetsTest {
         //   0.3085 是"影调斜率 1.19 与 filmic 抢职责、只能低强度混合"的旧账，不再适用。
         //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
         //   "不死白 vs 高光软肩"两套方案的数据）。
-        assertEquals("builtin_leica_m9 的 LUT 强度（0.12.90：高光层次约束下收到 0.9466）", 0.9466, preset("builtin_leica_m9").lutStrength, 0.0)
+        assertEquals("builtin_leica_m9 的 LUT 强度（0.12.92：压高反光荧光，收到 0.82）", 0.82, preset("builtin_leica_m9").lutStrength, 0.0)
         assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
             "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
@@ -150,11 +150,12 @@ class BuiltinPresetsTest {
         //   temp_mired[88] / fade[94]（暖调 + 褪色 = "油润厚重"的低对比层）。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94),
+            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94),
+            0 to -0.3,       // ★ 0.12.92：M9 适度压暗（相对用户 EV 的偏移）
             4 to 1.1974,    // contrast（0.12.90 三版）
             5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
             8 to 0.2286, 9 to 0.1519, 10 to 0.7734,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
-            20 to 0.78, 21 to 0.8, 22 to 0.82,          // 分区饱和（0.12.91：大晴天"不够浓"回归，中间调 0.6→0.8）
+            20 to 0.76, 21 to 0.76, 22 to 0.65,         // 分区饱和（0.12.92：高光收 0.65）
             23 to 0.12, 24 to 0.04,     // 分离色调（暖调稍强）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
@@ -162,7 +163,7 @@ class BuiltinPresetsTest {
             66 to -0.21,     // vignette_strength（负 = 暗角，略强）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
-            88 to 1.2,       // temp_mired（+1.2 mired，轻微暖偏色）
+            88 to 1.5,       // temp_mired（+1.5 mired，轻微暖偏色）
             94 to 0.04,      // fade（提黑位，油润感）
         )
     }
@@ -291,7 +292,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("三条预设的参数键总数（0.12.90 后：21 + 18 + 14）", 53, names.size)
+        assertEquals("三条预设的参数键总数（0.12.92 后：22 + 18 + 14）", 54, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

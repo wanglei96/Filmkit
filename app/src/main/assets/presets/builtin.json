@@ -15,14 +15,15 @@
       "toe[0]": 0.2286,
       "toe[1]": 0.1519,
       "toe[2]": 0.7734,
-      "sat_shadow": 0.78,
-      "sat_mid": 0.8,
-      "sat_high": 0.82,
+      "exposure_ev": -0.3,
+      "sat_shadow": 0.76,
+      "sat_mid": 0.76,
+      "sat_high": 0.65,
       "split_warm": 0.12,
       "split_cool": 0.04,
       "filmic_black_ev": -5.1725,
       "filmic_white_ev": 4.2,
-      "temp_mired": 1.2,
+      "temp_mired": 1.5,
       "fade": 0.04,
       "grain_amount": 20.0,
       "grain_size": 160.0,
@@ -30,7 +31,7 @@
       "vignette_radius": 85.0,
       "vignette_feather": 55.0
     },
-    "lut": { "id": "leica_m9_ccd", "strength": 0.9466 }
+    "lut": { "id": "leica_m9_ccd", "strength": 0.82 }
   },
   {
     "schema": 2,
