@@ -27,7 +27,11 @@
       "fade": 0.04,
       "grain_amount": 20.0,
       "grain_size": 160.0,
-      "vignette_strength": -0.21,
+      "halation_strength": 0.1,
+      "halation_threshold": 0.85,
+      "halation_radius": 0.5,
+      "halation_warmth": 0.55,
+      "vignette_strength": -0.24,
       "vignette_radius": 85.0,
       "vignette_feather": 55.0
     },

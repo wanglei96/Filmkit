@@ -98,7 +98,7 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfLeicaMomentIsExact() {
         val p = builtin("徕卡一瞬")
-        assertEquals(22, p.slots.size)  // 0.12.92：新增曝光 / sat_mid / temp_mired / fade
+        assertEquals(26, p.slots.size)  // 0.12.94：+ 光晕 4 槽（暗角 −0.24）
         assertEquals(
             // 0.12.92：M9 适度压暗（−0.3 EV）+ 暗 -24/中 -24/高 -35 + LUT 75
             "曝光 -0.3 EV · 饱和度 · 暗部 -24 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
