@@ -35,7 +35,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = "/tmp/pc-full/app/src/main/assets/leica/m9/PROCESS/LUTS.bin"
 OUT = os.path.join(ROOT, "app/src/main/assets/luts/leica_m9_ccd.lut")
-SIZE = 64
+SIZE = 128
 # PC LeicaProfile.kt 同款：M9 sRGB / 标准饱和 / 标准对比
 COLOR_SPACE, SATURATION, CONTRAST = 0, 2, 2
 EXPECT_SHA256 = "25debaf581d3fdbeca6ad7c6426ca5d9e597b98856c540ceddcc912b79409d8d"
@@ -97,6 +97,24 @@ def decode_luts_bin(path):
     return branches, curve
 
 
+def gamut_clip_linear(out):
+    """保色相/保亮度的 sRGB 色域压缩（越界格点把色度向 luma 收敛）。
+
+    为什么必须做（2026-10-27 真机）：M9 矩阵在高亮饱和色**过冲**（粉红输入 (1,.55,.72)
+    → R=1.47 / G=−0.02），裸 `clip(0, IDX_MAX)` 把单通道钉到 0 ⇒ 色相翻转成荧光品红
+    —— 用户看到的"紫红观感 / 高反光灰块"就是它。这里按 darktable gamut_mapping 同型：
+    保持亮度 Y 与色相，把色度压到刚好入界（高光自然去饱和成暖白），中低亮像素不动。
+    """
+    Y = out[..., 0] * 0.2126 + out[..., 1] * 0.7152 + out[..., 2] * 0.0722
+    Yc = np.clip(Y, 0.0, 1.0)[..., None]
+    d = out - Yc
+    eps = 1e-12
+    kpos = np.where(d > 0, (1.0 - Yc) / np.maximum(d, eps), 1e9)
+    kneg = np.where(d < 0, Yc / np.maximum(-d, eps), 1e9)
+    k = np.minimum(np.minimum(kpos, kneg).min(-1), 1.0)[..., None]
+    return Yc + k * d
+
+
 def bake(branches, size):
     """全格点向量化烘焙：格点 = display 编码域均匀网格（i/(N-1)，引擎 texelFetch 同口径）。"""
     m0, m1 = branches  # branch0 = R≥G, branch1 = R<G（行 = 输出通道，列 = R,G,B）
@@ -110,9 +128,9 @@ def bake(branches, size):
     for ch in range(3):
         idx0 = (m0[ch, 0] * camR + m0[ch, 1] * camG + m0[ch, 2] * camB) >> 16
         idx1 = (m1[ch, 0] * camR + m1[ch, 1] * camG + m1[ch, 2] * camB) >> 16
-        idx = np.where(branch0, idx0, idx1).clip(0, IDX_MAX)
-        out[..., ch] = idx / IDX_MAX  # 剥离曲线：11-bit 索引 / 2047 = 线性输出
-    return srgb_encode(out)
+        # ⚠ 不能先 clip：矩阵输出越界是色相过冲的信号，先经 gamut 压缩再落界。
+        out[..., ch] = np.where(branch0, idx0, idx1).astype(np.float64) / IDX_MAX
+    return srgb_encode(gamut_clip_linear(out))
 
 
 def trilinear(lut, coords):
@@ -141,8 +159,8 @@ def direct(coords, branches):
     for ch in range(3):
         idx0 = (m0[ch, 0] * cam[0] + m0[ch, 1] * cam[1] + m0[ch, 2] * cam[2]) >> 16
         idx1 = (m1[ch, 0] * cam[0] + m1[ch, 1] * cam[1] + m1[ch, 2] * cam[2]) >> 16
-        out[..., ch] = np.where(branch0, idx0, idx1).clip(0, IDX_MAX) / IDX_MAX
-    return srgb_encode(out)
+        out[..., ch] = np.where(branch0, idx0, idx1).astype(np.float64) / IDX_MAX
+    return srgb_encode(gamut_clip_linear(out))
 
 
 def check(lut, branches):

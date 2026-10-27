@@ -179,8 +179,8 @@ class CubeLutParserTest {
         for (f in files) {
             val bytes = f.readBytes()
             val l = CubeLutParser.parseBinary(bytes, f.name)
-            // 33³ 为主；leica_m9_ccd 是首个 64³ 资产（调研 19 号定案，2026-10-25）
-            val expectedSize = if (f.name == "leica_m9_ccd.lut") 64 else 33
+            // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：色域压缩的陡斜率 64³ 装不下）
+            val expectedSize = if (f.name == "leica_m9_ccd.lut") 128 else 33
             assertEquals(f.name, expectedSize, l.size)
             assertEquals(f.name, expectedSize * expectedSize * expectedSize * 3, l.data.size)
             // 只做"资产没坏"的通用检查：端点阈值本质是风格假设，会误报

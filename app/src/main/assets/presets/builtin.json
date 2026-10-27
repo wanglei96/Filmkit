@@ -31,7 +31,7 @@
       "vignette_radius": 85.0,
       "vignette_feather": 55.0
     },
-    "lut": { "id": "leica_m9_ccd", "strength": 0.82 }
+    "lut": { "id": "leica_m9_ccd", "strength": 0.75 }
   },
   {
     "schema": 2,

@@ -113,7 +113,7 @@ class BuiltinPresetsTest {
         //   0.3085 是"影调斜率 1.19 与 filmic 抢职责、只能低强度混合"的旧账，不再适用。
         //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
         //   "不死白 vs 高光软肩"两套方案的数据）。
-        assertEquals("builtin_leica_m9 的 LUT 强度（0.12.92：压高反光荧光，收到 0.82）", 0.82, preset("builtin_leica_m9").lutStrength, 0.0)
+        assertEquals("builtin_leica_m9 的 LUT 强度（0.12.92：压高反光荧光，收到 0.75）", 0.75, preset("builtin_leica_m9").lutStrength, 0.0)
         assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
             "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
@@ -243,9 +243,9 @@ class BuiltinPresetsTest {
 
             val lut = CubeLutParser.parseBinary(bytes, fallbackTitle = lutId)
             assertEquals("$lutId 的 TITLE", expectedTitle[lutId], lut.title)
-            // 33³ 为主；leica_m9_ccd 是首个 64³ 资产（调研 19 号定案：分支矩阵色彩
-            // 映射在暖肤色/饱和区 64³ 更稳，引擎 MAX_SIZE=128 支持）
-            assertEquals("$lutId 的 LUT_3D_SIZE", if (lutId == "leica_m9_ccd") 64 else 33, lut.size)
+            // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
+            // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
+            assertEquals("$lutId 的 LUT_3D_SIZE", if (lutId == "leica_m9_ccd") 128 else 33, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF

@@ -99,12 +99,12 @@ class PresetDetailTest {
             ),
             render(p.slots),
         )
-        // LUT 强度 0.82 ⇒ 读数 82（0..150 口径，与 LUT 强度滑杆同一函数）。
+        // LUT 强度 0.75 ⇒ 读数 82（0..150 口径，与 LUT 强度滑杆同一函数）。
         // 2026-10-25 徕卡一瞬一期：换固件配方烘焙 LUT leica_m9_ccd（纯色彩、
         // 中性恒等，满强度 = 配方原意）；旧 leica_m9 影调斜率 1.19 与 filmic 抢
         // 职责、只能 0.31 低强度混合，降级为 A/B 对照资产。
         // ★ 0.12.92：0.9466 → 0.82（压高反光的荧光品红/紫边，仍保 M9 色相）。
-        assertEquals(PresetLutLine("leica_m9_ccd", "82"), presetLutLine(p))
+        assertEquals(PresetLutLine("leica_m9_ccd", "75"), presetLutLine(p))
     }
 
     /** 三条内置预设都要能渲染（不许有"表里缺名字"的槽 —— 缺了就会露出英文语义名）。 */

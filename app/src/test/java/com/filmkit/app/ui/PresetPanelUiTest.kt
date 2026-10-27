@@ -298,14 +298,14 @@ class PresetPanelUiTest {
         val p = builtin("徕卡一瞬")
         assertEquals(22, p.slots.size)  // 0.12.92：新增曝光 / sat_mid / temp_mired / fade
         assertEquals(
-            // 0.12.92：M9 适度压暗（−0.3 EV）+ 暗 -24/中 -24/高 -35 + LUT 82
-            "曝光 -0.3 EV · 饱和度 · 暗部 -24 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 82",
+            // 0.12.92：M9 适度压暗（−0.3 EV）+ 暗 -24/中 -24/高 -35 + LUT 75
+            "曝光 -0.3 EV · 饱和度 · 暗部 -24 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）
         assertTrue(
             "LUT 中文名要能替换掉 id",
-            presetSummaryText(p, lutLabel = "徕卡 M9 CCD").endsWith("LUT 徕卡 M9 CCD 82"),
+            presetSummaryText(p, lutLabel = "徕卡 M9 CCD").endsWith("LUT 徕卡 M9 CCD 75"),
         )
     }
 
