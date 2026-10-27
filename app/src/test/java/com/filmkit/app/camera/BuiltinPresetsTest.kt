@@ -160,7 +160,7 @@ class BuiltinPresetsTest {
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
             37 to -5.1725, 38 to 4.2,                   // filmic 黑白点（★ 白点 4.0 → 4.2）
-            62 to 0.1, 63 to 0.85, 64 to 0.5, 65 to 0.55, // halation（0.12.94：轻微红光晕）
+            62 to 0.05, 63 to 0.85, 64 to 0.5, 65 to 0.55, // halation（0.12.95：减半，16:07 花色发淡）
             66 to -0.24,     // vignette_strength（负 = 暗角，0.12.94 加深）
             67 to 85.0,      // vignette_radius（%）
             68 to 55.0,      // vignette_feather（%）
