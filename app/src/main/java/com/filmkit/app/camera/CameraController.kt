@@ -1356,6 +1356,12 @@ class CameraController(private val context: Context, private val render: RenderC
         zebraPref = -1.0 // 同上，[30]
         autoTonePref = -1.0 // 同上，[35]
         lutStrengthFromPrefs = Float.NaN // 同上，[34]：换预设后强制重读 prefs
+        // 0.12.99：**[49] 高光重建档位也必须强制重读 prefs**。`cameraPresetParams` 从
+        // neutral() 基线展开，基线里 `[49] = 1.0`（自创 allSat 档）；而 `applyHlGReconPref`
+        // 用"值变化才写"的缓存比较 —— 缓存已等于 prefs 值时它**不写**，于是预设刚展开进
+        // 数组的 1.0 留了下来 ⇒ 用户"从没开过"的开关被预设静默打开（2026-10-27 16:51
+        // 天空发灰、hlGRecon 0→1 的现场）。置哨兵 ⇒ 下一次 apply 必写 prefs 的真实值。
+        hlGreconPref = -1.0
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
