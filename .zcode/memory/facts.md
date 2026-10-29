@@ -108,3 +108,9 @@ status: active
 - [2026-10-25] **真机指纹**（同口径）：M9 样张库彩色 p25 中位 20、≥240 中位 0.08%、C*P90 中位 ≈29；我们一期成片 C*P90 33.2、≥240 0.02%
 - [2026-10-25] **方向锁**：MainActivity `screenOrientation="portrait"`（0.12.86 起）
 - [2026-10-26] **版本**：0.12.89(538) tag v0.12.89；包 `filmkit-0.12.88-M9TONE.apk`(537)、`filmkit-0.12.89-M9TONE2.apk`(538)
+
+## PC 影调与暗部软边（10-29）
+- [2026-10-29] **PC 有两套 tone 引擎**：`AdobeCurveToneAlgorithm`（DCP profile 的 ToneCurve，逐通道 + `adobeRgbTone`）与 `DarktableFilmicToneAlgorithm` / `DarktableSigmoidToneAlgorithm`（与同源，系数按 darktable `computeFilmicToneCurveUniforms` 算）；`assets/dcp/` 只有 10 个 profile，**没有 vivo** ⇒ 该机上不适用 DCP 路径
+- [2026-10-29] **亮缝宽度实测**（FILMKIT_20261029-100221 红框 x1626-1942/y3139-3677）：RAW 2×2 块 34px（0.035→0.150）、我们 D4 26px、成片 24px、libraw AHD 14px；对比度 RAW 4.3× / D4 4.8× / 成片 1.5× / AHD 2.6×
+- [2026-10-29] **RCD 与 AMaZE 的抖动差**（同一 CFA 输入、粉椅高光边）：R/G lag-1 σ = 0.312（RCD） vs **0.018（AMaZE）**
+- [2026-10-29] **版本/包**：0.12.167(618) 当前；回退 0.12.132(552)；101 原样包 0.12.101-v615(615)
