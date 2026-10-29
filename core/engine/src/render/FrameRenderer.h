@@ -1030,10 +1030,12 @@ class FrameRenderer {
   int satm_w_ = 0, satm_h_ = 0;
   GLuint prog_satm_ = 0;
   struct { GLint raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
-           gain = -1, na = -1, nb = -1; } u_satm_;
+           gain = -1, na = -1, nb = -1, dbg = -1; } u_satm_;
   // 0.12.181 诊断：本张掩码覆盖率（%），进 raw.render 的 satmCov
   float dbg_satm_cov_ = 0.f;
   float dbg_satm_p_ = 0.f;   // 本张下发的 [101] 实际值（诊断）
+  float dbg_satm_dbg1_ = 0.f;   // 强制全 1 时的 1×1 读回（255 = 绘制+读回通）
+  float dbg_satm_c1_ = 0.f;     // 真实 mask 的中心像素读回
   bool satmask_enabled_ = false;   // 本张 [101] 实际值（PC3D / P0 共用）
   void passSatMask(int w, int h, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],

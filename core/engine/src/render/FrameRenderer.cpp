@@ -4462,6 +4462,8 @@ uniform float uWhite;
 uniform vec3 uGain;              // WB 增益 = 逐通道满阱（WB 域）
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+// 0.12.185 诊断：>0.5 时无条件输出 1 —— 用来区分"绘制/读回链路坏了"与"判据坏了"
+uniform float uDbgConst;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -4487,6 +4489,7 @@ float dilAt(ivec2 q) {
     return m;
 }
 void main() {
+    if (uDbgConst > 0.5) { oColor = vec4(1.0); return; }
     ivec2 p = ivec2(gl_FragCoord.xy);
     // ③ 2×2 聚合：块内任一 photosite（膨胀后）饱和 ⇒ 整块标记
     ivec2 q = ivec2(p.x & ~1, p.y & ~1);
@@ -9235,6 +9238,7 @@ bool FrameRenderer::init() {
   u_satm_.gain = glGetUniformLocation(prog_satm_, "uGain");
   u_satm_.na = glGetUniformLocation(prog_satm_, "uNoiseA");
   u_satm_.nb = glGetUniformLocation(prog_satm_, "uNoiseB");
+  u_satm_.dbg = glGetUniformLocation(prog_satm_, "uDbgConst");
   u_hl_dil_.mask = glGetUniformLocation(prog_hl_dil_, "uMask");
   u_hl_dil_.msize = glGetUniformLocation(prog_hl_dil_, "uMSize");
   u_hl_chroma_.mos = glGetUniformLocation(prog_hl_chroma_, "uMos");
@@ -11994,7 +11998,22 @@ void FrameRenderer::passSatMask(int w, int h, int cfa,
   glUniform3f(u_satm_.gain, gains[0], gains[1], gains[2]);
   glUniform3f(u_satm_.na, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
   glUniform3f(u_satm_.nb, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // ── 0.12.185 自检（不动画质：最后仍会重绘真实 mask）─────────────────────
+  // ① 强制全 1 → 读 1×1：验证"绘制能否落到目标 + 读回是否可信"
+  // ② 恢复判据 → 读 1×1：同一个像素的真实 mask 值
+  // 两个读数一起看：dbg1=255 & c1=0 ⇒ 链路好、问题在判据/输入；
+  //                dbg1=0              ⇒ 绘制或读回链路本身坏了。
+  unsigned char px[4] = {0, 0, 0, 0};
+  if (u_satm_.dbg >= 0) {
+    glUniform1f(u_satm_.dbg, 1.f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    dbg_satm_dbg1_ = static_cast<float>(px[0]);
+    glUniform1f(u_satm_.dbg, 0.f);
+  }
+  glDrawArrays(GL_TRIANGLES, 0, 3);   // 真实 mask（覆盖掉诊断值）
+  glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  dbg_satm_c1_ = static_cast<float>(px[0]);
   while (glGetError() != GL_NO_ERROR) {
   }
   // 覆盖率：9 个 32×32 抽样窗（3×3 网格）合并统计 —— 只判"开关/口径是否生效"。
@@ -15394,6 +15413,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += ",\"satmP\":" + jnum(dbg_satm_p_, 2);
   kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 2);
+  kv += ",\"satmDbg1\":" + jnum(dbg_satm_dbg1_, 0);
+  kv += ",\"satmC1\":" + jnum(dbg_satm_c1_, 0);
   kv += ",\"satmTx\":" + std::to_string(tex_satm_ != 0 ? 1 : 0);
   kv += ",\"satmPrg\":" + std::to_string(prog_satm_ != 0 ? 1 : 0);
   kv += ",\"gainmapOk\":" + std::to_string(dbg_gainmap_ok_);
