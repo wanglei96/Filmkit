@@ -13001,7 +13001,8 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
       glActiveTexture(GL_TEXTURE0);
     }
     if (u_pc3d_.satmaskon >= 0)
-      glUniform1i(u_pc3d_.satmaskon, satmask_enabled_ ? 1 : 0);
+      glUniform1i(u_pc3d_.satmaskon,
+                  (satmask_enabled_ && dst_w == raw_w_ && dst_h == raw_h_) ? 1 : 0);
     if (u_pc3d_.down >= 0) glUniform1i(u_pc3d_.down, down);
     if (u_pc3d_.fullsize >= 0) glUniform2i(u_pc3d_.fullsize, dst_w, dst_h);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -14327,7 +14328,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_satm_p_ = p.sat_mask;
     dbg_satm_cov_ = 0.f;
     if (satmask_enabled_) {
-      passSatMask(w, h, c.cfa, c.black_phase, c.white_level, c.gains,
+      // 0.12.189：用 **raw 尺寸**（与参考帧 RAW / tex_satm_ 同几何）。之前传 dst
+      // 尺寸，竖拍时 4080×3072 vs 3072×4080 不匹配 ⇒ pass 直接返回 ⇒ cov 恒 0。
+      passSatMask(raw_w_, raw_h_, c.cfa, c.black_phase, c.white_level, c.gains,
                   c.dn ? c.nc : kNoDn);
     }
     const bool hr_on = p.hr_raw > 0.5f && !bracket_info_ok;
