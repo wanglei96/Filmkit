@@ -1034,6 +1034,12 @@ class FrameRenderer {
   // 0.12.181 诊断：本张掩码覆盖率（%），进 raw.render 的 satmCov
   float dbg_satm_cov_ = 0.f;
   float dbg_satm_p_ = 0.f;   // 本张下发的 [101] 实际值（诊断）
+  // ── 0.12.186：参考帧 RAW 的 CPU 副本 ─────────────────────────────────────
+  // 为什么走 CPU：GPU 版（kFsSatMask + FBO）在 X300 上"program/纹理/FBO 全就绪、
+  // 强制输出 1.0 后读回仍是 0"（0.12.185 自检），绘制链路不可诊断。mask 是数据变换、
+  // 不涉及画质算法，CPU 算完上传反而确定可控（25MB 副本 + ~200ms，拍照 5s 内）。
+  std::vector<uint16_t> raw_cpu_;
+  int raw_cpu_w_ = 0, raw_cpu_h_ = 0;
   float dbg_satm_dbg1_ = 0.f;   // 强制全 1 时的 1×1 读回（255 = 绘制+读回通）
   float dbg_satm_c1_ = 0.f;     // 真实 mask 的中心像素读回
   bool satmask_enabled_ = false;   // 本张 [101] 实际值（PC3D / P0 共用）
@@ -1608,14 +1614,15 @@ class FrameRenderer {
   struct {
     // v0.10.167：wclamp = uWClamp，HR 前置的值域保护（权重用钳位值、信号用原值）
     GLint tex = -1, size = -1, cfalut = -1, noise_a = -1, noise_b = -1, mix = -1,
-          wclamp = -1;
+          wclamp = -1, satmask = -1, satmask_on = -1;
   } u_raw_dn_f_;
   // D-2（v0.10.58）：时域 × 空间联合 P0（4 帧 × 3×3 同相位邻域）
   struct {
     GLint raw[4] = {-1, -1, -1, -1}, off[3] = {-1, -1, -1}, fused = -1,
           size = -1, off_tiles = -1, cfalut = -1, black = -1, white = -1,
           gain = -1, noise_a = -1, noise_b = -1, sr_scale = -1, sub = -1, mix = -1,
-          wclamp = -1;   // v0.10.167：σ 的值域保护
+          wclamp = -1,   // v0.10.167：σ 的值域保护
+          satmask = -1, satmask_on = -1;   // 0.12.187：独立饱和掩码（纹理单元 8）
   } u_raw_dn_ts_;
   struct {
     GLint tex = -1, size = -1, black = -1, white = -1, gain = -1, cfalut = -1,
@@ -1653,7 +1660,7 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, noise_a = -1, noise_b = -1, lsc = -1,
           lsc_size = -1, mix = -1, moire = -1, moire_k = -1, cg_k = -1,
-          cg_scope = -1;
+          cg_scope = -1, satmask = -1, satmask_on = -1;
   } u_chroma_dn_;
   // 档 A：伪彩强度图统计（32×32 网格归约）
   struct {

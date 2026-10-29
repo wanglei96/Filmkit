@@ -1661,9 +1661,18 @@ void p4Accum(vec3 c, int dx, int dy, float y0, vec3 cd0, float sc, float scEff,
     acc += w * cd;
     wsum += w;
 }
+// 0.12.187：独立饱和掩码（纹理单元 2）—— 饱和核内**不动色度**。
+// P4 是 1-3px 的色度降噪，会把高光核边缘的品红/绿边摊成宽带；核内本来就没有
+// 可恢复的色度（信息已丢），唯一安全的做法是原样输出。
+uniform highp sampler2D uSatMask;
+uniform int uSatMaskOn;
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
     vec3 c0 = texelFetch(uTex, p, 0).rgb;
+    if (uSatMaskOn > 0 && texelFetch(uSatMask, p, 0).r > 0.5) {
+        oColor = vec4(c0, 1.0);
+        return;
+    }
     float y0 = dot(c0, LUMA);
     vec3 cd0 = c0 - y0;
     // 色度可保持较强：Y 原样输出，压彩噪不损 Laplacian 细节；Y 值域权重
@@ -3461,6 +3470,12 @@ uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实�
 //   · 累加进 acc 的仍然是原值 c（不丢 HR 刚补回来的亮度）。
 // uWClamp = 0（默认，非前置路径）时 wAt(x) ≡ x ⇒ 逐位等于改动前的实现。
 uniform float uWClamp;
+// ── 0.12.187：独立饱和掩码（P0 接线）─────────────────────────────────────
+// 现有保护只认"c0 > 1"（= HL 重建过的值）；物理饱和但未被重建的 photosite
+// （v 停在满阱）照样进 bilateral ⇒ 核内实测色比被邻域拉平（灰斑/绿晕的直接机制）。
+// mask=1 ⇒ 直接输出原值：既不参与、也不被平滑。
+uniform highp sampler2D uSatMask;
+uniform int uSatMaskOn;
 int chanAt(ivec2 p) {
     int k = ((p.y & 1) << 1) | (p.x & 1);
     return (uCfaLut >> (k << 1)) & 3;
@@ -3482,7 +3497,8 @@ void main() {
     // 判据用 `> 1` 而不是 mask：本域中性白 ≡ 1.0、任何通道的满阱都 ≥ 1.0，
     // 真测量的归一化值不可能超过 1（kNoDn 路径同样成立）。
     // 中心是重建值 ⇒ 整块区域都是合成值，直接输出、不做邻域运算。
-    if (c0 > 1.0) {
+    if (c0 > 1.0 ||
+        (uSatMaskOn > 0 && texelFetch(uSatMask, p, 0).r > 0.5)) {
         int chh = chanAt(p);
         oColor = vec4(chh == 0 ? c0 : 0.0, chh == 1 ? c0 : 0.0,
                       chh == 2 ? c0 : 0.0, 1.0);
@@ -3535,6 +3551,9 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform highp sampler2D uFused;
+// 0.12.187：独立饱和掩码（Ts 路径，纹理单元 8）
+uniform highp sampler2D uSatMask;
+uniform int uSatMaskOn;
 // v0.10.167：HR 前置的值域保护开关（1 = σ 用 clamp(ref,0,1)；见 main 内注释）
 uniform float uWClamp;
 uniform ivec2 uSize;
@@ -3600,6 +3619,13 @@ float linSubZ(int z, ivec2 p, vec2 d) {
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float ref = texelFetch(uFused, p, 0).r;
+    // 0.12.187：饱和核内不平滑（见 kFsRawDenoiseFused 的 uSatMask 注释）
+    if (uSatMaskOn > 0 && texelFetch(uSatMask, p, 0).r > 0.5) {
+        int chh = chanAt(p);
+        oColor = vec4(chh == 0 ? ref : 0.0, chh == 1 ? ref : 0.0,
+                      chh == 2 ? ref : 0.0, 1.0);
+        return;
+    }
     int ch = chanAt(p);
     float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
     float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
@@ -9197,6 +9223,8 @@ bool FrameRenderer::init() {
   u_raw_dn_f_.noise_b = glGetUniformLocation(prog_raw_dn_fused_, "uNoiseB");
   u_raw_dn_f_.mix = glGetUniformLocation(prog_raw_dn_fused_, "uMix");
   u_raw_dn_f_.wclamp = glGetUniformLocation(prog_raw_dn_fused_, "uWClamp");
+  u_raw_dn_f_.satmask = glGetUniformLocation(prog_raw_dn_fused_, "uSatMask");
+  u_raw_dn_f_.satmask_on = glGetUniformLocation(prog_raw_dn_fused_, "uSatMaskOn");
   // D-2（v0.10.58）时域 × 空间联合 P0
   for (int i = 0; i < 4; ++i) {
     u_raw_dn_ts_.raw[i] = glGetUniformLocation(
@@ -9217,6 +9245,8 @@ bool FrameRenderer::init() {
   u_raw_dn_ts_.noise_b = glGetUniformLocation(prog_raw_dn_ts_, "uNoiseB");
   u_raw_dn_ts_.mix = glGetUniformLocation(prog_raw_dn_ts_, "uMix");
   u_raw_dn_ts_.wclamp = glGetUniformLocation(prog_raw_dn_ts_, "uWClamp");
+  u_raw_dn_ts_.satmask = glGetUniformLocation(prog_raw_dn_ts_, "uSatMask");
+  u_raw_dn_ts_.satmask_on = glGetUniformLocation(prog_raw_dn_ts_, "uSatMaskOn");
   u_raw_dn_ts_.sr_scale = glGetUniformLocation(prog_raw_dn_ts_, "uSrScale");
   u_raw_dn_ts_.sub = glGetUniformLocation(prog_raw_dn_ts_, "uSub");
 
@@ -9487,6 +9517,8 @@ bool FrameRenderer::init() {
   u_chroma_dn_.moire = glGetUniformLocation(prog_chroma_dn_, "uMoire");
   u_chroma_dn_.moire_k = glGetUniformLocation(prog_chroma_dn_, "uMoireK");
   // v0.10.173：强边缘色度梯度门
+  u_chroma_dn_.satmask = glGetUniformLocation(prog_chroma_dn_, "uSatMask");
+  u_chroma_dn_.satmask_on = glGetUniformLocation(prog_chroma_dn_, "uSatMaskOn");
   u_chroma_dn_.cg_k = glGetUniformLocation(prog_chroma_dn_, "uCgK");
   u_chroma_dn_.cg_scope = glGetUniformLocation(prog_chroma_dn_, "uCgScope");
   u_moire_stat_.src = glGetUniformLocation(prog_moire_stat_, "uSrc");
@@ -11768,6 +11800,13 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glBindTexture(GL_TEXTURE_2D, lsc_tex_);
   glUniform1i(u_chroma_dn_.lsc, 1);
   glUniform2i(u_chroma_dn_.lsc_size, lsc_w_, lsc_h_);
+  // 0.12.187：饱和掩码（单元 2）
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, tex_satm_);
+  glUniform1i(u_chroma_dn_.satmask, 2);
+  if (u_chroma_dn_.satmask_on >= 0)
+    glUniform1i(u_chroma_dn_.satmask_on, satmask_enabled_ ? 1 : 0);
+  glActiveTexture(GL_TEXTURE1);
   glUniform2i(u_chroma_dn_.size, dst_w, dst_h);
   glUniform3f(u_chroma_dn_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
   glUniform1f(u_chroma_dn_.mix, nc.mix_p4);   // v0.10.108
@@ -11982,57 +12021,67 @@ void FrameRenderer::passSatMask(int w, int h, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const NoiseCoef& nc) {
   dbg_satm_cov_ = 0.f;
-  if (prog_satm_ == 0 || tex_satm_ == 0 || fbo_satm_ == 0 || raw_tex_ == 0)
+  if (tex_satm_ == 0 || w <= 0 || h <= 0) return;
+  if (raw_cpu_w_ != w || raw_cpu_h_ != h ||
+      raw_cpu_.size() != static_cast<size_t>(w) * h)
     return;
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_satm_);
-  glViewport(0, 0, w, h);
-  glUseProgram(prog_satm_);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, raw_tex_);
-  glUniform1i(u_satm_.raw, 0);
-  glUniform2i(u_satm_.size, w, h);
-  glUniform1i(u_satm_.cfalut, cfaLutOf(cfa));
-  glUniform4f(u_satm_.black, black_phase[0], black_phase[1], black_phase[2],
-              black_phase[3]);
-  glUniform1f(u_satm_.white, white_level);
-  glUniform3f(u_satm_.gain, gains[0], gains[1], gains[2]);
-  glUniform3f(u_satm_.na, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
-  glUniform3f(u_satm_.nb, nc.p0b[0], nc.p0b[1], nc.p0b[2]);
-  // ── 0.12.185 自检（不动画质：最后仍会重绘真实 mask）─────────────────────
-  // ① 强制全 1 → 读 1×1：验证"绘制能否落到目标 + 读回是否可信"
-  // ② 恢复判据 → 读 1×1：同一个像素的真实 mask 值
-  // 两个读数一起看：dbg1=255 & c1=0 ⇒ 链路好、问题在判据/输入；
-  //                dbg1=0              ⇒ 绘制或读回链路本身坏了。
-  unsigned char px[4] = {0, 0, 0, 0};
-  if (u_satm_.dbg >= 0) {
-    glUniform1f(u_satm_.dbg, 1.f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    dbg_satm_dbg1_ = static_cast<float>(px[0]);
-    glUniform1f(u_satm_.dbg, 0.f);
+  // ── 0.12.186：CPU 实现（GPU 版在 X300 上"强制 1.0 也读回 0"，链路不可诊断）──
+  // 判据：参考帧原始 RAW，逐 photosite `v >= 满阱[c] − 3σ`（σ 同 P0 的 A·x+B）。
+  const size_t n = static_cast<size_t>(w) * h;
+  std::vector<uint8_t> sat(n, 0), dil(n, 0), out(n * 4, 0);
+  const int lut = cfaLutOf(cfa);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int k = ((y & 1) << 1) | (x & 1);
+      const int c = (lut >> (k << 1)) & 3;
+      const float bl = black_phase[k];
+      const float v =
+          (static_cast<float>(raw_cpu_[static_cast<size_t>(y) * w + x]) - bl) /
+          std::max(white_level - bl, 1.f);
+      const float g = gains[c];
+      const float wb = v * g;
+      const float sig = std::sqrt(std::max(
+          nc.p0a[c] * std::min(std::max(wb, 0.f), 1.f) + nc.p0b[c], 0.f));
+      sat[static_cast<size_t>(y) * w + x] = (wb >= g - 3.f * sig) ? 1 : 0;
+    }
   }
-  glDrawArrays(GL_TRIANGLES, 0, 3);   // 真实 mask（覆盖掉诊断值）
-  glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-  dbg_satm_c1_ = static_cast<float>(px[0]);
+  // 1px 膨胀（吸收 MFNR 对齐残差）
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      uint8_t m = 0;
+      for (int dy = -1; dy <= 1 && !m; ++dy) {
+        for (int dx = -1; dx <= 1 && !m; ++dx) {
+          const int yy = y + dy, xx = x + dx;
+          if (yy < 0 || xx < 0 || yy >= h || xx >= w) continue;
+          m = sat[static_cast<size_t>(yy) * w + xx];
+        }
+      }
+      dil[static_cast<size_t>(y) * w + x] = m;
+    }
+  }
+  // 2×2 聚合：块内任一（膨胀后）饱和 ⇒ 四个 photosite 一起标记
+  size_t hit = 0;
+  for (int y = 0; y < h; y += 2) {
+    for (int x = 0; x < w; x += 2) {
+      uint8_t m = 0;
+      for (int dy = 0; dy < 2 && y + dy < h; ++dy)
+        for (int dx = 0; dx < 2 && x + dx < w; ++dx)
+          if (dil[static_cast<size_t>(y + dy) * w + x + dx]) m = 1;
+      if (m) ++hit;
+      for (int dy = 0; dy < 2 && y + dy < h; ++dy)
+        for (int dx = 0; dx < 2 && x + dx < w; ++dx)
+          out[(static_cast<size_t>(y + dy) * w + x + dx) * 4] = m ? 255 : 0;
+    }
+  }
+  glBindTexture(GL_TEXTURE_2D, tex_satm_);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
+                  out.data());
   while (glGetError() != GL_NO_ERROR) {
   }
-  // 覆盖率：9 个 32×32 抽样窗（3×3 网格）合并统计 —— 只判"开关/口径是否生效"。
-  // 单点中心窗口会漏掉不在画面中央的灯面（0.12.181 首次真机即 cov=0）。
-  if (w > 96 && h > 96) {
-    unsigned char buf[32 * 32 * 4];
-    int n = 0, tot = 0;
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_satm_);
-    for (int gy = 0; gy < 3; ++gy) {
-      for (int gx = 0; gx < 3; ++gx) {
-        const int x = (w - 32) * gx / 2, y = (h - 32) * gy / 2;
-        glReadPixels(x, y, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-        for (int i = 0; i < 32 * 32; ++i) n += (buf[i * 4] > 127) ? 1 : 0;
-        tot += 32 * 32;
-      }
-    }
-    dbg_satm_cov_ = 100.0f * static_cast<float>(n) / static_cast<float>(tot);
-  }
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  // 覆盖率按 2×2 块计（与"饱和度"的物理单位一致）
+  const size_t blocks = static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
+  dbg_satm_cov_ = 100.f * static_cast<float>(hit) / static_cast<float>(blocks);
 }
 
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
@@ -13909,6 +13958,17 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
 
   if (ensureRawTex(w, h) == 0) return false;
   if (!uploadRawTex(raw_tex_, raw, w, h, row_stride_px)) return false;
+  // 0.12.186：饱和掩码用 CPU 副本（见 FrameRenderer.h 的注释）
+  if (p.sat_mask > 0.5f) {
+    const auto* rp = static_cast<const uint16_t*>(raw);
+    raw_cpu_.assign(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; ++y)
+      std::memcpy(&raw_cpu_[static_cast<size_t>(y) * w],
+                  rp + static_cast<size_t>(y) * row_stride_px,
+                  sizeof(uint16_t) * w);
+    raw_cpu_w_ = w;
+    raw_cpu_h_ = h;
+  }
   const auto t1 = std::chrono::steady_clock::now();
 
   // U-3：[1..3] × [88][89] 后交给 prepareRawCommon（同一口径，见 wbTempTint 注释）
@@ -16293,6 +16353,11 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
       glBindTexture(GL_TEXTURE_2D, offs[i]);
       glUniform1i(u_raw_dn_ts_.off[i], 4 + i);
     }
+    glActiveTexture(GL_TEXTURE8);
+    glBindTexture(GL_TEXTURE_2D, tex_satm_);
+    glUniform1i(u_raw_dn_ts_.satmask, 8);
+    if (u_raw_dn_ts_.satmask_on >= 0)
+      glUniform1i(u_raw_dn_ts_.satmask_on, satmask_enabled_ ? 1 : 0);
     glActiveTexture(GL_TEXTURE7);
     // v0.10.167：Ts 的参考域必须与 P0 的输入同域 —— 前置时输入是 HR 输出 tex_hl_
     // （单通道 .r，与 tex_fused_ 同读法，故 Ts shader 无需改动）。
@@ -16336,6 +16401,13 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   // 同域同格式 —— 线性 mosaic、已扣黑阶 + WB）
   glBindTexture(GL_TEXTURE_2D, fused_tex != 0 ? fused_tex : tex_fused_);
   glUniform1i(u_raw_dn_f_.tex, 0);
+  // 0.12.187：饱和掩码（单元 1；关时 shader 走原路径，逐位不变）
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, tex_satm_);
+  glUniform1i(u_raw_dn_f_.satmask, 1);
+  if (u_raw_dn_f_.satmask_on >= 0)
+    glUniform1i(u_raw_dn_f_.satmask_on, satmask_enabled_ ? 1 : 0);
+  glActiveTexture(GL_TEXTURE0);
   glUniform2i(u_raw_dn_f_.size, w, h);
   glUniform1i(u_raw_dn_f_.cfalut, cfaLutOf(cfa));
   glUniform3f(u_raw_dn_f_.noise_a, nc.p0a[0], nc.p0a[1], nc.p0a[2]);
@@ -17066,6 +17138,16 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 含跨曝光侧帧 —— 归一在各 pass 内做）
   if (ensureRawTex(w, h) == 0) return false;
   if (!uploadRawTex(raw_tex_, frames[0], w, h, row_strides_px[0])) return false;
+  if (p.sat_mask > 0.5f) {   // 0.12.186：参考帧 CPU 副本（bracket 路径）
+    const auto* rp = static_cast<const uint16_t*>(frames[0]);
+    raw_cpu_.assign(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; ++y)
+      std::memcpy(&raw_cpu_[static_cast<size_t>(y) * w],
+                  rp + static_cast<size_t>(y) * row_strides_px[0],
+                  sizeof(uint16_t) * w);
+    raw_cpu_w_ = w;
+    raw_cpu_h_ = h;
+  }
   if (!ensureMfnrTargets(w, h)) return false;
   for (int i = 1; i < count; ++i) {
     if (!uploadRawTex(tex_mfnr_[i - 1], frames[i], w, h, row_strides_px[i]))
