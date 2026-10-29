@@ -19,7 +19,7 @@ object CameraPresets {
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 101
+    const val COUNT = 102
 
     /**
      * `[98] engine_slot` 的**默认档位** = `1`（sigmoid）—— 用户 2026-10-14 拍板
@@ -199,7 +199,18 @@ object CameraPresets {
         // 18.83%，同一束光差 8.7 倍）。而 opposed 的写出式 `MAX(inval, ref+chrominance)`
         // 物理上不会压值。设置页开关写 prefs("hl_grecon")，
         // CameraController.applyHlGReconPref 是决定下发值的那一层。
-        this[49] = 1.0
+        // ── 0.12.169：**复位为 0（原版档）** ──────────────────────────────────
+        // 0.12.132 为修「灯面偏暖米色」把这里改成 1（自创 allSat），并把引擎侧
+        // 的 uGRecon 一并强制成 1 —— 结果设置页开关变成死开关，且高光链重新带上
+        // 自创分支的两个已知副作用：满阱 luma 锚把 sat-fix 真值压回满阱、高光核
+        // 度抹平（这正是 10-29 粉蘑菇高光灰斑/天空平白的候选来源）。按「先 100%
+        // 原版跑通再评估」复位：默认走 darktable `hlreconstruct/opposed.c` 原版
+        // （MAX + 加性 chrominance），自创档保留为 [49]=1 的显式实验开关。
+        this[49] = 0.0
+        // 101 = 饱和掩码（0.12.181）：参考帧逐 photosite「满阱−3σ」→ 1px 膨胀
+        // → 2×2 聚合 → R8 全分辨率。默认开：PC3D 用它替代 D4 的 alpha（块状收手
+        // 造成的天空方块亮斑），P0 用它跳过饱和核平滑（保留实测色比）。
+        this[101] = 1.0
         // 50 = 镜头横向色差校正（v0.10.170）：0 = 关（A/B 通路，不跑任何 pass）；
         // >0 = 开关 + 估计位移的强度倍率。作用在 D3（RCD 去马赛克后 / CCM 前）
         // 相机 RGB 域，只重采样 R/B、G 不动；自动估计（1/8 降采样 + 径向 LK），

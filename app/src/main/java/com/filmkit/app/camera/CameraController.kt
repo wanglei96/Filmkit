@@ -1362,10 +1362,10 @@ class CameraController(private val context: Context, private val render: RenderC
         autoTonePref = -1.0 // 同上，[35]
         lutStrengthFromPrefs = Float.NaN // 同上，[34]：换预设后强制重读 prefs
         // 0.12.99：**[49] 高光重建档位也必须强制重读 prefs**。`cameraPresetParams` 从
-        // neutral() 基线展开，基线里 `[49] = 1.0`（自创 allSat 档）；而 `applyHlGReconPref`
-        // 用"值变化才写"的缓存比较 —— 缓存已等于 prefs 值时它**不写**，于是预设刚展开进
-        // 数组的 1.0 留了下来 ⇒ 用户"从没开过"的开关被预设静默打开（2026-10-27 16:51
-        // 天空发灰、hlGRecon 0→1 的现场）。置哨兵 ⇒ 下一次 apply 必写 prefs 的真实值。
+        // neutral() 基线展开，基线里 `[49] = 0.0`（0.12.169 起 = darktable 原版档）；
+        // 而 `applyHlGReconPref` 用"值变化才写"的缓存比较 —— 缓存已等于 prefs 值时它
+        // **不写**，于是预设刚展开进数组的基线值留了下来 ⇒ 用户设置被预设静默覆盖
+        //（2026-10-27 16:51 天空发灰、hlGRecon 0→1 的现场）。置哨兵 ⇒ 下一次 apply 必写。
         hlGreconPref = -1.0
         applyTonePref()
         applyZebraPref()
@@ -1910,7 +1910,9 @@ class CameraController(private val context: Context, private val render: RenderC
      * 满阱（≈1.27）并去色。设置页开关写 prefs("hl_grecon")。
      */
     private fun applyHlGReconPref() {
-        val v = if (appPrefs.getBoolean("hl_grecon", true)) HL_GRECON else 0.0
+        // 0.12.169：默认 false（darktable 原版 opposed）—— 与本函数文档、neutral()[49]
+        // 及设置页开关的默认值三处同步；0.12.132 曾默认 true 且引擎侧强制，开关失效。
+        val v = if (appPrefs.getBoolean("hl_grecon", false)) HL_GRECON else 0.0
         if (v != hlGreconPref) {
             hlGreconPref = v
             filmParams[49] = v

@@ -38,7 +38,7 @@ struct FilmParams {
   // v0.11.27（阶段 0，引擎插槽）：98 → 99，+[98] `engine_slot`。**只扩契约与注册表
   // 骨架，不接线**：shader / `FrameRenderer` 零改动、渲染路径不读该槽 ⇒ `[98] = 0`
   // 时成片与改动前逐字节一致。引擎实现与注入见 `docs/engine-slots-design.md`。
-  static constexpr int kCount = 99;
+  static constexpr int kCount = 102;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -520,9 +520,15 @@ struct FilmParams {
   // 旧预设数组长度 ≤ 98（即 < 99）⇒ 读不到该槽 ⇒ 保持结构体默认 ⇒ 与本行一致（= 1）。
   float engine_slot = 1.0f;   // 98
   // [99] 高光滚降（kFsOut 的 highlightRolloff）：1 = 开（默认），0 = 关
+  // v0.12.166：+[99]/[100]，**kCount 99 → 101**（0.12.167 漏改本常量，契约工具报
+  // "槽位 ≥ kCount 却仍有声明"；六处同步的第 ① 处，0.12.169 补上）。
   float hl_rolloff = 1.0f;  // 99
   // [100] D4 大半径 USM（1/8 低频）—— 0 = 关（默认），1 = 开
   float d4_usm = 0.0f;  // 100
+  // [101] 饱和掩码（0.12.181）：参考帧逐 photosite `v >= 满阱 − 3σ` → 1px 膨胀 →
+  // 2×2 聚合 → 独立 R8 全分辨率纹理，显式传给 P0（默认 0 = 关，A/B 通路）。
+  // 用途：P0 在饱和核内**不做平滑**（保留实测色比），替代"值判据"与"alpha 当 mask"。
+  float sat_mask = 1.0f;  // 101
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -662,6 +668,8 @@ struct FilmParams {
     // 0.12.167：[100] D4 大半径 USM 开关。**默认 0 = 关** —— 165 版强制开启时
     // 用户反馈"画面毁了"，所以改为默认关、设置页显式开。
     if (n > 100) d4_usm = static_cast<float>(v[100]);
+    // 0.12.181：饱和掩码开关（[101]）。缺槽（旧预设 ≤101）时保持默认 1。
+    if (n > 101) sat_mask = static_cast<float>(v[101]);
   }
 };
 

@@ -2162,6 +2162,11 @@ internal object FilmParamKeys {
         97 to "glow_threshold",
         // [98] 阶段 0（引擎插槽）：影调引擎选择（0 = 内置 filmic）
         98 to "engine_slot",
+        // [99]/[100] v0.12.166：高光滚降开关 / D4 大半径 USM（默认关）
+        99 to "hl_rolloff",
+        100 to "d4_usm",
+        // [101] 0.12.181：饱和掩码开关（参考帧 RAW → 满阱−3σ → 1px 膨胀 → 2×2 聚合）
+        101 to "sat_mask",
     )
 
     /**

@@ -1023,6 +1023,21 @@ class FrameRenderer {
   int edit_w_ = 0, edit_h_ = 0;
   GLuint raw_tex_ = 0;  // R16UI，Bayer 原始（texelFetch 整型采样）
   int raw_w_ = 0, raw_h_ = 0;
+  // ── 0.12.181：饱和掩码（R8 全分辨率，1 = 饱和核）────────────────────────
+  // 生成：参考帧 RAW → `v >= 满阱−3σ` → 1px 膨胀 → 2×2 聚合（kFsSatMask）。
+  // 消费者：P0（fused / Ts 两条路径的 uSatMask）。0 = 本张未生成。
+  GLuint tex_satm_ = 0, fbo_satm_ = 0;
+  int satm_w_ = 0, satm_h_ = 0;
+  GLuint prog_satm_ = 0;
+  struct { GLint raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
+           gain = -1, na = -1, nb = -1; } u_satm_;
+  // 0.12.181 诊断：本张掩码覆盖率（%），进 raw.render 的 satmCov
+  float dbg_satm_cov_ = 0.f;
+  float dbg_satm_p_ = 0.f;   // 本张下发的 [101] 实际值（诊断）
+  bool satmask_enabled_ = false;   // 本张 [101] 实际值（PC3D / P0 共用）
+  void passSatMask(int w, int h, int cfa, const float black_phase[4],
+                   float white_level, const float gains[3],
+                   const NoiseCoef& nc);
   // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────
   GLuint prog_mfnr_pyr_ = 0, prog_mfnr_down_ = 0, prog_mfnr_fuse_ = 0,
          prog_raw_dn_fused_ = 0;
@@ -1694,7 +1709,9 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, k = -1, kernel = -1, sig_a = -1, sig_b = -1,
           moire = -1, luma = -1, lsc = -1, lsc_size = -1, orig = -1, maskon = -1,
-          down = -1, fullsize = -1;
+          down = -1, fullsize = -1,
+          // 0.12.181：独立饱和掩码（R8）+ 开关
+          satmask = -1, satmaskon = -1;
   } u_pc3d_;
   struct {
     GLint tex = -1, size = -1, resize = -1, stride = -1, sigma = -1;

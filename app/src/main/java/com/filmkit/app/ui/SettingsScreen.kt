@@ -911,7 +911,8 @@ private fun ToneColorDrawerContent() {
     // v0.12.4 起**不再随 bracket 隐藏**：这正是 bracket 场景下要 A/B 的开关（灰斑来自
     // 自创档压低 sat-fix 真值 + 去色，与 bracket 本身无关）。
     // 日志 raw.render.hlGRecon 显示 1（自创）/ 0（原版）。
-    var hlGReconOn by remember { mutableStateOf(prefs.getBoolean("hl_grecon", true)) }
+    // 0.12.169：默认复位 false（原版档）—— 0.12.132 曾把两端都强制成 true，开关失效。
+    var hlGReconOn by remember { mutableStateOf(prefs.getBoolean("hl_grecon", false)) }
     SettingSwitchRow(
         title = "高光重建·自创 allSat 档",
         subtitle = "关（默认）= darktable 原版 opposed：只抬不压 + 加性色度补偿；开 = 自创档（按参考比替换三通道、用满阱亮度当锚），过曝高光会被压暗并去色。同场景 A/B 看高光带是否还有灰斑",
