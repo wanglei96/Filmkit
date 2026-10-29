@@ -12000,14 +12000,14 @@ void FrameRenderer::passSatMask(int w, int h, int cfa,
   // 覆盖率：9 个 32×32 抽样窗（3×3 网格）合并统计 —— 只判"开关/口径是否生效"。
   // 单点中心窗口会漏掉不在画面中央的灯面（0.12.181 首次真机即 cov=0）。
   if (w > 96 && h > 96) {
-    unsigned char buf[32 * 32];
+    unsigned char buf[32 * 32 * 4];
     int n = 0, tot = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_satm_);
     for (int gy = 0; gy < 3; ++gy) {
       for (int gx = 0; gx < 3; ++gx) {
         const int x = (w - 32) * gx / 2, y = (h - 32) * gy / 2;
-        glReadPixels(x, y, 32, 32, GL_RED, GL_UNSIGNED_BYTE, buf);
-        for (int i = 0; i < 32 * 32; ++i) n += (buf[i] > 127) ? 1 : 0;
+        glReadPixels(x, y, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+        for (int i = 0; i < 32 * 32; ++i) n += (buf[i * 4] > 127) ? 1 : 0;
         tot += 32 * 32;
       }
     }
@@ -13997,8 +13997,11 @@ GLuint FrameRenderer::ensureRawTex(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE,
-                 nullptr);
+    // 0.12.184：R8 → RGBA8。R8 的 FBO 在 X300 上"完整但不落值"（真机 satmTx/
+    // satmPrg 均 1、无 fbo_incomplete、cov 恒 0），改用项目既有的 RGBA8 路径，
+    // mask 写 .r（其余分量填 0/1）。内存 4×（50MB），但可读回、可验证。
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
     glGenFramebuffers(1, &fbo_satm_);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_satm_);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
