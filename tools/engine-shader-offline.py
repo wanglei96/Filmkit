@@ -146,6 +146,8 @@ def main():
     ap.add_argument('--roi', default='1800,2100,600,1000', help='Y0,Y1,X0,X1（sensor 域）')
     ap.add_argument('--out', default='/tmp/chain')
     ap.add_argument('--p3-split', type=int, default=1, help='1 = [58] G 位双 pass')
+    ap.add_argument('--cd-fix', type=float, default=1.0,
+                    help='[46] rcd_cdfix：1 = RawTherapee 原版（对角三项 + 无限幅）；0 = 旧行为（两项 + clamp ±4）')
     ap.add_argument('--defringe', type=int, default=0, help='1 = 跑 defringe 三段并统计线性域量纲')
     ap.add_argument('--ccm', default='1.627,-0.561,-0.066,-0.139,1.347,-0.208,0.009,-0.564,1.554')
     ap.add_argument('--pc3d', type=int, default=0, help='1 = 执行 kFsPc3d（需 LSC，暂用恒等）')
@@ -196,6 +198,14 @@ def main():
     ap.add_argument('--pc3d-siga', type=float, default=1e-5, help='噪声模型斜率（非真机标定值）')
     ap.add_argument('--pc3d-sigb', type=float, default=1e-6, help='噪声模型截距（非真机标定值）')
     ap.add_argument('--pc3d-msize', type=float, default=0.0, help='FilmParams[55] 强制核尺寸，0=自动')
+    ap.add_argument('--film-sharpen', type=float, default=0.5,
+                    help='FilmParams[39] 轻度锐化强度（真机默认 0.5；0 = 关）')
+    ap.add_argument('--p0-mix', type=float, default=1.0,
+                    help='P0 的 uMix：1 = 全强度；0 = 设置页「RAW 降噪」调 0（A=B=0 无邻域路径）')
+    ap.add_argument('--p0-a', default='1e-5,1e-5,1e-5',
+                    help='P0 的 σ²=A·x+B 的 A（逐通道；真机取日志 p0A）')
+    ap.add_argument('--p0-b', default='1e-6,1e-6,1e-6',
+                    help='P0 的 B（逐通道；真机取日志 p0B）')
     args = ap.parse_args()
 
     Y0, Y1, X0, X1 = [int(v) for v in args.roi.split(',')]
@@ -233,9 +243,11 @@ def main():
     tex_raw.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
     steps = {}
-    # ── P0：RAW 域同色 bilateral（uMix=1 全强度；σ 用真实模型，A/B 由 --noise 给）
-    noiseA = [1e-5, 1e-5, 1e-5]
-    noiseB = [1e-6, 1e-6, 1e-6]
+    # ── P0：RAW 域同色 bilateral（uMix 默认 1；A/B 由 --p0-a/--p0-b/--p0-mix 给）──
+    # 真机系数取自日志 p0A/p0B（P0 的 σ 模型）；--p0-mix 0 等价于设置页把
+    # "RAW 降噪"调到 0（shader 走 A=B=0 的无邻域路径）。
+    noiseA = [float(v) for v in args.p0_a.split(',')]
+    noiseB = [float(v) for v in args.p0_b.split(',')]
     # ⚠ P0 shader 的 oColor 三目只判 ch==1，G2（ch==3）会写 0 —— 离线执行器修正它
     p0_src = sh['kFsRawDenoise'].replace(
         'oColor = vec4(ch == 0 ? v : 0.0, ch == 1 ? v : 0.0, ch == 2 ? v : 0.0, 1.0);',
@@ -245,10 +257,10 @@ def main():
         'uSize': (w, h), 'uCfaLut': cfa_lut,
         'uBlack': tuple(float(bl[i]) for i in range(4)), 'uWhite': white,
         'uGain': tuple(float(v) for v in g),
-        'uNoiseA': tuple(noiseA), 'uNoiseB': tuple(noiseB), 'uMix': 1.0,
+        'uNoiseA': tuple(noiseA), 'uNoiseB': tuple(noiseB), 'uMix': args.p0_mix,
     }, {'uRaw': tex_raw})
     np.save(os.path.join(args.out, 'p0.npy'), p0)
-    steps['p0'] = 'kFsRawDenoise'
+    steps['p0'] = f'kFsRawDenoise (mix={args.p0_mix}, A={noiseA}, B={noiseB})'
 
     # ── RCD：P1/P2/P3（[58] 时用 A/B 双 pass）
     tex_mos = gl.ctx.texture((w, h), 4, dtype='f2')
@@ -277,7 +289,7 @@ def main():
               'uLscSize': (1, 1),
               'uSatClip': (float(g[0]), 1.0, float(g[2]))}
     if args.p3_split:
-        a = gl.run(sh['kFsRcdChromaA'], {**common, 'uCdFix': 1.0},
+        a = gl.run(sh['kFsRcdChromaA'], {**common, 'uCdFix': args.cd_fix},
                    {'uRaw': tex_raw, 'uMos': tex_mos, 'uDir': tex_dir, 'uG': tex_g, 'uLsc': tex_lsc})
         np.save(os.path.join(args.out, 'rcd_3a.npy'), a)
         tex_a = gl.ctx.texture((w, h), 4, dtype='f2'); tex_a.write(a.astype(np.float16).tobytes())
@@ -286,7 +298,7 @@ def main():
                     {'uRcdA': tex_a, 'uDir': tex_dir, 'uG': tex_g, 'uLsc': tex_lsc})
         steps['rcd'] = 'kFsRcdDir+G+ChromaA+B ([58] 双 pass)'
     else:
-        d3 = gl.run(sh['kFsRcdChroma'], {**common, 'uCdFix': 1.0},
+        d3 = gl.run(sh['kFsRcdChroma'], {**common, 'uCdFix': args.cd_fix},
                     {'uRaw': tex_raw, 'uMos': tex_mos, 'uDir': tex_dir, 'uG': tex_g, 'uLsc': tex_lsc})
         steps['rcd'] = 'kFsRcdDir+G+Chroma (单 pass)'
     np.save(os.path.join(args.out, 'rcd_d3.npy'), d3)
@@ -948,6 +960,10 @@ def film_stage(a):
         'uLocalKneeHi': 1.3,    # FrameRenderer.cpp:270 kLocalKneeHi
         'uLocalRef': 0.5,       # passFilm 内 local_ref 兜底（局部图未生成时的中灰）
         'uLocalSize': (1.0, 1.0),
+        # FilmParams[39] 轻度锐化（0.12.162 起可 A/B）：真机 0.5。
+        # 不传时 shader 里 uSharpen 缺省 = 0 ⇒ 离线**一直没跑锐化**，与成片有差。
+        'uSharpen': float(a.film_sharpen),
+        'uPx': (1.0 / max(w, 1), 1.0 / max(h, 1)),
     })
     # ── 引擎 1（sigmoid）的 7 个私有 uniform ─────────────────────────────────
     # 数值来源 = `tools/sigmoid-params-ref.py` 的 `compute_sigmoid_params()`
@@ -1244,6 +1260,8 @@ def _film_cli(argv):
                     help='噪声模型截距（真机 = p4b 同款加权）；默认 1e-6 同上')
     ap.add_argument('--pc3d-msize', type=float, default=0.0,
                     help='FilmParams[55] 强制核尺寸（奇数 7..21）；0 = 自动（PC 公式）')
+    ap.add_argument('--film-sharpen', type=float, default=0.5,
+                    help='FilmParams[39] 轻度锐化强度（真机默认 0.5；0 = 关）')
     a, _ = ap.parse_known_args(argv)
     return a
 

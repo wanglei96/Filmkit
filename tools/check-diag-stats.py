@@ -23,7 +23,10 @@ import sys
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "core/engine/src/render/FrameRenderer.cpp"
-STAGES = ["D3-camrgb", "D4-scene", "HR-filmsrc", "FILM-out", "D5-out-u8"]
+STAGES = ["D3-camrgb", "D4-scene", "HR-filmsrc", "FILM-out", "D5-out-u8",
+          # 0.12.109：降噪链逐段（PC3D → P4 → defringe → D-1）—— 灰块定位用。
+          # 只在对应 pass 真的跑过时才有条目（c.dn 关时整段不存在）。
+          "PC3D", "P4", "DEFRINGE", "D1"]
 
 FAILS: list[str] = []
 
