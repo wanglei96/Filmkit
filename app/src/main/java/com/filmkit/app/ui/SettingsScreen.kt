@@ -858,7 +858,40 @@ private fun ToneColorDrawerContent() {
     // 判据与采集侧同一个 prefs 键（"bracket"，默认 true）。
     val bracketOn = remember { prefs.getBoolean("bracket", true) }
     var hrRawOn by remember { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
-    if (!bracketOn) SettingSwitchRow(
+    // 0.12.166：用户要求——bracket 开着时也要能 A/B。旧版这条开关被 !bracketOn 藏起来，
+    // 而 hr_on 的判据是 `hr_raw && !bracket_info_ok`（bracket 下 sat 低时仍会跑），
+    // 所以隐藏它等于"能跑但没法关"。
+    var hlRollOffOn by remember { mutableStateOf(prefs.getBoolean("hl_rolloff", true)) }
+    SettingSwitchRow(
+        title = "高光滚降",
+        subtitle = "kFsOut 的 highlightRolloff：超白部分向白混合。关 = 高光只做 gamut 压缩，" +
+            "用于隔离暗部/高光边缘发灰是否来自滚降",
+        checked = hlRollOffOn,
+        onChecked = { v ->
+            hlRollOffOn = v
+            prefs.edit().putBoolean("hl_rolloff", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.hl_rolloff",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    var d4UsmOn by remember { mutableStateOf(prefs.getBoolean("d4_usm", false)) }
+    SettingSwitchRow(
+        title = "D4 大半径锐化（实验）",
+        subtitle = "去马赛克后、tone 之前做 1/8 低频 USM（等效半径 8~16px），收窄暗部软边。" +
+            "默认关：本版强制开启时画面变硬，先做成可开可关再评",
+        checked = d4UsmOn,
+        onChecked = { v ->
+            d4UsmOn = v
+            prefs.edit().putBoolean("d4_usm", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.d4_usm",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    SettingSwitchRow(
         title = "高光重建·RAW 域",
         subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
         checked = hrRawOn,

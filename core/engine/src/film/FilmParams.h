@@ -519,6 +519,10 @@ struct FilmParams {
   // `nativeSetEngineParams`（阶段 2 才加）。
   // 旧预设数组长度 ≤ 98（即 < 99）⇒ 读不到该槽 ⇒ 保持结构体默认 ⇒ 与本行一致（= 1）。
   float engine_slot = 1.0f;   // 98
+  // [99] 高光滚降（kFsOut 的 highlightRolloff）：1 = 开（默认），0 = 关
+  float hl_rolloff = 1.0f;  // 99
+  // [100] D4 大半径 USM（1/8 低频）—— 0 = 关（默认），1 = 开
+  float d4_usm = 0.0f;  // 100
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -652,6 +656,12 @@ struct FilmParams {
     // `CameraPresets.DEFAULT_ENGINE_SLOT` 及读取缺省**必须同值**，否则会出现
     // "C++ 走引擎 1、Kotlin 按引擎 0 判断旁路"的第三态（filmic 参数在引擎 1 下未归零）。
     if (n > 98) engine_slot = static_cast<float>(v[98]);
+    // 0.12.166：高光滚降开关 [99]（0.12.166 用户要求设置页可 A/B）。
+    // 缺槽（旧数组 ≤ 100）时保持默认 1.0 = 开，行为与改动前逐位一致。
+    if (n > 99) hl_rolloff = static_cast<float>(v[99]);
+    // 0.12.167：[100] D4 大半径 USM 开关。**默认 0 = 关** —— 165 版强制开启时
+    // 用户反馈"画面毁了"，所以改为默认关、设置页显式开。
+    if (n > 100) d4_usm = static_cast<float>(v[100]);
   }
 };
 

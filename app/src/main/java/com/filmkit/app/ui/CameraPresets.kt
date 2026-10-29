@@ -19,7 +19,7 @@ object CameraPresets {
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 99
+    const val COUNT = 101
 
     /**
      * `[98] engine_slot` 的**默认档位** = `1`（sigmoid）—— 用户 2026-10-14 拍板
@@ -77,6 +77,10 @@ object CameraPresets {
         this[28] = 1.0
         // 29 = 高光重建强度：1.0 = 开（CCM 前用未饱和通道外推饱和通道）。
         this[29] = 1.0
+        // 0.12.166：[99] 高光滚降（kFsOut highlightRolloff）—— 1 = 开（默认），0 = 关。
+        this[99] = 1.0
+        // 0.12.167：[100] D4 大半径 USM —— **默认 0 = 关**（用户反馈强制开启"画面毁了"）。
+        this[100] = 0.0
         // 30 = 过曝提示阈值（显示域）：0.95 ≈ 242/255，0 = 关；仅预览生效。
         this[30] = 0.95
         // 31..33 = 色彩外观层（M3 P1）：强度 / 饱和增益 / 色度 S 端点。

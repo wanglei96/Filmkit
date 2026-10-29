@@ -391,9 +391,25 @@ class FrameRenderer {
   // "按实际合并更新 σ"），CPU 读回取均值供 P0/P4 折减与日志。
   // 期 B bracket：参考帧饱和修复的目标纹理（R16UI，raw 尺寸）
   bool ensureSatFixTarget(int w, int h);
+  // 0.12.102：off_tex = 短帧 tile 位移场（mfnrAlign 输出，与 DFT 同一套），
+  // 短帧按亚像素对齐采样；tiles_w/h 为其网格。
   void passMfnrSatFix(GLuint ref_tex, GLuint short_tex, int w, int h,
                       const float black_phase[4], float white_level,
-                      float short_scale, GLuint sat_map, int sat_w, int sat_h);
+                      float short_scale, GLuint sat_map, int sat_w, int sat_h,
+                      GLuint off_tex, int tiles_w, int tiles_h);
+  // ── 0.12.133（方案 B 块 3）：短帧真值图 + 全饱和区亮度 inpaint ─────────────
+  // 短帧真值图 = 短帧按同一套位移场亚像素采样的 WB 线性值 + "短帧未饱和"标记。
+  // inpaint = 对参考帧饱和的 photosite：优先用短帧真值，短帧也饱和时按 1/d²
+  // 归一化卷积从周围有真值的像素扩散；输出替换 tex_fused_ 供 HL/P0 消费。
+  bool ensureShortValTarget(int w, int h);
+  void passMfnrShortVal(GLuint short_tex, int w, int h, int cfa,
+                        const float black_phase[4], float white_level,
+                        const float gains[3], float short_scale, GLuint off_tex,
+                        int tiles_w, int tiles_h);
+  bool ensureHlInpTarget(int w, int h);
+  bool passHlInpaint(int w, int h, int cfa, const float gains[3],
+                     float short_scale, GLuint fused_tex,
+                     GLuint short_val_tex);
   bool ensureMfnrFftTargets(int w, int h);
   // 返回 false = compute 程序不可用（非 ES 3.2 设备），调用方回退 mismatch 路径。
   // frames/strides = 4 帧原始 u16 指针与行距（burst 数组直传，见实现内注释）；
@@ -439,6 +455,9 @@ class FrameRenderer {
     // v0.12.0：bracket 是否真的跑了（不看 short_sat 的符号 —— 真机出现
     // "short_sat=0 但 HL 仍在跑"的矛盾，怀疑符号被非 bracket 路径复用）。
     bool bracket = false;
+    // 0.12.102：sat-fix 跑的是 HDR 四帧（不是旧 bracket）⇒ film 域 HR 不关，
+    // 由三态标记做条件重建（无真值区才 inpaint）。旧 bracket 维持 c.bracket 关 HR。
+    bool hdr = false;
     // MFNR 等效帧数（噪声方差折减 ÷neff）。NN 输入增益要按**实际输入**的噪声
     // 标定：融合路径喂的是 tex_fused_（方差已折减），与 P0/P4 系数同口径。
     float neff = 1.f;
@@ -483,6 +502,12 @@ class FrameRenderer {
   // tile 并行）→ LSC → 上传 tex_amaze_（源几何）。返回 false = 失败（调用方
   // 必须回退，照片优先红线）。demosaic == 2 才调用。
   bool runAmazeCpu(const ChainCtx& c);
+  // 0.12.147：AMaZE 改吃**完整前链的输出** —— 输入 = tex_mos_（HL 前置 + P0 之后的
+  // 线性 mosaic，与 RCD 逐字节同源）⇒ 饱和重建/RAW 降噪与 RCD 档完全一致，两档的
+  // 差异只剩"去马赛克算法"一个变量；CCM 及其下游全部共用。
+  bool runAmazeFromMosaic(const ChainCtx& c);
+  // CPU AMaZE 结果（源几何 RGB 浮点）→ tex_amaze_。两条 AMaZE 路径共用。
+  bool uploadAmazeTex(const float* rgb, int w, int h);
   // ── NN 降噪 pass（v0.10.102）：PMRID TFLite ─────────────────────────────
   // 位置 = 融合后 RAW 域、去马赛克前（finishStillChain 的 P0 之前）。数据流：
   // kFsNnPack（mosaic→packed 4ch 半分辨率、除回 WB、×VST 959/256）→ readPixels
@@ -590,6 +615,11 @@ class FrameRenderer {
   // RCD 产生的窄带伪彩，后置治 **PC3D 自身产生**的色度过冲（真机实测：D4 域
   // 该位置 ch 平缓无过冲，而成片有 52 vs 两侧 10/29 的过冲 ⇒ 过冲产生于 PC3D）。
   bool passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tmp = false);
+  // 0.12.162：色差域 3×3 中值（darktable color_smoothing 原版：R−G/B−G 各取 3×3
+  // 中值，G 逐位不变）。注意上面那条 passColorSmooth 的注释虽然也写"色差域中值"，
+  // 实现却是**判据式去饱和**（梯度门 + 局部色度峰），在暗部（阴影）结构性失效 ——
+  // 见 kFsColorMedian 头部。输入任意 D4 域纹理，输出 tex_cm_。
+  bool passColorMedian(int dst_w, int dst_h, GLuint src);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
   // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
   // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，
@@ -910,7 +940,7 @@ class FrameRenderer {
          // 紫边抑制（v0.10.134）：down+Lab / 检测 / 1/16 均值 / 替换
          prog_df_down_ = 0, prog_df_det_ = 0, prog_df_avg_ = 0,
          prog_df_apply_ = 0,
-         prog_cs_ = 0, prog_gainmap_ = 0,
+         prog_cs_ = 0, prog_cm_ = 0, prog_gainmap_ = 0,
          // 横向色差校正（v0.10.170）：1/8 降采样（估计）+ 全分辨率径向位移校正
          prog_ca_ds_ = 0, prog_ca_corr_ = 0,
          // PC ESD3D2 完整移植（v0.10.175）：本体 + 尺度结构入口/收口
@@ -998,6 +1028,23 @@ class FrameRenderer {
          prog_raw_dn_fused_ = 0;
   GLuint prog_mfnr_mis_ = 0;  // 阶段二（v0.10.0）：mismatch map
   GLuint prog_mfnr_satfix_ = 0;  // 期 B bracket：参考帧饱和修复
+  // 0.12.133（方案 B 块 3）：短帧真值图 + 全饱和区 inpaint（可选能力，prog 失败即降级）
+  GLuint prog_mfnr_sv_ = 0, prog_hl_inp_ = 0;
+  GLuint tex_short_val_ = 0, fbo_short_val_ = 0;
+  GLuint tex_fused_inp_ = 0, fbo_fused_inp_ = 0;
+  int sv_w_ = 0, sv_h_ = 0;
+  int inp_w_ = 0, inp_h_ = 0;
+  // 短帧曝光归一（长/短），0 = 本张没有可用短帧真值（单帧 / sat-fix 未跑）
+  float short_val_scale_ = 0.f;
+  int short_val_ok_ = 0;
+  struct {
+    GLint shrt = -1, off = -1, size = -1, tiles = -1, tile_m = -1, cfalut = -1,
+          black = -1, white = -1, gain = -1, scale = -1;
+  } u_mfnr_sv_;
+  struct {
+    GLint fused = -1, shrt = -1, size = -1, gain = -1, shortk = -1,
+          cfalut = -1;
+  } u_hl_inp_;
   // 局部影调（tone equalizer）：mask 生成 + 查表应用
   GLuint prog_teq_down_ = 0, prog_teq_box_ = 0, prog_teq_coef_ = 0,
          prog_teq_gain_ = 0, prog_teq_apply_ = 0;
@@ -1005,6 +1052,26 @@ class FrameRenderer {
   // 期 B bracket（0.11.72）：参考帧饱和修复 —— 把短帧归一后的真实高光移植到
   // 参考帧的饱和像素上，再送进融合（否则长帧饱和处的短帧高光会被收缩/平均抹平）。
   GLuint tex_ref_fix_ = 0, fbo_ref_fix_ = 0;
+  // 0.12.112：降噪链出口的 SNR 混合结果（高光取原图）。仅在 dn 且降噪输出 ≠ 原图时生成。
+  GLuint tex_dnb_ = 0, fbo_dnb_ = 0;
+  // 0.12.122 / 0.12.161：collar flow 修正后的位移场（tiles 尺寸，仅短帧那份用）
+  GLuint tex_off_fix_ = 0, fbo_off_fix_ = 0;
+  int off_fix_w_ = 0, off_fix_h_ = 0;
+  // 0.12.161：support 场（位移 + 每 tile 是否可观测），GPU 生成后读回 CPU
+  GLuint tex_off_supp_ = 0, fbo_off_supp_ = 0;
+  int off_supp_w_ = 0, off_supp_h_ = 0;
+  GLuint prog_collar_supp_ = 0;
+  struct { GLint off = -1, ref = -1, size = -1, tiles = -1, tilem = -1, white = -1; } u_collar_supp_;
+  bool passCollarFlow(GLuint off_tex, GLuint ref_tex, int w, int h,
+                      float white_level, int tw, int th);
+  // 诊断（进 mfnr 日志：collar 生效性，防再次静默 no-op）
+  int dbg_collar_regions_ = 0, dbg_collar_regions_collar_ = 0,
+      dbg_collar_regions_global_ = 0, dbg_collar_tiles_ = 0,
+      dbg_collar_supp_ = 0;
+  int dnb_w_ = 0, dnb_h_ = 0;
+  GLuint prog_dn_blend_ = 0;
+  struct { GLint dn = -1, orig = -1, noise_a = -1, noise_b = -1, snr_lo = -1, snr_hi = -1; } u_dn_blend_;
+  bool passDnBlend(int w, int h, GLuint dn_tex, GLuint orig_tex, const NoiseCoef& nc);
   // HR 的条件重建标记（= sat-fix 输出纹理；0 = 不用，即普通 HR）
   GLuint hr_fix_mark_ = 0;
   // 局部影调：1/4 分辨率的 I/mask/gain + 全分辨率输出
@@ -1084,6 +1151,10 @@ class FrameRenderer {
   GLuint tex_hl_ref_ = 0, fbo_hl_ref_ = 0;  // 1/32 网格参考色度场 (rg·w, bg·w, w)
   GLuint tex_hl_ref2_ = 0, fbo_hl_ref2_ = 0;  // 1/128 中尺度参考场（同上三元组）
   int hl_w_ = 0, hl_h_ = 0, hl_mw_ = 0, hl_mh_ = 0, hl_tw_ = 0, hl_th_ = 0;
+  // 0.12.133（方案 B 块 1）：最近一次 HL 跑出的**块级饱和掩码**（= tex_hl_dil_，
+  // 尺寸 hl_mw_×hl_mh_）。RCD 三段按源坐标 p/3 读它写进 alpha，随 RGB 一起旋转
+  // 进 D3/D4，供 kFsPc3d 在高光处收手。0 = 本张没跑 HL（PC3D 不收手，旧行为）。
+  GLuint hl_mask_tex_ = 0;
   // 非 0 时 RCD 三段改读它（= tex_hl_）；0 = 原行为（直读 tex_mos_）。
   GLuint hr_src_override_ = 0;
   GLuint fbo_dn_ = 0, tex_dn_ = 0;    // RGBA16F，P4 色度平滑输出
@@ -1097,10 +1168,28 @@ class FrameRenderer {
   int df_w_ = 0, df_h_ = 0;                 // 全分辨率尺寸（缓存键）
   int dbg_cs_ok_ = -1;                      // v0.10.198：色差中值 shader 是否链接成功
   int dbg_cs_on_ = -1;                      // v0.10.198：本帧该 pass 是否真的跑了
+  int dbg_cm_on_ = -1;                      // 0.12.162：色差域中值是否真的跑了
+  // 0.12.164（诊断）：D4 与 film 输出的亮度剖面（4 条水平线 × 64 点），进日志
+  std::string dbg_prof_d4_, dbg_prof_fm_;
+  // 0.12.164：读回 4 条水平线 × 64 点、编码成 3 位 hex 的亮度剖面
+  std::string profDump(GLuint fbo, GLuint tex, int w, int h);
   float dbg_cs_k_ = -1.f;                   // v0.10.198：下发的 FilmParams[59] 实际值
   // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
   GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F（最终输出）
   GLuint fbo_cs_tmp_ = 0, tex_cs_tmp_ = 0;  // ping-pong 中间缓冲（多 pass）
+  // 0.12.165：D4 层大半径 USM（1/8 低频，r≈8-16px）—— 收窄暗部软边，不动 tone curve
+  GLuint fbo_usm_ = 0, tex_usm_ = 0;
+  GLuint fbo_lc1_ = 0, tex_lc1_ = 0;
+  int usm_w_ = 0, usm_h_ = 0, lc1_w_ = 0, lc1_h_ = 0;
+  GLuint prog_usm_down_ = 0, prog_usm_ = 0;
+  struct { GLint tex = -1, size = -1; } u_usm_down_;
+  struct { GLint tex = -1, low = -1, size = -1, low_size = -1, k = -1; } u_usm_;
+  bool passUsm(int w, int h, GLuint src);
+  int dbg_usm_on_ = 0;
+  // 0.12.162：色差域 3×3 中值（**真正的** darktable color_smoothing）
+  GLuint fbo_cm_ = 0, tex_cm_ = 0;
+  GLuint fbo_cm_tmp_ = 0, tex_cm_tmp_ = 0;
+  int cm_w_ = 0, cm_h_ = 0;
   int cs_w_ = 0, cs_h_ = 0;                 // 全分辨率尺寸（缓存键）
   float dbg_df_cavg_ = 0.f;                 // 最近一次 chromave（日志）
   // 横向色差校正（v0.10.170）：tex_ca_ = 校正输出（只在 caApplied=1 时替换
@@ -1122,6 +1211,12 @@ class FrameRenderer {
   float dbg_rcd_a_ms_ = 0.f, dbg_rcd_b_ms_ = 0.f;
   // AMaZE 档（v0.10.172）：CPU AMaZE + 上传耗时（日志 amazeMs；0 = 未走本档）
   float dbg_amaze_ms_ = 0.f;
+  // 0.12.148：AMaZE 读回自检（mosaic 的 min/max）——全 0/NaN 说明读回口径错。
+  float dbg_amaze_min_ = 0.f, dbg_amaze_max_ = 0.f;
+  // 0.12.152：AMaZE 成本拆解（累计所有帧）—— 读回 / CPU / 上传。
+  // 只有把这三段分开，才能判断「手机 1~1.7s」里有多少是算法、多少是搬运。
+  float dbg_amaze_rd_ms_ = 0.f, dbg_amaze_cpu_ms_ = 0.f,
+        dbg_amaze_up_ms_ = 0.f;
   // 档 A（v0.10.165）伪彩强度图诊断（passChromaDenoise 内 GPU 统计读回）：
   //   moGain = 下发强度（FilmParams[48]）；moMean = 强度图全图均值；
   //   moP95  = 强度图的 P95（4 锚点分段线性 CDF 近似，口径见 kFsMoireStat）；
@@ -1171,6 +1266,10 @@ class FrameRenderer {
   // finishStillChain 在日志组装前读取。
   int dbg_hl_ok_ = 0;        // 1 = 执行成功（下游改用 tex_hl_）；0 = 未启用/失败
   int dbg_hl_mark_on_ = 0;   // v0.11.87：HR 条件重建的标记是否真绑上（0 = 没生效）
+  // 0.12.102：HL 与 HR 是两个消费点，共用一个字段会互相覆盖（HL 的 fix_mark 自
+  // v0.12.10 起恒 0 ⇒ 日志里的 hlMarkOn 永远 0）。HR 的实际绑定单独记一份。
+  int dbg_hr_mark_on_ = 0;
+  int dbg_dn_blend_ = 0;   // 0.12.114：降噪出口混合是否真的生效（日志 dnb）
   float dbg_hl_cnt_ = 0.f;   // 色度统计样本数（G 通道；darktable 的 100 样本闸）
   float dbg_hl_chroma_[3] = {0.f, 0.f, 0.f};  // 色度校正量
   double dbg_hl_sum_[3] = {0.0, 0.0, 0.0};    // Σ(实测−对立外推)，chroma 的分子
@@ -1189,6 +1288,11 @@ class FrameRenderer {
   float dbg_hl_r2hit_ = 0.f, dbg_hl_rghit_ = 0.f;  // 三级参考命中占比（%）
   int dbg_hl_grecon_ = 1;  // v0.10.169：apply 支实际下发的 uGRecon（日志 hlGRecon）
   int dbg_hl_rbrecon_ = 0;  // v0.10.179：apply 支实际下发的 uRbRecon（日志 hlRb）
+  // 0.12.133（方案 B）：hlMaskTx = RCD 拿到了 RAW 饱和掩码（→ alpha 链生效，
+  // PC3D 能收手）；hlInp = 全饱和区亮度 inpaint 真跑了（短帧真值 + 标记都有效）。
+  int dbg_hl_mask_tx_ = 0;
+  int dbg_hl_inp_ = 0;
+  float dbg_hl_inp_ms_ = 0.f;
   // ── v0.10.167 HR 前置的生效性字段（照 p0s/hlOk 的教训：改完必须能自证）──
   // 为什么必须记"统计源/判定源"两个名字：exp21 翻车的结构性根因就是二者共用
   // 一个 src、没有独立旋钮（改统计口径时把判定口径一起改了 ⇒ 修复面 47269→63903
@@ -1452,7 +1556,7 @@ class FrameRenderer {
     GLint st = -1, rot = -1, scale = -1, tex = -1, mos = -1, mosaic = -1,
           dir = -1, g = -1, size = -1, cfalut = -1, black = -1, white = -1,
           gain = -1, ccm = -1, lsc = -1, lsc_size = -1, cd_fix = -1,
-          gorig = -1;
+          gorig = -1, hlmask = -1, maskon = -1;
   } u_rcd_chroma_;
   // P3 拆双 pass（v0.10.180，[58] rcd_p3_split）：3a（vs_plain_ 源几何直写）
   // 与 3b（kVertRot 成片几何，与 kFsRcdChroma 同款坐标变换）的 uniform 句柄
@@ -1463,7 +1567,8 @@ class FrameRenderer {
   } u_rcd_chroma_a_;
   struct {
     GLint st = -1, rot = -1, scale = -1, rcd_a = -1, dir = -1, g = -1,
-          size = -1, cfalut = -1, lsc = -1, lsc_size = -1, satclip = -1;
+          size = -1, cfalut = -1, lsc = -1, lsc_size = -1, satclip = -1,
+          hlmask = -1, maskon = -1;
   } u_rcd_chroma_b_;
   // 第 4a 期（S14）：D3→D4 独立 CCM pass 的 uniform 句柄
   struct {
@@ -1474,6 +1579,10 @@ class FrameRenderer {
   // （kVertRot + uST 单位阵 + uScale=1，frag 里 tuv=(vUV0.x, 1−vUV0.y)）。
   struct {
     GLint tex = -1, size = -1, st = -1, rot = -1, scale = -1;
+    // 0.12.150：把 HL 的块级饱和掩码写进 D3 的 alpha（与 kFsRcdChroma 同口径）。
+    // 不写 ⇒ Amaze 档的 D4 alpha 恒 1 ⇒ color_smooth 的探测点全被判成饱和
+    // ⇒ nv==0 直接 return，整个伪彩抑制在 Amaze 档失效。
+    GLint hlmask = -1, maskon = -1, masksize = -1;
   } u_amaze_up_;
   struct {
     GLint tex = -1, size = -1, cfalut = -1, black = -1, white = -1, gain = -1,
@@ -1514,6 +1623,7 @@ class FrameRenderer {
   struct {
     GLint ref = -1, shrt = -1, size = -1, black = -1, white = -1, scale = -1;
     GLint satmap = -1, satsize = -1;   // v0.11.99：邻域饱和面积（1/2 灰度图）
+    GLint off = -1, offtiles = -1, minerr = -1;  // 0.12.102：短帧对齐采样 + fallback
   } u_mfnr_satfix_;
   // 局部影调（tone equalizer）
   struct { GLint tex = -1, src_texel = -1; } u_teq_down_;
@@ -1551,6 +1661,8 @@ class FrameRenderer {
   struct {
     GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1, side_k = -1, chroma_min = -1, peak_k = -1;
   } u_cs_;
+  // 色差域 3×3 中值（0.12.162）
+  struct { GLint tex = -1, size = -1, chroma_min = -1; } u_cm_;
   // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid）
   struct {
     GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1;
@@ -1581,7 +1693,8 @@ class FrameRenderer {
   //   u_pc3d_up_   = guidedupsample（low / guidehi / lowSize / hiSize / R）
   struct {
     GLint tex = -1, size = -1, k = -1, kernel = -1, sig_a = -1, sig_b = -1,
-          moire = -1, luma = -1, lsc = -1, lsc_size = -1;
+          moire = -1, luma = -1, lsc = -1, lsc_size = -1, orig = -1, maskon = -1,
+          down = -1, fullsize = -1;
   } u_pc3d_;
   struct {
     GLint tex = -1, size = -1, resize = -1, stride = -1, sigma = -1;
@@ -1593,14 +1706,18 @@ class FrameRenderer {
   // mono（v0.10.167）= 源布局开关：1 = 单通道 R16F（值在 .r），0 = RGBA16F 相位布局
   struct {
     GLint mos = -1, stat = -1, statraw = -1, mono = -1, size = -1, cfalut = -1,
-          clips = -1;
+          clips = -1,
+          satclip = -1;   // 0.12.105：满阱（= WB 增益），判据改成 per-channel 归一
   } u_hl_mask_;
   struct {
     GLint mask = -1, msize = -1;
   } u_hl_dil_;
   struct {
     GLint mos = -1, stat = -1, statraw = -1, mono = -1, dil = -1, size = -1,
-          msize = -1, cfalut = -1, clips = -1, mode = -1;
+          msize = -1, cfalut = -1, clips = -1, mode = -1,
+          // 0.12.127：三态信息标记（R16UI 的 G 通道）。refavg 只采纳标记 2
+          //（长帧本身未饱和）的邻域样本 —— 理由见 kFsHlChroma 顶部注释。
+          fixmark = -1, markon = -1;
   } u_hl_chroma_;
   struct {
     // clips = uSatClip（满阱，仅 allSat 判定）；hlclip = uHlClip（裁剪判据 0.987，
@@ -1668,7 +1785,7 @@ class FrameRenderer {
           // **逐字相同**的 shader 逻辑与 CPU 下发段（ADR-9 末段 / ADR-11）
           grain_amount = -1, grain_seed = -1, grain_zoom = -1, grain_norm = -1,
           grain_lut = -1,
-          flip_y = -1, zebra = -1, sharpen = -1, lut = -1, lut_on = -1,
+          flip_y = -1, zebra = -1, sharpen = -1, rolloff = -1, lut = -1, lut_on = -1,
           lut_strength = -1, lut_dmin = -1, lut_dinv = -1, lut_size = -1,
           // E4-2 暗角（vignette）：与 u_style_ 同名同义 —— 两条链路共用一段
           // 逐字相同的 shader 逻辑（ADR-9）

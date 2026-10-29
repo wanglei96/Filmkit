@@ -959,10 +959,15 @@ class CameraController(private val context: Context, private val render: RenderC
         /** MFNR 触发判定（纯函数供单测）：
          *  mode 0 = 关（永不）；1 = 自动（RAW+RCD 质量档 + 暗光阈值）；
          *  2 = 强制（RAW+RCD 即触发，白天也 4 帧，便于 A/B）。 */
-        fun mfnrShouldTrigger(mode: Int, rawMode: Boolean, demosaicRcd: Boolean,
+        fun mfnrShouldTrigger(mode: Int, rawMode: Boolean, demosaicFused: Boolean,
                               liveIso: Int, liveExposureNs: Long): Boolean {
             if (mode <= 0) return false
-            if (!rawMode || !demosaicRcd) return false
+            // 0.12.152：判据从「必须是 RCD」放宽到「走融合前链的档」。
+            // v0.10.172 的 AMaZE 是独立分支（原始 u16 自起一条链，绕开 P0/HL），
+            // 那时 MFNR 对它是空转，所以这里写死 demosaic==1；0.12.147 起 AMaZE
+            // 改吃 tex_mos_（HL 前置 + P0 的输出），与 RCD 同一条前链 ⇒ 必须放行。
+            // 只有 demosaic=0（快速/双线性，走 passRaw 内联）不在该链上。
+            if (!rawMode || !demosaicFused) return false
             if (mode >= 2) return true
             return liveIso >= MFNR_ISO_THRESHOLD ||
                 liveExposureNs >= MFNR_EXPOSURE_THRESHOLD_NS
@@ -1508,6 +1513,8 @@ class CameraController(private val context: Context, private val render: RenderC
     private var colorSmoothPref = -1.0
     private var rcdP3SplitPref = -1.0
     private var hrRawPref = -1.0
+    private var hlRolloffPref = -1.0   // 0.12.166：高光滚降（FilmParams[99]）
+    private var d4UsmPref = -1.0   // 0.12.167：D4 大半径 USM（FilmParams[100]，默认关）
     private var hrPref = -1.0
     private var whiteHlPref = -1.0
     // v0.10.111：白点下限边距（FilmParams[43]；0 = 旧行为）
@@ -1599,6 +1606,8 @@ class CameraController(private val context: Context, private val render: RenderC
         applyGamutPref()
         applyHrWaveletPref()
         applyHrRawPref()
+        applyHlRolloffPref()
+        applyD4UsmPref()
         applyRcdCdFixPref()
         applyRcdGOrigPref()
         applyHlRbReconPref()
@@ -1757,6 +1766,28 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != hrRawPref) {
             hrRawPref = v
             filmParams[45] = v
+        }
+    }
+
+    /**
+     * 0.12.166：高光滚降开关（用户要求设置页可 A/B）—— 写 FilmParams[99]。
+     * 1 = 开（kFsOut 的 highlightRolloff，默认）；0 = 关（高光只做 gamut 压缩，
+     * 不再向白混合）。用于隔离"暗部/高光边缘发灰"到底来自滚降还是别处。
+     */
+    /** 0.12.167：D4 大半径 USM（收窄暗部软边）—— 默认关，写真 FilmParams[100]。 */
+    private fun applyD4UsmPref() {
+        val v = if (appPrefs.getBoolean("d4_usm", false)) 1.0 else 0.0
+        if (v != d4UsmPref) {
+            d4UsmPref = v
+            filmParams[100] = v
+        }
+    }
+
+    private fun applyHlRolloffPref() {
+        val v = if (appPrefs.getBoolean("hl_rolloff", true)) 1.0 else 0.0
+        if (v != hlRolloffPref) {
+            hlRolloffPref = v
+            filmParams[99] = v
         }
     }
 
@@ -2178,7 +2209,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 val demosaic = prefs.getInt("demosaic_algo", -1)
             .let { if (it in 0..2) it else if (prefs.getBoolean("demosaic_quality", true)) 1 else 0 }
                 val trigger = mfnrShouldTrigger(
-                    mode, rawMode, demosaic == 1, liveIso, liveExposureNs,
+                    mode, rawMode, demosaic != 0, liveIso, liveExposureNs,
                 )
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "camera", "mfnr.trigger",

@@ -8,7 +8,7 @@ import org.junit.Test
 class MfnrTriggerTest {
 
     private val raw = true
-    private val rcd = true
+    private val rcd = true          // demosaicFused = RCD 或 Amaze（0.12.152 起）
 
     @Test
     fun mode0_off_neverTriggers() {
@@ -27,6 +27,17 @@ class MfnrTriggerTest {
         assertTrue(CameraController.mfnrShouldTrigger(1, raw, rcd, 3200, 8_000_000L))
         assertTrue(CameraController.mfnrShouldTrigger(1, raw, rcd, 50, 25_000_000L))
         assertTrue(CameraController.mfnrShouldTrigger(1, raw, rcd, 100, 333_000_000L))
+    }
+
+    @Test
+    fun amaze_isNotExcluded() {
+        // 0.12.152：AMaZE 改吃 tex_mos_（HL+P0）后与 RCD 同一条融合前链，
+        // 触发判据不能再把它挡在外面 —— 否则切到 Amaze 档就是"单帧出图"，
+        // 表现正是"HDR 效果跟没有一样"。
+        assertTrue(CameraController.mfnrShouldTrigger(2, raw, true, 50, 4_000_000L))
+        assertTrue(CameraController.mfnrShouldTrigger(1, raw, true, 3200, 8_000_000L))
+        // 只有 demosaic=0（快速/双线性，不走该链）被排除
+        assertFalse(CameraController.mfnrShouldTrigger(2, raw, false, 50, 4_000_000L))
     }
 
     @Test
