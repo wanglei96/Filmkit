@@ -3033,6 +3033,44 @@ void main() {
     if (bv < 0.0) bv = base;
     bool all_sat = rv >= uGain.x * 0.99 && gv >= uGain.y * 0.99
                 && bv >= uGain.z * 0.99;
+    // ── 0.12.196：**部分饱和**也要短帧真值（品红/绿边的真正位置）────────────
+    // 0.12.134 只填"三通道全饱和"，因为当时是逐 photosite 填 ⇒ G 用短帧、
+    // R/B 用长帧，两块数据混在一个 2×2 块里 ⇒ 色比撕裂（黄绿）。那不是"部分
+    // 饱和不能用短帧"，而是"不能用半块短帧"。
+    // 正确判据（PC Bento 的 mask 语义）：只要短帧在**本 2×2 块的四相位全都
+    // 未饱和**，整块就交给短帧 —— 四个 photosite 同源，色比天然正确；长帧此时
+    // 有几个通道顶到满阱都无所谓。真机 10:14 那张（satmHit 122113）：品红全部
+    // 贴着白壶/背景高光的边缘，正是"长帧部分饱和、短帧全有真值"的带。
+    bool any_sat = rv >= uGain.x * 0.99 || gv >= uGain.y * 0.99
+                || bv >= uGain.z * 0.99;
+    bool quad_ok = true;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            ivec2 q = clamp(ivec2((p.x & ~1) + dx, (p.y & ~1) + dy),
+                            ivec2(0), uSize - 1);
+            if (texelFetch(uShort, q, 0).g <= 0.5) quad_ok = false;
+        }
+    }
+    vec4 s0 = texelFetch(uShort, p, 0);
+    // 短帧 5×5 双边平滑（只平均同亮度样本）。两处共用，见下。
+    float sacc = 0.0, swsum = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1);
+            vec4 t = texelFetch(uShort, q, 0);
+            if (t.g <= 0.5) continue;
+            if (abs(t.r - s0.r) > 0.25) continue;   // 双边：跨亮度边界不混
+            float w = 1.0 / (float(dx * dx + dy * dy) + 1.0);
+            sacc += t.r * w;
+            swsum += w;
+        }
+    }
+    float sSmooth = (swsum > 1e-9) ? sacc / swsum : s0.r;
+    if (any_sat && quad_ok) {
+        // 整块同源短帧 ⇒ 保留真实色比（这正是 opposed 在边缘带做不到的事）
+        oColor = vec4(sSmooth, 0.0, 0.0, 1.0);
+        return;
+    }
     if (!all_sat) {
         oColor = vec4(base, 0.0, 0.0, 1.0);
         return;
@@ -3045,22 +3083,10 @@ void main() {
     //     向，1/(d²+1)）；环上也没有有效样本时才退回 uShortK（短帧满阱下界）。
     float acc = 0.0;
     float wsum = 0.0;
-    vec4 s0 = texelFetch(uShort, p, 0);
     if (s0.g > 0.5) {
-        // 中心有真值 → 5×5（±2 photosite）+ 双边门（只平均同一亮度的样本）。
-        // 5×5 把短帧单点噪声降 5×；双边门防止把灯沿外侧的低亮度搬进来
-        //（0.12.134 用 3×3 无门 ⇒ 亮部仍可见噪点/断层）。
-        for (int dy = -2; dy <= 2; ++dy) {
-            for (int dx = -2; dx <= 2; ++dx) {
-                ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1);
-                vec4 t = texelFetch(uShort, q, 0);
-                if (t.g <= 0.5) continue;
-                if (abs(t.r - s0.r) > 0.25) continue;   // 双边：跨亮度边界不混
-                float w = 1.0 / (float(dx * dx + dy * dy) + 1.0);
-                acc += t.r * w;
-                wsum += w;
-            }
-        }
+        // 中心有真值 → 复用上面的 5×5 双边平滑（0.12.196 提到前面）。
+        acc = sacc;
+        wsum = swsum;
     } else {
         for (int r = 8; r <= 24; r += 8) {
             for (int dy = -1; dy <= 1; ++dy) {
