@@ -8238,13 +8238,18 @@ float ratioFromScene(float sceneY) {
 float gainTrue(float sdrLin, float hdrLin) {
     const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
     float mid = max(uSceneMid, 1e-4);
-    // ── 0.12.199：锚定因子**下限 1.0** ─────────────────────────────────────
-    // 原式 `kDispMid/mid` 在"场景中灰比 0.1845 亮"时 <1（真机 10:52 楼景
-    // ae_p50=0.2304 ⇒ 0.80），等于把整张 HDR 亮度先压掉 20% 再去和 SDR 比 ——
-    // HDR 反而比 SDR 暗，gainmap 被 clamp[1,4] 吃掉，相册里就是"没有 HDR"。
-    // 锚定的本意只是把 scene 域折到显示域尺度（中灰 ratio=1），不是给整张图
-    // 定亮度；因此只允许它抬、不允许它压。
-    float anchor = max(1.0f, kDispMid / mid);
+    // ── 0.12.200：域映射改回**固定常数**（不再跟着 ae_p50 漂）──────────────
+    // 0.12.199 把锚定下限设成 1.0 只补回 25%，真机仍"没有 HDR"，因为问题不是
+    // 下限，是**锚定拿错了量**：uHdr 是 film 输出域（scene-referred）、uSdr 是
+    // 显示域线性，两者的换算是一个**固定的影调映射**（本机实测 film 输出中灰
+    // ≈0.072 ↔ 显示域 0.1845，差 −1.36EV），与"这一张的 RAW 中灰"无关。
+    // 用 ae_p50 当锚点等于让 HDR 强度随曝光浮动：同一台机同一场景，
+    //   10-27（ae_p50 小）boost p90 = 4.00×、HDR≥1.0 = 0.40%
+    //   10-30 楼景（ae_p50 0.2304）boost p90 = 1.49×、HDR≥1.0 = 0.01%
+    // 相差 4 倍，正是 0.1845/0.2304 与 0.1845/0.06 的比值。
+    const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测）
+    (void)mid;
+    float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
     float hdrAligned = hdrLin * anchor;
     float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), 1.0, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
