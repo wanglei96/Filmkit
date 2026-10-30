@@ -15802,7 +15802,14 @@ void FrameRenderer::setTeqCurveFromAe(float gap_ev, bool hl_dominant,
   // 现规则：`hl = -max(0, p95_rel_white)` —— 高光在白点以内就**不压**，
   // 超出去多少压回来多少。172200 的 p95_rel_white≈0 ⇒ hl=0（高光保住，回到 243）；
   // 4609/161952（超白点 1.07EV）⇒ hl≈-1.07（压回白点，天空不顶死）。
-  const float hl = -std::max(0.0f, p95_rel_white);
+  // ── 0.12.198：高光压深**归零**做 A/B（真机 10:36 叶子场景）──────────────
+  // 该张读数：aeEv +0.847（AE 为把 P50 0.056 提到 0.12 推了近 1EV）、aeP95 1.1148
+  // >白点、teqHl −1.0045 ⇒ 高光被"先推上去、再压回来"整整一档，观感就是用户说的
+  // "像糊了一层东西"（而 normal 场景 teqHl = 0 时画面正常）。
+  // 先关掉这一项做单变量验证：若高光层次回来而没顶白，说明压深的量与时机错了；
+  // 若没变化，则糊在 filmic 的 shoulder，不在 teq。
+  constexpr bool kTeqHighlightOn = false;
+  const float hl = kTeqHighlightOn ? -std::max(0.0f, p95_rel_white) : 0.0f;
   // ── v0.12.27：**去掉无条件的 +0.30 暗部提亮**（与高光那条同型）──────────────
   // 旧式 `0.30 + 0.55*t`：不管 AE 有没有让步，暗部先提亮 0.3EV。而 0.3EV 的线性
   // 提亮经 sigmoid 暗端（斜率大）放大后 ≈ 0.6EV 的观感，表现为"中间暗部亮太多、
