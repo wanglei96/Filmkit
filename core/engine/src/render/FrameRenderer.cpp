@@ -12033,40 +12033,44 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
 void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const NoiseCoef& nc) {
-  dbg_satm_cov_ = 0.f;
-  // 0.12.193：诊断字段一律先清零 —— 早退时它们必须显示"没测"，不能留上一张的值。
-  dbg_satm_hit_ = dbg_satm_hit90_ = 0.f;
+  dbg_satm_cov_ = 0.f;  // 0.12.193：诊断字段一律先清零 —— 早退时它们必须显示"没测"，不能留上一张的值。
+  dbg_satm_hit_ = 0.f;
   dbg_satm_cen_ = dbg_satm_max_ = 0.f;
-  dbg_satm_w_ = dbg_satm_blk_ = dbg_satm_g_ = dbg_satm_sg_ = 0.f;
+  dbg_satm_w_ = dbg_satm_blk_ = 0.f;
   if (tex_satm_ == 0 || w <= 0 || h <= 0) return;
   if (raw_cpu_w_ != w || raw_cpu_h_ != h ||
       raw_cpu_.size() != static_cast<size_t>(w) * h)
     return;
   // ── 0.12.186：CPU 实现（GPU 版在 X300 上"强制 1.0 也读回 0"，链路不可诊断）──
-  // 判据：参考帧原始 RAW，逐 photosite `v >= 满阱[c] − 3σ`（σ 同 P0 的 A·x+B）。
+  // ── 0.12.194：判据对齐 PC（bjzhou/PhotonCamera，MGC Bento）的传感器域口径 ──
+  // 一手出处：`GlesMgcRawSpatialStacker.kt` 的 renderAlignedRawClippingMask
+  //   （:5190 逐相位阈值）+ `GlesMgcRawSpatialShaders.kt` 的 quadIsNearClipping（:1600）。
+  //   · 域 = **未归一化传感器码**（原文："Detection stays in the unnormalized sensor
+  //     domain so exposure scaling cannot make a clipped sample appear valid."）
+  //   · 阈值 = 逐相位 `black + (white − black) × BENTO_MAX_RGB_CLIPPING/255`
+  //     （250/255 = 0.9804），**整数比较** `raw >= ceil(level)`（避免 Mali 把
+  //     uint16 样本降成 FP16）
+  //   · 不含 WB 增益、不含噪声项：饱和是"读数贴满阱"，不是"亮度接近白"
+  // 旧口径 `wb >= gain − 3σ`（WB 域 + 噪声项）是自创，两个方向都错：
+  //   σ→0（无噪声模型）时退化成 v ≥ 1.0，比 0.98 严 2% —— 白电平是标称值，传感器
+  //   峰值常差 1~3 LSB，整片零命中；σ 大时阈值又随 ISO 漂到 0.9 以下，过判。
+  const float kClipLevel = 250.f / 255.f;   // PC BENTO_MAX_RGB_CLIPPING = 250
   const size_t n = static_cast<size_t>(w) * h;
   std::vector<uint8_t> sat(n, 0), dil(n, 0), out(n * 4, 0);
-  const int lut = cfaLutOf(cfa);
-  size_t hits90 = 0;
   uint16_t mx = 0;
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       const int k = ((y & 1) << 1) | (x & 1);
-      const int c = (lut >> (k << 1)) & 3;
       const float bl = black_phase[k];
       const uint16_t rv = raw_cpu_[static_cast<size_t>(y) * w + x];
       if (rv > mx) mx = rv;
-      const float v =
-          (static_cast<float>(rv) - bl) /
-          std::max(white_level - bl, 1.f);
-      const float g = gains[c];
-      const float wb = v * g;
-      const float sig = std::sqrt(std::max(
-          nc.p0a[c] * std::min(std::max(wb, 0.f), 1.f) + nc.p0b[c], 0.f));
-      sat[static_cast<size_t>(y) * w + x] = (wb >= g - 3.f * sig) ? 1 : 0;
-      if (v >= 0.90f) ++hits90;   // 0.12.193：与 3σ 判据对拍（HL 的 0.90 档）
+      const float lvl = std::ceil(bl + (white_level - bl) * kClipLevel);
+      sat[static_cast<size_t>(y) * w + x] = (static_cast<float>(rv) >= lvl) ? 1 : 0;
     }
   }
+  (void)cfa;    // 判据逐相位、与通道无关（PC 同口径）；保留参数以固定调用约定
+  (void)gains;
+  (void)nc;
   size_t sat_hits = 0;
   for (size_t i = 0; i < n; ++i) sat_hits += sat[i] ? 1 : 0;   // 0.12.192 诊断
   // 1px 膨胀（吸收 MFNR 对齐残差）
@@ -12112,9 +12116,6 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   dbg_satm_max_ = static_cast<float>(mx);
   dbg_satm_w_ = white_level;
   dbg_satm_blk_ = black_phase[0];
-  dbg_satm_g_ = gains[1];
-  dbg_satm_sg_ = std::sqrt(std::max(nc.p0a[1] + nc.p0b[1], 0.f));
-  dbg_satm_hit90_ = static_cast<float>(hits90);
 
   // ── 0.12.191：转置到 D4 几何（映射与 kVertRot 逐字一致）──────────────
   // dst 像素 (x,y) 取样源 raw：uv = R(c)·scale + 0.5，c = (x/Wd-0.5, y/Hd-0.5)。
@@ -15548,19 +15549,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"nnTiles\":" + std::to_string(dbg_nn_tiles_);
     kv += ",\"nnGain\":" + jnum(dbg_nn_gain_, 6);
   }
-  kv += ",\"satmP\":" + jnum(dbg_satm_p_, 2);
+  kv += ",\"satmP\":" + jnum(dbg_satm_p_, 4);
   kv += ",\"satmRaw\":" + std::to_string(raw_cpu_w_ > 0 ? 1 : 0);
-  kv += ",\"satmHit\":" + jnum(dbg_satm_hit_, 0);
-  kv += ",\"satmHit90\":" + jnum(dbg_satm_hit90_, 0);
-  kv += ",\"satmCen\":" + jnum(dbg_satm_cen_, 0);
-  kv += ",\"satmMax\":" + jnum(dbg_satm_max_, 0);
-  kv += ",\"satmW\":" + jnum(dbg_satm_w_, 0);
-  kv += ",\"satmBlk\":" + jnum(dbg_satm_blk_, 2);
-  kv += ",\"satmG\":" + jnum(dbg_satm_g_, 3);
-  kv += ",\"satmSg\":" + jnum(dbg_satm_sg_, 5);
-  kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 2);
-  kv += ",\"satmDbg1\":" + jnum(dbg_satm_dbg1_, 0);
-  kv += ",\"satmC1\":" + jnum(dbg_satm_c1_, 0);
+  kv += ",\"satmHit\":" + jnum(dbg_satm_hit_, 12);
+  kv += ",\"satmCen\":" + jnum(dbg_satm_cen_, 8);
+  kv += ",\"satmMax\":" + jnum(dbg_satm_max_, 8);
+  kv += ",\"satmW\":" + jnum(dbg_satm_w_, 8);
+  kv += ",\"satmBlk\":" + jnum(dbg_satm_blk_, 8);
+  kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 8);
   kv += ",\"satmTx\":" + std::to_string(tex_satm_ != 0 ? 1 : 0);
   kv += ",\"satmPrg\":" + std::to_string(prog_satm_ != 0 ? 1 : 0);
   kv += ",\"gainmapOk\":" + std::to_string(dbg_gainmap_ok_);

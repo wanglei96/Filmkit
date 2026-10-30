@@ -27,13 +27,10 @@ EXPECT = {
     # 0.12.193 饱和掩码判据的输入面（诊断 satmHit=0）：passSatMask 必须在
     # finishStillChain 内、日志行之前跑完，否则字段是上一张的值。
     "satmHit": ("finishStillChain", ["passSatMask("]),
-    "satmHit90": ("finishStillChain", ["passSatMask("]),
     "satmCen": ("finishStillChain", ["passSatMask("]),
     "satmMax": ("finishStillChain", ["passSatMask("]),
     "satmW": ("finishStillChain", ["passSatMask("]),
     "satmBlk": ("finishStillChain", ["passSatMask("]),
-    "satmG": ("finishStillChain", ["passSatMask("]),
-    "satmSg": ("finishStillChain", ["passSatMask("]),
     # v0.10.102 NN 降噪 pass：runNnPass 必须在 finishStillChain 内、日志行之前
     "nnOk": ("finishStillChain", ["runNnPass("]),
     "nnFail": ("finishStillChain", ["runNnPass("]),

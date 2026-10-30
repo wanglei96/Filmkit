@@ -1045,17 +1045,12 @@ class FrameRenderer {
   float dbg_satm_max_ = 0.f;    // 副本最大像素（u16）
   float dbg_satm_w_ = 0.f;      // 传入的 white_level
   float dbg_satm_blk_ = 0.f;    // black_phase[0]
-  float dbg_satm_g_ = 0.f;      // gains[1]（G 通道 WB 增益）
-  float dbg_satm_sg_ = 0.f;     // 满阱处 σ = √(A+B)，G 通道
-  float dbg_satm_hit90_ = 0.f;  // 容差 0.90×gain 的命中数（与 3σ 判据对拍）
   // ── 0.12.186：参考帧 RAW 的 CPU 副本 ─────────────────────────────────────
   // 为什么走 CPU：GPU 版（kFsSatMask + FBO）在 X300 上"program/纹理/FBO 全就绪、
   // 强制输出 1.0 后读回仍是 0"（0.12.185 自检），绘制链路不可诊断。mask 是数据变换、
   // 不涉及画质算法，CPU 算完上传反而确定可控（25MB 副本 + ~200ms，拍照 5s 内）。
   std::vector<uint16_t> raw_cpu_;
   int raw_cpu_w_ = 0, raw_cpu_h_ = 0;
-  float dbg_satm_dbg1_ = 0.f;   // 强制全 1 时的 1×1 读回（255 = 绘制+读回通）
-  float dbg_satm_c1_ = 0.f;     // 真实 mask 的中心像素读回
   bool satmask_enabled_ = false;   // 本张 [101] 实际值（PC3D / P0 共用）
   void passSatMask(int w, int h, int rot, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
