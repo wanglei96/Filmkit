@@ -8253,7 +8253,7 @@ float gainTrue(float sdrLin, float hdrLin) {
     //   ratio' = 1 + (ratio − 1) × strength
     // 只放大高光偏移、中灰恒为 1 —— 真机 202 实测中灰 ratio 1.03（正确）但高光
     // 只有 1.4~1.8 倍，观感偏弱；1.5 档把高光推到 2.2~3.2 倍而中灰不动。
-    const float kGainStrength = 1.5;   // GLSL：没有 constexpr
+    const float kGainStrength = 1.3;   // GLSL：没有 constexpr
     ratio = clamp(1.0f + (ratio - 1.0f) * kGainStrength, kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
@@ -15828,8 +15828,12 @@ void FrameRenderer::setTeqCurveFromAe(float gap_ev, bool hl_dominant,
   // 144156 的 aeP95 = 2.52（超白点 2.5EV）而 teqHl = 0 ⇒ SDR base 直接死白，
   // gainmap 无可补。半强度让 −1.0EV 场只压 −0.5EV（叶子那种 "糊一层" 不再出现），
   // 同时超出白点 2.5EV 的窗外仍有 1.25EV 由这里吃掉，剩下的交给 filmic shoulder。
-  constexpr float kTeqHlScale = 0.5f;
-  const float hl = -std::max(0.0f, p95_rel_white) * kTeqHlScale;
+  // 0.12.204：回到**全关**（0 = 不压）。203 试过半强度，但它与 gainmap strength
+  // 方向相反（一个压高光、一个提高光），叠加后观感变差；而且真机 144156 的
+  // aeP95=2.52EV 即使全压也留不住层次 —— 那类场景的层次只能由 gainmap 端表达
+  // （SDR base 顶白是 Ultra HDR 的预期状态，PC 同样如此）。
+  const float hl = 0.0f;
+  (void)hl_dominant;
   // ── v0.12.27：**去掉无条件的 +0.30 暗部提亮**（与高光那条同型）──────────────
   // 旧式 `0.30 + 0.55*t`：不管 AE 有没有让步，暗部先提亮 0.3EV。而 0.3EV 的线性
   // 提亮经 sigmoid 暗端（斜率大）放大后 ≈ 0.6EV 的观感，表现为"中间暗部亮太多、
