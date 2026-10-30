@@ -10019,6 +10019,7 @@ void FrameRenderer::release() {
   if (prog_hl_mask_) glDeleteProgram(prog_hl_mask_);
   if (prog_satm_) glDeleteProgram(prog_satm_);   // 0.12.181
   if (tex_satm_) glDeleteTextures(1, &tex_satm_);
+  if (tex_satm_dst_) glDeleteTextures(1, &tex_satm_dst_);
   if (fbo_satm_) glDeleteFramebuffers(1, &fbo_satm_);
   if (prog_hl_dil_) glDeleteProgram(prog_hl_dil_);
   if (prog_hl_chroma_) glDeleteProgram(prog_hl_chroma_);
@@ -11810,7 +11811,7 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glUniform2i(u_chroma_dn_.lsc_size, lsc_w_, lsc_h_);
   // 0.12.187：饱和掩码（单元 2）
   glActiveTexture(GL_TEXTURE2);
-  glBindTexture(GL_TEXTURE_2D, tex_satm_);
+  glBindTexture(GL_TEXTURE_2D, tex_satm_dst_ ? tex_satm_dst_ : tex_satm_);
   glUniform1i(u_chroma_dn_.satmask, 2);
   if (u_chroma_dn_.satmask_on >= 0)
     glUniform1i(u_chroma_dn_.satmask_on, satmask_enabled_ ? 1 : 0);
@@ -12025,7 +12026,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
 // 口径见 kFsSatMask 顶部。放在 HL **之前**：mask 描述的是"采集时有没有丢信息"，
 // 与 HL 重建后的值无关（重建值不是测量值，不能反过来影响掩码）。
 // 诊断：覆盖率sampling（64×64 块）—— 只用于确认开关生效，不进画质路径。
-void FrameRenderer::passSatMask(int w, int h, int cfa,
+void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const NoiseCoef& nc) {
   dbg_satm_cov_ = 0.f;
@@ -12090,6 +12091,46 @@ void FrameRenderer::passSatMask(int w, int h, int cfa,
   // 覆盖率按 2×2 块计（与"饱和度"的物理单位一致）
   const size_t blocks = static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
   dbg_satm_cov_ = 100.f * static_cast<float>(hit) / static_cast<float>(blocks);
+
+  // ── 0.12.191：转置到 D4 几何（映射与 kVertRot 逐字一致）──────────────
+  // dst 像素 (x,y) 取样源 raw：uv = R(c)·scale + 0.5，c = (x/Wd-0.5, y/Hd-0.5)。
+  const int Wd = (rot % 2 == 1) ? h : w;
+  const int Hd = (rot % 2 == 1) ? w : h;
+  if (satm_dst_w_ != Wd || satm_dst_h_ != Hd || tex_satm_dst_ == 0) {
+    if (tex_satm_dst_) glDeleteTextures(1, &tex_satm_dst_);
+    tex_satm_dst_ = 0;
+    glGenTextures(1, &tex_satm_dst_);
+    glBindTexture(GL_TEXTURE_2D, tex_satm_dst_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, Wd, Hd, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    satm_dst_w_ = Wd;
+    satm_dst_h_ = Hd;
+  }
+  {
+    std::vector<uint8_t> dm(static_cast<size_t>(Wd) * Hd * 4, 0);
+    for (int y = 0; y < Hd; ++y) {
+      for (int x = 0; x < Wd; ++x) {
+        const float cx = (static_cast<float>(x) + 0.5f) / Wd - 0.5f;
+        const float cy = (static_cast<float>(y) + 0.5f) / Hd - 0.5f;
+        float rx, ry;
+        if (rot == 1) { rx = -cy; ry = cx; }
+        else if (rot == 2) { rx = -cx; ry = -cy; }
+        else if (rot == 3) { rx = cy; ry = -cx; }
+        else { rx = cx; ry = cy; }
+        const int sx = std::min(std::max(static_cast<int>((rx + 0.5f) * w), 0), w - 1);
+        const int sy = std::min(std::max(static_cast<int>((ry + 0.5f) * h), 0), h - 1);
+        dm[(static_cast<size_t>(y) * Wd + x) * 4] =
+            out[(static_cast<size_t>(sy) * w + sx) * 4];
+      }
+    }
+    glBindTexture(GL_TEXTURE_2D, tex_satm_dst_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, Wd, Hd, GL_RGBA, GL_UNSIGNED_BYTE,
+                    dm.data());
+  }
 }
 
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
@@ -13004,13 +13045,13 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     // 0.12.181：饱和掩码（单元 3）—— 关时 shader 回落 alpha 路径（逐位不变）
     if (u_pc3d_.satmask >= 0) {
       glActiveTexture(GL_TEXTURE3);
-      glBindTexture(GL_TEXTURE_2D, tex_satm_);
+      glBindTexture(GL_TEXTURE_2D, tex_satm_dst_ ? tex_satm_dst_ : tex_satm_);
       glUniform1i(u_pc3d_.satmask, 3);
       glActiveTexture(GL_TEXTURE0);
     }
     if (u_pc3d_.satmaskon >= 0)
       glUniform1i(u_pc3d_.satmaskon,
-                  (satmask_enabled_ && dst_w == raw_w_ && dst_h == raw_h_) ? 1 : 0);
+                  (satmask_enabled_ && tex_satm_dst_ != 0) ? 1 : 0);
     if (u_pc3d_.down >= 0) glUniform1i(u_pc3d_.down, down);
     if (u_pc3d_.fullsize >= 0) glUniform2i(u_pc3d_.fullsize, dst_w, dst_h);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -14077,6 +14118,7 @@ GLuint FrameRenderer::ensureRawTex(int w, int h) {
   // 0.12.181：饱和掩码随 raw 尺寸重建（R8，全分辨率，1 = 饱和核）
   if (satm_w_ != w || satm_h_ != h || tex_satm_ == 0) {
     if (tex_satm_) glDeleteTextures(1, &tex_satm_);
+  if (tex_satm_dst_) glDeleteTextures(1, &tex_satm_dst_);
     if (fbo_satm_) glDeleteFramebuffers(1, &fbo_satm_);
     tex_satm_ = fbo_satm_ = 0;
     glGenTextures(1, &tex_satm_);
@@ -14338,8 +14380,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     if (satmask_enabled_) {
       // 0.12.189：用 **raw 尺寸**（与参考帧 RAW / tex_satm_ 同几何）。之前传 dst
       // 尺寸，竖拍时 4080×3072 vs 3072×4080 不匹配 ⇒ pass 直接返回 ⇒ cov 恒 0。
-      passSatMask(raw_w_, raw_h_, c.cfa, c.black_phase, c.white_level, c.gains,
-                  c.dn ? c.nc : kNoDn);
+      passSatMask(raw_w_, raw_h_, c.effective_rot, c.cfa, c.black_phase,
+                  c.white_level, c.gains, c.dn ? c.nc : kNoDn);
     }
     const bool hr_on = p.hr_raw > 0.5f && !bracket_info_ok;
     // ① P0 前的 mosaic（HR 的输入域）

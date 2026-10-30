@@ -1027,6 +1027,10 @@ class FrameRenderer {
   // 生成：参考帧 RAW → `v >= 满阱−3σ` → 1px 膨胀 → 2×2 聚合（kFsSatMask）。
   // 消费者：P0（fused / Ts 两条路径的 uSatMask）。0 = 本张未生成。
   GLuint tex_satm_ = 0, fbo_satm_ = 0;
+  // 0.12.191：D4 几何（旋转后）的同一张掩码 —— P4/PC3D 跑在 dst 域，不能按
+  // 同坐标采 raw 几何的掩码（竖拍会错位一圈）。CPU 按 kVertRot 的映射转置一次。
+  GLuint tex_satm_dst_ = 0;
+  int satm_dst_w_ = 0, satm_dst_h_ = 0;
   int satm_w_ = 0, satm_h_ = 0;
   GLuint prog_satm_ = 0;
   struct { GLint raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
@@ -1043,7 +1047,7 @@ class FrameRenderer {
   float dbg_satm_dbg1_ = 0.f;   // 强制全 1 时的 1×1 读回（255 = 绘制+读回通）
   float dbg_satm_c1_ = 0.f;     // 真实 mask 的中心像素读回
   bool satmask_enabled_ = false;   // 本张 [101] 实际值（PC3D / P0 共用）
-  void passSatMask(int w, int h, int cfa, const float black_phase[4],
+  void passSatMask(int w, int h, int rot, int cfa, const float black_phase[4],
                    float white_level, const float gains[3],
                    const NoiseCoef& nc);
   // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────
