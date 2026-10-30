@@ -274,10 +274,13 @@ constexpr int kLocalW = 32, kLocalH = 24;
 // 差）时 m = 2/(2+s)：s=16 → m≈0.11（权重 0.89，基本满融）；运动 tile 的 d² 远超
 // 噪声底 → m→1（权重→0，回退参考帧）。离线扫描（tools/tuning 同法）真机再调。
 constexpr float kMfnrMisS = 16.0f;
-// 0.12.135：全饱和区亮度 inpaint 的总开关（默认关，理由见 finishStillChain 调用点
-// 与 docs/reports/bento-p0p1-design.md §22）。关 = 不生成短帧真值图、不跑 pass，
-// 等于把 0.12.133 新增的两个 pass 的全部成本归零；改 true 即完整的 A/B 通路。
-constexpr bool kHlInpaintOn = false;
+// 0.12.195：**打开**（0.12.135 起默认关）。用户 2026-10-30 的判断是"高光一塌糊涂、
+// PC 同场景没问题"——而 PC 的 MGC 高光正是走"短帧真值 + inpainting mask"
+// （Mask_AdjustHighlightMaskAndGenerateInpaintingMask），不是参考场色比外推。
+// 关着它时，三通道全饱和区只剩 opposed 外推 ⇒ 大面积平色（灰斑）与色比错（品红/绿边）
+// 都是这条唯一路径的产物。打开后其余链路一字不改：只有"三通道都顶到满阱"的 2×2 块
+// 会用短帧标量亮度替换，部分饱和仍由 opposed 从 R/B 外推（0.12.134 的口径）。
+constexpr bool kHlInpaintOn = true;
 // v0.10.5：权重从线性压制改**分段**（用户验收标准：允许自然拖影、不容重叠错误）：
 //   m ≤ kMisLo 全融合（静止/准静止 —— 比线性式更满，保细节）
 //   m ≥ kMisHi 权重硬清零（运动区域整体回退参考帧 —— 宁可糊/噪，不容叠影）
