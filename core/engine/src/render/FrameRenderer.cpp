@@ -3067,8 +3067,11 @@ void main() {
     }
     float sSmooth = (swsum > 1e-9) ? sacc / swsum : s0.r;
     if (any_sat && quad_ok) {
-        // 整块同源短帧 ⇒ 保留真实色比（这正是 opposed 在边缘带做不到的事）
-        oColor = vec4(sSmooth, 0.0, 0.0, 1.0);
+        // 整块同源短帧 ⇒ 保留真实色比（这正是 opposed 在边缘带做不到的事）。
+        // ⚠ uShort.r 是**归一化亮度**（kFsMfnrShortVal 里除过 gain）—— 必须乘回
+        // 本通道的满阱 gain 才是 WB 域通道值。0.12.196 漏了这一步 ⇒ R/B 被除成
+        // 1/2.1、1/1.46、只有 G 原样 ⇒ 高光边缘整圈泛绿（真机 10:21）。
+        oColor = vec4(at3(uGain, chanAt(p)) * sSmooth, 0.0, 0.0, 1.0);
         return;
     }
     if (!all_sat) {
