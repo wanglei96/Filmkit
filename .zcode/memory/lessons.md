@@ -100,3 +100,9 @@ status: active
 - [2026-10-29] **尺寸域错配会静默吞掉整个 pass**：传 dst 尺寸给按 raw 几何实现的函数，竖拍必现、横拍偶发，日志只显示 0。
 - [2026-10-30] **诊断字段自己会撒谎**：`*P/*Tx/*Prg` 全 1 只证明变量被赋值；要判内容必须打"命中数"这类实测量。
 - [2026-10-30] **全图统计不能代替局部判断**：拿 hlRgG（整张场景）去决定单个高光点是否偏色，必然把中性高光判成品红。
+
+## 诊断字段与外部对照（10-30）
+- [2026-10-30] **`jnum` 第二参是字符数，不是小数位**：`jnum(x,0)` 永远返回 `"0"`；`satmHit=0` 因此骗了整整一轮（含"判据零命中"的错误结论）。判据：同一函数里另一个字段（`satmCov=4`）与它矛盾。
+- [2026-10-30] **`raw.render` 的 `gm*` 恒 0 是设计**：`readGainmap` 在日志之后才跑；gainmap 真值看独立的 `gainmap.readback` 事件。
+- [2026-10-30] **照注释推断外部实现会错**：先按注释把 gainmap 改成"只提亮高光"，读实现（`RawHdrReferenceMath.evaluate` 的 `if (x <= joinInput) return sampleCurve(...)`）才确认语义；而用户观感仍偏好整体提亮 ⇒ **观感以样片为准、语义以源码为准，两者可以不一致**。
+- [2026-10-30] **`(void)mid;` 不是 GLSL**：Mali 宽容编译通过、glslang 报 `explicit typecast required extension`；改了 shader 常量（`constexpr` 也不存在，要写 `const`）必须重跑 `validate-shaders.sh`。

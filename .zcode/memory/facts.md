@@ -119,4 +119,12 @@ status: active
 - [2026-10-30] **WB 域 vs raw/1023 域**：WB 域中性白 1,1,1（opposed 前提成立）；raw/1023 域是 0.476/1.0/0.684（随 WB 变）。
 - [2026-10-30] **粉云实测**（165153.dng）：G 饱和像素 WB 中位 R 1.300 / G 1.000 / B 1.139；参考场 0.944/1.036；块级 mask 覆盖 4.23%（离线）。
 - [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，σ=√(A·clamp(wb,0,1)+B)；1px 膨胀 + 2×2 聚合；日志字段 satmP/satmRaw/satmHit/satmCov。
-- [2026-10-30] **版本/包**：0.12.192(643) `filmkit-0.12.192-HLGATE.apk`（当前）；回退 0.12.167-USMOFF。
+- [2026-10-30] **版本/包**：0.12.207(658) `filmkit-0.12.207-LIFT.apk`（当前）；共存对照
+  `filmkit-0.12.205-hdr-coexist.apk`（`com.filmkit.hdr205`，只提亮高光那版）。
+- [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback`
+  的 gmMin/gmMean/gmMax，解码 `ratio = 0.25 × 16^g`（g 为归一化值）。
+- [2026-10-30] **sat_comp**：prefs `sat_comp` 0..0.30 → FilmParams[20]/[21]（kFsFilm 的
+  uSatShadow/uSatMid），位置在 film pass ⇒ RCD/AMaZE 两档都吃；与用户"饱和度"滑杆
+  （EditorExport.writeSaturation 写三槽）共用槽位，后者覆盖前者。
+- [2026-10-30] **徕卡标定边界**：`tools/preset-exp/recipe-fit.py` 从 filmic 之后接起，
+  RAW/CCM/WB/kFsFilm 的 sat·split·mono 均为"未验证段" ⇒ 预设不在饱和度补偿之后标定。

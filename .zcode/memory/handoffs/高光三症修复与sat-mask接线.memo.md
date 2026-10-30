@@ -2,7 +2,7 @@
 summary: 高光三症修复与sat-mask接线
 created: 2026-10-30 09:40
 updated: 2026-10-30 09:40
-status: active
+status: absorbed
 ---
 
 # 高光三症修复与sat-mask接线
