@@ -8236,30 +8236,22 @@ float ratioFromScene(float sceneY) {
 // 数：A/B 档（=1）保留，若复现预案 = kHdrCeil 软限（HDR 亮度 ≤ 2×SDR 白，按 sdrY
 // 收上限，不全局砍）。
 float gainTrue(float sdrLin, float hdrLin) {
-    const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
-    float mid = max(uSceneMid, 1e-4);
-    // ── 0.12.200：域映射改回**固定常数**（不再跟着 ae_p50 漂）──────────────
-    // 0.12.199 把锚定下限设成 1.0 只补回 25%，真机仍"没有 HDR"，因为问题不是
-    // 下限，是**锚定拿错了量**：uHdr 是 film 输出域（scene-referred）、uSdr 是
-    // 显示域线性，两者的换算是一个**固定的影调映射**（本机实测 film 输出中灰
-    // ≈0.072 ↔ 显示域 0.1845，差 −1.36EV），与"这一张的 RAW 中灰"无关。
-    // 用 ae_p50 当锚点等于让 HDR 强度随曝光浮动：同一台机同一场景，
-    //   10-27（ae_p50 小）boost p90 = 4.00×、HDR≥1.0 = 0.40%
-    //   10-30 楼景（ae_p50 0.2304）boost p90 = 1.49×、HDR≥1.0 = 0.01%
-    // 相差 4 倍，正是 0.1845/0.2304 与 0.1845/0.06 的比值。
-    const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测）
-    (void)mid;
-    float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
-    float hdrAligned = hdrLin * anchor;
-    // ── 0.12.201：下限回到 kMin（= 0.25），与 PC / ISO 21496-1 一致 ──────────
-    // 0.12.85 把这里写成 1.0，注释给的依据是"UltraHDR 语义：HDR 相对 base 只会更亮"
-    // —— 规范里没有这条。ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
-    // 可以为负；PC 的 RawGainmapMath 明写 `MIN_GAIN_RATIO = 0.25`，即允许暗部压
-    // 2EV。真实的 hdr/sdr 比值小于 1 时就该原样表达（暗部在 HDR 显示下更暗），
-    // 用 1.0 截断等于替用户把暗部抬亮、同时丢掉这部分编码动态范围。
-    float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), kMin, kMax);
+    // ── 0.12.202：**与 PC 同式，无锚定** ────────────────────────────────────
+    // 一手出处：bjzhou/PhotonCamera `hdr/GpuReferenceGainmapProducer.kt` 的
+    // RAW_LUMA_RESIDUAL_FRAGMENT_SHADER + `hdr/RawGainmapMath.kt::encode`：
+    //   ratio = (hdrLinear + offset) / (sdrLinear + offset)，clamp [0.25, 4]，
+    //   无 scene-mid、无 0.1845 之类的目标值。
+    // 之所以能不锚定：它的 uHdr 是**线性 HDR 参考**（RAW 场景线性，未 tone map），
+    // uSdr 是 SDR 的 sRGB 码值反 OETF —— 两者都按反射率线性计量，同域。
+    // 我们这边同域的依据在 15043：uHdr 传的是 `film_src` = 降噪/去边之后的 RAW
+    // 线性（tone-eq 与 filmic 之前），与 tex_cap_ 反 OETF 后的线性同尺度。
+    // 0.12.85~0.12.201 用 `ae_p50` / 0.072 当锚，等于在这条同域式子上又乘了一次
+    // 尺度：实测锚定 2.56 时中灰 ratio 2.4（整张亮 2.4 倍）、gmMax 恒 1.0，
+    // 那不是 HDR 而是整体提亮。
+    float ratio = clamp((hdrLin + kOff) / (sdrLin + kOff), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
+
 float gainPc(float sdrLin, float hdrLin) {
     float ratio = clamp(ratioFromScene(hdrLin), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
