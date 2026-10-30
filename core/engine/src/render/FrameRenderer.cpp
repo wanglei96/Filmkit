@@ -12034,6 +12034,10 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
                                 const float black_phase[4], float white_level,
                                 const float gains[3], const NoiseCoef& nc) {
   dbg_satm_cov_ = 0.f;
+  // 0.12.193：诊断字段一律先清零 —— 早退时它们必须显示"没测"，不能留上一张的值。
+  dbg_satm_hit_ = dbg_satm_hit90_ = 0.f;
+  dbg_satm_cen_ = dbg_satm_max_ = 0.f;
+  dbg_satm_w_ = dbg_satm_blk_ = dbg_satm_g_ = dbg_satm_sg_ = 0.f;
   if (tex_satm_ == 0 || w <= 0 || h <= 0) return;
   if (raw_cpu_w_ != w || raw_cpu_h_ != h ||
       raw_cpu_.size() != static_cast<size_t>(w) * h)
@@ -12043,19 +12047,24 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   const size_t n = static_cast<size_t>(w) * h;
   std::vector<uint8_t> sat(n, 0), dil(n, 0), out(n * 4, 0);
   const int lut = cfaLutOf(cfa);
+  size_t hits90 = 0;
+  uint16_t mx = 0;
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       const int k = ((y & 1) << 1) | (x & 1);
       const int c = (lut >> (k << 1)) & 3;
       const float bl = black_phase[k];
+      const uint16_t rv = raw_cpu_[static_cast<size_t>(y) * w + x];
+      if (rv > mx) mx = rv;
       const float v =
-          (static_cast<float>(raw_cpu_[static_cast<size_t>(y) * w + x]) - bl) /
+          (static_cast<float>(rv) - bl) /
           std::max(white_level - bl, 1.f);
       const float g = gains[c];
       const float wb = v * g;
       const float sig = std::sqrt(std::max(
           nc.p0a[c] * std::min(std::max(wb, 0.f), 1.f) + nc.p0b[c], 0.f));
       sat[static_cast<size_t>(y) * w + x] = (wb >= g - 3.f * sig) ? 1 : 0;
+      if (v >= 0.90f) ++hits90;   // 0.12.193：与 3σ 判据对拍（HL 的 0.90 档）
     }
   }
   size_t sat_hits = 0;
@@ -12098,6 +12107,14 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   const size_t blocks = static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
   dbg_satm_cov_ = 100.f * static_cast<float>(hit) / static_cast<float>(blocks);
   dbg_satm_hit_ = static_cast<float>(sat_hits);
+  // 0.12.193：判据输入面（见 FrameRenderer.h 注释）
+  dbg_satm_cen_ = static_cast<float>(raw_cpu_[(static_cast<size_t>(h / 2)) * w + w / 2]);
+  dbg_satm_max_ = static_cast<float>(mx);
+  dbg_satm_w_ = white_level;
+  dbg_satm_blk_ = black_phase[0];
+  dbg_satm_g_ = gains[1];
+  dbg_satm_sg_ = std::sqrt(std::max(nc.p0a[1] + nc.p0b[1], 0.f));
+  dbg_satm_hit90_ = static_cast<float>(hits90);
 
   // ── 0.12.191：转置到 D4 几何（映射与 kVertRot 逐字一致）──────────────
   // dst 像素 (x,y) 取样源 raw：uv = R(c)·scale + 0.5，c = (x/Wd-0.5, y/Hd-0.5)。
@@ -15534,6 +15551,13 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"satmP\":" + jnum(dbg_satm_p_, 2);
   kv += ",\"satmRaw\":" + std::to_string(raw_cpu_w_ > 0 ? 1 : 0);
   kv += ",\"satmHit\":" + jnum(dbg_satm_hit_, 0);
+  kv += ",\"satmHit90\":" + jnum(dbg_satm_hit90_, 0);
+  kv += ",\"satmCen\":" + jnum(dbg_satm_cen_, 0);
+  kv += ",\"satmMax\":" + jnum(dbg_satm_max_, 0);
+  kv += ",\"satmW\":" + jnum(dbg_satm_w_, 0);
+  kv += ",\"satmBlk\":" + jnum(dbg_satm_blk_, 2);
+  kv += ",\"satmG\":" + jnum(dbg_satm_g_, 3);
+  kv += ",\"satmSg\":" + jnum(dbg_satm_sg_, 5);
   kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 2);
   kv += ",\"satmDbg1\":" + jnum(dbg_satm_dbg1_, 0);
   kv += ",\"satmC1\":" + jnum(dbg_satm_c1_, 0);

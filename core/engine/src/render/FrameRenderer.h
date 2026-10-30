@@ -1039,6 +1039,15 @@ class FrameRenderer {
   float dbg_satm_cov_ = 0.f;
   float dbg_satm_p_ = 0.f;   // 本张下发的 [101] 实际值（诊断）
   float dbg_satm_hit_ = 0.f; // 判据命中的 photosite 数（不含膨胀/聚合）
+  // 0.12.193 诊断：判据的**输入面**（一次分辨"副本空 / 白电平错 / 判据太紧"）。
+  // 全 0 = passSatMask 没跑到（早退），此时 satmP 仍会显示 1 —— 两个字段一起读。
+  float dbg_satm_cen_ = 0.f;    // 副本中心像素（u16）
+  float dbg_satm_max_ = 0.f;    // 副本最大像素（u16）
+  float dbg_satm_w_ = 0.f;      // 传入的 white_level
+  float dbg_satm_blk_ = 0.f;    // black_phase[0]
+  float dbg_satm_g_ = 0.f;      // gains[1]（G 通道 WB 增益）
+  float dbg_satm_sg_ = 0.f;     // 满阱处 σ = √(A+B)，G 通道
+  float dbg_satm_hit90_ = 0.f;  // 容差 0.90×gain 的命中数（与 3σ 判据对拍）
   // ── 0.12.186：参考帧 RAW 的 CPU 副本 ─────────────────────────────────────
   // 为什么走 CPU：GPU 版（kFsSatMask + FBO）在 X300 上"program/纹理/FBO 全就绪、
   // 强制输出 1.0 后读回仍是 0"（0.12.185 自检），绘制链路不可诊断。mask 是数据变换、
