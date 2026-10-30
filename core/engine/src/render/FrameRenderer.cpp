@@ -5145,7 +5145,15 @@ void main() {
     // ── 0.12.179：opposed 回到 WB 域（撤销 0.12.170 的逐通道满阱归一化）─────
     // 判据与 0.12.105 一致：v >= 0.987 × max(满阱[c], 1.0)，与 WB 域满阱同域。
     if (v >= uHlClip * max(at3(uSatClip, c), 1.0)) {
-        outv = max(v, refavg(p) + at3(uChroma, c));
+        // ── 0.12.190：refavg 抬 G 的强度按**参考场中性度**门控（治绿边）──────
+        // WB 域 refavg 对 G 位 = ((R^⅓+B^⅓)/2)³。天空（R/G 0.95）是中性略蓝，
+        // 抬 G 正确；粉色物体上的高光（R/G 1.15，真机 hlRgG=1.156）其 R 本身就高，
+        // 抬 G 会把边缘推成**绿边**。判据：参考场离中性越远，抬升越少；≥0.12
+        // 完全不抬（原值 = 满阱比例的粉色，正确）。
+        vec3 rrH = refRatiosW((vec2(p) + 0.5) / vec2(uSize));
+        float cenH = max(abs(rrH.x - 1.0), abs(rrH.y - 1.0));
+        float wN = 1.0 - smoothstep(0.04, 0.12, cenH);
+        outv = max(v, mix(v, refavg(p) + at3(uChroma, c), wN));
     }
     // ── 0.12.179：中性大面积饱和核 —— 三通道**同步**按参考比 × 实测 luma 重建 ──
     // 真机 2026-10-29 16:52 窗外粉云（165153.dng 逐 photosite 复算）：
@@ -15475,6 +15483,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     kv += ",\"nnGain\":" + jnum(dbg_nn_gain_, 6);
   }
   kv += ",\"satmP\":" + jnum(dbg_satm_p_, 2);
+  kv += ",\"satmRaw\":" + std::to_string(raw_cpu_w_ > 0 ? 1 : 0);
   kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 2);
   kv += ",\"satmDbg1\":" + jnum(dbg_satm_dbg1_, 0);
   kv += ",\"satmC1\":" + jnum(dbg_satm_c1_, 0);
