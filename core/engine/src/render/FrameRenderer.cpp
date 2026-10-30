@@ -8238,7 +8238,14 @@ float ratioFromScene(float sceneY) {
 float gainTrue(float sdrLin, float hdrLin) {
     const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
     float mid = max(uSceneMid, 1e-4);
-    float hdrAligned = hdrLin * (kDispMid / mid);
+    // ── 0.12.199：锚定因子**下限 1.0** ─────────────────────────────────────
+    // 原式 `kDispMid/mid` 在"场景中灰比 0.1845 亮"时 <1（真机 10:52 楼景
+    // ae_p50=0.2304 ⇒ 0.80），等于把整张 HDR 亮度先压掉 20% 再去和 SDR 比 ——
+    // HDR 反而比 SDR 暗，gainmap 被 clamp[1,4] 吃掉，相册里就是"没有 HDR"。
+    // 锚定的本意只是把 scene 域折到显示域尺度（中灰 ratio=1），不是给整张图
+    // 定亮度；因此只允许它抬、不允许它压。
+    float anchor = max(1.0f, kDispMid / mid);
+    float hdrAligned = hdrLin * anchor;
     float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), 1.0, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
