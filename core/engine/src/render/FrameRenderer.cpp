@@ -8248,7 +8248,19 @@ float gainTrue(float sdrLin, float hdrLin) {
     // 0.12.85~0.12.201 用 `ae_p50` / 0.072 当锚，等于在这条同域式子上又乘了一次
     // 尺度：实测锚定 2.56 时中灰 ratio 2.4（整张亮 2.4 倍）、gmMax 恒 1.0，
     // 那不是 HDR 而是整体提亮。
-    float ratio = clamp((hdrLin + kOff) / (sdrLin + kOff), kMin, kMax);
+    // ── 0.12.205：按 PC 的 "shoulder 延展" 语义构造 HDR 参考 ───────────────
+    // 一手出处（bjzhou/PhotonCamera, RawDemosaicProcessor.kt:4146 注释）：
+    //   "The HDR branch ... follows the selected engine's measured base response,
+    //    then leaves its SDR shoulder with a value/slope-continuous curve"
+    // 即：**暗部与中灰的 HDR 值 = SDR 值本身**（ratio 恒 1），只有超出 SDR 白点的
+    // scene 值才继续往上走。直接用 film_src（局部 tone mapping 之后的 RAW 线性）
+    // 相除，会把"局部影调已经提亮过的暗部/中灰"算成 HDR 增益 —— 真机 204 实测
+    // 中灰 ratio 1.18~2.23、暗部 0.68~0.95，HDR 屏上就是整张发灰。
+    // SDR 白点对应的 scene 线性值：中灰在两边都应是同一个位置 ⇒ sw = sceneMid/0.1845。
+    float sw = max(uSceneMid / 0.1845, 1e-3);
+    float excess = max(0.0, hdrLin - sw);
+    float ref = sdrLin + excess;
+    float ratio = clamp((ref + kOff) / (sdrLin + kOff), kMin, kMax);
     // 0.12.203：PC 的 `HdrGainmapStrength`（默认 1.0，范围 0.25~2.0）：
     //   ratio' = 1 + (ratio − 1) × strength
     // 只放大高光偏移、中灰恒为 1 —— 真机 202 实测中灰 ratio 1.03（正确）但高光
