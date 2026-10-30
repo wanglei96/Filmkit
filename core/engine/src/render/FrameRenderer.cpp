@@ -8249,6 +8249,12 @@ float gainTrue(float sdrLin, float hdrLin) {
     // 尺度：实测锚定 2.56 时中灰 ratio 2.4（整张亮 2.4 倍）、gmMax 恒 1.0，
     // 那不是 HDR 而是整体提亮。
     float ratio = clamp((hdrLin + kOff) / (sdrLin + kOff), kMin, kMax);
+    // 0.12.203：PC 的 `HdrGainmapStrength`（默认 1.0，范围 0.25~2.0）：
+    //   ratio' = 1 + (ratio − 1) × strength
+    // 只放大高光偏移、中灰恒为 1 —— 真机 202 实测中灰 ratio 1.03（正确）但高光
+    // 只有 1.4~1.8 倍，观感偏弱；1.5 档把高光推到 2.2~3.2 倍而中灰不动。
+    const float kGainStrength = 1.5;   // GLSL：没有 constexpr
+    ratio = clamp(1.0f + (ratio - 1.0f) * kGainStrength, kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
 
@@ -15818,8 +15824,12 @@ void FrameRenderer::setTeqCurveFromAe(float gap_ev, bool hl_dominant,
   // "像糊了一层东西"（而 normal 场景 teqHl = 0 时画面正常）。
   // 先关掉这一项做单变量验证：若高光层次回来而没顶白，说明压深的量与时机错了；
   // 若没变化，则糊在 filmic 的 shoulder，不在 teq。
-  constexpr bool kTeqHighlightOn = false;
-  const float hl = kTeqHighlightOn ? -std::max(0.0f, p95_rel_white) : 0.0f;
+  // 0.12.203：从"全关"改成"半强度的原式"。198 全关的代价在高动态场景暴露：
+  // 144156 的 aeP95 = 2.52（超白点 2.5EV）而 teqHl = 0 ⇒ SDR base 直接死白，
+  // gainmap 无可补。半强度让 −1.0EV 场只压 −0.5EV（叶子那种 "糊一层" 不再出现），
+  // 同时超出白点 2.5EV 的窗外仍有 1.25EV 由这里吃掉，剩下的交给 filmic shoulder。
+  constexpr float kTeqHlScale = 0.5f;
+  const float hl = -std::max(0.0f, p95_rel_white) * kTeqHlScale;
   // ── v0.12.27：**去掉无条件的 +0.30 暗部提亮**（与高光那条同型）──────────────
   // 旧式 `0.30 + 0.55*t`：不管 AE 有没有让步，暗部先提亮 0.3EV。而 0.3EV 的线性
   // 提亮经 sigmoid 暗端（斜率大）放大后 ≈ 0.6EV 的观感，表现为"中间暗部亮太多、
