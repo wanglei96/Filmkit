@@ -5150,9 +5150,13 @@ void main() {
         // 抬 G 正确；粉色物体上的高光（R/G 1.15，真机 hlRgG=1.156）其 R 本身就高，
         // 抬 G 会把边缘推成**绿边**。判据：参考场离中性越远，抬升越少；≥0.12
         // 完全不抬（原值 = 满阱比例的粉色，正确）。
+        // 0.12.192：**只在局部参考可信时**做中性度门控。rrH.z 是第 1 级参考场
+        // 的可用样本比例；背景虚化高光点（如截图 1 的 ①）局部 32 块常全饱和 ⇒
+        // 退到全图池化比（hlRgG 1.1 是整张粉蘑菇场景的统计），若拿它当"偏色"
+        // 关掉抬升，中性高光就会被判成品红。局部不可信 ⇒ 按中性处理（照常抬）。
         vec3 rrH = refRatiosW((vec2(p) + 0.5) / vec2(uSize));
         float cenH = max(abs(rrH.x - 1.0), abs(rrH.y - 1.0));
-        float wN = 1.0 - smoothstep(0.04, 0.12, cenH);
+        float wN = (rrH.z > 0.30) ? (1.0 - smoothstep(0.04, 0.12, cenH)) : 1.0;
         outv = max(v, mix(v, refavg(p) + at3(uChroma, c), wN));
     }
     // ── 0.12.179：中性大面积饱和核 —— 三通道**同步**按参考比 × 实测 luma 重建 ──
@@ -12054,6 +12058,8 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
       sat[static_cast<size_t>(y) * w + x] = (wb >= g - 3.f * sig) ? 1 : 0;
     }
   }
+  size_t sat_hits = 0;
+  for (size_t i = 0; i < n; ++i) sat_hits += sat[i] ? 1 : 0;   // 0.12.192 诊断
   // 1px 膨胀（吸收 MFNR 对齐残差）
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
@@ -12091,6 +12097,7 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   // 覆盖率按 2×2 块计（与"饱和度"的物理单位一致）
   const size_t blocks = static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
   dbg_satm_cov_ = 100.f * static_cast<float>(hit) / static_cast<float>(blocks);
+  dbg_satm_hit_ = static_cast<float>(sat_hits);
 
   // ── 0.12.191：转置到 D4 几何（映射与 kVertRot 逐字一致）──────────────
   // dst 像素 (x,y) 取样源 raw：uv = R(c)·scale + 0.5，c = (x/Wd-0.5, y/Hd-0.5)。
@@ -15526,6 +15533,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   kv += ",\"satmP\":" + jnum(dbg_satm_p_, 2);
   kv += ",\"satmRaw\":" + std::to_string(raw_cpu_w_ > 0 ? 1 : 0);
+  kv += ",\"satmHit\":" + jnum(dbg_satm_hit_, 0);
   kv += ",\"satmCov\":" + jnum(dbg_satm_cov_, 2);
   kv += ",\"satmDbg1\":" + jnum(dbg_satm_dbg1_, 0);
   kv += ",\"satmC1\":" + jnum(dbg_satm_c1_, 0);

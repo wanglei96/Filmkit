@@ -1038,6 +1038,7 @@ class FrameRenderer {
   // 0.12.181 诊断：本张掩码覆盖率（%），进 raw.render 的 satmCov
   float dbg_satm_cov_ = 0.f;
   float dbg_satm_p_ = 0.f;   // 本张下发的 [101] 实际值（诊断）
+  float dbg_satm_hit_ = 0.f; // 判据命中的 photosite 数（不含膨胀/聚合）
   // ── 0.12.186：参考帧 RAW 的 CPU 副本 ─────────────────────────────────────
   // 为什么走 CPU：GPU 版（kFsSatMask + FBO）在 X300 上"program/纹理/FBO 全就绪、
   // 强制输出 1.0 后读回仍是 0"（0.12.185 自检），绘制链路不可诊断。mask 是数据变换、
