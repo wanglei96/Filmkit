@@ -8181,15 +8181,15 @@ uniform vec2 uSrcSize;           // 全分辨率尺寸（px）
 //   2 = libultrahdr 官方版公式（同旧版塑形 + 暗部 sdr<2/255 钳 2.3；从未默认过，留作对照）
 // 基线证据（docs/reports/hdr-baseline-20261025-REPORT.md）：旧版 gainmap p90 恒 0.533
 //（=1.10x 中灰平台）、8bit 码值 136 占 96.5%、码值 212 钉死 2.5 封顶 —— 8bit 码值空间
-// 浪费 ~70%，且高光增益到不了元数据声称的 4.0；PC 是真实比值（p90 顶格 4x）。
+// 浪费 ~70%，且高光增益到不了元数据声称的 4.0；真实比值下 p90 可顶格 4x。
 // 两版旧数学**最终都归一化到固定 [0.25, 4.0]**（官方"自适应范围"需要两遍扫描，本 pass
 // 单遍做不到；且离线实测自适应范围在无高光场景会把 8bit 码值浪费在极窄区间）。
 uniform int uGainmapMath;
 uniform float uSceneMid;         // P4：本张 scene 域中灰实测（ae_p50_，与 uHdr 同一 film_src 测得）
-const int kDS = 2;               // 下采样倍数（= PC RawGainmapMath.DOWNSAMPLE）
-const float kMin = 0.25;         // PC MIN_GAIN_RATIO
-const float kMax = 4.0;          // PC MAX_GAIN_RATIO
-const float kOff = 1e-4;         // PC OFFSET
+const int kDS = 2;               // 增益图下采样倍数（1/2 分辨率）
+const float kMin = 0.25;         // 元数据 min_content_boost（log2 −2）
+const float kMax = 4.0;          // 元数据 max_content_boost（log2 +2）
+const float kOff = 1e-4;         // 编码偏移（防除零）
 
 // 与 kFsOut 的 workToSrgb **逐字相同**（Rec.2020 线性 → sRGB 线性）
 vec3 workToSrgb(vec3 c) {
@@ -8208,14 +8208,14 @@ float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // （−1.36 EV）⇒ 开 HDR 整张变暗/发灰（真机实测 gainmap 中位 −1.03 log2、base mean 111）。
 // Ultra HDR 的语义是"HDR 相对 base 只会更亮"：中灰及以下 ratio = 1（= base），
 // 只有 scene 超白点（>1）的部分才原样延伸成高光增益。
-// HDR 相对 base 的增益曲线：**中灰基线 1.1**（整体通透度，对齐 PC gainmap 实测
+// HDR 相对 base 的增益曲线：**中灰基线 1.1**（整体通透度，对齐实测 gainmap
 // 中位 ≈1.1×），随后按 scene 亮度平滑升到 kMax（高光）。0.11.74 只给 max(1, scene)
 // 会让"高光面积小"的场景（日志 163517：aeP995 1.24）HDR 开关等于没有效果。
 // v0.11.90：**按真实 scene 倍数延伸，不再用归一化 t²**。
 // 旧式 `t = clamp((sceneY-0.2)/0.8)` 把"scene ≥1.0"全部压成 t=1 ⇒ 一律 4×。天空的
 // scene 只有 1.38，却被给了 4×：base 190 → HDR 760，超出手机屏幕的可用 headroom，
 // 系统 tonemap 压回来时丢色度 —— 真机 5619 的"SDR 天空有淡蓝、开 HDR 变灰白"。
-// 新式：中灰及以下给 1.1（整体通透，对齐 PC gainmap 中位），白点以上按真实倍数
+// 新式：中灰及以下给 1.1（整体通透，对齐实测 gainmap 中位），白点以上按真实倍数
 // （scene 1.38 ⇒ 1.38×1.6 = 2.2×），封顶 2.5 —— 在 1000nits 屏上约 0.4 峰值，
 // 既看得出 HDR，又不会被 clip 成白。
 float ratioFromScene(float sceneY) {
@@ -8224,17 +8224,21 @@ float ratioFromScene(float sceneY) {
 // ── P4（0.12.85）：真实跨曝光比值 ─────────────────────────────────────────────
 // 旧版（=1/2 档）的 ratio 是 sceneY 的纯函数，SDR base 不参与 —— 基线实测
 //（docs/reports/hdr-baseline-20261025-REPORT.md）：p90 恒 0.533（1.10x 平台）、
-// 码值 136 占 96.5%、码值 212 钉死 2.5 封顶；PC 是真实比值（p90 顶格 4x）。
-// 关键是**中灰自锚定**（0.11.74 的教训：uHdr 域中灰 ≈0.072 与显示域 0.1845 差
-// −1.36EV，直接相除全图 ratio×0.39 → 整张发灰）：uSceneMid = 本张 ae_p50_（与
-// uHdr 同一 film_src 测得、随曝光自适应），把 scene 域按它折到显示域尺度后相除，
-// 中灰像素 ratio 恒 = 1，锚定不随曝光策略漂。
-// 边界：clamp [1.0, 4.0] —— 下限 1 = UltraHDR 语义"HDR 相对 base 只会更亮"（暗部
-// 零放大，旧版 offset 暗部陷阱一并消失）；上限 4 = 元数据 kMax（PC 同款顶格）。
-// ⚠ 上限 4 与 5619"天空灰白"：真实比值下 4x 只在小面积高光核心顶格（天空 ratio
-// 连续 1~4x，随 ae_p50_ 自适应），且 base 比 0.11.90 时代暗 —— 但未真机证实前不算
-// 数：A/B 档（=1）保留，若复现预案 = kHdrCeil 软限（HDR 亮度 ≤ 2×SDR 白，按 sdrY
-// 收上限，不全局砍）。
+// 码值 136 占 96.5%、码值 212 钉死 2.5 封顶；真实比值下 p90 可顶格 4x。
+//
+// ── 0.12.207：**整体提亮是观感选择，不是原版语义** ─────────────────────────
+// 原版语义（ISO 21496-1 / Adobe hdrgm 的 gainmap 定义）：暗部与中灰的 HDR 值
+// **等于 SDR 值本身**（ratio 恒 1），只有 SDR shoulder 之上的部分才延展进 HDR
+// —— scene white 处约 +0.5 stop，再对超白点线性外推。
+// 本实现**有意偏离**：把 HDR 源按固定常数 0.1845/0.072 ≈ 2.56 折到显示域后
+// 与 SDR 相除，于是整张（含暗部与中灰）一起提亮。真机对比确认这是要的观感
+//（HDR 屏上整张更亮、高光更亮），故保留。
+// ⚠ 引用时注意：这不是原版语义。两者在暗部/中灰处差 2.5 倍以上 —— 实测
+//   gmMean 0.82~0.93（中灰 2.4~3.3×），原版口径应为 ≈0.5（1.0×）。
+//   若将来要对齐原版，只改一处：把 hdrAligned 换成
+//   `sdrLin + max(0, hdrLin − sw)`，sw = 本张 SDR 白点对应的 scene 值。
+// 边界：clamp [kMin, kMax] —— 下限 0.25 允许暗部压暗（ISO 21496-1 的
+// GainMapMin 是 log2 增益、可为负）；上限 4 = 元数据 max_content_boost。
 float gainTrue(float sdrLin, float hdrLin) {
     const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
     // ── 0.12.200：域映射改回**固定常数**（不再跟着 ae_p50 漂）──────────────
@@ -8249,12 +8253,9 @@ float gainTrue(float sdrLin, float hdrLin) {
     const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测）
     float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
     float hdrAligned = hdrLin * anchor;
-    // ── 0.12.201：下限回到 kMin（= 0.25），与 PC / ISO 21496-1 一致 ──────────
-    // 0.12.85 把这里写成 1.0，注释给的依据是"UltraHDR 语义：HDR 相对 base 只会更亮"
-    // —— 规范里没有这条。ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
-    // 可以为负；PC 的 RawGainmapMath 明写 `MIN_GAIN_RATIO = 0.25`，即允许暗部压
-    // 2EV。真实的 hdr/sdr 比值小于 1 时就该原样表达（暗部在 HDR 显示下更暗），
-    // 用 1.0 截断等于替用户把暗部抬亮、同时丢掉这部分编码动态范围。
+    // 下限取 kMin（0.25）：ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
+    // 可以为负，真实 hdr/sdr < 1 时就该原样表达（暗部在 HDR 显示下压 2EV）；
+    // 0.12.85 写成 1.0 的依据（"HDR 相对 base 只会更亮"）规范里并不存在。
     float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
@@ -8286,7 +8287,7 @@ void main() {
     // 散布全图）；经 IDW 上采样后这些点连成环，把相邻的栏杆等暗部一起提亮
     // ——用户原话"太阳 HDR 显影把栏杆覆盖了"。
     // 重叠平均把孤立噪点摊薄，同时保留太阳区的整体高增益（offset 1e-7 的暗部抖动
-    // 是另一半根因，那部分靠默认用 PC 版 offset 1e-4 解决，见 setGainmapMath 注释）。
+    // 是另一半根因，那部分靠默认 offset 1e-4 解决，见 setGainmapMath 注释）。
     vec2 block = floor(vUV0 * uSrcSize / float(kDS)) * float(kDS);
     const int kK = kDS * 2;
     float hdrSum = 0.0, sdrSum = 0.0;
