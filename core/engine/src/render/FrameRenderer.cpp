@@ -8251,7 +8251,13 @@ float gainTrue(float sdrLin, float hdrLin) {
     (void)mid;
     float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
     float hdrAligned = hdrLin * anchor;
-    float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), 1.0, kMax);
+    // ── 0.12.201：下限回到 kMin（= 0.25），与 PC / ISO 21496-1 一致 ──────────
+    // 0.12.85 把这里写成 1.0，注释给的依据是"UltraHDR 语义：HDR 相对 base 只会更亮"
+    // —— 规范里没有这条。ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
+    // 可以为负；PC 的 RawGainmapMath 明写 `MIN_GAIN_RATIO = 0.25`，即允许暗部压
+    // 2EV。真实的 hdr/sdr 比值小于 1 时就该原样表达（暗部在 HDR 显示下更暗），
+    // 用 1.0 截断等于替用户把暗部抬亮、同时丢掉这部分编码动态范围。
+    float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), kMin, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
 float gainPc(float sdrLin, float hdrLin) {
