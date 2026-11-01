@@ -76,11 +76,11 @@ class BuiltinPresetsTest {
 
     @Test
     fun parsesExactlyThreeBuiltinPresets() {
-        assertEquals("内置包必须恰好 4 条（0.12.215 新增理光正片）", 4, presets.size)
+        assertEquals("内置包必须恰好 5 条（0.12.216 新增富士NC）", 5, presets.size)
         assertEquals(
             "顺序 = JSON 顺序（UI 分组排序在 UI 层做）",
             listOf("builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-                "builtin_leica_bw"),
+                "builtin_fuji_nc", "builtin_leica_bw"),
             presets.map { it.id },
         )
         for (p in presets) {
@@ -224,6 +224,8 @@ class BuiltinPresetsTest {
             "ricoh_negative_v2" to "理光 负片 · 标定",
             // 0.12.215：理光正片（GR III/IIIx 三代，同一脚本 --preset positive，64³）
             "ricoh_positive_v1" to "理光 正片 · 标定",
+            // 0.12.216：富士NC（原版 Classic Negative LUT 去自带影调，tools/fix-fuji-nc-lut.py）
+            "fuji_nc_v2" to "富士 NC · 标定",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
@@ -232,6 +234,7 @@ class BuiltinPresetsTest {
             "ricoh_negative_v2" to "理光",
             "leica_b_w_hc" to "徕卡",
             "ricoh_positive_v1" to "理光",
+            "fuji_nc_v2" to "富士",
         )
         for (p in presets) {
             val lutId = p.lutId ?: error("${p.id} 没有 LUT 引用")
@@ -244,7 +247,7 @@ class BuiltinPresetsTest {
             // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
             // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
             assertEquals("$lutId 的 LUT_3D_SIZE",
-                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1" -> 64; else -> 33 }, lut.size)
+                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2" -> 64; else -> 33 }, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF
@@ -291,7 +294,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("四条预设的参数键总数（0.12.215 正片 11 键：23 + 5 + 11 + 14）", 53, names.size)
+        assertEquals("五条预设的参数键总数（0.12.216 富士NC 13 键：23 + 5 + 11 + 13 + 14）", 66, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",
@@ -305,7 +308,7 @@ class BuiltinPresetsTest {
     fun builtinPackageParsesWithNoSkips() {
         val res = presetsFromJson(jsonText)
         assertEquals("内置包不得有被跳过的条目/槽：${res.skipped}", emptyList<String>(), res.skipped)
-        assertEquals(4, res.presets.size)
+        assertEquals(5, res.presets.size)
     }
 
     // ── ⑥ 解析失败降级（坏 JSON ⇒ 空列表且不抛）──────────────────────────
@@ -345,7 +348,7 @@ class BuiltinPresetsTest {
         val user = listOf(userPreset("p_1_a", "我的暖调"), userPreset("p_2_b", "我的冷调"))
         val merged = mergePresets(user, presets)
         assertEquals(
-            "用户预设在前 + 内置四条在后（顺序 = UI 呈现顺序，UI 不再排一次）",
+            "用户预设在前 + 内置五条在后（顺序 = UI 呈现顺序，UI 不再排一次）",
             listOf("p_1_a", "p_2_b") + presets.map { it.id },
             merged.map { it.id },
         )
@@ -355,8 +358,8 @@ class BuiltinPresetsTest {
         assertEquals("同 id 不得出现两次（LazyColumn 的 key 会崩）", clash.size, clash.map { it.id }.distinct().size)
         assertEquals("同 id 时留下的是用户那份（用户数据优先）", "我的暖调", clash.first { it.id == "p_1_a" }.name)
         assertEquals(
-            "总数 = 用户 2 + 内置（1 条伪造同 id + 真内置 4）− 重复 1",
-            6,
+            "总数 = 用户 2 + 内置（1 条伪造同 id + 真内置 5）− 重复 1",
+            7,
             clash.size,
         )
 

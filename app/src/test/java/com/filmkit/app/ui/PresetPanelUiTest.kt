@@ -263,19 +263,19 @@ class PresetPanelUiTest {
     fun deletingAUserPresetKeepsAllBuiltins() {
         val users = listOf(userPreset("p_1_a", "我的预设 1"), userPreset("p_2_b", "我的预设 2"))
         val before = mergePresets(users, builtins)
-        assertEquals(6, before.size)
+        assertEquals(7, before.size)
 
         val after = mergePresets(users.filterNot { it.id == "p_1_a" }, builtins)
-        assertEquals("删一条用户预设 ⇒ 只剩另一条 + 四条内置", 5, after.size)
+        assertEquals("删一条用户预设 ⇒ 只剩另一条 + 五条内置", 6, after.size)
         assertEquals(
             "内置三条一条都不能少（P-2c 踩过的坑）",
             listOf("builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-                "builtin_leica_bw"),
+                "builtin_fuji_nc", "builtin_leica_bw"),
             after.filter { it.source == PRESET_SOURCE_BUILTIN }.map { it.id },
         )
         // 用户预设的删除**只影响用户那部分**（顺序也保持不变：用户在前 + 内置在后）
         assertEquals(listOf("p_2_b", "builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-            "builtin_leica_bw"), after.map { it.id })
+            "builtin_fuji_nc", "builtin_leica_bw"), after.map { it.id })
     }
 
     /** 用户预设的既有语义没被改动（PS-2b 不该回退 P-2c 的用户侧行为）。 */

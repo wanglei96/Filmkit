@@ -383,7 +383,7 @@ class PresetScopeTest {
     fun builtinPresetsNoticesMatchTheirData() {
         val json = File("src/main/assets/${BuiltinPresets.ASSET_PATH}").readText()
         val presets = BuiltinPresets.parse(json)
-        assertEquals("内置包必须恰好 4 条（0.12.215）", 4, presets.size)
+        assertEquals("内置包必须恰好 5 条（0.12.216）", 5, presets.size)
 
         for (p in presets) {
             assertNull(

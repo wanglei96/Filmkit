@@ -76,6 +76,31 @@
   },
   {
     "schema": 2,
+    "id": "builtin_fuji_nc",
+    "name": "富士NC",
+    "group": "富士",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Fujifilm Classic Negative · 暗部青绿/高光暖品、黄绿降饱和 · 原版 LUT 已去自带影调（0.12.216）",
+    "params": {
+      "engine_slot": 0,
+      "contrast": 1.05,
+      "shoulder[0]": 0.04,
+      "shoulder[1]": 0.04,
+      "shoulder[2]": 0.04,
+      "toe[0]": 0.04,
+      "toe[1]": 0.04,
+      "toe[2]": 0.04,
+      "filmic_black_ev": -8.0,
+      "filmic_white_ev": 4.0,
+      "sat_shadow": 1.05,
+      "sat_mid": 1.12,
+      "sat_high": 1.05
+    },
+    "lut": { "id": "fuji_nc_v2", "strength": 1.0 }
+  },
+  {
+    "schema": 2,
     "id": "builtin_leica_bw",
     "name": "徕卡黑白",
     "group": "徕卡",

@@ -55,16 +55,16 @@ class Ps8PresetUiRedesignTest {
             listOf(
                 "builtin_standard", "p_1", "p_2",
                 "builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-                "builtin_leica_bw",
+                "builtin_fuji_nc", "builtin_leica_bw",
             ),
             items.map { it.preset.id },
         )
         assertEquals("标准", items.first().preset.name)
         assertEquals("选中态有且只有一个", 1, items.count { it.selected })
         assertEquals("选中的就是 selectedId 那条", "p_1", items.first { it.selected }.preset.id)
-        // 没有用户预设（调用侧只给内置四条）⇒ 条里仍有「标准」+ 内置四条（不会被清空）
+        // 没有用户预设（调用侧只给内置五条）⇒ 条里仍有「标准」+ 内置五条（不会被清空）
         assertEquals(
-            5,
+            6,
             presetStripItems(builtins, CAMERA_STANDARD_PRESET.id, emptyMap()).size,
         )
         assertTrue(
