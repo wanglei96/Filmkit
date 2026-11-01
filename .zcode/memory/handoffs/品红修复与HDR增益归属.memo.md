@@ -1,8 +1,8 @@
 ---
 summary: 品红修复与HDR增益归属
 created: 2026-10-30 15:55
-updated: 2026-10-30 15:55
-status: active
+updated: 2026-11-01 18:47
+status: absorbed
 ---
 
 # 品红修复与HDR增益归属

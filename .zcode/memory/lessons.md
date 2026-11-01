@@ -106,3 +106,11 @@ status: active
 - [2026-10-30] **`raw.render` 的 `gm*` 恒 0 是设计**：`readGainmap` 在日志之后才跑；gainmap 真值看独立的 `gainmap.readback` 事件。
 - [2026-10-30] **照注释推断外部实现会错**：先按注释把 gainmap 改成"只提亮高光"，读实现（`RawHdrReferenceMath.evaluate` 的 `if (x <= joinInput) return sampleCurve(...)`）才确认语义；而用户观感仍偏好整体提亮 ⇒ **观感以样片为准、语义以源码为准，两者可以不一致**。
 - [2026-10-30] **`(void)mid;` 不是 GLSL**：Mali 宽容编译通过、glslang 报 `explicit typecast required extension`；改了 shader 常量（`constexpr` 也不存在，要写 `const`）必须重跑 `validate-shaders.sh`。
+
+## 预设与样片标定（11-01）
+- [2026-11-01] **"值没变就不写"的缓存 + 换数组 = 静默失效**：`setFilmParams` 换预设数组后，只有 5 个 applier 有哨兵，其余 21 个把基线值留在数组里（027 的 local_tone 0.25 / color_smooth 0 / sat 0.76）。新增 applier 必须同步置哨兵。
+- [2026-11-01] **用带自定义参数的样片定目标会骗方向**：第一版 12 张里 5 张是作者自定义 `+B5`，据此把"负片"定成全图偏蓝（与官方"暗暖亮冷"相反）。先读图注、排除非默认参数再统计。
+- [2026-11-01] **bug 现场的 DNG 不能做影调标定**：test_temp 12 张中性像素 L* 中位 7.5（GR 样片 45.1）⇒ 场景差 6 倍，反推出的对比度必然错。
+- [2026-11-01] **自烘 LUT 的轴序是 `[b][g][r]`**（.cube 的 R 最快 ⇒ x 轴 = R）；按 `[r][g][b]` 采样会得到"红→蓝"的假象，别据此判定引擎 R/B 交换。
+- [2026-11-01] **`fit/builtin-curves.json` 的 `editor` 是历史实测**：换 LUT/改配方后必须重算（本轮用 Kotlin 复刻重算并标注待 recipe-fit 重跑），否则曲线交叉校验必红。
+- [2026-11-01] **改 assets 后单测要 `--rerun-tasks`**：否则 up-to-date 缓存报"1 秒成功"的假绿。
