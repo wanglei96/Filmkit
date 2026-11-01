@@ -231,6 +231,8 @@ class BuiltinPresetsTest {
             "hasselblad_classic" to "哈苏 Classic",
             // 0.12.219：柯达 5219（Vision3 500T）复用既有资产，未重烘（抬黑/压白是胶片特征）
             "kodak_5219" to "柯达 5219",
+            // 0.12.222：暗部 b* 加深版（tools/adjust-lut-shadow-blue.py）
+            "kodak_5219_deep" to "柯达 5219 · 深蓝",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
@@ -242,6 +244,7 @@ class BuiltinPresetsTest {
             "fuji_nc_v2" to "富士",
             "hasselblad_classic" to "哈苏",
             "kodak_5219" to "柯达",
+            "kodak_5219_deep" to "柯达",
         )
         for (p in presets) {
             val lutId = p.lutId ?: error("${p.id} 没有 LUT 引用")
@@ -254,7 +257,7 @@ class BuiltinPresetsTest {
             // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
             // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
             assertEquals("$lutId 的 LUT_3D_SIZE",
-                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2" -> 64; else -> 33 }, lut.size)
+                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2", "kodak_5219_deep" -> 64; else -> 33 }, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF

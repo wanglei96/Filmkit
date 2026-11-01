@@ -125,7 +125,7 @@
     "group": "柯达",
     "favorite": false,
     "source": "builtin",
-    "note": "KODAK VISION3 500T 5219 · 钨灯平衡、蓝青阴影 + 暖高光 · 对比度按摄影师版、色彩用原资产（0.12.221）",
+    "note": "KODAK VISION3 500T 5219 · 钨灯平衡、蓝青阴影 + 暖高光 · 对比按摄影师版、暗部蓝加深（0.12.222）",
     "params": {
       "engine_slot": 0,
       "contrast": 1.12,
@@ -142,7 +142,7 @@
       "sat_mid": 1.10,
       "sat_high": 1.05
     },
-    "lut": { "id": "kodak_5219", "strength": 1.0 }
+    "lut": { "id": "kodak_5219_deep", "strength": 1.0 }
   },
   {
     "schema": 2,
