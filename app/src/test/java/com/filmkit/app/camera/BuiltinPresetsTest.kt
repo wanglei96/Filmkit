@@ -304,7 +304,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("七条预设的参数键总数（0.12.221 柯达5219 14 键）", 87, names.size)
+        assertEquals("七条预设的参数键总数（0.12.225 柯达5219 17 键）", 93, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

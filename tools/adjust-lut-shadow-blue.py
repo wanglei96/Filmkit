@@ -112,7 +112,7 @@ def crush_black(lut, crush, size=SIZE):
     return np.clip(srgb_encode(lin), 0.0, 1.0).reshape(size, size, size, 3)
 
 
-def shift_blue(lut, amount, center=30.0, sigma=30.0, size=SIZE):
+def shift_blue(lut, amount, center=30.0, sigma=30.0, a_shift=0.0, size=SIZE):
     enc = grid(size)
     out = trilinear(lut, enc.reshape(-1, 3))
     lab = rgb2lab(srgb_decode(out))
@@ -120,6 +120,7 @@ def shift_blue(lut, amount, center=30.0, sigma=30.0, size=SIZE):
     w[lab[:, 0] > 60.0] = 0.0        # 高光不动
     w *= np.clip(lab[:, 0] / 8.0, 0.0, 1.0)  # 纯黑端点保护
     lab[:, 2] -= amount * w
+    lab[:, 1] += a_shift * w   # 微正 = 从"青"往"蓝紫"靠（5219 日光下的暗部）
     lin = np.clip(lab2rgb(lab), 0.0, 1.0)
     return np.clip(srgb_encode(lin), 0.0, 1.0).reshape(size, size, size, 3)
 
@@ -138,13 +139,15 @@ def main():
     ap.add_argument("--amount", type=float, default=2.0, help="暗部 b* 下压量（正值 = 更蓝）")
     ap.add_argument("--title", default="柯达 5219 · 深蓝")
     ap.add_argument("--category", default="柯达")
+    ap.add_argument("--a-shift", type=float, default=0.0,
+                    help="暗部 a* 偏移（正值 = 减青/偏紫，5219 暗部是蓝紫不是青）")
     ap.add_argument("--crush-black", type=float, default=0.0,
                     help="暗部端点压深量（L* 单位，15 以下线性生效；0 = 不压）")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
     src, _ = load(args.src)
-    out = shift_blue(src, args.amount)
+    out = shift_blue(src, args.amount, a_shift=args.a_shift)
     if args.crush_black > 0:
         out = crush_black(out, args.crush_black)
     ok = True
