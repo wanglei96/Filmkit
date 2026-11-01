@@ -117,11 +117,18 @@ class Stage3EngineSlotPresetAuditTest {
         val json = File("src/main/assets/presets/builtin.json").readText()
         val builtins = BuiltinPresets.parse(json)
         assertTrue("前提：内置预设至少三条，实际 ${builtins.size}", builtins.size >= 3)
-        // 只对已重新标定的**徕卡一瞬**要求锁定；理光/黑白待重新标定（用户 2026-11-01）。
-        val leica = builtins.first { it.id == "builtin_leica_m9" }
-        assertEquals("builtin_leica_m9 必须显式锁定 filmic（[98]=0）", 0.0, leica.slots[98] ?: Double.NaN, 0.0)
-        assertEquals("展开后必须落在 filmic", 0.0, cameraPresetParams(leica)[98], 0.0)
-        for (b in builtins.filter { it.id != "builtin_leica_m9" }) {
+        // 只对**已按 filmic 重新标定**的预设要求锁定：
+        //  · 徕卡一瞬（0.12.211 起）
+        //  · 理光正片（0.12.215：contrast / shoulder / toe / 黑白点全部按 filmic 解，
+        //    切 sigmoid 时 `EngineScope.FILMIC_OWNED_SLOTS` 会把这些槽整段旁路）
+        // 理光负片 / 徕卡黑白仍待重新标定 ⇒ 不锁定。
+        val pinned = setOf("builtin_leica_m9", "builtin_ricoh_positive")
+        for (id in pinned) {
+            val p = builtins.first { it.id == id }
+            assertEquals("$id 必须显式锁定 filmic（[98]=0）", 0.0, p.slots[98] ?: Double.NaN, 0.0)
+            assertEquals("$id 展开后必须落在 filmic", 0.0, cameraPresetParams(p)[98], 0.0)
+        }
+        for (b in builtins.filter { it.id !in pinned }) {
             assertNull("${b.id} 未重新标定 ⇒ 不锁定引擎", b.slots[98])
         }
     }

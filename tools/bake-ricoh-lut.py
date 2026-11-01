@@ -60,6 +60,44 @@ HUE_TABLE = [
 B_STAR_TABLE = [(0.0, 1.05), (15.0, 0.02), (35.0, -0.35), (55.0, -1.30), (75.0, -0.85), (95.0, -1.10)]
 A_STAR_TABLE = [(0.0, 0.55), (15.0, 0.55), (35.0, 0.75), (55.0, 0.0), (75.0, -0.4), (95.0, -0.8)]
 
+# ── 理光正片（Positive Film, GR III/IIIx 三代）────────────────────────────────
+# 目标表 = 负片表 ⊕ 「同场景 Positive↔Negative 配对」实测 delta（grblog 7151 三组，
+# 像素对齐、亮度匹配 |ΔL|<4 后按色相桶取中位）：
+#   红 h0-60:   Δh −4.5~−7.9°,  C×1.04~1.07
+#   绿 h90-180: Δh −10~−14.3°,  C×1.07~1.20
+#   蓝 h240-300: Δh −0.9~+2.4°, C×1.41~1.45
+# 实测与文章定性同向：正片 = 正红（非褪色朱红）、黄绿（非蓝绿）、蓝比负片浓。
+# 灰轴由 12 张默认参数 Positive 样片的低饱和像素分 L 桶中位统计（2026-11-01）。
+POSITIVE_HUE_TABLE = [
+    (0.0,   -2.0, 0.98),
+    (25.0,  18.0, 0.99),   # 红→正红（配对 Δh −7.9 ⇒ 相对负片的 37° 回到 29°）
+    (40.0,  29.0, 1.00),
+    (55.0,  47.0, 1.01),   # 橙/肤色（配对 Δh −4.5）
+    (80.0,  72.0, 1.02),
+    (103.0, 96.0, 1.02),   # 黄（配对 Δh −10）
+    (120.0, 116.0, 1.02),
+    (136.0, 134.0, 1.00),  # 绿→黄绿（配对 Δh −14.1，相对负片的 149°）
+    (170.0, 163.0, 0.98),
+    (196.0, 194.0, 0.96),  # 青
+    (240.0, 242.0, 0.95),
+    (280.0, 282.0, 0.94),
+    (306.0, 303.0, 0.96),  # 蓝：色相几乎不动、比负片浓（配对 C×1.45）
+    (328.0, 323.0, 0.95),  # 品红
+    (359.0, 357.0, 0.98),
+]
+# 正片灰轴（12 张默认参数样片，低饱和像素 C*<8、按亮度桶加权）：
+#   L 0-10 b*+1.36 / 20-30 −1.20 / 50-60 −1.06 / 90-100 +0.64（暗暖、中间略冷、高光回暖）
+POSITIVE_B_STAR_TABLE = [(0.0, 1.20), (15.0, 0.30), (35.0, -0.55), (55.0, -0.95), (75.0, 0.10), (95.0, 0.55)]
+POSITIVE_A_STAR_TABLE = [(0.0, 0.85), (15.0, 0.85), (35.0, 0.45), (55.0, 0.0), (75.0, -0.30), (95.0, -0.30)]
+
+# 预设 = 一组目标表 + 输出路径 + 标题（`--preset` 选择；默认 negative 保持旧行为兼容）
+PRESETS = {
+    "negative": dict(hue=HUE_TABLE, b=B_STAR_TABLE, a=A_STAR_TABLE,
+                     out="ricoh_negative_v2.lut", title="理光 负片 · 标定"),
+    "positive": dict(hue=POSITIVE_HUE_TABLE, b=POSITIVE_B_STAR_TABLE, a=POSITIVE_A_STAR_TABLE,
+                     out="ricoh_positive_v1.lut", title="理光 正片 · 标定"),
+}
+
 
 def srgb_decode(c):
     c = np.clip(c, 0.0, 1.0)
@@ -231,7 +269,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--preview", default=None)
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="negative",
+                    help="negative=理光负片（默认，旧行为）；positive=理光正片")
     args = ap.parse_args()
+    # 目标表/输出路径按预设切换（模块级常量，hue_curve/gray_shift 直接读全局）
+    global HUE_TABLE, B_STAR_TABLE, A_STAR_TABLE, OUT, TITLE
+    cfg = PRESETS[args.preset]
+    HUE_TABLE, B_STAR_TABLE, A_STAR_TABLE = cfg["hue"], cfg["b"], cfg["a"]
+    OUT = os.path.join(ROOT, "app/src/main/assets/luts/" + cfg["out"])
+    TITLE = cfg["title"]
     lut = build()
     if not args.check:
         write_asset(lut)

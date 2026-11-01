@@ -53,6 +53,29 @@
   },
   {
     "schema": 2,
+    "id": "builtin_ricoh_positive",
+    "name": "理光正片",
+    "group": "理光",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Ricoh GR Positive Film（GR III/IIIx 三代）· 正红/黄绿、蓝比负片浓 · 高对比 + 压暗 1/3EV（0.12.215 按官方样片标定）",
+    "params": {
+      "engine_slot": 0,
+      "contrast": 1.15,
+      "exposure_ev": -0.25,
+      "shoulder[0]": 0.06,
+      "shoulder[1]": 0.06,
+      "shoulder[2]": 0.06,
+      "toe[0]": 0.10,
+      "toe[1]": 0.10,
+      "toe[2]": 0.10,
+      "filmic_black_ev": -8.0,
+      "filmic_white_ev": 4.0
+    },
+    "lut": { "id": "ricoh_positive_v1", "strength": 1.0 }
+  },
+  {
+    "schema": 2,
     "id": "builtin_leica_bw",
     "name": "徕卡黑白",
     "group": "徕卡",
