@@ -101,6 +101,25 @@
   },
   {
     "schema": 2,
+    "id": "builtin_hasselblad_natural",
+    "name": "哈苏自然",
+    "group": "哈苏",
+    "favorite": false,
+    "source": "builtin",
+    "note": "Hasselblad Natural Colour Solution · 中性准确、肤色优先、过渡平顺 · filmic 影调（0.12.218）",
+    "params": {
+      "engine_slot": 0,
+      "contrast": 1.05,
+      "filmic_black_ev": -8.0,
+      "filmic_white_ev": 4.0,
+      "sat_shadow": 1.08,
+      "sat_mid": 1.10,
+      "sat_high": 1.05
+    },
+    "lut": { "id": "hasselblad_classic", "strength": 1.0 }
+  },
+  {
+    "schema": 2,
     "id": "builtin_leica_bw",
     "name": "徕卡黑白",
     "group": "徕卡",

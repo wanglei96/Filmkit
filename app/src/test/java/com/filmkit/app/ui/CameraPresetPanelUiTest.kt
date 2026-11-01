@@ -307,16 +307,16 @@ class CameraPresetPanelUiTest {
     fun deletingAUserPresetKeepsAllBuiltins() {
         val users = listOf(userPreset("p_1_a", "我的预设 1"), userPreset("p_2_b", "我的预设 2"))
         val after = mergePresets(users.filterNot { it.id == "p_1_a" }, builtins)
-        assertEquals("删一条用户预设 ⇒ 只剩另一条 + 五条内置", 6, after.size)
+        assertEquals("删一条用户预设 ⇒ 只剩另一条 + 六条内置", 7, after.size)
         assertEquals(
             "内置三条一条都不能少（P-2c 踩过的坑）",
             listOf("builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-                "builtin_fuji_nc", "builtin_leica_bw"),
+                "builtin_fuji_nc", "builtin_hasselblad_natural", "builtin_leica_bw"),
             after.filter { it.source == PRESET_SOURCE_BUILTIN }.map { it.id },
         )
         // 拍照界面的列表首项恒为内置「标准」⇒ 删除后仍应是「标准 + 1 用户 + 4 内置」
         val listed = listOf(CAMERA_STANDARD_PRESET) + after
-        assertEquals(7, listed.size)
+        assertEquals(8, listed.size)
         assertEquals("「标准」必须还在列表首项", "builtin_standard", listed.first().id)
     }
 

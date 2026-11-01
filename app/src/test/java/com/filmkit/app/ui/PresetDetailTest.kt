@@ -113,7 +113,7 @@ class PresetDetailTest {
     fun allBuiltinPresetsHaveChineseNamesAndUnits() {
         val json = File("src/main/assets/presets/builtin.json").readText()
         val list = BuiltinPresets.parse(json)
-        assertEquals("内置包应有五条（0.12.216 新增富士NC）", 5, list.size)
+        assertEquals("内置包应有六条（0.12.218 新增哈苏自然）", 6, list.size)
         for (p in list) {
             val rows = presetDetailSections(p.slots).flatMap { it.rows }
             assertEquals("${p.name}：行数必须与槽位数相等（一个都不许丢）", p.slots.size, rows.size)
