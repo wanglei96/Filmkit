@@ -99,7 +99,7 @@ class BuiltinPresetsTest {
         val ricoh = preset("builtin_ricoh_negative")
         assertEquals("理光负片", ricoh.name)
         assertEquals("理光", ricoh.group)
-        assertEquals("ricoh_negative", ricoh.lutId)
+        assertEquals("ricoh_negative_v2", ricoh.lutId)
 
         val bw = preset("builtin_leica_bw")
         assertEquals("徕卡黑白", bw.name)
@@ -114,7 +114,7 @@ class BuiltinPresetsTest {
         //   R-3 的代价见 `docs/reports/r3-white-point-refit-REPORT.md`（含残差取舍曲线与
         //   "不死白 vs 高光软肩"两套方案的数据）。
         assertEquals("builtin_leica_m9 的 LUT 强度（0.12.92：压高反光荧光，收到 0.75）", 0.75, preset("builtin_leica_m9").lutStrength, 0.0)
-        assertEquals("builtin_ricoh_negative 的 LUT 强度（贴下限）", 0.3, preset("builtin_ricoh_negative").lutStrength, 0.0)
+        assertEquals("builtin_ricoh_negative 的 LUT 强度", 1.0, preset("builtin_ricoh_negative").lutStrength, 0.0)
         assertEquals(
             "builtin_leica_bw 的 LUT 强度（R-3：从 1.0 降到 0.61 —— 全量会让高光更早到顶，" +
                 "与死白起点约束冲突；黑白靠 LUT 的通道混合仍是这条预设的核心）",
@@ -150,12 +150,12 @@ class BuiltinPresetsTest {
         //   temp_mired[88] / fade[94]（暖调 + 褪色 = "油润厚重"的低对比层）。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94),
+            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94, 98),
             0 to -0.3,       // ★ 0.12.92：M9 适度压暗（相对用户 EV 的偏移）
             4 to 1.1974,    // contrast（0.12.90 三版）
             5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
             8 to 0.2286, 9 to 0.1519, 10 to 0.7734,     // toe R/G/B（★ R-3 起与 shoulder **解耦**）
-            20 to 0.76, 21 to 0.76, 22 to 0.65,         // 分区饱和（0.12.92：高光收 0.65）
+            20 to 1.22, 21 to 1.22, 22 to 1.22,         // 分区饱和（0.12.209：用户按 154802 定档 1.22，三段同值）
             23 to 0.12, 24 to 0.04,     // 分离色调（暖调稍强）
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
@@ -170,25 +170,18 @@ class BuiltinPresetsTest {
 
     @Test
     fun ricohNegativeRecipeMatchesSpec() {
-        // ★ R-3：白点 2.6138 → **4.0**（死白起点 2.45 → 3.55EV）。**这一条是三条里代价最大的**
-        // （高光目标 251.9 本就超过拍照链路 246.53 的硬上限，白点提高后"不死白"与"高光够亮"
-        // 直接冲突 ⇒ 残差 8.40/11.85 → 17.42/19.55，见 R-3 报告 §3）。
+        // ★ 0.12.213（用户 2026-11-01）：理光负片按 GR 官方样片重标，**不再自创曲线/颗粒/暗角**。
+        // 依据：GR Blog 7151 两组同场景 Positive↔Negative 的亮度传递接近恒等
+        //（中调 +10~16/255，高光 ±0），说明 Negative 的味道在色彩而非曲线 ⇒ 影调走引擎
+        // 默认（darktable filmic 出厂黑白点 −8/+4），色彩全交 LUT（tools/bake-ricoh-lut.py）。
         assertRecipe(
             "builtin_ricoh_negative",
-            // ⚠ [22]（sat_high = 1.0）与 [27]（400 = 恒等值）不在 slots 里：都等于恒等值
-            setOf(4, 5, 6, 7, 8, 9, 10, 20, 21, 23, 24, 26, 37, 38, 66, 67, 68),
-            4 to 1.2,
-            5 to 0.0406, 6 to 0.0, 7 to 0.9906,    // shoulder（★ R-3 解耦后 R/G/B 各自独立）
-            8 to 0.0, 9 to 0.0, 10 to 0.0,         // toe：贴 0（早压暗部，与"晚弯肩部"相反方向）
-            20 to 0.85, 21 to 0.65, 22 to 1.0,     // sat：高光回恒等（1.0）
-            23 to 0.41, 24 to 0.6,                 // 分离色调（b* 目标 −1.7）
-            26 to 30.0,
-            27 to 400.0,
-            37 to -12.0, 38 to 4.0,                // ⚠ [37] 贴 −12 滑杆下界；[38] = 4.0
-            66 to -0.28,
-            67 to 75.0,
-            68 to 48.0,
+            setOf(20, 21, 22, 37, 38),
+            20 to 0.92, 21 to 0.90, 22 to 0.80,   // 三段饱和：按 GR 样片的 C*(L) 形状保守反推
+            37 to -8.0, 38 to 4.0,
         )
+        assertEquals("LUT = 按样片重标的 ricoh_negative_v2", "ricoh_negative_v2", preset("builtin_ricoh_negative").lutId)
+        assertEquals("LUT 满强度（色彩全由 LUT 承担）", 1.0, preset("builtin_ricoh_negative").lutStrength, 0.0)
     }
 
     @Test
@@ -226,13 +219,14 @@ class BuiltinPresetsTest {
             "leica_m9" to "徕卡 M9",
             // 2026-10-25 徕卡一瞬一期重标：固件配方烘焙 LUT（tools/bake-m9-lut.py）
             "leica_m9_ccd" to "徕卡 M9 CCD",
-            "ricoh_negative" to "理光 负片",
+            // 0.12.212：理光负片按官方样片重标（tools/bake-ricoh-lut.py，64³）
+            "ricoh_negative_v2" to "理光 负片 · 标定",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
             "leica_m9" to "徕卡",
             "leica_m9_ccd" to "徕卡",
-            "ricoh_negative" to "理光",
+            "ricoh_negative_v2" to "理光",
             "leica_b_w_hc" to "徕卡",
         )
         for (p in presets) {
@@ -245,7 +239,8 @@ class BuiltinPresetsTest {
             assertEquals("$lutId 的 TITLE", expectedTitle[lutId], lut.title)
             // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
             // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
-            assertEquals("$lutId 的 LUT_3D_SIZE", if (lutId == "leica_m9_ccd") 128 else 33, lut.size)
+            assertEquals("$lutId 的 LUT_3D_SIZE",
+                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2" -> 64; else -> 33 }, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF
@@ -292,7 +287,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("三条预设的参数键总数（0.12.92 后：22 + 18 + 14）", 54, names.size)
+        assertEquals("三条预设的参数键总数（0.12.214 理光 5 键：23 + 5 + 14）", 42, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

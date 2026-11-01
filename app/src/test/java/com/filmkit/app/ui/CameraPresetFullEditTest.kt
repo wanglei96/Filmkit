@@ -40,7 +40,9 @@ class CameraPresetFullEditTest {
         val secs = fullParamSections(FullParamTab.BASIC, emptySet())
         assertEquals(listOf("调整"), secs.map { it.title })
         val cells = secs.flatMap { it.rows.flatten() }
-        assertEquals(10, cells.size)
+        // 0.12.209：三段饱和进基础档 ⇒ 10 → 12 项（3 行 × 4 格，清晰度居最右）
+        assertEquals(12, cells.size)
+        assertEquals(listOf(4, 4, 4), secs[0].rows.map { it.size })
         // 顺序 = 参数表顺序（AdjustParams 的决策主干），不是集合的哈希顺序
         assertEquals(BASIC_PARAM_KEYS.toList(), cells.map { it.key })
         assertTrue("基础档每一项都必须有滑杆", cells.all { it.param != null })
@@ -55,10 +57,10 @@ class CameraPresetFullEditTest {
         val secs = fullParamSections(FullParamTab.ADVANCED, setOf(70))
         assertEquals(listOf("调整", "色彩", "质感", "只读"), secs.map { it.title })
         val tunable = secs.dropLast(1).flatMap { it.rows.flatten() }
-        // 31 = AdjustParams 17 + ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
+        // 33 = AdjustParams 19（三段饱和拆开 +2）+ ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
         // （★ PS-10：AdjustParams 15 → 17，filmic 黑白点补上滑杆）
-        assertEquals(31, CAMERA_TUNABLE_PARAMS.size)
-        assertEquals(31, tunable.size)
+        assertEquals(33, CAMERA_TUNABLE_PARAMS.size)
+        assertEquals(33, tunable.size)
         assertTrue(tunable.all { it.param != null })
         // 高级 ⊃ 基础（切档不丢项）
         assertTrue(tunable.map { it.key }.containsAll(BASIC_PARAM_KEYS))
@@ -120,10 +122,10 @@ class CameraPresetFullEditTest {
             )
         }
         val adjust = secs.first()
-        // ★ PS-10：17 项（15 + filmic 黑白点两条）⇒ 5 行（4/4/4/4/1）
-        assertEquals(17, adjust.rows.flatten().size)
+        // ★ PS-10：19 项（15 + filmic 黑白点两条 + 0.12.209 饱和度拆三条）⇒ 5 行（4/4/4/4/3）
+        assertEquals(19, adjust.rows.flatten().size)
         assertEquals(5, adjust.rows.size)
-        assertEquals(listOf(4, 4, 4, 4, 1), adjust.rows.map { it.size })
+        assertEquals(listOf(4, 4, 4, 4, 3), adjust.rows.map { it.size })
         assertEquals(1, secs[1].rows.size)                      // 色彩 4 项 ⇒ 1 行
         assertEquals(3, secs[2].rows.size)                      // 质感 10 项 ⇒ 3 行
         // 每格的 key 唯一（选中态按 key 走，重复 key 会让两格一起高亮）

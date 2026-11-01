@@ -562,13 +562,14 @@ private fun QualityDrawerContent() {
     // 依据（∇>60 旧口径）已被推翻。0 = 关 ⇒ FilmParams[54]=0 ⇒ 与 v0.10.174
     // 逐位相同；1 = 替换档（旁路 P4/D-1）；2 = 叠加档（叠在现有色度降噪之上）。
     // 核尺寸 `pc3d_msize`。
-    // 初始态 fallback = 2（叠加档）：与 CameraPresets.neutral() 的 [54]、
+    // 初始态 fallback = 1（替换档）：与 CameraPresets.neutral() 的 [54]、
     // CameraController.applyPc3dPref 的 getInt fallback 三方一致 —— 无记录的
-    // 升级用户显示与实际一致（叠加档），不会出现"显示关、实际开"的状态误导。
-    var pc3dMode by remember { mutableStateOf(prefs.getInt("pc3d", 2).coerceIn(0, 2)) }
+    // 升级用户显示与实际一致，不会出现"显示关、实际开"的状态误导。
+    // 0.12.208：兜底 2 → 1（用户 2026-11-01 拍板：默认替换档）。
+    var pc3dMode by remember { mutableStateOf(prefs.getInt("pc3d", 1).coerceIn(0, 2)) }
     SettingValueRow(
         title = "色度降噪·多尺度",
-        subtitle = "两趟降采样结构（核 11、尺度 2）作用于色度降噪：低分辨率趟先做亮度/色度分离降噪，再引导上采样回全分辨率做第二趟。离线重估（2026-10-05 新 KPI）：紫边主指标（剖面 core）四片全改善（×0.676）、色渗判据全绿，待真机验证。代价：采样 2.3×、额外显存约 240MB。叠加档 = 在现有色度降噪之上叠加；替换档 = 旁路现有色度降噪（新 KPI 下色渗指标在警戒侧，留作真机 A/B）。默认叠加档，待真机 pc3dMs/画质验证后定稿",
+        subtitle = "两趟降采样结构（核 11、尺度 2）作用于色度降噪：低分辨率趟先做亮度/色度分离降噪，再引导上采样回全分辨率做第二趟。离线重估（2026-10-05 新 KPI）：紫边主指标（剖面 core）四片全改善（×0.676）、色渗判据全绿，待真机验证。代价：采样 2.3×、额外显存约 240MB。叠加档 = 在现有色度降噪之上叠加；替换档 = 旁路现有色度降噪（新 KPI 下色渗指标在警戒侧，留作真机 A/B）。默认替换档（用户 2026-11-01 定档）",
         valueText = when (pc3dMode) {
             1 -> "替换档"
             2 -> "叠加档"
@@ -603,7 +604,7 @@ private fun QualityDrawerContent() {
     )
 }
 
-/** 抽屉内容：影调与色彩（基准影调 / 曝光基准 / 饱和 / 黑白点 / 局部色调 / 色彩链 / 色域 / 高光重建） */
+/** 抽屉内容：影调与色彩（基准影调 / 曝光基准 / 黑白点 / 局部色调 / 色彩链 / 色域 / 高光重建） */
 @Composable
 private fun ToneColorDrawerContent() {
     val context = LocalContext.current
@@ -698,28 +699,9 @@ private fun ToneColorDrawerContent() {
             EngineBridge.LEVEL_INFO, "app", "settings.base_ev", "{\"v\":$v}",
         )
     }
-    // ★ 阶段 3：以下四项都是"引擎 0（filmic）语义"的旋钮 ⇒ 同一道 gate。
-    // 饱和补偿写 `[20]/[21]`（判据取 `[20]`：两槽同命运，见 `EngineScope.NEUTRALIZE`）。
-    if (slotActiveInEngine(20, engineSlot)) {
-        // ── 饱和补偿（v0.10.21 标定旋钮）──────────────────────────────
-        // 原生 gamut 色度 min 的低饱和副作用由风格层（uSat 分区饱和）补偿：
-        // darktable 的 filmic → color balance、PC 的 filmic → LUT 是同一分层。
-        // 只作用阴影/中间调，高光不动（防过饱和）。定值后固化进默认。
-        SliderRow(
-            label = "饱和补偿",
-            desc = "标定旋钮：补偿原生色度收缩（暗部/中间调），高光不动。对照同场景样张调到灰感消失，定值后回传",
-            initial = prefs.getFloat("sat_comp", 0f),
-            range = 0f..0.30f,
-            steps = 0,
-            valueText = { "+%d%%".format((it * 100).toInt()) },
-        ) { v ->
-            val snap = (v * 100).toInt() / 100f
-            prefs.edit().putFloat("sat_comp", snap).apply()
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.sat_comp", "{\"v\":$snap}",
-            )
-        }
-    }
+    // ★ 阶段 3：以下都是"引擎 0（filmic）语义"的旋钮 ⇒ 同一道 gate。
+    // 0.12.208：饱和补偿滑杆已删（用户 2026-11-01 拍板）——饱和度归预设的
+    // 分区饱和（[20]/[21]/[22]），不再有第二个写入者。
     if (slotActiveInEngine(37, engineSlot)) {
         // ── filmic 黑白点（v0.7.6）：像 PhotonCamera 一样交给用户配置 ─────────────
         // 单位 = 相对中灰 18.45% 的 EV —— 物理量，换机型/换曲线都成立，所以它是

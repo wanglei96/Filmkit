@@ -98,10 +98,10 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfLeicaMomentIsExact() {
         val p = builtin("徕卡一瞬")
-        assertEquals(22, p.slots.size)  // 0.12.92：新增曝光 / sat_mid / temp_mired / fade
+        assertEquals(23, p.slots.size)  // 0.12.92：新增曝光 / sat_mid / temp_mired / fade；0.12.211：+引擎插槽
         assertEquals(
             // 0.12.92：M9 适度压暗（−0.3 EV）+ 暗 -24/中 -24/高 -35 + LUT 75
-            "曝光 -0.3 EV · 饱和度 · 暗部 -24 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
+            "曝光 -0.3 EV · 饱和度 · 暗部 +22 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）
@@ -121,10 +121,11 @@ class CameraPresetPanelUiTest {
      */
     @Test
     fun summaryOfRicohNegativeIsExact() {
+        // 0.12.214：理光 = 三段饱和 + 黑白点 + 满强度 LUT。
         val p = builtin("理光负片")
-        assertEquals(17, p.slots.size)
+        assertEquals(5, p.slots.size)
         assertEquals(
-            "对比度 +20 · 饱和度 · 暗部 -15 · 胶片曲线 · 肩部 红 0.04 · 颗粒 · 强度 30 · … · LUT ricoh_negative 30",
+            "饱和度 · 暗部 -8 · 黑点 -8.0 EV · 饱和度 · 中间调 -10 · 白点 +4.0 EV · … · LUT ricoh_negative_v2 100",
             presetSummaryText(p),
         )
     }

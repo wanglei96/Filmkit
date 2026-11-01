@@ -87,8 +87,10 @@ class EngineOverrideUiTest {
         }
         val adv = cells(FullParamTab.ADVANCED, engineSlot = effective).map { it.key }
         for (k in filmicKeys) assertTrue("$k 必须进网格", k in adv)
-        // 引擎 0 下被旁路的三槽（饱和）也一起回来
-        assertTrue("引擎 0 下「饱和度」照旧显示", "sat" in adv)
+        // 引擎 0 下被旁路的三槽（饱和）也一起回来 —— 0.12.209 起拆成三条滑杆
+        for (k in listOf("satShadow", "satMid", "satHigh")) {
+            assertTrue("引擎 0 下「$k」照旧显示", k in adv)
+        }
         // 对照：同一预设 `[98] = 1` 在跟随档下四项都消失
         val followed = EngineScope.effectiveEngineSlot(1, ENGINE_OVERRIDE_FOLLOW_PRESET)
         for (k in filmicKeys) assertFalse("跟随档下 $k 应隐藏", paramActiveInEngine(param(k), followed))
@@ -177,8 +179,9 @@ class EngineOverrideUiTest {
         // 三档开关**不进** `slotActiveInEngine` 的 gate 计数。期 B 起是 **6 项**：原 5 项
         // + `[40]` 色域映射（它本就在 `EngineScope.FILMIC_OWNED_SLOTS` 里，属设置页漏挂 ⇒
         // 引擎 1 下显示却完全无效；补挂见 EngineSlotUiTest 的同名判据）。
+        // 0.12.208：「饱和补偿」[20] 滑杆已删（饱和度归预设的分区饱和）⇒ gate 少一项。
         assertEquals(
-            listOf(28, 20, 37, 38, 36, 40, 41),
+            listOf(28, 37, 38, 36, 40, 41),
             Regex("""slotActiveInEngine\((\d+),""").findAll(settings).map { it.groupValues[1].toInt() }.toList(),
         )
     }

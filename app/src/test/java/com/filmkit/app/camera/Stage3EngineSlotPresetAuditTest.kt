@@ -5,6 +5,7 @@ import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -107,17 +108,33 @@ class Stage3EngineSlotPresetAuditTest {
      *（后者可能被将来某张卡改掉，届时本用例会红，正确）。
      */
     @Test
-    fun builtinPresetsWithoutTheEngineSlotKeyExpandToTheDefaultEngine() {
+    fun builtinPresetsPinTheEngineSlotToFilmic() {
+        // 0.12.211（用户 2026-11-01）：内置预设改为**显式锁定** [98] = 0（filmic）。
+        // 三条内置的肩/趾曲线与 filmic 黑白点都按 filmic 标定；走 sigmoid 时这些槽被
+        // `EngineScope.FILMIC_OWNED_SLOTS` 旁路 ⇒ 预设的影调整段失效。
+        // 旧用例（"内置预设不得含 [98]、缺键展开到默认 sigmoid"）记录的是 0.10.14
+        // "预设先不动"阶段的行为，已被本条取代。
         val json = File("src/main/assets/presets/builtin.json").readText()
         val builtins = BuiltinPresets.parse(json)
         assertTrue("前提：内置预设至少三条，实际 ${builtins.size}", builtins.size >= 3)
-        for (b in builtins) {
-            assertFalse("${b.id} 不得含 [98]（P2 卡要求内置预设零改动）", 98 in b.slots)
-            assertEquals(
-                "${b.id} 缺 engine_slot ⇒ 展开后必须是默认档（不是硬编码 0）",
-                CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), cameraPresetParams(b)[98], 0.0,
-            )
+        // 只对已重新标定的**徕卡一瞬**要求锁定；理光/黑白待重新标定（用户 2026-11-01）。
+        val leica = builtins.first { it.id == "builtin_leica_m9" }
+        assertEquals("builtin_leica_m9 必须显式锁定 filmic（[98]=0）", 0.0, leica.slots[98] ?: Double.NaN, 0.0)
+        assertEquals("展开后必须落在 filmic", 0.0, cameraPresetParams(leica)[98], 0.0)
+        for (b in builtins.filter { it.id != "builtin_leica_m9" }) {
+            assertNull("${b.id} 未重新标定 ⇒ 不锁定引擎", b.slots[98])
         }
+    }
+
+    /** 缺键时的默认档判据仍然成立（用不含 [98] 的预设验证，避免与上一条混淆）。 */
+    @Test
+    fun presetWithoutTheEngineSlotKeyExpandsToTheDefaultEngine() {
+        val p = EditorPreset(id = "no_slot", name = "无引擎槽", slots = mapOf(4 to 1.2))
+        assertEquals(98 !in p.slots, true)
+        assertEquals(
+            "缺 engine_slot ⇒ 展开后必须是默认档",
+            CameraPresets.DEFAULT_ENGINE_SLOT.toDouble(), cameraPresetParams(p)[98], 0.0,
+        )
     }
 
     /**

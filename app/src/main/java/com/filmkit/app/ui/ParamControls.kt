@@ -106,6 +106,7 @@ import com.filmkit.app.camera.monoUi
 import com.filmkit.app.camera.normalizedSlot
 import com.filmkit.app.camera.normalizedUi
 import com.filmkit.app.camera.pivotFraction
+import com.filmkit.app.camera.satSlot
 import com.filmkit.app.camera.satUi
 import com.filmkit.app.camera.splitSlot
 import com.filmkit.app.camera.splitUi
@@ -124,7 +125,6 @@ import com.filmkit.app.camera.vigStrengthUi
 import com.filmkit.app.camera.wbGainSlot
 import com.filmkit.app.camera.wbGainUi
 import com.filmkit.app.camera.writeLatitude
-import com.filmkit.app.camera.writeSaturation
 
 /**
  * ★ PS-3：**参数控件与参数表的共享位置**（拍照界面预设详情 ⇄ 编辑器参数面板）。
@@ -334,13 +334,30 @@ internal val AdjustParams: List<EditorParam> = listOf(
         write = { p, v -> p[93] = toneSlot(v) },
     ),
     // 全局色彩强度 → 质感 → 手动通道增益（顺序理由见 [AdjustParams] 的 KDoc）
+    // 0.12.209（用户 2026-11-01 拍板，方案 B）：**三段饱和拆成三条滑杆**。
+    // 引擎 `uSat` 本来就按 luma 三区加权（shadow / mid / high 各一个系数），此前 UI 用
+    // 一条滑杆同写三槽 ⇒ 拖动会把预设的"高光降饱和"（徕卡 0.65）拍平，分区能力形同虚设。
+    // 拆开后 UI 能力 == 引擎能力；想复刻机内直出（三段同值）把三条拉成一样即可。
     EditorParam(
-        key = "sat", label = "饱和度", icon = Icons.Outlined.WaterDrop,
+        key = "satShadow", label = "饱和度 · 暗部", icon = Icons.Outlined.WaterDrop,
         range = SAT_UI_RANGE, pivot = 1f,
         format = { formatOffset100(it, 1f) },
-        // 一个滑杆同写 [20][21][22] 三槽（ADR §5.6④ 的硬约束，见 writeSaturation 的 KDoc）
+        read = { satUi(it[20]) },
+        write = { p, v -> p[20] = satSlot(v) },
+    ),
+    EditorParam(
+        key = "satMid", label = "饱和度 · 中间调", icon = Icons.Outlined.WaterDrop,
+        range = SAT_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
         read = { satUi(it[21]) },
-        write = { p, v -> writeSaturation(p, v) },
+        write = { p, v -> p[21] = satSlot(v) },
+    ),
+    EditorParam(
+        key = "satHigh", label = "饱和度 · 高光", icon = Icons.Outlined.WaterDrop,
+        range = SAT_UI_RANGE, pivot = 1f,
+        format = { formatOffset100(it, 1f) },
+        read = { satUi(it[22]) },
+        write = { p, v -> p[22] = satSlot(v) },
     ),
     EditorParam(
         key = "clarity", label = "清晰度", icon = Icons.Outlined.Details,
@@ -673,7 +690,8 @@ internal val CAMERA_TUNABLE_SLOT_PARAM: Map<Int, EditorParam> = buildMap {
     // ★ PS-10：filmic 黑白点（一条滑杆一槽；量程 / 读数 / 写值全在参数表那两条自己身上）
     bind("filmicBlack", 37); bind("filmicWhite", 38)
     // 色彩
-    bind("sat", 20, 21, 22)          // 一条滑杆三槽（writeSaturation）
+    // 0.12.209：三段饱和度各一条滑杆（一条滑杆一槽）
+    bind("satShadow", 20); bind("satMid", 21); bind("satHigh", 22)
     bind("splitWarm", 23); bind("splitCool", 24); bind("mono", 25)
     bind("fade", 94)
     // 基础调整（影调分区）+ 清晰度 + 白平衡色温色调

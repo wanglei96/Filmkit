@@ -343,9 +343,9 @@ class Ps10FilmicEndpointsTest {
         // 黑白点属于「调整」组（不是「色彩」/「质感」）—— 与参数表里的位置同一个判据
         assertTrue("黑点在 AdjustParams 里", AdjustParams.any { it.key == "filmicBlack" })
         assertTrue("白点在 AdjustParams 里", AdjustParams.any { it.key == "filmicWhite" })
-        // 基础档不出现（仍是 Lightroom Basic 的十项）
+        // 基础档不出现（Lightroom Basic 的项 + 0.12.209 拆开的三段饱和 = 12）
         val basic = fullParamSections(FullParamTab.BASIC, emptySet()).flatMap { it.rows.flatten() }
-        assertEquals("基础档仍是 10 项", 10, basic.size)
+        assertEquals("基础档 12 项", 12, basic.size)
         assertTrue("黑白点不进基础档", basic.none { it.key == "filmicBlack" || it.key == "filmicWhite" })
         // 网格格子的 label 与参数表一致（不新造译名），且详情页的 label 包含它
         val cells = adjust.associateBy { it.key }

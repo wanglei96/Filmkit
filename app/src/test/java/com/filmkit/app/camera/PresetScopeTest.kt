@@ -357,9 +357,10 @@ class PresetScopeTest {
                 presetSlotScenes(slot),
             )
         }
+        // 0.12.208：+[99][100][101]（高光滚降 / D4 USM / 饱和掩码）—— 管线开关不进预设。
         assertEquals(
-            "排除槽位数（[28][29][30][31][32][33][34][35][36] + [39..59] + [79..87]）",
-            9 + 21 + 9,
+            "排除槽位数（[28][29][30][31][32][33][34][35][36][99][100][101] + [39..59] + [79..87]）",
+            12 + 21 + 9,
             checked,
         )
     }
@@ -398,19 +399,19 @@ class PresetScopeTest {
                 )
             }
         }
-        for (id in listOf("builtin_leica_m9", "builtin_ricoh_negative")) {
+        // 0.12.211：只有**徕卡一瞬**显式锁定 [98] = filmic（理光/黑白待重新标定，暂不锁定）。
+        // [98] 只被拍照链路读 ⇒ 编辑器侧的唯一提示就是它，且不得再多出别的。
+        val leica = presets.first { it.id == "builtin_leica_m9" }
+        assertEquals(
+            "徕卡编辑器侧只许提示引擎插槽",
+            "含 1 项仅拍照参数（引擎插槽），编辑器里不生效",
+            presetScopeNotice(leica, PresetScene.EDITOR),
+        )
+        for (id in listOf("builtin_ricoh_negative", "builtin_leica_bw")) {
             val p = presets.first { it.id == id }
-            assertNull(
-                "$id 含 [23][24] 分离色调 ⇒ ★ U-1 起编辑器里也生效 ⇒ 不该提示",
-                presetScopeNotice(p, PresetScene.EDITOR),
-            )
-            println("BUILTIN_SCOPE $id editor=\"${presetScopeNotice(p, PresetScene.EDITOR)}\"")
+            assertNull("$id 未锁定引擎 ⇒ 编辑器侧无提示", presetScopeNotice(p, PresetScene.EDITOR))
         }
         val bw = presets.first { it.id == "builtin_leica_bw" }
         assertFalse("徕卡黑白不得带 [25]（黑白由 LUT 承载）", bw.slots.containsKey(25))
-        assertNull(
-            "徕卡黑白不含 [25] ⇒ 编辑器里全部生效，不该提示",
-            presetScopeNotice(bw, PresetScene.EDITOR),
-        )
     }
 }

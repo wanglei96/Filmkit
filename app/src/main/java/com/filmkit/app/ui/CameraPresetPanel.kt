@@ -317,7 +317,7 @@ internal fun CameraParamOverrides?.forPreset(preset: EditorPreset): CameraParamO
  *
  * 算法：把 UI 值写进"当前生效参数数组"，再与**这条预设自己的配方**逐槽比对 —— 与预设原值相同
  * 的槽**不进** [CameraParamOverrides.values]（拖回原值 = 撤销这次调整，而不是"存一个等于原值的
- * 覆盖"）。多槽参数（饱和度 `[20..22]` / 胶片曲线 `[5..10]`）按 `write` 实际写的槽逐个记账 ⇒
+ * 覆盖"）。多槽参数（胶片曲线 `[5..10]`）按 `write` 实际写的槽逐个记账 ⇒
  * "一条滑杆改三槽"在改动集里也是三槽（引擎读什么就记什么）。
  *
  * 给某个槽设值 = **撤销**它之前那次「移除该项」（[CameraParamOverrides.removed] 里划掉它）：

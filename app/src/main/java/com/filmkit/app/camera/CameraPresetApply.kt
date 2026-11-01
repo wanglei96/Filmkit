@@ -70,6 +70,9 @@ internal val CAMERA_PATH_SLOTS: Set<Int> = buildSet {
     // 的判据（方案 §4 契约 5：不静默、不崩、不做 identity 伪装）；阶段 2 起由它真正选引擎。
     // ⚠ 编辑器链路 `passStyle` **不读**它（只有拍照链路有引擎选择）⇒ §1.6 标"仅拍照"。
     add(98)
+    // ⚠ `[99]/[100]/[101]`（高光滚降 / D4 USM / 饱和掩码）**不在此集合**：它们是管线开关，
+    // 引擎虽读它们做门控，但不属于预设可调作用域（用户 2026-11-01：预设不带管线开关）。
+    // 白名单测试对这三槽走显式豁免（`CameraStyleWhitelistTest.PIPELINE_ONLY_SLOTS`）。
 }
 
 /**

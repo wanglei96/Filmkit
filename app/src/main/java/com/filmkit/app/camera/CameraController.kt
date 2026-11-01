@@ -1367,6 +1367,36 @@ class CameraController(private val context: Context, private val render: RenderC
         // **不写**，于是预设刚展开进数组的基线值留了下来 ⇒ 用户设置被预设静默覆盖
         //（2026-10-27 16:51 天空发灰、hlGRecon 0→1 的现场）。置哨兵 ⇒ 下一次 apply 必写。
         hlGreconPref = -1.0
+        // 0.12.208：**其余 guard 型开关缓存一并置哨兵**。本函数把 filmParams 换成
+        // neutral() 展开的预设数组，而 applyZebraPref() 串起的 applyXxxPref() 都是
+        // "值变了才写"：prefs 与缓存相等时**不写** ⇒ 基线值留在数组里静默生效。
+        // 已实锤三例（2026-10-30 同场景三连拍）：[36] local_tone 基线 0.25（prefs 默认
+        // 关）⇒ 暗部被提亮 25%、画面发灰；[54] pc3d 基线 1（prefs 默认 2 = 叠加档）
+        // ⇒ 降噪结构静默降级为替换档；[59] color_smooth 基线 0（prefs 默认开）
+        // ⇒ 色差滤波被静默关掉。
+        // 纪律（用户 2026-11-01）：**管线开关不进预设**（预设只带风格：对比/曲线/分区饱和/
+        // 色温/颗粒/暗角/LUT），开关的唯一事实源是设置页 ⇒ 换数组后一律按 prefs 重写。
+        // [37]/[38] 例外（预设显式携带黑白点，由 presetFilmicEv 管）。
+        localTonePref = -1.0
+        sharpenPref = -1.0
+        gamutPref = -1.0
+        hrPref = -1.0
+        hrRawPref = -1.0
+        hlRolloffPref = -1.0
+        d4UsmPref = -1.0
+        rcdCdFixPref = -1.0
+        rcdGOrigPref = -1.0
+        colorSmoothPref = -1.0
+        hlRbReconPref = -1.0
+        rcdP3SplitPref = -1.0
+        defringePref = -1.0
+        caCorrPref = -1.0
+        chromaGatePref = -1.0
+        pc3dPref = -1.0
+        pc3dMsizePref = -1.0
+        whiteHlPref = -1.0
+        whiteFloorPref = -1.0
+        whiteProbePref = -1.0
         applyTonePref()
         applyZebraPref()
         applyLutStrengthPref()
@@ -1521,10 +1551,6 @@ class CameraController(private val context: Context, private val render: RenderC
     private var whiteFloorPref = -1.0
     // v0.10.111：白点上探幅度上限（FilmParams[44]；旧硬编码 1.5）
     private var whiteProbePref = -1.0
-    // 饱和补偿标定旋钮（v0.10.21）：原生 gamut 色度 min 的低饱和副作用由**风格层**
-    // （uSat 分区饱和，FilmParams[20..22]）标定补偿——分层架构对应 darktable 的
-    // filmic → color balance、PC 的 filmic → LUT。只作用阴影/中间调，高光不动。
-    private var satCompPref = Double.NaN
     // 标定探针按 **cameraId** 各记一次（v0.6.20）：原来整个会话只记一次，导致无法
     // 区分"主摄/长焦是否拿到不同的色彩矩阵"—— 真机反馈长焦色彩正、主摄明显差，
     // 必须先用日志确认厂商有没有给两个镜头写同一套 ColorMatrix/ForwardMatrix。
@@ -1621,7 +1647,6 @@ class CameraController(private val context: Context, private val render: RenderC
         applyWhiteHlPref()
         applyWhiteFloorPref()
         applyWhiteProbePref()
-        applySatCompPref()
         applyFilmicRangePrefs()
     }
 
@@ -1978,7 +2003,8 @@ class CameraController(private val context: Context, private val render: RenderC
      * pc3dMs 与 dnMs 同量级 ⇒ 成本正常，pc3dMs ≫ dnMs ⇒ 过强（把核尺寸调小）。
      */
     private fun applyPc3dPref() {
-        val v = appPrefs.getInt("pc3d", 2).let { if (it in 0..2) it else 0 }.toDouble()
+        // 0.12.208：兜底 2 → 1（用户 2026-11-01 拍板：ESD3D2 默认替换档，与 FilmParams.h 一致）。
+        val v = appPrefs.getInt("pc3d", 1).let { if (it in 0..2) it else 0 }.toDouble()
         if (v != pc3dPref) {
             pc3dPref = v
             filmParams[54] = v
@@ -2036,20 +2062,6 @@ class CameraController(private val context: Context, private val render: RenderC
         if (v != whiteProbePref) {
             whiteProbePref = v
             filmParams[44] = v
-        }
-    }
-
-    /**
-     * 饱和补偿（v0.10.21 标定旋钮）：prefs "sat_comp" 0..0.30，写 FilmParams[20]/[21]
-     * （阴影/中间调分区饱和 = 1+v；[22] 高光恒 1.0 防过饱和）。原生 gamut 色度 min
-     * 的低饱和由风格层补偿——对标 darktable color balance / PC 的 LUT 职责。
-     */
-    private fun applySatCompPref() {
-        val v = appPrefs.getFloat("sat_comp", 0f).toDouble().coerceIn(0.0, 0.30)
-        if (v != satCompPref) {
-            satCompPref = v
-            filmParams[20] = 1.0 + v
-            filmParams[21] = 1.0 + v
         }
     }
 
@@ -3049,7 +3061,6 @@ class CameraController(private val context: Context, private val render: RenderC
                     applyTonePref()
                     applyZebraPref()
                     applyLutStrengthPref()
-                    applySatCompPref()
                     // 预览旋转恒 0（v0.6.39 事故修复）：
                     // SurfaceTexture 的 STMatrix 已含传感器侧的变换，**显示方向由 Activity
                     // 跟随系统旋转处理**（本 Activity 未锁 screenOrientation）。所以预览

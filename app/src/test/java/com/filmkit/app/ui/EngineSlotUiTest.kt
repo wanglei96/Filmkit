@@ -69,13 +69,16 @@ class EngineSlotUiTest {
                          "vigStrength", "haloStrength", "glowStrength")) {
             assertTrue("引擎 1 下 $k 不该消失", k in adv)
         }
-        // 基础档 = Lightroom Basic 十项 ∩ 引擎 1 下仍活着的那些 —— 唯一被摘掉的是 `sat`
-        // （用户裁决"引擎 1 下整体隐藏"，由通用槽位判据达成：`[20][21][22]` 三槽全失效）
+        // 基础档 = Lightroom Basic 十项 ∩ 引擎 1 下仍活着的那些 —— 被摘掉的是三段「饱和度」
+        // （用户裁决"引擎 1 下整体隐藏"，由通用槽位判据达成：`[20][21][22]` 三槽全失效；
+        // 0.12.209 起饱和度拆成三条滑杆，基础档由 `satMid` 代表）
         assertEquals(
-            (BASIC_PARAM_KEYS - setOf("sat")).toList(),
+            (BASIC_PARAM_KEYS - setOf("satShadow", "satMid", "satHigh")).toList(),
             cells(FullParamTab.BASIC, engineSlot = 1).map { it.key },
         )
-        assertFalse("★ 产品决定（2026-10-14 用户拍板）：引擎 1 下「饱和度」整体隐藏", "sat" in adv)
+        for (k in listOf("satShadow", "satMid", "satHigh")) {
+            assertFalse("★ 产品决定（2026-10-14 用户拍板）：引擎 1 下「饱和度」整体隐藏", k in adv)
+        }
     }
 
     /**
@@ -93,21 +96,20 @@ class EngineSlotUiTest {
      */
     @Test
     fun saturationIsHiddenUnderEngineOneByTheGenericSlotRule() {
-        val sat = CAMERA_TUNABLE_PARAMS.first { it.key == "sat" }
-        assertEquals("[20][21][22] 三槽", listOf(20, 21, 22), paramSlotsOf(sat))
-        assertFalse("引擎 1 下不渲染", paramActiveInEngine(sat, 1))
-        assertTrue("引擎 0 下照常渲染", paramActiveInEngine(sat, 0))
-        assertTrue("引擎 0 下网格里真的有它", "sat" in cells(FullParamTab.ADVANCED, engineSlot = 0).map { it.key })
-        assertFalse("引擎 1 下网格里没有它", "sat" in cells(FullParamTab.ADVANCED, engineSlot = 1).map { it.key })
+        // 0.12.209：三段饱和拆成三条单槽滑杆（satShadow/satMid/satHigh）。
+        val pairs = listOf("satShadow" to 20, "satMid" to 21, "satHigh" to 22)
+        for ((key, slot) in pairs) {
+            val p = CAMERA_TUNABLE_PARAMS.first { it.key == key }
+            assertEquals("[$slot] 单槽", listOf(slot), paramSlotsOf(p))
+            assertFalse("引擎 1 下 $key 不渲染", paramActiveInEngine(p, 1))
+            assertTrue("引擎 0 下 $key 照常渲染", paramActiveInEngine(p, 0))
+            assertTrue("引擎 0 下网格里真的有 $key", key in cells(FullParamTab.ADVANCED, engineSlot = 0).map { it.key })
+            assertFalse("引擎 1 下网格里没有 $key", key in cells(FullParamTab.ADVANCED, engineSlot = 1).map { it.key })
+        }
         // 三槽在引擎 1 下都被旁路（`[22]` 的归零是"整体隐藏"能由通用判据达成的前提）
         assertTrue(
             "三槽在引擎 1 下都应被旁路（卡 C 的 P1 修正）",
             listOf(20, 21, 22).none { slotActiveInEngine(it, 1) },
-        )
-        // 隐藏不是"槽位判据之外的产品例外"：把它当作普通参数，判据给出的结论也是隐藏
-        assertFalse(
-            "通用判据独立地也能隐藏它（不需要产品级例外）",
-            paramSlotsOf(sat).any { slotActiveInEngine(it, 1) },
         )
     }
 
@@ -126,7 +128,8 @@ class EngineSlotUiTest {
         // 与引擎 1 的差别**恰好**是四条 filmic 独占项 + `sat`（产品决定）—— 不多不少，防误伤
         val zero = cells(FullParamTab.ADVANCED, engineSlot = 0).map { it.key }.toSet()
         val one = cells(FullParamTab.ADVANCED, engineSlot = 1).map { it.key }.toSet()
-        assertEquals((filmicOwnedKeys + "sat").sorted(), (zero - one).sorted())
+        // 0.12.209：饱和度拆成三条 ⇒ 差别是四条 filmic 独占项 + 三条饱和度滑杆
+        assertEquals((filmicOwnedKeys + setOf("satShadow", "satMid", "satHigh")).sorted(), (zero - one).sorted())
         assertTrue("引擎 1 不该多出任何参数", (one - zero).isEmpty())
     }
 
@@ -216,12 +219,13 @@ class EngineSlotUiTest {
         // `uGamut` 只被 filmic 段消费，引擎 1 的 program 里没有它 ⇒ location = −1 ⇒ 下发落空。
         // 用户实测"剩余开关全关了没影响"抓到的正是它。
         // v0.11.96：+ [41] hr_wavelet（filmic 原生高光重建，引擎 1 下参数被归零）
-        assertEquals(listOf(28, 20, 37, 38, 36, 40, 41), gated)
+        // 0.12.208：「饱和补偿」[20] 滑杆已删 ⇒ gate 少一项（见 SettingsScreen 同处注释）。
+        assertEquals(listOf(28, 37, 38, 36, 40, 41), gated)
         // ⚠「基准曝光」[0] 必须**不在** gate 里（通用能力，架构师定案 §8.1 的"保留"一条）：
         // 上面那条"恰好六项"就是它的机器判据（多挂一项就红），这里再钉一次槽位号不在列表里
         assertFalse("基准曝光 [0] 不许被 gate", 0 in gated)
         assertTrue("「基准曝光」条目本身不许被删", src.contains("label = \"基准曝光\""))
-        for (t in listOf("基准影调", "饱和补偿", "黑点（多暗算黑）", "白点（多亮算白）", "局部色调映射")) {
+        for (t in listOf("基准影调", "黑点（多暗算黑）", "白点（多亮算白）", "局部色调映射")) {
             assertTrue("设置页缺了「$t」", src.contains("title = \"$t\"") || src.contains("label = \"$t\""))
         }
     }

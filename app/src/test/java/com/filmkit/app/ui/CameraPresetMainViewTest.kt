@@ -77,7 +77,7 @@ class CameraPresetMainViewTest {
         // 口径：内置三条的 grain_amount（槽位 20 / 30 / 40）读出来的 UI 值 = 0.2 / 0.3 / 0.4
         //（与 `PresetDetail.kt` 的 `formatZero100((it / 100.0).toFloat())` 是同一个数：读数 20 / 30 / 40）
         assertEquals(0.2f, grainAmountUi(builtin("徕卡一瞬").slots.getValue(GRAIN_AMOUNT_SLOT)), 1e-3f)
-        assertEquals(0.3f, grainAmountUi(builtin("理光负片").slots.getValue(GRAIN_AMOUNT_SLOT)), 1e-3f)
+        // 0.12.213：理光负片重标后无颗粒（GR 直出干净）⇒ 改用徕卡黑白做第三档样本
         assertEquals(0.4f, grainAmountUi(builtin("徕卡黑白").slots.getValue(GRAIN_AMOUNT_SLOT)), 1e-3f)
         assertEquals("滑杆读的是当前生效数组（含预设覆盖）", 0.2f, GrainStrengthParam.read(cameraPresetParams(builtin("徕卡一瞬"))), 1e-3f)
         assertEquals("读数 = 0..100 整数（formatZero100）", "20", GrainStrengthParam.format(0.2f))

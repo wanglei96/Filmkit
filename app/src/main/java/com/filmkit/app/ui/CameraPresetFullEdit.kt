@@ -120,18 +120,23 @@ internal enum class FullParamTab(val title: String) {
 }
 
 /**
- * **基础**档 = Lightroom Classic「Basic」面板对应的 10 条。
+ * **基础**档 = Lightroom Classic「Basic」面板对应的滑杆 ∩ 本引擎已有的参数项。
  *
- * 判据（可辩护、不拍脑袋）：这 10 条正是 LrC Basic 面板里存在的滑杆 ∩ 本引擎已有的参数项
+ * 判据（可辩护、不拍脑袋）：这组正是 LrC Basic 面板里存在的滑杆 ∩ 本引擎已有的参数项
  * （LrC 的 texture / dehaze / vibrance 本引擎没有，故不在其中）。它们是"先定整体明暗与
  * 色偏、再定影调分区、最后定色彩浓度与局部质感"这条**调色决策主干**（与 `AdjustParams`
  * 的排序理由同源）。
+ *
+ * ★ 0.12.209（用户 2026-11-01 拍板）：饱和度拆成暗部/中间调/高光三条后，**三条都进基础档**
+ * —— 正好补满第三行的四个格位（三段 + 清晰度，清晰度居最右）。LrC Basic 只有一条
+ * Saturation，这里拆三条是"UI 能力 == 引擎能力"的必然结果，不是加了新概念。
  *
  * ⚠ 恒等值不是 0 的项（色温 6500K / 饱和度 0 / 对比度 0 在 UI 单位下都是"不变点"）由
  * [EditorParam.pivot] 自己承载 —— 本集合只回答"哪几条进基础档"，不含第二份数值。
  */
 internal val BASIC_PARAM_KEYS: Set<String> = linkedSetOf(
-    "ev", "temp", "tint", "contrast", "highlights", "shadows", "whites", "blacks", "sat", "clarity",
+    "ev", "temp", "tint", "contrast", "highlights", "shadows", "whites", "blacks",
+    "satShadow", "satMid", "satHigh", "clarity",
 )
 
 /**

@@ -88,9 +88,10 @@ class PresetDetailTest {
         assertEquals(
             listOf(
                 // 0.12.92：M9 适度压暗（曝光 −0.3 EV，真机"应该压暗"）+ 对比度 1.1974
-                "基础调整|曝光=-0.3 EV;对比度=+20;色温=6437K",
+                // 0.12.211：预设显式锁定引擎插槽 = filmic（曲线/黑白点按 filmic 标定）
+                "基础调整|曝光=-0.3 EV;对比度=+20;色温=6437K;引擎插槽=filmic",
                 // ★ 0.12.92：分区饱和 = 暗 0.76 / 中 0.76 / 高 0.65（高光收，压高反光荧光）
-                "色彩|饱和度 · 暗部=-24;饱和度 · 中间调=-24;饱和度 · 高光=-35;分离色调 · 暖=+0.12;分离色调 · 冷=+0.04;褪色=4",
+                "色彩|饱和度 · 暗部=+22;饱和度 · 中间调=+22;饱和度 · 高光=+22;分离色调 · 暖=+0.12;分离色调 · 冷=+0.04;褪色=4",
                 // ★ 0.12.90：白点 4.2、高光层次判据 1.5→ 8.80 LSB（真机高光发平的反向约束）
                 "影调曲线|胶片曲线 · 肩部 红=0.01;胶片曲线 · 肩部 绿=0.00;胶片曲线 · 肩部 蓝=0.11;" +
                     "胶片曲线 · 趾部 红=0.23;胶片曲线 · 趾部 绿=0.15;胶片曲线 · 趾部 蓝=0.77;" +
@@ -139,18 +140,18 @@ class PresetDetailTest {
 
     @Test
     fun unknownSlotsFallBackToSemanticNamesAndNeverDisappear() {
-        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[99] 越界 ⇒ 连语义名都没有。
-        // ⚠ 阶段 0（v0.11.27）：越界例子从 [98] 改为 [99] —— kCount 98 → 99 后 [98] 已是
-        // 合法槽（engine_slot，有语义名）⇒ 继续用它会测的是"新槽有没有名字"而不是"越界"。
-        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 99 to 2.0))
-        assertEquals("三个槽一个都不许消失", setOf(11, 29, 99), rows.keys)
+        // [11] 有语义名无中文名（cross 矩阵）；[29] 已退役、[102] 越界 ⇒ 连语义名都没有。
+        // ⚠ 越界例子随 kCount 推进：98 → 99（v0.11.27）→ 102（0.12.208，kCount = 102）。
+        // 必须用**真正越界**的槽号，否则测的是"新槽有没有名字"而不是"越界"。
+        val rows = allRows(mapOf(11 to 0.5, 29 to 1.0, 102 to 2.0))
+        assertEquals("三个槽一个都不许消失", setOf(11, 29, 102), rows.keys)
         assertEquals("cross[0]", rows.getValue(11).label)
         assertEquals("0.50", rows.getValue(11).value)
         assertEquals("槽29", rows.getValue(29).label)
         assertEquals("1", rows.getValue(29).value)
-        assertEquals("槽99", rows.getValue(99).label)
-        assertEquals("2", rows.getValue(99).value)
-        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 99 to 2.0)).map { it.title })
+        assertEquals("槽102", rows.getValue(102).label)
+        assertEquals("2", rows.getValue(102).value)
+        assertEquals("未映射槽位统一进「其它」组", listOf("其它"), presetDetailSections(mapOf(11 to 0.5, 102 to 2.0)).map { it.title })
     }
 
     /** 被 `presetSlotIncluded` 排除的槽（引擎旋钮 / 解码 / 局部）若出现在坏数据里，同样不许消失。 */

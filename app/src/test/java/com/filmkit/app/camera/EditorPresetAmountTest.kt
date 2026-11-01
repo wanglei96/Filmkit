@@ -269,9 +269,10 @@ class EditorPresetAmountTest {
     /** 表里没有的槽（引擎无硬边界）⇒ 外推照常生效，不夹 */
     @Test
     fun extrapolationDoesNotClampUnboundedSlots() {
-        // [36] 局部色调映射：恒等 0.25、无 UI 上界 ⇒ 0.25 + (0.4 − 0.25) × 1.5 = 0.475
+        // [36] 局部色调映射：恒等 0（0.12.208 基线由 0.25 改 0，开关事实源只剩设置页）、
+        // 无 UI 上界 ⇒ 0 + (0.4 − 0) × 1.5 = 0.6
         val out = scale(mapOf(36 to 0.4, 88 to 100.0), 1.5)
-        assertEquals("局部色调映射无 UI 上界 ⇒ 外推生效", 0.475, out[36]!!, 1e-12)
+        assertEquals("局部色调映射无 UI 上界 ⇒ 外推生效", 0.6, out[36]!!, 1e-12)
         assertEquals("mired 在 UI 量程内 ⇒ 不夹", 150.0, out[88]!!, 1e-12)
     }
 

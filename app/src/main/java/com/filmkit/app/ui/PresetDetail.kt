@@ -153,8 +153,8 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     meta(93, SEC_BASE, "黑色色阶") { formatOffset100(toneUi(it), 0f) }
 
     // ── 色彩 ──────────────────────────────────────────────────────────────────
-    // [20..22] 分区饱和三档：面板是**一个**滑杆（label "饱和度"）同写三槽（writeSaturation），
-    // 详情按槽拆开 ⇒ 加§1 第 2 层的"暗 / 中 / 高"后缀区分。三槽同值时显示也一致（如实）。
+    // [20..22] 分区饱和三档：0.12.209 起面板也是**三条独立滑杆**（暗 / 中间调 / 高光），
+    // 与这里逐槽显示同口径；三段同值 = 单值饱和（机内直出的做法）。
     meta(20, SEC_COLOR, "饱和度 · 暗部") { formatOffset100(satUi(it), 1f) }
     meta(21, SEC_COLOR, "饱和度 · 中间调") { formatOffset100(satUi(it), 1f) }
     meta(22, SEC_COLOR, "饱和度 · 高光") { formatOffset100(satUi(it), 1f) }

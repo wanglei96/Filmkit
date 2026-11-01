@@ -97,13 +97,15 @@ class CameraPresetEditTest {
      */
     @Test
     fun multiSlotParamsRecordEverySlotTheyWrite() {
-        val p = userPreset("p_1", slots = mapOf(21 to 1.05))
+        // 0.12.209：饱和度已拆成三条单槽滑杆 ⇒ "一条滑杆写多槽"只剩胶片曲线
+        //（肩部 [5..7] / 趾部 [8..10]，writeLatitude 同写三槽）。
+        val p = userPreset("p_1", slots = mapOf(5 to 0.1, 6 to 0.1, 7 to 0.1))
         val none: CameraParamOverrides? = null
-        val after = drag(none, p, slot = 20, uiValue = 1.4f)
-        assertEquals("一条滑杆写几槽就记几槽", setOf(20, 21, 22), after.values.keys)
+        val after = drag(none, p, slot = 5, uiValue = 0.5f)
+        assertEquals("一条滑杆写几槽就记几槽", setOf(5, 6, 7), after.values.keys)
         val film = cameraPresetParams(p, after.values)
-        assertEquals("三个槽都生效", film[20], film[22], 1e-9)
-        assertNotEquals("确实改了", 1.05, film[21], 1e-6)
+        assertEquals("三个槽都生效", film[5], film[7], 1e-9)
+        assertNotEquals("确实改了", 0.1, film[6], 1e-6)
     }
 
     // ── ② 切预设 = 清空（验收判据：微调不许串味）────────────────────────────────
