@@ -96,6 +96,22 @@ def grid(size):
     return np.stack([R, G, B], axis=-1)
 
 
+def crush_black(lut, crush, size=SIZE):
+    """把暗部端点压向真黑（crush 单位 = L*）。
+
+    5219 的负片 base fog 让输入 0 输出 4.7%（≈L*11.6）——"最黑处也是深灰"就是画面发灰的
+    物理来源。这里按 L* 线性下压：L<15 时减去 crush*(1 - L/15)，L≥15 不动 ⇒ 中调/高光零影响。
+    """
+    enc = grid(size)
+    out = trilinear(lut, enc.reshape(-1, 3))
+    lab = rgb2lab(srgb_decode(out))
+    Lv = lab[:, 0]
+    w = np.clip(1.0 - Lv / 15.0, 0.0, 1.0)
+    lab[:, 0] = np.maximum(0.0, Lv - crush * w)
+    lin = np.clip(lab2rgb(lab), 0.0, 1.0)
+    return np.clip(srgb_encode(lin), 0.0, 1.0).reshape(size, size, size, 3)
+
+
 def shift_blue(lut, amount, center=30.0, sigma=30.0, size=SIZE):
     enc = grid(size)
     out = trilinear(lut, enc.reshape(-1, 3))
@@ -122,11 +138,15 @@ def main():
     ap.add_argument("--amount", type=float, default=2.0, help="暗部 b* 下压量（正值 = 更蓝）")
     ap.add_argument("--title", default="柯达 5219 · 深蓝")
     ap.add_argument("--category", default="柯达")
+    ap.add_argument("--crush-black", type=float, default=0.0,
+                    help="暗部端点压深量（L* 单位，15 以下线性生效；0 = 不压）")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
     src, _ = load(args.src)
     out = shift_blue(src, args.amount)
+    if args.crush_black > 0:
+        out = crush_black(out, args.crush_black)
     ok = True
 
     # 判据 ①：L* 不变 —— 比的是"加蓝前后"（不是"输入 vs 输出"）。
@@ -136,7 +156,9 @@ def main():
     ax = np.stack([g, g, g], -1)
     l_before = rgb2lab(srgb_decode(trilinear(src, ax)))[:, 0]
     l_after = rgb2lab(srgb_decode(trilinear(out, ax)))[:, 0]
-    dl = np.abs(l_before - l_after).max()
+    # 用 --crush-black 时暗部本来就该变（那正是目的）⇒ 只对 L*>18 判"不动"。
+    mask = l_before > 18.0 if args.crush_black > 0 else np.ones_like(l_before, bool)
+    dl = np.abs(l_before[mask] - l_after[mask]).max()
     ok &= dl <= 0.5
     print(f"判据 1 灰阶 L* 不变: max|ΔL*| = {dl:.2f}（≤0.5）{'PASS' if dl <= 0.5 else 'FAIL'}")
 
@@ -151,6 +173,10 @@ def main():
         ok &= good
         print(f"判据 2 {name} b*: {b0:+.2f} → {b1:+.2f}（Δ{d:+.2f}，期望 ≈{want:.2f}±{tol}）"
               f"{'PASS' if good else 'FAIL'}")
+
+    if args.crush_black > 0:
+        x0 = trilinear(out, np.array([[0.0, 0.0, 0.0]]))[0]
+        print(f"判据 4 黑点: 输入 0 → 输出 {x0.mean()*255:.1f}/255（压深 {args.crush_black} L*）")
 
     # 判据 ④：格点跳变
     ds = max(np.abs(np.diff(src, axis=i)).max() for i in (0, 1, 2)) * 255

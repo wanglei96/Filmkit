@@ -112,9 +112,9 @@
       "contrast": 1.05,
       "filmic_black_ev": -8.0,
       "filmic_white_ev": 4.0,
-      "sat_shadow": 1.08,
-      "sat_mid": 1.10,
-      "sat_high": 1.05
+      "sat_shadow": 1.15,
+      "sat_mid": 1.18,
+      "sat_high": 1.10
     },
     "lut": { "id": "hasselblad_classic", "strength": 1.0 }
   },
@@ -125,10 +125,10 @@
     "group": "柯达",
     "favorite": false,
     "source": "builtin",
-    "note": "KODAK VISION3 500T 5219 · 钨灯平衡、蓝青阴影 + 暖高光 · 对比按摄影师版、暗部蓝加深（0.12.222）",
+    "note": "KODAK VISION3 500T 5219 · 钨灯平衡、蓝青阴影 + 暖高光 · 对比按摄影师版 + 提饱和去灰（0.12.223）",
     "params": {
       "engine_slot": 0,
-      "contrast": 1.12,
+      "contrast": 1.16,
       "exposure_ev": -0.2,
       "shoulder[0]": 0.03,
       "shoulder[1]": 0.03,
@@ -138,9 +138,9 @@
       "toe[2]": 0.03,
       "filmic_black_ev": -8.0,
       "filmic_white_ev": 4.0,
-      "sat_shadow": 1.08,
-      "sat_mid": 1.10,
-      "sat_high": 1.05
+      "sat_shadow": 1.15,
+      "sat_mid": 1.18,
+      "sat_high": 1.10
     },
     "lut": { "id": "kodak_5219_deep", "strength": 1.0 }
   },
