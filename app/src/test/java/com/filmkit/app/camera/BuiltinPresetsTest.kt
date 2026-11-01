@@ -162,9 +162,11 @@ class BuiltinPresetsTest {
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
             37 to -5.1725, 38 to 4.2,                   // filmic 黑白点（★ 白点 4.0 → 4.2）
-            66 to -0.24,     // vignette_strength（负 = 暗角，0.12.94 质感层保留）
-            67 to 85.0,      // vignette_radius（%）
-            68 to 55.0,      // vignette_feather（%）
+            // 0.12.226：暗角过渡重标（真机：85/55 的角落落在余弦斜率最大段 ⇒ 末端加速、
+            // 观感"生硬"）。改为更早起、更宽的过渡：起点 68%→52% 半径，末端落在平缓段。
+            66 to -0.20,     // vignette_strength
+            67 to 65.0,      // vignette_radius（%）
+            68 to 70.0,      // vignette_feather（%）
             88 to 1.5,       // temp_mired（+1.5 mired，轻微暖偏色）
             94 to 0.04,      // fade（提黑位，油润感）
         )

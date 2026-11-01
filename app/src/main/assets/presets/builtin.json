@@ -28,9 +28,9 @@
       "fade": 0.04,
       "grain_amount": 20.0,
       "grain_size": 160.0,
-      "vignette_strength": -0.24,
-      "vignette_radius": 85.0,
-      "vignette_feather": 55.0
+      "vignette_strength": -0.20,
+      "vignette_radius": 65.0,
+      "vignette_feather": 70.0
     },
     "lut": { "id": "leica_m9_ccd", "strength": 0.75 }
   },
