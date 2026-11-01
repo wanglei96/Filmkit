@@ -93,4 +93,4 @@ HNCS 的 "film curve + wide-ranging contrast + 平滑过渡" 需要可调肩/趾
 - 预设：`assets/presets/builtin.json` 第 6 条 `builtin_hasselblad_natural`（group「哈苏」）
 - LUT：复用 `assets/luts/hasselblad_classic.lut`（33³，未改动）
 - 单测：828 全绿（6 条预设的契约计数同步）
-- 样片统计脚本：`/tmp` 临时（需要可复用 `pos_stats.py` 的 Lab 统计；未入库，样片未入库）
+- 统计脚本：`tools/hasselblad-sample-stats.py <样片目录>`（本次所有数字可由它重跑；样片本身不入库，版权归哈苏）
