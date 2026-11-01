@@ -37,7 +37,7 @@
 
 ## 3. 修法：亮度归一（只动 L*，不动 a*/b*）
 
-`tools/fix-fuji-nc-lut.py`：
+`tools/normalize-lut-luma.py`（原名 fix-fuji-nc-lut.py，0.12.219 泛化）：
 
 1. 逐格点取源 LUT 输出，读它的 **L\*/a\*/b\***；
 2. **把输出的 L\* 换回输入的 L\***（影调还给 filmic），**a\*/b\* 原样保留**（色彩不动）；
@@ -119,6 +119,6 @@ NC 暖品倾向原样保留。判据新增「白点中性：三通道差 ≤1.5/
 ## 8. 产物
 
 - 资产：`assets/luts/fuji_nc_v2.lut`（64³ / TITLE「富士 NC · 标定」/ category「富士」）
-- 工具：`tools/fix-fuji-nc-lut.py`（判据自带，可 `--check` / `--preview`）
+- 工具：`tools/normalize-lut-luma.py —src … --highlight-start 0.86`（判据自带，可 `--check` / `--preview`）
 - 预设：`assets/presets/builtin.json` 第 5 条 `builtin_fuji_nc`（group「富士」）
 - 单测：828 全绿（5 条预设的契约计数同步更新）

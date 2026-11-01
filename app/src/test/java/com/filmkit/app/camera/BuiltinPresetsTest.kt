@@ -76,11 +76,12 @@ class BuiltinPresetsTest {
 
     @Test
     fun parsesExactlyThreeBuiltinPresets() {
-        assertEquals("内置包必须恰好 6 条（0.12.218 新增哈苏自然）", 6, presets.size)
+        assertEquals("内置包必须恰好 7 条（0.12.219 新增柯达5219）", 7, presets.size)
         assertEquals(
             "顺序 = JSON 顺序（UI 分组排序在 UI 层做）",
             listOf("builtin_leica_m9", "builtin_ricoh_negative", "builtin_ricoh_positive",
-                "builtin_fuji_nc", "builtin_hasselblad_natural", "builtin_leica_bw"),
+                "builtin_fuji_nc", "builtin_hasselblad_natural", "builtin_kodak_5219",
+                "builtin_leica_bw"),
             presets.map { it.id },
         )
         for (p in presets) {
@@ -228,6 +229,8 @@ class BuiltinPresetsTest {
             "fuji_nc_v2" to "富士 NC · 标定",
             // 0.12.218：哈苏自然复用既有「哈苏 Classic」资产（近中性 + 肤色优化）
             "hasselblad_classic" to "哈苏 Classic",
+            // 0.12.219：柯达 5219（Vision3 500T）复用既有资产，未重烘（抬黑/压白是胶片特征）
+            "kodak_5219" to "柯达 5219",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
@@ -238,6 +241,7 @@ class BuiltinPresetsTest {
             "ricoh_positive_v1" to "理光",
             "fuji_nc_v2" to "富士",
             "hasselblad_classic" to "哈苏",
+            "kodak_5219" to "柯达",
         )
         for (p in presets) {
             val lutId = p.lutId ?: error("${p.id} 没有 LUT 引用")
@@ -297,7 +301,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("六条预设的参数键总数（0.12.218 哈苏自然 7 键：23 + 5 + 11 + 13 + 14 + 7）", 73, names.size)
+        assertEquals("七条预设的参数键总数（0.12.219 柯达5219 10 键）", 83, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",
@@ -311,7 +315,7 @@ class BuiltinPresetsTest {
     fun builtinPackageParsesWithNoSkips() {
         val res = presetsFromJson(jsonText)
         assertEquals("内置包不得有被跳过的条目/槽：${res.skipped}", emptyList<String>(), res.skipped)
-        assertEquals(6, res.presets.size)
+        assertEquals(7, res.presets.size)
     }
 
     // ── ⑥ 解析失败降级（坏 JSON ⇒ 空列表且不抛）──────────────────────────
@@ -351,7 +355,7 @@ class BuiltinPresetsTest {
         val user = listOf(userPreset("p_1_a", "我的暖调"), userPreset("p_2_b", "我的冷调"))
         val merged = mergePresets(user, presets)
         assertEquals(
-            "用户预设在前 + 内置六条在后（顺序 = UI 呈现顺序，UI 不再排一次）",
+            "用户预设在前 + 内置七条在后（顺序 = UI 呈现顺序，UI 不再排一次）",
             listOf("p_1_a", "p_2_b") + presets.map { it.id },
             merged.map { it.id },
         )
@@ -361,8 +365,8 @@ class BuiltinPresetsTest {
         assertEquals("同 id 不得出现两次（LazyColumn 的 key 会崩）", clash.size, clash.map { it.id }.distinct().size)
         assertEquals("同 id 时留下的是用户那份（用户数据优先）", "我的暖调", clash.first { it.id == "p_1_a" }.name)
         assertEquals(
-            "总数 = 用户 2 + 内置（1 条伪造同 id + 真内置 6）− 重复 1",
-            8,
+            "总数 = 用户 2 + 内置（1 条伪造同 id + 真内置 7）− 重复 1",
+            9,
             clash.size,
         )
 

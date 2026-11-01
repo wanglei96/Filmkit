@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""富士 Classic Negative（NC）LUT —— 去掉自带影调，只保留色彩映射（display 域）。
+"""把「自带影调」的 3D LUT 归一成纯色彩 LUT（display 域）—— 通用工具。
+
+本工具从 `fix-fuji-nc-lut.py` 泛化而来（富士 NC 的高光品红带是第一个案例，柯达 5219 是第二个）。
 
 ## 为什么需要这一步（不是"重新标定色彩"）
 
@@ -34,10 +36,10 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc.lut")
-OUT = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc_v2.lut")
+DEFAULT_SRC = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc.lut")
+DEFAULT_OUT = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc_v2.lut")
 SIZE = 64
-TITLE, CATEGORY = "富士 NC · 标定", "富士"
+DEFAULT_TITLE, DEFAULT_CATEGORY = "富士 NC · 标定", "富士"
 
 M_RGB2XYZ = np.array([
     [0.4124564, 0.3575761, 0.1804375],
@@ -109,7 +111,7 @@ def grid(size):
     return np.stack([R, G, B], axis=-1)
 
 
-def normalize_luma(lut, size=SIZE):
+def normalize_luma(lut, size=SIZE, highlight_start=None):
     """输出 L* ← 输入 L*；保留输出的 a*/b*（色相与色度），超域点硬裁。
 
     ⚠️ 为什么是硬裁而不是保色相缩 C：L 归一后约 **2.1%** 的格点（亮黄/亮青这类高饱和
@@ -130,9 +132,12 @@ def normalize_luma(lut, size=SIZE):
     # 判据用"**三通道都亮**"（min(R,G,B)），不是"L 高"：纯黄 (1,1,0) 的 L 也有 97，
     # 按 L 去色会把亮黄直接洗成白（实测 C 96.9→10.7）。过曝高光的物理特征是**三通道
     # 同时接近满**，此时才没有色相信息。
-    # 0.86 起、0.96 到顶；开方抬前段（mn=0.93 时已去 84%），保证灯/窗边缘（mn≈0.93~0.98）
-    # 的品红环消失，同时 0.86 以下（≈219/255 以内）的暖调原样保留。
-    t = np.clip((out.min(axis=-1) - 0.86) / 0.10, 0.0, 1.0) ** 0.5
+    if highlight_start is None:
+        t = np.zeros(len(lab))
+    else:
+        # 0.86 起、0.96 到顶；开方抬前段（mn=0.93 时已去 84%），保证灯/窗边缘（mn≈0.93~0.98）
+        # 的品红环消失，同时 0.86 以下（≈219/255 以内）的暖调原样保留。
+        t = np.clip((out.min(axis=-1) - highlight_start) / 0.10, 0.0, 1.0) ** 0.5
     lab[:, 1] *= (1.0 - t)
     lab[:, 2] *= (1.0 - t)
     lin = lab2rgb(lab)
@@ -187,7 +192,7 @@ def check(src_lut, out_lut):
     return ok
 
 
-def write_asset(lut, title=TITLE):
+def write_asset(lut, title):
     lut8 = np.clip(lut * 255.0 + 0.5, 0, 255).astype(np.uint8)
     tb, cb = title.encode(), CATEGORY.encode()
     blob = bytes([SIZE, len(tb)]) + tb + bytes([len(cb)]) + cb + lut8.tobytes()
@@ -207,14 +212,22 @@ def preview(lut, path):
 
 
 def main():
+    global SRC, OUT, TITLE, CATEGORY
     ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default=DEFAULT_SRC, help="源 LUT（相对仓库根）")
+    ap.add_argument("--out", default=DEFAULT_OUT, help="输出 LUT（相对仓库根）")
+    ap.add_argument("--title", default=DEFAULT_TITLE)
+    ap.add_argument("--category", default=DEFAULT_CATEGORY)
+    ap.add_argument("--highlight-start", type=float, default=None,
+                    help="高光去色起点（min(R,G,B)，0~1）；不传 = 关。富士 NC 用 0.86")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--preview", default=None)
     args = ap.parse_args()
+    SRC, OUT, TITLE, CATEGORY = args.src, args.out, args.title, args.category
     src, _ = load_binary(SRC)
-    out = normalize_luma(src)
+    out = normalize_luma(src, highlight_start=args.highlight_start)
     if not args.check:
-        write_asset(out)
+        write_asset(out, TITLE)
     ok = check(src, out)
     if args.preview:
         preview(out, args.preview)

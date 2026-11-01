@@ -125,7 +125,7 @@ class Stage3EngineSlotPresetAuditTest {
         // 理光负片 / 徕卡黑白仍待重新标定 ⇒ 不锁定。
         val pinned = setOf(
             "builtin_leica_m9", "builtin_ricoh_positive", "builtin_fuji_nc",
-            "builtin_hasselblad_natural",
+            "builtin_hasselblad_natural", "builtin_kodak_5219",
         )
         for (id in pinned) {
             val p = builtins.first { it.id == id }
