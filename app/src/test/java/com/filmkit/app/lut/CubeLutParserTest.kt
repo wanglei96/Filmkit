@@ -184,8 +184,7 @@ class CubeLutParserTest {
             //  - ricoh_negative_v2 64³（0.12.212：色相映射平滑，64³ 足够且省内存）
             val expectedSize = when (f.name) {
                 "leica_m9_ccd.lut" -> 128
-                "ricoh_negative_v2.lut", "ricoh_positive_v1.lut", "fuji_nc_v2.lut",
-                "kodak_5219_ref.lut" -> 64
+                "ricoh_negative_v2.lut", "ricoh_positive_v1.lut", "fuji_nc_v2.lut" -> 64
                 else -> 33
             }
             assertEquals(f.name, expectedSize, l.size)
