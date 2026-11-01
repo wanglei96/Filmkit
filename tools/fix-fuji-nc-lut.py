@@ -123,6 +123,18 @@ def normalize_luma(lut, size=SIZE):
     lab_in = rgb2lab(srgb_decode(enc.reshape(-1, 3)))
     lab_out = rgb2lab(srgb_decode(out))
     lab = np.stack([lab_in[:, 0], lab_out[:, 1], lab_out[:, 2]], axis=-1)
+    # ★ 高光去色（2026-11-01 真机反馈）：源 LUT 在 80~97% 亮度把 a* 稳在 +2.8~+3.6
+    #   （白被染成粉白），而 97% 以上 R 通道先撞 255 ⇒ 灯/窗这类高光边缘出现**品红色带**。
+    #   物理上过曝高光没有色相信息，染色只会是假的 ⇒ L ≥ 85 起把色度线性衰减到 0
+    #   （85 以下原样保留 NC 的暖品倾向，100 = 纯白不染色）。
+    # 判据用"**三通道都亮**"（min(R,G,B)），不是"L 高"：纯黄 (1,1,0) 的 L 也有 97，
+    # 按 L 去色会把亮黄直接洗成白（实测 C 96.9→10.7）。过曝高光的物理特征是**三通道
+    # 同时接近满**，此时才没有色相信息。
+    # 0.86 起、0.96 到顶；开方抬前段（mn=0.93 时已去 84%），保证灯/窗边缘（mn≈0.93~0.98）
+    # 的品红环消失，同时 0.86 以下（≈219/255 以内）的暖调原样保留。
+    t = np.clip((out.min(axis=-1) - 0.86) / 0.10, 0.0, 1.0) ** 0.5
+    lab[:, 1] *= (1.0 - t)
+    lab[:, 2] *= (1.0 - t)
     lin = lab2rgb(lab)
     return np.clip(srgb_encode(np.clip(lin, 0.0, 1.0)), 0.0, 1.0).reshape(size, size, size, 3)
 
@@ -139,6 +151,10 @@ def check(src_lut, out_lut):
     err = np.abs(l_in - l_out).max()
     mono = np.all(np.diff(o[:, 0]) >= -1.0 / 255.0)
     ok &= err <= 1.0 and mono and abs(o[0].mean()) < 1.5 / 255 and abs(o[-1].mean() - 1.0) < 1.5 / 255
+    white = trilinear(out_lut, np.array([[1.0, 1.0, 1.0]]))[0]
+    wdiff = (white.max() - white.min()) * 255
+    ok &= wdiff <= 1.5
+    print(f"判据 1b 白点中性: 三通道差 {wdiff:.2f}/255（≤1.5）{'PASS' if wdiff <= 1.5 else 'FAIL'}")
     print(f"判据 1 灰阶 L* 恒等: max|ΔL*| = {err:.2f}，单调 {'PASS' if mono else 'FAIL'}，"
           f"端点 {o[0].mean()*255:.1f}/{o[-1].mean()*255:.1f} → {'PASS' if err <= 1.0 and mono else 'FAIL'}")
 
