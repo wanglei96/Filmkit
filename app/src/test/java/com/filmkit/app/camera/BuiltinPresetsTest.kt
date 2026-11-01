@@ -231,6 +231,8 @@ class BuiltinPresetsTest {
             "hasselblad_classic" to "哈苏 Classic",
             // 0.12.219：柯达 5219（Vision3 500T）复用既有资产，未重烘（抬黑/压白是胶片特征）
             "kodak_5219" to "柯达 5219",
+            // 0.12.220：摄影师调色版（归一后）替换预设引用，原资产保留可手选
+            "kodak_5219_ref" to "柯达 5219 · 参考",
             "leica_b_w_hc" to "徕卡 黑白 HC",
         )
         val expectedCategory = mapOf(
@@ -242,6 +244,7 @@ class BuiltinPresetsTest {
             "fuji_nc_v2" to "富士",
             "hasselblad_classic" to "哈苏",
             "kodak_5219" to "柯达",
+            "kodak_5219_ref" to "柯达",
         )
         for (p in presets) {
             val lutId = p.lutId ?: error("${p.id} 没有 LUT 引用")
@@ -254,7 +257,7 @@ class BuiltinPresetsTest {
             // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
             // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
             assertEquals("$lutId 的 LUT_3D_SIZE",
-                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2" -> 64; else -> 33 }, lut.size)
+                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2", "kodak_5219_ref" -> 64; else -> 33 }, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF
@@ -301,7 +304,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("七条预设的参数键总数（0.12.219 柯达5219 10 键）", 83, names.size)
+        assertEquals("七条预设的参数键总数（0.12.220 柯达5219 11 键）", 84, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

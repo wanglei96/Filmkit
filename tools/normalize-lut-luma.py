@@ -40,6 +40,9 @@ DEFAULT_SRC = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc.lut")
 DEFAULT_OUT = os.path.join(ROOT, "app/src/main/assets/luts/fuji_nc_v2.lut")
 SIZE = 64
 DEFAULT_TITLE, DEFAULT_CATEGORY = "富士 NC · 标定", "富士"
+# 白点中性判据的容差（/255）。1.5 = 要求纯白不染色（富士/数码模拟类）；
+# 电影负片的高光本身就是暖白（5219 归一后 b* +3.6、R−B ≈9），此时用 --white-tol 放宽并注明。
+WHITE_TOL = 1.5
 
 M_RGB2XYZ = np.array([
     [0.4124564, 0.3575761, 0.1804375],
@@ -76,6 +79,27 @@ def lab2rgb(lab):
     f = np.stack([fx, fy, fz], axis=-1)
     xyz = np.where(f ** 3 > 0.008856, f ** 3, (f - 16.0 / 116.0) / 7.787)
     return (xyz * WHITE) @ M_XYZ2RGB.T
+
+
+def load_cube(path):
+    """解析文本 .cube（LUT_3D_SIZE 33/64…，R 变化最快），返回 [b][g][r][rgb]。"""
+    data = []
+    n = None
+    for line in open(path, encoding="utf-8", errors="ignore"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("LUT_3D_SIZE"):
+            n = int(line.split()[1])
+            continue
+        if line.startswith(("DOMAIN", "TITLE", "LUT_1D")):
+            continue
+        parts = line.split()
+        if len(parts) == 3:
+            data.append([float(x) for x in parts])
+    if n is None or len(data) != n ** 3:
+        raise SystemExit(f".cube 解析失败：size={n} 数据行={len(data)}")
+    return np.array(data, dtype=np.float64).reshape(n, n, n, 3), n
 
 
 def load_binary(path):
@@ -140,6 +164,11 @@ def normalize_luma(lut, size=SIZE, highlight_start=None):
         t = np.clip((out.min(axis=-1) - highlight_start) / 0.10, 0.0, 1.0) ** 0.5
     lab[:, 1] *= (1.0 - t)
     lab[:, 2] *= (1.0 - t)
+    # 暗部端点保护：L*→0 时色度归零，否则纯黑会被染成 (0,0,9) 这类"抬黑 + 染色"
+    #（实测：5219 参考版不保护时黑点 3.5%，纯黑处带蓝）。
+    guard = np.clip(lab_in[:, 0] / 3.0, 0.0, 1.0)
+    lab[:, 1] *= guard
+    lab[:, 2] *= guard
     lin = lab2rgb(lab)
     return np.clip(srgb_encode(np.clip(lin, 0.0, 1.0)), 0.0, 1.0).reshape(size, size, size, 3)
 
@@ -158,8 +187,8 @@ def check(src_lut, out_lut):
     ok &= err <= 1.0 and mono and abs(o[0].mean()) < 1.5 / 255 and abs(o[-1].mean() - 1.0) < 1.5 / 255
     white = trilinear(out_lut, np.array([[1.0, 1.0, 1.0]]))[0]
     wdiff = (white.max() - white.min()) * 255
-    ok &= wdiff <= 1.5
-    print(f"判据 1b 白点中性: 三通道差 {wdiff:.2f}/255（≤1.5）{'PASS' if wdiff <= 1.5 else 'FAIL'}")
+    ok &= wdiff <= WHITE_TOL
+    print(f"判据 1b 白点中性: 三通道差 {wdiff:.2f}/255（≤{WHITE_TOL:g}）{'PASS' if wdiff <= WHITE_TOL else 'FAIL'}")
     print(f"判据 1 灰阶 L* 恒等: max|ΔL*| = {err:.2f}，单调 {'PASS' if mono else 'FAIL'}，"
           f"端点 {o[0].mean()*255:.1f}/{o[-1].mean()*255:.1f} → {'PASS' if err <= 1.0 and mono else 'FAIL'}")
 
@@ -212,7 +241,7 @@ def preview(lut, path):
 
 
 def main():
-    global SRC, OUT, TITLE, CATEGORY
+    global SRC, OUT, TITLE, CATEGORY, WHITE_TOL
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=DEFAULT_SRC, help="源 LUT（相对仓库根）")
     ap.add_argument("--out", default=DEFAULT_OUT, help="输出 LUT（相对仓库根）")
@@ -220,11 +249,15 @@ def main():
     ap.add_argument("--category", default=DEFAULT_CATEGORY)
     ap.add_argument("--highlight-start", type=float, default=None,
                     help="高光去色起点（min(R,G,B)，0~1）；不传 = 关。富士 NC 用 0.86")
+    ap.add_argument("--white-tol", type=float, default=1.5,
+                    help="白点中性容差 /255；电影负片的暖高光用大值（如 12）并注明")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--preview", default=None)
     args = ap.parse_args()
     SRC, OUT, TITLE, CATEGORY = args.src, args.out, args.title, args.category
-    src, _ = load_binary(SRC)
+    WHITE_TOL = args.white_tol
+    salary = None  # 占位，避免误用
+    src, _ = (load_cube(SRC) if SRC.lower().endswith(".cube") else load_binary(SRC))
     out = normalize_luma(src, highlight_start=args.highlight_start)
     if not args.check:
         write_asset(out, TITLE)
