@@ -2,7 +2,7 @@
 summary: 期B域切换落地与域错配修复
 created: 2026-10-19 15:55
 updated: 2026-10-20 09:45
-status: absorbed
+status: archived
 ---
 
 # 期B域切换落地与域错配修复

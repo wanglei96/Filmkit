@@ -101,20 +101,20 @@ status: active
 ## 高光三症与饱和掩码（10-30）
 - [2026-10-30] **WB 域 vs raw/1023 域**：WB 域中性白 1,1,1（opposed 前提成立）；raw/1023 域是 0.476/1.0/0.684（随 WB 变）。
 - [2026-10-30] **粉云实测**（165153.dng）：G 饱和像素 WB 中位 R 1.300 / G 1.000 / B 1.139；参考场 0.944/1.036；块级 mask 覆盖 4.23%（离线）。
-- [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，σ=√(A·clamp(wb,0,1)+B)；1px 膨胀 + 2×2 聚合；日志字段 satmP/satmRaw/satmHit/satmCov。
-  `filmkit-0.12.205-hdr-coexist.apk`（`com.filmkit.hdr205`，只提亮高光那版）。
-- [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback`
-  的 gmMin/gmMean/gmMax，解码 `ratio = 0.25 × 16^g`（g 为归一化值）。
-- [2026-10-30] **sat_comp**：prefs `sat_comp` 0..0.30 → FilmParams[20]/[21]（kFsFilm 的
-  uSatShadow/uSatMid），位置在 film pass ⇒ RCD/AMaZE 两档都吃；与用户"饱和度"滑杆
-  （EditorExport.writeSaturation 写三槽）共用槽位，后者覆盖前者。
-- [2026-10-30] **徕卡标定边界**：`tools/preset-exp/recipe-fit.py` 从 filmic 之后接起，
-  RAW/CCM/WB/kFsFilm 的 sat·split·mono 均为"未验证段" ⇒ 预设不在饱和度补偿之后标定。
+- [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`（σ=√(A·clamp(wb,0,1)+B)），1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov；`filmkit-0.12.205-hdr-coexist.apk` = 只提亮高光那版。
+- [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
+- [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
 ## 预设开关与理光负片（11-01）
-- [2026-11-01] 版本 0.12.214(665) 当前；回退 0.12.213(664)；HDR 对照 `filmkit-0.12.205-hdr-coexist.apk`。
-- [2026-11-01] `ricoh_negative_v2.lut`：64³ uint8 786464B、TITLE「理光 负片 · 标定」；由 `tools/bake-ricoh-lut.py` 烘焙（灰轴 a*/b* 表 + 色相表 + 周期平滑 + 端点保护）。
-- [2026-11-01] 理光配方 = sat 0.92/0.90/0.80 + filmic −8/+4 + LUT×1.0；旧 `ricoh_negative.lut` 自带中灰 127→150、白压 237，已弃用。
-- [2026-11-01] **`diag.stats.sat` = `[20][21][22]` 的实际下发值** —— 判断预设饱和度是否真生效的唯一日志字段。
-- [2026-11-01] `setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；新增 applier 要同步（否则预设基线静默生效）。
-- [2026-11-01] 单测改 assets 后必须 `--rerun-tasks`，否则 up-to-date 缓存报假绿。
+- [2026-11-02] 版本 **0.12.227(678)** 当前；回退 0.12.226；HDR 对照 `filmkit-0.12.205-hdr-coexist.apk`。
+- [2026-11-02] **7 条内置预设**（builtin.json，键总数 92）：徕卡一瞬 / 理光负片 / 理光正片 / 富士NC / 哈苏自然 / 柯达5219 / 徕卡黑白；**锁 filmic 的 5 条**（除理光负片、徕卡黑白）。
+- [2026-11-02] **64³ 自烘 LUT 四个**：`ricoh_negative_v2`（bake-ricoh-lut）、`ricoh_positive_v1`（同脚本 `--preset positive`）、`fuji_nc_v2`（normalize 归一）、`kodak_5219_deep`（normalize + 暗部加蓝/压黑）；33³ 原资产 `kodak_5219`/`fuji_nc`/`hasselblad_classic` 保留可手选。
+- [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
+
+## 预设群与 LUT 特征（11-02）
+- [2026-11-02] **理光正片**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / **高光 +0.64**（负片高光是 −1.9）；色相 红 29°、绿 134°、蓝 303°、C 0.98~1.02。
+- [2026-11-02] **富士NC**：`fuji_nc` 原资产灰阶 **100%→91.8%**（压白 8.2%）、灰轴 暗 a−2.8 / 中高光 a+3.1~+3.7；`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255、高光去色阈值 min(RGB) 0.86。
+- [2026-11-02] **哈苏自然**：`hasselblad_classic` 探针色相 0.0°、灰轴 0、端点 0→100、肤 C×1.23；哈苏官方 13 张样片 C\* p50 11.3 / 黑 11.95% / 白 0.85%，逐张灰轴散布 ±5 无共同符号 ⇒ 不系统偏色。
+- [2026-11-02] **柯达5219**：原资产灰阶 10%→15.9%、50%→56.5%、100%→97.3%（抬黑 4.7% = base fog）；灰轴 暗 b−4.8 / 高 b+1.9；`kodak_5219_deep` 加深后暗 b −6.2、黑点压到 0.5/255、暗部 a +0.45。
+- [2026-11-02] **暗角实现**：darktable 余弦 `vw=0.5−0.5cos(πt)`、`dscale=radius/100`、`fscale=feather/100`；4:3 竖图角落 cplen 1.252。**M9 机内 JPEG 默认开镜头暗角校正 ⇒ 原厂几乎无暗角**。
+- [2026-11-02] **外部资料入口**：柯达电影站 `kodak.com/en/motion/product/camera-films/<id>/`（**单数 product**，`/page/` 与 `motion.kodak.com` 均 404）；哈苏样片 `hasselblad.com/learn/sample-images/x-system/`（84 张，原图 20MB 级）；fujifilm-x.com 是 SPA + Cloudflare，样片不可抓。

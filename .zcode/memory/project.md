@@ -1,13 +1,13 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-01 18:45
+updated: 2026-11-02 17:15
 status: active
 ---
 
 # 项目状态
 
-<!-- 2026-11-01 d3 整理：压缩历史段、合并里程碑、删除被取代的中间状态；新增「预设开关归位与理光负片」。 -->
+<!-- 2026-11-02 d3 整理：新增「五条胶片预设」段；结构里的资产/预设数量按现状更新。 -->
 
 ## 目标
 胶片相机 App（Android 首发，vivo X300 专项适配）：Camera2 RAW/YUV 双输入 → 引擎胶片风格化（基准色彩科学 + 理光系 LUT 风格层）→ 全分辨率成片。核心卖点：M 档专业拍摄 + RAW 底片 + 胶片渲染全 GPU。里程碑 M0–M6 见 docs/开发计划.md。**色彩口径（D8/D9）**：基准 = 中性正确的色彩科学，风格 = 用户提供的理光系 LUT。
@@ -15,8 +15,8 @@ status: active
 ## 结构
 - `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染）+ StillRenderClient（拍照渲染）+ CameraAudit + `camera/StdColorMatrix.kt` + `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=102**）+ `ui/ParamControls.kt`（参数表单一来源，拍照与编辑器共用）
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
-- `assets/`：`luts/` 44 个内置 .lut（42 个 33³ + `leica_m9_ccd` 128³ + `ricoh_negative_v2` 64³）+ `noise_models/` 三摄标定 + `presets/builtin.json` 三条内置预设
-- `tools/`：validate-shaders.sh、check-diag-fields.py、check-log-json.py、bake-m9-lut.py、bake-ricoh-lut.py、preset-exp/recipe-fit.py、hdr-baseline-eval.py 及调参工具族
+- `assets/`：`luts/` 46 个内置 .lut（42 个 33³ + `leica_m9_ccd` 128³ + `ricoh_negative_v2`/`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep` 64³）+ `noise_models/` 三摄标定 + `presets/builtin.json` **七条**内置预设
+- `tools/`：validate-shaders.sh、check-diag-fields.py、check-log-json.py、bake-m9-lut.py、bake-ricoh-lut.py（`--preset positive`）、normalize-lut-luma.py、adjust-lut-shadow-blue.py、hasselblad-sample-stats.py、preset-exp/recipe-fit.py 及调参工具族
 
 ## 进行中（长期挂起）
 - [2026-10-07] 亮部亮度降噪（对标 PC 唯一成像短板）、超广畸变自校正（**待拍板**）；[2026-10-30] HDR 205 共存包观感对照未做
@@ -43,3 +43,11 @@ status: active
 - [2026-11-01] **开关归设置页、饱和度归预设**：删设置页「饱和补偿」滑杆与 `applySatCompPref`；ESD3D2 默认回替换档（3 处兜底 + 文案）；**只有徕卡一瞬锁 engine_slot=filmic**，理光/黑白待重标不锁。
 - [2026-11-01] **三段饱和拆三条滑杆**：`satShadow/satMid/satHigh` 各一槽；基础档 10→12（三行四列、清晰度最右）；徕卡三段按用户定档 1.22。
 - [2026-11-01] **理光负片重标**：19 张官方标准样片 + 2 组 Positive↔Negative 配对实测（灰轴暗暖亮冷、蓝 ×0.67、绿 +13°），重烘 64³ `ricoh_negative_v2`；亮度传递显示 Negative≈Positive ⇒ 曲线用引擎默认；预设压到「sat 0.92/0.90/0.80 + 黑白点 −8/+4 + LUT 1.0」。
+
+## 五条胶片预设（11-01→11-02，0.12.215→227）
+
+- [2026-11-01] **理光正片（0.12.215）**：GR III/IIIx 三代样片 + 3 组 Positive↔Negative 配对实测（红 Δh −7.9°、绿 −14.1°、蓝 C×1.45；高光回暖 +0.64）；新烘 64³ `ricoh_positive_v1`；预设锁 filmic，contrast 1.15 / 曝光 −0.25。
+- [2026-11-01] **富士NC（0.12.216→217）**：官方样片不可得（SPA + Cloudflare）⇒ 验收现有资产；白点被压 91.8%（救不回）⇒ 亮度归一；真机高光品红色带由"80~97% 染粉 + 97% R 先撞顶"造成 ⇒ 按 min(RGB) 高光去色。
+- [2026-11-01] **哈苏自然（0.12.218）**：官方 84 张样片取 13 张；逐张灰轴散布 ±5、符号不一致 ⇒ **HNCS 不系统偏色**；复用 `hasselblad_classic`（色相 0°、灰轴 0、肤色 ×1.23），只补饱和（C\* p50 7.5 vs 11.3）。
+- [2026-11-01→02] **柯达5219（0.12.219→225）**：原资产可用不归一（压白仅 2.7%，归一会让青偏 −20°）；真机四轮：暗部蓝偏淡（−2.5→−4.8，L\* 高斯下压）→ 提饱和无效改**压黑**（base fog 12→0.5/255）→ 补颗粒 12/500 + 高光加暖（[24] −0.30）→ 误用摄影师 LUT 致白墙发绿后回退。
+- [2026-11-02] **徕卡暗角（0.12.226→227）**：径向衰减末端加速（0.9–1.0 降 6.7）因角落落在余弦最陡段；柔化后仍"跟噪点一样"（8bit 色带）⇒ **直接去掉**（M9 机内默认开镜头暗角校正，原厂本就无暗角）。
