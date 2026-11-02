@@ -6,7 +6,7 @@
     "group": "徕卡",
     "favorite": false,
     "source": "builtin",
-    "note": "Leica M9 CCD 风格 · 固件配方色彩 LUT · 暖调/褪色/低饱和分区（0.12.90 去艳俗版）",
+    "note": "Leica M9 CCD 风格 · 固件配方色彩 LUT · 暖调/褪色/低饱和分区（0.12.227 去人工暗角）",
     "params": {
       "engine_slot": 0,
       "contrast": 1.1974,
@@ -28,7 +28,6 @@
       "fade": 0.04,
       "grain_amount": 20.0,
       "grain_size": 160.0,
-      "vignette_strength": -0.20,
       "vignette_radius": 65.0,
       "vignette_feather": 70.0
     },

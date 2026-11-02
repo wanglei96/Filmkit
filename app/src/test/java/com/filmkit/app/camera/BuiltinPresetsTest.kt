@@ -152,7 +152,7 @@ class BuiltinPresetsTest {
         //   temp_mired[88] / fade[94]（暖调 + 褪色 = "油润厚重"的低对比层）。
         assertRecipe(
             "builtin_leica_m9",
-            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 66, 67, 68, 88, 94, 98),
+            setOf(0, 4, 5, 6, 7, 8, 9, 10, 20, 21, 22, 23, 24, 26, 27, 37, 38, 67, 68, 88, 94, 98),
             0 to -0.3,       // ★ 0.12.92：M9 适度压暗（相对用户 EV 的偏移）
             4 to 1.1974,    // contrast（0.12.90 三版）
             5 to 0.0056, 6 to 0.0013, 7 to 0.1064,      // shoulder R/G/B
@@ -162,9 +162,9 @@ class BuiltinPresetsTest {
             26 to 20.0,      // grain_amount（%）
             27 to 160.0,     // grain_size（ISO）
             37 to -5.1725, 38 to 4.2,                   // filmic 黑白点（★ 白点 4.0 → 4.2）
-            // 0.12.226：暗角过渡重标（真机：85/55 的角落落在余弦斜率最大段 ⇒ 末端加速、
-            // 观感"生硬"）。改为更早起、更宽的过渡：起点 68%→52% 半径，末端落在平缓段。
-            66 to -0.20,     // vignette_strength
+            // 0.12.227：**去掉人工暗角**（[66] 不写 = 0 = 整段旁路）。原厂 M9 JPEG 默认开
+            // 镜头暗角校正，本就没有明显暗角；我们加的 −20% 在暗部会产生色带（"跟噪点一样"）。
+            // radius/feather 保留在 slots 里（[67]/[68] 无 [66] 时不生效，但保住配方可读）。
             67 to 65.0,      // vignette_radius（%）
             68 to 70.0,      // vignette_feather（%）
             88 to 1.5,       // temp_mired（+1.5 mired，轻微暖偏色）
@@ -306,7 +306,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("七条预设的参数键总数（0.12.225 柯达5219 17 键）", 93, names.size)
+        assertEquals("七条预设的参数键总数（0.12.227 徕卡去掉暗角强度键）", 92, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",
