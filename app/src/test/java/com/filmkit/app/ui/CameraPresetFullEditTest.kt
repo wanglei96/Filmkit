@@ -57,10 +57,10 @@ class CameraPresetFullEditTest {
         val secs = fullParamSections(FullParamTab.ADVANCED, setOf(70))
         assertEquals(listOf("调整", "色彩", "质感", "只读"), secs.map { it.title })
         val tunable = secs.dropLast(1).flatMap { it.rows.flatten() }
-        // 33 = AdjustParams 19（三段饱和拆开 +2）+ ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
+        // 35 = AdjustParams 21（三段饱和拆开 +2、自动白点/黑点 +2）+ ColorParams 4 + TextureParams 10 里"拍照链路真的可调"的那些
         // （★ PS-10：AdjustParams 15 → 17，filmic 黑白点补上滑杆）
-        assertEquals(33, CAMERA_TUNABLE_PARAMS.size)
-        assertEquals(33, tunable.size)
+        assertEquals(35, CAMERA_TUNABLE_PARAMS.size)
+        assertEquals(35, tunable.size)
         assertTrue(tunable.all { it.param != null })
         // 高级 ⊃ 基础（切档不丢项）
         assertTrue(tunable.map { it.key }.containsAll(BASIC_PARAM_KEYS))
@@ -122,10 +122,11 @@ class CameraPresetFullEditTest {
             )
         }
         val adjust = secs.first()
-        // ★ PS-10：19 项（15 + filmic 黑白点两条 + 0.12.209 饱和度拆三条）⇒ 5 行（4/4/4/4/3）
-        assertEquals(19, adjust.rows.flatten().size)
-        assertEquals(5, adjust.rows.size)
-        assertEquals(listOf(4, 4, 4, 4, 3), adjust.rows.map { it.size })
+        // ★ PS-10：21 项（15 + filmic 黑白点两条 + 0.12.209 饱和度拆三条 + 0.12.228 自动端点两条）
+        // ⇒ 6 行（4/4/4/4/4/1）
+        assertEquals(21, adjust.rows.flatten().size)
+        assertEquals(6, adjust.rows.size)
+        assertEquals(listOf(4, 4, 4, 4, 4, 1), adjust.rows.map { it.size })
         assertEquals(1, secs[1].rows.size)                      // 色彩 4 项 ⇒ 1 行
         assertEquals(3, secs[2].rows.size)                      // 质感 10 项 ⇒ 3 行
         // 每格的 key 唯一（选中态按 key 走，重复 key 会让两格一起高亮）

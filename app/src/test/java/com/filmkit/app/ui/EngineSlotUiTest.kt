@@ -34,7 +34,11 @@ class EngineSlotUiTest {
         EditorPreset(id = "p_engine", name = "引擎测试", slots = slots.toMap())
 
     /** 本卡点名要"切引擎即消失"的四条参数项。 */
-    private val filmicOwnedKeys = setOf("curveShoulder", "curveToe", "filmicBlack", "filmicWhite")
+    private val filmicOwnedKeys = setOf(
+        "curveShoulder", "curveToe", "filmicBlack", "filmicWhite",
+        // 0.12.228：自动白点 / 自动黑点（filmic 端点策略，sigmoid 下无意义）
+        "autoWhite", "autoBlack",
+    )
 
     private fun cells(tab: FullParamTab, included: Set<Int> = emptySet(), engineSlot: Int) =
         fullParamSections(tab, included, engineSlot).flatMap { it.rows.flatten() }
@@ -128,7 +132,7 @@ class EngineSlotUiTest {
         // 与引擎 1 的差别**恰好**是四条 filmic 独占项 + `sat`（产品决定）—— 不多不少，防误伤
         val zero = cells(FullParamTab.ADVANCED, engineSlot = 0).map { it.key }.toSet()
         val one = cells(FullParamTab.ADVANCED, engineSlot = 1).map { it.key }.toSet()
-        // 0.12.209：饱和度拆成三条 ⇒ 差别是四条 filmic 独占项 + 三条饱和度滑杆
+        // 0.12.209：饱和度拆成三条；0.12.228：filmic 独占项 4 → 6（+自动白点/黑点）
         assertEquals((filmicOwnedKeys + setOf("satShadow", "satMid", "satHigh")).sorted(), (zero - one).sorted())
         assertTrue("引擎 1 不该多出任何参数", (one - zero).isEmpty())
     }
@@ -145,11 +149,11 @@ class EngineSlotUiTest {
                 assertEquals(secs.map { it.title }.distinct(), secs.map { it.title })
             }
         }
-        // 引擎 1 下「调整」组仍在（12 项 = 17 − 4 条 filmic 独占 − 1 条产品决定 sat），
+        // 引擎 1 下「调整」组仍在（12 项 = 21 − 6 条 filmic 独占 − 3 条产品决定 sat），
         // 不是"整组消失"；组内其余项按原顺序（`sat` 在末尾被摘掉）
         val adjust = fullParamSections(FullParamTab.ADVANCED, emptySet(), 1)
             .first { it.title == "调整" }.rows.flatten()
-        assertEquals(17 - 4 - 1, adjust.size)
+        assertEquals(21 - 6 - 3, adjust.size)
         assertEquals("高光", adjust.first { it.key == "highlights" }.label)
     }
 

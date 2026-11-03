@@ -407,10 +407,16 @@ class PresetScopeTest {
             "含 1 项仅拍照参数（引擎插槽），编辑器里不生效",
             presetScopeNotice(leica, PresetScene.EDITOR),
         )
-        for (id in listOf("builtin_ricoh_negative", "builtin_leica_bw")) {
-            val p = presets.first { it.id == id }
-            assertNull("$id 未锁定引擎 ⇒ 编辑器侧无提示", presetScopeNotice(p, PresetScene.EDITOR))
-        }
+        // 0.12.228：理光负片带 `[102] auto_white_pt`（白点改自动）⇒ 编辑器侧**应当**提示
+        // 这一项"仅拍照"——它要场景分位统计，`passStyle` 的输入已是成片。这不再是"无提示"。
+        val ricoh = presets.first { it.id == "builtin_ricoh_negative" }
+        assertEquals(
+            "理光负片编辑器侧只许提示自动白点这一项",
+            "含 1 项仅拍照参数（自动白点），编辑器里不生效",
+            presetScopeNotice(ricoh, PresetScene.EDITOR),
+        )
+        val bw0 = presets.first { it.id == "builtin_leica_bw" }
+        assertNull("builtin_leica_bw 未锁定引擎且不带单侧参数 ⇒ 编辑器侧无提示", presetScopeNotice(bw0, PresetScene.EDITOR))
         val bw = presets.first { it.id == "builtin_leica_bw" }
         assertFalse("徕卡黑白不得带 [25]（黑白由 LUT 承载）", bw.slots.containsKey(25))
     }

@@ -57,6 +57,9 @@ internal object EngineScope {
         // 白点判据直接吃 filmic 的 `ev_white_`。sigmoid 下这条曲线不存在，跑它等于用
         // filmic 的白点去裁 sigmoid 的输入 —— 技术上"能跑"但语义错。归零 + UI 隐藏。
         41,
+        // [102]/[103] auto_white_pt / auto_black_pt（0.12.228）：filmic 端点的自动标定，
+        // sigmoid 下没有这条曲线 ⇒ UI 隐藏 + 归零。
+        102, 103,
     )
 
     /**
@@ -134,6 +137,11 @@ internal object EngineScope {
         // [37]/[38] 黑白点：同上（门控比较的是 FilmParams{} 的默认值）
         put(37, FILMIC_BLACK_EV_PIVOT.toDouble())
         put(38, FILMIC_WHITE_EV_PIVOT.toDouble())
+        // [102]/[103] 自动白点 / 自动黑点：默认 0（固定曲线），切引擎必须归零，
+        // 否则 sigmoid 下仍会按场景改 filmic EV（虽然 uFilmic* 已不在 shader 里，
+        // 但 ev_black_/ev_white_ 是成员变量，会漏进高光链的诊断与重建判据）。
+        put(102, 0.0)
+        put(103, 0.0)
     }
 
     /**

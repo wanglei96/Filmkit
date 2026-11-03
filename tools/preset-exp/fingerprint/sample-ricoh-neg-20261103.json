@@ -1,0 +1,547 @@
+{
+  "kind": "samples",
+  "name": "ricoh-neg-20261103",
+  "n_images": 4,
+  "tone": {
+    "luma_mean_255": {
+      "mean": 116.805,
+      "median": 111.33,
+      "min": 78.29,
+      "max": 166.27,
+      "n": 4
+    },
+    "luma_std_255": {
+      "mean": 42.315,
+      "median": 42.45,
+      "min": 37.94,
+      "max": 46.42,
+      "n": 4
+    },
+    "contrast_p95_minus_p5_255": {
+      "mean": 127.672,
+      "median": 126.61,
+      "min": 99.77,
+      "max": 157.7,
+      "n": 4
+    },
+    "contrast_p99_minus_p1_255": {
+      "mean": 188.362,
+      "median": 187.65,
+      "min": 145.71,
+      "max": 232.44,
+      "n": 4
+    },
+    "shadow_clip_frac": {
+      "mean": 0.0,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.001,
+      "n": 4
+    },
+    "highlight_clip_frac": {
+      "mean": 0.0,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "n": 4
+    },
+    "skewness": {
+      "mean": -0.146,
+      "median": 0.079,
+      "min": -1.736,
+      "max": 0.997,
+      "n": 4
+    }
+  },
+  "tone_percentile_median_255": {
+    "p0_1": 5.25,
+    "p1": 11.86,
+    "p5": 47.3,
+    "p25": 79.38,
+    "p50": 113.5,
+    "p75": 138.04,
+    "p95": 183.14,
+    "p99": 198.57,
+    "p99_9": 212.12
+  },
+  "color": {
+    "mean_chroma": {
+      "mean": 4.615,
+      "median": 3.85,
+      "min": 2.86,
+      "max": 7.9,
+      "n": 4
+    },
+    "chroma_p50": {
+      "mean": 2.042,
+      "median": 2.11,
+      "min": 1.07,
+      "max": 2.88,
+      "n": 4
+    },
+    "chroma_p90": {
+      "mean": 12.455,
+      "median": 9.545,
+      "min": 5.33,
+      "max": 25.4,
+      "n": 4
+    },
+    "chroma_p99": {
+      "mean": 28.203,
+      "median": 24.605,
+      "min": 16.62,
+      "max": 46.98,
+      "n": 4
+    },
+    "neutral_frac": {
+      "mean": 0.825,
+      "median": 0.836,
+      "min": 0.727,
+      "max": 0.903,
+      "n": 4
+    },
+    "neutral_a_mean": {
+      "mean": 0.573,
+      "median": 0.56,
+      "min": 0.09,
+      "max": 1.08,
+      "n": 4
+    },
+    "neutral_b_mean": {
+      "mean": 0.9,
+      "median": 0.91,
+      "min": 0.32,
+      "max": 1.46,
+      "n": 4
+    },
+    "sat_frac_chroma_gt20": {
+      "mean": 0.041,
+      "median": 0.02,
+      "min": 0.001,
+      "max": 0.122,
+      "n": 4
+    }
+  },
+  "grain": {
+    "rms_all_255": {
+      "mean": 1.623,
+      "median": 0.752,
+      "min": 0.621,
+      "max": 4.365,
+      "n": 4
+    },
+    "psd_radial_loglog_slope": {
+      "mean": -1.091,
+      "median": -0.792,
+      "min": -2.409,
+      "max": -0.372,
+      "n": 4
+    }
+  },
+  "per_image": [
+    {
+      "file": "FILMKIT_20261103-134701_理光负片标定.jpg",
+      "orig_size": [
+        4080,
+        3072
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 4.0,
+          "p1": 9.0,
+          "p5": 18.13,
+          "p25": 44.36,
+          "p50": 72.57,
+          "p75": 104.08,
+          "p95": 157.37,
+          "p99": 241.44,
+          "p99_9": 245.37
+        },
+        "luma_mean_255": 78.29,
+        "luma_std_255": 44.28,
+        "contrast_p95_minus_p5_255": 139.24,
+        "contrast_p99_minus_p1_255": 232.44,
+        "shadow_clip_frac": 0.00014,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.853
+      },
+      "color": {
+        "mean_chroma": 3.23,
+        "chroma_p50": 2.41,
+        "chroma_p90": 6.14,
+        "chroma_p99": 19.35,
+        "neutral_frac": 0.8964,
+        "neutral_ab_median": [
+          0.42,
+          0.15
+        ],
+        "neutral_a_mean": 0.37,
+        "neutral_b_mean": 0.32,
+        "overall_ab_median": [
+          0.43,
+          0.38
+        ],
+        "highlight_ab_median": [
+          -0.78,
+          -1.9
+        ],
+        "shadow_ab_median": [
+          0.51,
+          0.19
+        ],
+        "sat_frac_chroma_gt20": 0.0079
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1138,
+        "flat_luma_mean_255": 96.93,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 5.829,
+            "n": 83
+          },
+          "0.15-0.30": {
+            "rms_255": 5.845,
+            "n": 53
+          },
+          "0.30-0.45": {
+            "rms_255": 4.332,
+            "n": 130
+          },
+          "0.45-0.60": {
+            "rms_255": 3.546,
+            "n": 70
+          },
+          "0.60-0.75": {
+            "rms_255": 2.6,
+            "n": 41
+          },
+          "0.90-1.00": {
+            "rms_255": 1.498,
+            "n": 23
+          }
+        },
+        "rms_all_255": 4.365,
+        "psd_radial_loglog_slope": -2.409,
+        "psd_radial_profile": [
+          1.0,
+          0.1467,
+          0.073,
+          0.044,
+          0.0198,
+          0.0146,
+          0.0094,
+          0.0071,
+          0.0058,
+          0.0042,
+          0.004,
+          0.003,
+          0.0024,
+          0.002,
+          0.0016,
+          0.0014,
+          0.001,
+          0.0009,
+          0.0007,
+          0.0007,
+          0.0006,
+          0.0005,
+          0.0005
+        ]
+      }
+    },
+    {
+      "file": "FILMKIT_20261103-134730_理光负片标定.jpg",
+      "orig_size": [
+        3072,
+        4080
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 35.23,
+          "p1": 47.01,
+          "p5": 70.02,
+          "p25": 111.02,
+          "p50": 153.36,
+          "p75": 172.0,
+          "p95": 184.0,
+          "p99": 192.72,
+          "p99_9": 212.67
+        },
+        "luma_mean_255": 140.64,
+        "luma_std_255": 37.94,
+        "contrast_p95_minus_p5_255": 113.98,
+        "contrast_p99_minus_p1_255": 145.71,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": -0.696
+      },
+      "color": {
+        "mean_chroma": 4.47,
+        "chroma_p50": 1.81,
+        "chroma_p90": 12.95,
+        "chroma_p99": 29.86,
+        "neutral_frac": 0.7758,
+        "neutral_ab_median": [
+          0.89,
+          0.0
+        ],
+        "neutral_a_mean": 0.75,
+        "neutral_b_mean": 0.51,
+        "overall_ab_median": [
+          0.55,
+          0.13
+        ],
+        "highlight_ab_median": [
+          -0.0,
+          -0.94
+        ],
+        "shadow_ab_median": [
+          3.23,
+          3.36
+        ],
+        "sat_frac_chroma_gt20": 0.0324
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1272,
+        "flat_luma_mean_255": 171.47,
+        "rms_by_luma_255": {
+          "0.45-0.60": {
+            "rms_255": 0.805,
+            "n": 24
+          },
+          "0.60-0.75": {
+            "rms_255": 0.756,
+            "n": 361
+          },
+          "0.75-0.90": {
+            "rms_255": 0.776,
+            "n": 11
+          }
+        },
+        "rms_all_255": 0.761,
+        "psd_radial_loglog_slope": -0.791,
+        "psd_radial_profile": [
+          1.0,
+          0.1292,
+          0.0657,
+          0.0513,
+          0.0433,
+          0.0373,
+          0.036,
+          0.035,
+          0.0339,
+          0.0318,
+          0.0311,
+          0.0305,
+          0.03,
+          0.0303,
+          0.0306,
+          0.0312,
+          0.031,
+          0.0298,
+          0.0301,
+          0.0293,
+          0.0296,
+          0.03,
+          0.0295
+        ]
+      }
+    },
+    {
+      "file": "FILMKIT_20261103-134807_理光负片标定.jpg",
+      "orig_size": [
+        4080,
+        3072
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 2.0,
+          "p1": 7.14,
+          "p5": 24.59,
+          "p25": 47.75,
+          "p50": 73.63,
+          "p75": 96.45,
+          "p95": 182.29,
+          "p99": 197.29,
+          "p99_9": 211.57
+        },
+        "luma_mean_255": 82.02,
+        "luma_std_255": 46.42,
+        "contrast_p95_minus_p5_255": 157.7,
+        "contrast_p99_minus_p1_255": 190.15,
+        "shadow_clip_frac": 0.00061,
+        "highlight_clip_frac": 0.0,
+        "skewness": 0.997
+      },
+      "color": {
+        "mean_chroma": 7.9,
+        "chroma_p50": 2.88,
+        "chroma_p90": 25.4,
+        "chroma_p99": 46.98,
+        "neutral_frac": 0.7267,
+        "neutral_ab_median": [
+          1.03,
+          1.42
+        ],
+        "neutral_a_mean": 1.08,
+        "neutral_b_mean": 1.31,
+        "overall_ab_median": [
+          1.41,
+          2.18
+        ],
+        "highlight_ab_median": [
+          -1.22,
+          0.26
+        ],
+        "shadow_ab_median": [
+          2.16,
+          2.9
+        ],
+        "sat_frac_chroma_gt20": 0.1219
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1341,
+        "flat_luma_mean_255": 76.23,
+        "rms_by_luma_255": {
+          "0.00-0.15": {
+            "rms_255": 0.898,
+            "n": 5
+          },
+          "0.15-0.30": {
+            "rms_255": 0.774,
+            "n": 192
+          },
+          "0.30-0.45": {
+            "rms_255": 0.704,
+            "n": 193
+          },
+          "0.60-0.75": {
+            "rms_255": 0.858,
+            "n": 6
+          }
+        },
+        "rms_all_255": 0.743,
+        "psd_radial_loglog_slope": -0.792,
+        "psd_radial_profile": [
+          1.0,
+          0.1991,
+          0.1203,
+          0.0906,
+          0.0681,
+          0.059,
+          0.053,
+          0.0509,
+          0.053,
+          0.0522,
+          0.0484,
+          0.0472,
+          0.0455,
+          0.0433,
+          0.0396,
+          0.0416,
+          0.0429,
+          0.0422,
+          0.042,
+          0.0416,
+          0.0417,
+          0.042,
+          0.0416
+        ]
+      }
+    },
+    {
+      "file": "FILMKIT_20261103-134828_理光负片标定.jpg",
+      "orig_size": [
+        3072,
+        4080
+      ],
+      "tone": {
+        "luma_percentiles_255": {
+          "p0_1": 6.5,
+          "p1": 14.71,
+          "p5": 98.09,
+          "p25": 141.7,
+          "p50": 189.64,
+          "p75": 194.86,
+          "p95": 197.86,
+          "p99": 199.86,
+          "p99_9": 201.93
+        },
+        "luma_mean_255": 166.27,
+        "luma_std_255": 40.62,
+        "contrast_p95_minus_p5_255": 99.77,
+        "contrast_p99_minus_p1_255": 185.15,
+        "shadow_clip_frac": 0.0,
+        "highlight_clip_frac": 0.0,
+        "skewness": -1.736
+      },
+      "color": {
+        "mean_chroma": 2.86,
+        "chroma_p50": 1.07,
+        "chroma_p90": 5.33,
+        "chroma_p99": 16.62,
+        "neutral_frac": 0.9028,
+        "neutral_ab_median": [
+          -0.18,
+          1.0
+        ],
+        "neutral_a_mean": 0.09,
+        "neutral_b_mean": 1.46,
+        "overall_ab_median": [
+          -0.02,
+          1.0
+        ],
+        "highlight_ab_median": [
+          -0.37,
+          1.0
+        ],
+        "shadow_ab_median": [
+          1.0,
+          0.75
+        ],
+        "sat_frac_chroma_gt20": 0.0014
+      },
+      "grain": {
+        "block": 48,
+        "n_flat_patches": 1361,
+        "flat_luma_mean_255": 195.73,
+        "rms_by_luma_255": {
+          "0.75-0.90": {
+            "rms_255": 0.621,
+            "n": 397
+          }
+        },
+        "rms_all_255": 0.621,
+        "psd_radial_loglog_slope": -0.372,
+        "psd_radial_profile": [
+          1.0,
+          0.5298,
+          0.3808,
+          0.3173,
+          0.3,
+          0.2808,
+          0.2604,
+          0.2513,
+          0.2474,
+          0.2579,
+          0.2543,
+          0.2401,
+          0.2436,
+          0.2511,
+          0.2422,
+          0.2405,
+          0.2311,
+          0.2276,
+          0.2287,
+          0.2291,
+          0.2347,
+          0.2333,
+          0.235
+        ]
+      }
+    }
+  ]
+}

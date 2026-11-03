@@ -821,7 +821,10 @@ class FrameRenderer {
   // —— 与内部补偿 cp **相乘**后交给 computeFilmicSpline（不是覆盖：cp 保自动白点上探的
   // 中间调回退补偿，[4] 是风格参数，两者作用同一处 log 域斜率）。
   // 默认 1.0f ⇒ `cp * 1.0f` 逐位 == cp ⇒ 系数逐位不变（零回归）。
-  void updateFilmicEV(GLuint src, bool still, bool auto_on, float user_black,
+  // 0.12.228：auto_black_on / auto_white_on = FilmParams[103]/[102]，**两个独立开关**
+  // （[35] auto_tone 的成对语义已拆开；[35] 自 toneStandard() 恒 true 起是死槽）。
+  void updateFilmicEV(GLuint src, bool still, bool auto_black_on, bool auto_white_on,
+                      float user_black,
                       float user_white, float white_hl, float white_floor,
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);

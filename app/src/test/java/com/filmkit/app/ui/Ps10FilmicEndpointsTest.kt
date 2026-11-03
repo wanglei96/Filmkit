@@ -194,7 +194,7 @@ class Ps10FilmicEndpointsTest {
         }
         assertTrue(
             "拍照链路（成片）读 [37][38]",
-            engine.contains("updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,") &&
+            engine.contains("updateFilmicEV(src_tex, still, p.auto_black_pt > 0.5f, p.auto_white_pt > 0.5f,") &&
                 engine.contains("p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,"),
         )
         assertTrue(
@@ -339,7 +339,10 @@ class Ps10FilmicEndpointsTest {
         assertTrue("胶片曲线 · 趾部必须在「调整」组里", iToe >= 0)
         assertEquals("黑点紧跟胶片曲线 · 趾部", iToe + 1, keys.indexOf("filmicBlack"))
         assertEquals("白点紧跟黑点（成对相邻）", iToe + 2, keys.indexOf("filmicWhite"))
-        assertEquals("白点之后就是高光（曲线族与影调分区不交叉）", iToe + 3, keys.indexOf("highlights"))
+        // 0.12.228：白点之后是两个**自动标定**开关（同属端点策略），再往后才是影调分区
+        assertEquals("自动白点紧跟白点", iToe + 3, keys.indexOf("autoWhite"))
+        assertEquals("自动黑点紧跟自动白点", iToe + 4, keys.indexOf("autoBlack"))
+        assertEquals("自动黑点之后就是高光（曲线族与影调分区不交叉）", iToe + 5, keys.indexOf("highlights"))
         // 黑白点属于「调整」组（不是「色彩」/「质感」）—— 与参数表里的位置同一个判据
         assertTrue("黑点在 AdjustParams 里", AdjustParams.any { it.key == "filmicBlack" })
         assertTrue("白点在 AdjustParams 里", AdjustParams.any { it.key == "filmicWhite" })

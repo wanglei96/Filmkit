@@ -93,6 +93,11 @@ private val SLOT_SCENES: Map<Int, Set<PresetScene>> = buildMap {
     //     阶段 3 有了引擎切换入口后才第一次可达，且那时提示是正确的（预设带了引擎选择、
     //     编辑器链路不生效，用户需要知道）。
     put(98, setOf(PresetScene.CAMERA))
+    // 0.12.228：[102]/[103] 自动白点 / 自动黑点 —— **仅拍照**。`updateFilmicEV` 只在
+    // `passFilm` 里跑（它要场景分位统计），编辑器链路 `passStyle` 的输入已是成片，
+    // 没有"场景"可测 ⇒ 编辑器侧无落点（§1.6 同结论）。
+    put(102, setOf(PresetScene.CAMERA))
+    put(103, setOf(PresetScene.CAMERA))
     //
     // ── 仅编辑器链路（§1.6：`passStyle` 读、`passFilm`/`passOutput` 零引用）────────
     // ★ **U-4（2026-10-11）起一条都没有**（`[78]` / `[90..94]` 已接线）。
@@ -142,6 +147,8 @@ private val SLOT_LABELS: List<Pair<IntRange, String>> = listOf(
     // [98]）—— 必须有中文名，否则提示文案会露出英文语义名 `engine_slot`
     // （`everySingleSideSlotHasAChineseLabel` 直接抓这一条）。
     98..98 to "引擎插槽",      // [98] engine_slot（引擎选择；阶段 3 的入口在**引擎选择面**）
+    102..102 to "自动白点",     // [102] auto_white_pt（0.12.228）
+    103..103 to "自动黑点",     // [103] auto_black_pt（0.12.228）
 )
 
 /**

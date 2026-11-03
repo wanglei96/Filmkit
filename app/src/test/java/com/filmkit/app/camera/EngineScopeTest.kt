@@ -46,7 +46,7 @@ class EngineScopeTest {
      * **逐槽硬编码**：表被误删一行 / 误加一行同样是静默漂移，必须让测试红。
      */
     private val expectedNeutralized: Set<Int> =
-        setOf(28, 20, 21, 22, 36, 41, 35, 5, 6, 7, 8, 9, 10, 37, 38)
+        setOf(28, 20, 21, 22, 36, 41, 35, 5, 6, 7, 8, 9, 10, 37, 38, 102, 103)
 
     /**
      * 判据 3 的"通用槽位"（引擎 1 下必须**保留用户值**）：曝光 / 外观层 / 单色 / 影调分区。
@@ -184,10 +184,10 @@ class EngineScopeTest {
         // 一行同样是静默漂移，本用例负责把它变成红。
         assertEquals(
             "NEUTRALIZE 的槽位集合必须逐槽等于定案" +
-                "（15 槽：28/20/21/22/36/41/35 + 5..10 + 37/38）",
+                "（17 槽：28/20/21/22/36/41/35 + 5..10 + 37/38 + 102/103）",
             expectedNeutralized, EngineScope.NEUTRALIZE.keys,
         )
-        assertEquals("阶段 3 定案 = 15 槽（v0.11.96 增 [41]）", 15, EngineScope.NEUTRALIZE.size)
+        assertEquals("阶段 3 定案 = 17 槽（v0.11.96 增 [41]；0.12.228 增 [102]/[103]）", 17, EngineScope.NEUTRALIZE.size)
 
         val p = baseline(1)
         for (s in expectedNeutralized) p[s] = 777.0

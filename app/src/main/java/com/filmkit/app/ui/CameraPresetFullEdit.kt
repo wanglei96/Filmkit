@@ -232,6 +232,13 @@ internal data class FullParamSection(val title: String, val rows: List<List<Full
 internal const val FULL_GRID_COLUMNS = 4
 
 /**
+ * 0.12.228：**0/1 二值参数**（自动白点 / 自动黑点）—— 格子里点一下即翻转，
+ * 不进底部滑杆（滑杆对布尔没有意义，且"拖到中间"是无效状态）。
+ * 值仍然只有一条写路：[overrides.afterEdit] ⇒ 稀疏预设记账与保存链路零改动。
+ */
+internal val AUTO_POINT_KEYS: Set<String> = setOf("autoWhite", "autoBlack")
+
+/**
  * 只读槽（灰显 + 原因）= **没有滑杆的槽** ∪ **这条预设包含的、拍照链路不读的槽**
  * （与 `cameraTreeSlots` 同型："全量显示可调的 + 这条预设里存在的其它槽"）。
  *
@@ -627,7 +634,19 @@ internal fun CameraPresetFullEdit(
                                         value = fullParamCellValue(cell, film),
                                         selectedCell = selected == cell.key,
                                         modifier = Modifier.weight(1f),
-                                        onTap = { selected = if (selected == cell.key) null else cell.key },
+                                        onTap = {
+                                            val p = cell.param
+                                            if (p != null && p.key in AUTO_POINT_KEYS) {
+                                                // 0/1 二值：点一下翻转，直接保存（不进滑杆）
+                                                val flip = if (p.read(film) > 0.5f) 0f else 1f
+                                                val next = overrides.afterEdit(preset, p, flip)
+                                                selected = null
+                                                onPreview(next)
+                                                onOverrides(next)
+                                            } else {
+                                                selected = if (selected == cell.key) null else cell.key
+                                            }
+                                        },
                                     )
                                 }
                                 // 末行不满 ⇒ 补空位（否则最后一行的格子会被拉宽）

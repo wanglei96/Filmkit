@@ -18,9 +18,10 @@ class CameraPresetsTest {
 
     @Test
     fun lengthMatchesContract() {
-        // 阶段 0：98 → 99（[98] engine_slot）；0.12.166 起 kCount 102
-        //（[99]/[100] 高光滚降/USM + [101]）。此断言是 v0.10.196 启动崩溃的哨兵。
-        assertEquals(102, CameraPresets.COUNT)
+        // 阶段 0：98 → 99（[98] engine_slot）；0.12.166 起 kCount 102；
+        // 0.12.228：102 → 104（[102]/[103] 自动白点 / 自动黑点）。
+        // 此断言是 v0.10.196 启动崩溃的哨兵。
+        assertEquals(104, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
     }
 

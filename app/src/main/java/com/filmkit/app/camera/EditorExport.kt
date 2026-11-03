@@ -2170,6 +2170,9 @@ internal object FilmParamKeys {
         100 to "d4_usm",
         // [101] 0.12.181：饱和掩码开关（参考帧 RAW → 满阱−3σ → 1px 膨胀 → 2×2 聚合）
         101 to "sat_mask",
+        // [102]/[103] 0.12.228：自动白点 / 自动黑点（filmic 端点策略，预设可携带）
+        102 to "auto_white_pt",
+        103 to "auto_black_pt",
     )
 
     /**

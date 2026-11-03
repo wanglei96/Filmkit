@@ -183,6 +183,10 @@ private val DETAIL_META: Map<Int, DetailMeta> = buildMap {
     // [37][38] filmic 黑白点：PresetScope 用"黑点"/"白点"（= SettingsScreen「黑点（多暗算黑）」）
     meta(37, SEC_CURVE, "黑点") { evText(it) }
     meta(38, SEC_CURVE, "白点") { evText(it) }
+    // 0.12.228：filmic 端点的自动标定（0/1 开关）。名字逐字 = 面板 label（`EditorParam.label`
+    // 「自动白点」/「自动黑点」），读数是中文"开/关"而不是 0/1（与面板同一口径）。
+    meta(102, SEC_CURVE, "自动白点") { if (it > 0.5) "开" else "关" }
+    meta(103, SEC_CURVE, "自动黑点") { if (it > 0.5) "开" else "关" }
 
     // ── 胶片质感（§1 第 3 层；引擎 E4-3/E4-2/E4-5/SG-1 已实现）──────────────────
     // [26][60] 的槽位量程是 **0..100**（`FilmParams.h:55-58` / `:369`），

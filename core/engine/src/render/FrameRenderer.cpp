@@ -18722,7 +18722,8 @@ FrameRenderer::EditorCurve FrameRenderer::computeEditorCurve(const float lat_sh[
 // 中灰锚点固定 18.45%。于是**不同场景输出不同亮度**（暗的地方暗），而压 EV / 降 AE
 // 曝光能真的传导到成片 —— 旧的"中位锚定"会把它们补偿掉（v0.7.2 的死结）。
 // auto_on=false：用 darktable 默认（−7.65/+4.56），曲线完全固定、不随场景变。
-void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
+void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
+                                  bool auto_white_on,
                                   float user_black, float user_white,
                                   float white_hl, float white_floor,
                                   float white_probe, float user_ev,
@@ -18748,10 +18749,13 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   if (still && st.valid) {
     last_still_w999_ = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
   }
-  if (st.valid && auto_on) {
-    // v0.10.16/18：黑白点**成对**自动 = darktable autodetect 的 autotune 语义
-    // （apply_auto_black / apply_auto_white_point_source），取样统计量 = P0.1 / P99
-    // （max 通道）。v0.10.17 真机教训：分位必须钳在**物理量**上，否则自动化自毁——
+  // 0.12.228：`[35] auto_tone` 拆成 `[103] auto_black_pt` / `[102] auto_white_pt`
+  // 两个**独立**开关（预设可携带；[35] 自 `toneStandard()` 恒 true 起已是死槽）。
+  // 半自动是常用形态：理光负片 = 白点自动 + 黑点固定（阴天场景白墙顶不到白，
+  // 而自动黑点会把暗部压死）。
+  if (st.valid && auto_black_on) {
+    // v0.10.16/18：黑点自动 = darktable autodetect 的 autotune 语义
+    // （apply_auto_black），取样统计量 = P0.1（max 通道）。v0.10.17 真机教训：分位必须钳在**物理量**上，否则自动化自毁——
     //   ① black：暗光噪声把 P0.1 拉到噪声底（预览 blackEv 撞 −16 clamp）→ 下限钉
     //      darktable 固定默认 −7.65（场景没有比默认更暗的东西时用默认）；
     //   ② white：无饱和场景（暗光室内）P99 = 场景最亮 0.5 → white_ev 1.44 →
@@ -18762,6 +18766,8 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
     //   autodetect 的正常区间）；白天 black 随场景收紧（−4.5~−6）。
     b = std::clamp(std::log2(std::max(st.p_lo, 1e-6f) / kGrey), -16.0f, -1.0f);
     b = std::max(b, -7.654144f);
+  }
+  if (st.valid && auto_white_on) {
     // ── v0.10.27：白点高光感知（"高光太白压不住"的修正）──────────────────────
     // 真机定案（151748）：显示域统计 clamp 使 P99 撞顶恒 1.0 → whiteEv 恒钉 2.44
     // 下限 → dr 只剩 black−2.44（室内 black −5.63 时 dr 8.07、power 4.70）→ 肩部
@@ -18883,8 +18889,8 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_on,
   last_w99_ = w99;
   last_w999_ = w999;
   last_cp_ = cp;
-  last_wmax_ = st.valid && auto_on ? std::log2(std::max(st.p_max, 1e-6f) / kGrey)
-                                   : 0.0f;
+  last_wmax_ = st.valid && auto_white_on ? std::log2(std::max(st.p_max, 1e-6f) / kGrey)
+                                         : 0.0f;
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -18932,7 +18938,8 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // CPU 侧 spline 求解（per-channel）。默认全 0.01 ⇒ 与接线前逐位一致。
   // U-3：[4] contrast 一并透传（与内部补偿 cp **相乘**，见 updateFilmicEV 内注释）；
   // 默认 1.0 ⇒ 逐位零回归。
-  updateFilmicEV(src_tex, still, p.auto_tone > 0.5f, p.filmic_black_ev,
+  updateFilmicEV(src_tex, still, p.auto_black_pt > 0.5f, p.auto_white_pt > 0.5f,
+                 p.filmic_black_ev,
                  p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,
                  p.exposure_ev, p.contrast, p.shoulder, p.toe);
   // ── v0.10.15/18：darktable filmic 高光重建（HR），仅成片路径 ─────────────

@@ -302,6 +302,25 @@ internal val AdjustParams: List<EditorParam> = listOf(
         read = { it[38].toFloat() },
         write = { p, v -> p[38] = v.toDouble() },
     ),
+    // ── 0.12.228：filmic 端点**自动标定**两个开关（[102] 自动白点 / [103] 自动黑点）──
+    // 0/1 二值，格子点一下即翻转（[AUTO_POINT_KEYS] 特判，不进底部滑杆）。开 = 该端点
+    // 改由场景分位标定，对应 EV 槽（[38]/[37]）被忽略；两个独立，可只开白点。
+    // 预设可携带：理光负片默认「自动白点 + 固定黑点」（阴天白墙顶不到白，而自动黑点
+    // 会把暗部压死——真机 4 张实测死黑 2~19%，原厂直出仅 0.2%）。
+    EditorParam(
+        key = "autoWhite", label = "自动白点", icon = Icons.Outlined.ExposurePlus2,
+        range = 0f..1f, pivot = 0f,
+        format = { if (it > 0.5f) "开" else "关" },
+        read = { it[102].toFloat() },
+        write = { p, v -> p[102] = v.toDouble() },
+    ),
+    EditorParam(
+        key = "autoBlack", label = "自动黑点", icon = Icons.Outlined.ExposureNeg2,
+        range = 0f..1f, pivot = 0f,
+        format = { if (it > 0.5f) "开" else "关" },
+        read = { it[103].toFloat() },
+        write = { p, v -> p[103] = v.toDouble() },
+    ),
     // ── E2-14：影调分区四条（[90..93]，引擎 `kFsStyle` 的 `uToneOn` 段）────────────
     // 量程 −1..+1 直通槽位，恒等 0；读数 = ±100 整数（`+50` / `0` / `-50`），中点 0。
     // 方向：正 = 该分区提亮（引擎 `g = 1 + hl·l² + sh·s² + wh·l³ + bl·s³`，乘性保色度比）。
@@ -689,6 +708,9 @@ internal val CAMERA_TUNABLE_SLOT_PARAM: Map<Int, EditorParam> = buildMap {
     bind("curveToe", 8, 9, 10)
     // ★ PS-10：filmic 黑白点（一条滑杆一槽；量程 / 读数 / 写值全在参数表那两条自己身上）
     bind("filmicBlack", 37); bind("filmicWhite", 38)
+    // 0.12.228：filmic 端点自动标定两个开关（0/1 二值；格子里点一下翻转，见
+    // `CameraPresetFullEdit` 的 AUTO_POINT_KEYS）。两者独立，可只开白点。
+    bind("autoWhite", 102); bind("autoBlack", 103)
     // 色彩
     // 0.12.209：三段饱和度各一条滑杆（一条滑杆一槽）
     bind("satShadow", 20); bind("satMid", 21); bind("satHigh", 22)
