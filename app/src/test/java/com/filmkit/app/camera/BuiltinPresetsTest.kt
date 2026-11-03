@@ -180,11 +180,14 @@ class BuiltinPresetsTest {
         // 默认（darktable filmic 出厂黑白点 −8/+4），色彩全交 LUT（tools/bake-ricoh-lut.py）。
         assertRecipe(
             "builtin_ricoh_negative",
-            setOf(20, 21, 22, 37, 38, 102),
+            setOf(5, 6, 7, 8, 9, 10, 20, 21, 22, 37, 38, 98, 102),
             20 to 0.92, 21 to 0.90, 22 to 0.80,   // 三段饱和：按 GR 样片的 C*(L) 形状保守反推
             37 to -8.0, 38 to 4.0,
             // 0.12.228：白点改自动（阴天场景最亮只 +1.3~2.7EV，固定 4.0 白点把全图压进中段）
             102 to 1.0,
+            // 0.12.229：锁 filmic（自动端点是 filmic 参数）+ 肩/趾过渡 0.01→0.10
+            98 to 0.0,
+            5 to 0.1, 6 to 0.1, 7 to 0.1, 8 to 0.1, 9 to 0.1, 10 to 0.1,
         )
         assertEquals("LUT = 按样片重标的 ricoh_negative_v2", "ricoh_negative_v2", preset("builtin_ricoh_negative").lutId)
         assertEquals("LUT 满强度（色彩全由 LUT 承担）", 1.0, preset("builtin_ricoh_negative").lutStrength, 0.0)
@@ -308,7 +311,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("七条预设的参数键总数（0.12.228 理光负片 +auto_white_pt）", 93, names.size)
+        assertEquals("七条预设的参数键总数（0.12.229 理光负片：+engine_slot +肩趾6 槽 −auto_black）", 100, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

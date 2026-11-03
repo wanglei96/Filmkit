@@ -411,8 +411,8 @@ class PresetScopeTest {
         // 这一项"仅拍照"——它要场景分位统计，`passStyle` 的输入已是成片。这不再是"无提示"。
         val ricoh = presets.first { it.id == "builtin_ricoh_negative" }
         assertEquals(
-            "理光负片编辑器侧只许提示自动白点这一项",
-            "含 1 项仅拍照参数（自动白点），编辑器里不生效",
+            "理光负片编辑器侧提示 = 锁定的引擎插槽 + 自动白点两项",
+            "含 2 项仅拍照参数（引擎插槽/自动白点），编辑器里不生效",
             presetScopeNotice(ricoh, PresetScene.EDITOR),
         )
         val bw0 = presets.first { it.id == "builtin_leica_bw" }

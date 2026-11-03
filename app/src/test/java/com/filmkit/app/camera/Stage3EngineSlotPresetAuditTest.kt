@@ -122,10 +122,11 @@ class Stage3EngineSlotPresetAuditTest {
         //  · 理光正片（0.12.215：contrast / shoulder / toe / 黑白点全部按 filmic 解，
         //    切 sigmoid 时 `EngineScope.FILMIC_OWNED_SLOTS` 会把这些槽整段旁路）
         //  · 富士NC（0.12.216：同口径 —— LUT 已去自带影调，影调只由 filmic 的肩趾承担）
-        // 理光负片 / 徕卡黑白仍待重新标定 ⇒ 不锁定。
+        // 0.12.229：理光负片也按原厂默认负片重新标定（锁 filmic + 肩趾 + 自动白点）⇒ 加入锁定组。
+        // 徕卡黑白仍待重新标定 ⇒ 不锁定。
         val pinned = setOf(
             "builtin_leica_m9", "builtin_ricoh_positive", "builtin_fuji_nc",
-            "builtin_hasselblad_natural", "builtin_kodak_5219",
+            "builtin_hasselblad_natural", "builtin_kodak_5219", "builtin_ricoh_negative",
         )
         for (id in pinned) {
             val p = builtins.first { it.id == id }
