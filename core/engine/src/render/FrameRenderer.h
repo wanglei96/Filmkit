@@ -1503,6 +1503,11 @@ class FrameRenderer {
   float ae_sat_frac_ = 0.0f;  // 高光判据用的裁切比例（bracket 时 = 短帧实测值）
   float ae_white_ev_ = 0.0f;  // 本张实际用的高光上限（诊断：2.438 / 4.8）
   float ae_brk_sat_ = -1.0f;  // 采集端短帧裁切比例；<0 = 非 bracket（诊断）
+  // ── 显示域闭环（v0.12.232）──────────────────────────────────────────────
+  // 成片出片后量自己的显示域鲁棒中灰（与取景器同函数同区域），差多少补到 exposure_ev。
+  float still_disp_mid_ = 0.0f;  // 成片最终的显示域鲁棒中灰（线性）
+  float disp_add_ = 0.0f;        // 闭环**追加**到 exposure_ev 的 EV（0 = 未触发）
+  float disp_close_ev_ = 0.0f;   // 重渲染后的**残差**（收敛精度，不是补偿量）
   float ae_sat_raw_ = 0.0f;   // 融合后 >=0.98 白点的占比（诊断：判断"大面积高光"）
   float ae_hl_soft_ev_ = 0.0f; // P95 软约束允许的 EV（诊断）
   // v0.12.67：测光接管 + 高光簇中心（PC LutRenderer 的 HIGHLIGHT_PRIORITY 移植）

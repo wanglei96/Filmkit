@@ -8230,13 +8230,10 @@ float ratioFromScene(float sceneY) {
 // 原版语义（ISO 21496-1 / Adobe hdrgm 的 gainmap 定义）：暗部与中灰的 HDR 值
 // **等于 SDR 值本身**（ratio 恒 1），只有 SDR shoulder 之上的部分才延展进 HDR
 // —— scene white 处约 +0.5 stop，再对超白点线性外推。
-// 本实现**有意偏离**：把 HDR 源按固定常数 0.1845/0.072 ≈ 2.56 折到显示域后
-// 与 SDR 相除，于是整张（含暗部与中灰）一起提亮。真机对比确认这是要的观感
-//（HDR 屏上整张更亮、高光更亮），故保留。
-// ⚠ 引用时注意：这不是原版语义。两者在暗部/中灰处差 2.5 倍以上 —— 实测
-//   gmMean 0.82~0.93（中灰 2.4~3.3×），原版口径应为 ≈0.5（1.0×）。
-//   若将来要对齐原版，只改一处：把 hdrAligned 换成
-//   `sdrLin + max(0, hdrLin − sw)`，sw = 本张 SDR 白点对应的 scene 值。
+// ⚠ 0.12.207~0.12.229 曾**有意偏离**（hdrLin × 固定 2.56 全图提亮，实测 gmMean 0.87
+//   = 中灰 2.8×），真机对比确认"HDR 屏上整张更亮"。**0.12.230 已回归原版语义**
+//   （用户 2026-11-03：「AE/曝光问题不应该用 HDR 来补」）——中灰 ratio 恒 1、只有高光
+//   延展，base 不再相对 HDR 显暗。见 gainTrue 内的 hdrAligned 实现。
 // 边界：clamp [kMin, kMax] —— 下限 0.25 允许暗部压暗（ISO 21496-1 的
 // GainMapMin 是 log2 增益、可为负）；上限 4 = 元数据 max_content_boost。
 float gainTrue(float sdrLin, float hdrLin) {
@@ -8252,7 +8249,18 @@ float gainTrue(float sdrLin, float hdrLin) {
     // 相差 4 倍，正是 0.1845/0.2304 与 0.1845/0.06 的比值。
     const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测）
     float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
-    float hdrAligned = hdrLin * anchor;
+    // ── 0.12.230：回到 ISO 21496-1 / Adobe hdrgm 的**标准语义**（用户 2026-11-03 拍板）
+    // 标准：中灰及以下 HDR = SDR 本身（ratio 恒 1），只有 SDR 白点之上的部分才延展进
+    // HDR；base（SDR）就是"legacy 查看器显示的那张"，必须自身正确。
+    // 旧式 `hdrLin * anchor` 是**线性折算**，而 SDR 是 filmic S 曲线的输出 ⇒ 两者逐像素
+    // 对不上，全图中灰被抬 2.8×（实测 gmMean 0.87 ⇒ +1.5 EV），base 相对显暗。
+    // 新式 = SDR 本身 + 超出显示白点（1.0）的部分：中灰 ratio 恒 1，高光按真实 scene
+    // 延伸。唯一正确写法 `sdrLin + max(0, hdrLin − 1/anchor)`（1/anchor = SDR 白点在
+    // scene 域的值）。
+    // ⚠ 不能写成 `hdrLin*anchor − 1`（0.12.230 的误用）：它等于把 scene 差值放大
+    //   anchor(≈2.56) 倍，高光比标准语义多 0.35~0.86 EV，且更早打满 kMax —— 真机症状
+    //   是「HDR 高光提亮太多」。0.12.231 订正，中灰/暗部行为逐位不变。
+    float hdrAligned = sdrLin + max(0.0f, hdrLin - 1.0f / anchor);
     // 下限取 kMin（0.25）：ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
     // 可以为负，真实 hdr/sdr < 1 时就该原样表达（暗部在 HDR 显示下压 2EV）；
     // 0.12.85 写成 1.0 的依据（"HDR 相对 base 只会更亮"）规范里并不存在。
@@ -10526,6 +10534,54 @@ void FrameRenderer::setToneEq(bool on) { toneEqFlag().store(on); }
 bool FrameRenderer::toneEq() { return toneEqFlag().load(std::memory_order_relaxed); }
 bool FrameRenderer::autoExposure() { return g_ae_auto.load(std::memory_order_relaxed); }
 
+// ── 显示域鲁棒中灰（与 PC `MeteringSystem` 同口径，v0.12.232 抽成公共函数）──────
+// 输入 = sRGB 编码的 8bit RGBA（行优先，row_bytes 为行字节数）。
+// 口径 = 截尾四分位 25%~75% + 中心高斯权重（sigma 0.32 = PC CENTER_WEIGHT_SIGMA）
+//        + 对数域直方图（[-12,8] → 64 桶，与 measureSceneStats 同区间）。
+// 返回 = 线性域中灰（0.18 = 显示中灰目标）；0 = 无有效像素。
+// ⚠ 预览与成片**必须**调同一个函数、取同一区域，否则闭环对齐的是两把不同的尺。
+static float robustMidToneDisplayRgba8(const uint8_t* px, int w, int h, int row_bytes) {
+  if (px == nullptr || w <= 0 || h <= 0 || row_bytes < w * 4) return 0.0f;
+  constexpr int kBins = 64;
+  double bins[kBins] = {0.0};
+  double wsum = 0.0;
+  const double budget = 65536.0;
+  const int step = std::max(
+      1, static_cast<int>(std::sqrt(static_cast<double>(w) * h / budget)));
+  const float cx = w * 0.5f, cy = h * 0.5f;
+  const float inv = 1.0f / std::max(1.0f, std::min(w, h) * 0.5f);
+  for (int y = 0; y < h; y += step) {
+    const uint8_t* row = px + static_cast<size_t>(y) * row_bytes;
+    for (int x = 0; x < w; x += step) {
+      const uint8_t* q = row + static_cast<size_t>(x) * 4;
+      const float sr = q[0] / 255.0f, sg = q[1] / 255.0f, sb = q[2] / 255.0f;
+      const float luma = 0.2126f * sr + 0.7152f * sg + 0.0722f * sb;
+      const float lin = luma <= 0.04045f ? luma / 12.92f
+                                         : std::pow((luma + 0.055f) / 1.055f, 2.4f);
+      const float dx = (x + 0.5f - cx) * inv;
+      const float dy = (y + 0.5f - cy) * inv;
+      const float wgt = 0.35f + 0.65f * std::exp(-0.5f * (dx * dx + dy * dy) / 0.1024f);
+      const float enc = (std::log2(std::max(lin, 1e-4f)) + 12.0f) / 20.0f;
+      const int bi = std::clamp(static_cast<int>(enc * (kBins - 1)), 0, kBins - 1);
+      bins[bi] += wgt;
+      wsum += wgt;
+    }
+  }
+  if (wsum <= 0.0) return 0.0f;
+  const double lo = wsum * 0.25, hi = wsum * 0.75;
+  double cum = 0.0, acc = 0.0, n = 0.0;
+  for (int i = 0; i < kBins; ++i) {
+    if (bins[i] <= 0.0) continue;
+    const double a = cum, b = cum + bins[i];
+    cum = b;
+    const double s = std::max(a, lo), e = std::min(b, hi);
+    if (e <= s) continue;
+    acc += (e - s) * (static_cast<double>(i) / (kBins - 1) * 20.0 - 12.0);
+    n += e - s;
+  }
+  return n > 0.0 ? std::exp2(static_cast<float>(acc / n)) : 0.0f;
+}
+
 static std::atomic<bool>& aeRobustFlag() {
   static std::atomic<bool> f{false};
   return f;
@@ -10823,69 +10879,23 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   passOutput(dst_w, dst_h, p, false, true);  // 预览：允许过曝斑马纹
   if (diag) logPassDiag("pass3_out", 0, kOutputGlInternalFormat);
-  // ── 0.12.51：显示域 AE 闭环（首张生效的关键）────────────────────────────
-  // 预览每 10 帧量一次**最终显示输出**（tex_cap_，sRGB 编码）的中位，按目标 0.18
-  // （线性）积分 EV 到 g_still_ae_ema。预览与成片共用这个 EMA（见 passFilm 的
-  // `pv.exposure_ev += g_still_ae_ema`）⇒ 用户构图时闭环已经收敛，按下快门那一刻
-  // 成片拿到的就是收敛后的 EV，**第一张就是对的**，不需要"拍完再修正"。
-  if (aeHal()) {
-    // ⚠ 0.12.52：预览的 passOutput 直接画到默认帧缓冲（屏幕），**没有中间纹理**；
-    // 0.12.51 去读 tex_cap_ 读到的是空内容 ⇒ `aeDispP50` 恒 0、闭环从未生效。
-    // 改法 = 直接读屏幕中心 64×64（所见即所得，也就是用户看到的那块画面）。
-    // 0.12.53：节流 15 帧 → **5 帧**（@60fps ≈ 80ms/步）。15 帧 + 0.15 步长要从 0 爬到
-    // 2EV 需要 3~5 秒，用户当场质疑"PC 也要这么久吗"——不应该，HAL 的 AE 是几百毫秒
-    // 级收敛。这里把采样加密、增益提到 0.7，典型 1.2EV 缺口 3 步内到位（≈0.25s）。
-    if ((++disp_tick_ % 5) == 0 && dst_w >= 64 && dst_h >= 64) {
-      unsigned char px[64 * 64 * 4];
-      glReadPixels(dst_w / 2 - 32, dst_h / 2 - 32, 64, 64, GL_RGBA,
-                   GL_UNSIGNED_BYTE, px);
-      if (glGetError() == GL_NO_ERROR) {
-        // 加权对数域直方图 + 截尾 25%~75%：与 PhotonCamera `MeteringSystem` 的
-        // `robustMidToneLinearLuma` 同口径（MIDTONE_TRIM 0.25/0.75 + 中心高斯权重）。
-        // 这才是"一套"：统计对象是**显示域**，统计方式是**鲁棒中灰**，目标是 0.18。
-        constexpr int kBins = 64;
-        double bins[kBins] = {0.0};
-        double wsum = 0.0;
-        for (int y = 0; y < 64; ++y) {
-          for (int x = 0; x < 64; ++x) {
-            const size_t i = (static_cast<size_t>(y) * 64 + x) * 4;
-            const float sr = px[i] / 255.0f, sg = px[i + 1] / 255.0f, sb = px[i + 2] / 255.0f;
-            const float luma = 0.2126f * sr + 0.7152f * sg + 0.0722f * sb;
-            const float lin = luma <= 0.04045f ? luma / 12.92f
-                                               : std::pow((luma + 0.055f) / 1.055f, 2.4f);
-            const float dx = (x + 0.5f - 32.0f) / 32.0f;
-            const float dy = (y + 0.5f - 32.0f) / 32.0f;
-            const float w = 0.35f + 0.65f * std::exp(-0.5f * (dx * dx + dy * dy) / 0.1024f);
-            // 对数域 [-12, 8] → [0, kBins-1]（与 measureSceneStats 的编码同区间）
-            const float enc = (std::log2(std::max(lin, 1e-4f)) + 12.0f) / 20.0f;
-            const int bi = std::clamp(static_cast<int>(enc * (kBins - 1)), 0, kBins - 1);
-            bins[bi] += w;
-            wsum += w;
-          }
-        }
-        if (wsum > 0.0) {
-          const double lo = wsum * 0.25, hi = wsum * 0.75;
-          double cum = 0.0, acc = 0.0, n = 0.0;
-          for (int i = 0; i < kBins; ++i) {
-            if (bins[i] <= 0.0) continue;
-            const double a = cum, b = cum + bins[i];
-            cum = b;
-            const double s = std::max(a, lo), e = std::min(b, hi);
-            if (e <= s) continue;
-            acc += (e - s) * (static_cast<double>(i) / (kBins - 1) * 20.0 - 12.0);
-            n += e - s;
-          }
-          const float mid = n > 0.0 ? std::exp2(static_cast<float>(acc / n)) : 0.0f;
-          // 0.12.54：EMA 0.7/0.3 → 0.85/0.15。旧 EMA 让读数滞后约 3 步，而增益是 0.7
-          // —— "用旧读数猛推"必然过冲（真机室内 14:36~14:37：p50 卡在 0.17 而 ev
-          // 一路涨到 2.0、mean 185）。测量滞后是振荡的根因，不是增益本身。
-          g_pv_disp_p50 = g_pv_disp_p50 > 0.001f
-                              ? g_pv_disp_p50 * 0.85f + mid * 0.15f
-                              : mid;
-          // 0.12.56：**这里不再改 EV**。统计值只供 Kotlin 外环读取（1Hz、0.3EV 步长、
-          // 下发 HAL 的 EV 补偿）。渲染端碰 EV = 和 HAL 打架，这是已证明的结论。
-        }
-      }
+  // ── 显示域鲁棒中灰（v0.12.232）：无条件统计，供成片闭环对齐 ─────────────
+  // 口径 = PC `MeteringSystem`（截尾四分位 + 中心高斯，见 robustMidToneDisplayRgba8）。
+  // 区域 = 画面中心 1/2 —— 与成片闭环读取的**同一块区域**，否则两把尺不一样。
+  // 只统计、不改 EV：EV 由成片链出片时一次性对齐（渲染端逐帧推 HAL 的 EV = 双回路
+  // 互相激发，0.12.51~58 真机证过"忽暗忽亮"）。
+  if ((++disp_tick_ % 10) == 0 && dst_w >= 128 && dst_h >= 128) {
+    // 节流 10 帧（6Hz）：读数只给成片定锚，不需要跟 60fps；1/2 画面读回 ~2MB/次。
+    const int sw = dst_w / 2, sh = dst_h / 2;
+    std::vector<uint8_t> px(static_cast<size_t>(sw) * sh * 4);
+    glReadPixels((dst_w - sw) / 2, (dst_h - sh) / 2, sw, sh, GL_RGBA,
+                 GL_UNSIGNED_BYTE, px.data());
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    const float mid = robustMidToneDisplayRgba8(px.data(), sw, sh, sw * 4);
+    if (mid > 0.0f) {
+      // EMA 0.7/0.3：读数只给成片定锚，慢一点更稳（不做逐帧闭环，不需要快收敛）。
+      g_pv_disp_p50 = g_pv_disp_p50 > 0.001f ? g_pv_disp_p50 * 0.7f + mid * 0.3f : mid;
     }
   }
   return true;
@@ -15157,6 +15167,46 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
   // 成片：斑马纹绝不进成片；dither 除数按交付档重标（255 / 1023）
   passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+  // ── 显示域闭环（v0.12.232）：成片对齐取景器 ────────────────────────────
+  // 取景器的显示域鲁棒中灰 `g_pv_disp_p50` = 用户**实际看到**的亮度（同一函数、同一
+  // 中心 1/2 区域统计）。成片必须落在同一位置 —— 这正是 PC `MeteringSystem` 的做法
+  // （同一把尺量两张图），而不是拿 `g_domain_ratio` 标量去猜 HAL 的 tone map。
+  // 只重跑 filmic + output 两个 pass（场景线性纹理已就绪），不重跑去马赛克/降噪/融合。
+  still_disp_mid_ = 0.0f;
+  disp_close_ev_ = 0.0f;
+  disp_add_ = 0.0f;
+  if (!c.ten_bit && g_pv_disp_p50 > 0.005f && dst_w >= 256 && dst_h >= 256) {
+    const int rw = dst_w / 2, rh = dst_h / 2;
+    const int rx = (dst_w - rw) / 2, ry = (dst_h - rh) / 2;
+    std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4);
+    auto readStillMid = [&]() -> float {
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo_cap_);
+      glReadPixels(rx, ry, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      return robustMidToneDisplayRgba8(px.data(), rw, rh, rw * 4);
+    };
+    still_disp_mid_ = readStillMid();
+    // ── 阻尼 + 最多 2 次迭代（v0.12.235）──────────────────────────────────
+    // 闭环增益实测不是 1：`ev_shift` 让白点跟着 exposure_ev 一起平移，加 EV 的显示域
+    // 效果被放大（真机 15:42:29：`dispAdd` 1.18 产生 ~2.08 EV 的效果 ⇒ `dispErr` −0.9
+    // 过冲）。全量步进会振荡 ⇒ 0.7 阻尼 + 最多两轮。两轮后残差进 `dispErr`，不再递归。
+    for (int iter = 0; iter < 2 && still_disp_mid_ > 0.0f; ++iter) {
+      const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
+      // 死区 0.10 EV：低于此视为统计噪声，不动（避免成片亮度随预览抖动）。
+      if (std::fabs(d) <= 0.10f) break;
+      const float step = d * 0.7f;
+      pe.exposure_ev += step;
+      disp_add_ += step;
+      passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
+      passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+      still_disp_mid_ = readStillMid();
+    }
+    disp_close_ev_ = (still_disp_mid_ > 0.0f)
+                         ? std::log2(g_pv_disp_p50 / still_disp_mid_)
+                         : disp_close_ev_;
+  }
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
   // 在 glReadPixels **之前**（同一次 GL 提交里算完，省一次 flush）。
@@ -15368,6 +15418,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 离线对拍务必把两者相加。aeWhy：0 none / 1 mid / 2 highlight / 3 clamped / 4 invalid。
   kv += ",\"aeOn\":" + std::to_string(autoExposure() ? 1 : 0);
   kv += ",\"aeEv\":" + jnum(ae_ev_, 5);
+  // v0.12.232 显示域闭环：成片最终的显示域鲁棒中灰 + 闭环追加的 EV（0 = 未触发）。
+  // 判据：`dispMid` 应 ≈ 取景器的 `pvDispMid`（同一函数、同一中心 1/2 区域）。
+  kv += ",\"dispMid\":" + jnum(still_disp_mid_, 5);
+  kv += ",\"dispAdd\":" + jnum(disp_add_, 4);
+  kv += ",\"dispErr\":" + jnum(disp_close_ev_, 4);
   kv += ",\"aeMid\":" + jnum(ae_mid_ev_, 5);
   kv += ",\"aeHl\":" + jnum(ae_hl_ev_, 5);
   kv += ",\"aeP50\":" + jnum(ae_p50_, 6);
@@ -18889,8 +18944,9 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
   last_w99_ = w99;
   last_w999_ = w999;
   last_cp_ = cp;
-  last_wmax_ = st.valid && auto_white_on ? std::log2(std::max(st.p_max, 1e-6f) / kGrey)
-                                         : 0.0f;
+  // v0.12.233：诊断改为**无条件**记录 —— wmax 是统计量，与「自动白点」开关无关；
+  // 旧写法在关自动白点时把它写成 0，日志里看起来像统计失败（真机 15:29:30 误判过）。
+  last_wmax_ = st.valid ? std::log2(std::max(st.p_max, 1e-6f) / kGrey) : 0.0f;
 }
 
 void FrameRenderer::passFill(int dst_w, int dst_h) {
@@ -19101,6 +19157,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
             ",\"cp\":" + jnum(last_cp_, 6) +
             ",\"linMid\":" + jnum(last_lin_mid_, 6) +
             ",\"ratio\":" + jnum(g_domain_ratio, 6) +
+            ",\"pvDispMid\":" + jnum(g_pv_disp_p50, 5) +
             ",\"pLo\":" + jnum(last_p_lo_, 7) +
             ",\"pHi\":" + jnum(last_p_hi_, 7) +
             ",\"localRef\":" + jnum(local_ref, 5) +
