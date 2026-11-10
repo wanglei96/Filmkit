@@ -2,7 +2,7 @@
 summary: M档裁切、相册多选与ISZ收口
 created: 2026-10-22 22:15
 updated: 2026-10-22 22:15
-status: absorbed
+status: archived
 ---
 
 # M档裁切、相册多选与ISZ收口

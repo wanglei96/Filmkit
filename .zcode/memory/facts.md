@@ -61,8 +61,7 @@ status: active
 ## 引擎插槽与调研（10-13 → 10-14）
 - [2026-10-13] **引擎插槽方案** `docs/engine-slots-design.md`：`kFsFilm` 拆三段（公共前段/引擎段/公共后段），**保持单 pass**（初始化期字符串拼接）；引擎契约 5 项 + 私有参数走独立 KV + 资产 manifest 全量哈希 + 失败严格回落引擎 0
 - [2026-10-13] **引擎指纹**：引擎 0 `film_d5` = `0x589f8364`；引擎 1 链上 = `0x8fdb4e38`；空转（uToneK=0）= `0x189e4126`；**日志判据 = `raw.render` 的 `tone=1.0`**
-- [2026-10-14] **`EngineScope.kt`**：`FILMIC_OWNED_SLOTS` = {5..10, 35, 37, 38, 40}；`NEUTRALIZE` 14 槽（28=1.0 / 20,21,22=1.0 / 36=0 / 35=0 / 5..10=0.01 / 37,38=−7.65/+4.56）；`applyEngineScope` slot∈{0,未注册} 返回同一实例（零回归）；`applyEngineScopeForEditor` 跳过公共段（0.12.61）
-- [2026-10-19] **引擎 1 的 7 个 `uSig*` 全是曲线形状常量**（无"对比度"）⇒ 引擎 1 的对比度此前无实现
+- [2026-10-14] **`EngineScope.kt`**：`FILMIC_OWNED_SLOTS` = {5..10,35,37,38,40}；`NEUTRALIZE` 14 槽（28=1.0/20-22=1.0/36=0/35=0/5..10=0.01/37,38=−7.65/+4.56）；`applyEngineScope` slot∈{0,未注册} 返回同一实例；编辑器跳过公共段（0.12.61）；引擎 1 的 7 个 `uSig*` 全是曲线形状常量。
 
 ## 10bit HEIF / 期 B / 色相（10-15 → 10-19，压缩）
 - [2026-10-15] 10bit HEIF 交付链定稿；`Bitmap.compress`+`Gainmap` = 4:2:0，4:4:4 + HDR 走 libultrahdr
@@ -70,11 +69,9 @@ status: active
 
 ## HDR 交付与自动曝光（10-20，压缩）
 - [2026-10-20] **gainmap 数学两版可切**（prefs `gainmap_math`）：0 = PC（offset 1e-4）/ 1 = 官方（offset 1e-7 + sdr<2/255 钳 gain≤2.3）；都归一化 [0.25,4.0]
-- [2026-10-20] **App 内 HDR 显示三条件**：`BitmapFactory` + `inSampleSize=1`；`context.findActivity()` 逐层解包；`window.colorMode = COLOR_MODE_HDR`（不检查 `configuration.isScreenHdr`）
-- [2026-10-20] **导出 SDR 版**：`nativeExtractSdrBase` 用 `uhdr_dec_get_base_image` 无损取 base
+- [2026-10-20] **App 内 HDR 显示三条件**（`inSampleSize=1` + `findActivity()` 解包 + `colorMode=COLOR_MODE_HDR`）；**导出 SDR** 用 `uhdr_dec_get_base_image` 无损取 base。
 - [2026-10-20] **AE 判据常量**：`kAeRawWhiteEv 2.438307`、`kAeMiddleGrey 0.1845`、headroom 0.1、限幅 ±2EV、高光判据 P99.5；**渲染端 AE 已在 0.12.71 全删**（只剩 ExposurePlanner）
-- [2026-10-22] **teq 9 档**：第 i 档对应 q=i−8 EV；云/镜面 q≈−0.5（第 8 档）、天空主体 q≈−2.0（第 6 档）；压深只给第 6 档
-- [2026-10-22] **局部对比度实测基线**（1777×2360 同区域）：rawpy 单帧 19.4% / 我们 17.6% / PC 25.9%（PC 在链路里增加细节）
+- [2026-10-22] **teq 9 档**（q=i−8 EV；云第 8 档、天空主体第 6 档，压深只给第 6 档）；**局部对比度基线**：rawpy 19.4% / 我们 17.6% / PC 25.9%。
 
 ## 测光与 HDR 对标（10-24）
 - [2026-10-24] **测光实现**：`MeteringTargets.kt`；`SPOT_AE_FRACTION=0.06`、`HIGHLIGHT_AE_FRACTION=0.16`；高光点来自 32×32 网格
@@ -82,16 +79,13 @@ status: active
 
 ## P4 基线与徕卡一瞬（10-25/26）
 - [2026-10-25] **`tools/hdr-baseline-eval.py`**：JPEG/R 无损解析（MPF 对照 vendored libultrahdr）+ base/gainmap/HDR 重建统计；报告 `docs/reports/hdr-baseline-20261025-REPORT.md`
-- [2026-10-25] **P4 现状**：`kFsGainmap` 三档（0=真实比值默认 / 1=旧 sceneY / 2=官方）；`gainTrue` = hdrY×(0.1845/ae_p50_) ÷ sdrY，clamp[1,4]；uniform `uSceneMid`；prefs `gainmap_math` 三档
-- [2026-10-25] **LUTS.bin 布局（PC M9 配方）**：427744B；curveOffset 0xcf8 / matrixOffset 0xb44 / calibrationOffset 0xcd0；matrixIndex=CS×5+SAT=2、curveIndex=CS×5+CON=2（sRGB/标准饱和/标准对比）；矩阵 = Q16 整数、**行和 8198/8192/8185（Q13 ÷8192 = 1.000，保 WB）**；曲线 2048 点、首 0 末 1 单调
-- [2026-10-25] **M9 配方语义（数据验证）**：矩阵输出 `>>16` 后 = 线性值/8 的 11-bit 编码（clamp 2047 只在纯白）；**曲线输入域 = 线性值 11-bit 编码**（table[368]=0.588 ↔ 线性 0.18→0.59）、输出 sRGB 编码；分支 R≥G 在切换面连续（R 行差 [1152,−1147,0]）
-- [2026-10-25] **`leica_m9_ccd.lut`**：64³ uint8 786454B、TITLE "徕卡 M9 CCD"、分类 徕卡；判据 mean 0.13 LSB / max 20 LSB（钳制面）/ 灰轴 1.63 LSB / 格点跳变 56.7（配方固有陡斜率）
+- [2026-10-25] **P4 现状**：`kFsGainmap` 三档（0=真实比值/1=旧 sceneY/2=官方）；`gainTrue` clamp[1,4]；0.12.230 起改为 `sdrLin + max(0, hdrLin − 1/anchor)`（标准语义，中灰 ratio 恒 1）
+- [2026-10-25] **LUTS.bin 布局（PC M9 配方）**：427744B；curveOffset 0xcf8 / matrixOffset 0xb44 / calibrationOffset 0xcd0；matrixIndex=CS×5+SAT=2、curveIndex=CS×5+CON=2；矩阵 Q16（行和 ≈8192 保 WB）；曲线 2048 点、首 0 末 1 单调。
+- [2026-10-25] **M9 配方语义**：矩阵 `>>16` 后 = 线性值/8 的 11-bit 编码；曲线输入域 = 11-bit 编码、输出 sRGB；**`leica_m9_ccd.lut`** 64³ 786454B，mean 0.13 / max 20 / 灰轴 1.63 / 跳变 56.7（配方固有）。
 - [2026-10-25] **LUT 加载链**：`parseBinary` size∈2..128；引擎 `setLut` → `glTexImage3D RGBA16F size³`；采样 = `clamp(c×(N−1))` + 手写三线性 texelFetch（格点口径 i/(N−1)）
 - [2026-10-25] **色温槽语义**：`[88] temp_mired` = 目标白点 mired 偏移（基准 6500K、恒等 0，`EditorExport.kt:495`）；UI K 滑杆右移 = 变暖；**6500K = 不做补偿，不是锁 WB**
-- [2026-10-25] **recipe-fit 现状**：`--mode camera` 单链拟合（成片优先）；TARGETS[leica_m9] = 52→28.6、85→71.8、122→122.1、160→157.9、200→191.3、243→219.5（暗部 M9、中高段旧观感）；`--white-ev 4.0 --lut-min 1.0 --lat-split --hi-floor 3.5`；报告 `fit/builtin-curves.json`（`--export` 生成）
-- [2026-10-25] **真机指纹**（同口径）：M9 样张库彩色 p25 中位 20、≥240 中位 0.08%、C*P90 中位 ≈29；我们一期成片 C*P90 33.2、≥240 0.02%
-- [2026-10-25] **方向锁**：MainActivity `screenOrientation="portrait"`（0.12.86 起）
-- [2026-10-26] **版本**：0.12.89(538) tag v0.12.89；包 `filmkit-0.12.88-M9TONE.apk`(537)、`filmkit-0.12.89-M9TONE2.apk`(538)
+- [2026-10-25] **recipe-fit**：`--mode camera` 单链（TARGETS[leica_m9] 六点）；`--white-ev 4.0 --lut-min 1.0 --lat-split --hi-floor 3.5`；`--export` 生成 `fit/builtin-curves.json`
+- [2026-10-25/26] **真机指纹**：M9 样张库彩色 p25 中位 20、≥240 0.08%、C\*P90 ≈29；我们一期 C\*P90 33.2、≥240 0.02%；MainActivity 锁竖屏（0.12.86 起）。
 
 ## PC 影调与暗部软边（10-29）
 - [2026-10-29] **PC 有两套 tone 引擎**：`AdobeCurveToneAlgorithm`（DCP profile 的 ToneCurve，逐通道 + `adobeRgbTone`）与 `DarktableFilmicToneAlgorithm` / `DarktableSigmoidToneAlgorithm`（与同源，系数按 darktable `computeFilmicToneCurveUniforms` 算）；`assets/dcp/` 只有 10 个 profile，**没有 vivo** ⇒ 该机上不适用 DCP 路径
@@ -99,22 +93,27 @@ status: active
 - [2026-10-29] **RCD 与 AMaZE 的抖动差**（同一 CFA 输入、粉椅高光边）：R/G lag-1 σ = 0.312（RCD） vs **0.018（AMaZE）**
 
 ## 高光三症与饱和掩码（10-30）
-- [2026-10-30] **WB 域 vs raw/1023 域**：WB 域中性白 1,1,1（opposed 前提成立）；raw/1023 域是 0.476/1.0/0.684（随 WB 变）。
-- [2026-10-30] **粉云实测**（165153.dng）：G 饱和像素 WB 中位 R 1.300 / G 1.000 / B 1.139；参考场 0.944/1.036；块级 mask 覆盖 4.23%（离线）。
-- [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`（σ=√(A·clamp(wb,0,1)+B)），1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov；`filmkit-0.12.205-hdr-coexist.apk` = 只提亮高光那版。
+- [2026-10-30] **WB 域 vs raw/1023 域**：WB 域中性白 1,1,1；raw/1023 域 0.476/1.0/0.684（随 WB 变）；粉云 165153 的 G 饱和像素 WB 中位 1.300/1.000/1.139。
+- [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov。
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
 ## 预设开关与理光负片（11-01）
-- [2026-11-02] 版本 **0.12.227(678)** 当前；回退 0.12.226；HDR 对照 `filmkit-0.12.205-hdr-coexist.apk`。
-- [2026-11-02] **7 条内置预设**（builtin.json，键总数 92）：徕卡一瞬 / 理光负片 / 理光正片 / 富士NC / 哈苏自然 / 柯达5219 / 徕卡黑白；**锁 filmic 的 5 条**（除理光负片、徕卡黑白）。
-- [2026-11-02] **64³ 自烘 LUT 四个**：`ricoh_negative_v2`（bake-ricoh-lut）、`ricoh_positive_v1`（同脚本 `--preset positive`）、`fuji_nc_v2`（normalize 归一）、`kodak_5219_deep`（normalize + 暗部加蓝/压黑）；33³ 原资产 `kodak_5219`/`fuji_nc`/`hasselblad_classic` 保留可手选。
+- [2026-11-02→04] 版本 **0.12.242(693)** 当前、回退 0.12.241；**7 条内置预设**（键总 92），锁 filmic 5 条；**64³ 自烘 LUT 四个**（`ricoh_negative_v2`/`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`），33³ 原资产保留可手选。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
 - [2026-11-02] **理光正片**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / **高光 +0.64**（负片高光是 −1.9）；色相 红 29°、绿 134°、蓝 303°、C 0.98~1.02。
 - [2026-11-02] **富士NC**：`fuji_nc` 原资产灰阶 **100%→91.8%**（压白 8.2%）、灰轴 暗 a−2.8 / 中高光 a+3.1~+3.7；`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255、高光去色阈值 min(RGB) 0.86。
-- [2026-11-02] **哈苏自然**：`hasselblad_classic` 探针色相 0.0°、灰轴 0、端点 0→100、肤 C×1.23；哈苏官方 13 张样片 C\* p50 11.3 / 黑 11.95% / 白 0.85%，逐张灰轴散布 ±5 无共同符号 ⇒ 不系统偏色。
-- [2026-11-02] **柯达5219**：原资产灰阶 10%→15.9%、50%→56.5%、100%→97.3%（抬黑 4.7% = base fog）；灰轴 暗 b−4.8 / 高 b+1.9；`kodak_5219_deep` 加深后暗 b −6.2、黑点压到 0.5/255、暗部 a +0.45。
+- [2026-11-02] **哈苏自然**：探针色相 0、灰轴 0、肤 C×1.23；官方 13 张 C\* p50 11.3、灰轴散布 ±5 无共同符号 ⇒ 不系统偏色。
+- [2026-11-02] **柯达5219**：原资产抬黑 4.7%（base fog）、暗 b−4.8；`kodak_5219_deep` 暗 b −6.2、黑点压到 0.5/255、暗部 a +0.45。
 - [2026-11-02] **暗角实现**：darktable 余弦 `vw=0.5−0.5cos(πt)`、`dscale=radius/100`、`fscale=feather/100`；4:3 竖图角落 cplen 1.252。**M9 机内 JPEG 默认开镜头暗角校正 ⇒ 原厂几乎无暗角**。
 - [2026-11-02] **外部资料入口**：柯达电影站 `kodak.com/en/motion/product/camera-films/<id>/`（**单数 product**，`/page/` 与 `motion.kodak.com` 均 404）；哈苏样片 `hasselblad.com/learn/sample-images/x-system/`（84 张，原图 20MB 级）；fujifilm-x.com 是 SPA + Cloudflare，样片不可抓。
+
+## 显示域闭环与蓝天（11-04）
+
+- [2026-11-04] **显示域闭环实测**（成片中心 1/2 鲁棒中灰 vs 取景器 `pvDispMid`）：0.1375/0.130、0.0997/0.093、0.0344/0.034 ⇒ 差 0.02~0.13 EV；改前 0.9 EV。日志字段 `dispMid`/`dispAdd`/`dispErr`（0.12.233 起拆开）与 `preview.filmic` 的 `pvDispMid`。
+- [2026-11-04] **闭环收敛数据**：15:42:29 `dispAdd 1.18 → dispErr −0.9`（全量步进过冲）；0.7 阻尼+两轮后 16:42/16:49 的 `dispErr` 均在 0.04~0.09。
+- [2026-11-04] **PC ML-AE 规格**：`assets/mgc_ae/` 三个 tflite（short 62272B / long 61264B / portrait 62272B）；输入 64×64×9（`ln RGB` + `ln scene` + 语义哨兵，long 拆 4+5 两输入）；输出 logGain，`gain = exp(logGain) − 1e-6`；Mac CPU 三模型一套 6 ms。
+- [2026-11-04] **官方理光负片蓝天**：晴天深蓝天 `IP025159` h 270.9 / C\* 17.8 / L\* 46.8；同场景正片 `IP025354` C\* 25.2；阴天街景（6509 第 2 格）h 258.1 / C\* 13.1 / L\* 77.8。样片存 `test_temp/_official_{neg,pos}_sky_*.jpg`。
+- [2026-11-04] **LUT 判据 3 改口径**：p99.9 <12（原 max<12 永远被 sRGB 色域边界顶到 29.3）；当前 p99.9 9.3、max 22.8、边界对 166 万个已排除。

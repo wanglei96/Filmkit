@@ -2,7 +2,7 @@
 summary: P4真实gainmap落地验收与徕卡一瞬调研
 created: 2026-10-25 20:30
 updated: 2026-10-26 10:20
-status: absorbed
+status: archived
 ---
 
 # P4 真实 gainmap 落地验收与徕卡一瞬调研
