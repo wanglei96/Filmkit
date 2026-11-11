@@ -185,12 +185,11 @@ class BuiltinPresetsTest {
         // 默认（darktable filmic 出厂黑白点 −8/+4），色彩全交 LUT（tools/bake-ricoh-lut.py）。
         assertRecipe(
             "builtin_ricoh_negative",
-            setOf(0, 5, 6, 7, 8, 9, 10, 20, 21, 22, 37, 38, 98, 102),
+            setOf(5, 6, 7, 8, 9, 10, 20, 21, 22, 37, 38, 98, 102),
             // ★ 0.12.243（真机"发灰、天空太淡"反馈）：三段饱和 0.92/0.90/0.80 → 1.12/1.08/0.85。
             //   证据：真机全图 C* p50 3.1 vs GR 官方 12 张 6.2，而天空 C* 已是 23（官方 17.8）
             //   ⇒ 缺的是暗部/中调的「暗暖亮冷」灰轴（被 0.8~0.92 压平），不是整体再提。
             //   所以只抬 shadow/mid，高光段 0.80 → 0.85 保持接近（负片高光仍去饱和）。
-            0 to -0.8,     // ★ 0.12.246：压 −0.8EV（成片天空 +2.4EV 在 filmic 里必然到 232-255）
             20 to 1.12, 21 to 1.08, 22 to 0.85,   // 三段饱和（0.12.243：按 C* 分区缺口重配）
             37 to -8.0, 38 to 4.0,
             // 0.12.228：白点改自动（阴天场景最亮只 +1.3~2.7EV，固定 4.0 白点把全图压进中段）
@@ -321,7 +320,7 @@ class BuiltinPresetsTest {
             val params = (item as Map<*, *>)["params"] as Map<*, *>
             params.keys.map { it as String }
         }
-        assertEquals("七条预设的参数键总数（0.12.246 理光负片 +exposure_ev）", 101, names.size)
+        assertEquals("七条预设的参数键总数（0.12.229 理光负片：+engine_slot +肩趾6 槽 −auto_black）", 100, names.size)
         for (name in names) {
             assertTrue(
                 "未知参数名 \"$name\" —— 拼错会让**整条预设**被拒（静默少一条）",

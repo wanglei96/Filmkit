@@ -135,7 +135,25 @@ def grid(size):
     return np.stack([R, G, B], axis=-1)
 
 
-def normalize_luma(lut, size=SIZE, highlight_start=None):
+def film_curve_neg_hl(lstar):
+    """理光负片的高光压缩曲线（L* 域，单调、C1 连续）。
+
+    依据：GR 官方 12 张样片的高光分位 p99 = 85 / p90 = 76（8bit 换算 L*），而我们的
+    成片 p99 冲到 96、天空整片落在 L* 88-97 且 C* 只剩 2-3（白块）。把 L* 高段压
+    11 个点即可回到官方量级。
+      · L* ≤ 60 恒等 —— 暗部与中调一格不动（这是 0.12.241 钟形窗造带的教训的反面：
+        开窗只作用某一段会留边，单调全局曲线不会）；
+      · L* ≥ 60 起 smoothstep 加权下压，100 处压 11.3 ⇒ 输出 88.7（不死白，保留渐变）。
+    """
+    t = np.clip((lstar - 60.0) / 40.0, 0.0, 1.0)
+    return lstar - 11.3 * (t * t * (3.0 - 2.0 * t))
+
+CURVES = {
+    "none": None,
+    "neg-hl": film_curve_neg_hl,
+}
+
+def normalize_luma(lut, size=SIZE, highlight_start=None, curve=None):
     """输出 L* ← 输入 L*；保留输出的 a*/b*（色相与色度），超域点硬裁。
 
     ⚠️ 为什么是硬裁而不是保色相缩 C：L 归一后约 **2.1%** 的格点（亮黄/亮青这类高饱和
@@ -148,7 +166,8 @@ def normalize_luma(lut, size=SIZE, highlight_start=None):
     out = trilinear(lut, enc.reshape(-1, 3))
     lab_in = rgb2lab(srgb_decode(enc.reshape(-1, 3)))
     lab_out = rgb2lab(srgb_decode(out))
-    lab = np.stack([lab_in[:, 0], lab_out[:, 1], lab_out[:, 2]], axis=-1)
+    l_src = lab_in[:, 0] if curve is None else curve(lab_in[:, 0])
+    lab = np.stack([l_src, lab_out[:, 1], lab_out[:, 2]], axis=-1)
     # ★ 高光去色（2026-11-01 真机反馈）：源 LUT 在 80~97% 亮度把 a* 稳在 +2.8~+3.6
     #   （白被染成粉白），而 97% 以上 R 通道先撞 255 ⇒ 灯/窗这类高光边缘出现**品红色带**。
     #   物理上过曝高光没有色相信息，染色只会是假的 ⇒ L ≥ 85 起把色度线性衰减到 0
@@ -252,13 +271,17 @@ def main():
     ap.add_argument("--white-tol", type=float, default=1.5,
                     help="白点中性容差 /255；电影负片的暖高光用大值（如 12）并注明")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--curve", default="none", choices=sorted(CURVES),
+                    help="施加到 L* 的目标曲线：none = 纯亮度归一（默认）；"
+                         "neg-hl = 负片高光压缩（L* ≥60 单调下压，100 处 −11.3）")
     ap.add_argument("--preview", default=None)
     args = ap.parse_args()
     SRC, OUT, TITLE, CATEGORY = args.src, args.out, args.title, args.category
     WHITE_TOL = args.white_tol
     salary = None  # 占位，避免误用
     src, _ = (load_cube(SRC) if SRC.lower().endswith(".cube") else load_binary(SRC))
-    out = normalize_luma(src, highlight_start=args.highlight_start)
+    out = normalize_luma(src, highlight_start=args.highlight_start,
+                         curve=CURVES[args.curve])
     if not args.check:
         write_asset(out, TITLE)
     ok = check(src, out)

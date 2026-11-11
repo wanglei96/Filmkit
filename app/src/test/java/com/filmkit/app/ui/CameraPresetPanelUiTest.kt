@@ -122,11 +122,11 @@ class CameraPresetPanelUiTest {
     @Test
     fun summaryOfRicohNegativeIsExact() {
         // 0.12.214：理光 = 三段饱和 + 黑白点 + 满强度 LUT。
-        // 0.12.229：锁 filmic + 肩趾 6 槽 + 自动白点 = 13 项；0.12.246 加 exposure_ev = 14。
+        // 0.12.229：锁 filmic + 肩趾 6 槽 + 自动白点 = 13 项。
         val p = builtin("理光负片")
-        assertEquals(14, p.slots.size)
+        assertEquals(13, p.slots.size)
         assertEquals(
-            "曝光 -0.8 EV · 引擎插槽 filmic · 饱和度 · 暗部 +12 · 胶片曲线 · 肩部 红 0.10 · 饱和度 · 中间调 +8 · … · LUT ricoh_negative_v2 100",
+            "引擎插槽 filmic · 饱和度 · 暗部 +12 · 胶片曲线 · 肩部 红 0.10 · 饱和度 · 中间调 +8 · … · LUT ricoh_negative_v2 100",
             presetSummaryText(p),
         )
     }
