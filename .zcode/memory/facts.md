@@ -11,9 +11,9 @@ status: active
 <!-- 2026-10-26 d3 整理:压缩折行、删除被后续版本取代的"当时现状",保留当前有效值与口径。 -->
 
 ## 环境
-- [2026-09-18] 构建链：AGP 8.13.2 / Gradle 8.13 / Kotlin 2.3.21 / Compose BOM 2026.06.01 / NDK 29 / CMake 3.22.1 / minSdk 26 / compileSdk 36；依赖上限锁定（2026.09 版 AndroidX 需 AGP 9.1+/SDK 37）
+- [2026-09-18] 构建链：AGP 8.13.2 / Gradle 8.13 / Kotlin 2.3.21 / Compose BOM 2026.06.01 / NDK 29 / CMake 3.22.1 / minSdk 26 / compileSdk 36；依赖上限锁定（2026.09 版 AndroidX 需 AGP 9.1+/SDK 37）；构建命令 `JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`
 - [2026-09-18] 项目路径含中文：AGP externalNativeBuild 丢中文段（CXX1400），已改自定义 CMake Exec 直驱 NDK
-- [2026-09-23] 构建命令（本机已验证）：`JAVA_HOME=/opt/homebrew/opt/openjdk@23 ./gradlew assembleDebug testDebugUnitTest`
+
 - [2026-09-18] X300：Android 16/OriginOS 6，Mali-G1-Ultra MC12，GL ES 3.2，7 相机（0=逻辑主摄、1=前置、2-5 隐藏物理、6=第二逻辑组）；主摄 RAW 4080×3072、CFA=GRBG、黑阶 64、白阶 1023、maxISO 3200；RGBA16F 无线性过滤
 - [2026-09-21] adb：`~/Library/Android/sdk/platform-tools/adb install -r <apk>`；手机存储 Mac 直读 `~/Library/CloudStorage/文件管理系统-伯牙的vivoX300/storage/emulated/0/Pictures/`
 - [2026-09-18] 日志/审计导出：`/storage/emulated/0/Android/data/com.filmkit.app/files/{logs,audit}`（vivo 办公套件回传，落点 `~/Downloads/vivo办公套件/`）；未捕获异常写 `logs/crash-latest.txt` + JSONL `app.crash`
@@ -22,8 +22,8 @@ status: active
 ## 路径与约定
 - [2026-09-18] Git 远端 `git@github.com:wanglei96/Filmkit.git` main；**CI 仅手动触发**；出包在本地做
 - [2026-09-18] APK 产物：`app/build/outputs/apk/{release,debug}/*.apk` → 根目录 `filmkit-<versionName>-<TAG>.apk`；**出包前 `rm -rf app/build/outputs/apk`**；`*.apk` gitignore
-- [2026-09-18] 引擎 so `libfilmengine.so`，JNI 入口 `com.filmkit.app.EngineBridge`；源码 `core/engine/src/`
-- [2026-09-20] shader 校验 `tools/validate-shaders.sh`（本地二进制 `tools/bin/glslang`）；**发版前必跑**
+- [2026-09-18] 引擎 so `libfilmengine.so`，JNI 入口 `com.filmkit.app.EngineBridge`；源码 `core/engine/src/`；shader 校验 `tools/validate-shaders.sh`（`tools/bin/glslang`）发版前必跑
+
 - [2026-09-18] 版本约定：发版打附注标签 `v<versionName>` 并 push；Conventional Commits（英文）；每轮只打一个 tag；版本号单一来源（`app/build.gradle.kts`）
 
 ## 引擎实现现状
@@ -39,9 +39,7 @@ status: active
 - [2026-09-30] **PC 的"快门即撒手"架构**：`isCapturing` 只锁采集窗口；per-shot `PhotoCaptureContext`；处理完才 close
 - [2026-10-13] **PC 引擎插槽**：9 个引擎（AdobeCurve 0 / AgX 1 / Spektrafilm 2 / DarktableSigmoid 3 / DarktableFilmic 4 / Hncs 6 / Lumix 7 / Canon 8 / Leica 10）；公共模板 `RawEngineTonePass.kt:417-505`（引擎只注入 uniforms/profile/functions 四段，输出契约线性 RGB）
 
-## 工具与脚本
-- [2026-10-01] `tools/still-thread-verify.py`、`align-bench`、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**）
-- [2026-10-25] **`tools/bake-m9-lut.py`**：解码 LUTS.bin → 64³ LUT + 四条判据；`--check-only`、`--size`；理论依据见下条
+- [2026-10-01] `tools/still-thread-verify.py`、`align-bench`、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**）；`tools/bake-m9-lut.py` 解码 LUTS.bin → 64³ LUT（`--check-only`/`--size`）
 
 ## 对标数据与测量口径（10-03 → 10-08）
 - [2026-10-08] **GLSL/Mali 铁律**：FilmParams 加槽必须四处同改；**`float m[9]` 数组参数与动态索引编不过**（prog_=0 静默 return）；**多行宏不生效**（完全内联）；新 pass 没效果先查 `prog_ != 0`
@@ -63,7 +61,6 @@ status: active
 - [2026-10-13] **引擎指纹**：引擎 0 `film_d5` = `0x589f8364`；引擎 1 链上 = `0x8fdb4e38`；空转（uToneK=0）= `0x189e4126`；**日志判据 = `raw.render` 的 `tone=1.0`**
 - [2026-10-14] **`EngineScope.kt`**：`FILMIC_OWNED_SLOTS` = {5..10,35,37,38,40}；`NEUTRALIZE` 14 槽（28=1.0/20-22=1.0/36=0/35=0/5..10=0.01/37,38=−7.65/+4.56）；`applyEngineScope` slot∈{0,未注册} 返回同一实例；编辑器跳过公共段（0.12.61）；引擎 1 的 7 个 `uSig*` 全是曲线形状常量。
 
-## 10bit HEIF / 期 B / 色相（10-15 → 10-19，压缩）
 - [2026-10-15] 10bit HEIF 交付链定稿；`Bitmap.compress`+`Gainmap` = 4:2:0，4:4:4 + HDR 走 libultrahdr
 - [2026-10-19] **期 B**：工作空间切 Rec.2020 线性；交付域保持 sRGB；域错配三处修复（`3fa65af`→`a3aedfe`）
 
@@ -73,7 +70,6 @@ status: active
 - [2026-10-20] **AE 判据常量**：`kAeRawWhiteEv 2.438307`、`kAeMiddleGrey 0.1845`、headroom 0.1、限幅 ±2EV、高光判据 P99.5；**渲染端 AE 已在 0.12.71 全删**（只剩 ExposurePlanner）
 - [2026-10-22] **teq 9 档**（q=i−8 EV；云第 8 档、天空主体第 6 档，压深只给第 6 档）；**局部对比度基线**：rawpy 19.4% / 我们 17.6% / PC 25.9%。
 
-## 测光与 HDR 对标（10-24）
 - [2026-10-24] **测光实现**：`MeteringTargets.kt`；`SPOT_AE_FRACTION=0.06`、`HIGHLIGHT_AE_FRACTION=0.16`；高光点来自 32×32 网格
 - [2026-10-24] **gainmap 旧版中灰基线 1.1**（P4 已替换为 gainTrue 真实比值）
 
@@ -98,8 +94,7 @@ status: active
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
-## 预设开关与理光负片（11-01）
-- [2026-11-02→04] 版本 **0.12.242(693)** 当前、回退 0.12.241；**7 条内置预设**（键总 92），锁 filmic 5 条；**64³ 自烘 LUT 四个**（`ricoh_negative_v2`/`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`），33³ 原资产保留可手选。
+- [2026-11-11] 版本 **0.12.251(700)** 当前（dev 分支）、回退 0.12.248；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
@@ -117,3 +112,9 @@ status: active
 - [2026-11-04] **PC ML-AE 规格**：`assets/mgc_ae/` 三个 tflite（short 62272B / long 61264B / portrait 62272B）；输入 64×64×9（`ln RGB` + `ln scene` + 语义哨兵，long 拆 4+5 两输入）；输出 logGain，`gain = exp(logGain) − 1e-6`；Mac CPU 三模型一套 6 ms。
 - [2026-11-04] **官方理光负片蓝天**：晴天深蓝天 `IP025159` h 270.9 / C\* 17.8 / L\* 46.8；同场景正片 `IP025354` C\* 25.2；阴天街景（6509 第 2 格）h 258.1 / C\* 13.1 / L\* 77.8。样片存 `test_temp/_official_{neg,pos}_sky_*.jpg`。
 - [2026-11-04] **LUT 判据 3 改口径**：p99.9 <12（原 max<12 永远被 sRGB 色域边界顶到 29.3）；当前 p99.9 9.3、max 22.8、边界对 166 万个已排除。
+
+## LUT 换血与采集端判据（11-11）
+
+- [2026-11-11] **`ricoh_negative_ye.lut`**（33³、107846 B、title「理光 负片 · 杨子祯」）：由「理光负片 杨子祯(1).cube」逐字节转换，**自带影调**——灰阶 0.25→0.31 / 0.50→0.57 / 0.75→0.78。同场景天空 hue 260.8（旧的归一版 276.2、Filmix 263.2）。
+- [2026-11-11] **`nativeEngineGetStats` 新增 `pw999`**：当帧预览链 P99.9 ÷ `g_domain_ratio` 换算到 RAW 等效域。实测预览 1.03 vs 成片 2.91（低 1.88EV，因预览经 ISP tonemap）⇒ 只能当"有没有超白点"的粗判据。
+- [2026-11-11] **`hlOn` 语义修正**：条件只剩 `hl_protect >= 1`（原来还要求 `!ae_auto && !bracket && hdr_fusion<=0` ⇒ 出厂恒假、从未生效）。闭环补偿上限 `kDispAddMax = 0.60` EV（`FrameRenderer.cpp` 显示域闭环段）。
