@@ -301,7 +301,7 @@ class PresetPanelUiTest {
         assertEquals(22, p.slots.size)  // 0.12.227：去掉暗角强度（不写 = 关）⇒ 23 → 22
         assertEquals(
             // 0.12.92：M9 适度压暗（−0.3 EV）+ 暗 -24/中 -24/高 -35 + LUT 75
-            "曝光 -0.3 EV · 饱和度 · 暗部 +22 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
+            "曝光 -0.3 EV · 饱和度 · 暗部 -5 · 胶片曲线 · 肩部 红 0.01 · 颗粒 · 强度 20 · … · LUT leica_m9_ccd 75",
             presetSummaryText(p),
         )
         // UI 层查到中文名 ⇒ 用中文名（纯逻辑层不碰 Context，所以由调用侧传进来）

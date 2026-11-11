@@ -8260,7 +8260,24 @@ float gainTrue(float sdrLin, float hdrLin) {
     // ⚠ 不能写成 `hdrLin*anchor − 1`（0.12.230 的误用）：它等于把 scene 差值放大
     //   anchor(≈2.56) 倍，高光比标准语义多 0.35~0.86 EV，且更早打满 kMax —— 真机症状
     //   是「HDR 高光提亮太多」。0.12.231 订正，中灰/暗部行为逐位不变。
-    float hdrAligned = sdrLin + max(0.0f, hdrLin - 1.0f / anchor);
+    // ── v0.12.244：折点必须**平滑**，否则 gainmap 沿 hdr=白点 的等值线留硬边 ─────
+    // 真机实证（2026-11-10 16:33 徕卡横拍，test_temp/FILMKIT_20261110-163316_徕卡M9CCD.jpg）：
+    // 解出 gainmap 后 boost 场在天空里是「恒 1.00 → 跨过某条斜线变 1.10~1.35 → 又回 1.00」，
+    // 边界正好是 `hdrLin == 1/anchor(0.39)` 的等值线 —— 因为 max(0,x) 在 0 处只有 C0、
+    // 一阶导从 0 突变到 1，等比值的 8bit 量化(=1/64 EV)把这个斜率突变固化成一条可见边，
+    // HDR 屏上就是「有边界的亮块」（用户 16:39 圈出的区域，boost 1.26 vs 周围 1.00）。
+    // 处置：把 max(0,·) 换成**斜率连续**的 soft transition（transition 宽度 kSoft=0.12，
+    // 即 film 输出域 0.39 白点的 ~30%）。性质：
+    //   · excess ≤ 0（中灰及以下）→ 输出恒 0 ⇒ 「ratio 恒 1」的原版语义**逐位保持**；
+    //   · excess ≥ kSoft（真实高光）→ 输出 == excess ⇒ 高光延展量**逐位保持**；
+    //   · 0 < excess < kSoft ⇒ smoothstep 加权，斜率从 0 连续升到 1，**没有折点**。
+    // 不引入任何新参数、不改变 anchor 语义（仍是 0.1845/0.072 的固定比值）。
+    const float kSoft = 0.12;
+    float excess = hdrLin - 1.0 / anchor;
+    float tExc = clamp(excess / kSoft, 0.0, 1.0);
+    float softExcess =
+        (excess >= kSoft) ? excess : (tExc * tExc * (3.0 - 2.0 * tExc)) * excess;
+    float hdrAligned = sdrLin + softExcess;
     // 下限取 kMin（0.25）：ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
     // 可以为负，真实 hdr/sdr < 1 时就该原样表达（暗部在 HDR 显示下压 2EV）；
     // 0.12.85 写成 1.0 的依据（"HDR 相对 base 只会更亮"）规范里并不存在。
@@ -15196,7 +15213,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
       // 死区 0.10 EV：低于此视为统计噪声，不动（避免成片亮度随预览抖动）。
       if (std::fabs(d) <= 0.10f) break;
-      const float step = d * 0.7f;
+      float step = d * 0.7f;
+      // ── v0.12.245：累计补偿上限 ±0.60 EV ────────────────────────────────
+      // 闭环的本意是修**小误差**（0.12.242 实测 0.02~0.13 EV）。补到 1 EV 以上说明
+      // 预览链与成片链本身有系统偏差（真机 11-11 09:42 理光：dispAdd 1.24），此时
+      // 硬补的代价全落在高光 —— 整张 +1.24EV 把天空从 C* 17 推进 L* 95-100 / C* 2.1
+      // （纯白块）。上限把"链路偏差"与"画面的可接受亮度范围"解耦：偏差仍然记录在
+      // dispErr 里，但不再用高光去填。
+      constexpr float kDispAddMax = 0.60f;
+      const float room = kDispAddMax - std::fabs(disp_add_);
+      if (room <= 0.02f) break;
+      if (std::fabs(step) > room) step = std::copysign(room, step);
       pe.exposure_ev += step;
       disp_add_ += step;
       passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
@@ -18850,7 +18877,20 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
       // v0.10.111：上探幅度由 white_probe 控制（旧硬编码 1.5）。真机实测该闸每次都
       // 满额（红杯 w99=1.03 → 白点 2.53），把 1% 以上的高光整段推到肩部以下 ⇒ 白斑。
       const float probe = (white_probe > 0.0f) ? white_probe : 1.5f;
-      w = std::max(w99, std::min(w_max + 0.4f, w99 + probe));
+      // ── v0.12.243：P99 贴在 RAW 白点上时，probe 闸必须让位 ──────────────────
+      // probe 的用途是防"孤立高光尖峰"（占帧 <1% 的灯/釉面，P99 看不见它，w_max
+      // 却被它抬高）——那种场景 w99 很低（红杯 1.03），上探越多越白斑。
+      // 但 w99 已经顶到采集白点时语义**完全相反**：说明大面积（≥1%）高光就在
+      // RAW 饱和处，最大亮度 = w_max 是真实内容而非尖峰。此时 `w99 + probe(0.5)`
+      // 常数 2.94 低于场景 w_max(2.99)，肩部把整片天空压进最后 15 级 8bit ——
+      // 真机 11-10 15:46 实测：天空 G≥240 占 48%、单值 245 占 17%（"白块/假云"），
+      // 而且 LUT 全程无关（LUT strength=0 的同机位样片一样 38% ≥240）。
+      // 处置 = darktable autodetect 的 max 语义（white = 取样域最大 + 0.4EV
+      // security），probe 只保留下限（1.5 与旧硬编码同量级），不参与收紧。
+      // 离线 filmic 复算（同参数 black −8 / contrast 1.21 / lat 0.1）：
+      //   白点 2.94 → 天空 246→255、27% 平台；白点 3.39 → 236→252、0% 平台。
+      const float probe_eff = (w99 >= 2.40f) ? 1.5f : probe;
+      w = std::max(w99, std::min(w_max + 0.4f, w99 + probe_eff));
     } else {
       w = w99;  // v0.10.18 行为（A/B 通路）
     }
@@ -18907,6 +18947,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
   if (still) {
     ev_black_ = b;
     ev_white_ = w;  // 不写 EMA 状态，避免污染预览
+
   } else if (ev_smooth_black_ == 0.0f) {
     ev_smooth_black_ = b;
     ev_smooth_white_ = w;
@@ -18994,6 +19035,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // CPU 侧 spline 求解（per-channel）。默认全 0.01 ⇒ 与接线前逐位一致。
   // U-3：[4] contrast 一并透传（与内部补偿 cp **相乘**，见 updateFilmicEV 内注释）；
   // 默认 1.0 ⇒ 逐位零回归。
+  // v0.12.245：预览/HAL 域要把统计量 ÷ 域比再算黑白点（与 shader 的 uHalDomainMap 同一个数）
   updateFilmicEV(src_tex, still, p.auto_black_pt > 0.5f, p.auto_white_pt > 0.5f,
                  p.filmic_black_ev,
                  p.filmic_white_ev, p.white_hl, p.white_floor, p.white_probe,
