@@ -198,7 +198,7 @@ class BuiltinPresetsTest {
             98 to 0.0,
             5 to 0.1, 6 to 0.1, 7 to 0.1, 8 to 0.1, 9 to 0.1, 10 to 0.1,
         )
-        assertEquals("LUT = LUMIX Lab「杨子祯」33³（自带影调，0.12.250）", "ricoh_negative_ye", preset("builtin_ricoh_negative").lutId)
+        assertEquals("LUT = LUMIX Lab 导出 33³（自带影调，0.12.250；0.12.252 标题改「理光负片」）", "ricoh_negative_ye", preset("builtin_ricoh_negative").lutId)
         assertEquals("LUT 满强度（色彩全由 LUT 承担）", 1.0, preset("builtin_ricoh_negative").lutStrength, 0.0)
     }
 
@@ -238,7 +238,7 @@ class BuiltinPresetsTest {
             // 2026-10-25 徕卡一瞬一期重标：固件配方烘焙 LUT（tools/bake-m9-lut.py）
             "leica_m9_ccd" to "徕卡 M9 CCD",
             // 0.12.212：理光负片按官方样片重标（tools/bake-ricoh-lut.py，64³）
-            "ricoh_negative_ye" to "理光 负片 · 杨子祯",
+            "ricoh_negative_ye" to "理光负片",
             // 0.12.215：理光正片（GR III/IIIx 三代，同一脚本 --preset positive，64³）
             "ricoh_positive_v1" to "理光 正片 · 标定",
             // 0.12.216：富士NC（原版 Classic Negative LUT 去自带影调，tools/fix-fuji-nc-lut.py）
