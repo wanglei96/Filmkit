@@ -222,21 +222,27 @@ class CameraController(private val context: Context, private val render: RenderC
     /**
      * 场景高光分位（log2 相对中灰 0.1845，**测于提亮之前**）—— 高光保护判据（v0.10.110）。
      *
-     * 取引擎每帧写入的 `w999`（P99.9）。为什么不用 `wmax`：max 是单点，受坏点与孤立
-     * 点光源影响；P99.9 = 0.1% 像素，正是"高光会不会成片裁切"的量级。返回值 NaN 表示
-     * **无可用统计**（引擎未出帧 / 解析失败）⇒ 规划器不做高光保护，行为与历史一致。
+     * P99.9 = 0.1% 像素，正是"高光会不会成片裁切"的量级。返回值 NaN 表示**无可用
+     * 统计**（引擎未出帧 / 解析失败）⇒ 规划器不做高光保护。
+     *
+     * ★ 0.12.247：改用**当帧预览**（`pw999`，引擎已把 HAL 域 P99.9 除以在线标定的
+     * 域比换算到 RAW 等效域）。
+     * 为什么不能再用 `sw999`：那是**上一张成片**的统计，而相机不会拿上一张的曝光
+     * 去决定这一张（用户 2026-11-11 明确否决；旧注释里"无成片历史 ⇒ NaN ⇒ 不欠曝"
+     * 正是这个缺陷的自白 —— 会话第一张永远没有保护，场景一变就用错）。
+     * 为什么当帧预览可以用：域比 `g_domain_ratio` 是跨帧 EMA 标定的**域常数**
+     *（HAL/RAW 中位比），不是"上一张的场景亮度"，换算本身不引入跨张依赖。
      */
     private fun sceneHighlightEv(): Double = try {
         val s = EngineBridge.nativeEngineGetStats()
         if (s == null) {
             Double.NaN
         } else {
-            // v0.10.113：只认**成片链**的 P99.9（sw999，RAW 归一化域）。
-            // 原实现读的是 `w999`——那是"最后渲染过的那条链"的值，拍照前基本就是
-            // **预览链**（走 OES / ISP 已 tonemap），与 RAW 域**不是一个尺度**：同场景
-            // 实测预览 2.09 / 成片 2.674，差 0.58EV 且逐次不同 ⇒ 判据既不准也不稳
-            // （2026-10-03 真机教训）。无成片历史（会话第一张）⇒ NaN ⇒ 不欠曝。
-            val v = org.json.JSONObject(s).optDouble("sw999", 0.0)
+            val j = org.json.JSONObject(s)
+            val pv = j.optDouble("pw999", 0.0)
+            val st = j.optDouble("sw999", 0.0)
+            // 当帧预览优先；预览还没出帧（冷启动第一帧）才退回成片链的最后值。
+            val v = if (pv.isFinite() && pv > 0.0) pv else st
             if (v.isFinite() && v > 0.0) v else Double.NaN
         }
     } catch (_: Throwable) {
@@ -2419,7 +2425,18 @@ class CameraController(private val context: Context, private val render: RenderC
         //（多帧融合触发即自动走包围曝光；用户 2026-10-24 拍板）。旧 prefs 的
         // 2（融合档）归一为 1（P1 采集档随直通架构退役）。
         val hdrFusion = if (expPrefs.getInt("hdr_fusion", 1) >= 1) 1 else 0
-        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1 && !aeAutoOn && !bracketPref && hdrFusion <= 0
+        // ── 0.12.246：高光保护在 HDR+ 包围下**也必须生效** ──────────────────────
+        // 旧条件 `&& !aeAutoOn && !bracketPref && hdrFusion <= 0` 在出厂配置下恒假
+        //（ae_auto 默认 true、hdr_fusion 默认 1）⇒ 这条保护**从来没跑过**。真机
+        // 11-11 10:00 理光：RAW 的 P99 正好压在饱和白点（pHi=1.000），filmic 只能把
+        // 整片天空映射到 8bit 248-255，L* 85 以后 C* 从 15 断崖到 2（白块）。
+        // 两个旁路理由现在都不成立：
+        //   · `!aeAutoOn`（防"采集欠曝 + 渲染端再压"双重欠曝）——渲染端 AE 已在
+        //     0.12.71 全删，这一层不存在了；
+        //   · `hdrFusion<=0`（短帧自带余量）——短帧只有 −1.5EV，救不了 +2.4EV 的天空；
+        //     HDR+ 原文（§4）要求主曝光本身就是"刚好不烧高光"，短帧只补细节。
+        // 判据 = **当帧**预览的 P99.9（`pw999`，已换算到 RAW 等效域），不跨张。
+        val hlOn = expPrefs.getInt("hl_protect", 1) >= 1
         val hlSceneEv = if (hlOn) sceneHighlightEv() else Double.NaN
         // U-7：必须走 exposureEv()（含预设偏移）—— 这是"将要施加给成片的提亮"，漏掉预设
         // 那部分就会少算 EV，高光保护判据放行 → 成片高光裁切。

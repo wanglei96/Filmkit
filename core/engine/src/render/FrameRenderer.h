@@ -328,6 +328,14 @@ class FrameRenderer {
   // 预览值必然既不准也不稳（2026-10-03 真机教训）。判据只认这个成片域的值。
   float stillW999() const { return last_still_w999_; }
   float sceneW999() const { return last_w999_; }
+  /**
+   * **当帧**预览链的 P99.9，已换算到 RAW 归一化域（log2 相对中灰 0.1845，EV 前）。
+   * 高光保护（ExposurePlanner）必须用当帧的场景信息决定本次曝光 —— 相机里不存在
+   * "按上一张算"的做法（用户 2026-11-11 明确否决）。预览是 HAL OES 域，除以在线
+   * 标定的 `g_domain_ratio`（HAL/RAW 中位比，EMA 常数，不是场景假设）回到 RAW 域。
+   * 0 = 尚未出帧。
+   */
+  float previewW999Raw() const { return last_pv_w999_raw_; }
   float sceneWMax() const { return last_wmax_; }
   int highlightClipBlocks() const { return hr_blocks_; }
 
@@ -1487,6 +1495,7 @@ class FrameRenderer {
   // v0.10.28：wmax = 采样 max 判据值（上探主驱动）。
   float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
   float last_still_w999_ = 0.0f;   // 成片链最后一次的 P99.9（EV 前，RAW 归一化域）
+  float last_pv_w999_raw_ = 0.0f;  // 当帧预览链 P99.9（已 ÷ g_domain_ratio，RAW 等效域）
   // ── 自动曝光（v0.11.61）─────────────────────────────────────────────────
   // 本张 RAW 的 P50/P99.9 ⇒ 渲染端 EV（中灰锚定 + 高光约束，高光优先）。
   // 只在 submitRawBurst 的 still 链跑；预览/YUV 不走（域不同，见 AeMetering.h）。

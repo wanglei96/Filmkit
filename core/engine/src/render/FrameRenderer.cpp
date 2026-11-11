@@ -18828,8 +18828,20 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
   // v0.11.59：曝光判据（sw999）与 auto_tone **解耦**。高光保护读的就是它，而默认
   // [35]=0 ⇒ 此前恒 0 ⇒ sceneHighlightEv()=NaN ⇒ ExposurePlanner 永远不做高光约束，
   // 采集侧一直用 HAL AE 的曝光。这里只在 still 链写，预览域不碰（两者不是一个尺度）。
-  if (still && st.valid) {
-    last_still_w999_ = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+  // ── v0.12.247：预览也写一份**当帧** P99.9（换算到 RAW 域）──────────────────
+  // 高光保护（采集端 ExposurePlanner）在拍照**之前**就要拿到"这次场景有多亮"，
+  // 而它只可能来自当帧预览 —— 相机不会拿上一张的统计决定这一张的曝光（用户
+  // 2026-11-11 明确否决跨张做法）。旧实现只写 still 链 ⇒ 拍照前恒无统计 ⇒
+  // 高光保护要么不介入、要么被迫跨张。
+  // 预览是 HAL OES 域，÷ 在线标定的 HAL/RAW 中位比回到 RAW 等效域（该比值本身
+  // 是跨帧 EMA 标定的**域常数**，不是场景统计，与"按上一张算"是两件事）。
+  if (st.valid) {
+    if (still) {
+      last_still_w999_ = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
+    } else {
+      const float dom = std::max(g_domain_ratio, 1.0f);
+      last_pv_w999_raw_ = std::log2(std::max(st.p_hi999 / dom, 1e-6f) / kGrey);
+    }
   }
   // 0.12.228：`[35] auto_tone` 拆成 `[103] auto_black_pt` / `[102] auto_white_pt`
   // 两个**独立**开关（预设可携带；[35] 自 `toneStandard()` 恒 true 起已是死槽）。
