@@ -126,7 +126,7 @@ class CameraPresetPanelUiTest {
         val p = builtin("理光负片")
         assertEquals(13, p.slots.size)
         assertEquals(
-            "引擎插槽 filmic · 饱和度 · 暗部 +12 · 胶片曲线 · 肩部 红 0.10 · 饱和度 · 中间调 +8 · … · LUT ricoh_negative_v2 100",
+            "引擎插槽 filmic · 饱和度 · 暗部 +12 · 胶片曲线 · 肩部 红 0.10 · 饱和度 · 中间调 +8 · … · LUT ricoh_negative_ye 100",
             presetSummaryText(p),
         )
     }

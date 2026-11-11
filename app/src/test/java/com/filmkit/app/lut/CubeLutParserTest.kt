@@ -181,10 +181,10 @@ class CubeLutParserTest {
             val l = CubeLutParser.parseBinary(bytes, f.name)
             // 33³ 为主；两个自烘资产例外：
             //  - leica_m9_ccd 128³（0.12.93：色域压缩的陡斜率 64³ 装不下）
-            //  - ricoh_negative_v2 64³（0.12.212：色相映射平滑，64³ 足够且省内存）
+            //  - ricoh_negative_ye 33³（0.12.250：LUMIX Lab 导出，原尺寸 33 保留）
             val expectedSize = when (f.name) {
                 "leica_m9_ccd.lut" -> 128
-                "ricoh_negative_v2.lut", "ricoh_positive_v1.lut", "fuji_nc_v2.lut",
+                "ricoh_positive_v1.lut", "fuji_nc_v2.lut",
                 "kodak_5219_deep.lut" -> 64
                 else -> 33
             }

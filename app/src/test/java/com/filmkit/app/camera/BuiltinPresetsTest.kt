@@ -101,7 +101,7 @@ class BuiltinPresetsTest {
         val ricoh = preset("builtin_ricoh_negative")
         assertEquals("理光负片", ricoh.name)
         assertEquals("理光", ricoh.group)
-        assertEquals("ricoh_negative_v2", ricoh.lutId)
+        assertEquals("ricoh_negative_ye", ricoh.lutId)
 
         val bw = preset("builtin_leica_bw")
         assertEquals("徕卡黑白", bw.name)
@@ -198,7 +198,7 @@ class BuiltinPresetsTest {
             98 to 0.0,
             5 to 0.1, 6 to 0.1, 7 to 0.1, 8 to 0.1, 9 to 0.1, 10 to 0.1,
         )
-        assertEquals("LUT = 按样片重标的 ricoh_negative_v2", "ricoh_negative_v2", preset("builtin_ricoh_negative").lutId)
+        assertEquals("LUT = LUMIX Lab「杨子祯」33³（自带影调，0.12.250）", "ricoh_negative_ye", preset("builtin_ricoh_negative").lutId)
         assertEquals("LUT 满强度（色彩全由 LUT 承担）", 1.0, preset("builtin_ricoh_negative").lutStrength, 0.0)
     }
 
@@ -238,7 +238,7 @@ class BuiltinPresetsTest {
             // 2026-10-25 徕卡一瞬一期重标：固件配方烘焙 LUT（tools/bake-m9-lut.py）
             "leica_m9_ccd" to "徕卡 M9 CCD",
             // 0.12.212：理光负片按官方样片重标（tools/bake-ricoh-lut.py，64³）
-            "ricoh_negative_v2" to "理光 负片 · 标定",
+            "ricoh_negative_ye" to "理光 负片 · 杨子祯",
             // 0.12.215：理光正片（GR III/IIIx 三代，同一脚本 --preset positive，64³）
             "ricoh_positive_v1" to "理光 正片 · 标定",
             // 0.12.216：富士NC（原版 Classic Negative LUT 去自带影调，tools/fix-fuji-nc-lut.py）
@@ -254,7 +254,7 @@ class BuiltinPresetsTest {
         val expectedCategory = mapOf(
             "leica_m9" to "徕卡",
             "leica_m9_ccd" to "徕卡",
-            "ricoh_negative_v2" to "理光",
+            "ricoh_negative_ye" to "理光",
             "leica_b_w_hc" to "徕卡",
             "ricoh_positive_v1" to "理光",
             "fuji_nc_v2" to "富士",
@@ -273,7 +273,7 @@ class BuiltinPresetsTest {
             // 33³ 为主；leica_m9_ccd 是 128³ 资产（0.12.93：64³ 装不下色域压缩后的
             // 陡斜率，插值判据 20→87 LSB；128³ 回到 45 且高光色相正确，引擎 MAX_SIZE=128）
             assertEquals("$lutId 的 LUT_3D_SIZE",
-                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_negative_v2", "ricoh_positive_v1", "fuji_nc_v2", "kodak_5219_deep" -> 64; else -> 33 }, lut.size)
+                when (lutId) { "leica_m9_ccd" -> 128; "ricoh_positive_v1", "fuji_nc_v2", "kodak_5219_deep" -> 64; else -> 33 }, lut.size)
 
             val titleLen = bytes[1].toInt() and 0xFF
             val catLen = bytes[2 + titleLen].toInt() and 0xFF
