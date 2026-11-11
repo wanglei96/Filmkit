@@ -12762,7 +12762,68 @@ std::string FrameRenderer::profDump(GLuint fbo, GLuint tex, int w, int h) {
   return out;
 }
 
-// 0.12.165：D4 层大半径 USM —— 见 kFsUsm 头部。1/8 box 低频 + 相对增益。
+// 0.12.252（诊断）：顶部 20% 区域的"天空块"剖面 —— 一次拍摄定位白块落在哪一段。
+// 为什么需要：DNG 天空 RAW 线性 0.147（rawpy 渲染 L* 39.5，正常蓝天），而成片天空
+// L* 84.7 / G≥240 13.8%。用日志参数离线回放 filmic 只到 8bit 113-133，说明中间还有
+// 一段没归因的抬亮/去色 —— 直接把 D4 / filmic 输出 / 最终成片三处**同一区域**的
+// 均值、分位与通道分离度写进日志，一次拍摄即可分段。
+// 只读、不改管线；逐行（每 8 行）读、每 8 像素取一个样，读回量 ≈ 全图的 1/64。
+std::string FrameRenderer::skyProfile(GLuint fbo, GLuint tex, int w, int h, bool u8) {
+  std::string out;
+  if (fbo == 0 || tex == 0 || w <= 0 || h <= 0) return out;
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  const int y0 = h * 80 / 100;
+  std::vector<float> vr, vg, vb;
+  std::vector<uint16_t> row16(static_cast<size_t>(w) * 4);
+  std::vector<uint8_t> row8(static_cast<size_t>(w) * 4);
+  for (int y = y0; y < h; y += 8) {
+    if (u8) {
+      glReadPixels(0, y, w, 1, GL_RGBA, GL_UNSIGNED_BYTE, row8.data());
+      for (int x = 0; x < w; x += 8) {
+        const size_t o = static_cast<size_t>(x) * 4;
+        const float r = row8[o + 0] / 255.0f;
+        const float g = row8[o + 1] / 255.0f;
+        const float b = row8[o + 2] / 255.0f;
+        if (b < r) continue;  // 天空判据（与离线 sky.py 同口径）：蓝不弱于红
+        vr.push_back(r); vg.push_back(g); vb.push_back(b);
+      }
+    } else {
+      glReadPixels(0, y, w, 1, GL_RGBA, GL_HALF_FLOAT, row16.data());
+      for (int x = 0; x < w; x += 8) {
+        const size_t o = static_cast<size_t>(x) * 4;
+        const float r = halfToFloat(row16[o + 0]);
+        const float g = halfToFloat(row16[o + 1]);
+        const float b = halfToFloat(row16[o + 2]);
+        if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) continue;
+        if (b < r) continue;
+        vr.push_back(r); vg.push_back(g); vb.push_back(b);
+      }
+    }
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  const size_t n = vr.size();
+  if (n == 0) return "empty";
+  std::vector<float> lum(n);
+  double sr = 0.0, sg = 0.0, sb = 0.0, sep = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    sr += vr[i]; sg += vg[i]; sb += vb[i];
+    const float mx = std::max(vr[i], std::max(vg[i], vb[i]));
+    const float mn = std::min(vr[i], std::min(vg[i], vb[i]));
+    sep += mx - mn;
+    lum[i] = 0.2126f * vr[i] + 0.7152f * vg[i] + 0.0722f * vb[i];
+  }
+  const auto pct = [&](double q) {
+    const size_t k = static_cast<size_t>(q * static_cast<double>(n - 1));
+    std::nth_element(lum.begin(), lum.begin() + static_cast<long>(k), lum.end());
+    return static_cast<double>(lum[k]);
+  };
+  const double p50 = pct(0.50), p90 = pct(0.90), p99 = pct(0.99);
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "n=%zu|r=%.4f|g=%.4f|b=%.4f|p50=%.4f|p90=%.4f|p99=%.4f|sep=%.4f",
+                n, sr / n, sg / n, sb / n, p50, p90, p99, sep / n);
+  return std::string(buf);
+}
 bool FrameRenderer::passUsm(int w, int h, GLuint src) {
   dbg_usm_on_ = 0;
   if (w <= 0 || h <= 0 || src == 0 || prog_usm_ == 0 || prog_usm_down_ == 0)
@@ -15120,6 +15181,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 旧行为 `pe.exposure_ev += ae` 是自研的第二套 AE（补中灰/压高光），与 HAL 打架。
   const float ae = passAutoExposure(film_src, pe, c.short_sat);
   (void)ae;
+  // 0.12.252（诊断）：D4（CCM 后、曝光前）的天空剖面 —— 先钉住"进 filmic 之前"的亮度与色度
+  dbg_sky_d4_ = skyProfile(fbo_scene_, tex_scene_, dst_w, dst_h, false);
   // v0.11.91：teq 的"大面积高光"判据从"软约束是否主导"改为**绝对亮度**：
   // P95 必须真的亮到白点以上（>2.0EV），且 P99.5 不比它高太多（<1.5×，说明是
   // 平坦大面积而非孤立亮点）。旧判据在"室内窗景"上也会触发 −2.2EV，把窗外压成
@@ -15237,6 +15300,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
   // 在 glReadPixels **之前**（同一次 GL 提交里算完，省一次 flush）。
+  // 0.12.252（诊断）：filmic 输出与最终成片（闭环已收敛）的天空剖面 —— 与 d4 三段对拍
+  dbg_sky_fm_ = skyProfile(fbo_work_, tex_work_, dst_w, dst_h, false);
+  dbg_sky_out_ = c.ten_bit ? std::string()
+                           : skyProfile(fbo_cap_, tex_cap_, dst_w, dst_h, true);
   // 只在 8bit 档生成：10bit 档 tex_cap_ 是 GL_RGB10_A2，本 shader 按 sRGB 8bit 采样会错；
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
   if (!c.ten_bit) {
@@ -15439,6 +15506,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // "灰斑平台在哪一层"的唯一现场证据（10-29 的 143435/144543 两张全缺）。
   kv += ",\"d4Y\":\"" + dbg_prof_d4_ + "\"";
   kv += ",\"fmY\":\"" + dbg_prof_fm_ + "\"";
+  // 0.12.252（诊断）：顶部 20% 天空块的均值/分位/通道分离度（D4 → filmic 输出 → 成片）
+  kv += ",\"skyD4\":\"" + dbg_sky_d4_ + "\"";
+  kv += ",\"skyFm\":\"" + dbg_sky_fm_ + "\"";
+  kv += ",\"skyOut\":\"" + dbg_sky_out_ + "\"";
   kv += ",\"tone\":" + jnum(p.tone_strength, 3);
   kv += ",\"ev\":" + jnum(p.exposure_ev, 5);
   // v0.11.61 自动曝光（本张统计）：`aeEv` 是**追加**到 ev 上的量（实际生效 = ev + aeEv），

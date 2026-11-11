@@ -1216,6 +1216,10 @@ class FrameRenderer {
   std::string dbg_prof_d4_, dbg_prof_fm_;
   // 0.12.164：读回 4 条水平线 × 64 点、编码成 3 位 hex 的亮度剖面
   std::string profDump(GLuint fbo, GLuint tex, int w, int h);
+  // 0.12.252（诊断）：顶部 20% 区域的"天空"剖面 —— 定位高光白块落在哪一段。
+  // 只读不改管线；逐行（每 8 行）× 每 8 像素采样，按 b>=r 判天空。
+  std::string dbg_sky_d4_, dbg_sky_fm_, dbg_sky_out_;
+  std::string skyProfile(GLuint fbo, GLuint tex, int w, int h, bool u8);
   float dbg_cs_k_ = -1.f;                   // v0.10.198：下发的 FilmParams[59] 实际值
   // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
   GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F（最终输出）
