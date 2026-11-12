@@ -13236,7 +13236,9 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
                   (satmask_enabled_ && tex_satm_dst_ != 0) ? 1 : 0);
     if (u_pc3d_.down >= 0) glUniform1i(u_pc3d_.down, down);
     if (u_pc3d_.fullsize >= 0) glUniform2i(u_pc3d_.fullsize, dst_w, dst_h);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    // 0.13.17：PC3D 平滑趟 = 11×11 核全屏重读纹理（第二趟占 pc3dMs 大头），
+    // 单 draw 是长 job ⇒ 16 条条带化，让预览能在条带间插队；像素逐位不变。
+    drawStriped(16);
     glActiveTexture(GL_TEXTURE0);
   };
 
@@ -13262,7 +13264,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glUniform1i(u_pc3d_down_.resize, scale);
     glUniform1i(u_pc3d_down_.stride, stride);
     glUniform1f(u_pc3d_down_.sigma, blur / static_cast<float>(stride));
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped(16);
     glActiveTexture(GL_TEXTURE0);
     // 核尺寸也随缩放后的噪声模型（PC 的 ESD3DRun 重算 MSIZE）
     const double mp1 =
@@ -13289,7 +13291,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glUniform2i(u_pc3d_up_.low_size, lw, lh);
     glUniform2i(u_pc3d_up_.hi_size, dst_w, dst_h);
     glUniform1i(u_pc3d_up_.r, scale);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped(16);
     glActiveTexture(GL_TEXTURE0);
     dbg_pc3d_scale_ = scale;
   } else {
@@ -16048,7 +16050,8 @@ void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
                 frame_scale[2], frame_scale[3]);
   }
   if (u_mfnr_fuse_.sat_k >= 0) glUniform1f(u_mfnr_fuse_.sat_k, 0.98f);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 0.13.17：全屏单 draw 拆 16 条（默认空间域的主 job）。像素无依赖 ⇒ 逐位不变。
+  drawStriped(16);
 }
 
 // ── 降噪专项 A：DFT 逐频收缩合并（HDR+ §5 式 6/7）────────────────────────
@@ -16771,11 +16774,17 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 // 0.13.10：这里**不再**加 fence 窗口（试过 PC PassWindow 的 2 在飞，实测 p0Ms
 // 326→547，16 次同步往返白吃 ~220ms）。P0 整段才 300ms、每带 ~40ms，job 已经
 // 足够碎；真正的大 job 在 DFT（1.2~1.5s），那边才有 fence 窗口。
-void FrameRenderer::drawStriped() {
+//
+// 0.13.17：条带数参数化。0.13.16 默认切空间域后，**融合（passMfnrFuse）与 PC3D
+// 的全分辨率平滑趟**又变回单次全屏 draw（DFT 路径的拆块没覆盖它们）；两者都是
+// 重读纹理的 pass（4 帧 16 样本 / 11×11 核），pc3dMs 600ms 量级 ⇒ 一个 job 就是
+// 一两百毫秒，预览仍有零星掉帧。给它们 16 条（每条约 640 行 / 10~40ms）。
+// 像素结果逐位不变：gl_FragCoord 是窗口坐标，条带只改 viewport 的 y 偏移。
+void FrameRenderer::drawStriped(int strips) {
   GLint vp[4] = {0, 0, 0, 0};
   glGetIntegerv(GL_VIEWPORT, vp);
   const int w = vp[2], h = vp[3];
-  constexpr int kStrips = 8;
+  const int kStrips = std::max(strips, 1);
   if (w <= 0 || h < kStrips * 16) {   // 太小就不拆，免得 draw 开销反超
     glDrawArrays(GL_TRIANGLES, 0, 3);
     return;
