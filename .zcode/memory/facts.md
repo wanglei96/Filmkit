@@ -110,11 +110,11 @@ status: active
 ## LUT 换血与采集端判据（11-11）
 
 - [2026-11-11] **`ricoh_negative_ye.lut`**（33³、107846 B、title「理光 负片 · 杨子祯」）：由「理光负片 杨子祯(1).cube」逐字节转换，**自带影调**——灰阶 0.25→0.31 / 0.50→0.57 / 0.75→0.78。同场景天空 hue 260.8（旧的归一版 276.2、Filmix 263.2）。
-- [2026-11-11] **`nativeEngineGetStats` 新增 `pw999`**：当帧预览链 P99.9 ÷ `g_domain_ratio` 换算到 RAW 等效域。实测预览 1.03 vs 成片 2.91（低 1.88EV，因预览经 ISP tonemap）⇒ 只能当"有没有超白点"的粗判据。
-- [2026-11-11] **`hlOn` 语义修正**：条件只剩 `hl_protect >= 1`（原来还要求 `!ae_auto && !bracket && hdr_fusion<=0` ⇒ 出厂恒假、从未生效）。闭环补偿上限 `kDispAddMax = 0.60` EV（`FrameRenderer.cpp` 显示域闭环段）。
+- [2026-11-11] **采集端判据两处修正**：`nativeEngineGetStats` 新增 `pw999`（当帧预览链 P99.9 ÷ `g_domain_ratio` 换算到 RAW 等效域；实测预览 1.03 vs 成片 2.91，低 1.88EV 因 ISP tonemap ⇒ 只当"有没有超白点"的粗判据）；`hlOn` 条件只剩 `hl_protect >= 1`（原来还要求 `!ae_auto && !bracket && hdr_fusion<=0` ⇒ 出厂恒假、从未生效）。
 
 ## 天空闭环与诊断（11-12）
 
 - [2026-11-12] **预览 vs 成片的 filmic 输入中位**：`pvLastMid 0.1267 / stillMid 0.0276 = 4.59`（+2.2EV）⇒ vivo 的 YUV 去 gamma 后仍被 ISP tonemap；`ratio` 日志（`g_domain_ratio`）实测 2.0→4.59。**闭环护栏参数**：每步补 EV 后测成片顶部天空 P99（`skyProfile` u8），涨 >0.03（≈8 LSB）或 >0.88 就撤销该步；硬上限 `kDispAddMax 0.60`；`dispErr` 只记账不递归。
 - [2026-11-12] **诊断开关**：prefs `sky_diag`（默认 false）→ `nativeEngineSetSkyDiag` → `g_sky_diag`；控制 `skyD4/skyFm/skyOut/d4Y/fmY`，关闭时零额外读回；闭环护栏的 `skyP99` 不受控。工具 `tools/sky-diag.py` 读三段表。
-- [2026-11-12] **去马赛克调研（PC / Spektrafilm / 开源）**：PC 的 RAW 去马赛克**不是独立级**——MGC Spatial/Sabre 融合内置全分辨率绿重建 + VGN；源码 `RcdDemosaicAlgorithm.kt` **零引用**（死代码），AMaZE 只在 LibRaw（`dcraw_process.cpp:189` 的 quality=14），服务 `processDngNative` 的 DNG 文件路径；`RawLinearRcdPass` 只做 CCM+gain（命名误读，06 号文档已改）。Spektrafilm（rawpy）/SpektraLab（C++ libraw）都只是 LibRaw 调用方，**无自研 demosaic**；开源无成熟 GPU 高质量实现。我方 RCD 方向场是全分辨率、**从无画质 A/B**（RT 是 `tileSize²/2` + lpf 输入）；v0.5.29 记录 `dirMs 54ms` vs 现在 1202–1433ms，矛盾未解。详见 `docs/reports/raw-demosaic-benchmark-RESEARCH.md`。
+- [2026-11-12] **去马赛克调研（PC / Spektrafilm / 开源）**：PC 的 RAW 去马赛克**不是独立级**——MGC Spatial/Sabre 融合内置全分辨率绿重建 + VGN；源码 `RcdDemosaicAlgorithm.kt` **零引用**（死代码），AMaZE 只在 LibRaw（`dcraw_process.cpp:189` 的 quality=14），服务 `processDngNative` 的 DNG 文件路径；`RawLinearRcdPass` 只做 CCM+gain（命名误读，06 号文档已改）。Spektrafilm（rawpy）/SpektraLab（C++ libraw）都只是 LibRaw 调用方，**无自研 demosaic**；开源无成熟 GPU 高质量实现。我方 RCD 方向场是全分辨率、**从无画质 A/B**（RT 是 `tileSize²/2` + lpf 输入）；v0.5.29 的 `dirMs 54ms` 与现在 0.13.5 实测的 65–85ms 同量级——旧的 1202–1433ms 是「HR+P0+P1」合计（计时口径错）。详见 `docs/reports/raw-demosaic-benchmark-RESEARCH.md`。
+- [2026-11-12] **成片链真实耗时剖面（0.13.5 冷机 3 张，4080×3072 4 帧 MFNR+HDR，同场景支架固定）**：`fuseMs`(DFT) 1299–1374、`preMs`(HR+P0) 945–1160（HR 236–284 / P0 660–925）、`dnMs`(P4+PC3D+D1) 687–945、`dirMs`(RCD P1) **65–85**（GPU 48–66）、`gMs`(P2) 14–28、`passMs` 3063–3472、`totalMs` 5417–5904、快门→落盘 6.5–7.5s、编码 ~500ms。**RCD 不是热点**，热点是 DFT / P0 / P4。

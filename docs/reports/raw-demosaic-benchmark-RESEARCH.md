@@ -84,21 +84,34 @@ grep -rn "RcdDemosaicAlgorithm" app/src/main --include=*.kt | grep -v "class Rcd
 
 即决策目标是「算一次给 P2/P3 复用」，**没有讨论过分辨率**；首次实现（`965d298`）就是全分辨率，**没有过半分辨率版本，也就没有过画质 A/B**。
 
-### 4.3 未解矛盾：`dirMs` 54ms（v0.5.29）vs 1200–1560ms（现在）
+### 4.3 已解：`dirMs` 的 54ms → 1200ms 不是退化，是**计时口径**把 HR+P0 算进去了
 
-- `e0b9712` 提交信息：「On-device A/B (12MP X300): RCD 1969ms vs bilinear 359ms, gMs=1414ms dominant」，优化后 `dirMs=54ms`。
-- 2026-11-12 同场景实测：`dirMs` 1202 / 1376 / 1433（波动 30%），`gMs` 18–22ms。
-- 当前 shader 相比 v0.5.29 只多 `lpf`（9 taps）与 `uMos` 分支，不足以解释 20×。
-- 推测方向（未验证）：当时的 `dirMs` 口径/尺寸与现在不同，或受 GPU 频率/热状态影响。**在解释清楚之前，任何"改半分辨率能省 X ms"的估计都不可靠。**
+0.13.5（2026-11-12）把 `d0` 挪到 P1 提交前（起点 `glFinish`）并加 `EXT_disjoint_timer_query`，
+冷机支架同场景 3 张（16:50:47 / 16:51:13 / 16:51:40）：
+
+| preMs（HR+P0） | dirMs（P1 净墙钟） | dirGpuMs（P1 GPU） | gMs（P2） | gGpuMs |
+|---|---|---|---|---|
+| 945 / 1002 / 1160 | 65 / 70 / 85 | 48 / 65 / 66 | 14 / 22 / 28 | 6 / 9 / 9 |
+
+- **P1 方向场真身只有 65~85ms（GPU 48~66ms）**，与 v0.5.29 记录的 54ms 同量级 ⇒ 从来没有退化过。
+- 旧的 `dirMs`（909~1486ms）实际是 **HR 高光重建 + P0 RAW bilateral + P1** 的合计；`d0` 打在
+  HR/P0 之前，`d1` 打在 P1 的 `glFinish` 之后。
+- 结论：**RCD 不是性能热点**。改半分辨率方向场最多省 ~50ms，不值得动质量管线。
+- 真正的热点（同场景）：`fuseMs`（DFT）1299~1374ms、`preMs`（HR+P0）945~1160ms、
+  `dnMs`（P4/PC3D/D1）687~945ms、编码 ~500ms。
 
 ---
 
-## 5. 下一步（按顺序）
+## 5. 结论与下一步（2026-11-12 修正）
 
-1. **坐实基线**：冷机（Thermal Status 0）、支架固定、同场景，拍 3 张，记录 `dirMs/fuseMs/dnMs/passMs/totalMs` 与温度。
-2. **`rcd_dir_half` 开关 A/B**（默认关）：方向场 1/2 分辨率 + `lpf` 输入（即 RT 结构）。
-3. **三方对比**：现状 / RT 结构 / AMaZE（LibRaw 离线），用 `tools/rcd-linecompare*.py` 比边缘细节与伪彩，而不是目视。
-4. 数据出来再决定是否默认开、是否延伸改其他 pass。
+**不做 RCD 半分辨率改造**：P1 净耗时 65~85ms，省 50ms 不值得冒画质风险。
+
+下一步按真实热点重排：
+1. **拆分 `preMs`**：HR（`hlMs` 236~284ms）之外，P0 占 660~925ms —— 单列 `p0Ms` 确认。
+2. **DFT 融合 1.3s**：先去「每次现场编译 compute shader」（`passMfnrFft` 里 `compileShader + linkProgram`，已知待办），再评估算法侧。
+3. **P4/PC3D/D1 降噪 687~945ms**：与 PC 的 1340ms 同量级，不是弱项，但占总额可观。
+4. 编码 ~500ms：stb 单线程；换 libjpeg-turbo 4:4:4 可省 300ms（新增依赖，待拍板）。
+5. 预览卡顿：需「帧到达 vs 渲染完成」诊断区分 HAL 与 GPU 占用。
 
 ---
 
