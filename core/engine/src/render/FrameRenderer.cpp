@@ -15268,39 +15268,23 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       return robustMidToneDisplayRgba8(px.data(), rw, rh, rw * 4);
     };
     still_disp_mid_ = readStillMid();
-    // ── 阻尼 + 最多 2 次迭代（v0.12.235）──────────────────────────────────
-    // 闭环增益实测不是 1：`ev_shift` 让白点跟着 exposure_ev 一起平移，加 EV 的显示域
-    // 效果被放大（真机 15:42:29：`dispAdd` 1.18 产生 ~2.08 EV 的效果 ⇒ `dispErr` −0.9
-    // 过冲）。全量步进会振荡 ⇒ 0.7 阻尼 + 最多两轮。两轮后残差进 `dispErr`，不再递归。
-    for (int iter = 0; iter < 2 && still_disp_mid_ > 0.0f; ++iter) {
+    // ── v0.12.254：**不再给成片补 EV**，把差反馈给「预览的域比」──────────────
+    // 真机 11-12 09:19：成片 `dispMid 0.087` vs 取景器 `aeDispP50 0.158` ⇒ 差 0.86 EV。
+    // 旧实现用「成片 +EV 重跑」把差抹平，代价是把天空推白（11-12 08:57 那张
+    // `dispAdd 0.60` ⇒ 天空 8bit 230+/L* 90）。这条路走不通：成片与预览的差是
+    // **域/曲线差**，不是曝光差；PC（`RawEngineTonePass.render()`）也从不对成片补 EV。
+    // 正确方向：让**预览**回到成片的度量上 —— 成片比预览暗 d EV，说明预览把场景
+    // 渲染亮了，`g_domain_ratio`（HAL 域/RAW 域之比）偏小，按 2^d 的方向放大它。
+    // 0.5 阻尼逐步收敛（一次拍摄一步），取景器随之下沉到与成片一致的位置。
+    // 成片本身一次成像，不再受闭环影响 —— 天空亮度只由曝光与目标曲线决定。
+    if (still_disp_mid_ > 0.01f && g_pv_disp_p50 > 0.005f) {
       const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
-      // 死区 0.10 EV：低于此视为统计噪声，不动（避免成片亮度随预览抖动）。
-      if (std::fabs(d) <= 0.10f) break;
-      float step = d * 0.7f;
-      // ── v0.12.253：±0.60 → ±0.15，**只修小误差** ─────────────────────────
-      // 真机 11-12 08:57（逆光建筑+天空）：`dispMid 0.139` vs 预览 `aeDispP50 0.152`
-      // 只差 0.12 EV，但闭环一轮就补满 0.60（首轮读数 0.084，差 0.86 EV）。成片亮 0.6 EV
-      // ⇒ 天空从 8bit 211 推到 230+，正是用户看到的"白块"。
-      // 差距的根子不在曝光：成片白点 3.74 vs 预览 3.14（差 0.60 EV），两条链的白点
-      // 估计不通用（预览 HAL YUV / 成片 RAW），闭环把"白点差"当成"曝光差"，用全局 EV
-      // 去补 —— 与 11-11 否决的"全局压 EV 修局部问题"是同一类错误的反向版本。
-      // PC 的做法（对比实证）：RawEngineTonePass.render() 单次渲染，曝光一次定死，
-      // 没有事后测中灰再补 EV 的环；WYSIWYG 靠预览与成片共用同一曝光与引擎参数。
-      // 所以这里把闭环降级为"小误差修正"：0.15 EV 只吸收统计噪声与亚像素级差，
-      // 更大的偏差留给 `dispErr` 记账（诊断用），不再拿高光去填。
-      constexpr float kDispAddMax = 0.15f;
-      const float room = kDispAddMax - std::fabs(disp_add_);
-      if (room <= 0.02f) break;
-      if (std::fabs(step) > room) step = std::copysign(room, step);
-      pe.exposure_ev += step;
-      disp_add_ += step;
-      passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
-      passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
-      still_disp_mid_ = readStillMid();
+      if (std::fabs(d) > 0.05f) {
+        g_domain_ratio =
+            std::clamp(g_domain_ratio * std::exp2(d * 0.5f), 1.2f, 8.0f);
+      }
+      disp_close_ev_ = d;
     }
-    disp_close_ev_ = (still_disp_mid_ > 0.0f)
-                         ? std::log2(g_pv_disp_p50 / still_disp_mid_)
-                         : disp_close_ev_;
   }
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
@@ -19161,8 +19145,12 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   // 语义 —— 它在 HR 小波（:8457）与日志节流（:8558）处的含义才是"是否静拍"。
   if (!hal_domain) {
     if (g_pv_mid_ema > 1e-4f && last_lin_mid_ > 1e-6f) {
-      const float r = std::clamp(g_pv_mid_ema / last_lin_mid_, 1.2f, 4.5f);
-      g_domain_ratio = g_domain_ratio * 0.7f + r * 0.3f;
+      // 0.12.254：这里是**粗**校准（HAL 域/RAW 域线性中位比，受 AE/构图抖动影响），
+      // 权重从 0.3 降到 0.1 —— 主导权交给成片后的显示域校准（submitStill 里的
+      // `dispMid` vs `aeDispP50`，同一把尺量两张图）。clamp 上限同步放到 8.0：
+      // 11-04 实测真实比值有 6.71 的帧，旧上限 4.5 会把它截断、让预览持续偏亮。
+      const float r = std::clamp(g_pv_mid_ema / last_lin_mid_, 1.2f, 8.0f);
+      g_domain_ratio = g_domain_ratio * 0.9f + r * 0.1f;
     }
   } else {
     g_pv_mid_ema = g_pv_mid_ema > 1e-4f ? g_pv_mid_ema * 0.7f + last_lin_mid_ * 0.3f
