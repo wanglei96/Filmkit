@@ -1,12 +1,17 @@
 #include "EglCore.h"
 
 #include <android/log.h>
+#include <cstring>
 
 namespace filmkit {
 
 namespace {
 constexpr const char* kTag = "filmkit";
-}
+// EGL_IMG_context_priority（未进 EGL 1.5 头文件，按扩展原文数值）
+constexpr EGLint kContextPriorityLevelImg = 0x3100;
+constexpr EGLint kContextPriorityLowImg = 0x3103;
+constexpr const char* kContextPriorityExt = "EGL_IMG_context_priority";
+}  // namespace
 
 bool EglCore::ensureDisplay() {
   if (display_ != EGL_NO_DISPLAY) return true;
@@ -21,7 +26,7 @@ bool EglCore::ensureDisplay() {
   return true;
 }
 
-bool EglCore::init() {
+bool EglCore::init(bool background) {
   if (!ensureDisplay()) return false;
   if (context_ != EGL_NO_CONTEXT) return true;  // 幂等
 
@@ -43,8 +48,23 @@ bool EglCore::init() {
   config_ = cfg;
 
   // client version 3 → 驱动返回其支持的 ES 3.x（3.0/3.1/3.2）
-  const EGLint ctx_attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-  context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, ctx_attrs);
+  const char* exts = eglQueryString(display_, EGL_EXTENSIONS);
+  priority_ext_ = exts != nullptr && std::strstr(exts, kContextPriorityExt);
+  context_ = EGL_NO_CONTEXT;
+  if (background && priority_ext_) {
+    // PC GlesGpuScheduler.createBackgroundContext 同款：拍照链在低优先级 context
+    // 里跑，GPU 调度器才肯让预览插队（0.13.8 只加条带没加这个，冻结只降 17ms）。
+    const EGLint pri_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3, kContextPriorityLevelImg,
+        kContextPriorityLowImg,       EGL_NONE};
+    context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, pri_attrs);
+    low_priority_ = context_ != EGL_NO_CONTEXT;
+    if (!low_priority_) eglGetError();  // 清掉失败码，回退普通上下文
+  }
+  if (context_ == EGL_NO_CONTEXT) {
+    const EGLint ctx_attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, ctx_attrs);
+  }
   if (context_ == EGL_NO_CONTEXT) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "eglCreateContext 失败");
     return false;

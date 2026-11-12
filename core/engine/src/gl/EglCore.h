@@ -9,8 +9,12 @@ namespace filmkit {
 class EglCore {
  public:
   // 初始化 display/context（幂等）；share 传入可共享上下文（M1 用不到，预留）。
-  bool init();
+  // background=true：请求 EGL_IMG_context_priority 低优先级上下文（拍照链专用），
+  // 让预览 context 在 GPU 调度上插队；扩展不支持/创建失败时静默回退普通上下文。
+  bool init(bool background = false);
   void release();
+  bool lowPriorityContext() const { return low_priority_; }
+  bool contextPriorityExt() const { return priority_ext_; }
 
   EGLSurface createWindowSurface(void* anative_window);
   EGLSurface createPbufferSurface(int w, int h);
@@ -25,6 +29,8 @@ class EglCore {
   EGLContext context_ = EGL_NO_CONTEXT;
   EGLConfig config_ = nullptr;
   EGLSurface pbuffer_ = EGL_NO_SURFACE;
+  bool priority_ext_ = false;   // EGL_IMG_context_priority 扩展可用
+  bool low_priority_ = false;   // 本 context 实际以 LOW 优先级创建
 };
 
 }  // namespace filmkit

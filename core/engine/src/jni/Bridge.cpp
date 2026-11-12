@@ -470,7 +470,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStop(JNIEnv*, jobject) {
 // —— 重建会丢掉 LUT/程序，且与本函数"只 start 不 stop"的生命周期约定一致。
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
-  if (!stillEgl().init()) return JNI_FALSE;
+  if (!stillEgl().init(true)) return JNI_FALSE;
   if (g_still_surface == EGL_NO_SURFACE) {
     g_still_surface = stillEgl().createPbufferSurface(1, 1);
   }
@@ -494,11 +494,17 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
     g_renderer_still.load()->setMeterManual(g_meter_manual.load());
     g_renderer_still.load()->setMeterFocusPoint(g_meter_focus_x.load(),
                                                 g_meter_focus_y.load());
-    Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
-                           "{\"fresh\":true}");
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "engine.still_start",
+        std::string("{\"fresh\":true,\"eglLow\":") +
+            (stillEgl().lowPriorityContext() ? "1" : "0") + ",\"eglPriExt\":" +
+            (stillEgl().contextPriorityExt() ? "1" : "0") + "}");
   } else {
-    Logger::instance().log(LogLevel::kInfo, "engine", "engine.still_start",
-                           "{\"fresh\":false}");
+    Logger::instance().log(
+        LogLevel::kInfo, "engine", "engine.still_start",
+        std::string("{\"fresh\":false,\"eglLow\":") +
+            (stillEgl().lowPriorityContext() ? "1" : "0") + ",\"eglPriExt\":" +
+            (stillEgl().contextPriorityExt() ? "1" : "0") + "}");
   }
   return JNI_TRUE;
 }

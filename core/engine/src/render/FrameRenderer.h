@@ -1370,6 +1370,10 @@ class FrameRenderer {
   // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
   // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
   GLuint prog_mfnr_fft_sum_ = 0;  // 相位组求和 pass(fragment,init 创建)
+  // 0.13.11：DFT compute program 惰性缓存（首张创建、之后复用）。0.13.6 埋的
+  // `mfnr.fft.compile_ms` 实测热路径只要 0.4~6ms，但冷启动/缓存失效时出现过 779ms
+  // （20:12:20 真机）—— 每张照片现场 compile+link 让这个尖峰随时可能复发。
+  GLuint prog_mfnr_fft_ = 0;
   // 0.13.6 性能诊断：DFT compute program 的现场编译耗时（每次拍照都 compile+link）
   float dbg_fft_cms_ = 0.f;
   int burst_w_ = 0, burst_h_ = 0;  // 输出纹理尺寸标记(输入直接用 4 张 2D)

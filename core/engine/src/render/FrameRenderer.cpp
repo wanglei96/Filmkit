@@ -3860,7 +3860,8 @@ layout(rgba16f, binding = 1) writeonly uniform highp image2D uOut1;
 layout(rgba16f, binding = 2) writeonly uniform highp image2D uOut2;
 layout(rgba16f, binding = 3) writeonly uniform highp image2D uOut3;
 uniform int uLayer;  // 本 dispatch 的输出层 = gy*2+gx（组内 tile 互不重叠）
-uniform int uRows;   // 本组 tile 行数（plane 并入 y 维：wgRow = wg.y % uRows）
+uniform int uRows;   // 本 dispatch 的 tile 行数（plane 并入 y 维：wgRow = wg.y % uRows）
+uniform int uRowStart;  // 本 dispatch 在组内的起始 tile 行（按行块拆 dispatch）
 uniform ivec2 uSize;      // mosaic 尺寸
 uniform ivec2 uOffTiles;  // 位移场网格（对齐 tile 128 mosaic px）
 uniform int uTxMax;       // 平面 tile x 上限（ceil(pw/8)-1；ty 同理由 dispatch 保证）
@@ -4045,7 +4046,7 @@ void main() {
     // plane 并入 y 维（z 恒 1 = spike 真机口径；v0.10.40/41 的 gl_WorkGroupID.z
     // 疑似被驱动放弃——实为 0.10.41 的 image 格式错配，双保险都做）
     int plane = int(wg.y) / uRows;
-    int wgRow = int(wg.y) % uRows;
+    int wgRow = int(wg.y) % uRows + uRowStart;
     int ox = plane & 1;
     int oy = plane >> 1;
     // 本 workgroup 的两个水平相邻同组 tile。组 gx 的 host 列举是
@@ -10135,6 +10136,8 @@ void FrameRenderer::release() {
   if (prog_nn_pack_) glDeleteProgram(prog_nn_pack_);
   if (prog_nn_unpack_) glDeleteProgram(prog_nn_unpack_);
   if (prog_mfnr_fft_sum_) glDeleteProgram(prog_mfnr_fft_sum_);
+  if (prog_mfnr_fft_) glDeleteProgram(prog_mfnr_fft_);
+  prog_mfnr_fft_ = 0;
   // 0.12.133（方案 B 块 3）：短帧真值图 + inpaint 目标
   if (prog_mfnr_sv_) glDeleteProgram(prog_mfnr_sv_);
   if (prog_hl_inp_) glDeleteProgram(prog_hl_inp_);
@@ -16476,35 +16479,35 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     pa[p] = plane_a[ch];
     pb[p] = plane_b[ch];
   }
-  // ── compute program 现场创建、用完删除（v0.10.49 起；**事后判定为无关变量**）
-  // 0.10.48 曾据"现场创建的 spike 成功、init 创建的微测试失败"推断 init 创建的
-  // program 写入丢失，0.10.49 改为现场创建——0.10.49 真机 store_check
-  //（micro:false + sum:0 + spikeOk:true）证伪该推断：现场创建的微测试同样失败。
-  // 真变量是输出纹理的创建方式（glTexStorage2D，见 ensureMfnrFftTargets）。
-  // 现场创建暂留（一次只动一个变量），验收通过后可回退到 init 创建省 CPU 编译。
+  // ── compute program：惰性创建一次、之后复用（0.13.11）────────────────────
+  // 0.10.49 起为了"一次只动一个变量"保留现场创建；真变量早已定案是输出纹理必须
+  // glTexStorage2D（见 ensureMfnrFftTargets），与 program 创建时机无关。现场
+  // 创建的热路径成本只有 0.4~6ms，但冷启动/驱动缓存失效时出现过 779ms
+  //（20:12:20 真机）—— 缓存后这个尖峰不会再落到某张照片的等待里。
   const auto t_fft_c0 = std::chrono::steady_clock::now();
-  const GLuint cs_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
-  GLuint prog_fft = 0;
-  if (cs_fft) {
-    prog_fft = glCreateProgram();
-    glAttachShader(prog_fft, cs_fft);
-    glLinkProgram(prog_fft);
-    GLint linked = 0;
-    glGetProgramiv(prog_fft, GL_LINK_STATUS, &linked);
-    if (!linked) {
-      char buf[512];
-      glGetProgramInfoLog(prog_fft, sizeof(buf), nullptr, buf);
-      Logger::instance().log(
-          LogLevel::kError, "engine", "mfnr.fft.link_fail",
-          "{\"log\":\"" + jsonEscape(buf) + "\"}");
-      glDeleteProgram(prog_fft);
-      prog_fft = 0;
+  GLuint prog_fft = prog_mfnr_fft_;
+  if (prog_fft == 0) {
+    const GLuint cs_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
+    if (cs_fft) {
+      prog_fft = glCreateProgram();
+      glAttachShader(prog_fft, cs_fft);
+      glLinkProgram(prog_fft);
+      GLint linked = 0;
+      glGetProgramiv(prog_fft, GL_LINK_STATUS, &linked);
+      if (!linked) {
+        char buf[512];
+        glGetProgramInfoLog(prog_fft, sizeof(buf), nullptr, buf);
+        Logger::instance().log(
+            LogLevel::kError, "engine", "mfnr.fft.link_fail",
+            "{\"log\":\"" + jsonEscape(buf) + "\"}");
+        glDeleteProgram(prog_fft);
+        prog_fft = 0;
+      }
     }
+    if (cs_fft) glDeleteShader(cs_fft);
+    prog_mfnr_fft_ = prog_fft;
   }
-  if (cs_fft) glDeleteShader(cs_fft);
-  // 0.13.6 诊断：现场编译 + 链接的耗时（单独一条日志，便于判断是否值得改成
-  // init 缓存 —— 两处历史注释对"init 创建的 compute program 是否可靠"说法相反，
-  // 先量成本再决定，不拿注释当依据）。
+  // 0.13.6 诊断：编译 + 链接耗时（缓存命中时为 0）
   dbg_fft_cms_ = std::chrono::duration<float, std::milli>(
                      std::chrono::steady_clock::now() - t_fft_c0).count();
   Logger::instance().log(LogLevel::kInfo, "engine", "mfnr.fft.compile_ms",
@@ -16587,6 +16590,21 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     glBindImageTexture(g, tex_fft_out_[g], 0, GL_FALSE, 0, GL_WRITE_ONLY,
                        GL_RGBA16F);
   }
+  // 0.13.10 卡顿：每个相位组再按 tile 行拆 kFftRowBlocks 块，在飞限 2（PC
+  // GlesGpuScheduler.PassWindow 同款）。DFT 单项 1.2~1.5s，是快门后画面冻结的
+  // 最大来源：原实现一个 dispatch = 1/4 全图 ≈ 300ms 的 GPU job，预览只能等它
+  // 跑完（实测冻结 218~264ms 与单 dispatch 时长吻合）。拆块后单 job ≤ 1/16 全图，
+  // 预览插队粒度同步缩小；吞吐不变（GPU 本来就串行），代价只是每块一次 fence。
+  // 同组 tile 行互不覆盖（ty 由 wgRow 唯一决定），拆块像素等价。
+  constexpr int kFftRowBlocks = 2;
+  GLsync fft_sync[2] = {nullptr, nullptr};
+  int fft_pending = 0;
+  const auto fft_retire = [&](int idx) {
+    if (fft_sync[idx] == nullptr) return;
+    glClientWaitSync(fft_sync[idx], GL_SYNC_FLUSH_COMMANDS_BIT, 200'000'000);
+    glDeleteSync(fft_sync[idx]);
+    fft_sync[idx] = nullptr;
+  };
   for (int g = 0; g < 4; ++g) {
     const int gx = g & 1, gy = g >> 1;
     // 组内 tile：tx ≡ 2gx−1 (mod 2)，x ∈ [-1, tx_max]；每 workgroup 2 tile
@@ -16600,11 +16618,26 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     }
     glUniform2i(uni("uGroup"), gx, gy);
     glUniform1i(uni("uLayer"), gy * 2 + gx);
-    glUniform1i(uni("uRows"), m);
     // plane 并入 y 维（z 恒 1 = spike 真机口径）：wg.y / uRows = plane
-    glDispatchCompute((n + 1) / 2, m * 4, 1);
+    const int blockRows = std::max(1, (m + kFftRowBlocks - 1) / kFftRowBlocks);
+    for (int row0 = 0; row0 < m; row0 += blockRows) {
+      const int rows = std::min(blockRows, m - row0);
+      glUniform1i(uni("uRows"), rows);
+      glUniform1i(uni("uRowStart"), row0);
+      glDispatchCompute((n + 1) / 2, rows * 4, 1);
+      glFlush();
+      fft_sync[fft_pending] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (fft_sync[fft_pending] != nullptr) ++fft_pending;
+      if (fft_pending == 2) {
+        fft_retire(0);
+        fft_sync[0] = fft_sync[1];
+        fft_sync[1] = nullptr;
+        fft_pending = 1;
+      }
+    }
     // 层间无写竞争（各写各层），无需组间 barrier
   }
+  for (int i = 0; i < fft_pending; ++i) fft_retire(i);
   // 末组写入要被**收口 pass 的纹理采样**与 **neff 的 framebuffer 读回**看到
   // —— TEXTURE_FETCH / FRAMEBUFFER barrier（ALL_BARRIER_BITS 一次覆盖；
   // v0.10.38 只下 SHADER_IMAGE_ACCESS 时收口读全 0 的教训保留）。
@@ -16640,7 +16673,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
       Logger::instance().log(
           LogLevel::kError, "engine", "mfnr.fft.store_lost",
           "{\"fuseMs\":" + jnum(gpu_ms, 8) + "}");
-      glDeleteProgram(prog_fft);
+      // program 已是缓存成员：这里只回退，不删除（0.13.11）
       *out_neff = 0.f;
       return false;  // 调用方回退 mismatch 路径
     }
@@ -16671,7 +16704,6 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   out_ms[1] = ms(t_dsp, t_rb);
   out_ms[2] = ms(t_rb, t_end);
   out_ms[3] = gpu_ms;
-  glDeleteProgram(prog_fft);
   return true;
 }
 
@@ -16735,6 +16767,10 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 // 每条 glFlush，把 job 边界变密，让预览能在条带之间被调度。
 // 只用于"当前 viewport 就是整屏输出"的 pass。gl_FragCoord 是窗口坐标，条带化不改变
 // 任何像素结果（这些 pass 像素之间无依赖）。
+//
+// 0.13.10：这里**不再**加 fence 窗口（试过 PC PassWindow 的 2 在飞，实测 p0Ms
+// 326→547，16 次同步往返白吃 ~220ms）。P0 整段才 300ms、每带 ~40ms，job 已经
+// 足够碎；真正的大 job 在 DFT（1.2~1.5s），那边才有 fence 窗口。
 void FrameRenderer::drawStriped() {
   GLint vp[4] = {0, 0, 0, 0};
   glGetIntegerv(GL_VIEWPORT, vp);
@@ -17669,10 +17705,19 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     const auto readL = [&](GLuint fbo, int ww, int hh,
                            std::vector<uint8_t>* dst) {
       glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-      std::vector<uint8_t> rgba(static_cast<size_t>(ww) * hh * 4);
-      glReadPixels(0, 0, ww, hh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
       dst->resize(static_cast<size_t>(ww) * hh);
-      for (size_t k = 0; k < dst->size(); ++k) (*dst)[k] = rgba[k * 4];
+      // 0.13.11：只读 R 通道。金字塔图是灰度（R=G=B），原来按 RGBA 读 4× 数据
+      //（1/2 域每帧 12.5MB），传输量占 alignRbMs 的大头。GL_RED 不被驱动接受时
+      // 回退整块 RGBA 再抽 R —— 像素结果逐位不变。
+      while (glGetError() != GL_NO_ERROR) {
+      }
+      glReadPixels(0, 0, ww, hh, GL_RED, GL_UNSIGNED_BYTE, dst->data());
+      if (glGetError() != GL_NO_ERROR) {
+        std::vector<uint8_t> rgba(static_cast<size_t>(ww) * hh * 4);
+        glReadPixels(0, 0, ww, hh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        for (size_t k = 0; k < dst->size(); ++k) (*dst)[k] = rgba[k * 4];
+      }
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
     };
     const auto rb0 = std::chrono::steady_clock::now();
     // align_l1 = false（prefs align_l1，A/B 开关）时不读 1/2 域：l1 为空 →
