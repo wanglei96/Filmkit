@@ -15,7 +15,7 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
 
-**进行中**：**性能优化专项**（下一项）→ **Spektrafilm 引擎 + 预设标定**（用户 11-12 定序）；理光目标曲线待用新 LUT 重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
+**进行中**：**性能优化专项**（11-12 起，已拆出真实热点：DFT 1.2~1.5s / P0 300~350ms / P4 0.5~1.1s，RCD 仅 65~85ms；编码换 libjpeg 后 8.0s→6.2~7.3s）→ **Spektrafilm 引擎 + 预设标定**（用户 11-12 定序）；理光目标曲线待用新 LUT 重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
 
 ## 里程碑沿革（压缩）
 - [2026-09-18→30] **M0–M2 + 域映射 + MFNR + 亚像素**：YUV/RAW 双链、RCD 12MP 477ms、LSC 接去马赛克后 CCM 前、M4 display 域 LUT；EV 单一来源与 WYSIWYG 定稿；MFNR 4 帧 Bayer 域对齐（残余 4.4×/2.2×→1.22×/1.45×）；P0 亚像素 +43.7%/+46.5%、快门间隔 2.5s→0.54s
@@ -49,4 +49,4 @@ status: active
 
 - [2026-11-12] **白块真因是显示域闭环**：成片中灰比取景器低 0.86EV（首轮读数 0.084 vs 0.152），闭环一轮补满 0.60EV，把 D4 天空（+1.28EV）推到 8bit 230+/L* 90。改法 = **当帧补 EV + 天空 P99 护栏**（涨 >0.03 或 >0.88 撤销该步），逆光场景宁留 `dispErr` 也不推白。
 - [2026-11-12] **vivo 预览被 ISP tonemap 4.59×**（`pvLastMid/stillMid`，+2.2EV）：PC 的"YUV 即场景线性 + 单位阵还原"假设在 X300 不成立；域比只影响预览、不跨场景复用。
-- [2026-11-12] **0.13.0(708) 发版**（tag `v0.13.0`）：诊断开关 `sky_diag` 默认关 + 关于页版本号；Spektrafilm 定为 **slot=2 引擎**（场景线性输入）。
+- [2026-11-12] **0.13.0(708) 发版**（tag `v0.13.0`）：诊断开关 `sky_diag` 默认关 + 关于页版本号；Spektrafilm 定为 **slot=2 引擎**。 性能专项首轮（0.13.1→0.13.9）见下：修正 `dirMs` 口径（原含 HR+P0）⇒ RCD 65~85ms 不是热点、DFT 1.2~1.5s 才是；编码换 libjpeg-turbo（复用 libultrahdr 的 `jpeg-static`）492→190~290ms；闭环读回 1/2→1/3；对齐 CPU 多线程；新增 `preview_arrive_gap` 与 `tools/preview-stall.py`，把体感卡顿量化为快门后 4×218~264ms 冻结。同场景快门→落盘 8.03/8.10s → 6.15~7.27s。
