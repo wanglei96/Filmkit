@@ -7920,6 +7920,9 @@ int cfaLutOf(int cfa) {
 //   · 任何一步失败（program 缺失、FBO 不完整、GL 错误、读回全零）⇒ 静默跳过，
 //     只写一条 diag.stats_fail，成片链一像素不改。
 std::atomic<bool> g_diag_stats{true};
+// 0.12.258：重读回类诊断（天空剖面 skyD4/skyFm/skyOut、d4Y/fmY 亮度剖面）的开关。
+// 这些诊断每张成片要做 200+ 次逐行 glReadPixels（~100-200ms），只在排查时开。
+std::atomic<bool> g_sky_diag{false};
 // gainmap 数学版本（0 = PC / 1 = 官方）。**进程级**而非实例级：预览与拍照是两个
 // FrameRenderer 实例，设置页改一次要两边同时生效（否则 A/B 会混进"实例不同"这个变量）。
 std::atomic<int> g_gainmap_math{0};   // 0 = PC 版（offset 1e-4），默认
@@ -7931,6 +7934,7 @@ bool g_diag_chain = false;  // 仅成片链（finishStillChain）内为 true
 int g_diag_seq = 0;         // 本帧序号（日志配对用）
 
 inline bool diagOn() { return g_diag_stats.load(std::memory_order_relaxed); }
+inline bool skyDiagOn() { return g_sky_diag.load(std::memory_order_relaxed); }
 
 // 归约网格与采样密度：块数 = 12288（块间近似独立 ⇒ 均值的有效样本数 ≈ 块数），
 // 采样点 = 786432 ≈ 全图的 6.3%（4080×3072）。规则网格采样对低频统计量近似无偏，
@@ -10825,6 +10829,7 @@ float FrameRenderer::passAutoExposure(GLuint src, const FilmParams& p,
 }
 
 void FrameRenderer::setDiagStats(bool on) { g_diag_stats.store(on); }
+void FrameRenderer::setSkyDiag(bool on) { g_sky_diag.store(on); }
 
 void FrameRenderer::setNnInferFn(NnInferFn fn) { nn_infer_slot() = fn; }
 
@@ -14803,7 +14808,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                  std::chrono::steady_clock::now() - d3).count();
     // 诊断统计 D4（CCM 后 / P4 前，场景线性）
     diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
-    dbg_prof_d4_ = profDump(fbo_scene_, tex_scene_, dst_w, dst_h);   // 0.12.164 诊断
+    if (skyDiagOn()) dbg_prof_d4_ = profDump(fbo_scene_, tex_scene_, dst_w, dst_h);  // 0.12.164 诊断
     // ── HDR 融合 P2（0.12.78）：侧帧前链 + zero/侧帧 Mertens 融合 ────────
     // 位置 = D4 之后、P4/PC3D/defringe 之前（设计 §4.3：融合后的整图再统一
     // 降噪/伪彩处理）。ponytail: 逐像素加权（接缝风险已知，P3 pyramid 解决）。
@@ -15194,7 +15199,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const float ae = passAutoExposure(film_src, pe, c.short_sat);
   (void)ae;
   // 0.12.252（诊断）：D4（CCM 后、曝光前）的天空剖面 —— 先钉住"进 filmic 之前"的亮度与色度
-  dbg_sky_d4_ = skyProfile(fbo_scene_, tex_scene_, dst_w, dst_h, false);
+  if (skyDiagOn()) dbg_sky_d4_ = skyProfile(fbo_scene_, tex_scene_, dst_w, dst_h, false);
   // v0.11.91：teq 的"大面积高光"判据从"软约束是否主导"改为**绝对亮度**：
   // P95 必须真的亮到白点以上（>2.0EV），且 P99.5 不比它高太多（<1.5×，说明是
   // 平坦大面积而非孤立亮点）。旧判据在"室内窗景"上也会触发 −2.2EV，把窗外压成
@@ -15228,7 +15233,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   if (p.d4_usm > 0.5f && passUsm(dst_w, dst_h, film_src)) film_in = tex_usm_;
   const GLuint teq_src = applyToneEq(dst_w, dst_h, film_in, hl_dominant);
   passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
-  dbg_prof_fm_ = profDump(fbo_work_, tex_work_, dst_w, dst_h);   // 0.12.164 诊断
+  if (skyDiagOn()) dbg_prof_fm_ = profDump(fbo_work_, tex_work_, dst_w, dst_h);  // 0.12.164 诊断
   const auto t2 = std::chrono::steady_clock::now();
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
   // 放在 t2 之后，passMs 不受统计耗时污染。
@@ -15331,9 +15336,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
   // 在 glReadPixels **之前**（同一次 GL 提交里算完，省一次 flush）。
   // 0.12.252（诊断）：filmic 输出与最终成片（闭环已收敛）的天空剖面 —— 与 d4 三段对拍
-  dbg_sky_fm_ = skyProfile(fbo_work_, tex_work_, dst_w, dst_h, false);
-  dbg_sky_out_ = c.ten_bit ? std::string()
-                           : skyProfile(fbo_cap_, tex_cap_, dst_w, dst_h, true);
+  if (skyDiagOn()) {
+    dbg_sky_fm_ = skyProfile(fbo_work_, tex_work_, dst_w, dst_h, false);
+    dbg_sky_out_ = c.ten_bit ? std::string()
+                             : skyProfile(fbo_cap_, tex_cap_, dst_w, dst_h, true);
+  }
   // 只在 8bit 档生成：10bit 档 tex_cap_ 是 GL_RGB10_A2，本 shader 按 sRGB 8bit 采样会错；
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
   if (!c.ten_bit) {

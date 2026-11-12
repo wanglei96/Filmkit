@@ -2150,6 +2150,13 @@ class CameraController(private val context: Context, private val render: RenderC
                 context.getSharedPreferences("filmkit", 0).getBoolean("diag_stats", true),
             )
         }
+        // 0.12.258：重读回类诊断（天空/亮度剖面）。**默认关** —— 开一次成片多 200 次
+        // 逐行读回；排查"天空白块/影调分布"时才在 设置 → 实验与诊断 里打开。
+        runCatching {
+            EngineBridge.nativeEngineSetSkyDiag(
+                context.getSharedPreferences("filmkit", 0).getBoolean("sky_diag", false),
+            )
+        }
         // M4：切镜头/重进相机后 EGL 上下文已重建（引擎纹理被释放），重传当前 3D LUT
         currentLut?.let { render.setLut(it) }
         orientationListener.enable() // 设备方向 → orientationStep（成片旋转 + 对焦区域映射）

@@ -58,6 +58,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmkit.app.EngineBridge
+import com.filmkit.app.FilmKitApp
 import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
@@ -325,6 +326,12 @@ fun SettingsScreen(
             SectionHeader("关于")
             Text(
                 "FilmKit 胶片相机 · M3 开发中 · vivo X300 专项适配",
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(bottom = 2.dp),
+            )
+            Text(
+                "版本 ${FilmKitApp.VERSION}",
                 color = FilmTheme.CreamDim,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(bottom = 24.dp),
@@ -1015,6 +1022,22 @@ private fun LowLightDrawerContent() {
 private fun LabDrawerContent() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("filmkit", 0) }
+
+    // 0.12.258：重读回类诊断（默认关）。开 = 每张成片多读回顶部 20% 天空剖面
+    // （skyD4/skyFm/skyOut）与 4 条亮度剖面（d4Y/fmY），约 200 次逐行 glReadPixels；
+    // 关 = 全链零额外读回。闭环的高光护栏不受它影响（那是功能读数）。
+    var skyDiag by remember { mutableStateOf(prefs.getBoolean("sky_diag", false)) }
+    SettingSwitchRow(
+        title = "天空 / 亮度剖面诊断",
+        subtitle = if (skyDiag) "开：每张成片额外读回天空与亮度剖面（~100-200ms）" else "关：默认，零额外读回",
+        checked = skyDiag,
+        onChecked = { on ->
+            skyDiag = on
+            prefs.edit().putBoolean("sky_diag", on).apply()
+            // 改完立即生效，不必重进相机界面（native 侧走 atomic）
+            runCatching { EngineBridge.nativeEngineSetSkyDiag(on) }
+        },
+    )
 
     // 10bit HEIF 交付链能力探针（实现卡 A0；方案 docs/rec2020-heif-design.md §4.1）：
     // 点一次 = 枚举 HEVC 编码器能力 → CPU 造已知测试图 → MediaCodec HEVC Main10 编 1 帧 →

@@ -267,6 +267,16 @@ object EngineBridge {
     external fun nativeEngineSetDiagStats(on: Boolean)
 
     /**
+     * 0.12.258：**重读回**类诊断开关（prefs `sky_diag`，**默认关**）。
+     *
+     * 开：每张成片额外读回顶部 20% 天空剖面（`skyD4`/`skyFm`/`skyOut`）与 4 条亮度剖面
+     * （`d4Y`/`fmY`），约 200 次逐行 glReadPixels（实测 100~200ms，拍照链本来 5~8s）。
+     * 关：全链零额外读回 —— 这是默认状态，排查白块/影调分布时才开。
+     * 闭环的高光护栏（`skyP99`）不归这个开关管：那是功能读数，不是诊断。
+     */
+    external fun nativeEngineSetSkyDiag(on: Boolean)
+
+    /**
      * 3D LUT（M4）：display 域 LUT，引擎把它接在输出 OETF 之后（kFsOut/kFsHist，四面体插值）。
      * data = RGB 交错、顺序与 .cube 一致（红最快），长度 size³×3；size ≤ 1 或 data = null = 关闭。
      * 可在任意线程调用（引擎内暂存，渲染线程上传纹理）；强度走 FilmParams[34]。

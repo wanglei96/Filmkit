@@ -138,6 +138,9 @@ class FrameRenderer {
   // 读回失败且破坏了渲染状态（成片全黑），已彻底删除。
   // 关闭时全链零额外开销（每个统计点一次 relaxed atomic load）。任意线程可调。
   static void setDiagStats(bool on);
+  // 0.12.258：重读回类诊断开关（天空剖面 / 亮度剖面），默认关；只影响日志字段，
+  // 不影响闭环护栏（护栏的 skyP99 是功能读数，不归诊断开关管）。
+  static void setSkyDiag(bool on);
   // gainmap 数学版本（v0.11.50）：0 = PC 版（offset 1e-4）/ 1 = libultrahdr 官方版
   // （offset 1e-7 + 暗部钳位）。供真机 A/B —— 离线对比用的是近似 SDR（Reinhard），
   // 结论只在"两版相对行为"上成立，绝对效果必须真机实测。

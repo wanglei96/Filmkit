@@ -653,6 +653,15 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSetDiagStats(JNIEnv*, jobject,
   FrameRenderer::setDiagStats(on == JNI_TRUE);
 }
 
+// 0.12.258：重读回类诊断开关（prefs `sky_diag`，默认关）。开 = 每张成片额外读回
+// 顶部 20% 天空剖面（skyD4/skyFm/skyOut）与 4 条亮度剖面（d4Y/fmY），约 200 次
+// 逐行 glReadPixels；关 = 全链零额外读回。闭环护栏的 skyP99 不走这个开关。
+extern "C" JNIEXPORT void JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEngineSetSkyDiag(JNIEnv*, jobject,
+                                                         jboolean on) {
+  FrameRenderer::setSkyDiag(on == JNI_TRUE);
+}
+
 // M4：3D LUT（display 域）。data = RGB 交错（.cube 顺序，红最快），长度 size³×3；
 // size ≤ 1 或 data 为空 = 关闭。任意线程可调（引擎内部暂存，渲染线程上传纹理）。
 // v0.10.85：同时写入进程级快照并下发到预览 / 拍照两个实例 —— 拍照侧实例可能
