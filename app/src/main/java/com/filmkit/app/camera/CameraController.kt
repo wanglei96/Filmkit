@@ -2745,9 +2745,48 @@ class CameraController(private val context: Context, private val render: RenderC
             buf.position(0)
             burstBuffers[slot] = buf
             burstStrides[slot] = p.rowStride / 2
+            // 0.13.14 调试：把每帧 RAW 原样落盘（.raw + .meta），供 T3 离线 A/B。
+            // 帧 1-3 的 Image 在 processRawBurst 前已 close，只能在拷贝点存 buffer。
+            dumpBurstFrame(slot, buf, img.width, img.height, p.rowStride / 2)
         } finally {
             if (close) runCatching { img.close() }
         }
+    }
+
+    /** 见 copyRaw：burst_dump 哨兵存在时，异步把该帧写进 files/burst/。 */
+    private fun dumpBurstFrame(
+        slot: Int,
+        buf: java.nio.ByteBuffer,
+        w: Int,
+        h: Int,
+        stridePx: Int,
+    ) {
+        val root = context.getExternalFilesDir(null) ?: return
+        if (!File(root, "burst_dump").exists()) return
+        val dir = File(root, "burst").apply { mkdirs() }
+        val copy = ByteArray(buf.capacity())
+        runCatching {
+            val dup = buf.duplicate()
+            dup.position(0)
+            dup.get(copy)
+        }.onFailure { return }
+        Thread {
+            try {
+                File(dir, "f$slot.raw").outputStream().use { it.write(copy) }
+                File(dir, "f$slot.meta").writeText(
+                    "{\"slot\":$slot,\"w\":$w,\"h\":$h,\"stridePx\":$stridePx}",
+                )
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "camera", "dng.burst_raw_dumped",
+                    kv("slot" to slot, "bytes" to copy.size),
+                )
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "camera", "dng.burst_raw_failed",
+                    kv("slot" to slot, "error" to (t.message ?: t.toString())),
+                )
+            }
+        }.start()
     }
 
     private fun onBurstTimeout() {
@@ -3887,6 +3926,25 @@ class CameraController(private val context: Context, private val render: RenderC
             ),
         )
         logRawMeta(dngImg, dngResult, meta)
+        // 0.13.11 调试：burst_dump 打开时把 4 帧原样各存一份 DNG（_f0.._f3）。
+        // 用途 = T3（空间域融合替换 DFT）的离线 A/B：现有 DNG 只是参考帧，单帧
+        // 验证不了 4 帧融合；有真实 burst 才能在 Mac 上跑对照实现。默认关（4×25MB）。
+        // 0.13.13：release 包不可 run-as，prefs 改不了 ⇒ 再加一个外部文件哨兵
+        //（files/burst_dump，adb touch 即可），两种开关任一生效。
+        val burstDump = prefs.getBoolean("burst_dump", false) ||
+            java.io.File(context.getExternalFilesDir(null), "burst_dump").exists()
+        if (burstDump && ch != null) {
+            images.forEachIndexed { i, im ->
+                try {
+                    saveDng(im, results[i], ch, "_f$i")
+                } catch (t: Throwable) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_ERROR, "camera", "dng.burst_dump_failed",
+                        kv("frame" to i, "error" to (t.message ?: t.toString())),
+                    )
+                }
+            }
+        }
         if (dngOn && ch != null) {
             try {
                 saveDng(dngImg, dngResult, ch)
@@ -4038,7 +4096,12 @@ class CameraController(private val context: Context, private val render: RenderC
         //（HDR+ 式 6/7），false 走 mismatch 加权融合（并联 A/B 口径）
         // 2026-10-22：默认改为 true —— 频域合并的细节明显优于空域（真机实拍对比），
         // 代价是亮部噪声略高；按"质量优先"取细节。设置页仍可关掉做 A/B。
-        val useDft = prefs.getBoolean("mfnr_dft", true)
+        // 0.13.16：默认改回空间域（mismatch + fuse）。0.13.15 真机 A/B 两场景
+        //（明亮 ISO 1163 / 暗光 ISO 662）实测：空间域快 1.8~2.8s、暗部噪声更低
+        //（1.71 vs 2.08 LSB）、100% 裁剪无可见细节差。DFT 保留为设置页开关。
+        // 0.13.15 的哨兵（files/mfnr_spatial）仍然反向可用：touch 它 = 强制 DFT。
+        val useDft = prefs.getBoolean("mfnr_dft", false) ||
+            File(context.getExternalFilesDir(null), "mfnr_spatial").exists()
         // D-2 对齐精度 A/B（2026-09-30）：prefs align_l1 = true 时最细对齐层用
         // 1/2 域（新，需 readback 1/2 域），false 退回 1/4 域旧路径
         val alignL1 = prefs.getBoolean("align_l1", true)
@@ -4522,6 +4585,7 @@ class CameraController(private val context: Context, private val render: RenderC
         img: Image,
         result: TotalCaptureResult,
         ch: CameraCharacteristics,
+        suffix: String = "",
     ) {
         val creator = android.hardware.camera2.DngCreator(ch, result)
         // DNG 存的是**传感器原始方向**的像素（DngCreator 不旋转），所以方向必须由 EXIF 标签表达，
@@ -4538,7 +4602,7 @@ class CameraController(private val context: Context, private val render: RenderC
             },
         )
         val now = Date()
-        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}.dng"
+        val name = "FILMKIT_${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(now)}$suffix.dng"
         if (Build.VERSION.SDK_INT >= 29) {
             val cv = android.content.ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name)

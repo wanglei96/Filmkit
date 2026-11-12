@@ -1085,10 +1085,11 @@ private fun LabDrawerContent() {
     // 结论按"质量优先"取细节：**保留开启**。上一版本注释曾写"净损失、别开"，
     // 那个判断只量了噪声、没量细节，是片面的，此处更正。
     // 若某场景噪声难以接受，可临时关掉它做对照。
-    var mfnrDft by remember { mutableStateOf(prefs.getBoolean("mfnr_dft", true)) }
+    var mfnrDft by remember { mutableStateOf(prefs.getBoolean("mfnr_dft", false)) }
     SettingSwitchRow(
-        title = "频域合并（实验）",
-        subtitle = "HDR+ 式 DFT 逐频收缩（16×16 tile 半重叠，暗光 σ 更优）；关 = mismatch 加权融合",
+        title = "频域合并（DFT）",
+        subtitle = "默认关 = mismatch 加权融合（0.13.15 A/B：快 1.8~2.8s、暗部 σ 更低）；" +
+            "开 = HDR+ 式 DFT 逐频收缩",
         checked = mfnrDft,
         onChecked = { v ->
             mfnrDft = v

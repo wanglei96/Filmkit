@@ -115,6 +115,10 @@ object StillRenderClient {
     /** 取（必要时创建）拍照线程的 handler。 */
     private fun handlerOrStart(): Handler? {
         if (handler == null) {
+            // 0.13.11：线程优先级回到默认。0.13.10 降到 BACKGROUND（照 PC
+            // lowerCurrentThreadPriority）后，GPU 段已由 still context 的 LOW 优先级
+            // 让路，但 CPU 段（对齐/编码/打包）也被 UI 抢占 —— 实测 totalMs 多
+            // 700~1200ms。预览本来就只吃一点 CPU，BACKGROUND 是重复让路。
             val t = HandlerThread("FilmStill").apply { start() }
             handler = Handler(t.looper)
         }
