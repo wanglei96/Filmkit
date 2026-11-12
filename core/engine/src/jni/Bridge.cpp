@@ -397,7 +397,9 @@ Java_com_filmkit_app_EngineBridge_nativeRunFftSpike(JNIEnv* env, jobject, jint w
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeEngineStart(JNIEnv* env, jobject,
                                                     jobject surface) {
-  if (!engineEgl().init()) return JNI_FALSE;
+  // 0.13.18：预览 context 请求 HIGH（EGL_IMG_context_priority）；不支持/失败回退
+  // 默认 MEDIUM —— 与 still 的 LOW 形成两侧优先级差，拍照处理期间预览 job 先跑。
+  if (!engineEgl().init(/*background=*/false, /*high=*/true)) return JNI_FALSE;
 
   if (g_renderer == nullptr) {
     g_renderer = new FrameRenderer();

@@ -9,6 +9,7 @@ namespace {
 constexpr const char* kTag = "filmkit";
 // EGL_IMG_context_priority（未进 EGL 1.5 头文件，按扩展原文数值）
 constexpr EGLint kContextPriorityLevelImg = 0x3100;
+constexpr EGLint kContextPriorityHighImg = 0x3101;
 constexpr EGLint kContextPriorityLowImg = 0x3103;
 constexpr const char* kContextPriorityExt = "EGL_IMG_context_priority";
 }  // namespace
@@ -26,7 +27,7 @@ bool EglCore::ensureDisplay() {
   return true;
 }
 
-bool EglCore::init(bool background) {
+bool EglCore::init(bool background, bool high) {
   if (!ensureDisplay()) return false;
   if (context_ != EGL_NO_CONTEXT) return true;  // 幂等
 
@@ -51,15 +52,19 @@ bool EglCore::init(bool background) {
   const char* exts = eglQueryString(display_, EGL_EXTENSIONS);
   priority_ext_ = exts != nullptr && std::strstr(exts, kContextPriorityExt);
   context_ = EGL_NO_CONTEXT;
-  if (background && priority_ext_) {
+  if ((background || high) && priority_ext_) {
     // PC GlesGpuScheduler.createBackgroundContext 同款：拍照链在低优先级 context
     // 里跑，GPU 调度器才肯让预览插队（0.13.8 只加条带没加这个，冻结只降 17ms）。
+    // 0.13.18：预览 context 显式 HIGH —— still 处理 3~4s 期间 GPU 常满，MEDIUM
+    // 对 LOW 的让路粒度仍不够（真机 fps 30→24~27）；HIGH 让预览的 job 排在
+    // still 的条带边界前面。创建失败静默回退普通上下文（与 LOW 同处理）。
     const EGLint pri_attrs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 3, kContextPriorityLevelImg,
-        kContextPriorityLowImg,       EGL_NONE};
+        high ? kContextPriorityHighImg : kContextPriorityLowImg, EGL_NONE};
     context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, pri_attrs);
-    low_priority_ = context_ != EGL_NO_CONTEXT;
-    if (!low_priority_) eglGetError();  // 清掉失败码，回退普通上下文
+    low_priority_ = (context_ != EGL_NO_CONTEXT) && background;
+    high_priority_ = (context_ != EGL_NO_CONTEXT) && high;
+    if (context_ == EGL_NO_CONTEXT) eglGetError();  // 清掉失败码，回退普通上下文
   }
   if (context_ == EGL_NO_CONTEXT) {
     const EGLint ctx_attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "../log/GpuTimer.h"
@@ -44,6 +45,31 @@ extern const char* kFsSigmoidDef;
 extern const char* kFsSigmoidMain;
 
 namespace {
+
+// 0.13.18：CPU 段按行并行（与 Align.cpp 的 parallelRows 同款口径）。
+// 只用于"每行只写自己的输出、行间无共享写"的循环 ⇒ 结果与串行逐位一致。
+// satmask 的 12.5M 像素主循环是拍照后 CPU 段的固定大块；串行时仍线程单核占满
+// 数百 ms，预览线程在调度上分不到时间（真机拍照后 30→24~27fps）。
+template <typename Fn>
+void parallelRows(int n, Fn fn) {
+  const unsigned hc = std::thread::hardware_concurrency();
+  const int workers = static_cast<int>(std::min<unsigned>(hc > 0 ? hc : 1, 8));
+  if (workers <= 1 || n < 8) {
+    fn(0, n);
+    return;
+  }
+  const int nw = std::min(workers, n);
+  const int chunk = (n + nw - 1) / nw;
+  std::vector<std::thread> ts;
+  ts.reserve(static_cast<size_t>(nw));
+  for (int w = 0; w < nw; ++w) {
+    const int b = w * chunk;
+    const int e = std::min(n, b + chunk);
+    if (b >= e) break;
+    ts.emplace_back(fn, b, e);
+  }
+  for (auto& t : ts) t.join();
+}
 
 // E4-3 颗粒：成片种子的**内容指纹**（FNV-1a 采样）。目的 = 成片的颗粒图案"同一张可
 // 复现、不同张不同"（darktable 用文件名 hash 达到同一目的）。
@@ -12169,20 +12195,22 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   (void)nc;
   size_t sat_hits = 0;
   for (size_t i = 0; i < n; ++i) sat_hits += sat[i] ? 1 : 0;   // 0.12.192 诊断
-  // 1px 膨胀（吸收 MFNR 对齐残差）
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      uint8_t m = 0;
-      for (int dy = -1; dy <= 1 && !m; ++dy) {
-        for (int dx = -1; dx <= 1 && !m; ++dx) {
-          const int yy = y + dy, xx = x + dx;
-          if (yy < 0 || xx < 0 || yy >= h || xx >= w) continue;
-          m = sat[static_cast<size_t>(yy) * w + xx];
+  // 1px 膨胀（吸收 MFNR 对齐残差）。0.13.18：按行并行（每行只写自己的 dil）。
+  parallelRows(h, [&](int y0, int y1) {
+    for (int y = y0; y < y1; ++y) {
+      for (int x = 0; x < w; ++x) {
+        uint8_t m = 0;
+        for (int dy = -1; dy <= 1 && !m; ++dy) {
+          for (int dx = -1; dx <= 1 && !m; ++dx) {
+            const int yy = y + dy, xx = x + dx;
+            if (yy < 0 || xx < 0 || yy >= h || xx >= w) continue;
+            m = sat[static_cast<size_t>(yy) * w + xx];
+          }
         }
+        dil[static_cast<size_t>(y) * w + x] = m;
       }
-      dil[static_cast<size_t>(y) * w + x] = m;
     }
-  }
+  });
   // 2×2 聚合：块内任一（膨胀后）饱和 ⇒ 四个 photosite 一起标记
   size_t hit = 0;
   for (int y = 0; y < h; y += 2) {
@@ -12233,21 +12261,24 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   }
   {
     std::vector<uint8_t> dm(static_cast<size_t>(Wd) * Hd * 4, 0);
-    for (int y = 0; y < Hd; ++y) {
-      for (int x = 0; x < Wd; ++x) {
-        const float cx = (static_cast<float>(x) + 0.5f) / Wd - 0.5f;
-        const float cy = (static_cast<float>(y) + 0.5f) / Hd - 0.5f;
-        float rx, ry;
-        if (rot == 1) { rx = -cy; ry = cx; }
-        else if (rot == 2) { rx = -cx; ry = -cy; }
-        else if (rot == 3) { rx = cy; ry = -cx; }
-        else { rx = cx; ry = cy; }
-        const int sx = std::min(std::max(static_cast<int>((rx + 0.5f) * w), 0), w - 1);
-        const int sy = std::min(std::max(static_cast<int>((ry + 0.5f) * h), 0), h - 1);
-        dm[(static_cast<size_t>(y) * Wd + x) * 4] =
-            out[(static_cast<size_t>(sy) * w + sx) * 4];
+    // 0.13.18：转置同样按行并行（12.5M 次随机读，串行是老 build 里的隐形大头）。
+    parallelRows(Hd, [&](int y0, int y1) {
+      for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < Wd; ++x) {
+          const float cx = (static_cast<float>(x) + 0.5f) / Wd - 0.5f;
+          const float cy = (static_cast<float>(y) + 0.5f) / Hd - 0.5f;
+          float rx, ry;
+          if (rot == 1) { rx = -cy; ry = cx; }
+          else if (rot == 2) { rx = -cx; ry = -cy; }
+          else if (rot == 3) { rx = cy; ry = -cx; }
+          else { rx = cx; ry = cy; }
+          const int sx = std::min(std::max(static_cast<int>((rx + 0.5f) * w), 0), w - 1);
+          const int sy = std::min(std::max(static_cast<int>((ry + 0.5f) * h), 0), h - 1);
+          dm[(static_cast<size_t>(y) * Wd + x) * 4] =
+              out[(static_cast<size_t>(sy) * w + sx) * 4];
+        }
       }
-    }
+    });
     glBindTexture(GL_TEXTURE_2D, tex_satm_dst_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, Wd, Hd, GL_RGBA, GL_UNSIGNED_BYTE,
                     dm.data());
@@ -12650,7 +12681,8 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
   // 参考场尺寸（手写双线性需要；点采样 + 硬件 LINEAR 在 Mali RGBA16F 上不可靠）
   glUniform2f(u_hl_apply_.refsize, static_cast<float>(rw32), static_cast<float>(rh32));
   glUniform2f(u_hl_apply_.ref2size, static_cast<float>(rw128), static_cast<float>(rh128));
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 0.13.18：全屏 apply 条带化（hlMs 228~255ms 的主要长 job）。
+  drawStriped(16);
 
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -12743,7 +12775,7 @@ bool FrameRenderer::passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tm
     glUniform1f(u_cs_.side_k, 0.5f);    // min(两侧) < 0.5×中心（排除真实色度边缘）
     glUniform1f(u_cs_.peak_k, 1.05f);    // 中心 > 1.05×max(两侧)（"局部色度峰"，实测最优）
     glUniform1f(u_cs_.chroma_min, 0.12f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped(16);   // 0.13.18：4 尺度全屏色度平滑，单 job 长
     in = last ? cs_out_tex : (to_tmp ? tex_cs_ : tex_cs_tmp_);
   }
   glActiveTexture(GL_TEXTURE0);
@@ -12952,7 +12984,7 @@ bool FrameRenderer::passColorMedian(int dst_w, int dst_h, GLuint src) {
     glUniform1i(u_cm_.tex, 0);
     glUniform2i(u_cm_.size, dst_w, dst_h);
     glUniform1f(u_cm_.chroma_min, 0.12f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped(16);   // 0.13.18：全屏 3×3 色差中值（两趟）
     in = last ? tex_cm_ : tex_cm_tmp_;
   }
   glActiveTexture(GL_TEXTURE0);
@@ -13334,7 +13366,8 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   glBindTexture(GL_TEXTURE_2D, df_src_);
   glUniform1i(u_df_down_.tex, 0);
   glUniform2i(u_df_down_.size, dst_w, dst_h);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // 0.13.18：defringe 各趟条带化（替换档下 defringe 是 dnMs 的剩余大头）。
+  drawStriped(16);
   // ② 11×11 box 局部基线 + chroma（门已乘入）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_det_);
   glViewport(0, 0, hw, hh);
@@ -13342,7 +13375,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   glBindTexture(GL_TEXTURE_2D, tex_df_lab_);
   glUniform1i(u_df_det_.src, 0);
   glUniform2i(u_df_det_.half, hw, hh);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);   // 0.13.18：半分辨率 11×11 核，单个 job 也不小
   // ③ chroma 均值网格 + CPU 读回（RGBA16F + GL_FLOAT 组合 X300 已验证）
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_df_avg_);
   glViewport(0, 0, aw, ah);
@@ -13395,7 +13428,7 @@ bool FrameRenderer::passDefringe(int dst_w, int dst_h, float df_gate, GLuint src
   // 梯度下限：gL = |∇L|·255（线性域）。全图 P90 = 4.97、P99 = 55.8；
   // 强紫边 P10 = 6.75。取 5.0：高于全图 P90（排除平坦区），覆盖紫边主体。
   glUniform1f(u_df_apply_.grad_min, 5.0f);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -13480,7 +13513,7 @@ bool FrameRenderer::passCaCorrect(int dst_w, int dst_h, float strength) {
   glUniform1f(u_ca_corr_.kr, kr_s);
   glUniform1f(u_ca_corr_.kb, kb_s);
   glUniform1f(u_ca_corr_.maxshift, kCaMaxShift);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);   // 0.13.18：全分辨率重采样，单 job 78~113ms
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -13836,7 +13869,7 @@ void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) 
   glUniform2i(u_ccm_.size, dst_w, dst_h);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
   glUniformMatrix3fv(u_ccm_.ccm, 1, GL_TRUE, ccm);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);   // 0.13.18：全屏 CCM（ccmMs 120~189ms），拆条带让预览插队
 }
 
 // ── HDR 曝光融合 P2（0.12.77）──────────────────────────────────────────
@@ -16232,7 +16265,7 @@ GLuint FrameRenderer::applyToneEq(int w, int h, GLuint src, bool hl_dominant) {
   glUniform2f(glGetUniformLocation(prog_teq_apply_, "uGainSize"),
               static_cast<float>(tw), static_cast<float>(th));
   glUniform1fv(glGetUniformLocation(prog_teq_apply_, "uCurve"), 9, teq_curve_);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);   // 0.13.18：全分辨率 guided upsample（teqMs 90~138ms）
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glActiveTexture(GL_TEXTURE0);
   glFinish();

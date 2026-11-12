@@ -65,6 +65,12 @@ class RenderClient {
             val latch = CountDownLatch(1)
             var ok = false
             h.post {
+                // 0.13.18：预览渲染线程提到 DISPLAY（-4）。still 线程默认 nice=0，
+                // 拍照后 3~4s 的 GPU/CPU 段会让预览线程在 CPU 调度上吃亏（真机
+                // 30→24~27fps）。DISPLAY 是相机预览的标准做法，不改任何画面。
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_DISPLAY,
+                )
                 ok = EngineBridge.nativeEngineStart(surface)
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "engine", "render.thread_start",
