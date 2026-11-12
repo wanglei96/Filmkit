@@ -42,7 +42,6 @@ status: active
 - [2026-10-01] `tools/still-thread-verify.py`、`align-bench`、`p0-subpixel-eval.py`、`check-log-json.py`（**分析前先跑**）、`check-diag-fields.py`（**出包前必跑**）；`tools/bake-m9-lut.py` 解码 LUTS.bin → 64³ LUT（`--check-only`/`--size`）
 
 ## 对标数据与测量口径（10-03 → 10-08）
-- [2026-10-08] **GLSL/Mali 铁律**：FilmParams 加槽必须四处同改；**`float m[9]` 数组参数与动态索引编不过**（prog_=0 静默 return）；**多行宏不生效**（完全内联）；新 pass 没效果先查 `prog_ != 0`
 - [2026-10-08] **色差修复三次纠正**：PC3D 把伪彩摊成宽带 ⇒ color_smooth 前置；判据改局部色度峰；替换值用去饱和；**任何"用邻居值替换"必须先证明邻居未被污染**
 - [2026-10-06] **紫边真机基线（1777 尺度，跨场景不可混用）**：台灯逆光 PC 超额 ≈0；红笔亮场景锐化是主放大器（关锐化 +0.12≈PC）；**色散 = 成片域 dRG +0.9~1.0px 而 RAW 域对齐 ⇒ 管线产生**
 
@@ -71,13 +70,10 @@ status: active
 - [2026-10-22] **teq 9 档**（q=i−8 EV；云第 8 档、天空主体第 6 档，压深只给第 6 档）；**局部对比度基线**：rawpy 19.4% / 我们 17.6% / PC 25.9%。
 
 - [2026-10-24] **测光实现**：`MeteringTargets.kt`；`SPOT_AE_FRACTION=0.06`、`HIGHLIGHT_AE_FRACTION=0.16`；高光点来自 32×32 网格
-- [2026-10-24] **gainmap 旧版中灰基线 1.1**（P4 已替换为 gainTrue 真实比值）
 
 ## P4 基线与徕卡一瞬（10-25/26）
 - [2026-10-25] **`tools/hdr-baseline-eval.py`**：JPEG/R 无损解析（MPF 对照 vendored libultrahdr）+ base/gainmap/HDR 重建统计；报告 `docs/reports/hdr-baseline-20261025-REPORT.md`
 - [2026-10-25] **P4 现状**：`kFsGainmap` 三档（0=真实比值/1=旧 sceneY/2=官方）；`gainTrue` clamp[1,4]；0.12.230 起改为 `sdrLin + max(0, hdrLin − 1/anchor)`（标准语义，中灰 ratio 恒 1）
-- [2026-10-25] **LUTS.bin 布局（PC M9 配方）**：427744B；curveOffset 0xcf8 / matrixOffset 0xb44 / calibrationOffset 0xcd0；matrixIndex=CS×5+SAT=2、curveIndex=CS×5+CON=2；矩阵 Q16（行和 ≈8192 保 WB）；曲线 2048 点、首 0 末 1 单调。
-- [2026-10-25] **M9 配方语义**：矩阵 `>>16` 后 = 线性值/8 的 11-bit 编码；曲线输入域 = 11-bit 编码、输出 sRGB；**`leica_m9_ccd.lut`** 64³ 786454B，mean 0.13 / max 20 / 灰轴 1.63 / 跳变 56.7（配方固有）。
 - [2026-10-25] **LUT 加载链**：`parseBinary` size∈2..128；引擎 `setLut` → `glTexImage3D RGBA16F size³`；采样 = `clamp(c×(N−1))` + 手写三线性 texelFetch（格点口径 i/(N−1)）
 - [2026-10-25] **色温槽语义**：`[88] temp_mired` = 目标白点 mired 偏移（基准 6500K、恒等 0，`EditorExport.kt:495`）；UI K 滑杆右移 = 变暖；**6500K = 不做补偿，不是锁 WB**
 - [2026-10-25] **recipe-fit**：`--mode camera` 单链（TARGETS[leica_m9] 六点）；`--white-ev 4.0 --lut-min 1.0 --lat-split --hi-floor 3.5`；`--export` 生成 `fit/builtin-curves.json`
@@ -86,15 +82,13 @@ status: active
 ## PC 影调与暗部软边（10-29）
 - [2026-10-29] **PC 有两套 tone 引擎**：`AdobeCurveToneAlgorithm`（DCP profile 的 ToneCurve，逐通道 + `adobeRgbTone`）与 `DarktableFilmicToneAlgorithm` / `DarktableSigmoidToneAlgorithm`（与同源，系数按 darktable `computeFilmicToneCurveUniforms` 算）；`assets/dcp/` 只有 10 个 profile，**没有 vivo** ⇒ 该机上不适用 DCP 路径
 - [2026-10-29] **亮缝宽度实测**（FILMKIT_20261029-100221 红框 x1626-1942/y3139-3677）：RAW 2×2 块 34px（0.035→0.150）、我们 D4 26px、成片 24px、libraw AHD 14px；对比度 RAW 4.3× / D4 4.8× / 成片 1.5× / AHD 2.6×
-- [2026-10-29] **RCD 与 AMaZE 的抖动差**（同一 CFA 输入、粉椅高光边）：R/G lag-1 σ = 0.312（RCD） vs **0.018（AMaZE）**
 
 ## 高光三症与饱和掩码（10-30）
-- [2026-10-30] **WB 域 vs raw/1023 域**：WB 域中性白 1,1,1；raw/1023 域 0.476/1.0/0.684（随 WB 变）；粉云 165153 的 G 饱和像素 WB 中位 1.300/1.000/1.139。
 - [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov。
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
-- [2026-11-11] 版本 **0.12.251(700)** 当前（dev 分支）、回退 0.12.248；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
+- [2026-11-12] 版本 **0.13.0(708)** 当前（dev/main 已合并、tag `v0.13.0`）、回退 0.12.258；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
@@ -118,3 +112,9 @@ status: active
 - [2026-11-11] **`ricoh_negative_ye.lut`**（33³、107846 B、title「理光 负片 · 杨子祯」）：由「理光负片 杨子祯(1).cube」逐字节转换，**自带影调**——灰阶 0.25→0.31 / 0.50→0.57 / 0.75→0.78。同场景天空 hue 260.8（旧的归一版 276.2、Filmix 263.2）。
 - [2026-11-11] **`nativeEngineGetStats` 新增 `pw999`**：当帧预览链 P99.9 ÷ `g_domain_ratio` 换算到 RAW 等效域。实测预览 1.03 vs 成片 2.91（低 1.88EV，因预览经 ISP tonemap）⇒ 只能当"有没有超白点"的粗判据。
 - [2026-11-11] **`hlOn` 语义修正**：条件只剩 `hl_protect >= 1`（原来还要求 `!ae_auto && !bracket && hdr_fusion<=0` ⇒ 出厂恒假、从未生效）。闭环补偿上限 `kDispAddMax = 0.60` EV（`FrameRenderer.cpp` 显示域闭环段）。
+
+## 天空闭环与诊断（11-12）
+
+- [2026-11-12] **预览 vs 成片的 filmic 输入中位**：`pvLastMid 0.1267 / stillMid 0.0276 = 4.59`（+2.2EV）⇒ vivo 的 YUV 去 gamma 后仍被 ISP tonemap；`ratio` 日志（`g_domain_ratio`）实测 2.0→4.59。
+- [2026-11-12] **闭环护栏参数**：每步补 EV 后测成片顶部天空 P99（`skyProfile` u8），涨 >0.03（≈8 LSB）或 >0.88 就撤销该步；硬上限 `kDispAddMax 0.60`；`dispErr` 只记账不递归。
+- [2026-11-12] **诊断开关**：prefs `sky_diag`（默认 false）→ `nativeEngineSetSkyDiag` → `g_sky_diag`；控制 `skyD4/skyFm/skyOut/d4Y/fmY`，关闭时零额外读回；闭环护栏的 `skyP99` 不受控。工具 `tools/sky-diag.py` 读三段表。

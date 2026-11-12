@@ -2,7 +2,7 @@
 summary: LUT换血与AE高光保护
 created: 2026-11-11 16:15
 updated: 2026-11-11 16:15
-status: active
+status: absorbed
 ---
 
 # LUT换血与AE高光保护
