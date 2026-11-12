@@ -92,12 +92,9 @@ status: active
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
-- [2026-11-02] **理光正片**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / **高光 +0.64**（负片高光是 −1.9）；色相 红 29°、绿 134°、蓝 303°、C 0.98~1.02。
-- [2026-11-02] **富士NC**：`fuji_nc` 原资产灰阶 **100%→91.8%**（压白 8.2%）、灰轴 暗 a−2.8 / 中高光 a+3.1~+3.7；`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255、高光去色阈值 min(RGB) 0.86。
-- [2026-11-02] **哈苏自然**：探针色相 0、灰轴 0、肤 C×1.23；官方 13 张 C\* p50 11.3、灰轴散布 ±5 无共同符号 ⇒ 不系统偏色。
-- [2026-11-02] **柯达5219**：原资产抬黑 4.7%（base fog）、暗 b−4.8；`kodak_5219_deep` 暗 b −6.2、黑点压到 0.5/255、暗部 a +0.45。
-- [2026-11-02] **暗角实现**：darktable 余弦 `vw=0.5−0.5cos(πt)`、`dscale=radius/100`、`fscale=feather/100`；4:3 竖图角落 cplen 1.252。**M9 机内 JPEG 默认开镜头暗角校正 ⇒ 原厂几乎无暗角**。
-- [2026-11-02] **外部资料入口**：柯达电影站 `kodak.com/en/motion/product/camera-films/<id>/`（**单数 product**，`/page/` 与 `motion.kodak.com` 均 404）；哈苏样片 `hasselblad.com/learn/sample-images/x-system/`（84 张，原图 20MB 级）；fujifilm-x.com 是 SPA + Cloudflare，样片不可抓。
+- [2026-11-02] **理光正片 / 富士NC**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / 高光 +0.64，色相 红 29°/绿 134°/蓝 303°；`fuji_nc` 原资产压白 8.2%，`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255。
+- [2026-11-02] **哈苏自然 / 柯达5219**：哈苏探针色相 0、灰轴 0、肤 C×1.23，官方 13 张 C\* p50 11.3；5219 原资产抬黑 4.7%、`kodak_5219_deep` 暗 b −6.2、黑点 0.5/255。
+- [2026-11-02] **暗角与资料入口**：darktable 余弦 `vw=0.5−0.5cos(πt)`、`dscale=radius/100`、`fscale=feather/100`，4:3 竖图角落 cplen 1.252；M9 机内默认开暗角校正。柯达样片 `kodak.com/en/motion/product/camera-films/<id>/`（单数 product），哈苏 `hasselblad.com/learn/sample-images/x-system/`，fujifilm-x.com 是 SPA 抓不到。
 
 ## 显示域闭环与蓝天（11-04）
 
@@ -118,3 +115,6 @@ status: active
 - [2026-11-12] **诊断开关**：prefs `sky_diag`（默认 false）→ `nativeEngineSetSkyDiag` → `g_sky_diag`；控制 `skyD4/skyFm/skyOut/d4Y/fmY`，关闭时零额外读回；闭环护栏的 `skyP99` 不受控。工具 `tools/sky-diag.py` 读三段表。
 - [2026-11-12] **去马赛克调研（PC / Spektrafilm / 开源）**：PC 的 RAW 去马赛克**不是独立级**——MGC Spatial/Sabre 融合内置全分辨率绿重建 + VGN；源码 `RcdDemosaicAlgorithm.kt` **零引用**（死代码），AMaZE 只在 LibRaw（`dcraw_process.cpp:189` 的 quality=14），服务 `processDngNative` 的 DNG 文件路径；`RawLinearRcdPass` 只做 CCM+gain（命名误读，06 号文档已改）。Spektrafilm（rawpy）/SpektraLab（C++ libraw）都只是 LibRaw 调用方，**无自研 demosaic**；开源无成熟 GPU 高质量实现。我方 RCD 方向场是全分辨率、**从无画质 A/B**（RT 是 `tileSize²/2` + lpf 输入）；v0.5.29 的 `dirMs 54ms` 与现在 0.13.5 实测的 65–85ms 同量级——旧的 1202–1433ms 是「HR+P0+P1」合计（计时口径错）。详见 `docs/reports/raw-demosaic-benchmark-RESEARCH.md`。
 - [2026-11-12] **成片链真实耗时剖面（0.13.6/0.13.9 冷机，4080×3072 4 帧 MFNR+HDR，同场景支架固定）**：`fuseMs`(DFT) 1201–1561、`p0Ms` **300–352**、`hlMs` 212–250、`preMs` 949–1223（含 ~340ms 未归因的 satmask/inpaint）、`dnMs` 542–1131、`dirMs` **39–66**（GPU 31–66）、`gMs` 9–33、闭环 `dispMs` 378–423、编码 **189–290**（libjpeg-turbo）、`totalMs` 5162–6523、快门→落盘 **6.15–7.27s**。**RCD 不是热点**；热点 = DFT / P0 / P4。预览体感：快门后 4 次 218–264ms 画面冻结（录屏实测），`preview_gap` 的 400ms 阈值会漏报；`preview_arrive_gap` 与它同时出现才算 HAL 停帧。
+- [2026-11-12] **0.13.16(724) 当前**：`mfnr_dft` 默认 **false**（空间域 mismatch+fuse），设置页可切回 DFT；`files/mfnr_spatial` 哨兵强制 DFT，`files/burst_dump` 导出 4 帧 `.raw/.meta`（25MB/帧）。
+- [2026-11-12] **融合两条链实测**（同场景同曝光）：明亮 ISO 1163 DFT 6033ms → 空间域 4233ms；暗光 ISO 662 DFT 8000ms → 空间域 5240ms。暗部平场 σ 2.08→1.71 LSB、全局高频 −18%，100% 裁剪无可见差。
+- [2026-11-12] **EGL_IMG_context_priority 在 X300 可用**：`eglPriExt=1, eglLow=1`（still context 以 LOW 创建）；`engine.still_start` 日志带这两个字段。

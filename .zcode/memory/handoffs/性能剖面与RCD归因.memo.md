@@ -2,7 +2,7 @@
 summary: 性能剖面与RCD归因
 created: 2026-11-12 19:49
 updated: 2026-11-12 19:49
-status: active
+status: absorbed
 ---
 
 # 性能剖面与RCD归因
