@@ -1368,6 +1368,8 @@ class FrameRenderer {
   // 串行 dispatch + kFsMfnrFftSum 收口进 tex_fused_。compute 编译失败（非
   // ES 3.1+/r32f image 不可用设备）→ 置 0，运行时回退 mismatch 融合路径。
   GLuint prog_mfnr_fft_sum_ = 0;  // 相位组求和 pass(fragment,init 创建)
+  // 0.13.6 性能诊断：DFT compute program 的现场编译耗时（每次拍照都 compile+link）
+  float dbg_fft_cms_ = 0.f;
   int burst_w_ = 0, burst_h_ = 0;  // 输出纹理尺寸标记(输入直接用 4 张 2D)
   // 相位组输出 ×4（R32F image2D writeonly；glslang ES profile 只放行 r32f、
   // image2DArray 的 store 在 X300 Mali 上静默丢失 —— v0.10.42 dftGpu 577ms

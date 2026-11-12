@@ -31,6 +31,8 @@ class RenderClient {
     //（改前 ≈1600~3400ms，独立线程后应不再出现；采集期 150~250ms 的正常停顿
     //  被 400ms 阈值挡在外面）。
     private var lastPresentMs = 0L
+    /** 0.13.7：上一帧**到达**时刻（区分 HAL 停帧 vs 渲染被占，见 frameAvailable） */
+    private var lastArriveMs = 0L
 
     // 预览帧率曲线（v0.10.87）：preview_gap 只抓 >400ms 的"停更"，抓不到"降帧"
     // ——拍照时 still 线程跑 DFT/RCD 与预览争同一颗 GPU，30fps 掉到十几 fps 时
@@ -143,6 +145,22 @@ class RenderClient {
             )
             return  // pending 未置位，无需回滚
         }
+        // ── 0.13.7 预览卡顿归因：**帧到达**时刻（在 pending 闸门之前）──────────
+        // 现有 render.preview_gap 量的是"渲染完成"的间隔，它把两种完全不同的原因
+        // 混在一起：① HAL 在拍照/burst 期间不出帧（我们改不了）；② 帧到了但渲染
+        // 线程被长链占住（我们的锅）。到达间隔（本字段）与完成间隔（preview_gap）
+        // 放在同一时间轴上一比就能分开：到达就停 = HAL；到达正常而完成停 = 我们。
+        val nowArrive = android.os.SystemClock.elapsedRealtime()
+        if (lastArriveMs > 0) {
+            val ag = (nowArrive - lastArriveMs).toInt()
+            if (ag in 401..10_000) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "engine", "render.preview_arrive_gap",
+                    com.filmkit.app.kv("gapMs" to ag),
+                )
+            }
+        }
+        lastArriveMs = nowArrive
         if (!pending.compareAndSet(false, true)) return
         val posted = h.post {
             try {

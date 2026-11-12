@@ -14471,7 +14471,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const FilmParams& p = *c.p;
   float dir_ms = 0.0f, g_ms = 0.0f, ccm_ms = 0.0f, dn_ms = 0.0f;
   // 0.13.5：RCD 三段拆分（preMs = HR+P0 到 P1 提交前；dirGpuMs/gGpuMs = GPU query）
-  float pre_ms = 0.0f, dir_gpu_ms = 0.0f, g_gpu_ms = 0.0f;
+  float pre_ms = 0.0f, dir_gpu_ms = 0.0f, g_gpu_ms = 0.0f, p0_ms = 0.0f;
   diagBeginFrame();  // 诊断统计：关时仅一次 atomic load，无 pass / 无 GL 调用
   // AMaZE 诊断帧首清零（passCaCorrect 里的清零已删除，见那里的注释）
   dbg_amaze_ms_ = 0.f;
@@ -14693,6 +14693,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 值域保护只在"P0 直接吃 HR 输出"时需要（NN 输出本就落在 [0,1] 训练域）
     // 0.12.133：inpaint 输出同样是 scene-referred（可 >1）⇒ 与 HR 输出同口径保护
     const bool p0_wclamp = (!nn_ok && (hr_out != 0 || fused_src != tex_fused_));
+    const auto t_p0 = std::chrono::steady_clock::now();
     if (c.mfnr_fused) {
       if (nn_ok) {
         passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
@@ -14722,6 +14723,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                        c.dn ? c.nc : kNoDn);
       }
     }
+    // 0.13.6 性能细分：P0（RAW bilateral / 线性化展开）单列。旧口径只有
+    // preMs = HR + P0，拆开后才能判断该优化 HR 还是 P0。
+    glFinish();
+    p0_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_p0).count();
     // ── 0.12.147：AMaZE 与 RCD 二选一（前链共用，见块首注释）────────────────
     if (c.amaze) {
       const auto a0 = std::chrono::steady_clock::now();
@@ -15519,6 +15525,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 分 pass 成本 —— rcdSplit=0 而 [58]>0.5 ⇒ 未生效；rcdAMs+rcdBMs 对比
     // 旧单 pass 成本（多一次全分辨率 RGBA16F 往返）。
     kv += ",\"preMs\":" + jnum(pre_ms, 6) +
+          ",\"p0Ms\":" + jnum(p0_ms, 7) +
+          ",\"fftCms\":" + jnum(dbg_fft_cms_, 7) +
           ",\"dirMs\":" + jnum(dir_ms, 6) +
           ",\"dirGpuMs\":" + jnum(dir_gpu_ms, 7) +
           ",\"gGpuMs\":" + jnum(g_gpu_ms, 7) +
@@ -16470,6 +16478,7 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
   //（micro:false + sum:0 + spikeOk:true）证伪该推断：现场创建的微测试同样失败。
   // 真变量是输出纹理的创建方式（glTexStorage2D，见 ensureMfnrFftTargets）。
   // 现场创建暂留（一次只动一个变量），验收通过后可回退到 init 创建省 CPU 编译。
+  const auto t_fft_c0 = std::chrono::steady_clock::now();
   const GLuint cs_fft = compileShader(GL_COMPUTE_SHADER, kFsMfnrFft);
   GLuint prog_fft = 0;
   if (cs_fft) {
@@ -16489,6 +16498,13 @@ bool FrameRenderer::passMfnrFft(int w, int h, int cfa,
     }
   }
   if (cs_fft) glDeleteShader(cs_fft);
+  // 0.13.6 诊断：现场编译 + 链接的耗时（单独一条日志，便于判断是否值得改成
+  // init 缓存 —— 两处历史注释对"init 创建的 compute program 是否可靠"说法相反，
+  // 先量成本再决定，不拿注释当依据）。
+  dbg_fft_cms_ = std::chrono::duration<float, std::milli>(
+                     std::chrono::steady_clock::now() - t_fft_c0).count();
+  Logger::instance().log(LogLevel::kInfo, "engine", "mfnr.fft.compile_ms",
+                         "{\"ms\":" + jnum(dbg_fft_cms_, 8) + "}");
   if (prog_fft == 0) {
     Logger::instance().log(LogLevel::kError, "engine", "mfnr.fft.compile_fail",
                            "{}");
