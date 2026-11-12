@@ -57,7 +57,13 @@
 - 该 pass 的着色器声明了 `uniform sampler3D uLinearDcpHueSatMap;`（`RawLinearRcdPass.kt:162`）、
   `uniform mat3 uColorCorrectionMatrix;`（`:163`）、`uniform vec3 uCameraWhite;`（`:164`）。
 - 顺序明确：**CCM → clamp → DCP HueSatMap → 曝光增益**，全部在去马赛克后的**线性**域。
-  该 pass 名为 `RawLinearRcdPass`（"Linear" + RCD 去马赛克），本身即其域标注。
+- ⚠️ **别被名字带偏**（2026-11-12 修正）：该 pass 叫 `RawLinearRcdPass`，但内部只做「线性
+  RGB → CCM → 可选 clamp → DCP HueSatMap → 曝光增益」，**不是 RCD 去马赛克**；"Rcd" 是
+  历史命名残留。PC 真机 RAW 的去马赛克发生在 GPU 融合链内部（MGC Spatial / Sabre 的
+  `MergeRgbRaw16F16` 自带全分辨率绿重建），之后接 VGN；源码里 `RcdDemosaicAlgorithm.kt`
+  **零引用**，是死代码。AMaZE 只存在于 `app/src/main/cpp/LibRaw`（`dcraw_process.cpp:189`
+  的 `quality == 14` 分支），服务于 `processDngNative` 的 DNG 文件路径。证据见
+  `docs/reports/raw-demosaic-benchmark-RESEARCH.md`。
 
 ### 1.2 引擎 tone pass：Adobe profile 管线（HueSatMap → LookTable → ToneCurve）
 

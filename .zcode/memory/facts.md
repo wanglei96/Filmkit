@@ -88,7 +88,7 @@ status: active
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
-- [2026-11-12] 版本 **0.13.0(708)** 当前（dev/main 已合并、tag `v0.13.0`）、回退 0.12.258；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
+- [2026-11-12] 版本 **0.13.4(712)** 当前（性能迭代，未打 tag；上一正式版 0.13.0(708) tag `v0.13.0`）、回退 0.13.0；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
@@ -115,6 +115,6 @@ status: active
 
 ## 天空闭环与诊断（11-12）
 
-- [2026-11-12] **预览 vs 成片的 filmic 输入中位**：`pvLastMid 0.1267 / stillMid 0.0276 = 4.59`（+2.2EV）⇒ vivo 的 YUV 去 gamma 后仍被 ISP tonemap；`ratio` 日志（`g_domain_ratio`）实测 2.0→4.59。
-- [2026-11-12] **闭环护栏参数**：每步补 EV 后测成片顶部天空 P99（`skyProfile` u8），涨 >0.03（≈8 LSB）或 >0.88 就撤销该步；硬上限 `kDispAddMax 0.60`；`dispErr` 只记账不递归。
+- [2026-11-12] **预览 vs 成片的 filmic 输入中位**：`pvLastMid 0.1267 / stillMid 0.0276 = 4.59`（+2.2EV）⇒ vivo 的 YUV 去 gamma 后仍被 ISP tonemap；`ratio` 日志（`g_domain_ratio`）实测 2.0→4.59。**闭环护栏参数**：每步补 EV 后测成片顶部天空 P99（`skyProfile` u8），涨 >0.03（≈8 LSB）或 >0.88 就撤销该步；硬上限 `kDispAddMax 0.60`；`dispErr` 只记账不递归。
 - [2026-11-12] **诊断开关**：prefs `sky_diag`（默认 false）→ `nativeEngineSetSkyDiag` → `g_sky_diag`；控制 `skyD4/skyFm/skyOut/d4Y/fmY`，关闭时零额外读回；闭环护栏的 `skyP99` 不受控。工具 `tools/sky-diag.py` 读三段表。
+- [2026-11-12] **去马赛克调研（PC / Spektrafilm / 开源）**：PC 的 RAW 去马赛克**不是独立级**——MGC Spatial/Sabre 融合内置全分辨率绿重建 + VGN；源码 `RcdDemosaicAlgorithm.kt` **零引用**（死代码），AMaZE 只在 LibRaw（`dcraw_process.cpp:189` 的 quality=14），服务 `processDngNative` 的 DNG 文件路径；`RawLinearRcdPass` 只做 CCM+gain（命名误读，06 号文档已改）。Spektrafilm（rawpy）/SpektraLab（C++ libraw）都只是 LibRaw 调用方，**无自研 demosaic**；开源无成熟 GPU 高质量实现。我方 RCD 方向场是全分辨率、**从无画质 A/B**（RT 是 `tileSize²/2` + lpf 输入）；v0.5.29 记录 `dirMs 54ms` vs 现在 1202–1433ms，矛盾未解。详见 `docs/reports/raw-demosaic-benchmark-RESEARCH.md`。
