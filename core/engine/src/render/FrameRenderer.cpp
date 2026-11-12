@@ -12178,7 +12178,16 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   //   峰值常差 1~3 LSB，整片零命中；σ 大时阈值又随 ISO 漂到 0.9 以下，过判。
   const float kClipLevel = 250.f / 255.f;   // PC BENTO_MAX_RGB_CLIPPING = 250
   const size_t n = static_cast<size_t>(w) * h;
-  std::vector<uint8_t> sat(n, 0), dil(n, 0), out(n * 4, 0);
+  // 0.13.20：4 张缓冲复用（见 FrameRenderer.h）。尺寸不变时不重新分配；
+  // 所有元素下面都会被完整覆盖（含 2×2 聚合的末行/末列），不需要清零。
+  if (satm_sat_.size() != n) {
+    satm_sat_.assign(n, 0);
+    satm_dil_.assign(n, 0);
+    satm_out_.assign(n * 4, 0);
+  }
+  std::vector<uint8_t>& sat = satm_sat_;
+  std::vector<uint8_t>& dil = satm_dil_;
+  std::vector<uint8_t>& out = satm_out_;
   uint16_t mx = 0;
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
@@ -12260,7 +12269,9 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
     satm_dst_h_ = Hd;
   }
   {
-    std::vector<uint8_t> dm(static_cast<size_t>(Wd) * Hd * 4, 0);
+    const size_t dn = static_cast<size_t>(Wd) * Hd * 4;
+    if (satm_dm_.size() != dn) satm_dm_.assign(dn, 0);
+    std::vector<uint8_t>& dm = satm_dm_;
     // 0.13.18：转置同样按行并行（12.5M 次随机读，串行是老 build 里的隐形大头）。
     parallelRows(Hd, [&](int y0, int y1) {
       for (int y = y0; y < y1; ++y) {

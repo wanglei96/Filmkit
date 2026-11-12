@@ -1049,6 +1049,11 @@ class FrameRenderer {
   GLuint tex_satm_dst_ = 0;
   int satm_dst_w_ = 0, satm_dst_h_ = 0;
   int satm_w_ = 0, satm_h_ = 0;
+  // 0.13.20：satmask 的 4 张 CPU 缓冲按尺寸复用（原实现每张拍照新建 4 个
+  // vector，合计 ~125MB：判据 sat 12.5MB、膨胀 dil 12.5MB、输出 out 50MB、
+  // 转置 dm 50MB ⇒ 每次 malloc + 首次触页都在 still 线程上，属于固定开销）。
+  // 只在尺寸变化时重新分配；所有元素每次都被完整覆盖（2×2 聚合覆盖到边缘）。
+  std::vector<uint8_t> satm_sat_, satm_dil_, satm_out_, satm_dm_;
   GLuint prog_satm_ = 0;
   struct { GLint raw = -1, size = -1, cfalut = -1, black = -1, white = -1,
            gain = -1, na = -1, nb = -1, dbg = -1; } u_satm_;

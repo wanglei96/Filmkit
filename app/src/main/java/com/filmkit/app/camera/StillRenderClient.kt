@@ -52,9 +52,12 @@ object StillRenderClient {
     private var disabled = false
 
     /** 空闲释放（v0.10.88）：拍完这么久没有新任务就销毁拍照实例，把合成链留下的
-     *  约 2GB 全分辨率中间纹理还给系统（实测常驻 2418MB，重建只要 ~60ms）。
-     *  10s 是折中：连拍间隔通常 <10s 不会误释放，单张拍完能及时回收。 */
-    private val idleReleaseMs = 10_000L
+     *  约 2GB 全分辨率中间纹理还给系统（实测常驻 2418MB，重建 initMs 135~265ms）。
+     *  0.13.20：10s → 60s。真机日志（22:58~23:00）实测：间隔一超过 10s 就重建，
+     *  重建后的那一张 totalMs 1615→2858ms、fps 掉到 19/23 —— 用户感知就是
+     *  "冷启动第一张还顿"。60s 内连拍/回看不重建；真正的冷启动第一张仍付一次
+     *  init（150~265ms，与 burst 采集 300~500ms 重叠），这是硬件冷启动的底。 */
+    private val idleReleaseMs = 60_000L
 
     /** 在拍照线程上执行销毁（与所有 native 调用同一条队列 → 必然排在在飞合成之后）。 */
     private val idleRelease = Runnable {
