@@ -5806,6 +5806,14 @@ void main() {
     // 另：本 uniform 原名 uPreviewMap，但它的真实语义是"输入是 HAL 显示域"——
     // 被当成"是否预览"用，正是 YUV 静拍链（HAL 域）被误当场景线性域的根因（S12）。
     // 现更名为 uHalDomainMap，与"是否静拍"完全解耦。
+    // ── 0.12.256：**保留域比**，但把它从"猜"改成"实测对齐"─────────────────
+    // 试过直接照搬 PC 的形态（`srgbToLinear` + 矩阵、除法比），实测数据不支持：
+    //   `g_pv_mid_ema / last_lin_mid_` 实测 **3.6**（09:19 日志的 `ratio`），
+    //   即 vivo 的预览线性中灰是 RAW 的 3.6 倍（+1.85 EV）——厂家 ISP 的 tonemap
+    //   把预览提亮了近 2 EV。PC 的 `RawPreviewRestoration.SceneLinearSrgb` 假设
+    //   YUV 已是场景线性，那是它那套采集配置；在 X300 上直接去掉除法，取景器会
+    //   立刻亮 1.85 EV（与成片差更大）。所以除法必须留，要修的是**这个比值的
+    //   准确度**：它现在由成片后的显示域中灰（同一把尺）全步校准。
     vec3 out3 = (uHalDomainMap > 0.5) ? mapped / uDomainRatio : mapped;
     // v0.7.9：旧 log 域胶片链（log2 编码 / filmCurve / 域外延展 / 0.18·exp2 重构）已删，
     // filmic 直接吃线性场景输入 —— blackEv/whiteEv 的标定域与渲染域首次严格一致。
