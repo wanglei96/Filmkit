@@ -16812,7 +16812,15 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 // 的全分辨率平滑趟**又变回单次全屏 draw（DFT 路径的拆块没覆盖它们）；两者都是
 // 重读纹理的 pass（4 帧 16 样本 / 11×11 核），pc3dMs 600ms 量级 ⇒ 一个 job 就是
 // 一两百毫秒，预览仍有零星掉帧。给它们 16 条（每条约 640 行 / 10~40ms）。
-// 像素结果逐位不变：gl_FragCoord 是窗口坐标，条带只改 viewport 的 y 偏移。
+//
+// ⛔ 0.13.18 的严重回归（用户实测"预览画面重复了 N 次"）：**不能用 glViewport
+// 做条带**。全屏三角形的 UV（vUV0）是按 NDC 插值的，viewport 一缩，每条带的
+// vUV0 又重新从 0 到 1 —— 于是每条带都画了一遍整幅图。P0/fuse/PC3D 恰好都用
+// gl_FragCoord（窗口坐标，与 viewport 无关）才没暴露，而 TEQ apply / CCM /
+// HL apply / defringe / CA / color_smooth 全部用 vUV0 ⇒ 预览与成片一起花掉。
+// ✅ 正解 = **glScissor**：viewport 保持全屏，用裁剪矩形只让当前条带的片段
+// 落地。UV 插值与 gl_FragCoord 都不变，对任何 shader 都逐位等价；代价只是
+// 每带一次 glScissor + glFlush（与原来同量级）。
 void FrameRenderer::drawStriped(int strips) {
   GLint vp[4] = {0, 0, 0, 0};
   glGetIntegerv(GL_VIEWPORT, vp);
@@ -16822,14 +16830,19 @@ void FrameRenderer::drawStriped(int strips) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     return;
   }
+  const bool scissor_was = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+  GLint sb[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_SCISSOR_BOX, sb);
+  glEnable(GL_SCISSOR_TEST);
   const int rows = (h + kStrips - 1) / kStrips;
   for (int y = vp[1]; y < vp[1] + h; y += rows) {
     const int rh = std::min(rows, vp[1] + h - y);
-    glViewport(vp[0], y, w, rh);
+    glScissor(vp[0], y, w, rh);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glFlush();
   }
-  glViewport(vp[0], vp[1], w, h);
+  glScissor(sb[0], sb[1], sb[2], sb[3]);
+  if (!scissor_was) glDisable(GL_SCISSOR_TEST);
 }
 
 void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
