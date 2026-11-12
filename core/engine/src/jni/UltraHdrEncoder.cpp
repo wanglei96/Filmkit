@@ -28,6 +28,7 @@
 // 两者必须**同像素对齐**：gainmap 描述的是"成片的这个像素在 HDR 下应该更亮多少"。
 
 #include <jni.h>
+#include "JpegEncode.h"
 
 #include <android/bitmap.h>
 
@@ -245,12 +246,29 @@ Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
   std::vector<unsigned char> rgb;
   rgbaToRgb(packed.data(), w, h, rgb);
   const int q = std::clamp(static_cast<int>(quality), 1, 100);
-  auto baseJpeg = stbEncodeRgb(rgb.data(), w, h, q);
+  // 0.13.9：base 优先 libjpeg-turbo 4:4:4（与 JpegEncoder 同一条路），失败再回退 stb。
+  std::vector<unsigned char> baseJpeg;
+  {
+    std::vector<uint8_t> turbo;
+    if (filmkit::encodeJpegTurbo444(rgb.data(), w, h, 3, q, &turbo)) {
+      baseJpeg.assign(turbo.begin(), turbo.end());
+    } else {
+      baseJpeg = stbEncodeRgb(rgb.data(), w, h, q);
+    }
+  }
   if (baseJpeg.empty()) return nullptr;
 
   // ── ② gainmap 已是 8bit，直接编成灰度 JPEG ────────────────────────
   // gainmap 是辅助数据（8bit 量化 + 1/2 分辨率），q95 足够且省体积。
-  auto gmJpeg = stbEncodeGray(gm.data(), gw, gh, 95);
+  std::vector<unsigned char> gmJpeg;
+  {
+    std::vector<uint8_t> turbo;
+    if (filmkit::encodeJpegTurbo444(gm.data(), gw, gh, 1, 95, &turbo)) {
+      gmJpeg.assign(turbo.begin(), turbo.end());
+    } else {
+      gmJpeg = stbEncodeGray(gm.data(), gw, gh, 95);
+    }
+  }
   if (gmJpeg.empty()) return nullptr;
 
   // ── ③ 封装：base 原样 + gainmap + 元数据 → JPEG/R ─────────────────

@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(filmengine SHARED
         src/jni/Bridge.cpp
         src/jni/JpegEncoder.cpp
+        src/jni/JpegEncode.cpp
         src/gl/Capabilities.cpp
         src/gl/EglCore.cpp
         src/log/Logger.cpp
@@ -44,7 +45,7 @@ if(FILMKIT_HDR)
     # include() 保持作用域在 core/engine，third_party/ultrahdr/CMakeLists.txt 内的相对路径稳定。
     include(third_party/ultrahdr/CMakeLists.txt)
     target_sources(filmengine PRIVATE src/jni/UltraHdrEncoder.cpp)
-    target_link_libraries(filmengine PRIVATE ultrahdr)
+    target_link_libraries(filmengine PRIVATE ultrahdr jpeg-static)
     target_compile_definitions(filmengine PRIVATE FILMKIT_HDR=1)
 endif()
 

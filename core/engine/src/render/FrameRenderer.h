@@ -359,6 +359,8 @@ class FrameRenderer {
                     int row_stride_px);
   // raw_tex_ 的建/复用（尺寸变化时重建），返回纹理 id（0 = 失败）
   GLuint ensureRawTex(int w, int h);
+  /** 0.13.8：按当前 viewport 做行条带化的全屏 draw（见 cpp 注释，治拍照时预览卡顿） */
+  void drawStriped();
   // 金字塔 pass：raw → 1/2 灰度（kFsMfnrPyr，sqrt 预编码）；再逐层 2× box（kFsMfnrDown）
   void passMfnrPyr(GLuint raw_tex, int cfa, const float black_phase[4],
                    float white_level, const float gains[3], float frame_scale = 1.0f);

@@ -15309,7 +15309,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   disp_add_ = 0.0f;
   if (!c.ten_bit && g_pv_disp_p50 > 0.005f && dst_w >= 256 && dst_h >= 256) {
     const auto t_disp0 = std::chrono::steady_clock::now();
-    const int rw = dst_w / 2, rh = dst_h / 2;
+    // 0.13.9：读回区域 1/2 → 1/3（每边）。robustMidToneDisplayRgba8 是截尾四分位 +
+    // 中心高斯，样本数从 3.1M 降到 1.4M 仍然是"大样本鲁棒统计"，但每次 glReadPixels
+    // 从 12.5MB 降到 5.6MB。闭环每张跑 1~2 次读回，真机实测这段 70~713ms（波动大），
+    // 是"不改任何成像结果、只省同步"的一块钱。
+    const int rw = dst_w / 3, rh = dst_h / 3;
     const int rx = (dst_w - rw) / 2, ry = (dst_h - rh) / 2;
     std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4);
     auto readStillMid = [&]() -> float {
@@ -16725,6 +16729,31 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+// 0.13.8 预览卡顿优化（照 PC photon denoiser 的 strip 做法，2026-11-12）：
+// 一次全屏 draw 在 Mali 上是一个长 job，跑完才轮到预览 context 的 draw ⇒ 拍照期间
+// 画面每 1~2s 冻 200~260ms（录屏实测，tools/preview-stall.py）。按行拆条带 +
+// 每条 glFlush，把 job 边界变密，让预览能在条带之间被调度。
+// 只用于"当前 viewport 就是整屏输出"的 pass。gl_FragCoord 是窗口坐标，条带化不改变
+// 任何像素结果（这些 pass 像素之间无依赖）。
+void FrameRenderer::drawStriped() {
+  GLint vp[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_VIEWPORT, vp);
+  const int w = vp[2], h = vp[3];
+  constexpr int kStrips = 8;
+  if (w <= 0 || h < kStrips * 16) {   // 太小就不拆，免得 draw 开销反超
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    return;
+  }
+  const int rows = (h + kStrips - 1) / kStrips;
+  for (int y = vp[1]; y < vp[1] + h; y += rows) {
+    const int rh = std::min(rows, vp[1] + h - y);
+    glViewport(vp[0], y, w, rh);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFlush();
+  }
+  glViewport(vp[0], vp[1], w, h);
+}
+
 void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
                                         const float black_phase[4],
                                         float white_level, const float gains[3],
@@ -16778,7 +16807,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     glUniform1f(u_raw_dn_ts_.sr_scale, 2.2360679f);   // √(neff+1)，neff≡4
     glUniform1f(u_raw_dn_ts_.sub, subpixel ? 1.f : 0.f);
     dbg_p0s_ = 96;                                   // 4 帧 × 24（±4 mosaic 内同相位）
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped();
     // 诊断读回：alpha = wsum。平均权重 ≈ wsum / 97（96 邻域 + 中心）
     {
       GLuint dfbo = 0;
@@ -16818,7 +16847,7 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
   dbg_hl_wclamp_ = wclamp ? 1.f : 0.f;   // 生效性自证：真机日志直接可查
   dbg_p0s_ = 9;                                      // 旧路径：融合后 9 空间样本
   dbg_p0w_ = -1.f;                                   // 旧路径无 wsum 诊断
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped();
 }
 
 // ── NN 降噪 pass（v0.10.102）：PMRID TFLite 接拍照链 ──────────────────────

@@ -30,6 +30,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBI_WRITE_NO_STDIO
 #include "../../third_party/stb/stb_image_write.h"
+#include "JpegEncode.h"
 
 namespace {
 
@@ -84,18 +85,32 @@ Java_com_filmkit_app_EngineBridge_nativeEncodeJpeg444(JNIEnv* env, jclass,
   // stb 按紧密打包读取（p = row*width*comp + col*comp），不认 stride。
   // 常规 ARGB_8888 的 stride 就是 width*4（零拷贝直编）；ABI/对齐异常时逐行压紧，
   // 宁可多一次拷贝也不产出错行图像。
-  bool ok;
-  if (info.stride == tight) {
-    ok = stbi_write_jpg_to_func(sinkWrite, &sink, w, h, 4, pixels, q) != 0;
-  } else {
-    std::vector<unsigned char> packed(tight * h);
-    const unsigned char* src = static_cast<const unsigned char*>(pixels);
+  std::vector<unsigned char> packed;
+  const unsigned char* src = static_cast<const unsigned char*>(pixels);
+  if (info.stride != tight) {
+    packed.resize(tight * h);
     for (int y = 0; y < h; ++y) {
       memcpy(packed.data() + tight * y, src + static_cast<size_t>(info.stride) * y,
              tight);
     }
-    ok = stbi_write_jpg_to_func(sinkWrite, &sink, w, h, 4, packed.data(), q) != 0;
+    src = packed.data();
   }
+
+  // 0.13.9：优先 libjpeg-turbo（JCS_EXT_RGBA 零拷贝、整数 DCT + NEON，约 stb 的 1/3~1/4）。
+  // 不可用或失败再退回 stb —— 照片优先红线，两条路都产出 4:4:4。
+  if (filmkit::jpegTurboAvailable()) {
+    std::vector<uint8_t> turbo;
+    if (filmkit::encodeJpegTurbo444(src, w, h, 4, q, &turbo)) {
+      AndroidBitmap_unlockPixels(env, bitmap);
+      const jsize tn = static_cast<jsize>(turbo.size());
+      jbyteArray tout = env->NewByteArray(tn);
+      if (!tout) return nullptr;
+      env->SetByteArrayRegion(tout, 0, tn,
+                              reinterpret_cast<const jbyte*>(turbo.data()));
+      return tout;
+    }
+  }
+  bool ok = stbi_write_jpg_to_func(sinkWrite, &sink, w, h, 4, src, q) != 0;
 
   AndroidBitmap_unlockPixels(env, bitmap);
 
