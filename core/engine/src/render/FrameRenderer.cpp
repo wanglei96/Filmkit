@@ -165,6 +165,10 @@ void tempTintGain(float mired, float tint, float g[3]) {
 // ratio 长期钉在初值 2.0 不收敛。进程存活期间跨实例保持；App 冷启动回落
 // 初值、拍一张静拍即重新收敛（EMA α=0.3）。
 float g_pv_mid_ema = 0.0f;   // 预览统计中位的 EMA（0 = 未初始化）
+// 0.12.257（诊断）：**最近一帧预览的 filmic 输入中位**（当帧，非 EMA）。
+// 与成片的 `last_lin_mid_` 同域（两者都是 kFsFilm 输入纹理的中位）⇒ 比值直接回答
+// "vivo 的 YUV 去 gamma 后是不是场景线性"：≈1 = 同域；≈2-4 = 被 ISP tonemap 提亮。
+float g_pv_last_mid = 0.0f;
 // v0.11.92：预览的**几何平均** EMA —— 成片 AE 的目标亮度直接用它（"对齐取景器"）。
 // 为什么不是 P50：P50 只说"一半像素比它暗"，对"半暗半亮"的构图会严重偏低（真机
 // 2147：P50 0.1076 → 锚到固定 0.45 要 +2.0EV → mean 184、hi240 2.67%）。预览的
@@ -15533,6 +15537,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   kv += ",\"d4Y\":\"" + dbg_prof_d4_ + "\"";
   kv += ",\"fmY\":\"" + dbg_prof_fm_ + "\"";
   // 0.12.252（诊断）：顶部 20% 天空块的均值/分位/通道分离度（D4 → filmic 输出 → 成片）
+  kv += ",\"pvLastMid\":" + jnum(g_pv_last_mid, 6);   // 0.12.257 诊断：当帧预览 filmic 输入中位
+  kv += ",\"stillMid\":" + jnum(last_lin_mid_, 6);     //                    成片 filmic 输入中位
   kv += ",\"skyD4\":\"" + dbg_sky_d4_ + "\"";
   kv += ",\"skyFm\":\"" + dbg_sky_fm_ + "\"";
   kv += ",\"skyOut\":\"" + dbg_sky_out_ + "\"";
@@ -19192,6 +19198,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   } else {
     g_pv_mid_ema = g_pv_mid_ema > 1e-4f ? g_pv_mid_ema * 0.7f + last_lin_mid_ * 0.3f
                                         : last_lin_mid_;
+    g_pv_last_mid = last_lin_mid_;
     if (last_lin_geo_ > 1e-5f) {
       g_pv_geo_ema = g_pv_geo_ema > 1e-5f
                          ? g_pv_geo_ema * 0.7f + last_lin_geo_ * 0.3f
