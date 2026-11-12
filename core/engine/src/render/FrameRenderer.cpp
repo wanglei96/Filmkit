@@ -15279,9 +15279,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 成片本身一次成像，不再受闭环影响 —— 天空亮度只由曝光与目标曲线决定。
     if (still_disp_mid_ > 0.01f && g_pv_disp_p50 > 0.005f) {
       const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
-      if (std::fabs(d) > 0.05f) {
-        g_domain_ratio =
-            std::clamp(g_domain_ratio * std::exp2(d * 0.5f), 1.2f, 8.0f);
+      if (std::fabs(d) > 0.03f) {
+        // 全步（不是 0.5 阻尼）：这一张拍完，**下一帧取景器就已经对齐**。
+        // 用户不需要为对齐连拍几张 —— 校准是设备的事，不是用户的事。
+        g_domain_ratio = std::clamp(g_domain_ratio * std::exp2(d), 1.2f, 8.0f);
       }
       disp_close_ev_ = d;
     }
