@@ -14470,6 +14470,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   const int w = c.w, h = c.h, dst_w = c.dst_w, dst_h = c.dst_h;
   const FilmParams& p = *c.p;
   float dir_ms = 0.0f, g_ms = 0.0f, ccm_ms = 0.0f, dn_ms = 0.0f;
+  // 0.13.5：RCD 三段拆分（preMs = HR+P0 到 P1 提交前；dirGpuMs/gGpuMs = GPU query）
+  float pre_ms = 0.0f, dir_gpu_ms = 0.0f, g_gpu_ms = 0.0f;
   diagBeginFrame();  // 诊断统计：关时仅一次 atomic load，无 pass / 无 GL 调用
   // AMaZE 诊断帧首清零（passCaCorrect 里的清零已删除，见那里的注释）
   dbg_amaze_ms_ = 0.f;
@@ -14732,15 +14734,31 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       dbg_amaze_ms_ = std::chrono::duration<float, std::milli>(
                           std::chrono::steady_clock::now() - a0).count();
     }
+    // ── 0.13.5 计时口径修正（2026-11-12）─────────────────────────────────
+    // 原实现 d0 打在 HR/P0 **之前**，d1 打在 P1 的 glFinish 之后 ⇒ dirMs 实际是
+    // 「HR + P0 + P1」的合计。冷机支架实测 dirMs 909~1486ms 波动 63%，而同样全分辨率的
+    // gMs（P2）只有 12~21ms —— 两个数不可能同时为真，正是这个口径造成的。
+    // 现在拆成三段：preMs（HR+P0，到 P1 提交前）、dirMs（P1 净墙钟）、dirGpuMs（GPU query）。
+    glFinish();  // 起点同步：只计本 pass，不背前序 pass 的尾巴
+    pre_ms = std::chrono::duration<float, std::milli>(
+                 std::chrono::steady_clock::now() - d0)
+                 .count();
+    GpuTimer gpu_dir, gpu_g;
+    const bool gpu_timers = GpuTimer::supported();
+    const auto d_dir0 = std::chrono::steady_clock::now();
     if (!c.amaze) {
+    if (gpu_timers) gpu_dir.begin();
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
     glFinish();
     const auto d1 = std::chrono::steady_clock::now();
+    if (gpu_timers) dir_gpu_ms = static_cast<float>(gpu_dir.endMs());
+    if (gpu_timers) gpu_g.begin();
     passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
              p.rcd_g_orig);
     glFinish();
     const auto d2 = std::chrono::steady_clock::now();
-    dir_ms = std::chrono::duration<float, std::milli>(d1 - d0).count();
+    if (gpu_timers) g_gpu_ms = static_cast<float>(gpu_g.endMs());
+    dir_ms = std::chrono::duration<float, std::milli>(d1 - d_dir0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     // ── P3 色度段（v0.10.180 加 [58] 拆双 pass A/B 路径）───────────────────
     // rcdSplit=1：3a 对角段填充（tex_rcd_a_）→ 3b G 位轴向填充（交叉轴 ±1 读
@@ -15235,6 +15253,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
   if (skyDiagOn()) dbg_prof_fm_ = profDump(fbo_work_, tex_work_, dst_w, dst_h);  // 0.12.164 诊断
   const auto t2 = std::chrono::steady_clock::now();
+  // 0.13.1 性能细分（纯计时，零 GL 行为变化）：t2 之后是"成片交付段"——
+  // passOutput / 显示域闭环（含中心读回与天空护栏读回）/ 半分辨率 gainmap /
+  // 最终 50MB 读回 / CPU 统计。真机实测这段 ~500ms，逐段记便于定位。
+  const auto elMs = [](std::chrono::steady_clock::time_point a,
+                       std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<float, std::milli>(b - a).count();
+  };
+  float out_ms = 0.f, disp_ms = 0.f, sky_ms = 0.f, gm_ms = 0.f, rb_ms = 0.f;
+  float stat_ms = 0.f;
+  int disp_n = 0;
   // 诊断统计：kFsFilm 的整链输出（filmic → gamut → sat/split → look → mono）。
   // 放在 t2 之后，passMs 不受统计耗时污染。
   diagStatsTex("FILM-out", tex_work_, dst_w, dst_h, &p);
@@ -15264,6 +15292,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   halo_ref_min_ = static_cast<float>(std::min(dst_w, dst_h));
   // 成片：斑马纹绝不进成片；dither 除数按交付档重标（255 / 1023）
   passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+  out_ms = elMs(t2, std::chrono::steady_clock::now());
   // ── 显示域闭环（v0.12.232）：成片对齐取景器 ────────────────────────────
   // 取景器的显示域鲁棒中灰 `g_pv_disp_p50` = 用户**实际看到**的亮度（同一函数、同一
   // 中心 1/2 区域统计）。成片必须落在同一位置 —— 这正是 PC `MeteringSystem` 的做法
@@ -15273,6 +15302,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   disp_close_ev_ = 0.0f;
   disp_add_ = 0.0f;
   if (!c.ten_bit && g_pv_disp_p50 > 0.005f && dst_w >= 256 && dst_h >= 256) {
+    const auto t_disp0 = std::chrono::steady_clock::now();
     const int rw = dst_w / 2, rh = dst_h / 2;
     const int rx = (dst_w - rw) / 2, ry = (dst_h - rh) / 2;
     std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4);
@@ -15295,7 +15325,9 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // P99；一旦补前补后 P99 涨超 0.03（≈8 LSB）或绝对值超 0.88，就撤销这一步并停手。
     // 结果：普通场景差压到 <0.2 EV；逆光天空场景停在"天空刚好不白"的位置，差 ≤0.4 EV。
     const auto skyP99 = [&]() -> float {
+      const auto s0 = std::chrono::steady_clock::now();
       const std::string s = skyProfile(fbo_cap_, tex_cap_, dst_w, dst_h, true);
+      sky_ms += elMs(s0, std::chrono::steady_clock::now());
       const size_t pos = s.find("p99=");
       if (pos == std::string::npos) return -1.0f;
       return static_cast<float>(std::atof(s.c_str() + pos + 4));
@@ -15310,6 +15342,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         const float room = kDispAddMax - std::fabs(disp_add_);
         if (room <= 0.02f) break;
         if (std::fabs(step) > room) step = std::copysign(room, step);
+        ++disp_n;
         pe.exposure_ev += step;
         disp_add_ += step;
         passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
@@ -15331,6 +15364,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                            ? std::log2(g_pv_disp_p50 / still_disp_mid_)
                            : disp_close_ev_;
     }
+    disp_ms = elMs(t_disp0, std::chrono::steady_clock::now());
   }
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
@@ -15344,15 +15378,18 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 只在 8bit 档生成：10bit 档 tex_cap_ 是 GL_RGB10_A2，本 shader 按 sRGB 8bit 采样会错；
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
   if (!c.ten_bit) {
+    const auto t_gm0 = std::chrono::steady_clock::now();
     if (passGainmap(dst_w, dst_h, film_src, tex_cap_)) {
       dbg_gainmap_ok_ = 1;
     } else {
       dbg_gainmap_ok_ = 0;
     }
+    gm_ms = elMs(t_gm0, std::chrono::steady_clock::now());
   } else {
     dbg_gainmap_ok_ = 0;
   }
   // readPixels 是异步提交，glFinish 后计时才是真实端到端耗时（拍照单张路径可接受）
+  const auto t_rb0 = std::chrono::steady_clock::now();
   glFinish();
   // ⚠ **显式绑回 fbo_cap_**（v0.11.50 真机事故的保险）：原实现依赖"passOutput 把
   // fbo_cap_ 绑上后一直不恢复"，而中间插入的 passGainmap 会切 FBO。哪怕它内部的
@@ -15363,12 +15400,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),
                outputReadTypeOf(c.ten_bit), out_rgba->data());
+  rb_ms = elMs(t_rb0, std::chrono::steady_clock::now());
   // 诊断统计 D5（最终成片，基准；零 GL 调用的 CPU 侧统计）。
   // ⚠ 卡 H2：该统计的口径是 **u8**（逐字节 /255 的直方图/均值），10bit 档下字节流是
   //   打包的 2_10_10_10_REV ⇒ 统计值无意义（会把 10bit 位段读成 8bit 灰度）。
   //   因此 10bit 档**跳过**（不是"改了统计"，而是"该口径不适用于该档"）——
   //   对应的诊断需求由 heif10.selfcheck / render.diag 的 bits:10 分支承担。
-  if (!c.ten_bit) diagStatsU8("D5-out-u8", out_rgba->data(), dst_w, dst_h, &p);
+  if (!c.ten_bit) {
+    const auto t_st0 = std::chrono::steady_clock::now();
+    diagStatsU8("D5-out-u8", out_rgba->data(), dst_w, dst_h, &p);
+    stat_ms = elMs(t_st0, std::chrono::steady_clock::now());
+  }
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   const auto t3 = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
@@ -15377,6 +15419,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   std::string kv =
       std::string("{\"uploadMs\":") + jnum(c.upload_ms, 6) +
       ",\"passMs\":" + jnum(ms(t1, t2), 6) +
+      // 0.13.1 成片交付段细分：out + disp + gm + rb + stat ≈ total − upload − pass（同口径 glFinish 收尾）。
+      ",\"outMs\":" + jnum(out_ms, 7) +
+      ",\"dispMs\":" + jnum(disp_ms, 7) +
+      ",\"dispN\":" + std::to_string(disp_n) +
+      ",\"skyMs\":" + jnum(sky_ms, 7) +
+      ",\"gmMs\":" + jnum(gm_ms, 7) +
+      ",\"rbMs\":" + jnum(rb_ms, 7) +
+      ",\"statMs\":" + jnum(stat_ms, 7) +
       ",\"totalMs\":" + jnum(ms(t0, t3), 7) +
       // ── 强边缘色度门（v0.10.174，FilmParams[51]/[52]/[53]）─────────────────
       // cgK = 下发的 κ（0 = 关）；cgCap = shader 常量 kCgRel = 16.0（**相对**上限
@@ -15468,7 +15518,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // rcdSplit/rcdAMs/rcdBMs（v0.10.180，[58]）：P3 拆双 pass 的生效性与
     // 分 pass 成本 —— rcdSplit=0 而 [58]>0.5 ⇒ 未生效；rcdAMs+rcdBMs 对比
     // 旧单 pass 成本（多一次全分辨率 RGBA16F 往返）。
-    kv += ",\"dirMs\":" + jnum(dir_ms, 6) +
+    kv += ",\"preMs\":" + jnum(pre_ms, 6) +
+          ",\"dirMs\":" + jnum(dir_ms, 6) +
+          ",\"dirGpuMs\":" + jnum(dir_gpu_ms, 7) +
+          ",\"gGpuMs\":" + jnum(g_gpu_ms, 7) +
           ",\"gMs\":" + jnum(g_ms, 6) +
           ",\"ccmMs\":" + jnum(ccm_ms, 6);
     // 局部影调（tone equalizer）：开关状态（关 = 完全跳过，逐位不变）

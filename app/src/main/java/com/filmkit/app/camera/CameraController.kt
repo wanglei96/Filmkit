@@ -5106,8 +5106,12 @@ class CameraController(private val context: Context, private val render: RenderC
             }.getOrNull()
             hdrPath = if (hdrBytes != null) "platform420" else "platform420_failed"
         }
+        // 0.13.1 性能：HDR 成功时 hdrBytes 已经是完整成片（JPEG/R 的 base 就是同一路
+        // stb 4:4:4，见 UltraHdrEncoder ①），再跑一遍 nativeEncodeJpeg444 是**纯重复**
+        // —— 真机 0.13.0 实测 photo.encode 1467ms 里两次全分辨率编码各占约一半。
+        // 只在 HDR 不可用/失败时才编普通 4:4:4（兜底语义不变）。
         val native444: ByteArray? =
-            if (jpeg444) runCatching {
+            if (jpeg444 && hdrBytes == null) runCatching {
                 EngineBridge.nativeEncodeJpeg444(outBmp, jpegQ)
             }.getOrNull() else null
         // 卡 FIX2 可疑点：此前 4:2:0 分支的 `photo.encode{bytes:0,ms:0}` 是在 compress **之前**
@@ -5121,11 +5125,17 @@ class CameraController(private val context: Context, private val render: RenderC
             jpegBytes = bos.toByteArray().takeIf { it.isNotEmpty() }
         }
         val encMs = (System.nanoTime() - encT0) / 1_000_000
+        // chroma/encoder 按**实际产出**的字节流报（hdrBytes 的 base 也是 4:4:4）：
+        // 0.13.0 之前这两项靠 native444 != null 推断，HDR 成功时会误报 420/bitmap420。
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "photo.encode",
-            kv("chroma" to (if (native444 != null) "444" else "420"),
-                "encoder" to (if (native444 != null) "native444" else "bitmap420"),
-                "jpeg444" to jpeg444, "nativeFail" to (jpeg444 && native444 == null),
+            kv("chroma" to (if (hdrBytes != null || native444 != null) "444" else "420"),
+                "encoder" to (when {
+                    hdrBytes != null -> "jpegR"
+                    native444 != null -> "native444"
+                    else -> "bitmap420"
+                }),
+                "jpeg444" to jpeg444, "nativeFail" to (jpeg444 && hdrBytes == null && native444 == null),
                 "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0),
                 "hdr" to hdrPath),
         )

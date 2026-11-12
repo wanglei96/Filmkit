@@ -2,12 +2,39 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 namespace filmkit {
 
 namespace {
 
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// 0.13.1 性能：tile 网格按行切块并行（X300 8 核，串行 SAD 实测 alignCpuMs 633ms/张）。
+// 每个 tile 只写自己那格 d3x/d2x/out/conf —— 行间无共享写 ⇒ 结果与串行**逐位一致**；
+// 置信度和也按行独立累加、最后串行求和，避免原子加法的顺序抖动（便于 A/B 逐位对比）。
+// 线程上限 8：再多只是增加调度与内存带宽争用（SAD 是纯带宽活）。
+template <typename Fn>
+void parallelRows(int n, Fn fn) {
+  const unsigned hc = std::thread::hardware_concurrency();
+  const int workers = static_cast<int>(std::min<unsigned>(hc > 0 ? hc : 1, 8));
+  if (workers <= 1 || n < 8) {
+    fn(0, n);
+    return;
+  }
+  const int nw = std::min(workers, n);
+  const int chunk = (n + nw - 1) / nw;
+  std::vector<std::thread> ts;
+  ts.reserve(static_cast<size_t>(nw));
+  for (int w = 0; w < nw; ++w) {
+    const int b = w * chunk;
+    const int e = std::min(n, b + chunk);
+    if (b >= e) break;
+    ts.emplace_back(fn, b, e);
+  }
+  for (auto& t : ts) t.join();
+}
 
 // SAD：a 的 (x0,y0) tile 对 b 的 (x0+dx, y0+dy) tile，步长 step 采样。
 // 所有读地址逐点 clamp（tile 32/16/8 不整除图像尺寸时，末行末列 tile 的
@@ -173,7 +200,8 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   const int ny3 = (ref.h3 + kTile3 - 1) / kTile3;
   std::vector<int> d3x(static_cast<size_t>(nx3 * ny3), 0);
   std::vector<int> d3y(static_cast<size_t>(nx3 * ny3), 0);
-  for (int ty = 0; ty < ny3; ++ty) {
+  parallelRows(ny3, [&](int row0, int row1) {
+  for (int ty = row0; ty < row1; ++ty) {
     for (int tx = 0; tx < nx3; ++tx) {
       const int x0 = tx * kTile3, y0 = ty * kTile3;
       int best3 = 1 << 30;
@@ -193,6 +221,7 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
       d3y[static_cast<size_t>(ty * nx3 + tx)] = by;
     }
   }
+  });
 
   // ── 3) L2（1/4 域）每 tile 精化（±2） ───────────────────────────────
   // 1/2 域 64px tile ≡ L3 域 16px tile（同一区域逐级减半），网格同
@@ -205,8 +234,10 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   out.used_l1 = use_l1;
   std::vector<int> d2x(static_cast<size_t>(n_tiles), 0);
   std::vector<int> d2y(static_cast<size_t>(n_tiles), 0);
-  float conf_sum = 0.f;
-  for (int ty = 0; ty < tiles_y; ++ty) {
+  // 置信度和按行暂存（并行安全 + 求和顺序固定）
+  std::vector<float> conf_rows(static_cast<size_t>(tiles_y), 0.f);
+  parallelRows(tiles_y, [&](int row0, int row1) {
+  for (int ty = row0; ty < row1; ++ty) {
     for (int tx = 0; tx < tiles_x; ++tx) {
       const int x0 = tx * kTile2, y0 = ty * kTile2;
       // 1/2 域 32px tile ≡ L3 域 8px tile（同一区域逐级减半），网格同尺寸
@@ -222,17 +253,19 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
         out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 4.f;
         out.off[static_cast<size_t>(idx) * 2 + 1] = (m.by + m.sy) * 4.f;
         out.conf[static_cast<size_t>(idx)] = m.conf;
-        conf_sum += m.conf;
+        conf_rows[static_cast<size_t>(ty)] += m.conf;
       }
     }
   }
+  });
 
   // ── 4) L1（1/2 域）每 tile 精化（±2）+ 亚像素 + 置信度 ───────────────
   // 最细层 = 2×2 Bayer 块平均灰度（HDR+ §4 原版最细层），初值 = 2×L2 位移。
   // 位移域换算 L1→mosaic = ×2：量化从 4 mosaic px 降到 2，是 P0 同相位邻域
   // （±4 mosaic px）精度提升的直接来源。tile 与输出网格同为 tiles_x/y。
   if (use_l1) {
-    for (int ty = 0; ty < tiles_y; ++ty) {
+    parallelRows(tiles_y, [&](int row0, int row1) {
+    for (int ty = row0; ty < row1; ++ty) {
       for (int tx = 0; tx < tiles_x; ++tx) {
         const int idx = ty * tiles_x + tx;
         const int x0 = tx * kMfnrTile + kMfnrTile / 2 - ALIGN_SAD_TILE / 2;
@@ -244,10 +277,13 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
         out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 2.f;
         out.off[static_cast<size_t>(idx) * 2 + 1] = (m.by + m.sy) * 2.f;
         out.conf[static_cast<size_t>(idx)] = m.conf;
-        conf_sum += m.conf;
+        conf_rows[static_cast<size_t>(ty)] += m.conf;
       }
     }
+    });
   }
+  float conf_sum = 0.f;
+  for (float v : conf_rows) conf_sum += v;
   out.conf_med = n_tiles > 0 ? conf_sum / n_tiles : 0.f;
   // 全局位移：L4 是 1/16 域，1px = 16 mosaic px（旧版写 ×4 = L2 域，口径修正）。
   out.gx = static_cast<float>(bgx) * 16.f;
