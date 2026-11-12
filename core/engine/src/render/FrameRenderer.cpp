@@ -15276,23 +15276,51 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       return robustMidToneDisplayRgba8(px.data(), rw, rh, rw * 4);
     };
     still_disp_mid_ = readStillMid();
-    // ── v0.12.254：**不再给成片补 EV**，把差反馈给「预览的域比」──────────────
-    // 真机 11-12 09:19：成片 `dispMid 0.087` vs 取景器 `aeDispP50 0.158` ⇒ 差 0.86 EV。
-    // 旧实现用「成片 +EV 重跑」把差抹平，代价是把天空推白（11-12 08:57 那张
-    // `dispAdd 0.60` ⇒ 天空 8bit 230+/L* 90）。这条路走不通：成片与预览的差是
-    // **域/曲线差**，不是曝光差；PC（`RawEngineTonePass.render()`）也从不对成片补 EV。
-    // 正确方向：让**预览**回到成片的度量上 —— 成片比预览暗 d EV，说明预览把场景
-    // 渲染亮了，`g_domain_ratio`（HAL 域/RAW 域之比）偏小，按 2^d 的方向放大它。
-    // 0.5 阻尼逐步收敛（一次拍摄一步），取景器随之下沉到与成片一致的位置。
-    // 成片本身一次成像，不再受闭环影响 —— 天空亮度只由曝光与目标曲线决定。
+    // ── v0.12.256：成片按**当帧自己的中灰**补 EV + **高光护栏** ────────────────
+    // 11-12 的两次实测把取舍逼到了唯一解：
+    //   · 不补 EV（0.12.254/255）：成片比取景器暗 0.86 EV，用户不接受"差这么多"。
+    //   · 补满 EV（≤0.12.252）：天空被推到 8bit 230+/L* 90，就是白块。
+    // 而且**不能用上一张的域比跨场景对齐**（用户 11-12 指出）：厂家 ISP 的 tonemap
+    // 随场景变，上一张的比值是别的场景的量。
+    // 所以：对齐只发生在**这一张自己**身上 —— 补 EV，但每补一步就测**成片顶部天空**的
+    // P99；一旦补前补后 P99 涨超 0.03（≈8 LSB）或绝对值超 0.88，就撤销这一步并停手。
+    // 结果：普通场景差压到 <0.2 EV；逆光天空场景停在"天空刚好不白"的位置，差 ≤0.4 EV。
+    const auto skyP99 = [&]() -> float {
+      const std::string s = skyProfile(fbo_cap_, tex_cap_, dst_w, dst_h, true);
+      const size_t pos = s.find("p99=");
+      if (pos == std::string::npos) return -1.0f;
+      return static_cast<float>(std::atof(s.c_str() + pos + 4));
+    };
     if (still_disp_mid_ > 0.01f && g_pv_disp_p50 > 0.005f) {
-      const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
-      if (std::fabs(d) > 0.03f) {
-        // 全步（不是 0.5 阻尼）：这一张拍完，**下一帧取景器就已经对齐**。
-        // 用户不需要为对齐连拍几张 —— 校准是设备的事，不是用户的事。
-        g_domain_ratio = std::clamp(g_domain_ratio * std::exp2(d), 1.2f, 8.0f);
+      const float sky0 = skyP99();
+      for (int iter = 0; iter < 2 && still_disp_mid_ > 0.0f; ++iter) {
+        const float d = std::clamp(std::log2(g_pv_disp_p50 / still_disp_mid_), -2.0f, 2.0f);
+        if (std::fabs(d) <= 0.10f) break;  // 死区：统计噪声不动
+        float step = d * 0.7f;
+        constexpr float kDispAddMax = 0.60f;  // 硬上限：链路偏差不靠高光去填
+        const float room = kDispAddMax - std::fabs(disp_add_);
+        if (room <= 0.02f) break;
+        if (std::fabs(step) > room) step = std::copysign(room, step);
+        pe.exposure_ev += step;
+        disp_add_ += step;
+        passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
+        passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+        still_disp_mid_ = readStillMid();
+        const float sky1 = skyP99();
+        if (sky1 >= 0.0f && sky0 >= 0.0f &&
+            (sky1 > 0.88f || sky1 - sky0 > 0.03f)) {
+          // 这一步把天空推白了 ⇒ 撤销，回到上一步的画面
+          pe.exposure_ev -= step;
+          disp_add_ -= step;
+          passFilm(dst_w, dst_h, pe, teq_src, /*still=*/true, /*hal_domain=*/false);
+          passOutput(dst_w, dst_h, p, true, false, outputMaxOf(c.ten_bit));
+          still_disp_mid_ = readStillMid();
+          break;
+        }
       }
-      disp_close_ev_ = d;
+      disp_close_ev_ = (still_disp_mid_ > 0.0f)
+                           ? std::log2(g_pv_disp_p50 / still_disp_mid_)
+                           : disp_close_ev_;
     }
   }
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
