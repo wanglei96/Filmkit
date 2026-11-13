@@ -357,6 +357,9 @@ class FrameRenderer {
   bool ensureDefringe(int w, int h);
   // 色差域中值滤波（v0.10.196）：对标 darktable color_smoothing
   bool ensureColorSmooth(int w, int h);
+  // 0.13.22：HL / PC3D 的分配抽成 ensure，供 warmup 预分配（行为与 pass 内原块一致）
+  bool ensureHlTargets(int w, int h);
+  bool ensurePc3dTargets(int dst_w, int dst_h, int scale);
   // MFNR 阶段一（v0.9.0）：raw 尺寸的 burst 纹理 / 金字塔 / 融合目标
   bool ensureMfnrTargets(int w, int h);
   // u16 Bayer 上传（submitRaw / submitRawBurst 共用）：rowStride 跳行 + 失败日志

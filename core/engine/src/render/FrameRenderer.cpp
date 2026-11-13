@@ -12296,6 +12296,54 @@ void FrameRenderer::passSatMask(int w, int h, int rot, int cfa,
   }
 }
 
+// 0.13.22：HL 纹理分配抽成 ensure（行为与原分配块逐字一致），供 warmup 预分配。
+bool FrameRenderer::ensureHlTargets(int w, int h) {
+  const int mw = w / 3, mh = h / 3;    // 块网格（darktable: iwidth/3、iheight/3）
+  const int tw = w / 16, th = h / 16;  // 色度统计归约网格（16×16）
+  const int rw32 = (w + 31) / 32, rh32 = (h + 31) / 32;
+  if (w <= 0 || h <= 0 || mw <= 0 || mh <= 0 || tw <= 0 || th <= 0) return false;
+  if (hl_w_ == w && hl_h_ == h && tex_hl_mask_ != 0) return true;
+  if (tex_hl_mask_) glDeleteTextures(1, &tex_hl_mask_);
+  if (fbo_hl_mask_) glDeleteFramebuffers(1, &fbo_hl_mask_);
+  if (tex_hl_dil_) glDeleteTextures(1, &tex_hl_dil_);
+  if (fbo_hl_dil_) glDeleteFramebuffers(1, &fbo_hl_dil_);
+  if (tex_hl_sum_) glDeleteTextures(1, &tex_hl_sum_);
+  if (fbo_hl_sum_) glDeleteFramebuffers(1, &fbo_hl_sum_);
+  if (tex_hl_) glDeleteTextures(1, &tex_hl_);
+  if (fbo_hl_) glDeleteFramebuffers(1, &fbo_hl_);
+  if (tex_hl_ref_) glDeleteTextures(1, &tex_hl_ref_);
+  if (fbo_hl_ref_) glDeleteFramebuffers(1, &fbo_hl_ref_);
+  if (tex_hl_ref2_) glDeleteTextures(1, &tex_hl_ref2_);
+  if (fbo_hl_ref2_) glDeleteFramebuffers(1, &fbo_hl_ref2_);
+  tex_hl_mask_ = fbo_hl_mask_ = tex_hl_dil_ = fbo_hl_dil_ = 0;
+  tex_hl_sum_ = fbo_hl_sum_ = tex_hl_ = fbo_hl_ = 0;
+  tex_hl_ref_ = fbo_hl_ref_ = 0;
+  tex_hl_ref2_ = fbo_hl_ref2_ = 0;
+  // @domain: D2 —— 高光重建（S17 判定掩码）——输入域 = 线性 mosaic + WB
+  makeTex(&tex_hl_mask_, &fbo_hl_mask_, GL_RGBA16F, mw, mh);
+  // @domain: D2
+  makeTex(&tex_hl_dil_, &fbo_hl_dil_, GL_RGBA16F, mw, mh);
+  // @domain: D2
+  makeTex(&tex_hl_sum_, &fbo_hl_sum_, GL_RGBA16F, tw, th);
+  // @domain: D2 —— 高光重建输出（替代 tex_mos_ 进入 RCD）
+  makeTex(&tex_hl_, &fbo_hl_, GL_RGBA16F, w, h);
+  // 参考色度场：1/32 网格（尺寸键 = w/h，随上面的 hl_w_/hl_h_ 一起失效重建）
+  // @domain: D2
+  makeTex(&tex_hl_ref_, &fbo_hl_ref_, GL_RGBA16F, rw32, rh32);
+  // 中尺度参考场（Pass3.55）：4×4 降采样 ⇒ 每格 128×128 CFA 像素
+  // @domain: D2 —— 高光重建参考场（中尺度）
+  makeTex(&tex_hl_ref2_, &fbo_hl_ref2_, GL_RGBA16F, (rw32 + 3) / 4,
+          (rh32 + 3) / 4);
+  hl_w_ = w;
+  hl_h_ = h;
+  hl_mw_ = mw;
+  hl_mh_ = mh;
+  hl_tw_ = tw;
+  hl_th_ = th;
+  return tex_hl_mask_ && tex_hl_dil_ && tex_hl_sum_ && tex_hl_ &&
+         tex_hl_ref_ && tex_hl_ref2_;
+}
+
 HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
                                             const float gains[3], GLuint src,
                                             GLuint stat_src, int stat_raw,
@@ -12320,47 +12368,7 @@ HlRawResult FrameRenderer::passHighlightRaw(int w, int h, int cfa,
     return r;
   const auto t0 = std::chrono::steady_clock::now();
 
-  if (hl_w_ != w || hl_h_ != h || tex_hl_mask_ == 0) {
-    if (tex_hl_mask_) glDeleteTextures(1, &tex_hl_mask_);
-    if (fbo_hl_mask_) glDeleteFramebuffers(1, &fbo_hl_mask_);
-    if (tex_hl_dil_) glDeleteTextures(1, &tex_hl_dil_);
-    if (fbo_hl_dil_) glDeleteFramebuffers(1, &fbo_hl_dil_);
-    if (tex_hl_sum_) glDeleteTextures(1, &tex_hl_sum_);
-    if (fbo_hl_sum_) glDeleteFramebuffers(1, &fbo_hl_sum_);
-    if (tex_hl_) glDeleteTextures(1, &tex_hl_);
-    if (fbo_hl_) glDeleteFramebuffers(1, &fbo_hl_);
-    if (tex_hl_ref_) glDeleteTextures(1, &tex_hl_ref_);
-    if (fbo_hl_ref_) glDeleteFramebuffers(1, &fbo_hl_ref_);
-    if (tex_hl_ref2_) glDeleteTextures(1, &tex_hl_ref2_);
-    if (fbo_hl_ref2_) glDeleteFramebuffers(1, &fbo_hl_ref2_);
-    tex_hl_mask_ = fbo_hl_mask_ = tex_hl_dil_ = fbo_hl_dil_ = 0;
-    tex_hl_sum_ = fbo_hl_sum_ = tex_hl_ = fbo_hl_ = 0;
-    tex_hl_ref_ = fbo_hl_ref_ = 0;
-    tex_hl_ref2_ = fbo_hl_ref2_ = 0;
-    // @domain: D2 —— 高光重建（S17 判定掩码）——输入域 = 线性 mosaic + WB
-    makeTex(&tex_hl_mask_, &fbo_hl_mask_, GL_RGBA16F, mw, mh);
-    // @domain: D2
-    makeTex(&tex_hl_dil_, &fbo_hl_dil_, GL_RGBA16F, mw, mh);
-    // @domain: D2
-    makeTex(&tex_hl_sum_, &fbo_hl_sum_, GL_RGBA16F, tw, th);
-    // @domain: D2 —— 高光重建输出（替代 tex_mos_ 进入 RCD）
-    makeTex(&tex_hl_, &fbo_hl_, GL_RGBA16F, w, h);
-    // 参考色度场：1/32 网格（尺寸键 = w/h，随上面的 hl_w_/hl_h_ 一起失效重建）
-    // @domain: D2
-    makeTex(&tex_hl_ref_, &fbo_hl_ref_, GL_RGBA16F, rw32, rh32);
-    // 中尺度参考场（Pass3.55）：4×4 降采样 ⇒ 每格 128×128 CFA 像素
-    // @domain: D2 —— 高光重建参考场（中尺度）
-    makeTex(&tex_hl_ref2_, &fbo_hl_ref2_, GL_RGBA16F, (rw32 + 3) / 4, (rh32 + 3) / 4);
-    hl_w_ = w;
-    hl_h_ = h;
-    hl_mw_ = mw;
-    hl_mh_ = mh;
-    hl_tw_ = tw;
-    hl_th_ = th;
-  }
-  if (!tex_hl_mask_ || !tex_hl_dil_ || !tex_hl_sum_ || !tex_hl_ || !tex_hl_ref_ ||
-      !tex_hl_ref2_)
-    return r;
+  if (!ensureHlTargets(w, h)) return r;
 
   const int cfalut = cfaLutOf(cfa);
   // ── 域核实（v0.10.161，改判据前必须钉死的一步）────────────────────────
@@ -13162,6 +13170,41 @@ constexpr int kPc3dMaxSize = 21;
 constexpr float kPc3dMoire = 1.5f;
 constexpr float kPc3dLuma = 0.8f;
 
+// 0.13.22：PC3D 的纹理分配抽成 ensure（行为与原分配块逐字一致），供 warmup 用。
+bool FrameRenderer::ensurePc3dTargets(int dst_w, int dst_h, int scale) {
+  if (dst_w <= 0 || dst_h <= 0) return false;
+  const int lw = std::max(1, dst_w / scale), lh = std::max(1, dst_h / scale);
+  if (tex_pc3d_ == 0 || pc3d_w_ != dst_w || pc3d_h_ != dst_h) {
+    if (tex_pc3d_) {
+      glDeleteTextures(1, &tex_pc3d_);
+      glDeleteFramebuffers(1, &fbo_pc3d_);
+      glDeleteTextures(1, &tex_pc3d_t1_);
+      glDeleteFramebuffers(1, &fbo_pc3d_t1_);
+    }
+    tex_pc3d_ = fbo_pc3d_ = tex_pc3d_t1_ = fbo_pc3d_t1_ = 0;
+    // @domain: D4 —— PC3D 全分辨率输出（与 tex_scene_ 同域同几何）
+    makeTex(&tex_pc3d_, &fbo_pc3d_, GL_RGBA16F, dst_w, dst_h);
+    makeTex(&tex_pc3d_t1_, &fbo_pc3d_t1_, GL_RGBA16F, dst_w, dst_h);
+    pc3d_w_ = dst_w;
+    pc3d_h_ = dst_h;
+    pc3d_lw_ = pc3d_lh_ = 0;   // 尺度可能变，低分辨率缓冲一并失效
+  }
+  if (scale > 1 && (tex_pc3d_lo_[0] == 0 || pc3d_lw_ != lw || pc3d_lh_ != lh)) {
+    for (int i = 0; i < 2; ++i) {
+      if (tex_pc3d_lo_[i]) {
+        glDeleteTextures(1, &tex_pc3d_lo_[i]);
+        glDeleteFramebuffers(1, &fbo_pc3d_lo_[i]);
+      }
+      tex_pc3d_lo_[i] = fbo_pc3d_lo_[i] = 0;
+      makeTex(&tex_pc3d_lo_[i], &fbo_pc3d_lo_[i], GL_RGBA16F, lw, lh);
+    }
+    pc3d_lw_ = lw;
+    pc3d_lh_ = lh;
+  }
+  return tex_pc3d_ != 0 && tex_pc3d_t1_ != 0 &&
+         (scale <= 1 || (tex_pc3d_lo_[0] != 0 && tex_pc3d_lo_[1] != 0));
+}
+
 bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
                              const FilmParams& p, GLuint in_src) {
   // v0.10.205：输入源（0 = tex_scene_，逐位等于改动前）
@@ -13206,35 +13249,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
 
   // ④ 缓冲（惰性；[54] = 0 时一个都不建）
   const int lw = std::max(1, dst_w / scale), lh = std::max(1, dst_h / scale);
-  if (tex_pc3d_ == 0 || pc3d_w_ != dst_w || pc3d_h_ != dst_h) {
-    if (tex_pc3d_) {
-      glDeleteTextures(1, &tex_pc3d_);
-      glDeleteFramebuffers(1, &fbo_pc3d_);
-      glDeleteTextures(1, &tex_pc3d_t1_);
-      glDeleteFramebuffers(1, &fbo_pc3d_t1_);
-    }
-    tex_pc3d_ = fbo_pc3d_ = tex_pc3d_t1_ = fbo_pc3d_t1_ = 0;
-    // @domain: D4 —— PC3D 全分辨率输出（与 tex_scene_ 同域同几何）
-    makeTex(&tex_pc3d_, &fbo_pc3d_, GL_RGBA16F, dst_w, dst_h);
-    makeTex(&tex_pc3d_t1_, &fbo_pc3d_t1_, GL_RGBA16F, dst_w, dst_h);
-    pc3d_w_ = dst_w;
-    pc3d_h_ = dst_h;
-    pc3d_lw_ = pc3d_lh_ = 0;   // 尺度可能变，低分辨率缓冲一并失效
-  }
-  if (scale > 1 && (tex_pc3d_lo_[0] == 0 || pc3d_lw_ != lw || pc3d_lh_ != lh)) {
-    for (int i = 0; i < 2; ++i) {
-      if (tex_pc3d_lo_[i]) {
-        glDeleteTextures(1, &tex_pc3d_lo_[i]);
-        glDeleteFramebuffers(1, &fbo_pc3d_lo_[i]);
-      }
-      tex_pc3d_lo_[i] = fbo_pc3d_lo_[i] = 0;
-      makeTex(&tex_pc3d_lo_[i], &fbo_pc3d_lo_[i], GL_RGBA16F, lw, lh);
-    }
-    pc3d_lw_ = lw;
-    pc3d_lh_ = lh;
-  }
-  if (tex_pc3d_ == 0 || tex_pc3d_t1_ == 0 ||
-      (scale > 1 && (tex_pc3d_lo_[0] == 0 || tex_pc3d_lo_[1] == 0))) {
+  if (!ensurePc3dTargets(dst_w, dst_h, scale)) {
     return false;   // 分配失败 → 调用方沿用 tex_scene_（照片优先红线）
   }
 
@@ -17588,7 +17603,14 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
   const int dst_h = swap_wh ? raw_w : raw_h;
   bool ok = ensureMfnrTargets(raw_w, raw_h);
   ok = ensureRcdTargets(raw_w, raw_h) && ok;
+  ok = ensureHlTargets(raw_w, raw_h) && ok;
   ok = ensureTargets(dst_w, dst_h) && ok;
+  ok = ensureDefringe(dst_w, dst_h) && ok;
+  ok = ensureColorSmooth(dst_w, dst_h) && ok;
+  ok = ensureCaTargets(dst_w, dst_h) && ok;
+  ok = ensureTeqTargets(dst_w, dst_h) && ok;
+  // PC3D 全分辨率两张恒定；低分辨率按 scale=2 预分配（实际 scale 变化时只重建小的）
+  ok = ensurePc3dTargets(dst_w, dst_h, 2) && ok;
   // satmask 的 4 张 CPU 缓冲（~125MB）同步预分配：passSatMask 按 raw 尺寸复用。
   const size_t n = static_cast<size_t>(raw_w) * raw_h;
   if (satm_sat_.size() != n) {
@@ -17596,6 +17618,47 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
     satm_dil_.assign(n, 0);
     satm_out_.assign(n * 4, 0);
   }
+  // 触页（0.13.22）：glTexImage2D 只分配虚拟页，首次写入才提交物理页；不先写一遍，
+  // 第一张会在每条全屏 pass 上逐页触发 page fault（实测 dn/teq/hl 全变慢 1.5~2×）。
+  // 只 clear **每张都会被完整重写**的中间 target —— 资产（LUT/LSC/grain）与交付
+  // 纹理（gainmap/out）绝不碰。glClear 受 scissor 影响，这里临时关掉再恢复。
+  const bool scissor_was = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+  GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+  glGetIntegerv(GL_VIEWPORT, prev_vp);
+  glDisable(GL_SCISSOR_TEST);
+  const auto clearTarget = [](GLuint fbo) {
+    if (fbo == 0) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    GLint tex = 0;
+    glGetFramebufferAttachmentParameteriv(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &tex);
+    if (tex == 0) return;
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(tex));
+    GLint w = 0, h = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    if (w <= 0 || h <= 0) return;
+    glViewport(0, 0, w, h);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+  };
+  const GLuint targets[] = {
+      fbo_pyr1_, fbo_pyr2_, fbo_pyr3_, fbo_pyr4_, fbo_fused_,
+      fbo_dir_, fbo_g_, fbo_mos_, fbo_rcd_a_,
+      fbo_hl_mask_, fbo_hl_dil_, fbo_hl_sum_, fbo_hl_, fbo_hl_ref_, fbo_hl_ref2_,
+      fbo_scene_, fbo_work_,
+      fbo_df_lab_, fbo_df_det_, fbo_df_avg_, fbo_df_,
+      fbo_cs_, fbo_cs_tmp_, fbo_cm_, fbo_cm_tmp_,
+      fbo_teq_i_, fbo_teq_mean_, fbo_teq_tmp_, fbo_teq_out_,
+      fbo_pc3d_, fbo_pc3d_t1_, fbo_pc3d_lo_[0], fbo_pc3d_lo_[1],
+      fbo_ca_, fbo_ca_ds_,
+  };
+  for (GLuint f : targets) clearTarget(f);
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  if (scissor_was) glEnable(GL_SCISSOR_TEST);
   glFinish();
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
