@@ -88,7 +88,7 @@ status: active
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
 
-- [2026-11-12] 版本 **0.13.4(712)** 当前（性能迭代，未打 tag；上一正式版 0.13.0(708) tag `v0.13.0`）、回退 0.13.0；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个（`ricoh_positive_v1`/`fuji_nc_v2`/`kodak_5219_deep`）+ **`ricoh_negative_ye` 33³**（LUMIX Lab 导出，自带影调）。
+- [2026-11-13] 版本：**设备实际 0.13.38(746)**；最新包 0.13.40(748) **未安装成功**（install 被 echo 掩盖，见 lessons）；0.13.0(708) 是最后打 tag 的版本；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个 + `ricoh_negative_ye` 33³。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 
 ## 预设群与 LUT 特征（11-02）
@@ -118,3 +118,11 @@ status: active
 - [2026-11-12] **0.13.16(724) 当前**：`mfnr_dft` 默认 **false**（空间域 mismatch+fuse），设置页可切回 DFT；`files/mfnr_spatial` 哨兵强制 DFT，`files/burst_dump` 导出 4 帧 `.raw/.meta`（25MB/帧）。
 - [2026-11-12] **融合两条链实测**（同场景同曝光）：明亮 ISO 1163 DFT 6033ms → 空间域 4233ms；暗光 ISO 662 DFT 8000ms → 空间域 5240ms。暗部平场 σ 2.08→1.71 LSB、全局高频 −18%，100% 裁剪无可见差。
 - [2026-11-12] **EGL_IMG_context_priority 在 X300 可用**：`eglPriExt=1, eglLow=1`（still context 以 LOW 创建）；`engine.still_start` 日志带这两个字段。
+
+## 预览体感实测（11-13）
+
+- [2026-11-13] **warmup 实测**：相机页可见 2s 后启动，冷启动 `engine.still_warmup` 992~1197ms（全量 ensure + 35 个 FBO clear）；第一张 3805→3129ms、与热态差 1261→398ms；teq/hl 与热态一致；剩 323ms 在采集侧 `upload`。
+- [2026-11-13] **保活实测**：停 87s 不重建；HOME 立即 `render.still_release {"why":"lifecycle"}`；回前台重建 + warmup（init 204ms + warmup 333ms）。
+- [2026-11-13] **fence/时间片实验**：在飞 2 的 total 3124 vs 3121、fps 不变；sleep 10ms/30ms 让路 total +231ms、fps 不变 ⇒ 掉帧不是队列深度造成。
+- [2026-11-13] **PC 实测**：专业模式 RAW 拍照 tap→落盘 6.59s（我们 3.2~3.5s）；PC 无帧率日志、`SurfaceFlinger --latency` 对 BLAST layer 无效。
+- [2026-11-13] **界面动画**：相机页请求最高刷新率（`preferredDisplayModeId`），`dumpsys display` 实测 `appRequestBaseModeRefreshRate=120`；快门飞入 560ms、动画结束即 `resumePreviewNow`（`preview_gap` 607~633ms）。

@@ -15,7 +15,7 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
 
-**进行中**：**性能优化专项**（11-12 起；卡顿已定档：still context LOW 优先级 + DFT 拆块，用户确认预览「好很多」；融合默认切**空间域**，两场景 A/B 快 1.8~2.8s、画质无差）→ **Spektrafilm 引擎 + 预设标定**（用户 11-12 定序）；理光目标曲线待用新 LUT 重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
+**进行中**：**预览体感专项**（11-12→13）：卡顿定档（LOW context + DFT 拆块）；空间域 fusion/PC3D/HL/defringe/CCM/TEQ/CA 全部 16 条**scissor** 条带（⛔ 不能用 viewport，0.13.18 画面重复 N 次）；still 改**生命周期保活**（相机页可见+亮屏，离开/熄屏释放，不再定时）；相机页 2s 后 **warmup**（全量 ensure + 35 个 FBO 触页，第一张 3805→3129ms、与热态差 1261→398ms）；快门**定格+飞入动画**（0.13.40 未装上，设备实际 0.13.38）。fence 窗口与时间片让路实测零收益、已弃用。掉帧剩采集期（HAL 重配）+ 处理期 GPU 饱和。→ **Spektrafilm 引擎 + 预设标定**（11-12 定序）；理光目标曲线待重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
 
 ## 里程碑沿革（压缩）
 - [2026-09-18→30] **M0–M2 + 域映射 + MFNR + 亚像素**：YUV/RAW 双链、RCD 12MP 477ms、LSC 接去马赛克后 CCM 前、M4 display 域 LUT；EV 单一来源与 WYSIWYG 定稿；MFNR 4 帧 Bayer 域对齐（残余 4.4×/2.2×→1.22×/1.45×）；P0 亚像素 +43.7%/+46.5%、快门间隔 2.5s→0.54s
