@@ -162,9 +162,13 @@ object StillRenderClient {
         if (w <= 0 || h <= 0) return
         // 不在**调用线程**上判 ready_：startAsync 只是排队，ready_ 要等 start 执行完
         // 才变 true。这里同样只排队，真正的就绪判断放到队列内（start 必然先执行）。
-        val hd = handler ?: return
-        hd.post {
-            if (!ready_) return@post
+        val hd = handlerOrStart() ?: return
+        lateinit var task: Runnable
+        task = Runnable {
+            // 0.13.23：拍照入口会 cancelWarmup()；若本任务已经开始执行，说明
+            // 用户按下快门时预热已跑完（或正在跑最后几十 ms）——不再重复。
+            synchronized(this) { if (warmupTask === task) warmupTask = null }
+            if (!ready_) return@Runnable
             val t0 = SystemClock.elapsedRealtime()
             val ok = try {
                 EngineBridge.nativeStillWarmup(w, h, rot)
@@ -181,6 +185,21 @@ object StillRenderClient {
                    "size" to "${w}x$h", "rot" to rot),
             )
         }
+        synchronized(this) {
+            warmupTask?.let { hd.removeCallbacks(it) }
+            warmupTask = task
+            hd.post(task)
+        }
+    }
+
+    /** 0.13.23：按下快门时取消**尚未开始**的预热 —— 预热是构图期的后台工作，
+     *  用户已经要拍照就不能让它排在合成前面（否则快门白等 ~1s）。已开始执行的
+     *  预热无法中断（GL 调用在飞），只能让它跑完（通常只剩几十 ms）。 */
+    fun cancelWarmup() {
+        synchronized(this) {
+            warmupTask?.let { handler?.removeCallbacks(it) }
+            warmupTask = null
+        }
     }
 
     /** 是否就绪（v0.10.93 单帧路由用）：调用方（渲染线程上的 tryProcessRaw）只做
@@ -192,6 +211,9 @@ object StillRenderClient {
 
     @Volatile
     private var ready_ = false
+
+    /** 0.13.23：队列里尚未开始的预热任务（capture 入口 cancelWarmup 用）。 */
+    private var warmupTask: Runnable? = null
 
     /** 在拍照线程上跑一次 MFNR 合成。onDone 在**拍照线程**回调（与 RenderClient
      *  同一约定），调用方只做轻量收尾（计数、入队保存）。 */

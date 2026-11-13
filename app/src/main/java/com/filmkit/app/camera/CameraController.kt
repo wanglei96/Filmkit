@@ -2218,6 +2218,9 @@ class CameraController(private val context: Context, private val render: RenderC
         if (context.getSharedPreferences("filmkit", 0)
                 .getBoolean("still_thread", false)
         ) {
+            // 0.13.23：预热是构图期的后台工作，用户已经按快门就不能排在合成前面
+            // （否则第一张白等预热的 ~1s）。只取消尚未开始的那次。
+            StillRenderClient.cancelWarmup()
             StillRenderClient.startAsync()
         }
         if (shutterSound) {
