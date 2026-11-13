@@ -8,6 +8,17 @@ import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -18,7 +29,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import com.filmkit.app.ui.AccentColorScreen
 import com.filmkit.app.ui.CameraScreen
@@ -174,117 +189,166 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         screen = backTarget(screen, editorFrom, galleryFrom, viewerFrom)
     }
 
-    when (screen) {
-        "settings" -> SettingsScreen(
-            onBack = { screen = "camera" },
-            onOpenLogs = { screen = "logs" },
-            onOpenSpike = { screen = "spike" },
-            onOpenLenses = { screen = "lens" },
-            onOpenAccent = { screen = "accent" },
-            onOpenFocals = { screen = "focals" },
-        )
-        "lens" -> LensConfigScreen(onBack = { screen = "settings" })
-        "accent" -> AccentColorScreen(onBack = { screen = "settings" })
-        "focals" -> com.filmkit.app.ui.FocalScreen(onBack = { screen = "settings" })
-        "logs" -> LogScreen(onBack = { screen = "settings" })
-        "spike" -> SpikeScreen(onBack = { screen = "settings" })
-        // 相册：点缩略图进**查看页**（E2-13）—— 不再直接进编辑器。E2-20 起带上整条扁平
-        // 列表 + 点中的索引，查看页据此左右滑动切换。
-        "gallery" -> GalleryScreen(
-            onBack = { screen = backTarget("gallery", editorFrom, galleryFrom) },
-            onOpenPhoto = { uris, index ->
-                viewerUris = uris
-                viewerIndex = index
-                viewerFrom = "gallery"
-                screen = "viewer"
-            },
-        )
-        // 查看页：全屏原图 + 左右滑动切图 + 双指缩放 + 底栏五项。点「编辑」才进编辑器，并记下
-        // "从查看页来的"；删除成功后回相册（那张已经不存在，留在查看页只会看到失效图）。
-        // ★ P-3：底栏「胶片」→ 面板选一条预设 → **同样进编辑器**，但带上预设 id（直接看效果，
-        // 不是保存副本 —— 用户 2026-10-11 拍板）。两条入口的返回语义完全一致（回本页同一张）。
-        "viewer" -> PhotoViewScreen(
-            uris = viewerUris,
-            pending = viewerPending,
-            index = viewerIndex,
-            onIndexChange = { viewerIndex = it }, // 滑到新的一张 ⇒ 路由层跟着走（编辑器回同一张）
-            onBack = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
-            onEdit = { uri ->
-                editorUri = uri
-                editorFrom = "viewer"
-                editorPresetId = null // 普通「编辑」入口：起点仍是全恒等基线（与 P-3 之前一致）
-                screen = "editor"
-            },
-            onEditWithPreset = { uri, presetId ->
-                editorUri = uri
-                editorFrom = "viewer"
-                editorPresetId = presetId
-                screen = "editor"
-            },
-            onDeleted = {
-                // ★ v0.12.37：删除成功后清空查看页列表 —— 否则路由里残留的 URI 还会把
-                // 这张**已删除**的图弹回大图（用户报"相册返回事件跳回已删的图片"）。
-                viewerUris = emptyList()
-                viewerIndex = 0
-                screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom)
-            },
-            // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口。
-            // ⚠ v0.12.37：这里**不能**把 galleryFrom 设成 "viewer" —— 那样相册页的返回
-            // 键会回到查看页（用户要求："相册返回直接回拍照页，不要回上一次打开的大图"）。
-            onOpenGallery = if (viewerFrom == "camera") {
-                {
+    // 相册 / 查看页是**覆盖层**：盖在相机页之上，相机页不销毁 ⇒ 返回时预览不重建，
+    // 不再黑 1~2s（整页替换会连 SurfaceView 一起销毁，重进要重开相机 + 重建 EGL）。
+    val overlay = screen == "gallery" || screen == "viewer"
+    // 覆盖层退场期间 screen 已经变了，内容要按"最后一次的覆盖页"渲染，否则退场会空白
+    var overlayScreen by remember { mutableStateOf("gallery") }
+    LaunchedEffect(screen) {
+        if (screen == "gallery" || screen == "viewer") overlayScreen = screen
+    }
+    // 其余整页路由（设置/编辑器/日志…）仍是替换 + 单页淡入
+    val pageAlpha = remember { Animatable(1f) }
+    LaunchedEffect(screen) {
+        if (screen != "camera" && !overlay) {
+            pageAlpha.snapTo(0f)
+            pageAlpha.animateTo(1f, tween(durationMillis = 200, easing = LinearEasing))
+        }
+    }
+
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        // ── 相机页：常驻底层（相册打开时也保留）──
+        if (screen == "camera" || overlay) {
+            CameraScreen(
+                onOpenSettings = { screen = "settings" },
+                onOpenGallery = {
                     galleryFrom = "camera"
                     screen = "gallery"
-                }
-            } else {
-                null
-            },
-        )
-        // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
-        "editor" -> EditorScreen(
-            uri = editorUri,
-            initialPresetId = editorPresetId,
-            onBack = { screen = backTarget("editor", editorFrom, galleryFrom) },
-            onOpenGallery = {
-                galleryFrom = "editor"
-                screen = "gallery"
-            },
-        )
-        else -> CameraScreen(
-            onOpenSettings = { screen = "settings" },
-            onOpenGallery = {
-                galleryFrom = "camera"
-                screen = "gallery"
-            },
-            // 胶卷位：有最近成片 ⇒ 直接看这张大图，返回回相机。
-            // ★ v0.12.35：还要能左右切图 —— 先把相册（与相册页同一条查询口径）查出来，
-            // 把这张定位到它的索引上；查不到（未授权且不在本应用目录 / 刚被删）才退化成
-            // 单张列表。查询在 IO 线程，本地 MediaStore 通常 <100ms。
-            onOpenPendingPhoto = {
-                viewerPendingBase = context.getSharedPreferences("filmkit", 0)
-                    .getString("last_photo_uri", null)
-                viewerPending = true
-                viewerUris = emptyList()
-                viewerIndex = 0
-                viewerFrom = "camera"
-                screen = "viewer"
-            },
-            onOpenLastPhoto = { uri ->
-                scope.launch {
-                    val list = withContext(Dispatchers.IO) {
-                        runCatching {
-                            queryPhotos(context, hasImagePermission(context)).first
-                        }.getOrDefault(emptyList()).map { it.uri }
-                    }
-                    val i = list.indexOf(uri)
-                    viewerUris = if (i >= 0) list else listOf(uri)
-                    viewerIndex = if (i >= 0) i else 0
+                },
+                // 胶卷位：有最近成片 ⇒ 直接看这张大图，返回回相机。
+                // ★ v0.12.35：还要能左右切图 —— 先把相册（与相册页同一条查询口径）查出来，
+                // 把这张定位到它的索引上；查不到（未授权且不在本应用目录 / 刚被删）才退化成
+                // 单张列表。查询在 IO 线程，本地 MediaStore 通常 <100ms。
+                onOpenPendingPhoto = {
+                    viewerPendingBase = context.getSharedPreferences("filmkit", 0)
+                        .getString("last_photo_uri", null)
+                    viewerPending = true
+                    viewerUris = emptyList()
+                    viewerIndex = 0
                     viewerFrom = "camera"
-                    viewerPending = false
                     screen = "viewer"
+                },
+                onOpenLastPhoto = { uri ->
+                    scope.launch {
+                        val list = withContext(Dispatchers.IO) {
+                            runCatching {
+                                queryPhotos(context, hasImagePermission(context)).first
+                            }.getOrDefault(emptyList()).map { it.uri }
+                        }
+                        val i = list.indexOf(uri)
+                        viewerUris = if (i >= 0) list else listOf(uri)
+                        viewerIndex = if (i >= 0) i else 0
+                        viewerFrom = "camera"
+                        viewerPending = false
+                        screen = "viewer"
+                    }
+                },
+                onRegisterVolume = onRegisterVolume,
+            )
+        }
+
+        // ── 覆盖层：相册 / 大图，从底部滑上来（iOS 相册感），关闭滑下去 ──
+        AnimatedVisibility(
+            visible = overlay,
+            enter = slideInVertically(initialOffsetY = { it / 10 }) + fadeIn(tween(220)),
+            exit = slideOutVertically(targetOffsetY = { it / 10 }) + fadeOut(tween(200)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    // 占住命中路径：覆盖层空白处的触摸不能穿透到底下的相机页
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope { while (true) awaitPointerEvent() }
+                    },
+            ) {
+                when (overlayScreen) {
+                    // 相册：点缩略图进**查看页**（E2-13）—— 不再直接进编辑器。E2-20 起带上整条扁平
+                    // 列表 + 点中的索引，查看页据此左右滑动切换。
+                    "gallery" -> GalleryScreen(
+                        onBack = { screen = backTarget("gallery", editorFrom, galleryFrom) },
+                        onOpenPhoto = { uris, index ->
+                            viewerUris = uris
+                            viewerIndex = index
+                            viewerFrom = "gallery"
+                            screen = "viewer"
+                        },
+                    )
+                    // 查看页：全屏原图 + 左右滑动切图 + 双指缩放 + 底栏五项。点「编辑」才进编辑器
+                    // ★ P-3：底栏「胶片」→ 面板选一条预设 → **同样进编辑器**，但带上预设 id
+                    else -> PhotoViewScreen(
+                        uris = viewerUris,
+                        pending = viewerPending,
+                        index = viewerIndex,
+                        onIndexChange = { viewerIndex = it }, // 滑到新的一张 ⇒ 路由层跟着走
+                        onBack = { screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom) },
+                        onEdit = { uri ->
+                            editorUri = uri
+                            editorFrom = "viewer"
+                            editorPresetId = null
+                            screen = "editor"
+                        },
+                        onEditWithPreset = { uri, presetId ->
+                            editorUri = uri
+                            editorFrom = "viewer"
+                            editorPresetId = presetId
+                            screen = "editor"
+                        },
+                        onDeleted = {
+                            // ★ v0.12.37：删除成功后清空查看页列表 —— 否则路由里残留的 URI 还会把
+                            // 这张**已删除**的图弹回大图（用户报"相册返回事件跳回已删的图片"）。
+                            viewerUris = emptyList()
+                            viewerIndex = 0
+                            screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom)
+                        },
+                        // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口。
+                        onOpenGallery = if (viewerFrom == "camera") {
+                            {
+                                galleryFrom = "camera"
+                                screen = "gallery"
+                            }
+                        } else {
+                            null
+                        },
+                    )
                 }
-            },
-            onRegisterVolume = onRegisterVolume,
-        )
+            }
+        }
+
+        // ── 其余整页路由 ──
+        if (screen != "camera" && !overlay) {
+            Box(
+                Modifier.fillMaxSize().graphicsLayer {
+                    alpha = pageAlpha.value
+                    translationY = (1f - pageAlpha.value) * 24.dp.toPx()
+                },
+            ) {
+                when (screen) {
+                    "settings" -> SettingsScreen(
+                        onBack = { screen = "camera" },
+                        onOpenLogs = { screen = "logs" },
+                        onOpenSpike = { screen = "spike" },
+                        onOpenLenses = { screen = "lens" },
+                        onOpenAccent = { screen = "accent" },
+                        onOpenFocals = { screen = "focals" },
+                    )
+                    "lens" -> LensConfigScreen(onBack = { screen = "settings" })
+                    "accent" -> AccentColorScreen(onBack = { screen = "settings" })
+                    "focals" -> com.filmkit.app.ui.FocalScreen(onBack = { screen = "settings" })
+                    "logs" -> LogScreen(onBack = { screen = "settings" })
+                    "spike" -> SpikeScreen(onBack = { screen = "settings" })
+                    // 编辑器：uri 为 null 时 EditorScreen 显示失败态（见其 KDoc），不做额外拦截
+                    "editor" -> EditorScreen(
+                        uri = editorUri,
+                        initialPresetId = editorPresetId,
+                        onBack = { screen = backTarget("editor", editorFrom, galleryFrom) },
+                        onOpenGallery = {
+                            galleryFrom = "editor"
+                            screen = "gallery"
+                        },
+                    )
+                }
+            }
+        }
     }
 }
