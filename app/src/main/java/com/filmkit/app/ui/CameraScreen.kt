@@ -87,6 +87,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -1008,12 +1009,36 @@ fun CameraScreen(
     // 快门黑闪 + 快门钮脉冲
     val shutterAlpha = remember { Animatable(0f) }
     val shutterPulse = remember { Animatable(1f) }
+    // 0.13.28 iPhone 味飞入：上一张成片从画面中心缩小飞向左下角胶卷位（420ms）。
+    // ⚠ 帧率：`flyProgress.value` 只在 graphicsLayer 的 **draw 阶段**读（见下方），
+    // 组合作用域里只用 flyVisible 控制挂载 —— 动画期间零重组、只重绘该图层，
+    // 才能跟满 60/120Hz。若把 value 读在组合里，每帧重组整个相机页会掉到十几帧。
+    val flyProgress = remember { Animatable(0f) }
+    var flyVisible by remember { mutableStateOf(false) }
     LaunchedEffect(captureTick) {
         if (captureTick == 0) return@LaunchedEffect
         shutterAlpha.snapTo(0.85f)
-        shutterAlpha.animateTo(0f, tween(durationMillis = 190, easing = LinearEasing))
+        launch { shutterAlpha.animateTo(0f, tween(durationMillis = 190, easing = LinearEasing)) }
         shutterPulse.snapTo(0.86f)
-        shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f))
+        launch { shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f)) }
+        if (thumb != null) {
+            flyVisible = true
+            flyProgress.snapTo(1f)
+            flyProgress.animateTo(0f, tween(durationMillis = 420))
+            flyVisible = false
+        } else {
+            delay(420)
+        }
+        // 0.13.29：动画一结束就解除定格（合成还需 2~3s，不能一直卡屏）
+        controller.resumePreviewNow()
+    }
+    // 飞入终点 = 左下角胶卷位中心（屏幕坐标 → 相对画面中心的平移量）
+    val flyEndX = with(LocalDensity.current) {
+        (56.dp - LocalConfiguration.current.screenWidthDp.dp / 2f).toPx()
+    }
+    val flyEndY = with(LocalDensity.current) {
+        ((LocalConfiguration.current.screenHeightDp - 150).dp -
+            LocalConfiguration.current.screenHeightDp.dp / 2f).toPx()
     }
 
     // 占位结束：**photoUri 相对按下快门时发生变化**（保存完成）即清；20s 兜底防卡死
@@ -1286,9 +1311,37 @@ fun CameraScreen(
                     modifier = Modifier.fillMaxSize(),
                 )
 
-                // 快门黑闪（模拟机械快门，覆盖画面但保留机框线）
-                if (shutterAlpha.value > 0.01f) {
-                    Box(Modifier.matchParentSize().alpha(shutterAlpha.value).background(Color.Black))
+                // 快门黑闪（模拟机械快门）—— 用 drawBehind 在**绘制阶段**读 alpha，
+                // 动画期间不触发重组（否则每帧重组整个相机页，动画只有十几帧）。
+                Box(
+                    Modifier.matchParentSize().drawBehind {
+                        val a = shutterAlpha.value
+                        if (a > 0.001f) drawRect(Color.Black, alpha = a)
+                    },
+                )
+
+                // 0.13.28 iPhone 味飞入：上一张成片从中心缩小飞向左下角胶卷位。
+                // 该层不接收触摸（无 clickable），不挡快门/滑杆。
+                if (flyVisible && thumb != null) {
+                    Box(Modifier.matchParentSize(), contentAlignment = Alignment.Center) {
+                        Image(
+                            bitmap = thumb!!,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(132.dp)
+                                .graphicsLayer {
+                                    val t = 1f - flyProgress.value   // draw 阶段读
+                                    val s = 1f - 0.70f * t
+                                    scaleX = s
+                                    scaleY = s
+                                    translationX = flyEndX * t
+                                    translationY = flyEndY * t
+                                    alpha = (1f - 0.55f * t).coerceIn(0f, 1f)
+                                }
+                                .clip(RoundedCornerShape(16.dp)),
+                        )
+                    }
                 }
 
                 // v0.10.82：删除"多帧合成中…"提示（用户要求）。合成已经彻底后台化

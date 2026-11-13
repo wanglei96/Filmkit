@@ -46,6 +46,37 @@ class RenderClient {
     @Volatile
     private var acceptingFrames = false
 
+    /** 0.13.28：最近一次预览 SurfaceTexture（resumePreview 清积压 buffer 用）。 */
+    @Volatile
+    private var lastSt: SurfaceTexture? = null
+
+    /** 0.13.27：拍照期定格（iPhone 味）。快门后停止消费新帧，SurfaceView 保留
+     *  最后提交的那一帧 —— 用户看到的是"照片定格"，而不是处理期 3 秒的掉帧。
+     *  [resumePreview] 在合成结束（done 回调）时恢复；恢复后 SurfaceTexture 队列
+     *  里积压的旧帧会被 pending 闸门丢掉，只渲染最新一帧（≤2 帧内追上）。 */
+    fun pausePreview() {
+        acceptingFrames = false
+    }
+
+    /** 0.13.28：恢复时**先把暂停期间积压的 buffer 消费掉**（只 updateTexImage、
+     *  不渲染）。暂停 3~4 秒不消费，SurfaceTexture 队列会满、HAL producer 被堵，
+     *  恢复后可能再也不出帧（真机实测"预览没释放"）。最多清 4 帧，异常忽略。 */
+    fun resumePreview() {
+        acceptingFrames = true
+        val h = handler ?: return
+        val st = lastSt
+        if (st == null) return
+        h.post {
+            repeat(4) {
+                try {
+                    st.updateTexImage()
+                } catch (_: Throwable) {
+                    return@repeat
+                }
+            }
+        }
+    }
+
     val looper: android.os.Looper?
         get() = thread?.looper
 
@@ -144,6 +175,7 @@ class RenderClient {
         film: DoubleArray,
         fillTest: Boolean,
     ) {
+        lastSt = st
         val h = handler
         if (h == null) {
             EngineBridge.nativeAppendLog(

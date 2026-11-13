@@ -2210,6 +2210,10 @@ class CameraController(private val context: Context, private val render: RenderC
             return
         }
         capturing = true
+        // 0.13.27：拍照期**定格预览**（iPhone 味）—— 快门后不再消费新帧，画面停在
+        // 最后一帧，处理完（done 回调）再恢复。处理期 3~4 秒的掉帧就不会出现在
+        // 用户眼前；失败/无成片路径也会在 done 里恢复（见下方 releasePreviewScaleGuard）。
+        render.pausePreview()
         // 预览降载（v0.10.93 方案 A）：快门即降（0.5×），合成结束回升。实验判读
         //（2026-10-01 四组开关）：拍照期掉帧主因 = MFNR 链路 GPU 负载 + 预览自身
         // 争抢份额，降噪已排除。同时预热拍照线程（单帧 RAW/YUV 也迁入独立线程了，
@@ -2268,6 +2272,7 @@ class CameraController(private val context: Context, private val render: RenderC
             capturing = false
             capturePhase = 0
             releasePreviewScaleGuard()
+            render.resumePreview()   // 0.13.27：提交失败也要解除定格
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "camera", "capture.submit_failed",
                 kv("error" to (t.message ?: t.toString())),
@@ -2890,6 +2895,16 @@ class CameraController(private val context: Context, private val render: RenderC
         if (!context.getSharedPreferences("filmkit", 0).getBoolean("still_thread", false)) return
         StillRenderClient.startAsync()
         StillRenderClient.warmup(stillSize.width, stillSize.height, stillRot)
+    }
+
+    /**
+     * 0.13.29：快门动画结束立刻解除定格 —— 不等合成完成。
+     * 合成还要 2~3 秒，定格到那时用户会觉得"卡屏太久"；宁可让它恢复实时预览
+     * （处理期会有掉帧），也不要长时间冻住取景。done 回调里的 resume 仍在，
+     * 作为失败/异常路径的兜底（幂等）。
+     */
+    fun resumePreviewNow() {
+        render.resumePreview()
     }
 
     @SuppressLint("MissingPermission")
@@ -4157,6 +4172,8 @@ class CameraController(private val context: Context, private val render: RenderC
             // 合成结束（无论成败）：预览降载回升（v0.10.93）。capturing 已在下面
             // 提前解锁，这里的恢复点才是"GPU 不再被合成占用"的时刻。
             releasePreviewScaleGuard()
+            // 0.13.27：定格解除 —— 处理完立刻恢复实时预览（失败也恢复）
+            render.resumePreview()
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。
