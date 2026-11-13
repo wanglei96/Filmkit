@@ -15,6 +15,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -88,7 +89,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -121,6 +122,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -1075,25 +1077,26 @@ fun CameraScreen(
     // 快门黑闪 + 快门钮脉冲
     val shutterAlpha = remember { Animatable(0f) }
     val shutterPulse = remember { Animatable(1f) }
-    // 0.13.28 iPhone 味飞入：上一张成片从画面中心缩小飞向左下角胶卷位（420ms）。
-    // ⚠ 帧率：`flyProgress.value` 只在 graphicsLayer 的 **draw 阶段**读（见下方），
-    // 组合作用域里只用 flyVisible 控制挂载 —— 动画期间零重组、只重绘该图层，
-    // 才能跟满 60/120Hz。若把 value 读在组合里，每帧重组整个相机页会掉到十几帧。
+    // 恢复预览时的压暗遮罩：resume 前后各一次，盖住预览第一帧的跳变
+    val resumeCover = remember { Animatable(0f) }
+    // 抽出一张：从**取景框原位**浮起（1.04× + 白边闪出），再缩到胶卷位。
+    // ⚠ 帧率：`flyProgress.value` 只在 graphicsLayer 的 **draw 阶段**读，组合作用域里
+    // 只用 flyVisible 控制挂载 —— 动画期间零重组、只重绘该图层，才能跟满 60/120Hz。
     val flyProgress = remember { Animatable(0f) }
     var flyVisible by remember { mutableStateOf(false) }
-    // 0.13.34：截屏动画 —— 不压暗。快门白闪 120ms，同时 PixelCopy 抓下当前
-    // 预览帧；随后这张"从取景器取出来的图"缩小飞向左下角胶卷位（460ms），
-    // 飞完恢复预览。抓帧失败才回落到上一张成片。
+    // 已落进胶卷位的预览帧：新成片落盘前顶着，避免"图飞进一个转圈的 spinner"
+    var flyLanded by remember { mutableStateOf(false) }
+    // 抓帧失败才回落到上一张成片
     var flySource by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     LaunchedEffect(captureTick) {
         if (captureTick == 0) return@LaunchedEffect
-        // ① 快门白闪（120ms）+ 快门钮回弹
+        // ① 快门黑闪（80ms 快速收）+ 快门钮回弹
         shutterAlpha.snapTo(0.85f)
-        launch { shutterAlpha.animateTo(0f, tween(durationMillis = 120, easing = LinearEasing)) }
+        launch { shutterAlpha.animateTo(0f, tween(durationMillis = 80, easing = LinearEasing)) }
         shutterPulse.snapTo(0.86f)
         launch { shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f)) }
-        // ② 等抓帧（白闪期间完成，通常 10~30ms），取预览帧作飞入素材
-        delay(120)
+        // ② 等抓帧（PixelCopy 通常 10~30ms），取预览帧作飞入素材
+        delay(90)
         val src = flyBitmap ?: thumb
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.fly_src",
@@ -1103,25 +1106,41 @@ fun CameraScreen(
             flySource = src
             flyVisible = true
             flyProgress.snapTo(1f)
-            flyProgress.animateTo(0f, tween(durationMillis = 460))
+            // easeOutCubic：起飞快（抽起来）、落格缓（不砸）
+            flyProgress.animateTo(
+                0f,
+                tween(durationMillis = 520, easing = CubicBezierEasing(0.22f, 0.61f, 0.36f, 1f)),
+            )
             flyVisible = false
+            flyLanded = true
         } else {
-            delay(460)
+            delay(520)
         }
-        // ③ 飞完立刻恢复预览
+        // ③ 先压暗再 resume：预览第一帧被这层黑吃掉，淡出收尾，不硬切
+        resumeCover.animateTo(0.34f, tween(durationMillis = 80))
         controller.resumePreviewNow()
+        delay(80)
+        resumeCover.animateTo(0f, tween(durationMillis = 260, easing = LinearEasing))
     }
     // 0.13.30：飞入终点改用**两个控件的真实 root 坐标**（胶卷位 vs 飞入层中心），
     // 不再按屏幕边缘猜。两者都在同一窗口坐标系，差值就是 translation。
     var slotCenter by remember { mutableStateOf<Offset?>(null) }
     var flyCenter by remember { mutableStateOf<Offset?>(null) }
-    // 0.13.37：截屏动画的起点 = **整个预览框**（不是中心裁切的一小块）
+    // 截屏动画的起点 = **整个预览框**（不是中心裁切的一小块）
     var previewCenter by remember { mutableStateOf<Offset?>(null) }
-    // 截屏动画：图从**整张预览框大小**开始，缩小飞入胶卷位。
-    // ⚠ 尺寸必须用稳定值（屏幕宽 92% × 3:4），不能用 boxW —— 它在首帧尚为 1px，
-    // 会退化成 1dp 的图 + 20dp 阴影 = 屏幕上只剩一圈阴影环（真机出现过的 bug）。
-    val flyW = (LocalConfiguration.current.screenWidthDp * 0.92f).dp
-    val flyH = flyW * 1.333f
+    val density = LocalDensity.current
+    // 起点尺寸 = 取景框**真实像素尺寸**（boxW/boxH 由 onSizeChanged 给出，4:3/16:9 自动正确）。
+    // 首帧 boxW 还是 1px，只有取景尚未布局时才退回屏幕比例兜底。
+    val flySize = if (boxW > 100 && boxH > 100) {
+        with(density) { DpSize(boxW.toDp(), boxH.toDp()) }
+    } else {
+        with(density) {
+            val w = LocalConfiguration.current.screenWidthDp.dp * 0.92f
+            DpSize(w, w * 1.333f)
+        }
+    }
+    // 终点缩放 = 胶卷位 44dp / 取景框宽（宽度对齐，落格不跳）
+    val flyEndScale = with(density) { (44.dp.toPx() / boxW.coerceAtLeast(1)).coerceAtMost(1f) }
     // 兜底：控件尚未布局时（理论上不会）退回屏幕估算
     val flyEndX = with(LocalDensity.current) {
         (56.dp - LocalConfiguration.current.screenWidthDp.dp / 2f).toPx()
@@ -1148,6 +1167,8 @@ fun CameraScreen(
 
     // 最近成片缩略图（保存完成后 lastPhotoUri 才会更新，此时文件已就绪）
     LaunchedEffect(photoUri) {
+        // 新成片已落盘：交还给真实缩略图（飞入的预览帧卸任）
+        flyLanded = false
         // 没有最近成片（从没拍过 / 刚在查看页删掉）⇒ 回落到相册最新一张，
         // 而不是显示 ▦ 空占位（v0.12.36 用户要求）。未授权时 queryPhotos 自动
         // 降级为本 App 目录，所以这条回落不会因为权限而失效。
@@ -1404,18 +1425,40 @@ fun CameraScreen(
                     modifier = Modifier.fillMaxSize(),
                 )
 
-                // 快门黑闪（模拟机械快门）—— 用 drawBehind 在**绘制阶段**读 alpha，
-                // 动画期间不触发重组（否则每帧重组整个相机页，动画只有十几帧）。
+                // 三分构图线：画在**取景框内**（与预览严格同框；此前挂在整屏上会溢出）
+                if (gridOn) {
+                    Canvas(Modifier.matchParentSize()) {
+                        val c = FilmTheme.Cream.copy(alpha = 0.28f)
+                        val w = 1.dp.toPx()
+                        for (i in 1..2) {
+                            drawLine(
+                                c,
+                                Offset(size.width * i / 3f, 0f),
+                                Offset(size.width * i / 3f, size.height),
+                                w,
+                            )
+                            drawLine(
+                                c,
+                                Offset(0f, size.height * i / 3f),
+                                Offset(size.width, size.height * i / 3f),
+                                w,
+                            )
+                        }
+                    }
+                }
+
+                // 快门黑闪 + 恢复预览时的压暗（draw 阶段读，零重组）
                 Box(
                     Modifier.matchParentSize().drawBehind {
-                        // 快门白闪（draw 阶段读，零重组）
                         val a = shutterAlpha.value
                         if (a > 0.001f) drawRect(Color.Black, alpha = a)
+                        val c = resumeCover.value
+                        if (c > 0.001f) drawRect(Color.Black, alpha = c)
                     },
                 )
 
-                // 0.13.28 iPhone 味飞入：上一张成片从中心缩小飞向左下角胶卷位。
-                // 该层不接收触摸（无 clickable），不挡快门/滑杆。
+                // 抽出一张：与取景框原位重合 → 微微浮起（1.04×）+ 白边闪出 → 缩到胶卷位。
+                // 缩放/平移/白边全在 draw 阶段读，动画期间零重组。
                 if (flyVisible && flySource != null) {
                     Box(
                         Modifier.matchParentSize()
@@ -1425,34 +1468,40 @@ fun CameraScreen(
                         Image(
                             bitmap = flySource!!,
                             contentDescription = null,
-                            contentScale = ContentScale.Crop,
+                            contentScale = ContentScale.FillBounds,
                             modifier = Modifier
-                                .size(flyW, flyH)
-                                .shadow(8.dp, RoundedCornerShape(10.dp))
-                                .border(1.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp))
+                                .size(flySize)
                                 .graphicsLayer {
-                                    // 截屏动画：起点 = 整个预览框（与背景重合，看不出），
-                                    // 然后一边缩小一边飞向胶卷位。draw 阶段读，零重组。
+                                    shape = RoundedCornerShape(10.dp)
+                                    clip = true
                                     val t = 1f - flyProgress.value
-                                    val s = 1f - 0.72f * t
+                                    // 起点略大于取景框 = 被从画面里"抽起来"
+                                    val s = 1.04f - (1.04f - flyEndScale) * t
                                     scaleX = s
                                     scaleY = s
                                     val pc = previewCenter
                                     val fc = flyCenter
                                     val sc = slotCenter
                                     if (pc != null && fc != null) {
-                                        val dx0 = pc.x - fc.x
-                                        val dy0 = pc.y - fc.y
-                                        val dx1 = (sc?.x ?: pc.x) - pc.x
-                                        val dy1 = (sc?.y ?: pc.y) - pc.y
-                                        translationX = dx0 + dx1 * t
-                                        translationY = dy0 + dy1 * t
+                                        translationX = (pc.x - fc.x) + ((sc?.x ?: pc.x) - pc.x) * t
+                                        translationY = (pc.y - fc.y) + ((sc?.y ?: pc.y) - pc.y) * t
                                     } else {
                                         translationX = flyEndX * t
                                         translationY = flyEndY * t
                                     }
                                 }
-                                .clip(RoundedCornerShape(10.dp)),
+                                .drawWithContent {
+                                    drawContent()
+                                    // 白边：起飞瞬间满亮（闪白），落格前 30% 路程淡出
+                                    val t = 1f - flyProgress.value
+                                    val a = if (t < 0.7f) 1f else ((1f - t) / 0.3f).coerceIn(0f, 1f)
+                                    drawRoundRect(
+                                        color = Color.White,
+                                        cornerRadius = CornerRadius(10.dp.toPx()),
+                                        style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()),
+                                        alpha = a,
+                                    )
+                                },
                         )
                     }
                 }
@@ -1484,28 +1533,6 @@ fun CameraScreen(
                         cornerRadius = CornerRadius(radius, radius),
                         style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx()),
                     )
-                }
-
-                // 三分构图线
-                if (gridOn) {
-                    Canvas(Modifier.matchParentSize()) {
-                        val c = FilmTheme.Cream.copy(alpha = 0.28f)
-                        val w = 1.dp.toPx()
-                        for (i in 1..2) {
-                            drawLine(
-                                c,
-                                Offset(size.width * i / 3f, 0f),
-                                Offset(size.width * i / 3f, size.height),
-                                w,
-                            )
-                            drawLine(
-                                c,
-                                Offset(0f, size.height * i / 3f),
-                                Offset(size.width, size.height * i / 3f),
-                                w,
-                            )
-                        }
-                    }
                 }
 
                 // 水平仪：中心圆环 + 两侧短刻度为固定参考；长指示线随重力方向
@@ -1989,7 +2016,8 @@ fun CameraScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
-            val t = thumb
+            // 刚飞入的那张先顶着格子（新成片落盘前），避免"图飞进转圈"
+            val t = (if (flyLanded) flySource else null) ?: thumb
             Box(
                 Modifier
                     .size(44.dp)
@@ -2013,7 +2041,7 @@ fun CameraScreen(
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                if (shotPending) {
+                if (shotPending && !flyLanded) {
                     // 处理中占位：胶片位立刻有反馈；点开只给提示
                     Box(
                         Modifier
