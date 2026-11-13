@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -141,6 +142,10 @@ class FrameRenderer {
   // 0.12.258：重读回类诊断开关（天空剖面 / 亮度剖面），默认关；只影响日志字段，
   // 不影响闭环护栏（护栏的 skyP99 是功能读数，不归诊断开关管）。
   static void setSkyDiag(bool on);
+  /** 0.13.24：标记本实例是拍照链（still context）。只有拍照链才做条带化 + GPU
+   *  fence 窗口；预览链走单次 draw（预览自己的 context 不存在被抢的问题）。
+   *  Bridge 在创建 g_renderer_still 时打开。 */
+  void setStillContext(bool on) { still_ctx_ = on; }
   // gainmap 数学版本（v0.11.50）：0 = PC 版（offset 1e-4）/ 1 = libultrahdr 官方版
   // （offset 1e-7 + 暗部钳位）。供真机 A/B —— 离线对比用的是近似 SDR（Reinhard），
   // 结论只在"两版相对行为"上成立，绝对效果必须真机实测。
@@ -368,8 +373,15 @@ class FrameRenderer {
   // raw_tex_ 的建/复用（尺寸变化时重建），返回纹理 id（0 = 失败）
   GLuint ensureRawTex(int w, int h);
   /** 0.13.8：按当前 viewport 做行条带化的全屏 draw（见 cpp 注释，治拍照时预览卡顿）
-   *  0.13.17：strips 参数化；默认 8（P0 的既定口径）。 */
+   *  0.13.17：strips 参数化；默认 8（P0 的既定口径）。
+   *  0.13.24：只有拍照链做条带 + fence 窗口；预览链单次 draw。 */
   void drawStriped(int strips = 8);
+  /** 0.13.24：拍照链的 GPU fence 窗口（照 PC PassWindow 的"在飞 ≤2"）。
+   *  每个条带化 pass 结束插一个 fence；在飞超过 2 时等最老的完成，把驱动命令
+   *  队列压短 —— 预览的 draw 才不会排在几十个 pass 后面等。 */
+  void endGpuPass();
+  bool still_ctx_ = false;
+  std::deque<GLsync> gpu_fences_;
   // 金字塔 pass：raw → 1/2 灰度（kFsMfnrPyr，sqrt 预编码）；再逐层 2× box（kFsMfnrDown）
   void passMfnrPyr(GLuint raw_tex, int cfa, const float black_phase[4],
                    float white_level, const float gains[3], float frame_scale = 1.0f);

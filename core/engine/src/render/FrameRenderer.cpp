@@ -16847,6 +16847,33 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
 // ✅ 正解 = **glScissor**：viewport 保持全屏，用裁剪矩形只让当前条带的片段
 // 落地。UV 插值与 gl_FragCoord 都不变，对任何 shader 都逐位等价；代价只是
 // 每带一次 glScissor + glFlush（与原来同量级）。
+// 0.13.24：fence 窗口（照 PC GlesGpuScheduler.PassWindow 的"在飞 ≤2"）。
+// 只限制**队列深度**，不改任何像素：每个条带化 pass 结束插一个 GLsync；在飞超过
+// 2 时 clientWait 最老的那个。作用是把驱动命令队列压短 —— 预览的 draw 提交后
+// 不会排在十几 pass / 几十条带之后，掉帧从"处理期持续掉"变成"每个边界最多 1 帧"。
+// 代价：still 链总时长上升（同步等待），这是 PC 用 6.6s 换来的同一件事。
+void FrameRenderer::endGpuPass() {
+  if (!still_ctx_) return;
+  GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  if (sync == nullptr) {   // 驱动分配失败：退回整队同步（行为仍正确，只是更慢）
+    glFinish();
+    return;
+  }
+  gpu_fences_.push_back(sync);
+  while (gpu_fences_.size() > 2) {
+    GLsync oldest = gpu_fences_.front();
+    gpu_fences_.pop_front();
+    GLenum res;
+    do {
+      res = glClientWaitSync(oldest, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000ULL);
+    } while (res == GL_TIMEOUT_EXPIRED);
+    glDeleteSync(oldest);
+  }
+  // 0.13.26：**回退 0.13.25 的时间片 sleep**。真机实测（09:25）：每 30ms 让 10ms
+  // 只把 total 3124→3355ms，预览最低帧仍是 19~24 —— 掉帧不在"队列排队"上，
+  // 让路没有换来帧率，纯亏时间。fence 窗口保留（它把队列压到 ≤2，成本可忽略）。
+}
+
 void FrameRenderer::drawStriped(int strips) {
   GLint vp[4] = {0, 0, 0, 0};
   glGetIntegerv(GL_VIEWPORT, vp);
@@ -16869,6 +16896,7 @@ void FrameRenderer::drawStriped(int strips) {
   }
   glScissor(sb[0], sb[1], sb[2], sb[3]);
   if (!scissor_was) glDisable(GL_SCISSOR_TEST);
+  endGpuPass();
 }
 
 void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,

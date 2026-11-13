@@ -487,6 +487,8 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
       return JNI_FALSE;  // 调用方（Kotlin）回退预览线程
     }
     g_renderer_still.store(r);
+    // 0.13.24：标记拍照实例 —— 只有它做条带 + fence 窗口（预览链单次 draw）
+    r->setStillContext(true);
     // 补齐风格层：后建实例默认没有 LUT，不补就是"照片少一层"的静默回归
     applyLutSnapshot(g_renderer_still.load());
     // YUV 解码矩阵同理（v0.10.93 补齐）：快照在 nativeEngineSetYuvMatrix 里写，
