@@ -103,6 +103,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -974,6 +976,32 @@ fun CameraScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
+    // 0.13.31：相机页请求 120Hz。X300 屏幕支持 120Hz，但系统默认把窗口限在 60
+    // （dumpsys display: frameRateCategoryRate normal=60）—— 窗口 60Hz 时 Compose
+    // 动画跟随 vsync，代码再优化也只能 60fps。只在相机页打开，离开恢复默认。
+    DisposableEffect(Unit) {
+        val act = generateSequence(context as android.content.Context?) {
+            (it as? android.content.ContextWrapper)?.baseContext
+        }.filterIsInstance<android.app.Activity>().firstOrNull()
+        val w = act?.window
+        val prevMode = w?.attributes?.preferredDisplayModeId ?: -1
+        // 取该屏支持的最高刷新率模式（X300 = modeId 1 / 120Hz）
+        val mode = @Suppress("DEPRECATION") w?.windowManager?.defaultDisplay
+            ?.supportedModes?.maxByOrNull { it.refreshRate }
+        if (w != null && mode != null) {
+            runCatching {
+                w.attributes = w.attributes.apply { preferredDisplayModeId = mode.modeId }
+            }
+        }
+        onDispose {
+            if (w != null && prevMode >= 0) {
+                runCatching {
+                    w.attributes = w.attributes.apply { preferredDisplayModeId = prevMode }
+                }
+            }
+        }
+    }
+
     // 0.13.21：预热（照 PC 的 onFirstPreviewFrame + grace）。相机页可见 2s 后
     // 异步建 still 引擎（init 135~265ms）并用真实采集尺寸预分配 2.4GB 纹理与
     // satmask 缓冲，把第一张的冷启动从快门挪到构图时。仍线程未开启时内部直接返回。
@@ -1024,15 +1052,19 @@ fun CameraScreen(
         if (thumb != null) {
             flyVisible = true
             flyProgress.snapTo(1f)
-            flyProgress.animateTo(0f, tween(durationMillis = 420))
+            flyProgress.animateTo(0f, tween(durationMillis = 560))
             flyVisible = false
         } else {
-            delay(420)
+            delay(560)
         }
         // 0.13.29：动画一结束就解除定格（合成还需 2~3s，不能一直卡屏）
         controller.resumePreviewNow()
     }
-    // 飞入终点 = 左下角胶卷位中心（屏幕坐标 → 相对画面中心的平移量）
+    // 0.13.30：飞入终点改用**两个控件的真实 root 坐标**（胶卷位 vs 飞入层中心），
+    // 不再按屏幕边缘猜。两者都在同一窗口坐标系，差值就是 translation。
+    var slotCenter by remember { mutableStateOf<Offset?>(null) }
+    var flyCenter by remember { mutableStateOf<Offset?>(null) }
+    // 兜底：控件尚未布局时（理论上不会）退回屏幕估算
     val flyEndX = with(LocalDensity.current) {
         (56.dp - LocalConfiguration.current.screenWidthDp.dp / 2f).toPx()
     }
@@ -1323,7 +1355,11 @@ fun CameraScreen(
                 // 0.13.28 iPhone 味飞入：上一张成片从中心缩小飞向左下角胶卷位。
                 // 该层不接收触摸（无 clickable），不挡快门/滑杆。
                 if (flyVisible && thumb != null) {
-                    Box(Modifier.matchParentSize(), contentAlignment = Alignment.Center) {
+                    Box(
+                        Modifier.matchParentSize()
+                            .onGloballyPositioned { flyCenter = it.boundsInRoot().center },
+                        contentAlignment = Alignment.Center,
+                    ) {
                         Image(
                             bitmap = thumb!!,
                             contentDescription = null,
@@ -1335,8 +1371,16 @@ fun CameraScreen(
                                     val s = 1f - 0.70f * t
                                     scaleX = s
                                     scaleY = s
-                                    translationX = flyEndX * t
-                                    translationY = flyEndY * t
+                                    val sc = slotCenter
+                                    val fc = flyCenter
+                                    if (sc != null && fc != null) {
+                                        // 真实终点：胶卷位中心 − 飞入层中心
+                                        translationX = (sc.x - fc.x) * t
+                                        translationY = (sc.y - fc.y) * t
+                                    } else {
+                                        translationX = flyEndX * t
+                                        translationY = flyEndY * t
+                                    }
                                     alpha = (1f - 0.55f * t).coerceIn(0f, 1f)
                                 }
                                 .clip(RoundedCornerShape(16.dp)),
@@ -1880,6 +1924,9 @@ fun CameraScreen(
             Box(
                 Modifier
                     .size(44.dp)
+                    // 0.13.30：记录胶卷位在 root 坐标系里的真实中心 —— 飞入动画
+                    // 的终点用它，而不是按屏幕边缘猜的固定偏移（上一版落点偏了）。
+                    .onGloballyPositioned { slotCenter = it.boundsInRoot().center }
                     .clip(RoundedCornerShape(10.dp))
                     .background(FilmTheme.ChipBg)
                     .alpha(if (t == null) 0.5f else 1f)
