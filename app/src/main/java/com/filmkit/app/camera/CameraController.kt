@@ -242,8 +242,19 @@ class CameraController(private val context: Context, private val render: RenderC
             val pv = j.optDouble("pw999", 0.0)
             val st = j.optDouble("sw999", 0.0)
             // 当帧预览优先；预览还没出帧（冷启动第一帧）才退回成片链的最后值。
-            val v = if (pv.isFinite() && pv > 0.0) pv else st
-            if (v.isFinite() && v > 0.0) v else Double.NaN
+            // ⚠ 2026-11-13：pw999/sw999 是 **log2 值（EV，可为负）**，不是线性亮度。
+            // 旧判据 `> 0.0` 把"场景高光低于中灰"（负 EV）当成"没有统计"⇒ 退回 sw999，
+            // 而 sw999 也常为负 ⇒ 判 NaN ⇒ hlEv=-99 ⇒ 这张不压。预览的 P99.9 在灯盘这种
+            // "大片暗背景 + 一块亮灯"里正好在 0.1845 上下跳，于是 expDv 在 0 与 -3.3 之间
+            // **隔张交替**（真机 13:57 / 14:10 各出现一次 → 用户看到的"间隔一张必紫"）。
+            // 0.0 才是"没写过"的哨兵（成员初始值），有效值可以是负数。
+            val v = if (pv.isFinite() && pv != 0.0) pv else st
+            // 2026-11-13 诊断：**每次**都记整串原始值（pw999/p999pv/dom/pw999sr/hasSr/hasPv）。
+            // 只在缺失时记会看不到有效值的来源 —— 那是上一版的坑。
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "hl_stat", s,
+            )
+            if (v.isFinite() && v != 0.0) v else Double.NaN
         }
     } catch (_: Throwable) {
         Double.NaN
@@ -1472,6 +1483,11 @@ class CameraController(private val context: Context, private val render: RenderC
      *  判据都必须读它 —— [effectiveExposureEv] 是本式唯一的定义点。 */
     private fun exposureEv(): Double =
         effectiveExposureEv(baseEvPref, (evSteps * evStep).toDouble(), presetEvOffset)
+            // 提亮上限 2EV（与渲染端 `kAeMaxOverEv` 同语义）。
+            // 2026-11-13 真机：某张被推到 ev=+4.0，欠曝 RAW 的暗部乘 16 倍，
+            // G 通道信噪最差、R/B 残留被一起放大 ⇒ 整片背景品红（用户报"紫了"）。
+            // 超过 2EV 的提亮是在用 EV 拉噪声，应该交给多帧/降噪。
+            .coerceIn(-2.0, 2.0)
 
     private fun applyBaseEvPref() {
         val v = appPrefs.getFloat("base_ev", 0.7f).toDouble().coerceIn(-2.0, 2.0)

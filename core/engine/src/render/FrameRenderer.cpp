@@ -8229,6 +8229,8 @@ uniform vec2 uSrcSize;           // 全分辨率尺寸（px）
 // 单遍做不到；且离线实测自适应范围在无高光场景会把 8bit 码值浪费在极窄区间）。
 uniform int uGainmapMath;
 uniform float uSceneMid;         // P4：本张 scene 域中灰实测（ae_p50_，与 uHdr 同一 film_src 测得）
+uniform float uExposure;      // 与 kFsFilm 同一条基准曝光（SDR 已含它，HDR 必须同乘）
+uniform float uDispMid;       // 本张成片的显示域中灰（与 uSceneMid 同一张，做域换算）
 const int kDS = 2;               // 增益图下采样倍数（1/2 分辨率）
 const float kMin = 0.25;         // 元数据 min_content_boost（log2 −2）
 const float kMax = 4.0;          // 元数据 max_content_boost（log2 +2）
@@ -8290,41 +8292,40 @@ float gainTrue(float sdrLin, float hdrLin) {
     //   10-27（ae_p50 小）boost p90 = 4.00×、HDR≥1.0 = 0.40%
     //   10-30 楼景（ae_p50 0.2304）boost p90 = 1.49×、HDR≥1.0 = 0.01%
     // 相差 4 倍，正是 0.1845/0.2304 与 0.1845/0.06 的比值。
-    const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测）
-    float anchor = kDispMid / kSceneMid;   // ≈2.56，与场景无关
-    // ── 0.12.230：回到 ISO 21496-1 / Adobe hdrgm 的**标准语义**（用户 2026-11-03 拍板）
-    // 标准：中灰及以下 HDR = SDR 本身（ratio 恒 1），只有 SDR 白点之上的部分才延展进
-    // HDR；base（SDR）就是"legacy 查看器显示的那张"，必须自身正确。
-    // 旧式 `hdrLin * anchor` 是**线性折算**，而 SDR 是 filmic S 曲线的输出 ⇒ 两者逐像素
-    // 对不上，全图中灰被抬 2.8×（实测 gmMean 0.87 ⇒ +1.5 EV），base 相对显暗。
-    // 新式 = SDR 本身 + 超出显示白点（1.0）的部分：中灰 ratio 恒 1，高光按真实 scene
-    // 延伸。唯一正确写法 `sdrLin + max(0, hdrLin − 1/anchor)`（1/anchor = SDR 白点在
-    // scene 域的值）。
-    // ⚠ 不能写成 `hdrLin*anchor − 1`（0.12.230 的误用）：它等于把 scene 差值放大
-    //   anchor(≈2.56) 倍，高光比标准语义多 0.35~0.86 EV，且更早打满 kMax —— 真机症状
-    //   是「HDR 高光提亮太多」。0.12.231 订正，中灰/暗部行为逐位不变。
-    // ── v0.12.244：折点必须**平滑**，否则 gainmap 沿 hdr=白点 的等值线留硬边 ─────
-    // 真机实证（2026-11-10 16:33 徕卡横拍，test_temp/FILMKIT_20261110-163316_徕卡M9CCD.jpg）：
-    // 解出 gainmap 后 boost 场在天空里是「恒 1.00 → 跨过某条斜线变 1.10~1.35 → 又回 1.00」，
-    // 边界正好是 `hdrLin == 1/anchor(0.39)` 的等值线 —— 因为 max(0,x) 在 0 处只有 C0、
-    // 一阶导从 0 突变到 1，等比值的 8bit 量化(=1/64 EV)把这个斜率突变固化成一条可见边，
-    // HDR 屏上就是「有边界的亮块」（用户 16:39 圈出的区域，boost 1.26 vs 周围 1.00）。
-    // 处置：把 max(0,·) 换成**斜率连续**的 soft transition（transition 宽度 kSoft=0.12，
-    // 即 film 输出域 0.39 白点的 ~30%）。性质：
-    //   · excess ≤ 0（中灰及以下）→ 输出恒 0 ⇒ 「ratio 恒 1」的原版语义**逐位保持**；
-    //   · excess ≥ kSoft（真实高光）→ 输出 == excess ⇒ 高光延展量**逐位保持**；
-    //   · 0 < excess < kSoft ⇒ smoothstep 加权，斜率从 0 连续升到 1，**没有折点**。
-    // 不引入任何新参数、不改变 anchor 语义（仍是 0.1845/0.072 的固定比值）。
-    const float kSoft = 0.12;
-    float excess = hdrLin - 1.0 / anchor;
-    float tExc = clamp(excess / kSoft, 0.0, 1.0);
-    float softExcess =
-        (excess >= kSoft) ? excess : (tExc * tExc * (3.0 - 2.0 * tExc)) * excess;
-    float hdrAligned = sdrLin + softExcess;
-    // 下限取 kMin（0.25）：ISO 21496-1 / Adobe hdrgm 的 GainMapMin 是 log2 增益、
-    // 可以为负，真实 hdr/sdr < 1 时就该原样表达（暗部在 HDR 显示下压 2EV）；
-    // 0.12.85 写成 1.0 的依据（"HDR 相对 base 只会更亮"）规范里并不存在。
-    float ratio = clamp((hdrAligned + kOff) / (sdrLin + kOff), kMin, kMax);
+    const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测的典型值）
+    // 2026-11-13：域换算改成**本张实测**（uDispMid / uSceneMid），固定 2.56 只在
+    // 典型曝光下成立。真机（14:48:42 理光正片）本张 stillMid=0.0115 / aeP50=0.0169
+    // ⇒ 真实比值 0.68，而固定 2.56 高估 3.8 倍 ⇒ 整张 ratio 被 clamp 到 4.0
+    //（gainmap 90% 像素 = 满档），HDR 屏上整幅提亮 2EV、灯面反而压不下去。
+    // 取本张实测后中灰处 ratio 恒 1，提亮只由高光决定 —— 这才是 gainmap 的定义。
+    float anchor = (uSceneMid > 1e-6f && uDispMid > 1e-6f)
+                       ? clamp(uDispMid / uSceneMid, 0.25f, 8.0f)
+                       : (kDispMid / kSceneMid);
+    // ── 历史（0.12.230~0.12.244，已被 2026-11-13 推翻）────────────────────────
+    // 那三版用加性 `sdrLin + max(0, hdrLin − 1/anchor)`（后来加 smoothstep 消折点），
+    // 声称是"ISO 21496-1 标准语义"。**对照 libultrahdr 源码，这个说法不成立**：
+    // 标准就是逐像素比值，没有白点门限。加性写法在灯盘这类"大片中高光"上
+    // 实测 63% 像素 ratio=1，HDR 端提不动（证据与现象见下方新实现）。
+    // ── 2026-11-13：改回**标准的乘性比值**（对齐 libultrahdr encodeGain）────────
+    // 官方一手实现 third_party/ultrahdr/lib/src/gainmapmath.cpp:775：
+    //     gain = y_hdr / y_sdr;                        // 逐像素比值（同一域）
+    //     clamp [min_content_boost=1.0, max=hdr_white/sdr_white]
+    // 规范里**没有**"中灰以下 ratio 恒 1"，也没有白点门限。
+    // 此前 0.12.230 的 `sdrLin + max(0, hdrLin − 1/anchor)` 是**加性**延展，等价于给
+    // 高光设了一道 0.39 的门槛。真机实测（2026-11-13 灯盘 FILMKIT_20261113-113928）：
+    // 灯盘 63% 像素 ratio=1.00、中位 1.01，只有灯泡核心有增益 ⇒ HDR 屏上灯盘不亮、
+    // 灯泡四周留一圈没提亮的灰（"灯泡像糊了一层"）。PC 同场景整盘 ratio 3.9。
+    // 加性近似只在"高光段近似线性"时成立，而 filmic 的高光是强压缩，必须按比值算。
+    // 域换算：hdrLin 是 scene 域（film_src），sdrLin 是显示域线性 —— 乘同一个 anchor
+    // （kDispMid/kSceneMid）把 scene 折到显示域，两者才是同一把尺。
+    const float kSdrEps = 1e-4;
+    // ⚠ SDR base 已经乘过 uExposure（用户 EV / AE 基准曝光 / 闭环补光），HDR 参考
+    // （film_src）是**曝光前**的场景线性值 —— 必须同乘，否则 EV 一大比值就 <1、
+    // gainmap 整张退化成 1.0（2026-11-13 13:46:21 真机：ev=+3.77，boost 全 1、画面发紫）。
+    float hdrDisp = hdrLin * anchor * uExposure;
+    float ratio = (sdrLin > kSdrEps) ? (hdrDisp / sdrLin) : 1.0f;
+    // 下限 1：HDR 不应比 SDR 暗（标准 min_content_boost = 1）。
+    ratio = clamp(ratio, 1.0f, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
 }
 float gainPc(float sdrLin, float hdrLin) {
@@ -9056,6 +9057,8 @@ bool FrameRenderer::init() {
     u_gainmap_.src_size = glGetUniformLocation(prog_gainmap_, "uSrcSize");
     u_gainmap_.math = glGetUniformLocation(prog_gainmap_, "uGainmapMath");
     u_gainmap_.scene_mid = glGetUniformLocation(prog_gainmap_, "uSceneMid");
+    u_gainmap_.exposure = glGetUniformLocation(prog_gainmap_, "uExposure");
+    u_gainmap_.disp_mid = glGetUniformLocation(prog_gainmap_, "uDispMid");
   }
   // HDR 曝光融合 P2（0.12.77）：同 gainmap 的可选处理 —— link/编译失败只记日志
   // 置 0，passHdrMertens 直接返回（成片 = zero 链，J10 语义），不拖死引擎。
@@ -13032,7 +13035,8 @@ bool FrameRenderer::ensureGainmap(int w, int h) {
   return true;
 }
 
-bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex) {
+bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, float exposure,
+                                  float disp_mid) {
   if (!prog_gainmap_ || hdr_tex == 0 || sdr_tex == 0) return false;
   if (!ensureGainmap(w, h)) return false;
   // ⚠ **必须保存/恢复 FBO 与 viewport**（v0.11.50 真机事故）：
@@ -13058,6 +13062,8 @@ bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex) {
   // 这里在其后使用 ⇒ 同一次 submit 内先写后读，无跨张时序）。预览链不跑 gainmap，
   // ae_p50_ 恒 0 的路径不存在；兜底钳到 1e-4（纯黑场景）。
   glUniform1f(u_gainmap_.scene_mid, std::max(ae_p50_, 1e-4f));
+  glUniform1f(u_gainmap_.exposure, exposure);
+  glUniform1f(u_gainmap_.disp_mid, disp_mid > 1e-6f ? disp_mid : 0.0f);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
@@ -15453,7 +15459,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
   if (!c.ten_bit) {
     const auto t_gm0 = std::chrono::steady_clock::now();
-    if (passGainmap(dst_w, dst_h, film_src, tex_cap_)) {
+    if (passGainmap(dst_w, dst_h, film_src, tex_cap_, std::exp2(pe.exposure_ev),
+                    still_disp_mid_)) {
       dbg_gainmap_ok_ = 1;
     } else {
       dbg_gainmap_ok_ = 0;
@@ -18784,6 +18791,9 @@ bool FrameRenderer::histogramFrom(GLuint src, int* out, int n, bool bypass_lut,
 // 系统性偏低（luma ≤ max），算出的黑点/白点都会往里收。旁路 LUT：风格层不该改 EV 判据。
 // **一次直方图出三个分位**：P0.5 → black relative exposure，P50 → 诊断，P99.5 → white。
 // 统计失败返回 valid=false（调用方保持上一帧参数，不写 last_*）。
+// 2026-11-13：域比访问器（头文件里 inline 不到 g_domain_ratio —— 它在 .cpp 定义）
+float FrameRenderer::domainRatio() const { return g_domain_ratio; }
+
 FrameRenderer::SceneStats FrameRenderer::measureSceneStats(GLuint src,
                                                           float center_frac) {
   // v0.10.27：64 → 256 桶。对数域统计编码下 readback 的 256 级与桶一一对应
@@ -19284,6 +19294,7 @@ void FrameRenderer::updateFilmicEV(GLuint src, bool still, bool auto_black_on,
       last_still_w999_ = std::log2(std::max(st.p_hi999, 1e-6f) / kGrey);
     } else {
       const float dom = std::max(g_domain_ratio, 1.0f);
+      last_pv_p999_ = st.p_hi999;
       last_pv_w999_raw_ = std::log2(std::max(st.p_hi999 / dom, 1e-6f) / kGrey);
     }
   }

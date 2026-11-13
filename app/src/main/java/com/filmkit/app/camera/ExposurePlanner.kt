@@ -134,12 +134,23 @@ object ExposurePlanner {
         // w999 = 2.4383 恰为 RAW 饱和白点，再乘 2^0.5 就把 0.1% 的饱和像素扩成
         // 大片裁切（成片 clipB 711/3072 = 23% 块命中裁剪）——LUT 只是在这片压平的
         // 白上染色。根因是曝光没有余量，不是 LUT。
-        val nHl = if (sceneHighlightEv.isFinite()) {
+        // 2026-11-13：欠曝**限幅 1EV**。判据是 P99.9（一个分位数），点光源/灯盘这种
+        // "大面积高光里最亮的一小撮"会把 over 算到 3+ EV —— 真机实测 expDv=-3.31
+        //（13:57:33），采集 0.001s 欠曝 3.3 档、成片再把 3.3EV 提回来，暗部乘 16 倍后
+        // G 通道信噪最差、R/B 残留放大 ⇒ 整片品红。这正是 2026-10-03 那条教训
+        //「为 0.1% 像素让全图欠曝」的复发。
+        // 取舍按既有拍板（2026-10-03「用户优先噪声 ⇒ 默认曝光给足」）：超过 1EV 的
+        // 欠曝收益远小于全图噪声代价，高光交给 HDR+ 短帧（-1.5EV）+ 高光重建。
+        val nHlRaw = if (sceneHighlightEv.isFinite()) {
             val over = sceneHighlightEv + exposureCompEv - (whitePointEv - highlightHeadroomEv)
             if (over > 0.0) Math.pow(2.0, -over) else 1.0
         } else {
             1.0
         }
+        // ⚠ 暂不设欠曝上限：1EV 的硬限会砍掉大逆光/大面积高光的合法欠曝（用户质疑，
+        // 且相机工程的通行做法是**判据带面积权重**，不是硬限 EV）。真正的修法是把
+        // 判据从「纯 P99.9 分位数」改成「面积加权高光」——见 next 里的面积门控。
+        val nHl = nHlRaw
 
         var why = "target"
         var n = nTarget

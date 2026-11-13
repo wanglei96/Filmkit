@@ -349,6 +349,10 @@ class FrameRenderer {
    * 0 = 尚未出帧。
    */
   float previewW999Raw() const { return last_pv_w999_raw_; }
+  // 2026-11-13 诊断：原始 P99.9（预览域，未除域比）与当时的域比 —— 用来分辨
+  // "预览链自己算低" 还是 "域比把值除小"（pw999 = log2(p999/dom/0.1845)）。
+  float previewP999Raw() const { return last_pv_p999_; }
+  float domainRatio() const;
   float sceneWMax() const { return last_wmax_; }
   int highlightClipBlocks() const { return hr_blocks_; }
 
@@ -863,7 +867,7 @@ class FrameRenderer {
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
   // HDR gainmap：tex_scene_（Rec.2020 线性）÷ tex_cap_（sRGB 8bit）→ 8bit 比值图
-  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex);
+  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, float exposure, float disp_mid);
   bool ensureGainmap(int w, int h);
 
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
@@ -1537,6 +1541,7 @@ class FrameRenderer {
   float last_w99_ = 0.0f, last_w999_ = 0.0f, last_cp_ = 1.0f, last_wmax_ = 0.0f;
   float last_still_w999_ = 0.0f;   // 成片链最后一次的 P99.9（EV 前，RAW 归一化域）
   float last_pv_w999_raw_ = 0.0f;  // 当帧预览链 P99.9（已 ÷ g_domain_ratio，RAW 等效域）
+  float last_pv_p999_ = 0.0f;      // 当帧预览链原始 P99.9（预览域，未除域比）
   // ── 自动曝光（v0.11.61）─────────────────────────────────────────────────
   // 本张 RAW 的 P50/P99.9 ⇒ 渲染端 EV（中灰锚定 + 高光约束，高光优先）。
   // 只在 submitRawBurst 的 still 链跑；预览/YUV 不走（域不同，见 AeMetering.h）。
@@ -1756,7 +1761,7 @@ class FrameRenderer {
   struct { GLint tex = -1, size = -1, chroma_min = -1; } u_cm_;
   // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid）
   struct {
-    GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1;
+    GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1, exposure = -1, disp_mid = -1;
   } u_gainmap_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {

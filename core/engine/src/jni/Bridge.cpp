@@ -1068,7 +1068,20 @@ Java_com_filmkit_app_EngineBridge_nativeEngineGetStats(JNIEnv* env, jobject) {
                             ",\"sw999\":" + jf(sr ? sr->stillW999() : 0.0f) +
                             // 当帧预览链的 P99.9（已 ÷ 域比回 RAW 等效域）—— 采集端
                             // 高光保护用**当帧**信息，不跨张（v0.12.247）
-                            ",\"pw999\":" + jf(sr ? sr->previewW999Raw() : 0.0f) +
+                            // ⚠ 2026-11-13：必须读**预览实例** g_renderer。`last_pv_w999_raw_`
+                            // 只在预览帧（still=false）上写，而 g_renderer_still 只做拍照、
+                            // 从不着预览帧 ⇒ 读 sr 会恒 0；sr 为空时 fallback 到 g_renderer
+                            // 又有值 ⇒ still 引擎"建/不建"交替时统计在 0 与有效值之间跳，
+                            // 表现为**隔张差 3~4EV**（真机 13:57:01 hlEv=-99 vs 13:57:27
+                            // hlEv=4.948，同场景连拍）。这是"用错实例"的第三次复发。
+                            ",\"pw999\":" + jf(g_renderer ? g_renderer->previewW999Raw() : 0.0f) +
+                            // 2026-11-13 诊断：这份统计"谁写了、谁没写"，一次拍摄就能分辨
+                            // 是预览链没跑 measureSceneStats，还是又读错了实例。
+                            ",\"pw999sr\":" + jf(sr ? sr->previewW999Raw() : 0.0f) +
+                            ",\"hasSr\":" + std::to_string(g_renderer_still.load() != nullptr ? 1 : 0) +
+                            ",\"hasPv\":" + std::to_string(g_renderer != nullptr ? 1 : 0) +
+                            ",\"p999pv\":" + jf(g_renderer ? g_renderer->previewP999Raw() : 0.0f) +
+                            ",\"dom\":" + jf(g_renderer ? g_renderer->domainRatio() : 0.0f) +
                             ",\"wmax\":" + jf(g_renderer ? g_renderer->sceneWMax() : 0.0f) +
                             ",\"clipB\":" + std::to_string(g_renderer ? g_renderer->highlightClipBlocks() : -1) + "}");
 }
