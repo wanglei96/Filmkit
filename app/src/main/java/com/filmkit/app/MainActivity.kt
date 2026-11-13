@@ -173,8 +173,16 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
         while (waited < 30_000L) {
             val u = navPrefs.getString("last_photo_uri", null)
             if (!u.isNullOrBlank() && u != viewerPendingBase) {
-                viewerUris = listOf(u)
-                viewerIndex = 0
+                // 与 onOpenLastPhoto 同一口径：查**整个相册列表**再定位索引。
+                // 只塞一张会让 Pager 只有 1 页 —— 成片后首次从胶卷位点开大图左右滑不动，
+                // 必须返回再进才行（用户 2026-11-13 报的 bug）。
+                val list = withContext(Dispatchers.IO) {
+                    runCatching { queryPhotos(context, hasImagePermission(context)).first }
+                        .getOrDefault(emptyList()).map { it.uri }
+                }
+                val i = list.indexOf(u)
+                viewerUris = if (i >= 0) list else listOf(u)
+                viewerIndex = if (i >= 0) i else 0
                 viewerPending = false
                 return@LaunchedEffect
             }
