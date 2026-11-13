@@ -511,6 +511,22 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
   return JNI_TRUE;
 }
 
+// 0.13.21：预热（见 FrameRenderer::warmup）。调用前必须已 nativeStillStart 成功；
+// 在本线程（still 线程）执行，所有分配与后续拍照共用同一 context。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeStillWarmup(JNIEnv*, jobject, jint w,
+                                                    jint h, jint rot) {
+  FrameRenderer* r = g_renderer_still.load();
+  if (r == nullptr) return JNI_FALSE;
+  if (g_still_surface == EGL_NO_SURFACE ||
+      !stillEgl().makeCurrent(g_still_surface))
+    return JNI_FALSE;
+  return r->warmup(static_cast<int>(w), static_cast<int>(h),
+                   static_cast<int>(rot))
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
 // 空闲释放（v0.10.88）：合成链在全分辨率下会留下约 2GB 中间纹理（RCD 三段 +
 // DFT + 高光重建的 RGBA16F 全分辨率 target），实测拍完常驻 2418MB 不回落
 // （对照：单实例路径拍完回到 459MB）。这里在**空闲一段时间后**把拍照实例整体

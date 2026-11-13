@@ -2877,6 +2877,18 @@ class CameraController(private val context: Context, private val render: RenderC
         // 在飞的合成照常跑完并落盘 —— 相机页退出不该以照片为代价。
     }
 
+    /**
+     * 0.13.21：预热 still 引擎（照 PC 的 prewarmCapturePipeline）。相机页可见后
+     * 由 CameraScreen 延迟调用：先异步建 context/program，再用当前采集尺寸分配
+     * 2.4GB 中间纹理与 satmask CPU 缓冲 —— 把第一张的冷启动成本提前到构图时。
+     * 只在用户开了独立拍照线程（still_thread）时预热；未就绪时 warmup 自行跳过。
+     */
+    fun warmupStillEngine() {
+        if (!context.getSharedPreferences("filmkit", 0).getBoolean("still_thread", false)) return
+        StillRenderClient.startAsync()
+        StillRenderClient.warmup(stillSize.width, stillSize.height, stillRot)
+    }
+
     @SuppressLint("MissingPermission")
     private fun openCamera(forcedId: String? = null) {
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager

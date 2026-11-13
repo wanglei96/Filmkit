@@ -51,40 +51,33 @@ object StillRenderClient {
     @Volatile
     private var disabled = false
 
-    /** 空闲释放（v0.10.88）：拍完这么久没有新任务就销毁拍照实例，把合成链留下的
-     *  约 2GB 全分辨率中间纹理还给系统（实测常驻 2418MB，重建 initMs 135~265ms）。
-     *  0.13.20：10s → 60s。真机日志（22:58~23:00）实测：间隔一超过 10s 就重建，
-     *  重建后的那一张 totalMs 1615→2858ms、fps 掉到 19/23 —— 用户感知就是
-     *  "冷启动第一张还顿"。60s 内连拍/回看不重建；真正的冷启动第一张仍付一次
-     *  init（150~265ms，与 burst 采集 300~500ms 重叠），这是硬件冷启动的底。 */
-    private val idleReleaseMs = 60_000L
-
-    /** 在拍照线程上执行销毁（与所有 native 调用同一条队列 → 必然排在在飞合成之后）。 */
-    private val idleRelease = Runnable {
-        if (!ready_) return@Runnable
-        try {
-            EngineBridge.nativeStillDestroy()
-        } catch (t: Throwable) {
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_ERROR, "engine", "render.still_destroy_error",
-                kv("error" to (t.message ?: t.toString())),
-            )
-        }
-        ready_ = false
-        EngineBridge.nativeAppendLog(
-            EngineBridge.LEVEL_INFO, "engine", "render.still_idle_release", "{}",
-        )
-        EngineBridge.nativeFlushLogs()
-    }
-
-    private fun scheduleIdleRelease() {
+    /** 0.13.21：**取消按时间释放**，改为生命周期驱动（相机页可见 + 亮屏保活）。
+     *
+     *  理由（真机日志 22:58~23:00）：定时器每 10s 销毁一次，重建后的那张
+     *  totalMs 1615→2858ms、fps 掉到 19/23 —— 时间释放本身在制造"冷启动第一张"。
+     *  显存/纹理驻留**不耗电**（UMA 下就是系统内存，2.4GB 对 16GB 机型可接受），
+     *  真正耗电且卡顿的是重复 init + 2.4GB 重新分配。
+     *  释放时机 = 相机页不可见 / 熄屏 / 系统内存压力（由 CameraScreen 生命周期调用
+     *  [releaseNow]）；用户在用相机就一直保活，并在 resume 后预热。 */
+    fun releaseNow() {
         val h = handler ?: return
-        h.removeCallbacks(idleRelease)
-        h.postDelayed(idleRelease, idleReleaseMs)
-    }
-
-    private fun cancelIdleRelease() {
-        handler?.removeCallbacks(idleRelease)
+        h.post {
+            if (!ready_) return@post
+            try {
+                EngineBridge.nativeStillDestroy()
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_ERROR, "engine", "render.still_destroy_error",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+            }
+            ready_ = false
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "engine", "render.still_release",
+                "{\"why\":\"lifecycle\"}",
+            )
+            EngineBridge.nativeFlushLogs()
+        }
     }
 
     /** 懒启动（阻塞至多 5s）。失败返回 false → 调用方回退预览线程：
@@ -93,7 +86,6 @@ object StillRenderClient {
         synchronized(this) {
             if (ready_) return true
             if (disabled) return false
-            cancelIdleRelease()  // 别让到期释放和本次启动打架（同队列下只是白跑一趟）
             val h = handlerOrStart() ?: return false
             val latch = CountDownLatch(1)
             postStart(h, latch)
@@ -109,7 +101,6 @@ object StillRenderClient {
     fun startAsync() {
         synchronized(this) {
             if (ready_ || disabled) return
-            cancelIdleRelease()
             val h = handlerOrStart() ?: return
             postStart(h, null)
         }
@@ -164,10 +155,38 @@ object StillRenderClient {
         }
     }
 
+    /** 0.13.21 预热：把大纹理与 satmask 缓冲先分配好（见 nativeStillWarmup）。
+     *  未就绪时静默跳过 —— 调用方（相机页可见 2s 后）已经先 startAsync，队列串行
+     *  保证 warmup 排在 start 之后。失败只记日志，不影响拍照路径。 */
+    fun warmup(w: Int, h: Int, rot: Int) {
+        if (w <= 0 || h <= 0) return
+        // 不在**调用线程**上判 ready_：startAsync 只是排队，ready_ 要等 start 执行完
+        // 才变 true。这里同样只排队，真正的就绪判断放到队列内（start 必然先执行）。
+        val hd = handler ?: return
+        hd.post {
+            if (!ready_) return@post
+            val t0 = SystemClock.elapsedRealtime()
+            val ok = try {
+                EngineBridge.nativeStillWarmup(w, h, rot)
+            } catch (t: Throwable) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_WARN, "engine", "render.still_warmup_error",
+                    kv("error" to (t.message ?: t.toString())),
+                )
+                false
+            }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "engine", "render.still_warmup",
+                kv("ok" to ok, "ms" to (SystemClock.elapsedRealtime() - t0),
+                   "size" to "${w}x$h", "rot" to rot),
+            )
+        }
+    }
+
     /** 是否就绪（v0.10.93 单帧路由用）：调用方（渲染线程上的 tryProcessRaw）只做
      *  非阻塞判断 —— 不 ready 就直接走预览线程，**绝不**在预览渲染线程上干等
-     *  ensureStarted（那本身就是一次卡顿，0.10.85 的教训）。预热由 capture 入口的
-     *  startAsync 负责，本张没赶上就下一张。 */
+     *  ensureStarted（那本身就是一次卡顿，0.10.85 的教训）。预热由相机页可见后的
+     *  startAsync + warmup 负责，本张没赶上就下一张。 */
     val ready: Boolean
         get() = ready_
 
@@ -205,7 +224,6 @@ object StillRenderClient {
             onDone(null, 0, 0)
             return
         }
-        cancelIdleRelease()  // 新任务来了，取消待执行的空闲释放
         val tPost = SystemClock.elapsedRealtime()
         val posted = h.post {
             // 与 submitRaw 一致：静拍实际旋转 = 界面方向 + 传感器旋转(+1)
@@ -273,8 +291,6 @@ object StillRenderClient {
             // 失败节点立刻落盘：这条日志往往就是崩溃现场的最后一条
             if (bytes == null) EngineBridge.nativeFlushLogs()
             onDone(bytes, rotatedW, rotatedH)
-            // 合成结束：起一段空闲计时，到期把 ~2GB 中间纹理还给系统
-            scheduleIdleRelease()
         }
         if (!posted) onDone(null, 0, 0)
     }
@@ -297,7 +313,6 @@ object StillRenderClient {
             onDone(null, 0, 0)
             return
         }
-        cancelIdleRelease()
         val tPost = SystemClock.elapsedRealtime()
         val posted = h.post {
             val effectiveRot = (rotation + 1) % 4
@@ -353,8 +368,6 @@ object StillRenderClient {
             // 失败节点立刻落盘：这条日志往往就是崩溃现场的最后一条
             if (bytes == null) EngineBridge.nativeFlushLogs()
             onDone(bytes, rotatedW, rotatedH)
-            // 合成结束：起一段空闲计时，到期把 ~2GB 中间纹理还给系统
-            scheduleIdleRelease()
         }
         if (!posted) onDone(null, 0, 0)
     }
@@ -374,7 +387,6 @@ object StillRenderClient {
             onDone(null, 0, 0)
             return
         }
-        cancelIdleRelease()
         val tPost = SystemClock.elapsedRealtime()
         val posted = h.post {
             val effectiveRot = (rotation + 1) % 4
@@ -418,7 +430,6 @@ object StillRenderClient {
             )
             if (bytes == null) EngineBridge.nativeFlushLogs()
             onDone(bytes, rotatedW, rotatedH)
-            scheduleIdleRelease()
         }
         if (!posted) onDone(null, 0, 0)
     }

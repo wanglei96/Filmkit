@@ -142,6 +142,7 @@ import com.filmkit.app.camera.EditorPreset
 import com.filmkit.app.camera.PresetLutAction
 import com.filmkit.app.camera.PresetStore
 import com.filmkit.app.camera.RenderClient
+import com.filmkit.app.camera.StillRenderClient
 import com.filmkit.app.camera.cameraPresetParams
 import com.filmkit.app.camera.effectivePresetEvOffset
 import com.filmkit.app.camera.mergePresets
@@ -905,7 +906,12 @@ fun CameraScreen(
     }
 
     DisposableEffect(Unit) {
-        onDispose { controller.stop() }
+        onDispose {
+            controller.stop()
+            // 0.13.21：离开相机页（切相册/编辑器）= 用户不再取景 ⇒ 释放 still 引擎
+            // 的 ~2.4GB 中间纹理。不再用空闲定时器（它每 10s 制造一次"冷启动第一张"）。
+            StillRenderClient.releaseNow()
+        }
     }
 
     // 水平仪：加速度计重力方向 φ=atan2(gx,-gy)。
@@ -953,6 +959,8 @@ fun CameraScreen(
                 androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
                     resumed = false
                     controller.stop()
+                    // 切后台/熄屏：用户不在取景，释放 still 引擎（0.13.21 生命周期驱动）
+                    StillRenderClient.releaseNow()
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
                     resumed = true
@@ -963,6 +971,15 @@ fun CameraScreen(
         }
         lifecycleOwner.lifecycle.addObserver(obs)
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
+    // 0.13.21：预热（照 PC 的 onFirstPreviewFrame + grace）。相机页可见 2s 后
+    // 异步建 still 引擎（init 135~265ms）并用真实采集尺寸预分配 2.4GB 纹理与
+    // satmask 缓冲，把第一张的冷启动从快门挪到构图时。仍线程未开启时内部直接返回。
+    LaunchedEffect(resumed) {
+        if (!resumed) return@LaunchedEffect
+        delay(2000)
+        if (resumed) controller.warmupStillEngine()
     }
 
     LaunchedEffect(Unit) {

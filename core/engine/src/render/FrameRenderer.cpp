@@ -17575,6 +17575,40 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
   return tex_hr_recon_[recon_rd];
 }
 
+// 0.13.21：预热（照 PC 的 prewarmCapturePipeline，2026-11-13）。
+// 真机日志（0.13.19/0.13.20）：第一张的 preMs 比第二张多 ~300ms，主要是
+// 2.4GB 纹理首次分配 + satmask 的 125MB CPU 缓冲首次触页；预热把这些搬到
+// 用户构图时（相机页可见 2s 后）。只做尺寸驱动的分配，不跑画质 pass、不写像素。
+bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
+  if (raw_w <= 0 || raw_h <= 0) return false;
+  const auto t0 = std::chrono::steady_clock::now();
+  const int effective_rot = (rotation + 1) % 4;
+  const bool swap_wh = (effective_rot % 2) == 1;
+  const int dst_w = swap_wh ? raw_h : raw_w;
+  const int dst_h = swap_wh ? raw_w : raw_h;
+  bool ok = ensureMfnrTargets(raw_w, raw_h);
+  ok = ensureRcdTargets(raw_w, raw_h) && ok;
+  ok = ensureTargets(dst_w, dst_h) && ok;
+  // satmask 的 4 张 CPU 缓冲（~125MB）同步预分配：passSatMask 按 raw 尺寸复用。
+  const size_t n = static_cast<size_t>(raw_w) * raw_h;
+  if (satm_sat_.size() != n) {
+    satm_sat_.assign(n, 0);
+    satm_dil_.assign(n, 0);
+    satm_out_.assign(n * 4, 0);
+  }
+  glFinish();
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  Logger::instance().log(
+      LogLevel::kInfo, "engine", "engine.still_warmup",
+      std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"w\":" +
+          std::to_string(raw_w) + ",\"h\":" + std::to_string(raw_h) +
+          ",\"rot\":" + std::to_string(rotation) + ",\"ms\":" +
+          std::to_string(static_cast<int>(ms)) + "}");
+  return ok;
+}
+
 // RAW 多帧融合端到端：4 帧 u16 Bayer → 上传 → Bayer 域金字塔对齐（Align.cpp）
 // → 置信度加权均值（kFsMfnrFuse）→ P0（fused 变体）→ 与 submitRaw 完全相同的
 // RCD/胶片链 → RGBA8 读回。元数据统一取帧 0（burst 恒曝光）。

@@ -295,6 +295,11 @@ class FrameRenderer {
   //   mfnr.capture 日志可核对）。noise_model/noise_sigma/demosaic 语义同 submitRaw。
   //   short_ratio（期 B bracket）：帧 0 是短曝光帧时传"长/短"曝光比（>1），
   //   引擎在扣黑阶后把帧 0 归一到长帧域再对齐/融合；1 = 无短帧（零行为变化）。
+  /** 0.13.21 预热（照 PC 的 prewarmCapturePipeline）：用真实采集尺寸把 MFNR/RCD/
+   *  dst 侧的大纹理与 satmask CPU 缓冲先分配好，让第一张的 ~2.4GB 分配发生在
+   *  用户构图时而不是快门后。不跑任何画质 pass，不写像素；失败只是没预热。
+   *  rotation 语义与 submitRawBurst 相同（引擎内部 +1 后再换宽高）。 */
+  bool warmup(int raw_w, int raw_h, int rotation);
   bool submitRawBurst(const void* const* frames, int count,
                       const int* row_strides_px, int w, int h, int cfa,
                       const float black_phase[4], int white_level,

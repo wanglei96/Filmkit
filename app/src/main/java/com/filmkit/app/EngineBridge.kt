@@ -63,10 +63,17 @@ object EngineBridge {
     external fun nativeStillStart(): Boolean
 
     /**
-     * 空闲释放（v0.10.88）：销毁拍照侧 FrameRenderer（**保留 EGL context**），
-     * 释放合成链留下的约 2GB 全分辨率中间纹理。必须在拍照线程上调用；因为所有
-     * GL 调用都排在同一条 Handler 队列上串行，它天然排在在飞合成之后，安全。
-     * 下次拍照 nativeStillStart 会重建（~60ms，LUT 由 start 里的快照补齐）。
+     * 0.13.21 预热：用真实采集尺寸把 still 链的大纹理（MFNR/RCD/dst）与 satmask
+     * CPU 缓冲先分配好，不跑画质 pass、不写像素。调用前必须 nativeStillStart 成功，
+     * 且必须在拍照线程上调用（与后续合成同一 context）。
+     */
+    external fun nativeStillWarmup(w: Int, h: Int, rot: Int): Boolean
+
+    /**
+     * 生命周期释放（0.13.21）：销毁拍照侧 FrameRenderer（**保留 EGL context**），
+     * 释放合成链留下的约 2GB 全分辨率中间纹理。**不再按时间触发**，由相机页
+     * 不可见/熄屏调用；下次 start 会重建（LUT 由 start 里的快照补齐）。
+     * 所有 GL 调用都排在同一条 Handler 队列上串行，天然排在在飞合成之后。
      */
     external fun nativeStillDestroy()
 
