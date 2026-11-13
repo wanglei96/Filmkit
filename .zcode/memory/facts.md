@@ -126,3 +126,9 @@ status: active
 - [2026-11-13] **fence/时间片实验**：在飞 2 的 total 3124 vs 3121、fps 不变；sleep 10ms/30ms 让路 total +231ms、fps 不变 ⇒ 掉帧不是队列深度造成。
 - [2026-11-13] **PC 实测**：专业模式 RAW 拍照 tap→落盘 6.59s（我们 3.2~3.5s）；PC 无帧率日志、`SurfaceFlinger --latency` 对 BLAST layer 无效。
 - [2026-11-13] **界面动画**：相机页请求最高刷新率（`preferredDisplayModeId`），`dumpsys display` 实测 `appRequestBaseModeRefreshRate=120`；快门飞入 560ms、动画结束即 `resumePreviewNow`（`preview_gap` 607~633ms）。
+
+## HDR 灯盘实测（11-13）
+
+- [2026-11-13] **4 帧 RAW 真实饱和率**（`files/burst_dump` 导出的 f0-f3，4080×3072）：f0/f1 参考帧 1.84%、f2 长帧(+2.2EV) 13.2%、f3 短帧(-1.5EV) **0.02%**；离线复算融合权重 f0/f1/f2=0、f3=0.98 ⇒ 融合后灯面 scene p50 1.52 / max 3.94。
+- [2026-11-13] **灯面白的三段数据**：融合后 1.52 → 白点 2.95（whiteEv 4.0 相对中灰 0.1845）→ filmic 输出 0.80 线性（8bit 232）；PC 同场景 base 139。`satmCov 3.15%`、`hlCnt 94189`、`wmax 4.87`。
+- [2026-11-13] **预览统计与 RAW 的偏差**：`hl_stat` 实测 `pw999=0.889 / p999pv=0.6835 / dom=2.0 / wmax(预览)=1.97`；换算 `log2(p999pv/dom/0.1845)` 与日志逐位一致。历史 `pw999` 在同一场景抖动 0.10~5.65。

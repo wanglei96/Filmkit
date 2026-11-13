@@ -15,7 +15,7 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
 
-**进行中**：**预览体感专项**（11-12→13）：卡顿定档（LOW context + DFT 拆块）；空间域 fusion/PC3D/HL/defringe/CCM/TEQ/CA 全部 16 条**scissor** 条带（⛔ 不能用 viewport，0.13.18 画面重复 N 次）；still 改**生命周期保活**（相机页可见+亮屏，离开/熄屏释放，不再定时）；相机页 2s 后 **warmup**（全量 ensure + 35 个 FBO 触页，第一张 3805→3129ms、与热态差 1261→398ms）；快门**定格+飞入动画**（0.13.40 未装上，设备实际 0.13.38）。fence 窗口与时间片让路实测零收益、已弃用。掉帧剩采集期（HAL 重配）+ 处理期 GPU 饱和。→ **Spektrafilm 引擎 + 预设标定**（11-12 定序）；理光目标曲线待重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
+**进行中**：**预览体感专项**（11-12→13）：卡顿定档（LOW context + DFT 拆块）；空间域 fusion/PC3D/HL/defringe/CCM/TEQ/CA 全部 16 条**scissor** 条带（⛔ 不能用 viewport，0.13.18 画面重复 N 次）；still 改**生命周期保活**（相机页可见+亮屏，离开/熄屏释放，不再定时）；相机页 2s 后 **warmup**（全量 ensure + 35 个 FBO 触页，第一张 3805→3129ms、与热态差 1261→398ms）；快门**定格+飞入动画**（0.13.40 未装上，设备实际 0.13.38）。fence 窗口与时间片让路实测零收益、已弃用。掉帧剩采集期（HAL 重配）+ 处理期 GPU 饱和。UI 侧已收：飞入重做（真实取景框尺寸 / 白边 / 落格承接）、三分线入框、页面切换单层淡入、**相册/大图改覆盖层**（相机常驻，返回不再黑 1~2s）。→ **Spektrafilm 引擎 + 预设标定**（11-12 定序）；理光目标曲线待重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
 
 ## 里程碑沿革（压缩）
 - [2026-09-18→30] **M0–M2 + 域映射 + MFNR + 亚像素**：YUV/RAW 双链、RCD 12MP 477ms、LSC 接去马赛克后 CCM 前、M4 display 域 LUT；EV 单一来源与 WYSIWYG 定稿；MFNR 4 帧 Bayer 域对齐（残余 4.4×/2.2×→1.22×/1.45×）；P0 亚像素 +43.7%/+46.5%、快门间隔 2.5s→0.54s
@@ -55,3 +55,19 @@ status: active
 
 - [2026-11-12] **卡顿根因不是 strip**：PC 的 strip = LOW 优先级 EGL context（`EGL_IMG_context_priority`，X300 Mali 支持）+ 线程降级 + fence 窗口；上轮只抄了「条带 + glFlush」且加在 P0（300ms），而冻结来自 DFT 单 dispatch ~300ms。补齐后用户确认「好很多」；DFT 按 tile 行拆 2 块 + 在飞限 2，单 job 300→150ms，代价 dftGpu +400ms。
 - [2026-11-12] **融合默认切空间域**（0.13.16，`mfnr_dft=false`）：明亮 ISO 1163 6033→4233ms、暗光 ISO 662 8000→5240ms；暗部 σ 2.08→1.71、高频 −18% 但 100% 裁剪无可见差。写新融合的模拟（1~30px 位移）两条权重路径差 0~1.7 LSB ⇒ 不做。
+
+## HDR 灯盘与 gainmap 语义（11-13）
+
+- [2026-11-13] **gainmap 改回标准乘性比值**：`gainTrue` 从加性 `sdr+max(0,hdr−1/anchor)`
+  改成 `hdrDisp/sdrLin`（libultrahdr `encodeGain` 口径，clamp [1,4]）。加性版实测灯盘
+  63% 像素 ratio=1.00、只有灯泡核心有增益（HDR 屏上灯盘不亮、灯泡四周一圈灰），PC 同场景
+  整盘 3.9；改后 0% 恒 1、中位 2.2~2.9、p90 4.0。
+- [2026-11-13] **两个 gainmap 必修**：① 输入必须同 exposure（SDR 已乘，参考帧没乘 ⇒
+  EV+3.8 时整张退化 ratio=1、画面发紫）；② 用单锚点线性换算近似不了 filmic S 曲线
+  （固定 2.56 与本张 0.42 都让整张顶满 4x）。
+- [2026-11-13] **灯面白的根因在曲线不在融合**：4 帧离线复算证明 satW 正常（f0/f1/f2 权重 0、
+  短帧 f3 权重 0.98，融合后灯面 scene 1.52），而 filmic 白点 2.95 把 1.52 映射到 0.8
+  （8bit 232）；PC 同场景映射到 0.55（139）。
+- [2026-11-13] **采集端高光保护的判据源不可用**：`p999pv=0.68 / dom=2.0` 换算 0.89EV，
+  真实 3.04EV，低报 2.15EV；`dom` 是中位比，ISP tonemap 在高光段压 7~14×，修不了肩部。
+
