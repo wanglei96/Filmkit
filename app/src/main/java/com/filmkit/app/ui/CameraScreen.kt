@@ -88,6 +88,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -408,11 +409,48 @@ fun CameraScreen(
     var shotPending by remember { mutableStateOf(false) }
     var pendingBaseUri by remember { mutableStateOf<android.net.Uri?>(null) }
 
+    // 0.13.34：截屏动画素材 —— 按下快门时**抓当前预览帧**，飞入相册的就是
+    // "从取景器取出来的这一张"，而不是上一张成片。PixelCopy 异步（~10~30ms），
+    // 由 120ms 白闪盖住；抓失败/超时才回落到上一张成片。
+    var flyBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val previewSv = remember { java.util.concurrent.atomic.AtomicReference<android.view.SurfaceView?>(null) }
+
+    fun grabPreviewFrame() {
+        val sv = previewSv.get()
+        if (sv == null || sv.width <= 0 || sv.height <= 0) return
+        try {
+            val bmp = Bitmap.createBitmap(sv.width, sv.height, Bitmap.Config.ARGB_8888)
+            android.view.PixelCopy.request(
+                sv, bmp,
+                { result ->
+                    // 0.13.35：PixelCopy 对 GL SurfaceView 可能抓到全透明/全黑，
+                    // 采样中心像素确认真有内容才用作素材（否则回落上一张成片）。
+                    val px = if (result == android.view.PixelCopy.SUCCESS) {
+                        runCatching { bmp.getPixel(bmp.width / 2, bmp.height / 2) }.getOrDefault(0)
+                    } else 0
+                    val a = android.graphics.Color.alpha(px)
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_INFO, "app", "camera.fly_capture",
+                        com.filmkit.app.kv("result" to result, "alpha" to a),
+                    )
+                    if (result == android.view.PixelCopy.SUCCESS && a > 0) {
+                        flyBitmap = bmp.asImageBitmap()
+                    }
+                },
+                android.os.Handler(android.os.Looper.getMainLooper()),
+            )
+        } catch (_: Throwable) {
+            // 抓帧失败：飞入回落到上一张成片（thumb）
+        }
+    }
+
     fun doCapture() {
         androidView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         captureTick++
         pendingBaseUri = photoUri
         shotPending = true
+        flyBitmap = null
+        grabPreviewFrame()
         controller.capture()
     }
 
@@ -1043,38 +1081,47 @@ fun CameraScreen(
     // 才能跟满 60/120Hz。若把 value 读在组合里，每帧重组整个相机页会掉到十几帧。
     val flyProgress = remember { Animatable(0f) }
     var flyVisible by remember { mutableStateOf(false) }
-    // 0.13.33：把"冻结 → 飞入 → 恢复"串成一条时间轴，避免硬切。遮罩在快门瞬间
-    // 压暗一点点（定格的可视化），恢复预览后再淡出 —— 预览第一帧的跳变被淡出盖住。
-    // 与其它动画一样只在 draw 阶段读，不触发重组。
-    val coverAlpha = remember { Animatable(0f) }
+    // 0.13.34：截屏动画 —— 不压暗。快门白闪 120ms，同时 PixelCopy 抓下当前
+    // 预览帧；随后这张"从取景器取出来的图"缩小飞向左下角胶卷位（460ms），
+    // 飞完恢复预览。抓帧失败才回落到上一张成片。
+    var flySource by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     LaunchedEffect(captureTick) {
         if (captureTick == 0) return@LaunchedEffect
-        // ① 快门黑闪（190ms）+ 快门钮回弹，与 ②③ 并行
+        // ① 快门白闪（120ms）+ 快门钮回弹
         shutterAlpha.snapTo(0.85f)
-        launch { shutterAlpha.animateTo(0f, tween(durationMillis = 190, easing = LinearEasing)) }
+        launch { shutterAlpha.animateTo(0f, tween(durationMillis = 120, easing = LinearEasing)) }
         shutterPulse.snapTo(0.86f)
         launch { shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f)) }
-        // ② 定格压暗（140ms 渐入到 0.28）
-        coverAlpha.snapTo(0f)
-        launch { coverAlpha.animateTo(0.28f, tween(durationMillis = 140)) }
-        // ③ 缩略图飞入胶卷位（560ms，与 ② 同时推进）
-        if (thumb != null) {
+        // ② 等抓帧（白闪期间完成，通常 10~30ms），取预览帧作飞入素材
+        delay(120)
+        val src = flyBitmap ?: thumb
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "app", "camera.fly_src",
+            com.filmkit.app.kv("pixelOk" to (flyBitmap != null), "thumbOk" to (thumb != null)),
+        )
+        if (src != null) {
+            flySource = src
             flyVisible = true
             flyProgress.snapTo(1f)
-            flyProgress.animateTo(0f, tween(durationMillis = 560))
+            flyProgress.animateTo(0f, tween(durationMillis = 460))
             flyVisible = false
         } else {
-            delay(560)
+            delay(460)
         }
-        // ④ 动画结束恢复预览，等第一帧上屏后遮罩柔和淡出（280ms）
+        // ③ 飞完立刻恢复预览
         controller.resumePreviewNow()
-        delay(120)
-        coverAlpha.animateTo(0f, tween(durationMillis = 280))
     }
     // 0.13.30：飞入终点改用**两个控件的真实 root 坐标**（胶卷位 vs 飞入层中心），
     // 不再按屏幕边缘猜。两者都在同一窗口坐标系，差值就是 translation。
     var slotCenter by remember { mutableStateOf<Offset?>(null) }
     var flyCenter by remember { mutableStateOf<Offset?>(null) }
+    // 0.13.37：截屏动画的起点 = **整个预览框**（不是中心裁切的一小块）
+    var previewCenter by remember { mutableStateOf<Offset?>(null) }
+    // 截屏动画：图从**整张预览框大小**开始，缩小飞入胶卷位。
+    // ⚠ 尺寸必须用稳定值（屏幕宽 92% × 3:4），不能用 boxW —— 它在首帧尚为 1px，
+    // 会退化成 1dp 的图 + 20dp 阴影 = 屏幕上只剩一圈阴影环（真机出现过的 bug）。
+    val flyW = (LocalConfiguration.current.screenWidthDp * 0.92f).dp
+    val flyH = flyW * 1.333f
     // 兜底：控件尚未布局时（理论上不会）退回屏幕估算
     val flyEndX = with(LocalDensity.current) {
         (56.dp - LocalConfiguration.current.screenWidthDp.dp / 2f).toPx()
@@ -1259,11 +1306,14 @@ fun CameraScreen(
             Box(
                 Modifier
                     .aspectRatio(guideAspect)
-                    .onSizeChanged { boxW = it.width; boxH = it.height },
+                    .onSizeChanged { boxW = it.width; boxH = it.height }
+                    .onGloballyPositioned { previewCenter = it.boundsInRoot().center },
             ) {
                 AndroidView(
                     factory = { c ->
                         SurfaceView(c).apply {
+                            // 0.13.34：供 PixelCopy 抓当前预览帧（截屏动画素材）
+                            previewSv.set(this)
                             var pinching = false
                             val pinch = ScaleGestureDetector(
                                 c,
@@ -1358,46 +1408,51 @@ fun CameraScreen(
                 // 动画期间不触发重组（否则每帧重组整个相机页，动画只有十几帧）。
                 Box(
                     Modifier.matchParentSize().drawBehind {
-                        // 快门黑闪 + 定格压暗，两层都只在 draw 阶段读（零重组）
+                        // 快门白闪（draw 阶段读，零重组）
                         val a = shutterAlpha.value
                         if (a > 0.001f) drawRect(Color.Black, alpha = a)
-                        val c = coverAlpha.value
-                        if (c > 0.001f) drawRect(Color.Black, alpha = c)
                     },
                 )
 
                 // 0.13.28 iPhone 味飞入：上一张成片从中心缩小飞向左下角胶卷位。
                 // 该层不接收触摸（无 clickable），不挡快门/滑杆。
-                if (flyVisible && thumb != null) {
+                if (flyVisible && flySource != null) {
                     Box(
                         Modifier.matchParentSize()
                             .onGloballyPositioned { flyCenter = it.boundsInRoot().center },
                         contentAlignment = Alignment.Center,
                     ) {
                         Image(
-                            bitmap = thumb!!,
+                            bitmap = flySource!!,
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
-                                .size(132.dp)
+                                .size(flyW, flyH)
+                                .shadow(8.dp, RoundedCornerShape(10.dp))
+                                .border(1.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp))
                                 .graphicsLayer {
-                                    val t = 1f - flyProgress.value   // draw 阶段读
-                                    val s = 1f - 0.70f * t
+                                    // 截屏动画：起点 = 整个预览框（与背景重合，看不出），
+                                    // 然后一边缩小一边飞向胶卷位。draw 阶段读，零重组。
+                                    val t = 1f - flyProgress.value
+                                    val s = 1f - 0.72f * t
                                     scaleX = s
                                     scaleY = s
-                                    val sc = slotCenter
+                                    val pc = previewCenter
                                     val fc = flyCenter
-                                    if (sc != null && fc != null) {
-                                        // 真实终点：胶卷位中心 − 飞入层中心
-                                        translationX = (sc.x - fc.x) * t
-                                        translationY = (sc.y - fc.y) * t
+                                    val sc = slotCenter
+                                    if (pc != null && fc != null) {
+                                        val dx0 = pc.x - fc.x
+                                        val dy0 = pc.y - fc.y
+                                        val dx1 = (sc?.x ?: pc.x) - pc.x
+                                        val dy1 = (sc?.y ?: pc.y) - pc.y
+                                        translationX = dx0 + dx1 * t
+                                        translationY = dy0 + dy1 * t
                                     } else {
                                         translationX = flyEndX * t
                                         translationY = flyEndY * t
                                     }
-                                    alpha = (1f - 0.55f * t).coerceIn(0f, 1f)
                                 }
-                                .clip(RoundedCornerShape(16.dp)),
+                                .clip(RoundedCornerShape(10.dp)),
                         )
                     }
                 }
