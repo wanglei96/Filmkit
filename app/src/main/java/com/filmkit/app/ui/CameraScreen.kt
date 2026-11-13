@@ -1043,12 +1043,21 @@ fun CameraScreen(
     // 才能跟满 60/120Hz。若把 value 读在组合里，每帧重组整个相机页会掉到十几帧。
     val flyProgress = remember { Animatable(0f) }
     var flyVisible by remember { mutableStateOf(false) }
+    // 0.13.33：把"冻结 → 飞入 → 恢复"串成一条时间轴，避免硬切。遮罩在快门瞬间
+    // 压暗一点点（定格的可视化），恢复预览后再淡出 —— 预览第一帧的跳变被淡出盖住。
+    // 与其它动画一样只在 draw 阶段读，不触发重组。
+    val coverAlpha = remember { Animatable(0f) }
     LaunchedEffect(captureTick) {
         if (captureTick == 0) return@LaunchedEffect
+        // ① 快门黑闪（190ms）+ 快门钮回弹，与 ②③ 并行
         shutterAlpha.snapTo(0.85f)
         launch { shutterAlpha.animateTo(0f, tween(durationMillis = 190, easing = LinearEasing)) }
         shutterPulse.snapTo(0.86f)
         launch { shutterPulse.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = 500f)) }
+        // ② 定格压暗（140ms 渐入到 0.28）
+        coverAlpha.snapTo(0f)
+        launch { coverAlpha.animateTo(0.28f, tween(durationMillis = 140)) }
+        // ③ 缩略图飞入胶卷位（560ms，与 ② 同时推进）
         if (thumb != null) {
             flyVisible = true
             flyProgress.snapTo(1f)
@@ -1057,8 +1066,10 @@ fun CameraScreen(
         } else {
             delay(560)
         }
-        // 0.13.29：动画一结束就解除定格（合成还需 2~3s，不能一直卡屏）
+        // ④ 动画结束恢复预览，等第一帧上屏后遮罩柔和淡出（280ms）
         controller.resumePreviewNow()
+        delay(120)
+        coverAlpha.animateTo(0f, tween(durationMillis = 280))
     }
     // 0.13.30：飞入终点改用**两个控件的真实 root 坐标**（胶卷位 vs 飞入层中心），
     // 不再按屏幕边缘猜。两者都在同一窗口坐标系，差值就是 translation。
@@ -1347,8 +1358,11 @@ fun CameraScreen(
                 // 动画期间不触发重组（否则每帧重组整个相机页，动画只有十几帧）。
                 Box(
                     Modifier.matchParentSize().drawBehind {
+                        // 快门黑闪 + 定格压暗，两层都只在 draw 阶段读（零重组）
                         val a = shutterAlpha.value
                         if (a > 0.001f) drawRect(Color.Black, alpha = a)
+                        val c = coverAlpha.value
+                        if (c > 0.001f) drawRect(Color.Black, alpha = c)
                     },
                 )
 
