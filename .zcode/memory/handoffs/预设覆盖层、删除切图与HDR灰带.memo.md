@@ -2,7 +2,7 @@
 summary: 预设覆盖层、删除切图与HDR灰带
 created: 2026-11-14 18:42
 updated: 2026-11-14 18:42
-status: active
+status: absorbed
 ---
 
 # 预设覆盖层、删除切图与HDR灰带

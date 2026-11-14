@@ -124,3 +124,11 @@ status: active
 - [2026-11-14] **`color_smooth` 3×3 救不了 3~5px 宽带**：它是 1px 半径；"色差中值滤波无效 + 关紫边抑制紫边更强"正是分工证据 —— 宽带靠判据象限（defringe），窄带才靠中值。
 - [2026-11-14] **覆盖层化之后，"外层改 prefs"不再反映到常驻页**：相机页常驻（0.13.44）后，`last_photo_uri` 被清、LUT/预设被改都不会自动同步。已修 `last_photo_uri`（`OnSharedPreferenceChangeListener`），其余同类问题优先查这条。
 - [2026-11-14] **硬编码对象不在出厂列表里 ⇒ 覆盖层永远匹配不上**：「标准」预设是 `CameraPresetApply.kt` 的 `EditorPreset` 常量，`applyBuiltinOverrides` 只对 `builtin.json` 的 id 生效。凡是"某个内置 by-id 的特例"，先确认它在不在 `load()` 的返回值里。
+
+## HDR reference 接线（11-14 晚）
+- [2026-11-14] **`ChainCtx::hdr_side_raw` 曾全仓无赋值**：`tex_hdr_side_` 这条"独立 HDR reference"从 0.12.77 起是死路径，日志里连 `hdr.side` 事件都没有。判"某条链路在跑"必须看事件日志，不能只看代码存在。
+- [2026-11-14] **side 链会覆盖 `tex_scene_`**：`passCcm` 硬编码写 `fbo_scene_`，Mertens 关闭时没人写回 zero ⇒ 成片暗 2.8 倍（0.13.73 真机）。只取 reference 时必须 `glBlitFramebuffer` 从 `fbo_hdr_zero_` 恢复。
+- [2026-11-14] **短帧在灯面部分饱和**：`satmCov=2.42%`、`satmMax=1023`(满阱)，归一后只能到 6.1，低于 HL 重建的 8~9 —— 物理上限，不是 bug。
+- [2026-11-14] **`gmMean` 会掩盖分布**：0.13.64 的 gmMean 0.51 看着与 PC 一致，实际是"97.6% 恒 1 + 2.4% 剧变"。判 gainmap 要看 `gmMax` 与 base 的分箱对应。
+- [2026-11-14] **PC 的 boost 3.3× 不是公式而是曝光策略**：`recoveryWhiteGain = HDR scene exposure / SDR render exposure`；PC 的 SDR base 228 vs 我们 246，留给 HDR 的余量本来就不同。
+

@@ -123,3 +123,10 @@ status: active
 - [2026-11-14] **删除后留在查看页切下一张**：只摘掉被删下标（`currentPage` 原地显示原下一张，零滚动），删最后一张夹到前一张，删空才退出。同页换图 ≠ 翻页：翻页必须丢旧像素，删除换图保留旧图当淡出底（`shownPage == page` 判据）。
 - [2026-11-14] **gainmap = 纯比值 + LUT 补偿，没有任何 anchor**：对照 `bjzhou/PhotonCamera` 的 `HdrBufferEncoding.LINEAR_SRGB` 参考 + `RawGainmapMath.encodeLuminance`：`ratio=(hdrLuma+ε)/(sdrLuma+ε)`、`targetHdrLuma=(hdrLuma+ε)·lutGain−ε`、`[0.25,4]`、offset 1e-4。中灰 ratio≡1 是同域比值的自然结果；`film_src` 本来就在显示域，**不需要任何域换算系数**。
 - [2026-11-14] **defringe 判据用 `min(R−G, B−G)`**：紫（B>R>G）与品红（R>B>G）的共性是 R、B 都高于 G；单看 `B−R` 会把品红整个排除。零误伤仍靠邻域色差标准差 + 亮度梯度两道闸。
+
+## HDR 短帧 reference 与平台边界（11-14）
+- [2026-11-14] **HDR 高光用短帧，不用 HL 重建值**：`film_src` 的 8~9 含高光重建（偏高），短帧归一后 6.1 才是物理值，用户拍板"真实该多亮就多亮"。
+- [2026-11-14] **短帧必须乘 `frame_scale[short_idx]`**：−1.5EV 短帧 ×2.82 才回到 frame 0 曝光域；乘在已融合 scene 上是二次曝光（0.13.71 的 `gmMax=1.00` 就是这么来的）。
+- [2026-11-14] **HDR 延伸不能写在 `kFsFilm` 里**：`tex_work_` 同时是 SDR 成片源，任何 >1 改动都会被 `kFsOut` 的 `min(c,1)` 变成硬截断（0.13.66 的 SDR 横向波纹）。
+- [2026-11-14] **不再用更大采样核 / 邻域最大救灰带**：kK=12 平均（0.13.68）、12×12 最大（0.13.76）都只换灰带形状。
+

@@ -75,5 +75,11 @@ status: active
 
 - [2026-11-14] **「标准」预设的覆盖层漏洞**：`CAMERA_STANDARD_PRESET` 是硬编码对象、不在 `builtin.json`，`applyBuiltinOverrides` 匹配不到它 ⇒ 用户改的引擎/自动白点每次冷启动还原。`BuiltinPresets.forCamera()` 让标准也走覆盖层；`resolveCameraPreset` 先查列表（`savedId` 为空时也查，因为选中标准会删 `camera_preset_id`）。
 - [2026-11-14] **相册改覆盖层的连带修复**：相机页常驻 ⇒ 外层改 prefs 不再反映到 state。胶卷位加 prefs 监听 + 解码失败自愈；查看页删除改为"留在页内切下一张"（`onDeleted(Int)`），同页换图走交叉淡入，空列表不再报"照片已失效"。
-- [2026-11-14] **HDR gainmap 对齐 PhotonCamera**：删 `anchor`（显示域中灰 ÷ RAW 域中灰 ≈2.4）与重复 exposure，改纯比值 + LUT 亮度补偿，`gmMean` 0.79→0.51；`filmicTone` 白点之上保留线性 headroom（SDR 侧 `min(c,1)` 截断）。**灯面边缘 HDR 灰带仍未解决**：延伸幅度 4.0×/2.66×/1.414× 三档都无改善，根因不在斜率。
+- [2026-11-14] **HDR gainmap 对齐 PhotonCamera**：删 `anchor`（显示域中灰 ÷ RAW 域中灰 ≈2.4）与重复 exposure，改纯比值 + LUT 亮度补偿，`gmMean` 0.79→0.51；`filmicTone` 白点之上保留线性 headroom（SDR 侧 `min(c,1)` 截断）。
+
+## HDR 灰带追因与短帧归一（11-14 晚，0.13.65→0.13.77）
+
+- [2026-11-14] **灰带真因是 reference 与 SDR 不同形**：SDR 在灯面被 filmic 肩部压成 80px 平台（8bit 246 恒定），任何更有结构的 HDR reference（裸 scene / 曲线延伸 / HL 重建值 / 邻域最大）都会在平台边界显形——换 reference 只换灰带形状。
+- [2026-11-14] **两处代码级错位**：① gainmap 的 `uHdr` 从 0.11.50 起绑的是 `film_src`（filmic **之前**），`ratio` 退化成 `scene/clamp(scene,1)`；② `filmicTone` 里的白点延伸被下游 `gamutMapV5` 吃干净（Y 钳 ≈1.058 + `gamutCheckRgb` 钳 [0,1]），实测 `gmMax=0.50`。
+- [2026-11-14] **定版 0.13.77 用短帧**：`tex_hdr_side_`（−1.5EV 短帧 D4）× `frame_scale[short_idx]`(2.82) 归一到 frame 0 曝光域，4×4 盒式平均 + 完整 PC `CurveExtension`；side 链后用 `fbo_hdr_zero_` blit 恢复 zero D4，SDR 亮度不变。灯面 HDR ≈1.4× SDR 白点 = 短帧能给的物理真实值。
 - [2026-11-14] **紫边判据扩到品红象限**：`defringe` 原本只认 `B−R>thr`（紫 B>R>G），灯面边缘是 R>B>G 被结构性排除；改用 `min(R−G, B−G)`，峰值 85→11。
