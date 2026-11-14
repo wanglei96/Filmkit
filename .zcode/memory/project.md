@@ -71,3 +71,9 @@ status: active
 - [2026-11-13] **采集端高光保护的判据源不可用**：`p999pv=0.68 / dom=2.0` 换算 0.89EV，
   真实 3.04EV，低报 2.15EV；`dom` 是中位比，ISP tonemap 在高光段压 7~14×，修不了肩部。
 
+## 预设覆盖层与相册删除（11-14）
+
+- [2026-11-14] **「标准」预设的覆盖层漏洞**：`CAMERA_STANDARD_PRESET` 是硬编码对象、不在 `builtin.json`，`applyBuiltinOverrides` 匹配不到它 ⇒ 用户改的引擎/自动白点每次冷启动还原。`BuiltinPresets.forCamera()` 让标准也走覆盖层；`resolveCameraPreset` 先查列表（`savedId` 为空时也查，因为选中标准会删 `camera_preset_id`）。
+- [2026-11-14] **相册改覆盖层的连带修复**：相机页常驻 ⇒ 外层改 prefs 不再反映到 state。胶卷位加 prefs 监听 + 解码失败自愈；查看页删除改为"留在页内切下一张"（`onDeleted(Int)`），同页换图走交叉淡入，空列表不再报"照片已失效"。
+- [2026-11-14] **HDR gainmap 对齐 PhotonCamera**：删 `anchor`（显示域中灰 ÷ RAW 域中灰 ≈2.4）与重复 exposure，改纯比值 + LUT 亮度补偿，`gmMean` 0.79→0.51；`filmicTone` 白点之上保留线性 headroom（SDR 侧 `min(c,1)` 截断）。**灯面边缘 HDR 灰带仍未解决**：延伸幅度 4.0×/2.66×/1.414× 三档都无改善，根因不在斜率。
+- [2026-11-14] **紫边判据扩到品红象限**：`defringe` 原本只认 `B−R>thr`（紫 B>R>G），灯面边缘是 R>B>G 被结构性排除；改用 `min(R−G, B−G)`，峰值 85→11。

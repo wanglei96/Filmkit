@@ -2,7 +2,7 @@
 summary: 胶片预设群与LUT归一方法论
 created: 2026-11-02 17:15
 updated: 2026-11-02 17:15
-status: absorbed
+status: archived
 ---
 
 # 胶片预设群与LUT归一方法论

@@ -2,7 +2,7 @@
 summary: HDR gainmap与高光判据归因
 created: 2026-11-13 15:40
 updated: 2026-11-13 15:40
-status: active
+status: absorbed
 ---
 
 # HDR gainmap与高光判据归因
