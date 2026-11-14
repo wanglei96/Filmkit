@@ -521,6 +521,8 @@ class FrameRenderer {
     // 加权融合，写回 tex_scene_）。ev_side = 侧帧相对 zero 的实测 EV（日志用；
     // P2 权重不消费它，deghost 是 P3）。默认 false ⇒ 整条链逐位不变（J10）。
     bool hdr_mertens = false;
+    // 独立 HDR side reference：即使 Mertens 融合退役，也要生成并保留给 gainmap。
+    bool hdr_scene_ref = false;
     float hdr_ev_side = 0.f;
     // 侧帧原始数据（submitRawBurst 填充；finishStillChain 里把 high 重传进
     // raw_tex_ 再跑侧帧前链 —— passRawDenoise/RCD 读的是 raw_tex_，侧帧必须
@@ -532,6 +534,8 @@ class FrameRenderer {
     // B×ratio²（GCam 模型 σ²=A·x+B 的 B∝gain²；散粒项 A 归一化后不变）。
     // 1.0 = 同增益（零行为变化）。clamp [1, 64] 防呆。
     float hdr_side_gain = 1.f;
+    // HDR gainmap 的场景 reference 增益：多曝光短帧归一后的 HDR 场景尺度。
+    float hdr_scene_gain = 1.f;
   };
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
@@ -813,6 +817,16 @@ class FrameRenderer {
                                           float contrast_param,
                                           const float lat_sh[3],
                                           const float lat_toe[3]);
+  struct HdrCurveExtension {
+    float join_input = 0.305f;
+    float join_output = 1.0f;
+    float join_slope = 0.0f;
+    float quadratic = 0.0f;
+    float white_output = 1.41421356f;
+    float white_slope = 0.0f;
+    int extends_base = 0;
+  };
+  static HdrCurveExtension computeHdrCurveExtension(const FilmicSpline& sp);
   // ── U-2 编辑器链路胶片曲线（[5..10] latitude + [37][38] 黑白点；**显示域**）────────
   // 用户 2026-10-11"不统一的要统一掉，缺的补上"（参数统一方案 §9 的最后一批）。
   // 完整设计依据（为什么是"相对默认的差值"、中段斜率 c 的来源、与 [4] 的正交性、
@@ -866,8 +880,10 @@ class FrameRenderer {
                       float user_white, float white_hl, float white_floor,
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
-  // HDR gainmap：tex_scene_（Rec.2020 线性）÷ tex_cap_（sRGB 8bit）→ 8bit 比值图
-  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, float exposure, float disp_mid);
+  // HDR gainmap：hdr_tex（kFsFilm 输出）÷ sdr_tex（sRGB 8bit）→ 8bit 比值图。
+  // scene_tex = film_src（D4 场景线性），只用于在 pass 内算白点以上的延伸量。
+  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, GLuint scene_tex,
+                   float scene_gain, float exposure, float disp_mid);
   bool ensureGainmap(int w, int h);
 
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
@@ -1604,6 +1620,9 @@ class FrameRenderer {
     GLint scale = -1;
   } u_hdr_mertens_;
   bool ensureHdrSideTargets(int dst_w, int dst_h);
+  // HDR side reference 专用：side 链会覆盖 fbo_scene_，需要在只取 reference 时
+  // 用这个 FBO 把 zero 的 D4 blit 回去（否则 SDR 成片会跑在 -1.5EV 短帧上变暗）。
+  GLuint fbo_hdr_zero_ = 0;
   // kFsHdrMertens：zero（tex_hdr_zero_，读）与侧帧（tex_hdr_side_，读）逐像素
   // 加权融合 → 写回 fbo_scene_。权重/归一公式照抄 PC（MERTENS_WEIGHT/NORMALIZE，
   // GlesYuvStacker.kt:3451/3612），ponytail: P2 临时形态（无 pyramid/deghost）。
@@ -1759,9 +1778,16 @@ class FrameRenderer {
   } u_cs_;
   // 色差域 3×3 中值（0.12.162）
   struct { GLint tex = -1, size = -1, chroma_min = -1; } u_cm_;
-  // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid）
+  // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid；0.13.67 加 scene/grey/white_ev）
+  // scene + grey + white_ev 只服务"HDR 白点延伸"：延伸必须在 gainmap pass 内现场算，
+  // 不能写进 kFsFilm（那条纹理同时是 SDR 成片源，>1 会被 kFsOut 的 min(c,1) 硬截断）。
   struct {
     GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1, exposure = -1, disp_mid = -1;
+    GLint scene = -1, filmic_grey = -1, white_ev = -1, ext_peak = -1;
+    GLint scene_gain = -1;
+    GLint scene_white = -1, join_input = -1, join_output = -1, join_slope = -1,
+          curve_quadratic = -1, curve_white_output = -1, curve_white_slope = -1,
+          curve_extends_base = -1;
   } u_gainmap_;
   // 横向色差校正（v0.10.170）：① 1/8 降采样（估计输入）② 径向位移校正
   struct {

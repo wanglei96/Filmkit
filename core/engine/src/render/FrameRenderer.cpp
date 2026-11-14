@@ -5634,39 +5634,14 @@ vec3 filmicTone(vec3 c) {
     //（主感光层，luma 权重 0.7152 最大）。默认三通道相同 ⇒ 与接线前逐位一致。
     vec3 normed = (p / ratioNorm) * filmicScalarG(toneNorm, uFilmicBlackDisp);
     vec3 outv = 0.5 * naive + 0.5 * normed;
-    // ── ★ 2026-11-13：**白点以上保留线性 headroom**（HDR 参考的唯一来源）────────
-    // 旧实现（filmicScalar* 里的 `clamp(spline, lo, 1.0)` + `e` 上界钳 1）把白点以上的
-    // 输入全部压成 1 ⇒ film_src 恒 ≤1、没有任何 headroom。于是 gainmap 只能靠
-    // `anchor = disp_mid/raw_mid` 造增益，把中灰也乘了 2.4 —— 真机 21:17 实测
-    // gmMean 0.79（≈2.23×）对应"HDR 整张提亮"，而 PC 同场景 0.509（≈1.03×）。
-    //
-    // 现在按物理语义外推：**白点之上每 1 EV 线性 ×2**（2EV ⇒ 4.0×，正好对齐
-    // UltraHDR 的 max_content_boost=4）。SDR 侧在 kFsOut 入口 `min(c,1)` 截断，
-    // 所以成片逐位不变；只有 gainmap 能读到 >1 的参考值。
-    // 上限 3EV：再往上没有意义（4×8=32 倍已远超屏幕 headroom），防止极亮坏点把
-    // gainmap 编码空间顶爆。
-    float whiteEv = uFilmicBlackEv + uFilmicDr;
-    float overEv = log2(max(mx, kFilmicNormMin) / kFilmicGrey) - whiteEv;
-    if (overEv > 0.0) {
-        // 对齐 PhotonCamera `raw/RawHdrReferenceMath.kt` 的构造（HDR_WHITE_MULTIPLIER
-        // = √2）：**白点处 1.0，白点上方 +0.5EV 处 1.414，之后按端点切线线性延伸**。
-        //   斜率 = (√2 − 1) / 0.5 = 0.828 / EV
-        // 旧实现用 `exp2(overEv)`（每 EV ×2、2EV 直接 4x）：目标过冲，而且**指数放大**
-        // —— 灯面边缘 scene 抖 0.3~0.5EV 会被放大成 1.4~2 倍亮度起伏，HDR 屏上就是那条
-        // 灰色过渡带（实测 48px 内 ratio 在 2.6~4.0 间反复跳）。线性延伸把同一抖动压到
-        // 1.25~1.4 倍，且与 PC 的曲线形状一致。
-        // PC 的真形态（`RawHdrReferenceMath.HDR_WHITE_MULTIPLIER = √2`）：**+0.5 stop 封顶**。
-        // 0.5EV 之内线性升到 1.414，之后保持在 1.414 —— 对应它"scene white 处达到
-        // baseWhite×1.414，之后按白点处切线（压缩曲线 ≈ 0 斜率）延伸"。
-        // 旧式 `1+0.828*min(overEv,4)` 在灯面（超出白点 3.6EV）给到 **4.0×**，与边缘
-        // 的 1.01× 形成 4 倍落差 ⇒ HDR 屏上就是灯面外那圈 30px 的硬灰带
-        // （2026-11-14 18:30:15 实测 ratio 4.00 → 1.18 只隔 30px）。
-        float ext = 1.0 + 0.41421356 * min(overEv / 0.5, 1.0);
-        // 逐像素**标量**缩放（保色度）：把最大通道摆到 ext，其余按原比例 —— PC 的
-        // `gain = extendedCurveOutput / baseCurveOutput` 也是标量增益。
-        float mxOut = max(max(outv.r, outv.g), outv.b);
-        if (mxOut > 1e-6) outv *= ext / mxOut;
-    }
+    // ── ★ HDR headroom 延伸**不在这里**（0.13.66 修正）─────────────────────────
+    // 0.13.61~0.13.65 把延伸写在本函数尾部（白点之上 `outv *= ext/mxOut`），但本函数
+    // 的返回值紧接着要过 `gamutMapV5` —— darktable 的显示域收口（Y 钳 ≈1.058、
+    // gamutCheckRgb 回钳 [0,1]），会把 >1 的延伸整个吃回 1.0。
+    // 真机证据（0.13.65，19:40:18）：`gainmap.readback gmMax=0.50` = ratio 恒 1.0，
+    // 而同一张 `aeP999=9.81 / wmax=5.81`，灯芯明确超白点。
+    // 现在延伸挪到 `kFsFilm` 的 tone/gamut 调用段、gamutMapV5 **之后**（见那里注释）。
+    // 保留这条注记是为了防止有人"顺手"把它挪回来 —— 挪回来等于回到 gmMax=0.50。
     return outv;
 }
 // ── darktable filmic v5 gamut mapping（v0.10.13，标准算法补全）──────────────
@@ -5941,6 +5916,11 @@ void main() {
         if (uGamut > 0.5) toned = gamutMapV5(out3, toned);
         out3 = mix(out3, toned, uToneK);
     }
+    // ⚠ **HDR 白点延伸不在这里**（0.13.67 定案）：本 pass 的输出既是 SDR 成片源
+    //   （kFsOut `min(c,1)`），又是 gainmap 的 HDR 参考 —— 任何在这里做的 >1 延伸都会
+    //   连带改 SDR（实测 0.13.66：边缘像素被 `ext/mxT` 标量拉爆后截断，SDR 灯面边缘
+    //   出现一圈纯白硬边）。延伸改在 `kFsGainmap` 内部用 `uScene` 现场合成，
+    //   本 pass 恢复为"纯曲线 + gamut"，成片逐位不变。
     float l = luma(out3);
     float ws = exp(-l * 3.0);
     float wh = smoothstep(0.5, 1.0, l);
@@ -8267,7 +8247,7 @@ const char* kFsGainmap = R"(#version 300 es
 precision highp float;
 in vec2 vUV0;
 layout(location = 0) out vec4 oColor;
-uniform highp sampler2D uHdr;    // tex_scene_：Rec.2020 线性（D4）
+uniform highp sampler2D uHdr;    // tex_work_（kFsFilm 输出）：Rec.2020 线性，含白点延伸
 uniform highp sampler2D uSdr;    // tex_cap_：sRGB 已编码（D5，RGBA8）
 uniform vec2 uSrcSize;           // 全分辨率尺寸（px）
 // gainmap 数学版本（v0.12.85 起 **三档**，运行时切换）：
@@ -8283,6 +8263,24 @@ uniform int uGainmapMath;
 uniform float uSceneMid;         // P4：本张 scene 域中灰实测（ae_p50_，与 uHdr 同一 film_src 测得）
 uniform float uExposure;      // 与 kFsFilm 同一条基准曝光（SDR 已含它，HDR 必须同乘）
 uniform float uDispMid;       // 本张成片的显示域中灰（与 uSceneMid 同一张，做域换算）
+// ── HDR 白点延伸的判据源（0.13.67）──────────────────────────────────────────
+// uScene = `film_src`（D4 场景线性，与 uHdr 同向）。延伸必须在**本 pass 里**现场算，
+// 不能写进 kFsFilm：那条纹理同时是 SDR 成片源，任何 >1 的改动都会经 kFsOut 的
+// `min(c,1)` 变成硬截断（0.13.66 真机实测 = SDR 灯面边缘一圈纯白硬边）。
+// PC `RawHdrReferenceMath.CurveExtension` 的完整参数。HDR reference 必须是同一条
+// Filmic base curve 的 join/quadratic/white-tangent 延伸，不能用 scene 白点阈值+常数近似。
+uniform highp sampler2D uScene;  // film_src：Rec.2020 场景线性（方向 A，同 uHdr）
+uniform float uHdrSceneGain;      // 多曝光 HDR reference 的场景增益（frame_scale[短帧]）
+uniform float uFilmicGrey;       // kFilmicGrey（0.1845）
+uniform float uWhiteEv;          // 兼容旧诊断；scene white = grey*2^whiteEv
+uniform float uSceneWhite;
+uniform float uHdrCurveJoinInput;
+uniform float uHdrCurveJoinOutput;
+uniform float uHdrCurveJoinSlope;
+uniform float uHdrCurveQuadratic;
+uniform float uHdrCurveWhiteOutput;
+uniform float uHdrCurveWhiteSlope;
+uniform int uHdrCurveExtendsBase;
 const int kDS = 2;               // 增益图下采样倍数（1/2 分辨率）
 const float kMin = 0.25;         // 元数据 min_content_boost（log2 −2）
 const float kMax = 4.0;          // 元数据 max_content_boost（log2 +2）
@@ -8299,10 +8297,19 @@ float srgbInvOetf(float x) {
     return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
 }
 float luma709(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// 与 kFsOut 的 dhash 同款（Dave Hoskins，无 sin）：gainmap 8bit 量化台阶的 TPDF 抖动
+float dhash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
 
-// **2026-10-20 修正（0.11.74）**：hdrLin 是**未 tone map 的 scene 线性**（白点 1.0），
+// **2026-10-20 修正（0.11.74）**：hdrLin 曾经是**未 tone map 的 scene 线性**，
 // sdrLin 是**已 tone map 的显示线性**（中灰 0.18）—— 直接相除，中灰 ratio ≈ 0.39
 // （−1.36 EV）⇒ 开 HDR 整张变暗/发灰（真机实测 gainmap 中位 −1.03 log2、base mean 111）。
+// ⚠ 0.13.65 起 hdrLin 已改为来自 `tex_work_`（kFsFilm 输出 = 曲线 + 白点延伸），
+// 与 sdrLin 同域，"中灰 ratio ≈ 0.39"这个域错配不复存在；下面这段是 ratioFromScene
+// （uGainmapMath=1 的旧档，非默认）的历史说明，保留供 A/B 对照。
 // Ultra HDR 的语义是"HDR 相对 base 只会更亮"：中灰及以下 ratio = 1（= base），
 // 只有 scene 超白点（>1）的部分才原样延伸成高光增益。
 // HDR 相对 base 的增益曲线：**中灰基线 1.1**（整体通透度，对齐实测 gainmap
@@ -8343,11 +8350,33 @@ float gainTrue(float sdrLin, float hdrLin, float baseLin) {
     //      ratio         = (targetHdrLuma + eps) / (sdrLuma + eps)    // 同域逐像素比值
     //
     //    **没有 anchor、没有域换算系数**。成立的前提是 hdrLin 与 sdrLin 本来就是同一
-    //    条曲线（同域）—— `filmicTone` 现在会保留白点以上的线性 headroom（>1），
-    //    SDR 侧在 kFsOut 入口截断到 1，于是：
+    //    条曲线（同域）—— `filmicTone` 会保留白点以上的线性 headroom（>1），SDR 侧在
+    //    kFsOut 入口截断到 1，于是：
     //      暗部/中灰：hdr == sdr（都没被截断）  ⇒ ratio ≡ 1
     //      白点以上：hdr / 1.0                  ⇒ ratio = 真实倍数，2EV 即 4x
-    //    PC 同场景实测 boost p90 1.04x / p99 1.68x 正是这个形状。
+    //
+    //    ⚠ **这个前提直到 0.13.65 才真正成立**：此前 uHdr 绑的是 `film_src`（D4 场景
+    //    线性，filmic **之前**），hdrLin 是裸 scene，`baseLin = clamp(scene,0,1)` 也不是
+    //    "LUT 前的 SDR"而是"未 tone map 的 scene 截断" ⇒ 本函数实际算出
+    //    `ratio = scene / clamp(scene,1)`：scene≤1 恒 1、scene>1 时 = scene。
+    //    184017 样片实测：97.6% 像素 ratio=1.005、2.4% 是 1.0→4.0，灯面外沿多条灰带；
+    //    而把 `filmicTone` 的延伸改了三档都无感 —— 因为那段代码根本不在本 pass 的输入里。
+    //    0.13.65 起 uHdr = `tex_work_`（kFsFilm 输出），`clamp(hdrLin,0,1)` 才等于
+    //    "LUT 前的 SDR 线性"，与 PhotonCamera 的 sdrBeforeLut 同义。
+    //
+    //    PC 的对照实现（一手源码，勿凭样片反推）：
+    //      `hdr/GpuReferenceGainmapProducer.kt` RAW_LUMA_RESIDUAL shader：
+    //        sdrLuma = luma(srgbToLinear(uSdr))      // LUT 后的 SDR 编码值
+    //        lutGain = sidecar = (SDR_after+off)/(SDR_before+off)
+    //        ratio   = (hdrLuma*lutGain) / sdrLuma
+    //                ≡ hdrLuma / SDR_beforeLut       // 与我们下面的 lutGain 同义
+    //      hdrLuma 来自 `raw/RawHdrReferenceMath.CurveExtension`（引擎曲线 + 白点延伸 +
+    //      切线外推），`GainmapSourceSet` 里 encoding = LINEAR_SRGB、描述
+    //      "raw_linear_srgb_selected_engine_highlight_reference"。
+    //    注意：PC 样片的 boost 普遍偏大（19:13 那张 p50 3.3×）是**它的 SDR 曝光比 HDR
+    //    参考低 ~1.8EV** 的曝光策略（`recoveryWhiteGain = HDR scene exposure / SDR
+    //    render exposure`），不是 gainmap 公式的一部分。我们的 SDR/HDR 走同一曝光，
+    //    所以白点以下 ratio 就该是 1。
     //
     //    ⚠ 删掉的旧实现（务必不要再加回来）：`hdrDisp = hdrLin * anchor * uExposure`，
     //    anchor = uDispMid/uSceneMid = 显示域中灰 ÷ RAW scene 域中灰 ≈ 2.4 —— 两个量
@@ -8379,14 +8408,21 @@ float gainOfficial(float sdrLin, float hdrLin) {
 
 void main() {
     // ⚠ **两张输入的方向相反**（v0.11.50 真机事故，症状 = HDR 增益上下错位/键盘鬼影）：
-    //   uHdr = tex_scene_  ← kFsFilm 用 `texture(uTex, vUV0)` 直接采样 ⇒ 方向 A
+    //   uHdr = tex_work_   ← kFsFilm 直接采样 vUV0 后写 FBO ⇒ 与 tex_scene_ 同向（方向 A）
     //   uSdr = tex_cap_    ← kFsOut 带 `uFlipY`（拍照读回 GL 底行在前）翻转输出 ⇒ 方向 B = flip(A)
+    // （0.13.65 前 uHdr 是 tex_scene_，同样方向 A —— `tex_work_` 由 `passFilm` 输出，
+    //   顶点/UV 与 tex_scene_ 完全同构，方向约定不变。）
     // 用同一个 UV 采两者 = 拿"上方像素的 HDR"去除"下方像素的 SDR" ⇒ 增益整体上下颠倒。
     // 真机实测：床面出现键盘的鬼影（下方真实键盘的增益被搬到上方）。
     // 输出走**方向 B**（与 tex_cap_ / 最终 glReadPixels 的 base 同向），所以：
     //   · uSdr 用 vUV0（B）
     //   · uHdr 用 (x, 1-y)（转回 A）
-    // ⚠ **采样核 kK = kDS*2（步长仍是 kDS）⇒ 相邻 gainmap 像素的输入区重叠 50%，
+    // ⚠ 0.13.68：kK 从 4（kDS*2）加到 **12**（覆盖 12px 全分辨率）。原因：SDR 在灯面
+    // 外沿被 filmic 肩部压成一个 80px 宽的平平台（8bit 246 恒定），而 HDR 参考要还原
+    // 平台内的真实落差（scene 8→4.5），这个 40px 的陡降就是"HDR 灰带"的宏观成分。
+    // 12px 核把 scene 的梯度摊到更宽的空间，过渡从 40px 拉到 ~100px，视觉上接近自然光晕。
+    // 成本：144 采样/像素 × 3 纹理（原 16 采样），gmMs 从 ~0.9ms 升到 ~20ms，占比 <1%。
+    // ⚠ 原记录保留：**采样核 kK = kDS*2（步长仍是 kDS）⇒ 相邻 gainmap 像素的输入区重叠 50%，
     // 等于隐式做了一次 2×2 盒式平滑**（v0.11.53 真机事故的修复）。
     // 事故：2×2 无重叠采样时 gainmap 全是高频噪声点 —— 真机实测 1536×2040 的 gainmap
     // JPEG 有 **570KB**（正常应几十 KB），且 >=0.90 的像素占 1.61%（约 5 万个高增益点
@@ -8396,20 +8432,26 @@ void main() {
     // 是另一半根因，那部分靠默认 offset 1e-4 解决，见 setGainmapMath 注释）。
     vec2 block = floor(vUV0 * uSrcSize / float(kDS)) * float(kDS);
     const int kK = kDS * 2;
-    float hdrSum = 0.0, sdrSum = 0.0, baseSum = 0.0;
+    float hdrSum = 0.0, sdrSum = 0.0, baseSum = 0.0, sceneSum = 0.0, sceneMaxV = 0.0;
     for (int y = 0; y < kK; ++y) {
         for (int x = 0; x < kK; ++x) {
             vec2 pxB = (block + vec2(float(x), float(y)) - float(kDS) * 0.5 + 0.5) / uSrcSize;
-            vec2 pxA = vec2(pxB.x, 1.0 - pxB.y);   // tex_scene_ 的方向
+            vec2 pxA = vec2(pxB.x, 1.0 - pxB.y);   // tex_work_/film_src 的方向（A）
             // HDR：Rec.2020 线性 → sRGB 线性 → 709 luma
             vec3 hdrWork = workToSrgb(texture(uHdr, pxA).rgb);
             hdrSum += luma709(hdrWork);
-            // LUT 前的 SDR 线性亮度（= base 若不做 LUT/颗粒的样子）——
-            // `lutGain` 的分母，用来把 LUT 造成的提亮从 HDR 侧除掉。
+            // **LUT 前的 SDR 线性亮度** —— `lutGain` 的分母。
+            // 输入是 kFsFilm 输出（= filmic 曲线 + gamut 收口，恒 ≤1），clamp 到 1 之后
+            // 就等于 "SDR 若不做 LUT/颗粒/肩部滚降的样子"，与 PC 的 sdrBeforeLut 同义。
             baseSum += luma709(clamp(hdrWork, 0.0, 1.0));
             // SDR：sRGB 编码 → sRGB 线性 → 709 luma
             vec3 s = texture(uSdr, pxB).rgb;
             sdrSum += luma709(vec3(srgbInvOetf(s.r), srgbInvOetf(s.g), srgbInvOetf(s.b)));
+            // 场景线性：只用于算白点以上的延伸量（不参与 baseY/lutGain）
+            vec3 sceneWork = workToSrgb(texture(uScene, pxA).rgb);
+            float sv = luma709(max(sceneWork, 0.0)) * max(uHdrSceneGain, 1.0);
+            sceneSum += sv;
+            sceneMaxV = max(sceneMaxV, sv);
         }
     }
     float n = float(kK * kK);
@@ -8417,9 +8459,38 @@ void main() {
     // sdrY 是**线性** luma（上面已反过 OETF）—— 两版都吃线性域
     float sdrY = sdrSum / n;
     float baseY = baseSum / n;
+    // ── PC RawHdrReferenceMath.CurveExtension（逐像素、同一条 Filmic base curve）────
+    // sceneX 是 PC 的 CurveExtension.evaluate() 输入坐标：scene white = 1。
+    // x<=join：保留 SDR base curve；join<x<=1：二次式保 C1；x>1：白点切线外推。
+    // 关键：baseCurveOutput 不是 clamp(scene)，也不是一个全局 ext 平台；它必须和 SDR
+    // 的 Filmic curve 在同一坐标上连续，否则 gainmap 会在灯面边缘提前跳变。
+    // 短帧的 4x4 盒式平均（与 PC 的 RAW_LUMA_RESIDUAL 同口径）。不取最大值：
+    // 最大窗口会把邻域的亮度搬进来，反而在平台上造出新的边界。
+    float sceneY = sceneSum / n;
+    float sceneX = sceneY / max(uSceneWhite, 1e-6);
+    if (sceneX > uHdrCurveJoinInput) {
+        float extendedY;
+        if (sceneX <= 1.0) {
+            float d = sceneX - uHdrCurveJoinInput;
+            extendedY = (uHdrCurveExtendsBase != 0)
+                ? (hdrY + uHdrCurveQuadratic * d * d)
+                : (uHdrCurveJoinOutput + uHdrCurveJoinSlope * d +
+                   uHdrCurveQuadratic * d * d);
+        } else {
+            extendedY = uHdrCurveWhiteOutput +
+                        uHdrCurveWhiteSlope * (sceneX - 1.0);
+        }
+        hdrY = max(hdrY, extendedY);
+    }
     float v = (uGainmapMath == 0) ? gainTrue(sdrY, hdrY, baseY)
             : (uGainmapMath == 1) ? gainPc(sdrY, hdrY)
                                   : gainOfficial(sdrY, hdrY);
+    // 8bit 量化前加 TPDF dither（±1LSB）：gainmap 的 ratio 在 0.25..4 之间是
+    // 对数等分的 256 级（每级 ×1.0109 = 1.09% 增益），在灯面这种大面积平滑渐变上
+    // 会被 Mach band 放大成一条条等值线（用户报的"多圈灰带"的微观成分）。
+    // 与 kFsOut 的成片 dither 同源：两个独立均匀分布之和 = 三角分布，规则斜坡→噪声。
+    float dth = (dhash(gl_FragCoord.xy) + dhash(gl_FragCoord.xy + vec2(37.0, 17.0)) - 1.0) / 255.0;
+    v = clamp(v + dth, 0.0, 1.0);
     oColor = vec4(v, v, v, 1.0);
 }
 )";
@@ -9101,6 +9172,18 @@ bool FrameRenderer::init() {
     u_gainmap_.scene_mid = glGetUniformLocation(prog_gainmap_, "uSceneMid");
     u_gainmap_.exposure = glGetUniformLocation(prog_gainmap_, "uExposure");
     u_gainmap_.disp_mid = glGetUniformLocation(prog_gainmap_, "uDispMid");
+    u_gainmap_.scene = glGetUniformLocation(prog_gainmap_, "uScene");
+    u_gainmap_.scene_gain = glGetUniformLocation(prog_gainmap_, "uHdrSceneGain");
+    u_gainmap_.filmic_grey = glGetUniformLocation(prog_gainmap_, "uFilmicGrey");
+    u_gainmap_.white_ev = glGetUniformLocation(prog_gainmap_, "uWhiteEv");
+    u_gainmap_.scene_white = glGetUniformLocation(prog_gainmap_, "uSceneWhite");
+    u_gainmap_.join_input = glGetUniformLocation(prog_gainmap_, "uHdrCurveJoinInput");
+    u_gainmap_.join_output = glGetUniformLocation(prog_gainmap_, "uHdrCurveJoinOutput");
+    u_gainmap_.join_slope = glGetUniformLocation(prog_gainmap_, "uHdrCurveJoinSlope");
+    u_gainmap_.curve_quadratic = glGetUniformLocation(prog_gainmap_, "uHdrCurveQuadratic");
+    u_gainmap_.curve_white_output = glGetUniformLocation(prog_gainmap_, "uHdrCurveWhiteOutput");
+    u_gainmap_.curve_white_slope = glGetUniformLocation(prog_gainmap_, "uHdrCurveWhiteSlope");
+    u_gainmap_.curve_extends_base = glGetUniformLocation(prog_gainmap_, "uHdrCurveExtendsBase");
   }
   // HDR 曝光融合 P2（0.12.77）：同 gainmap 的可选处理 —— link/编译失败只记日志
   // 置 0，passHdrMertens 直接返回（成片 = zero 链，J10 语义），不拖死引擎。
@@ -10081,8 +10164,10 @@ void FrameRenderer::release() {
     gainmap_w_ = gainmap_h_ = 0;
   }
   // HDR 曝光融合 P2（0.12.77）：侧帧 Bayer 与 D4 保存纹理（惰性建，拍照用）
+  if (fbo_hdr_zero_) glDeleteFramebuffers(1, &fbo_hdr_zero_);
   if (tex_hdr_side_) glDeleteTextures(1, &tex_hdr_side_);
   if (tex_hdr_zero_) glDeleteTextures(1, &tex_hdr_zero_);
+  fbo_hdr_zero_ = 0;
   tex_hdr_side_ = tex_hdr_zero_ = 0;
   hdr_side_dst_w_ = hdr_side_dst_h_ = 0;
   if (tex_dir_) glDeleteTextures(1, &tex_dir_);
@@ -13077,9 +13162,11 @@ bool FrameRenderer::ensureGainmap(int w, int h) {
   return true;
 }
 
-bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, float exposure,
-                                  float disp_mid) {
-  if (!prog_gainmap_ || hdr_tex == 0 || sdr_tex == 0) return false;
+// `hdr_tex` = **kFsFilm 的输出**（`tex_work_`，曲线 + 白点延伸）。0.13.65 前传的是
+// `film_src`（D4 场景线性），那是域错配：gainmap 会退化成 scene/clamp(scene)。
+bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, GLuint scene_tex,
+                                float scene_gain, float exposure, float disp_mid) {
+  if (!prog_gainmap_ || hdr_tex == 0 || sdr_tex == 0 || scene_tex == 0) return false;
   if (!ensureGainmap(w, h)) return false;
   // ⚠ **必须保存/恢复 FBO 与 viewport**（v0.11.50 真机事故）：
   // 调用点紧跟 `passOutput`，而 passOutput 把 fbo_cap_ 绑上后**故意不恢复** ——
@@ -13098,14 +13185,35 @@ bool FrameRenderer::passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, fl
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, sdr_tex);
   glUniform1i(u_gainmap_.sdr, 1);
+  // 场景线性（同方向 A）：只用于算白点以上的延伸量，不参与 baseY/lutGain
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, scene_tex);
+  glUniform1i(u_gainmap_.scene, 2);
+  glActiveTexture(GL_TEXTURE0);
   glUniform2f(u_gainmap_.src_size, static_cast<float>(w), static_cast<float>(h));
   glUniform1i(u_gainmap_.math, g_gainmap_math.load());
-  // P4：scene 域中灰锚（本张 ae_p50_，与 uHdr=同一 film_src 测得；9593 在 passFilm 前赋值、
+  // P4：scene 域中灰锚（本张 ae_p50_，与 film_src 同一张测得；9593 在 passFilm 前赋值、
   // 这里在其后使用 ⇒ 同一次 submit 内先写后读，无跨张时序）。预览链不跑 gainmap，
-  // ae_p50_ 恒 0 的路径不存在；兜底钳到 1e-4（纯黑场景）。
+  // ae_p50_ 恒 0 的路径不存在；兜底钳到 1e-4（纯黑场景）。gainTrue 不消费它，
+  // 留作 uGainmapMath=1/2 两档旧数学的输入。
   glUniform1f(u_gainmap_.scene_mid, std::max(ae_p50_, 1e-4f));
+  glUniform1f(u_gainmap_.scene_gain, std::max(scene_gain, 1.0f));
   glUniform1f(u_gainmap_.exposure, exposure);
   glUniform1f(u_gainmap_.disp_mid, disp_mid > 1e-6f ? disp_mid : 0.0f);
+  // PC RawHdrReferenceMath 的曲线扩展：CPU 与当前 Filmic spline 同源求 join，
+  // shader 只按 sceneX 评价二次段/白点切线段，gainTrue 再与 SDR base 求比值。
+  const HdrCurveExtension ext = computeHdrCurveExtension(filmic_);
+  const float white_ev = filmic_.black_ev + filmic_.dynamic_range;
+  glUniform1f(u_gainmap_.filmic_grey, 0.1845f);
+  glUniform1f(u_gainmap_.white_ev, white_ev);
+  glUniform1f(u_gainmap_.scene_white, 0.1845f * std::exp2(white_ev));
+  glUniform1f(u_gainmap_.join_input, ext.join_input);
+  glUniform1f(u_gainmap_.join_output, ext.join_output);
+  glUniform1f(u_gainmap_.join_slope, ext.join_slope);
+  glUniform1f(u_gainmap_.curve_quadratic, ext.quadratic);
+  glUniform1f(u_gainmap_.curve_white_output, ext.white_output);
+  glUniform1f(u_gainmap_.curve_white_slope, ext.white_slope);
+  glUniform1i(u_gainmap_.curve_extends_base, ext.extends_base);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
   while (glGetError() != GL_NO_ERROR) {
@@ -13950,8 +14058,10 @@ void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) 
 bool FrameRenderer::ensureHdrSideTargets(int dst_w, int dst_h) {
   if (dst_w <= 0 || dst_h <= 0) return false;
   if (hdr_side_dst_w_ == dst_w && hdr_side_dst_h_ == dst_h) return true;
+  if (fbo_hdr_zero_) glDeleteFramebuffers(1, &fbo_hdr_zero_);
   if (tex_hdr_side_) glDeleteTextures(1, &tex_hdr_side_);
   if (tex_hdr_zero_) glDeleteTextures(1, &tex_hdr_zero_);
+  fbo_hdr_zero_ = 0;
   tex_hdr_side_ = tex_hdr_zero_ = 0;
   // 侧帧 D4 与 zero D4 拷贝：RGBA16F、成片几何（与 tex_scene_ 同规格 ×2）
   const auto mkD4 = [&](GLuint* tex) {
@@ -13966,6 +14076,13 @@ bool FrameRenderer::ensureHdrSideTargets(int dst_w, int dst_h) {
   };
   mkD4(&tex_hdr_side_);
   mkD4(&tex_hdr_zero_);
+  // tex_hdr_zero_ 需要一个 FBO 才能 glBlitFramebuffer 回 fbo_scene_
+  if (fbo_hdr_zero_) glDeleteFramebuffers(1, &fbo_hdr_zero_);
+  glGenFramebuffers(1, &fbo_hdr_zero_);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_hdr_zero_);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex_hdr_zero_, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
   hdr_side_dst_w_ = dst_w;
   hdr_side_dst_h_ = dst_h;
   return true;
@@ -14953,7 +15070,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 方案让侧帧链跑在 zero 数据上，D4-hdr≈D4-scene，已废）→ ③ 侧帧前链
     //（展开 kNoDn → RCD 三段 → CCM）→ ④ side 的 D4 存走 → ⑤ Mertens 写回
     // tex_scene_。任何一步失败：留痕并跳过融合（成片 = zero 链，照片优先）。
-    if (c.hdr_mertens && c.hdr_side_raw != nullptr) {
+    if ((c.hdr_mertens || c.hdr_scene_ref) && c.hdr_side_raw != nullptr) {
       const auto hs0 = std::chrono::steady_clock::now();
       bool hdr_ok = ensureHdrSideTargets(dst_w, dst_h);
       const auto hdrFail = [&](const char* why) {
@@ -15102,8 +15219,19 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dst_w, dst_h);
         if (glGetError() != GL_NO_ERROR) hdrFail("side_copy");
       }
-      // ⑤ Mertens 融合写回 tex_scene_ + 诊断
-      if (hdr_ok) {
+      // ④.5 只取 reference（Mertens 关闭）时，必须把 zero 的 D4 blit 回 fbo_scene_。
+      // 否则 side 链的 passCcm 已经把 tex_scene_ 覆盖成 -1.5EV 短帧，后续 filmic
+      // 全在短帧上跑 ⇒ SDR 成片整体变暗（0.13.73 真机实测）。
+      if (hdr_ok && !c.hdr_mertens && fbo_hdr_zero_ != 0) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_hdr_zero_);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_scene_);
+        glBlitFramebuffer(0, 0, dst_w, dst_h, 0, 0, dst_w, dst_h,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+        if (glGetError() != GL_NO_ERROR) hdrFail("zero_restore");
+      }
+      // ⑤ 只有 Mertens 开启时才改写 SDR 的 tex_scene_；hdr_scene_ref 只保留 side texture。
+      if (hdr_ok && c.hdr_mertens) {
         passHdrMertens(dst_w, dst_h, c.hdr_ev_side);
         diagStatsTex("D4-hdr", tex_scene_, dst_w, dst_h, &p);
         Logger::instance().log(
@@ -15491,6 +15619,19 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // ── HDR gainmap（v0.11.50）─────────────────────────────────────────
   // 位置：必须在 passOutput **之后**（tex_cap_ 才是最终 SDR 成片，含 LUT/颗粒/dither），
   // 在 glReadPixels **之前**（同一次 GL 提交里算完，省一次 flush）。
+  //
+  // ⚠ 0.13.65：HDR 参考纹理从 `film_src` 改为 **`tex_work_`（kFsFilm 输出）**。
+  //   `film_src` 是 D4 **场景线性**（CCM 后、filmic 前），而 SDR 是 filmic+LUT 之后的成片
+  //   —— 两者不同域，`gainTrue` 里 `ratio = hdrLuma/clamp(hdrLuma,1)` 会把"HDR 参考"
+  //   变成裸 scene 值：scene≤1 时 ratio≡1、scene>1 时 ratio=scene。实测 0.13.64 的
+  //   184017 样片：97.6% 像素 ratio=1.005、2.4% 是 1.0→4.0 剧变，灯面外沿出现多条灰带。
+  //   一手源码 PhotonCamera `HdrBufferEncoding`：hdrReference 是
+  //   "raw_linear_srgb_**selected_engine_highlight_reference**"，即引擎曲线 + 白点延伸
+  //   （`RawHdrReferenceMath.CurveExtension`），不是裸 scene。`tex_work_` 正是同一形态。
+  //   改后 ratio = filmic_out/clamp(filmic_out)：白点以下恒 1（HDR 与 SDR 逐像素同源），
+  //   只有超白点的高光才有 1~4 倍增益 —— 这正是 `gainTrue` 头注释声称的语义。
+  //   安全前提：`passOutput` 只读 `tex_work_`（halation/glow 读它、写别的纹理），
+  //   显示域闭环重跑 passFilm 时也会重写它，调用点在本 pass 之后仍是最后一次的结果。
   // 0.12.252（诊断）：filmic 输出与最终成片（闭环已收敛）的天空剖面 —— 与 d4 三段对拍
   if (skyDiagOn()) {
     dbg_sky_fm_ = skyProfile(fbo_work_, tex_work_, dst_w, dst_h, false);
@@ -15501,8 +15642,16 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
   if (!c.ten_bit) {
     const auto t_gm0 = std::chrono::steady_clock::now();
-    if (passGainmap(dst_w, dst_h, film_src, tex_cap_, std::exp2(pe.exposure_ev),
-                    still_disp_mid_)) {
+    // HDR bracket：tex_hdr_side_ 是已经走完 RAW→RCD→CCM 的独立短帧 D4 reference。
+    // 不要再把融合后的 film_src 乘 frame_scale[3]：那会把短帧曝光二次乘入，导致
+    // HDR reference 在灯面边界提前顶满。无 side frame 时才回退 film_src + scene_gain。
+    // HDR+ 的高光真值来自 −1.5EV 短帧：tex_hdr_side_ 是它的 D4，
+    // 必须乘 frame_scale[short_idx]（本场景 2.82）归一到 frame 0 曝光域。
+    const bool have_hdr_side = c.hdr && tex_hdr_side_ != 0;
+    const GLuint hdr_scene_tex = have_hdr_side ? tex_hdr_side_ : film_src;
+    const float hdr_scene_gain = have_hdr_side ? c.hdr_scene_gain : 1.0f;
+    if (passGainmap(dst_w, dst_h, tex_work_, tex_cap_, hdr_scene_tex,
+                    hdr_scene_gain, std::exp2(pe.exposure_ev), still_disp_mid_)) {
       dbg_gainmap_ok_ = 1;
     } else {
       dbg_gainmap_ok_ = 0;
@@ -18465,6 +18614,20 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   c.short_sat = satfix_on ? short_sat : -1.0f;
   c.bracket = satfix_on;
   c.hdr = hdr_active;
+  // 接入真实短帧作为独立 HDR reference：此前 hdr_side_raw 从未赋值，导致
+  // tex_hdr_side_ 永远不生成，gainmap 一直回退到 film_src×frame_scale 的错误近似。
+  c.hdr_side_raw = (hdr_active && short_idx >= 0 && short_idx < count)
+                       ? frames[short_idx] : nullptr;
+  c.hdr_side_stride = (hdr_active && short_idx >= 0 && short_idx < count)
+                          ? row_strides_px[short_idx] : 0;
+  c.hdr_side_gain = (hdr_active && short_idx >= 0 && short_idx < count)
+                        ? hdr_gain_4[short_idx] : 1.0f;
+  // HDR+ 的高光由短帧提供：让 side 链生成 tex_hdr_side_，只供 gainmap 消费。
+  c.hdr_scene_ref = c.hdr_side_raw != nullptr;
+  // 短帧本身是 -1.5EV：tex_hdr_side_ 存的是它的 D4，必须乘 2^1.5 归一到 frame 0
+  // 曝光域，gainmap 的 HDR reference 才与 SDR 同一场景尺度。
+  // （0.13.71 把这个增益乘在已融合的 scene 上是二次曝光；乘在短帧本身上才是归一。）
+  c.hdr_scene_gain = c.hdr_scene_ref ? frame_scale[short_idx] : 1.0f;
   c.nn = nn_dn;
   // 卡 H2：交付档（10bit HEIF）—— 同 submitRaw
   c.ten_bit = ten_bit;
@@ -18535,6 +18698,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       fss += jnum(frame_scale[i], 4);
     }
     c.mfnr_kv += ",\"hdrEv\":[" + evs + "],\"hdrFs\":[" + fss + "]";
+    c.mfnr_kv += ",\"hdrSceneGain\":" + jnum(c.hdr_scene_gain, 4);
   }
   finishStillChain(c, t0, out_rgba);
   return true;
@@ -19123,6 +19287,84 @@ FrameRenderer::FilmicSpline FrameRenderer::computeFilmicSpline(float black_ev, f
   sp.contrast = static_cast<float>(contrast);
   sp.contrast_param = contrast_param_in;
   return sp;
+}
+
+FrameRenderer::HdrCurveExtension FrameRenderer::computeHdrCurveExtension(
+    const FilmicSpline& sp) {
+  constexpr int kSamples = 1024;
+  constexpr double kGrey = 0.1845;
+  constexpr double kWhiteMultiplier = 1.41421356237;
+  constexpr double kSearchStart = 20000.0 / 65535.0;
+  std::array<double, kSamples> curve{};
+  const double sceneWhite = kGrey * std::exp2(static_cast<double>(sp.white_ev));
+  auto eval = [&](double scene) {
+    const double s = std::max(scene, static_cast<double>(sp.input_min));
+    const double e = std::clamp(
+        (std::log2(std::max(s, 1e-12) / kGrey) - sp.black_ev) /
+            std::max(static_cast<double>(sp.dynamic_range), 0.2),
+        0.0, 1.0);
+    const float ef = static_cast<float>(e);
+    double v;
+    if (ef < sp.lat_min[1]) {
+      v = sp.m1[1][0] + ef * (sp.m2[1][0] + ef * (sp.m3[1][0] +
+          ef * (sp.m4[1][0] + ef * sp.m5[1][0])));
+    } else if (ef > sp.lat_max[1]) {
+      v = sp.m1[1][1] + ef * (sp.m2[1][1] + ef * (sp.m3[1][1] +
+          ef * (sp.m4[1][1] + ef * sp.m5[1][1])));
+    } else {
+      v = sp.m1[1][2] + ef * sp.m2[1][2];
+    }
+    return std::pow(std::max(0.0, std::clamp(v, static_cast<double>(sp.black_disp), 1.0)),
+                    static_cast<double>(sp.output_power));
+  };
+  for (int i = 0; i < kSamples; ++i) {
+    const double x = static_cast<double>(i) / (kSamples - 1);
+    curve[i] = eval(sceneWhite * x);
+  }
+  const int start = std::clamp(static_cast<int>(std::ceil(kSearchStart * (kSamples - 1))),
+                               1, kSamples - 2);
+  const int span = std::max(1, static_cast<int>((20.0 / 65535.0) * (kSamples - 1)));
+  const double baseWhite = std::max(curve.back(), 1e-4);
+  HdrCurveExtension out;
+  bool found = false;
+  for (int i = start; i < kSamples - 1; ++i) {
+    const int lo = std::max(0, i - span);
+    const double x = static_cast<double>(i) / (kSamples - 1);
+    const double lx = static_cast<double>(lo) / (kSamples - 1);
+    const double slope = (curve[i] - curve[lo]) / std::max(x - lx, 1e-4);
+    const double interval = 1.0 - x;
+    const double whiteOut = baseWhite * kWhiteMultiplier;
+    const double q = (whiteOut - curve[i] - slope * interval) /
+                     std::max(interval * interval, 1e-8);
+    const double whiteSlope = slope + 2.0 * q * interval;
+    const double tangent = curve[i] + slope * interval;
+    if (std::isfinite(slope) && slope >= 0.0 && tangent >= baseWhite &&
+        std::isfinite(whiteSlope) && whiteSlope >= 0.0) {
+      out.join_input = static_cast<float>(x);
+      out.join_output = static_cast<float>(curve[i]);
+      out.join_slope = static_cast<float>(slope);
+      out.quadratic = static_cast<float>(q);
+      out.white_output = static_cast<float>(whiteOut);
+      out.white_slope = static_cast<float>(whiteSlope);
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    const double x = static_cast<double>(start) / (kSamples - 1);
+    const double interval = 1.0 - x;
+    const double q = (baseWhite * kWhiteMultiplier - curve.back()) /
+                     std::max(interval * interval, 1e-8);
+    out.join_input = static_cast<float>(x);
+    out.join_output = static_cast<float>(curve[start]);
+    out.join_slope = static_cast<float>((curve[start] - curve[start - 1]) * (kSamples - 1));
+    out.quadratic = static_cast<float>(q);
+    out.white_output = static_cast<float>(baseWhite * kWhiteMultiplier);
+    out.white_slope = static_cast<float>((curve.back() - curve[kSamples - 2]) * (kSamples - 1) +
+                                          2.0 * q * interval);
+    out.extends_base = 1;
+  }
+  return out;
 }
 
 // ── U-2：编辑器链路胶片曲线（[5..10] latitude + [37][38] 黑白点；显示域）────────────
