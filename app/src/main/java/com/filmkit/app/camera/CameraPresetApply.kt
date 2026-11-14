@@ -281,11 +281,23 @@ internal fun presetLutAction(preset: EditorPreset, lutExists: (String) -> Boolea
  * 返回 [CAMERA_STANDARD_PRESET] 而调用侧只需比对 `restored.id != savedId` 即可发现悬空，
  * 顺手把 prefs 里的脏 id 清掉（下次冷启动少一次无用的查找）。
  */
-internal fun resolveCameraPreset(savedId: String?, presets: List<EditorPreset>): EditorPreset =
-    when {
-        savedId.isNullOrEmpty() || savedId == CAMERA_STANDARD_PRESET_ID -> CAMERA_STANDARD_PRESET
-        else -> presets.firstOrNull { it.id == savedId } ?: CAMERA_STANDARD_PRESET
+/**
+ * ★ 2026-11-13：**先查列表，再回落硬编码**。
+ *
+ * 两个入口都必须查列表，否则「标准」的修改活不过冷启动：
+ *  - `savedId` 为空：`applyCameraPreset` 选中「标准」时会**删掉** `camera_preset_id`
+ *    （`CameraScreen.kt:659`，标准 = 默认档不落盘）⇒ 冷启动恒走这一支。旧实现直接返回
+ *    硬编码的 [CAMERA_STANDARD_PRESET]（空 slots），列表里那条「标准 + 用户覆盖」被绕过；
+ *  - `savedId == builtin_standard`：由 `BuiltinPresets.forCamera` 送进来的那条才是覆盖版。
+ *
+ * 列表里也没有「标准」（编辑器 / 查看页传 `all()`，不含标准）⇒ 才回落到硬编码出厂值。
+ */
+internal fun resolveCameraPreset(savedId: String?, presets: List<EditorPreset>): EditorPreset {
+    if (!savedId.isNullOrEmpty()) {
+        presets.firstOrNull { it.id == savedId }?.let { return it }
     }
+    return presets.firstOrNull { it.id == CAMERA_STANDARD_PRESET_ID } ?: CAMERA_STANDARD_PRESET
+}
 
 /**
  * 预设卡片的小字（`LutCard` 的 `sub`）：**分组**（有则显示）+ **是否含 LUT**。

@@ -323,14 +323,14 @@ class CameraPresetPanelUiTest {
 
     /**
      * **源码哨兵**：`CameraScreen.kt` 里每一条 `presets = …` 刷新都必须带上内置包 ——
-     * 要么 `mergePresets(..., BuiltinPresets.load(context))`（删除那条路径），
-     * 要么 `BuiltinPresets.all(context, prefs)`（★ PS-3 起写路径统一到 `persistPreset`：
-     * 用户预设 → `PresetStore`，内置 → 覆盖层，刷新一律走 `BuiltinPresets.all` —— 它是
-     * **唯一列表源**：用户预设 + 出厂内置 + 覆盖层）。
+     * 拍照页统一走 `BuiltinPresets.forCamera(context, prefs)`（★ 2026-11-13 起：标准 + 用户预设
+     * + 出厂内置 + 覆盖层，**标准也走覆盖层**）；删除路径改用 `PresetStore.delete(prefs, …)` 写库后
+     * 同样用 forCamera 重读。
      *
      * 为什么值得用正则读源码：这个坑（只赋 `PresetStore` 的返回值 ⇒ 内置三条当场消失）
      * 已经犯过一次（P-2c），而它**不会编译失败、不会崩**，只在界面上少三条 ——
      * 靠人记得在每条新路径上写 `mergePresets` 是不可靠的（PS-2a 一次新增了四条写路径）。
+     * 第二个坑（2026-11-13）：用 `all` 刷新 ⇒ 「标准」不在覆盖层里 ⇒ 改完杀进程还原。
      */
     @Test
     fun everyPresetListRefreshInCameraScreenCarriesTheBuiltinPackage() {
@@ -343,11 +343,15 @@ class CameraPresetPanelUiTest {
             assigns.size,
         )
         for (a in assigns) {
-            val ok = a.contains("BuiltinPresets.all(") ||
+            val ok = a.contains("BuiltinPresets.forCamera(") ||
+                a.contains("BuiltinPresets.all(") ||
                 (a.contains("mergePresets(") && a.contains("BuiltinPresets.load("))
             assertTrue("列表刷新必须带内置包（否则内置三条当场消失）：$a", ok)
         }
-        assertTrue("初始列表也走 BuiltinPresets.all", src.contains("BuiltinPresets.all(context, prefs)"))
+        assertTrue(
+            "初始列表走 BuiltinPresets.forCamera（标准也在这条链上，覆盖层才认它）",
+            src.contains("BuiltinPresets.forCamera(context, prefs)"),
+        )
         for (fn in listOf("PresetStore.upsert", "PresetStore.delete")) {
             assertTrue("$fn 的调用点消失了 ⇒ 写路径变了", src.contains(fn))
         }

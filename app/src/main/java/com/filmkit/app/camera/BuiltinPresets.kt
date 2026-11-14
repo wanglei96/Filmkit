@@ -107,6 +107,27 @@ internal object BuiltinPresets {
             applyBuiltinOverrides(load(context), BuiltinOverrides.load(prefs)),
         )
 
+    /**
+     * ★ 2026-11-13：**拍照界面用的列表** = 标准（首项）+ 用户预设 + 内置，**全部走覆盖层**。
+     *
+     * 为什么「标准」必须在这里：[CAMERA_STANDARD_PRESET] **不来自 `builtin.json`**，是硬编码的
+     * 出厂定义（`CameraPresetApply.kt`）。旧实现让 [all] 不带它、由 UI 自己 `listOf(标准) + presets`
+     * 补首项 ⇒ 用户对「标准」的修改确实写进了 [BuiltinOverrides]（日志 `slots=2`），但
+     * [applyBuiltinOverrides] 的出厂列表里没有这个 id（KDoc 最后一句"覆盖表里有、出厂列表里
+     * 没有的 id ⇒ 忽略"）⇒ **杀进程重开就还原**。真机 2026-11-13：改引擎 + 自动白点，保存后
+     * `save_slots` 落了 2 个槽，紧接着 `save_full` 的 `target.slots=0`（列表里查不到 ⇒ 回落打开
+     * 时的空对象），界面与画面全回默认。
+     *
+     * 不把标准并进 [all] 的原因：编辑器的预设列表是"可套用到照片的配方"集合，多一条不可删除
+     * 的空配方会污染那两处（编辑器 / 查看页 / 设置页都读 [all]）。
+     */
+    fun forCamera(context: Context, prefs: SharedPreferences): List<EditorPreset> {
+        val overrides = BuiltinOverrides.load(prefs)
+        val standard = applyBuiltinOverrides(listOf(CAMERA_STANDARD_PRESET), overrides).first()
+        return listOf(standard) +
+            mergePresets(PresetStore.load(prefs), applyBuiltinOverrides(load(context), overrides))
+    }
+
     /** 诊断日志（与 [PresetStore] 同一出口：`nativeAppendLog` 的 `app` 模块）。 */
     private fun log(event: String, vararg detail: Pair<String, Any?>) {
         EngineBridge.nativeAppendLog(EngineBridge.LEVEL_WARN, "app", event, kv(*detail))

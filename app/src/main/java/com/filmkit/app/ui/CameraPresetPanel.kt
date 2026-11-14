@@ -670,7 +670,8 @@ internal data class PresetStripItem(
 /**
  * 横向条的内容与顺序（**纯函数**：UI 与单测读同一份判据，不在 Composable 里各拼一套）。
  *
- * @param presets `presets`（用户预设 + 内置三条；**不含**「标准」，由本函数补在首项 —— P-2a 契约）
+ * @param presets 拍照页传 `BuiltinPresets.forCamera`（**含**首项「标准+覆盖」）；传不含标准的旧列表
+ *   （编辑器 / 旧测试）时由本函数补在首项 —— 幂等，两种输入首项都是「标准」（P-2a 契约）
  * @param selectedId 当前生效的预设 id（选中态 = 强调色描边 + 底色）
  * @param builtinOverrides 内置覆盖表（判「已改」）
  */
@@ -679,7 +680,11 @@ internal fun presetStripItems(
     selectedId: String,
     builtinOverrides: Map<String, EditorPreset>,
 ): List<PresetStripItem> =
-    (listOf(CAMERA_STANDARD_PRESET) + presets).map { p ->
+    // ★ 2026-11-13：**幂等**。拍照页的数据源改成 `BuiltinPresets.forCamera`（标准也走覆盖层）
+    // 后，列表首项已经是「标准 + 用户覆盖」；这里再无条件 prepend 会出两条同 id（Compose
+    // LazyColumn 直接抛异常）。调用方传不含标准的列表（编辑器 / 旧测试）时行为不变。
+    (if (presets.any { it.id == CAMERA_STANDARD_PRESET.id }) presets
+    else listOf(CAMERA_STANDARD_PRESET) + presets).map { p ->
         PresetStripItem(
             preset = p,
             badge = presetStripBadge(p, edited = builtinOverrides.containsKey(p.id)),
@@ -820,7 +825,7 @@ private val CamDisabledInk = FilmTheme.CreamDim.copy(alpha = 0.35f)
  * （LUT tab 的强度滑杆走的是同一条），保存时再经 [saveSlotsWithLutStrength] 落到预设的
  * [EditorPreset.lutStrength]。
  *
- * @param presets `BuiltinPresets.all(context, prefs)`（用户预设在前 + 内置三条在后，含覆盖层）
+ * @param presets `BuiltinPresets.forCamera(context, prefs)`（标准 + 用户预设 + 内置，**全含覆盖层**）
  * @param selected 当前生效的预设（列表首项恒为 [CAMERA_STANDARD_PRESET]）
  * @param lutId / lutStrength 当前相机选中的 LUT 与强度（新建态 / "这条预设不含 LUT"的判据）
  * @param overrides ★ PS-3：当前**未保存**的改动（null = 没有；带归属 id ⇒ 切预设自动失效）
