@@ -1999,12 +1999,24 @@ void main() {
     // 唯一会命中 = 「B>R>G + 色度高于基线 + 色度跳变 + 贴强边缘」= 紫边定义本身。
     float br0 = lin0.b - lin0.r;
     float gr0 = lin0.r - lin0.g;
+    float gb0 = lin0.b - lin0.g;
+    // ★ 2026-11-13：**判据①扩到品红象限**（原本只认紫 B>R）。
+    // 真机 22:31:41 灯面边缘实测 R=192 / G=107 / B=162 ⇒ br0 = −30 < 0，
+    // 旧判据 `br0 > thr` 把整圈挡在门外 —— 表现就是"紫边抑制开着、关掉更强，
+    // 但品红环还在"。品红与紫的共性 = **R、B 双双高于 G**（差别只在 R/B 谁高），
+    // 所以强度取两者的最小盈余 `min(R−G, B−G)`：
+    //   紫   B>R>G ⇒ min = R−G ✓
+    //   品红 R>B>G ⇒ min = B−G ✓
+    //   红/橙/黄 R>G>B ⇒ B−G<0 ⇒ 排除；绿/青 R<G ⇒ R−G<0 ⇒ 排除。
+    // 与判据③（邻域 br 标准差）和④（亮度梯度）串联，大面积真实粉色物体
+    // （std≈0）仍不会被误伤。
+    float mag0 = min(gr0, gb0);
     float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
     float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
     float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
     float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
     float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
-    if (br0 <= thr || gr0 <= 0.0 || d0.w < std_thr || gL < uGradMin) {
+    if (mag0 <= thr || d0.w < std_thr || gL < uGradMin) {
         oColor = vec4(lin0, 1.0);
         return;
     }
@@ -5621,7 +5633,41 @@ vec3 filmicTone(vec3 c) {
     // E4-4：norm 分支的输入是**标量** max-RGB，必须挑一套通道系数 —— 取 **G**
     //（主感光层，luma 权重 0.7152 最大）。默认三通道相同 ⇒ 与接线前逐位一致。
     vec3 normed = (p / ratioNorm) * filmicScalarG(toneNorm, uFilmicBlackDisp);
-    return 0.5 * naive + 0.5 * normed;
+    vec3 outv = 0.5 * naive + 0.5 * normed;
+    // ── ★ 2026-11-13：**白点以上保留线性 headroom**（HDR 参考的唯一来源）────────
+    // 旧实现（filmicScalar* 里的 `clamp(spline, lo, 1.0)` + `e` 上界钳 1）把白点以上的
+    // 输入全部压成 1 ⇒ film_src 恒 ≤1、没有任何 headroom。于是 gainmap 只能靠
+    // `anchor = disp_mid/raw_mid` 造增益，把中灰也乘了 2.4 —— 真机 21:17 实测
+    // gmMean 0.79（≈2.23×）对应"HDR 整张提亮"，而 PC 同场景 0.509（≈1.03×）。
+    //
+    // 现在按物理语义外推：**白点之上每 1 EV 线性 ×2**（2EV ⇒ 4.0×，正好对齐
+    // UltraHDR 的 max_content_boost=4）。SDR 侧在 kFsOut 入口 `min(c,1)` 截断，
+    // 所以成片逐位不变；只有 gainmap 能读到 >1 的参考值。
+    // 上限 3EV：再往上没有意义（4×8=32 倍已远超屏幕 headroom），防止极亮坏点把
+    // gainmap 编码空间顶爆。
+    float whiteEv = uFilmicBlackEv + uFilmicDr;
+    float overEv = log2(max(mx, kFilmicNormMin) / kFilmicGrey) - whiteEv;
+    if (overEv > 0.0) {
+        // 对齐 PhotonCamera `raw/RawHdrReferenceMath.kt` 的构造（HDR_WHITE_MULTIPLIER
+        // = √2）：**白点处 1.0，白点上方 +0.5EV 处 1.414，之后按端点切线线性延伸**。
+        //   斜率 = (√2 − 1) / 0.5 = 0.828 / EV
+        // 旧实现用 `exp2(overEv)`（每 EV ×2、2EV 直接 4x）：目标过冲，而且**指数放大**
+        // —— 灯面边缘 scene 抖 0.3~0.5EV 会被放大成 1.4~2 倍亮度起伏，HDR 屏上就是那条
+        // 灰色过渡带（实测 48px 内 ratio 在 2.6~4.0 间反复跳）。线性延伸把同一抖动压到
+        // 1.25~1.4 倍，且与 PC 的曲线形状一致。
+        // PC 的真形态（`RawHdrReferenceMath.HDR_WHITE_MULTIPLIER = √2`）：**+0.5 stop 封顶**。
+        // 0.5EV 之内线性升到 1.414，之后保持在 1.414 —— 对应它"scene white 处达到
+        // baseWhite×1.414，之后按白点处切线（压缩曲线 ≈ 0 斜率）延伸"。
+        // 旧式 `1+0.828*min(overEv,4)` 在灯面（超出白点 3.6EV）给到 **4.0×**，与边缘
+        // 的 1.01× 形成 4 倍落差 ⇒ HDR 屏上就是灯面外那圈 30px 的硬灰带
+        // （2026-11-14 18:30:15 实测 ratio 4.00 → 1.18 只隔 30px）。
+        float ext = 1.0 + 0.41421356 * min(overEv / 0.5, 1.0);
+        // 逐像素**标量**缩放（保色度）：把最大通道摆到 ext，其余按原比例 —— PC 的
+        // `gain = extendedCurveOutput / baseCurveOutput` 也是标量增益。
+        float mxOut = max(max(outv.r, outv.g), outv.b);
+        if (mxOut > 1e-6) outv *= ext / mxOut;
+    }
+    return outv;
 }
 // ── darktable filmic v5 gamut mapping（v0.10.13，标准算法补全）──────────────
 // 出处：darktable src/iop/filmicrgb.c（filmic_v5 / gamut_mapping / gamut_check_RGB /
@@ -6610,6 +6656,12 @@ void main() {
     vec2 uv = vUV0;
     if (uFlipY > 0.5) uv.y = 1.0 - uv.y;
     vec3 c = texture(uTex, uv).rgb;
+    // ★ 2026-11-13：**SDR 侧在这一行截断**。kFsFilm 的 filmicTone 现在会在白点之上
+    // 保留 >1 的线性 headroom（HDR gainmap 的参考），而 SDR 成片必须与改动前**逐位一致**
+    // —— 旧实现里 film 输出被 filmicScalar 的 `clamp(...,1.0)` 保证 ≤1，所以这里
+    // `min(c,1)` 恰好复现旧输入值。不截断会让 highlightRolloff/sharpen 拿到 >1 的输入，
+    // SDR 高光行为随之变化。
+    c = min(c, vec3(1.0));
     if (uRollOff > 0.5) c = highlightRolloff(c);   // 0.12.166：设置页可关（A/B）
     if (uSharpen > 0.0) sharpenLuma(c, uv);
     c = srgbEncode(workToDisplayLinear(c));
@@ -8281,49 +8333,34 @@ float ratioFromScene(float sceneY) {
 //   延展，base 不再相对 HDR 显暗。见 gainTrue 内的 hdrAligned 实现。
 // 边界：clamp [kMin, kMax] —— 下限 0.25 允许暗部压暗（ISO 21496-1 的
 // GainMapMin 是 log2 增益、可为负）；上限 4 = 元数据 max_content_boost。
-float gainTrue(float sdrLin, float hdrLin) {
-    const float kDispMid = 0.1845;   // kAeMiddleGrey（显示域中灰目标）
-    // ── 0.12.200：域映射改回**固定常数**（不再跟着 ae_p50 漂）──────────────
-    // 0.12.199 把锚定下限设成 1.0 只补回 25%，真机仍"没有 HDR"，因为问题不是
-    // 下限，是**锚定拿错了量**：uHdr 是 film 输出域（scene-referred）、uSdr 是
-    // 显示域线性，两者的换算是一个**固定的影调映射**（本机实测 film 输出中灰
-    // ≈0.072 ↔ 显示域 0.1845，差 −1.36EV），与"这一张的 RAW 中灰"无关。
-    // 用 ae_p50 当锚点等于让 HDR 强度随曝光浮动：同一台机同一场景，
-    //   10-27（ae_p50 小）boost p90 = 4.00×、HDR≥1.0 = 0.40%
-    //   10-30 楼景（ae_p50 0.2304）boost p90 = 1.49×、HDR≥1.0 = 0.01%
-    // 相差 4 倍，正是 0.1845/0.2304 与 0.1845/0.06 的比值。
-    const float kSceneMid = 0.072f;   // film 输出域中灰（0.11.74 实测的典型值）
-    // 2026-11-13：域换算改成**本张实测**（uDispMid / uSceneMid），固定 2.56 只在
-    // 典型曝光下成立。真机（14:48:42 理光正片）本张 stillMid=0.0115 / aeP50=0.0169
-    // ⇒ 真实比值 0.68，而固定 2.56 高估 3.8 倍 ⇒ 整张 ratio 被 clamp 到 4.0
-    //（gainmap 90% 像素 = 满档），HDR 屏上整幅提亮 2EV、灯面反而压不下去。
-    // 取本张实测后中灰处 ratio 恒 1，提亮只由高光决定 —— 这才是 gainmap 的定义。
-    float anchor = (uSceneMid > 1e-6f && uDispMid > 1e-6f)
-                       ? clamp(uDispMid / uSceneMid, 0.25f, 8.0f)
-                       : (kDispMid / kSceneMid);
-    // ── 历史（0.12.230~0.12.244，已被 2026-11-13 推翻）────────────────────────
-    // 那三版用加性 `sdrLin + max(0, hdrLin − 1/anchor)`（后来加 smoothstep 消折点），
-    // 声称是"ISO 21496-1 标准语义"。**对照 libultrahdr 源码，这个说法不成立**：
-    // 标准就是逐像素比值，没有白点门限。加性写法在灯盘这类"大片中高光"上
-    // 实测 63% 像素 ratio=1，HDR 端提不动（证据与现象见下方新实现）。
-    // ── 2026-11-13：改回**标准的乘性比值**（对齐 libultrahdr encodeGain）────────
-    // 官方一手实现 third_party/ultrahdr/lib/src/gainmapmath.cpp:775：
-    //     gain = y_hdr / y_sdr;                        // 逐像素比值（同一域）
-    //     clamp [min_content_boost=1.0, max=hdr_white/sdr_white]
-    // 规范里**没有**"中灰以下 ratio 恒 1"，也没有白点门限。
-    // 此前 0.12.230 的 `sdrLin + max(0, hdrLin − 1/anchor)` 是**加性**延展，等价于给
-    // 高光设了一道 0.39 的门槛。真机实测（2026-11-13 灯盘 FILMKIT_20261113-113928）：
-    // 灯盘 63% 像素 ratio=1.00、中位 1.01，只有灯泡核心有增益 ⇒ HDR 屏上灯盘不亮、
-    // 灯泡四周留一圈没提亮的灰（"灯泡像糊了一层"）。PC 同场景整盘 ratio 3.9。
-    // 加性近似只在"高光段近似线性"时成立，而 filmic 的高光是强压缩，必须按比值算。
-    // 域换算：hdrLin 是 scene 域（film_src），sdrLin 是显示域线性 —— 乘同一个 anchor
-    // （kDispMid/kSceneMid）把 scene 折到显示域，两者才是同一把尺。
+float gainTrue(float sdrLin, float hdrLin, float baseLin) {
+    // ── ★ 2026-11-13：对齐 PhotonCamera 的**纯比值**口径（`bjzhou/PhotonCamera`
+    //    `hdr/GpuReferenceGainmapProducer.kt` 的 RAW_LUMA_RESIDUAL_FRAGMENT_SHADER +
+    //    `hdr/RawGainmapMath.kt encodeLuminance`）：
+    //
+    //      lutGain       = (SDR_after + eps) / (SDR_before + eps)     // LUT 只改 base 亮度
+    //      targetHdrLuma = (hdrLuma + eps) * lutGain - eps            // 把 LUT 影响搬回 HDR 侧
+    //      ratio         = (targetHdrLuma + eps) / (sdrLuma + eps)    // 同域逐像素比值
+    //
+    //    **没有 anchor、没有域换算系数**。成立的前提是 hdrLin 与 sdrLin 本来就是同一
+    //    条曲线（同域）—— `filmicTone` 现在会保留白点以上的线性 headroom（>1），
+    //    SDR 侧在 kFsOut 入口截断到 1，于是：
+    //      暗部/中灰：hdr == sdr（都没被截断）  ⇒ ratio ≡ 1
+    //      白点以上：hdr / 1.0                  ⇒ ratio = 真实倍数，2EV 即 4x
+    //    PC 同场景实测 boost p90 1.04x / p99 1.68x 正是这个形状。
+    //
+    //    ⚠ 删掉的旧实现（务必不要再加回来）：`hdrDisp = hdrLin * anchor * uExposure`，
+    //    anchor = uDispMid/uSceneMid = 显示域中灰 ÷ RAW scene 域中灰 ≈ 2.4 —— 两个量
+    //    不同域，乘上去等于给**全图**（含中灰）灌常数增益。真机 21:17 实测 gmMean 0.79
+    //    （≈2.23×），PC 同场景 0.509（≈1.03×）：HDR 端整张提亮 1.2EV 的直接原因。
+    //    film 输出已含 uExposure（kFsFilm 输入端乘过），再乘一次是重复曝光。
     const float kSdrEps = 1e-4;
-    // ⚠ SDR base 已经乘过 uExposure（用户 EV / AE 基准曝光 / 闭环补光），HDR 参考
-    // （film_src）是**曝光前**的场景线性值 —— 必须同乘，否则 EV 一大比值就 <1、
-    // gainmap 整张退化成 1.0（2026-11-13 13:46:21 真机：ev=+3.77，boost 全 1、画面发紫）。
-    float hdrDisp = hdrLin * anchor * uExposure;
-    float ratio = (sdrLin > kSdrEps) ? (hdrDisp / sdrLin) : 1.0f;
+    float lutGain =
+        (sdrLin > kSdrEps) ? ((sdrLin + kSdrEps) / (max(baseLin, 0.0) + kSdrEps)) : 1.0f;
+    float targetHdr = (max(hdrLin, 0.0) + kSdrEps) * lutGain - kSdrEps;
+    float ratio = (sdrLin > kSdrEps)
+                      ? ((max(targetHdr, 0.0) + kSdrEps) / (sdrLin + kSdrEps))
+                      : 1.0f;
     // 下限 1：HDR 不应比 SDR 暗（标准 min_content_boost = 1）。
     ratio = clamp(ratio, 1.0f, kMax);
     return (log(ratio) - log(kMin)) / (log(kMax) - log(kMin));
@@ -8359,13 +8396,17 @@ void main() {
     // 是另一半根因，那部分靠默认 offset 1e-4 解决，见 setGainmapMath 注释）。
     vec2 block = floor(vUV0 * uSrcSize / float(kDS)) * float(kDS);
     const int kK = kDS * 2;
-    float hdrSum = 0.0, sdrSum = 0.0;
+    float hdrSum = 0.0, sdrSum = 0.0, baseSum = 0.0;
     for (int y = 0; y < kK; ++y) {
         for (int x = 0; x < kK; ++x) {
             vec2 pxB = (block + vec2(float(x), float(y)) - float(kDS) * 0.5 + 0.5) / uSrcSize;
             vec2 pxA = vec2(pxB.x, 1.0 - pxB.y);   // tex_scene_ 的方向
             // HDR：Rec.2020 线性 → sRGB 线性 → 709 luma
-            hdrSum += luma709(workToSrgb(texture(uHdr, pxA).rgb));
+            vec3 hdrWork = workToSrgb(texture(uHdr, pxA).rgb);
+            hdrSum += luma709(hdrWork);
+            // LUT 前的 SDR 线性亮度（= base 若不做 LUT/颗粒的样子）——
+            // `lutGain` 的分母，用来把 LUT 造成的提亮从 HDR 侧除掉。
+            baseSum += luma709(clamp(hdrWork, 0.0, 1.0));
             // SDR：sRGB 编码 → sRGB 线性 → 709 luma
             vec3 s = texture(uSdr, pxB).rgb;
             sdrSum += luma709(vec3(srgbInvOetf(s.r), srgbInvOetf(s.g), srgbInvOetf(s.b)));
@@ -8375,7 +8416,8 @@ void main() {
     float hdrY = hdrSum / n;
     // sdrY 是**线性** luma（上面已反过 OETF）—— 两版都吃线性域
     float sdrY = sdrSum / n;
-    float v = (uGainmapMath == 0) ? gainTrue(sdrY, hdrY)
+    float baseY = baseSum / n;
+    float v = (uGainmapMath == 0) ? gainTrue(sdrY, hdrY, baseY)
             : (uGainmapMath == 1) ? gainPc(sdrY, hdrY)
                                   : gainOfficial(sdrY, hdrY);
     oColor = vec4(v, v, v, 1.0);
