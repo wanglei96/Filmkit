@@ -244,7 +244,11 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                             }.getOrDefault(emptyList()).map { it.uri }
                         }
                         val i = list.indexOf(uri)
-                        viewerUris = if (i >= 0) list else listOf(uri)
+                        // ★ 2026-11-13：**失效 uri 不进查看页**（否则进去就是"图片不存在"）。
+                        // 相册删了那张、相机页的 state 还没来得及同步时会走到这里 ⇒ 兜底顶上
+                        // 相册最新一张；连列表都空（未授权且本应用目录也空）才什么都不做。
+                        if (i < 0 && list.isEmpty()) return@launch
+                        viewerUris = list
                         viewerIndex = if (i >= 0) i else 0
                         viewerFrom = "camera"
                         viewerPending = false
@@ -302,12 +306,21 @@ private fun FilmKitNav(onRegisterVolume: ((() -> Unit)?) -> Unit) {
                             editorPresetId = presetId
                             screen = "editor"
                         },
-                        onDeleted = {
-                            // ★ v0.12.37：删除成功后清空查看页列表 —— 否则路由里残留的 URI 还会把
-                            // 这张**已删除**的图弹回大图（用户报"相册返回事件跳回已删的图片"）。
-                            viewerUris = emptyList()
-                            viewerIndex = 0
-                            screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom)
+                        // ★ 2026-11-13：删除当前这张后**留在查看页切到下一张**（用户要求），
+                        // 不再直接退出。摘掉被删的索引即可 —— 后面的整体前移，Pager 的
+                        // currentPage 原地显示的就是原来的下一张；删最后一张时把索引夹到
+                        // 新的最后一张（PhotoViewScreen 里同步 scrollToPage）。删空才退出。
+                        onDeleted = { removed ->
+                            val left = viewerUris.filterIndexed { i, _ -> i != removed }
+                            if (left.isEmpty()) {
+                                // 一张不剩 ⇒ 原逻辑：清空并回来源页（gallery / camera）
+                                viewerUris = emptyList()
+                                viewerIndex = 0
+                                screen = backTarget("viewer", editorFrom, galleryFrom, viewerFrom)
+                            } else {
+                                viewerUris = left
+                                viewerIndex = removed.coerceAtMost(left.size - 1)
+                            }
                         },
                         // 从相机页直接看大图时，"返回"只会回相机 ⇒ 顶栏必须有去相册的入口。
                         onOpenGallery = if (viewerFrom == "camera") {

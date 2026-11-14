@@ -2,6 +2,7 @@ package com.filmkit.app.ui
 
 import android.Manifest
 import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.content.pm.PackageManager
 import android.os.SystemClock
@@ -247,9 +248,10 @@ fun CameraScreen(
     // 列表与选中项都用 remember（**非 saveable**）+ prefs 回落，与 photoUri 同款（ADR §5.2 G-1）：
     // prefs 本身就是持久层，Activity/进程重建后重读一次即可拿回同一个选中项，再叠一层 saveable
     // 是多余的（EditorPreset 也不是 Parcelable）。冷启动恢复见下方 LaunchedEffect。
-    // ★ P-2c：数据源 = `BuiltinPresets.all`（用户预设在前 + 内置三条在后）—— 直接用
-    // `PresetStore.load` 会让内置包在界面上消失（本卡修掉的原始缺陷）。
-    var presets by remember { mutableStateOf(BuiltinPresets.all(context, prefs)) }
+    // ★ P-2c：数据源 = `BuiltinPresets.forCamera`（标准 + 用户预设 + 内置，全部走覆盖层）
+    // —— 直接用 `PresetStore.load` 会让内置包在界面上消失（本卡修掉的原始缺陷）；
+    // 用 `all` 则「标准」不在覆盖层里 ⇒ 用户对它的修改杀进程就还原（2026-11-13）。
+    var presets by remember { mutableStateOf(BuiltinPresets.forCamera(context, prefs)) }
     var selectedPreset by remember {
         mutableStateOf(resolveCameraPreset(prefs.getString("camera_preset_id", null), presets))
     }
@@ -401,6 +403,22 @@ fun CameraScreen(
     // 缩略图加载失败 → 显示占位符，点进编辑器有"图片已失效"失败态，不会崩也不白屏。
     var photoUri by remember {
         mutableStateOf(prefs.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) })
+    }
+    // ★ 2026-11-13：**相册删除要立刻反映到胶卷位**。
+    // 相册/大图自 0.13.44 起是覆盖层、相机页常驻不销毁 ⇒ 删掉最后一张时 `dropLastPhotoUri`
+    // 虽然清了 prefs，本地 state 仍指着那张已删除的 URI：缩略图退化成占位，点开走
+    // `onOpenLastPhoto(失效 uri)` → 大图提示"图片不存在"（旧版靠相机页重建重读 prefs 才没这问题）。
+    // 监听 prefs 是唯一跨页通道（相册与相机拿的是同一个 "filmkit" 文件）；置 null 后下面
+    // `LaunchedEffect(photoUri)` 的既有回落逻辑会把相册最新一张顶上来（v0.12.36 的行为）。
+    DisposableEffect(prefs) {
+        val l = SharedPreferences.OnSharedPreferenceChangeListener { p, key ->
+            if (key == "last_photo_uri") {
+                val next = p.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) }
+                if (next != photoUri) photoUri = next
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(l)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(l) }
     }
     var thumb by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     // 胶卷位**真正显示**的那张（v0.12.36）：有最近成片就用它；没有（没拍过 / 刚被删）
@@ -727,7 +745,7 @@ fun CameraScreen(
     fun persistPreset(next: EditorPreset) {
         if (presetDeletable(next)) PresetStore.upsert(prefs, next) else BuiltinOverrides.save(prefs, next)
         builtinOverrides = BuiltinOverrides.load(prefs)
-        presets = BuiltinPresets.all(context, prefs)
+        presets = BuiltinPresets.forCamera(context, prefs)
     }
 
     /**
@@ -876,7 +894,7 @@ fun CameraScreen(
         if (presetDeletable(p)) return         // 只有内置有出厂定义
         BuiltinOverrides.clear(prefs, p.id)
         builtinOverrides = BuiltinOverrides.load(prefs)
-        presets = BuiltinPresets.all(context, prefs)
+        presets = BuiltinPresets.forCamera(context, prefs)
         val restored = presets.firstOrNull { it.id == p.id } ?: return
         if (selectedPreset.id == restored.id) applyCameraPreset(restored)
         EngineBridge.nativeAppendLog(
@@ -908,7 +926,9 @@ fun CameraScreen(
      */
     fun deleteCameraPreset(p: EditorPreset) {
         if (!presetDeletable(p)) return
-        presets = mergePresets(PresetStore.delete(prefs, p.id), BuiltinPresets.load(context))
+        // delete 已写库 ⇒ 直接用 forCamera 重读（保持「标准 + 覆盖层」,不要退回 load()）
+        PresetStore.delete(prefs, p.id)
+        presets = BuiltinPresets.forCamera(context, prefs)
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "app", "camera.preset.delete",
             kv("id" to p.id, "name" to p.name, "stillSelected" to (p.id == selectedPreset.id)),
@@ -1203,6 +1223,13 @@ fun CameraScreen(
             EngineBridge.LEVEL_WARN, "app", "camera.thumb_failed",
             kv("uri" to target.toString()),
         )
+        // ★ 2026-11-13：**自带自愈**。连续 3 次解不出来 = 这张已经不在了（系统相册删的、
+        // 回收站清空、或 App 内删除时监听没派发）。不清的话胶卷位永远是占位、点开永远
+        // 提示"图片不存在"。清掉 prefs（与 `dropLastPhotoUri` 同一口径）⇒ 监听把 photoUri
+        // 置 null ⇒ 本 effect 重跑并回落到相册最新一张。
+        if (target == photoUri) {
+            prefs.edit().remove("last_photo_uri").apply()
+        }
     }
 
     fun secText(ns: Long): String =

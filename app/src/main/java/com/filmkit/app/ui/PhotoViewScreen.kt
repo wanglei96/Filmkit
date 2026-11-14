@@ -522,7 +522,9 @@ fun PhotoViewScreen(
     onBack: () -> Unit = {},
     onEdit: (Uri) -> Unit = {},
     onEditWithPreset: (Uri, String) -> Unit = { _, _ -> },
-    onDeleted: () -> Unit = {},
+    // ★ 2026-11-13：传**被删的那一页索引**。路由层据此从列表里摘掉它并留在查看页切到
+    // 下一张（用户："删除当前照片后自动切到下一张，而不是返回拍照页"）；删空才退出。
+    onDeleted: (Int) -> Unit = {},
     onOpenGallery: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -560,6 +562,14 @@ fun PhotoViewScreen(
     }
     val pageCount = uris.size
     val pagerState = rememberPagerState(initialPage = clampIndex(index, pageCount)) { pageCount }
+    // ★ 2026-11-13：删除后列表变短（路由层摘掉被删那张，不退出查看页）。删的是**最后一张**
+    // 时 currentPage 越界 —— Pager 自身 clamp 会先渲染一帧空页；这里同步滚到新的最后一张，
+    // 删中间张则不用动（currentPage 原地显示的就是原来的下一张）。[clampIndex] 已有单测。
+    LaunchedEffect(pageCount) {
+        if (pageCount > 0 && pagerState.currentPage > pageCount - 1) {
+            pagerState.scrollToPage(pageCount - 1)
+        }
+    }
     val hdrUri = uris.getOrNull(pagerState.settledPage)
     val hdrKey = if (hdrUri != null) "view_hdr_$hdrUri" else "view_hdr"
     var hdrOn by rememberSaveable(hdrKey) { mutableStateOf(prefs.getBoolean(hdrKey, true)) }
@@ -621,6 +631,9 @@ fun PhotoViewScreen(
     // （高清留着更好，降回去反而更糊）。
     var shownUri by remember { mutableStateOf<String?>(null) }
     var shownTier by remember { mutableStateOf(TIER_PREVIEW) }
+    // ★ 2026-11-13：`shownUri` 对应的**页号**。删除当前张后列表前移，同一个 page 上换了
+    // 内容（uri 变、page 不变）—— 这一支要走交叉淡入，而不是"翻页"的原子替换。
+    var shownPage by remember { mutableStateOf(-1) }
     var meta by remember { mutableStateOf(PhotoMeta()) }
     var error by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
@@ -675,7 +688,7 @@ fun PhotoViewScreen(
         if (result.resultCode == Activity.RESULT_OK) {
             val target = deleteTarget
             if (target == null) {
-                onDeleted()
+                onDeleted(page)
             } else {
                 deleteScope.launch {
                     val gone = withContext(Dispatchers.IO) { !mediaStillExists(context, target) }
@@ -686,7 +699,7 @@ fun PhotoViewScreen(
                     )
                     if (gone) {
                         dropLastPhotoUri(context, listOf(target.toString()))
-                        onDeleted()
+                        onDeleted(page)
                     } else {
                         status = "系统没有删除这张照片（可重试）"
                     }
@@ -731,7 +744,7 @@ fun PhotoViewScreen(
                 t.message?.take(60) ?: "无权限或该照片不可删除"
             }
             when {
-                rows > 0 -> onDeleted()
+                rows > 0 -> onDeleted(page)
                 err != null -> status = "删除失败：$err"
                 else -> status = "删除失败：系统没有删除这张照片"
             }
@@ -751,7 +764,13 @@ fun PhotoViewScreen(
         status = "" // 上一张的提示（分享失败等）不跟着跨图
         val u = uris.getOrNull(page)
         if (u == null) {
-            error = "照片已失效"
+            // ★ 2026-11-13：**取不到就当过渡态，不报错**。两种来源都不是"这张失效"：
+            //  ① 删除成功后路由层清空列表（v0.12.37 防返回跳回已删图），覆盖层还在跑
+            //     200ms 退场动画 ⇒ 组合仍在、page 指着旧下标；
+            //  ② 删除一张后 pageCount 缩小、Pager 尚未 clamp（`LaunchedEffect(pageCount)`
+            //     会立刻滚到合法页）—— 这一帧 page 同样越界。
+            // 旧代码在这两种情况下都写 "照片已失效"，用户看到它**闪一下**。
+            // 真正的解码失败有独立文案（见下面的 `error = "照片已失效或无法读取"`）。
             return@LaunchedEffect
         }
         // 元数据（MediaStore + EXIF）几十毫秒就回来，先更新顶栏，别让日期停在上一张
@@ -837,14 +856,27 @@ fun PhotoViewScreen(
             // 这里**不能**沿用 PV-1 的"先把 bitmap 置 null、等另一个 effect 来填"：那正是转圈的
             // 来源。也不能"未命中时保留上一张"：那会让新页显示**上一张的像素**（错图比黑底更糟）。
             // 判据本身在 [frameAfterPageChange] 里（纯函数，JVM 单测钉死）。
-            zoom.floatValue = MIN_ZOOM
-            pan.value = Offset.Zero
-            under = null
+            //
+            // ★ 2026-11-13：**同页换图是唯一例外** —— 删掉当前这张后，路由层把列表前移一位，
+            // 同一个 `page` 上换成了下一张（`shownPage == page`）。此时不翻页、不该复位缩放，
+            // 也不该瞬切：把旧图垫进 `under`、`fade` 归零 ⇒ 走 PV-1 的交叉淡入（用户："切图
+            // 要有过渡动画"）。有下层兜底，所以不会黑屏，也不违反上面"不显示上一张"的规矩 ——
+            // 那条针对的是**换页**（新页显示别人的像素），这里是同一页的内容被替换。
+            val samePage = shownPage == page
+            if (samePage && bitmap != null) {
+                under = bitmap
+                fade.snapTo(0f)
+            } else {
+                zoom.floatValue = MIN_ZOOM
+                pan.value = Offset.Zero
+                under = null
+            }
             val frame = frameAfterPageChange(u, previews.get(u))
             bitmap = frame.bitmap
             shownUri = frame.uri
             shownTier = frame.tier
         }
+        shownPage = page
         // 已经有"不差于目标档"的位图（同页缩回 Fit / 无关重组）⇒ 什么都不做。
         // （走到这里时 `shownUri == u` 恒成立：换页分支刚设过，没进分支说明本来就相等。）
         if (shownTier >= target && bitmap != null) return@LaunchedEffect
@@ -896,8 +928,18 @@ fun PhotoViewScreen(
     // 收尾把 under 交回 GC —— 那张（3MB 量级）只在换档的这 180ms 里有存在价值。
     // ⚠ 整段是**绘制层行为，JVM 单测覆盖不到**：真机确认步骤见报告 §5。
     LaunchedEffect(bitmap) {
-        if (under != null) fade.animateTo(1f, tween(PREVIEW_FADE_MS)) else fade.snapTo(1f)
-        under = null
+        if (under != null) {
+            // ★ 2026-11-13：新图还没解出来（删除后换到的下一张没命中预载）⇒ **先别动**：
+            // `under` 继续垫底、`fade` 停在 0，屏上是旧图而不是黑屏；等预览档解出、`bitmap`
+            // 有值后本 effect 重启再淡入。旧实现会在这里 animateTo(1) 并清掉 under，
+            // 随后新图到位时已无下层 ⇒ 退回瞬切。
+            if (bitmap != null) {
+                fade.animateTo(1f, tween(PREVIEW_FADE_MS))
+                under = null
+            }
+        } else {
+            fade.snapTo(1f)
+        }
     }
 
     // 当前是哪张要回写路由层：从查看页进编辑器、退出回查看页时必须回到**同一张**（E2-20）。
@@ -1044,7 +1086,9 @@ fun PhotoViewScreen(
             contentAlignment = Alignment.Center,
         ) {
             if (pageCount == 0) {
-                Text("照片已失效", color = FilmTheme.CreamDim, fontSize = 13.sp)
+                // ★ 2026-11-13：**空列表不报错**。删除成功后路由层会主动清空 `viewerUris`
+                // （防返回事件跳回已删图），覆盖层还要跑 200ms 退场动画 ⇒ 这一帧屏上会
+                // 闪出"照片已失效"。留黑底（父 Box 已是黑底），把"失效"留给真正的解码失败态。
             } else {
                 HorizontalPager(
                     state = pagerState,
@@ -1150,7 +1194,16 @@ fun PhotoViewScreen(
                         }
                         // 位图 / 下层 `under` / 淡入 alpha 共用这一条判据（缩放平移的判据不变）
                         val owns = bitmapBelongsToPage(p == page, pageUri, shownUri)
-                        val b = visibleBitmapFor(p == page, pageUri, shownUri, bitmap, cached)
+                        // ★ 2026-11-13：**同页换图（删除后列表前移）** 的单帧判据。
+                        // 它和翻页长得像（都表现为 `shownUri != pageUri`），但语义相反：
+                        // 翻页是"这一页换了主人"，必须立刻丢掉旧像素；删除是"这一页的主人走了，
+                        // 下一张顶上"，旧图应当垫底做交叉淡入。若按翻页处理，`visibleBitmapFor`
+                        // 会在 effect 跑之前先画新图预载档（全不透明）⇒ 下一帧 effect 把 alpha
+                        // 归零切回旧图 ⇒ **画面新→旧→新跳一下**（用户报的"删除会闪烁"）。
+                        // 判据 = `shownPage == page`：翻页时 shownPage 是上一页，恒不等。
+                        val samePageSwap = p == page && shownPage == page
+                        val b = if (samePageSwap) bitmap
+                        else visibleBitmapFor(p == page, pageUri, shownUri, bitmap, cached)
                         when {
                             p == page && error.isNotEmpty() ->
                                 Text(error, color = FilmTheme.CreamDim, fontSize = 13.sp)
@@ -1161,7 +1214,9 @@ fun PhotoViewScreen(
                                 // ★ PV-3：`under` 也是**整页共享**的 state，同样要过归属校验 ——
                                 // 切页那一帧 `under` 可能还是上一页的（清它的是 effect，异步），
                                 // 只判 `p == page` 就会把上一张的像素画到新页上（旧图闪现的第二条路径）。
-                                if (owns) under?.let { u ->
+                                // ★ 2026-11-13：`samePageSwap` 时 `owns` 恒为 false（shownUri 还是旧 uri），
+                                // 但那时 `under` 装的正是**本页被删掉的那张**，必须画出来当淡出底。
+                                if (owns || samePageSwap) under?.let { u ->
                                     Image(
                                         bitmap = u.asImageBitmap(),
                                         contentDescription = null,
@@ -1189,7 +1244,7 @@ fun PhotoViewScreen(
                                     // 只判 `p == page` 会让**新页的预载档**半透明地压在黑底上（变暗一闪）。
                                     // 几何判据（[pageScaleAt] / [pageShiftAt]）仍然是 `p == page`，未改。
                                     modifier = Modifier.viewerLayer(p == page, zoom, pan) {
-                                        pageAlphaAt(owns, under != null, fade.value)
+                                        pageAlphaAt(owns || samePageSwap, under != null, fade.value)
                                     },
                                 )
                             }
