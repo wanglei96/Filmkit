@@ -11,8 +11,11 @@ status: active
 
 ## 活跃任务（2026-11-15）
 
-- [2026-11-15] **0.14.0 高光回归抽样** | 待做 | 只验了灯边一类场景；其他高光/镜头/预设各拍一张，
-  确认无新高光或紫边回归 | 快照「HDR灰带定位到高光inpaint并0.14.0发版」
+- [2026-11-15 21:20] **0.14.5 高光融合实现与离线验收完成** | 待日光实拍 | 包 802；手机仍0.14.4未替用户安装。
+  native clip/全CFA有效残差、真实双向FB+RGB/collar准入、整帧hole拒绝、dual-kernel Bayer merge、
+  去马赛克后RGB CameraWhite解析、局部V/完整六cov与多尺度消费已接；defringe/旧scalar inpaint仍关。
+  两组原RAW完整guide→merge重放：matched按285px大hole拒绝，17:07按24px孔洞接受、G高光约97%恢复；
+  Mali原生58checks/16draw通过，12生产shaderlink通过；未证明完整App日光外观，详见 `docs/reports/highlight-fusion-0.14.5.md`。
 - [2026-11-12] **Spektrafilm 引擎 + 预设标定** | 待做 | slot=2、场景线性输入、65³ LUT；
   先 Portra 400，再 Ektar / Vision3 500T / Velvia
 - [2026-11-11] **理光目标曲线重标** | 待做 | 用新 LUT 样片重跑 `recipe-fit.py`，把摘掉的
@@ -21,8 +24,8 @@ status: active
 
 ## 下一步
 
-0. **回归抽样优先**：0.14.0 只在灯边场景验收过；先补其他高光/镜头/预设的样片，
-   再动任何成像链。
+0. **日光验收待条件**：0.14.5实现不再等天气；条件允许再验极高光、云朵、花瓣、栏杆、灯面和运动。
+   CameraWhite是输出白界政策非满阱检测，保守cov非精确非线性RCD噪声，风险见报告；不因阴天停离线工作。
 1. 旧账：编辑器整页路由；Spektrafilm；理光曲线重标；绿植/绿段；AE 高光保护效果。
 2. 若长期不用：`kFsHlInpaint` 代码与 `edge_dump` 诊断可评估删除；注意
    `tools/check-hl-inpaint-kernel.py` 测的是已禁用的核，不能当生产判据。
