@@ -145,6 +145,28 @@ def gpu_check():
     assert curve[-1] > .1, 'GPU probe returned no engine response'
     assert np.max(abs(probe[0, :, 0] - probe[0, :, 1])) < .01
     print(f'Filmic GPU probe: white={curve[-1]:.6f} join={ext[0]:.6f} PASS')
+    # Exercise production RGBA8 fallback as actual byte render/readback, rather
+    # than treating normalized float framebuffer output as byte-exact evidence.
+    probe_tex = gl.ctx.texture((1024, 1), 4, probe.astype('f2').tobytes(), dtype='f2')
+    byte_tex = gl.ctx.texture((1024, 1), 4, dtype='f1')
+    byte_fbo = gl.ctx.framebuffer(color_attachments=[byte_tex])
+    pack_program = gl.ctx.program(gl.vs_src, offline.to_core(shaders['kFsHdrCurvePack']))
+    pack_vao = gl.ctx.vertex_array(pack_program, [])
+    byte_fbo.use()
+    gl.ctx.viewport = (0, 0, 1024, 1)
+    probe_tex.use(0)
+    pack_program['uTex'].value = 0
+    pack_vao.render(offline.moderngl.TRIANGLES, vertices=3)
+    packed = np.frombuffer(byte_fbo.read(components=4, dtype='f1', alignment=1), dtype='u1').reshape(1024, 4)
+    bits = (packed[:, 0].astype('u4') | (packed[:, 1].astype('u4') << 8) |
+            (packed[:, 2].astype('u4') << 16) | (packed[:, 3].astype('u4') << 24))
+    np.testing.assert_array_equal(bits.view('f4'), probe[0, :, 0])
+    pack_vao.release()
+    pack_program.release()
+    byte_fbo.release()
+    byte_tex.release()
+    probe_tex.release()
+    print('RGBA8 float-bit packing fallback: exact GPU round trip PASS')
     # Execute production gainmap shader, including its spatial reduction and dither.
     lut = np.ones((1, 1024, 4), np.float32)
     lut[0, :, :3] = curve[:, None]
