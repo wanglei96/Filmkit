@@ -311,7 +311,11 @@ constexpr float kMfnrMisS = 16.0f;
 // 关着它时，三通道全饱和区只剩 opposed 外推 ⇒ 大面积平色（灰斑）与色比错（品红/绿边）
 // 都是这条唯一路径的产物。打开后其余链路一字不改：只有"三通道都顶到满阱"的 2×2 块
 // 会用短帧标量亮度替换，部分饱和仍由 opposed 从 R/B 外推（0.12.134 的口径）。
-constexpr bool kHlInpaintOn = true;
+// PC/Bento does not write a per-pixel scalar short-frame inpaint into the
+// SDR Bayer stack. It accepts/rejects the selected ultrashort at frame level
+// and merges CFA phases with exposure-aware weights. Keep the old experiment
+// available for diagnostics, but never consume it in the production chain.
+constexpr bool kHlInpaintOn = false;
 // v0.10.5：权重从线性压制改**分段**（用户验收标准：允许自然拖影、不容重叠错误）：
 //   m ≤ kMisLo 全融合（静止/准静止 —— 比线性式更满，保细节）
 //   m ≥ kMisHi 权重硬清零（运动区域整体回退参考帧 —— 宁可糊/噪，不容叠影）
