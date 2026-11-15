@@ -1,8 +1,8 @@
 ---
 summary: HDR灰带参考源与短帧归一
 created: 2026-11-14 22:55
-updated: 2026-11-14 22:55
-status: active
+updated: 2026-11-15 14:20
+status: absorbed
 ---
 
 # HDR灰带参考源与短帧归一

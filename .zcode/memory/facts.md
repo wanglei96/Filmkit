@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-10-26 10:17
+updated: 2026-11-15 14:20
 status: active
 ---
 # 事实
@@ -38,7 +38,7 @@ status: active
 - [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov。
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
-- [2026-11-13] 版本：**设备实际 0.13.38(746)**；最新包 0.13.40(748) **未安装成功**（install 被 echo 掩盖，见 lessons）；0.13.0(708) 是最后打 tag 的版本；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个 + `ricoh_negative_ye` 33³。
+- [2026-11-13] 版本：**截至 2026-11-15 为 0.14.0(797)**（tag `v0.14.0`）；0.13.0(708) 是上一个打 tag 的版本；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个 + `ricoh_negative_ye` 33³。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 ## 预设群与 LUT 特征（11-02）
 - [2026-11-02] **理光正片 / 富士NC**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / 高光 +0.64，色相 红 29°/绿 134°/蓝 303°；`fuji_nc` 原资产压白 8.2%，`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255。
@@ -83,4 +83,13 @@ status: active
 - [2026-11-14] **gamut 吃掉延伸**：0.13.65 `gmMax=0.50`（ratio 恒 1）而同一张 `aeP999=9.81`、`wmax=5.81`；0.13.66 把延伸移到 gamut 后 `gmMax=0.83`（ratio 2.5）。
 - [2026-11-14] **短帧归一后的真实值**：`hdrFs=[1.00,1.00,0.34,2.82]`、`hdrSceneGain=2.82`；短帧归一 scene≈6.1，白点 4.35 ⇒ `overEv≈0.51`、`ext≈1.42`、`gmMax≈0.62`。`film_src` 同场景是 8~9（HL 重建）。
 - [2026-11-14] **SDR 平台宽度**：灯面 8bit 246 恒定横跨约 80px（r 200→280），边缘 280→300 从 246 降到 194；同期 scene 从 8.07 降到 4.49。
+
+## HDR 语义对齐与 0.14.0（11-15）
+- [2026-11-15] **版本**：0.14.0(797)，tag `v0.14.0`，`main`/`dev`/tag 同点 `465a4b4` 已 push；包 `filmkit-0.14.0.apk`，回退 `filmkit-0.13.88-NOINPAINT.apk`(796)。
+- [2026-11-15] **`raw.render` 的高光字段**：`hlOk` = `passHighlightRaw` 是否执行；`hlInp` = 独立 inpaint 是否执行（与 `hr` 无关）；`hlCnt` 高光命中数。0.14.0 起 `hlInp=0`。
+- [2026-11-15] **短帧有效性按 CFA 相位不等**：实测 `[G 7%, R 89%, B 7.6%, G 7%]`（灯边场景）；`kFsMfnrShortVal` 存 `.r=v/gain[ch]`、`.g=valid`。
+- [2026-11-15] **分段 dump 工具**：哨兵 `files/edge_dump.enable` → `<dir>/edge_dump_<token>_<stage>.{rgba16f,rgba8}` + `.json`（`w/h/components/type/orientation/complete`）；stage 含 D4-CCM / film-src-pre-TEQ / prepared-hdr / film-out / sdr-final / gainmap / mosaic-fused-before-HL(R16F) / mosaic-short-aligned / mosaic-after-P0。分析器 `tools/analyze-edge-dump.py`（单通道按 `components==1` 复制成 RGB）。
+- [2026-11-15] **0.14.0 真机读数**：`FILMKIT_20261115-140138/140155`，`gainmap.readback gmMin 0.49/gmMax 0.94~0.95`，boost p99 3.05×/3.11×、max 3.44×/3.51×，HDR `luma>=1.0` 3.29%/3.49%。
+- [2026-11-15] **ponytail 痕迹位置**：`FrameRenderer.cpp:1295/15125`、`FrameRenderer.h:1631`（Mertens 逐像素加权，已退役）、`UltraHdrEncoder.cpp:162`（盒式平均）、`CameraController.kt:1283`（crop 变焦近似）、`docs/engine-hdr-exposure-fusion-design.md:190`（授权临时形态）。
+
 

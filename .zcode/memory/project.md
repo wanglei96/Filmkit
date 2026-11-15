@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-11 16:00
+updated: 2026-11-15 14:20
 status: active
 ---
 
@@ -15,7 +15,7 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
 
-**进行中**：**预览体感专项**（11-12→13）：卡顿定档（LOW context + DFT 拆块）；空间域 fusion/PC3D/HL/defringe/CCM/TEQ/CA 全部 16 条**scissor** 条带（⛔ 不能用 viewport，0.13.18 画面重复 N 次）；still 改**生命周期保活**（相机页可见+亮屏，离开/熄屏释放，不再定时）；相机页 2s 后 **warmup**（全量 ensure + 35 个 FBO 触页，第一张 3805→3129ms、与热态差 1261→398ms）；快门**定格+飞入动画**（0.13.40 未装上，设备实际 0.13.38）。fence 窗口与时间片让路实测零收益、已弃用。掉帧剩采集期（HAL 重配）+ 处理期 GPU 饱和。UI 侧已收：飞入重做（真实取景框尺寸 / 白边 / 落格承接）、三分线入框、页面切换单层淡入、**相册/大图改覆盖层**（相机常驻，返回不再黑 1~2s）。→ **Spektrafilm 引擎 + 预设标定**（11-12 定序）；理光目标曲线待重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
+**进行中**：**预览体感专项**（11-12→13）：卡顿定档（LOW context + DFT 拆块）；空间域 fusion/PC3D/HL/defringe/CCM/TEQ/CA 全部 16 条**scissor** 条带（⛔ 不能用 viewport，0.13.18 画面重复 N 次）；still 改**生命周期保活**（相机页可见+亮屏，离开/熄屏释放，不再定时）；相机页 2s 后 **warmup**（全量 ensure + 35 个 FBO 触页，第一张 3805→3129ms、与热态差 1261→398ms）；快门**定格+飞入动画**（0.13.40 起已装上并验收）。fence 窗口与时间片让路实测零收益、已弃用。掉帧剩采集期（HAL 重配）+ 处理期 GPU 饱和。UI 侧已收：飞入重做（真实取景框尺寸 / 白边 / 落格承接）、三分线入框、页面切换单层淡入、**相册/大图改覆盖层**（相机常驻，返回不再黑 1~2s）。→ **Spektrafilm 引擎 + 预设标定**（11-12 定序）；理光目标曲线待重标（recipe-fit）、绿植绿段未对齐；长期挂起：亮部亮度降噪、超广畸变自校正（待拍板）、HDR 205 共存包对照。
 
 ## 里程碑沿革（压缩）
 - [2026-09-18→30] **M0–M2 + 域映射 + MFNR + 亚像素**：YUV/RAW 双链、RCD 12MP 477ms、LSC 接去马赛克后 CCM 前、M4 display 域 LUT；EV 单一来源与 WYSIWYG 定稿；MFNR 4 帧 Bayer 域对齐（残余 4.4×/2.2×→1.22×/1.45×）；P0 亚像素 +43.7%/+46.5%、快门间隔 2.5s→0.54s
@@ -83,3 +83,12 @@ status: active
 - [2026-11-14] **两处代码级错位**：① gainmap 的 `uHdr` 从 0.11.50 起绑的是 `film_src`（filmic **之前**），`ratio` 退化成 `scene/clamp(scene,1)`；② `filmicTone` 里的白点延伸被下游 `gamutMapV5` 吃干净（Y 钳 ≈1.058 + `gamutCheckRgb` 钳 [0,1]），实测 `gmMax=0.50`。
 - [2026-11-14] **定版 0.13.77 用短帧**：`tex_hdr_side_`（−1.5EV 短帧 D4）× `frame_scale[short_idx]`(2.82) 归一到 frame 0 曝光域，4×4 盒式平均 + 完整 PC `CurveExtension`；side 链后用 `fbo_hdr_zero_` blit 恢复 zero D4，SDR 亮度不变。灯面 HDR ≈1.4× SDR 白点 = 短帧能给的物理真实值。
 - [2026-11-14] **紫边判据扩到品红象限**：`defringe` 原本只认 `B−R>thr`（紫 B>R>G），灯面边缘是 R>B>G 被结构性排除；改用 `min(R−G, B−G)`，峰值 85→11。
+
+## HDR 语义对齐与灰带消除（11-15，0.14.0 发版）
+
+- [2026-11-15] **灰带根因 = 跨 CFA scalar 短帧 inpaint**：`kFsHlInpaint` 把各相位 `v/gain[c]` 当同一亮度平均、无观测回 `uShortK=2.828` ⇒ 平台/圆弧。PC/Bento 的 short clipping mask 只做**整帧接受判定**（8 连通 ≥80px 拒绝），接受后走 phase-preserving MergeBayer。已 `kHlInpaintOn=false` 从生产链移除。
+- [2026-11-15] **证据链**：分段 dump 显示灰环在 D4 已存在；正确 R16F 读取后 P0 前后 408,098 个高光 photosite `delta=0`；真实 GLSL 重放显示平台首次出现于 HL 输出（`fused=1.0` → HL 2.4~2.8）。短帧有效按相位 `[G 7%, R 89%, B 7.6%, G 7%]`。
+- [2026-11-15] **四次核形实验全部失败**（离散 8/16/24、连续 1..24、连续盘 24、5×5 双边）：只换灰带形状；语义错时调核无效。
+- [2026-11-15] **0.14.0(797) 发版**（tag `v0.14.0`）：`main`/`dev`/tag 同点 `465a4b4` 已 push；真机 `hlInp=0/hlOk=1/gainmapOk=1`，boost p99 3.05×/3.11×，用户判定"完全正常"。
+- [2026-11-15] **ponytail 与成像链冲突**：全局规则默认加载 ponytail（最懒可行），项目铁律要求最完整实现；HDR 融合链曾有 `ponytail:` 临时形态授权，本次根因代码无该标记但同属"标量近似"模式 ⇒ 成像关键链禁用 ponytail。
+

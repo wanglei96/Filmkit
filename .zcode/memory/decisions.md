@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-11-10 14:50
+updated: 2026-11-15 14:20
 status: active
 ---
 
@@ -129,4 +129,11 @@ status: active
 - [2026-11-14] **短帧必须乘 `frame_scale[short_idx]`**：−1.5EV 短帧 ×2.82 才回到 frame 0 曝光域；乘在已融合 scene 上是二次曝光（0.13.71 的 `gmMax=1.00` 就是这么来的）。
 - [2026-11-14] **HDR 延伸不能写在 `kFsFilm` 里**：`tex_work_` 同时是 SDR 成片源，任何 >1 改动都会被 `kFsOut` 的 `min(c,1)` 变成硬截断（0.13.66 的 SDR 横向波纹）。
 - [2026-11-14] **不再用更大采样核 / 邻域最大救灰带**：kK=12 平均（0.13.68）、12×12 最大（0.13.76）都只换灰带形状。
+
+## HDR 语义对齐与 0.14.0（11-15）
+
+- [2026-11-15] **禁止跨 CFA 相位的标量亮度 inpaint**：短帧各相位 `v/gain[c]` 仍是不同光谱响应；"平均再乘回 `gain[c]`"必然污染色比。PC/Bento 只做整帧接受 + 相位保真融合。`kHlInpaintOn=false` 已从生产链移除，代码保留作诊断 A/B。
+- [2026-11-15] **`hr_raw` 开关 ≠ 高光链关闭**：`hr_on` 只控 `passHighlightRaw`，inpaint 独立执行且 P0 直接消费 `fused_src`；`hlOk=0, hlInp=1` 是合法组合，不能用来排除 inpaint。判定只认 `hlInp`。
+- [2026-11-15] **成像关键链禁用 ponytail**：RAW/融合/高光重建/去马赛克/色彩科学一律"先读完一手参考再完整实现"；ponytail 只用于 UI/工具/构建类任务。HDR 融合链历史上的 `ponytail:` 临时形态授权（per-pixel Mertens）正是本类风险的来源。
+
 
