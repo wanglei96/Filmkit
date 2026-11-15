@@ -3065,22 +3065,21 @@ void main() {
     // 正确判据与 kFsHlApply 的 allSat **同一口径**：只有三通道都顶到满阱，
     // 真实色度才不可知，此时注入一个**标量亮度**才是安全的；部分饱和时 R/B
     // 有真值，G 必须由 opposed 从 R/B 外推 —— 那正是 0.12.129 的路径。
+    // Use one physical 2x2 CFA block for all saturation decisions. The old
+    // 3x3 "first sample per channel" search expanded all_sat/any_sat beyond
+    // the current block while quad_ok stayed 2x2; at a clipped boundary that
+    // mixed neighborhoods and selected the radius-8/16/24 fallback in rings.
     float rv = -1.0, gv = -1.0, bv = -1.0;
-    for (int k = 0; k < 9; ++k) {
-        ivec2 d = k == 0 ? ivec2(0, 0)
-                : (k == 1 ? ivec2(1, 0)
-                : (k == 2 ? ivec2(-1, 0)
-                : (k == 3 ? ivec2(0, 1)
-                : (k == 4 ? ivec2(0, -1)
-                : (k == 5 ? ivec2(1, 1)
-                : (k == 6 ? ivec2(-1, 1)
-                : (k == 7 ? ivec2(1, -1) : ivec2(-1, -1))))))));
-        ivec2 q = clamp(p + d, ivec2(0), uSize - 1);
-        int c = chanAt(q);
-        float v = texelFetch(uFused, q, 0).r;
-        if (c == 0) { if (rv < 0.0) rv = v; }
-        else if (c == 1) { if (gv < 0.0) gv = v; }
-        else { if (bv < 0.0) bv = v; }
+    ivec2 block = ivec2(p.x & ~1, p.y & ~1);
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            ivec2 q = clamp(block + ivec2(dx, dy), ivec2(0), uSize - 1);
+            int c = chanAt(q);
+            float v = texelFetch(uFused, q, 0).r;
+            if (c == 0) rv = max(rv, v);
+            else if (c == 1) gv = max(gv, v);
+            else bv = max(bv, v);
+        }
     }
     if (rv < 0.0) rv = base;
     if (gv < 0.0) gv = base;
@@ -3100,8 +3099,7 @@ void main() {
     bool quad_ok = true;
     for (int dy = 0; dy < 2; ++dy) {
         for (int dx = 0; dx < 2; ++dx) {
-            ivec2 q = clamp(ivec2((p.x & ~1) + dx, (p.y & ~1) + dy),
-                            ivec2(0), uSize - 1);
+            ivec2 q = clamp(block + ivec2(dx, dy), ivec2(0), uSize - 1);
             if (texelFetch(uShort, q, 0).g <= 0.5) quad_ok = false;
         }
     }
@@ -3145,7 +3143,9 @@ void main() {
         acc = sacc;
         wsum = swsum;
     } else {
-        for (int r = 8; r <= 24; r += 8) {
+        // Sample every radius instead of only 8/16/24. Discrete rings create
+        // visible plateaus at exactly those radii on lamp edges.
+        for (int r = 1; r <= 24; ++r) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     if (dx == 0 && dy == 0) continue;
