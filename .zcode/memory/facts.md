@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-11-15 14:20
+updated: 2026-11-15 22:20
 status: active
 ---
 # 事实
@@ -38,7 +38,7 @@ status: active
 - [2026-10-30] **sat mask 判据**：`wb >= gain[c] − 3σ`，1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov。
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
-- [2026-11-13] 版本：**截至 2026-11-15 为 0.14.0(797)**（tag `v0.14.0`）；0.13.0(708) 是上一个打 tag 的版本；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个 + `ricoh_negative_ye` 33³。
+- [2026-11-15] 版本：**截至 2026-11-15 晚为 0.14.6(803)**（0.14.0/797 为 tag `v0.14.0`；回退包 0.14.4/801）；0.13.0(708) 是上一个打 tag 的版本；**7 条内置预设**（键总 100）；自烘 64³ LUT 三个 + `ricoh_negative_ye` 33³。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 ## 预设群与 LUT 特征（11-02）
 - [2026-11-02] **理光正片 / 富士NC**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / 高光 +0.64，色相 红 29°/绿 134°/蓝 303°；`fuji_nc` 原资产压白 8.2%，`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255。
@@ -92,4 +92,10 @@ status: active
 - [2026-11-15] **0.14.0 真机读数**：`FILMKIT_20261115-140138/140155`，`gainmap.readback gmMin 0.49/gmMax 0.94~0.95`，boost p99 3.05×/3.11×、max 3.44×/3.51×，HDR `luma>=1.0` 3.29%/3.49%。
 - [2026-11-15] **ponytail 痕迹位置**：`FrameRenderer.cpp:1295/15125`、`FrameRenderer.h:1631`（Mertens 逐像素加权，已退役）、`UltraHdrEncoder.cpp:162`（盒式平均）、`CameraController.kt:1283`（crop 变焦近似）、`docs/engine-hdr-exposure-fusion-design.md:190`（授权临时形态）。
 
+## 高光融合与出片回归事实（11-15 晚）
+- [2026-11-15] **`GL_GPU_DISJOINT_EXT` 标准值 = 0x8FBB**（NDK `GLES2/gl2ext.h`）；`0x8FBD` 会稳定产生 `GL_INVALID_ENUM(1280)`。`GpuTimer` 现 include 平台头 + `eglGetProcAddress` 成套 EXT 入口，扩展不支持时 `supported()=false`。
+- [2026-11-15] **真实 so 全链出片读数**（Mali-G1-Ultra MC12，synthetic 4 帧 HDR）：256² → RGBA 262144/B、JPEG 31742、~908ms；512² → JPEG 112344、~1104ms；2048² → JPEG 1660859、~4593ms；`--demosaic 0` 在 HDR 下路由 RCD 与默认同 JPEG；rotation=1 512² JPEG 112233。
+- [2026-11-15] **`files/burst_dump` 语义已收窄**：只允许 app-specific `burst/*.raw` 诊断，**不再**经 `saveDng` 写相册；公共 DNG 仍只由 `dngOn` 控制。
+- [2026-11-15] **高光链新增纹理预算**（4080×3072）：原生 noise RGBA32F ≈200MB、D4 cov 两张 RGBA32F ≈200MB/份、PC3D 每趟 2 张全分辨率 cov ≈200MB；这是"拍照变慢/预览卡"的首要嫌疑，需实测确认。
+- [2026-11-15] **0.14.5 无 JPEG 的真实现场**：`highlight.admission accepted=true`、`highlight.merge native_bayer` 均正常，随后 `render.burst_done ok=false bytes=0`；首个 GL 错误在 `after_RCD_direction`（内含 `gpu_dir.endMs()`），不在 resolve shader。
 

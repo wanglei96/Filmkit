@@ -2,7 +2,7 @@
 summary: HDR灰带定位到高光inpaint并0.14.0发版
 created: 2026-11-15 14:20
 updated: 2026-11-15 14:20
-status: active
+status: absorbed
 ---
 
 # HDR灰带定位到高光inpaint并0.14.0发版

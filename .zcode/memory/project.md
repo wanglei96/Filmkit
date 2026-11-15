@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-15 14:20
+updated: 2026-11-15 22:20
 status: active
 ---
 
@@ -91,4 +91,11 @@ status: active
 - [2026-11-15] **四次核形实验全部失败**（离散 8/16/24、连续 1..24、连续盘 24、5×5 双边）：只换灰带形状；语义错时调核无效。
 - [2026-11-15] **0.14.0(797) 发版**（tag `v0.14.0`）：`main`/`dev`/tag 同点 `465a4b4` 已 push；真机 `hlInp=0/hlOk=1/gainmapOk=1`，boost p99 3.05×/3.11×，用户判定"完全正常"。
 - [2026-11-15] **ponytail 与成像链冲突**：全局规则默认加载 ponytail（最懒可行），项目铁律要求最完整实现；HDR 融合链曾有 `ponytail:` 临时形态授权，本次根因代码无该标记但同属"标量近似"模式 ⇒ 成像关键链禁用 ponytail。
+
+## 高光融合落地与出片回归（11-15 晚，0.14.5→0.14.6）
+
+- [2026-11-15] **PC/Bento 高光融合完整落地**：native CFA clipping 有效性（四相位、扣黑前整数判据）、真实双向 FB+RGB 可观测配准、radius4 collar/全局中位回退、8 连通 hole ≥80 整帧拒绝、phase-preserving dual-kernel MergeBayer、去马赛克后 RGB CameraWhite 白界、局部 V 与六分量 cov 经 LSC²+CCM 传到 PC3D/P4/小波。两组原 RAW 重放：一组按 285px 大孔拒绝，另一组 24px 孔洞接受且 G 高光 ~97% 恢复。
+- [2026-11-15] **0.14.5 交付事故**：`GpuTimer` 手写 `GL_GPU_DISJOINT_EXT=0x8FBD`（标准 `0x8FBB`）⇒ `GL_INVALID_ENUM` 被新硬失败检查判死，融合成功但 `bytes=0`（无 JPEG）；同时遗留 `burst_dump` 哨兵绕过 DNG 开关往相册写 DNG。
+- [2026-11-15] **0.14.6(803) 修复并验收**：改用平台头文件枚举 + 成套 EXT 入口；删除调试 DNG 旁路；新增真实 so 全链出片测试（256/512/2048/rotation/bilinear 全 PASS，JPEG 到 1.66MB）。用户验收「JPEG 正常、DNG 不再出现」。
+- [2026-11-15] **新开口：拍照变慢 + 预览卡**：用户反馈，怀疑条带化被吃掉；尚未测量，下窗口先取剖面再决定，禁止先重写。
 
