@@ -826,7 +826,7 @@ class FrameRenderer {
     float white_slope = 0.0f;
     int extends_base = 0;
   };
-  static HdrCurveExtension computeHdrCurveExtension(const FilmicSpline& sp);
+  static HdrCurveExtension computeHdrCurveExtension(const std::vector<float>& curve);
   // ── U-2 编辑器链路胶片曲线（[5..10] latitude + [37][38] 黑白点；**显示域**）────────
   // 用户 2026-10-11"不统一的要统一掉，缺的补上"（参数统一方案 §9 的最后一批）。
   // 完整设计依据（为什么是"相对默认的差值"、中段斜率 c 的来源、与 [4] 的正交性、
@@ -880,10 +880,10 @@ class FrameRenderer {
                       float user_white, float white_hl, float white_floor,
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
-  // HDR gainmap：hdr_tex（kFsFilm 输出）÷ sdr_tex（sRGB 8bit）→ 8bit 比值图。
-  // scene_tex = film_src（D4 场景线性），只用于在 pass 内算白点以上的延伸量。
-  bool passGainmap(int w, int h, GLuint hdr_tex, GLuint sdr_tex, GLuint scene_tex,
-                   float scene_gain, float exposure, float disp_mid);
+  // Final SDR and same-pass prepared engine RGB produce the HDR residual.
+  bool passGainmap(int w, int h, GLuint sdr_tex);
+  void captureHdrProbes(int w, int h);
+  void releaseHdrProbeTargets();
   bool ensureGainmap(int w, int h);
 
   void passFilm(int w, int h, const FilmParams& p, GLuint src_tex, bool still,
@@ -1634,6 +1634,13 @@ class FrameRenderer {
   // 必须在 GPU 内算成 8bit 再读回 —— 见 kFsGainmap 的头注释。
   GLuint fbo_gainmap_ = 0, tex_gainmap_ = 0;
   int gainmap_w_ = 0, gainmap_h_ = 0;
+  GLuint tex_hdr_curve_ = 0, fbo_hdr_curve_ = 0;
+  GLuint tex_hdr_prepared_ = 0, fbo_hdr_prepared_ = 0;
+  GLuint tex_hdr_curve_pack_ = 0, fbo_hdr_curve_pack_ = 0, prog_hdr_curve_pack_ = 0;
+  int hdr_prepared_w_ = 0, hdr_prepared_h_ = 0;
+  bool hdr_probe_valid_ = false;
+  HdrCurveExtension hdr_curve_extension_;
+
   int dbg_gainmap_ok_ = 0;   // 本帧 gainmap 是否生成成功（0 = 无/失败，供日志）
   // gainmap 的实际数值分布（0..1 的 8bit 值）。**这是判断"HDR 有没有内容"的唯一依据**：
   // 若 min≈max≈0.5，说明 HDR/SDR 比值恒 1 ⇒ 该场景没有可表达的动态范围。
@@ -1778,14 +1785,10 @@ class FrameRenderer {
   } u_cs_;
   // 色差域 3×3 中值（0.12.162）
   struct { GLint tex = -1, size = -1, chroma_min = -1; } u_cm_;
-  // HDR gainmap（v0.11.50；P4 0.12.85 加 scene_mid；0.13.67 加 scene/grey/white_ev）
-  // scene + grey + white_ev 只服务"HDR 白点延伸"：延伸必须在 gainmap pass 内现场算，
-  // 不能写进 kFsFilm（那条纹理同时是 SDR 成片源，>1 会被 kFsOut 的 min(c,1) 硬截断）。
+  // Prepared engine RGB -> continuous measured-curve residual on final SDR.
   struct {
-    GLint hdr = -1, sdr = -1, src_size = -1, math = -1, scene_mid = -1, exposure = -1, disp_mid = -1;
-    GLint scene = -1, filmic_grey = -1, white_ev = -1, ext_peak = -1;
-    GLint scene_gain = -1;
-    GLint scene_white = -1, join_input = -1, join_output = -1, join_slope = -1,
+    GLint base_curve = -1, sdr = -1, src_size = -1, scene = -1;
+    GLint join_input = -1, join_output = -1, join_slope = -1,
           curve_quadratic = -1, curve_white_output = -1, curve_white_slope = -1,
           curve_extends_base = -1;
   } u_gainmap_;
@@ -1871,7 +1874,7 @@ class FrameRenderer {
   struct {
     // v0.7.9：contrast/shoulder/toe/cross（旧 log 域胶片链）已随链删除；
     // FilmParams 槽位保留解析（契约不移位），引擎不再消费。
-    GLint tex = -1, sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
+    GLint hdr_probe_mode = -1, tex = -1, sat = -1, split = -1, mono = -1, tone_k = -1, look = -1,
           look_sat = -1, look_chroma = -1, local = -1,
           local_strength = -1, local_knee = -1, local_knee_hi = -1, local_ref = -1,
           local_size = -1, hal_domain = -1, domain_ratio = -1,
