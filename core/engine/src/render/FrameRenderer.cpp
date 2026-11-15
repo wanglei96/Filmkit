@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -12997,6 +12998,25 @@ void FrameRenderer::releaseHdrProbeTargets() {
   hdr_probe_valid_ = false;
 }
 
+void FrameRenderer::edgeDumpEvent(const char* stage, const std::string& path) {
+  Logger::instance().log(LogLevel::kInfo, "engine", "edge_dump.stage",
+    std::string("{\"stage\":\"") + jsonEscape(stage) + "\",\"path\":\"" + jsonEscape(path) + "\"}");
+}
+void FrameRenderer::captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h, bool rgba8) {
+  if (edge_dump_token_.empty() || !tex || !fbo || w <= 0 || h <= 0) return;
+  const std::string dir = Logger::instance().dir(); if (dir.empty()) return;
+  const std::string base = dir + "/edge_dump_" + edge_dump_token_ + "_" + stage;
+  const std::string raw = base + (rgba8 ? ".rgba8" : ".rgba16f"), meta = base + ".json";
+  GLint draw=0,read=0,vp[4],pack=0,al=0,row=0,sr=0,sp=0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw); glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read); glGetIntegerv(GL_VIEWPORT,vp); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&pack); glGetIntegerv(GL_PACK_ALIGNMENT,&al); glGetIntegerv(GL_PACK_ROW_LENGTH,&row); glGetIntegerv(GL_PACK_SKIP_ROWS,&sr); glGetIntegerv(GL_PACK_SKIP_PIXELS,&sp);
+  glBindFramebuffer(GL_FRAMEBUFFER,fbo); GLint old_attachment=0; glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,&old_attachment); glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,0); glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0); glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+  const size_t row_bytes=static_cast<size_t>(w)*4*(rgba8?1u:2u); std::vector<uint8_t> pixels(row_bytes); std::ofstream f(raw,std::ios::binary); bool ok=f.good();
+  for(int y=0; ok && y<h; ++y){ glReadPixels(0,y,w,1,GL_RGBA,rgba8?GL_UNSIGNED_BYTE:GL_HALF_FLOAT,pixels.data()); ok=glGetError()==GL_NO_ERROR; if(ok) { f.write(reinterpret_cast<const char*>(pixels.data()),static_cast<std::streamsize>(pixels.size())); ok=f.good(); } }
+  f.close();
+  if(ok && f.good()){ std::ofstream j(meta); j<<"{\"w\":"<<w<<",\"h\":"<<h<<",\"components\":4,\"type\":\""<<(rgba8?"uint8":"float16")<<"\",\"orientation\":\"gl_bottom_up\",\"stage\":\""<<jsonEscape(stage)<<"\",\"token\":\""<<edge_dump_token_<<"\",\"raw_path\":\""<<jsonEscape(raw)<<"\",\"complete\":true}\n"; j.close(); if(j.good()) edgeDumpEvent(stage,raw); else ok=false; }
+  if(!ok) Logger::instance().log(LogLevel::kWarn,"engine","edge_dump.failed",std::string("{\"stage\":\"")+jsonEscape(stage)+"\"}");
+  glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,(GLuint)old_attachment,0); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)draw); glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read); glViewport(vp[0],vp[1],vp[2],vp[3]); glBindBuffer(GL_PIXEL_PACK_BUFFER,(GLuint)pack); glPixelStorei(GL_PACK_ALIGNMENT,al); glPixelStorei(GL_PACK_ROW_LENGTH,row); glPixelStorei(GL_PACK_SKIP_ROWS,sr); glPixelStorei(GL_PACK_SKIP_PIXELS,sp);
+}
+
 void FrameRenderer::captureHdrProbes(int w, int h) {
   // Called directly after the normal film draw: the source on unit 0 is the
   // actual post-HR film_src, and every engine/preparation uniform is still live.
@@ -14722,6 +14742,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // 0.13.5：RCD 三段拆分（preMs = HR+P0 到 P1 提交前；dirGpuMs/gGpuMs = GPU query）
   float pre_ms = 0.0f, dir_gpu_ms = 0.0f, g_gpu_ms = 0.0f, p0_ms = 0.0f;
   diagBeginFrame();  // 诊断统计：关时仅一次 atomic load，无 pass / 无 GL 调用
+  edge_dump_token_.clear();
+  { const std::string d = Logger::instance().dir(); const std::string s = d.empty() ? std::string() : d + "/edge_dump.enable"; FILE* f = s.empty() ? nullptr : std::fopen(s.c_str(), "rb"); if (f) { std::fclose(f); edge_dump_token_ = std::to_string(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(t1.time_since_epoch()).count())); std::remove(s.c_str()); } }
   // AMaZE 诊断帧首清零（passCaCorrect 里的清零已删除，见那里的注释）
   dbg_amaze_ms_ = 0.f;
   dbg_amaze_min_ = 0.f;
@@ -14827,6 +14849,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_hl_inp_ = 0;
     dbg_hl_inp_ms_ = 0.f;
     GLuint fused_src = tex_fused_;
+    if (c.mfnr_fused) {
+      captureEdgeDumpTexture("mosaic-fused-before-HL", tex_fused_, fbo_fused_, w, h, false);
+      if (short_val_ok_) captureEdgeDumpTexture("mosaic-short-aligned", tex_short_val_, fbo_short_val_, w, h, false);
+    }
     // ── 0.12.135：inpaint **默认不启用**（代码保留，改 true 即回到 A/B 通路）───
     // 真机数据（2026-10-28 20:18，灯面 RAW 逐通道分析）：
     //   · 灯的发光面三通道**同时**饱和（饱和率 0.82/0.82/0.83），未饱和部分的
@@ -14941,6 +14967,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                                               : (c.mfnr_fused ? fused_src : tex_mos_));
     // 值域保护只在"P0 直接吃 HR 输出"时需要（NN 输出本就落在 [0,1] 训练域）
     // 0.12.133：inpaint 输出同样是 scene-referred（可 >1）⇒ 与 HR 输出同口径保护
+    if (c.mfnr_fused) captureEdgeDumpTexture("mosaic-before-P0", p0_in, fbo_mos_, w, h, false);
     const bool p0_wclamp = (!nn_ok && (hr_out != 0 || fused_src != tex_fused_));
     const auto t_p0 = std::chrono::steady_clock::now();
     if (c.mfnr_fused) {
@@ -14972,6 +14999,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                        c.dn ? c.nc : kNoDn);
       }
     }
+    captureEdgeDumpTexture("mosaic-after-P0", tex_mos_, fbo_mos_, w, h, false);
     // 0.13.6 性能细分：P0（RAW bilateral / 线性化展开）单列。旧口径只有
     // preMs = HR + P0，拆开后才能判断该优化 HR 还是 P0。
     glFinish();
@@ -15081,6 +15109,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                  std::chrono::steady_clock::now() - d3).count();
     // 诊断统计 D4（CCM 后 / P4 前，场景线性）
     diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
+    captureEdgeDumpTexture("D4-CCM", tex_scene_, fbo_scene_, dst_w, dst_h, false);
     if (skyDiagOn()) dbg_prof_d4_ = profDump(fbo_scene_, tex_scene_, dst_w, dst_h);  // 0.12.164 诊断
     // ── HDR 融合 P2（0.12.78）：侧帧前链 + zero/侧帧 Mertens 融合 ────────
     // 位置 = D4 之后、P4/PC3D/defringe 之前（设计 §4.3：融合后的整图再统一
@@ -15480,6 +15509,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // v0.12.71（PC 架构，用户拍板）：渲染端 AE **只诊断、不参与曝光**。
   // 曝光 = HAL 的 AE + planner + baseEv + 用户 EV；预览和成片同一次曝光，逐张独立。
   // 旧行为 `pe.exposure_ev += ae` 是自研的第二套 AE（补中灰/压高光），与 HAL 打架。
+  captureEdgeDumpTexture("film-src-pre-TEQ", film_src, fbo_scene_, dst_w, dst_h, false);
   const float ae = passAutoExposure(film_src, pe, c.short_sat);
   (void)ae;
   // 0.12.252（诊断）：D4（CCM 后、曝光前）的天空剖面 —— 先钉住"进 filmic 之前"的亮度与色度
@@ -15643,6 +15673,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   // The latest passFilm (including any display-loop redraw) captured the curve
   // and post-HR prepared RGB with its live engine uniforms. Never sample a separate short frame.
   // 0.12.252（诊断）：filmic 输出与最终成片（闭环已收敛）的天空剖面 —— 与 d4 三段对拍
+  captureEdgeDumpTexture("film-out", tex_work_, fbo_work_, dst_w, dst_h, false);
   if (skyDiagOn()) {
     dbg_sky_fm_ = skyProfile(fbo_work_, tex_work_, dst_w, dst_h, false);
     dbg_sky_out_ = c.ten_bit ? std::string()
@@ -15650,9 +15681,11 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   }
   // 只在 8bit 档生成：10bit 档 tex_cap_ 是 GL_RGB10_A2，本 shader 按 sRGB 8bit 采样会错；
   // 而 HDR 交付只走 JPEG 8bit 路径（HEIC 的 HDR 走平台 HeifWriter，不经这里）。
+  captureEdgeDumpTexture("sdr-final", tex_cap_, fbo_cap_, dst_w, dst_h, true);
   if (!c.ten_bit) {
     const auto t_gm0 = std::chrono::steady_clock::now();
     if (passGainmap(dst_w, dst_h, tex_cap_)) {
+      captureEdgeDumpTexture("gainmap", tex_gainmap_, fbo_gainmap_, gainmap_w_, gainmap_h_, true);
       dbg_gainmap_ok_ = 1;
     } else {
       dbg_gainmap_ok_ = 0;
@@ -19922,7 +19955,7 @@ void FrameRenderer::passFilm(int w, int h, const FilmParams& p, GLuint src_tex,
   glBindTexture(GL_TEXTURE_2D, tex_local_);
   glUniform1i(u_film_.local, 2);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  if (still) captureHdrProbes(w, h);
+  if (still) { captureHdrProbes(w, h); if (!edge_dump_token_.empty() && hdr_probe_valid_) captureEdgeDumpTexture("prepared-hdr", tex_hdr_prepared_, fbo_hdr_prepared_, w, h, false); }
   // 预览统计观测（排查"预览过曝 vs 成片正常"）：每 120 帧一条，与 raw.render 的
   // blackEv/whiteEv/linMid 直接对比 —— 若同场景下预览的 linMid 与成片明显不一致，
   // 说明 OES 预览流与 RAW/YUV 链的线性亮度标定不同（两条源的判据不同）。

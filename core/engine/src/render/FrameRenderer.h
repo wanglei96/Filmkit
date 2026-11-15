@@ -883,6 +883,9 @@ class FrameRenderer {
   // Final SDR and same-pass prepared engine RGB produce the HDR residual.
   bool passGainmap(int w, int h, GLuint sdr_tex);
   void captureHdrProbes(int w, int h);
+  void captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h,
+                              bool rgba8);
+  void edgeDumpEvent(const char* stage, const std::string& path);
   void releaseHdrProbeTargets();
   bool ensureGainmap(int w, int h);
 
@@ -1640,6 +1643,7 @@ class FrameRenderer {
   int hdr_prepared_w_ = 0, hdr_prepared_h_ = 0;
   bool hdr_probe_valid_ = false;
   HdrCurveExtension hdr_curve_extension_;
+  std::string edge_dump_token_;
 
   int dbg_gainmap_ok_ = 0;   // 本帧 gainmap 是否生成成功（0 = 无/失败，供日志）
   // gainmap 的实际数值分布（0..1 的 8bit 值）。**这是判断"HDR 有没有内容"的唯一依据**：
