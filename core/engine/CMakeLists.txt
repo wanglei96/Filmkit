@@ -20,6 +20,8 @@ add_library(filmengine SHARED
         src/film/EngineRegistry.cpp
         src/film/SigmoidParams.cpp
         src/render/Align.cpp
+        src/render/HighlightGeometry.cpp
+        src/render/HighlightRecovery.cpp
         src/render/AeMetering.cpp
         src/render/AmazeDemosaic.cpp
         src/render/FrameRenderer.cpp

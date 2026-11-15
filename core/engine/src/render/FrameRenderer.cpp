@@ -23,6 +23,12 @@
 #include "../film/EngineRegistry.h"
 #include "../film/SigmoidParams.h"
 #include "Align.h"
+#include "HighlightGeometry.h"
+#include "HighlightRecovery.h"
+#include "HighlightMergeShader.h"
+#include "HighlightResolveShader.h"
+#include "HighlightNoiseShader.h"
+#include "HighlightNoiseFilterShader.h"
 #include "AmazeDemosaic.h"
 #include "AeMetering.h"
 #include "GrainLut.h"
@@ -1680,6 +1686,18 @@ vec3 lscAt(ivec2 p) {
 // 单个邻居的值域权重累加（P4 原式；档 A 起色度阈值用 scEff = 放大后的 σc）。
 // v0.10.174：亮度项阈值**恒为 sc**（不再接受"放宽后的 sy" —— 同步步放宽 wy 的
 // 路径已删除）；gate > 0 时按 PC 的 w2 形式（1 − d²/(d² + scEff)）逐像素混合。
+uniform highp sampler2D uLocalVariance;
+uniform highp sampler2D uLocalCovariance;
+uniform int uLocalNoiseOn;
+uniform float uLocalNoiseScale;
+mat3 localCovariance(vec2 uv) {
+    ivec2 sz = textureSize(uLocalVariance, 0);
+    ivec2 q = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
+    vec3 d = max(texelFetch(uLocalVariance, q, 0).rgb, vec3(0));
+    vec3 o = texelFetch(uLocalCovariance, q, 0).rgb;
+    return mat3(d.r, o.r, o.g, o.r, d.g, o.b, o.g, o.b, d.b) * uLocalNoiseScale;
+}
+float projectedVariance(mat3 cov, vec3 axis) { return max(dot(axis, cov * axis), 1e-12); }
 void p4Accum(vec3 c, int dx, int dy, float y0, vec3 cd0, float sc, float scEff,
              float pcGate, inout vec3 acc, inout float wsum) {
     float y = dot(c, LUMA);
@@ -1687,7 +1705,25 @@ void p4Accum(vec3 c, int dx, int dy, float y0, vec3 cd0, float sc, float scEff,
     float wy = (y - y0) / (sc * 1.2);
     float wc = length(cd - cd0) / scEff;   // ← 档 A 起 = 放大后的 σc
     float w = exp(-0.5 * (wy * wy + wc * wc)
-                  - 0.5 * float(dx * dx + dy * dy) / 9.68);  // σs=2.2（v0.6.32）
+                  - 0.5 * float(dx * dx + dy * dy) / 9.68);
+    if (uLocalNoiseOn != 0) {
+        ivec2 center = ivec2(gl_FragCoord.xy);
+        mat3 pair = localCovariance((vec2(center) + .5) / vec2(uSize)) +
+                    localCovariance((vec2(clamp(center + ivec2(dx,dy), ivec2(0), uSize-1)) + .5) / vec2(uSize));
+        vec3 e0 = vec3(1,-1,0), e1 = vec3(0,-1,1);
+        float a = max(dot(e0, pair * e0), 1e-12);
+        float b = dot(e0, pair * e1);
+        float d = max(dot(e1, pair * e1), 1e-12);
+        float determinant = max(a*d - b*b, 1e-24);
+        vec3 delta = c - (cd0 + y0);
+        vec2 chromaDelta = vec2(dot(e0,delta),dot(e1,delta));
+        float chromaDistance = max((d*chromaDelta.x*chromaDelta.x -
+            2.0*b*chromaDelta.x*chromaDelta.y + a*chromaDelta.y*chromaDelta.y) / determinant, 0.0);
+        float yVariance = projectedVariance(pair,LUMA);
+        float yDistance = (y-y0)*(y-y0) / (yVariance * 1.44);
+        w = exp(-.5 * (chromaDistance + yDistance) -
+                .5 * float(dx*dx+dy*dy) / 9.68);
+    }  // σs=2.2（v0.6.32）
     if (pcGate > 0.0) {
         // PC esd3d2.glsl:104-106 的 w2：d = |c − c0|（3D，含亮度差），唯一阈值
         // scEff，**没有独立的亮度项** ⇒ 跨亮度边缘的邻居在此分支重新获得权重。
@@ -1742,6 +1778,14 @@ void main() {
     // （2026-10-03 14:30）降噪从 21~32% 猛增到 43~62% ⇒ 画面发糊，而色块**毫无改善**。
     // 结论：σ 不是杯体色块的根因，该修正只有副作用，回退。
     float sc = sqrt(max(ay * y0 + by * glY * glY, 1e-12));
+    if (uLocalNoiseOn != 0) {
+        mat3 cov = localCovariance((vec2(p) + .5) / vec2(uSize));
+        vec3 cr = vec3(1,0,0) - LUMA;
+        vec3 cg = vec3(0,1,0) - LUMA;
+        vec3 cb = vec3(0,0,1) - LUMA;
+        sc = sqrt((projectedVariance(cov, cr) + projectedVariance(cov, cg) +
+                   projectedVariance(cov, cb)) / 3.0);
+    }
     // ── 档 A（v0.10.165）：逐像素伪彩强度 → 色度 σc 放大 ────────────────────
     // PC 依据 esd3d2_steered.glsl:94-98（sigZ = max(sigY, min(chromaNoise·MOIRE,
     // 0.2))）。四条可搬运规则照抄：① 只增强不减弱 ② 结构门控 ③ 通道差异 ④ 封顶。
@@ -2369,6 +2413,14 @@ vec3 lscAt(ivec2 p) {
 // 独立标量路径**，故必须逐路给 σ（P4 的合并口径是另一个问题，见 σ 核实报告）。
 const vec3 WCB2 = vec3(0.0452, 0.5115, 0.8608);
 const vec3 WCR2 = vec3(0.6200, 0.5115, 0.0052);
+uniform highp sampler2D uLocalVariance;
+uniform highp sampler2D uLocalCovariance;
+uniform int uLocalNoiseOn;
+mat3 covarianceAt(ivec2 p) {
+    vec3 d=texelFetch(uLocalVariance,p,0).rgb;
+    vec3 o=texelFetch(uLocalCovariance,p,0).rgb;
+    return mat3(d.r,o.r,o.g,o.r,d.g,o.b,o.g,o.b,d.b);
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy) * 2;
     vec2 acc = vec2(0.0);
@@ -2385,13 +2437,19 @@ void main() {
         // 通道差异（WB 增益把三通道噪声拉开后，这个差异正是要修的东西）。
         vec3 gl = lscAt(q);
         vec3 v = max(uNoiseA * c + uNoiseB * gl * gl, vec3(0.0));
-        sacc += sqrt(max(vec2(dot(v, WCB2), dot(v, WCR2)), vec2(1e-12)));
+        if (uLocalNoiseOn != 0) {
+            mat3 cov=covarianceAt(q);
+            vec3 cb=vec3(0,0,1)-LUMA, cr=vec3(1,0,0)-LUMA;
+            sacc += sqrt(max(vec2(dot(cb,cov*cb),dot(cr,cov*cr)),vec2(1e-12)));
+        } else {
+            sacc += sqrt(max(vec2(dot(v, WCB2), dot(v, WCR2)), vec2(1e-12)));
+        }
     }
     // b 通道 = 半分辨率 Y（v0.10.173）：kFsChromaAtrous 的梯度门需要 |∇L|，而它的
     // uPrev 只有 Cb/Cr ⇒ 这里顺带把 2×2 的 Y 均值带下去（零新增纹理、零新增采样）。
     oChroma = vec4(acc * 0.25, yacc * 0.25, 1.0);
     // 2×2 box 平均使白噪 σ 减半：σ_half = mean(σ_full)/2（两路同一规则）
-    oSigma = vec4(sacc * 0.125, 0.0, 1.0);
+    oSigma = vec4(sacc * (uLocalNoiseOn != 0 ? 0.25 : 0.125), 0.0, 1.0);
 })";
 
 // ② 每级：a_l = B3_dilated(a_{l-1}, step)；d = a_{l-1} − a_l；收缩 + revert
@@ -2562,6 +2620,8 @@ void main() {
 const char* kFsPc3d = R"(#version 300 es
 precision highp float;
 layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oNoiseDiag;
+layout(location = 2) out vec4 oNoiseOff;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
 uniform int uK;          // KSIZE = (MSIZE-1)/2（PC 的 #define KSIZE）
@@ -2613,6 +2673,46 @@ vec3 lscAt(ivec2 p) {
     vec3 c01 = texelFetch(uLsc, clamp(b + ivec2(0, 1), ivec2(0), mx), 0).rgb;
     vec3 c11 = texelFetch(uLsc, clamp(b + ivec2(1, 1), ivec2(0), mx), 0).rgb;
     return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+uniform highp sampler2D uLocalVariance;
+uniform highp sampler2D uLocalCovariance;
+uniform int uLocalNoiseOn;
+uniform float uLocalNoiseScale;
+mat3 localCovariance(vec2 uv) {
+    ivec2 sz = textureSize(uLocalVariance, 0);
+    ivec2 q = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
+    vec3 d = max(texelFetch(uLocalVariance, q, 0).rgb, vec3(0));
+    vec3 o = texelFetch(uLocalCovariance, q, 0).rgb;
+    return mat3(d.r, o.r, o.g, o.r, d.g, o.b, o.g, o.b, d.b) * uLocalNoiseScale;
+}
+float projectedVariance(mat3 cov, vec3 axis) { return max(dot(axis, cov * axis), 1e-12); }
+float localDistance(vec3 delta, ivec2 p, ivec2 q, float extra) {
+    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +
+                localCovariance((vec2(q)+.5)/vec2(uSize));
+    float floorValue = max((pair[0][0]+pair[1][1]+pair[2][2])*1e-6, 1e-12);
+    pair += mat3(floorValue + extra);
+    return max(dot(delta, inverse(pair) * delta),0.0);
+}
+
+mat3 pc3dOutputNoise(vec3 center,vec3 A,vec3 B,mat3 covA,mat3 covB,
+                    mat3 covCenter,float lumaMix) {
+    const vec3 L=vec3(0.25,0.5,0.25);
+    float t=dot(B,L);
+    float denominator=max(1e-6,t);
+    vec3 u=B/denominator;
+    float br=mix(dot(center,L),dot(A,L),lumaMix);
+    mat3 J0=outerProduct(u*(1.0-lumaMix),L);
+    mat3 JA=outerProduct(u*lumaMix,L);
+    mat3 JB=mat3(br/denominator);
+    if(t>=1e-6) JB-=outerProduct(B*(br/(denominator*denominator)),L);
+    vec3 alive=vec3(greaterThan(u*br,vec3(0.0)));
+    mat3 D=mat3(alive.r,0,0, 0,alive.g,0, 0,0,alive.b);
+    J0=D*J0; JA=D*JA; JB=D*JB;
+    mat3 sum=J0*covCenter*transpose(J0)+JA*covA*transpose(JA)+JB*covB*transpose(JB);
+    float count=1.0; // B branch
+    if(lumaMix!=1.0) count+=1.0;
+    if(lumaMix!=0.0) count+=1.0;
+    return count*sum; // arbitrary unknown correlation between branches
 }
 void main() {
     ivec2 mx = uSize - ivec2(1);
@@ -2675,6 +2775,10 @@ void main() {
     vec3 gl = lscAt(xy);
     float glY = dot(gl, LW3);
     float sigY = max(uSigA * noisefactor + uSigB * glY * glY, 0.0000001);
+    if (uLocalNoiseOn != 0) {
+        mat3 cov = localCovariance((vec2(xy) + .5) / vec2(uSize));
+        sigY = max(projectedVariance(cov, LW3), 1e-7);
+    }
     vec3 chromaDiff = (abs(cavg - cinX) + abs(cavg - cinY) +
                        abs(cavg - cinXY) + abs(cavg - cin)) * 0.25;
     chromaDiff *= max(abs(xDelta), abs(yDelta));
@@ -2691,6 +2795,10 @@ void main() {
             float dd = length(abs(c - cin));
             float ww = max(0.0, 1.0 - dd * dd / (dd * dd + sigY))
                      * (1.0 - maskAt(qg));
+            if (uLocalNoiseOn != 0) {
+                float distance = localDistance(c-cin,xy,qg,0.0);
+                ww = (1.0 / (1.0+distance)) * (1.0-maskAt(qg));
+            }
             gref += c * ww;
             gW += ww;
         }
@@ -2700,6 +2808,9 @@ void main() {
     vec3 final_colour2 = cin * kSeed;
     float Z = kSeed;
     float Z2 = kSeed;
+    mat3 centerCovariance = uLocalNoiseOn != 0 ? localCovariance((vec2(xy)+.5)/vec2(uSize)) : mat3(0);
+    mat3 covarianceA = kSeed * centerCovariance;
+    mat3 covarianceB = covarianceA;
     // ⑥ 主循环（:121-152）：对称折叠 —— 一格同时取 4 个象限点，四者共享 f1；
     //    w（sigY 路）与 w2（sigZ 路）各自做「减去四者最小值再归一化」再乘回。
     for (int i = 0; i <= 10; ++i) {
@@ -2719,6 +2830,19 @@ void main() {
                           length(abs(cc2 - cref)), length(abs(cc3 - cref)));
             vec4 w = (1.0 - d * d / (d * d + vec4(sigY)));
             vec4 w2 = (1.0 - d * d / (d * d + vec4(sigZ)));
+            if (uLocalNoiseOn != 0) {
+                vec4 dy = vec4(localDistance(cc0-cref,xy,q0,0.0),
+                               localDistance(cc1-cref,xy,q1,0.0),
+                               localDistance(cc2-cref,xy,q2,0.0),
+                               localDistance(cc3-cref,xy,q3,0.0));
+                float extra = max(sigZ-sigY,0.0);
+                vec4 dz = vec4(localDistance(cc0-cref,xy,q0,extra),
+                               localDistance(cc1-cref,xy,q1,extra),
+                               localDistance(cc2-cref,xy,q2,extra),
+                               localDistance(cc3-cref,xy,q3,extra));
+                w = 1.0 / (vec4(1.0)+dy);
+                w2 = 1.0 / (vec4(1.0)+dz);
+            }
             // 高光样本权重 0（仅首趟）；wm 必须跳过被排除项，否则排除会经
             // (w−wm)/|w−wm| 归一化把其余样本**放大**（135 踩过的坑）。
             vec4 keep = vec4(1.0)
@@ -2740,6 +2864,14 @@ void main() {
             float ut = float(i) * tng.x + float(j) * tng.y;
             float f1 = mix(normpdf(float(i), uKernel) * normpdf(float(j), uKernel),
                            normpdf(ut, uKernel), coh);
+            if (uLocalNoiseOn != 0) {
+                mat3 c0 = localCovariance((vec2(q0)+.5)/vec2(uSize));
+                mat3 c1 = localCovariance((vec2(q1)+.5)/vec2(uSize));
+                mat3 c2 = localCovariance((vec2(q2)+.5)/vec2(uSize));
+                mat3 c3 = localCovariance((vec2(q3)+.5)/vec2(uSize));
+                covarianceA += f1 * (w.x*c0+w.y*c1+w.z*c2+w.w*c3);
+                covarianceB += f1 * (w2.x*c0+w2.y*c1+w2.z*c2+w2.w*c3);
+            }
             final_colour += f1 * mat4x3(cc0, cc1, cc2, cc3) * w;
             final_colour2 += f1 * mat4x3(cc0, cc1, cc2, cc3) * w2;
             Z += dot(vec4(f1), w);
@@ -2775,7 +2907,13 @@ void main() {
     // 真正错的是 136 的 allSat 判据**跨块取值**，把光晕误判成"全饱和"并改写成中性白
     // （见 blockRGB 注释，0.12.141 已修）。高光趋白由 film 的 highlightRolloff 负责，
     // 不在色度降噪里做。
-    oColor = vec4(resColour, 1.0);    oColor = vec4(resColour, 1.0);
+    oColor = vec4(resColour, 1.0);    if (uLocalNoiseOn != 0) {
+        mat3 resultNoise = pc3dOutputNoise(cin, final_colour/Z, final_colour2/Z2,
+            covarianceA/Z, covarianceB/Z2, centerCovariance, uLuma);
+        oNoiseDiag = vec4(resultNoise[0][0], resultNoise[1][1], resultNoise[2][2], 1);
+        oNoiseOff = vec4(resultNoise[1][0], resultNoise[2][0], resultNoise[2][1], 1);
+    } else { oNoiseDiag=vec4(0); oNoiseOff=vec4(0); }
+    oColor = vec4(resColour, 1.0);
 })";
 
 // PC gaussdown（GLUtils.java:246-280，k 倍）—— 尺度结构的入口。5×5 高斯
@@ -3403,7 +3541,9 @@ uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform ivec2 uSize;
 uniform vec2 uTiles;    // mismatch 网格 = 4×tile 网格（cell = 32 mosaic px，v0.10.3）
-uniform vec2 uOffTiles; // 位移场网格（tile 级，采样 off 用）
+uniform vec2 uOffTiles; // 位移场真实尺寸；off1/2/3 的坐标与 clamp 均用此值
+// uTiles is the 4x finer mismatch-cell grid, not the displacement texture size.
+// Using it for off2/3 addressed out of bounds and broke residual/fusion parity.
 uniform float uTileM;   // cell 尺寸（mosaic px，= kMfnrTile/2）
 // C 专项（2026-09-29）：σ² 从常数改为逐像素模型 var(x) = A·x + B（WB 后域）。
 // d = ref − alt 的噪声底 = var(ref) + var(alt) = A·(r+a) + 2B（两独立样本），
@@ -3434,8 +3574,8 @@ vec3 off1At(vec2 uv) {
     vec2 px = uv * uOffTiles - 0.5;
     vec2 fr = fract(px);
     ivec2 i0 = ivec2(floor(px));
-    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
-    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uOffTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uOffTiles) - 1);
     vec3 a = texelFetch(uOff1, lo, 0).rgb;
     vec3 b = texelFetch(uOff1, ivec2(hi.x, lo.y), 0).rgb;
     vec3 c = texelFetch(uOff1, ivec2(lo.x, hi.y), 0).rgb;
@@ -3443,11 +3583,11 @@ vec3 off1At(vec2 uv) {
     return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
 }
 vec3 off2At(vec2 uv) {
-    vec2 px = uv * uTiles - 0.5;
+    vec2 px = uv * uOffTiles - 0.5;
     vec2 fr = fract(px);
     ivec2 i0 = ivec2(floor(px));
-    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
-    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uOffTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uOffTiles) - 1);
     vec3 a = texelFetch(uOff2, lo, 0).rgb;
     vec3 b = texelFetch(uOff2, ivec2(hi.x, lo.y), 0).rgb;
     vec3 c = texelFetch(uOff2, ivec2(lo.x, hi.y), 0).rgb;
@@ -3455,11 +3595,11 @@ vec3 off2At(vec2 uv) {
     return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
 }
 vec3 off3At(vec2 uv) {
-    vec2 px = uv * uTiles - 0.5;
+    vec2 px = uv * uOffTiles - 0.5;
     vec2 fr = fract(px);
     ivec2 i0 = ivec2(floor(px));
-    ivec2 lo = clamp(i0, ivec2(0), ivec2(uTiles) - 1);
-    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uTiles) - 1);
+    ivec2 lo = clamp(i0, ivec2(0), ivec2(uOffTiles) - 1);
+    ivec2 hi = clamp(i0 + ivec2(1), ivec2(0), ivec2(uOffTiles) - 1);
     vec3 a = texelFetch(uOff3, lo, 0).rgb;
     vec3 b = texelFetch(uOff3, ivec2(hi.x, lo.y), 0).rgb;
     vec3 c = texelFetch(uOff3, ivec2(lo.x, hi.y), 0).rgb;
@@ -3480,6 +3620,46 @@ float linSub(highp usampler2D t, ivec2 p, vec2 d) {
     float v11 = linAt(t, min(b + ivec2(2, 2), hi));
     return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
 }
+// Native integer codes decide observability BEFORE interpolation/WB/exposure.
+// UNKNOWN means no comparable motion measurement, never "stationary". The
+// separately admitted Bento short slice does not consume this rejection map.
+bool nativeValid(highp usampler2D raw, ivec2 p) {
+    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, uSize))) return false;
+    int phase = (p.y & 1) * 2 + (p.x & 1);
+    uint limit = uint(ceil(uBlack[phase] + (uWhite - uBlack[phase]) * 0.98));
+    return texelFetch(raw, p, 0).r < limit;
+}
+bool alignedValid(highp usampler2D raw, ivec2 p, vec2 offset) {
+    ivec2 phase = p & ivec2(1);
+    vec2 position = (vec2(p) + offset - vec2(phase)) * 0.5;
+    vec2 maxGrid = vec2((uSize - 1 - phase) / 2);
+    if (any(lessThan(position, vec2(0.0))) || any(greaterThan(position, maxGrid))) return false;
+    ivec2 base = phase + ivec2(floor(position)) * 2;
+    vec2 f = fract(position);
+    if (!nativeValid(raw, base)) return false;
+    if (f.x > 0.0 && !nativeValid(raw, base + ivec2(2, 0))) return false;
+    if (f.y > 0.0 && !nativeValid(raw, base + ivec2(0, 2))) return false;
+    if (f.x > 0.0 && f.y > 0.0 && !nativeValid(raw, base + ivec2(2, 2))) return false;
+    return true;
+}
+void comparePair(highp usampler2D raw, ivec2 p, vec2 offset, float scale,
+                 float gainRatio, float reference, float shot, float read,
+                 inout float sumSquared, inout float sumVariance,
+                 inout float pairs, inout vec4 phases) {
+    if (!nativeValid(uRaw0, p) || !alignedValid(raw, p, offset)) return;
+    float value = frameLin(linSub(raw, p, offset), scale);
+    float delta = reference - value;
+    sumSquared += delta * delta;
+    float s0 = uFrameScale.x;
+    sumVariance += shot * (reference * s0 + value * scale) +
+        read * (uGainRatio.x * uGainRatio.x * s0 * s0 + gainRatio * gainRatio * scale * scale);
+    pairs += 1.0;
+    phases[(p.y & 1) * 2 + (p.x & 1)] += 1.0;
+}
+float observedMismatch(float residual, float variance, float pairs, vec4 phases) {
+    if (pairs < 4.0 || any(lessThan(phases, vec4(1.0)))) return 1.0;
+    return residual / (residual + uS * max(variance, 1e-12));
+}
 void main() {
     ivec2 t = ivec2(gl_FragCoord.xy);
     // cell 中心 → 整图 uv → 采样所属 tile（uOffTiles 网格）的位移。
@@ -3496,47 +3676,32 @@ void main() {
     ivec2 base = t * int(uTileM);
     int cm = int(uTileM);
     float s1 = 0.0, s2 = 0.0, s3 = 0.0;
-    float va1 = 0.0, va2 = 0.0, va3 = 0.0;  // 逐点噪声底 var(ref)+var(alt)
-    float n = 0.0;
+    float v1 = 0.0, v2 = 0.0, v3 = 0.0;
+    float n1 = 0.0, n2 = 0.0, n3 = 0.0;
+    vec4 phases1 = vec4(0), phases2 = vec4(0), phases3 = vec4(0);
+    // Preserve spatial sampling density per CFA phase. The former stride-4
+    // loop sampled one green lattice only and could miss real R/B motion.
     for (int dy = 0; dy < cm; dy += 4) {
         for (int dx = 0; dx < cm; dx += 4) {
-            ivec2 p = base + ivec2(dx, dy);
-            if (p.x >= uSize.x || p.y >= uSize.y) continue;
-            int ch = chanAt(p);
-            float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
-            float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
-            float r = frameLin(linAt(uRaw0, p), uFrameScale.x);
-            float a1 = frameLin(linSub(uRaw1, p, o1), uFrameScale.y);
-            float a2 = frameLin(linSub(uRaw2, p, o2), uFrameScale.z);
-            float a3 = frameLin(linSub(uRaw3, p, o3), uFrameScale.w);
-            float d1 = r - a1;
-            float d2 = r - a2;
-            float d3 = r - a3;
-            s1 += d1 * d1;
-            s2 += d2 * d2;
-            s3 += d3 * d3;
-            // var(r)+var(a_z) = A·r'+B·(gr0·s0)² + A·a'+B·(gr_z·s_z)²
-            // （σ²=A·x_raw+B 归一 ×s 后的展开；r'/a' 已是归一域值）。
-            // 0.12.83：旧式 A·(r+a)+2B 是 s=1/gr=1 特例 —— 长帧（gr≈9.3）的
-            // 读噪声低估 → 残差被判"运动"整帧回退。与 DFT 同一公式。
-            float g0 = uGainRatio.x;
-            float sr0 = uFrameScale.x;
-            float b0t = bv * g0 * g0 * sr0 * sr0;
-            float g1 = uGainRatio.y, s1s = uFrameScale.y;
-            float g2 = uGainRatio.z, s2s = uFrameScale.z;
-            float g3 = uGainRatio.w, s3s = uFrameScale.w;
-            va1 += av * (r * sr0 + a1 * s1s) + b0t + bv * g1 * g1 * s1s * s1s;
-            va2 += av * (r * sr0 + a2 * s2s) + b0t + bv * g2 * g2 * s2s * s2s;
-            va3 += av * (r * sr0 + a3 * s3s) + b0t + bv * g3 * g3 * s3s * s3s;
-            n += 1.0;
+            for (int phase = 0; phase < 4; ++phase) {
+                ivec2 p = base + ivec2(dx + (phase & 1), dy + (phase >> 1));
+                if (any(greaterThanEqual(p, uSize))) continue;
+                int color = chanAt(p);
+                float shot = color == 0 ? uNoiseA.x : (color == 1 ? uNoiseA.y : uNoiseA.z);
+                float read = color == 0 ? uNoiseB.x : (color == 1 ? uNoiseB.y : uNoiseB.z);
+                float r = frameLin(linAt(uRaw0, p), uFrameScale.x);
+                comparePair(uRaw1, p, o1, uFrameScale.y, uGainRatio.y, r, shot, read,
+                            s1, v1, n1, phases1);
+                comparePair(uRaw2, p, o2, uFrameScale.z, uGainRatio.z, r, shot, read,
+                            s2, v2, n2, phases2);
+                comparePair(uRaw3, p, o3, uFrameScale.w, uGainRatio.w, r, shot, read,
+                            s3, v3, n3, phases3);
+            }
         }
     }
-    float inv = 1.0 / max(n, 1.0);
-    float v1 = s1 * inv, v2 = s2 * inv, v3 = s3 * inv;
-    float kk1 = uS * max(va1 * inv, 1e-12);
-    float kk2 = uS * max(va2 * inv, 1e-12);
-    float kk3 = uS * max(va3 * inv, 1e-12);
-    oColor = vec4(v1 / (v1 + kk1), v2 / (v2 + kk2), v3 / (v3 + kk3), 1.0);
+    oColor = vec4(observedMismatch(s1, v1, n1, phases1),
+                  observedMismatch(s2, v2, n2, phases2),
+                  observedMismatch(s3, v3, n3, phases3), 1.0);
 })";
 
 // kFsRawDenoiseFused：P0 同色 bilateral 的 MFNR 变体——输入换成 tex_fused_
@@ -3553,6 +3718,9 @@ uniform int uCfaLut;
 // C 专项：σ²(x) = A·x + B（同 kFsRawDenoise；融合输入的系数已 ÷neff）
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
+uniform highp sampler2D uMergedNoise;
+uniform int uMergedNoiseOn;
+uniform float uNoiseStrength;
 uniform float uMix;   // v0.10.108：强度<1 的输出混合（σ 恒为真实噪声）
 // ── v0.10.167 值域保护（HR 前置的必备件）────────────────────────────────
 // HR（RAW 域 opposed）的输出是 scene-referred、**不钳到 1**（饱和像素被重建抬到
@@ -3592,7 +3760,7 @@ void main() {
     // 判据用 `> 1` 而不是 mask：本域中性白 ≡ 1.0、任何通道的满阱都 ≥ 1.0，
     // 真测量的归一化值不可能超过 1（kNoDn 路径同样成立）。
     // 中心是重建值 ⇒ 整块区域都是合成值，直接输出、不做邻域运算。
-    if (c0 > 1.0 ||
+    if ((uMergedNoiseOn == 0 && c0 > 1.0) ||
         (uSatMaskOn > 0 && texelFetch(uSatMask, p, 0).r > 0.5)) {
         int chh = chanAt(p);
         oColor = vec4(chh == 0 ? c0 : 0.0, chh == 1 ? c0 : 0.0,
@@ -3604,7 +3772,8 @@ void main() {
     int ch = chanAt(p);
     float av = ch == 0 ? uNoiseA.x : (ch == 1 ? uNoiseA.y : uNoiseA.z);
     float bv = ch == 0 ? uNoiseB.x : (ch == 1 ? uNoiseB.y : uNoiseB.z);
-    float sr2 = av * w0 + bv;
+    float variance0 = uMergedNoiseOn != 0 ? texelFetch(uMergedNoise, p, 0).r : 0.0;
+    float sr2 = uMergedNoiseOn != 0 ? variance0 * uNoiseStrength : av * w0 + bv;
     if (sr2 > 1e-12) {
         float sr = sqrt(sr2);
         float wsum = 1.0, acc = c0;
@@ -3614,8 +3783,12 @@ void main() {
                 float c = fused0(p + ivec2(dx, dy));
                 // 重建值（>1）既无噪声也不是测量，权重恒 0（否则 wAt 把它钳到
                 // 1.0 ⇒ d=0 ⇒ **最高权重**混进真实测量值旁边）。
-                if (c > 1.0) continue;
-                float d = (wAt(c) - w0) / sr;
+                if (uMergedNoiseOn == 0 && c > 1.0) continue;
+                float varianceSample = uMergedNoiseOn != 0
+                    ? texelFetch(uMergedNoise, clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1), 0).r : 0.0;
+                float sigmaPair = uMergedNoiseOn != 0
+                    ? sqrt(max((variance0 + varianceSample) * uNoiseStrength, 1e-12)) : sr;
+                float d = (wAt(c) - w0) / sigmaPair;
                 float w = exp(-0.5 * d * d
                               - 0.5 * float(dx * dx + dy * dy) / 6.48);
                 acc += w * c;   // 信号用原值（wAt 只进权重）
@@ -5266,7 +5439,11 @@ void main() {
     //   粉色物体上的镜面高光其参考场本身偏粉（hlRgG 1.1+）⇒ 不满足 ⇒ 保持原样
     //   （0.12.171 停 chroma 要护的正是它）。chroma 补偿维持停用：WK 域实测它会把
     //   该场景的 G 顶到 1.55（R/G 0.84、偏绿），量级远超真实缺口 0.08。
-    if (uGRecon <= 0.5) {
+    // A/B: the custom neutral-core rewrite is the cloud gray-spot suspect.
+    // The reference opposed path above remains active; do not neutralize
+    // partially saturated cloud/petal highlights until a phase-preserving
+    // reconstruction is available.
+    if (false && uGRecon <= 0.5) {
         // 先做便宜的块内饱和度判定（4 次 fetch）；只有确有通道到满阱才查参考场
         //（refRatiosW 是三级纹理读，不能对全图每个像素付这个成本）。
         float Rn, Gn, Bn;
@@ -10094,6 +10271,38 @@ void FrameRenderer::release() {
   if (prog_mfnr_pyr_) glDeleteProgram(prog_mfnr_pyr_);
   if (prog_mfnr_down_) glDeleteProgram(prog_mfnr_down_);
   if (prog_mfnr_fuse_) glDeleteProgram(prog_mfnr_fuse_);
+  if (prog_highlight_merge_) glDeleteProgram(prog_highlight_merge_);
+  prog_highlight_merge_ = 0;
+  if (prog_highlight_resolve_) glDeleteProgram(prog_highlight_resolve_);
+  prog_highlight_resolve_ = 0;
+  if (prog_highlight_noise_) glDeleteProgram(prog_highlight_noise_);
+  prog_highlight_noise_ = 0;
+  if (fbo_highlight_cov_) glDeleteFramebuffers(1, &fbo_highlight_cov_);
+  if (tex_highlight_cov_diag_) glDeleteTextures(1, &tex_highlight_cov_diag_);
+  if (tex_highlight_cov_off_) glDeleteTextures(1, &tex_highlight_cov_off_);
+  fbo_highlight_cov_ = tex_highlight_cov_diag_ = tex_highlight_cov_off_ = 0;
+  highlight_cov_w_ = highlight_cov_h_ = 0;
+  if (prog_highlight_noise_down_) glDeleteProgram(prog_highlight_noise_down_);
+  if (prog_highlight_noise_up_) glDeleteProgram(prog_highlight_noise_up_);
+  prog_highlight_noise_down_ = prog_highlight_noise_up_ = 0;
+  for (int slot = 0; slot < 4; ++slot) {
+    if (highlight_filter_fbo_[slot]) glDeleteFramebuffers(1, &highlight_filter_fbo_[slot]);
+    glDeleteTextures(2, highlight_filter_cov_[slot]);
+    highlight_filter_fbo_[slot] = 0;
+    highlight_filter_cov_[slot][0] = highlight_filter_cov_[slot][1] = 0;
+    highlight_filter_w_[slot] = highlight_filter_h_[slot] = 0;
+  }
+  if (tex_highlight_rgb_) glDeleteTextures(1, &tex_highlight_rgb_);
+  if (fbo_highlight_rgb_) glDeleteFramebuffers(1, &fbo_highlight_rgb_);
+  tex_highlight_rgb_ = fbo_highlight_rgb_ = 0;
+  highlight_rgb_w_ = highlight_rgb_h_ = 0;
+  for (GLuint* tex : {&tex_highlight_flow_, &tex_highlight_mask_, &tex_highlight_linear_, &tex_highlight_noise_}) {
+    if (*tex) glDeleteTextures(1, tex);
+    *tex = 0;
+  }
+  highlight_short_index_ = -1;
+  highlight_merge_ready_ = false;
+  highlight_noise_w_ = highlight_noise_h_ = 0;
   if (prog_mfnr_mis_) glDeleteProgram(prog_mfnr_mis_);
   if (prog_raw_dn_fused_) glDeleteProgram(prog_raw_dn_fused_);
   if (prog_raw_dn_ts_) glDeleteProgram(prog_raw_dn_ts_);
@@ -11458,7 +11667,10 @@ void FrameRenderer::passRaw(int dst_w, int dst_h, int rot, int cfa,
   glActiveTexture(GL_TEXTURE0);
   // ccm 数组是行主序（ColorSpaceTransform 语义），GL 按列主序读取——必须 transpose，
   // 否则实际作用转置矩阵 → 严重偏色（v0.5.20 样张全局品红的根因）
-  glUniformMatrix3fv(u_raw_.ccm, 1, GL_TRUE, ccm);
+  // GLES requires transpose=FALSE; convert the capture's row-major matrix
+  // explicitly rather than relying on a driver accepting an illegal transpose.
+  const float ccm_columns[9] = {ccm[0],ccm[3],ccm[6],ccm[1],ccm[4],ccm[7],ccm[2],ccm[5],ccm[8]};
+  glUniformMatrix3fv(u_raw_.ccm, 1, GL_FALSE, ccm_columns);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -11885,6 +12097,15 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_dn_);
   glViewport(0, 0, dst_w, dst_h);
   glUseProgram(prog_chroma_dn_);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? (dbg_pc3d_on_ ? highlight_filter_cov_[3][0] : tex_highlight_cov_diag_) : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_chroma_dn_, "uLocalVariance"), 6);
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? (dbg_pc3d_on_ ? highlight_filter_cov_[3][1] : tex_highlight_cov_off_) : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_chroma_dn_, "uLocalCovariance"), 7);
+    glUniform1i(glGetUniformLocation(prog_chroma_dn_, "uLocalNoiseOn"), highlight_merge_ready_ ? 1 : 0);
+    glUniform1f(glGetUniformLocation(prog_chroma_dn_, "uLocalNoiseScale"), 1.f);
+    glActiveTexture(GL_TEXTURE0);
   glActiveTexture(GL_TEXTURE0);
   // v0.10.175：src_tex = 0 时读 tex_scene_（原行为，**逐位不变**）；PC3D 开启时
   // 读 tex_pc3d_（同一域、同一几何，只是多了一层照抄 PC 的降噪）。
@@ -11997,6 +12218,14 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glDrawBuffers(2, bufs2);
   glViewport(0, 0, hw, hh);
   glUseProgram(prog_chroma_down_);
+  glActiveTexture(GL_TEXTURE6);
+  glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? (dbg_pc3d_on_ ? highlight_filter_cov_[3][0] : tex_highlight_cov_diag_) : tex_scene_);
+  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalVariance"),6);
+  glActiveTexture(GL_TEXTURE7);
+  glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? (dbg_pc3d_on_ ? highlight_filter_cov_[3][1] : tex_highlight_cov_off_) : tex_scene_);
+  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalCovariance"),7);
+  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalNoiseOn"),highlight_merge_ready_?1:0);
+  glActiveTexture(GL_TEXTURE0);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
   glUniform1i(u_chroma_down_.tex, 0);
@@ -13458,14 +13687,42 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     return false;   // 分配失败 → 调用方沿用 tex_scene_（照片优先红线）
   }
 
+  if (highlight_merge_ready_) {
+    if (!prog_highlight_noise_down_) {
+      GLuint fs=compileShader(GL_FRAGMENT_SHADER,kFsHighlightNoiseDown);
+      prog_highlight_noise_down_=fs?linkProgram(vs_plain_,fs):0;
+      if(fs)glDeleteShader(fs);
+    }
+    if (!prog_highlight_noise_up_) {
+      GLuint fs=compileShader(GL_FRAGMENT_SHADER,kFsHighlightNoiseUp);
+      prog_highlight_noise_up_=fs?linkProgram(vs_plain_,fs):0;
+      if(fs)glDeleteShader(fs);
+    }
+    if(!prog_highlight_noise_down_||!prog_highlight_noise_up_)return false;
+  }
   const GLenum bufs1[1] = {GL_COLOR_ATTACHMENT0};
   auto runPc3d = [&](GLuint src, GLuint dst_fbo, int w, int h, int ms,
                      float moire, float sA, float sB, GLuint orig,
-                     int mask_on, int down) {
+                     int mask_on, int down, GLuint covDiag, GLuint covOff, int noiseSlot) {
+    if (highlight_merge_ready_ && !ensureHighlightFilterCov(noiseSlot, w, h)) return;
     glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
-    glDrawBuffers(1, bufs1);
+    if (highlight_merge_ready_) {
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, highlight_filter_cov_[noiseSlot][0], 0);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, highlight_filter_cov_[noiseSlot][1], 0);
+      const GLenum targets[] = {GL_COLOR_ATTACHMENT0,GL_COLOR_ATTACHMENT1,GL_COLOR_ATTACHMENT2};
+      glDrawBuffers(3, targets);
+    } else glDrawBuffers(1, bufs1);
     glViewport(0, 0, w, h);
     glUseProgram(prog_pc3d_);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? covDiag : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_pc3d_, "uLocalVariance"), 6);
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, highlight_merge_ready_ ? covOff : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_pc3d_, "uLocalCovariance"), 7);
+    glUniform1i(glGetUniformLocation(prog_pc3d_, "uLocalNoiseOn"), highlight_merge_ready_ ? 1 : 0);
+    glUniform1f(glGetUniformLocation(prog_pc3d_, "uLocalNoiseScale"), 1.f);
+    glActiveTexture(GL_TEXTURE0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, src);
     glUniform1i(u_pc3d_.tex, 0);
@@ -13502,6 +13759,11 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     // 0.13.17：PC3D 平滑趟 = 11×11 核全屏重读纹理（第二趟占 pc3dMs 大头），
     // 单 draw 是长 job ⇒ 16 条条带化，让预览能在条带间插队；像素逐位不变。
     drawStriped(16);
+    if (highlight_merge_ready_) {
+      glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT1,GL_TEXTURE_2D,0,0);
+      glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT2,GL_TEXTURE_2D,0,0);
+      glDrawBuffers(1,bufs1);
+    }
     glActiveTexture(GL_TEXTURE0);
   };
 
@@ -13529,6 +13791,17 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glUniform1f(u_pc3d_down_.sigma, blur / static_cast<float>(stride));
     drawStriped(16);
     glActiveTexture(GL_TEXTURE0);
+    if (highlight_merge_ready_) {
+      if(!ensureHighlightFilterCov(0,lw,lh))return false;
+      glBindFramebuffer(GL_FRAMEBUFFER,highlight_filter_fbo_[0]);
+      glViewport(0,0,lw,lh);glUseProgram(prog_highlight_noise_down_);
+      auto loc=[&](const char* n){return glGetUniformLocation(prog_highlight_noise_down_,n);};
+      glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex_highlight_cov_diag_);glUniform1i(loc("uVariance"),0);
+      glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,tex_highlight_cov_off_);glUniform1i(loc("uCovariance"),1);
+      glUniform2i(loc("uSize"),dst_w,dst_h);glUniform1i(loc("uResize"),scale);
+      glUniform1i(loc("uStride"),stride);glUniform1f(loc("uSigma"),blur/static_cast<float>(stride));
+      drawStriped(16);glActiveTexture(GL_TEXTURE0);
+    }
     // 核尺寸也随缩放后的噪声模型（PC 的 ESD3DRun 重算 MSIZE）
     const double mp1 =
         std::max(static_cast<double>(sigA1 + sigB1) / kPc3dNoiseTarget, 1e-7);
@@ -13539,7 +13812,7 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     if (p.pc3d_msize > 0.f) ms1 = msize;
     // 首趟（低分辨率）：按 mask 排除高光样本 —— 不把高光色度摊进 1/2 域
     runPc3d(tex_pc3d_lo_[0], fbo_pc3d_lo_[1], lw, lh, ms1, 0.0f, sigA1, sigB1,
-            pc_src, 1, scale);
+            pc_src, 1, scale, highlight_filter_cov_[0][0], highlight_filter_cov_[0][1], 1);
     // guided upsample：低分辨率结果 + 全分辨率引导 → tex_pc3d_t1_
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_pc3d_t1_);
     glDrawBuffers(1, bufs1);
@@ -13556,6 +13829,17 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     glUniform1i(u_pc3d_up_.r, scale);
     drawStriped(16);
     glActiveTexture(GL_TEXTURE0);
+    if (highlight_merge_ready_) {
+      if(!ensureHighlightFilterCov(2,dst_w,dst_h))return false;
+      glBindFramebuffer(GL_FRAMEBUFFER,highlight_filter_fbo_[2]);
+      glViewport(0,0,dst_w,dst_h);glUseProgram(prog_highlight_noise_up_);
+      auto loc=[&](const char* n){return glGetUniformLocation(prog_highlight_noise_up_,n);};
+      const GLuint tex[]={tex_pc3d_lo_[1],pc_src,highlight_filter_cov_[1][0],highlight_filter_cov_[1][1],tex_highlight_cov_diag_,tex_highlight_cov_off_};
+      const char* names[]={"uLow","uGuideHi","uLowVariance","uLowCovariance","uGuideVariance","uGuideCovariance"};
+      for(int u=0;u<6;++u){glActiveTexture(GL_TEXTURE0+u);glBindTexture(GL_TEXTURE_2D,tex[u]);glUniform1i(loc(names[u]),u);}
+      glUniform2i(loc("uLowSize"),lw,lh);glUniform2i(loc("uHiSize"),dst_w,dst_h);glUniform1i(loc("uR"),scale);
+      drawStriped(16);glActiveTexture(GL_TEXTURE0);
+    }
     dbg_pc3d_scale_ = scale;
   } else {
     // ── 0.12.145：scale==1 时**这一趟就是唯一的平滑趟**，mask 排除必须同样启用 ──
@@ -13563,13 +13847,13 @@ bool FrameRenderer::passPc3d(int dst_w, int dst_h, const NoiseCoef& nc,
     // 传的是 0 ⇒ 排除从未生效。真机日志（21:25:32）的 `pc3dSc:1` 就是证据：
     // 那一版的光晕宽度完全没有变化。语义与低分辨率首趟一致：只在这一趟排。
     runPc3d(pc_src, fbo_pc3d_t1_, dst_w, dst_h, msize, 0.0f, sigA, sigB,
-            pc_src, 1, 1);
+            pc_src, 1, 1, tex_highlight_cov_diag_, tex_highlight_cov_off_, 2);
   }
   // ⑥ 第二趟（ESD3D2.java:161-162）：全分辨率 + MOIRE = 1.5（伪彩强度逻辑在这里
   //    才真正开火；第一趟 MOIRE = 0 ⇒ sigZ = sigY）。
   // 第二趟（全分辨率）：不排除 —— 保持 132 的降噪强度（亮部色噪不放大）
   runPc3d(tex_pc3d_t1_, fbo_pc3d_, dst_w, dst_h, msize, kPc3dMoire, sigA, sigB,
-          0, 0, 1);
+          0, 0, 1, highlight_filter_cov_[2][0], highlight_filter_cov_[2][1], 3);
 
   dbg_pc3d_on_ = 1;
   dbg_pc3d_m_ = msize;
@@ -13992,7 +14276,10 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniform2i(u_rcd_chroma_.lsc_size, lsc_w_, lsc_h_);
   glActiveTexture(GL_TEXTURE0);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
-  glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_TRUE, ccm);
+  // GLES requires transpose=FALSE; convert the capture's row-major matrix
+  // explicitly rather than relying on a driver accepting an illegal transpose.
+  const float ccm_columns[9] = {ccm[0],ccm[3],ccm[6],ccm[1],ccm[4],ccm[7],ccm[2],ccm[5],ccm[8]};
+  glUniformMatrix3fv(u_rcd_chroma_.ccm, 1, GL_FALSE, ccm_columns);
   // 0.12.133（方案 B 块 1）：RAW 饱和掩码（单元 5，0-4 已被占用）。
   // 未跑 HL 时 uMaskOn=0 ⇒ 逐位回到旧行为（alpha 恒 0，PC3D 不收手）。
   const bool hl_mask_on = (hl_mask_tex_ != 0);
@@ -14099,7 +14386,10 @@ void FrameRenderer::passCcm(int dst_w, int dst_h, const float* ccm, GLuint src) 
   glUniform1i(u_ccm_.tex, 0);
   glUniform2i(u_ccm_.size, dst_w, dst_h);
   // 行主序 CCM 必须 transpose=GL_TRUE（v0.5.20 品红根因，见 passRaw 同款注释）
-  glUniformMatrix3fv(u_ccm_.ccm, 1, GL_TRUE, ccm);
+  // GLES requires transpose=FALSE; convert the capture's row-major matrix
+  // explicitly rather than relying on a driver accepting an illegal transpose.
+  const float ccm_columns[9] = {ccm[0],ccm[3],ccm[6],ccm[1],ccm[4],ccm[7],ccm[2],ccm[5],ccm[8]};
+  glUniformMatrix3fv(u_ccm_.ccm, 1, GL_FALSE, ccm_columns);
   drawStriped(16);   // 0.13.18：全屏 CCM（ccmMs 120~189ms），拆条带让预览插队
 }
 
@@ -14551,7 +14841,7 @@ bool FrameRenderer::submitRaw(const void* raw, int w, int h, int row_stride_px,
   dbg_nn_ok_ = 0; dbg_nn_fail_ = 0; dbg_nn_del_ = "";
   dbg_nn_ms_ = 0.f; dbg_nn_tiles_ = 0; dbg_nn_gain_ = 0.f;
   finishStillChain(c, t0, out_rgba);
-  return true;
+  return still_chain_ok_;
 }
 
 // ── RAW 静拍共享件（v0.9.0 从 submitRaw 抽出，submitRawBurst 复用）────────
@@ -14744,6 +15034,20 @@ void FrameRenderer::denoiseParams(float strength, const NoiseModel& model,
 void FrameRenderer::finishStillChain(const ChainCtx& c,
                                      std::chrono::steady_clock::time_point t0,
                                      std::vector<uint8_t>* out_rgba) {
+  still_chain_ok_ = false;
+  auto stageGl = [&](const char* stage) {
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) Logger::instance().log(LogLevel::kError,"engine","still.stage_gl_error",
+        std::string("{\"stage\":\"")+stage+"\",\"glError\":"+std::to_string(error)+"}");
+    return error == GL_NO_ERROR;
+  };
+  out_rgba->clear();
+
+  if (!c.mfnr_fused) {
+    highlight_merge_ready_ = false;
+    highlight_short_index_ = -1;
+  }
+
   const auto t1 = std::chrono::steady_clock::now();
   const int w = c.w, h = c.h, dst_w = c.dst_w, dst_h = c.dst_h;
   const FilmParams& p = *c.p;
@@ -14844,7 +15148,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       passSatMask(raw_w_, raw_h_, c.effective_rot, c.cfa, c.black_phase,
                   c.white_level, c.gains, c.dn ? c.nc : kNoDn);
     }
-    const bool hr_on = p.hr_raw > 0.5f && !bracket_info_ok;
+    // 0.14.3：RAW 域高光重建**默认关**（FilmParams[45] / prefs "hr_raw" 默认 0）。
+    // 真机 0.14.2 A/B（2026-11-15，云朵场景）：关闭后云朵高光灰斑消失、紫边未回归；
+    // 开着时 hlCnt 达 8 万~12 万，opposed 在 G 满阱先于 R/B 触发 ⇒ 饱和边界出现
+    // 通道台阶，紧跟其后的 P0 bilateral 把它摊成灰斑。开关保持真实生效（关 = 不跑，
+    // 开 = 恢复原链做 A/B），不再用编译期常量硬关 —— 死开关是项目明令禁止的形态。
+    // ⚠ 历史回归面：RAW HL 负责"去马赛克前恢复被裁剪通道"，关闭后大面积过曝区
+    // （逆光窗、灯面、天空）可能出现品红/绿彩边（0.12.1 强制关后即出现过）。本版
+    // 只在云朵/栏杆场景验收，其他高光场景需继续抽样。
+    // Admitted observations already carry measured exposure provenance. Legacy
+    // opposed has no such validity contract and must not rewrite recovered RAW.
+    const bool hr_on = p.hr_raw > 0.5f && !bracket_info_ok && !highlight_merge_ready_;
     // ① P0 前的 mosaic（HR 的输入域）
     //    MFNR：tex_fused_（融合后 R16F 单通道，已扣黑阶+WB）
     //    单帧：无现成中间纹理 ⇒ 先用 kNoDn 的 P0 做一趟纯线性化+WB 展开（无邻域
@@ -14860,6 +15174,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     GLuint fused_src = tex_fused_;
     if (c.mfnr_fused) {
       captureEdgeDumpTexture("mosaic-fused-before-HL", tex_fused_, fbo_fused_, w, h, false, true);
+      // Preserve the actual maps consumed by spatial fusion so clipping loss
+      // can be distinguished from geometric rejection using the same token.
+      captureEdgeDumpTexture("mfnr-weight", tex_w_, fbo_fused_, tiles_w_ * 4, tiles_h_ * 4, true);
+      captureEdgeDumpTexture("mfnr-mismatch", tex_mis_, fbo_fused_, tiles_w_ * 4, tiles_h_ * 4, true);
+      for (int z = 0; z < 3; ++z) {
+        const std::string stage = "mfnr-offset-" + std::to_string(z + 1);
+        captureEdgeDumpTexture(stage.c_str(), tex_off_[z], fbo_fused_, tiles_w_, tiles_h_, false);
+      }
       if (short_val_ok_) captureEdgeDumpTexture("mosaic-short-aligned", tex_short_val_, fbo_short_val_, w, h, false);
     }
     // ── 0.12.135：inpaint **默认不启用**（代码保留，改 true 即回到 A/B 通路）───
@@ -14949,7 +15271,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 同读法 ⇒ kFsNnPack 零改动且域等价：linFused(HR 输出) ≡ linRaw(raw)）。
     // HR 关或失败时保持原输入（tex_fused_ / raw_tex_）。
     bool nn_ok = false;
-    if (c.nn) {
+    if (c.nn && highlight_merge_ready_) {
+      dbg_nn_fail_ = 1;
+      Logger::instance().log(LogLevel::kWarn, "engine", "nn.highlight_domain_unsupported",
+          "{\"fallback\":\"measured_variance_P0\",\"reason\":\"trained_single_exposure_domain\"}");
+    }
+    if (c.nn && !highlight_merge_ready_) {
       NnSrc nsrc;
       if (hr_out != 0) {
         nsrc.fused_tex = hr_out;   // HR 后的 P0 前 mosaic
@@ -14987,7 +15314,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       } else {
       passRawDenoiseFused(w, h, c.cfa, c.black_phase, c.white_level,
                           c.gains, c.dn ? c.nc : kNoDn, nullptr, c.p0_sub, p0_in,
-                          /*allow_ts=*/true, p0_wclamp);
+                          /*allow_ts=*/!highlight_merge_ready_, p0_wclamp);
       }
     } else {
       if (nn_ok) {
@@ -15008,6 +15335,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                        c.dn ? c.nc : kNoDn);
       }
     }
+    if (!stageGl("after_P0")) return;
     captureEdgeDumpTexture("mosaic-after-P0", tex_mos_, fbo_mos_, w, h, false, false);
     // 0.13.6 性能细分：P0（RAW bilateral / 线性化展开）单列。旧口径只有
     // preMs = HR + P0，拆开后才能判断该优化 HR 还是 P0。
@@ -15045,6 +15373,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     const auto d1 = std::chrono::steady_clock::now();
     if (gpu_timers) dir_gpu_ms = static_cast<float>(gpu_dir.endMs());
     if (gpu_timers) gpu_g.begin();
+    if (!stageGl("after_RCD_direction")) return;
     passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
              p.rcd_g_orig);
     glFinish();
@@ -15052,6 +15381,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     if (gpu_timers) g_gpu_ms = static_cast<float>(gpu_g.endMs());
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d_dir0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
+    if (!stageGl("after_RCD_green")) return;
     // ── P3 色度段（v0.10.180 加 [58] 拆双 pass A/B 路径）───────────────────
     // rcdSplit=1：3a 对角段填充（tex_rcd_a_）→ 3b G 位轴向填充（交叉轴 ±1 读
     // 3a 的 STEP4.2 已填充色，恢复原版四正邻双轴估计）——单 pass 版并行读不到
@@ -15079,7 +15409,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                     c.white_level, c.gains, c.ccm, true, p.rcd_cdfix,
                     p.rcd_g_orig);
     }
+    if (!stageGl("after_RCD_chroma")) return;
     }  // !c.amaze：AMaZE 档不走 RCD 三段（D3 由 passAmazeUp 写 tex_work_）
+    // PC source CameraWhite resolve is nonlinear: execute AFTER demosaic in
+    // full RGB, undo/reapply LSC, before channel-warp CA and CCM.
+    if (!passHighlightResolve(dst_w, dst_h, c.effective_rot, c.gains)) return;
+
     // 第 4a 期（S14）：RCD 档的 D3→D4 收口（tex_work_ D3 → tex_scene_ D4）。
     // 必须在 P4（读 tex_scene_）之前；双线性档不经此处（passRaw 内联 CCM）。
     // v0.10.154：本 pass 是 4a 新增的全屏 pass，单独计时入日志（ccmMs）——
@@ -15119,6 +15454,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 诊断统计 D4（CCM 后 / P4 前，场景线性）
     diagStatsTex("D4-scene", tex_scene_, dst_w, dst_h, &p);
     captureEdgeDumpTexture("D4-CCM", tex_scene_, fbo_scene_, dst_w, dst_h, false);
+    if (!passHighlightNoise(dst_w, dst_h, c.effective_rot, c.cfa, c.ccm)) return;
     if (skyDiagOn()) dbg_prof_d4_ = profDump(fbo_scene_, tex_scene_, dst_w, dst_h);  // 0.12.164 诊断
     // ── HDR 融合 P2（0.12.78）：侧帧前链 + zero/侧帧 Mertens 融合 ────────
     // 位置 = D4 之后、P4/PC3D/defringe 之前（设计 §4.3：融合后的整图再统一
@@ -15390,11 +15726,17 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // (132,151,181)；(286,866) 由中性灰 (147,151,152) 变成 (138,147,186)），
       // 全图过冲像素数反而从 932 升到 1209。根因 = 后置的替换值取"最中性探测点"
       // 的色差，而该点落在**蓝色背景**上时就把蓝色**搬进了中性区**。
-      // df_src 优先级：PC3D 输出 > 前置结果 > D4 原图。
-      GLuint df_src = pc3d_ok ? tex_pc3d_
-                    : (cm_src ? cm_src : (cs_ok ? tex_cs_ : tex_scene_));
+      // df_src 优先级：PC3D 输出 > 前置结果 > D4 原图（0.14.3 起 df_src 只供
+      // 下线后的 A/B 恢复使用，生产链 df_ok 恒 false ⇒ 不定义变量，避免死值）。
+      // 0.14.3：当前 RGB 品红判据**已从生产成片链下线**（开关随之删除），原因：
+      // ① 它偏离一手实现（RT/darktable 是 Lab 残差 + 高斯基线 + 邻域实测色度加权），
+      //    用 min(R−G,B−G) + 局部 std + 固定 k_desat=0.12，命中后一律去色 88%；
+      // ② 真机实测它会误伤真实粉色花瓣（0.14.0 样片），且去色边界留绿边；
+      // ③ 关闭后 0.14.1/0.14.2 两批样片（栏杆紫边、云朵、花瓣）均无紫边复现。
+      // 代码与本函数保留作 A/B 通路（不预删铁律），恢复时按完整 Lab 算法重写，
+      // 不要再打标量门控补丁。
       dbg_cs_on_ = cs_ok ? 1 : 0;
-      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
+      df_ok = false;
     } else {
       passChromaDenoise(dst_w, dst_h, c.effective_rot, c.nc, c.p->moire,
                         p.chroma_gate, p.cg_scope, p4_src);
@@ -15405,8 +15747,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       // v0.10.196：色差域中值（同替换档，输入为 P4 输出 tex_dn_）
       // v0.10.205：color_smooth 已前置（PC3D 之前）；叠加档下 P4 已吃它的输出
       // （p4_src = tex_pc3d_，而 PC3D 读 tex_cs_）⇒ 此处不重复。
-      GLuint df_src = tex_dn_;
-      df_ok = (p.defringe > 0.5f) ? passDefringe(dst_w, dst_h, p.df_gate, df_src) : false;
+      // 同替换档：生产链不跑当前 RGB 品红判据（原因见上一分支注释）。
+      df_ok = false;
       // D 专项（v0.10.53）：多尺度色度降噪（4-32px 色斑）。失败则保持 P4 输出
       mst_ok = passChromaMultiScale(dst_w, dst_h, c.nc,
                                     df_ok ? tex_df_ : tex_dn_, p.chroma_gate);
@@ -15715,6 +16057,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   out_rgba->resize(static_cast<size_t>(dst_w) * dst_h * 4);
   glReadPixels(0, 0, dst_w, dst_h, outputReadFormatOf(c.ten_bit),
                outputReadTypeOf(c.ten_bit), out_rgba->data());
+  still_chain_ok_ = glGetError() == GL_NO_ERROR;
+
   rb_ms = elMs(t_rb0, std::chrono::steady_clock::now());
   // 诊断统计 D5（最终成片，基准；零 GL 调用的 CPU 侧统计）。
   // ⚠ 卡 H2：该统计的口径是 **u8**（逐字节 /255 的直方图/均值），10bit 档下字节流是
@@ -16309,6 +16653,215 @@ void FrameRenderer::passMfnrDown(GLuint src, GLuint fbo, int sw, int sh) {
   glUniform1i(u_mfnr_down_.tex, 0);
   glUniform2i(u_mfnr_down_.size, sw, sh);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+bool FrameRenderer::ensureHighlightFilterCov(int slot, int width, int height) {
+  if (slot < 0 || slot >= 4 || width <= 0 || height <= 0) return false;
+  if (highlight_filter_fbo_[slot] && highlight_filter_w_[slot] == width &&
+      highlight_filter_h_[slot] == height) return true;
+  if (highlight_filter_fbo_[slot]) glDeleteFramebuffers(1, &highlight_filter_fbo_[slot]);
+  glDeleteTextures(2, highlight_filter_cov_[slot]);
+  glGenFramebuffers(1, &highlight_filter_fbo_[slot]);
+  glBindFramebuffer(GL_FRAMEBUFFER, highlight_filter_fbo_[slot]);
+  glGenTextures(2, highlight_filter_cov_[slot]);
+  for (int channel = 0; channel < 2; ++channel) {
+    glBindTexture(GL_TEXTURE_2D, highlight_filter_cov_[slot][channel]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0+channel, GL_TEXTURE_2D,
+        highlight_filter_cov_[slot][channel], 0);
+  }
+  const GLenum attachments[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+  glDrawBuffers(2, attachments);
+  const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  highlight_filter_w_[slot] = width; highlight_filter_h_[slot] = height;
+  return complete;
+}
+
+bool FrameRenderer::passHighlightNoise(int width, int height, int rotation,
+                                       int cfa, const float* ccm) {
+  if (!highlight_merge_ready_) return true;
+  if (!prog_highlight_noise_) {
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFsHighlightNoise);
+    if (!fs) return false;
+    prog_highlight_noise_ = linkProgram(vs_rot_, fs);
+    glDeleteShader(fs);
+    if (!prog_highlight_noise_) return false;
+  }
+  if (width != highlight_cov_w_ || height != highlight_cov_h_ || !fbo_highlight_cov_) {
+    if (fbo_highlight_cov_) glDeleteFramebuffers(1, &fbo_highlight_cov_);
+    if (tex_highlight_cov_diag_) glDeleteTextures(1, &tex_highlight_cov_diag_);
+    if (tex_highlight_cov_off_) glDeleteTextures(1, &tex_highlight_cov_off_);
+    glGenFramebuffers(1, &fbo_highlight_cov_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_highlight_cov_);
+    GLuint* textures[] = {&tex_highlight_cov_diag_, &tex_highlight_cov_off_};
+    for (int i = 0; i < 2; ++i) {
+      glGenTextures(1, textures[i]); glBindTexture(GL_TEXTURE_2D, *textures[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, *textures[i], 0);
+    }
+    highlight_cov_w_ = width; highlight_cov_h_ = height;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_highlight_cov_);
+  const GLenum targets[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+  glDrawBuffers(2, targets);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+  glViewport(0, 0, width, height); glUseProgram(prog_highlight_noise_);
+  auto loc = [&](const char* name) { return glGetUniformLocation(prog_highlight_noise_, name); };
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  glUniformMatrix4fv(loc("uST"), 1, GL_FALSE, identity);
+  glUniform1i(loc("uRot"), rotation); glUniform2f(loc("uScale"), 1.f, 1.f);
+  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_highlight_noise_);
+  glUniform1i(loc("uNoise"), 0);
+  glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+  glUniform1i(loc("uLsc"), 1);
+  glUniform2i(loc("uRawSize"), raw_w_, raw_h_);
+  glUniform2i(loc("uLscSize"), lsc_w_, lsc_h_);
+  glUniform1i(loc("uCfaLut"), cfaLutOf(cfa));
+  const float column_major[9] = {ccm[0], ccm[3], ccm[6], ccm[1], ccm[4],
+                                  ccm[7], ccm[2], ccm[5], ccm[8]};
+  glUniformMatrix3fv(loc("uCcm"), 1, GL_FALSE, column_major);
+  drawStriped(16);
+  GLenum result = glGetError();
+  glActiveTexture(GL_TEXTURE0);
+  return result == GL_NO_ERROR;
+}
+
+bool FrameRenderer::passHighlightResolve(int width, int height, int rotation,
+                                         const float gains[3]) {
+  if (!highlight_merge_ready_) return true;
+  auto check = [&](const char* stage) {
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) Logger::instance().log(LogLevel::kError, "engine", "highlight.resolve_error",
+        std::string("{\"stage\":\"") + stage + "\",\"glError\":" + std::to_string(error) + "}");
+    return error == GL_NO_ERROR;
+  };
+  if (!check("input_after_demosaic")) return false;
+  if (!prog_highlight_resolve_) {
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFsHighlightResolve);
+    if (!fs) return false;
+    prog_highlight_resolve_ = linkProgram(vs_plain_, fs);
+    glDeleteShader(fs);
+    if (!prog_highlight_resolve_) return false;
+  }
+  if (!tex_highlight_rgb_ || width != highlight_rgb_w_ || height != highlight_rgb_h_) {
+    if (tex_highlight_rgb_) glDeleteTextures(1, &tex_highlight_rgb_);
+    if (fbo_highlight_rgb_) glDeleteFramebuffers(1, &fbo_highlight_rgb_);
+    makeTex(&tex_highlight_rgb_, &fbo_highlight_rgb_, GL_RGBA16F, width, height);
+    highlight_rgb_w_ = width; highlight_rgb_h_ = height;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_highlight_rgb_);
+  const GLenum framebufferStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  if (framebufferStatus != GL_FRAMEBUFFER_COMPLETE) {
+    Logger::instance().log(LogLevel::kError, "engine", "highlight.resolve_fbo",
+        "{\"status\":"+std::to_string(framebufferStatus)+"}");
+    return false;
+  }
+  glViewport(0, 0, width, height);
+  glUseProgram(prog_highlight_resolve_);
+  auto loc = [&](const char* name) { return glGetUniformLocation(prog_highlight_resolve_, name); };
+  const GLuint textures[] = {tex_work_, tex_highlight_mask_, lsc_tex_};
+  const char* names[] = {"uTex", "uBentoMask", "uLsc"};
+  for (int i = 0; i < 3; ++i) {
+    glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, textures[i]);
+    glUniform1i(loc(names[i]), i);
+  }
+  glUniform2i(loc("uDstSize"), width, height);
+  glUniform2i(loc("uRawSize"), raw_w_, raw_h_);
+  glUniform1i(loc("uRot"), rotation);
+  glUniform2i(loc("uLscSize"), lsc_w_, lsc_h_);
+  glUniform3fv(loc("uCameraWhite"), 1, highlight_camera_white_);
+  glUniform3fv(loc("uGain"), 1, gains);
+  glUniform1f(loc("uReferenceScale"), highlight_reference_scale_);
+  glUniform1f(loc("uShortScale"), highlight_short_scale_);
+  glUniform1i(loc("uHasShort"), highlight_short_index_ >= 1 ? 1 : 0);
+  drawStriped(16);
+  if (!check("draw")) return false;
+  // CA consumes tex_work_. Copy back only after independent RGB resolve completes.
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_highlight_rgb_);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_work_);
+  glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_work_);
+  glActiveTexture(GL_TEXTURE0);
+  return check("copy_back");
+}
+
+bool FrameRenderer::passHighlightMerge(int w, int h, int cfa,
+    const float black[4], float white, const float gains[3], const float scales[4]) {
+  if (!highlight_merge_ready_ || !tex_highlight_mask_ || !tex_highlight_flow_ ||
+      !tex_highlight_linear_) return false;
+  if (!prog_highlight_merge_) {
+    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFsHighlightMerge);
+    if (!fs) return false;
+    prog_highlight_merge_ = linkProgram(vs_plain_, fs);
+    glDeleteShader(fs);
+    if (!prog_highlight_merge_) return false;
+  }
+  while (glGetError() != GL_NO_ERROR) {}
+  if (!tex_highlight_noise_ || highlight_noise_w_ != w || highlight_noise_h_ != h) {
+    if (tex_highlight_noise_) glDeleteTextures(1, &tex_highlight_noise_);
+    glGenTextures(1, &tex_highlight_noise_);
+    glBindTexture(GL_TEXTURE_2D, tex_highlight_noise_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    highlight_noise_w_ = w; highlight_noise_h_ = h;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex_highlight_noise_, 0);
+  const GLenum targets[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+  glDrawBuffers(2, targets);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+  glViewport(0, 0, w, h);
+  glUseProgram(prog_highlight_merge_);
+  const GLuint textures[] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2],
+      tex_off_[0], tex_off_[1], tex_off_[2], tex_w_,
+      tex_highlight_flow_, tex_highlight_mask_, tex_highlight_linear_};
+  const char* samplers[] = {"uRaw0", "uRaw1", "uRaw2", "uRaw3", "uOff1", "uOff2",
+      "uOff3", "uW", "uBentoFlow", "uBentoMask", "uLinearMask"};
+  for (int unit = 0; unit < 11; ++unit) {
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, textures[unit]);
+    glUniform1i(glGetUniformLocation(prog_highlight_merge_, samplers[unit]), unit);
+  }
+  auto loc = [&](const char* name) { return glGetUniformLocation(prog_highlight_merge_, name); };
+  glUniform2i(loc("uSize"), w, h);
+  glUniform2f(loc("uTiles"), static_cast<float>(tiles_w_), static_cast<float>(tiles_h_));
+  glUniform1i(loc("uCfaLut"), cfaLutOf(cfa));
+  glUniform4fv(loc("uBlack"), 1, black);
+  glUniform1f(loc("uWhite"), white);
+  glUniform3fv(loc("uGain"), 1, gains);
+  glUniform4fv(loc("uFrameScale"), 1, scales);
+  glUniform1i(loc("uShortIndex"), highlight_short_index_);
+  glUniform4fv(loc("uKernelSigma"), 1, highlight_kernel_sigma_);
+  glUniform4fv(loc("uGlobalWeight"), 1, highlight_global_weight_);
+  glUniform3fv(loc("uNoiseShot"), 1, highlight_noise_shot_);
+  glUniform3fv(loc("uNoiseRead"), 1, highlight_noise_read_);
+  glUniform4fv(loc("uNoiseGainRatio"), 1, highlight_noise_gain_);
+  drawStriped(16);
+  const GLenum error = glGetError();
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+  const GLenum only = GL_COLOR_ATTACHMENT0;
+  glDrawBuffers(1, &only);
+  glActiveTexture(GL_TEXTURE0);
+  if (error != GL_NO_ERROR) {
+    Logger::instance().log(LogLevel::kError, "engine", "highlight.merge_failed",
+        "{\"glError\":" + std::to_string(error) + "}");
+    return false;
+  }
+  Logger::instance().log(LogLevel::kInfo, "engine", "highlight.merge",
+      "{\"path\":\"native_bayer\",\"shortIndex\":" +
+      std::to_string(highlight_short_index_) + ",\"domain\":\"reference_radiance\"}");
+  return true;
 }
 
 void FrameRenderer::passMfnrFuse(int w, int h, int cfa,
@@ -17210,6 +17763,14 @@ void FrameRenderer::passRawDenoiseFused(int w, int h, int cfa,
     return;
   }
   glUseProgram(prog_raw_dn_fused_);
+  const bool measuredNoise = highlight_merge_ready_ && tex_highlight_noise_ != 0 && nc.k_p0 > 0.f;
+  glActiveTexture(GL_TEXTURE7);
+  glBindTexture(GL_TEXTURE_2D, measuredNoise ? tex_highlight_noise_ : tex_fused_);
+  glUniform1i(glGetUniformLocation(prog_raw_dn_fused_, "uMergedNoise"), 7);
+  glUniform1i(glGetUniformLocation(prog_raw_dn_fused_, "uMergedNoiseOn"), measuredNoise ? 1 : 0);
+  const float strengthVariance = std::max(1.f, nc.k_p0) * std::max(1.f, nc.k_p0);
+  glUniform1f(glGetUniformLocation(prog_raw_dn_fused_, "uNoiseStrength"), strengthVariance);
+  glActiveTexture(GL_TEXTURE0);
   glActiveTexture(GL_TEXTURE0);
   // v0.10.102：NN 直读展开时输入 = tex_nn_fused_（PMRID 输出，与 tex_fused_
   // 同域同格式 —— 线性 mosaic、已扣黑阶 + WB）
@@ -18267,6 +18828,154 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
                  std::chrono::steady_clock::now() - t0)
                  .count();
 
+  // Complete highlight admission is separate from temporal mismatch. A clipped
+  // reference is unobservable, not a motion measurement. Transfer only verified
+  // collar flow, then assess the selected short over the whole frame.
+  highlight_merge_ready_ = false;
+  highlight_short_index_ = -1;
+  if (satfix_on && frame_scale[short_idx] > 1.001f) {
+    HighlightRawView base_view;
+    base_view.data = static_cast<const uint16_t*>(frames[0]);
+    base_view.width = w; base_view.height = h;
+    base_view.stride = row_strides_px[0]; base_view.white = wl;
+    base_view.cfaLut = static_cast<unsigned>(cfaLutOf(cfa));
+    HighlightRawView short_view = base_view;
+    short_view.data = static_cast<const uint16_t*>(frames[short_idx]);
+    short_view.stride = row_strides_px[short_idx];
+    HighlightNoise base_noise, short_noise;
+    for (int phase = 0; phase < 4; ++phase) {
+      base_view.black_phase[phase] = short_view.black_phase[phase] = black_phase[phase];
+      const int color = (base_view.cfaLut >> (2 * phase)) & 3;
+      base_noise.shot[phase] = model.S[color];
+      base_noise.read[phase] = model.O[color];
+      short_noise.shot[phase] = model.S[color] * hdr_gain_4[short_idx];
+      short_noise.read[phase] = model.O[color] * hdr_gain_4[short_idx] * hdr_gain_4[short_idx];
+    }
+    HighlightGuideSet guides;
+    std::string admission_error;
+    const auto admission_start = std::chrono::steady_clock::now();
+    const bool guides_ok = highlightGenerateGuides(base_view, short_view,
+        {rc.gains[0], rc.gains[1], rc.gains[2]}, frame_scale[0], frame_scale[short_idx],
+        base_noise, short_noise, &guides, &admission_error);
+    HighlightGeometryResult geometry;
+    HighlightMaskAssessment assessment;
+    const int stride = 8;  // PC admission/MergeBayer grid: eight Bayer quads.
+    const int gw = (guides.base.width + stride - 1) / stride;
+    const int gh = (guides.base.height + stride - 1) / stride;
+    if (guides_ok) {
+      // The temporal A/B preference may skip L1; it must not silently lower the
+      // fixed eight-quad highlight solver to a coarser observation domain.
+      auto readFine = [&](MfnrPyramid* pyramid) {
+        if (!pyramid->l1.empty()) return;
+        std::vector<uint8_t> rgba(static_cast<size_t>(pyr1_w_) * pyr1_h_ * 4);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_pyr1_);
+        glReadPixels(0, 0, pyr1_w_, pyr1_h_, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        pyramid->l1.resize(static_cast<size_t>(pyr1_w_) * pyr1_h_);
+        for (size_t k = 0; k < pyramid->l1.size(); ++k) pyramid->l1[k] = rgba[k * 4];
+        pyramid->w1 = pyr1_w_; pyramid->h1 = pyr1_h_;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      };
+      MfnrPyramid highlight_ref = ref;
+      if (highlight_ref.l1.empty()) {
+        passMfnrPyr(raw_tex_, cfa, black_phase, wl, rc.gains, frame_scale[0]);
+        readFine(&highlight_ref);
+      }
+      MfnrPyramid short_pyramid;
+      capturePyr(tex_mfnr_[short_idx - 1], &short_pyramid, frame_scale[short_idx]);
+      readFine(&short_pyramid);
+      auto both = highlightAlignBidirectional(highlight_ref, short_pyramid, gw, gh, true, stride);
+      HighlightGeometryGrid grid{guides.base.width, guides.base.height, gw, gh, stride, 0.5f};
+      std::vector<HighlightTileSupport> support;
+      if (both.valid && highlightObservableSupport(grid, guides.base.rgb,
+          guides.short_normalized.rgb, guides.highlight, both.forward.off,
+          both.reverse.off, &support)) {
+        geometry = highlightResolveGeometry(grid, guides.highlight, both.forward.off, support);
+      }
+      HighlightFlowView flow;
+      if (geometry.usable()) flow = {geometry.flow.data(), gw, gh, stride * 2};
+      const bool masks_ok = highlightAssessMasks(short_view, guides, flow,
+          geometry.usable(), &assessment, &admission_error);
+      if (masks_ok) {
+        // Preserve full adjusted RGB-derived mask and its R8 complementary
+        // quantization on the actual RAW/4 merge-weight domain. PC's current
+        // RAW/2 -> texelFetch RAW/4 linear-mask wiring is corrected explicitly.
+        const int mw = w / 4, mh = h / 4;
+        std::vector<uint8_t> selected, linear;
+        if (!highlightBuildMergeMasks(assessment.adjusted, guides.base.width,
+            guides.base.height, w, h, assessment.accepted(), &selected, &linear,
+            &admission_error)) return false;
+        auto upload = [&](GLuint* texture, int ww, int hh, GLenum internal,
+                          GLenum format, const void* values, GLenum type, GLint filter) {
+          if (!*texture) glGenTextures(1, texture);
+          glBindTexture(GL_TEXTURE_2D, *texture);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+          glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+          glTexImage2D(GL_TEXTURE_2D, 0, internal, ww, hh, 0, format, type, values);
+        };
+        std::vector<float> flow4(static_cast<size_t>(gw) * gh * 4, 0.f);
+        if (assessment.accepted()) for (int t = 0; t < gw * gh; ++t) {
+          flow4[static_cast<size_t>(t) * 4] = geometry.flow[static_cast<size_t>(t) * 2];
+          flow4[static_cast<size_t>(t) * 4 + 1] = geometry.flow[static_cast<size_t>(t) * 2 + 1];
+        }
+        upload(&tex_highlight_flow_, gw, gh, GL_RGBA32F, GL_RGBA, flow4.data(), GL_FLOAT, GL_NEAREST);
+        upload(&tex_highlight_mask_, mw, mh, GL_R8, GL_RED, selected.data(), GL_UNSIGNED_BYTE, GL_LINEAR);
+        upload(&tex_highlight_linear_, mw, mh, GL_R8, GL_RED, linear.data(), GL_UNSIGNED_BYTE, GL_LINEAR);
+        highlight_short_index_ = assessment.accepted() ? short_idx : -1;
+        for (int color = 0; color < 3; ++color) {
+          highlight_noise_shot_[color] = model.S[color];
+          highlight_noise_read_[color] = model.O[color];
+        }
+        std::copy(hdr_gain_4, hdr_gain_4 + 4, highlight_noise_gain_);
+        highlight_reference_scale_ = frame_scale[0];
+        highlight_short_scale_ = frame_scale[short_idx];
+        // Export remains in the reference radiance domain; PC's 1/ratio and
+        // baselineExposure are an equivalent unit conversion, NOT another gain.
+        const float neutral_max = std::max({neutral_r, neutral_g, neutral_b, 1e-6f});
+        highlight_camera_white_[0] = neutral_r / neutral_max;
+        highlight_camera_white_[1] = neutral_g / neutral_max;
+        highlight_camera_white_[2] = neutral_b / neutral_max;
+        const float signal = 0.18f;
+        const float reference_snr = signal / std::sqrt(std::max(model.S[1] * signal + model.O[1], 1e-12f));
+        const float merged_snr = reference_snr * std::sqrt(static_cast<float>(count));
+        auto interpolate = [](float x, float x0, float y0, float x1, float y1) {
+          return y0 + std::clamp((x - x0) / (x1 - x0), 0.f, 1.f) * (y1 - y0);
+        };
+        const float base_scale = merged_snr <= 29.5f
+            ? interpolate(merged_snr, 14.5f, 0.6f, 29.5f, 0.42f)
+            : interpolate(merged_snr, 29.5f, 0.42f, 44.f, 0.35f);
+        for (int i = 0; i < 4; ++i) {
+          float weight = 1.f;
+          if (i != 0 && model.O[1] > 0.f) weight = std::min(50.f,
+              1.f / (hdr_gain_4[i] * hdr_gain_4[i] * frame_scale[i] * frame_scale[i]));
+          if (i == short_idx && !assessment.accepted()) weight = 0.f;
+          if (i == highlight_short_index_) weight = 1.f;
+          highlight_global_weight_[i] = weight;
+          const float multiplier = interpolate(weight, 10.f, 1.f, 30.f, 1.414000034332275f);
+          highlight_kernel_sigma_[i] = 1.f / (base_scale * multiplier);
+        }
+        highlight_merge_ready_ = glGetError() == GL_NO_ERROR;
+      }
+    }
+    Logger::instance().log(LogLevel::kInfo, "engine", "highlight.admission",
+        "{\"accepted\":" + std::string(assessment.accepted() ? "true" : "false") +
+        ",\"reason\":\"" + highlightAdmissionName(assessment.status) + "\"" +
+        ",\"clippedPixels\":" + std::to_string(assessment.clipped_pixels) +
+        ",\"largestHole\":" + std::to_string(assessment.largest_inpainting_area) +
+        ",\"supportedTiles\":" + std::to_string(geometry.supported_tiles) +
+        ",\"regions\":" + std::to_string(geometry.regions) +
+        ",\"ready\":" + std::string(highlight_merge_ready_ ? "true" : "false") +
+        ",\"error\":\"" + jsonEscape(admission_error) + "\"" +
+        ",\"ms\":" + std::to_string(std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - admission_start).count()) + "}");
+    // This fully prepared path owns selected-short recovery. Neither legacy
+    // scalar sat-fix nor cross-CFA inpaint may rewrite its input observations.
+    ref_fuse_tex_ = raw_tex_;
+    if (!highlight_merge_ready_) return false;
+  }
+
   // ── 0.12.102：参考帧饱和修复搬到 align **之后** ─────────────────────────
   // 旧位置在 align 之前（直接同坐标取短帧）⇒ HDR 四帧手持有位移时注入错位值。
   // 现在位移场已知，短帧按亚像素对齐采样（shader 侧 linSub 同式）。
@@ -18276,7 +18985,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 0.12.133（方案 B 块 3）：每张先作废上一张的短帧真值（无 bracket 时必须回退）。
   short_val_ok_ = 0;
   short_val_scale_ = 0.f;
-  if (satfix_on) {
+  if (satfix_on && !highlight_merge_ready_) {
     if (!ensureSatFixTarget(w, h)) return false;
     // 0.12.122：先用 collar flow 修正短帧位移场（highlight 区从周围可靠 tile 插值）
     // 0.12.161：support 由参考帧 RAW 的裁剪判据给出（0.12.122 的版本是 no-op，
@@ -18313,7 +19022,9 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   bool dft_active = false;
   // upload_ms 语义 = t0 → 融合开始（两路径统一：upload+align+合并前段）
   std::chrono::steady_clock::time_point tf;
-  if (use_dft) {
+  // Selected HDR recovery owns exposure mixing; equal-exposure DFT cannot
+  // reconstruct censored highlights and must not bypass the admitted mask.
+  if (use_dft && !highlight_merge_ready_) {
     stage("dft");
     tf = std::chrono::steady_clock::now();
     if (!ensureMfnrFftTargets(w, h)) return false;
@@ -18545,11 +19256,15 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     for (int z = 0; z < count - 1; ++z) {
       const float m = msm[ti * (count - 1) + z];
       // 分段：≤kMisLo 全融合（保细节）；≥kMisHi 硬清零（不容重叠）；中间线性
-      const float wgt = m <= kMisLo
+      // The producer encodes UNKNOWN as the saturated code 255. Keep that
+      // rejection separate from ISO residual fade and spatial median; otherwise
+      // high ISO can turn invalid/clipped/out-of-frame data into positive weight.
+      const bool unobservable = mis[ti * 4 + z] == 255;
+      const float wgt = unobservable ? 0.f : (m <= kMisLo
                             ? 1.0f
                             : (m >= kMisHi
                                    ? 0.0f
-                                   : (kMisHi - m) / (kMisHi - kMisLo));
+                                   : (kMisHi - m) / (kMisHi - kMisLo)));
       wtex[ti * 4 + z] = static_cast<uint8_t>(wgt * 255.0f + 0.5f);
       wsum_cell += wgt;
       mags.push_back(m);
@@ -18576,7 +19291,11 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // 融合 → tex_fused_（R16F 线性 mosaic）
   tf = std::chrono::steady_clock::now();
   stage("fuse");
-  passMfnrFuse(w, h, cfa, black_phase, wl, rc.gains, frame_scale);
+  if (highlight_merge_ready_) {
+    if (!passHighlightMerge(w, h, cfa, black_phase, wl, rc.gains, frame_scale)) return false;
+  } else {
+    passMfnrFuse(w, h, cfa, black_phase, wl, rc.gains, frame_scale);
+  }
   glFinish();
   stage("chain");
   fuse_ms = std::chrono::duration<float, std::milli>(
@@ -18592,7 +19311,13 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   if (!ensureTargets(dst_w, dst_h)) return false;
   while (glGetError() != GL_NO_ERROR) {
   }
-  const bool rcd = demosaic == 1;
+  // The legacy bilinear renderer samples raw_tex_ directly and cannot consume
+  // an admitted stack. Use the complete shared mosaic/RCD path for HDR rather
+  // than silently discarding the recovered observations or stale noise maps.
+  const bool rcd = demosaic == 1 || (demosaic == 0 && highlight_merge_ready_);
+  if (demosaic == 0 && highlight_merge_ready_)
+    Logger::instance().log(LogLevel::kInfo, "engine", "highlight.demosaic_route",
+        "{\"requested\":\"bilinear\",\"effective\":\"rcd\",\"reason\":\"admitted_native_stack\"}");
   // MFNR（v0.9.3）：融合把噪声 σ 降为单帧的 1/√N，P0/P4 的值域 σ 正比于 ns，
   // 仍喂单帧 σ 会错配 —— 真机 A/B（v0.9.2）实测：残余噪声（>4σr）依旧漏过、
   // 低对比纹理（1-2σr）反被抹掉（"降噪一般 + 糊"的双重观感）。σ 折减后值域
@@ -18740,7 +19465,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     c.mfnr_kv += ",\"hdrSceneGain\":" + jnum(c.hdr_scene_gain, 4);
   }
   finishStillChain(c, t0, out_rgba);
-  return true;
+  return still_chain_ok_;
 }
 
 // setLut：任意线程调用，只暂存（渲染线程在下一帧 applyPendingLut 里建纹理）。

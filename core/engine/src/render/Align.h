@@ -59,7 +59,8 @@ constexpr int kMfnrTile = 64;
 // allow_l1=false 强制走旧路径（最细层 1/4 域）—— 用于同帧 A/B 诊断：同一次
 // 拍摄的同一 burst 跑两遍对齐，唯一差异就是最细层。
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
-                       int tiles_x, int tiles_y, bool allow_l1 = true);
+                       int tiles_x, int tiles_y, bool allow_l1 = true,
+                       int tile_size = kMfnrTile);
 
 // 对齐残差（诊断，v0.10.74）：给定位移场，在 1/2 域（无 l1 时退 1/4 域）上按
 // **与实际融合采样一致**的取整（mosaic 位移 round 到最近偶数）逐 tile 算

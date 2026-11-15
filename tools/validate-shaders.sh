@@ -310,7 +310,14 @@ PY
 fi
 
 if run_check "$SRC" "$TMP/run"; then
-  echo "全部 shader 校验通过（含引擎 1 sigmoid）"
+  # Complete standalone literals live in these included headers. Validate them
+  # by default as well; a successful C++ build does not compile runtime GLSL.
+  if [ "$SRC" = "core/engine/src/render/FrameRenderer.cpp" ]; then
+    for header in HighlightMergeShader.h HighlightResolveShader.h HighlightNoiseShader.h HighlightNoiseFilterShader.h; do
+      run_check "core/engine/src/render/$header" "$TMP/$header"
+    done
+  fi
+  echo "全部 shader 校验通过（含引擎 1 sigmoid 与完整高光融合链）"
 else
   echo "存在校验失败的 shader——设备端会编译失败并黑屏（v0.5.13 事故同类），禁止发版" >&2
   exit 1

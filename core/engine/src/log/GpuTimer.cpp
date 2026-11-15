@@ -2,28 +2,31 @@
 
 #include <EGL/egl.h>
 #include <GLES3/gl31.h>
+#include <GLES2/gl2ext.h>
 
 #include <string>
 
-#ifndef GL_EXT_disjoint_timer_query
-#define GL_TIME_ELAPSED_EXT 0x88BF
-#define GL_GPU_DISJOINT_EXT 0x8FBD
-#endif
+// Use the platform EXT enums. GL_GPU_DISJOINT_EXT is 0x8FBB, not 0x8FBD.
+
 
 // 64bit 查询结果读取入口属于扩展函数，NDK 头文件不保证声明，动态取地址。
-using GlGetQueryObjectUi64vEXT = void (*)(unsigned int, unsigned int,
-                                          unsigned long long*);
+using GenQueriesExt = void (*)(int, unsigned int*);
+using DeleteQueriesExt = void (*)(int, const unsigned int*);
+using BeginQueryExt = void (*)(unsigned int, unsigned int);
+using EndQueryExt = void (*)(unsigned int);
+using GetQueryUi64Ext = void (*)(unsigned int, unsigned int, unsigned long long*);
 
 namespace filmkit {
-
 namespace {
-GlGetQueryObjectUi64vEXT queryUi64Proc() {
-  // eglGetProcAddress 与 glXGetProcAddress 不同，Android 上扩展入口
-  // 也可直接链接；这里统一走 eglGetProcAddress 以兼容驱动差异。
-  auto p = reinterpret_cast<GlGetQueryObjectUi64vEXT>(
-      eglGetProcAddress("glGetQueryObjectui64vEXT"));
-  return p;
-}
+struct TimerApi {
+  GenQueriesExt gen = reinterpret_cast<GenQueriesExt>(eglGetProcAddress("glGenQueriesEXT"));
+  DeleteQueriesExt del = reinterpret_cast<DeleteQueriesExt>(eglGetProcAddress("glDeleteQueriesEXT"));
+  BeginQueryExt begin = reinterpret_cast<BeginQueryExt>(eglGetProcAddress("glBeginQueryEXT"));
+  EndQueryExt end = reinterpret_cast<EndQueryExt>(eglGetProcAddress("glEndQueryEXT"));
+  GetQueryUi64Ext result = reinterpret_cast<GetQueryUi64Ext>(eglGetProcAddress("glGetQueryObjectui64vEXT"));
+  bool valid() const { return gen && del && begin && end && result; }
+};
+const TimerApi& api() { static const TimerApi value; return value; }
 }  // namespace
 
 bool GpuTimer::supported() {
@@ -33,29 +36,29 @@ bool GpuTimer::supported() {
     const GLubyte* e = glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
     if (e && std::string(reinterpret_cast<const char*>(e)) ==
                  "GL_EXT_disjoint_timer_query") {
-      return true;
+      return api().valid();
     }
   }
   return false;
 }
 
 GpuTimer::GpuTimer() {
-  glGenQueries(1, &query_);
+  if (supported()) api().gen(1, &query_);
 }
 
 GpuTimer::~GpuTimer() {
-  if (query_) glDeleteQueries(1, &query_);
+  if (query_) { if (active_) api().end(GL_TIME_ELAPSED_EXT); api().del(1, &query_); }
 }
 
 void GpuTimer::begin() {
   if (!query_) return;
-  glBeginQuery(GL_TIME_ELAPSED_EXT, query_);
+  api().begin(GL_TIME_ELAPSED_EXT, query_);
   active_ = true;
 }
 
 double GpuTimer::endMs() {
   if (!query_ || !active_) return -1.0;
-  glEndQuery(GL_TIME_ELAPSED_EXT);
+  api().end(GL_TIME_ELAPSED_EXT);
   active_ = false;
 
   // M0：glFinish 保证查询结果就绪，代价是打断流水线（产品化后改延迟收集）。
@@ -66,13 +69,7 @@ double GpuTimer::endMs() {
   if (disjoint) return -1.0;
 
   unsigned long long ns = 0;
-  if (auto p64 = queryUi64Proc()) {
-    p64(query_, GL_QUERY_RESULT, &ns);
-  } else {
-    GLuint v32 = 0;
-    glGetQueryObjectuiv(query_, GL_QUERY_RESULT, &v32);
-    ns = v32;  // 低 32bit 纳秒，~4.3s 内不溢出，M0 的 pass 量级远低于此
-  }
+  api().result(query_, GL_QUERY_RESULT, &ns);
   return static_cast<double>(ns) / 1e6;
 }
 

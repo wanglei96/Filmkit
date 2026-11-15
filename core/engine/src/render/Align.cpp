@@ -91,9 +91,8 @@ inline float smoothstepf(float t0, float t1, float x) {
 // 看的范围 —— 暗光下匹配不稳的根源是采样点数不足（√N），窗口放大 2× 让采样点
 // 数 ×4。相邻 tile 的窗口因此重叠（计算冗余，但网格密度不变）。
 // 离线扫描用（2026-09-30，σ=0.008 暗光档）：见 tools/align-bench.cpp。
-#ifndef ALIGN_SAD_TILE
-#define ALIGN_SAD_TILE kMfnrTile
-#endif
+// ALIGN_SAD_TILE, if supplied by an offline benchmark, overrides the matching
+// window only; production follows the requested tile_size.
 
 // 置信度判据参数：残差（每采样平均 SAD）相对 ref tile 纹理度 —— 见 matchTile。
 constexpr float kConf0 = 0.40f, kConf1 = 0.90f, kGradEps = 4.0f;
@@ -160,12 +159,20 @@ inline TileMatch matchTile(const uint8_t* a, const uint8_t* b, int aw, int ah,
 }  // namespace
 
 MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
-                       int tiles_x, int tiles_y, bool allow_l1) {
+                       int tiles_x, int tiles_y, bool allow_l1, int tile_size) {
   MfnrAlignOut out;
   const int n_tiles = tiles_x * tiles_y;
   out.off.assign(static_cast<size_t>(n_tiles) * 2, 0.f);
   out.conf.assign(static_cast<size_t>(n_tiles), 0.f);
-  if (n_tiles <= 0 || ref.w4 <= 0 || cur.w4 <= 0) return out;
+  if (n_tiles <= 0 || ref.w4 <= 0 || cur.w4 <= 0 ||
+      tile_size < 4 || tile_size % 4 != 0) return out;
+  // Default tiles preserve the temporal MFNR solver bit-for-bit. Highlight
+  // geometry uses eight Bayer quads (16 native pixels), matching admission.
+#ifdef ALIGN_SAD_TILE
+  const int sad_tile = ALIGN_SAD_TILE;
+#else
+  const int sad_tile = tile_size;
+#endif
 
   // ── 1) L4（1/16 域）全局粗搜 ────────────────────────────────────────
   // 顶层不做 tile（4×4 tile 对暗光 8bit 噪声太小），整图穷搜 ±16、步长 2；
@@ -195,7 +202,8 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   // 3) L2（1/4 域）每 tile 精化：±2。tile 随 kMfnrTile 逐级减半（1/2 域 64 →
   //    L2 域 32 → L3 域 16，同一物理区域），输出到 1/2 域 tile 网格（tiles_x/y）。
   //    位移域换算 L2→mosaic = ×4。
-  constexpr int kTile3 = kMfnrTile / 4, kTile2 = kMfnrTile / 2, kRange = 2;
+  const int kTile3 = tile_size / 4, kTile2 = tile_size / 2;
+  constexpr int kRange = 2;
   const int nx3 = (ref.w3 + kTile3 - 1) / kTile3;
   const int ny3 = (ref.h3 + kTile3 - 1) / kTile3;
   std::vector<int> d3x(static_cast<size_t>(nx3 * ny3), 0);
@@ -268,10 +276,10 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
     for (int ty = row0; ty < row1; ++ty) {
       for (int tx = 0; tx < tiles_x; ++tx) {
         const int idx = ty * tiles_x + tx;
-        const int x0 = tx * kMfnrTile + kMfnrTile / 2 - ALIGN_SAD_TILE / 2;
-        const int y0 = ty * kMfnrTile + kMfnrTile / 2 - ALIGN_SAD_TILE / 2;
+        const int x0 = tx * tile_size + tile_size / 2 - sad_tile / 2;
+        const int y0 = ty * tile_size + tile_size / 2 - sad_tile / 2;
         const TileMatch m = matchTile(
-            ref.l1.data(), cur.l1.data(), ref.w1, ref.h1, x0, y0, ALIGN_SAD_TILE, 2,
+            ref.l1.data(), cur.l1.data(), ref.w1, ref.h1, x0, y0, sad_tile, 2,
             2 * d2x[static_cast<size_t>(idx)], 2 * d2y[static_cast<size_t>(idx)],
             kRange, true);
         out.off[static_cast<size_t>(idx) * 2 + 0] = (m.bx + m.sx) * 2.f;

@@ -1123,6 +1123,36 @@ class FrameRenderer {
   // ── MFNR 阶段一（v0.9.0）──────────────────────────────────────────────
   GLuint prog_mfnr_pyr_ = 0, prog_mfnr_down_ = 0, prog_mfnr_fuse_ = 0,
          prog_raw_dn_fused_ = 0;
+  // Full highlight branch: observed RGB guides -> bidirectional/collar admission
+  // -> complementary RAW/4 masks -> native-CFA dual-kernel Bayer merge.
+  GLuint prog_highlight_merge_ = 0, prog_highlight_resolve_ = 0;
+  GLuint tex_highlight_rgb_ = 0, fbo_highlight_rgb_ = 0;
+  int highlight_rgb_w_ = 0, highlight_rgb_h_ = 0;
+  float highlight_reference_scale_ = 1.f, highlight_short_scale_ = 1.f;
+  bool passHighlightResolve(int width, int height, int rotation, const float gains[3]);
+  GLuint tex_highlight_flow_ = 0, tex_highlight_mask_ = 0, tex_highlight_linear_ = 0;
+  GLuint tex_highlight_noise_ = 0;
+  GLuint prog_highlight_noise_ = 0, fbo_highlight_cov_ = 0;
+  GLuint tex_highlight_cov_diag_ = 0, tex_highlight_cov_off_ = 0;
+  int highlight_cov_w_ = 0, highlight_cov_h_ = 0;
+  GLuint prog_highlight_noise_down_ = 0, prog_highlight_noise_up_ = 0;
+  GLuint highlight_filter_fbo_[4] = {0, 0, 0, 0};
+  GLuint highlight_filter_cov_[4][2] = {{0,0}, {0,0}, {0,0}, {0,0}};
+  int highlight_filter_w_[4] = {0,0,0,0}, highlight_filter_h_[4] = {0,0,0,0};
+  bool ensureHighlightFilterCov(int slot, int width, int height);
+  bool passHighlightNoise(int width, int height, int rotation, int cfa, const float* ccm);
+  int highlight_noise_w_ = 0, highlight_noise_h_ = 0;
+  float highlight_noise_shot_[3] = {0.f, 0.f, 0.f};
+  float highlight_noise_read_[3] = {0.f, 0.f, 0.f};
+  float highlight_noise_gain_[4] = {1.f, 1.f, 1.f, 1.f};
+  int highlight_short_index_ = -1;
+  bool highlight_merge_ready_ = false;
+  bool still_chain_ok_ = false;
+  float highlight_global_weight_[4] = {1.f, 1.f, 1.f, 1.f};
+  float highlight_kernel_sigma_[4] = {1.f, 1.f, 1.f, 1.f};
+  float highlight_camera_white_[3] = {1.f, 1.f, 1.f};
+  bool passHighlightMerge(int w, int h, int cfa, const float black[4],
+                          float white, const float gains[3], const float scales[4]);
   GLuint prog_mfnr_mis_ = 0;  // 阶段二（v0.10.0）：mismatch map
   GLuint prog_mfnr_satfix_ = 0;  // 期 B bracket：参考帧饱和修复
   // 0.12.133（方案 B 块 3）：短帧真值图 + 全饱和区 inpaint（可选能力，prog 失败即降级）
