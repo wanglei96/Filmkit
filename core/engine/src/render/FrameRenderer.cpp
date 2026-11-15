@@ -1855,10 +1855,12 @@ void main() {
 //   avg（16×16 网格均值，CPU 读回 chromave）→ apply（命中替换）。
 const char* kFsDefringeDown = R"(#version 300 es
 precision highp float;
-layout(location = 0) out vec4 oLab;   // (lum, br, gr, gate)  v0.10.194
-uniform highp sampler2D uTex;         // 全分辨率场景线性 RGB
+layout(location = 0) out vec4 oLab;   // (lum, br, gr, mag-gate)  v0.10.194
+uniform highp sampler2D uTex;         // 全分辨率场景线性 Rec.2020 RGB
 uniform ivec2 uSize;
-const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+// Defringe runs before film/gamut in the Rec.2020 working space. Keep its
+// luminance and gradient in the same BT.2020 domain as kFsFilm.
+const vec3 LW = vec3(0.2627, 0.6780, 0.0593);
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy) * 2, ivec2(0), uSize - 1);
     vec3 acc = vec3(0.0);
@@ -1890,8 +1892,8 @@ void main() {
 
 const char* kFsDefringeDetect = R"(#version 300 es
 precision highp float;
-layout(location = 0) out vec4 oDet;   // (br, gr, |br|, base_std)
-uniform highp sampler2D uSrc;         // 半分辨率 (lum, br, gr, gate)
+layout(location = 0) out vec4 oDet;   // (br, gr, |mag|, mag_std)
+uniform highp sampler2D uSrc;         // 半分辨率 (lum, br, gr, mag-gate)
 uniform ivec2 uHalf;
 void main() {
     ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uHalf - 1);
@@ -1907,14 +1909,23 @@ void main() {
     for (int dy = -5; dy <= 5; ++dy)
         for (int dx = -5; dx <= 5; ++dx) {
             ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uHalf - 1);
-            float br_n = texelFetch(uSrc, q, 0).y;
-            sum += br_n;
-            sqsum += br_n * br_n;
+            vec4 n = texelFetch(uSrc, q, 0);
+            // The apply gate now covers both purple (B>R>G) and magenta
+            // (R>B>G): mag = min(R-G, B-G) = min(gr, br+gr).
+            // The old std used only B-R, so a magenta edge with R≈B had
+            // near-zero variance and was rejected before the hard gate.
+            float mag_n = min(n.z, n.y + n.z);
+            sum += mag_n;
+            sqsum += mag_n * mag_n;
         }
     float mu = sum / 121.0;
     float var = sqsum / 121.0 - mu * mu;
     float base_std = sqrt(max(var, 0.0));
-    oDet = vec4(c0.y, c0.z, abs(c0.y), base_std);
+    // Store the same magenta/purple magnitude used by the Apply gate in .z.
+    // Avg therefore computes cavg in the same scale as mag0/std, rather than
+    // the old |B-R| scale which collapses for R≈B>G edges.
+    float mag0 = min(c0.z, c0.y + c0.z);
+    oDet = vec4(c0.y, c0.z, abs(mag0), base_std);
 })";
 
 const char* kFsDefringeAvg = R"(#version 300 es
@@ -2011,10 +2022,10 @@ void main() {
     // 与判据③（邻域 br 标准差）和④（亮度梯度）串联，大面积真实粉色物体
     // （std≈0）仍不会被误伤。
     float mag0 = min(gr0, gb0);
-    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float yL = dot(texelFetch(uTex, clamp(p - ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2627, 0.6780, 0.0593));
+    float yR = dot(texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2627, 0.6780, 0.0593));
+    float yU = dot(texelFetch(uTex, clamp(p - ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2627, 0.6780, 0.0593));
+    float yD = dot(texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), uHalf * 2 - 1), 0).rgb, vec3(0.2627, 0.6780, 0.0593));
     float gL = length(vec2(yR - yL, yD - yU)) * 255.0;
     if (mag0 <= thr || d0.w < std_thr || gL < uGradMin) {
         oColor = vec4(lin0, 1.0);
@@ -2033,7 +2044,7 @@ void main() {
     // 为什么不用 Lab 重建（v0.10.188/189）：Lab 在低 RGB 区数值不稳定，去饱和后
     // 常出负值，需要 clamp + XYZ 重建，反而引入新噪声。此处数值稳定、零转换误差。
     // k_desat 0.12 = 保留 12% 彩度（0 = 完全中性化）。
-    const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+    const vec3 LW = vec3(0.2627, 0.6780, 0.0593);
     float k_desat = 0.12;
     float gg = lin0.g;
     vec3 desat = vec3(gg + gr0 * k_desat, gg, gg + (br0 + gr0) * k_desat);
