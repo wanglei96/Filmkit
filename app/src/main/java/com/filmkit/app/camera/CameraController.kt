@@ -1518,8 +1518,9 @@ class CameraController(private val context: Context, private val render: RenderC
     //（P2 无四邻 G 范围限幅；G 位轴向填充 ±1 近对 + 三项梯度反比、无限幅）；
     // 0 = 旧行为（v0.5.28/30 的 clamp/0.75·0.25 混合）。默认 0 = 旧行为逐位不变。
     private val RCD_G_ORIG = 1.0
-    // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）
-    private val DEFRINGE = 1.0
+    // v0.10.134：逆光边缘紫边抑制（FilmParams[47]，RawTherapee Defringe 同形态）。
+    // 0.14.3 起生产链下线（当前实现误伤真实粉色花瓣），[47] 恒发 0 ⇒ 常量删除。
+    // 未来按完整 Lab 算法重写时再补回 1.0。
     // v0.10.169 引入，v0.12.4 转正为**算法选择**（FilmParams[49]）。
     // 1 = 自创档（kFsHlApply 的 G 三级池化比 + allSat 三通道改写，用满阱 luma 当锚）；
     // 0 = darktable 原版档（`MAX(inval, refavg + chrominance)`，只抬不压）。
@@ -1809,7 +1810,9 @@ class CameraController(private val context: Context, private val render: RenderC
      * 0 = 关（A/B 通路，行为同 exp12）。
      */
     private fun applyHrRawPref() {
-        val v = if (appPrefs.getBoolean("hr_raw", true)) HR_RAW else 0.0
+        // 0.14.3：默认关（真机云朵场景 A/B 验收：开 = 高光灰斑，关 = 正常）。
+        // 开关仍真实生效，用户可在设置页恢复做同场景对照。
+        val v = if (appPrefs.getBoolean("hr_raw", false)) HR_RAW else 0.0
         if (v != hrRawPref) {
             hrRawPref = v
             filmParams[45] = v
@@ -1931,13 +1934,14 @@ class CameraController(private val context: Context, private val render: RenderC
 
     /**
      * 逆光边缘紫边抑制开关（v0.10.134）：写 FilmParams[47]。
-     * RawTherapee Defringe 同形态（Lab 域"色度相对局部基线偏离"检测 + Lab a
-     * 通道色相门 + 低偏离邻居加权替换，L 零损失），作用在 P4 之后、D-1 之前。
-     * 对症 2026-10-04 样片定量：品红伪影 56~66% 贴边，P4/D-1 保边判据恰好
-     * 保护它，整链近零压制。0 = 关（A/B 通路）。
+     * ── 0.14.3：**默认关，且设置页开关已删除** ─────────────────────────────
+     * 当前实现偏离一手 RT/darktable（Lab 残差 + 高斯基线 + 邻域实测色度加权），
+     * 真机实测会误伤真实粉色花瓣并留绿边；关闭后 0.14.1/0.14.2 三批样片无紫边
+     * 复现 ⇒ 生产链下线（引擎侧另硬关 df_ok，双保险）。FilmParams[47] 恒发 0，
+     * 保留槽位与 passDefringe 代码作未来按完整算法重写的落点。
      */
     private fun applyDefringePref() {
-        val v = if (appPrefs.getBoolean("defringe", true)) DEFRINGE else 0.0
+        val v = 0.0
         if (v != defringePref) {
             defringePref = v
             filmParams[47] = v
@@ -3972,25 +3976,8 @@ class CameraController(private val context: Context, private val render: RenderC
             ),
         )
         logRawMeta(dngImg, dngResult, meta)
-        // 0.13.11 调试：burst_dump 打开时把 4 帧原样各存一份 DNG（_f0.._f3）。
-        // 用途 = T3（空间域融合替换 DFT）的离线 A/B：现有 DNG 只是参考帧，单帧
-        // 验证不了 4 帧融合；有真实 burst 才能在 Mac 上跑对照实现。默认关（4×25MB）。
-        // 0.13.13：release 包不可 run-as，prefs 改不了 ⇒ 再加一个外部文件哨兵
-        //（files/burst_dump，adb touch 即可），两种开关任一生效。
-        val burstDump = prefs.getBoolean("burst_dump", false) ||
-            java.io.File(context.getExternalFilesDir(null), "burst_dump").exists()
-        if (burstDump && ch != null) {
-            images.forEachIndexed { i, im ->
-                try {
-                    saveDng(im, results[i], ch, "_f$i")
-                } catch (t: Throwable) {
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_ERROR, "camera", "dng.burst_dump_failed",
-                        kv("frame" to i, "error" to (t.message ?: t.toString())),
-                    )
-                }
-            }
-        }
+        // RAW diagnostics use app-specific burst/*.raw + metadata only.
+        // Never publish a DNG to MediaStore unless the user's DNG switch is on.
         if (dngOn && ch != null) {
             try {
                 saveDng(dngImg, dngResult, ch)

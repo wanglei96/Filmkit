@@ -499,22 +499,12 @@ private fun QualityDrawerContent() {
             )
         },
     )
-    // 逆光边缘紫边抑制（v0.10.134）：RawTherapee Defringe 同形态。2026-10-04
-    // 样片定量：品红伪影 56~66% 贴着物体轮廓，P4/D-1 的保边判据恰好保护它。
-    var defringeOn by remember { mutableStateOf(prefs.getBoolean("defringe", true)) }
-    SettingSwitchRow(
-        title = "边缘紫边抑制",
-        subtitle = "逆光轮廓品红渐晕（Lab 域 defringe，红物体与亮度不受损）；关 = 同场景 A/B 对照",
-        checked = defringeOn,
-        onChecked = { v ->
-            defringeOn = v
-            prefs.edit().putBoolean("defringe", v).apply()
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_INFO, "app", "settings.defringe",
-                "{\"on\":$v}",
-            )
-        },
-    )
+    // ── 0.14.3：删掉「边缘紫边抑制」开关 ───────────────────────────────────
+    // 当前实现偏离一手 RT/darktable（Lab 残差 + 高斯基线 + 邻域实测色度加权），
+    // 用 min(R−G,B−G) + 局部 std + 固定 k_desat 判据，真机实测会误伤真实粉色
+    // 花瓣并留下绿边；关闭后 0.14.1/0.14.2 三批样片无紫边复现 ⇒ 从生产链下线。
+    // 开关保留会造成"开着却不生效"的死开关（项目明令禁止），故一并移除；
+    // 引擎侧 passDefringe 代码与 FilmParams[47] 槽位保留作 A/B 通路（不预删）。
     // 镜头横向色差校正（v0.10.170）：D3（去马赛克后 / CCM 前）相机 RGB 域的
     // 自动估计（1/8 降采样 + 径向 LK）+ 径向位移校正（只动 R/B，G 不变）。
     // 见 CameraController.applyCaCorrPref 与 docs/reports/cacorr-REPORT.md。
@@ -846,7 +836,10 @@ private fun ToneColorDrawerContent() {
     // 高光由短帧的真实值接管。留在界面上只会让人以为"关掉它能改变画面"。
     // 判据与采集侧同一个 prefs 键（"bracket"，默认 true）。
     val bracketOn = remember { prefs.getBoolean("bracket", true) }
-    var hrRawOn by remember { mutableStateOf(prefs.getBoolean("hr_raw", true)) }
+    // 0.14.3：默认改为**关**。真机 A/B（2026-11-15 云朵场景）确认 RAW HL 会在
+    // 饱和边界制造通道台阶、被 P0 摊成云朵灰斑；关掉后灰斑消失且紫边未回归。
+    // 开关仍真实生效（关 = 不跑，开 = 恢复原链 A/B），默认值在 CameraPresets[45]。
+    var hrRawOn by remember { mutableStateOf(prefs.getBoolean("hr_raw", false)) }
     // 0.12.166：用户要求——bracket 开着时也要能 A/B。旧版这条开关被 !bracketOn 藏起来，
     // 而 hr_on 的判据是 `hr_raw && !bracket_info_ok`（bracket 下 sat 低时仍会跑），
     // 所以隐藏它等于"能跑但没法关"。
@@ -882,7 +875,9 @@ private fun ToneColorDrawerContent() {
     )
     SettingSwitchRow(
         title = "高光重建·RAW 域",
-        subtitle = "darktable highlights（inpaint opposed）：去马赛克前恢复被裁剪通道，治高光边缘彩色伪影；关 = 同场景 A/B 对照",
+        subtitle = "旧版 RAW opposed 高光路径，默认关；此前关闭后云朵灰斑消失。" +
+            "0.14.5 多曝光拍摄由独立准入的短帧融合负责，不再重复运行此重建；" +
+            "此开关仅用于未走新融合的单帧/旧路径 A/B。",
         checked = hrRawOn,
         onChecked = { v ->
             hrRawOn = v
@@ -904,7 +899,8 @@ private fun ToneColorDrawerContent() {
     var hlGReconOn by remember { mutableStateOf(prefs.getBoolean("hl_grecon", false)) }
     SettingSwitchRow(
         title = "高光重建·自创 allSat 档",
-        subtitle = "关（默认）= darktable 原版 opposed：只抬不压 + 加性色度补偿；开 = 自创档（按参考比替换三通道、用满阱亮度当锚），过曝高光会被压暗并去色。同场景 A/B 看高光带是否还有灰斑",
+        subtitle = "关（默认）= darktable 原版 opposed：只抬不压 + 加性色度补偿；开 = 自创档（按参考比替换三通道、用满阱亮度当锚），过曝高光会被压暗并去色。" +
+            "⚠ 仅在上方「高光重建·RAW 域」开启时生效（该项 0.14.3 起默认关）",
         checked = hlGReconOn,
         onChecked = { v ->
             hlGReconOn = v
@@ -1190,7 +1186,8 @@ private fun LabDrawerContent() {
     var hlRbReconOn by remember { mutableStateOf(prefs.getBoolean("hl_rb_recon", false)) }
     SettingSwitchRow(
         title = "高光重建·R/B 反推",
-        subtitle = "亮暗交界品红窄带修复 A/B（clip 过渡带 R/B 满阱时按参考比反推替换）；开 = 启用，关 = 旧行为",
+        subtitle = "亮暗交界品红窄带修复 A/B（clip 过渡带 R/B 满阱时按参考比反推替换）；开 = 启用，关 = 旧行为。" +
+            "⚠ 仅在上方「高光重建·RAW 域」开启时生效（该项 0.14.3 起默认关）",
         checked = hlRbReconOn,
         onChecked = { v ->
             hlRbReconOn = v
