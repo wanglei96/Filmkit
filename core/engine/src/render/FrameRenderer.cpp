@@ -13002,17 +13002,17 @@ void FrameRenderer::edgeDumpEvent(const char* stage, const std::string& path) {
   Logger::instance().log(LogLevel::kInfo, "engine", "edge_dump.stage",
     std::string("{\"stage\":\"") + jsonEscape(stage) + "\",\"path\":\"" + jsonEscape(path) + "\"}");
 }
-void FrameRenderer::captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h, bool rgba8) {
+void FrameRenderer::captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h, bool rgba8, bool mono) {
   if (edge_dump_token_.empty() || !tex || !fbo || w <= 0 || h <= 0) return;
   const std::string dir = Logger::instance().dir(); if (dir.empty()) return;
   const std::string base = dir + "/edge_dump_" + edge_dump_token_ + "_" + stage;
   const std::string raw = base + (rgba8 ? ".rgba8" : ".rgba16f"), meta = base + ".json";
   GLint draw=0,read=0,vp[4],pack=0,al=0,row=0,sr=0,sp=0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw); glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read); glGetIntegerv(GL_VIEWPORT,vp); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&pack); glGetIntegerv(GL_PACK_ALIGNMENT,&al); glGetIntegerv(GL_PACK_ROW_LENGTH,&row); glGetIntegerv(GL_PACK_SKIP_ROWS,&sr); glGetIntegerv(GL_PACK_SKIP_PIXELS,&sp);
   glBindFramebuffer(GL_FRAMEBUFFER,fbo); GLint old_attachment=0; glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,&old_attachment); glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,0); glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0); glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
-  const size_t row_bytes=static_cast<size_t>(w)*4*(rgba8?1u:2u); std::vector<uint8_t> pixels(row_bytes); std::ofstream f(raw,std::ios::binary); bool ok=f.good();
-  for(int y=0; ok && y<h; ++y){ glReadPixels(0,y,w,1,GL_RGBA,rgba8?GL_UNSIGNED_BYTE:GL_HALF_FLOAT,pixels.data()); ok=glGetError()==GL_NO_ERROR; if(ok) { f.write(reinterpret_cast<const char*>(pixels.data()),static_cast<std::streamsize>(pixels.size())); ok=f.good(); } }
+  const size_t row_bytes=static_cast<size_t>(w)*(mono?1u:4u)*(rgba8?1u:2u); std::vector<uint8_t> pixels(row_bytes); std::ofstream f(raw,std::ios::binary); bool ok=f.good();
+  for(int y=0; ok && y<h; ++y){ glReadPixels(0,y,w,1,mono?GL_RED:GL_RGBA,rgba8?GL_UNSIGNED_BYTE:GL_HALF_FLOAT,pixels.data()); ok=glGetError()==GL_NO_ERROR; if(ok) { f.write(reinterpret_cast<const char*>(pixels.data()),static_cast<std::streamsize>(pixels.size())); ok=f.good(); } }
   f.close();
-  if(ok && f.good()){ std::ofstream j(meta); j<<"{\"w\":"<<w<<",\"h\":"<<h<<",\"components\":4,\"type\":\""<<(rgba8?"uint8":"float16")<<"\",\"orientation\":\"gl_bottom_up\",\"stage\":\""<<jsonEscape(stage)<<"\",\"token\":\""<<edge_dump_token_<<"\",\"raw_path\":\""<<jsonEscape(raw)<<"\",\"complete\":true}\n"; j.close(); if(j.good()) edgeDumpEvent(stage,raw); else ok=false; }
+  if(ok && f.good()){ std::ofstream j(meta); j<<"{\"w\":"<<w<<",\"h\":"<<h<<",\"components\":"<<(mono?1:4)<<",\"type\":\""<<(rgba8?"uint8":"float16")<<"\",\"orientation\":\"gl_bottom_up\",\"stage\":\""<<jsonEscape(stage)<<"\",\"token\":\""<<edge_dump_token_<<"\",\"raw_path\":\""<<jsonEscape(raw)<<"\",\"complete\":true}\n"; j.close(); if(j.good()) edgeDumpEvent(stage,raw); else ok=false; }
   if(!ok) Logger::instance().log(LogLevel::kWarn,"engine","edge_dump.failed",std::string("{\"stage\":\"")+jsonEscape(stage)+"\"}");
   glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,(GLuint)old_attachment,0); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)draw); glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read); glViewport(vp[0],vp[1],vp[2],vp[3]); glBindBuffer(GL_PIXEL_PACK_BUFFER,(GLuint)pack); glPixelStorei(GL_PACK_ALIGNMENT,al); glPixelStorei(GL_PACK_ROW_LENGTH,row); glPixelStorei(GL_PACK_SKIP_ROWS,sr); glPixelStorei(GL_PACK_SKIP_PIXELS,sp);
 }
@@ -14850,7 +14850,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     dbg_hl_inp_ms_ = 0.f;
     GLuint fused_src = tex_fused_;
     if (c.mfnr_fused) {
-      captureEdgeDumpTexture("mosaic-fused-before-HL", tex_fused_, fbo_fused_, w, h, false);
+      captureEdgeDumpTexture("mosaic-fused-before-HL", tex_fused_, fbo_fused_, w, h, false, true);
       if (short_val_ok_) captureEdgeDumpTexture("mosaic-short-aligned", tex_short_val_, fbo_short_val_, w, h, false);
     }
     // ── 0.12.135：inpaint **默认不启用**（代码保留，改 true 即回到 A/B 通路）───
@@ -14967,7 +14967,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                                               : (c.mfnr_fused ? fused_src : tex_mos_));
     // 值域保护只在"P0 直接吃 HR 输出"时需要（NN 输出本就落在 [0,1] 训练域）
     // 0.12.133：inpaint 输出同样是 scene-referred（可 >1）⇒ 与 HR 输出同口径保护
-    if (c.mfnr_fused) captureEdgeDumpTexture("mosaic-before-P0", p0_in, fbo_mos_, w, h, false);
+    if (c.mfnr_fused) captureEdgeDumpTexture("mosaic-before-P0", p0_in, fbo_mos_, w, h, false, true);
     const bool p0_wclamp = (!nn_ok && (hr_out != 0 || fused_src != tex_fused_));
     const auto t_p0 = std::chrono::steady_clock::now();
     if (c.mfnr_fused) {
@@ -14999,7 +14999,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
                        c.dn ? c.nc : kNoDn);
       }
     }
-    captureEdgeDumpTexture("mosaic-after-P0", tex_mos_, fbo_mos_, w, h, false);
+    captureEdgeDumpTexture("mosaic-after-P0", tex_mos_, fbo_mos_, w, h, false, false);
     // 0.13.6 性能细分：P0（RAW bilateral / 线性化展开）单列。旧口径只有
     // preMs = HR + P0，拆开后才能判断该优化 HR 还是 P0。
     glFinish();

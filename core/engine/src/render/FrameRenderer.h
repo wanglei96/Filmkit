@@ -884,7 +884,7 @@ class FrameRenderer {
   bool passGainmap(int w, int h, GLuint sdr_tex);
   void captureHdrProbes(int w, int h);
   void captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h,
-                              bool rgba8);
+                              bool rgba8, bool mono = false);
   void edgeDumpEvent(const char* stage, const std::string& path);
   void releaseHdrProbeTargets();
   bool ensureGainmap(int w, int h);

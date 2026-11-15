@@ -21,7 +21,7 @@ def main():
   if meta['type']=='uint8':data/=255
   # Output/gain textures are flipped by kFsOut relative to the scene texture.
   if meta.get('stage') in ('sdr-final','gainmap'):data=data[::-1]
-  rgb=data[:,:,:3]
+  rgb=np.repeat(data,3,axis=2) if n==1 else data[:,:,:3]
   print(path.name,'stage=',meta.get('stage'),'shape=',rgb.shape,'range=',float(np.nanmin(rgb)),float(np.nanmax(rgb)))
   y=(rgb*np.array([.2627,.6780,.0593])).sum(-1)
   print('  Y p1/p50/p99',np.percentile(y,[1,50,99]).round(6).tolist())
