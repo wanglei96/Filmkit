@@ -1,6 +1,6 @@
 # HDR reference audit — 2026-11-15
 
-Status: 0.13.79(787) built, signed, installed and verified by dumpsys. GPU regressions and real-device daylight gain checks passed. Strong-light halo/gray-band acceptance remains pending: user has no suitable scene currently.
+Status: 0.13.80(788) built and signed; device was disconnected before install. 0.13.79 daylight gain checks passed. Latest 0.13.79 sample confirmed SDR-origin magenta edge; strong-light gray-band acceptance remains pending.
 
 ## Corrections to previous conclusions
 
@@ -37,7 +37,9 @@ Status: 0.13.79(787) built, signed, installed and verified by dumpsys. GPU regre
 - Gain map evaluates the continuous extended/base curve ratio in raw max-RGB engine coordinates on the same prepared source. The ratio multiplies final SDR linear luminance before downsampling; independent unregistered short-frame input is removed.
 - Half-float readback has an explicit RGBA8 float-bit packing fallback; failures prevent stale gain-map delivery and log SDR fallback.
 - `python3 tools/check-hdr-reference.py --gpu`: SDR gray-ramp baseline bit-identical; prepared source EV -2/0/+2 passes; both engine probes pass; production gainmap versus independent oracle max relative error 1.1826% including dither. `bash tools/validate-shaders.sh` passes.
-- Release build, debug signature verification, manifest 787/0.13.79, DEX version string and gainmap/probe JNI/native symbols verified. Installed device reports 787/0.13.79. Three daylight captures produced p99 boosts 1.95x, 1.29x and 3.08x; strongest capture reconstructed HDR luma >=1.0 for 14.11% of pixels. All three logged hdr.probe_ready with direct half-float readback. Strong-light halo/gray-band scene was not available, so that visual acceptance remains open.
+- Release build, debug signature verification, manifest 787/0.13.79, DEX version string and gainmap/probe JNI/native symbols verified. Installed device reported 787/0.13.79. Three daylight captures produced p99 boosts 1.95x, 1.29x and 3.08x; strongest capture reconstructed HDR luma >=1.0 for 14.11% of pixels. All three logged hdr.probe_ready with direct half-float readback.
+- Latest sample `FILMKIT_20261115-112450.jpg`: SDR base had 277 magenta-edge candidates; candidate purple strips were 16–18 8-bit luminance levels below adjacent neutral pixels, and their local boost was only 1.16–1.21x; zero overlapped the gain=4 region. This proves SDR-origin fringe, not gainmap color creation. The production defringe detector had an inconsistent scale: Apply used `min(R-G,B-G)` but Detect variance and cavg used `B-R`; it also used Rec.709 luminance in a Rec.2020 working domain.
+- 0.13.80 fixes the detector scale to magenta magnitude and uses BT.2020 luminance/gradient in defringe. Synthetic production-shader test: R=B>G edge mag 0.4501→0.0542, luminance preserved; neutral/warm/blue/green controls unchanged. 0.13.80 signature/version/JNI checks pass. Device install and gray-band/fringe recapture are pending.
 
 ## References
 
