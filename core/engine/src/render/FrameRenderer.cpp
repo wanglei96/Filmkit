@@ -3143,20 +3143,21 @@ void main() {
         acc = sacc;
         wsum = swsum;
     } else {
-        // Sample every radius instead of only 8/16/24. Discrete rings create
-        // visible plateaus at exactly those radii on lamp edges.
-        for (int r = 1; r <= 24; ++r) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    ivec2 q = clamp(p + ivec2(dx, dy) * r, ivec2(0), uSize - 1);
-                    vec4 t = texelFetch(uShort, q, 0);
-                    if (t.g <= 0.5) continue;
-                    float dd = float(dx * dx + dy * dy) * float(r * r);
-                    float w = 1.0 / (dd + 1.0);
-                    acc += t.r * w;
-                    wsum += w;
-                }
+        // Continuous inpainting kernel: sample every valid short-frame pixel in
+        // the radius instead of discrete 8/16/24 rings. Discrete rings become
+        // visible arcs on lamp boundaries; the continuous kernel has no radial
+        // branch transitions and never samples invalid/clipped short pixels.
+        for (int dy = -24; dy <= 24; ++dy) {
+            for (int dx = -24; dx <= 24; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                float radius2 = float(dx * dx + dy * dy);
+                if (radius2 > 24.0 * 24.0) continue;
+                ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), uSize - 1);
+                vec4 t = texelFetch(uShort, q, 0);
+                if (t.g <= 0.5) continue;
+                float w = 1.0 / (radius2 + 1.0);
+                acc += t.r * w;
+                wsum += w;
             }
         }
     }
