@@ -174,6 +174,21 @@ def gpu_check():
     assert float(np.quantile(decoded, .9)) > 2., 'HDR extension silently disabled'
     print(f'Production gainmap GPU vs independent curve oracle: max relative error={error:.4%} PASS')
     print('Prepared RGB matches same source at EV=-2/0/+2 PASS')
+    # Asymmetric horizontal/vertical highlight edges catch accidental Y flips and
+    # prevent a uniform gray ramp from hiding a wrong spatial correspondence.
+    edge = np.ones((16, 1024, 4), np.float32)
+    edge[:, :, :3] = .18
+    edge[2:7, 256:768, :3] = 2.
+    tex.write(edge.astype('f2').tobytes())
+    edge_gain = gl.run(shaders['kFsGainmap'], gu,
+                       {'uHdrBaseCurveTexture': curve_tex, 'uScene': tex, 'uSdr': sdr_tex}, size=(512, 8))
+    edge_ratio = 2 ** (edge_gain[:, :, 0] * 4 - 2)
+    assert float(edge_ratio[5:7, 150:350].mean()) > 2., 'Y-flipped highlight missing'
+    assert float(edge_ratio[:3, 150:350].max()) < 1.03, 'highlight gain displaced to opposite side'
+    assert float(edge_ratio[:, :120].max()) < 1.03, 'gain leaks far outside highlight edge'
+    assert float(edge_ratio[:, 390:].max()) < 1.03, 'gain leaks beyond spatial reduction footprint'
+    print('Asymmetric high-contrast edge: orientation/localization PASS')
+    tex.write(pixels.astype('f2').tobytes())
     sig = load('sigmoid-params-ref').compute_sigmoid_params(1.5, 0., 100., .0152, 100.)
     for name, key in [('WhiteTarget', 'white_target'), ('BlackTarget', 'black_target'),
                       ('PaperExposure', 'paper_exposure'), ('FilmFog', 'film_fog'),

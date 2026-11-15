@@ -1,6 +1,6 @@
 # HDR reference audit — 2026-11-15
 
-Status: 0.13.79(787) implementation built and signed; GPU regression checks passed. Camera acceptance pending (device disconnected).
+Status: 0.13.79(787) built, signed, installed and verified by dumpsys. GPU regressions and real-device daylight gain checks passed. Strong-light halo/gray-band acceptance remains pending: user has no suitable scene currently.
 
 ## Corrections to previous conclusions
 
@@ -37,7 +37,7 @@ Status: 0.13.79(787) implementation built and signed; GPU regression checks pass
 - Gain map evaluates the continuous extended/base curve ratio in raw max-RGB engine coordinates on the same prepared source. The ratio multiplies final SDR linear luminance before downsampling; independent unregistered short-frame input is removed.
 - Half-float readback has an explicit RGBA8 float-bit packing fallback; failures prevent stale gain-map delivery and log SDR fallback.
 - `python3 tools/check-hdr-reference.py --gpu`: SDR gray-ramp baseline bit-identical; prepared source EV -2/0/+2 passes; both engine probes pass; production gainmap versus independent oracle max relative error 1.1826% including dither. `bash tools/validate-shaders.sh` passes.
-- Release build, debug signature verification, manifest 787/0.13.79, DEX version string and gainmap/probe JNI/native symbols verified. No device/display acceptance performed.
+- Release build, debug signature verification, manifest 787/0.13.79, DEX version string and gainmap/probe JNI/native symbols verified. Installed device reports 787/0.13.79. Three daylight captures produced p99 boosts 1.95x, 1.29x and 3.08x; strongest capture reconstructed HDR luma >=1.0 for 14.11% of pixels. All three logged hdr.probe_ready with direct half-float readback. Strong-light halo/gray-band scene was not available, so that visual acceptance remains open.
 
 ## References
 
