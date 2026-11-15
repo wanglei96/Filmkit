@@ -8467,7 +8467,13 @@ void main() {
     // 短帧的 4x4 盒式平均（与 PC 的 RAW_LUMA_RESIDUAL 同口径）。不取最大值：
     // 最大窗口会把邻域的亮度搬进来，反而在平台上造出新的边界。
     float sceneY = sceneSum / n;
-    float sceneX = sceneY / max(uSceneWhite, 1e-6);
+    // ⚠ 0.13.78：**必须乘 uExposure**。`hdrY` 来自 `uHdr = tex_work_`，那条纹理是
+    // kFsFilm 的 `mapped = scene * uExposure` 之后再进 filmic 的结果；而 `uScene`
+    // （film_src/tex_hdr_side_）与 `uSceneWhite`（grey·2^white_ev）都在**曝光前**场景域。
+    // 不乘曝光时 `extendedY`（曝光前曲线延伸）与 `hdrY`（曝光后曲线输出）不同域，
+    // `max(hdrY, extendedY)` 在 EV>0（用户 EV 或显示域闭环补的 0.6EV）时被 hdrY 直接
+    // 吃掉 ⇒ 白点延伸静默失效、ratio 退化成 1（与 0.13.65 的 uHdr 错绑同类错误）。
+    float sceneX = sceneY * uExposure / max(uSceneWhite, 1e-6);
     if (sceneX > uHdrCurveJoinInput) {
         float extendedY;
         if (sceneX <= 1.0) {
