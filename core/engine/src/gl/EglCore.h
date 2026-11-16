@@ -17,6 +17,8 @@ class EglCore {
   bool lowPriorityContext() const { return low_priority_; }
   bool highPriorityContext() const { return high_priority_; }
   bool contextPriorityExt() const { return priority_ext_; }
+  int requestedPriority() const { return requested_priority_; }
+  int actualPriority() const { return actual_priority_; }  // 0 = unavailable
 
   EGLSurface createWindowSurface(void* anative_window);
   EGLSurface createPbufferSurface(int w, int h);
@@ -34,6 +36,8 @@ class EglCore {
   bool priority_ext_ = false;   // EGL_IMG_context_priority 扩展可用
   bool low_priority_ = false;   // 本 context 实际以 LOW 优先级创建
   bool high_priority_ = false;  // 本 context 实际以 HIGH 优先级创建
+  int requested_priority_ = 0;
+  int actual_priority_ = 0;
 };
 
 }  // namespace filmkit

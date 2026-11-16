@@ -1097,8 +1097,6 @@ fun CameraScreen(
     // 快门黑闪 + 快门钮脉冲
     val shutterAlpha = remember { Animatable(0f) }
     val shutterPulse = remember { Animatable(1f) }
-    // 恢复预览时的压暗遮罩：resume 前后各一次，盖住预览第一帧的跳变
-    val resumeCover = remember { Animatable(0f) }
     // 抽出一张：从**取景框原位**浮起（1.04× + 白边闪出），再缩到胶卷位。
     // ⚠ 帧率：`flyProgress.value` 只在 graphicsLayer 的 **draw 阶段**读，组合作用域里
     // 只用 flyVisible 控制挂载 —— 动画期间零重组、只重绘该图层，才能跟满 60/120Hz。
@@ -1136,11 +1134,6 @@ fun CameraScreen(
         } else {
             delay(520)
         }
-        // ③ 先压暗再 resume：预览第一帧被这层黑吃掉，淡出收尾，不硬切
-        resumeCover.animateTo(0.34f, tween(durationMillis = 80))
-        controller.resumePreviewNow()
-        delay(80)
-        resumeCover.animateTo(0f, tween(durationMillis = 260, easing = LinearEasing))
     }
     // 0.13.30：飞入终点改用**两个控件的真实 root 坐标**（胶卷位 vs 飞入层中心），
     // 不再按屏幕边缘猜。两者都在同一窗口坐标系，差值就是 translation。
@@ -1474,13 +1467,11 @@ fun CameraScreen(
                     }
                 }
 
-                // 快门黑闪 + 恢复预览时的压暗（draw 阶段读，零重组）
+                // 快门黑闪（draw 阶段读，零重组）；底层实时预览始终运行。
                 Box(
                     Modifier.matchParentSize().drawBehind {
                         val a = shutterAlpha.value
                         if (a > 0.001f) drawRect(Color.Black, alpha = a)
-                        val c = resumeCover.value
-                        if (c > 0.001f) drawRect(Color.Black, alpha = c)
                     },
                 )
 

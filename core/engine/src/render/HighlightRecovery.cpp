@@ -1,4 +1,5 @@
 #include "HighlightRecovery.h"
+#include "ParallelRows.h"
 
 // CPU reference of PhotonCamera GlesMgcRawSpatialShaders: guide (13-110),
 // bentoGenerateHighlightMask (965-995), bentoAdjustHighlightMask (1112-1183),
@@ -274,15 +275,34 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
   const std::size_t n = static_cast<std::size_t>(result.width) * result.height;
   result.rgb.resize(n * 3);
   result.variance.resize(n);
-  for (int y = 0; y < result.height; ++y)
+  std::vector<uint8_t> row_error(result.height, 0);
+  parallelRows(result.height, [&](int row0, int row1) {
+  // Cache calibrated CFA quads, not reduced moments: every output retains the
+  // reference's nine samples and exact accumulation order. Each worker owns
+  // its rows; reflected borders and odd RAW extents still use rawQuad's clamp.
+  std::array<std::vector<std::array<float, 4>>, 3> quadRows;
+  std::array<int, 3> cachedY{{-1, -1, -1}};
+  for (auto& row : quadRows) row.resize(result.width);
+  for (int y = row0; y < row1; ++y) {
+    const int cy = mirrorGuideCenter(y, result.height);
+    const std::array<float, 4>* neighbors[3];
+    for (int dy = -1; dy <= 1; ++dy) {
+      const int qy = cy + dy;
+      const int slot = qy % 3;
+      if (cachedY[slot] != qy) {
+        for (int qx = 0; qx < result.width; ++qx)
+          quadRows[slot][qx] = rawQuad(raw, qx, qy, gains, blackTerms);
+        cachedY[slot] = qy;
+      }
+      neighbors[dy + 1] = quadRows[slot].data();
+    }
     for (int x = 0; x < result.width; ++x) {
       const int cx = mirrorGuideCenter(x, result.width);
-      const int cy = mirrorGuideCenter(y, result.height);
       std::array<float, 3> m0{{0.f, 0.f, 0.f}}, m1 = m0, average = m0;
       float g0 = 0.f, g1 = 0.f, centerGreen = 0.f;
       for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
-          const auto q = rawQuad(raw, cx + dx, cy + dy, gains, blackTerms);
+          const auto& q = neighbors[dy + 1][cx + dx];
           const std::array<float, 3> rgb{{q[0], .5f * (q[1] + q[2]), q[3]}};
           const float weight = (dx ? .25f : .5f) * (dy ? .25f : .5f);
           for (int c = 0; c < 3; ++c) {
@@ -322,11 +342,16 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
       const std::size_t p = static_cast<std::size_t>(y) * result.width + x;
       for (int c = 0; c < 3; ++c) {
         result.rgb[3 * p + c] = halfStorage(average[c]);
-        if (!std::isfinite(result.rgb[3 * p + c])) return fail(error, "guide RGB binary16 overflow");
+        if (!std::isfinite(result.rgb[3 * p + c])) { row_error[y] = 1; return; }
       }
       result.variance[p] = halfStorage(referenceVariance * 1024.f);
-      if (!std::isfinite(result.variance[p])) return fail(error, "guide variance binary16 overflow");
+      if (!std::isfinite(result.variance[p])) { row_error[y] = 2; return; }
     }
+  }
+  });
+  for (uint8_t code : row_error) {
+    if (code) return fail(error, code == 1 ? "guide RGB binary16 overflow" : "guide variance binary16 overflow");
+  }
   *output = std::move(result);
   return true;
 }
@@ -355,7 +380,8 @@ bool highlightGenerateGuides(const HighlightRawView& base,
   result.native_clipping.resize(n);
   result.highlight.resize(n);
   const auto levels = clippingLevels(base);
-  for (int y = 0; y < result.base.height; ++y)
+  parallelRows(result.base.height, [&](int row0, int row1) {
+  for (int y = row0; y < row1; ++y)
     for (int x = 0; x < result.base.width; ++x) {
       const std::size_t p = static_cast<std::size_t>(y) * result.base.width + x;
       const bool clipped = footprintClipped(base, x, y, levels);
@@ -365,6 +391,7 @@ bool highlightGenerateGuides(const HighlightRawView& base,
         maximum = std::max(maximum, quantizeBase(result.base.rgb[3 * p + c]));
       result.highlight[p] = clipped ? 255 : storeR8((maximum - kClip) / (1.f - kClip));
     }
+  });
   *output = std::move(result);
   return true;
 }
@@ -406,7 +433,10 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
   result.short_clipping.resize(n);
   result.normalized_error.resize(n);
   const auto levels = clippingLevels(short_frame);
-  for (int y = 0; y < h; ++y)
+  std::vector<uint8_t> row_error(h, 0);
+  std::vector<size_t> row_clipped(h, 0), row_short_clipped(h, 0);
+  parallelRows(h, [&](int row0, int row1) {
+  for (int y = row0; y < row1; ++y)
     for (int x = 0; x < w; ++x) {
       const std::size_t p = static_cast<std::size_t>(y) * w + x;
       float du = 0.f, dv = 0.f;
@@ -417,7 +447,7 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
         // PC ConvertAlignment stores normalized XY in RGBA16F before use.
         du = halfStorage((corrected_flow.xy[2 * tile] * .5f) / w);
         dv = halfStorage((corrected_flow.xy[2 * tile + 1] * .5f) / h);
-        if (!std::isfinite(du) || !std::isfinite(dv)) return fail(error, "converted flow binary16 overflow");
+        if (!std::isfinite(du) || !std::isfinite(dv)) { row_error[y] = 1; return; }
       }
       const auto shortRgb = sampleMirrored(guides.short_unscaled,
                                            (x + .5f) / w + du, (y + .5f) / h + dv);
@@ -446,10 +476,16 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
       const int ay = anchorEven(y + dv * h, h - 1);
       result.short_clipping[p] = footprintClipped(short_frame, ax, ay, levels) ? 255 : 0;
       if (guides.highlight[p]) {
-        ++result.clipped_pixels;
-        if (result.short_clipping[p]) ++result.short_clipped_highlight_pixels;
+        ++row_clipped[y];
+        if (result.short_clipping[p]) ++row_short_clipped[y];
       }
     }
+  });
+  for (int y = 0; y < h; ++y) {
+    if (row_error[y]) return fail(error, "converted flow binary16 overflow");
+    result.clipped_pixels += row_clipped[y];
+    result.short_clipped_highlight_pixels += row_short_clipped[y];
+  }
   result.clipped_ratio = static_cast<float>(result.clipped_pixels) / n;
   result.short_clipping_overlap = result.clipped_pixels
       ? static_cast<float>(result.short_clipped_highlight_pixels) / result.clipped_pixels : 0.f;

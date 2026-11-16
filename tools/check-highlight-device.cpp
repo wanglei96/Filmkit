@@ -8,12 +8,15 @@
 // adb shell /data/local/tmp/check-highlight-device
 // Optional extra real-driver compile/link check for every .frag in a directory:
 // adb shell /data/local/tmp/check-highlight-device --shader-dir /data/local/tmp/device-production-shaders
+// Timed production PC3D draws and diagnostic ablations (no app/camera required):
+// adb shell /data/local/tmp/check-highlight-device --pc3d-bench /data/local/tmp/kFsPc3d.frag --size 1024 --repeats 3
 // A failed numerical, compile/link, EGL or FBO check returns EXIT_FAILURE.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +27,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../core/engine/src/render/HighlightMergeShader.h"
@@ -460,6 +464,354 @@ void pc3dDrawTests(GLuint p) {
             moire,image[0],image[1],image[2],diag[0],diag[1],diag[2],off[0],off[1],off[2]);
     }
 }
+
+// Diagnostic-only source variant: reuse the same six covariance components and
+// pair matrices. No tap, inverse, regularization or propagation term is removed.
+std::string cachedPc3d(std::string source) {
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        const auto at = source.find(from);
+        require(at != std::string::npos, "PC3D source contract changed: " + from);
+        require(source.find(from, at + from.size()) == std::string::npos,
+                "ambiguous PC3D source contract: " + from);
+        source.replace(at, from.size(), to);
+    };
+    replace("float localDistance(vec3 delta, ivec2 p, ivec2 q, float extra) {\n"
+            "    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +\n"
+            "                localCovariance((vec2(q)+.5)/vec2(uSize));",
+            "float localDistance(vec3 delta, mat3 pair, float extra) {");
+    const std::string center = "    mat3 centerCovariance = uLocalNoiseOn != 0 ? localCovariance((vec2(xy)+.5)/vec2(uSize)) : mat3(0);\n";
+    replace(center, "");
+    replace("    vec3 gl = lscAt(xy);", center + "    vec3 gl = lscAt(xy);");
+    replace("localDistance(c-cin,xy,qg,0.0)",
+            "localDistance(c-cin,centerCovariance+localCovariance((vec2(qg)+.5)/vec2(uSize)),0.0)");
+    std::string loads;
+    for (int i = 0; i < 4; ++i) {
+        const std::string n = std::to_string(i);
+        const std::string actual = "                mat3 c" + n + " = localCovariance((vec2(q" + n + ")+.5)/vec2(uSize));\n";
+        replace(actual, "");
+        loads += "            mat3 c" + n + " = uLocalNoiseOn != 0 ? localCovariance((vec2(q" + n + ")+.5)/vec2(uSize)) : mat3(0);\n";
+        for (const std::string extra : {"0.0", "extra"}) {
+            replace("localDistance(cc" + n + "-cref,xy,q" + n + "," + extra + ")",
+                    "localDistance(cc" + n + "-cref,centerCovariance+c" + n + "," + extra + ")");
+        }
+    }
+    replace("            vec4 d = vec4(length(abs(cc0 - cref)), length(abs(cc1 - cref)),",
+            loads + "            vec4 d = vec4(length(abs(cc0 - cref)), length(abs(cc1 - cref)),");
+    return source;
+}
+
+std::string sharedPc3dDistance(std::string source) {
+    const std::string from =
+        "                vec4 dz = vec4(localDistance(cc0-cref,xy,q0,extra),\n"
+        "                               localDistance(cc1-cref,xy,q1,extra),\n"
+        "                               localDistance(cc2-cref,xy,q2,extra),\n"
+        "                               localDistance(cc3-cref,xy,q3,extra));";
+    const auto at=source.find(from);
+    require(at!=std::string::npos,"PC3D dual-distance source contract changed");
+    require(source.find(from,at+from.size())==std::string::npos,"ambiguous dual distance block");
+    source.replace(at,from.size(),
+        "                vec4 dz = dy;\n"
+        "                if (extra > 0.0) {\n" + from.substr(from.find("vec4 dz")+5) + "\n                }");
+    return source;
+}
+
+std::string symmetricPc3d(std::string source, int mode) {
+    const std::string from = "    return max(dot(delta, inverse(pair) * delta),0.0);";
+    const auto at = source.find(from);
+    require(at != std::string::npos, "PC3D inverse source contract changed");
+    const char* cofactor = R"GLSL(
+    vec3 d = vec3(pair[0][0],pair[1][1],pair[2][2]);
+    vec3 o = vec3(pair[1][0],pair[2][0],pair[2][1]);
+    vec3 adjD = d.yzx*d.zxy - o.zyx*o.zyx;
+    vec3 adjO = o.yxx*o.zzy - o*d.zyx;
+    float determinant = d.x*adjD.x + o.x*adjO.x + o.y*adjO.y;
+    vec3 solved = vec3(dot(vec3(adjD.x,adjO.x,adjO.y),delta),
+                       dot(vec3(adjO.x,adjD.y,adjO.z),delta),
+                       dot(vec3(adjO.y,adjO.z,adjD.z),delta)) / determinant;
+    return max(dot(delta,solved),0.0);
+)GLSL";
+    const char* ordered = R"GLSL(
+    vec3 d = vec3(pair[0][0],pair[1][1],pair[2][2]);
+    vec3 o = vec3(pair[1][0],pair[2][0],pair[2][1]);
+    vec3 adjD = d.yzx*d.zxy - o.zyx*o.zyx;
+    vec3 adjO = o.yxx*o.zzy - o*d.zyx;
+    float determinant = dot(vec3(d.x,o.x,o.y),vec3(adjD.x,adjO.x,adjO.y));
+    adjD /= determinant;
+    adjO /= determinant;
+    mat3 inv = mat3(adjD.x,adjO.x,adjO.y,adjO.x,adjD.y,adjO.z,adjO.y,adjO.z,adjD.z);
+    return max(dot(delta, inv*delta),0.0);
+)GLSL";
+    const char* cross = R"GLSL(
+    vec3 c0 = cross(pair[1],pair[2]);
+    vec3 c1 = cross(pair[2],pair[0]);
+    vec3 c2 = cross(pair[0],pair[1]);
+    mat3 inv = transpose(mat3(c0,c1,c2)) / dot(pair[0],c0);
+    return max(dot(delta, inv*delta),0.0);
+)GLSL";
+    const char* solve = R"GLSL(
+    float a = pair[0][0];
+    float l10 = pair[1][0]/a, l20 = pair[2][0]/a;
+    float b = pair[1][1] - l10*pair[1][0];
+    float v21 = pair[2][1] - l20*pair[1][0];
+    float l21 = v21/b;
+    float c = pair[2][2] - l20*pair[2][0] - l21*v21;
+    float y1 = delta.y - l10*delta.x;
+    float y2 = delta.z - l20*delta.x - l21*y1;
+    return max(delta.x*delta.x/a + y1*y1/b + y2*y2/c,0.0);
+)GLSL";
+    const char* pivoted = R"GLSL(
+    vec3 d = vec3(pair[0][0],pair[1][1],pair[2][2]);
+    vec3 o = vec3(pair[1][0],pair[2][0],pair[2][1]);
+    if(d.y > d.x && d.y >= d.z) {d=d.yxz;o=o.xzy;delta=delta.yxz;}
+    else if(d.z > d.x) {d=d.zyx;o=o.zyx;delta=delta.zyx;}
+    float l10=o.x/d.x, l20=o.y/d.x;
+    float b=d.y-l10*o.x, c=d.z-l20*o.y;
+    float v=o.z-l20*o.x;
+    if(c > b) {float temp=b;b=c;c=temp;temp=l10;l10=l20;l20=temp;delta=delta.xzy;}
+    float l21=v/b;
+    float y1=delta.y-l10*delta.x;
+    float y2=delta.z-l20*delta.x-l21*y1;
+    return max(delta.x*delta.x/d.x+y1*y1/b+y2*y2/(c-l21*v),0.0);
+)GLSL";
+    std::string branchless=pivoted;
+    const auto replace=[&](const std::string& from,const std::string& to) {
+        const auto at=branchless.find(from);
+        require(at!=std::string::npos,"pivoted solve source changed");
+        branchless.replace(at,from.size(),to);
+    };
+    replace("    if(d.y > d.x && d.y >= d.z) {d=d.yxz;o=o.xzy;delta=delta.yxz;}\n"
+            "    else if(d.z > d.x) {d=d.zyx;o=o.zyx;delta=delta.zyx;}",
+            "    bvec3 sy=bvec3(d.y>d.x && d.y>=d.z);\n"
+            "    d=mix(d,d.yxz,sy);o=mix(o,o.xzy,sy);delta=mix(delta,delta.yxz,sy);\n"
+            "    bvec3 sz=bvec3(d.z>d.x);\n"
+            "    d=mix(d,d.zyx,sz);o=mix(o,o.zyx,sz);delta=mix(delta,delta.zyx,sz);");
+    replace("    if(c > b) {float temp=b;b=c;c=temp;temp=l10;l10=l20;l20=temp;delta=delta.xzy;}",
+            "    bool sc=c>b;vec2 bc=mix(vec2(b,c),vec2(c,b),bvec2(sc));\n"
+            "    vec2 ls=mix(vec2(l10,l20),vec2(l20,l10),bvec2(sc));\n"
+            "    b=bc.x;c=bc.y;l10=ls.x;l20=ls.y;delta=mix(delta,delta.xzy,bvec3(sc));");
+    source.replace(at,from.size(),mode==1 ? solve : mode==2 ? ordered : mode==3 ? cross : mode==4 ? pivoted : mode==5 ? branchless.c_str() : cofactor);
+    return source;
+}
+
+void pc3dMetricTests(const std::string& source) {
+    constexpr int size=128;
+    constexpr size_t count=size*size;
+    std::vector<float> diag(count*4),off(count*4),delta(count*4);
+    std::vector<double> expected(count);
+    for(size_t k=0;k<count;++k) {
+        const double angle=double(k)*.731;
+        std::array<double,3> u={std::cos(angle)*.6,std::sin(angle)*.6,.8};
+        std::array<double,3> v={-std::sin(angle),std::cos(angle),0};
+        std::array<double,3> w={-.8*std::cos(angle),-.8*std::sin(angle),.6};
+        const double scale=std::pow(10.,-10.+double(k%11));
+        const double ratio=std::pow(10.,-double(k%8));
+        double m[3][3];
+        for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+            m[i][j]=scale*(u[i]*u[j]+ratio*v[i]*v[j]+ratio*ratio*w[i]*w[j]);
+        for(int i=0;i<3;++i) diag[4*k+i]=float(m[i][i]);
+        off[4*k]=float(m[0][1]);off[4*k+1]=float(m[0][2]);off[4*k+2]=float(m[1][2]);
+        const float regularizer=std::max((diag[4*k]*2+diag[4*k+1]*2+diag[4*k+2]*2)*1e-6f,1e-12f);
+        const double amp=std::sqrt(scale*(ratio*ratio+1e-6))*std::pow(10.,double(k%5)-2);
+        for(int i=0;i<3;++i) delta[4*k+i]=float(w[i]*amp);
+        double a[3][4];
+        const float packed[3][3]={{diag[4*k],off[4*k],off[4*k+1]},
+            {off[4*k],diag[4*k+1],off[4*k+2]},{off[4*k+1],off[4*k+2],diag[4*k+2]}};
+        for(int i=0;i<3;++i) {
+            for(int j=0;j<3;++j) a[i][j]=float(packed[i][j]*2+(i==j?regularizer:0.f));
+            a[i][3]=delta[4*k+i];
+        }
+        // Independent double partial-pivot Gaussian solve of the float input.
+        for(int i=0;i<3;++i) {
+            int pivot=i;
+            for(int j=i+1;j<3;++j) if(std::abs(a[j][i])>std::abs(a[pivot][i])) pivot=j;
+            for(int j=0;j<4;++j) std::swap(a[i][j],a[pivot][j]);
+            for(int j=i+1;j<3;++j) {
+                const double f=a[j][i]/a[i][i];
+                for(int c=i;c<4;++c) a[j][c]-=f*a[i][c];
+            }
+        }
+        double x[3]={};
+        for(int i=2;i>=0;--i) {
+            double b=a[i][3];
+            for(int j=i+1;j<3;++j) b-=a[i][j]*x[j];
+            x[i]=b/a[i][i];
+        }
+        double distance=0;
+        for(int i=0;i<3;++i) distance+=delta[4*k+i]*x[i];
+        expected[k]=1./(1.+std::max(distance,0.));
+    }
+    GLuint d=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,diag.data());
+    GLuint o=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,off.data());
+    GLuint dt=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,delta.data());
+    GLuint out=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT);
+    target({out},size,size,"isolated full matrix distance");
+    const auto begin=source.find("uniform highp sampler2D uLocalVariance;");
+    const auto end=source.find("mat3 pc3dOutputNoise(",begin);
+    require(begin!=std::string::npos && end!=std::string::npos,"metric source extraction failed");
+    const std::string metric="#version 300 es\nprecision highp float;\nlayout(location=0) out vec4 oColor;\nuniform ivec2 uSize;\nuniform highp sampler2D uDelta;\n"+
+        source.substr(begin,end-begin)+R"GLSL(
+void main(){
+    ivec2 xy=ivec2(gl_FragCoord.xy);
+    float distance=localDistance(texelFetch(uDelta,xy,0).rgb,xy,xy,0.0);
+    oColor=vec4(1.0/(1.0+distance),distance,0,1);
+})GLSL";
+    const bool productionSolve=source.find("    return max(dot(delta, inverse(pair) * delta),0.0);")==std::string::npos;
+    for(int mode=-1;mode<(productionSolve?0:6);++mode) {
+        const std::string variant=mode<0?metric:symmetricPc3d(metric,mode);
+        GLuint p=program(variant.c_str(),"isolated metric");
+        use(p);bind(p,"uLocalVariance",d,0);bind(p,"uLocalCovariance",o,1);bind(p,"uDelta",dt,2);
+        u2i(p,"uSize",size,size);uf(p,"uLocalNoiseScale",1);
+        draw();auto got=read(0,size,size);
+        double maxError=0,sum=0;size_t invalid=0;
+        for(size_t k=0;k<count;++k) {
+            const double error=std::abs(got[4*k]-expected[k]);
+            if(!std::isfinite(got[4*k]) || !std::isfinite(got[4*k+1])) ++invalid;
+            maxError=std::max(maxError,error);sum+=error*error;
+        }
+        std::printf("METRIC_JSON {\"mode\":%d,\"cases\":%zu,\"maxWeightError\":%.12g,\"rmsWeightError\":%.12g,\"nonfinite\":%zu}\n",
+            mode,count,maxError,std::sqrt(sum/count),invalid);
+        if(productionSolve || mode==4 || mode==5) {
+            result("full pivoted metric finite",invalid,0);
+            result("full pivoted metric vs double solve worst case",maxError,.005);
+            result("full pivoted metric vs double solve RMS",std::sqrt(sum/count),.0006);
+        }
+        glDeleteProgram(p);
+    }
+}
+
+void pc3dBenchmark(const std::string& path, int size, int repeats) {
+    std::ifstream stream(path, std::ios::binary);
+    require(stream.is_open(), "cannot read production PC3D source");
+    std::string source((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    pc3dMetricTests(source);
+    const GLuint original = program(source.c_str(), "production PC3D benchmark");
+    const GLuint cached = program(cachedPc3d(source).c_str(), "covariance reuse experiment");
+    const GLuint shared = program(sharedPc3dDistance(source).c_str(), "identical pair distance reuse experiment");
+    const GLuint symmetric = program(symmetricPc3d(source,0).c_str(), "symmetric full cofactor experiment");
+    const GLuint ldlt = program(symmetricPc3d(source,1).c_str(), "symmetric full LDLT experiment");
+    const GLuint ordered = program(symmetricPc3d(source,2).c_str(), "symmetric full inverse ordered experiment");
+    const GLuint cross = program(symmetricPc3d(source,3).c_str(), "full inverse cross experiment");
+    const GLuint pivoted = program(symmetricPc3d(source,4).c_str(), "full pivoted LDLT experiment");
+    const GLuint branchless = program(symmetricPc3d(source,5).c_str(), "full pivoted LDLT select experiment");
+    std::string distanceOnly=source;
+    for(const std::string name:{"oNoiseDiag","oNoiseOff"}) {
+        const std::string from="out vec4 "+name+";";
+        const auto at=distanceOnly.find(from);
+        require(at!=std::string::npos,"missing covariance output declaration");
+        const auto start=distanceOnly.rfind("layout(",at);
+        require(start!=std::string::npos,"missing covariance output layout");
+        distanceOnly.replace(start,at+from.size()-start,"vec4 "+name+";");
+    }
+    const GLuint metric=program(distanceOnly.c_str(),"diagnostic distances without output propagation");
+    std::string propagationOnly=source;
+    const auto function=propagationOnly.find("float localDistance(");
+    const auto start=propagationOnly.find('{',function), end=propagationOnly.find("\n}",start);
+    require(function!=std::string::npos && start!=std::string::npos && end!=std::string::npos,
+            "missing localDistance body");
+    propagationOnly.replace(start+1,end-start-1,"\n    return dot(delta,delta);");
+    const GLuint propagation=program(propagationOnly.c_str(),"diagnostic propagation without pair metric");
+    const size_t count = size_t(size) * size * 4;
+    std::vector<float> image(count), diagonal(count), offDiagonal(count);
+    std::vector<uint8_t> masks(size_t(size)*size);
+    for (int y=0; y<size; ++y) for (int x=0; x<size; ++x) {
+        const size_t k=(size_t(y)*size+x)*4;
+        const float u=float(x)/size, v=float(y)/size;
+        const float base=.02f+.7f*u+.02f*std::sin(float(x)*.37f)*std::cos(float(y)*.29f);
+        image[k]=base; image[k+1]=base*(.8f+.2f*v); image[k+2]=base*(.7f+.15f*u); image[k+3]=1;
+        if (x>size/2 && y>size/2) {
+            const float t=float((x*13+y*7)%17)/16.f;
+            image[k]=.02f+.9f*t; image[k+1]=.8f-.7f*t; image[k+2]=.05f+.45f*t;
+        }
+        const float n=.0001f+.001f*(.1f+u+v);
+        diagonal[k]=n; diagonal[k+1]=n*1.3f; diagonal[k+2]=n*1.7f; diagonal[k+3]=1;
+        offDiagonal[k]=-n*.15f; offDiagonal[k+1]=n*.1f; offDiagonal[k+2]=-n*.2f; offDiagonal[k+3]=1;
+        masks[size_t(y)*size+x]=(x>size/2 && x<size/2+3) ? 255 : 0;
+    }
+    const float unity[]={1,1,1,1};
+    const GLuint input=texture(GL_RGBA16F,size,size,GL_RGBA,GL_FLOAT,image.data());
+    const GLuint variance=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,diagonal.data());
+    const GLuint covariance=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,offDiagonal.data());
+    const GLuint lsc=texture(GL_RGBA32F,1,1,GL_RGBA,GL_FLOAT,unity);
+    const GLuint mask=texture(GL_R8,size,size,GL_RED,GL_UNSIGNED_BYTE,masks.data());
+    const GLuint color=texture(GL_RGBA16F,size,size,GL_RGBA,GL_HALF_FLOAT);
+    const GLuint outDiag=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT);
+    const GLuint outOff=texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT);
+    target({color,outDiag,outOff},size,size,"benchmark full-size three MRT");
+    const GLenum buffers[]={GL_COLOR_ATTACHMENT0,GL_COLOR_ATTACHMENT1,GL_COLOR_ATTACHMENT2};
+    const auto setup=[&](GLuint p, int local, float moire) {
+        use(p);
+        bind(p,"uTex",input,0); bind(p,"uOrig",input,1);
+        bind(p,"uLocalVariance",variance,2); bind(p,"uLocalCovariance",covariance,3);
+        bind(p,"uLsc",lsc,4); bind(p,"uSatMask",mask,5);
+        u2i(p,"uSize",size,size); u2i(p,"uFullSize",size,size); u2i(p,"uLscSize",1,1);
+        ui(p,"uK",5); uf(p,"uKernel",2.4f); uf(p,"uSigA",.002f); uf(p,"uSigB",.0001f);
+        uf(p,"uLuma",.8f); ui(p,"uMaskOn",1); ui(p,"uDown",1); ui(p,"uSatMaskOn",1);
+        ui(p,"uLocalNoiseOn",local); uf(p,"uLocalNoiseScale",1); uf(p,"uMoire",moire);
+    };
+    const auto striped=[&](int strips) {
+        if (strips==1) { glDrawArrays(GL_TRIANGLES,0,3); ++draws; }
+        else {
+            glEnable(GL_SCISSOR_TEST);
+            const int rows=(size+strips-1)/strips;
+            for(int y=0;y<size;y+=rows) {
+                glScissor(0,y,size,std::min(rows,size-y));
+                glDrawArrays(GL_TRIANGLES,0,3); ++draws; glFlush();
+            }
+            glDisable(GL_SCISSOR_TEST);
+        }
+        glFinish(); glCheck("benchmark draw");
+    };
+    const auto measure=[&](const char* name,GLuint p,int local,int attachments,int strips,float moire) {
+        setup(p,local,moire); glDrawBuffers(attachments,buffers);
+        striped(strips); // Driver specialization/page commitment are excluded.
+        std::vector<double> timings;
+        for(int i=0;i<repeats;++i) {
+            const auto start=std::chrono::steady_clock::now();
+            striped(strips);
+            timings.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
+        }
+        std::sort(timings.begin(),timings.end());
+        const double median=(timings[(timings.size()-1)/2]+timings[timings.size()/2])*.5;
+        std::printf("BENCH_JSON {\"variant\":\"%s\",\"size\":%d,\"localNoise\":%d,\"attachments\":%d,\"strips\":%d,\"moire\":%.1f,\"repeats\":%d,\"medianMs\":%.6f,\"minMs\":%.6f,\"maxMs\":%.6f}\n",
+            name,size,local,attachments,strips,moire,repeats,median,timings.front(),timings.back());
+    };
+    for (float moire : {0.f,1.5f}) {
+        measure("production",original,1,3,16,moire);
+        std::array<std::vector<float>,3> expected={read(0,size,size),read(1,size,size),read(2,size,size)};
+        const std::array<std::pair<const char*,GLuint>,8> candidates={{{"reuse_full_covariance",cached},{"reuse_identical_distance",shared},
+            {"symmetric_full_cofactor",symmetric},{"symmetric_full_ldlt",ldlt},
+            {"symmetric_full_ordered",ordered},{"full_cross_inverse",cross},{"full_pivoted_ldlt",pivoted},{"full_pivoted_ldlt_select",branchless}}};
+        for(const auto& candidate:candidates) {
+            measure(candidate.first,candidate.second,1,3,16,moire);
+            for(int attachment=0;attachment<3;++attachment) {
+                auto got=read(attachment,size,size);
+                double maxError=0, maxScaled=0; size_t different=0;
+                for(size_t k=0;k<count;++k) {
+                    errorAt(maxError,got[k],expected[attachment][k]);
+                    different+=std::memcmp(&got[k],&expected[attachment][k],sizeof(float))!=0;
+                    const size_t px=(k/4)*4;
+                    const double trace=std::max(double(expected[1][px]+expected[1][px+1]+expected[1][px+2]),1e-10);
+                    // A signed off-diagonal may cross zero. Normalize by the
+                    // full PSD covariance trace, not that single component.
+                    errorAt(maxScaled,got[k]/trace,expected[attachment][k]/trace);
+                }
+                const bool exact = candidate.second==cached || candidate.second==shared;
+                result(std::string(candidate.first)+" attachment "+std::to_string(attachment)+(exact?" bit equality":" numerical agreement"),
+                    exact ? (different?INFINITY:maxError) : (attachment==0?maxError:maxScaled),exact?0:(attachment==0?1./2048:.0005));
+                std::printf("EQUALITY_JSON {\"variant\":\"%s\",\"moire\":%.1f,\"attachment\":%d,\"values\":%zu,\"differentBits\":%zu,\"maxAbsError\":%.12g}\n",
+                    candidate.first,moire,attachment,count,different,maxError);
+            }
+        }
+        // Ablations below are measurements only, NEVER image-quality candidates.
+        measure("diagnostic_single_attachment",original,1,1,16,moire);
+        measure("diagnostic_metric_no_propagation",metric,1,1,16,moire);
+        measure("diagnostic_propagation_no_pair_metric",propagation,1,3,16,moire);
+        measure("diagnostic_global_noise",original,0,1,16,moire);
+        measure("production",original,1,3,1,moire);
+        measure("production",original,1,3,64,moire);
+        measure("production_repeat",original,1,3,16,moire);
+    }
+}
 void productionShaderTests(const std::string& directory) {
     DIR* dir = opendir(directory.c_str());
     require(dir != nullptr, "cannot open shader directory: " + directory);
@@ -491,6 +843,7 @@ void productionShaderTests(const std::string& directory) {
                 name.c_str(), source.size(), uniforms, attributes);
             result("production compile/link " + name, 0, 0);
             if (name == "kFsPc3d.frag") pc3dDrawTests(p);
+            if (name == "kFsPc3d.frag") pc3dMetricTests(source);
         } catch (const std::exception& e) {
             std::printf("PRODUCTION_SHADER_ERROR %s %s\n", name.c_str(), e.what());
             result("production compile/link " + name, INFINITY, 0);
@@ -522,15 +875,31 @@ std::string jsonString(const std::string& s) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout,nullptr,_IONBF,0);
     try {
-        std::string shaderDirectory;
+        std::string shaderDirectory, benchmarkPath;
+        int benchmarkSize=512, benchmarkRepeats=3;
         if (argc == 3 && std::string(argv[1]) == "--shader-dir") shaderDirectory = argv[2];
-        else require(argc == 1, "usage: check-highlight-device [--shader-dir DIRECTORY]");
+        else if (argc >= 3 && std::string(argv[1]) == "--pc3d-bench") {
+            benchmarkPath=argv[2];
+            for(int i=3;i<argc;i+=2) {
+                require(i+1<argc,"missing benchmark option value");
+                if(std::string(argv[i])=="--size") benchmarkSize=std::stoi(argv[i+1]);
+                else if(std::string(argv[i])=="--repeats") benchmarkRepeats=std::stoi(argv[i+1]);
+                else require(false,"unknown benchmark option");
+            }
+            require(benchmarkSize>=256 && benchmarkSize<=4096 && benchmarkRepeats>=1 && benchmarkRepeats<=20,
+                    "benchmark size must be [256,4096], repeats [1,20]");
+        }
+        else require(argc == 1, "usage: check-highlight-device [--shader-dir DIRECTORY | --pc3d-bench FILE [--size N] [--repeats N]]");
         init();
-        GLuint merge=program(filmkit::kFsHighlightMerge,"HighlightMergeShader.h");
-        GLuint resolve=program(filmkit::kFsHighlightResolve,"HighlightResolveShader.h");
-        GLuint noise=program(filmkit::kFsHighlightNoise,"HighlightNoiseShader.h");
-        mergeTests(merge);resolveTests(resolve);noiseTests(noise);
-        if (!shaderDirectory.empty()) productionShaderTests(shaderDirectory);
+        if (!benchmarkPath.empty()) {
+            pc3dBenchmark(benchmarkPath,benchmarkSize,benchmarkRepeats);
+        } else {
+            GLuint merge=program(filmkit::kFsHighlightMerge,"HighlightMergeShader.h");
+            GLuint resolve=program(filmkit::kFsHighlightResolve,"HighlightResolveShader.h");
+            GLuint noise=program(filmkit::kFsHighlightNoise,"HighlightNoiseShader.h");
+            mergeTests(merge);resolveTests(resolve);noiseTests(noise);
+            if (!shaderDirectory.empty()) productionShaderTests(shaderDirectory);
+        }
     } catch(const std::exception& e) {
         ++failures;
         std::printf("FATAL %s EGL_error=0x%04x\n",e.what(),eglGetError());

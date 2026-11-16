@@ -1,8 +1,8 @@
 #include "Align.h"
+#include "ParallelRows.h"
 
 #include <algorithm>
 #include <cmath>
-#include <thread>
 #include <vector>
 
 namespace filmkit {
@@ -15,27 +15,6 @@ inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v
 // 每个 tile 只写自己那格 d3x/d2x/out/conf —— 行间无共享写 ⇒ 结果与串行**逐位一致**；
 // 置信度和也按行独立累加、最后串行求和，避免原子加法的顺序抖动（便于 A/B 逐位对比）。
 // 线程上限 8：再多只是增加调度与内存带宽争用（SAD 是纯带宽活）。
-template <typename Fn>
-void parallelRows(int n, Fn fn) {
-  const unsigned hc = std::thread::hardware_concurrency();
-  const int workers = static_cast<int>(std::min<unsigned>(hc > 0 ? hc : 1, 8));
-  if (workers <= 1 || n < 8) {
-    fn(0, n);
-    return;
-  }
-  const int nw = std::min(workers, n);
-  const int chunk = (n + nw - 1) / nw;
-  std::vector<std::thread> ts;
-  ts.reserve(static_cast<size_t>(nw));
-  for (int w = 0; w < nw; ++w) {
-    const int b = w * chunk;
-    const int e = std::min(n, b + chunk);
-    if (b >= e) break;
-    ts.emplace_back(fn, b, e);
-  }
-  for (auto& t : ts) t.join();
-}
-
 // SAD：a 的 (x0,y0) tile 对 b 的 (x0+dx, y0+dy) tile，步长 step 采样。
 // 所有读地址逐点 clamp（tile 32/16/8 不整除图像尺寸时，末行末列 tile 的
 // x0+采样点会跨过图像宽 —— 基址不带 x0、索引单独 clamp，杜绝越界读）。

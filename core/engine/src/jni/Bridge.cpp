@@ -436,7 +436,9 @@ Java_com_filmkit_app_EngineBridge_nativeEngineStart(JNIEnv* env, jobject,
   Logger::instance().log(
       LogLevel::kInfo, "engine", "engine.start",
       "{\"w\":" + std::to_string(ANativeWindow_getWidth(g_window)) +
-          ",\"h\":" + std::to_string(ANativeWindow_getHeight(g_window)) + "}");
+          ",\"h\":" + std::to_string(ANativeWindow_getHeight(g_window)) +
+          ",\"eglRequested\":" + std::to_string(engineEgl().requestedPriority()) +
+          ",\"eglActual\":" + std::to_string(engineEgl().actualPriority()) + "}");
   return JNI_TRUE;
 }
 
@@ -502,13 +504,17 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
         LogLevel::kInfo, "engine", "engine.still_start",
         std::string("{\"fresh\":true,\"eglLow\":") +
             (stillEgl().lowPriorityContext() ? "1" : "0") + ",\"eglPriExt\":" +
-            (stillEgl().contextPriorityExt() ? "1" : "0") + "}");
+            (stillEgl().contextPriorityExt() ? "1" : "0") +
+            ",\"eglRequested\":" + std::to_string(stillEgl().requestedPriority()) +
+            ",\"eglActual\":" + std::to_string(stillEgl().actualPriority()) + "}");
   } else {
     Logger::instance().log(
         LogLevel::kInfo, "engine", "engine.still_start",
         std::string("{\"fresh\":false,\"eglLow\":") +
             (stillEgl().lowPriorityContext() ? "1" : "0") + ",\"eglPriExt\":" +
-            (stillEgl().contextPriorityExt() ? "1" : "0") + "}");
+            (stillEgl().contextPriorityExt() ? "1" : "0") +
+            ",\"eglRequested\":" + std::to_string(stillEgl().requestedPriority()) +
+            ",\"eglActual\":" + std::to_string(stillEgl().actualPriority()) + "}");
   }
   return JNI_TRUE;
 }
@@ -619,15 +625,25 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitST(
     }
   }
 
+  const auto draw_start = std::chrono::steady_clock::now();
   const bool ok = g_renderer->submitFrame(m, rotation, sx, sy, dst_w, dst_h, p,
                                           fill_test == JNI_TRUE);
   if (!ok) return JNI_FALSE;
 
+  const auto draw_done = std::chrono::steady_clock::now();
   if (!engineEgl().swapBuffers(g_win_surface)) {
     Logger::instance().log(LogLevel::kError, "engine", "render.swap_failed",
                            "{\"frames\":" +
                                std::to_string(g_renderer->frameCount()) + "}");
     return JNI_FALSE;
+  }
+  const auto swap_done = std::chrono::steady_clock::now();
+  const double draw_ms = std::chrono::duration<double, std::milli>(draw_done - draw_start).count();
+  const double swap_ms = std::chrono::duration<double, std::milli>(swap_done - draw_done).count();
+  if (FrameRenderer::previewScale() < 1.f && draw_ms + swap_ms >= 40.) {
+    Logger::instance().log(LogLevel::kInfo, "engine", "preview.slow_submit",
+        "{\"drawMs\":" + std::to_string(draw_ms) +
+        ",\"swapMs\":" + std::to_string(swap_ms) + "}");
   }
   static int64_t last_logged = 0;
   const int64_t f = g_renderer->frameCount();

@@ -2230,10 +2230,12 @@ class CameraController(private val context: Context, private val render: RenderC
             return
         }
         capturing = true
-        // 0.13.27：拍照期**定格预览**（iPhone 味）—— 快门后不再消费新帧，画面停在
-        // 最后一帧，处理完（done 回调）再恢复。处理期 3~4 秒的掉帧就不会出现在
-        // 用户眼前；失败/无成片路径也会在 done 里恢复（见下方 releasePreviewScaleGuard）。
-        render.pausePreview()
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_INFO, "camera", "capture.begin",
+            kv("monoMs" to android.os.SystemClock.elapsedRealtime()),
+        )
+        // CameraScreen animates its PixelCopy snapshot, not the live producer.
+        // Keep consuming preview buffers throughout acquisition and rendering.
         // 预览降载（v0.10.93 方案 A）：快门即降（0.5×），合成结束回升。实验判读
         //（2026-10-01 四组开关）：拍照期掉帧主因 = MFNR 链路 GPU 负载 + 预览自身
         // 争抢份额，降噪已排除。同时预热拍照线程（单帧 RAW/YUV 也迁入独立线程了，
@@ -2292,7 +2294,6 @@ class CameraController(private val context: Context, private val render: RenderC
             capturing = false
             capturePhase = 0
             releasePreviewScaleGuard()
-            render.resumePreview()   // 0.13.27：提交失败也要解除定格
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "camera", "capture.submit_failed",
                 kv("error" to (t.message ?: t.toString())),
@@ -2556,6 +2557,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     "longIso" to longIso, "longSec" to "%.4f".format(longSec / 1e9f),
                     "shortIso" to shortIso,
                     "shortSec" to "%.4f".format(shortSecPlanned / 1e9f),
+                    "baseNs" to capSec, "longNs" to longSec, "shortNs" to shortSecPlanned,
+                    "minNs" to expLower, "maxNs" to expUpper, "minIso" to isoLower,
                     "longEvReq" to HDR_LONG_EV, "shortEvReq" to HDR_SHORT_EV,
                     // ISO 钳模拟顶后长帧实际 EV 可能远低于请求值（暗场快门 10ms 顶 +
                     // 模拟 ISO 顶），实测核对走 bracket.actual（P0 日志，无条件记）。
@@ -2764,6 +2767,7 @@ class CameraController(private val context: Context, private val render: RenderC
      *  Image 给 DngCreator，buffer 给融合 —— 只保留 Image 会让融合少一帧，
      *  0.11.66 真机"无成像"就是这条（frames.size=3 ⇒ submitRawBurst 入口直接失败）。 */
     private fun copyRaw(img: Image, slot: Int, close: Boolean) {
+        val startNs = android.os.SystemClock.elapsedRealtimeNanos()
         try {
             val p = img.planes[0]
             val buf = java.nio.ByteBuffer.allocateDirect(p.buffer.capacity())
@@ -2778,6 +2782,10 @@ class CameraController(private val context: Context, private val render: RenderC
             dumpBurstFrame(slot, buf, img.width, img.height, p.rowStride / 2)
         } finally {
             if (close) runCatching { img.close() }
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "camera", "raw.copy",
+                kv("slot" to slot, "ms" to (android.os.SystemClock.elapsedRealtimeNanos() - startNs) / 1e6),
+            )
         }
     }
 
@@ -2915,16 +2923,6 @@ class CameraController(private val context: Context, private val render: RenderC
         if (!context.getSharedPreferences("filmkit", 0).getBoolean("still_thread", false)) return
         StillRenderClient.startAsync()
         StillRenderClient.warmup(stillSize.width, stillSize.height, stillRot)
-    }
-
-    /**
-     * 0.13.29：快门动画结束立刻解除定格 —— 不等合成完成。
-     * 合成还要 2~3 秒，定格到那时用户会觉得"卡屏太久"；宁可让它恢复实时预览
-     * （处理期会有掉帧），也不要长时间冻住取景。done 回调里的 resume 仍在，
-     * 作为失败/异常路径的兜底（幂等）。
-     */
-    fun resumePreviewNow() {
-        render.resumePreview()
     }
 
     @SuppressLint("MissingPermission")
@@ -3120,6 +3118,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 stillSize.width, stillSize.height, stillFormat, 4,
             ).apply {
                 setOnImageAvailableListener({ r ->
+                    val callbackNs = android.os.SystemClock.elapsedRealtimeNanos()
+                    try {
                     // burst 期间 acquireLatestImage 的"丢旧帧"语义会吃掉 4 帧中的
                     // 3 帧 —— 必须按队列逐帧 acquireNextImage
                     val img =
@@ -3149,6 +3149,12 @@ class CameraController(private val context: Context, private val render: RenderC
                     } else {
                         submitStill(img)
                     }
+                    } finally {
+                        EngineBridge.nativeAppendLog(
+                            EngineBridge.LEVEL_INFO, "camera", "raw.callback",
+                            kv("ms" to (android.os.SystemClock.elapsedRealtimeNanos() - callbackNs) / 1e6),
+                        )
+                    }
                 }, render.looper?.let { android.os.Handler(it) })
             }
         }
@@ -3165,29 +3171,23 @@ class CameraController(private val context: Context, private val render: RenderC
             }
             SurfaceTexture(texId).apply {
                 setOnFrameAvailableListener({ texture ->
-                    if (!firstFrameLogged) {
-                        firstFrameLogged = true
-                        EngineBridge.nativeAppendLog(
-                            EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
-                        )
-                    }
-                    applyTonePref()
-                    applyZebraPref()
-                    applyLutStrengthPref()
-                    // 预览旋转恒 0（v0.6.39 事故修复）：
-                    // SurfaceTexture 的 STMatrix 已含传感器侧的变换，**显示方向由 Activity
-                    // 跟随系统旋转处理**（本 Activity 未锁 screenOrientation）。所以预览
-                    // 不需要也不应该再叠加一次旋转 —— 而 v0.6.39 把 orientationStep 接上来
-                    // 之后，设备一转预览就被多转 90°，方向与手机相反、完全无法取景。
-                    // 注意 orientationStep 与静拍的旋转量**语义不同**：静拍走 CPU 纹理，
-                    // 需要引擎自己补传感器 90°（RenderClient 里 effectiveRot = (rot+1)%4），
-                    // 预览走 STMatrix 则不需要。PhotonCamera 同样把"像素方向"与"显示方向"
-                    // 解耦（成片像素转正 + EXIF 恒 ORIENTATION_NORMAL）。
                     render.frameAvailable(
-                        texture, previewSize.width, previewSize.height,
-                        0, engineScopedForCapture(filmParams), fillTest,
+                        texture, previewSize.width, previewSize.height, 0,
+                        film = {
+                            if (!firstFrameLogged) {
+                                firstFrameLogged = true
+                                EngineBridge.nativeAppendLog(
+                                    EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
+                                )
+                            }
+                            applyTonePref()
+                            applyZebraPref()
+                            applyLutStrengthPref()
+                            // STMatrix contains the sensor transform; preview rotation stays 0.
+                            engineScopedForCapture(filmParams)
+                        }, fillTest = fillTest,
                     )
-                }, render.looper?.let { android.os.Handler(it) })
+                }, render.frameCallbackHandler)
             }
         }
         st.setDefaultBufferSize(previewSize.width, previewSize.height)
@@ -4175,8 +4175,6 @@ class CameraController(private val context: Context, private val render: RenderC
             // 合成结束（无论成败）：预览降载回升（v0.10.93）。capturing 已在下面
             // 提前解锁，这里的恢复点才是"GPU 不再被合成占用"的时刻。
             releasePreviewScaleGuard()
-            // 0.13.27：定格解除 —— 处理完立刻恢复实时预览（失败也恢复）
-            render.resumePreview()
             // 这里**不再清 burst* 共享数组**：capturing 已经提前解锁，用户此刻
             // 很可能已经开了下一张采集并在写这些数组，清空会把新一张的帧数据
             // 抹掉。数组统一由 startBurst() 在每张采集开始时重置。

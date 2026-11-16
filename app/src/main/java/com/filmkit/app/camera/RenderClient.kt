@@ -8,22 +8,27 @@ import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 渲染线程：独占 EGL 上下文（native 侧）。
  * 帧流：Camera2 → SurfaceTexture（系统 YUV→RGB，参照 PhotonCamera 路径）→
- * updateTexImage → 胶片链 → 上屏。相机回调与本线程 looper 绑定，天然串行。
+ * updateTexImage → 胶片链 → 上屏。预览通知独立派发，参数与 GL 操作仍在渲染线程串行。
  */
 class RenderClient {
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
+    private var callbackThread: HandlerThread? = null
+    var frameCallbackHandler: Handler? = null
+        private set
 
     @Volatile
     private var startedSurface: Surface? = null
 
-    private val pending = AtomicBoolean(false)
+    private val frameGate = PreviewFrameGate()
+    private val latestCallbackNs = AtomicLong(0L)
     private val stMat = FloatArray(16)
 
     // 预览停更量化（v0.10.85）：渲染线程被长链阻塞时，相邻两次渲染的间隔会拉大
@@ -31,8 +36,17 @@ class RenderClient {
     //（改前 ≈1600~3400ms，独立线程后应不再出现；采集期 150~250ms 的正常停顿
     //  被 400ms 阈值挡在外面）。
     private var lastPresentMs = 0L
-    /** 0.13.7：上一帧**到达**时刻（区分 HAL 停帧 vs 渲染被占，见 frameAvailable） */
+    // Only touched on FilmFrameCallback; callback dispatch is not a HAL timestamp.
     private var lastArriveMs = 0L
+    private val droppedCallbacks = AtomicInteger(0)
+    private var timingStartNs = 0L
+    private var lastFrameNs = 0L
+    private var lastTextureNs = 0L
+    private val frameIntervals = ArrayList<Double>(64)
+    private val queueTimes = ArrayList<Double>(64)
+    private val updateTimes = ArrayList<Double>(64)
+    private val renderTimes = ArrayList<Double>(64)
+    private val textureIntervals = ArrayList<Double>(64)
 
     // 预览帧率曲线（v0.10.87）：preview_gap 只抓 >400ms 的"停更"，抓不到"降帧"
     // ——拍照时 still 线程跑 DFT/RCD 与预览争同一颗 GPU，30fps 掉到十几 fps 时
@@ -45,37 +59,6 @@ class RenderClient {
 
     @Volatile
     private var acceptingFrames = false
-
-    /** 0.13.28：最近一次预览 SurfaceTexture（resumePreview 清积压 buffer 用）。 */
-    @Volatile
-    private var lastSt: SurfaceTexture? = null
-
-    /** 0.13.27：拍照期定格（iPhone 味）。快门后停止消费新帧，SurfaceView 保留
-     *  最后提交的那一帧 —— 用户看到的是"照片定格"，而不是处理期 3 秒的掉帧。
-     *  [resumePreview] 在合成结束（done 回调）时恢复；恢复后 SurfaceTexture 队列
-     *  里积压的旧帧会被 pending 闸门丢掉，只渲染最新一帧（≤2 帧内追上）。 */
-    fun pausePreview() {
-        acceptingFrames = false
-    }
-
-    /** 0.13.28：恢复时**先把暂停期间积压的 buffer 消费掉**（只 updateTexImage、
-     *  不渲染）。暂停 3~4 秒不消费，SurfaceTexture 队列会满、HAL producer 被堵，
-     *  恢复后可能再也不出帧（真机实测"预览没释放"）。最多清 4 帧，异常忽略。 */
-    fun resumePreview() {
-        acceptingFrames = true
-        val h = handler ?: return
-        val st = lastSt
-        if (st == null) return
-        h.post {
-            repeat(4) {
-                try {
-                    st.updateTexImage()
-                } catch (_: Throwable) {
-                    return@repeat
-                }
-            }
-        }
-    }
 
     val looper: android.os.Looper?
         get() = thread?.looper
@@ -92,6 +75,19 @@ class RenderClient {
             thread = t
             val h = Handler(t.looper)
             handler = h
+            callbackThread = HandlerThread(
+                "FilmFrameCallback", android.os.Process.THREAD_PRIORITY_DISPLAY,
+            ).apply {
+                start()
+                frameCallbackHandler = Handler(looper)
+            }
+            lastArriveMs = 0L
+            lastPresentMs = 0L
+            timingStartNs = 0L
+            lastFrameNs = 0L
+            lastTextureNs = 0L
+            droppedCallbacks.set(0)
+            listOf(frameIntervals, queueTimes, updateTimes, renderTimes, textureIntervals).forEach { it.clear() }
 
             val latch = CountDownLatch(1)
             var ok = false
@@ -172,10 +168,9 @@ class RenderClient {
         srcW: Int,
         srcH: Int,
         rotation: Int,
-        film: DoubleArray,
+        film: () -> DoubleArray,
         fillTest: Boolean,
     ) {
-        lastSt = st
         val h = handler
         if (h == null) {
             EngineBridge.nativeAppendLog(
@@ -183,11 +178,8 @@ class RenderClient {
             )
             return  // pending 未置位，无需回滚
         }
-        // ── 0.13.7 预览卡顿归因：**帧到达**时刻（在 pending 闸门之前）──────────
-        // 现有 render.preview_gap 量的是"渲染完成"的间隔，它把两种完全不同的原因
-        // 混在一起：① HAL 在拍照/burst 期间不出帧（我们改不了）；② 帧到了但渲染
-        // 线程被长链占住（我们的锅）。到达间隔（本字段）与完成间隔（preview_gap）
-        // 放在同一时间轴上一比就能分开：到达就停 = HAL；到达正常而完成停 = 我们。
+        // Independent callback dispatch; still includes dispatch/coalescing delay.
+        // Queue and update/submit times below isolate FilmRender blocking.
         val nowArrive = android.os.SystemClock.elapsedRealtime()
         if (lastArriveMs > 0) {
             val ag = (nowArrive - lastArriveMs).toInt()
@@ -199,57 +191,105 @@ class RenderClient {
             }
         }
         lastArriveMs = nowArrive
-        if (!pending.compareAndSet(false, true)) return
-        val posted = h.post {
-            try {
-                if (acceptingFrames) {  // stop 后到达的迟到帧直接丢弃（防 updateTexImage 崩溃）
-                    st.updateTexImage()
-                    st.getTransformMatrix(stMat)
-                    EngineBridge.nativeEngineSubmitST(
-                        stMat, srcW, srcH, rotation, film, fillTest,
-                    )
-                }
-            } catch (t: Throwable) {
-                EngineBridge.nativeAppendLog(
-                    EngineBridge.LEVEL_ERROR, "engine", "render.frame_error",
-                    com.filmkit.app.kv("error" to (t.message ?: t.toString())),
-                )
-            }
-            // 渲染完成时刻：与上一次的间隔 > 400ms 说明预览停更过一次。
-            // 阈值取 400 而非 250：拍照采集期本身有 DNG 落盘 + 4 帧拷贝
-            //（≈150~250ms，走独立线程时也照旧发生在预览线程上），别把它误报成"冻住"。
-            // 上限 10s：切后台/切镜头造成的会话级空档不算（那是重建预览，不是被链阻塞）。
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (lastPresentMs > 0) {
-                val gap = (now - lastPresentMs).toInt()
-                if (gap in 401..10_000) {
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_WARN, "engine", "render.preview_gap",
-                        com.filmkit.app.kv("gapMs" to gap),
-                    )
-                }
-            }
-            lastPresentMs = now
-            // 帧率统计（见字段处说明）：按秒计数，攒够 5 秒发一条
-            if (fpsSecStart == 0L) fpsSecStart = now
-            fpsInSec++
-            if (now - fpsSecStart >= 1000L) {
-                fpsWindow.add(fpsInSec)
-                fpsInSec = 0
-                fpsSecStart = now
-                if (fpsWindow.size >= 5) {
-                    EngineBridge.nativeAppendLog(
-                        EngineBridge.LEVEL_INFO, "engine", "render.fps",
-                        com.filmkit.app.kv("fps" to fpsWindow.joinToString(",")),
-                    )
-                    fpsWindow.clear()
-                }
-            }
-            pending.set(false)
+        latestCallbackNs.set(android.os.SystemClock.elapsedRealtimeNanos())
+        if (!frameGate.offer()) {
+            droppedCallbacks.incrementAndGet()
+            return
         }
+        var queuedNs = latestCallbackNs.get()
+        val posted = h.post(object : Runnable {
+            override fun run() {
+                if (!acceptingFrames) {
+                    frameGate.cancel()
+                    return
+                }
+                val sequence = frameGate.begin()
+                val startNs = android.os.SystemClock.elapsedRealtimeNanos()
+                try {
+                    val updateNs = android.os.SystemClock.elapsedRealtimeNanos()
+                    st.updateTexImage()
+                    val textureNs = st.timestamp
+                    // A trailing notification may refer to the buffer already latched.
+                    // Still complete the gate below, but do not redraw/count that buffer.
+                    if (lastFrameNs != 0L && textureNs == lastTextureNs) return
+                    st.getTransformMatrix(stMat)
+                    val params = film() // Mutable film state stays on FilmRender.
+                    val submitNs = android.os.SystemClock.elapsedRealtimeNanos()
+                    EngineBridge.nativeEngineSubmitST(
+                        stMat, srcW, srcH, rotation, params, fillTest,
+                    )
+                    recordFrameTiming(queuedNs, startNs, updateNs, submitNs,
+                        android.os.SystemClock.elapsedRealtimeNanos(), textureNs)
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (lastPresentMs > 0) {
+                        val gap = (now - lastPresentMs).toInt()
+                        if (gap in 401..10_000) {
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_WARN, "engine", "render.preview_gap",
+                                com.filmkit.app.kv("gapMs" to gap),
+                            )
+                        }
+                    }
+                    lastPresentMs = now
+                    if (fpsSecStart == 0L) fpsSecStart = now
+                    fpsInSec++
+                    if (now - fpsSecStart >= 1000L) {
+                        fpsWindow.add(fpsInSec)
+                        fpsInSec = 0
+                        fpsSecStart = now
+                        if (fpsWindow.size >= 5) {
+                            EngineBridge.nativeAppendLog(
+                                EngineBridge.LEVEL_INFO, "engine", "render.fps",
+                                com.filmkit.app.kv("fps" to fpsWindow.joinToString(",")),
+                            )
+                            fpsWindow.clear()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    EngineBridge.nativeAppendLog(
+                        EngineBridge.LEVEL_ERROR, "engine", "render.frame_error",
+                        com.filmkit.app.kv("error" to (t.message ?: t.toString())),
+                    )
+                } finally {
+                    // Drain a notification arriving during the draw, including when
+                    // no new texture was latched or drawing failed.
+                    if (frameGate.complete(sequence)) {
+                        queuedNs = latestCallbackNs.get()
+                        if (!h.post(this)) frameGate.cancel()
+                    }
+                }
+            }
+        })
         // post 失败（线程正在退出）：必须回滚 pending，否则永久卡 true，
         // 后续会话所有帧被丢弃 → 后台恢复黑屏（X300 实测竞态）
-        if (!posted) pending.set(false)
+        if (!posted) frameGate.cancel()
+    }
+
+    private fun recordFrameTiming(queued: Long, start: Long, update: Long, submit: Long, done: Long, texture: Long) {
+        if (timingStartNs == 0L) timingStartNs = start
+        if (lastFrameNs > 0L) frameIntervals.add((done - lastFrameNs) / 1e6)
+        if (lastTextureNs > 0L && texture > lastTextureNs) textureIntervals.add((texture - lastTextureNs) / 1e6)
+        lastFrameNs = done
+        lastTextureNs = texture
+        queueTimes.add((start - queued) / 1e6)
+        updateTimes.add((submit - update) / 1e6)
+        renderTimes.add((done - submit) / 1e6)
+        if (done - timingStartNs < 1_000_000_000L) return
+        val values = arrayListOf<Pair<String, Any?>>()
+        values.add("windowMs" to (done - timingStartNs) / 1e6)
+        values.add("frames" to queueTimes.size)
+        values.add("droppedCallbacks" to droppedCallbacks.getAndSet(0))
+        for ((name, samples) in listOf("frame" to frameIntervals, "queue" to queueTimes,
+            "update" to updateTimes, "submit" to renderTimes, "texture" to textureIntervals)) {
+            samples.sort()
+            if (samples.isNotEmpty()) {
+                values.add("${name}P95Ms" to samples[(kotlin.math.ceil(samples.size * .95).toInt() - 1).coerceAtLeast(0)])
+                values.add("${name}MaxMs" to samples.last())
+            }
+            samples.clear()
+        }
+        EngineBridge.nativeAppendLog(EngineBridge.LEVEL_INFO, "engine", "render.timing", kv(*values.toTypedArray()))
+        timingStartNs = done
     }
 
     /** 拍照读回后的统计辅助（帧计数/尺寸），供 UI 轮询。 */
@@ -482,6 +522,12 @@ class RenderClient {
 
     private fun stopInternal() {
         acceptingFrames = false
+        callbackThread?.let { callback ->
+            callback.quitSafely()
+            try { callback.join(2000) } catch (_: InterruptedException) { }
+        }
+        callbackThread = null
+        frameCallbackHandler = null
         val t = thread ?: return
         val h = handler ?: return
         h.post { EngineBridge.nativeEngineStop() }
@@ -494,7 +540,7 @@ class RenderClient {
         handler = null
         startedSurface = null
         // 线程已死：强制复位排队闸，防止上一会话的竞态卡死新会话
-        pending.set(false)
+        frameGate.cancel()
     }
 
     private fun kvOf(vararg pairs: Pair<String, Any?>): String =

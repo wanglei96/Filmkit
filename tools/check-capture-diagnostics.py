@@ -19,4 +19,10 @@ assert '#include <GLES2/gl2ext.h>' in timer
 assert '#define GL_GPU_DISJOINT_EXT' not in timer
 assert 'glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint)' in timer
 assert 'glGetIntegerv(0x8FBD' not in timer
+renderer = (root / 'app/src/main/java/com/filmkit/app/camera/RenderClient.kt').read_text()
+screen = (root / 'app/src/main/java/com/filmkit/app/ui/CameraScreen.kt').read_text()
+assert 'pausePreview(' not in controller + renderer
+assert 'resumePreviewNow(' not in controller + screen
+assert 'resumeCover' not in screen
 print('PASS diagnostics do not publish DNG without user opt-in; GPU enums use platform definitions')
+print('PASS shutter animation does not suspend or drain live preview')

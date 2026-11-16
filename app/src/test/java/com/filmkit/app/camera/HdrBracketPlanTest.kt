@@ -1,6 +1,7 @@
 package com.filmkit.app.camera
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** HDR 融合 P1（v0.12.76）：侧帧曝光规划 —— 照抄 PC HdrBracketConfig.planManualExposure
@@ -77,6 +78,29 @@ class HdrBracketPlanTest {
         assertEquals(Math.round(target / iso.toDouble()).toLong(), sec)
         val ev = CameraController.evOffsetSecIso(sec, iso, 200_000L, 200)
         assertEquals(-1.5f, ev, 0.001f)
+    }
+
+    @Test
+    fun shortEv_bothAtFloor_hasNoHighlightHeadroom() {
+        val (iso, sec) = CameraController.planBracketExposure(
+            72, secLo, CameraController.HDR_SHORT_EV, 72, isoHi, secLo, secHi)
+        assertEquals(72, iso)
+        assertEquals(secLo, sec)
+        assertEquals(0f, CameraController.evOffsetSecIso(sec, iso, secLo, 72), 0f)
+    }
+
+    @Test
+    fun shortEv_autoReferenceBelowManualFloor_canBeLongerThanReference() {
+        // The diagnostic DNG's auto reference is 63218ns; manual capture is
+        // constrained to 100000ns. Role names cannot create negative actual EV.
+        val referenceNs = 63_218L
+        val (iso, sec) = CameraController.planBracketExposure(
+            72, referenceNs, CameraController.HDR_SHORT_EV, 72, isoHi, secLo, secHi)
+        assertEquals(72, iso)
+        assertEquals(secLo, sec)
+        val ev = CameraController.evOffsetSecIso(sec, iso, referenceNs, 72)
+        assertTrue(ev > 0f)
+        assertEquals(0.662f, ev, 0.001f)
     }
 
     @Test

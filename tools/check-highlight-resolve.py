@@ -158,13 +158,30 @@ def check_shader():
     return "glslangValidator unavailable; source contract only (not GPU compilation)"
 
 
+def check_caller():
+    source = (ROOT / "core/engine/src/render/FrameRenderer.cpp").read_text()
+    start = source.index("bool FrameRenderer::passHighlightResolve(")
+    resolve = source[start:source.index("bool FrameRenderer::ensureHighlightMergeResources", start)]
+    assert "if (!highlight_resolve_ready_) return true;" in resolve
+    assert "if (!highlight_merge_ready_) return true;" not in resolve
+    assert "has_short ? tex_highlight_mask_ : lsc_tex_" in resolve
+    burst = source[source.index("bool FrameRenderer::submitRawBurst("):]
+    assert "highlight_resolve_ready_ = true;" in burst
+    assert "passMfnrSatFix(" not in burst
+    assert "demosaic == 0 && highlight_resolve_ready_" in burst
+    single = source[source.index("void FrameRenderer::finishStillChain("):start]
+    assert "highlight_resolve_ready_ = false;" in single
+
+
 def main():
     result = check_shader()
+    check_caller()
     checks = check_pixels()
     check_policy()
     print(f"PASS: {checks} independent RGB/rotation/mask/LSC comparisons; {result}")
     print("POLICY: below-ceiling colours preserved; above-source-white unclipped colours CAN be reduced (not sensor fullwell detection).")
     print("SCOPE: CPU/reference + shader contract only; on-device GPU replay and integrated P0/noise validation remain required.")
+    print("CALLER: no-short bracket retains RGB source-white; typed dummy, single reset and demosaic routing guarded.")
 
 
 if __name__ == "__main__":

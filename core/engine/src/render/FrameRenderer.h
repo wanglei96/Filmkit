@@ -1137,9 +1137,12 @@ class FrameRenderer {
   int highlight_cov_w_ = 0, highlight_cov_h_ = 0;
   GLuint prog_highlight_noise_down_ = 0, prog_highlight_noise_up_ = 0;
   GLuint highlight_filter_fbo_[4] = {0, 0, 0, 0};
+  // Slot 3 borrows fbo_highlight_cov_/its textures after the last original read.
   GLuint highlight_filter_cov_[4][2] = {{0,0}, {0,0}, {0,0}, {0,0}};
   int highlight_filter_w_[4] = {0,0,0,0}, highlight_filter_h_[4] = {0,0,0,0};
   bool ensureHighlightFilterCov(int slot, int width, int height);
+  bool ensureHighlightNoiseResources(int width, int height);
+  bool ensureHighlightMergeResources(int width, int height);
   bool passHighlightNoise(int width, int height, int rotation, int cfa, const float* ccm);
   int highlight_noise_w_ = 0, highlight_noise_h_ = 0;
   float highlight_noise_shot_[3] = {0.f, 0.f, 0.f};
@@ -2040,6 +2043,8 @@ class FrameRenderer {
   struct {
     GLint rot = -1, scale = -1;
   } u_fill_;
+  // Source-white resolve also applies when a bracket has no usable short.
+  bool highlight_resolve_ready_ = false;
 };
 
 }  // namespace filmkit
