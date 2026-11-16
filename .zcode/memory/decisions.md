@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-11-15 14:20
+updated: 2026-11-16 15:59
 status: active
 ---
 
@@ -87,3 +87,13 @@ status: active
 - [2026-11-15] **调试诊断不得进入用户可见输出**：RAW dump 只写 app-specific 目录；公共相册写入必须且仅由用户开关授权。
 - [2026-11-15] **新增硬失败检查必须先隔离既有 GL 错误**：否则历史上的非致命错误（如计时器枚举）会被放大成"出片失败"。
 - [2026-11-15] **"能做出来"的判据是真实 host 全链出片**：单 shader/离线 replay 全绿不构成出片证据，交付前必须跑真实 `FrameRenderer` → 真实 JPEG。
+
+## 性能生命周期与高光 readiness（11-16）
+- [2026-11-16] **当前调用内缓存允许，跨张统计复用禁止**：highlight guide 可缓存本调用三行校准 CFA，
+  但必须保留全部样本、曝光域、累加顺序与精度，并在调用结束释放；前张 guide/cov/mask 不得消费。
+- [2026-11-16] **协方差纹理复用按最后读者证明**：slot3 仅在原始 RGB cov 最后读者完成后借用，
+  slot2 在 PC3D 第二趟读取时不可覆写；下一张必须完整重写，不以少分配冒充 PSS 收益。
+- [2026-11-16] **CameraWhite resolve 与真实短帧 merge readiness 分离**：无更短曝光不得放宽准入，
+  但本张 RGB source-white 必须执行，short share 明确为 0，typed dummy 只绑定本张纹理。
+- [2026-11-16] **拍照期间预览持续消费**：禁止 pause/resume 冻结底层预览；动画只做视觉覆盖，
+  SurfaceTexture 必须持续更新，避免队列堵死 producer。

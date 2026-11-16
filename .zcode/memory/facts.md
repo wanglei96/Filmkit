@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-11-15 22:20
+updated: 2026-11-16 15:59
 status: active
 ---
 # 事实
@@ -98,4 +98,23 @@ status: active
 - [2026-11-15] **`files/burst_dump` 语义已收窄**：只允许 app-specific `burst/*.raw` 诊断，**不再**经 `saveDng` 写相册；公共 DNG 仍只由 `dngOn` 控制。
 - [2026-11-15] **高光链新增纹理预算**（4080×3072）：原生 noise RGBA32F ≈200MB、D4 cov 两张 RGBA32F ≈200MB/份、PC3D 每趟 2 张全分辨率 cov ≈200MB；这是"拍照变慢/预览卡"的首要嫌疑，需实测确认。
 - [2026-11-15] **0.14.5 无 JPEG 的真实现场**：`highlight.admission accepted=true`、`highlight.merge native_bayer` 均正常，随后 `render.burst_done ok=false bytes=0`；首个 GL 错误在 `after_RCD_direction`（内含 `gpu_dir.endMs()`），不在 resolve shader。
+
+## 性能收线与 0.14.20（11-16）
+- [2026-11-16] **当前版本/远端**：0.14.20(817)，commit `d6f6ede` 已 push `origin/dev`；
+  根目录保留 `filmkit-0.14.20-PERF.apk` 与回退 `filmkit-0.14.19-HIGHLIGHT.apk`，下一版 0.14.21/818。
+- [2026-11-16] **0.14.19/20 真机保存耗时**：19 = 6.894/6.671/6.220s；
+  20 = 5.599/5.289/5.881s。两版均 Thermal 2，SKIN、ISO、曝光和场景亮度不同，不是锁定 A/B。
+- [2026-11-16] **highlight guide 行缓存收益**：独立 4096×3072 ABBA 中位 418.675→306.400ms
+  （约 -26.8%/-112ms），只覆盖 guide/clipping/highlight 生成段；实际 App guide 中位 486.36→330.00ms。
+- [2026-11-16] **剩余性能热点**：0.14.20 PC3D 1785/1809/2264ms；启动 warmup 1534ms；
+  启动窗口最低约 20.11FPS；histogram 同步读回等待峰值约 104/108/175ms；
+  全流程重叠窗口仍有 287--386ms 空档。完整合成窗口最低约 24.54--27.51FPS。
+- [2026-11-16] **0.14.19 品红现场**：长焦 4096×3072 GRBG 四帧实际 EV
+  `[0,0,+2.2,+0.251]`（复拍 `[0,0,+2.2,+0.662]`），没有更短曝光；
+  同一 P0 的 D4 高亮品红像素 156442→71，真实 Mali 默认 FilmParams 复放为 0。
+- [2026-11-16] **协方差 slot3 复用**：原始 RGB cov 最后读者完成后借用其两张 RGBA32F 作为 slot3，
+  下一张 `passHighlightNoise` 全量重写；逻辑少分配 4080×3072×16×2=401080320B（约 382.5MiB），
+  不是已测 PSS 峰值收益；slot2 在 PC3D 第二趟读取期间不可覆写。
+- [2026-11-16] **test_temp 清理**：从 9.1GB 降到 203MB，删除 474 文件/9516482613B（8.863GiB），
+  含 182 张 JPG/PNG/DNG；保留 313 文件/212319593B。记录 `test_temp/CLEANUP-20261116.md`。
 
