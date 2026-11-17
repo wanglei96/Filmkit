@@ -46,6 +46,15 @@ import kotlin.math.roundToInt
 private const val SPOT_AE_FRACTION = 0.06f
 private const val HIGHLIGHT_AE_FRACTION = 0.16f
 
+internal fun selectOpenLens(
+    lenses: List<CameraController.LensInfo>, forcedId: String?, previousId: String?,
+): CameraController.LensInfo? {
+    val pool = lenses.filter { it.enabled }.ifEmpty { lenses }
+    return pool.firstOrNull { it.id == forcedId }
+        ?: pool.firstOrNull { it.id == previousId }
+        ?: pool.minByOrNull { kotlin.math.abs(it.equivMm - 24f) }
+}
+
 class CameraController(private val context: Context, private val render: RenderClient) {
 
     private var camera: CameraDevice? = null
@@ -414,6 +423,8 @@ class CameraController(private val context: Context, private val render: RenderC
         return if (active?.enabled != false) active?.equivMm ?: 24f
         else enabledLenses().minByOrNull { kotlin.math.abs(it.equivMm - 24f) }?.equivMm ?: 24f
     }
+
+    fun currentZoomEquiv(): Float = currentLensEquiv() * zoomRatio
 
     /** 变焦倍率基线 = 主摄（等效最接近 24mm）的等效焦距：70mm 显示 2.9x、15mm 显示 0.6x */
     fun mainEquiv(): Float =
@@ -2947,8 +2958,8 @@ class CameraController(private val context: Context, private val render: RenderC
                 },
             ),
         )
-        val lens = forcedId?.let { id -> backLenses.firstOrNull { it.id == id && it.enabled } }
-            ?: enabledLenses().minByOrNull { kotlin.math.abs(it.equivMm - 24f) } // 主摄 = 等效最接近 24mm
+        val previousLensId = currentLensId
+        val lens = selectOpenLens(backLenses, forcedId, previousLensId)
         if (lens == null) {
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_ERROR, "camera", "camera.not_found", "{}",
@@ -2979,6 +2990,8 @@ class CameraController(private val context: Context, private val render: RenderC
             null
         }
         maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        zoomRatio = if (lens.id != previousLensId && lens.id != forcedId) 1f
+            else zoomRatio.coerceIn(1f, maxZoom)
         colorFilterArrangement = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         isoRangeUpper = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             ?.upper ?: 3200
@@ -3247,6 +3260,9 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.LEVEL_INFO, "camera", "camera.session_ready",
                     kv(
                         "preview" to "${previewSize.width}x${previewSize.height}",
+                        "lens" to d.id,
+                        "equiv" to currentZoomEquiv(),
+                        "zoom" to zoomRatio,
                         "still" to "${stillSize.width}x${stillSize.height}",
                         "stillFormat" to (if (rawMode) "RAW_SENSOR" else "YUV"),
                         "sensorOrientation" to sensorOrientation,

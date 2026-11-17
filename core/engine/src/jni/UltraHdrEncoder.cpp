@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "ultrahdr_api.h"
@@ -213,61 +214,60 @@ Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
   if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return nullptr;
   if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || !info.width || !info.height) return nullptr;
 
-  void* pixels = nullptr;
-  if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
-      !pixels) {
-    if (pixels) AndroidBitmap_unlockPixels(env, bitmap);
-    return nullptr;
-  }
-
+  if (info.width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+      info.height > static_cast<uint32_t>(std::numeric_limits<int>::max())) return nullptr;
   const int w = static_cast<int>(info.width);
   const int h = static_cast<int>(info.height);
   const size_t tight = static_cast<size_t>(w) * 4;
+  if (info.stride < tight || static_cast<size_t>(h) >
+      std::numeric_limits<size_t>::max() / info.stride) return nullptr;
 
-  std::vector<unsigned char> packed(static_cast<size_t>(w) * h * 4);
-  const auto* src = static_cast<const unsigned char*>(pixels);
-  if (info.stride == tight) {
-    memcpy(packed.data(), src, tight * h);
-  } else {
-    for (int y = 0; y < h; ++y) {
-      memcpy(packed.data() + tight * y, src + static_cast<size_t>(info.stride) * y, tight);
-    }
-  }
-  AndroidBitmap_unlockPixels(env, bitmap);
-
-  // ── 取 gainmap ────────────────────────────────────────────────────
-  if (env->GetArrayLength(gainmap) < static_cast<jsize>(gw) * gh) return nullptr;
-  std::vector<unsigned char> gm(static_cast<size_t>(gw) * gh);
-  env->GetByteArrayRegion(gainmap, 0, static_cast<jsize>(gm.size()),
+  // Validate/copy the Java array before locking the Bitmap.
+  if (static_cast<size_t>(gw) >
+      static_cast<size_t>(std::numeric_limits<jsize>::max()) / gh) return nullptr;
+  const size_t gmSize = static_cast<size_t>(gw) * gh;
+  if (env->GetArrayLength(gainmap) < static_cast<jsize>(gmSize)) return nullptr;
+  std::vector<unsigned char> gm(gmSize);
+  env->GetByteArrayRegion(gainmap, 0, static_cast<jsize>(gmSize),
                           reinterpret_cast<jbyte*>(gm.data()));
   if (env->ExceptionCheck()) return nullptr;
 
+  void* pixels = nullptr;
+  if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
+    return nullptr;
+  if (!pixels) {
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return nullptr;
+  }
+
   // ── ① base = 我们的 4:4:4 JPEG ───────────────────────────────────
-  std::vector<unsigned char> rgb;
-  rgbaToRgb(packed.data(), w, h, rgb);
   const int q = std::clamp(static_cast<int>(quality), 1, 100);
-  // 0.13.9：base 优先 libjpeg-turbo 4:4:4（与 JpegEncoder 同一条路），失败再回退 stb。
   std::vector<unsigned char> baseJpeg;
   {
-    std::vector<uint8_t> turbo;
-    if (filmkit::encodeJpegTurbo444(rgb.data(), w, h, 3, q, &turbo)) {
-      baseJpeg.assign(turbo.begin(), turbo.end());
-    } else {
+    // Keep the Bitmap locked until encoding finishes; only padded rows need packing.
+    const auto* src = static_cast<const unsigned char*>(pixels);
+    std::vector<unsigned char> packed;
+    if (info.stride != tight) {
+      packed.resize(tight * h);
+      for (int y = 0; y < h; ++y) {
+        memcpy(packed.data() + tight * y, src + static_cast<size_t>(info.stride) * y, tight);
+      }
+      src = packed.data();
+    }
+    if (!filmkit::encodeJpegTurbo444(src, w, h, 4, q, &baseJpeg)) {
+      std::vector<unsigned char> rgb;
+      rgbaToRgb(src, w, h, rgb);
       baseJpeg = stbEncodeRgb(rgb.data(), w, h, q);
     }
   }
+  AndroidBitmap_unlockPixels(env, bitmap);
   if (baseJpeg.empty()) return nullptr;
 
   // ── ② gainmap 已是 8bit，直接编成灰度 JPEG ────────────────────────
   // gainmap 是辅助数据（8bit 量化 + 1/2 分辨率），q95 足够且省体积。
   std::vector<unsigned char> gmJpeg;
-  {
-    std::vector<uint8_t> turbo;
-    if (filmkit::encodeJpegTurbo444(gm.data(), gw, gh, 1, 95, &turbo)) {
-      gmJpeg.assign(turbo.begin(), turbo.end());
-    } else {
-      gmJpeg = stbEncodeGray(gm.data(), gw, gh, 95);
-    }
+  if (!filmkit::encodeJpegTurbo444(gm.data(), gw, gh, 1, 95, &gmJpeg)) {
+    gmJpeg = stbEncodeGray(gm.data(), gw, gh, 95);
   }
   if (gmJpeg.empty()) return nullptr;
 

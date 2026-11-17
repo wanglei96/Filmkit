@@ -139,6 +139,9 @@ class FrameRenderer {
   // 读回失败且破坏了渲染状态（成片全黑），已彻底删除。
   // 关闭时全链零额外开销（每个统计点一次 relaxed atomic load）。任意线程可调。
   static void setDiagStats(bool on);
+  // Profiling-only waits; disabled mode reports affected stage timings as -1.
+  // Image readbacks, PC3D timing and cross-context synchronization are unchanged.
+  static void setStillStageTimingSync(bool on);
   // 0.12.258：重读回类诊断开关（天空剖面 / 亮度剖面），默认关；只影响日志字段，
   // 不影响闭环护栏（护栏的 skyP99 是功能读数，不归诊断开关管）。
   static void setSkyDiag(bool on);
@@ -661,6 +664,7 @@ class FrameRenderer {
   // 中值，G 逐位不变）。注意上面那条 passColorSmooth 的注释虽然也写"色差域中值"，
   // 实现却是**判据式去饱和**（梯度门 + 局部色度峰），在暗部（阴影）结构性失效 ——
   // 见 kFsColorMedian 头部。输入任意 D4 域纹理，输出 tex_cm_。
+  bool ensureColorMedianTargets(int dst_w, int dst_h);
   bool passColorMedian(int dst_w, int dst_h, GLuint src);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
   // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
@@ -686,7 +690,7 @@ class FrameRenderer {
   // 返回 false = 关闭 / 估计失败 / 位移低于门限（tex_work_ 直通，逐位等于改动前）。
   bool passCaCorrect(int dst_w, int dst_h, float strength);
   bool ensureCaTargets(int w, int h);
-  static constexpr int kChromaLevels = 5;
+  static constexpr int kChromaLevels = 6;
   // RAW 域高光重建（darktable highlights 模块 / "inpaint opposed"，2026-10-03）：
   // 在**去马赛克前**对线性 mosaic（已扣黑阶 + WB，白点 1.0）恢复被裁剪通道 ——
   // mask(3×3 photosite 块) → 膨胀 → 全图 chrominance 统计 → 对立外推应用。
@@ -991,7 +995,8 @@ class FrameRenderer {
          prog_chroma_dn_ = 0,
          prog_moire_stat_ = 0,   // 档 A（v0.10.165）伪彩强度图统计
          prog_raw_dn_ts_ = 0,
-         prog_chroma_down_ = 0, prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
+         prog_chroma_down_ = 0, prog_chroma_blur_ = 0,
+         prog_chroma_at_ = 0, prog_chroma_apply_ = 0,
          prog_hist_ = 0, prog_local_ = 0,
          prog_nn_pack_ = 0, prog_nn_unpack_ = 0,
          // RAW 域高光重建（darktable highlights / inpaint opposed）
@@ -1143,7 +1148,10 @@ class FrameRenderer {
   bool ensureHighlightFilterCov(int slot, int width, int height);
   bool ensureHighlightNoiseResources(int width, int height);
   bool ensureHighlightMergeResources(int width, int height);
-  bool passHighlightNoise(int width, int height, int rotation, int cfa, const float* ccm);
+  bool passHighlightNoise(int width, int height, int rotation, int cfa,
+                          const float* ccm, const NoiseCoef* profile = nullptr,
+                          GLuint camera_rgb = 0);
+  bool chroma_model_ready_ = false;
   int highlight_noise_w_ = 0, highlight_noise_h_ = 0;
   float highlight_noise_shot_[3] = {0.f, 0.f, 0.f};
   float highlight_noise_read_[3] = {0.f, 0.f, 0.f};
@@ -1388,11 +1396,12 @@ class FrameRenderer {
   int pc3d_w_ = 0, pc3d_h_ = 0, pc3d_lw_ = 0, pc3d_lh_ = 0;
   // 档 A：强度图统计网格（32×32 RGBA16F，惰性分配；强度 = 0 时零成本不分配）
   GLuint tex_mo_stat_ = 0, fbo_mo_stat_ = 0;
-  // D 专项：半分辨率 à trous 色度降噪缓冲（2× 近似层 ping-pong + 5× 细节层
-  // + 1× σ 图；RGBA16F、1/2 分辨率 ≈ 25MB/张）
+  // Full-resolution starlet: coarse and removed-detail ping-pong, plus noise.
+  // c0 - sum(dl-dl') equals cL + sum(dl'); all six scales remain present.
   GLuint tex_ch_a_[2] = {0, 0}, fbo_ch_a_[2] = {0, 0};
-  GLuint tex_ch_dp_[kChromaLevels] = {0}, fbo_ch_dp_[kChromaLevels] = {0};
+  GLuint tex_ch_dp_[2] = {0}, fbo_ch_dp_[2] = {0};
   GLuint tex_ch_sig_ = 0, fbo_ch_sig_ = 0;
+  GLuint tex_ch_tmp_ = 0, fbo_ch_tmp_ = 0;
   int ch_w_ = 0, ch_h_ = 0;
   // v0.10.59 诊断：本轮新增算法是否真的执行（0.10.58 起日志无字段，无法验证生效）
   int dbg_p0s_ = 0;      // P0 实际样本数（9 = 旧"融合后"路径，36 = 时域×空间联合）
@@ -1842,12 +1851,10 @@ class FrameRenderer {
   } u_chroma_down_;
   struct {
     GLint prev = -1, sigma = -1, size = -1, step = -1, k = -1, revert = -1,
-          cg_k = -1;
+          cg_k = -1, removed = -1, band_sigma = -1;
   } u_chroma_at_;
   struct {
-    GLint tex = -1, coarse = -1, d[5] = {-1, -1, -1, -1, -1}, size = -1,
-          half = -1, noise_a = -1, noise_b = -1, lsc = -1, lsc_size = -1,
-          kr = -1;
+    GLint tex = -1, removed = -1, mix = -1, satmask = -1, satmask_on = -1;
   } u_chroma_apply_;
   // PC ESD3D2 完整移植（v0.10.175）：
   //   u_pc3d_      = 本体（k / kernel / sigA / sigB / moire / luma / lsc）

@@ -21,7 +21,15 @@
 // --highlight-cases (no-short -> accepted short -> no-short -> plain -> single -> no-short).
 // --raw-directory DIR (four fN.raw files and generated replay.txt calibration).
 // --expect-source-white (assert production resolve event for each HDR capture).
+// --expect-chroma (require the full multiscale pass, not only nonblack output).
+// --lens-switch-cases (warmup/RAW-size/rotation/strength changes in one renderer).
 // --edge-dump (save production diagnostic stages in the output directory).
+// --no-stage-sync (disable profiling-only P0/RCD/CCM waits; not image readbacks).
+// --diag-stats (enable production stage diagnostics; off by default in this tool).
+// --pc3d 0|1|2 --pc3d-msize 0|7|11|15|21 (still replay overrides only).
+// --chroma-gate 0..2 (same production edge-chroma setting).
+// --film-params FILE (exactly FilmParams::kCount finite double slots, no LUT upload).
+// --ae-hal (production HAL exposure mode; avoid uninitialized preview AE history).
 // Exit failure on init, render, byte count, image-range, JPEG or file-write error.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -190,19 +198,28 @@ void checkAllocation() {
 int run(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   try {
-    int size = 256, demosaic = 1, rotation = 0;
+    int size = 256, demosaic = 1, rotation = 0, pc3d = -1, pc3dMsize = -1;
     bool hdr = true, dft = true, timerOnly = false, allocationOnly = false, preview = false, warmup = false, covarianceCases = false;
     bool noShort = false, highlightCases = false, expectSourceWhite = false, edgeDump = false;
-    std::string output = ".", rawDirectory;
+    bool stageSync = true, diagStats = false, aeHal = false, expectChroma = false;
+    bool lensSwitchCases = false;
+    float chromaGate = -1.f;
+    std::string output = ".", rawDirectory, filmParamsFile;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--timer-only") timerOnly = true;
       else if (arg == "--allocation-only") allocationOnly = true;
       else if (arg == "--covariance-cases") covarianceCases = true;
       else if (arg == "--highlight-cases") highlightCases = true;
+      else if (arg == "--lens-switch-cases") lensSwitchCases = true;
       else if (arg == "--no-short") noShort = true;
       else if (arg == "--expect-source-white") expectSourceWhite = true;
+      else if (arg == "--expect-chroma") expectChroma = true;
       else if (arg == "--edge-dump") edgeDump = true;
+      else if (arg == "--no-stage-sync") stageSync = false;
+      else if (arg == "--diag-stats") diagStats = true;
+      else if (arg == "--ae-hal") aeHal = true;
+      else if (arg == "--film-params" && i + 1 < argc) filmParamsFile = argv[++i];
       else if (arg == "--raw-directory" && i + 1 < argc) rawDirectory = argv[++i];
       else if (arg == "--preview") preview = true;
       else if (arg == "--warmup") warmup = true;
@@ -211,19 +228,35 @@ int run(int argc, char** argv) {
       else if (arg == "--size" && i + 1 < argc) size = std::stoi(argv[++i]);
       else if (arg == "--demosaic" && i + 1 < argc) demosaic = std::stoi(argv[++i]);
       else if (arg == "--rotation" && i + 1 < argc) rotation = std::stoi(argv[++i]);
+      else if (arg == "--pc3d" && i + 1 < argc) pc3d = std::stoi(argv[++i]);
+      else if (arg == "--pc3d-msize" && i + 1 < argc) pc3dMsize = std::stoi(argv[++i]);
+      else if (arg == "--chroma-gate" && i + 1 < argc) chromaGate = std::stof(argv[++i]);
       else if (arg == "--output" && i + 1 < argc) output = argv[++i];
       else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
     require(size >= 128 && size <= 4096 && size % 32 == 0, "size must be a multiple of 32 in [128,4096]");
     require(demosaic >= 0 && demosaic <= 2, "demosaic must be 0, 1 or 2");
     require(rotation >= 0 && rotation <= 3, "rotation must be 0, 1, 2 or 3");
+    require(pc3d >= -1 && pc3d <= 2, "pc3d must be 0, 1 or 2");
+    require(std::isfinite(chromaGate) && (chromaGate == -1.f ||
+            (chromaGate >= 0.f && chromaGate <= 2.f)), "chroma-gate must be in [0,2]");
+    require(pc3dMsize == -1 || pc3dMsize == 0 || pc3dMsize == 7 ||
+            pc3dMsize == 11 || pc3dMsize == 15 || pc3dMsize == 21,
+            "pc3d-msize must be 0 (auto), 7, 11, 15 or 21");
+    require((pc3d == -1 && pc3dMsize == -1) || (!preview && !covarianceCases),
+            "pc3d overrides require a still replay without covariance cases");
+    require(!warmup || !preview, "--warmup requires a still render");
     require(!highlightCases || (!covarianceCases && rawDirectory.empty()), "highlight cases require synthetic input and no covariance cases");
+    require(!lensSwitchCases || (!preview && !covarianceCases && !highlightCases && rawDirectory.empty()),
+            "lens switch cases require synthetic still input without other case sets");
     require(filmkit::Logger::instance().init(output), "Logger::init failed (output directory must exist)");
     Egl egl(preview ? size : 16);
     if (allocationOnly) { checkAllocation(); return EXIT_SUCCESS; }
     if (timerOnly) { checkTimer(); return EXIT_SUCCESS; }
     filmkit::FrameRenderer renderer;
-    filmkit::FrameRenderer::setDiagStats(false);
+    filmkit::FrameRenderer::setDiagStats(diagStats);
+    filmkit::FrameRenderer::setStillStageTimingSync(stageSync);
+    filmkit::FrameRenderer::setAeHal(aeHal);
     renderer.setStillContext(!preview);
     std::printf("STAGE renderer.init\n");
     const auto initStart = std::chrono::steady_clock::now();
@@ -231,12 +264,6 @@ int run(int argc, char** argv) {
     std::printf("INIT ok=%d elapsed_ms=%.3f glError=0x%x\n", initialized,
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count(), glGetError());
     if (!initialized) { printLogs(); return EXIT_FAILURE; }
-    if (warmup) {
-      require(!preview, "--warmup requires a still render");
-      require(renderer.warmup(size, size, rotation), "still warmup failed");
-      require(glGetError() == GL_NO_ERROR, "still warmup GL error");
-    }
-
     if (preview) {
       filmkit::FrameRenderer::setToneEq(true);
       const float st[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -299,13 +326,37 @@ int run(int argc, char** argv) {
       for (float& value : lsc) input >> value;
       require(bool(input), "truncated replay calibration");
     }
+    if (warmup) {
+      std::printf("STAGE warmup size=%dx%d rotation=%d\n", width, height, rotation);
+      require(renderer.warmup(width, height, rotation), "still warmup failed");
+      require(glGetError() == GL_NO_ERROR, "still warmup GL error");
+    }
     const int grbg[4] = {1, 0, 2, 1};
     std::array<std::vector<uint16_t>, 4> raw;
     const void* frames[4];
     filmkit::FilmParams params;
+    if (!filmParamsFile.empty()) {
+      std::ifstream input(filmParamsFile);
+      std::array<double, filmkit::FilmParams::kCount> slots;
+      for (double& value : slots)
+        require(bool(input >> value) && std::isfinite(value), "invalid film parameter slots");
+      std::string extra;
+      require(!(input >> extra), "extra film parameter slots");
+      params.fromDoubles(slots.data(), slots.size());
+    }
+    if (lensSwitchCases && filmParamsFile.empty()) {
+      // Match the production allocation order without a private preset snapshot.
+      params.color_smooth = 1.f;
+      params.engine_slot = 0.f;
+    }
+    if (pc3d >= 0) params.pc3d = static_cast<float>(pc3d);
+    if (pc3dMsize >= 0) params.pc3d_msize = static_cast<float>(pc3dMsize);
+    if (chromaGate >= 0.f) params.chroma_gate = chromaGate;
+    std::printf("PARAMS pc3d=%.1f pc3d_msize=%.1f chroma_gate=%.1f\n",
+                params.pc3d, params.pc3d_msize, params.chroma_gate);
     const float shotCases[] = {.0007f, .000004f, .00008f, .00008f, .000004f, .0007f, .000004f, .0007f};
     const float pc3dCases[] = {1.f, 1.f, 1.f, 2.f, 0.f, 2.f, 1.f, 1.f};
-    for (int capture = 0; capture < (covarianceCases ? 8 : highlightCases ? 6 : 1); ++capture) {
+    for (int capture = 0; capture < (covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : 1); ++capture) {
     const bool single = highlightCases && capture == 4;
     if (highlightCases) {
       hdr = capture != 3 && !single;
@@ -316,6 +367,24 @@ int run(int argc, char** argv) {
       for (int& stride : strides) stride = width;
       std::printf("HIGHLIGHT_CASE capture=%d hdr=%d single=%d short_ev=%.3f size=%dx%d\n",
                   capture, hdr, single, ev[3], width, height);
+    }
+    if (lensSwitchCases) {
+      const bool tele = (capture >= 1 && capture <= 3) || capture == 6;
+      width = size == 4096 ? (tele ? 4096 : 4080) : size + (tele ? 32 : 0);
+      height = size * 3 / 4;
+      rotation = capture >= 5 ? 1 : 0;
+      noiseStrength = capture == 2 || capture == 5 ? 0.f : capture == 3 ? 1.f : .5f;
+      params.sat_mask = 1.f;
+      params.ca_corr = 1.f;
+      params.contrast = capture == 3 || capture == 6 ? 1.15f : 1.f;
+      for (int& stride : strides) stride = width;
+      const bool prewarm = capture == 0 || warmup;
+      std::printf("LENS_SWITCH capture=%d size=%dx%d rotation=%d noise=%.2f contrast=%.2f warmup=%d\n",
+                  capture, width, height, rotation, noiseStrength, params.contrast, prewarm);
+      if (prewarm) {
+        require(renderer.warmup(width, height, rotation), "lens-switch warmup failed");
+        require(glGetError() == GL_NO_ERROR, "lens-switch warmup GL error");
+      }
     }
     for (int f = 0; f < 4; ++f) {
       raw[f].resize(size_t(strides[f]) * height);
@@ -365,8 +434,8 @@ int run(int argc, char** argv) {
     };
     const auto resolvesBefore = resolveCount();
     if (edgeDump) save(output + "/edge_dump.enable", "", 0);
-    std::printf("STAGE submitRawBurst hdr=%d dft=%d demosaic=%d diagStats=0 stillContext=1 engine_slot=%.1f tone_strength=%.1f\n",
-                hdr, dft, demosaic, params.engine_slot, params.tone_strength);
+    std::printf("STAGE submitRawBurst hdr=%d dft=%d demosaic=%d diagStats=%d stageSync=%d stillContext=1 engine_slot=%.1f tone_strength=%.1f\n",
+                hdr, dft, demosaic, diagStats, stageSync, params.engine_slot, params.tone_strength);
     const auto start = std::chrono::steady_clock::now();
     const bool ok = single ? renderer.submitRaw(frames[0], width, height, strides[0], cfa,
       black, white, neutral[0], neutral[1], neutral[2], ccm, lsc.data(), lscCols, lscRows,
@@ -382,6 +451,14 @@ int run(int argc, char** argv) {
       glGetError(), renderer.sceneW(), renderer.sceneH());
     printLogs();
     require(ok && rgba.size() == size_t(width) * height * 4, "full-chain render failed or returned wrong byte count");
+    if (expectChroma) {
+      const auto logs = filmkit::Logger::instance().recentLines(1000);
+      const size_t last = logs.rfind("\"event\":\"raw.render\"");
+      require(last != std::string::npos, "missing final render diagnostics");
+      const auto finalLog = logs.substr(last,logs.find('\n',last)-last);
+      require(finalLog.find("\"cms\":1,") != std::string::npos,
+              "multiscale chroma pass did not complete");
+    }
     if (expectSourceWhite) {
       const size_t expected = hdr && !single ? 1 : 0;
       require(resolveCount() == resolvesBefore + expected, "wrong per-capture source-white resolve count");
@@ -394,6 +471,9 @@ int run(int argc, char** argv) {
     }
     std::printf("OUTPUT rgb_min=%u rgb_max=%u rgb_mean=%.3f\n", low, high, sum / (size_t(width) * height * 3));
     require(high > low && high > 0, "full-chain output is constant/black");
+    if (lensSwitchCases)
+      require(sum / (size_t(width) * height * 3) > 10.,
+              "known bright lens-switch fixture became black (dither is not image signal)");
     save(output + "/render.rgba", rgba.data(), rgba.size());
     std::vector<uint8_t> jpeg;
     const int outWidth = ((rotation + 1) % 2) ? height : width;
@@ -404,7 +484,7 @@ int run(int argc, char** argv) {
     require(encoded && jpeg.size() > 4 && jpeg[0] == 0xff && jpeg[1] == 0xd8 &&
             jpeg[jpeg.size()-2] == 0xff && jpeg.back() == 0xd9, "JPEG encode or markers failed");
     save(output + "/render.jpg", jpeg.data(), jpeg.size());
-    if (covarianceCases || highlightCases) {
+    if (covarianceCases || highlightCases || lensSwitchCases) {
       save(output + "/case-" + std::to_string(capture) + ".rgba", rgba.data(), rgba.size());
       save(output + "/case-" + std::to_string(capture) + ".jpg", jpeg.data(), jpeg.size());
     }

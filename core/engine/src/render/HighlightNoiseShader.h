@@ -30,6 +30,10 @@ in vec2 vUV0;
 layout(location = 0) out vec4 oVariance;
 layout(location = 1) out vec4 oCovariance;
 uniform highp sampler2D uNoise;
+uniform highp sampler2D uCameraRgb;
+uniform int uInputMode; // 0: measured merge RAW variance; 1: profiled D3 model
+uniform vec3 uNoiseA;
+uniform vec3 uNoiseB;
 uniform highp sampler2D uLsc;
 uniform ivec2 uRawSize;
 uniform ivec2 uLscSize;
@@ -52,6 +56,7 @@ void main() {
     ivec2 quad = (p / 2) * 2;
     vec3 v = vec3(0.0);
     for (int phase = 0; phase < 4; ++phase) {
+        if (uInputMode != 0) break;
         ivec2 q = min(quad + ivec2(phase & 1, phase >> 1), uRawSize - 1);
         float variance = max(texelFetch(uNoise, q, 0).r, 0.0);
         int channel = (uCfaLut >> (phase * 2)) & 3;
@@ -60,7 +65,13 @@ void main() {
         else if (channel == 2) v.b += variance;
     }
     vec3 gain = lscAt(p);
-    v *= gain * gain;
+    if (uInputMode == 0) v *= gain * gain;
+    else {
+        // Camera RGB already contains WB and LSC. For z=g*x,
+        // Var(z)=A*g*z+B*g^2, before the CCM creates channel covariance.
+        vec3 camera = texelFetch(uCameraRgb,ivec2(gl_FragCoord.xy),0).rgb;
+        v = max(uNoiseA*gain*max(camera,vec3(0)) + uNoiseB*gain*gain,vec3(0));
+    }
     mat3 sigma = uCcm * mat3(v.r, 0.0, 0.0,
                              0.0, v.g, 0.0,
                              0.0, 0.0, v.b) * transpose(uCcm);

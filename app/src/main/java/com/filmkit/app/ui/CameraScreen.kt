@@ -370,6 +370,7 @@ fun CameraScreen(
     // 在悬浮菜单里切换；两种信息**不并存**（v0.6.8）
     var focalStrip by rememberSaveable { mutableStateOf(prefs.getString("focal_strip", "focal") ?: "focal") }
     var wheelActive by remember { mutableStateOf(false) } // 长按轮盘变焦进行中
+    var zoomGestureActive by remember { mutableStateOf(false) }
     val wheelOn = remember { prefs.getBoolean("wheel_zoom", true) }
     val wheelMinE = (lensChips.minOrNull() ?: 15).toFloat()
     val wheelMaxE = (lensChips.maxOrNull() ?: 70).toFloat() * controller.maxZoom
@@ -1021,6 +1022,7 @@ fun CameraScreen(
             when (event) {
                 androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
                     resumed = false
+                    zoomGestureActive = false
                     controller.stop()
                     // 切后台/熄屏：用户不在取景，释放 still 引擎（0.13.21 生命周期驱动）
                     StillRenderClient.releaseNow()
@@ -1076,6 +1078,7 @@ fun CameraScreen(
             delay(400)
             lensChips = controller.lensEquivs()
             focalBase = controller.currentLensEquiv()
+            if (!wheelActive && !zoomGestureActive) zoomEquiv = controller.currentZoomEquiv()
             liveIso = controller.liveIso
             liveNs = controller.liveExposureNs
             liveK = controller.liveK
@@ -1361,6 +1364,7 @@ fun CameraScreen(
                                 object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                                     override fun onScaleBegin(d: ScaleGestureDetector): Boolean {
                                         pinching = true
+                                        zoomGestureActive = true
                                         return true
                                     }
 
@@ -1380,10 +1384,14 @@ fun CameraScreen(
                                 pinch.onTouchEvent(e)
                                 when (e.actionMasked) {
                                     MotionEvent.ACTION_DOWN -> downAt = SystemClock.uptimeMillis()
-                                    MotionEvent.ACTION_POINTER_DOWN -> pinching = true
+                                    MotionEvent.ACTION_POINTER_DOWN -> {
+                                        pinching = true
+                                        zoomGestureActive = true
+                                    }
                                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                         val wasPinching = pinching
                                         pinching = false
+                                        zoomGestureActive = false
                                         if (e.actionMasked == MotionEvent.ACTION_UP && !wasPinching) {
                                             val nx = (e.x / width).coerceIn(0f, 1f)
                                             val ny = (e.y / height).coerceIn(0f, 1f)

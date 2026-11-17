@@ -10,10 +10,17 @@
 // adb shell /data/local/tmp/check-highlight-device --shader-dir /data/local/tmp/device-production-shaders
 // Timed production PC3D draws and diagnostic ablations (no app/camera required):
 // adb shell /data/local/tmp/check-highlight-device --pc3d-bench /data/local/tmp/kFsPc3d.frag --size 1024 --repeats 3
+// Current-source uniform vs constant-0/1 specialization, with raw MRT byte checks:
+// --pc3d-specialize-bench FILE [--size 1024] [--repeats 3]
+//   [--kernels 11] [--local-noise 0,1] [--strips 16]
+//   [--candidate paired|shared|center|kernel|packed]
+//   Or --candidate-file FILE to compare an actual production candidate source.
+// Repeats counts ABBA blocks per case. Filters can limit expensive local1/K21 runs.
 // A failed numerical, compile/link, EGL or FBO check returns EXIT_FAILURE.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -100,11 +107,12 @@ void main() {
     vUV0 = (uST * vec4(uv, 0.0, 1.0)).xy;
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 })";
-GLuint program(const char* fragment, const char* name) {
+GLuint program(const char* fragment, const char* name, bool retrievable = false) {
     GLuint vs = shader(GL_VERTEX_SHADER, vertex, "production-compatible vertex");
     GLuint fs = shader(GL_FRAGMENT_SHADER, fragment, name);
     GLuint p = glCreateProgram();
     programs.push_back(p);
+    if (retrievable) glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glAttachShader(p, vs); glAttachShader(p, fs); glLinkProgram(p);
     glDeleteShader(vs); glDeleteShader(fs);
     GLint ok = 0, length = 0;
@@ -812,6 +820,399 @@ void pc3dBenchmark(const std::string& path, int size, int repeats) {
         measure("production_repeat",original,1,3,16,moire);
     }
 }
+// This benchmark deliberately bypasses all older solver/propagation variants.
+std::string specializePc3d(std::string source, int local) {
+    const std::string declaration = "uniform int uLocalNoiseOn;";
+    const auto at = source.find(declaration);
+    require(at != std::string::npos, "missing exact uLocalNoiseOn uniform declaration");
+    require(source.find(declaration, at + declaration.size()) == std::string::npos,
+            "ambiguous uLocalNoiseOn uniform declaration");
+    source.replace(at, declaration.size(), "const int uLocalNoiseOn = " + std::to_string(local) + ";");
+    return source;
+}
+
+std::string pairedPc3dDistances(std::string source) {
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        const auto at = source.find(from);
+        require(at != std::string::npos && source.find(from, at+from.size()) == std::string::npos,
+                "PC3D paired-distance source contract changed");
+        source.replace(at,from.size(),to);
+    };
+    replace("float localDistance(vec3 delta, ivec2 p, ivec2 q, float extra) {\n"
+            "    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +\n"
+            "                localCovariance((vec2(q)+.5)/vec2(uSize));",
+            "float localPairDistance(vec3 delta, mat3 pair, float extra) {");
+    replace("mat3 pc3dOutputNoise(",
+        "float localDistance(vec3 delta, ivec2 p, ivec2 q, float extra) {\n"
+        "    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +\n"
+        "                localCovariance((vec2(q)+.5)/vec2(uSize));\n"
+        "    return localPairDistance(delta, pair, extra);\n"
+        "}\n"
+        "vec2 localDistances(vec3 delta, ivec2 p, ivec2 q, float extra) {\n"
+        "    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +\n"
+        "                localCovariance((vec2(q)+.5)/vec2(uSize));\n"
+        "    return vec2(localPairDistance(delta, pair, 0.0),\n"
+        "                localPairDistance(delta, pair, extra));\n"
+        "}\n\nmat3 pc3dOutputNoise(");
+    replace("                vec4 dy = vec4(localDistance(cc0-cref,xy,q0,0.0),\n"
+            "                               localDistance(cc1-cref,xy,q1,0.0),\n"
+            "                               localDistance(cc2-cref,xy,q2,0.0),\n"
+            "                               localDistance(cc3-cref,xy,q3,0.0));\n"
+            "                float extra = max(sigZ-sigY,0.0);\n"
+            "                vec4 dz = vec4(localDistance(cc0-cref,xy,q0,extra),\n"
+            "                               localDistance(cc1-cref,xy,q1,extra),\n"
+            "                               localDistance(cc2-cref,xy,q2,extra),\n"
+            "                               localDistance(cc3-cref,xy,q3,extra));",
+            "                float extra = max(sigZ-sigY,0.0);\n"
+            "                vec2 d0 = localDistances(cc0-cref,xy,q0,extra);\n"
+            "                vec2 d1 = localDistances(cc1-cref,xy,q1,extra);\n"
+            "                vec2 d2 = localDistances(cc2-cref,xy,q2,extra);\n"
+            "                vec2 d3 = localDistances(cc3-cref,xy,q3,extra);\n"
+            "                vec4 dy = vec4(d0.x,d1.x,d2.x,d3.x);\n"
+            "                vec4 dz = vec4(d0.y,d1.y,d2.y,d3.y);");
+    return source;
+}
+
+std::string centerPc3dCovariance(std::string source) {
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        const auto at = source.find(from);
+        require(at != std::string::npos && source.find(from,at+from.size()) == std::string::npos,
+                "PC3D center covariance source contract changed");
+        source.replace(at,from.size(),to);
+    };
+    replace("float localDistance(vec3 delta, ivec2 p, ivec2 q, float extra) {\n"
+            "    mat3 pair = localCovariance((vec2(p)+.5)/vec2(uSize)) +",
+            "float localDistance(vec3 delta, mat3 centerCovariance, ivec2 q, float extra) {\n"
+            "    mat3 pair = centerCovariance +");
+    const std::string center = "    mat3 centerCovariance = uLocalNoiseOn != 0 ? localCovariance((vec2(xy)+.5)/vec2(uSize)) : mat3(0);\n";
+    replace(center, "");
+    replace("    vec3 gl = lscAt(xy);",center+"    vec3 gl = lscAt(xy);");
+    replace("localDistance(c-cin,xy,qg,0.0)","localDistance(c-cin,centerCovariance,qg,0.0)");
+    for (int i=0;i<4;++i) for (const std::string extra : {"0.0","extra"}) {
+        const auto n = std::to_string(i);
+        replace("localDistance(cc"+n+"-cref,xy,q"+n+","+extra+")",
+                "localDistance(cc"+n+"-cref,centerCovariance,q"+n+","+extra+")");
+    }
+    return source;
+}
+
+std::string fixedPc3dKernel(std::string source, int kernel) {
+    const std::string declaration="uniform int uK;";
+    const auto at=source.find(declaration);
+    require(at!=std::string::npos,"missing PC3D kernel uniform");
+    source.replace(at,declaration.size(),"const int uK = "+std::to_string((kernel-1)/2)+";");
+    return source;
+}
+
+std::string packedPc3dCovariance(std::string source) {
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        const auto at=source.find(from);
+        require(at!=std::string::npos && source.find(from,at+from.size())==std::string::npos,
+                "PC3D packed covariance source contract changed");
+        source.replace(at,from.size(),to);
+    };
+    replace("mat3 pc3dOutputNoise(",
+        "vec3 covDiagonal(mat3 c) { return vec3(c[0][0],c[1][1],c[2][2]); }\n"
+        "vec3 covOffDiagonal(mat3 c) { return vec3(c[1][0],c[2][0],c[2][1]); }\n"
+        "mat3 covMatrix(vec3 d, vec3 o) { return mat3(d.r,o.r,o.g, o.r,d.g,o.b, o.g,o.b,d.b); }\n"
+        "mat3 pc3dOutputNoise(");
+    replace("    mat3 covarianceA = kSeed * centerCovariance;\n"
+            "    mat3 covarianceB = covarianceA;",
+            "    vec3 covarianceADiag = kSeed * covDiagonal(centerCovariance);\n"
+            "    vec3 covarianceAOff = kSeed * covOffDiagonal(centerCovariance);\n"
+            "    vec3 covarianceBDiag = covarianceADiag;\n"
+            "    vec3 covarianceBOff = covarianceAOff;");
+    replace("                covarianceA += f1 * (w.x*c0+w.y*c1+w.z*c2+w.w*c3);\n"
+            "                covarianceB += f1 * (w2.x*c0+w2.y*c1+w2.z*c2+w2.w*c3);",
+            "                mat3 updateA = f1 * (w.x*c0+w.y*c1+w.z*c2+w.w*c3);\n"
+            "                covarianceADiag += covDiagonal(updateA);\n"
+            "                covarianceAOff += covOffDiagonal(updateA);\n"
+            "                mat3 updateB = f1 * (w2.x*c0+w2.y*c1+w2.z*c2+w2.w*c3);\n"
+            "                covarianceBDiag += covDiagonal(updateB);\n"
+            "                covarianceBOff += covOffDiagonal(updateB);");
+    replace("            covarianceA/Z, covarianceB/Z2, centerCovariance, uLuma);",
+            "            covMatrix(covarianceADiag,covarianceAOff)/Z,\n"
+            "            covMatrix(covarianceBDiag,covarianceBOff)/Z2, centerCovariance, uLuma);");
+    return source;
+}
+
+struct Pc3dBenchTimer {
+    PFNGLGENQUERIESEXTPROC gen = nullptr;
+    PFNGLDELETEQUERIESEXTPROC del = nullptr;
+    PFNGLBEGINQUERYEXTPROC begin = nullptr;
+    PFNGLENDQUERYEXTPROC end = nullptr;
+    PFNGLGETQUERYOBJECTUI64VEXTPROC get = nullptr;
+    GLuint query = 0;
+    Pc3dBenchTimer() {
+        GLint count = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+        bool supported = false;
+        for (GLint i = 0; i < count; ++i) {
+            const auto* extension = glGetStringi(GL_EXTENSIONS, GLuint(i));
+            supported |= extension && std::strcmp(reinterpret_cast<const char*>(extension),
+                "GL_EXT_disjoint_timer_query") == 0;
+        }
+        if (!supported) return;
+        gen = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(eglGetProcAddress("glGenQueriesEXT"));
+        del = reinterpret_cast<PFNGLDELETEQUERIESEXTPROC>(eglGetProcAddress("glDeleteQueriesEXT"));
+        begin = reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(eglGetProcAddress("glBeginQueryEXT"));
+        end = reinterpret_cast<PFNGLENDQUERYEXTPROC>(eglGetProcAddress("glEndQueryEXT"));
+        get = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(eglGetProcAddress("glGetQueryObjectui64vEXT"));
+        const auto queryInfo = reinterpret_cast<PFNGLGETQUERYIVEXTPROC>(eglGetProcAddress("glGetQueryivEXT"));
+        if (!(gen && del && begin && end && get && queryInfo)) return;
+        GLint bits = 0;
+        queryInfo(GL_TIME_ELAPSED_EXT, GL_QUERY_COUNTER_BITS_EXT, &bits);
+        if (bits > 0) gen(1, &query);
+        glCheck("specialization GPU timer setup");
+    }
+    ~Pc3dBenchTimer() { if (query) del(1, &query); }
+    Pc3dBenchTimer(const Pc3dBenchTimer&) = delete;
+    Pc3dBenchTimer& operator=(const Pc3dBenchTimer&) = delete;
+};
+
+void pc3dSpecializeBenchmark(const std::string& path, int size, int repeats,
+                             const std::vector<int>& kernels, const std::vector<int>& locals, int strips,
+                             const std::string& candidate, const std::string& candidatePath) {
+    std::ifstream stream(path, std::ios::binary);
+    require(stream.is_open(), "cannot read production PC3D source: " + path);
+    const std::string source((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    require(!stream.bad() && !source.empty(), "empty/unreadable PC3D source");
+    require(candidate.empty() || candidate == "paired" || candidate == "shared" ||
+            candidate == "center" || candidate == "kernel" || candidate == "packed", "unknown PC3D candidate");
+    require(candidate.empty() || candidatePath.empty(), "choose a candidate transform or file, not both");
+    if(candidate=="kernel")require(kernels.size()==1,"fixed kernel benchmark requires one kernel");
+    const bool specialization = candidate.empty() && candidatePath.empty();
+    std::string zeroSource;
+    if (!candidatePath.empty()) {
+        std::ifstream input(candidatePath, std::ios::binary);
+        require(input.is_open(), "cannot read PC3D candidate: " + candidatePath);
+        zeroSource.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        require(!input.bad() && !zeroSource.empty(), "empty/unreadable PC3D candidate");
+    } else zeroSource = candidate.empty() ? specializePc3d(source, 0) :
+        candidate == "paired" ? pairedPc3dDistances(source) :
+        candidate == "center" ? centerPc3dCovariance(source) :
+        candidate == "packed" ? packedPc3dCovariance(source) :
+        candidate == "kernel" ? fixedPc3dKernel(source,kernels[0]) : sharedPc3dDistance(source);
+    const std::string oneSource = specialization ? specializePc3d(source, 1) : zeroSource;
+    const std::array<GLuint, 3> p = {{program(source.c_str(), "specialize uniform", true),
+        program(zeroSource.c_str(), "specialize const0", true),
+        program(oneSource.c_str(), "specialize const1", true)}};
+    const char* candidateName = candidatePath.empty() ? candidate.c_str() : "file";
+    const char* names[] = {"uniform", specialization ? "const0" : candidateName,
+        specialization ? "const1" : candidateName};
+    GLint maxAttachments = 0, maxBuffers = 0, binaryFormats = 0;
+    glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maxAttachments);
+    glGetIntegerv(GL_MAX_DRAW_BUFFERS, &maxBuffers);
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &binaryFormats);
+    require(maxAttachments >= 3 && maxBuffers >= 3, "specialization requires three MRT attachments");
+    const auto binaryInfo = [&](const char* phase) {
+        for (size_t i = 0; i < p.size(); ++i) {
+            GLint length = 0;
+            glGetProgramiv(p[i], GL_PROGRAM_BINARY_LENGTH, &length);
+            std::printf("SPECIALIZE_PROGRAM_JSON {\"phase\":\"%s\",\"variant\":\"%s\",\"sourceBytes\":%zu,"
+                "\"binaryFormats\":%d,\"binaryLength\":%d,\"retrievableHint\":true}\n", phase, names[i],
+                i == 0 ? source.size() : i == 1 ? zeroSource.size() : oneSource.size(), binaryFormats, length);
+        }
+        glCheck("specialization program binary lengths");
+    };
+    binaryInfo("linked");
+    const size_t pixels = size_t(size) * size, values = pixels * 4;
+    std::vector<float> image(values), diagonal(values), offDiagonal(values);
+    std::vector<uint8_t> masks(pixels);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const size_t pixel = size_t(y) * size + x, k = pixel * 4;
+        const float u = float(x) / size, v = float(y) / size;
+        const float base = .02f + .7f*u + .02f*std::sin(float(x)*.37f)*std::cos(float(y)*.29f);
+        image[k] = base; image[k+1] = base*(.8f+.2f*v); image[k+2] = base*(.7f+.15f*u);
+        if (x > size/2 && y > size/2) {
+            const float t = float((x*13+y*7)%17)/16.f;
+            image[k] = .02f+.9f*t; image[k+1] = .8f-.7f*t; image[k+2] = .05f+.45f*t;
+        }
+        if (x < size/8 && y < size/8) image[k] = image[k+1] = image[k+2] = 0;
+        if (x > 7*size/8 && y < size/8) { image[k] = 2.4f; image[k+1] = 1.6f; image[k+2] = 1.2f; }
+        masks[pixel] = (x > size/2 && x < size/2+3) ? 255 : (y % 29 == 0 ? 96 : 0);
+        image[k+3] = float(masks[pixel])/255.f;
+        const float n = .0001f+.001f*(.1f+u+v);
+        diagonal[k] = n; diagonal[k+1] = n*1.3f; diagonal[k+2] = n*1.7f; diagonal[k+3] = 1;
+        offDiagonal[k] = -n*.15f; offDiagonal[k+1] = n*.1f; offDiagonal[k+2] = -n*.2f; offDiagonal[k+3] = 1;
+    }
+    constexpr int lscWidth = 17, lscHeight = 13;
+    std::vector<float> gains(lscWidth*lscHeight*4);
+    for (int y = 0; y < lscHeight; ++y) for (int x = 0; x < lscWidth; ++x) {
+        const size_t k = size_t(y*lscWidth+x)*4;
+        const float dx = 2.f*x/(lscWidth-1)-1.f, dy = 2.f*y/(lscHeight-1)-1.f;
+        const float radius = dx*dx+dy*dy;
+        gains[k] = 1.f+.35f*radius; gains[k+1] = 1.f+.2f*radius;
+        gains[k+2] = 1.f+.45f*radius; gains[k+3] = 1;
+    }
+    const std::array<GLuint, 6> inputs = {{
+        texture(GL_RGBA16F,size,size,GL_RGBA,GL_FLOAT,image.data()), 0,
+        texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,diagonal.data()),
+        texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT,offDiagonal.data()),
+        texture(GL_RGBA32F,lscWidth,lscHeight,GL_RGBA,GL_FLOAT,gains.data()),
+        texture(GL_R8,size,size,GL_RED,GL_UNSIGNED_BYTE,masks.data())}};
+    const GLuint color = texture(GL_RGBA16F,size,size,GL_RGBA,GL_HALF_FLOAT);
+    const GLuint outDiag = texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT);
+    const GLuint outOff = texture(GL_RGBA32F,size,size,GL_RGBA,GL_FLOAT);
+    const GLuint covarianceFbo = target({color,outDiag,outOff},size,size,
+        "specialization RGBA16F+2xRGBA32F equality/local1 MRT");
+    const GLuint colorFbo = target({color},size,size,"specialization local0 production RGB target");
+    Pc3dBenchTimer timer;
+    std::printf("SPECIALIZE_CONFIG_JSON {\"size\":%d,\"abbaBlocks\":%d,\"strips\":%d,\"gpuTimer\":%s,"
+        "\"maskOn\":1,\"satMaskOn\":1,\"lscSize\":[17,13],\"timedAttachmentsByLocalNoise\":[1,3],\"equalityAttachments\":3}\n",
+        size,repeats,strips,timer.query ? "true" : "false");
+    const auto setup = [&](GLuint object, int local, int kernel, float moire) {
+        glBindFramebuffer(GL_FRAMEBUFFER, local ? covarianceFbo : colorFbo);
+        use(object);
+        constexpr const char* samplers[] = {"uTex","uOrig","uLocalVariance","uLocalCovariance","uLsc","uSatMask"};
+        for (int unit = 0; unit < 6; ++unit) {
+            glActiveTexture(GL_TEXTURE0+unit);
+            glBindTexture(GL_TEXTURE_2D, unit == 1 ? inputs[0] : inputs[unit]);
+            const GLint location = glGetUniformLocation(object,samplers[unit]);
+            if (location >= 0) glUniform1i(location,unit);
+        }
+        // Constants remove inactive uniforms; bind identical textures even then.
+        const auto setInt = [&](const char* name,int value) {
+            const GLint location = glGetUniformLocation(object,name);
+            if (location >= 0) glUniform1i(location,value);
+        };
+        const auto setFloat = [&](const char* name,float value) {
+            const GLint location = glGetUniformLocation(object,name);
+            if (location >= 0) glUniform1f(location,value);
+        };
+        u2i(object,"uSize",size,size); u2i(object,"uFullSize",size,size);
+        const GLint lscSize = glGetUniformLocation(object,"uLscSize");
+        if (lscSize >= 0) glUniform2i(lscSize,lscWidth,lscHeight);
+        setInt("uK",(kernel-1)/2); setFloat("uKernel",2.4f);
+        setFloat("uSigA",.002f); setFloat("uSigB",.0001f); setFloat("uLuma",.8f);
+        setInt("uMaskOn",1); setInt("uDown",1); setInt("uSatMaskOn",1);
+        setInt("uLocalNoiseOn",local); setFloat("uLocalNoiseScale",1); setFloat("uMoire",moire);
+        glActiveTexture(GL_TEXTURE0);
+        glCheck("specialization uniforms/textures");
+    };
+    const auto striped = [&]() {
+        if (strips == 1 || size < strips*16) { glDrawArrays(GL_TRIANGLES,0,3); ++draws; }
+        else {
+            glEnable(GL_SCISSOR_TEST);
+            const int rows = (size+strips-1)/strips;
+            for (int y = 0; y < size; y += rows) {
+                glScissor(0,y,size,std::min(rows,size-y));
+                glDrawArrays(GL_TRIANGLES,0,3); ++draws; glFlush();
+            }
+            glDisable(GL_SCISSOR_TEST);
+        }
+    };
+    struct Timing { double wall = 0, gpu = -1; GLint disjoint = 0; };
+    const auto measure = [&]() {
+        glFinish();
+        if (timer.query) { GLint discarded = 0; glGetIntegerv(GL_GPU_DISJOINT_EXT,&discarded); }
+        const auto start = std::chrono::steady_clock::now();
+        if (timer.query) timer.begin(GL_TIME_ELAPSED_EXT,timer.query);
+        striped();
+        if (timer.query) timer.end(GL_TIME_ELAPSED_EXT);
+        glFinish();
+        Timing timing;
+        timing.wall = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        if (timer.query) {
+            glGetIntegerv(GL_GPU_DISJOINT_EXT,&timing.disjoint);
+            GLuint64 ns = 0;
+            timer.get(timer.query,GL_QUERY_RESULT_EXT,&ns);
+            if (!timing.disjoint) timing.gpu = double(ns)/1e6;
+        }
+        glCheck("specialization timed draw");
+        return timing;
+    };
+    using Output = std::array<std::vector<uint8_t>,3>;
+    const auto readBytes = [&]() {
+        Output output;
+        for (int attachment = 0; attachment < 3; ++attachment) {
+            glReadBuffer(GL_COLOR_ATTACHMENT0+attachment);
+            const GLenum type = attachment == 0 ? GL_HALF_FLOAT : GL_FLOAT;
+            GLint implementationFormat = 0, implementationType = 0;
+            glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT,&implementationFormat);
+            glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE,&implementationType);
+            require(implementationFormat == GL_RGBA && GLenum(implementationType) == type,
+                "native RGBA HALF_FLOAT/FLOAT readback unavailable; refusing converted byte comparison");
+            auto& bytes = output[attachment];
+            const size_t componentBytes = attachment == 0 ? sizeof(uint16_t) : sizeof(float);
+            bytes.resize(values*componentBytes);
+            glReadPixels(0,0,size,size,GL_RGBA,type,bytes.data());
+            glCheck("specialization native-byte readback"); ++readbacks;
+            for (size_t k = 0; k < values; ++k) {
+                if (attachment == 0) {
+                    uint16_t value = 0; std::memcpy(&value,bytes.data()+k*componentBytes,sizeof(value));
+                    require((value & 0x7c00) != 0x7c00,"nonfinite RGBA16F benchmark output");
+                } else {
+                    float value = 0; std::memcpy(&value,bytes.data()+k*componentBytes,sizeof(value));
+                    require(std::isfinite(value),"nonfinite RGBA32F benchmark covariance");
+                }
+            }
+        }
+        return output;
+    };
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(),values.end());
+        return (values[(values.size()-1)/2]+values[values.size()/2])*.5;
+    };
+    for (int local : locals) for (int kernel : kernels) for (float moire : {0.f,1.5f}) {
+        const GLuint a = p[0], b = p[local+1];
+        std::printf("SPECIALIZE_CASE_BEGIN localNoise=%d kernel=%d moire=%.1f\n",local,kernel,moire);
+        // Warm each program twice before any timed block or readback.
+        for (GLuint object : {a,b,b,a}) { setup(object,local,kernel,moire); measure(); }
+        const auto equality = [&](const char* phase) {
+            setup(a,local,kernel,moire);
+            glBindFramebuffer(GL_FRAMEBUFFER,covarianceFbo);
+            striped(); glFinish(); glCheck("uniform equality draw");
+            const Output expected = readBytes();
+            setup(b,local,kernel,moire);
+            glBindFramebuffer(GL_FRAMEBUFFER,covarianceFbo);
+            striped(); glFinish(); glCheck("constant equality draw");
+            const Output got = readBytes();
+            for (int attachment = 0; attachment < 3; ++attachment) {
+                size_t different = 0, first = expected[attachment].size();
+                for (size_t k = 0; k < expected[attachment].size(); ++k) {
+                    if (expected[attachment][k] != got[attachment][k]) { ++different; first = std::min(first,k); }
+                }
+                result("specialization "+std::string(phase)+" native bytes attachment "+std::to_string(attachment),
+                       different ? INFINITY : 0,0);
+                std::printf("SPECIALIZE_EQUALITY_JSON {\"phase\":\"%s\",\"localNoise\":%d,\"kernel\":%d,\"moire\":%.1f,"
+                    "\"attachment\":%d,\"componentBits\":%d,\"bytes\":%zu,\"differentBytes\":%zu,\"firstDifferentByte\":%zu}\n",
+                    phase,local,kernel,moire,attachment,attachment == 0 ? 16 : 32,expected[attachment].size(),different,first);
+            }
+        };
+        equality("before");
+        std::array<std::vector<double>,2> wallTimes, gpuTimes;
+        for (int block = 0; block < repeats; ++block) {
+            std::array<Timing,4> samples;
+            constexpr int order[] = {0,1,1,0};
+            for (int slot = 0; slot < 4; ++slot) {
+                const int variant = order[slot];
+                setup(variant == 0 ? a : b,local,kernel,moire);
+                const Timing timing = measure(); samples[slot] = timing;
+                wallTimes[variant].push_back(timing.wall);
+                char gpuText[64] = "null";
+                if (timing.gpu >= 0) std::snprintf(gpuText,sizeof(gpuText),"%.6f",timing.gpu);
+                std::printf("SPECIALIZE_SAMPLE_JSON {\"localNoise\":%d,\"kernel\":%d,\"moire\":%.1f,\"block\":%d,\"slot\":%d,"
+                    "\"variant\":\"%s\",\"wallMs\":%.6f,\"gpuMs\":%s,\"disjoint\":%d}\n",
+                    local,kernel,moire,block,slot,variant == 0 ? names[0] : names[local+1],timing.wall,gpuText,timing.disjoint);
+            }
+            // One disjoint invalidates the whole paired GPU block, not just one side.
+            if (std::all_of(samples.begin(),samples.end(),[](const Timing& t){ return t.gpu >= 0; }))
+                for (int slot = 0; slot < 4; ++slot) gpuTimes[order[slot]].push_back(samples[slot].gpu);
+        }
+        equality("after");
+        for (int variant = 0; variant < 2; ++variant) {
+            char gpuText[64] = "null";
+            if (!gpuTimes[variant].empty()) std::snprintf(gpuText,sizeof(gpuText),"%.6f",median(gpuTimes[variant]));
+            std::printf("SPECIALIZE_BENCH_JSON {\"localNoise\":%d,\"kernel\":%d,\"moire\":%.1f,\"variant\":\"%s\","
+                "\"wallSamples\":%zu,\"pairedGpuSamples\":%zu,\"wallMedianMs\":%.6f,\"gpuMedianMs\":%s}\n",
+                local,kernel,moire,variant == 0 ? names[0] : names[local+1],wallTimes[variant].size(),
+                gpuTimes[variant].size(),median(wallTimes[variant]),gpuText);
+        }
+    }
+    binaryInfo("finished");
+}
+
 void productionShaderTests(const std::string& directory) {
     DIR* dir = opendir(directory.c_str());
     require(dir != nullptr, "cannot open shader directory: " + directory);
@@ -875,8 +1276,10 @@ std::string jsonString(const std::string& s) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout,nullptr,_IONBF,0);
     try {
-        std::string shaderDirectory, benchmarkPath;
+        std::string shaderDirectory, benchmarkPath, specializePath, specializeCandidate, specializeCandidatePath;
         int benchmarkSize=512, benchmarkRepeats=3;
+        int specializeStrips=16;
+        std::vector<int> specializeKernels={11}, specializeLocals={0,1};
         if (argc == 3 && std::string(argv[1]) == "--shader-dir") shaderDirectory = argv[2];
         else if (argc >= 3 && std::string(argv[1]) == "--pc3d-bench") {
             benchmarkPath=argv[2];
@@ -889,9 +1292,51 @@ int main(int argc, char** argv) {
             require(benchmarkSize>=256 && benchmarkSize<=4096 && benchmarkRepeats>=1 && benchmarkRepeats<=20,
                     "benchmark size must be [256,4096], repeats [1,20]");
         }
-        else require(argc == 1, "usage: check-highlight-device [--shader-dir DIRECTORY | --pc3d-bench FILE [--size N] [--repeats N]]");
+        else if (argc >= 3 && std::string(argv[1]) == "--pc3d-specialize-bench") {
+            specializePath=argv[2]; benchmarkSize=1024;
+            const auto choices=[](const std::string& text,const std::vector<int>& allowed) {
+                std::vector<int> selected;
+                size_t start=0;
+                do {
+                    const size_t end=text.find(',',start);
+                    const std::string token=text.substr(start,end==std::string::npos?end:end-start);
+                    size_t consumed=0;
+                    const int value=std::stoi(token,&consumed);
+                    require(consumed==token.size() && std::find(allowed.begin(),allowed.end(),value)!=allowed.end(),
+                            "invalid specialization case filter");
+                    require(std::find(selected.begin(),selected.end(),value)==selected.end(),"duplicate specialization case filter");
+                    selected.push_back(value);
+                    if(end==std::string::npos)break;
+                    start=end+1;
+                } while(true);
+                return selected;
+            };
+            for(int i=3;i<argc;i+=2) {
+                require(i+1<argc,"missing specialization option value");
+                const std::string option=argv[i], value=argv[i+1];
+                if(option=="--candidate")specializeCandidate=value;
+                else if(option=="--candidate-file")specializeCandidatePath=value;
+                else if(option=="--kernels")specializeKernels=choices(value,{7,11,21});
+                else if(option=="--local-noise")specializeLocals=choices(value,{0,1});
+                else {
+                    size_t consumed=0;
+                    const int number=std::stoi(value,&consumed);
+                    require(consumed==value.size(),"invalid specialization numeric option");
+                    if(option=="--size")benchmarkSize=number;
+                    else if(option=="--repeats")benchmarkRepeats=number;
+                    else if(option=="--strips")specializeStrips=number;
+                    else require(false,"unknown specialization option");
+                }
+            }
+            require(benchmarkSize>=256 && benchmarkSize<=4096 && benchmarkRepeats>=1 && benchmarkRepeats<=20 &&
+                    specializeStrips>=1 && specializeStrips<=256,
+                    "specialization size [256,4096], ABBA repeats [1,20], strips [1,256]");
+        }
+        else require(argc == 1, "usage: check-highlight-device [--shader-dir DIRECTORY | --pc3d-bench FILE [--size N] [--repeats N] | --pc3d-specialize-bench FILE [--size N] [--repeats N] [--kernels 7,11,21] [--local-noise 0,1] [--strips N] [--candidate paired|shared|center|kernel|packed | --candidate-file FILE]]");
         init();
-        if (!benchmarkPath.empty()) {
+        if (!specializePath.empty()) {
+            pc3dSpecializeBenchmark(specializePath,benchmarkSize,benchmarkRepeats,specializeKernels,specializeLocals,specializeStrips,specializeCandidate,specializeCandidatePath);
+        } else if (!benchmarkPath.empty()) {
             pc3dBenchmark(benchmarkPath,benchmarkSize,benchmarkRepeats);
         } else {
             GLuint merge=program(filmkit::kFsHighlightMerge,"HighlightMergeShader.h");

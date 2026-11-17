@@ -155,12 +155,16 @@ class Pv3StaleFrameTest {
             src.contains("visibleBitmapFor(p == page, pageUri, shownUri, bitmap, cached)"),
         )
         assertTrue(
-            "`under` 层必须过归属校验 —— 它是旧页像素漏到新页的第二条路径",
-            src.contains("if (owns) under?.let"),
+            "删除后的交叉淡入只允许同一停稳页；翻页不能借 samePageSwap 绕过归属校验",
+            src.contains("val samePageSwap = p == page && shownPage == page"),
         )
         assertTrue(
-            "淡入 alpha 的闸门必须是 owns（只判 p == page 会让新页的预载档半透明压在黑底上）",
-            src.contains("pageAlphaAt(owns, under != null, fade.value)"),
+            "`under` 层必须过归属校验 —— 它是旧页像素漏到新页的第二条路径",
+            src.contains("if (owns || samePageSwap) under?.let"),
+        )
+        assertTrue(
+            "淡入 alpha 必须校验归属或同页切图，不能只判 p == page",
+            src.contains("pageAlphaAt(owns || samePageSwap, under != null, fade.value)"),
         )
         assertTrue(
             "几何判据必须仍是 p == page —— 缩放/平移是 E2-23 的另一道闸，不许被这次收紧带走",

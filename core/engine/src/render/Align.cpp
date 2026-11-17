@@ -5,6 +5,10 @@
 #include <cmath>
 #include <vector>
 
+#if defined(__aarch64__) && !defined(FILMKIT_ALIGN_SCALAR)
+#include <arm_neon.h>
+#endif
+
 namespace filmkit {
 
 namespace {
@@ -21,6 +25,27 @@ inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v
 inline int sadTile(const uint8_t* a, const uint8_t* b, int w, int h, int x0,
                    int y0, int dx, int dy, int tw, int th, int step) {
   int s = 0;
+#if defined(__aarch64__) && !defined(FILMKIT_ALIGN_SCALAR)
+  // libvpx sad_neon.c uses widened integer absolute-difference reductions.
+  // Keep every existing sample, including step=2; boundary tiles stay scalar.
+  if ((step == 1 || step == 2) && x0 >= 0 && x0 + tw <= w &&
+      x0 + dx >= 0 && x0 + dx + tw <= w) {
+    uint32x4_t sums = vdupq_n_u32(0);
+    const int span = 16 * step;
+    for (int y = 0; y < th; y += step) {
+      const uint8_t* pa = a + static_cast<size_t>(clampi(y0 + y, 0, h - 1)) * w + x0;
+      const uint8_t* pb = b + static_cast<size_t>(clampi(y0 + y + dy, 0, h - 1)) * w + x0 + dx;
+      int x = 0;
+      for (; x + span <= tw; x += span) {
+        const uint8x16_t va = step == 1 ? vld1q_u8(pa + x) : vld2q_u8(pa + x).val[0];
+        const uint8x16_t vb = step == 1 ? vld1q_u8(pb + x) : vld2q_u8(pb + x).val[0];
+        sums = vpadalq_u16(sums, vpaddlq_u8(vabdq_u8(va, vb)));
+      }
+      for (; x < tw; x += step) s += std::abs(pa[x] - pb[x]);
+    }
+    return s + static_cast<int>(vaddvq_u32(sums));
+  }
+#endif
   for (int y = 0; y < th; y += step) {
     const int ay = clampi(y0 + y, 0, h - 1);
     const int by = clampi(y0 + y + dy, 0, h - 1);
