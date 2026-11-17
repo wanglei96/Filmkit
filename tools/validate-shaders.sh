@@ -313,7 +313,7 @@ if run_check "$SRC" "$TMP/run"; then
   # Complete standalone literals live in these included headers. Validate them
   # by default as well; a successful C++ build does not compile runtime GLSL.
   if [ "$SRC" = "core/engine/src/render/FrameRenderer.cpp" ]; then
-    for header in HighlightMergeShader.h HighlightResolveShader.h HighlightNoiseShader.h HighlightNoiseFilterShader.h; do
+    for header in HighlightMergeShader.h HighlightLongShader.h HighlightResolveShader.h HighlightNoiseShader.h HighlightNoiseFilterShader.h; do
       run_check "core/engine/src/render/$header" "$TMP/$header"
     done
   fi

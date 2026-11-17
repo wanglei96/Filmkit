@@ -1137,6 +1137,14 @@ class FrameRenderer {
   bool passHighlightResolve(int width, int height, int rotation, const float gains[3]);
   GLuint tex_highlight_flow_ = 0, tex_highlight_mask_ = 0, tex_highlight_linear_ = 0;
   GLuint tex_highlight_noise_ = 0;
+  GLuint tex_highlight_reference_mask_ = 0;
+  GLuint prog_highlight_long_[3] = {0, 0, 0};
+  GLuint tex_highlight_long_[3] = {0, 0, 0}; // clip, reference-weight, final-weight
+  GLuint fbo_highlight_long_[3] = {0, 0, 0};
+  int highlight_long_w_ = 0, highlight_long_h_ = 0, highlight_long_frames_ = 0;
+  bool ensureHighlightLongResources(int width, int height);
+  bool passHighlightLongWeights(int width, int height, const float black[4],
+                               float white, const float scales[4]);
   GLuint prog_highlight_noise_ = 0, fbo_highlight_cov_ = 0;
   GLuint tex_highlight_cov_diag_ = 0, tex_highlight_cov_off_ = 0;
   int highlight_cov_w_ = 0, highlight_cov_h_ = 0;

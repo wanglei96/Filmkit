@@ -26,6 +26,7 @@
 #include "HighlightGeometry.h"
 #include "HighlightRecovery.h"
 #include "HighlightMergeShader.h"
+#include "HighlightLongShader.h"
 #include "HighlightResolveShader.h"
 #include "HighlightNoiseShader.h"
 #include "HighlightNoiseFilterShader.h"
@@ -10383,11 +10384,19 @@ void FrameRenderer::release() {
   if (fbo_highlight_rgb_) glDeleteFramebuffers(1, &fbo_highlight_rgb_);
   tex_highlight_rgb_ = fbo_highlight_rgb_ = 0;
   highlight_rgb_w_ = highlight_rgb_h_ = 0;
-  for (GLuint* tex : {&tex_highlight_flow_, &tex_highlight_mask_, &tex_highlight_linear_, &tex_highlight_noise_}) {
+  for (GLuint* tex : {&tex_highlight_flow_, &tex_highlight_mask_, &tex_highlight_linear_,
+                      &tex_highlight_noise_, &tex_highlight_reference_mask_}) {
     if (*tex) glDeleteTextures(1, tex);
     *tex = 0;
   }
   highlight_short_index_ = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (prog_highlight_long_[i]) glDeleteProgram(prog_highlight_long_[i]);
+    if (tex_highlight_long_[i]) glDeleteTextures(1, &tex_highlight_long_[i]);
+    if (fbo_highlight_long_[i]) glDeleteFramebuffers(1, &fbo_highlight_long_[i]);
+    prog_highlight_long_[i] = tex_highlight_long_[i] = fbo_highlight_long_[i] = 0;
+  }
+  highlight_long_w_ = highlight_long_h_ = highlight_long_frames_ = 0;
   highlight_merge_ready_ = false;
   highlight_resolve_ready_ = false;
   highlight_noise_w_ = highlight_noise_h_ = 0;
@@ -17041,11 +17050,107 @@ bool FrameRenderer::ensureHighlightMergeResources(int w, int h) {
   return true;
 }
 
+bool FrameRenderer::ensureHighlightLongResources(int width, int height) {
+  const char* shaders[] = {kFsHighlightLongClip, kFsHighlightLongReferenceWeight,
+                           kFsHighlightLongSourceWeight};
+  for (int i = 0; i < 3; ++i) {
+    if (prog_highlight_long_[i]) continue;
+    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, shaders[i]);
+    if (!fs) return false;
+    prog_highlight_long_[i] = linkProgram(vs_plain_, fs);
+    glDeleteShader(fs);
+    if (!prog_highlight_long_[i]) return false;
+  }
+  const int mw = width / 4, mh = height / 4;
+  if (mw <= 0 || mh <= 0) return false;
+  if (highlight_long_w_ != mw || highlight_long_h_ != mh) {
+    // Each independent channel retains the original R8 precision. Never resize
+    // these masks into tex_w_'s 32-RAW-pixel confidence cells.
+    highlight_long_w_ = highlight_long_h_ = 0;
+    for (int i = 0; i < 3; ++i) {
+      makeTex(&tex_highlight_long_[i], &fbo_highlight_long_[i], GL_RGBA8, mw, mh);
+      if (i != 0) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      }
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    }
+    if (glGetError() != GL_NO_ERROR) return false;
+    highlight_long_w_ = mw; highlight_long_h_ = mh;
+  }
+  return true;
+}
+
+bool FrameRenderer::passHighlightLongWeights(int width, int height,
+    const float black[4], float white, const float scales[4]) {
+  highlight_long_frames_ = 0;
+  for (int i = 1; i < 4; ++i)
+    if (scales[i] < scales[0] && i != highlight_short_index_)
+      highlight_long_frames_ |= 1 << (i - 1);
+  if (!highlight_long_frames_) return true;
+  if (!tex_highlight_reference_mask_ || !ensureHighlightLongResources(width, height)) return false;
+  const GLboolean dither = glIsEnabled(GL_DITHER);
+  glDisable(GL_DITHER); // These RGBA8 channels are data, not display colour.
+  auto finish = [&](bool ok) {
+    glActiveTexture(GL_TEXTURE0);
+    if (dither) glEnable(GL_DITHER);
+    return ok;
+  };
+  const int mw = highlight_long_w_, mh = highlight_long_h_;
+  glViewport(0, 0, mw, mh);
+  auto bind = [&](GLuint program, const char* name, int unit, GLuint texture) {
+    glActiveTexture(GL_TEXTURE0 + unit); glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(glGetUniformLocation(program, name), unit);
+  };
+  for (int pass = 0; pass < 3; ++pass) {
+    const GLuint program = prog_highlight_long_[pass];
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_highlight_long_[pass]);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return finish(false);
+    glUseProgram(program);
+    auto loc = [&](const char* name) { return glGetUniformLocation(program, name); };
+    if (pass == 0) {
+      const char* raw_names[] = {"uRaw1", "uRaw2", "uRaw3"};
+      const char* flow_names[] = {"uOff1", "uOff2", "uOff3"};
+      for (int i = 0; i < 3; ++i) {
+        bind(program, raw_names[i], i, tex_mfnr_[i]);
+        bind(program, flow_names[i], 3 + i, tex_off_[i]);
+      }
+      float levels[4];
+      for (int i = 0; i < 4; ++i) levels[i] = black[i] + (white - black[i]) * (250.f / 255.f);
+      glUniform4fv(loc("uPhaseClippingLevels"), 1, levels);
+      glUniform1i(loc("uLongFrames"), highlight_long_frames_);
+    } else if (pass == 1) {
+      bind(program, "uW", 0, tex_w_);
+      bind(program, "uReferenceHighlight", 1, tex_highlight_reference_mask_);
+    } else {
+      bind(program, "uExistingWeight", 0, tex_highlight_long_[1]);
+      bind(program, "uClippingMask", 1, tex_highlight_long_[0]);
+    }
+    glUniform2i(loc("uRawSize"), width, height);
+    glUniform2i(loc("uOutputSize"), mw, mh);
+    glUniform2f(loc("uTiles"), static_cast<float>(tiles_w_), static_cast<float>(tiles_h_));
+    drawStriped(16);
+    const GLenum error = glGetError();
+    glActiveTexture(GL_TEXTURE0);
+    if (error != GL_NO_ERROR) {
+      Logger::instance().log(LogLevel::kError, "engine", "highlight.long_guard_failed",
+          "{\"pass\":" + std::to_string(pass) + ",\"glError\":" + std::to_string(error) + "}");
+      return finish(false);
+    }
+  }
+  Logger::instance().log(LogLevel::kInfo, "engine", "highlight.long_guard",
+      "{\"frames\":" + std::to_string(highlight_long_frames_) +
+      ",\"referenceClipping\":true,\"sourceRawClipping\":true,\"threshold\":0.980392157," +
+      "\"w\":" + std::to_string(mw) + ",\"h\":" + std::to_string(mh) + "}");
+  return finish(true);
+}
+
 bool FrameRenderer::passHighlightMerge(int w, int h, int cfa,
     const float black[4], float white, const float gains[3], const float scales[4]) {
   if (!highlight_merge_ready_ || !tex_highlight_mask_ || !tex_highlight_flow_ ||
       !tex_highlight_linear_) return false;
   if (!ensureHighlightMergeResources(w, h)) return false;
+  if (!passHighlightLongWeights(w, h, black, white, scales)) return false;
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_fused_);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex_highlight_noise_, 0);
   const GLenum targets[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
@@ -17055,10 +17160,11 @@ bool FrameRenderer::passHighlightMerge(int w, int h, int cfa,
   glUseProgram(prog_highlight_merge_);
   const GLuint textures[] = {raw_tex_, tex_mfnr_[0], tex_mfnr_[1], tex_mfnr_[2],
       tex_off_[0], tex_off_[1], tex_off_[2], tex_w_,
-      tex_highlight_flow_, tex_highlight_mask_, tex_highlight_linear_};
+      tex_highlight_flow_, tex_highlight_mask_, tex_highlight_linear_,
+      highlight_long_frames_ ? tex_highlight_long_[2] : tex_w_};
   const char* samplers[] = {"uRaw0", "uRaw1", "uRaw2", "uRaw3", "uOff1", "uOff2",
-      "uOff3", "uW", "uBentoFlow", "uBentoMask", "uLinearMask"};
-  for (int unit = 0; unit < 11; ++unit) {
+      "uOff3", "uW", "uBentoFlow", "uBentoMask", "uLinearMask", "uLongWeights"};
+  for (int unit = 0; unit < 12; ++unit) {
     glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_2D, textures[unit]);
     glUniform1i(glGetUniformLocation(prog_highlight_merge_, samplers[unit]), unit);
@@ -17072,6 +17178,7 @@ bool FrameRenderer::passHighlightMerge(int w, int h, int cfa,
   glUniform3fv(loc("uGain"), 1, gains);
   glUniform4fv(loc("uFrameScale"), 1, scales);
   glUniform1i(loc("uShortIndex"), highlight_short_index_);
+  glUniform1i(loc("uLongFrames"), highlight_long_frames_);
   glUniform4fv(loc("uKernelSigma"), 1, highlight_kernel_sigma_);
   glUniform4fv(loc("uGlobalWeight"), 1, highlight_global_weight_);
   glUniform3fv(loc("uNoiseShot"), 1, highlight_noise_shot_);
@@ -17090,7 +17197,8 @@ bool FrameRenderer::passHighlightMerge(int w, int h, int cfa,
   }
   Logger::instance().log(LogLevel::kInfo, "engine", "highlight.merge",
       "{\"path\":\"native_bayer\",\"shortIndex\":" +
-      std::to_string(highlight_short_index_) + ",\"domain\":\"reference_radiance\"}");
+      std::to_string(highlight_short_index_) + ",\"longGuardFrames\":" +
+      std::to_string(highlight_long_frames_) + ",\"domain\":\"reference_radiance\"}");
   return true;
 }
 
@@ -18677,6 +18785,7 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
   ok = ensurePc3dTargets(dst_w, dst_h, 2) && ok;
   // Reuse the same RGBA32F allocations as capture; no image-dependent state.
   ok = ensureHighlightMergeResources(raw_w, raw_h) && ok;
+  ok = ensureHighlightLongResources(raw_w, raw_h) && ok;
   ok = ensureHighlightNoiseResources(dst_w, dst_h) && ok;
   ok = ensureHighlightFilterCov(2, dst_w, dst_h) && ok;
   ok = ensureHighlightFilterCov(3, dst_w, dst_h) && ok;
@@ -18723,6 +18832,7 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
       fbo_teq_i_, fbo_teq_mean_, fbo_teq_tmp_, fbo_teq_out_,
       fbo_pc3d_, fbo_pc3d_t1_, fbo_pc3d_lo_[0], fbo_pc3d_lo_[1],
       fbo_highlight_cov_, highlight_filter_fbo_[2],
+      fbo_highlight_long_[0], fbo_highlight_long_[1], fbo_highlight_long_[2],
       fbo_ca_, fbo_ca_ds_,
   };
   for (GLuint f : targets) clearTarget(f);
@@ -19100,6 +19210,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // collar flow, then assess the selected short over the whole frame.
   highlight_merge_ready_ = false;
   highlight_short_index_ = -1;
+  highlight_long_frames_ = 0;
   if (satfix_on && frame_scale[short_idx] > 1.001f) {
     HighlightRawView base_view;
     base_view.data = static_cast<const uint16_t*>(frames[0]);
@@ -19203,6 +19314,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
         upload(&tex_highlight_flow_, gw, gh, GL_RGBA32F, GL_RGBA, flow4.data(), GL_FLOAT, GL_NEAREST);
         upload(&tex_highlight_mask_, mw, mh, GL_R8, GL_RED, selected.data(), GL_UNSIGNED_BYTE, GL_LINEAR);
         upload(&tex_highlight_linear_, mw, mh, GL_R8, GL_RED, linear.data(), GL_UNSIGNED_BYTE, GL_LINEAR);
+        upload(&tex_highlight_reference_mask_, guides.base.width, guides.base.height,
+            GL_R8, GL_RED, guides.highlight.data(), GL_UNSIGNED_BYTE, GL_NEAREST);
         highlight_short_index_ = assessment.accepted() ? short_idx : -1;
         for (int color = 0; color < 3; ++color) {
           highlight_noise_shot_[color] = model.S[color];

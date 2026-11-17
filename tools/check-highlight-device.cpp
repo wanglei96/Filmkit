@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "../core/engine/src/render/HighlightMergeShader.h"
+#include "../core/engine/src/render/HighlightLongShader.h"
 #include "../core/engine/src/render/HighlightResolveShader.h"
 #include "../core/engine/src/render/HighlightNoiseShader.h"
 
@@ -248,6 +249,7 @@ void mergeTests(GLuint p) {
     bind(p,"uRaw2",r0,2); bind(p,"uRaw3",r0,3);
     bind(p,"uOff1",zero,4); bind(p,"uOff2",zero,5); bind(p,"uOff3",zero,6);
     bind(p,"uW",zero,7); bind(p,"uBentoFlow",zero,8);
+    bind(p,"uLongWeights",zero,11); ui(p,"uLongFrames",0);
     bind(p,"uBentoMask",mask,9); bind(p,"uLinearMask",linear,10);
     u2i(p,"uSize",N,N); glUniform2f(uniform(p,"uTiles"),1,1);
     u4(p,"uBlack",100,100,100,100); uf(p,"uWhite",60100);
@@ -1339,6 +1341,9 @@ int main(int argc, char** argv) {
         } else if (!benchmarkPath.empty()) {
             pc3dBenchmark(benchmarkPath,benchmarkSize,benchmarkRepeats);
         } else {
+            program(filmkit::kFsHighlightLongClip,"HighlightLongShader.h clip");
+            program(filmkit::kFsHighlightLongReferenceWeight,"HighlightLongShader.h reference weight");
+            program(filmkit::kFsHighlightLongSourceWeight,"HighlightLongShader.h source weight");
             GLuint merge=program(filmkit::kFsHighlightMerge,"HighlightMergeShader.h");
             GLuint resolve=program(filmkit::kFsHighlightResolve,"HighlightResolveShader.h");
             GLuint noise=program(filmkit::kFsHighlightNoise,"HighlightNoiseShader.h");

@@ -104,9 +104,12 @@ class Case:
     noise_read: tuple = (2.e-6, 3.e-6, 5.e-6)
     noise_gain_ratio: tuple = (1., .7, 1.5, 2.)
     flow_half: bool = False
+    long_frames: int = 0
+    long_weights: np.ndarray | None = None
 
 
-def cpu_reference(c, with_noise=False):
+def cpu_reference(c, with_noise=False, long_samples=None, mask_samples=None,
+                  linear_samples=None, temporal_samples=None):
     h, w = c.raw[0].shape
     yy, xx = np.mgrid[:h, :w]
     phase = (xx & 1) + 2*(yy & 1)
@@ -123,6 +126,16 @@ def cpu_reference(c, with_noise=False):
     m = linear(c.mask.astype(float)/255., uv) if accepted else np.zeros((h, w))
     lm = linear(c.linear_mask.astype(float)/255., quad_uv) if accepted else np.zeros((h, w))
     temporal = linear(c.weights.astype(float)/255., temporal_uv)
+    if accepted and mask_samples is not None:
+        m = mask_samples
+    if accepted and linear_samples is not None:
+        lm = linear_samples
+    if temporal_samples is not None:
+        temporal = temporal_samples
+    guarded = (linear(c.long_weights.astype(float)/255., uv)
+               if c.long_weights is not None else np.zeros((h, w, 3)))
+    if long_samples is not None:
+        guarded = long_samples
     total = np.zeros((h, w))
     support = np.zeros((h, w))
     noise_total = np.zeros((h, w, 3))
@@ -135,8 +148,11 @@ def cpu_reference(c, with_noise=False):
                           np.minimum(tile_x, c.flow.shape[1]-1)].astype(float)
         else:
             flow = linear(c.off[frame-1].astype(float), temporal_uv)
-        tile_px = tile_x*8 + flow[..., 0]*.5
-        tile_py = tile_y*8 + flow[..., 1]*.5
+        # Match the shader's FP32 tile-anchor addition before the discontinuous
+        # 1.5px stencil boundary. Float64 can retain a sub-ULP residue which GLSL
+        # rounds onto that exact boundary, incorrectly dropping a real tap.
+        tile_px = (tile_x*8).astype('f4') + flow[..., 0].astype('f4')*np.float32(.5)
+        tile_py = (tile_y*8).astype('f4') + flow[..., 1].astype('f4')*np.float32(.5)
         anchor_x, anchor_y = np.rint(tile_px).astype(int), np.rint(tile_py).astype(int)
         residual_x, residual_y = 2*(anchor_x-tile_px), 2*(anchor_y-tile_py)
         anchor_x, anchor_y = anchor_x+wx, anchor_y+wy
@@ -184,7 +200,8 @@ def cpu_reference(c, with_noise=False):
         else:
             fw = (1-m)*c.global_weight[frame]
             if frame:
-                fw = fw*temporal[..., frame-1]
+                fw = (guarded[..., frame-1]*c.global_weight[frame]
+                      if c.long_frames & (1 << (frame-1)) else fw*temporal[..., frame-1])
         total += intensity*fw
         support += sw*fw
         if with_noise:
@@ -229,6 +246,68 @@ void main() {
             fragment_shader=shader.replace('#version 300 es', '#version 330 core'))
         self.vao = self.ctx.vertex_array(self.program, [])
 
+    def sample_unorm(self, c, data, quad=False, padded=False):
+        """Measure UNORM filtering separately, without changing the merge GLSL."""
+        h, w = c.raw[0].shape
+        program = self.ctx.program(vertex_shader='''#version 330 core
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}''', fragment_shader='''#version 330 core
+uniform sampler2D uWeights;
+uniform vec2 uExtent;
+uniform int uQuad;
+out vec4 oColor;
+void main() {
+    vec2 p = uQuad != 0 ? floor(gl_FragCoord.xy/2.0)*2.0+1.0 : gl_FragCoord.xy;
+    oColor = texture(uWeights, p / uExtent);
+}
+''')
+        vao = self.ctx.vertex_array(program, [])
+        components = data.shape[2] if data.ndim == 3 else 1
+        texture = self.ctx.texture((data.shape[1], data.shape[0]), components,
+            np.ascontiguousarray(data).tobytes(), dtype='f1', alignment=1)
+        texture.filter = (moderngl.LINEAR,) * 2
+        texture.repeat_x = texture.repeat_y = False
+        target = self.ctx.texture((w, h), 4, dtype='f4')
+        fbo = self.ctx.framebuffer([target])
+        try:
+            fbo.use()
+            self.ctx.viewport = (0, 0, w, h)
+            texture.use(0)
+            program['uWeights'].value = 0
+            extent = ((c.off[0].shape[1]*128, c.off[0].shape[0]*128) if padded else (w, h))
+            program['uExtent'].value = tuple(float(x) for x in extent)
+            program['uQuad'].value = int(quad)
+            vao.render(moderngl.TRIANGLES, vertices=3)
+            sampled = np.frombuffer(fbo.read(components=4, dtype='f4', alignment=1),
+                                    'f4').reshape(h, w, 4)[..., :components].copy()
+            if components == 1:
+                sampled = sampled[..., 0]
+            yy, xx = np.mgrid[:h, :w]
+            uv = (np.stack([2*(xx//2)+1., 2*(yy//2)+1.], axis=-1) if quad
+                  else np.stack([xx+.5, yy+.5], axis=-1))/np.array(extent)
+            ideal = linear(data.astype(float)/255., uv)
+            # Bound measured filtering itself to one UNORM code. Do not relax
+            # the merge/noise tolerances to absorb small-support amplification.
+            np.testing.assert_allclose(sampled, ideal, atol=1/255.+1e-6, rtol=0)
+            return sampled, float(np.max(np.abs(sampled-ideal)))
+        finally:
+            for resource in (fbo, target, texture, vao, program):
+                resource.release()
+
+    def sample_coefficients(self, c):
+        samples, errors = {}, []
+        for name, data, quad, padded in (
+            ('long_samples', c.long_weights, False, False),
+            ('mask_samples', c.mask, False, False),
+            ('linear_samples', c.linear_mask, True, False),
+            ('temporal_samples', c.weights, False, True),
+        ):
+            samples[name], error = self.sample_unorm(c, data, quad, padded)
+            errors.append(error)
+        return samples, max(errors)
+
     def run(self, c, target_dtype='f2', with_noise=False):
         h, w = c.raw[0].shape
         textures = []
@@ -250,12 +329,15 @@ void main() {
         bind('uBentoFlow', c.flow, 'f2' if c.flow_half else 'f4')
         bind('uBentoMask', c.mask, 'f1', True)
         bind('uLinearMask', c.linear_mask, 'f1', True)
+        bind('uLongWeights', c.long_weights if c.long_weights is not None
+             else np.zeros((1, 1, 3), dtype='u1'), 'f1', True)
         uniforms = {'uSize': (w, h), 'uTiles': (float(c.off[0].shape[1]), float(c.off[0].shape[0])),
                     'uCfaLut': c.cfa, 'uBlack': c.black, 'uWhite': c.white,
                     'uGain': c.gain, 'uFrameScale': c.scales, 'uShortIndex': c.short,
                     'uKernelSigma': c.sigma, 'uGlobalWeight': c.global_weight,
                     'uNoiseShot': c.noise_shot, 'uNoiseRead': c.noise_read,
                     'uNoiseGainRatio': c.noise_gain_ratio}
+        uniforms['uLongFrames'] = c.long_frames
         for name, value in uniforms.items():
             self.program[name].value = value
         target = self.ctx.texture((w, h), 1, dtype=target_dtype)
@@ -405,6 +487,12 @@ def cases():
                        noise_gain_ratio=(1., .5, 4., 8.)))
     out.append(replace(c, name='noise-read-only', noise_shot=(0.,)*3))
     out.append(replace(c, name='noise-zero', noise_shot=(0.,)*3, noise_read=(0.,)*3))
+    for flags in (1, 2, 4, 7):
+        for short in (-1, 1, 2, 3):
+            guarded = np.random.default_rng(flags*41+short).integers(
+                0, 256, (c.raw[0].shape[0]//4, c.raw[0].shape[1]//4, 3), dtype='u1')
+            out.append(replace(c, name=f'long-guard-{flags}-short-{short}',
+                               long_frames=flags, long_weights=guarded, short=short))
     return out
 
 
@@ -579,7 +667,9 @@ def main():
     rows = []
     try:
         for c in cases():
-            expected, expected_noise = cpu_reference(c, with_noise=True)
+            samples, sampling_error = (gpu.sample_coefficients(c) if c.long_frames
+                                       else ({}, 0.))
+            expected, expected_noise = cpu_reference(c, with_noise=True, **samples)
             actual, actual_noise = gpu.run(c, with_noise=True)
             full_precision = gpu.run(c, 'f4')
             noise_error = np.abs(actual_noise-expected_noise)
@@ -611,6 +701,7 @@ def main():
                    'r32f_max_abs': float(arithmetic_error.max()),
                    'storage_max_abs': float(storage_error.max()),
                    'noise_max_abs': [float(x) for x in noise_error.max(axis=(0, 1))],
+                   'unorm_sampling_max_abs': sampling_error,
                    'rms': float(np.sqrt(np.mean(error**2))),
                    'range': [float(actual.min()), float(actual.max())]}
             rows.append(row)

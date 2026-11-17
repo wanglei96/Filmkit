@@ -36,6 +36,10 @@ namespace filmkit {
 //   NOT a temporal union and NOT a 3x3 operation on RAW/2 M). Quad-centre lookup.
 // * uW: existing temporal mismatch RGB weights for frames 1/2/3, LINEAR + CLAMP.
 //   short=M (ignores uW); all others=(1-M)*existingWeight, reference weight=1.
+// * uLongWeights: RAW/4 RGBA8, LINEAR + CLAMP, RGB = frame 1/2/3 weights after
+//   the TWO original long-frame exclusions (reference highlight, native source
+//   clipping). uLongFrames bit 0/1/2 selects these instead of (1-M)*uW. Do not
+//   multiply by adjusted M again; long and accepted short have distinct masks.
 //   CPU must reject the WHOLE short frame by binding M=0, linearMask=0 and
 //   uShortIndex=-1 AND originalShort's uGlobalWeight=0 to exclude that frame.
 //   In rejection mode M/linearMix are forced 0 regardless of texture contents;
@@ -67,8 +71,8 @@ namespace filmkit {
 //   consumers needing signal-specific variance should use .r, not that shortcut.
 //   Short share uses the same unnormalized dual-green support as image resolve,
 //   not M alone. These are marginal statistics, NOT inter-output covariance.
-// No satW/darkW: admission is upstream; clipping is diagnostic, never a second
-// local veto. Negative noise and highlights >1 are retained. CameraWhite's
+// No per-tap satW/darkW: accepted-short admission and long-frame exclusions are
+// upstream, with distinct contracts. Negative noise/highlights >1 are retained. CameraWhite's
 // nonlinear bound belongs AFTER actual demosaic/unshade in RGB resolve; it must
 // not be applied to Bayer here because clipping and demosaic do not commute.
 // Render location 0 to R16F (.r); optional location 1 RGBA32F; no blending.
@@ -88,6 +92,8 @@ uniform highp sampler2D uOff1;
 uniform highp sampler2D uOff2;
 uniform highp sampler2D uOff3;
 uniform highp sampler2D uW;
+uniform highp sampler2D uLongWeights;
+uniform int uLongFrames;
 uniform highp sampler2D uBentoFlow;
 uniform highp sampler2D uBentoMask;
 uniform highp sampler2D uLinearMask;
@@ -235,15 +241,20 @@ void main() {
     float m = accepted ? texture(uBentoMask, rawUv).r : 0.0;
     float linearMix = accepted ? texture(uLinearMask, quadUv).r : 0.0;
     vec3 temporalWeight = texture(uW, weightUv).rgb;
+    vec3 longWeight = texture(uLongWeights, rawUv).rgb;
+    vec3 ordinaryWeight = (1.0-m)*temporalWeight;
+    if ((uLongFrames & 1) != 0) ordinaryWeight.r = longWeight.r;
+    if ((uLongFrames & 2) != 0) ordinaryWeight.g = longWeight.g;
+    if ((uLongFrames & 4) != 0) ordinaryWeight.b = longWeight.b;
     ivec2 flowTile = clamp(q / 8, ivec2(0), textureSize(uBentoFlow, 0) - 1);
     vec2 shortFlow = texelFetch(uBentoFlow, flowTile, 0).xy;
     vec2 f1 = uShortIndex == 1 ? shortFlow : coarseFlow(uOff1, weightUv);
     vec2 f2 = uShortIndex == 2 ? shortFlow : coarseFlow(uOff2, weightUv);
     vec2 f3 = uShortIndex == 3 ? shortFlow : coarseFlow(uOff3, weightUv);
     vec4 frameWeight = vec4((1.0-m)*uGlobalWeight.x,
-        uShortIndex == 1 ? m : (1.0-m)*temporalWeight.r*uGlobalWeight.y,
-        uShortIndex == 2 ? m : (1.0-m)*temporalWeight.g*uGlobalWeight.z,
-        uShortIndex == 3 ? m : (1.0-m)*temporalWeight.b*uGlobalWeight.w);
+        uShortIndex == 1 ? m : ordinaryWeight.r*uGlobalWeight.y,
+        uShortIndex == 2 ? m : ordinaryWeight.g*uGlobalWeight.z,
+        uShortIndex == 3 ? m : ordinaryWeight.b*uGlobalWeight.w);
     FrameMerge r0 = mergeFrame(uRaw0, q, phase, vec2(0), uFrameScale.x,
                                uKernelSigma.x, linearMix, uNoiseGainRatio.x);
     FrameMerge r1 = mergeFrame(uRaw1, q, phase, f1, uFrameScale.y,
