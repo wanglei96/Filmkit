@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-16 15:59
+updated: 2026-11-17 14:36
 status: active
 ---
 
@@ -15,13 +15,10 @@ status: active
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
 
-**当前（2026-11-16 15:59）**：0.14.20(817) 已安装、提交并推送；性能目标 3--5s/优选≤4s
-与拍照期间预览几乎不掉帧**仍未达成**。已落地的相关优化：预览回调专用线程 + `PreviewFrameGate`、
-去重时间戳、拍照不再主动暂停预览、实际 EGL 优先级查询、首拍大纹理接入 warmup、协方差 slot3
-生命周期复用、histogram 固定几何权重缓存、mismatch 条带、highlight guide 当前调用行缓存。
-0.14.20 保存中位 5.599s，PC3D 仍 1.8--2.3s；下一轮重点 = PC3D/共享 GPU 调度、warmup 分配争用、
-RAW producer 空档、histogram 同步等待。0.14.19 云边品红已由两张长焦天空实拍验收；扩展场景仍待验。
-旧账：Spektrafilm 引擎 + 预设标定、理光目标曲线重标、绿植/绿段、亮部亮度降噪、超广畸变。
+**当前（2026-11-17 14:36）**：0.14.25(822, `9613b51`) 已安装，dev/main/tag/GitHub Release 同步；
+切镜头黑图与焦段假保持已修复。性能目标 3--5s/优选≤4s 与预览几乎不掉帧仍未全面证明；
+0.14.20 保存中位 5.599s，剩余热点仍是 PC3D/共享 GPU、warmup、RAW producer 与 histogram 同步。
+旧账：高光扩展场景、Spektrafilm、理光曲线重标、绿植/绿段、亮部亮度降噪、超广畸变。
 
 ## 里程碑沿革（压缩）
 - [2026-09-18→30] **M0–M2 + 域映射 + MFNR + 亚像素**：YUV/RAW 双链、RCD 12MP 477ms、LSC 接去马赛克后 CCM 前、M4 display 域 LUT；EV 单一来源与 WYSIWYG 定稿；MFNR 4 帧 Bayer 域对齐（残余 4.4×/2.2×→1.22×/1.45×）；P0 亚像素 +43.7%/+46.5%、快门间隔 2.5s→0.54s
@@ -105,13 +102,14 @@ RAW producer 空档、histogram 同步等待。0.14.19 云边品红已由两张�
 - [2026-11-15] **0.14.6(803) 修复并验收**：改用平台头文件枚举 + 成套 EXT 入口；删除调试 DNG 旁路；新增真实 so 全链出片测试（256/512/2048/rotation/bilinear 全 PASS，JPEG 到 1.66MB）。用户验收「JPEG 正常、DNG 不再出现」。
 - [2026-11-15] **新开口：拍照变慢 + 预览卡**：用户反馈，怀疑条带化被吃掉；尚未测量，下窗口先取剖面再决定，禁止先重写。
 
-## 性能收线与云边品红（11-16，0.14.6→0.14.20）
+## 镜头切换、性能收线与 0.14.25（11-16→17）
 
-- [2026-11-16] **0.14.20 性能收线**：预览专用回调线程 + gate、去重时间戳、取消 capture 暂停预览、
-  warmup 预建 full-size noise/cov、slot3 协方差借用、histogram 权重缓存、mismatch 条带、
-  highlight guide 当前调用三行缓存；质量数值回归逐字节一致，但目标仍差约 1--2s 且启动/采集有停顿。
-- [2026-11-16] **0.14.19 云边品红**：无真实短帧时 RGB CameraWhite resolve 与短帧 merge readiness
-  混用，导致 resolve 被跳过且旧 CFA sat-fix 重开；分离 readiness 后用户两张长焦天空验收通过。
-- [2026-11-16] **仓库与临时材料**：`d6f6ede` 已 push `origin/dev`；`test_temp` 大图/RAW/stage dump
-  已清理到 203MB，日志/JSON/parity/校验和保留；历史样片路径不再保证可重放。
+- [2026-11-16] **0.14.20 性能收线**：预览线程/gate、warmup、协方差复用、guide 行缓存落地，
+  质量逐字节一致；保存 5.599/5.289/5.881s，目标仍差约 1--2s。
+- [2026-11-16] **0.14.19 云边品红**：拆分 CameraWhite resolve 与短帧 merge readiness，
+  无真实短帧也执行本张白界，旧 CFA sat-fix 不再回退；两张长焦天空验收通过。
+- [2026-11-17] **切镜头黑图**：`ensureRawTex` 删除饱和掩码纹理后未清句柄/尺寸，
+  驱动复用 GL 名后 `passSatMask` 删除新目标；清零句柄/尺寸并完整 release 后，旧库复现消失。
+- [2026-11-17] **0.14.25 发版**：同一 renderer 八例尺寸/镜头回归与五张真机均正常；841 项单测、
+  864 项 JNI 对照和 ARM64/x86_64 Release 通过，提交、main 快进、tag、Release 与 APK 已核验。
 

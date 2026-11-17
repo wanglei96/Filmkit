@@ -1,7 +1,7 @@
 ---
 summary: 已拍板的决策与理由,append-only
 created: 2026-09-18 10:20
-updated: 2026-11-16 15:59
+updated: 2026-11-17 14:36
 status: active
 ---
 
@@ -97,3 +97,11 @@ status: active
   但本张 RGB source-white 必须执行，short share 明确为 0，typed dummy 只绑定本张纹理。
 - [2026-11-16] **拍照期间预览持续消费**：禁止 pause/resume 冻结底层预览；动画只做视觉覆盖，
   SurfaceTexture 必须持续更新，避免队列堵死 producer。
+
+## 资源生命周期、镜头恢复与发版（11-17）
+- [2026-11-17] **GL 资源删除后必须原子清空句柄、尺寸和 enabled 状态**：删除纹理名不等于资源状态
+  失效；`ensureRawTex`、owner pass 与 `release()` 必须共享同一生命周期，防驱动复用名字后被二次删除。
+- [2026-11-17] **同 controller 后台恢复以实际 session lens/zoom 为准**：UI 在非 wheel/pinch 手势时
+  同步实际等效焦距；禁止只保住 UI 数字，也不为假保持新增跨冷启动偏好。
+- [2026-11-17] **0.14.25 收线不等于性能目标达成**：完整六分量 PC3D、P4/D1 和编码优化随版本发布，
+  但不得宣称所有场景 5s 内或 P4/D1 全面胜 PC3D；后续取舍继续用同 RAW、真机、锁定条件实测。
