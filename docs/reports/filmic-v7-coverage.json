@@ -1,0 +1,51 @@
+{
+  "upstream_commit": "395aa7d5156b68a69d8f2d25a3e6fc66c525a3c2",
+  "scope": "Fixed-exposure, isolated CPU Filmic V7 tone and matrix gamut in spline v3; no production implementation yet",
+  "fixtures": {
+    "synthetic": "test_temp/engine-reference-20261118/v7-fixtures-verified/manifest.json",
+    "device_input_srgb": "test_temp/engine-reference-20261118/v7-d0-srgb-verified/manifest.json",
+    "device_input_p3": "test_temp/engine-reference-20261118/v7-d0-p3-verified/manifest.json",
+    "colorout_synthetic": "test_temp/engine-reference-20261118/v7-colorout-fixtures-verified/manifest.json",
+    "colorout_d0_srgb": "test_temp/engine-reference-20261118/v7-colorout-d0-srgb-verified/manifest.json",
+    "colorout_d0_p3": "test_temp/engine-reference-20261118/v7-colorout-d0-p3-verified/manifest.json",
+    "native_defaults_d0_srgb": "test_temp/engine-reference-20261118/v7-native-parity-srgb-verified/manifest.json",
+    "native_defaults_d0_p3": "test_temp/engine-reference-20261118/v7-native-parity-p3-verified/manifest.json"
+  },
+  "coverage": [
+    {
+      "stage": "Parameters and spline",
+      "source": ["src/iop/filmicrgb.c::commit_params", "src/iop/filmicrgb.c::_compute_output_power", "src/iop/filmicrgb.c::dt_iop_filmic_rgb_compute_spline", "src/iop/gaussian_elimination.h::gauss_solve"],
+      "units": "Source black/white EV; scene/display grey and display black/white percent; latitude and balance percent; unitless contrast and hardness",
+      "consumer": "CPU Filmic V7 kernel via upstream committed data; parameter metadata and derived coefficients dumped",
+      "verification": "synthetic: all 3x3 hard/soft/safe curve modes, default settings and manual hardness with custom grey/latitude/balance; exhaustive parameter edges and stage parity pending"
+    },
+    {
+      "stage": "Exposure ratio, tone and mix",
+      "source": ["src/iop/filmicrgb.c::log_tonemapping_v2", "src/iop/filmicrgb.c::exp_tonemapping_v2", "src/iop/filmicrgb.c::norm_tone_mapping_v4", "src/iop/filmicrgb.c::RGB_tone_mapping_v4", "src/iop/filmicrgb.c::filmic_v5"],
+      "units": "Scene-linear Rec.2020 samples; saturation percent / 100, with pure branch points at -50 and +50 percent",
+      "consumer": "Isolated CPU rendering with the original pre-division norm clamp and blend",
+      "verification": "synthetic and both D0 cases: finite output and target bounds; per-branch RGB dumps and independent numeric parity pending"
+    },
+    {
+      "stage": "Hue and output-profile gamut",
+      "source": ["src/iop/filmicrgb.c::filmic_v4_prepare_matrices", "src/iop/filmicrgb.c::filmic_desaturate_v4", "src/iop/filmicrgb.c::gamut_mapping", "src/iop/filmicrgb.c::gamut_check_RGB", "src/common/gamut_mapping.h", "src/common/colorspaces_inline_conversions.h", "src/common/colorspaces.c"],
+      "consumer": "Isolated CPU Ych/chroma path and round-trip to work RGB; sRGB web-safe, P3, matching Rec.2020, and null export profile",
+      "verification": "synthetic with all targets; D0 for sRGB and P3; target matrix bounds checked before colorout"
+    },
+    {
+      "stage": "SDR colorout matrix and shaper",
+      "source": ["src/iop/colorout.c::_transform_cmatrix_linear", "src/iop/colorout.c::_process_fastpath_apply_tonecurves", "src/common/colorspaces.c::dt_colorspaces_get_matrix_from_output_profile"],
+      "units": "display-referred work RGB through Lab D50 to target linear RGB, then encoded float SDR RGB",
+      "verification": "Isolated upstream matrix-shaper functions checked via nominal D65 primary matrices and independent one-pass sRGB transfer, both built-in SDR profiles, synthetic and full-size D0. The LUT/extrapolation boundary is exercised; HDR, file encoding and mobile paths are not covered."
+    },
+    {
+      "stage": "Whole module and OpenCL cross-check",
+      "source": ["src/iop/filmicrgb.c::process", "src/iop/colorout.c::process", "src/iop/filmicrgb.c::process_cl", "data/kernels/filmic.cl"],
+      "verification": "Pinned CPU Release plugins loaded by upstream headless runtime and executed on full-size D0, with the computed default hardness supplied to both paths. No OpenCL, full pixelpipe or production export was exercised. Difference counts and matched-input colorout results are in the native manifests; non-default native parameter and compiler parity remain pending."
+    },
+    {
+      "stage": "Separate boundaries",
+      "verification": "Upstream auto-picking UI, optional wavelet reconstruction, legacy spline versions, proofing/Little CMS/HDR output paths, and FilmKit HDR/preview/product wiring are not claimed by this reference. Release license path and same-RAW production parity are pending."
+    }
+  ]
+}
