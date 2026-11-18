@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-11-17 20:08
+updated: 2026-11-18 21:38
 status: active
 ---
 # 事实
@@ -109,10 +109,12 @@ status: active
 - [2026-11-17] 原版完整RCD固定RT `64c2d90a3248c7ad41842d9162368858b61aac6a`；无HDR截断归一8/16结果754.337/754.375，生产854.308。原版降低但不消除紫边，不代表完整RT显影流程。
 - [2026-11-17] f0/f3各400紫边峰值中心均未裁切，但±2px邻域均有裁切；完整原版RCD中只扰动裁切G可改变峰值RGB，证明邻域影响，不证明真实丢失量或光学唯一根因。
 - [2026-11-17] `raw-support-trace/report.json`状态`REPLAY_DIVERGES_NOT_DEVICE_PROVENANCE`：设备粗场/权重已用，fine-flow为桌面重建；峰值quad仅2.25%--11.75%相位在2half ULP内，支持比例不能当设备采样真值。
-- [2026-11-17] `FilmParams::kCount=104`；Spektrafilm讨论稿`docs/reports/spektrafilm-manufacturer-engine-PLAN-20261117.md`，上游固定`3bb2c2d2801ff68b92019cf1dbcbb133d60832bc`，未运行原版或实施接入。
-
-- [2026-11-17] 旧快照长期合同：highlight分支强制完整L1，NN不兼容恢复域时明确回退/日志；0.14.20完整对称主元LDLT、thread-local诊断、重复SurfaceTexture时间戳跳过，细节见对应性能快照。
-
-- [2026-11-17] 历史HEIF质量契约：VBR+官方QP固定4，不按体积自动升QP；10bit→8bit HEIF→JPEG三级回退，读头失败回退，见archive/10bitHEIF交付链定稿与期A收官.memo.md。
-- [2026-11-17] 历史PMRID只替P0，非PC3D；失败整张回退，通道R/Gr/Gb/B，S_train=1.0093e-3、cvt_k=S_train·neff/S_input，详见archive/NN集成定因与判死转HDR+.memo.md；不据此宣称当前已启用或适用恢复域。
-
+- [2026-11-18] 当前包 0.14.27(824, `63e5d4b`)，`FilmParams::kCount=105`；CS=`[59]` 默认 1，CM=`[104]` 默认 0，CM 不进预设。APK SHA256 `dec44714e3c9ba4e3846134ee36e2147ebb0073d74b7a6c0b7cb55c606e5d6e5`，签名/版本/JNI 已验并覆盖安装。
+- [2026-11-18] CS/CM 在 D4 场景线性 Rec.2020 工作：BT.2020 亮度系数、输出 `[0,64]`、alpha 有效支持、独立两趟 CM、RGB+完整六分量协方差 MRT；4080×3072 的协方差 ping-pong 名义增量约 382.5 MiB。PC3D=0 的 P4 也消费选择后的 CS/CM。
+- [2026-11-18] 同 RAW 真机线性灯弧指标：关 843.331、CS 200.413(-76.24%)、CM 653.462(-22.51%)、CS+CM 158.793(-81.17%)；SDR JPEG 编码域：74.051、42.008(-43.27%)、75.757(+2.30%)、30.667(-58.59%)。编码域不是线性辐射量或感知分。
+- [2026-11-18] Filmic V7 参考固定 darktable `395aa7d5156b68a69d8f2d25a3e6fc66c525a3c2`；UI V7 是 `DT_FILMIC_COLORSCIENCE_V5`/`filmic_v5`。原版 CPU 整模块与隔离参考在 sRGB/P3 D0 的编码端到端最大差约 `1.08e-4`，不是设备生产误差预算。
+- [2026-11-18] 旧 Filmic 与 V7 固定 `-7.65/+4.56` 的同输入 A/B：灯罩 D0 和 PhotonCamera 白天 DNG 均无肉眼差异，全图任一 RGB 通道最多差 1 个 8-bit 阶；两张都未覆盖 V7 白点以上输入，也未做完整应用链。
+- [2026-11-18] Spektrafilm `3bb2c2d2801ff68b92019cf1dbcbb133d60832bc` 的原版冒烟和 4080×3072 Provia 正片直扫通过；Portra 负片印放在相纸曝光阶段因 5 GiB 磁盘保护主动终止，未取得完整 `rgb_out`，不能称全尺寸负片通过。
+- [2026-11-18] 长期合同：highlight 分支强制完整 L1；NN 不兼容恢复域时明确回退并记日志；0.14.20 使用完整对称主元 LDLT、thread-local 诊断与重复 SurfaceTexture 时间戳跳过。
+- [2026-11-18] 长期合同：HEIF 使用 VBR 与官方固定 QP 4，不按体积自动升 QP；10bit→8bit HEIF→JPEG 三级回退，读头失败继续回退。
+- [2026-11-18] 长期边界：历史 PMRID 只替 P0、不是 PC3D，失败整张回退；不得据此宣称当前已启用或适用于高光恢复域。

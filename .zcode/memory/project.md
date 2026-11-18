@@ -1,17 +1,17 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-17 20:08
+updated: 2026-11-18 21:38
 status: active
 ---
 # 项目状态
 ## 目标
 胶片相机 App（Android 首发，vivo X300 专项适配）：Camera2 RAW/YUV 双输入 → 引擎胶片风格化（基准色彩科学 + 理光系 LUT 风格层）→ 全分辨率成片。核心卖点：M 档专业拍摄 + RAW 底片 + 胶片渲染全 GPU。里程碑 M0–M6 见 docs/开发计划.md。**色彩口径（D8/D9）**：基准 = 中性正确的色彩科学，风格 = 用户提供的理光系 LUT。
 ## 结构
-- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染）+ StillRenderClient（拍照渲染）+ CameraAudit + `camera/StdColorMatrix.kt` + `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=104**）+ `ui/ParamControls.kt`（参数表单一来源，拍照与编辑器共用）
+- `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染）+ StillRenderClient（拍照渲染）+ CameraAudit + `camera/StdColorMatrix.kt` + `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=105**）+ `ui/ParamControls.kt`（参数表单一来源，拍照与编辑器共用）
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
-**历史发布（2026-11-17 14:36）**：0.14.25(822, `9613b51`) 的 dev/main/tag/GitHub Release 当时同步；当前0.14.26状态见末节。
+**历史发布（2026-11-17 14:36）**：0.14.25(822, `9613b51`) 的 dev/main/tag/GitHub Release 当时同步；当前 0.14.27 状态见末节。
 切镜头黑图与焦段假保持已修复。性能目标 3--5s/优选≤4s 与预览几乎不掉帧仍未全面证明；
 0.14.20 保存中位 5.599s，剩余热点仍是 PC3D/共享 GPU、warmup、RAW producer 与 histogram 同步。
 旧账：高光扩展场景、Spektrafilm、理光曲线重标、绿植/绿段、亮部亮度降噪、超广畸变。
@@ -72,11 +72,11 @@ status: active
 - [2026-11-16] **0.14.19 云边品红**：拆分 CameraWhite resolve 与短帧 merge readiness， 无真实短帧也执行本张白界，旧 CFA sat-fix 不再回退；两张长焦天空验收通过。
 - [2026-11-17] **切镜头黑图**：`ensureRawTex` 删除饱和掩码纹理后未清句柄/尺寸， 驱动复用 GL 名后 `passSatMask` 删除新目标；清零句柄/尺寸并完整 release 后，旧库复现消失。
 - [2026-11-17] **0.14.25 发版**：同一 renderer 八例尺寸/镜头回归与五张真机均正常；841 项单测、 864 项 JNI 对照和 ARM64/x86_64 Release 通过，提交、main 快进、tag、Release 与 APK 已核验。
-## 当前交接：长帧保护与紫边追因
-- [2026-11-17] 0.14.26(823)长帧裁切保护已交付并安装，日光栏杆待复测；窄灯边紫边仍未根治，不能把新包称作全面验收。代码`34691a1`、方案`237db47`已推送dev。
-- [2026-11-17] 用户暂停性能专项，当前优先查紫边。P4+D1不是本张主要生成点，单帧完整原版RCD仍有残留；裁切邻域存在影响，但光学/光谱与插值贡献未唯一拆开。
-- [2026-11-17] 照片/日志/4帧RAW/16阶段已归档，42源文件hash复核通过，手机已释放；未保存完整私有预设快照，不得宣称最终LUT/JPEG精确重放。
-- [2026-11-17] 下一步先读`docs/reports/purple-lampshade-20261117.md`§7--14；设备fine-flow/mask等未归档，桌面融合边缘失配，不能以其支持比例下最终结论。
-- [2026-11-17] 不重开已验证有灰斑副作用的高光重建；CS/原版defringe有细彩线误伤，不能接上就算修好。生产候选须同RAW保色/细节/高光/灰斑回归与真机验证。
-- [2026-11-17] Spektrafilm保持讨论稿：完整原版引擎+厂商LUT，逐预设与filmic/sigmoid竞争；无厂商相机，公开素材由实施方取得并分级。RAW预览/线性底片/HDR另评估，非当前擅自扩项。
+## 当前交接：彩边前置与 Filmic V7 定案
+- [2026-11-18] 0.14.27(824, `63e5d4b`) 已推送并安装：CS 默认开、CM 独立可选默认关，统一 D4 BT.2020 亮度/64 上限并传播完整 RGB 协方差；仍不宣称根因闭环或跨场景质量验收。
+- [2026-11-18] 同 RAW 真机四档证明 CS 把最终线性灯弧指标压低 76.24%、编码 RGB 指标压低 43.27%；CS+CM 为 81.17%/58.59%，CM 单开在线性域 22.51%、编码域反增 2.30%。
+- [2026-11-18] Filmic V7 固定提交隔离参考和原版 CPU 整模块对拍已完成；灯罩 D0 与 PhotonCamera 白天 DNG 的旧/V7 同工作点 A/B 均无肉眼收益，任一 RGB 通道最多差 1 个 8-bit 阶。当前不升级、不替换旧 Filmic，默认仍为 sigmoid。
+- [2026-11-18] 0.14.26 长帧裁切保护的日光栏杆场景仍未复测；灯边窄紫边的光学/光谱、裁切与插值贡献也未唯一拆开。
+- [2026-11-18] Spektrafilm 定位改为独立可选风格引擎，优先完整原版、稳定性和设备成本；停止与 Filmic/sigmoid 做逐预设四路质量排名，不阻塞 V7 定案，也未接入生产。
+- [2026-11-18] 不重开已因灰云斑失败的 RAW opposed 高光重建；彩边修复必须先做真实细彩线/色准/噪声/高光/运动回归，不能只按紫边指标放行。
 
