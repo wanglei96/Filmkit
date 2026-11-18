@@ -139,6 +139,7 @@ class EditorPresetTest {
         assertFalse(presetSlotIncluded(33))
         assertFalse(presetSlotIncluded(39))
         assertFalse(presetSlotIncluded(59))
+        assertFalse(presetSlotIncluded(104))
         assertFalse("局部模式是构图相关，v1 不进预设（调研 D7）", presetSlotIncluded(79))
         assertFalse(presetSlotIncluded(87))
         assertTrue(presetSlotIncluded(38))

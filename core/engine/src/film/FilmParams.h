@@ -45,7 +45,7 @@ struct FilmParams {
   // 中段（P5 47 vs 原厂 7、P95 183 vs 原厂 190）。「自动白点 + 固定黑点」正是要的
   // 半自动形态：[35] 的成对语义做不到，而 [35] 自 v0.10.113 起 `toneStandard()` 恒
   // true ⇒ 永久为 0（死槽）。两个新槽默认 0 = 全固定 ⇒ 与改动前逐位一致。
-  static constexpr int kCount = 104;
+  static constexpr int kCount = 105;
 
   float exposure_ev = 0.0f;   // 0
   float wb_r = 1.0f;          // 1
@@ -398,9 +398,7 @@ struct FilmParams {
   //     路径，默认）；1 = A/B 通路，改默认前必须真机数据说话。
   // prefs("hl_rb_recon")。
   float hl_rb_recon = 0.0f;    // 57
-  // [59] color_smooth（v0.10.196）：色差域 3×3 中值滤波（darktable color_smoothing
-  // 逐行移植）。>0.5 = 启用。这是"任意色相窄带伪彩"的通解 —— defringe 只治紫/品红
-  // （色相门），本 pass 不判色相，靠中值的保边性替换 1~3px 色差异常。
+  // [59] Edge chroma-peak desaturation (CS), NOT a median filter.
   float color_smooth = 0.0f;   // 59
 
   // 58：RCD P3 拆双 pass（v0.10.180）。1 = 色度段拆成 3a（R/B 位对角填充
@@ -545,6 +543,8 @@ struct FilmParams {
   // 默认关：自动黑点会把每场景最暗 0.5% 钉在显示黑（真机 4 张实测死黑 2~19%，
   // 原厂直出仅 0.2%）—— 校准时按题材显式打开。
   float auto_black_pt = 0.0f;  // 103
+  // Optional two-pass 3x3 R-G/B-G median (CM), independent of CS.
+  float color_median = 0.0f;  // 104
 
   void fromDoubles(const double* v, int n) {
     // 防呆：按实际长度读取（26 = M1 核心段 0..25 的下限）。旧长度不丢核心参数，
@@ -690,6 +690,7 @@ struct FilmParams {
     // = 全固定曲线，与改动前逐位一致。
     if (n > 102) auto_white_pt = static_cast<float>(v[102]);
     if (n > 103) auto_black_pt = static_cast<float>(v[103]);
+    if (n > 104) color_median = static_cast<float>(v[104]);
   }
 };
 

@@ -1983,7 +1983,7 @@ private val PRESET_LOCAL_SLOTS = 79..87
 // 0.12.208：+[99]/[100]/[101]（高光滚降 / D4 大半径 USM / 饱和掩码）。它们是**管线开关**，
 // 引擎读它们做门控、设置页各有开关 —— 与 [28]/[30]/[35]/[36] 同一类"引擎状态不是用户风格"，
 // 用户 2026-11-01 定档：**预设一律不携带管线开关**。
-private val PRESET_ENGINE_KNOB_SLOTS = setOf(28, 30, 31, 32, 33, 35, 36, 99, 100, 101)
+private val PRESET_ENGINE_KNOB_SLOTS = setOf(28, 30, 31, 32, 33, 35, 36, 99, 100, 101, 104)
 
 /**
  * [29] = **已退役的槽位**（原 `hl_recon`，v0.10.15 删除；`FilmParams.h:68-71`："索引 29 留空不复用"）。
@@ -2173,6 +2173,7 @@ internal object FilmParamKeys {
         // [102]/[103] 0.12.228：自动白点 / 自动黑点（filmic 端点策略，预设可携带）
         102 to "auto_white_pt",
         103 to "auto_black_pt",
+        104 to "color_median",
     )
 
     /**

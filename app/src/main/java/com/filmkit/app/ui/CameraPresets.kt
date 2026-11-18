@@ -19,7 +19,7 @@ object CameraPresets {
      *  Kotlin 侧**只此一处**定义长度：本文件的 `neutral()` 与
      *  `CameraController.setFilmParams` 的长度兜底都读它 ⇒ 少一个漂移点
      *（v0.10.196 的启动崩溃就是"两处长度不一致"造成的）。 */
-    const val COUNT = 104
+    const val COUNT = 105
 
     /**
      * `[98] engine_slot` 的**默认档位** = `1`（sigmoid）—— 用户 2026-10-14 拍板
@@ -232,6 +232,7 @@ object CameraPresets {
         // 默认全 0 = 固定曲线 ⇒ 与改动前逐位一致。理光负片显式带 [102] = 1。
         this[102] = 0.0
         this[103] = 0.0
+        this[104] = 0.0 // CM is optional; CS retains its independent preference.
         // 50 = 镜头横向色差校正（v0.10.170）：0 = 关（A/B 通路，不跑任何 pass）；
         // >0 = 开关 + 估计位移的强度倍率。作用在 D3（RCD 去马赛克后 / CCM 前）
         // 相机 RGB 域，只重采样 R/B、G 不动；自动估计（1/8 降采样 + 径向 LK），

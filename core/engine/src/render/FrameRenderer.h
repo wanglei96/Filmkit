@@ -367,7 +367,7 @@ class FrameRenderer {
   bool ensureDnTarget(int w, int h);
   bool ensureChromaMst(int w, int h);
   bool ensureDefringe(int w, int h);
-  // 色差域中值滤波（v0.10.196）：对标 darktable color_smoothing
+  // D4 edge chroma-peak desaturation targets (CS).
   bool ensureColorSmooth(int w, int h);
   // 0.13.22：HL / PC3D 的分配抽成 ensure，供 warmup 预分配（行为与 pass 内原块一致）
   bool ensureHlTargets(int w, int h);
@@ -653,23 +653,18 @@ class FrameRenderer {
   // ⇒ 强亮度边缘附近的色度偏离更容易进入校正区。
   // src: 输入纹理（默认 tex_dn_ = P4 输出；替换档 [54]=1 时传 tex_pc3d_）
   bool passDefringe(int dst_w, int dst_h, float df_gate = 0.f, GLuint src = 0);
-  // 色差域 3×3 中值（darktable color_smoothing）：输入任意 D4 域纹理，
-  // 输出 tex_cs_。失败返回 false（调用方回落 src）。
-  // to_tmp（v0.10.208）：输出目标 —— false = tex_cs_（PC3D **之前**的前置调用）；
-  // true = tex_cs_tmp_（PC3D **之后**的后置调用）。两次调用是必要的：前置治
-  // RCD 产生的窄带伪彩，后置治 **PC3D 自身产生**的色度过冲（真机实测：D4 域
-  // 该位置 ch 平缓无过冲，而成片有 52 vs 两侧 10/29 的过冲 ⇒ 过冲产生于 PC3D）。
+  // CS: one D4 edge chroma-peak desaturation pass; true selects its spare target.
+  // A failed signal/covariance MRT aborts capture, never consumes stale noise.
   bool passColorSmooth(int dst_w, int dst_h, GLuint src, bool to_tmp = false);
-  // 0.12.162：色差域 3×3 中值（darktable color_smoothing 原版：R−G/B−G 各取 3×3
-  // 中值，G 逐位不变）。注意上面那条 passColorSmooth 的注释虽然也写"色差域中值"，
-  // 实现却是**判据式去饱和**（梯度门 + 局部色度峰），在暗部（阴影）结构性失效 ——
-  // 见 kFsColorMedian 头部。输入任意 D4 域纹理，输出 tex_cm_。
+  // CM: two 3x3 chroma-median passes with BT.2020 luminance compensation.
   bool ensureColorMedianTargets(int dst_w, int dst_h);
   bool passColorMedian(int dst_w, int dst_h, GLuint src);
+  // Signal + RGB covariance use the same gates/ranks in a single MRT draw.
+  bool drawChromaPrefilter(GLuint program, GLuint fbo, int width, int height,
+                          GLuint source);
   // ── PC ESD3D2 完整移植（v0.10.175）─────────────────────────────────────
-  // 输入 tex_scene_（CCM 后的场景线性 RGB，与 P4 同域），成功时输出 tex_pc3d_
-  // 并把 P4/D-1 的输入源切到它；返回 false = 未执行（调用方沿用 tex_scene_，
-  // 与加本模块之前**逐位相同**）。
+  // D4 input (including enabled CS/CM); output tex_pc3d_ and matching covariance.
+  // A requested pass returning false aborts capture rather than reusing stale noise.
   // 结构完全照抄 PhotonCamera 的 ESD3D2.Run（ESD3D2.java:121-176）：
   //   ① scale = clamp(round(clamp(sqrt(0.5·S+O)/noiseTarget,1,4)),1,4)
   //   ② scale > 1：gaussdown(scale) → PC3D(低分辨率, MOIRE=0, 噪声/scaleF·0.75)
@@ -886,7 +881,7 @@ class FrameRenderer {
                       const float lat_sh[3], const float lat_toe[3]);
   // Final SDR and same-pass prepared engine RGB produce the HDR residual.
   bool passGainmap(int w, int h, GLuint sdr_tex);
-  void captureHdrProbes(int w, int h);
+  void captureHdrProbes(int w, int h, float exposure_ev, bool hal_domain);
   void captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h,
                               bool rgba8, bool mono = false);
   void edgeDumpEvent(const char* stage, const std::string& path);
@@ -1149,10 +1144,12 @@ class FrameRenderer {
   GLuint tex_highlight_cov_diag_ = 0, tex_highlight_cov_off_ = 0;
   int highlight_cov_w_ = 0, highlight_cov_h_ = 0;
   GLuint prog_highlight_noise_down_ = 0, prog_highlight_noise_up_ = 0;
-  GLuint highlight_filter_fbo_[4] = {0, 0, 0, 0};
+  GLuint highlight_filter_fbo_[5] = {0, 0, 0, 0, 0};
   // Slot 3 borrows fbo_highlight_cov_/its textures after the last original read.
-  GLuint highlight_filter_cov_[4][2] = {{0,0}, {0,0}, {0,0}, {0,0}};
-  int highlight_filter_w_[4] = {0,0,0,0}, highlight_filter_h_[4] = {0,0,0,0};
+  GLuint highlight_filter_cov_[5][2] = {};
+  int highlight_filter_w_[5] = {}, highlight_filter_h_[5] = {};
+  // Slot 4 and the original covariance ping-pong through CS/CM; no stale maps.
+  GLuint chroma_input_cov_[2] = {0, 0};
   bool ensureHighlightFilterCov(int slot, int width, int height);
   bool ensureHighlightNoiseResources(int width, int height);
   bool ensureHighlightMergeResources(int width, int height);
@@ -1324,7 +1321,7 @@ class FrameRenderer {
   std::string dbg_sky_d4_, dbg_sky_fm_, dbg_sky_out_;
   std::string skyProfile(GLuint fbo, GLuint tex, int w, int h, bool u8);
   float dbg_cs_k_ = -1.f;                   // v0.10.198：下发的 FilmParams[59] 实际值
-  // 色差域中值滤波（v0.10.196）：tex_cs_ = 输出（替换 src 进 defringe/film）
+  // CS D4 image targets, consumed by PC3D/P4/film according to denoise mode.
   GLuint fbo_cs_ = 0, tex_cs_ = 0;          // 全分辨率 RGBA16F（最终输出）
   GLuint fbo_cs_tmp_ = 0, tex_cs_tmp_ = 0;  // ping-pong 中间缓冲（多 pass）
   // 0.12.165：D4 层大半径 USM（1/8 低频，r≈8-16px）—— 收窄暗部软边，不动 tone curve
@@ -1336,7 +1333,7 @@ class FrameRenderer {
   struct { GLint tex = -1, low = -1, size = -1, low_size = -1, k = -1; } u_usm_;
   bool passUsm(int w, int h, GLuint src);
   int dbg_usm_on_ = 0;
-  // 0.12.162：色差域 3×3 中值（**真正的** darktable color_smoothing）
+  // CM: two chroma-median passes with validity/gate/luminance adaptation.
   GLuint fbo_cm_ = 0, tex_cm_ = 0;
   GLuint fbo_cm_tmp_ = 0, tex_cm_tmp_ = 0;
   int cm_w_ = 0, cm_h_ = 0;
@@ -1833,7 +1830,7 @@ class FrameRenderer {
           chroma_avg = -1, thresh_k = -1, thresh_min = -1, thresh_max = -1,
           std_k = -1, std_max = -1, grad_min = -1;
   } u_df_apply_;
-  // 色差域中值滤波（v0.10.196）
+  // CS edge chroma-peak desaturation.
   struct {
     GLint tex = -1, size = -1, grad_lo = -1, grad_hi = -1, side_k = -1, chroma_min = -1, peak_k = -1;
   } u_cs_;

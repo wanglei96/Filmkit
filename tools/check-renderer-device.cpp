@@ -29,7 +29,10 @@
 // --pc3d 0|1|2 --pc3d-msize 0|7|11|15|21 (still replay overrides only).
 // --chroma-gate 0..2 (same production edge-chroma setting).
 // --film-params FILE (exactly FilmParams::kCount finite double slots, no LUT upload).
+// --color-smooth 0|1 --color-median 0|1 (independent CS/CM still overrides).
+// --prefilter-cases (24 repeated burst/single x CS/CM x PC3D captures).
 // --ae-hal (production HAL exposure mode; avoid uninitialized preview AE history).
+// --synthetic-feedback 0|1 (prime real preview statistics for slot 0 or 1 with a test pattern).
 // Exit failure on init, render, byte count, image-range, JPEG or file-write error.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -203,11 +206,17 @@ int run(int argc, char** argv) {
     bool noShort = false, highlightCases = false, expectSourceWhite = false, edgeDump = false;
     bool stageSync = true, diagStats = false, aeHal = false, expectChroma = false;
     bool lensSwitchCases = false;
+    bool prefilterCases = false;
+    int feedbackSlot = -1;
+    int colorSmooth = -1, colorMedian = -1;
     float chromaGate = -1.f;
     std::string output = ".", rawDirectory, filmParamsFile;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--timer-only") timerOnly = true;
+      else if (arg == "--prefilter-cases") prefilterCases = true;
+      else if (arg == "--color-smooth" && i + 1 < argc) colorSmooth = std::stoi(argv[++i]);
+      else if (arg == "--color-median" && i + 1 < argc) colorMedian = std::stoi(argv[++i]);
       else if (arg == "--allocation-only") allocationOnly = true;
       else if (arg == "--covariance-cases") covarianceCases = true;
       else if (arg == "--highlight-cases") highlightCases = true;
@@ -219,6 +228,7 @@ int run(int argc, char** argv) {
       else if (arg == "--no-stage-sync") stageSync = false;
       else if (arg == "--diag-stats") diagStats = true;
       else if (arg == "--ae-hal") aeHal = true;
+      else if (arg == "--synthetic-feedback" && i + 1 < argc) feedbackSlot = std::stoi(argv[++i]);
       else if (arg == "--film-params" && i + 1 < argc) filmParamsFile = argv[++i];
       else if (arg == "--raw-directory" && i + 1 < argc) rawDirectory = argv[++i];
       else if (arg == "--preview") preview = true;
@@ -235,6 +245,10 @@ int run(int argc, char** argv) {
       else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
     require(size >= 128 && size <= 4096 && size % 32 == 0, "size must be a multiple of 32 in [128,4096]");
+    require(colorSmooth >= -1 && colorSmooth <= 1 && colorMedian >= -1 && colorMedian <= 1,
+            "prefilter overrides must be 0 or 1");
+    require(!prefilterCases || (!preview && !lensSwitchCases && !highlightCases &&
+            !covarianceCases && rawDirectory.empty()), "prefilter cases require synthetic still input");
     require(demosaic >= 0 && demosaic <= 2, "demosaic must be 0, 1 or 2");
     require(rotation >= 0 && rotation <= 3, "rotation must be 0, 1, 2 or 3");
     require(pc3d >= -1 && pc3d <= 2, "pc3d must be 0, 1 or 2");
@@ -250,13 +264,40 @@ int run(int argc, char** argv) {
     require(!lensSwitchCases || (!preview && !covarianceCases && !highlightCases && rawDirectory.empty()),
             "lens switch cases require synthetic still input without other case sets");
     require(filmkit::Logger::instance().init(output), "Logger::init failed (output directory must exist)");
-    Egl egl(preview ? size : 16);
+    require(feedbackSlot >= -1 && feedbackSlot <= 1, "invalid synthetic feedback slot");
+    const bool syntheticFeedback = feedbackSlot >= 0;
+    require(!syntheticFeedback || (!rawDirectory.empty() && !preview && !warmup && filmParamsFile.empty()),
+            "synthetic feedback requires a real RAW replay without warmup");
+    Egl egl(preview || syntheticFeedback ? size : 16);
     if (allocationOnly) { checkAllocation(); return EXIT_SUCCESS; }
     if (timerOnly) { checkTimer(); return EXIT_SUCCESS; }
-    filmkit::FrameRenderer renderer;
+    filmkit::FilmParams params;
+    if (!filmParamsFile.empty()) {
+      std::ifstream input(filmParamsFile);
+      std::array<double, filmkit::FilmParams::kCount> slots;
+      for (double& value : slots)
+        require(bool(input >> value) && std::isfinite(value), "invalid film parameter slots");
+      std::string extra;
+      require(!(input >> extra), "extra film parameter slots");
+      params.fromDoubles(slots.data(), slots.size());
+    }
     filmkit::FrameRenderer::setDiagStats(diagStats);
     filmkit::FrameRenderer::setStillStageTimingSync(stageSync);
     filmkit::FrameRenderer::setAeHal(aeHal);
+    if (syntheticFeedback) {
+      params.engine_slot = static_cast<float>(feedbackSlot);
+      const float st[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+      filmkit::FrameRenderer previewRenderer;
+      require(previewRenderer.init(), "synthetic feedback preview init failed");
+      for (int i = 0; i < 10; ++i)
+        require(previewRenderer.submitFrame(st, 0, 1.f, 1.f, size, size, params, true),
+                "synthetic feedback preview submit failed");
+      const float anchor = filmkit::FrameRenderer::displayP50();
+      require(std::isfinite(anchor) && anchor > .005f, "synthetic feedback did not produce an anchor");
+      std::printf("PREVIEW_FEEDBACK source=synthetic_fill frames=10 anchor=%.9g engine=%.1f\n",
+                  anchor, params.engine_slot);
+    }
+    filmkit::FrameRenderer renderer;
     renderer.setStillContext(!preview);
     std::printf("STAGE renderer.init\n");
     const auto initStart = std::chrono::steady_clock::now();
@@ -334,16 +375,6 @@ int run(int argc, char** argv) {
     const int grbg[4] = {1, 0, 2, 1};
     std::array<std::vector<uint16_t>, 4> raw;
     const void* frames[4];
-    filmkit::FilmParams params;
-    if (!filmParamsFile.empty()) {
-      std::ifstream input(filmParamsFile);
-      std::array<double, filmkit::FilmParams::kCount> slots;
-      for (double& value : slots)
-        require(bool(input >> value) && std::isfinite(value), "invalid film parameter slots");
-      std::string extra;
-      require(!(input >> extra), "extra film parameter slots");
-      params.fromDoubles(slots.data(), slots.size());
-    }
     if (lensSwitchCases && filmParamsFile.empty()) {
       // Match the production allocation order without a private preset snapshot.
       params.color_smooth = 1.f;
@@ -352,12 +383,22 @@ int run(int argc, char** argv) {
     if (pc3d >= 0) params.pc3d = static_cast<float>(pc3d);
     if (pc3dMsize >= 0) params.pc3d_msize = static_cast<float>(pc3dMsize);
     if (chromaGate >= 0.f) params.chroma_gate = chromaGate;
+    if (colorSmooth >= 0) params.color_smooth = static_cast<float>(colorSmooth);
+    if (colorMedian >= 0) params.color_median = static_cast<float>(colorMedian);
     std::printf("PARAMS pc3d=%.1f pc3d_msize=%.1f chroma_gate=%.1f\n",
                 params.pc3d, params.pc3d_msize, params.chroma_gate);
     const float shotCases[] = {.0007f, .000004f, .00008f, .00008f, .000004f, .0007f, .000004f, .0007f};
     const float pc3dCases[] = {1.f, 1.f, 1.f, 2.f, 0.f, 2.f, 1.f, 1.f};
-    for (int capture = 0; capture < (covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : 1); ++capture) {
-    const bool single = highlightCases && capture == 4;
+    for (int capture = 0; capture < (prefilterCases ? 24 : covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : 1); ++capture) {
+    const bool single = (highlightCases && capture == 4) || (prefilterCases && capture >= 12);
+    if (prefilterCases) {
+      const int mode = (capture/3)%4;
+      params.color_smooth = float(mode&1);
+      params.color_median = float((mode>>1)&1);
+      params.pc3d = float(capture%3);
+      std::printf("PREFILTER_CASE capture=%d single=%d CS=%.0f CM=%.0f PC3D=%.0f\n",
+                  capture,single,params.color_smooth,params.color_median,params.pc3d);
+    }
     if (highlightCases) {
       hdr = capture != 3 && !single;
       ev[3] = capture == 1 ? -1.5f : .662f;
@@ -451,6 +492,16 @@ int run(int argc, char** argv) {
       glGetError(), renderer.sceneW(), renderer.sceneH());
     printLogs();
     require(ok && rgba.size() == size_t(width) * height * 4, "full-chain render failed or returned wrong byte count");
+    if (prefilterCases) {
+      const auto logs = filmkit::Logger::instance().recentLines(1000);
+      const size_t last = logs.rfind("\"event\":\"raw.render\"");
+      require(last != std::string::npos, "missing prefilter render diagnostics");
+      const auto line = logs.substr(last, logs.find('\n', last)-last);
+      require(line.find(params.color_smooth > .5f ? "\"csOn\":1," : "\"csOn\":0,") != std::string::npos,
+              "CS gate/consumer mismatch");
+      require(line.find(params.color_median > .5f ? "\"cmOn\":1," : "\"cmOn\":0,") != std::string::npos,
+              "CM gate/consumer mismatch");
+    }
     if (expectChroma) {
       const auto logs = filmkit::Logger::instance().recentLines(1000);
       const size_t last = logs.rfind("\"event\":\"raw.render\"");

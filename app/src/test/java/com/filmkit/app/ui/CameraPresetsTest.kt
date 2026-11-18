@@ -21,8 +21,19 @@ class CameraPresetsTest {
         // 阶段 0：98 → 99（[98] engine_slot）；0.12.166 起 kCount 102；
         // 0.12.228：102 → 104（[102]/[103] 自动白点 / 自动黑点）。
         // 此断言是 v0.10.196 启动崩溃的哨兵。
-        assertEquals(104, CameraPresets.COUNT)
+        assertEquals(105, CameraPresets.COUNT)
         assertEquals(CameraPresets.COUNT, CameraPresets.standard().size)
+    }
+
+    @Test
+    fun chromaPrefiltersHaveIndependentDefaults() {
+        val p = CameraPresets.standard()
+        assertEquals("CS default", 1.0, p[59], 0.0)
+        assertEquals("CM default", 0.0, p[104], 0.0)
+        p[59] = 0.0
+        assertEquals("CS does not enable CM", 0.0, p[104], 0.0)
+        p[104] = 1.0
+        assertEquals("CM does not enable CS", 0.0, p[59], 0.0)
     }
 
     @Test

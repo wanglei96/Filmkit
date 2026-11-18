@@ -43,9 +43,11 @@ class Check:
 
 
 class Draw:
-    """Own float32 MRTs; retain actual GPU outputs as next-pass inputs."""
-    def __init__(self, gl, shaders, check):
+    """Own MRTs (float32 by default); retain GPU outputs as next-pass inputs."""
+    def __init__(self, gl, shaders, check, target_dtype='f4'):
         self.gl, self.ctx, self.shaders, self.check = gl, gl.ctx, shaders, check
+        assert target_dtype in ('f2', 'f4')
+        self.target_dtype = target_dtype
         self.resources, self.programs = [], {}
         self.calls, self.interfaces = 0, {}
 
@@ -57,7 +59,7 @@ class Draw:
         self.resources.append(t)
         return t
 
-    def run(self, name, images, uniforms, size, outputs=1):
+    def run(self, name, images, uniforms, size, outputs=1, output_dtypes=None):
         if name not in self.programs:
             p = self.ctx.program(vertex_shader=self.gl.vs_src, fragment_shader=offline.to_core(self.shaders[name]))
             vao = self.ctx.vertex_array(p, [])
@@ -77,7 +79,9 @@ class Draw:
         for key, value in uniforms.items():
             if key in p:
                 p[key].value = value
-        targets = [self.ctx.texture(size, 4, dtype='f4') for _ in range(outputs)]
+        dtypes = output_dtypes or [self.target_dtype] * outputs
+        assert len(dtypes) == outputs
+        targets = [self.ctx.texture(size, 4, dtype=dtype) for dtype in dtypes]
         self.resources.extend(targets)
         fbo = self.ctx.framebuffer(targets)
         fbo.use()
@@ -192,14 +196,13 @@ def execute(draw, check, dtype, measured):
                     uLocalNoiseOn=1, uLocalNoiseScale=1., uSatMaskOn=1)
         p4_images = dict(uTex=tex, uLsc=lsc, uLocalVariance=variance, uLocalCovariance=covar, uSatMask=sat)
         _, p4 = draw.run('kFsChromaDenoise', p4_images, p4_u, (w, h))
-        d1_u = {key: p4_u[key] for key in ('uSize', 'uNoiseA', 'uNoiseB', 'uLscSize', 'uLocalNoiseOn')}
-        _, d1 = draw.run('kFsChromaDown', {key: p4_images[key] for key in ('uTex', 'uLsc', 'uLocalVariance', 'uLocalCovariance')}, d1_u, low_size, 2)
+        d1_u = {key: p4_u[key] for key in ('uSize', 'uNoiseA', 'uNoiseB', 'uLscSize', 'uLocalNoiseOn', 'uLocalNoiseScale')}
+        _, d1 = draw.run('kFsChromaDown', {key: p4_images[key] for key in ('uTex', 'uLsc', 'uLocalVariance', 'uLocalCovariance')}, d1_u, (w, h), 3)
         check.test(label+'/'+tag+'/D1Down-sigma-nonzero', np.all(d1[1][..., :2] > 0),
                    sigma_range=[float(d1[1][..., :2].min()), float(d1[1][..., :2].max())])
         # Interface projection sanity, not a rerun of LOWCOVFULL reference tests.
-        axes = np.array([[0, 0, 1], [1, 0, 0]]) - np.array([.2126, .7152, .0722])
+        axes = np.array([[0, 0, 1], [1, 0, 0]]) - np.array([.2627, .6780, .0593])
         expected = np.sqrt(np.einsum('ki,...ij,kj->...k', axes, c*scale if cross else c*scale*np.eye(3), axes))
-        expected = expected.reshape(h//2, 2, w//2, 2, 2).mean(axis=(1, 3))
         err = float(np.max(np.abs(d1[1][..., :2]-expected)))
         check.test(label+'/'+tag+'/D1Down-local-fullcov-binding', err < 2e-7, max_abs_error=err)
         results[tag+'-p4'], results[tag+'-d1'] = p4[0][..., :3], d1[1][..., :2]

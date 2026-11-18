@@ -809,21 +809,31 @@ private fun ToneColorDrawerContent() {
             )
         },
     )
-    // 色差域中值滤波（v0.10.196）：darktable demosaic 模块的 color_smoothing 移植
-    // —— 在 (R−G)/(B−G) 色差域做 3×3 中值，G 不变。**唯一不判色相**的边缘伪彩解法：
-    // 紫/蓝/青/绿任何方向的 1~3px 窄带色差异常都会被中值替换；中值对阶跃保边，
-    // 真实色度边界不受影响。代价 = 1px 尺度的色度细节会被抹掉（darktable 因此
-    // 默认关）。关 = 同场景 A/B 对照。
+    // CS and CM are independent capture-pipeline preferences.
     var colorSmoothOn by remember { mutableStateOf(prefs.getBoolean("color_smooth", true)) }
     SettingSwitchRow(
-        title = "色差中值滤波",
-        subtitle = "darktable color_smoothing：色差域 3×3 中值，治**任意色相**的边缘窄带伪彩（紫/蓝/青/绿）；代价是 1px 色度细节被抹平",
+        title = "去彩边",
+        subtitle = "抑制边缘彩边；可能削弱真实的细彩线颜色",
         checked = colorSmoothOn,
         onChecked = { v ->
             colorSmoothOn = v
             prefs.edit().putBoolean("color_smooth", v).apply()
             EngineBridge.nativeAppendLog(
                 EngineBridge.LEVEL_INFO, "app", "settings.color_smooth",
+                "{\"on\":$v}",
+            )
+        },
+    )
+    var colorMedianOn by remember { mutableStateOf(prefs.getBoolean("color_median", false)) }
+    SettingSwitchRow(
+        title = "色差中值滤波",
+        subtitle = "默认关闭；可能损失细小彩色纹理",
+        checked = colorMedianOn,
+        onChecked = { v ->
+            colorMedianOn = v
+            prefs.edit().putBoolean("color_median", v).apply()
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "app", "settings.color_median",
                 "{\"on\":$v}",
             )
         },
