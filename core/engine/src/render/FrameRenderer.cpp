@@ -22,6 +22,7 @@
 #include "../log/Logger.h"
 #include "../film/EngineRegistry.h"
 #include "../film/SigmoidParams.h"
+#include "../film/spektrafilm/Profile.h"
 #include "Align.h"
 #include "HighlightGeometry.h"
 #include "HighlightRecovery.h"
@@ -11414,6 +11415,10 @@ bool FrameRenderer::submitStill(const void* y, const void* u, const void* v,
                                 int uv_pix, int rotation, const FilmParams& p,
                                 std::vector<uint8_t>* out_rgba, bool ten_bit) {
   if (w <= 0 || h <= 0 || !y || !u) return false;
+  if (std::lround(p.engine_slot) == kSpektrafilmSlot) {
+    Logger::instance().log(LogLevel::kError, "engine", "spektrafilm.yuv_still_unsupported", "{}");
+    return false;
+  }
   // 卡 H2：10bit 交付前先跑**一次**读回自检（进程级缓存）。失败 ⇒ 拒绝本次 10bit
   // 交付 ⇒ 调用方按回退链降级（照片优先红线：宁可回退 JPEG，不交付错位的数据）。
   if (ten_bit && !selfCheck10BitOnce()) return false;
@@ -13796,7 +13801,7 @@ void FrameRenderer::captureHdrProbes(int w, int h, float exposure_ev, bool hal_d
   }
 }
 
-bool FrameRenderer::passGainmap(int w, int h, GLuint sdr_tex) {
+bool FrameRenderer::passGainmap(int w, int h, GLuint sdr_tex, GLuint scene_tex) {
   if (!prog_gainmap_ || !sdr_tex || !hdr_probe_valid_ ||
       hdr_prepared_w_ != w || hdr_prepared_h_ != h) {
     Logger::instance().log(LogLevel::kWarn, "engine", "hdr.gainmap_unavailable",
@@ -13822,7 +13827,7 @@ bool FrameRenderer::passGainmap(int w, int h, GLuint sdr_tex) {
     glBindTexture(GL_TEXTURE_2D, sdr_tex);
     glUniform1i(u_gainmap_.sdr, 1);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_hdr_prepared_);
+    glBindTexture(GL_TEXTURE_2D, scene_tex ? scene_tex : tex_hdr_prepared_);
     glUniform1i(u_gainmap_.scene, 2);
     glUniform2f(u_gainmap_.src_size, static_cast<float>(w), static_cast<float>(h));
     const HdrCurveExtension& ext = hdr_curve_extension_;
@@ -15395,6 +15400,225 @@ void FrameRenderer::denoiseParams(float strength, const NoiseModel& model,
 
 // 成片链共享后半段（v0.9.0）：P0（raw 或 fused 输入）→ RCD/bilinear → P4 →
 // filmic → 输出读回 → raw.render 日志。submitRaw 与 submitRawBurst 共用。
+bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
+                                     std::vector<uint8_t>* out_rgba) {
+  using Clock = std::chrono::steady_clock;
+  using namespace spektrafilm;
+  const auto start = Clock::now();
+  // A previous Filmic capture's HDR probe must never be reused by this branch.
+  hdr_probe_valid_ = false;
+  dbg_gainmap_ok_ = 0;
+  gainmap_w_ = gainmap_h_ = 0;
+  last_still_w999_ = 0.f;
+  const auto stored = spektrafilm_profile_;
+  if (!stored || c.dst_w <= 0 || c.dst_h <= 0) {
+    Logger::instance().log(LogLevel::kError, "engine", "spektrafilm.unavailable", "{}");
+    return false;
+  }
+  try {
+    auto params = *stored;
+    params.pixelUm /= std::max(c.dst_w, c.dst_h);
+    params.exposureEv += c.p->exposure_ev;
+    const int w = c.dst_w, h = c.dst_h;
+    std::vector<Triplet> image(static_cast<std::size_t>(w) * h);
+    struct ReadbackState {
+      GLint draw = 0, read = 0, pack = 0, buffer = 0, row = 0, rows = 0, pixels = 0, texture = 0;
+      GLuint fbo = 0;
+      ReadbackState() {
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
+        glGetIntegerv(GL_PACK_ROW_LENGTH, &row);
+        glGetIntegerv(GL_PACK_SKIP_ROWS, &rows);
+        glGetIntegerv(GL_PACK_SKIP_PIXELS, &pixels);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+      }
+      ~ReadbackState() {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
+        glDeleteFramebuffers(1, &fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, pack);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(buffer));
+        glPixelStorei(GL_PACK_ROW_LENGTH, row);
+        glPixelStorei(GL_PACK_SKIP_ROWS, rows);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, pixels);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
+      }
+    };
+    bool ok = false;
+    GLint format = 0;
+    {
+    const ReadbackState state;
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+    ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    glBindTexture(GL_TEXTURE_2D, source);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+    ok = ok && glGetError() == GL_NO_ERROR && (format == GL_RGBA16F || format == GL_RGBA32F);
+    {
+      constexpr int rows = 128;
+      std::vector<unsigned short> half(format == GL_RGBA16F ? static_cast<std::size_t>(w) * rows * 4 : 0);
+      std::vector<float> full(format == GL_RGBA32F ? static_cast<std::size_t>(w) * rows * 4 : 0);
+      for (int y = 0; ok && y < h; y += rows) {
+        const int count = std::min(rows, h - y);
+        glReadPixels(0, y, w, count, GL_RGBA, format == GL_RGBA16F ? GL_HALF_FLOAT : GL_FLOAT,
+                     format == GL_RGBA16F ? static_cast<void*>(half.data()) : static_cast<void*>(full.data()));
+        ok = glGetError() == GL_NO_ERROR;
+        for (int i = 0; ok && i < count * w; ++i) for (int channel = 0; channel < 3; ++channel) {
+          const double v = format == GL_RGBA16F ? halfToFloat(half[i * 4 + channel]) : full[i * 4 + channel];
+          if (!std::isfinite(v)) { ok = false; break; }
+          image[static_cast<std::size_t>(y) * w + i][channel] = v;
+        }
+      }
+    }
+    }
+    if (!ok) {
+      Logger::instance().log(LogLevel::kError, "engine", "spektrafilm.readback_failed",
+                             "{\"format\":" + std::to_string(format) + "}");
+      return false;
+    }
+    const auto readEnd = Clock::now();
+    const auto backend = hasSpectralBackend(SpectralBackend::AdvSimd) ? SpectralBackend::AdvSimd : SpectralBackend::Scalar;
+    const auto seed = c.grain_fp ^ (std::uint64_t(w) << 32) ^ std::uint64_t(h);
+    RenderTimings timing;
+    if (!renderNegativeSrgb(image, w, h, params, backend, {8, 8, 8, 4}, seed,
+                            seed ^ 0x9e3779b97f4a7c15ULL, &timing)) return false;
+    out_rgba->resize(image.size() * 4);
+    // Match passOutput(flip_y=true): Bitmap row zero is the scene's top row.
+    // No second OETF,
+    // legacy rolloff, USM, grain, halation, LUT or display-AE redraw is applied.
+    for (std::size_t i = 0; i < image.size(); ++i) {
+      const std::size_t dst = (static_cast<std::size_t>(h - 1) - i / w) * w + i % w;
+      std::uint32_t packed = 3u << 30;
+      for (int channel = 0; channel < 3; ++channel) {
+        const double v = image[i][channel];
+        if (!std::isfinite(v)) { out_rgba->clear(); return false; }
+        const auto code = static_cast<std::uint32_t>(std::floor(std::clamp(v, 0.0, 1.0) * (c.ten_bit ? 1023.0 : 255.0) + 0.5));
+        if (c.ten_bit) packed |= code << (10 * channel);
+        else (*out_rgba)[dst * 4 + channel] = static_cast<uint8_t>(code);
+      }
+      if (c.ten_bit) std::memcpy(out_rgba->data() + dst * 4, &packed, sizeof(packed));
+      else (*out_rgba)[dst * 4 + 3] = 255;
+    }
+    std::vector<Triplet>().swap(image);
+    // Reuse the PC display-reference solve, but never probe the composition
+    // proxy shader: measure this exact spectral recipe, including its gamut.
+    // Exposure is already inside the sampled response, so source stays unscaled.
+    const auto hdrStart = Clock::now();
+    std::vector<Triplet> response(1024);
+    bool hdrOk = negativeNeutralResponse(params, backend, response);
+    GLuint baseTex = 0;
+    GLint active = 0, texture = 0, draw = 0, read = 0, unpack = 0;
+    GLint alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skipRows);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skipPixels);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    if (hdrOk) {
+      std::vector<float> curve(1024), rgba(1024 * 4, 1.0f);
+      float previous = 0.0f;
+      for (std::size_t i = 0; i < curve.size(); ++i) {
+        // Match the display-linear luminance probe and RGBA16F storage.
+        const float v = halfToFloat(grain::floatToHalf(static_cast<float>(
+            0.2126 * response[i][0] + 0.7152 * response[i][1] + 0.0722 * response[i][2])));
+        curve[i] = previous = std::max(v, previous);
+        rgba[4 * i] = rgba[4 * i + 1] = rgba[4 * i + 2] = curve[i];
+        hdrOk = hdrOk && std::isfinite(v);
+      }
+      hdrOk = hdrOk && curve.back() > 1e-6f;
+      hdr_curve_extension_ = computeHdrCurveExtension(curve);
+      hdrOk = hdrOk && std::isfinite(hdr_curve_extension_.quadratic) &&
+              std::isfinite(hdr_curve_extension_.white_slope) && hdr_curve_extension_.white_slope >= 0.0f;
+      if (!tex_hdr_curve_) makeTex(&tex_hdr_curve_, &fbo_hdr_curve_, GL_RGBA16F, 1024, 1);
+      glBindTexture(GL_TEXTURE_2D, tex_hdr_curve_);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 1, GL_RGBA, GL_FLOAT, rgba.data());
+      // Gainmap must see the exact quantized SDR base, including HEIC's existing
+      // 10-to-8 conversion. Do not estimate it from the pre-quantized scan.
+      std::vector<uint8_t> base8;
+      const uint8_t* base = out_rgba->data();
+      if (c.ten_bit) {
+        base8.resize(out_rgba->size());
+        for (std::size_t i = 0; i < base8.size() / 4; ++i) {
+          uint32_t packed;
+          std::memcpy(&packed, out_rgba->data() + i * 4, 4);
+          for (int ch = 0; ch < 3; ++ch) base8[i * 4 + ch] = (((packed >> (ch * 10)) & 1023) * 255 + 511) / 1023;
+          base8[i * 4 + 3] = 255;
+        }
+        base = base8.data();
+      }
+      glGenTextures(1, &baseTex);
+      glBindTexture(GL_TEXTURE_2D, baseTex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, base);
+      hdrOk = hdrOk && glGetError() == GL_NO_ERROR;
+      hdr_prepared_w_ = w;
+      hdr_prepared_h_ = h;
+      hdr_probe_valid_ = hdrOk;
+      if (hdrOk) hdrOk = passGainmap(w, h, baseTex, source);
+    }
+    if (baseTex) glDeleteTextures(1, &baseTex);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(unpack));
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, skipRows);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, skipPixels);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
+    glActiveTexture(static_cast<GLenum>(active));
+    hdrOk = hdrOk && glGetError() == GL_NO_ERROR;
+    while (glGetError() != GL_NO_ERROR) {}
+    hdr_probe_valid_ = hdrOk;
+    dbg_gainmap_ok_ = hdrOk ? 1 : 0;
+    if (!hdrOk) gainmap_w_ = gainmap_h_ = 0;
+    Logger::instance().log(hdrOk ? LogLevel::kInfo : LogLevel::kWarn, "engine", "spektrafilm.hdr_reference",
+        "{\"ok\":" + std::string(hdrOk ? "true" : "false") +
+        ",\"samples\":1024,\"join\":" + jnum(hdr_curve_extension_.join_input, 7) +
+        ",\"ms\":" + std::to_string(std::chrono::duration<double, std::milli>(Clock::now() - hdrStart).count()) + "}");
+    const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    Logger::instance().log(LogLevel::kInfo, "engine", "spektrafilm.render",
+        "{\"directScan\":" + std::string(params.directScan ? "true" : "false") +
+        ",\"grain\":" + (params.grain.active ? "true" : "false") + ",\"w\":" + std::to_string(w) +
+        ",\"h\":" + std::to_string(h) + ",\"mfnr\":" + (c.mfnr_fused ? "true" : "false") +
+        ",\"bits\":" + (c.ten_bit ? "10" : "8") + ",\"backend\":\"" +
+        (backend == SpectralBackend::AdvSimd ? "neon-fp64" : "scalar-fp64") + "\"" +
+        ",\"readMs\":" + std::to_string(elapsed(start, readEnd)) +
+        ",\"renderMs\":" + std::to_string(timing.total * 1000) +
+        ",\"grainMs\":" + std::to_string(timing.grain * 1000) +
+        ",\"branchMs\":" + std::to_string(elapsed(start, Clock::now())) +
+        ",\"exposureEv\":" + std::to_string(params.exposureEv) +
+        ",\"pixelUm\":" + std::to_string(params.pixelUm) + "}");
+    return true;
+  } catch (const std::exception& e) {
+    out_rgba->clear();
+    Logger::instance().log(LogLevel::kError, "engine", "spektrafilm.render_failed",
+                           "{\"error\":\"" + jsonEscape(e.what()) + "\"}");
+    return false;
+  }
+}
+
 void FrameRenderer::finishStillChain(const ChainCtx& c,
                                      std::chrono::steady_clock::time_point t0,
                                      std::vector<uint8_t>* out_rgba) {
@@ -16193,6 +16417,26 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       : (pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
                       : ((c.dn && mst_ok) ? tex_scene_
                           : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_)));
+  if (std::lround(p.engine_slot) == kSpektrafilmSlot) {
+    // Shared complete RAW front chain, then the original spectral stage order.
+    // Legacy TEQ/Filmic/output sharpening are not part of this recipe.
+    const auto frontEnd = std::chrono::steady_clock::now();
+    still_chain_ok_ = renderSpektrafilm(c, film_src, out_rgba);
+    const auto end = std::chrono::steady_clock::now();
+    const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    Logger::instance().log(still_chain_ok_ ? LogLevel::kInfo : LogLevel::kError,
+        "engine", "raw.render", "{\"engine\":\"spektrafilm\",\"ok\":" +
+        std::string(still_chain_ok_ ? "true" : "false") +
+        ",\"mfnr\":" + (c.mfnr_fused ? "true" : "false") +
+        ",\"frontSubmitMs\":" + std::to_string(elapsed(t1, frontEnd)) +
+        ",\"uploadMs\":" + std::to_string(c.upload_ms) +
+        ",\"totalMs\":" + std::to_string(elapsed(t0, end)) +
+        ",\"pc3dOn\":" + std::to_string(dbg_pc3d_on_) +
+        ",\"csOn\":" + std::to_string(dbg_cs_on_) +
+        ",\"cmOn\":" + std::to_string(dbg_cm_on_) +
+        ",\"hlOk\":" + std::to_string(dbg_hl_ok_) + "}");
+    return;
+  }
   // ── 自动曝光（v0.11.61）──────────────────────────────────────────────
   // 本张 RAW 统计 ⇒ 渲染端 EV。必须在 passFilm 之前：ev 要参与 filmic 的黑白点标定、
   // HR 阈值与 uExposure 三处（它们都以 pe.exposure_ev 为唯一来源）。

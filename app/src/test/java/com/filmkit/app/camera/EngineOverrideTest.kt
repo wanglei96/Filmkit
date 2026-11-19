@@ -273,9 +273,11 @@ class EngineOverrideTest {
             1, Regex("engineScoped\\(").findAll(camera).count(),
         )
         assertEquals(
-            "拍照链 5 个下发点（预览帧 / submitStill / submitRaw / submitRawBurst×2）必须全覆盖：1 定义 + 5 调用",
-            6, Regex("engineScopedForCapture\\(").findAll(camera).count(),
+            "作用域入口：快门冻结，预览和诊断保留原入口",
+            5, Regex("engineScopedForCapture\\(").findAll(camera).count(),
         )
+        assertTrue("快门冻结后的参数被单帧与多帧消费", "acceptedCaptureFilm(compensate = true)" in camera)
+        assertEquals(2, Regex("acceptedCaptureFilm\\(\\)").findAll(camera).count())
         // 0.12.61 设计变更（用户报「相册饱和度旋钮失效」）：编辑器**不能**再用拍照链的
         // `engineScoped` —— 它会把公共段的 `[20]/[21]/[22]`（饱和度）置恒等值 1.0，
         // 那是"切引擎观感不跳"的兼容策略，编辑器照搬等于旋钮失效。

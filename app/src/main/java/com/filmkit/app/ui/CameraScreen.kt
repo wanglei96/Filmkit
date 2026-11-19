@@ -405,6 +405,13 @@ fun CameraScreen(
     var photoUri by remember {
         mutableStateOf(prefs.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) })
     }
+    fun spectralTitle(): String {
+        val settings = com.filmkit.app.camera.SpektrafilmSettings.read(prefs)
+        return com.filmkit.app.camera.SpektrafilmAssets.catalog(context).firstOrNull {
+            it.film == settings.film && (it.positive || it.paper == settings.paper)
+        }?.title.orEmpty()
+    }
+    var spektrafilmTitle by remember { mutableStateOf(spectralTitle()) }
     // ★ 2026-11-13：**相册删除要立刻反映到胶卷位**。
     // 相册/大图自 0.13.44 起是覆盖层、相机页常驻不销毁 ⇒ 删掉最后一张时 `dropLastPhotoUri`
     // 虽然清了 prefs，本地 state 仍指着那张已删除的 URI：缩略图退化成占位，点开走
@@ -413,6 +420,7 @@ fun CameraScreen(
     // `LaunchedEffect(photoUri)` 的既有回落逻辑会把相册最新一张顶上来（v0.12.36 的行为）。
     DisposableEffect(prefs) {
         val l = SharedPreferences.OnSharedPreferenceChangeListener { p, key ->
+            if (key?.startsWith("spektra_") == true) spektrafilmTitle = spectralTitle()
             if (key == "last_photo_uri") {
                 val next = p.getString("last_photo_uri", null)?.let { android.net.Uri.parse(it) }
                 if (next != photoUri) photoUri = next
@@ -1338,6 +1346,14 @@ fun CameraScreen(
             ) { quickOpen = !quickOpen }
         }
 
+        if (controller.compositionPreviewOnly) {
+            Text(
+                "Spektrafilm · $spektrafilmTitle · 构图预览",
+                color = FilmTheme.CreamDim,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            )
+        }
         // ── 取景窗口 = 所选画幅（WYSIWYG），窗口外为机身黑，随屏幕方向适配 ──
         // weight(fill=false)：预览框按画幅内容自适应高度——4:3 不再吃掉多余空间
         // （快门/瓦片跟随上移、底部留白），16:9 需求高过可用空间时被约束不挤压其他 UI

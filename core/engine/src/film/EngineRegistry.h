@@ -25,7 +25,8 @@ namespace filmkit {
 enum class ExposureDomain { kLinear, kCurve };
 
 // 阶段 0 只有内置引擎 0（filmic）；阶段 2 起 = 2（filmic / sigmoid）；每加一个引擎 +1。
-constexpr int kEngineCount = 2;
+constexpr int kEngineCount = 3;
+constexpr int kSpektrafilmSlot = 2;
 
 struct EngineEntry {
   int slot;                     // = `FilmParams[98] engine_slot` 的取值

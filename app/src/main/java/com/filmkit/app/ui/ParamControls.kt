@@ -846,7 +846,7 @@ internal fun effectiveEngineSlotOf(prefs: SharedPreferences, presetSlot: Int): I
 internal fun slotActiveInEngine(slot: Int, engineSlot: Int): Boolean {
     val effective = if (engineSlot in EngineScope.KNOWN_ENGINE_SLOTS) engineSlot else 0
     if (effective == 0) return true
-    return slot !in EngineScope.FILMIC_OWNED_SLOTS && slot !in EngineScope.NEUTRALIZE
+    return slot !in EngineScope.FILMIC_OWNED_SLOTS && slot !in EngineScope.neutralizeFor(effective)
 }
 
 /**

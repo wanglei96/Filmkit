@@ -69,6 +69,7 @@ internal object EngineScope {
     fun engineName(slot: Int): String = when (slot) {
         0 -> "filmic"
         1 -> "sigmoid"
+        2 -> "Spektrafilm"
         else -> "engine$slot"
     }
 
@@ -182,7 +183,30 @@ internal object EngineScope {
      * `EngineSlotUiTest.engineChoicesMatchTheCppRegistry` 已有"直接解析 C++ 表对拍"的纪律 ——
      * 加第 3 个引擎时两处要同步。
      */
-    val KNOWN_ENGINE_SLOTS: Set<Int> = setOf(0, 1)
+    const val SPEKTRAFILM_SLOT = 2
+    val KNOWN_ENGINE_SLOTS: Set<Int> = setOf(0, 1, SPEKTRAFILM_SLOT)
+
+    // The native spectral recipe owns these stages. Sensor reconstruction and
+    // cleanup slots are deliberately absent; they remain fully operational.
+    val SPEKTRAFILM_BYPASS: Map<Int, Double> = buildMap {
+        putAll(NEUTRALIZE)
+        val defaults = com.filmkit.app.ui.CameraPresets.standard()
+        val legacy = setOf(4, 26, 27, 28, 31, 32, 33, 34, 39, 40, 60, 61,
+            62, 63, 64, 65, 66, 67, 68, 78, 90, 91, 92, 93, 94, 95, 96, 97, 99, 100) +
+            (11..25) + (69..77)
+        for (slot in legacy) put(slot, defaults[slot])
+        put(31, 0.0)
+        put(34, 0.0)
+        put(39, 0.0)
+        put(40, 0.0)
+        put(99, 0.0)
+    }
+
+    fun neutralizeFor(engineSlot: Int): Map<Int, Double> = when (engineSlot) {
+        1 -> NEUTRALIZE
+        SPEKTRAFILM_SLOT -> SPEKTRAFILM_BYPASS
+        else -> emptyMap()
+    }
 
     /**
      * **编辑器专用**作用域（0.12.61，修「相册饱和度旋钮失效」）。
@@ -216,7 +240,7 @@ internal object EngineScope {
         val effective = if (engineSlot in KNOWN_ENGINE_SLOTS) engineSlot else 0
         if (effective == 0) return slots
         val out = slots.copyOf()
-        for ((slot, v) in NEUTRALIZE) if (slot in out.indices) out[slot] = v
+        for ((slot, v) in neutralizeFor(effective)) if (slot in out.indices) out[slot] = v
         return out
     }
 }

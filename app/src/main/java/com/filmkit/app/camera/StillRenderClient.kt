@@ -239,6 +239,7 @@ object StillRenderClient {
         hdrEv: FloatArray? = null,
         hdrGainArr: FloatArray? = null,
         hdrHighIdx: Int = -1,
+        spectral: SpektrafilmCapture? = null,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -266,6 +267,8 @@ object StillRenderClient {
                     nnDn, shortRatio = shortRatio, shortSat = shortSat,
                     film = film, useStill = true, tenBit = tenBit,
                     hdrEv = hdrEv, hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx,
+                    spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                    spectralOptions = spectral?.options,
                 )
                 if (bytes == null) {
                     // 合成失败先自愈再谈回退（v0.10.89）：真机 0.10.88 出现过
@@ -287,6 +290,8 @@ object StillRenderClient {
                             useStill = true, tenBit = tenBit,
                             hdrEv = hdrEv, hdrGainArr = hdrGainArr,
                             hdrHighIdx = hdrHighIdx,
+                            spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                            spectralOptions = spectral?.options,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",
@@ -328,6 +333,7 @@ object StillRenderClient {
         meta: RenderClient.RawFrameMeta, rotation: Int, film: DoubleArray,
         demosaic: Int, noiseStrength: Float, nnDn: Boolean,
         tenBit: Boolean = false,
+        spectral: SpektrafilmCapture? = null,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -350,6 +356,8 @@ object StillRenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, nnDn, film, useStill = true, tenBit = tenBit,
+                    spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                    spectralOptions = spectral?.options,
                 )
                 if (bytes == null) {
                     // 自愈一次（v0.10.89 同款："空闲释放后重建，首次合成纹理分配
@@ -363,6 +371,8 @@ object StillRenderClient {
                             meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                             rotation, demosaic, noiseStrength, meta.noiseModel,
                             meta.noiseSigma, nnDn, film, useStill = true, tenBit = tenBit,
+                            spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                            spectralOptions = spectral?.options,
                         )
                         EngineBridge.nativeAppendLog(
                             EngineBridge.LEVEL_WARN, "camera", "render.still_retry",

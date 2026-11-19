@@ -12,6 +12,7 @@
 
 #include "../film/FilmParams.h"
 #include "../film/SigmoidParams.h"
+#include "../film/spektrafilm/Profile.h"
 #include "OutputBitDepth.h"  // 交付位深单一真源（8bit JPEG / 10bit HEIF，卡 H2）
 
 namespace filmkit {
@@ -111,6 +112,9 @@ struct HlRawResult {
 // M2 RAW 路径在此层替换 pass1，pass2/3 复用。
 class FrameRenderer {
  public:
+  void setSpektrafilmProfile(std::shared_ptr<const spektrafilm::NegativeRenderParams> profile) {
+    spektrafilm_profile_ = std::move(profile);
+  }
   FrameRenderer() = default;
   ~FrameRenderer();
 
@@ -360,6 +364,7 @@ class FrameRenderer {
   int highlightClipBlocks() const { return hr_blocks_; }
 
  private:
+  std::shared_ptr<const spektrafilm::NegativeRenderParams> spektrafilm_profile_;
   bool ensureTargets(int w, int h);
   bool ensureRcdTargets(int w, int h);
   // tex_amaze_（源几何）→ 成片几何 tex_work_（D3）。与 kFsRcdChroma 同一几何口径。
@@ -542,6 +547,8 @@ class FrameRenderer {
   };
   void finishStillChain(const ChainCtx& c,
                         std::chrono::steady_clock::time_point t0,
+                        std::vector<uint8_t>* out_rgba);
+  bool renderSpektrafilm(const ChainCtx& c, GLuint source,
                         std::vector<uint8_t>* out_rgba);
   // AMaZE 档（v0.10.172）：CPU 跑 AMaZE（src/render/AmazeDemosaic.cpp，多线程
   // tile 并行）→ LSC → 上传 tex_amaze_（源几何）。返回 false = 失败（调用方
@@ -880,7 +887,7 @@ class FrameRenderer {
                       float white_probe, float user_ev, float user_contrast,
                       const float lat_sh[3], const float lat_toe[3]);
   // Final SDR and same-pass prepared engine RGB produce the HDR residual.
-  bool passGainmap(int w, int h, GLuint sdr_tex);
+  bool passGainmap(int w, int h, GLuint sdr_tex, GLuint scene_tex = 0);
   void captureHdrProbes(int w, int h, float exposure_ev, bool hal_domain);
   void captureEdgeDumpTexture(const char* stage, GLuint tex, GLuint fbo, int w, int h,
                               bool rgba8, bool mono = false);

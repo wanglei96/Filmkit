@@ -109,7 +109,7 @@ class Stage3EngineScopeAuditTest {
     fun knownEngineSlotsSnapshotMatchesTheContractUnderTest() {
         // 注册表是"哪些值走旁路"的判据来源 ⇒ 它的内容必须显式可见（加第 3 个引擎时两处同步：
         // C++ 的 EngineRegistry 表 + 本常量；EngineSlotUiTest 有直接解析 C++ 表的对拍）。
-        assertEquals("已知引擎槽位 = {0, 1}（见 EngineRegistry.cpp 的 kEngines）", setOf(0, 1), EngineScope.KNOWN_ENGINE_SLOTS)
+        assertEquals("已知引擎槽位与注册表同步", setOf(0, 1, 2), EngineScope.KNOWN_ENGINE_SLOTS)
     }
 
     // ══════════════════════════════════════════════════════════════════════════

@@ -33,6 +33,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,6 +65,8 @@ import com.filmkit.app.camera.BuiltinPresets
 import com.filmkit.app.camera.CameraAudit
 import com.filmkit.app.camera.CameraController
 import com.filmkit.app.camera.NoiseCalibStore
+import com.filmkit.app.camera.SpektrafilmAssets
+import com.filmkit.app.camera.SpektrafilmSettings
 import com.filmkit.app.camera.resolveCameraPreset
 import com.filmkit.app.diag.Heif10BitProbe
 import kotlinx.coroutines.Dispatchers
@@ -95,6 +99,7 @@ fun SettingsScreen(
     var toneOpen by rememberSaveable { mutableStateOf(false) }
     var lowlightOpen by rememberSaveable { mutableStateOf(false) }
     var labOpen by rememberSaveable { mutableStateOf(false) }
+    var licensesOpen by rememberSaveable { mutableStateOf(false) }
 
     Box(
         Modifier
@@ -324,6 +329,12 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = FilmTheme.ChipBorder)
             SectionHeader("关于")
+            SettingValueRow(
+                title = "Spektrafilm 来源与许可",
+                subtitle = "Andrea Volpato · CC BY-SA 4.0 / GPLv3 · 本地验证版",
+                valueText = "查看",
+                onTap = { licensesOpen = true },
+            )
             Text(
                 "FilmKit 胶片相机 · M3 开发中 · vivo X300 专项适配",
                 color = FilmTheme.CreamDim,
@@ -350,6 +361,26 @@ fun SettingsScreen(
         }
         SettingsDrawer(visible = labOpen, title = "实验与诊断", onDismiss = { labOpen = false }) {
             LabDrawerContent()
+        }
+        if (licensesOpen) {
+            val notices = remember {
+                listOf("CHANGELOG.txt", "SPEKTRAFILM_LICENSE.txt", "LICENSE-GPL-3.0.txt", "LICENSE-ARM.txt")
+                    .joinToString("\n\n") { name ->
+                        context.assets.open("spektrafilm/$name").bufferedReader().use { it.readText() }
+                    }
+            }
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { licensesOpen = false },
+                title = { Text("Spektrafilm 来源与许可") },
+                text = {
+                    androidx.compose.foundation.text.selection.SelectionContainer {
+                        Text(notices, fontSize = 12.sp, modifier = Modifier.verticalScroll(rememberScrollState()))
+                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = { licensesOpen = false }) { Text("关闭") }
+                },
+            )
         }
     }
 }
@@ -644,7 +675,7 @@ private fun ToneColorDrawerContent() {
         title = "引擎插槽",
         subtitle = "跟随预设 = 每条预设用自己存的引擎（在「完整参数」页改）；强制 = 全局覆盖，" +
             "只作用于拍照链路（编辑器仍按照片拍摄时的引擎）。filmic（胶片曲线）与 sigmoid" +
-            "（暗table 对数逻辑）是两条不同的影调曲线",
+            "（暗table 对数逻辑）是两条不同的影调曲线。Spektrafilm：RAW 多帧与 HDR，预览仅供构图",
         valueText = engineOverrideLabel(engineOverride),
         onTap = {
             val v = nextEngineOverride(engineOverride)
@@ -656,6 +687,8 @@ private fun ToneColorDrawerContent() {
             )
         },
     )
+
+    if (engineSlot == 2) SpektrafilmControls(prefs)
 
     // ★ 阶段 3：下面这些旋钮分别写进 `[28]` / `[20][21]` / `[37]` / `[38]` / `[36]`，而
     // `engine_slot != 0` 时这些槽在参数组装处被置**恒等**（`EngineScope.NEUTRALIZE`）⇒
@@ -1857,6 +1890,85 @@ private fun SettingNavRow(title: String, subtitle: String?, onTap: () -> Unit) {
             }
         }
         Text("›", color = FilmTheme.CreamDim, fontSize = 16.sp)
+    }
+}
+
+@Composable
+private fun SpektrafilmControls(prefs: android.content.SharedPreferences) {
+    val context = LocalContext.current
+    val catalog = remember { SpektrafilmAssets.catalog(context) }
+    var settings by remember { mutableStateOf(SpektrafilmSettings.read(prefs)) }
+    var choosing by remember { mutableStateOf("") }
+    val films = remember(catalog) { catalog.distinctBy { it.film } }
+    val selected = catalog.first { it.film == settings.film && (it.positive || it.paper == settings.paper) }
+    fun commit(next: SpektrafilmSettings) { settings = next; next.save(prefs) }
+    SpektrafilmChoiceRow("Spektrafilm · 胶片", selected.filmName) { choosing = "film" }
+    Text(if (selected.positive) "正片直扫" else "负片 → 相纸 → 扫描",
+        color = FilmTheme.CreamDim, fontSize = 12.sp, modifier = Modifier.padding(vertical = 6.dp))
+    if (!selected.positive) {
+        SpektrafilmChoiceRow("相纸／印相片", selected.paperName) { choosing = "paper" }
+    }
+    if (choosing.isNotEmpty()) {
+        val choices = if (choosing == "film") films else catalog.filter { it.film == settings.film }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { choosing = "" },
+            title = { Text(if (choosing == "film") "胶片" else "相纸／印相片") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    choices.forEach { recipe ->
+                        val checked = if (choosing == "film") recipe.film == settings.film else recipe.paper == settings.paper
+                        Row(Modifier.fillMaxWidth().clickable {
+                            commit(if (choosing == "film") settings.copy(film = recipe.film) else settings.copy(paper = recipe.paper))
+                            choosing = ""
+                        }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            androidx.compose.material3.RadioButton(checked, onClick = null)
+                            Text(if (choosing == "film") recipe.filmName + (if (recipe.positive) " · 正片直扫" else "") else recipe.paperName,
+                                modifier = Modifier.weight(1f), fontSize = 14.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+        )
+    }
+    SettingSwitchRow("Spektrafilm · 颗粒", null, settings.grain,
+        onChecked = { commit(settings.copy(grain = it)) })
+    if (settings.grain) {
+        SliderRow("颗粒面积倍率", null, settings.grainArea.toFloat(), 0.1f..4f, 0,
+            { "%.2f".format(it) }) { commit(settings.copy(grainArea = it.toDouble())) }
+        SliderRow("颗粒模糊", null, settings.grainBlur.toFloat(), 0f..3f, 0,
+            { "%.2f px".format(it) }) { commit(settings.copy(grainBlur = it.toDouble())) }
+    }
+    SliderRow("晕光倍率", null, settings.halation.toFloat(), 0f..3f, 0,
+        { "%.2f".format(it) }) { commit(settings.copy(halation = it.toDouble())) }
+    SliderRow("散射倍率", null, settings.scatter.toFloat(), 0f..3f, 0,
+        { "%.2f".format(it) }) { commit(settings.copy(scatter = it.toDouble())) }
+    SliderRow("DIR 倍率", null, settings.dir.toFloat(), 0f..2f, 0,
+        { "%.2f".format(it) }) { commit(settings.copy(dir = it.toDouble())) }
+    if (!selected.positive) {
+        SliderRow("印相曝光", null, settings.printEv.toFloat(), -3f..3f, 0,
+            { "%+.2f EV".format(it) }) { commit(settings.copy(printEv = it.toDouble())) }
+    }
+    SliderRow("扫描模糊", null, settings.scanBlur.toFloat(), 0f..3f, 0,
+        { "%.2f px".format(it) }) { commit(settings.copy(scanBlur = it.toDouble())) }
+    SliderRow("扫描锐化半径", null, settings.unsharpRadius.toFloat(), 0f..3f, 0,
+        { "%.2f px".format(it) }) { commit(settings.copy(unsharpRadius = it.toDouble())) }
+    SliderRow("扫描锐化强度", null, settings.unsharpAmount.toFloat(), 0f..2f, 0,
+        { "%.2f".format(it) }) { commit(settings.copy(unsharpAmount = it.toDouble())) }
+    SliderRow("胶片长边", null, settings.formatMm.toFloat(), 10f..100f, 0,
+        { "%.1f mm".format(it) }) { commit(settings.copy(formatMm = it.toDouble())) }
+}
+
+@Composable
+private fun SpektrafilmChoiceRow(title: String, value: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = FilmTheme.Cream, fontSize = 14.sp)
+            Text(value, color = FilmTheme.Accent, fontSize = 13.sp)
+        }
+        androidx.compose.material3.Icon(Icons.Filled.ArrowDropDown, contentDescription = title,
+            tint = FilmTheme.CreamDim, modifier = Modifier.size(24.dp))
     }
 }
 

@@ -1,0 +1,26 @@
+Derived from spektrafilm by Andrea Volpato
+https://github.com/andreavolpato/spektrafilm
+Reference revision: 3bb2c2d2801ff68b92019cf1dbcbb133d60832bc
+Profiles and direct encodings: CC BY-SA 4.0 (SPEKTRAFILM_LICENSE.txt).
+Reference source: GPL-3.0 (LICENSE-GPL-3.0.txt).
+
+2026-11-19, modified by FilmKit:
+Exported the resolved Portra 400 / Endura negative-paper-scanner parameters
+to a little-endian FP64 configuration (SKB1 schema version 2).
+Scene-linear Rec.2020 D65 input, automatic camera exposure off, no resizing,
+original full 81-band spectral projection, layered grain and paper glare.
+Camera/enlarger diffusion disabled by the original default recipe.
+Pixel pitch is instantiated from the original 35 mm format and frame size.
+No image samples, random draws, or per-image reference results are embedded.
+The response table and enlarger midgray normalization are build-time profile
+data, not a replacement for the runtime spectral film/paper/scanner stages.
+Native stage implementation and platform adapter are in core/engine/src/film/
+spektrafilm and core/engine/src/render/FrameRenderer.cpp in the shared project.
+
+Internal local-device validation build. This is not a public-release license
+clearance or an assertion that this independently written engine avoids
+upstream source obligations. Public redistribution requires a corresponding-
+source and dependency/license audit for the actual complete application.
+
+Arm FP64 vector exp10: Arm Limited, Optimized Routines revision
+4be260a5117480382690c6d8c300bc784e927d76, LICENSE-ARM.txt.

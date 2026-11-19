@@ -91,6 +91,9 @@ class CameraController(private val context: Context, private val render: RenderC
     @Volatile
     private var filmParams: DoubleArray = CameraPresets.standard()
 
+    var compositionPreviewOnly by mutableStateOf(false)
+        private set
+
     @Volatile
     private var fillTest = false
 
@@ -188,6 +191,15 @@ class CameraController(private val context: Context, private val render: RenderC
      */
     @Volatile
     private var burstHlUnderEv = 0.0
+    @Volatile private var captureFilm: DoubleArray? = null
+    @Volatile private var captureSpectral: SpektrafilmCapture? = null
+    @Volatile private var captureHdr = false
+
+    private fun acceptedCaptureFilm(compensate: Boolean = false): DoubleArray {
+        val p = captureFilm?.copyOf() ?: engineScopedForCapture(filmParams).copyOf()
+        if (compensate) p[0] += burstHlUnderEv
+        return p
+    }
 
     /** 成片用 filmParams：把高光保护的欠曝量加到 EV（[0]）。预览用原始数组（预览曝光
      *  由 HAL AE 决定、没有欠曝），故两侧中间调一致、成片高光更低。
@@ -210,10 +222,17 @@ class CameraController(private val context: Context, private val render: RenderC
      * 描述"这张片子实际用了什么"，不能记一个没生效的 id。强度直接用下发数组的 [34]，
      * 不另立来源（applyLutStrengthPref 就是写这一槽）。
      */
-    private fun snapshotOf(film: DoubleArray): StillSnapshot = StillSnapshot(
+    private fun snapshotOf(film: DoubleArray, spectral: SpektrafilmCapture? = captureSpectral): StillSnapshot = StillSnapshot(
         params = film.copyOf(),
-        lutId = if (currentLut != null) appPrefs.getString("lut_id", "").orEmpty() else "",
+        lutId = if (film.getOrElse(98) { 1.0 }.toInt() != EngineScope.SPEKTRAFILM_SLOT && currentLut != null)
+            appPrefs.getString("lut_id", "").orEmpty() else "",
         lutK = if (film.size > 34) film[34] else 1.0,
+        engineProfile = spectral?.recipe?.id.orEmpty(),
+        engineProfileSha256 = spectral?.recipe?.sha256.orEmpty(),
+        engineProfileTitle = spectral?.recipe?.title.orEmpty(),
+        engineResponseSha256 = spectral?.recipe?.responseSha256.orEmpty(),
+        engineOptions = spectral?.options?.copyOf() ?: doubleArrayOf(),
+        hdrRequested = captureHdr,
     )
 
     /** 总抖动 RMS（rad/s）—— 仅诊断，不参与决策（含高频，外推会严重高估帧内模糊）。 */
@@ -1446,8 +1465,17 @@ class CameraController(private val context: Context, private val render: RenderC
      * 传 override —— 编辑一张照片要用它**拍摄时**的引擎（照片元数据里的 `[98]`），
      * 否则编辑旧照片会因设置页开关突然变样。
      */
-    private fun engineScopedForCapture(p: DoubleArray): DoubleArray =
-        engineScoped(p, appPrefs.getInt("engine_override", ENGINE_OVERRIDE_FOLLOW_PRESET))
+    private fun engineScopedForCapture(p: DoubleArray): DoubleArray {
+        val scoped = engineScoped(p, appPrefs.getInt("engine_override", ENGINE_OVERRIDE_FOLLOW_PRESET))
+        compositionPreviewOnly = scoped.getOrElse(98) { 1.0 }.toInt() == EngineScope.SPEKTRAFILM_SLOT
+        return scoped
+    }
+
+    private fun captureNotice(message: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
 
     private var tonePref = -1.0
     private var zebraPref = -1.0
@@ -2211,6 +2239,19 @@ class CameraController(private val context: Context, private val render: RenderC
 
     fun capture() {
         val s = session ?: return
+        val selected = engineScopedForCapture(filmParams)
+        val spectral = selected.getOrElse(98) { 1.0 }.toInt() == EngineScope.SPEKTRAFILM_SLOT
+        if (spectral) {
+            val reason = when {
+                !rawMode -> "Spektrafilm 验证版仅支持 RAW 采集，请切换到 M 档"
+                else -> null
+            }
+            if (reason != null) {
+                captureNotice(reason)
+                EngineBridge.nativeAppendLog(EngineBridge.LEVEL_WARN, "camera", "spektrafilm.capture_blocked", kv("reason" to reason))
+                return
+            }
+        }
         // 快门瞬间快照方向与画幅（见 stillRot/stillAspect 注释）：渲染/保存链路必须用
         // 拍照那一刻的姿态，否则用户"拍完就转回竖屏"会把横拍裁成竖幅。
         stillRot = orientationStep
@@ -2243,6 +2284,17 @@ class CameraController(private val context: Context, private val render: RenderC
             )
             return
         }
+        val recipe = try {
+            if (spectral) SpektrafilmAssets.prepare(context, SpektrafilmSettings.read(appPrefs)) else null
+        } catch (e: Exception) {
+            captureNotice("Spektrafilm 配置加载失败")
+            EngineBridge.nativeAppendLog(EngineBridge.LEVEL_ERROR, "camera", "spektrafilm.capture_blocked",
+                kv("error" to e.toString()))
+            return
+        }
+        captureFilm = selected.copyOf()
+        captureSpectral = recipe
+        captureHdr = hdrEnabled()
         capturing = true
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "camera", "capture.begin",
@@ -2255,7 +2307,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // 争抢份额，降噪已排除。同时预热拍照线程（单帧 RAW/YUV 也迁入独立线程了，
         // burst 与单帧都需要）。
         armPreviewScaleGuard()
-        if (context.getSharedPreferences("filmkit", 0)
+        if (spectral || context.getSharedPreferences("filmkit", 0)
                 .getBoolean("still_thread", false)
         ) {
             // 0.13.23：预热是构图期的后台工作，用户已经按快门就不能排在合成前面
@@ -3481,13 +3533,14 @@ class CameraController(private val context: Context, private val render: RenderC
         bytes: ByteArray?, w: Int, h: Int, snap: StillSnapshot, tenBit: Boolean,
         zoom: Float,
     ) {
+        val gainmap = if (bytes != null && snap.hdrRequested) readGainmapSnapshot() else null
         capturing = false
         capturePhase = 0
         releasePreviewScaleGuard()
         if (bytes != null) {
             // 卡 H2：按**冻结的交付档**分派 —— 10bit 流走 HEIF（失败回退 JPEG），
             // 8bit 流走原 JPEG 链（一字不动）。卡 FIX1：分派收口到 [deliverStill]。
-            deliverStill(bytes, w, h, snap, tenBit, zoom = zoom)
+            deliverStill(bytes, w, h, snap, tenBit, gainmap, zoom = zoom)
         }
     }
 
@@ -3523,7 +3576,7 @@ class CameraController(private val context: Context, private val render: RenderC
         val uvStride = pU.rowStride
         val uvPix = pU.pixelStride
         runCatching { img.close() }
-        val film = engineScopedForCapture(filmParams)
+        val film = acceptedCaptureFilm()
         // E1-2：单帧路径下发的就是 filmParams（高光保护补偿是 burst 专属），快照同源；
         // 本函数在渲染线程（ImageReader 回调）上，与 filmParams 的写同线程，无竞态
         val snap = snapshotOf(film)
@@ -3701,15 +3754,17 @@ class CameraController(private val context: Context, private val render: RenderC
         // E1-2：快照必须在三个 applyXxxPref 之后取（它们会覆盖 filmParams 的槽位，
         // 这才是真正下发的值）；本函数在渲染线程上，与 filmParams 的写同线程，无竞态
         // 阶段 3：快照与下发必须是**同一份**数组（归零后）—— 否则快照记的是没生效的值
-        val film = engineScopedForCapture(filmParams)
-        val snap = snapshotOf(film)
+        val film = acceptedCaptureFilm()
+        val spectral = captureSpectral
+        val snap = snapshotOf(film, spectral)
         // 拍照线程路由（v0.10.93，prefs still_thread）：非阻塞判断 ready（本函数
         // 在渲染线程上，绝不干等）；预热在 capture() 入口 startAsync。
-        val useStill = prefs.getBoolean("still_thread", false) && StillRenderClient.ready
+        val useStill = (prefs.getBoolean("still_thread", false) ||
+            film[98].toInt() == EngineScope.SPEKTRAFILM_SLOT) && StillRenderClient.ready
         if (useStill) {
             StillRenderClient.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn, tenBit = tenBit,
+                demosaic, noiseStrength, nnDn, tenBit = tenBit, spectral = spectral,
             ) { bytes, w, h ->
                 if (bytes != null) {
                     finishStillCapture(bytes, w, h, snap, tenBit, zoom)
@@ -3722,14 +3777,14 @@ class CameraController(private val context: Context, private val render: RenderC
                     EngineBridge.nativeFlushLogs()
                     render.submitRawBuf(
                         rawBuf, rawW, rawH, rawStridePx, meta, stillRot,
-                        film, demosaic, noiseStrength, nnDn, tenBit = tenBit,
+                        film, demosaic, noiseStrength, nnDn, tenBit = tenBit, spectral = spectral,
                     ) { b2, w2, h2 -> finishStillCapture(b2, w2, h2, snap, tenBit, zoom) }
                 }
             }
         } else {
             render.submitRawBuf(
                 rawBuf, rawW, rawH, rawStridePx, meta, stillRot, film,
-                demosaic, noiseStrength, nnDn, tenBit = tenBit,
+                demosaic, noiseStrength, nnDn, tenBit = tenBit, spectral = spectral,
             ) { bytes, w, h -> finishStillCapture(bytes, w, h, snap, tenBit, zoom) }
         }
     }
@@ -4171,13 +4226,14 @@ class CameraController(private val context: Context, private val render: RenderC
         // 曝光欠 X + 提亮补 X ⇒ 中间调与预览一致，高光因为少收光子而不裁切。
         // ⚠ 定义在 done **之前**是 E1-2 的要求：下面的快照与下发必须是同一份数组。
         // 阶段 3：engine_slot != 0 时在此归零（EngineScope）；= 0 时返回同一实例，零回归
-        val filmStill = engineScopedForCapture(filmParamsForStill())
+        val filmStill = acceptedCaptureFilm(compensate = true)
+        val spectral = captureSpectral
         // 成片参数快照（E1-2 / ADR-4）：在此处取 —— 紧邻下发点；snapshotOf 内 copyOf()
         // 冻结（filmParamsForStill 在无欠曝补偿时返回的正是活跃数组 filmParams 本身，
         // 后台落盘线程执行时用户可能已改参数，不冻结就是假快照）。
         // 例外：A/B 诊断分支（still_ab 默认关）下发的是 submitStillAb 内部用同一函数
         // 算出的 film，那里另有一份同源快照。
-        val snap = snapshotOf(filmStill)
+        val snap = snapshotOf(filmStill, spectral)
         // 卡 H2 / FIX1：本张的交付档在**下发点**冻结成局部 val，随回调传递（不落成员）
         val tenBit = tenBitForCapture()
         // 数码变焦裁切倍率同样在**下发点**冻结（见 stillZoom 注释）
@@ -4188,7 +4244,7 @@ class CameraController(private val context: Context, private val render: RenderC
             // 上下文里的 tex_gainmap_，下一次拍照会把它覆盖。
             // 本 lambda 就是拍照线程的 onDone（StillRenderClient 保证），
             // 而渲染线程路径的回退（render.submitRawBurst）也是同一线程的 onDone。
-            val gainmap = if (bytes != null && hdrEnabled()) readGainmapSnapshot() else null
+            val gainmap = if (bytes != null && snap.hdrRequested) readGainmapSnapshot() else null
             rendersInFlight.decrementAndGet()
             capturePhase = 0
             // 合成结束（无论成败）：预览降载回升（v0.10.93）。capturing 已在下面
@@ -4205,11 +4261,12 @@ class CameraController(private val context: Context, private val render: RenderC
         // 拍照渲染线程（v0.10.85 重做，prefs still_thread **默认关**）：把这条
         // 1.6~3.4s 的合成链挪出预览线程 —— 否则预览的 updateTexImage 全排在它
         // 后面，"拍完挪手机画面完全冻住 1~2 秒"。启动失败即回退预览线程。
-        val useStill = prefs.getBoolean("still_thread", false) &&
+        val useStill = (prefs.getBoolean("still_thread", false) ||
+            filmStill[98].toInt() == EngineScope.SPEKTRAFILM_SLOT) &&
             StillRenderClient.ensureStarted()
         // NN 同帧 A/B（v0.10.102）：NN 路线已判死，入口随 nn_dn 一并删除，恒关
         val nnAb = false
-        if (useStill && prefs.getBoolean("still_ab", false)) {
+        if (useStill && spectral == null && prefs.getBoolean("still_ab", false)) {
             submitStillAb(fuseBufs, fuseStrides, refW, refH, meta, demosaic, noiseStrength,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio, shortSatFrac,
                 /*varyNn=*/false, zoom, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
@@ -4226,7 +4283,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 stillRot, filmStill, demosaic, noiseStrength, burstRefNoiseScale,
                 useDft, alignL1, alignAb, p0Sub, nnDn, shortRatio = shortRatio,
                 shortSat = shortSatFrac, tenBit = tenBit, hdrEv = hdrEvArr,
-                hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx) { bytes, w, h ->
+                hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx, spectral = spectral) { bytes, w, h ->
                 if (bytes != null) {
                     done(bytes, w, h)
                 } else {
@@ -4242,7 +4299,7 @@ class CameraController(private val context: Context, private val render: RenderC
                         burstRefNoiseScale, useDft, alignL1, alignAb, p0Sub, nnDn,
                         shortRatio = shortRatio, shortSat = shortSatFrac,
                         tenBit = tenBit, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
-                        hdrHighIdx = hdrHighIdx, onDone = done)
+                        hdrHighIdx = hdrHighIdx, spectral = spectral, onDone = done)
                 }
             }
         } else {
@@ -4251,7 +4308,7 @@ class CameraController(private val context: Context, private val render: RenderC
                 useDft, alignL1, alignAb, p0Sub, nnDn,
                 shortRatio = shortRatio, shortSat = shortSatFrac,
                 tenBit = tenBit, hdrEv = hdrEvArr, hdrGainArr = hdrGainArr,
-                hdrHighIdx = hdrHighIdx, onDone = done)
+                hdrHighIdx = hdrHighIdx, spectral = spectral, onDone = done)
         }
         // 提前解锁（v0.10.81，学 PhotonCamera 的"快门即撒手"）：上面
         // copyRawAndClose 之后 HAL 槽位已全部释放，4 帧数据也已各自独立
@@ -4812,7 +4869,7 @@ class CameraController(private val context: Context, private val render: RenderC
         // "10bit 收益很低"（HEIC 的 4:2:0 色度损失是主导短板，10bit 的量化精度被稀释），
         // 用可见的 HDR 动态范围换不可见的量化精度，划算。
         // 失败 ⇒ 继续走下面的三级链（10bit → 8bit → JPEG），绝不丢照片。
-        if (gainmap != null && hdrEnabled() && HdrDelivery.platformGainmapSupported) {
+        if (gainmap != null && snap.hdrRequested && HdrDelivery.platformGainmapSupported) {
             val hdrBytes = runCatching {
                 val rgba8 = com.filmkit.app.heif.Heif10Pipeline.toRgba8(rgba10, w, h)
                 val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
@@ -5257,7 +5314,7 @@ class CameraController(private val context: Context, private val render: RenderC
         )
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
         // 未选 LUT 时无后缀。只保留字母/数字/下划线/连字符（中文名照常保留），避免非法路径字符。
-        val lutTag = currentLut?.title
+        val lutTag = (snap.engineProfileTitle.takeIf { it.isNotEmpty() } ?: currentLut?.title)
             ?.takeIf { prefs.getBoolean("lut_in_name", true) }
             ?.replace(Regex("[^\\p{L}\\p{N}_-]"), "")
         // extraTag = 诊断标签前置（如 nn_ab 第二遍的 "_nn"）——同秒落盘的两张

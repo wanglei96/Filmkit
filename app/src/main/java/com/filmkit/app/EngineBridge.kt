@@ -38,6 +38,7 @@ object EngineBridge {
 
     // ── M0 ──
     external fun nativeInitLogger(dir: String): Boolean
+    external fun nativeLoadSpektrafilmProfile(data: ByteArray): Boolean
     external fun nativeAppendLog(level: Int, module: String, event: String, kvJson: String)
     external fun nativeRecentLogs(maxLines: Int): String?
     external fun nativeFlushLogs(): Boolean
@@ -198,6 +199,9 @@ object EngineBridge {
         nnDn: Boolean, film: DoubleArray,
         useStill: Boolean = false,
         tenBit: Boolean = false,
+        spectralProfile: ByteArray? = null,
+        spectralResponse: ByteArray? = null,
+        spectralOptions: DoubleArray? = null,
     ): ByteArray?
 
     /**
@@ -246,6 +250,9 @@ object EngineBridge {
          *  推断角色是自创，暗场长帧 −0.1EV 时误判关闭，真机 203750 实锤）。
          *  <0 = 无高帧（关闭）。hdrEv 仍须传（deghost 的曝光比 scale=2^ev 用）。 */
         hdrHighIdx: Int = -1,
+        spectralProfile: ByteArray? = null,
+        spectralResponse: ByteArray? = null,
+        spectralOptions: DoubleArray? = null,
     ): ByteArray?
 
     /** 预览实时直方图（M3）：填充显示域亮度分布（建议 256 桶）；false = 暂无可用帧 */

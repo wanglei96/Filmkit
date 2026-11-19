@@ -1,0 +1,16 @@
+{
+  "id": "portra400-endura-v1",
+  "schema": "SKB1-v2-profile-only",
+  "asset": "portra400-endura.skp",
+  "sha256": "436c0050838d7aa3ef2dbba235b55502aec16423bfe0f2013f4bcecfb67f84c9",
+  "bytes": 931048,
+  "reference_revision": "3bb2c2d2801ff68b92019cf1dbcbb133d60832bc",
+  "author": "Andrea Volpato",
+  "profile_license": "CC-BY-SA-4.0",
+  "source_license": "GPL-3.0",
+  "input": "scene-linear Rec.2020 D65",
+  "output": "encoded sRGB SDR",
+  "film_format_mm": 35,
+  "recipe": "Portra 400 / Endura, negative-paper-scan, default optics",
+  "distribution": "local-validation-only; public release audit pending"
+}

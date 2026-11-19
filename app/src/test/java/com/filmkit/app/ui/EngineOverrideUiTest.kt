@@ -131,7 +131,7 @@ class EngineOverrideUiTest {
             controller.contains("getInt(\"$ENGINE_OVERRIDE_PREFS_KEY\", ENGINE_OVERRIDE_FOLLOW_PRESET)"),
         )
         assertEquals("三档 = 跟随预设 + 契约的已注册引擎（不另立引擎表）",
-            listOf(-1, 0, 1), ENGINE_OVERRIDE_CHOICES)
+            listOf(-1, 0, 1, 2), ENGINE_OVERRIDE_CHOICES)
         assertEquals(EngineScope.KNOWN_ENGINE_SLOTS.sorted(), ENGINE_OVERRIDE_CHOICES.drop(1))
         // 循环一圈写出的三个值恰好是 -1 / 0 / 1，且回到跟随档
         var v = ENGINE_OVERRIDE_FOLLOW_PRESET
@@ -140,7 +140,7 @@ class EngineOverrideUiTest {
             v = nextEngineOverride(v)
             seen += v
         }
-        assertEquals(listOf(0, 1, -1), seen)
+        assertEquals(listOf(0, 1, 2, -1), seen)
         assertEquals("转一圈回到出发档", ENGINE_OVERRIDE_FOLLOW_PRESET, v)
         assertEquals(
             "最后一档绕回「跟随预设」",

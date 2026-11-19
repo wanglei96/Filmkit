@@ -26,6 +26,12 @@ data class StillSnapshot(
     val lutId: String,
     val lutK: Double,
     val timeMs: Long = 0L,
+    val engineProfile: String = "",
+    val engineProfileSha256: String = "",
+    val engineProfileTitle: String = "",
+    val engineResponseSha256: String = "",
+    val engineOptions: DoubleArray = doubleArrayOf(),
+    val hdrRequested: Boolean = false,
 )
 
 /**
@@ -107,6 +113,12 @@ object StillSnapshotStore {
                 lutId = o.optString("lut", ""),
                 lutK = o.optDouble("lutK", 1.0),
                 timeMs = o.optLong("t", 0L),
+                engineProfile = o.optString("engineProfile", ""),
+                engineProfileSha256 = o.optString("engineProfileSha256", ""),
+                engineProfileTitle = o.optString("engineProfileTitle", ""),
+                engineResponseSha256 = o.optString("engineResponseSha256", ""),
+                engineOptions = decodeParams(o.optJSONArray("engineOptions")?.toString() ?: "[]") ?: doubleArrayOf(),
+                hdrRequested = o.optBoolean("hdrRequested", false),
             )
         }
     } catch (t: Throwable) {
@@ -141,6 +153,14 @@ object StillSnapshotStore {
         put("lut", snap.lutId)
         put("lutK", snap.lutK)
         put("t", snap.timeMs)
+        if (snap.engineProfile.isNotEmpty()) {
+            put("engineProfile", snap.engineProfile)
+            put("engineProfileSha256", snap.engineProfileSha256)
+            put("engineProfileTitle", snap.engineProfileTitle)
+            put("engineResponseSha256", snap.engineResponseSha256)
+            put("engineOptions", JSONArray().apply { snap.engineOptions.forEach { put(it) } })
+        }
+        put("hdrRequested", snap.hdrRequested)
     }
 
     /**

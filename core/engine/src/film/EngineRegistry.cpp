@@ -36,6 +36,10 @@ const EngineEntry kEngines[kEngineCount] = {
      nullptr, nullptr, nullptr, nullptr},
     {1, "sigmoid", "LinearSRGB", ExposureDomain::kLinear, 0.0f,
      nullptr, nullptr, kFsSigmoidDef, kFsSigmoidMain},
+    // The shader is a composition-only YUV preview proxy. RAW stills dispatch
+    // to the complete native negative/paper/scanner renderer before passFilm.
+    {2, "spektrafilm", "SceneLinearRec2020", ExposureDomain::kLinear, 0.0f,
+     nullptr, nullptr, kFsSigmoidDef, kFsSigmoidMain},
 };
 
 }  // namespace

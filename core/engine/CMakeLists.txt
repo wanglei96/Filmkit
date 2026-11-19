@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(filmengine LANGUAGES CXX)
+project(filmengine LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +19,16 @@ add_library(filmengine SHARED
         src/pipeline/Pipeline.cpp
         src/film/EngineRegistry.cpp
         src/film/SigmoidParams.cpp
+        src/film/spektrafilm/Development.cpp
+        src/film/spektrafilm/DirDevelopment.cpp
+        src/film/spektrafilm/FilmExposure.cpp
+        src/film/spektrafilm/Grain.cpp
+        src/film/spektrafilm/OutputGamut.cpp
+        src/film/spektrafilm/PrintScan.cpp
+        src/film/spektrafilm/Profile.cpp
+        src/film/spektrafilm/Render.cpp
+        src/film/spektrafilm/SpatialFilter.cpp
+        src/film/spektrafilm/Spectral.cpp
         src/render/Align.cpp
         src/render/HighlightGeometry.cpp
         src/render/HighlightRecovery.cpp
@@ -29,6 +39,33 @@ add_library(filmengine SHARED
         src/spike/SpikeFftMerge.cpp)
 
 target_include_directories(filmengine PRIVATE src)
+
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(arm_math "${CMAKE_CURRENT_SOURCE_DIR}/third_party/arm-math")
+    add_library(spektrafilm_exp10 STATIC
+        "${arm_math}/math/aarch64/advsimd/exp10.c"
+        "${arm_math}/math/aarch64/v_exp_data.c")
+    set_target_properties(spektrafilm_exp10 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(spektrafilm_exp10 PRIVATE
+        "${arm_math}/math/include" "${arm_math}/math" "${arm_math}/math/aarch64/advsimd")
+    target_link_libraries(filmengine PRIVATE spektrafilm_exp10)
+    set_property(SOURCE src/film/spektrafilm/Spectral.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_EXP10)
+endif()
+
+# Match the FP64 oracle's operation order without changing unrelated pipelines.
+set_source_files_properties(
+        src/film/spektrafilm/Development.cpp
+        src/film/spektrafilm/DirDevelopment.cpp
+        src/film/spektrafilm/FilmExposure.cpp
+        src/film/spektrafilm/Grain.cpp
+        src/film/spektrafilm/OutputGamut.cpp
+        src/film/spektrafilm/PrintScan.cpp
+        src/film/spektrafilm/Profile.cpp
+        src/film/spektrafilm/Render.cpp
+        src/film/spektrafilm/SpatialFilter.cpp
+        src/film/spektrafilm/Spectral.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # jnigraphics：JpegEncoder.cpp 的 AndroidBitmap_lockPixels（成片 4:4:4 直编，零拷贝）
 find_library(log-lib log)

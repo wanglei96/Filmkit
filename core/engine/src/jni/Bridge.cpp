@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include "../render/FrameRenderer.h"
+#include "../film/spektrafilm/Profile.h"
 #include "../spike/SpikeFftMerge.h"
 #include "../spike/SpikePass.h"
 
@@ -42,6 +43,26 @@ using filmkit::Logger;
 using filmkit::LogLevel;
 using filmkit::runSpikePass;
 using filmkit::runSpikeFftMerge;
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeLoadSpektrafilmProfile(JNIEnv* env, jobject, jbyteArray data) {
+  if (!data) return JNI_FALSE;
+  const auto length = env->GetArrayLength(data);
+  if (length <= 0 || length > 64 * 1024 * 1024) return JNI_FALSE;
+  try {
+    std::vector<std::byte> bytes(static_cast<std::size_t>(length));
+    env->GetByteArrayRegion(data, 0, length, reinterpret_cast<jbyte*>(bytes.data()));
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    std::string error;
+    const bool ok = filmkit::spektrafilm::installNegativeProfile(bytes, &error);
+    Logger::instance().log(ok ? LogLevel::kInfo : LogLevel::kError, "engine", "spektrafilm.profile",
+        "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"bytes\":" +
+        std::to_string(length) + ",\"error\":\"" + jsonEscape(error) + "\"}");
+    return ok ? JNI_TRUE : JNI_FALSE;
+  } catch (const std::exception&) {
+    return JNI_FALSE;
+  }
+}
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
@@ -329,6 +350,37 @@ FilmParams paramsFromJava(JNIEnv* env, jdoubleArray film) {
     p.fromDoubles(v.data(), n);
   }
   return p;
+}
+
+bool prepareSpectralCapture(JNIEnv* env, FrameRenderer* renderer, const FilmParams& film,
+                            jbyteArray profile, jbyteArray response, jdoubleArray options) {
+  renderer->setSpektrafilmProfile({});
+  if (static_cast<int>(film.engine_slot) != 2) return true;
+  try {
+    const auto read = [&](jbyteArray data) {
+      const jsize n = data ? env->GetArrayLength(data) : 0;
+      if (n <= 0 || n > 32 * 1024 * 1024) throw std::runtime_error("missing spectral asset");
+      std::vector<std::byte> bytes(n);
+      env->GetByteArrayRegion(data, 0, n, reinterpret_cast<jbyte*>(bytes.data()));
+      return bytes;
+    };
+    const auto bytes = read(profile), table = read(response);
+    std::string error;
+    const auto loaded = filmkit::spektrafilm::loadNegativeProfile(bytes, &error, table);
+    if (!loaded) throw std::runtime_error(error);
+    if (!options || env->GetArrayLength(options) != 12) throw std::runtime_error("missing spectral options");
+    std::array<double, 12> values;
+    env->GetDoubleArrayRegion(options, 0, values.size(), values.data());
+    auto configured = std::make_shared<filmkit::spektrafilm::NegativeRenderParams>(*loaded);
+    if (env->ExceptionCheck() || !filmkit::spektrafilm::applyRenderOptions(*configured, values))
+      throw std::runtime_error("invalid spectral options");
+    renderer->setSpektrafilmProfile(std::move(configured));
+    return true;
+  } catch (const std::exception& e) {
+    Logger::instance().log(LogLevel::kError, "engine", "spektrafilm.capture_config_failed",
+        "{\"error\":\"" + jsonEscape(e.what()) + "\"}");
+    return false;
+  }
 }
 
 }  // namespace
@@ -857,7 +909,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
     // 落到 nn_dn 上（NN"已判死恒关"却真跑），film 数组落到 use_still（jboolean）、
     // nnDn=false 落到 film ⇒ FilmParams 解析到垃圾 ⇒ **整帧参数全错、成片全黑**。
     // 该路径只在"多帧融合=关"时走到，故长期未被发现（2026-10-05 用户实测暴露）。
-    jboolean nn_dn, jdoubleArray film, jboolean use_still, jboolean ten_bit) {
+    jboolean nn_dn, jdoubleArray film, jboolean use_still, jboolean ten_bit,
+    jbyteArray spectral_profile, jbyteArray spectral_response, jdoubleArray spectral_options) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -908,6 +961,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRaw(
   const FilmParams p = paramsFromJava(env, film);
   std::vector<uint8_t> rgba;
   const int64_t t0 = nowMs();
+  if (!prepareSpectralCapture(env, r, p, spectral_profile, spectral_response, spectral_options)) return nullptr;
   const bool ok = r->submitRaw(
       env->GetDirectBufferAddress(raw_buf), w, h, row_stride_px, cfa, black4,
       white_level, neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr,
@@ -941,7 +995,8 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
     jfloat noise_sigma, jfloat ref_noise_scale, jboolean use_dft, jboolean align_l1,
     jboolean align_ab, jboolean p0_sub, jboolean nn_dn, jfloat short_ratio,
     jfloat short_sat, jdoubleArray film, jboolean use_still, jboolean ten_bit,
-    jfloatArray hdr_ev, jfloatArray hdr_gain_arr, jint hdr_high_idx) {
+    jfloatArray hdr_ev, jfloatArray hdr_gain_arr, jint hdr_high_idx,
+    jbyteArray spectral_profile, jbyteArray spectral_response, jdoubleArray spectral_options) {
   // NN 回桥（v0.10.102）：注入推理/信息回调 + 刷新 env 快照（契约见 g_nn 注释）
   g_nn.env = env;
   FrameRenderer::setNnInferFn(&nnBridgeInfer);
@@ -1022,6 +1077,7 @@ Java_com_filmkit_app_EngineBridge_nativeEngineSubmitRawBurst(
   }
   std::vector<uint8_t> rgba;
   const int64_t t0 = nowMs();
+  if (!prepareSpectralCapture(env, r, p, spectral_profile, spectral_response, spectral_options)) return nullptr;
   const bool ok = r->submitRawBurst(
       bufs.data(), count, strides.data(), w, h, cfa, black4, white_level,
       neutral_r, neutral_g, neutral_b, ccm ? ccm9 : nullptr, lsc_ptr, lsc_cols,

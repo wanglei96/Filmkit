@@ -203,13 +203,13 @@ class EngineSlotUiTest {
                 slotActiveInEngine(slot, 1),
             )
             assertTrue(
-                "未注册的 engine_slot（如 2）按 0 处理 ⇒ 槽 $slot 照旧显示",
-                slotActiveInEngine(slot, 2) && slotActiveInEngine(slot, -7),
+                "未注册的 engine_slot（如 7）按 0 处理 ⇒ 槽 $slot 照旧显示",
+                slotActiveInEngine(slot, 7) && slotActiveInEngine(slot, -7),
             )
         }
         // 未注册值在参数级也走同一条路（不是"非 0 即隐藏"）
         for (p in CAMERA_TUNABLE_PARAMS) {
-            assertEquals("${p.key} 在未注册引擎值下必须按引擎 0 显示", paramActiveInEngine(p, 0), paramActiveInEngine(p, 2))
+            assertEquals("${p.key} 在未注册引擎值下必须按引擎 0 显示", paramActiveInEngine(p, 0), paramActiveInEngine(p, 7))
         }
     }
 

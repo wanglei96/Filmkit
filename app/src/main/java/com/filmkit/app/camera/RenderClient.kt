@@ -393,6 +393,7 @@ class RenderClient {
         meta: RawFrameMeta, rotation: Int, film: DoubleArray,
         demosaic: Int, noiseStrength: Float, nnDn: Boolean,
         tenBit: Boolean = false,
+        spectral: SpektrafilmCapture? = null,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -414,6 +415,8 @@ class RenderClient {
                     meta.ccm, meta.lsc, meta.lscCols, meta.lscRows,
                     rotation, demosaic, noiseStrength, meta.noiseModel,
                     meta.noiseSigma, nnDn, film, useStill = false, tenBit = tenBit,
+                    spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                    spectralOptions = spectral?.options,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
@@ -462,6 +465,7 @@ class RenderClient {
         hdrEv: FloatArray? = null,
         hdrGainArr: FloatArray? = null,
         hdrHighIdx: Int = -1,
+        spectral: SpektrafilmCapture? = null,
         onDone: (ByteArray?, Int, Int) -> Unit,
     ) {
         val h = handler
@@ -488,6 +492,8 @@ class RenderClient {
                     nnDn, shortRatio = shortRatio, shortSat = shortSat,
                     film = film, tenBit = tenBit, hdrEv = hdrEv,
                     hdrGainArr = hdrGainArr, hdrHighIdx = hdrHighIdx,
+                    spectralProfile = spectral?.profile, spectralResponse = spectral?.response,
+                    spectralOptions = spectral?.options,
                 )
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
