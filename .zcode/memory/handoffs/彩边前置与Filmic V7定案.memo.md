@@ -1,8 +1,8 @@
 ---
 summary: 彩边前置与Filmic V7定案
 created: 2026-11-18 21:38
-updated: 2026-11-18 21:38
-status: active
+updated: 2026-11-19 21:15
+status: absorbed
 ---
 
 # 彩边前置与Filmic V7定案

@@ -1,12 +1,10 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-11-18 21:38
+updated: 2026-11-19 21:15
 status: active
 ---
 # 事实
-<!-- 原子事实:环境约束、关键路径、可复用命令、版本号。一条一事,带日期前缀。 -->
-<!-- 2026-10-26 d3 整理:压缩折行、删除被后续版本取代的"当时现状",保留当前有效值与口径。 -->
 ## 相机能力与标定
 - [2026-10-22] **X300 后置 camera id**：0 = 逻辑主摄（0.67–10x）；2 = 物理主摄（RAW 4080×3072，SupportSATRemosaic=1）；3 = 长焦 70.3mm；4 = 超广 15.4mm；5 = 潜望 165mm；6 = 逻辑组（0.6–100x）；三个 23.6mm = id 0/2/6
 - [2026-10-22] **ISZ**：remosaic key 全可下发且 set 成功，但 RAW 尺寸/crop 不变，`vsdofFeatureOpticalZoomSets=0` ⇒ 标准版主摄不可达
@@ -100,7 +98,7 @@ status: active
 - [2026-11-17] **发布产物**：`filmkit-0.14.25-LENS.apk`，57,519,060B，SHA256 `4578b3a95df196e2a5c5c6d64d1e054f0aa9e3200ee015ec95608d9d3d9d2e9c`；822/0.14.25，签名/JNI 通过并已安装。
 - [2026-11-17] **清理与磁盘**：`cleanup-applied.json` 记录 153 文件/3,397,116,589B（3.163811GiB）； `test_temp` 约 1.3GB、`/private/tmp` 约 1.9GB，根目录仅留 0.14.25 与回退 0.14.20。
 ## 长帧保护与灯边证据（11-17）
-- [2026-11-17] 当前交付并由用户安装：0.14.26(823)，`filmkit-0.14.26-HLGUARD.apk`，回退包0.14.25；代码提交 `34691a1`。日光栏杆问题待条件复测，细紫边未闭环。
+- [2026-11-17] 历史交付0.14.26(823)，`filmkit-0.14.26-HLGUARD.apk`，代码提交 `34691a1`。日光栏杆问题待条件复测，细紫边未闭环。
 - [2026-11-17] long guard 完整三阶段接入：RAW/4 原生四相位裁切、原始 reference-highlight exclusion、source exclusion 两次 UNORM 存储；同权重消费于融合/支持/归一化/方差，未修改 PC3D/预设。
 - [2026-11-17] 0.14.26构建/GLSL通过，20裁切夹具、80融合噪声组、75既有merge组通过；841单测中839通过/2跳过。签名/DEX版本/JNI已验；非日光实拍质量验收。
 - [2026-11-17] 灯罩证据：`test_temp/purple-lampshade-burst-20261117-1819/`；4帧GRBG4080×3072，stage token83158734972；42文件950093410B的大小/SHA256复核通过；DNG RAW与f0逐值一致。
@@ -109,12 +107,14 @@ status: active
 - [2026-11-17] 原版完整RCD固定RT `64c2d90a3248c7ad41842d9162368858b61aac6a`；无HDR截断归一8/16结果754.337/754.375，生产854.308。原版降低但不消除紫边，不代表完整RT显影流程。
 - [2026-11-17] f0/f3各400紫边峰值中心均未裁切，但±2px邻域均有裁切；完整原版RCD中只扰动裁切G可改变峰值RGB，证明邻域影响，不证明真实丢失量或光学唯一根因。
 - [2026-11-17] `raw-support-trace/report.json`状态`REPLAY_DIVERGES_NOT_DEVICE_PROVENANCE`：设备粗场/权重已用，fine-flow为桌面重建；峰值quad仅2.25%--11.75%相位在2half ULP内，支持比例不能当设备采样真值。
-- [2026-11-18] 当前包 0.14.27(824, `63e5d4b`)，`FilmParams::kCount=105`；CS=`[59]` 默认 1，CM=`[104]` 默认 0，CM 不进预设。APK SHA256 `dec44714e3c9ba4e3846134ee36e2147ebb0073d74b7a6c0b7cb55c606e5d6e5`，签名/版本/JNI 已验并覆盖安装。
+- [2026-11-18] 稳定回退包0.14.27(824, `63e5d4b`)，`FilmParams::kCount=105`；CS=`[59]` 默认1，CM=`[104]` 默认0且不进预设。APK SHA256 `dec44714e3c9ba4e3846134ee36e2147ebb0073d74b7a6c0b7cb55c606e5d6e5`，签名/版本/JNI已验。
 - [2026-11-18] CS/CM 在 D4 场景线性 Rec.2020 工作：BT.2020 亮度系数、输出 `[0,64]`、alpha 有效支持、独立两趟 CM、RGB+完整六分量协方差 MRT；4080×3072 的协方差 ping-pong 名义增量约 382.5 MiB。PC3D=0 的 P4 也消费选择后的 CS/CM。
 - [2026-11-18] 同 RAW 真机线性灯弧指标：关 843.331、CS 200.413(-76.24%)、CM 653.462(-22.51%)、CS+CM 158.793(-81.17%)；SDR JPEG 编码域：74.051、42.008(-43.27%)、75.757(+2.30%)、30.667(-58.59%)。编码域不是线性辐射量或感知分。
 - [2026-11-18] Filmic V7 参考固定 darktable `395aa7d5156b68a69d8f2d25a3e6fc66c525a3c2`；UI V7 是 `DT_FILMIC_COLORSCIENCE_V5`/`filmic_v5`。原版 CPU 整模块与隔离参考在 sRGB/P3 D0 的编码端到端最大差约 `1.08e-4`，不是设备生产误差预算。
 - [2026-11-18] 旧 Filmic 与 V7 固定 `-7.65/+4.56` 的同输入 A/B：灯罩 D0 和 PhotonCamera 白天 DNG 均无肉眼差异，全图任一 RGB 通道最多差 1 个 8-bit 阶；两张都未覆盖 V7 白点以上输入，也未做完整应用链。
-- [2026-11-18] Spektrafilm `3bb2c2d2801ff68b92019cf1dbcbb133d60832bc` 的原版冒烟和 4080×3072 Provia 正片直扫通过；Portra 负片印放在相纸曝光阶段因 5 GiB 磁盘保护主动终止，未取得完整 `rgb_out`，不能称全尺寸负片通过。
+- [2026-11-19] Spektrafilm上游锁定`3bb2c2d2801ff68b92019cf1dbcbb133d60832bc`，位于`test_temp/engine-reference-20261118/spektrafilm-upstream`；配套Python为同目录`spektrafilm-env/bin/python`。0.14.29(826)已安装于10AG6Y0DEH009DA，完整负片/直扫、RAW多帧/HDR落盘，详见新交接。
+- [2026-11-19] `test_temp/spektrafilm-apk-20261119/phone-controls.log`记录快门保存22.098/25.539/19.309s，光谱17453.553/19451.609/13576.293ms；生产日志尚未暴露已有RenderTimings全部子阶段，须补同RAW测量。
+- [2026-11-19] 同DNG颗粒开关Q100444：10676174→20246324B（1.8964倍）；真机21.05MB中主图20.87MB、gainmap0.178MB，无重复颗粒调用。`spektrafilm-grain-size-20261119.json`保留，同输入300MB中间文件/完整JPEG已删；不改生产JPEG质量。
 - [2026-11-18] 长期合同：highlight 分支强制完整 L1；NN 不兼容恢复域时明确回退并记日志；0.14.20 使用完整对称主元 LDLT、thread-local 诊断与重复 SurfaceTexture 时间戳跳过。
 - [2026-11-18] 长期合同：HEIF 使用 VBR 与官方固定 QP 4，不按体积自动升 QP；10bit→8bit HEIF→JPEG 三级回退，读头失败继续回退。
 - [2026-11-18] 长期边界：历史 PMRID 只替 P0、不是 PC3D，失败整张回退；不得据此宣称当前已启用或适用于高光恢复域。
