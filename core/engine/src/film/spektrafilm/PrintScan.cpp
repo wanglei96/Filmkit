@@ -1,5 +1,6 @@
 #include "PrintScan.h"
 #include "OutputGamut.h"
+#include "ParallelPixels.h"
 #include "SpatialFilter.h"
 
 #include <algorithm>
@@ -96,9 +97,9 @@ PrintReferences preparePrintReferences(const SpectralProjection& enlarger,
 bool exposePaperRaw(const SpectralProjection& enlarger, std::span<const Triplet> film,
                     std::span<Triplet> raw, double printExposure,
                     const PrintReferences& references, SpectralBackend backend) {
-    if (!projectLogSpectral(enlarger, film, raw, backend)) return false;
+    if (!projectSpectralLight(enlarger, film, raw, backend)) return false;
     for (auto& pixel : raw) {
-        for (auto& v : pixel) v = std::pow(10.0, v) * printExposure * references.exposureScale;
+        for (auto& v : pixel) v = v * printExposure * references.exposureScale;
     }
     return true;
 }
@@ -113,18 +114,20 @@ bool developPaper(std::span<Triplet> raw, const DensityCurve& curve) {
 bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xyz,
                         std::size_t width, std::size_t height,
                         const PrintReferences& references, const PaperGlare& glare,
-                        std::uint64_t seed, std::span<const double> replay, std::size_t filterWorkers) {
+                        std::uint64_t seed, std::span<const double> replay,
+                        std::size_t filterWorkers, std::size_t pixelWorkers) {
     if (!width || !height || width > xyz.size() / height || width * height != xyz.size() ||
+        !pixelWorkers || pixelWorkers > 8 ||
         (!replay.empty() && replay.size() != xyz.size())) return false;
-    for (auto& pixel : xyz) {
-        for (auto& v : pixel) v = std::pow(10.0, v);
-        if (references.correctXyz) {
+    if (references.correctXyz && !parallelPixels(xyz.size(), pixelWorkers, [&](auto begin, auto count) {
+        for (auto& pixel : xyz.subspan(begin, count)) {
             const double y = pixel[1];
             const double scaledY = std::clamp(references.slope * y + references.offset, 0.0, 1.0);
             const double scale = scaledY / (y + kFloor);
             for (auto& v : pixel) v *= scale;
         }
-    }
+        return true;
+    })) return false;
     if (!glare.active || glare.percent <= 0.0) return true;
     const Triplet illuminant = scannerWhite(scanner);
     std::vector<double> randomField;
@@ -145,15 +148,17 @@ bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xy
         if (!gaussianBlur(replay, filtered, scratch, width, height, glare.blurPx, filterWorkers)) return false;
         replay = filtered;
     }
-    for (std::size_t i = 0; i < xyz.size(); ++i) {
-        const double amount = replay[i] / 100.0;
-        for (std::size_t c = 0; c < 3; ++c) xyz[i][c] += amount * illuminant[c];
-    }
-    return true;
+    return parallelPixels(xyz.size(), pixelWorkers, [&](auto begin, auto count) {
+        for (std::size_t i = begin; i < begin + count; ++i) {
+            const double amount = replay[i] / 100.0;
+            for (std::size_t c = 0; c < 3; ++c) xyz[i][c] += amount * illuminant[c];
+        }
+        return true;
+    });
 }
 
 bool finishPaperScanSrgb(const SpectralProjection& scanner,
-                         std::span<Triplet> logXyz,
+                         std::span<Triplet> xyz,
                          std::size_t width, std::size_t height,
                          const PrintReferences& references, const PaperGlare& glare,
                          std::uint64_t seed,
@@ -162,9 +167,9 @@ bool finishPaperScanSrgb(const SpectralProjection& scanner,
                          std::span<double> filtered, std::span<double> scratch,
                          std::span<const double> replay,
                          std::size_t workerCount) {
-    return finishPaperScanXYZ(scanner, logXyz, width, height, references,
+    return finishPaperScanXYZ(scanner, xyz, width, height, references,
                               glare, seed, replay) &&
-           finishScanSrgb(logXyz, width, height, scannerWhite(scanner),
+           finishScanSrgb(xyz, width, height, scannerWhite(scanner),
                           lensBlurSigma, unsharpSigma, unsharpAmount, true,
                           plane, filtered, scratch, workerCount);
 }

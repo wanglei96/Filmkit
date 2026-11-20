@@ -1,10 +1,15 @@
 #include "SpatialFilter.h"
+#include "ParallelPixels.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <future>
 #include <limits>
+#include <memory>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace filmkit::spektrafilm {
 namespace {
@@ -13,15 +18,10 @@ using Index = std::ptrdiff_t;
 
 template <class Function>
 void parallelLines(Index lines, std::size_t workers, const Function& run) {
-    workers = std::min(workers, static_cast<std::size_t>(lines));
-    const auto range = [&](std::size_t worker) {
-        run(lines * static_cast<Index>(worker) / static_cast<Index>(workers),
-            lines * static_cast<Index>(worker + 1) / static_cast<Index>(workers));
-    };
-    std::array<std::future<void>, 7> pending;
-    for (std::size_t i = 1; i < workers; ++i) pending[i - 1] = std::async(std::launch::async, range, i);
-    range(0);
-    for (std::size_t i = 1; i < workers; ++i) pending[i - 1].get();
+    parallelPixels(static_cast<std::size_t>(lines), workers, [&](auto begin, auto count) {
+        run(static_cast<Index>(begin), static_cast<Index>(begin + count));
+        return true;
+    }, 4);
 }
 
 Index reflect(Index i, Index length) noexcept {
@@ -32,9 +32,10 @@ Index reflect(Index i, Index length) noexcept {
     return i < length ? i : period - 1 - i;
 }
 
-void fir(const double* input, double* output, double* scratch,
-         Index width, Index height, double sigma, std::size_t workers) {
-    const auto radius = static_cast<Index>(3.0 * sigma + 0.5);
+template <Index FixedRadius = 0>
+void fir(const double* input, double* output, Index width, Index height,
+         double sigma, Index computedRadius, std::size_t workers) {
+    const Index radius = FixedRadius ? FixedRadius : computedRadius;
     std::array<double, 19> weights{};
     double total = 0.0;
     for (Index i = -radius; i <= radius; ++i) {
@@ -43,24 +44,54 @@ void fir(const double* input, double* output, double* scratch,
         total += weights[i + radius];
     }
     for (Index i = 0; i <= 2 * radius; ++i) weights[i] /= total;
+    const Index first = std::min(radius, width);
+    const Index last = std::max(first, width - radius);
 
     // Small-sigma filtering is vertical first, with half-sample reflection.
     parallelLines(height, workers, [&](Index begin, Index end) {
+        const std::unique_ptr<double[]> rowStorage(new double[width]);
+        auto* row = rowStorage.get();
         for (Index y = begin; y < end; ++y) {
-            auto* row = scratch + y * width;
-            std::fill_n(row, width, 0.0);
+            std::array<const double*, 19> rows;
             for (Index k = -radius; k <= radius; ++k) {
-                const auto* src = input + reflect(y + k, height) * width;
-                const double weight = weights[k + radius];
-                for (Index x = 0; x < width; ++x) row[x] += src[x] * weight;
+                rows[k + radius] = input + reflect(y + k, height) * width;
             }
-            for (Index x = 0; x < width; ++x) {
+            const auto sumRange = [&](Index x, Index endX, auto source, double* dest) {
+#if defined(__aarch64__)
+                // Independent pixels stay in registers for all taps; tap order is unchanged.
+                for (; endX - x >= 8; x += 8) {
+                    auto s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
+                    for (Index k = 0; k <= 2 * radius; ++k) {
+                        const auto* p = source(k) + x;
+                        s0 = vaddq_f64(s0, vmulq_n_f64(vld1q_f64(p), weights[k]));
+                        s1 = vaddq_f64(s1, vmulq_n_f64(vld1q_f64(p + 2), weights[k]));
+                        s2 = vaddq_f64(s2, vmulq_n_f64(vld1q_f64(p + 4), weights[k]));
+                        s3 = vaddq_f64(s3, vmulq_n_f64(vld1q_f64(p + 6), weights[k]));
+                    }
+                    vst1q_f64(dest + x, s0);
+                    vst1q_f64(dest + x + 2, s1);
+                    vst1q_f64(dest + x + 4, s2);
+                    vst1q_f64(dest + x + 6, s3);
+                }
+#endif
+                for (; x < endX; ++x) {
+                    double sum = 0.0;
+                    for (Index k = 0; k <= 2 * radius; ++k) sum += source(k)[x] * weights[k];
+                    dest[x] = sum;
+                }
+            };
+            sumRange(0, width, [&](Index k) { return rows[k]; }, row);
+            auto* dst = output + y * width;
+            const auto edge = [&](Index x) {
                 double sum = 0.0;
                 for (Index k = -radius; k <= radius; ++k) {
                     sum += row[reflect(x + k, width)] * weights[k + radius];
                 }
-                output[y * width + x] = sum;
-            }
+                dst[x] = sum;
+            };
+            for (Index x = 0; x < first; ++x) edge(x);
+            sumRange(0, last - first, [&](Index k) { return row + (first - radius) + k; }, dst + first);
+            for (Index x = last; x < width; ++x) edge(x);
         }
     });
 }
@@ -68,8 +99,9 @@ void fir(const double* input, double* output, double* scratch,
 struct RecursiveWeights {
     double input, a, b, c;
 
-    double step(double value, std::array<double, 3>& history) const noexcept {
-        const double next = input * value + a * history[0] + b * history[1] + c * history[2];
+    template <class Sample>
+    Sample step(Sample value, std::array<Sample, 3>& history) const noexcept {
+        const Sample next = input * value + a * history[0] + b * history[1] + c * history[2];
         history = {next, history[0], history[1]};
         return next;
     }
@@ -90,34 +122,83 @@ void recursive(const double* input, double* output, double* scratch,
                Index width, Index height, const RecursiveWeights& weights, std::size_t workers) {
     // Large-sigma filtering sweeps complete rows, then complete columns.
     // Each reverse sweep starts from the last forward result, not the input edge.
-    parallelLines(height, workers, [&](Index begin, Index end) {
-        for (Index y = begin; y < end; ++y) {
-            const auto* src = input + y * width;
-            auto* row = scratch + y * width;
-            std::array<double, 3> state;
-            state.fill(src[0]);
-            for (Index x = 0; x < width; ++x) row[x] = weights.step(src[x], state);
-            state.fill(row[width - 1]);
-            for (Index x = width; x-- > 0;) row[x] = weights.step(row[x], state);
+    const auto rowSweep = [&](Index y) {
+        const auto* src = input + y * width;
+        auto* row = scratch + y * width;
+        std::array<double, 3> state;
+        state.fill(src[0]);
+        for (Index x = 0; x < width; ++x) row[x] = weights.step(src[x], state);
+        state.fill(row[width - 1]);
+        for (Index x = width; x-- > 0;) row[x] = weights.step(row[x], state);
+    };
+#if defined(__aarch64__)
+    // Interleave independent row pairs to hide the recurrence latency. Each
+    // row keeps its original arithmetic and edge conditions in one FP64 lane.
+    constexpr Index pairs = 4, rows = pairs * 2;
+    parallelLines((height + rows - 1) / rows, workers, [&](Index begin, Index end) {
+        for (Index y = begin * rows; y < end * rows; y += rows) {
+            if (height - y < rows) {
+                for (Index tail = y; tail < height; ++tail) rowSweep(tail);
+                break;
+            }
+            const double* src = input + y * width;
+            double* row = scratch + y * width;
+            const auto load = [&](const double* p) {
+                return vld1q_lane_f64(p + width, vld1q_lane_f64(p, vdupq_n_f64(0.0), 0), 1);
+            };
+            const auto store = [&](double* p, float64x2_t v) {
+                vst1q_lane_f64(p, v, 0);
+                vst1q_lane_f64(p + width, v, 1);
+            };
+            std::array<std::array<float64x2_t, 3>, pairs> state;
+            for (Index p = 0; p < pairs; ++p) state[p].fill(load(src + 2 * p * width));
+            const auto step = [&](const double* from, double* to) {
+                for (Index p = 0; p < pairs; ++p) {
+                    const Index offset = 2 * p * width;
+                    store(to + offset, weights.step(load(from + offset), state[p]));
+                }
+            };
+            for (Index x = 0; x < width; ++x) step(src + x, row + x);
+            for (Index p = 0; p < pairs; ++p) state[p].fill(load(row + 2 * p * width + width - 1));
+            for (Index x = width; x-- > 0;) step(row + x, row + x);
         }
     });
+#else
+    parallelLines(height, workers, [&](Index begin, Index end) {
+        for (Index y = begin; y < end; ++y) rowSweep(y);
+    });
+#endif
     constexpr Index chunk = 32;
     // Join the complete row sweeps before any column reads their results.
     parallelLines(1 + (width - 1) / chunk, workers, [&](Index begin, Index end) {
         for (Index block = begin; block < end; ++block) {
             const Index x0 = block * chunk;
             const Index count = std::min(chunk, width - x0);
-            std::array<std::array<double, 3>, chunk> state;
-            for (Index x = 0; x < count; ++x) state[x].fill(scratch[x0 + x]);
+            // Keep each recurrence tap contiguous so independent columns vectorize.
+            std::array<double, chunk> newest, middle, oldest;
+            const auto initialize = [&](const double* edge) {
+                std::copy_n(edge, count, newest.data());
+                std::copy_n(edge, count, middle.data());
+                std::copy_n(edge, count, oldest.data());
+            };
+            const auto stepRow = [&](const double* src, double* dst) {
+                for (Index x = 0; x < count; ++x) {
+                    const double next = weights.input * src[x] + weights.a * newest[x] +
+                                        weights.b * middle[x] + weights.c * oldest[x];
+                    oldest[x] = middle[x];
+                    middle[x] = newest[x];
+                    newest[x] = dst[x] = next;
+                }
+            };
+            initialize(scratch + x0);
             for (Index y = 0; y < height; ++y) {
                 const Index base = y * width + x0;
-                for (Index x = 0; x < count; ++x) output[base + x] = weights.step(scratch[base + x], state[x]);
+                stepRow(scratch + base, output + base);
             }
-            const Index last = (height - 1) * width + x0;
-            for (Index x = 0; x < count; ++x) state[x].fill(output[last + x]);
+            initialize(output + (height - 1) * width + x0);
             for (Index y = height; y-- > 0;) {
                 const Index base = y * width + x0;
-                for (Index x = 0; x < count; ++x) output[base + x] = weights.step(output[base + x], state[x]);
+                stepRow(output + base, output + base);
             }
         }
     });
@@ -138,7 +219,19 @@ bool gaussianBlur(std::span<const double> input, std::span<double> output,
     if (sigma <= 0.0 || (sigma < 3.0 && 3.0 * sigma + 0.5 < 1.0)) {
         std::copy(input.begin(), input.end(), output.begin());
     } else if (sigma < 3.0) {
-        fir(input.data(), output.data(), scratch.data(), width, height, sigma, workers);
+        const auto radius = static_cast<Index>(3.0 * sigma + 0.5);
+        const auto run = [&]<Index FixedRadius>() {
+            fir<FixedRadius>(input.data(), output.data(), width, height, sigma, radius, workers);
+        };
+        // Compile the common short kernels with fixed loop bounds, retaining
+        // the same weights, boundary handling and accumulation order.
+        switch (radius) {
+            case 1: run.template operator()<1>(); break;
+            case 2: run.template operator()<2>(); break;
+            case 3: run.template operator()<3>(); break;
+            case 4: run.template operator()<4>(); break;
+            default: run.template operator()<0>(); break;
+        }
     } else {
         const auto weights = youngVanVliet(sigma);
         if (!std::isfinite(weights.input) || !std::isfinite(weights.a) ||

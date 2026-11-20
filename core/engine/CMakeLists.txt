@@ -44,17 +44,32 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(arm_math "${CMAKE_CURRENT_SOURCE_DIR}/third_party/arm-math")
     add_library(spektrafilm_exp10 STATIC
         "${arm_math}/math/aarch64/advsimd/exp10.c"
-        "${arm_math}/math/aarch64/v_exp_data.c")
+        "${arm_math}/math/aarch64/advsimd/atan2.c"
+        "${arm_math}/math/aarch64/advsimd/expm1.c"
+        "${arm_math}/math/aarch64/advsimd/hypot.c"
+        "${arm_math}/math/aarch64/advsimd/log1p.c"
+        "${arm_math}/math/aarch64/v_exp_data.c"
+        "${arm_math}/math/aarch64/advsimd/pow.c"
+        "${arm_math}/math/aarch64/v_pow_log_data.c"
+        "${arm_math}/math/aarch64/v_pow_exp_data.c")
     set_target_properties(spektrafilm_exp10 PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(spektrafilm_exp10 PRIVATE
         "${arm_math}/math/include" "${arm_math}/math" "${arm_math}/math/aarch64/advsimd")
+    # Inline the pinned vector exponent into the spectral pixel loop without
+    # enabling LTO for RAW, shaders or the rest of the engine.
+    set_property(SOURCE "${arm_math}/math/aarch64/advsimd/exp10.c" APPEND PROPERTY
+        COMPILE_OPTIONS -flto=thin)
+    set_property(SOURCE src/film/spektrafilm/Spectral.cpp APPEND PROPERTY
+        COMPILE_OPTIONS -flto=thin)
     target_link_libraries(filmengine PRIVATE spektrafilm_exp10)
     set_property(SOURCE src/film/spektrafilm/Spectral.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_EXP10)
+    set_property(SOURCE src/film/spektrafilm/OutputGamut.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_CAM16)
 endif()
 
 # Match the FP64 oracle's operation order without changing unrelated pipelines.
-set_source_files_properties(
+set_property(SOURCE
         src/film/spektrafilm/Development.cpp
         src/film/spektrafilm/DirDevelopment.cpp
         src/film/spektrafilm/FilmExposure.cpp
@@ -65,7 +80,7 @@ set_source_files_properties(
         src/film/spektrafilm/Render.cpp
         src/film/spektrafilm/SpatialFilter.cpp
         src/film/spektrafilm/Spectral.cpp
-        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+        APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
 
 # jnigraphics：JpegEncoder.cpp 的 AndroidBitmap_lockPixels（成片 4:4:4 直编，零拷贝）
 find_library(log-lib log)

@@ -10,6 +10,8 @@ src=$root/core/engine/src
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/filmkit-spektra-render.XXXXXXXX")
 remote=
 adb=${ADB:-adb}
+grain=${FILMKIT_BENCH_GRAIN:-1}
+[[ $grain == 0 || $grain == 1 ]] || exit 2
 cleanup() {
     if [[ -n $remote ]]; then "$adb" shell "rm -rf '$remote'" || true; fi
     rm -rf -- "$scratch"
@@ -30,16 +32,23 @@ if [[ $# -ge 5 ]]; then flags+=(-static-libstdc++); fi
 if [[ $# == 6 ]]; then
     arm=$6
     cc=${cxx%++}
-    flags+=(-DFILMKIT_SPEKTRAFILM_ARM_EXP10)
-    "$cc" -O3 -I"$arm/math/include" -I"$arm/math" -I"$arm/math/aarch64/advsimd" \
-        -c "$arm/math/aarch64/advsimd/exp10.c" -o "$scratch/exp10.o"
-    "$cc" -O3 -I"$arm/math" -c "$arm/math/aarch64/v_exp_data.c" -o "$scratch/v_exp_data.o"
-    objects+=("$scratch/exp10.o" "$scratch/v_exp_data.o")
+    flags+=(-DFILMKIT_SPEKTRAFILM_ARM_EXP10 -DFILMKIT_SPEKTRAFILM_ARM_CAM16)
+    for name in advsimd/exp10 v_exp_data advsimd/pow v_pow_log_data v_pow_exp_data \
+                advsimd/atan2 advsimd/hypot advsimd/log1p advsimd/expm1; do
+        object=$scratch/$(basename "$name").o
+        lto=(-fno-lto)
+        if [[ $name == advsimd/exp10 ]]; then lto=(-flto=thin); fi
+        "$cc" -O3 "${lto[@]}" -I"$arm/math/include" -I"$arm/math" -I"$arm/math/aarch64/advsimd" \
+            -c "$arm/math/aarch64/$name.c" -o "$object"
+        objects+=("$object")
+    done
     git -C "$arm" rev-parse HEAD > "$out/arm-math-revision.txt"
 fi
 for source in "$src"/film/spektrafilm/*.cpp; do
     object=$scratch/$(basename "$source" .cpp).o
-    "$cxx" "${flags[@]}" -c "$source" -o "$object"
+    lto=(-fno-lto)
+    if [[ $# == 6 && ${source##*/} == Spectral.cpp ]]; then lto=(-flto=thin); fi
+    "$cxx" "${flags[@]}" "${lto[@]}" -c "$source" -o "$object"
     objects+=("$object")
 done
 "$cxx" "${flags[@]}" "$root/tools/spektrafilm-render-bench.cpp" "${objects[@]}" -o "$scratch/render"
@@ -69,7 +78,7 @@ for workers in ${WORKERS:-4 8 8 4}; do
             result=
             if [[ ${VERIFY_FILTERS:-0} == 1 ]]; then result="'$result_path'"; fi
             "$adb" shell dumpsys thermalservice > "$out/thermal-before-$i.log"
-            "$adb" shell "'$remote/render' '$remote/input.bin' '$workers' '$workers' '$workers' '$filter_workers' $result" | tee "$out/run-$i.log"
+            "$adb" shell "FILMKIT_BENCH_GRAIN=$grain '$remote/render' '$remote/input.bin' '$workers' '$workers' '$workers' '$filter_workers' $result" | tee "$out/run-$i.log"
             "$adb" shell dumpsys thermalservice > "$out/thermal-after-$i.log"
             if [[ ${VERIFY_FILTERS:-0} == 1 ]]; then
                 if [[ $i == 0 ]]; then

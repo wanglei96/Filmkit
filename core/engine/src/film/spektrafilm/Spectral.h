@@ -33,4 +33,10 @@ bool projectLogSpectral(const SpectralProjection& projection,
                         std::span<Triplet> output,
                         SpectralBackend backend) noexcept;
 
+// Same projection and floor as projectLogSpectral, before taking log10.
+bool projectSpectralLight(const SpectralProjection& projection,
+                          std::span<const Triplet> density,
+                          std::span<Triplet> output,
+                          SpectralBackend backend) noexcept;
+
 }  // namespace filmkit::spektrafilm

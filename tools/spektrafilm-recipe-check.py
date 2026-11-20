@@ -18,6 +18,7 @@ def main():
     parser.add_argument('executable', type=Path)
     parser.add_argument('report', type=Path)
     parser.add_argument('--neutral', action='store_true')
+    parser.add_argument('--capture-exposure', type=float)
     parser.add_argument('--adb', type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.upstream.resolve() / 'src'))
@@ -29,6 +30,13 @@ def main():
     rgb = np.stack((x / 8, y / 6, ((x * 7 + y * 3) % 23) / 11), axis=-1)
     cases = []
     for recipe in entries:
+        if args.capture_exposure is not None:
+            if recipe['positive'] or recipe['id'] in {
+                'kodak_gold_200--kodak_portra_endura', 'kodak_gold_200--kodak_2383',
+                'fujifilm_pro_400h--kodak_2383',
+            }:
+                cases.extend((recipe, ev, False) for ev in (0, .75))
+            continue
         if args.neutral:
             if recipe['positive'] or recipe['id'] == 'kodak_portra_400--kodak_portra_endura':
                 cases.extend((recipe, ev, False) for ev in (-2, 0, 2))
@@ -90,19 +98,25 @@ def run_cases(args, cases, rgb, results, remote):
                 values = []
                 for grey in np.linspace(0, 1, 65):
                     original = np.full((1, 1, 3), grey)
+                    if args.capture_exposure is not None:
+                        original *= 2 ** args.capture_exposure
                     for node in pipe._topology[1:]:
                         original = node.run(original)
                     values.append(colour.cctf_decoding(original.reshape(3), function='sRGB'))
                 original = np.array(values)
             else:
                 original = rgb.copy()
+                if args.capture_exposure is not None:
+                    original *= 2 ** args.capture_exposure
                 for node in pipe._topology[1:]:
                     original = node.run(original)
             command = ([str(args.adb), 'shell', remote + '/check', remote + '/assets/' + recipe['asset'],
                         remote + '/assets/' + recipe['response'], remote + '/native.bin', str(ev), str(int(altered))]
                        if remote else [str(args.executable.resolve()), str(args.assets / recipe['asset']),
                         str(args.assets / recipe['response']), str(output), str(ev), str(int(altered))])
-            if args.neutral:
+            if args.capture_exposure is not None:
+                command.extend(('neutral' if args.neutral else 'image', str(args.capture_exposure)))
+            elif args.neutral:
                 command.append('neutral')
             subprocess.run(command, check=True)
             native = (np.frombuffer(subprocess.check_output([str(args.adb), 'exec-out', 'cat', remote + '/native.bin']), dtype='<f8')

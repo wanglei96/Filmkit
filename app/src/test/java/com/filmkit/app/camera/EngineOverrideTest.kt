@@ -252,7 +252,7 @@ class EngineOverrideTest {
 
     /**
      * 两条结构性纪律（本卡的"只做渲染侧、编辑器不接"是**设计约束**，不是实现细节）：
-     *  1. prefs 键 `engine_override` 只有**一个**读点（`CameraController.engineScopedForCapture`）
+     *  1. prefs 键 `engine_override` 只有**一个**读点（`CameraController.captureEngineOverride`）
      *     —— 多一处读点 = 多一处漂移面；
      *  2. `CameraController` 的 5 个拍照下发点**全部**走它，一个都不许裸调 `engineScoped(`
      *     （裸调 = 那一链悄悄退回"跟随预设"）；
@@ -265,9 +265,10 @@ class EngineOverrideTest {
         val editor = File("src/main/java/com/filmkit/app/camera/EditorEngineSession.kt").readText()
 
         assertEquals(
-            "prefs 键只许有一个读点（engineScopedForCapture 内）",
+            "预热与快门的 prefs 键只许有一个读点",
             1, Regex("\"engine_override\"").findAll(camera).count(),
         )
+        assertTrue("快门调用唯一读点", "engineScoped(p, captureEngineOverride())" in camera)
         assertEquals(
             "裸 engineScoped( 在 CameraController 里只许是 engineScopedForCapture 的定义体",
             1, Regex("engineScoped\\(").findAll(camera).count(),

@@ -2,7 +2,7 @@
 // Build (NDK 29, API 26; run from repo root):
 // NDK=$HOME/Library/Android/sdk/ndk/29.0.14206865
 // $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android26-clang++ \
-//   -std=c++17 -O2 tools/check-renderer-device.cpp \
+//   -std=c++20 -O2 tools/check-renderer-device.cpp \
 //   -Lapp/build/filmengine/arm64-v8a -lfilmengine -lEGL -lGLESv3 -llog \
 //   -o /tmp/check-renderer-device
 // adb shell mkdir -p /data/local/tmp/fkrender
@@ -33,6 +33,8 @@
 // --prefilter-cases (24 repeated burst/single x CS/CM x PC3D captures).
 // --ae-hal (production HAL exposure mode; avoid uninitialized preview AE history).
 // --synthetic-feedback 0|1 (prime real preview statistics for slot 0 or 1 with a test pattern).
+// --spektrafilm PROFILE RESPONSE (production recipe, test RGBA and HDR gainmap).
+// --print-ev EV (Spektrafilm enlarger exposure, independent of capture EV).
 // Exit failure on init, render, byte count, image-range, JPEG or file-write error.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -48,6 +50,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "../core/engine/src/film/EngineRegistry.h"
 #include "../core/engine/src/render/FrameRenderer.h"
 #include "../core/engine/src/log/Logger.h"
 #include "../core/engine/src/log/GpuTimer.h"
@@ -210,7 +213,8 @@ int run(int argc, char** argv) {
     int feedbackSlot = -1;
     int colorSmooth = -1, colorMedian = -1;
     float chromaGate = -1.f;
-    std::string output = ".", rawDirectory, filmParamsFile;
+    double printEv = 0.0;
+    std::string output = ".", rawDirectory, filmParamsFile, spektraProfile, spektraResponse;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--timer-only") timerOnly = true;
@@ -230,6 +234,11 @@ int run(int argc, char** argv) {
       else if (arg == "--ae-hal") aeHal = true;
       else if (arg == "--synthetic-feedback" && i + 1 < argc) feedbackSlot = std::stoi(argv[++i]);
       else if (arg == "--film-params" && i + 1 < argc) filmParamsFile = argv[++i];
+      else if (arg == "--print-ev" && i + 1 < argc) printEv = std::stod(argv[++i]);
+      else if (arg == "--spektrafilm" && i + 2 < argc) {
+        spektraProfile = argv[++i];
+        spektraResponse = argv[++i];
+      }
       else if (arg == "--raw-directory" && i + 1 < argc) rawDirectory = argv[++i];
       else if (arg == "--preview") preview = true;
       else if (arg == "--warmup") warmup = true;
@@ -299,6 +308,25 @@ int run(int argc, char** argv) {
     }
     filmkit::FrameRenderer renderer;
     renderer.setStillContext(!preview);
+    if (!spektraProfile.empty()) {
+      require(!preview && !syntheticFeedback, "Spektrafilm requires a still replay");
+      const auto load = [](const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        require(bool(input), "cannot open " + path);
+        return std::vector<char>(std::istreambuf_iterator<char>(input), {});
+      };
+      const auto profileBytes = load(spektraProfile), responseBytes = load(spektraResponse);
+      std::string error;
+      const auto loaded = filmkit::spektrafilm::loadNegativeProfile(std::as_bytes(std::span(profileBytes)),
+          &error, std::as_bytes(std::span(responseBytes)));
+      require(bool(loaded), "Spektrafilm profile rejected: " + error);
+      auto recipe = std::make_shared<filmkit::spektrafilm::NegativeRenderParams>(*loaded);
+      const std::array<double, 12> options{1, 0, .45, .8, .5, .5, 1, printEv, 0, .7, .7, 35};
+      require(filmkit::spektrafilm::applyRenderOptions(*recipe, options), "Spektrafilm options rejected");
+      renderer.setSpektrafilmProfile(std::move(recipe));
+      params.engine_slot = filmkit::kSpektrafilmSlot;
+      params.exposure_ev = .7f;
+    }
     std::printf("STAGE renderer.init\n");
     const auto initStart = std::chrono::steady_clock::now();
     const bool initialized = renderer.init();
@@ -526,6 +554,11 @@ int run(int argc, char** argv) {
       require(sum / (size_t(width) * height * 3) > 10.,
               "known bright lens-switch fixture became black (dither is not image signal)");
     save(output + "/render.rgba", rgba.data(), rgba.size());
+    if (!spektraProfile.empty()) {
+      std::vector<uint8_t> gainmap;
+      require(renderer.readGainmap(&gainmap) && !gainmap.empty(), "Spektrafilm HDR gainmap unavailable");
+      save(output + "/render.gainmap", gainmap.data(), gainmap.size());
+    }
     std::vector<uint8_t> jpeg;
     const int outWidth = ((rotation + 1) % 2) ? height : width;
     const int outHeight = ((rotation + 1) % 2) ? width : height;

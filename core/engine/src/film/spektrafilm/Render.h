@@ -20,6 +20,7 @@ struct NegativeRenderParams {
     std::size_t responseSide = 0;
     std::vector<Triplet> response;
     double exposureEv = 0.0;
+    double captureExposureEv = 0.0;  // Scene exposure correction, not a print reference adjustment.
     HighlightBoost boost;
     double lensBlurUm = 0.0;
     FilmHalation halation;

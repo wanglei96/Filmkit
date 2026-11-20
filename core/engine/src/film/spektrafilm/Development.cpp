@@ -82,6 +82,19 @@ DensityCurve::DensityCurve(std::span<const double> exposure, std::span<const Tri
             }
             curve.push_back({x, density[i][c], 0.0});
         }
+        const double extent = curve.back().x - curve.front().x;
+        const double scale = kSearchBins / extent;
+        if (!(extent > 0) || !positiveFinite(scale)) continue;
+        auto& index = search_[c];
+        index.scale = scale;
+        index.lower.resize(kSearchBins);
+        std::size_t lo = 0;
+        for (std::size_t bin = 0; bin < kSearchBins; ++bin) {
+            const double x = std::lerp(curve.front().x, curve.back().x,
+                                       (bin + 0.5) / kSearchBins);
+            while (lo + 2 < curve.size() && curve[lo + 1].x <= x) ++lo;
+            index.lower[bin] = lo;
+        }
     }
 }
 
@@ -98,11 +111,24 @@ bool DensityCurve::develop(std::span<const Triplet> exposure, std::span<Triplet>
             } else if (x >= curve.back().x) {
                 density[i][c] = curve.back().y;
             } else {
-                const auto hi = std::upper_bound(curve.begin(), curve.end(), x,
-                                                 [](double value, const Knot& k) { return value < k.x; });
-                const auto& lo = *(hi - 1);
-                const double t = (x - lo.x) * lo.inverseNextStep;
-                density[i][c] = lo.y + t * (hi->y - lo.y);
+                const auto& index = search_[c];
+                std::size_t lo = 0;
+                if (!index.lower.empty()) {
+                    const double bin = std::min((x - curve.front().x) * index.scale,
+                                                static_cast<double>(kSearchBins - 1));
+                    lo = index.lower[static_cast<std::size_t>(bin)];
+                    if (x < curve[lo].x && lo > 0) --lo;
+                    else if (x >= curve[lo + 1].x && lo + 2 < curve.size()) ++lo;
+                }
+                // The index only suggests a bracket. Keep upper-bound semantics
+                // at exact knots, including repeated or non-uniform knots.
+                if (!(curve[lo].x <= x && x < curve[lo + 1].x)) {
+                    lo = std::upper_bound(curve.begin(), curve.end(), x,
+                                          [](double value, const Knot& k) { return value < k.x; }) - curve.begin() - 1;
+                }
+                const auto& a = curve[lo];
+                const double t = (x - a.x) * a.inverseNextStep;
+                density[i][c] = a.y + t * (curve[lo + 1].y - a.y);
             }
         }
     }

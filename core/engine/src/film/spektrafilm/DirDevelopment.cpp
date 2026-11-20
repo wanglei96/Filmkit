@@ -1,9 +1,11 @@
 #include "DirDevelopment.h"
+#include "ParallelPixels.h"
 #include "SpatialFilter.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace filmkit::spektrafilm {
@@ -55,22 +57,30 @@ bool diffuse(std::span<const Triplet> exposure, std::span<Triplet> correction,
              std::size_t filterWorkers) {
     constexpr std::array amplitudes{0.1633, 0.6496, 0.1870};
     constexpr std::array ratios{0.5360, 1.5236, 2.7684};
-    std::vector<double> plane(exposure.size()), filtered(exposure.size()), scratch(exposure.size());
-    std::vector<double> tail(exposure.size());
+    const auto count = exposure.size();
+    // Every plane is written in full before its first read, including the first tail tap.
+    const std::unique_ptr<double[]> planeStorage(new double[count]);
+    const std::unique_ptr<double[]> filteredStorage(new double[count]);
+    const std::unique_ptr<double[]> scratchStorage(new double[count]);
+    const std::unique_ptr<double[]> tail(new double[count]);
+    const std::span<double> plane(planeStorage.get(), count), filtered(filteredStorage.get(), count),
+                            scratch(scratchStorage.get(), count);
     for (std::size_t c = 0; c < 3; ++c) {
-        for (std::size_t i = 0; i < plane.size(); ++i) plane[i] = correction[i][c];
-        if (!gaussianBlur(plane, filtered, scratch, width, height, sigma, filterWorkers)) return false;
-        for (std::size_t i = 0; i < plane.size(); ++i) correction[i][c] = (1.0 - tailWeight) * filtered[i];
+        if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
+            plane[i] = correction[i][c];
+        })) return false;
         for (std::size_t j = 0; j < amplitudes.size(); ++j) {
             if (!gaussianBlur(plane, filtered, scratch, width, height, ratios[j] * decay, filterWorkers)) return false;
-            for (std::size_t i = 0; i < plane.size(); ++i) {
+            if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
                 const double value = amplitudes[j] * filtered[i];
                 tail[i] = j == 0 ? value : tail[i] + value;
-            }
+            })) return false;
         }
-        for (std::size_t i = 0; i < plane.size(); ++i) {
-            correction[i][c] = exposure[i][c] - (correction[i][c] + tail[i] * tailWeight);
-        }
+        if (!gaussianBlur(plane, filtered, scratch, width, height, sigma, filterWorkers)) return false;
+        if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
+            const double core = (1.0 - tailWeight) * filtered[i];
+            correction[i][c] = exposure[i][c] - (core + tail[i] * tailWeight);
+        })) return false;
     }
     return true;
 }
@@ -83,7 +93,12 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
                             Triplet gamma, EmulsionType type, const DirCouplers& dir, std::size_t filterWorkers) {
     if (!width || !height || width > exposure.size() / height || width * height != exposure.size() ||
         density.size() != exposure.size() || exposure.data() == density.data()) return false;
-    if (!dir.active) return prepareInitialFilmDevelopment(axis, stock, gamma).develop(exposure, density);
+    if (!dir.active) {
+        const auto curve = prepareInitialFilmDevelopment(axis, stock, gamma);
+        return parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
+            return curve.develop(exposure.subspan(begin, count), density.subspan(begin, count));
+        });
+    }
     if (!std::isfinite(dir.diffusionUm) || (dir.diffusionUm > 0.0 &&
         (!(pixelSizeUm > 0.0) || !std::isfinite(pixelSizeUm) || !std::isfinite(dir.tailUm) ||
          !std::isfinite(dir.tailWeight)))) return false;
@@ -102,17 +117,25 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
     }
     const DensityCurve initial(axis, normalized, gamma);
     const auto beforeDir = preInhibitionCurve(axis, normalized, maximum, gamma, type, dir);
-    if (!initial.develop(exposure, density)) return false;
-    for (auto& pixel : density) pixel = inhibitors(pixel, maximum, type, dir.inhibition);
-    if (dir.diffusionUm > 0.0) {
-        if (!diffuse(exposure, density, width, height, dir.diffusionUm / pixelSizeUm,
-                     dir.tailUm / pixelSizeUm, dir.tailWeight, filterWorkers)) return false;
-    } else {
-        for (std::size_t i = 0; i < density.size(); ++i) {
-            for (std::size_t c = 0; c < 3; ++c) density[i][c] = exposure[i][c] - density[i][c];
+    const bool spread = dir.diffusionUm > 0.0;
+    if (!parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
+        const auto input = exposure.subspan(begin, count);
+        const auto output = density.subspan(begin, count);
+        if (!initial.develop(input, output)) return false;
+        for (std::size_t i = 0; i < output.size(); ++i) {
+            output[i] = inhibitors(output[i], maximum, type, dir.inhibition);
+            if (!spread) {
+                for (std::size_t c = 0; c < 3; ++c) output[i][c] = input[i][c] - output[i][c];
+            }
         }
-    }
-    return beforeDir.develop(density, density);
+        return true;
+    })) return false;
+    if (spread && !diffuse(exposure, density, width, height, dir.diffusionUm / pixelSizeUm,
+                           dir.tailUm / pixelSizeUm, dir.tailWeight, filterWorkers)) return false;
+    return parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
+        const auto part = density.subspan(begin, count);
+        return beforeDir.develop(part, part);
+    });
 }
 
 }  // namespace filmkit::spektrafilm

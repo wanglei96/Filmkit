@@ -1,29 +1,13 @@
 #include "Render.h"
 #include "OutputGamut.h"
+#include "ParallelPixels.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <future>
+#include <memory>
 
 namespace filmkit::spektrafilm {
-namespace {
-
-template <class Function>
-bool parallelPixels(std::size_t pixels, std::size_t workers, Function operation) {
-    workers = std::min(workers, pixels);
-    const auto run = [&](std::size_t worker) {
-        const auto begin = pixels * worker / workers;
-        return operation(begin, pixels * (worker + 1) / workers - begin);
-    };
-    std::array<std::future<bool>, 7> pending;
-    for (std::size_t i = 1; i < workers; ++i) pending[i - 1] = std::async(std::launch::async, run, i);
-    bool ok = run(0);
-    for (std::size_t i = 1; i < workers; ++i) ok = pending[i - 1].get() && ok;
-    return ok;
-}
-
-}  // namespace
 
 bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::size_t height,
                          const NegativeRenderParams& p, SpectralBackend backend,
@@ -47,8 +31,8 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
     const auto pixels = [&] { return std::span<Triplet>(image); };
     auto enlarger = p.enlarger;
     if (!p.directScan && p.compensatePrintExposure) {
-        // Original FilmingStage's unboosted, unblurred, simple-development
-        // midgray reference, recomputed at this capture's actual exposure.
+        // Match the recipe's unboosted, unblurred midgray reference. Scene
+        // exposure correction must not be compensated away by the enlarger.
         std::array<Triplet, 1> reference{{p.midgrayRaw}};
         for (auto& v : reference[0]) v = std::log10(std::fmax(v * std::exp2(p.exposureEv), 0.0) + 1e-10);
         const DensityCurve curve(p.filmAxis, p.filmStock, p.filmGamma);
@@ -64,7 +48,7 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
             return projectHanatosRaw(part, part, p.xyzFromRgb, p.response, p.responseSide);
         })) return false;
     mark(t.hanatos);
-    if (!boostFilmRaw(image, p.exposureEv, p.boost) ||
+    if (!boostFilmRaw(image, p.exposureEv + p.captureExposureEv, p.boost) ||
         !finishFilmLogExposure(image, width, height, p.pixelUm, p.lensBlurUm,
                                p.halation, p.exposureCorrection, workers.filters)) return false;
     mark(t.filmExposure);
@@ -74,10 +58,12 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
                                 p.filmType, p.dir, workers.filters)) return false;
     image.swap(work);
     mark(t.dir);
-    if (!applyFilmGrain(image, work, width, height, p.pixelUm, p.grainTotal, p.grainLayers,
-                        p.filmType, p.grain, grainSeed, grainReplay,
-                        &t.grainParts, workers.grain, workers.filters)) return false;
-    image.swap(work);
+    if (p.grain.active) {
+        if (!applyFilmGrain(image, work, width, height, p.pixelUm, p.grainTotal, p.grainLayers,
+                            p.filmType, p.grain, grainSeed, grainReplay,
+                            &t.grainParts, workers.grain, workers.filters)) return false;
+        image.swap(work);
+    }
     std::vector<Triplet>().swap(work);
     mark(t.grain);
     if (!p.directScan) {
@@ -93,24 +79,27 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
     }
     if (!parallelPixels(image.size(), workers.pixels, [&](auto begin, auto count) {
             const auto part = pixels().subspan(begin, count);
-            return projectLogSpectral(p.scanner, part, part, backend);
+            return projectSpectralLight(p.scanner, part, part, backend);
         })) return false;
     mark(t.scanSpectral);
     if (!finishPaperScanXYZ(p.scanner, image, width, height, p.references, p.glare,
-                            glareSeed, glareReplay, workers.filters)) return false;
+                            glareSeed, glareReplay, workers.filters, workers.pixels)) return false;
     mark(t.scanGlare);
     Triplet white{};
     for (const auto& band : p.scanner.bands) {
         for (std::size_t c = 0; c < 3; ++c) white[c] += band.illuminant * band.response[c];
     }
     for (auto& value : white) value /= p.scanner.normalizer;
-    std::vector<double> plane(image.size()), filtered(image.size()), scratch(image.size());
-    if (!finishScanSrgb(image, width, height, white, p.scanLensBlur, p.unsharpSigma,
-                        p.unsharpAmount, true, plane, filtered, scratch, workers.output, workers.filters)) return false;
-    // Include final work-buffer release in the measured render time.
-    std::vector<double>().swap(plane);
-    std::vector<double>().swap(filtered);
-    std::vector<double>().swap(scratch);
+    {
+        // Scan filtering overwrites all used work planes, so no clearing pass is needed.
+        const auto n = image.size();
+        const std::unique_ptr<double[]> plane(new double[n]);
+        const std::unique_ptr<double[]> filtered(new double[n]);
+        const std::unique_ptr<double[]> scratch(new double[n]);
+        if (!finishScanSrgb(image, width, height, white, p.scanLensBlur, p.unsharpSigma,
+                            p.unsharpAmount, true, {plane.get(), n}, {filtered.get(), n},
+                            {scratch.get(), n}, workers.output, workers.filters)) return false;
+    }
     mark(t.scanOutput);
     t.total = std::chrono::duration<double>(Clock::now() - start).count();
     if (timings) *timings = t;

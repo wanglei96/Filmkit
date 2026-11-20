@@ -1,13 +1,21 @@
 #include "OutputGamut.h"
+#include "ParallelPixels.h"
 #include "SpatialFilter.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <numbers>
-#include <thread>
+
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+#include <arm_neon.h>
+extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_pow(float64x2_t, float64x2_t);
+extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_atan2(float64x2_t, float64x2_t);
+extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_hypot(float64x2_t, float64x2_t);
+extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2v_log1p(float64x2_t);
+extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2v_expm1(float64x2_t);
+#endif
 
 namespace filmkit::spektrafilm {
 namespace {
@@ -80,10 +88,11 @@ bool finite(Triplet value) {
 struct ViewingState {
     Triplet adaptation;
     double fL;
-    double n;
     double nbb;
     double z;
     double aw;
+    double chromaScale;
+    double colorfulnessScale;
 };
 
 ViewingState prepareViewingState() {
@@ -107,8 +116,8 @@ ViewingState prepareViewingState() {
     const double n = kBackground / 100.0;
     const double nbb = 0.725 * std::pow(1.0 / n, 0.2);
     const double z = 1.48 + std::sqrt(n);
-    return {adaptation, fL, n, nbb, z,
-            achromatic(adaptedWhite, nbb)};
+    return {adaptation, fL, nbb, z, achromatic(adaptedWhite, nbb),
+            std::pow(1.64 - std::pow(0.29, n), 0.73), std::pow(fL, 0.25)};
 }
 
 const ViewingState kViewing = prepareViewingState();
@@ -174,11 +183,29 @@ double reinhardKnee(double distance, double threshold, double limit,
     if (distance <= threshold) return distance;
     const double scale = limit - threshold;
     const double x = (distance - threshold) / scale;
+    const double squared = x * x;
+    const double powered = power == 6.0 ? (squared * squared) * squared : std::pow(x, power);
     return threshold +
-           scale * x / std::pow(1.0 + std::pow(x, power), 1.0 / power);
+           scale * x / std::pow(1.0 + powered, 1.0 / power);
 }
 
-bool xyzToCam16Ucs(Triplet xyz, Triplet& jab) noexcept {
+namespace {
+
+struct Cam16Hue {
+    double angle, sinH, cosH, eccentricity;
+};
+
+Cam16Hue hueFromAngle(double hue) {
+    return {hue, std::sin(hue), std::cos(hue), 0.25 * (std::cos(hue + 2.0) + 3.8)};
+}
+
+struct Cam16Polar {
+    double lightness, chroma;
+    Cam16Hue hue;
+    double achromaticResponse = 0.0;
+};
+
+bool xyzToCam16Polar(Triplet xyz, Cam16Polar& jch, bool reuseDirection = false) noexcept {
     if (!finite(xyz)) return false;
     const auto& state = kViewing;
     for (double& channel : xyz) channel *= 100.0;
@@ -191,48 +218,49 @@ bool xyzToCam16Ucs(Triplet xyz, Triplet& jab) noexcept {
     const double b = (adapted[0] + adapted[1] - 2.0 * adapted[2]) / 9.0;
     double hue = std::atan2(b, a);
     if (hue < 0.0) hue += 2.0 * std::numbers::pi;
-    const double eccentricity = 0.25 * (std::cos(hue + 2.0) + 3.8);
+    const double radius = std::hypot(a, b);
+    Cam16Hue direction;
+    if (reuseDirection && radius > 1e-12) {
+        const double sinH = b / radius, cosH = a / radius;
+        // cos(h + 2) via the normalized opponent coordinates. Both CAM16
+        // transforms use the same eccentricity and hue direction.
+        static const double cos2 = std::cos(2.0), sin2 = std::sin(2.0);
+        direction = {hue, sinH, cosH, 0.25 * (cosH * cos2 - sinH * sin2 + 3.8)};
+    } else {
+        direction = hueFromAngle(hue);
+    }
     const double A = achromatic(adapted, state.nbb);
     const double J = 100.0 * signedPower(A / state.aw, kSurroundC * state.z);
     const double denominator = adapted[0] + adapted[1] + 21.0 * adapted[2] / 20.0;
     const double t = denominator == 0.0
                          ? 0.0
-                         : (50000.0 / 13.0) * kSurroundNc * state.nbb * eccentricity *
-                               std::hypot(a, b) / denominator;
-    const double C = signedPower(t, 0.9) * signedPower(J / 100.0, 0.5) *
-                     std::pow(1.64 - std::pow(0.29, state.n), 0.73);
-    const double M = C * std::pow(state.fL, 0.25);
+                         : (50000.0 / 13.0) * kSurroundNc * state.nbb * direction.eccentricity *
+                               radius / denominator;
+    const double C = signedPower(t, 0.9) * std::copysign(std::sqrt(std::abs(J / 100.0)), J) * state.chromaScale;
+    const double M = C * state.colorfulnessScale;
     const double Jp = (1.0 + 100.0 * kUcsC1) * J / (1.0 + kUcsC1 * J);
     const double Mp = std::log1p(kUcsC2 * M) / kUcsC2;
-    jab = {Jp, Mp * std::cos(hue), Mp * std::sin(hue)};
-    return finite(jab);
+    jch = {Jp, Mp, direction, A};
+    return std::isfinite(Jp) && std::isfinite(Mp) && std::isfinite(hue);
 }
 
-bool cam16UcsToXyz(Triplet jab, Triplet& xyz) noexcept {
-    if (!finite(jab)) return false;
+bool cam16PolarToXyz(Cam16Polar jch, Triplet& xyz, bool preserveAchromatic = false) noexcept {
     const auto& state = kViewing;
-    const double Jp = jab[0];
+    const double Jp = jch.lightness;
     const double J = -Jp / (kUcsC1 * Jp - 1.0 - 100.0 * kUcsC1);
-    const double ap = jab[1];
-    const double bp = jab[2];
-    const double Mp = std::hypot(ap, bp);
-    const double M = std::expm1(kUcsC2 * Mp) / kUcsC2;
-    double hue = std::atan2(bp, ap);
-    if (hue < 0.0) hue += 2.0 * std::numbers::pi;
-    const double C = M / std::pow(state.fL, 0.25);
+    const double M = std::expm1(kUcsC2 * jch.chroma) / kUcsC2;
+    const double C = M / state.colorfulnessScale;
     const double jSafe = std::max(J, std::numeric_limits<double>::epsilon());
-    const double t = std::pow(C / (std::sqrt(jSafe / 100.0) *
-                                   std::pow(1.64 - std::pow(0.29, state.n), 0.73)),
-                              1.0 / 0.9);
-    const double A = state.aw * signedPower(J / 100.0, 1.0 / (kSurroundC * state.z));
+    const double t = std::pow(C / (std::sqrt(jSafe / 100.0) * state.chromaScale), 1.0 / 0.9);
+    const double A = preserveAchromatic ? jch.achromaticResponse
+        : state.aw * signedPower(J / 100.0, 1.0 / (kSurroundC * state.z));
     const double p2 = A / state.nbb + 0.305;
     constexpr double p3 = 21.0 / 20.0;
-    const double sinH = std::sin(hue);
-    const double cosH = std::cos(hue);
+    const double sinH = jch.hue.sinH, cosH = jch.hue.cosH;
     const double n = p2 * (2.0 + p3) * (460.0 / 1403.0);
     double a = 0.0, b = 0.0;
     const double p1 = t == 0.0 ? 0.0 : (50000.0 / 13.0) * kSurroundNc * state.nbb *
-                      (0.25 * (std::cos(hue + 2.0) + 3.8)) / t;
+                      jch.hue.eccentricity / t;
     if (t != 0.0 && std::abs(sinH) >= std::abs(cosH)) {
         const double p4 = p1 / sinH;
         b = n / (p4 + (2.0 + p3) * (220.0 / 1403.0) * cosH / sinH -
@@ -258,22 +286,58 @@ bool cam16UcsToXyz(Triplet jab, Triplet& xyz) noexcept {
     return finite(xyz);
 }
 
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+#include "OutputGamutNeon.inc"
+#endif
+
+}  // namespace
+
+bool xyzToCam16Ucs(Triplet xyz, Triplet& jab) noexcept {
+    Cam16Polar jch;
+    if (!xyzToCam16Polar(xyz, jch)) return false;
+    jab = {jch.lightness, jch.chroma * jch.hue.cosH, jch.chroma * jch.hue.sinH};
+    return finite(jab);
+}
+
+bool cam16UcsToXyz(Triplet jab, Triplet& xyz) noexcept {
+    if (!finite(jab)) return false;
+    double hue = std::atan2(jab[2], jab[1]);
+    if (hue < 0.0) hue += 2.0 * std::numbers::pi;
+    return cam16PolarToXyz({jab[0], std::hypot(jab[1], jab[2]), hueFromAngle(hue)}, xyz);
+}
+
 bool compressSrgbCam16Ucs(Triplet linearRgb, Triplet& compressedRgb) noexcept {
     if (!finite(linearRgb)) return false;
-    Triplet jab{};
-    if (!xyzToCam16Ucs(multiply(kSrgbToXyz, linearRgb), jab)) return false;
+    Cam16Polar jch;
+    if (!xyzToCam16Polar(multiply(kSrgbToXyz, linearRgb), jch, true)) return false;
 
-    const double Jp = reinhardKnee(jab[0] / 100.0, 0.7, 1.0, 2.2) * 100.0;
-    const double Cp = std::hypot(jab[1], jab[2]);
-    const double hp = std::atan2(jab[2], jab[1]);
+    const double normalizedLightness = jch.lightness / 100.0;
+    const double Jp = reinhardKnee(normalizedLightness, 0.7, 1.0, 2.2) * 100.0;
+    const bool positiveChroma = jch.chroma > 0.0;
+    double Cp = jch.chroma;
+    double hp = jch.hue.angle;
+    if (hp > std::numbers::pi) hp -= 2.0 * std::numbers::pi;
+    if (!positiveChroma) {
+        // Keep the original hue convention for negative chroma and signed zeros.
+        const double a = jch.chroma * std::cos(jch.hue.angle);
+        const double b = jch.chroma * std::sin(jch.hue.angle);
+        Cp = std::hypot(a, b);
+        hp = std::atan2(b, a);
+    }
     const double CpMax = lookupPreparedGamut(kSrgbCam16Gamut, Jp, hp);
     const double safeMax = std::max(CpMax, 1e-9);
     const double normalized = Cp / safeMax;
     const double compressedChroma = reinhardKnee(normalized, 0.0, 1.0, 6.0) * safeMax;
-    const Triplet mappedJab{Jp, compressedChroma * std::cos(hp),
-                           compressedChroma * std::sin(hp)};
     Triplet xyz{};
-    if (!cam16UcsToXyz(mappedJab, xyz)) return false;
+    // Compression changes lightness and chroma, but not hue. Stay in polar
+    // coordinates instead of repeatedly recovering them from Cartesian UCS.
+    if (positiveChroma) {
+        // When the lightness knee is inactive, inverse J is the original A.
+        const bool preserveAchromatic = normalizedLightness >= 0.0 && normalizedLightness <= 0.7;
+        if (!cam16PolarToXyz({Jp, compressedChroma, jch.hue, jch.achromaticResponse},
+                             xyz, preserveAchromatic)) return false;
+    } else if (!cam16UcsToXyz({Jp, compressedChroma * std::cos(hp),
+                              compressedChroma * std::sin(hp)}, xyz)) return false;
     compressedRgb = multiply(kXyzToSrgb, xyz);
     return finite(compressedRgb);
 }
@@ -318,62 +382,58 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
 
     if (workerCount == 0) return false;
     workerCount = std::min<std::size_t>({workerCount, 8, xyz.size()});
-    std::atomic<bool> validPixels{true};
-    const auto mapRange = [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) {
-            Triplet& value = xyz[i];
-            if (!finite(value)) {
-                validPixels.store(false, std::memory_order_relaxed);
-                continue;
-            }
+    if (!parallelPixels(xyz.size(), workerCount, [&](std::size_t begin, std::size_t count) {
+        const auto adapt = [&](Triplet value) {
             Triplet cone = multiply(cat02, value);
             for (std::size_t c = 0; c < 3; ++c) cone[c] *= adaptation[c];
-            Triplet linearRgb = multiply(kXyzToSrgb, multiply(cat02Inverse, cone));
+            return multiply(kXyzToSrgb, multiply(cat02Inverse, cone));
+        };
+        auto i = begin;
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+        for (; begin + count - i >= 2; i += 2) {
+            if (!compressSrgbCam16UcsPair(adapt(xyz[i]), adapt(xyz[i + 1]), xyz[i], xyz[i + 1])) return false;
+        }
+#endif
+        for (; i < begin + count; ++i) {
+            Triplet& value = xyz[i];
+            if (!finite(value)) return false;
             Triplet compressed{};
-            if (!compressSrgbCam16Ucs(linearRgb, compressed)) {
-                validPixels.store(false, std::memory_order_relaxed);
-                continue;
-            }
+            if (!compressSrgbCam16Ucs(adapt(value), compressed)) return false;
             value = compressed;
         }
-    };
-    if (workerCount == 1) {
-        mapRange(0, xyz.size());
-    } else {
-        std::array<std::thread, 7> threads;
-        std::size_t started = 0;
-        try {
-            for (std::size_t worker = 1; worker < workerCount; ++worker) {
-                const std::size_t begin = xyz.size() * worker / workerCount;
-                const std::size_t end = xyz.size() * (worker + 1) / workerCount;
-                threads[started] = std::thread(mapRange, begin, end);
-                ++started;
-            }
-        } catch (...) {
-            for (std::size_t i = 0; i < started; ++i) threads[i].join();
-            return false;
-        }
-        mapRange(0, xyz.size() / workerCount);
-        for (std::size_t i = 0; i < started; ++i) threads[i].join();
-    }
-    if (!validPixels.load(std::memory_order_relaxed)) return false;
+        return true;
+    })) return false;
 
-    for (std::size_t channel = 0; channel < 3; ++channel) {
-        for (std::size_t i = 0; i < xyz.size(); ++i) plane[i] = xyz[i][channel];
-        if (lensBlurSigma > 0.0) {
-            if (!gaussianBlur(plane, filtered, scratch, width, height, lensBlurSigma, filterWorkers)) return false;
-            for (std::size_t i = 0; i < xyz.size(); ++i) xyz[i][channel] = filtered[i];
-        }
-        if (unsharpSigma > 0.0 && unsharpAmount > 0.0) {
-            for (std::size_t i = 0; i < xyz.size(); ++i) plane[i] = xyz[i][channel];
-            if (!gaussianBlur(plane, filtered, scratch, width, height, unsharpSigma, filterWorkers)) return false;
-            for (std::size_t i = 0; i < xyz.size(); ++i) {
-                xyz[i][channel] = plane[i] + unsharpAmount * (plane[i] - filtered[i]);
+    const bool blur = lensBlurSigma > 0.0;
+    const bool sharpen = unsharpSigma > 0.0 && unsharpAmount > 0.0;
+    if (blur || sharpen) {
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            if (!parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
+                for (std::size_t i = begin; i < begin + count; ++i) plane[i] = xyz[i][channel];
+                return true;
+            })) return false;
+            if (blur) {
+                if (!gaussianBlur(plane, filtered, scratch, width, height, lensBlurSigma, filterWorkers)) return false;
+                std::swap(plane, filtered);
             }
+            if (sharpen) {
+                if (!gaussianBlur(plane, filtered, scratch, width, height, unsharpSigma, filterWorkers)) return false;
+            }
+            if (!parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
+                if (sharpen) {
+                    for (std::size_t i = begin; i < begin + count; ++i) {
+                        xyz[i][channel] = plane[i] + unsharpAmount * (plane[i] - filtered[i]);
+                    }
+                } else {
+                    for (std::size_t i = begin; i < begin + count; ++i) xyz[i][channel] = plane[i];
+                }
+                return true;
+            })) return false;
         }
     }
-    if (encodeSrgb) {
-        for (Triplet& rgb : xyz) {
+    if (!encodeSrgb) return true;
+    return parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
+        for (Triplet& rgb : xyz.subspan(begin, count)) {
             // The published rounded matrices are not exact inverses.
             rgb = multiply(kXyzToSrgb, multiply(kSrgbToXyz, rgb));
             for (double& value : rgb) {
@@ -382,8 +442,8 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
                             : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
             }
         }
-    }
-    return true;
+        return true;
+    });
 }
 
 }  // namespace filmkit::spektrafilm

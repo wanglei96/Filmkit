@@ -111,14 +111,16 @@ int main(int argc, char** argv) {
             if (!developPaper(work, curve)) return 2;
             read(in, expected);
             const double cmyError = compare(work, expected);
-            if (!projectLogSpectral(scanner, work, work, backend)) return 2;
+            if (!projectSpectralLight(scanner, work, work, backend)) return 2;
             read(in, expected);
+            const auto linearXyz = work;
+            for (auto& pixel : work) for (auto& value : pixel) value = std::log10(value);
             const double scanError = compare(work, expected);
-            const auto logXyz = work;
+            work = linearXyz;
             if (!finishPaperScanXYZ(scanner, work, width, height, refs, glareParams, 64, glareField)) return 2;
             read(in, expected);
             const double xyzError = compare(work, expected);
-            work = logXyz;
+            work = linearXyz;
             if (!finishPaperScanSrgb(scanner, work, width, height, refs, glareParams, 64,
                                      data[20], data[21], data[22], plane, filtered, scratch, glareField)) return 2;
             read(in, expected);

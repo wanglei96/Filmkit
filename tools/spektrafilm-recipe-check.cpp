@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 using namespace filmkit::spektrafilm;
 
@@ -17,7 +18,7 @@ std::vector<std::byte> read(const char* path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 6 && argc != 7) return 2;
+    if (argc < 6 || argc > 8) return 2;
     try {
         const auto bytes = read(argv[1]), table = read(argv[2]);
         std::string error;
@@ -31,6 +32,9 @@ int main(int argc, char** argv) {
         auto invalid = options; invalid[1] = .5;
         if (applyRenderOptions(p, invalid)) throw std::runtime_error("invalid options accepted");
         p.exposureEv = std::stod(argv[4]);
+        const bool neutral = argc >= 7 && std::string_view(argv[6]) == "neutral";
+        if (argc >= 7 && !neutral && std::string_view(argv[6]) != "image") return 2;
+        if (argc == 8) p.captureExposureEv = std::stod(argv[7]);
         p.pixelUm /= 4080;
         p.glare.roughness = 0;
         const auto backend = hasSpectralBackend(SpectralBackend::AdvSimd)
@@ -40,7 +44,7 @@ int main(int argc, char** argv) {
         for (std::size_t y = 0; y < h; ++y) for (std::size_t x = 0; x < w; ++x) {
             image[y * w + x] = {double(x) / 8, double(y) / 6, double((x * 7 + y * 3) % 23) / 11};
         }
-        if (argc == 7) {
+        if (neutral) {
             image.resize(65);
             if (!negativeNeutralResponse(p, backend, image)) throw std::runtime_error("HDR reference failed");
         } else if (!renderNegativeSrgb(image, w, h, p, backend, {4, 4, 4, 2}, 63, 64))

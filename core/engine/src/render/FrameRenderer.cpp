@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -22,6 +23,7 @@
 #include "../log/Logger.h"
 #include "../film/EngineRegistry.h"
 #include "../film/SigmoidParams.h"
+#include "../film/spektrafilm/ParallelPixels.h"
 #include "../film/spektrafilm/Profile.h"
 #include "Align.h"
 #include "HighlightGeometry.h"
@@ -15418,7 +15420,7 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
   try {
     auto params = *stored;
     params.pixelUm /= std::max(c.dst_w, c.dst_h);
-    params.exposureEv += c.p->exposure_ev;
+    params.captureExposureEv = c.p->exposure_ev;
     const int w = c.dst_w, h = c.dst_h;
     std::vector<Triplet> image(static_cast<std::size_t>(w) * h);
     struct ReadbackState {
@@ -15463,18 +15465,40 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
     ok = ok && glGetError() == GL_NO_ERROR && (format == GL_RGBA16F || format == GL_RGBA32F);
     {
-      constexpr int rows = 128;
-      std::vector<unsigned short> half(format == GL_RGBA16F ? static_cast<std::size_t>(w) * rows * 4 : 0);
-      std::vector<float> full(format == GL_RGBA32F ? static_cast<std::size_t>(w) * rows * 4 : 0);
+      constexpr int rows = 512;
+      const std::size_t capacity = static_cast<std::size_t>(w) * std::min(rows, h) * 4;
+      const bool isHalf = format == GL_RGBA16F;
+      const auto half = isHalf && ok ? std::make_unique_for_overwrite<unsigned short[]>(capacity) : nullptr;
+      const auto full = !isHalf && ok ? std::make_unique_for_overwrite<float[]>(capacity) : nullptr;
+      const auto convert = [&](const auto* src, auto decode, int y, int count) {
+        auto* dst = image.data() + static_cast<std::size_t>(y) * w;
+        return parallelPixels(static_cast<std::size_t>(count) * w, 4, [&](auto begin, auto n) {
+          for (std::size_t i = begin; i < begin + n; ++i) {
+            for (int ch = 0; ch < 3; ++ch) {
+              const float v = decode(src[i * 4 + ch]);
+              if (!std::isfinite(v)) return false;
+              dst[i][ch] = v;
+            }
+          }
+          return true;
+        });
+      };
       for (int y = 0; ok && y < h; y += rows) {
         const int count = std::min(rows, h - y);
-        glReadPixels(0, y, w, count, GL_RGBA, format == GL_RGBA16F ? GL_HALF_FLOAT : GL_FLOAT,
-                     format == GL_RGBA16F ? static_cast<void*>(half.data()) : static_cast<void*>(full.data()));
+        glReadPixels(0, y, w, count, GL_RGBA, isHalf ? GL_HALF_FLOAT : GL_FLOAT,
+                     isHalf ? static_cast<void*>(half.get()) : static_cast<void*>(full.get()));
         ok = glGetError() == GL_NO_ERROR;
-        for (int i = 0; ok && i < count * w; ++i) for (int channel = 0; channel < 3; ++channel) {
-          const double v = format == GL_RGBA16F ? halfToFloat(half[i * 4 + channel]) : full[i * 4 + channel];
-          if (!std::isfinite(v)) { ok = false; break; }
-          image[static_cast<std::size_t>(y) * w + i][channel] = v;
+        if (!ok) break;
+        if (isHalf) {
+          // Exact decode for every bit pattern, including the existing special values.
+          static const auto decoded = [] {
+            std::array<float, 65536> table;
+            for (std::size_t i = 0; i < table.size(); ++i) table[i] = halfToFloat(static_cast<unsigned short>(i));
+            return table;
+          }();
+          ok = convert(half.get(), [](auto v) { return decoded[v]; }, y, count);
+        } else {
+          ok = convert(full.get(), [](float v) { return v; }, y, count);
         }
       }
     }
@@ -15488,8 +15512,9 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     const auto backend = hasSpectralBackend(SpectralBackend::AdvSimd) ? SpectralBackend::AdvSimd : SpectralBackend::Scalar;
     const auto seed = c.grain_fp ^ (std::uint64_t(w) << 32) ^ std::uint64_t(h);
     RenderTimings timing;
-    if (!renderNegativeSrgb(image, w, h, params, backend, {8, 8, 8, 4}, seed,
+    if (!renderNegativeSrgb(image, w, h, params, backend, {8, 8, 8, 8}, seed,
                             seed ^ 0x9e3779b97f4a7c15ULL, &timing)) return false;
+    const auto renderEnd = Clock::now();
     out_rgba->resize(image.size() * 4);
     // Match passOutput(flip_y=true): Bitmap row zero is the scene's top row.
     // No second OETF,
@@ -15508,12 +15533,14 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       else (*out_rgba)[dst * 4 + 3] = 255;
     }
     std::vector<Triplet>().swap(image);
+    const auto rgbaEnd = Clock::now();
     // Reuse the PC display-reference solve, but never probe the composition
     // proxy shader: measure this exact spectral recipe, including its gamut.
     // Exposure is already inside the sampled response, so source stays unscaled.
     const auto hdrStart = Clock::now();
     std::vector<Triplet> response(1024);
     bool hdrOk = negativeNeutralResponse(params, backend, response);
+    const auto hdrProbeEnd = Clock::now();
     GLuint baseTex = 0;
     GLint active = 0, texture = 0, draw = 0, read = 0, unpack = 0;
     GLint alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0;
@@ -15593,22 +15620,45 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     hdr_probe_valid_ = hdrOk;
     dbg_gainmap_ok_ = hdrOk ? 1 : 0;
     if (!hdrOk) gainmap_w_ = gainmap_h_ = 0;
+    const auto hdrEnd = Clock::now();
+    const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     Logger::instance().log(hdrOk ? LogLevel::kInfo : LogLevel::kWarn, "engine", "spektrafilm.hdr_reference",
         "{\"ok\":" + std::string(hdrOk ? "true" : "false") +
         ",\"samples\":1024,\"join\":" + jnum(hdr_curve_extension_.join_input, 7) +
-        ",\"ms\":" + std::to_string(std::chrono::duration<double, std::milli>(Clock::now() - hdrStart).count()) + "}");
-    const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        ",\"probeMs\":" + std::to_string(elapsed(hdrStart, hdrProbeEnd)) +
+        ",\"gainmapMs\":" + std::to_string(elapsed(hdrProbeEnd, hdrEnd)) +
+        ",\"ms\":" + std::to_string(elapsed(hdrStart, hdrEnd)) + "}");
+    const auto branchEnd = Clock::now();
+    const char* path = params.directScan ? "positive_direct_scan" : "negative_print_scan";
     Logger::instance().log(LogLevel::kInfo, "engine", "spektrafilm.render",
-        "{\"directScan\":" + std::string(params.directScan ? "true" : "false") +
+        "{\"path\":\"" + std::string(path) + "\"" +
+        ",\"directScan\":" + std::string(params.directScan ? "true" : "false") +
         ",\"grain\":" + (params.grain.active ? "true" : "false") + ",\"w\":" + std::to_string(w) +
         ",\"h\":" + std::to_string(h) + ",\"mfnr\":" + (c.mfnr_fused ? "true" : "false") +
         ",\"bits\":" + (c.ten_bit ? "10" : "8") + ",\"backend\":\"" +
         (backend == SpectralBackend::AdvSimd ? "neon-fp64" : "scalar-fp64") + "\"" +
         ",\"readMs\":" + std::to_string(elapsed(start, readEnd)) +
-        ",\"renderMs\":" + std::to_string(timing.total * 1000) +
+        ",\"hanatosMs\":" + std::to_string(timing.hanatos * 1000) +
+        ",\"filmExposureMs\":" + std::to_string(timing.filmExposure * 1000) +
+        ",\"dirMs\":" + std::to_string(timing.dir * 1000) +
         ",\"grainMs\":" + std::to_string(timing.grain * 1000) +
-        ",\"branchMs\":" + std::to_string(elapsed(start, Clock::now())) +
-        ",\"exposureEv\":" + std::to_string(params.exposureEv) +
+        ",\"grainParticlesMs\":" + std::to_string(timing.grainParts.particlesSeconds * 1000) +
+        ",\"grainDyeCloudMs\":" + std::to_string(timing.grainParts.dyeCloudSeconds * 1000) +
+        ",\"grainFinishMs\":" + std::to_string(timing.grainParts.finishSeconds * 1000) +
+        ",\"paperExposureMs\":" + std::to_string(timing.paperExposure * 1000) +
+        ",\"paperDevelopmentMs\":" + std::to_string(timing.paperDevelopment * 1000) +
+        ",\"scanSpectralMs\":" + std::to_string(timing.scanSpectral * 1000) +
+        ",\"scanGlareMs\":" + std::to_string(timing.scanGlare * 1000) +
+        ",\"scanOutputMs\":" + std::to_string(timing.scanOutput * 1000) +
+        ",\"renderMs\":" + std::to_string(timing.total * 1000) +
+        ",\"rgbaMs\":" + std::to_string(elapsed(renderEnd, rgbaEnd)) +
+        ",\"hdrProbeMs\":" + std::to_string(elapsed(hdrStart, hdrProbeEnd)) +
+        ",\"hdrGainmapMs\":" + std::to_string(elapsed(hdrProbeEnd, hdrEnd)) +
+        ",\"hdrMs\":" + std::to_string(elapsed(hdrStart, hdrEnd)) +
+        ",\"branchMs\":" + std::to_string(elapsed(start, branchEnd)) +
+        ",\"exposureEv\":" + std::to_string(params.exposureEv + params.captureExposureEv) +
+        ",\"captureExposureEv\":" + std::to_string(params.captureExposureEv) +
+        ",\"recipeExposureEv\":" + std::to_string(params.exposureEv) +
         ",\"pixelUm\":" + std::to_string(params.pixelUm) + "}");
     return true;
   } catch (const std::exception& e) {
@@ -19498,6 +19548,54 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // HR 的 inpaint 灰块（大面积、低频）比 RCD 的彩色斑块（高频、扎眼）可接受，
   // 且灰块可以靠"饱和标记 + 条件重建"在下一轮消掉（HR 只重建短帧也没救到的像素）。
   FilmParams p_burst = p;
+  NoiseModel model;
+  if (noise_model != nullptr) {
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+      model.S[i] = noise_model[i];
+      model.O[i] = noise_model[3 + i];
+      if (!std::isfinite(model.S[i]) || !std::isfinite(model.O[i]) ||
+          model.S[i] < 0.f || model.O[i] < 0.f)
+        ok = false;
+    }
+    if (!ok) model = NoiseModel{};
+  }
+  const bool admit_short = satfix_on && frame_scale[short_idx] > 1.001f;
+  HighlightRawView short_view;
+  HighlightGuideSet guides;
+  std::string admission_error;
+  bool guides_ok = false;
+  const auto buildGuides = [&]() {
+    const auto start = std::chrono::steady_clock::now();
+    HighlightRawView base_view;
+    base_view.data = static_cast<const uint16_t*>(frames[0]);
+    base_view.width = w; base_view.height = h;
+    base_view.stride = row_strides_px[0]; base_view.white = wl;
+    base_view.cfaLut = static_cast<unsigned>(cfaLutOf(cfa));
+    short_view = base_view;
+    short_view.data = static_cast<const uint16_t*>(frames[short_idx]);
+    short_view.stride = row_strides_px[short_idx];
+    HighlightNoise base_noise, short_noise;
+    for (int phase = 0; phase < 4; ++phase) {
+      base_view.black_phase[phase] = short_view.black_phase[phase] = black_phase[phase];
+      const int color = (base_view.cfaLut >> (2 * phase)) & 3;
+      base_noise.shot[phase] = model.S[color];
+      base_noise.read[phase] = model.O[color];
+      short_noise.shot[phase] = model.S[color] * hdr_gain_4[short_idx];
+      short_noise.read[phase] = model.O[color] * hdr_gain_4[short_idx] * hdr_gain_4[short_idx];
+    }
+    guides_ok = highlightGenerateGuides(base_view, short_view,
+        {rc.gains[0], rc.gains[1], rc.gains[2]}, frame_scale[0], frame_scale[short_idx],
+        base_noise, short_noise, &guides, &admission_error);
+    return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+  };
+  std::future<float> guide_job;
+  const bool overlap_guides = admit_short && std::lround(p.engine_slot) == kSpektrafilmSlot;
+  if (overlap_guides) {
+    // Current RAW/calibration only; no GL access or dependency on temporal flow.
+    // If a worker cannot be created, run the same work at the join point.
+    guide_job = std::async(std::launch::async | std::launch::deferred, buildGuides);
+  }
   stage("pyr");
 
   // 金字塔 + readback + CPU 对齐。1/2 域尺寸 w1×h1，tile kMfnrTile → tiles。
@@ -19567,18 +19665,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // （融合后折减 ÷neff，见下）；mismatch 的噪声底 = var(ref)+var(alt)，shader
   // 内按各帧实测信号代入（不再需要 rn 归一）。rn 仅保留在日志。
   const float rn = std::max(ref_noise_scale, 1.0f);
-  NoiseModel model;
-  if (noise_model != nullptr) {
-    bool ok = true;
-    for (int i = 0; i < 3; ++i) {
-      model.S[i] = noise_model[i];
-      model.O[i] = noise_model[3 + i];
-      if (!std::isfinite(model.S[i]) || !std::isfinite(model.O[i]) ||
-          model.S[i] < 0.f || model.O[i] < 0.f)
-        ok = false;
-    }
-    if (!ok) model = NoiseModel{};
-  }
   NoiseCoef nc_single;  // 单帧系数（mismatch 用）
   denoiseParams(noise_strength, model, rc.gains, noise_sigma, &nc_single);
   const float ns_single = nc_single.ns_typ;
@@ -19587,6 +19673,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   std::vector<std::vector<float>> offs(
       static_cast<size_t>(count - 1),
       std::vector<float>(static_cast<size_t>(n_tiles) * 2, 0.f));
+  MfnrPyramid short_pyramid;
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
     capturePyr(tex_mfnr_[i - 1], &cur, frame_scale[i]);
@@ -19642,6 +19729,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     if (a.used_l1) ++align_l1_frames;
     dx_med_max = std::max(dx_med_max, a.dx_med);
     dx_p90_max = std::max(dx_p90_max, a.dx_p90);
+    if (overlap_guides && align_l1 && i == short_idx) short_pyramid = std::move(cur);
   }
   align_ms = std::chrono::duration<float, std::milli>(
                  std::chrono::steady_clock::now() - t0)
@@ -19653,26 +19741,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   highlight_merge_ready_ = false;
   highlight_short_index_ = -1;
   highlight_long_frames_ = 0;
-  if (satfix_on && frame_scale[short_idx] > 1.001f) {
-    HighlightRawView base_view;
-    base_view.data = static_cast<const uint16_t*>(frames[0]);
-    base_view.width = w; base_view.height = h;
-    base_view.stride = row_strides_px[0]; base_view.white = wl;
-    base_view.cfaLut = static_cast<unsigned>(cfaLutOf(cfa));
-    HighlightRawView short_view = base_view;
-    short_view.data = static_cast<const uint16_t*>(frames[short_idx]);
-    short_view.stride = row_strides_px[short_idx];
-    HighlightNoise base_noise, short_noise;
-    for (int phase = 0; phase < 4; ++phase) {
-      base_view.black_phase[phase] = short_view.black_phase[phase] = black_phase[phase];
-      const int color = (base_view.cfaLut >> (2 * phase)) & 3;
-      base_noise.shot[phase] = model.S[color];
-      base_noise.read[phase] = model.O[color];
-      short_noise.shot[phase] = model.S[color] * hdr_gain_4[short_idx];
-      short_noise.read[phase] = model.O[color] * hdr_gain_4[short_idx] * hdr_gain_4[short_idx];
-    }
-    HighlightGuideSet guides;
-    std::string admission_error;
+  if (admit_short) {
     const auto admission_start = std::chrono::steady_clock::now();
     auto admission_mark = admission_start;
     auto stageMs = [&]() {
@@ -19681,10 +19750,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       admission_mark = now;
       return ms;
     };
-    const bool guides_ok = highlightGenerateGuides(base_view, short_view,
-        {rc.gains[0], rc.gains[1], rc.gains[2]}, frame_scale[0], frame_scale[short_idx],
-        base_noise, short_noise, &guides, &admission_error);
-    const float guide_ms = stageMs();
+    const float guide_ms = guide_job.valid() ? guide_job.get() : buildGuides();
+    const float guide_wait_ms = stageMs();
     float pyramid_ms = 0.f, align_ms = 0.f, geometry_ms = 0.f, mask_ms = 0.f, upload_ms = 0.f;
     HighlightGeometryResult geometry;
     HighlightMaskAssessment assessment;
@@ -19709,9 +19776,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
         passMfnrPyr(raw_tex_, cfa, black_phase, wl, rc.gains, frame_scale[0]);
         readFine(&highlight_ref);
       }
-      MfnrPyramid short_pyramid;
-      capturePyr(tex_mfnr_[short_idx - 1], &short_pyramid, frame_scale[short_idx]);
-      readFine(&short_pyramid);
+      if (short_pyramid.l1.empty()) {
+        capturePyr(tex_mfnr_[short_idx - 1], &short_pyramid, frame_scale[short_idx]);
+        readFine(&short_pyramid);
+      }
       pyramid_ms = stageMs();
       auto both = highlightAlignBidirectional(highlight_ref, short_pyramid, gw, gh, true, stride);
       align_ms = stageMs();
@@ -19801,6 +19869,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
         ",\"ready\":" + std::string(highlight_merge_ready_ ? "true" : "false") +
         ",\"error\":\"" + jsonEscape(admission_error) + "\"" +
         ",\"guideMs\":" + std::to_string(guide_ms) +
+        ",\"guideWaitMs\":" + std::to_string(guide_wait_ms) +
         ",\"pyramidMs\":" + std::to_string(pyramid_ms) +
         ",\"alignMs\":" + std::to_string(align_ms) +
         ",\"geometryMs\":" + std::to_string(geometry_ms) +

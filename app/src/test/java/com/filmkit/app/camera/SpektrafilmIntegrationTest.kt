@@ -57,4 +57,38 @@ class SpektrafilmIntegrationTest {
         assertTrue(branch < chain.indexOf("passFilm(dst_w, dst_h"))
         assertTrue(chain.substring(branch, chain.indexOf("passFilm(dst_w, dst_h")).contains("return;"))
     }
+
+    @Test fun productionTimingLogKeepsPrintAndDirectScanPhasesSeparate() {
+        val src = File("../core/engine/src/render/FrameRenderer.cpp").readText()
+        val log = src.substringAfter("const char* path =")
+            .substringBefore("\"spektrafilm.render_failed\"")
+        for (field in listOf("path", "directScan", "hanatosMs", "filmExposureMs", "dirMs",
+                "grainMs", "grainParticlesMs", "grainDyeCloudMs", "grainFinishMs",
+                "paperExposureMs", "paperDevelopmentMs", "scanSpectralMs", "scanGlareMs",
+                "scanOutputMs", "renderMs", "rgbaMs", "hdrProbeMs", "hdrGainmapMs",
+                "hdrMs", "branchMs")) {
+            assertTrue("missing timing field $field", log.contains("\\\"$field\\\""))
+        }
+        assertTrue(log.contains("negative_print_scan"))
+        assertTrue(log.contains("positive_direct_scan"))
+    }
+
+    @Test fun spectralWarmupStartsAfterFirstPreviewAndYieldsToCapture() {
+        val src = File("src/main/java/com/filmkit/app/camera/CameraController.kt").readText()
+        val spectral = src.substringAfter("private fun usesSpectralStill()").substringBefore("\n\n")
+        assertTrue(spectral.contains("rawMode && EngineScope.effectiveEngineSlot("))
+        assertTrue(spectral.contains("captureEngineOverride()"))
+        val firstPreview = src.substringAfter("if (!firstFrameLogged) {").substringBefore("applyTonePref()")
+        assertTrue(firstPreview.contains("if (usesSpectralStill())"))
+        assertTrue(firstPreview.substringAfter("render.post {")
+            .contains("if (openGen == generation && usesSpectralStill()) warmupStillTargets()"))
+        val delayed = src.substringAfter("fun warmupStillEngine() {").substringBefore("\n    }")
+        assertTrue(delayed.contains("if (usesSpectralStill() ||"))
+        val warmup = src.substringAfter("private fun warmupStillTargets() {").substringBefore("\n    }")
+        assertTrue(warmup.contains("!capturing && rendersInFlight.get() == 0"))
+        assertTrue(warmup.contains("orientationStep, idle)"))
+        val client = File("src/main/java/com/filmkit/app/camera/StillRenderClient.kt").readText()
+            .substringAfter("fun warmup(").substringBefore("fun cancelWarmup(")
+        assertTrue(client.contains("if (!ready_ || !idle()) return@Runnable"))
+    }
 }

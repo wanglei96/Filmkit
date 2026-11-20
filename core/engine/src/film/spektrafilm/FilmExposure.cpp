@@ -1,9 +1,11 @@
 #include "FilmExposure.h"
+#include "ParallelPixels.h"
 #include "SpatialFilter.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace filmkit::spektrafilm {
@@ -132,7 +134,13 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
     const bool reflect = h.active && h.bounces > 0 && anyPositive(strength) && anyPositive(sigma);
     if (lensBlurUm > 0.0 || scatter || reflect) {
         const auto count = raw.size();
-        std::vector<double> input(count), output(count), scratch(count), accum(scatter || reflect ? count : 0);
+        // Input, blur work planes and the first accumulation tap are fully written on use.
+        const std::unique_ptr<double[]> inputStorage(new double[count]);
+        const std::unique_ptr<double[]> outputStorage(new double[count]);
+        const std::unique_ptr<double[]> scratchStorage(new double[count]);
+        const std::unique_ptr<double[]> accum(scatter || reflect ? new double[count] : nullptr);
+        std::span<double> input(inputStorage.get(), count), output(outputStorage.get(), count);
+        const std::span<double> scratch(scratchStorage.get(), count);
         std::vector<double> weights;
         if (reflect) {
             weights.resize(h.bounces);
@@ -146,47 +154,54 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
         }
         const auto blur = [&](double s) { return gaussianBlur(input, output, scratch, width, height, s, filterWorkers); };
         for (std::size_t c = 0; c < 3; ++c) {
-            for (std::size_t i = 0; i < count; ++i) input[i] = raw[i][c];
+            if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
+                input[i] = raw[i][c];
+            })) return false;
             if (lensBlurUm > 0.0) {
                 if (!blur(lensBlurUm / pixelUm)) return false;
-                input.swap(output);
+                std::swap(input, output);
             }
             if (scatter) {
                 constexpr std::array weights{0.1633, 0.6496, 0.1870};
                 constexpr std::array ratios{0.5360, 1.5236, 2.7684};
                 for (std::size_t k = 0; k < weights.size(); ++k) {
                     if (!blur(ratios[k] * std::max(tail[c], 1e-6))) return false;
-                    for (std::size_t i = 0; i < count; ++i) {
+                    if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                         const double tap = weights[k] * output[i];
                         accum[i] = k ? accum[i] + tap : tap;
-                    }
+                    })) return false;
                 }
                 if (!blur(std::max(core[c], 1e-6))) return false;
-                for (std::size_t i = 0; i < count; ++i) {
+                if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                     const double mixed = (1.0 - h.scatterTailWeight[c]) * output[i] + h.scatterTailWeight[c] * accum[i];
                     input[i] = (1.0 - h.scatterAmount) * input[i] + h.scatterAmount * mixed;
-                }
+                })) return false;
             }
-            if (reflect) {
+            // A zero-strength channel has no reflected contribution.
+            if (reflect && (strength[c] != 0.0 || !std::isfinite(sigma[c]))) {
                 for (std::size_t k = 0; k < weights.size(); ++k) {
                     if (!blur(std::max(sigma[c] * std::sqrt(static_cast<double>(k + 1)), 1e-6))) return false;
-                    for (std::size_t i = 0; i < count; ++i) {
+                    if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                         const double tap = weights[k] * output[i];
                         accum[i] = k ? accum[i] + tap : tap;
-                    }
+                    })) return false;
                 }
-                for (std::size_t i = 0; i < count; ++i) {
+                if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                     input[i] += strength[c] * accum[i];
                     if (h.renormalize) input[i] /= 1.0 + strength[c];
-                }
+                })) return false;
             }
-            for (std::size_t i = 0; i < count; ++i) raw[i][c] = input[i];
+            if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
+                raw[i][c] = input[i];
+            })) return false;
         }
     }
-    for (auto& pixel : raw) {
-        for (auto& value : pixel) value = std::log10(std::fmax(value * exposureCorrection, 0.0) + 1e-10);
-    }
-    return true;
+    return parallelPixels(raw.size(), filterWorkers, [&](auto begin, auto count) {
+        for (auto& pixel : raw.subspan(begin, count)) {
+            for (auto& value : pixel) value = std::log10(std::fmax(value * exposureCorrection, 0.0) + 1e-10);
+        }
+        return true;
+    });
 }
 
 }  // namespace filmkit::spektrafilm

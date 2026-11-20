@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <sys/resource.h>
 
 using namespace filmkit::spektrafilm;
@@ -62,7 +64,7 @@ std::uint64_t replay(void* ctx, std::size_t c, std::size_t layer, std::size_t pi
 int main(int argc, char** argv) {
     static_assert(std::endian::native == std::endian::little);
     static_assert(sizeof(Triplet) == 24 && sizeof(GrainLayers) == 72);
-    if (argc != 6 && argc != 7 && argc != 8) return 2;
+    if (argc < 6 || argc > 9) return 2;
     try {
         RenderWorkers workers{std::stoul(argv[2]), std::stoul(argv[3]), std::stoul(argv[4]), std::stoul(argv[5])};
         std::ifstream in(argv[1], std::ios::binary);
@@ -149,15 +151,25 @@ int main(int argc, char** argv) {
             paperAxis, paperStock, {flags[0] != 0, flags[1] != 0, s[0], s[1]});
         p.glare = {flags[2] != 0, s[3], s[4], s[5]};
         p.scanLensBlur = s[19]; p.unsharpSigma = s[20]; p.unsharpAmount = s[21];
-        if (argc == 8) {
+        if (argc >= 8) {
             std::ifstream asset(argv[7], std::ios::binary);
             const std::vector<char> bytes{std::istreambuf_iterator<char>(asset), {}};
+            std::vector<char> table;
+            if (argc == 9) {
+                std::ifstream responseFile(argv[8], std::ios::binary);
+                table.assign(std::istreambuf_iterator<char>(responseFile), {});
+            }
             std::string error;
-            auto profile = loadNegativeProfile(std::as_bytes(std::span(bytes)), &error);
+            auto profile = loadNegativeProfile(std::as_bytes(std::span(bytes)), &error,
+                                               std::as_bytes(std::span(table)));
             if (!profile) throw std::runtime_error(error);
             const double pixelUm = p.pixelUm;
             p = *profile;
             p.pixelUm = pixelUm;
+        }
+        if (const char* grain = std::getenv("FILMKIT_BENCH_GRAIN");
+            grain && std::string_view(grain) == "0") {
+            p.grain.active = false;
         }
         std::vector<Triplet> image(n), expected;
         read(in, image);
@@ -199,6 +211,7 @@ int main(int argc, char** argv) {
         const bool failed = nonfinite || !(maximum > minimum) ||
             (oracle && (error > 1e-10 || tape.failures || tape.calls != 9 * n));
         std::cout << std::setprecision(10) << "pixels=" << n << " backend=" << (backend == SpectralBackend::AdvSimd ? "neon" : "scalar")
+            << " direct=" << p.directScan << " grain_active=" << p.grain.active
             << " pixel_workers=" << workers.pixels << " grain_workers=" << workers.grain << " output_workers=" << workers.output
             << " filter_workers=" << workers.filters << " render_s=" << t.total << " hanatos_s=" << t.hanatos << " film_exposure_s=" << t.filmExposure
             << " dir_s=" << t.dir << " grain_s=" << t.grain << " grain_particles_s=" << t.grainParts.particlesSeconds

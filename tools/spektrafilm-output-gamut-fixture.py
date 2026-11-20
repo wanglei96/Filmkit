@@ -54,6 +54,9 @@ def main():
         ],
         dtype=np.float64,
     )
+    levels = np.array([0.0, 1e-10, 0.0031308, 0.025, 0.1, 0.18, 0.5, 1.0, 2.0, 4.0])
+    grid = np.stack(np.meshgrid(levels, levels, levels, indexing="ij"), axis=-1)
+    rgb = np.concatenate((rgb, grid.reshape(-1, 3)))
     spec = OutputGamutCompressSpec(algorithm="cam16ucs")
     expected = compress_rgb(rgb, spec, output_color_space="sRGB")
     with args.output.open("xb") as out:

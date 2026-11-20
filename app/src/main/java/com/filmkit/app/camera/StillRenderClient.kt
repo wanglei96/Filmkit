@@ -156,19 +156,21 @@ object StillRenderClient {
     }
 
     /** 0.13.21 预热：把大纹理与 satmask 缓冲先分配好（见 nativeStillWarmup）。
-     *  未就绪时静默跳过 —— 调用方（相机页可见 2s 后）已经先 startAsync，队列串行
+     *  未就绪时静默跳过 —— 调用方已经先 startAsync，队列串行
      *  保证 warmup 排在 start 之后。失败只记日志，不影响拍照路径。 */
-    fun warmup(w: Int, h: Int, rot: Int) {
+    fun warmup(w: Int, h: Int, rot: Int, idle: () -> Boolean) {
         if (w <= 0 || h <= 0) return
         // 不在**调用线程**上判 ready_：startAsync 只是排队，ready_ 要等 start 执行完
         // 才变 true。这里同样只排队，真正的就绪判断放到队列内（start 必然先执行）。
         val hd = handlerOrStart() ?: return
         lateinit var task: Runnable
         task = Runnable {
-            // 0.13.23：拍照入口会 cancelWarmup()；若本任务已经开始执行，说明
-            // 用户按下快门时预热已跑完（或正在跑最后几十 ms）——不再重复。
-            synchronized(this) { if (warmupTask === task) warmupTask = null }
-            if (!ready_) return@Runnable
+            synchronized(this) {
+                if (warmupTask !== task) return@Runnable
+                warmupTask = null
+            }
+            // A session callback can enqueue after shutter cancellation. Recheck at execution.
+            if (!ready_ || !idle()) return@Runnable
             val t0 = SystemClock.elapsedRealtime()
             val ok = try {
                 EngineBridge.nativeStillWarmup(w, h, rot)

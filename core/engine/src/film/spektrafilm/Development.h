@@ -18,7 +18,13 @@ public:
 
 private:
     struct Knot { double x, y, inverseNextStep; };
+    static constexpr std::size_t kSearchBins = 512;
+    struct SearchIndex {
+        std::vector<std::size_t> lower;
+        double scale = 0.0;
+    };
     std::array<std::vector<Knot>, 3> channels_;
+    std::array<SearchIndex, 3> search_;
 };
 
 struct EmulsionLayer { double center, amplitude, sigma; };

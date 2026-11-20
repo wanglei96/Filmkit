@@ -1072,9 +1072,7 @@ fun CameraScreen(
         }
     }
 
-    // 0.13.21：预热（照 PC 的 onFirstPreviewFrame + grace）。相机页可见 2s 后
-    // 异步建 still 引擎（init 135~265ms）并用真实采集尺寸预分配 2.4GB 纹理与
-    // satmask 缓冲，把第一张的冷启动从快门挪到构图时。仍线程未开启时内部直接返回。
+    // 可选独立线程沿用构图期的延迟预热；Spektrafilm 在首帧预览提交后提前排队。
     LaunchedEffect(resumed) {
         if (!resumed) return@LaunchedEffect
         delay(2000)

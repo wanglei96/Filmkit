@@ -43,18 +43,18 @@ struct PaperGlare {
     double blurPx = 0.5;
 };
 
-// Converts the scanner's log XYZ to linear XYZ, then applies the scan level
-// correction and paper glare. Replay contains unblurred percentages.
-bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> logXyz,
+// Applies the scan level correction and paper glare to linear XYZ.
+// Replay contains unblurred percentages.
+bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xyz,
                         std::size_t width, std::size_t height,
                         const PrintReferences& references, const PaperGlare& glare,
                         std::uint64_t seed, std::span<const double> replay = {},
-                        std::size_t filterWorkers = 1);
+                        std::size_t filterWorkers = 1, std::size_t pixelWorkers = 1);
 
 // Complete the original scanner output after the linear-XYZ scan correction.
 // The three scalar buffers are caller-owned, reusable pixel-sized work planes.
 bool finishPaperScanSrgb(const SpectralProjection& scanner,
-                         std::span<Triplet> logXyz,
+                         std::span<Triplet> xyz,
                          std::size_t width, std::size_t height,
                          const PrintReferences& references, const PaperGlare& glare,
                          std::uint64_t seed,

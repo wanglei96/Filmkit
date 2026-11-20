@@ -1465,8 +1465,11 @@ class CameraController(private val context: Context, private val render: RenderC
      * 传 override —— 编辑一张照片要用它**拍摄时**的引擎（照片元数据里的 `[98]`），
      * 否则编辑旧照片会因设置页开关突然变样。
      */
+    private fun captureEngineOverride(): Int =
+        appPrefs.getInt("engine_override", ENGINE_OVERRIDE_FOLLOW_PRESET)
+
     private fun engineScopedForCapture(p: DoubleArray): DoubleArray {
-        val scoped = engineScoped(p, appPrefs.getInt("engine_override", ENGINE_OVERRIDE_FOLLOW_PRESET))
+        val scoped = engineScoped(p, captureEngineOverride())
         compositionPreviewOnly = scoped.getOrElse(98) { 1.0 }.toInt() == EngineScope.SPEKTRAFILM_SLOT
         return scoped
     }
@@ -2979,16 +2982,22 @@ class CameraController(private val context: Context, private val render: RenderC
         // 在飞的合成照常跑完并落盘 —— 相机页退出不该以照片为代价。
     }
 
-    /**
-     * 0.13.21：预热 still 引擎（照 PC 的 prewarmCapturePipeline）。相机页可见后
-     * 由 CameraScreen 延迟调用：先异步建 context/program，再用当前采集尺寸分配
-     * 2.4GB 中间纹理与 satmask CPU 缓冲 —— 把第一张的冷启动成本提前到构图时。
-     * 只在用户开了独立拍照线程（still_thread）时预热；未就绪时 warmup 自行跳过。
-     */
+    private fun usesSpectralStill(): Boolean = rawMode && EngineScope.effectiveEngineSlot(
+        filmParams[98].toInt(), captureEngineOverride(),
+    ) == EngineScope.SPEKTRAFILM_SLOT
+
+    /** Delayed prewarm for the optional legacy still thread. Spectral starts after first preview. */
     fun warmupStillEngine() {
-        if (!context.getSharedPreferences("filmkit", 0).getBoolean("still_thread", false)) return
+        if (usesSpectralStill() || !appPrefs.getBoolean("still_thread", false)) return
+        warmupStillTargets()
+    }
+
+    private fun warmupStillTargets() {
+        val generation = openGen
+        val idle = { started && openGen == generation && !capturing && rendersInFlight.get() == 0 }
+        if (!idle()) return
         StillRenderClient.startAsync()
-        StillRenderClient.warmup(stillSize.width, stillSize.height, stillRot)
+        StillRenderClient.warmup(stillSize.width, stillSize.height, orientationStep, idle)
     }
 
     @SuppressLint("MissingPermission")
@@ -3247,6 +3256,13 @@ class CameraController(private val context: Context, private val render: RenderC
                                 EngineBridge.nativeAppendLog(
                                     EngineBridge.LEVEL_INFO, "camera", "camera.first_frame", "{}",
                                 )
+                                if (usesSpectralStill()) {
+                                    val generation = openGen
+                                    // Run after this frame's texture update and window submission.
+                                    render.post {
+                                        if (openGen == generation && usesSpectralStill()) warmupStillTargets()
+                                    }
+                                }
                             }
                             applyTonePref()
                             applyZebraPref()

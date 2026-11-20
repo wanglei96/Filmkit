@@ -1,12 +1,15 @@
 #include "film/spektrafilm/Development.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -66,10 +69,43 @@ DensityCurve prepare(std::istream& source, int paper, std::size_t knots, std::si
     for (auto& knot : axis) read(source, knot);
     return preparePaperDevelopment(axis, model, morph, positive ? EmulsionType::Positive : EmulsionType::Negative);
 }
+
+bool exactKnotLookup() {
+    constexpr std::array axis{-50.0, -1.0, 0.0, 0.0, 0.0, 1e-7, 2e-7, 3e-7, 50.0};
+    std::array<Triplet, axis.size()> stock{};
+    for (std::size_t i = 0; i < stock.size(); ++i) stock[i].fill(static_cast<double>(i));
+    DensityCurve curve(axis, stock);
+    const auto check = [&](double x, double expected) {
+        std::array<Triplet, 1> pixel{{{x, x, x}}};
+        return curve.develop(pixel, pixel) &&
+               std::all_of(pixel[0].begin(), pixel[0].end(), [&](double y) {
+                   return std::bit_cast<std::uint64_t>(y) == std::bit_cast<std::uint64_t>(expected);
+               });
+    };
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    if (!check(-inf, 0.0) || !check(inf, stock.back()[0])) return false;
+    for (double knot : axis) for (double x : {std::nextafter(knot, -inf), knot, std::nextafter(knot, inf)}) {
+        const auto hi = std::upper_bound(axis.begin(), axis.end(), x);
+        double expected = stock.front()[0];
+        if (hi == axis.end()) expected = stock.back()[0];
+        else if (x > axis.front()) {
+            const auto lo = static_cast<std::size_t>(hi - axis.begin() - 1);
+            const double t = (x - axis[lo]) * (1.0 / (axis[lo + 1] - axis[lo]));
+            expected = stock[lo][0] + t * (stock[lo + 1][0] - stock[lo][0]);
+        }
+        if (!check(x, expected)) return false;
+    }
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc > 2) return 2;
+    if (!exactKnotLookup()) {
+        std::cerr << "density curve knot lookup differs from upper_bound\n";
+        return 1;
+    }
+    if (argc == 1) return 0;
     try {
         std::ifstream source(argv[1]);
         std::size_t cases;

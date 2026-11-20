@@ -12,6 +12,14 @@ namespace {
 
 constexpr double kLogFloor = 1e-10;
 
+template <bool LogOutput>
+double finishLight(double v) noexcept {
+    const double light = std::fmax(v, 0.0) + kLogFloor;
+    if constexpr (LogOutput) return std::log10(light);
+    return light;
+}
+
+template <bool LogOutput>
 Triplet projectScalar(const SpectralProjection& p, const Triplet& density) noexcept {
     Triplet sum{};
     for (const auto& band : p.bands) {
@@ -24,31 +32,73 @@ Triplet projectScalar(const SpectralProjection& p, const Triplet& density) noexc
     }
     for (int k = 0; k < 3; ++k) {
         const double v = (sum[k] * p.gain[k] + p.preflash[k]) / p.normalizer;
-        sum[k] = std::log10(std::fmax(v, 0.0) + kLogFloor);
+        sum[k] = finishLight<LogOutput>(v);
     }
     return sum;
 }
 
 #if defined(FILMKIT_SPEKTRAFILM_ARM_EXP10)
-void projectPair(const SpectralProjection& p, const Triplet* density, Triplet* output) noexcept {
-    const float64x2_t c{density[0][0], density[1][0]};
-    const float64x2_t m{density[0][1], density[1][1]};
-    const float64x2_t y{density[0][2], density[1][2]};
-    std::array<float64x2_t, 3> sum{};
-    for (const auto& band : p.bands) {
-        const auto& dye = band.dyeDensity;
-        const auto d = ((c * dye[0] + m * dye[1]) + y * dye[2]) + band.baseDensity;
-        auto light = _ZGVnN2v_exp10(-d) * band.illuminant;
-        light = vbslq_f64(vceqq_f64(light, light), light, vdupq_n_f64(0.0));
-        for (int k = 0; k < 3; ++k) sum[k] += light * band.response[k];
+template <bool LogOutput, std::size_t Pairs>
+void projectBatch(const SpectralProjection& p, std::span<const SpectralBand* const> bands,
+                   const Triplet* density, Triplet* output) noexcept {
+    std::array<float64x2_t, Pairs> c, m, y;
+    std::array<std::array<float64x2_t, 3>, Pairs> sum{};
+    for (std::size_t i = 0; i < Pairs; ++i) {
+        c[i] = {density[2 * i][0], density[2 * i + 1][0]};
+        m[i] = {density[2 * i][1], density[2 * i + 1][1]};
+        y[i] = {density[2 * i][2], density[2 * i + 1][2]};
     }
-    for (int k = 0; k < 3; ++k) {
-        const auto v = (sum[k] * p.gain[k] + p.preflash[k]) / p.normalizer;
-        output[0][k] = std::log10(std::fmax(v[0], 0.0) + kLogFloor);
-        output[1][k] = std::log10(std::fmax(v[1], 0.0) + kLogFloor);
+    for (const auto* entry : bands) {
+        const auto& band = *entry;
+        const auto& dye = band.dyeDensity;
+        for (std::size_t i = 0; i < Pairs; ++i) {
+            const auto d = ((c[i] * dye[0] + m[i] * dye[1]) + y[i] * dye[2]) + band.baseDensity;
+            auto light = _ZGVnN2v_exp10(-d) * band.illuminant;
+            light = vbslq_f64(vceqq_f64(light, light), light, vdupq_n_f64(0.0));
+            for (int k = 0; k < 3; ++k) sum[i][k] += light * band.response[k];
+        }
+    }
+    for (std::size_t i = 0; i < Pairs; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            const auto v = (sum[i][k] * p.gain[k] + p.preflash[k]) / p.normalizer;
+            output[2 * i][k] = finishLight<LogOutput>(v[0]);
+            output[2 * i + 1][k] = finishLight<LogOutput>(v[1]);
+        }
     }
 }
 #endif
+
+template <bool LogOutput>
+bool project(const SpectralProjection& projection, std::span<const Triplet> density,
+             std::span<Triplet> output, SpectralBackend backend) noexcept {
+    if (density.size() != output.size() || !hasSpectralBackend(backend)) return false;
+    std::size_t i = 0;
+#if defined(FILMKIT_SPEKTRAFILM_ARM_EXP10)
+    if (backend == SpectralBackend::AdvSimd) {
+        std::array<const SpectralBand*, 81> contributing;
+        std::size_t count = 0;
+        for (const auto& p : projection.bands) {
+            const bool zeroLight = p.illuminant == 0.0 || std::isnan(p.illuminant) ||
+                std::isnan(p.baseDensity) || std::isnan(p.dyeDensity[0]) ||
+                std::isnan(p.dyeDensity[1]) || std::isnan(p.dyeDensity[2]);
+            // Zero light with finite response contributes only signed zero.
+            // Keep nonfinite responses and the order of every other addition.
+            if (zeroLight && std::isfinite(p.response[0]) && std::isfinite(p.response[1]) &&
+                std::isfinite(p.response[2])) continue;
+            contributing[count++] = &p;
+        }
+        const std::span<const SpectralBand* const> bands(contributing.data(), count);
+        for (; density.size() - i >= 4; i += 4) {
+            projectBatch<LogOutput, 2>(projection, bands, density.data() + i, output.data() + i);
+        }
+        for (; density.size() - i >= 2; i += 2) {
+            projectBatch<LogOutput, 1>(projection, bands, density.data() + i, output.data() + i);
+        }
+    }
+#endif
+    for (; i < density.size(); ++i) output[i] = projectScalar<LogOutput>(projection, density[i]);
+    return true;
+}
 
 }  // namespace
 
@@ -60,21 +110,14 @@ bool hasSpectralBackend(SpectralBackend backend) noexcept {
     return false;
 }
 
-bool projectLogSpectral(const SpectralProjection& projection,
-                        std::span<const Triplet> density,
-                        std::span<Triplet> output,
-                        SpectralBackend backend) noexcept {
-    if (density.size() != output.size() || !hasSpectralBackend(backend)) return false;
-    std::size_t i = 0;
-#if defined(FILMKIT_SPEKTRAFILM_ARM_EXP10)
-    if (backend == SpectralBackend::AdvSimd) {
-        for (; density.size() - i >= 2; i += 2) {
-            projectPair(projection, density.data() + i, output.data() + i);
-        }
-    }
-#endif
-    for (; i < density.size(); ++i) output[i] = projectScalar(projection, density[i]);
-    return true;
+bool projectLogSpectral(const SpectralProjection& projection, std::span<const Triplet> density,
+                        std::span<Triplet> output, SpectralBackend backend) noexcept {
+    return project<true>(projection, density, output, backend);
+}
+
+bool projectSpectralLight(const SpectralProjection& projection, std::span<const Triplet> density,
+                          std::span<Triplet> output, SpectralBackend backend) noexcept {
+    return project<false>(projection, density, output, backend);
 }
 
 }  // namespace filmkit::spektrafilm
