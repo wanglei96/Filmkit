@@ -23,6 +23,7 @@ import android.view.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.exifinterface.media.ExifInterface
 import com.filmkit.app.hdr.HdrDelivery
 import com.filmkit.app.hdr.PlatformGainmapWriter
 import com.filmkit.app.EngineBridge
@@ -2997,7 +2998,10 @@ class CameraController(private val context: Context, private val render: RenderC
         val idle = { started && openGen == generation && !capturing && rendersInFlight.get() == 0 }
         if (!idle()) return
         StillRenderClient.startAsync()
-        StillRenderClient.warmup(stillSize.width, stillSize.height, orientationStep, idle)
+        val spectral = usesSpectralStill()
+        val pc3d = !spectral || filmParams[54] > 0.5
+        val prefilter = !spectral || filmParams[59] > 0.5 || filmParams[104] > 0.5
+        StillRenderClient.warmup(stillSize.width, stillSize.height, orientationStep, pc3d, prefilter, idle)
     }
 
     @SuppressLint("MissingPermission")
@@ -5276,9 +5280,23 @@ class CameraController(private val context: Context, private val render: RenderC
         // 任何一步失败都落回 ③ —— 照片优先红线。
         var hdrBytes: ByteArray? = null
         var hdrPath = "none"
+        var embeddedExif = false
+        var exifNs = 0L
         if (useGainmap != null && jpeg444) {
+            val exifStart = System.nanoTime()
+            val payload = runCatching {
+                JpegExif.payload(context.cacheDir, outW, outH) {
+                    setPhotoExif(it, now, iso, secNs)
+                }
+            }.onFailure { logExifFailure(it) }.getOrNull()
+            exifNs = System.nanoTime() - exifStart
             hdrBytes = HdrDelivery.encodeJpegR(outBmp, useGainmap.data, useGainmap.w,
-                useGainmap.h, jpegQ)
+                useGainmap.h, jpegQ, payload)
+            embeddedExif = payload != null && hdrBytes != null
+            if (payload != null && hdrBytes == null) {
+                hdrBytes = HdrDelivery.encodeJpegR(outBmp, useGainmap.data, useGainmap.w,
+                    useGainmap.h, jpegQ)
+            }
             hdrPath = if (hdrBytes != null) "jpegR444" else "jpegR_failed"
         } else if (useGainmap != null && HdrDelivery.platformGainmapSupported) {
             // 平台路径：base 4:2:0，但 HDR 信息完整（对齐 PC 的 UltraHdrWriter）
@@ -5313,7 +5331,7 @@ class CameraController(private val context: Context, private val render: RenderC
             outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, bos)   // Android 恒 4:2:0
             jpegBytes = bos.toByteArray().takeIf { it.isNotEmpty() }
         }
-        val encMs = (System.nanoTime() - encT0) / 1_000_000
+        val encMs = (System.nanoTime() - encT0 - exifNs) / 1_000_000
         // chroma/encoder 按**实际产出**的字节流报（hdrBytes 的 base 也是 4:4:4）：
         // 0.13.0 之前这两项靠 native444 != null 推断，HDR 成功时会误报 420/bitmap420。
         EngineBridge.nativeAppendLog(
@@ -5341,11 +5359,13 @@ class CameraController(private val context: Context, private val render: RenderC
         val jpegOut: ByteArray? = jpegBytes
         val writeJpeg: (java.io.OutputStream) -> Unit = { os ->
             if (jpegOut != null) os.write(jpegOut)
-            else outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, os)
+            else check(outBmp.compress(Bitmap.CompressFormat.JPEG, jpegQ, os)) { "JPEG write failed" }
         }
         try {
             var savedUri: android.net.Uri? = null
-            var savedFile: File? = null
+            var insertMs = 0L
+            var publishMs = 0L
+            val writeMs: Long
             if (Build.VERSION.SDK_INT >= 29) {
                 val cv = android.content.ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, name)
@@ -5353,27 +5373,44 @@ class CameraController(private val context: Context, private val render: RenderC
                     put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FilmKit")
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
-                context.contentResolver
-                    .insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
-                    ?.let { uri ->
-                        context.contentResolver.openOutputStream(uri)?.use {
-                            writeJpeg(it)
-                        }
-                        cv.clear()
-                        cv.put(MediaStore.Images.Media.IS_PENDING, 0)
-                        context.contentResolver.update(uri, cv, null, null)
-                        savedUri = uri
+                val resolver = context.contentResolver
+                val insertStart = System.nanoTime()
+                val uri = checkNotNull(resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv))
+                insertMs = (System.nanoTime() - insertStart) / 1_000_000
+                try {
+                    val writeStart = System.nanoTime()
+                    checkNotNull(resolver.openOutputStream(uri)).use(writeJpeg)
+                    writeMs = (System.nanoTime() - writeStart) / 1_000_000
+                    if (!embeddedExif) {
+                        val exifStart = System.nanoTime()
+                        writeExif(uri, null, now, iso, secNs)
+                        exifNs += System.nanoTime() - exifStart
                     }
+                    val publishStart = System.nanoTime()
+                    cv.clear()
+                    cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    check(resolver.update(uri, cv, null, null) == 1) { "Photo publication failed" }
+                    publishMs = (System.nanoTime() - publishStart) / 1_000_000
+                    savedUri = uri
+                } catch (t: Throwable) {
+                    // Do not delete a fully written photo if publishing fails.
+                    EngineBridge.nativeAppendLog(EngineBridge.LEVEL_WARN, "camera", "photo.pending",
+                        kv("uri" to uri.toString()))
+                    throw t
+                }
             } else {
                 val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "FilmKit")
                 dir.mkdirs()
-                File(dir, name).outputStream().use {
-                    writeJpeg(it)
+                val file = File(dir, name)
+                val writeStart = System.nanoTime()
+                file.outputStream().use(writeJpeg)
+                writeMs = (System.nanoTime() - writeStart) / 1_000_000
+                if (!embeddedExif) {
+                    val exifStart = System.nanoTime()
+                    writeExif(null, file, now, iso, secNs)
+                    exifNs += System.nanoTime() - exifStart
                 }
-                savedFile = File(dir, name)
             }
-            // Bitmap.compress 不写任何元数据——用 ExifInterface 补写拍摄参数
-            writeExif(savedUri, savedFile, now)
             // ── 胶卷位 URI **写完才发布**（v0.12.34，用户报"左下角缩略图有概率丢失"）──
             // 原来在 `insert` 之后、写字节之前就赋值 ⇒ UI 的 400ms 轮询可能正好在文件
             // 还是空的时候拿到新 URI，decode 失败一次就再也不会重试（LaunchedEffect 只在
@@ -5396,6 +5433,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     "name" to name, "w" to outW, "h" to outH,
                     "avgLuma" to (sum / n.coerceAtLeast(1)),
                     "iso" to iso, "sec" to "%.4f".format(secNs / 1e9f),
+                    "insertMs" to insertMs, "writeMs" to writeMs, "publishMs" to publishMs,
+                    "exifMs" to exifNs / 1_000_000, "embeddedExif" to embeddedExif,
                 ),
             )
             // 成片参数快照（E1-2 / ADR-4）：**落盘成功后**才写，键 = MediaStore 的真实
@@ -5419,60 +5458,50 @@ class CameraController(private val context: Context, private val render: RenderC
     }
 
     /** 补写 EXIF：机型/时间/ISO/快门/光圈/焦距（35mm 等效）/白平衡模式 */
-    private fun writeExif(uri: android.net.Uri?, file: File?, whenShot: Date) {
+    private fun writeExif(
+        uri: android.net.Uri?, file: File?, whenShot: Date,
+        iso: Int = liveIso, secNs: Long = liveExposureNs,
+    ) {
         runCatching {
-            // 可写 FileDescriptor 构造的 ExifInterface 才支持 saveAttributes
-            val pfd = uri?.let { context.contentResolver.openFileDescriptor(it, "rw") }
-            val exif = when {
-                pfd != null -> androidx.exifinterface.media.ExifInterface(pfd.fileDescriptor)
-                file != null -> androidx.exifinterface.media.ExifInterface(file.absolutePath)
-                else -> return
+            fun save(exif: ExifInterface) {
+                setPhotoExif(exif, whenShot, iso, secNs)
+                exif.saveAttributes()
             }
-            val dt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(whenShot)
-            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, dt)
-            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, dt)
-            // 成片像素在渲染端已转正，方向恒为标准值 1（默认 0 是非法定义值）
-            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, "1")
-            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MAKE, Build.MANUFACTURER)
-            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MODEL, Build.MODEL)
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
-                liveIso.coerceAtLeast(0).toString(),
-            )
-            // ExposureTime 属 ExifInterface 的「兼容标签」：setAttribute 内部走 Double.parseDouble，
-            // 传 "1/125" 这类分数串会抛 NumberFormatException 被**静默丢弃**（Log.w 后 return，成片由此一直缺 33434）。
-            // 只能传十进制秒数，由 ExifInterface 自行转 Rational；取不到实测值回退用户设定值。
-            val nsForExif = if (liveExposureNs > 0L) liveExposureNs else exposureNs
-            if (nsForExif > 0L) {
-                exif.setAttribute(
-                    androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME,
-                    "%.6f".format(Locale.US, nsForExif / 1e9),
-                )
+            if (uri != null) {
+                checkNotNull(context.contentResolver.openFileDescriptor(uri, "rw")).use {
+                    save(ExifInterface(it.fileDescriptor))
+                }
+            } else if (file != null) {
+                save(ExifInterface(file.absolutePath))
             }
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER,
-                "%.1f".format(apertureF.coerceAtLeast(1f)),
-            )
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH,
-                "%.1f/1".format(baseFocalMm * zoomRatio),
-            )
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM,
-                (currentLensEquiv() * zoomRatio).roundToInt().toString(),
-            )
-            exif.setAttribute(
-                androidx.exifinterface.media.ExifInterface.TAG_WHITE_BALANCE,
-                if (wbMode == CaptureRequest.CONTROL_AWB_MODE_AUTO) "0" else "1", // EXIF: 0=Auto 1=Manual
-            )
-            exif.saveAttributes()
-            pfd?.close()
-        }.onFailure {
-            EngineBridge.nativeAppendLog(
-                EngineBridge.LEVEL_WARN, "camera", "photo.exif_failed",
-                kv("error" to (it.message ?: it.toString())),
-            )
+        }.onFailure { logExifFailure(it) }
+    }
+
+    private fun setPhotoExif(exif: ExifInterface, whenShot: Date, iso: Int, secNs: Long) {
+        val dt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(whenShot)
+        exif.setAttribute(ExifInterface.TAG_DATETIME, dt)
+        exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dt)
+        exif.setAttribute(ExifInterface.TAG_ORIENTATION, "1") // Pixels are already rotated.
+        exif.setAttribute(ExifInterface.TAG_MAKE, Build.MANUFACTURER)
+        exif.setAttribute(ExifInterface.TAG_MODEL, Build.MODEL)
+        exif.setAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, iso.coerceAtLeast(0).toString())
+        val nsForExif = if (secNs > 0L) secNs else exposureNs
+        // AndroidX expects decimal seconds for this tag, not a rational string.
+        if (nsForExif > 0L) {
+            exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, "%.6f".format(Locale.US, nsForExif / 1e9))
         }
+        exif.setAttribute(ExifInterface.TAG_F_NUMBER, "%.1f".format(Locale.US, apertureF.coerceAtLeast(1f)))
+        exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH, "${(baseFocalMm * zoomRatio * 10).roundToInt()}/10")
+        exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, (currentLensEquiv() * zoomRatio).roundToInt().toString())
+        exif.setAttribute(ExifInterface.TAG_WHITE_BALANCE,
+            if (wbMode == CaptureRequest.CONTROL_AWB_MODE_AUTO) "0" else "1")
+    }
+
+    private fun logExifFailure(t: Throwable) {
+        EngineBridge.nativeAppendLog(
+            EngineBridge.LEVEL_WARN, "camera", "photo.exif_failed",
+            kv("error" to (t.message ?: t.toString())),
+        )
     }
 }
 

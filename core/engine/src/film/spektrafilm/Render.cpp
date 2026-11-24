@@ -1,34 +1,85 @@
 #include "Render.h"
 #include "OutputGamut.h"
 #include "ParallelPixels.h"
+#include "SpectralLut.h"
+#include "SpatialWorkspace.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 namespace filmkit::spektrafilm {
+namespace {
 
-bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::size_t height,
-                         const NegativeRenderParams& p, SpectralBackend backend,
-                         RenderWorkers workers, std::uint64_t grainSeed,
-                         std::uint64_t glareSeed, RenderTimings* timings,
-                         const GrainReplay* grainReplay, std::span<const double> glareReplay) {
+template <class Exact, class Finish>
+bool projectFrame(std::span<Triplet> pixels, const SpectralProjection& projection,
+                  SpectralBackend backend, std::size_t workers, bool useSpectralLut,
+                  const std::pair<Triplet, Triplet>& bounds, Exact exact, Finish finish) {
+    constexpr std::size_t kSpectralLutSide = 49;
+    SpectralLut lut;
+    const bool ready = useSpectralLut &&
+        lut.prepare(projection, backend, bounds.first, bounds.second, kSpectralLutSide, workers);
+    return parallelPixels(pixels.size(), workers, [&](auto begin, auto count) {
+        const auto part = pixels.subspan(begin, count);
+        if (!ready) return exact(part);
+        const auto resolve = [&](std::span<Triplet> run, bool fromTable) {
+            if (run.empty()) return true;
+            if (!fromTable) return exact(run);
+            decodeLogSpectralLight(run, backend);
+            for (auto& v : run) v = finish(v);
+            return true;
+        };
+        std::size_t start = 0;
+        bool fromTable = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            Triplet logLight;
+            const bool found = lut.sample(part[i], logLight);
+            if (found != fromTable) {
+                if (!resolve(part.subspan(start, i - start), fromTable)) return false;
+                start = i;
+                fromTable = found;
+            }
+            if (found) part[i] = logLight;
+        }
+        return resolve(part.subspan(start), fromTable);
+    });
+}
+
+template <class Buffer>
+bool renderSrgb(Buffer& image, std::size_t size, std::size_t width, std::size_t height,
+                const NegativeRenderParams& p, SpectralBackend backend,
+                RenderWorkers workers, std::uint64_t grainSeed,
+                std::uint64_t glareSeed, RenderTimings* timings,
+                const GrainReplay* grainReplay, std::span<const double> glareReplay,
+                bool useSpectralLut) {
     using Clock = std::chrono::steady_clock;
     if (timings) *timings = {};
-    if (!width || !height || width > image.size() / height || width * height != image.size() ||
+    const auto view = [&](Buffer& buffer) -> std::span<Triplet> {
+        if constexpr (requires { buffer.get(); }) return {buffer.get(), size};
+        else return buffer;
+    };
+    if (!width || !height || width > size / height || width * height != size ||
         !workers.pixels || workers.pixels > 8 || !workers.grain || workers.grain > 8 ||
         !workers.output || workers.output > 8 || !workers.filters || workers.filters > 8 ||
         !hasSpectralBackend(backend)) return false;
     RenderTimings t;
     const auto start = Clock::now();
+    std::optional<ScopedPixelWorkers> pool;
+    const auto maxWorkers = std::max({workers.pixels, workers.grain, workers.output, workers.filters});
+    if (size >= 16384) {
+        auto* current = ScopedPixelWorkers::current();
+        if (!current || !current->supports(maxWorkers)) pool.emplace(maxWorkers);
+    }
     auto previous = start;
     const auto mark = [&](double& field) {
         const auto now = Clock::now();
         field = std::chrono::duration<double>(now - previous).count();
         previous = now;
     };
-    const auto pixels = [&] { return std::span<Triplet>(image); };
+    const auto pixels = [&] { return view(image); };
+    SpatialWorkspace workspace(size);
     auto enlarger = p.enlarger;
     if (!p.directScan && p.compensatePrintExposure) {
         // Match the recipe's unboosted, unblurred midgray reference. Scene
@@ -43,47 +94,69 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
         const double mean = (reference[0][0] + reference[0][1] + reference[0][2]) / 3.0;
         enlarger.gain.fill(std::pow(10.0, -mean));
     }
-    if (!parallelPixels(image.size(), workers.pixels, [&](auto begin, auto count) {
+    const double exposureEv = p.exposureEv + p.captureExposureEv;
+    double exposureGain = 1.0;
+    if (p.boost.ev == 0.0 && !prepareFilmExposureGain(exposureEv, p.boost, exposureGain)) return false;
+    if (!parallelPixels(size, workers.pixels, [&](auto begin, auto count) {
             const auto part = pixels().subspan(begin, count);
-            return projectHanatosRaw(part, part, p.xyzFromRgb, p.response, p.responseSide);
+            return projectHanatosRaw(part, part, p.xyzFromRgb, p.response, p.responseSide, exposureGain);
         })) return false;
     mark(t.hanatos);
-    if (!boostFilmRaw(image, p.exposureEv + p.captureExposureEv, p.boost) ||
-        !finishFilmLogExposure(image, width, height, p.pixelUm, p.lensBlurUm,
-                               p.halation, p.exposureCorrection, workers.filters)) return false;
+    if ((p.boost.ev != 0.0 && !boostFilmRaw(pixels(), exposureEv, p.boost)) ||
+        !finishFilmLogExposure(pixels(), width, height, p.pixelUm, p.lensBlurUm,
+                               p.halation, p.exposureCorrection, workers.filters, &workspace)) return false;
     mark(t.filmExposure);
-    std::vector<Triplet> work(image.size());
-    if (!developFilmBeforeGrain(image, work, width, height, p.pixelUm,
+    Buffer work = [size] {
+        if constexpr (requires (Buffer b) { b.get(); }) return std::make_unique_for_overwrite<Triplet[]>(size);
+        else return Buffer(size);
+    }();
+    if (!developFilmBeforeGrain(pixels(), view(work), width, height, p.pixelUm,
                                 p.filmAxis, p.filmStock, p.filmGamma,
-                                p.filmType, p.dir, workers.filters)) return false;
+                                p.filmType, p.dir, workers.filters, &workspace)) return false;
     image.swap(work);
     mark(t.dir);
     if (p.grain.active) {
-        if (!applyFilmGrain(image, work, width, height, p.pixelUm, p.grainTotal, p.grainLayers,
+        // Grain owns its own work planes; do not increase its peak memory use.
+        workspace.release();
+        if (!applyFilmGrain(pixels(), view(work), width, height, p.pixelUm, p.grainTotal, p.grainLayers,
                             p.filmType, p.grain, grainSeed, grainReplay,
                             &t.grainParts, workers.grain, workers.filters)) return false;
         image.swap(work);
     }
-    std::vector<Triplet>().swap(work);
+    Buffer{}.swap(work);
     mark(t.grain);
-    if (!p.directScan) {
-    if (!parallelPixels(image.size(), workers.pixels, [&](auto begin, auto count) {
-            const auto part = pixels().subspan(begin, count);
-            return exposePaperRaw(enlarger, part, part, p.printExposure, p.references, backend);
-        })) return false;
-    mark(t.paperExposure);
-    if (!parallelPixels(image.size(), workers.pixels, [&](auto begin, auto count) {
-            return developPaper(pixels().subspan(begin, count), p.paperCurve);
-        })) return false;
-    mark(t.paperDevelopment);
+    std::pair<Triplet, Triplet> filmBounds{};
+    if (useSpectralLut) {
+        for (const auto& knot : p.filmStock) for (int c = 0; c < 3; ++c) {
+            filmBounds.first[c] = std::min(filmBounds.first[c], knot[c]);
+            filmBounds.second[c] = std::max(filmBounds.second[c], knot[c]);
+        }
+        for (int c = 0; c < 3; ++c) {
+            filmBounds.first[c] = std::min(filmBounds.first[c], -p.grain.densityFloor[c]);
+        }
     }
-    if (!parallelPixels(image.size(), workers.pixels, [&](auto begin, auto count) {
-            const auto part = pixels().subspan(begin, count);
-            return projectSpectralLight(p.scanner, part, part, backend);
-        })) return false;
+    if (!p.directScan) {
+        if (!projectFrame(pixels(), enlarger, backend, workers.pixels, useSpectralLut, filmBounds,
+                          [&](auto part) {
+                              return exposePaperRaw(enlarger, part, part, p.printExposure, p.references, backend);
+                          }, [&](Triplet raw) {
+                              for (auto& v : raw) v = v * p.printExposure * p.references.exposureScale;
+                              return raw;
+                          })) return false;
+        mark(t.paperExposure);
+        if (!parallelPixels(size, workers.pixels, [&](auto begin, auto count) {
+                return developPaper(pixels().subspan(begin, count), p.paperCurve);
+            })) return false;
+        mark(t.paperDevelopment);
+    }
+    if (!projectFrame(pixels(), p.scanner, backend, workers.pixels, useSpectralLut,
+                      !useSpectralLut || p.directScan ? filmBounds : p.paperCurve.densityBounds(),
+                      [&](auto part) {
+                          return projectSpectralLight(p.scanner, part, part, backend);
+                      }, [](Triplet xyz) { return xyz; })) return false;
     mark(t.scanSpectral);
-    if (!finishPaperScanXYZ(p.scanner, image, width, height, p.references, p.glare,
-                            glareSeed, glareReplay, workers.filters, workers.pixels)) return false;
+    if (!finishPaperScanXYZ(p.scanner, pixels(), width, height, p.references, p.glare,
+                            glareSeed, glareReplay, workers.filters, workers.pixels, &workspace)) return false;
     mark(t.scanGlare);
     Triplet white{};
     for (const auto& band : p.scanner.bands) {
@@ -92,38 +165,56 @@ bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::siz
     for (auto& value : white) value /= p.scanner.normalizer;
     {
         // Scan filtering overwrites all used work planes, so no clearing pass is needed.
-        const auto n = image.size();
-        const std::unique_ptr<double[]> plane(new double[n]);
-        const std::unique_ptr<double[]> filtered(new double[n]);
-        const std::unique_ptr<double[]> scratch(new double[n]);
-        if (!finishScanSrgb(image, width, height, white, p.scanLensBlur, p.unsharpSigma,
-                            p.unsharpAmount, true, {plane.get(), n}, {filtered.get(), n},
-                            {scratch.get(), n}, workers.output, workers.filters)) return false;
+        if (!finishScanSrgb(pixels(), width, height, white, p.scanLensBlur, p.unsharpSigma,
+                            p.unsharpAmount, true, workspace.plane(0), workspace.plane(1),
+                            workspace.plane(2), workers.output, workers.filters)) return false;
     }
     mark(t.scanOutput);
+    pool.reset();
     t.total = std::chrono::duration<double>(Clock::now() - start).count();
     if (timings) *timings = t;
     return true;
 }
 
+}  // namespace
+
+bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::size_t height,
+                        const NegativeRenderParams& p, SpectralBackend backend, RenderWorkers workers,
+                        std::uint64_t grainSeed, std::uint64_t glareSeed, RenderTimings* timings,
+                        const GrainReplay* grainReplay, std::span<const double> glareReplay,
+                        bool useSpectralLut) {
+    return renderSrgb(image, image.size(), width, height, p, backend, workers, grainSeed, glareSeed,
+                      timings, grainReplay, glareReplay, useSpectralLut);
+}
+
+bool renderNegativeSrgb(std::unique_ptr<Triplet[]>& image, std::size_t size,
+                        std::size_t width, std::size_t height, const NegativeRenderParams& p,
+                        SpectralBackend backend, RenderWorkers workers, std::uint64_t grainSeed,
+                        std::uint64_t glareSeed, RenderTimings* timings, bool useSpectralLut) {
+    return image && renderSrgb(image, size, width, height, p, backend, workers, grainSeed, glareSeed,
+                               timings, nullptr, {}, useSpectralLut);
+}
+
 bool negativeNeutralResponse(const NegativeRenderParams& params, SpectralBackend backend,
-                              std::span<Triplet> response) {
+                              std::span<Triplet> response, std::size_t workers) {
     if (response.size() < 2) return false;
     auto calibration = params;
     calibration.grain.active = false;
     calibration.glare.roughness = 0.0;
-    std::vector<Triplet> patch(1);
-    for (std::size_t i = 0; i < response.size(); ++i) {
-        const double x = static_cast<double>(i) / (response.size() - 1);
-        patch[0] = {x, x, x};
-        if (!renderNegativeSrgb(patch, 1, 1, calibration, backend, {1, 1, 1, 1}, 0, 0)) return false;
-        for (std::size_t c = 0; c < 3; ++c) {
-            const double v = patch[0][c];
-            response[i][c] = v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
-            if (!std::isfinite(response[i][c])) return false;
+    return parallelPixels(response.size(), workers, [&](auto begin, auto count) {
+        std::vector<Triplet> patch(1);
+        for (std::size_t i = begin; i < begin + count; ++i) {
+            const double x = static_cast<double>(i) / (response.size() - 1);
+            patch[0] = {x, x, x};
+            if (!renderNegativeSrgb(patch, 1, 1, calibration, backend, {1, 1, 1, 1}, 0, 0)) return false;
+            for (std::size_t c = 0; c < 3; ++c) {
+                const double v = patch[0][c];
+                response[i][c] = v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+                if (!std::isfinite(response[i][c])) return false;
+            }
         }
-    }
-    return true;
+        return true;
+    }, 16);
 }
 
 bool applyRenderOptions(NegativeRenderParams& p, std::span<const double> v) {

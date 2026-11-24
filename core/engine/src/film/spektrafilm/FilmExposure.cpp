@@ -1,6 +1,8 @@
 #include "FilmExposure.h"
+#include "ExposureMath.h"
 #include "ParallelPixels.h"
 #include "SpatialFilter.h"
+#include "SpatialWorkspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,16 +17,6 @@ bool anyPositive(const Triplet& value) {
     return std::any_of(value.begin(), value.end(), [](double x) { return x > 0.0; });
 }
 
-double mitchell(double t) {
-    constexpr double b = 1.0 / 3.0, c = 1.0 / 3.0;
-    const double x = std::abs(t);
-    const double x2 = x * x;
-    const double x3 = x2 * x;
-    if (x < 1.0) return ((12 - 9*b - 6*c)*x3 + (-18 + 12*b + 6*c)*x2 + (6 - 2*b)) / 6.0;
-    if (x < 2.0) return ((-b - 6*c)*x3 + (6*b + 30*c)*x2 + (-12*b - 48*c)*x + (8*b + 24*c)) / 6.0;
-    return 0.0;
-}
-
 struct Taps {
     std::array<std::size_t, 4> index;
     std::array<double, 4> weight;
@@ -34,22 +26,21 @@ Taps responseTaps(double position, std::ptrdiff_t end) {
     const double coord = std::clamp(position, 0.0, static_cast<double>(end));
     const auto base = std::min(static_cast<std::ptrdiff_t>(coord), end - 1);
     const double t = coord - static_cast<double>(base);
-    Taps taps;
-    for (std::ptrdiff_t k = 0; k < 4; ++k) {
-        auto i = base + k - 1;
-        if (i < 0) i = -i;
-        if (i > end) i = 2 * end - i;
-        taps.index[k] = static_cast<std::size_t>(i);
-        taps.weight[k] = mitchell(t - static_cast<double>(k - 1));
-    }
-    return taps;
+    const double t2 = t * t;
+    // Expand Mitchell B=C=1/3 at the four offsets for t in [0,1].
+    return {{static_cast<std::size_t>(std::abs(base - 1)), static_cast<std::size_t>(base),
+             static_cast<std::size_t>(base + 1), static_cast<std::size_t>(std::min(base + 2, 2 * end - (base + 2)))},
+            {1.0 / 18.0 - 0.5 * t + t2 * (5.0 / 6.0 - (7.0 / 18.0) * t),
+             8.0 / 9.0 + t2 * ((7.0 / 6.0) * t - 2.0),
+             1.0 / 18.0 + 0.5 * t + t2 * (1.5 - (7.0 / 6.0) * t),
+             t2 * ((7.0 / 18.0) * t - 1.0 / 3.0)}};
 }
 
 }  // namespace
 
 bool projectHanatosRaw(std::span<const Triplet> rgb, std::span<Triplet> raw,
                        const std::array<Triplet, 3>& xyzFromRgb,
-                       std::span<const Triplet> response, std::size_t side) {
+                       std::span<const Triplet> response, std::size_t side, double exposureGain) {
     if (rgb.size() != raw.size() || side < 2 || side > response.size() / side ||
         side * side != response.size()) return false;
     const auto end = static_cast<std::ptrdiff_t>(side - 1);
@@ -62,32 +53,46 @@ bool projectHanatosRaw(std::span<const Triplet> rgb, std::span<Triplet> raw,
         }
         const double sum = (xyz[0] + xyz[1]) + xyz[2];
         if (!std::isfinite(sum)) return false;
-        const double denominator = std::max(sum, 1e-10);
-        const double oneMinusX = 1.0 - xyz[0] / denominator;
+        const double inverse = 1.0 / std::max(sum, 1e-10);
+        const double oneMinusX = 1.0 - xyz[0] * inverse;
         const double x = std::clamp(oneMinusX * oneMinusX, 0.0, 1.0);
-        const double y = std::clamp((xyz[1] / denominator) / std::max(oneMinusX, 1e-10), 0.0, 1.0);
+        const double y = std::clamp((xyz[1] * inverse) / std::max(oneMinusX, 1e-10), 0.0, 1.0);
         const auto tx = responseTaps(x * end, end);
         const auto ty = responseTaps(y * end, end);
         Triplet result{};
-        double norm = 0.0;
+        double sumX = 0.0, sumY = 0.0;
+        for (double weight : ty.weight) sumY += weight;
+        // The same 4x4 Mitchell weights factor into independent axes.
         for (std::size_t a = 0; a < 4; ++a) {
+            const auto row = response.data() + tx.index[a] * side;
+            Triplet horizontal{};
+            sumX += tx.weight[a];
             for (std::size_t b = 0; b < 4; ++b) {
-                const double weight = tx.weight[a] * ty.weight[b];
-                const auto& tap = response[tx.index[a] * side + ty.index[b]];
-                norm += weight;
-                for (std::size_t c = 0; c < 3; ++c) result[c] += weight * tap[c];
+                const auto& tap = row[ty.index[b]];
+                for (std::size_t c = 0; c < 3; ++c) horizontal[c] += ty.weight[b] * tap[c];
             }
+            for (std::size_t c = 0; c < 3; ++c) result[c] += tx.weight[a] * horizontal[c];
         }
-        for (std::size_t c = 0; c < 3; ++c) raw[i][c] = (norm != 0.0 ? result[c] / norm : result[c]) * sum;
+        const double norm = sumX * sumY;
+        const double inverseNorm = norm != 0.0 ? 1.0 / norm : 1.0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            raw[i][c] = ((result[c] * inverseNorm) * sum) * exposureGain;
+        }
     }
     return true;
 }
 
-bool boostFilmRaw(std::span<Triplet> raw, double exposureEv, const HighlightBoost& boost) {
-    if (raw.empty() || !std::isfinite(exposureEv) || !std::isfinite(boost.ev) || boost.ev < 0.0 ||
+bool prepareFilmExposureGain(double exposureEv, const HighlightBoost& boost, double& gain) {
+    if (!std::isfinite(exposureEv) || !std::isfinite(boost.ev) || boost.ev < 0.0 ||
         !(boost.range >= 0.0 && boost.range <= 1.0) || !std::isfinite(boost.protectEv) ||
         boost.protectEv < 0.0) return false;
-    const double gain = std::exp2(exposureEv);
+    gain = std::exp2(exposureEv);
+    return true;
+}
+
+bool boostFilmRaw(std::span<Triplet> raw, double exposureEv, const HighlightBoost& boost) {
+    double gain;
+    if (raw.empty() || !prepareFilmExposureGain(exposureEv, boost, gain)) return false;
     for (auto& pixel : raw) for (auto& value : pixel) value *= gain;
     if (boost.ev == 0.0) return true;
 
@@ -119,10 +124,12 @@ bool boostFilmRaw(std::span<Triplet> raw, double exposureEv, const HighlightBoos
 
 bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_t height,
                            double pixelUm, double lensBlurUm, const FilmHalation& h,
-                           double exposureCorrection, std::size_t filterWorkers) {
+                           double exposureCorrection, std::size_t filterWorkers,
+                           SpatialWorkspace* workspace) {
     if (!width || !height || width > raw.size() / height || width * height != raw.size() ||
         !(pixelUm > 0.0) || !std::isfinite(pixelUm) || !std::isfinite(lensBlurUm) ||
-        !std::isfinite(exposureCorrection) || !(exposureCorrection > 0.0)) return false;
+        !std::isfinite(exposureCorrection) || !(exposureCorrection > 0.0) ||
+        (workspace && workspace->size() != raw.size())) return false;
     Triplet core, tail, strength, sigma;
     for (std::size_t c = 0; c < 3; ++c) {
         core[c] = h.scatterCoreUm[c] * h.scatterScale / pixelUm;
@@ -135,22 +142,21 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
     if (lensBlurUm > 0.0 || scatter || reflect) {
         const auto count = raw.size();
         // Input, blur work planes and the first accumulation tap are fully written on use.
-        const std::unique_ptr<double[]> inputStorage(new double[count]);
-        const std::unique_ptr<double[]> outputStorage(new double[count]);
-        const std::unique_ptr<double[]> scratchStorage(new double[count]);
-        const std::unique_ptr<double[]> accum(scatter || reflect ? new double[count] : nullptr);
-        std::span<double> input(inputStorage.get(), count), output(outputStorage.get(), count);
-        const std::span<double> scratch(scratchStorage.get(), count);
-        std::vector<double> weights;
+        SpatialWorkspace local(count);
+        auto& buffers = workspace ? *workspace : local;
+        auto input = buffers.plane(0), output = buffers.plane(1);
+        const auto scratch = buffers.plane(2);
+        const auto accum = scatter || reflect ? buffers.plane(3) : std::span<double>{};
+        std::vector<GaussianTap> bounces;
         if (reflect) {
-            weights.resize(h.bounces);
+            bounces.resize(h.bounces);
             double sum = 0.0;
-            for (std::size_t k = 0; k < weights.size(); ++k) {
-                weights[k] = std::pow(h.bounceDecay, static_cast<double>(k));
-                sum += weights[k];
+            for (std::size_t k = 0; k < bounces.size(); ++k) {
+                bounces[k].weight = std::pow(h.bounceDecay, static_cast<double>(k));
+                sum += bounces[k].weight;
             }
             if (!(sum > 0.0) || !std::isfinite(sum)) return false;
-            for (auto& weight : weights) weight /= sum;
+            for (auto& tap : bounces) tap.weight /= sum;
         }
         const auto blur = [&](double s) { return gaussianBlur(input, output, scratch, width, height, s, filterWorkers); };
         for (std::size_t c = 0; c < 3; ++c) {
@@ -164,13 +170,12 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
             if (scatter) {
                 constexpr std::array weights{0.1633, 0.6496, 0.1870};
                 constexpr std::array ratios{0.5360, 1.5236, 2.7684};
-                for (std::size_t k = 0; k < weights.size(); ++k) {
-                    if (!blur(ratios[k] * std::max(tail[c], 1e-6))) return false;
-                    if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
-                        const double tap = weights[k] * output[i];
-                        accum[i] = k ? accum[i] + tap : tap;
-                    })) return false;
+                std::array<GaussianTap, weights.size()> taps;
+                for (std::size_t k = 0; k < taps.size(); ++k) {
+                    taps[k] = {ratios[k] * std::max(tail[c], 1e-6), weights[k]};
                 }
+                if (!gaussianBlurMixture(input, output, scratch, accum, taps, width, height,
+                                         filterWorkers)) return false;
                 if (!blur(std::max(core[c], 1e-6))) return false;
                 if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                     const double mixed = (1.0 - h.scatterTailWeight[c]) * output[i] + h.scatterTailWeight[c] * accum[i];
@@ -179,13 +184,11 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
             }
             // A zero-strength channel has no reflected contribution.
             if (reflect && (strength[c] != 0.0 || !std::isfinite(sigma[c]))) {
-                for (std::size_t k = 0; k < weights.size(); ++k) {
-                    if (!blur(std::max(sigma[c] * std::sqrt(static_cast<double>(k + 1)), 1e-6))) return false;
-                    if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
-                        const double tap = weights[k] * output[i];
-                        accum[i] = k ? accum[i] + tap : tap;
-                    })) return false;
+                for (std::size_t k = 0; k < bounces.size(); ++k) {
+                    bounces[k].sigma = std::max(sigma[c] * std::sqrt(static_cast<double>(k + 1)), 1e-6);
                 }
+                if (!gaussianBlurMixture(input, output, scratch, accum, bounces, width, height,
+                                         filterWorkers)) return false;
                 if (!parallelPixelIndices(count, filterWorkers, [&](auto i) {
                     input[i] += strength[c] * accum[i];
                     if (h.renormalize) input[i] /= 1.0 + strength[c];
@@ -197,9 +200,7 @@ bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_
         }
     }
     return parallelPixels(raw.size(), filterWorkers, [&](auto begin, auto count) {
-        for (auto& pixel : raw.subspan(begin, count)) {
-            for (auto& value : pixel) value = std::log10(std::fmax(value * exposureCorrection, 0.0) + 1e-10);
-        }
+        logExposure(raw.subspan(begin, count), exposureCorrection);
         return true;
     });
 }

@@ -9,10 +9,8 @@
 #include <numbers>
 
 #if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
-#include <arm_neon.h>
-extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_pow(float64x2_t, float64x2_t);
+#include "FixedPowerNeon.h"
 extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_atan2(float64x2_t, float64x2_t);
-extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2vv_hypot(float64x2_t, float64x2_t);
 extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2v_log1p(float64x2_t);
 extern "C" __attribute__((aarch64_vector_pcs)) float64x2_t _ZGVnN2v_expm1(float64x2_t);
 #endif
@@ -381,6 +379,19 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
     for (std::size_t c = 0; c < 3; ++c) adaptation[c] = targetCone[c] / sourceCone[c];
 
     if (workerCount == 0) return false;
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+    // Compose only adjacent linear operations, including the published
+    // rounded RGB/XYZ pair. Leave the nonlinear CAM transform unchanged.
+    constexpr auto rgbRoundTrip = composeMatrix(kXyzToSrgb, kSrgbToXyz);
+    constexpr auto rgbToCone = composeMatrix(kCat16, kSrgbToXyz);
+    Matrix scaledCat02;
+    for (std::size_t row = 0; row < 3; ++row) {
+        for (std::size_t col = 0; col < 3; ++col) scaledCat02[row][col] = adaptation[row] * cat02[row][col];
+    }
+    const auto cat02Adapted = composeMatrix(cat02Inverse, scaledCat02);
+    auto scanToCone = composeMatrix(rgbToCone, composeMatrix(kXyzToSrgb, cat02Adapted));
+    for (auto& row : scanToCone) for (auto& value : row) value *= 100.0;
+#endif
     workerCount = std::min<std::size_t>({workerCount, 8, xyz.size()});
     if (!parallelPixels(xyz.size(), workerCount, [&](std::size_t begin, std::size_t count) {
         const auto adapt = [&](Triplet value) {
@@ -391,7 +402,7 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
         auto i = begin;
 #if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
         for (; begin + count - i >= 2; i += 2) {
-            if (!compressSrgbCam16UcsPair(adapt(xyz[i]), adapt(xyz[i + 1]), xyz[i], xyz[i + 1])) return false;
+            if (!compressScanCam16UcsPair(xyz[i], xyz[i + 1], scanToCone, adapt)) return false;
         }
 #endif
         for (; i < begin + count; ++i) {
@@ -406,7 +417,12 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
 
     const bool blur = lensBlurSigma > 0.0;
     const bool sharpen = unsharpSigma > 0.0 && unsharpAmount > 0.0;
-    if (blur || sharpen) {
+    const bool fusedSharpen = !blur && sharpen && unsharpSigma >= 1.0 / 6.0 && unsharpSigma < 3.0 &&
+        filterWorkers > 1 && xyz.size() >= 16384;
+    if (fusedSharpen) {
+        if (!unsharpRgbFir(xyz, {plane, filtered, scratch}, width, height, unsharpSigma, unsharpAmount,
+                           filterWorkers)) return false;
+    } else if (blur || sharpen) {
         for (std::size_t channel = 0; channel < 3; ++channel) {
             if (!parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
                 for (std::size_t i = begin; i < begin + count; ++i) plane[i] = xyz[i][channel];
@@ -431,9 +447,38 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
             })) return false;
         }
     }
-    if (!encodeSrgb) return true;
+    if (!encodeSrgb && !fusedSharpen) return true;
     return parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
-        for (Triplet& rgb : xyz.subspan(begin, count)) {
+        auto block = xyz.subspan(begin, count);
+        const auto scanPlanes = std::array{plane, filtered, scratch};
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+        while (encodeSrgb && block.size() >= 2) {
+            PairRgb rgb;
+            if (fusedSharpen) {
+                for (int c = 0; c < 3; ++c) rgb[c] = vld1q_f64(scanPlanes[c].data() + begin);
+            } else {
+                const auto input = vld3q_f64(block.front().data());
+                rgb = {input.val[0], input.val[1], input.val[2]};
+            }
+            auto lanes = pairMultiply(rgbRoundTrip, rgb);
+            for (auto& x : lanes) {
+                const auto low = vcleq_f64(x, vdupq_n_f64(0.0031308));
+                const auto base = vbslq_f64(low, vdupq_n_f64(1.0), x);
+                const auto p = fixedPower(base, [] { return 1.0 / 2.4; });
+                x = vbslq_f64(low, vmulq_n_f64(x, 12.92), vsubq_f64(vmulq_n_f64(p, 1.055), vdupq_n_f64(0.055)));
+            }
+            const float64x2x3_t output{{lanes[0], lanes[1], lanes[2]}};
+            vst3q_f64(block.front().data(), output);
+            block = block.subspan(2);
+            begin += 2;
+        }
+#endif
+        for (Triplet& rgb : block) {
+            if (fusedSharpen) {
+                for (int c = 0; c < 3; ++c) rgb[c] = scanPlanes[c][begin];
+                ++begin;
+            }
+            if (!encodeSrgb) continue;
             // The published rounded matrices are not exact inverses.
             rgb = multiply(kXyzToSrgb, multiply(kSrgbToXyz, rgb));
             for (double& value : rgb) {

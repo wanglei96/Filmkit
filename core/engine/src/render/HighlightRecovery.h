@@ -69,6 +69,16 @@ bool highlightGenerateGuides(const HighlightRawView& base,
                              HighlightGuideSet* output,
                              std::string* error = nullptr);
 
+// The full reference mask is always generated. Only a zero mask can omit
+// both short guides; in that case no short-frame geometry can affect the merge.
+bool highlightPrepareMergeGuides(const HighlightRawView& base,
+                                 const HighlightRawView& short_frame,
+                                 const std::array<float, 3>& wb,
+                                 float refExposureScale, float shortExposureScale,
+                                 const HighlightNoise& base_noise, const HighlightNoise& short_noise,
+                                 HighlightGuideSet* output, bool& emptyReferenceMask,
+                                 std::string* error = nullptr);
+
 struct HighlightFlowView {
   const float* xy = nullptr;  // 2*width*height floats, tightly packed (dx,dy)
   int width = 0, height = 0;
@@ -118,6 +128,12 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
                           bool hasSupport,
                           HighlightMaskAssessment* output,
                           std::string* error = nullptr);
+
+// Same adjusted/inpainting masks and admission; omits the short-clipping and
+// RGB error maps that are only used by the offline diagnostic assessment.
+bool highlightAssessMergeMasks(const HighlightRawView& short_frame, const HighlightGuideSet& guides,
+                               const HighlightFlowView& flow, bool hasSupport,
+                               HighlightMaskAssessment* output, std::string* error = nullptr);
 
 // PC merge consumption: sample RAW/2 adjusted M with GL_LINEAR/CLAMP_TO_EDGE
 // at RAW/4 destination pixel centers, write R8 reference weight (1-M), then

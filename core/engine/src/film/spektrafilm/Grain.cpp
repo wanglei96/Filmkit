@@ -141,7 +141,6 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
                                          static_cast<std::uint32_t>(block), 1U};
                     std::mt19937_64 rng(stream);
                     std::poisson_distribution<std::uint64_t> poisson;
-                    std::binomial_distribution<std::uint64_t> binomial;
                     const auto start = block * blockSize;
                     const auto stop = start + std::min(blockSize, n - start);
                     for (std::size_t i = start; i < stop; ++i) {
@@ -149,13 +148,11 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
                         const double probability = std::clamp((d + spec.floor) / spec.maxDensity, 1e-6, 1.0 - 1e-6);
                         const double saturation = 1.0 - probability * p.uniformity[c] * (1.0 - 1e-6);
                         const double mean = spec.population / saturation;
-                        std::uint64_t developed;
-                        if (replay) {
-                            developed = replay->developed(replay->context, c, s, i, mean, probability);
-                        } else {
-                            const auto seeds = poisson(rng, decltype(poisson)::param_type(mean));
-                            developed = seeds ? binomial(rng, decltype(binomial)::param_type(seeds, probability)) : 0;
-                        }
+                        // Exact Poisson thinning: only developed particles are consumed.
+                        // Keep the two original parameters for upstream draw replay.
+                        const auto developed = replay
+                            ? replay->developed(replay->context, c, s, i, mean, probability)
+                            : poisson(rng, decltype(poisson)::param_type(mean * probability));
                         plane[i] = static_cast<double>(developed) * od * saturation;
                     }
                 }

@@ -57,15 +57,17 @@ float halfStorage(float value) {
   }
   const uint32_t e = (h >> 10) & 31u;
   const uint32_t m = h & 1023u;
-  float out;
-  if (e == 31u) {
-    const uint32_t bits = sign | 0x7f800000u | (m ? 0x400000u : 0u);
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
+  if (!e) {
+    const float out = static_cast<float>(m) * 0x1p-24f;
+    return sign ? -out : out;
   }
-  out = e ? std::ldexp(static_cast<float>(1024u + m), static_cast<int>(e) - 25)
-          : std::ldexp(static_cast<float>(m), -24);
-  return sign ? -out : out;
+  // Normal half values widen exactly by rebiasing the exponent and shifting
+  // the fraction. Preserve the original signed infinity/quiet-NaN encoding.
+  const uint32_t bits = sign | (e == 31u ? 0x7f800000u | (m ? 0x400000u : 0u)
+                                         : ((e + 112u) << 23) | (m << 13));
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
 }
 
 bool dimensions(int w, int h, std::size_t* n) {
@@ -167,7 +169,7 @@ bool validGuide(const HighlightGuide& g, int w, int h) {
   return true;
 }
 float mirroredUv(float v) {
-  v = std::fmod(v, 2.f);
+  if (!(v > -2.f && v < 2.f)) v = std::fmod(v, 2.f);
   if (v < 0.f) v += 2.f;
   return v > 1.f ? 2.f - v : v;
 }
@@ -356,24 +358,22 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
   return true;
 }
 
-bool highlightGenerateGuides(const HighlightRawView& base,
+static bool generateGuides(const HighlightRawView& base,
                              const HighlightRawView& short_frame,
                              const std::array<float, 3>& wb,
                              float refExposureScale, float shortExposureScale,
                              const HighlightNoise& base_noise,
                              const HighlightNoise& short_noise,
-                             HighlightGuideSet* output, std::string* error) {
+                             HighlightGuideSet* output, bool* emptyReferenceMask, std::string* error) {
   if (error) error->clear();
+  if (emptyReferenceMask) *emptyReferenceMask = false;
   if (!output) return fail(error, "guide-set output is null");
   *output = HighlightGuideSet{};
   if (base.width != short_frame.width || base.height != short_frame.height ||
       base.cfaLut != short_frame.cfaLut)
     return fail(error, "base and short must have matching RAW size and CFA");
   HighlightGuideSet result;
-  if (!highlightGenerateGuide(base, wb, refExposureScale, base_noise, &result.base, error) ||
-      !highlightGenerateGuide(short_frame, wb, 1.f, short_noise, &result.short_unscaled, error) ||
-      !highlightGenerateGuide(short_frame, wb, shortExposureScale, short_noise,
-                              &result.short_normalized, error)) return false;
+  if (!highlightGenerateGuide(base, wb, refExposureScale, base_noise, &result.base, error)) return false;
   result.refExposureScale = refExposureScale;
   result.shortExposureScale = shortExposureScale;
   const std::size_t n = result.base.variance.size();
@@ -381,25 +381,78 @@ bool highlightGenerateGuides(const HighlightRawView& base,
   result.highlight.resize(n);
   const auto levels = clippingLevels(base);
   parallelRows(result.base.height, [&](int row0, int row1) {
-  for (int y = row0; y < row1; ++y)
-    for (int x = 0; x < result.base.width; ++x) {
-      const std::size_t p = static_cast<std::size_t>(y) * result.base.width + x;
-      const bool clipped = footprintClipped(base, x, y, levels);
-      result.native_clipping[p] = clipped ? 255 : 0;
-      float maximum = 0.f;
-      for (int c = 0; c < 3; ++c)
-        maximum = std::max(maximum, quantizeBase(result.base.rgb[3 * p + c]));
-      result.highlight[p] = clipped ? 255 : storeR8((maximum - kClip) / (1.f - kClip));
+    const int width = result.base.width, height = result.base.height;
+    // Cache each native quad's horizontal dilation: the 3x3 union then
+    // needs three row lookups instead of testing up to nine quads per pixel.
+    std::array<std::vector<uint8_t>, 3> rows;
+    for (auto& row : rows) row.resize(width);
+    std::array<int, 3> cached{{-1, -1, -1}};
+    for (int y = row0; y < row1; ++y) {
+      std::array<const uint8_t*, 3> footprint;
+      for (int dy = -1; dy <= 1; ++dy) {
+        const int qy = bounded(y + dy, height - 1);
+        const int slot = qy % 3;
+        auto& row = rows[slot];
+        if (cached[slot] != qy) {
+          bool center = quadClipped(base, 0, qy, levels), left = center;
+          for (int x = 0; x < width; ++x) {
+            const bool right = x + 1 < width ? quadClipped(base, x + 1, qy, levels) : center;
+            row[x] = left || center || right;
+            left = center;
+            center = right;
+          }
+          cached[slot] = qy;
+        }
+        footprint[dy + 1] = row.data();
+      }
+      for (int x = 0; x < width; ++x) {
+        const std::size_t p = static_cast<std::size_t>(y) * width + x;
+        const bool clipped = footprint[0][x] || footprint[1][x] || footprint[2][x];
+        result.native_clipping[p] = clipped ? 255 : 0;
+        float maximum = 0.f;
+        for (int c = 0; c < 3; ++c)
+          maximum = std::max(maximum, quantizeBase(result.base.rgb[3 * p + c]));
+        result.highlight[p] = clipped ? 255 : storeR8((maximum - kClip) / (1.f - kClip));
+      }
     }
   });
+  if (emptyReferenceMask) {
+    if (!validRaw(short_frame, error)) return false;
+    if (!std::isfinite(shortExposureScale) || shortExposureScale <= 0.f)
+      return fail(error, "exposure scale must be finite and positive");
+    *emptyReferenceMask = std::none_of(result.highlight.begin(), result.highlight.end(),
+                                      [](uint8_t value) { return value != 0; });
+  }
+  if ((!emptyReferenceMask || !*emptyReferenceMask) &&
+      (!highlightGenerateGuide(short_frame, wb, 1.f, short_noise, &result.short_unscaled, error) ||
+       !highlightGenerateGuide(short_frame, wb, shortExposureScale, short_noise,
+                               &result.short_normalized, error))) return false;
   *output = std::move(result);
   return true;
 }
 
-bool highlightAssessMasks(const HighlightRawView& short_frame,
+bool highlightGenerateGuides(const HighlightRawView& base, const HighlightRawView& short_frame,
+                             const std::array<float, 3>& wb, float refExposureScale,
+                             float shortExposureScale, const HighlightNoise& base_noise,
+                             const HighlightNoise& short_noise, HighlightGuideSet* output,
+                             std::string* error) {
+  return generateGuides(base, short_frame, wb, refExposureScale, shortExposureScale,
+                        base_noise, short_noise, output, nullptr, error);
+}
+
+bool highlightPrepareMergeGuides(const HighlightRawView& base, const HighlightRawView& short_frame,
+                                 const std::array<float, 3>& wb, float refExposureScale,
+                                 float shortExposureScale, const HighlightNoise& base_noise,
+                                 const HighlightNoise& short_noise, HighlightGuideSet* output,
+                                 bool& emptyReferenceMask, std::string* error) {
+  return generateGuides(base, short_frame, wb, refExposureScale, shortExposureScale,
+                        base_noise, short_noise, output, &emptyReferenceMask, error);
+}
+
+static bool assessMasks(const HighlightRawView& short_frame,
                           const HighlightGuideSet& guides,
                           const HighlightFlowView& corrected_flow,
-                          bool hasSupport, HighlightMaskAssessment* output,
+                          bool hasSupport, bool diagnostics, HighlightMaskAssessment* output,
                           std::string* error) {
   if (error) error->clear();
   if (!output) return fail(error, "assessment output is null");
@@ -430,8 +483,10 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
   result.has_support = hasSupport;
   result.adjusted.resize(n);
   result.inpainting.resize(n);
-  result.short_clipping.resize(n);
-  result.normalized_error.resize(n);
+  if (diagnostics) {
+    result.short_clipping.resize(n);
+    result.normalized_error.resize(n);
+  }
   const auto levels = clippingLevels(short_frame);
   std::vector<uint8_t> row_error(h, 0);
   std::vector<size_t> row_clipped(h, 0), row_short_clipped(h, 0);
@@ -449,6 +504,8 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
         dv = halfStorage((corrected_flow.xy[2 * tile + 1] * .5f) / h);
         if (!std::isfinite(du) || !std::isfinite(dv)) { row_error[y] = 1; return; }
       }
+      // A zero reference weight makes both merge masks zero, regardless of the short RGB.
+      if (!diagnostics && guides.highlight[p] == 0) continue;
       const auto shortRgb = sampleMirrored(guides.short_unscaled,
                                            (x + .5f) / w + du, (y + .5f) / h + dv);
       std::array<float, 3> base8;
@@ -462,7 +519,7 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
         base8[c] = std::round(unit(base) * 255.f) / 255.f;
       }
       const float normalizedError = std::sqrt(errorSquared);
-      result.normalized_error[p] = normalizedError;
+      if (diagnostics) result.normalized_error[p] = normalizedError;
       const float highlight = guides.highlight[p] / 255.f;
       const float fallback = highlight > 0.f && normalizedError >= kErrorThreshold
                            ? std::floor(normalizedError * 255.f) / 255.f : 0.f;
@@ -472,12 +529,12 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
       const float middle = base8[0] + base8[1] + base8[2] - smallest - largest;
       result.inpainting[p] = fallback > 0.f && (highlight >= 1.f ||
                        (smallest >= kInpaintMinimum && middle >= kClip)) ? 255 : 0;
-      const int ax = anchorEven(x + du * w, w - 1);
-      const int ay = anchorEven(y + dv * h, h - 1);
-      result.short_clipping[p] = footprintClipped(short_frame, ax, ay, levels) ? 255 : 0;
-      if (guides.highlight[p]) {
-        ++row_clipped[y];
-        if (result.short_clipping[p]) ++row_short_clipped[y];
+      if (guides.highlight[p]) ++row_clipped[y];
+      if (diagnostics) {
+        const int ax = anchorEven(x + du * w, w - 1);
+        const int ay = anchorEven(y + dv * h, h - 1);
+        result.short_clipping[p] = footprintClipped(short_frame, ax, ay, levels) ? 255 : 0;
+        if (guides.highlight[p] && result.short_clipping[p]) ++row_short_clipped[y];
       }
     }
   });
@@ -496,6 +553,18 @@ bool highlightAssessMasks(const HighlightRawView& short_frame,
                     ? HighlightAdmission::LargeInpaintingHole : HighlightAdmission::Accepted;
   *output = std::move(result);
   return true;
+}
+
+bool highlightAssessMasks(const HighlightRawView& short_frame, const HighlightGuideSet& guides,
+                          const HighlightFlowView& flow, bool hasSupport, HighlightMaskAssessment* output,
+                          std::string* error) {
+  return assessMasks(short_frame, guides, flow, hasSupport, true, output, error);
+}
+
+bool highlightAssessMergeMasks(const HighlightRawView& short_frame, const HighlightGuideSet& guides,
+                               const HighlightFlowView& flow, bool hasSupport, HighlightMaskAssessment* output,
+                               std::string* error) {
+  return assessMasks(short_frame, guides, flow, hasSupport, false, output, error);
 }
 
 bool highlightBuildMergeMasks(const std::vector<uint8_t>& adjusted,

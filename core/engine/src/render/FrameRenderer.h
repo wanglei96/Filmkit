@@ -311,7 +311,7 @@ class FrameRenderer {
    *  dst 侧的大纹理与 satmask CPU 缓冲先分配好，让第一张的 ~2.4GB 分配发生在
    *  用户构图时而不是快门后。不跑任何画质 pass，不写像素；失败只是没预热。
    *  rotation 语义与 submitRawBurst 相同（引擎内部 +1 后再换宽高）。 */
-  bool warmup(int raw_w, int raw_h, int rotation);
+  bool warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter);
   bool submitRawBurst(const void* const* frames, int count,
                       const int* row_strides_px, int w, int h, int cfa,
                       const float black_phase[4], int white_level,
@@ -366,6 +366,8 @@ class FrameRenderer {
  private:
   std::shared_ptr<const spektrafilm::NegativeRenderParams> spektrafilm_profile_;
   bool ensureTargets(int w, int h);
+  bool ensurePreviewTargets(int w, int h);
+  void releasePreviewSpare();
   bool ensureRcdTargets(int w, int h);
   // tex_amaze_（源几何）→ 成片几何 tex_work_（D3）。与 kFsRcdChroma 同一几何口径。
   void passAmazeUp(int dst_w, int dst_h, int rot);
@@ -387,7 +389,7 @@ class FrameRenderer {
   /** 0.13.8：按当前 viewport 做行条带化的全屏 draw（见 cpp 注释，治拍照时预览卡顿）
    *  0.13.17：strips 参数化；默认 8（P0 的既定口径）。
    *  0.13.24：只有拍照链做条带 + fence 窗口；预览链单次 draw。 */
-  void drawStriped(int strips = 8);
+  void drawStriped(int strips = 8, int min_rows = 16);
   /** 0.13.24：拍照链的 GPU fence 窗口（照 PC PassWindow 的"在飞 ≤2"）。
    *  每个条带化 pass 结束插一个 fence；在飞超过 2 时等最老的完成，把驱动命令
    *  队列压短 —— 预览的 draw 才不会排在几十个 pass 后面等。 */
@@ -1159,6 +1161,7 @@ class FrameRenderer {
   GLuint chroma_input_cov_[2] = {0, 0};
   bool ensureHighlightFilterCov(int slot, int width, int height);
   bool ensureHighlightNoiseResources(int width, int height);
+  void releaseChromaCovarianceTargets();
   bool ensureHighlightMergeResources(int width, int height);
   bool passHighlightNoise(int width, int height, int rotation, int cfa,
                           const float* ccm, const NoiseCoef* profile = nullptr,
@@ -2064,6 +2067,10 @@ class FrameRenderer {
   } u_fill_;
   // Source-white resolve also applies when a bracket has no usable short.
   bool highlight_resolve_ready_ = false;
+  struct PreviewSpare {
+    GLuint textures[7] = {}, framebuffers[7] = {};
+    int width = 0, height = 0, teqWidth = 0, teqHeight = 0;
+  } preview_spare_;
 };
 
 }  // namespace filmkit

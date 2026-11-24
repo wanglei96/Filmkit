@@ -25,6 +25,7 @@
 // --lens-switch-cases (warmup/RAW-size/rotation/strength changes in one renderer).
 // --edge-dump (save production diagnostic stages in the output directory).
 // --no-stage-sync (disable profiling-only P0/RCD/CCM waits; not image readbacks).
+// --no-align-l1 (skip fine temporal alignment, leaving highlight admission intact).
 // --diag-stats (enable production stage diagnostics; off by default in this tool).
 // --pc3d 0|1|2 --pc3d-msize 0|7|11|15|21 (still replay overrides only).
 // --chroma-gate 0..2 (same production edge-chroma setting).
@@ -35,6 +36,11 @@
 // --synthetic-feedback 0|1 (prime real preview statistics for slot 0 or 1 with a test pattern).
 // --spektrafilm PROFILE RESPONSE (production recipe, test RGBA and HDR gainmap).
 // --print-ev EV (Spektrafilm enlarger exposure, independent of capture EV).
+// --spektrafilm-grain (enable seeded grain for Spektrafilm replay).
+// --ten-bit (check packed RGB10_A2 before converting a copy for JPEG).
+// --preview-reinit (also release and recreate a preview renderer).
+// --concurrent-preview (30 Hz synthetic preview alongside one RAW replay).
+// --repeat N (repeat identical input on one renderer, saving each result).
 // Exit failure on init, render, byte count, image-range, JPEG or file-write error.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -46,9 +52,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include "../core/engine/src/film/EngineRegistry.h"
 #include "../core/engine/src/render/FrameRenderer.h"
@@ -64,11 +73,13 @@ struct Egl {
   EGLDisplay display = EGL_NO_DISPLAY;
   EGLContext context = EGL_NO_CONTEXT;
   EGLSurface surface = EGL_NO_SURFACE;
-  explicit Egl(int surfaceSize = 16) {
-    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  explicit Egl(int width = 16, int height = 16, EGLint priority = 0,
+               EGLDisplay sharedDisplay = EGL_NO_DISPLAY)
+      : ownsDisplay_(sharedDisplay == EGL_NO_DISPLAY) {
+    display = ownsDisplay_ ? eglGetDisplay(EGL_DEFAULT_DISPLAY) : sharedDisplay;
     require(display != EGL_NO_DISPLAY, "eglGetDisplay failed");
     EGLint major = 0, minor = 0;
-    require(eglInitialize(display, &major, &minor), "eglInitialize failed");
+    if (ownsDisplay_) require(eglInitialize(display, &major, &minor), "eglInitialize failed");
     require(eglBindAPI(EGL_OPENGL_ES_API), "eglBindAPI failed");
     const EGLint attributes[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
       EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_RED_SIZE, 8,
@@ -77,25 +88,75 @@ struct Egl {
     EGLint count = 0;
     require(eglChooseConfig(display, attributes, &config, 1, &count) && count == 1,
             "no ES3 pbuffer EGL config");
-    const EGLint pbuffer[] = {EGL_WIDTH, surfaceSize, EGL_HEIGHT, surfaceSize, EGL_NONE};
+    const EGLint pbuffer[] = {EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE};
     surface = eglCreatePbufferSurface(display, config, pbuffer);
     require(surface != EGL_NO_SURFACE, "eglCreatePbufferSurface failed");
     const EGLint ctx[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx);
+    const char* extensions = eglQueryString(display, EGL_EXTENSIONS);
+    if (priority && extensions && std::strstr(extensions, "EGL_IMG_context_priority")) {
+      const EGLint attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                              priority, EGL_NONE};
+      context = eglCreateContext(display, config, EGL_NO_CONTEXT, attrs);
+      if (context == EGL_NO_CONTEXT) eglGetError();
+      EGLint actual = 0;
+      if (context != EGL_NO_CONTEXT &&
+          !eglQueryContext(display, context, EGL_CONTEXT_PRIORITY_LEVEL_IMG, &actual)) eglGetError();
+      std::printf("EGL_PRIORITY requested=%d actual=%d\n", priority, actual);
+    }
+    if (context == EGL_NO_CONTEXT) context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx);
     require(context != EGL_NO_CONTEXT, "eglCreateContext failed");
     require(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent failed");
-    std::printf("EGL=%d.%d GL_VENDOR=%s GL_RENDERER=%s GL_VERSION=%s\n",
-                major, minor, glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    if (ownsDisplay_)
+      std::printf("EGL=%d.%d GL_VENDOR=%s GL_RENDERER=%s GL_VERSION=%s\n",
+                  major, minor, glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
   }
   ~Egl() {
     if (display != EGL_NO_DISPLAY) {
       eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
       if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
       if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
-      eglTerminate(display);
+      if (ownsDisplay_) eglTerminate(display);
     }
   }
+ private:
+  bool ownsDisplay_;
 };
+using Clock = std::chrono::steady_clock;
+double ms(Clock::duration elapsed) {
+  return std::chrono::duration<double, std::milli>(elapsed).count();
+}
+void concurrentPreview(std::stop_token stop, EGLDisplay display, std::promise<void>& ready,
+                       std::vector<std::pair<Clock::time_point, Clock::time_point>>& samples,
+                       std::exception_ptr& error) {
+  try {
+    constexpr int width = 1216, height = 1621;
+    const float st[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    Egl egl(width, height, EGL_CONTEXT_PRIORITY_HIGH_IMG, display);
+    filmkit::FrameRenderer renderer;
+    require(renderer.init(), "concurrent preview init failed");
+    filmkit::FilmParams params;
+    params.auto_black_pt = params.auto_white_pt = 1.f;
+    auto next = Clock::now();
+    constexpr auto period = std::chrono::nanoseconds(33333333);
+    for (int i = 0; !stop.stop_requested(); ++i) {
+      std::this_thread::sleep_until(next);
+      if (stop.stop_requested()) break;
+      const auto start = Clock::now();
+      require(renderer.submitFrame(st, 0, 1.f, 1.f, width, height, params, true),
+              "concurrent preview submit failed");
+      // Measure GPU completion, not just CPU submission. No pixel readback.
+      glFinish();
+      const auto end = Clock::now();
+      require(glGetError() == GL_NO_ERROR, "concurrent preview GL error");
+      samples.emplace_back(start, end);
+      if (i == 7) ready.set_value();
+      do { next += period; } while (next < end);
+    }
+  } catch (...) {
+    error = std::current_exception();
+    try { ready.set_exception(error); } catch (const std::future_error&) {}
+  }
+}
 void save(const std::string& path, const void* bytes, size_t count) {
   FILE* file = std::fopen(path.c_str(), "wb");
   require(file != nullptr, "cannot open " + path);
@@ -204,12 +265,12 @@ void checkAllocation() {
 int run(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   try {
-    int size = 256, demosaic = 1, rotation = 0, pc3d = -1, pc3dMsize = -1;
+    int size = 256, demosaic = 1, rotation = 0, pc3d = -1, pc3dMsize = -1, repeat = 1;
     bool hdr = true, dft = true, timerOnly = false, allocationOnly = false, preview = false, warmup = false, covarianceCases = false;
     bool noShort = false, highlightCases = false, expectSourceWhite = false, edgeDump = false;
-    bool stageSync = true, diagStats = false, aeHal = false, expectChroma = false;
-    bool lensSwitchCases = false;
-    bool prefilterCases = false;
+    bool stageSync = true, diagStats = false, aeHal = false, expectChroma = false, alignL1 = true;
+    bool lensSwitchCases = false, tenBit = false, previewReinit = false;
+    bool prefilterCases = false, concurrent = false, spektraGrain = false;
     int feedbackSlot = -1;
     int colorSmooth = -1, colorMedian = -1;
     float chromaGate = -1.f;
@@ -218,6 +279,10 @@ int run(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--timer-only") timerOnly = true;
+      else if (arg == "--ten-bit") tenBit = true;
+      else if (arg == "--preview-reinit") previewReinit = true;
+      else if (arg == "--concurrent-preview") concurrent = true;
+      else if (arg == "--repeat" && i + 1 < argc) repeat = std::stoi(argv[++i]);
       else if (arg == "--prefilter-cases") prefilterCases = true;
       else if (arg == "--color-smooth" && i + 1 < argc) colorSmooth = std::stoi(argv[++i]);
       else if (arg == "--color-median" && i + 1 < argc) colorMedian = std::stoi(argv[++i]);
@@ -230,11 +295,13 @@ int run(int argc, char** argv) {
       else if (arg == "--expect-chroma") expectChroma = true;
       else if (arg == "--edge-dump") edgeDump = true;
       else if (arg == "--no-stage-sync") stageSync = false;
+      else if (arg == "--no-align-l1") alignL1 = false;
       else if (arg == "--diag-stats") diagStats = true;
       else if (arg == "--ae-hal") aeHal = true;
       else if (arg == "--synthetic-feedback" && i + 1 < argc) feedbackSlot = std::stoi(argv[++i]);
       else if (arg == "--film-params" && i + 1 < argc) filmParamsFile = argv[++i];
       else if (arg == "--print-ev" && i + 1 < argc) printEv = std::stod(argv[++i]);
+      else if (arg == "--spektrafilm-grain") spektraGrain = true;
       else if (arg == "--spektrafilm" && i + 2 < argc) {
         spektraProfile = argv[++i];
         spektraResponse = argv[++i];
@@ -254,6 +321,9 @@ int run(int argc, char** argv) {
       else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
     require(size >= 128 && size <= 4096 && size % 32 == 0, "size must be a multiple of 32 in [128,4096]");
+    require(repeat >= 1 && repeat <= 16 && (repeat == 1 ||
+            (!preview && !prefilterCases && !lensSwitchCases && !highlightCases && !covarianceCases)),
+            "repeat must be in [1,16] without preview or case sets");
     require(colorSmooth >= -1 && colorSmooth <= 1 && colorMedian >= -1 && colorMedian <= 1,
             "prefilter overrides must be 0 or 1");
     require(!prefilterCases || (!preview && !lensSwitchCases && !highlightCases &&
@@ -277,7 +347,11 @@ int run(int argc, char** argv) {
     const bool syntheticFeedback = feedbackSlot >= 0;
     require(!syntheticFeedback || (!rawDirectory.empty() && !preview && !warmup && filmParamsFile.empty()),
             "synthetic feedback requires a real RAW replay without warmup");
-    Egl egl(preview || syntheticFeedback ? size : 16);
+    require(!concurrent || (!rawDirectory.empty() && !preview && !syntheticFeedback &&
+            !covarianceCases && !prefilterCases && repeat == 1),
+            "concurrent preview requires one RAW replay");
+    const int surfaceSize = preview || syntheticFeedback ? size : 16;
+    Egl egl(surfaceSize, surfaceSize, concurrent ? EGL_CONTEXT_PRIORITY_LOW_IMG : 0);
     if (allocationOnly) { checkAllocation(); return EXIT_SUCCESS; }
     if (timerOnly) { checkTimer(); return EXIT_SUCCESS; }
     filmkit::FilmParams params;
@@ -321,7 +395,7 @@ int run(int argc, char** argv) {
           &error, std::as_bytes(std::span(responseBytes)));
       require(bool(loaded), "Spektrafilm profile rejected: " + error);
       auto recipe = std::make_shared<filmkit::spektrafilm::NegativeRenderParams>(*loaded);
-      const std::array<double, 12> options{1, 0, .45, .8, .5, .5, 1, printEv, 0, .7, .7, 35};
+      const std::array<double, 12> options{1, spektraGrain ? 1.0 : 0.0, .45, .8, .5, .5, 1, printEv, 0, .7, .7, 35};
       require(filmkit::spektrafilm::applyRenderOptions(*recipe, options), "Spektrafilm options rejected");
       renderer.setSpektrafilmProfile(std::move(recipe));
       params.engine_slot = filmkit::kSpektrafilmSlot;
@@ -336,6 +410,7 @@ int run(int argc, char** argv) {
     if (preview) {
       filmkit::FrameRenderer::setToneEq(true);
       const float st[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+      for (int round = 0; round < 2; ++round) {
       for (int slot : {0, 1}) for (int scaled : {0, 1}) {
         filmkit::FilmParams params;
         params.engine_slot = static_cast<float>(slot);
@@ -353,10 +428,25 @@ int run(int argc, char** argv) {
           low = std::min(low, rgba[i]); high = std::max(high, rgba[i]);
         }
         require(high > low && high > 0, "synthetic preview constant/black");
-        save(output + "/preview-" + std::to_string(slot) + "-" +
+        save(output + "/preview-" + std::to_string(round) + "-" + std::to_string(slot) + "-" +
              std::to_string(scaled) + ".rgba", rgba.data(), rgba.size());
         std::printf("PREVIEW engine=%d scaled=%d frames=3 min=%u max=%u bytes=%zu\n",
                     slot, scaled, low, high, rgba.size());
+      }
+      }
+      if (previewReinit) {
+        renderer.release();
+        require(glGetError() == GL_NO_ERROR, "preview release GL error");
+        filmkit::FrameRenderer rebuilt;
+        require(rebuilt.init(), "preview recreation failed");
+        filmkit::FilmParams params;
+        for (float scale : {1.f, .5f, 1.f}) {
+          filmkit::FrameRenderer::setPreviewScale(scale);
+          require(rebuilt.submitFrame(st, 0, 1.f, 1.f, size, size, params, true),
+                  "recreated preview submit failed");
+          glFinish();
+          require(glGetError() == GL_NO_ERROR, "recreated preview GL error");
+        }
       }
       std::printf("PASS full/scaled preview, both engines, full current-frame statistics\n");
       return EXIT_SUCCESS;
@@ -397,7 +487,11 @@ int run(int argc, char** argv) {
     }
     if (warmup) {
       std::printf("STAGE warmup size=%dx%d rotation=%d\n", width, height, rotation);
-      require(renderer.warmup(width, height, rotation), "still warmup failed");
+      const bool usePc3d = (pc3d >= 0 ? pc3d : params.pc3d) > .5f;
+      const bool usePrefilter = (colorSmooth >= 0 ? colorSmooth : params.color_smooth) > .5f ||
+          (colorMedian >= 0 ? colorMedian : params.color_median) > .5f;
+      require(renderer.warmup(width, height, rotation, spektraProfile.empty() || usePc3d,
+                             spektraProfile.empty() || usePrefilter), "still warmup failed");
       require(glGetError() == GL_NO_ERROR, "still warmup GL error");
     }
     const int grbg[4] = {1, 0, 2, 1};
@@ -406,7 +500,7 @@ int run(int argc, char** argv) {
     if (lensSwitchCases && filmParamsFile.empty()) {
       // Match the production allocation order without a private preset snapshot.
       params.color_smooth = 1.f;
-      params.engine_slot = 0.f;
+      if (spektraProfile.empty()) params.engine_slot = 0.f;
     }
     if (pc3d >= 0) params.pc3d = static_cast<float>(pc3d);
     if (pc3dMsize >= 0) params.pc3d_msize = static_cast<float>(pc3dMsize);
@@ -417,7 +511,7 @@ int run(int argc, char** argv) {
                 params.pc3d, params.pc3d_msize, params.chroma_gate);
     const float shotCases[] = {.0007f, .000004f, .00008f, .00008f, .000004f, .0007f, .000004f, .0007f};
     const float pc3dCases[] = {1.f, 1.f, 1.f, 2.f, 0.f, 2.f, 1.f, 1.f};
-    for (int capture = 0; capture < (prefilterCases ? 24 : covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : 1); ++capture) {
+    for (int capture = 0; capture < (prefilterCases ? 24 : covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : repeat); ++capture) {
     const bool single = (highlightCases && capture == 4) || (prefilterCases && capture >= 12);
     if (prefilterCases) {
       const int mode = (capture/3)%4;
@@ -451,7 +545,7 @@ int run(int argc, char** argv) {
       std::printf("LENS_SWITCH capture=%d size=%dx%d rotation=%d noise=%.2f contrast=%.2f warmup=%d\n",
                   capture, width, height, rotation, noiseStrength, params.contrast, prewarm);
       if (prewarm) {
-        require(renderer.warmup(width, height, rotation), "lens-switch warmup failed");
+        require(renderer.warmup(width, height, rotation, true, true), "lens-switch warmup failed");
         require(glGetError() == GL_NO_ERROR, "lens-switch warmup GL error");
       }
     }
@@ -505,21 +599,46 @@ int run(int argc, char** argv) {
     if (edgeDump) save(output + "/edge_dump.enable", "", 0);
     std::printf("STAGE submitRawBurst hdr=%d dft=%d demosaic=%d diagStats=%d stageSync=%d stillContext=1 engine_slot=%.1f tone_strength=%.1f\n",
                 hdr, dft, demosaic, diagStats, stageSync, params.engine_slot, params.tone_strength);
-    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::pair<Clock::time_point, Clock::time_point>> previewSamples;
+    std::exception_ptr previewError;
+    std::promise<void> previewReady;
+    std::jthread previewThread;
+    if (concurrent) {
+      previewSamples.reserve(512);
+      filmkit::FrameRenderer::setPreviewScale(.5f);
+      auto ready = previewReady.get_future();
+      previewThread = std::jthread(concurrentPreview, egl.display, std::ref(previewReady),
+                                 std::ref(previewSamples), std::ref(previewError));
+      ready.get();
+    }
+    const auto wallStart = std::chrono::system_clock::now();
+    const auto start = Clock::now();
     const bool ok = single ? renderer.submitRaw(frames[0], width, height, strides[0], cfa,
       black, white, neutral[0], neutral[1], neutral[2], ccm, lsc.data(), lscCols, lscRows,
-      rotation, params, demosaic, noiseStrength, noise, .015f, false, &rgba, false)
+      rotation, params, demosaic, noiseStrength, noise, .015f, false, &rgba, tenBit)
       : renderer.submitRawBurst(frames, 4, strides, width, height, cfa,
       black, white, neutral[0], neutral[1], neutral[2], ccm, lsc.data(), lscCols, lscRows, rotation,
-      params, demosaic, noiseStrength, noise, .015f, 1.f, dft, true, false, true,
+      params, demosaic, noiseStrength, noise, .015f, 1.f, dft, alignL1, false, true,
       false, 1.f, hdr ? 0.f : -1.f, hdr ? ev : nullptr, hdr ? gain : nullptr,
-      hdr ? 2 : -1, &rgba, false);
+      hdr ? 2 : -1, &rgba, tenBit);
+    const auto end = Clock::now();
+    const GLenum renderError = glGetError();
+    if (concurrent) {
+      previewThread.request_stop();
+      previewThread.join();
+      if (previewError) std::rethrow_exception(previewError);
+      std::printf("CONCURRENT start_epoch_ms=%.3f end_ms=%.3f\n",
+          std::chrono::duration<double, std::milli>(wallStart.time_since_epoch()).count(), ms(end - start));
+      for (const auto& [begin, done] : previewSamples)
+        std::printf("PREVIEW_GPU start_ms=%.3f done_ms=%.3f\n", ms(begin - start), ms(done - start));
+    }
     std::printf("RENDER ok=%d bytes=%zu expected=%zu elapsed_ms=%.3f glError=0x%x scene=%dx%d\n",
       ok, rgba.size(), size_t(width) * height * 4,
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
-      glGetError(), renderer.sceneW(), renderer.sceneH());
+      ms(end - start),
+      renderError, renderer.sceneW(), renderer.sceneH());
     printLogs();
     require(ok && rgba.size() == size_t(width) * height * 4, "full-chain render failed or returned wrong byte count");
+    require(renderError == GL_NO_ERROR, "full-chain render GL error");
     if (prefilterCases) {
       const auto logs = filmkit::Logger::instance().recentLines(1000);
       const size_t last = logs.rfind("\"event\":\"raw.render\"");
@@ -543,6 +662,19 @@ int run(int argc, char** argv) {
       require(resolveCount() == resolvesBefore + expected, "wrong per-capture source-white resolve count");
       std::printf("SOURCE_WHITE expected=%zu observed=%zu\n", expected, resolveCount() - resolvesBefore);
     }
+    save(output + "/render.rgba", rgba.data(), rgba.size());
+    if (repeat > 1 || covarianceCases || highlightCases || lensSwitchCases)
+      save(output + "/case-" + std::to_string(capture) + ".rgba", rgba.data(), rgba.size());
+    if (tenBit) {
+      for (size_t i = 0; i < rgba.size(); i += 4) {
+        uint32_t packed;
+        std::memcpy(&packed, rgba.data() + i, sizeof(packed));
+        require((packed >> 30) == 3u, "packed RGB10_A2 alpha is not opaque");
+        for (int c = 0; c < 3; ++c)
+          rgba[i + c] = static_cast<uint8_t>((((packed >> (10 * c)) & 1023u) * 255u + 511u) / 1023u);
+        rgba[i + 3] = 255;
+      }
+    }
     uint8_t low = 255, high = 0;
     double sum = 0;
     for (size_t i = 0; i < rgba.size(); i += 4) for (int c = 0; c < 3; ++c) {
@@ -553,11 +685,12 @@ int run(int argc, char** argv) {
     if (lensSwitchCases)
       require(sum / (size_t(width) * height * 3) > 10.,
               "known bright lens-switch fixture became black (dither is not image signal)");
-    save(output + "/render.rgba", rgba.data(), rgba.size());
     if (!spektraProfile.empty()) {
       std::vector<uint8_t> gainmap;
       require(renderer.readGainmap(&gainmap) && !gainmap.empty(), "Spektrafilm HDR gainmap unavailable");
       save(output + "/render.gainmap", gainmap.data(), gainmap.size());
+      if (repeat > 1 || covarianceCases || highlightCases || lensSwitchCases)
+        save(output + "/case-" + std::to_string(capture) + ".gainmap", gainmap.data(), gainmap.size());
     }
     std::vector<uint8_t> jpeg;
     const int outWidth = ((rotation + 1) % 2) ? height : width;
@@ -568,8 +701,7 @@ int run(int argc, char** argv) {
     require(encoded && jpeg.size() > 4 && jpeg[0] == 0xff && jpeg[1] == 0xd8 &&
             jpeg[jpeg.size()-2] == 0xff && jpeg.back() == 0xd9, "JPEG encode or markers failed");
     save(output + "/render.jpg", jpeg.data(), jpeg.size());
-    if (covarianceCases || highlightCases || lensSwitchCases) {
-      save(output + "/case-" + std::to_string(capture) + ".rgba", rgba.data(), rgba.size());
+    if (repeat > 1 || covarianceCases || highlightCases || lensSwitchCases) {
       save(output + "/case-" + std::to_string(capture) + ".jpg", jpeg.data(), jpeg.size());
     }
     }

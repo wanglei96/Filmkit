@@ -201,13 +201,17 @@ enum class GainmapMath { kOfficial, kPhotonCamera };
 //
 // rgba8：    长度 w*h*4 的 ARGB_8888 内存序成片
 // gainmap：  长度 gw*gh 的单通道 8bit 归一化比值（0..255）
-extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
-                                                       jobject bitmap,
-                                                       jbyteArray gainmap,
-                                                       jint gw, jint gh,
-                                                       jint quality) {
+static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap,
+                                jint gw, jint gh, jint quality, jbyteArray exif) {
   if (!bitmap || !gainmap || gw <= 0 || gh <= 0) return nullptr;
+  std::vector<uint8_t> exifBytes;
+  if (exif) {
+    const auto size = env->GetArrayLength(exif);
+    if (size < 14 || size > 65533) return nullptr;
+    exifBytes.resize(size);
+    env->GetByteArrayRegion(exif, 0, size, reinterpret_cast<jbyte*>(exifBytes.data()));
+    if (env->ExceptionCheck() || std::memcmp(exifBytes.data(), "Exif\0\0", 6) != 0) return nullptr;
+  }
 
   // ── 取成片 RGBA8 ──────────────────────────────────────────────────
   AndroidBitmapInfo info;
@@ -323,6 +327,12 @@ Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
   bool ok = true;
   ok = ok && uhdr_enc_set_compressed_image(enc, &base, UHDR_BASE_IMG).error_code == UHDR_CODEC_OK;
   ok = ok && uhdr_enc_set_gainmap_image(enc, &gimg, &meta).error_code == UHDR_CODEC_OK;
+  if (!exifBytes.empty()) {
+    uhdr_mem_block_t block{};
+    block.data = exifBytes.data();
+    block.capacity = block.data_sz = exifBytes.size();
+    ok = ok && uhdr_enc_set_exif_data(enc, &block).error_code == UHDR_CODEC_OK;
+  }
   // 显式选 JPEG/R 输出容器（对齐 PC `jpeg_r_encoder.cpp:packageJpegR`）。
   // 默认就是 JPG，但显式写出能防止上游改默认值时静默变成别种容器。
   ok = ok && uhdr_enc_set_output_format(enc, UHDR_CODEC_JPG).error_code == UHDR_CODEC_OK;
@@ -350,4 +360,16 @@ Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
   }
   uhdr_release_encoder(enc);
   return result;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdr(JNIEnv* env, jclass,
+    jobject bitmap, jbyteArray gainmap, jint gw, jint gh, jint quality) {
+  return encodeUltraHdr(env, bitmap, gainmap, gw, gh, quality, nullptr);
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_filmkit_app_EngineBridge_nativeEncodeUltraHdrWithExif(JNIEnv* env, jclass,
+    jobject bitmap, jbyteArray gainmap, jint gw, jint gh, jint quality, jbyteArray exif) {
+  return encodeUltraHdr(env, bitmap, gainmap, gw, gh, quality, exif);
 }

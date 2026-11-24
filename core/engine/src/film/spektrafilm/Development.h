@@ -2,6 +2,7 @@
 
 #include "Spectral.h"
 
+#include <utility>
 #include <vector>
 
 namespace filmkit::spektrafilm {
@@ -15,6 +16,7 @@ public:
 
     // Inputs and outputs can be disjoint or identical. Work can be split into spans.
     bool develop(std::span<const Triplet> logExposure, std::span<Triplet> density) const noexcept;
+    std::pair<Triplet, Triplet> densityBounds() const noexcept;
 
 private:
     struct Knot { double x, y, inverseNextStep; };

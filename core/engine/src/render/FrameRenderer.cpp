@@ -17,7 +17,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include "../log/GpuTimer.h"
 #include "../log/Logger.h"
@@ -3460,7 +3465,7 @@ void main() {
     oColor = vec4(at3(uGain, chanAt(p)) * k, 0.0, 0.0, 1.0);
 })";
 
-// kFsMfnrPyr：raw → 1/2 灰度（RGBA8）。sqrt 预编码：8bit 灰度域里暗部分辨率
+// kFsMfnrPyr：raw → 1/2 灰度（R8）。sqrt 预编码：8bit 灰度域里暗部分辨率
 // 太低（线性 0.01 → 2.5 级），sqrt 把它抬到 25 级——对齐度量在感知域也更稳。
 const char* kFsMfnrPyr = R"(#version 300 es
 precision highp float;
@@ -3700,17 +3705,6 @@ uniform vec3 uGain;
 // 期 B bracket：逐帧曝光归一，与 kFsMfnrFuse 同口径（不 clamp，见其注释）。
 uniform vec4 uFrameScale;
 float frameLin(float x, float sc) { return x * sc; }
-int chanAt(ivec2 p) {
-    int k = ((p.y & 1) << 1) | (p.x & 1);
-    return (uCfaLut >> (k << 1)) & 3;
-}
-float gainAt(int c) { return c == 0 ? uGain.x : (c == 1 ? uGain.y : uGain.z); }
-float linAt(highp usampler2D t, ivec2 p) {
-    p = clamp(p, ivec2(0), uSize - 1);
-    float v = float(texelFetch(t, p, 0).r);
-    float bl = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-    return max((v - bl) / max(uWhite - bl, 1.0), 0.0) * gainAt(chanAt(p));
-}
 vec3 off1At(vec2 uv) {
     vec2 px = uv * uOffTiles - 0.5;
     vec2 fr = fract(px);
@@ -3747,55 +3741,49 @@ vec3 off3At(vec2 uv) {
     vec3 d = texelFetch(uOff3, hi, 0).rgb;
     return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
 }
-float linSub(highp usampler2D t, ivec2 p, vec2 d) {
-    ivec2 ph = ivec2(p.x & 1, p.y & 1);
-    vec2 gmax = vec2(uSize - 1 - ph) * 0.5;
-    vec2 s = clamp((vec2(p) + d - vec2(ph)) * 0.5, vec2(0.0), gmax);
-    vec2 s0 = floor(s);
-    vec2 w = s - s0;
-    ivec2 hi = ph + ((uSize - 1 - ph) & ~1);
-    ivec2 b = ph + ivec2(s0) * 2;
-    float v00 = linAt(t, b);
-    float v10 = linAt(t, min(b + ivec2(2, 0), hi));
-    float v01 = linAt(t, min(b + ivec2(0, 2), hi));
-    float v11 = linAt(t, min(b + ivec2(2, 2), hi));
-    return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+float linearCode(uint code, float black, float range, float gain) {
+    return max((float(code) - black) / range, 0.0) * gain;
 }
 // Native integer codes decide observability BEFORE interpolation/WB/exposure.
 // UNKNOWN means no comparable motion measurement, never "stationary". The
 // separately admitted Bento short slice does not consume this rejection map.
-bool nativeValid(highp usampler2D raw, ivec2 p) {
-    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, uSize))) return false;
-    int phase = (p.y & 1) * 2 + (p.x & 1);
-    uint limit = uint(ceil(uBlack[phase] + (uWhite - uBlack[phase]) * 0.98));
-    return texelFetch(raw, p, 0).r < limit;
-}
-bool alignedValid(highp usampler2D raw, ivec2 p, vec2 offset) {
-    ivec2 phase = p & ivec2(1);
+bool alignedSample(highp usampler2D raw, ivec2 p, ivec2 phase, vec2 offset,
+                   uint limit, float black, float range, float gain, out float sampleValue) {
+    ivec2 last = (uSize - 1 - phase) / 2;
     vec2 position = (vec2(p) + offset - vec2(phase)) * 0.5;
-    vec2 maxGrid = vec2((uSize - 1 - phase) / 2);
-    if (any(lessThan(position, vec2(0.0))) || any(greaterThan(position, maxGrid))) return false;
-    ivec2 base = phase + ivec2(floor(position)) * 2;
-    vec2 f = fract(position);
-    if (!nativeValid(raw, base)) return false;
-    if (f.x > 0.0 && !nativeValid(raw, base + ivec2(2, 0))) return false;
-    if (f.y > 0.0 && !nativeValid(raw, base + ivec2(0, 2))) return false;
-    if (f.x > 0.0 && f.y > 0.0 && !nativeValid(raw, base + ivec2(2, 2))) return false;
+    if (any(lessThan(position, vec2(0.0))) || any(greaterThan(position, vec2(last)))) return false;
+    vec2 origin = floor(position);
+    vec2 f = position - origin;
+    ivec2 lo = phase + ivec2(origin) * 2;
+    ivec2 hi = min(lo + 2, phase + last * 2);
+    uint a = texelFetch(raw, lo, 0).r;
+    if (a >= limit) return false;
+    uint b = texelFetch(raw, ivec2(hi.x, lo.y), 0).r;
+    if (f.x > 0.0 && b >= limit) return false;
+    uint c = texelFetch(raw, ivec2(lo.x, hi.y), 0).r;
+    if (f.y > 0.0 && c >= limit) return false;
+    uint d = texelFetch(raw, hi, 0).r;
+    if (f.x > 0.0 && f.y > 0.0 && d >= limit) return false;
+    // Interpolate the same four linearized CFA taps; don't fetch them again.
+    sampleValue = mix(mix(linearCode(a, black, range, gain), linearCode(b, black, range, gain), f.x),
+                      mix(linearCode(c, black, range, gain), linearCode(d, black, range, gain), f.x), f.y);
     return true;
 }
-void comparePair(highp usampler2D raw, ivec2 p, vec2 offset, float scale,
+void comparePair(highp usampler2D raw, ivec2 p, ivec2 phase, vec2 offset,
+                 uint limit, float black, float range, float gain, float scale,
                  float gainRatio, float reference, float shot, float read,
                  inout float sumSquared, inout float sumVariance,
                  inout float pairs, inout vec4 phases) {
-    if (!nativeValid(uRaw0, p) || !alignedValid(raw, p, offset)) return;
-    float value = frameLin(linSub(raw, p, offset), scale);
+    float aligned;
+    if (!alignedSample(raw, p, phase, offset, limit, black, range, gain, aligned)) return;
+    float value = frameLin(aligned, scale);
     float delta = reference - value;
     sumSquared += delta * delta;
     float s0 = uFrameScale.x;
     sumVariance += shot * (reference * s0 + value * scale) +
         read * (uGainRatio.x * uGainRatio.x * s0 * s0 + gainRatio * gainRatio * scale * scale);
     pairs += 1.0;
-    phases[(p.y & 1) * 2 + (p.x & 1)] += 1.0;
+    phases[phase.y * 2 + phase.x] += 1.0;
 }
 float observedMismatch(float residual, float variance, float pairs, vec4 phases) {
     if (pairs < 4.0 || any(lessThan(phases, vec4(1.0)))) return 1.0;
@@ -3827,15 +3815,23 @@ void main() {
             for (int phase = 0; phase < 4; ++phase) {
                 ivec2 p = base + ivec2(dx + (phase & 1), dy + (phase >> 1));
                 if (any(greaterThanEqual(p, uSize))) continue;
-                int color = chanAt(p);
+                ivec2 cfaPhase = p & ivec2(1);
+                int k = cfaPhase.y * 2 + cfaPhase.x;
+                float black = uBlack[k];
+                uint limit = uint(ceil(black + (uWhite - black) * 0.98));
+                uint code = texelFetch(uRaw0, p, 0).r;
+                if (code >= limit) continue;
+                int color = (uCfaLut >> (k << 1)) & 3;
+                float range = max(uWhite - black, 1.0);
+                float gain = color == 0 ? uGain.x : (color == 1 ? uGain.y : uGain.z);
                 float shot = color == 0 ? uNoiseA.x : (color == 1 ? uNoiseA.y : uNoiseA.z);
                 float read = color == 0 ? uNoiseB.x : (color == 1 ? uNoiseB.y : uNoiseB.z);
-                float r = frameLin(linAt(uRaw0, p), uFrameScale.x);
-                comparePair(uRaw1, p, o1, uFrameScale.y, uGainRatio.y, r, shot, read,
+                float r = frameLin(linearCode(code, black, range, gain), uFrameScale.x);
+                comparePair(uRaw1, p, cfaPhase, o1, limit, black, range, gain, uFrameScale.y, uGainRatio.y, r, shot, read,
                             s1, v1, n1, phases1);
-                comparePair(uRaw2, p, o2, uFrameScale.z, uGainRatio.z, r, shot, read,
+                comparePair(uRaw2, p, cfaPhase, o2, limit, black, range, gain, uFrameScale.z, uGainRatio.z, r, shot, read,
                             s2, v2, n2, phases2);
-                comparePair(uRaw3, p, o3, uFrameScale.w, uGainRatio.w, r, shot, read,
+                comparePair(uRaw3, p, cfaPhase, o3, limit, black, range, gain, uFrameScale.w, uGainRatio.w, r, shot, read,
                             s3, v3, n3, phases3);
             }
         }
@@ -8507,6 +8503,74 @@ void diagStatsLog(const char* stage, const float* v, const FilmParams* p,
   Logger::instance().log(LogLevel::kInfo, "engine", "diag.stats", kv);
 }
 
+constexpr std::size_t kStatPackBytes = kStatPackW * kStatPackH * 4;
+
+void logPackedDiag(const char* stage, const unsigned char* bytes, const FilmParams* p) {
+  float v[kSlotCount];
+  if (bytes) {
+    for (int i = 0; i < kSlotCount; ++i) v[i] = statUnpack(bytes + i * 4);
+    if (v[kSlotN] > 0.f) {
+      diagStatsLog(stage, v, p, nullptr);
+      return;
+    }
+  }
+  diagStatsLog(stage, nullptr, p, "readback");
+}
+
+struct DiagReadBatch {
+  struct Entry { const char* stage; const FilmParams* params; };
+  static constexpr std::size_t kCapacity = 12;
+  std::array<Entry, kCapacity> entries;
+  std::size_t count = 0;
+  GLuint buffer = 0;
+  bool allocationFailed = false;
+
+  bool bindForRead() {
+    if (count == entries.size() || allocationFailed) return false;
+    if (!buffer) {
+      glGenBuffers(1, &buffer);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
+      if (buffer) glBufferData(GL_PIXEL_PACK_BUFFER, entries.size() * kStatPackBytes, nullptr, GL_STREAM_READ);
+      if (!buffer || glGetError() != GL_NO_ERROR) {
+        if (buffer) glDeleteBuffers(1, &buffer);
+        buffer = 0;
+        allocationFailed = true;
+        return false;
+      }
+    } else {
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
+    }
+    return true;
+  }
+
+  void finish() {
+    if (!buffer) return;
+    GLint previous = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previous);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
+    std::array<unsigned char, kCapacity * kStatPackBytes> copy;
+    bool ok = count == 0;
+    if (count) {
+      const auto bytes = count * kStatPackBytes;
+      const auto* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT);
+      if (mapped) {
+        std::memcpy(copy.data(), mapped, bytes);
+        ok = glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;
+      }
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previous));
+    glDeleteBuffers(1, &buffer);
+    buffer = 0;
+    while (glGetError() != GL_NO_ERROR) ok = false;
+    for (std::size_t i = 0; i < count; ++i) {
+      logPackedDiag(entries[i].stage, ok ? copy.data() + i * kStatPackBytes : nullptr, entries[i].params);
+    }
+    count = 0;
+  }
+};
+
+thread_local DiagReadBatch* g_diag_read_batch = nullptr;
+
 // 成片链入口（finishStillChain 开头）：开表。默认关闭时仅一次 atomic load。
 void diagBeginFrame() {
   g_diag_chain = false;
@@ -8516,12 +8580,26 @@ void diagBeginFrame() {
   g_diag_params.clear();
 }
 
-// 成片链出口：关表（统计逐阶段即时上报，这里只负责把链标志清掉）。
+// 成片链出口：关表。
 void diagEndFrame() { g_diag_chain = false; }
 
 struct DiagFrameScope {
-  DiagFrameScope() { diagBeginFrame(); }
-  ~DiagFrameScope() { diagEndFrame(); }
+  explicit DiagFrameScope(bool deferred) {
+    diagBeginFrame();
+    if (deferred && g_diag_chain) g_diag_read_batch = &batch;
+  }
+  ~DiagFrameScope() {
+    finish();
+    diagEndFrame();
+  }
+  void finish() {
+    if (g_diag_read_batch == &batch) {
+      g_diag_read_batch = nullptr;
+      batch.finish();
+    }
+  }
+
+  DiagReadBatch batch;
 };
 
 }  // namespace
@@ -8961,12 +9039,35 @@ void FrameRenderer::diagStatsTex(const char* stage, GLuint tex, int w, int h,
   glUniform1i(u_diag_pack_.t2, 2);
   glUniform1i(u_diag_pack_.t3, 3);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  glFinish();
-  unsigned char buf[kStatPackW * kStatPackH * 4] = {0};
-  glReadPixels(0, 0, kStatPackW, kStatPackH, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-  GLenum post_err = GL_NO_ERROR;
+  GLenum post_err = glGetError();
+  GLint prev_buffer = 0, prev_pack = 0, prev_row = 0, prev_rows = 0, prev_pixels = 0;
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_buffer);
+  glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+  glGetIntegerv(GL_PACK_ROW_LENGTH, &prev_row);
+  glGetIntegerv(GL_PACK_SKIP_ROWS, &prev_rows);
+  glGetIntegerv(GL_PACK_SKIP_PIXELS, &prev_pixels);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+  glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+  glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+  auto* batch = g_diag_read_batch;
+  const bool deferred = post_err == GL_NO_ERROR && batch && batch->bindForRead();
+  unsigned char buf[kStatPackBytes] = {0};
+  void* destination = buf;
+  if (deferred) {
+    destination = reinterpret_cast<void*>(batch->count * kStatPackBytes);
+  } else {
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    if (!batch) glFinish();
+  }
+  glReadPixels(0, 0, kStatPackW, kStatPackH, GL_RGBA, GL_UNSIGNED_BYTE, destination);
   for (GLenum e = glGetError(); e != GL_NO_ERROR; e = glGetError()) post_err = e;
 
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(prev_buffer));
+  glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+  glPixelStorei(GL_PACK_ROW_LENGTH, prev_row);
+  glPixelStorei(GL_PACK_SKIP_ROWS, prev_rows);
+  glPixelStorei(GL_PACK_SKIP_PIXELS, prev_pixels);
   glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
   glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
   glUseProgram(static_cast<GLuint>(prev_prog));
@@ -8985,14 +9086,8 @@ void FrameRenderer::diagStatsTex(const char* stage, GLuint tex, int w, int h,
     diagStatsLog(stage, nullptr, p, "gl_error");
     return;
   }
-  float v[kSlotCount];
-  for (int i = 0; i < kSlotCount; ++i) v[i] = statUnpack(buf + i * 4);
-  // 读回全零 = FBO/读回静默失效（X300 上遇到过同型：attachment 配错格式静默回零）
-  if (!(v[kSlotN] > 0.0f)) {
-    diagStatsLog(stage, nullptr, p, "readback");
-    return;
-  }
-  diagStatsLog(stage, v, p, nullptr);
+  if (deferred) batch->entries[batch->count++] = {stage, p};
+  else logPackedDiag(stage, buf, p);
 }
 
 // 最终成片：引擎内本就是 RGBA8 读回（finishStillChain 的 glReadPixels），
@@ -10373,6 +10468,14 @@ void FrameRenderer::release() {
   // E4-5 halation：5 级金字塔 + tmp + 全分辨率输出（releaseHaloTargets 同时复位
   // 缓存键 ⇒ 下次 [62] > 0 时按新尺寸重建）。
   releaseHaloTargets();
+  releasePreviewSpare();
+  const GLuint teqTextures[]{tex_teq_i_, tex_teq_mean_, tex_teq_tmp_, tex_teq_gain_, tex_teq_out_};
+  const GLuint teqFramebuffers[]{fbo_teq_i_, fbo_teq_mean_, fbo_teq_tmp_, fbo_teq_gain_, fbo_teq_out_};
+  glDeleteTextures(5, teqTextures);
+  glDeleteFramebuffers(5, teqFramebuffers);
+  tex_teq_i_ = tex_teq_mean_ = tex_teq_tmp_ = tex_teq_gain_ = tex_teq_out_ = 0;
+  fbo_teq_i_ = fbo_teq_mean_ = fbo_teq_tmp_ = fbo_teq_gain_ = fbo_teq_out_ = 0;
+  teq_w_ = teq_h_ = 0;
   if (fbo_scene_) glDeleteFramebuffers(1, &fbo_scene_);
   if (fbo_work_) glDeleteFramebuffers(1, &fbo_work_);
   if (fbo_cap_) glDeleteFramebuffers(1, &fbo_cap_);
@@ -10436,26 +10539,10 @@ void FrameRenderer::release() {
   prog_highlight_resolve_ = 0;
   if (prog_highlight_noise_) glDeleteProgram(prog_highlight_noise_);
   prog_highlight_noise_ = 0;
-  if (fbo_highlight_cov_) glDeleteFramebuffers(1, &fbo_highlight_cov_);
-  if (tex_highlight_cov_diag_) glDeleteTextures(1, &tex_highlight_cov_diag_);
-  if (tex_highlight_cov_off_) glDeleteTextures(1, &tex_highlight_cov_off_);
-  fbo_highlight_cov_ = tex_highlight_cov_diag_ = tex_highlight_cov_off_ = 0;
-  highlight_cov_w_ = highlight_cov_h_ = 0;
-  chroma_model_ready_ = false;
+  releaseChromaCovarianceTargets();
   if (prog_highlight_noise_down_) glDeleteProgram(prog_highlight_noise_down_);
   if (prog_highlight_noise_up_) glDeleteProgram(prog_highlight_noise_up_);
   prog_highlight_noise_down_ = prog_highlight_noise_up_ = 0;
-  for (int slot = 0; slot < 5; ++slot) {
-    // Slot 3 borrows the original RGB covariance after its last PC3D read.
-    if (slot != 3) {
-      if (highlight_filter_fbo_[slot]) glDeleteFramebuffers(1, &highlight_filter_fbo_[slot]);
-      glDeleteTextures(2, highlight_filter_cov_[slot]);
-    }
-    highlight_filter_fbo_[slot] = 0;
-    highlight_filter_cov_[slot][0] = highlight_filter_cov_[slot][1] = 0;
-    highlight_filter_w_[slot] = highlight_filter_h_[slot] = 0;
-  }
-  chroma_input_cov_[0] = chroma_input_cov_[1] = 0;
   if (tex_highlight_rgb_) glDeleteTextures(1, &tex_highlight_rgb_);
   if (fbo_highlight_rgb_) glDeleteFramebuffers(1, &fbo_highlight_rgb_);
   tex_highlight_rgb_ = fbo_highlight_rgb_ = 0;
@@ -10658,9 +10745,9 @@ void FrameRenderer::makeTex(GLuint* tex, GLuint* fbo, GLenum internal, int w,
   // （X300 实测：RGBA8 + HALF_FLOAT 非法组合静默失败 → 捕获 FBO 永不完整 → 照片全黑）
   // 卡 H2：交付档有三种内部格式（RGBA8 / GL_RGB10_A2 / RGBA16F）⇒ 映射收口到
   // OutputBitDepth.h 的 outputUploadTypeOf（10bit 档 = GL_UNSIGNED_INT_2_10_10_10_REV）。
-  const GLenum type = (internal == GL_RGBA32F || internal == GL_RG32F)
-                          ? GL_FLOAT : outputUploadTypeOf(internal);
-  const GLenum format = internal == GL_RG32F ? GL_RG : GL_RGBA;
+  const GLenum type = internal == GL_R8 ? GL_UNSIGNED_BYTE
+      : (internal == GL_RGBA32F || internal == GL_RG32F) ? GL_FLOAT : outputUploadTypeOf(internal);
+  const GLenum format = internal == GL_R8 ? GL_RED : internal == GL_RG32F ? GL_RG : GL_RGBA;
   glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internal), w, h, 0, format,
                type, nullptr);
   glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
@@ -10842,6 +10929,34 @@ bool FrameRenderer::selfCheck10BitOnce() {
     }
   }
   return s == 1;
+}
+
+void FrameRenderer::releasePreviewSpare() {
+  glDeleteTextures(7, preview_spare_.textures);
+  glDeleteFramebuffers(7, preview_spare_.framebuffers);
+  preview_spare_ = {};
+}
+
+bool FrameRenderer::ensurePreviewTargets(int w, int h) {
+  if (w <= 0 || h <= 0) return false;
+  if (w != scene_w_ || h != scene_h_) {
+    // Retain just the other preview size. All pixels are redrawn each frame;
+    // only allocations, never image contents or metering results, are reused.
+    if (w != preview_spare_.width || h != preview_spare_.height) releasePreviewSpare();
+    const std::array textures{&tex_scene_, &tex_work_, &tex_teq_i_, &tex_teq_mean_,
+                              &tex_teq_tmp_, &tex_teq_gain_, &tex_teq_out_};
+    const std::array framebuffers{&fbo_scene_, &fbo_work_, &fbo_teq_i_, &fbo_teq_mean_,
+                                  &fbo_teq_tmp_, &fbo_teq_gain_, &fbo_teq_out_};
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+      std::swap(*textures[i], preview_spare_.textures[i]);
+      std::swap(*framebuffers[i], preview_spare_.framebuffers[i]);
+    }
+    std::swap(scene_w_, preview_spare_.width);
+    std::swap(scene_h_, preview_spare_.height);
+    std::swap(teq_w_, preview_spare_.teqWidth);
+    std::swap(teq_h_, preview_spare_.teqHeight);
+  }
+  return ensureTargets(w, h);
 }
 
 bool FrameRenderer::ensureTargets(int w, int h) {
@@ -11237,7 +11352,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
   const int rh = std::max(1, static_cast<int>(std::lround(dst_h * s)));
   const bool scaled = rw != dst_w || rh != dst_h;
   PreviewDrawTiming timing(scaled, rw, rh);
-  if (!ensureTargets(rw, rh)) return false;
+  if (!ensurePreviewTargets(rw, rh)) return false;
   timing.mark(timing.targets);
 
   // 吞掉上一帧/诊断残留的 GL 错误，保证诊断只反映本帧问题
@@ -11280,7 +11395,7 @@ bool FrameRenderer::submitFrame(const float* st, int rot, float sx, float sy,
       timing.mark(timing.output);
       return true;
     }
-    if (!ensureTargets(dst_w, dst_h)) return false;
+    if (!ensurePreviewTargets(dst_w, dst_h)) return false;
     if (fill_test) {
       passFill(dst_w, dst_h);
     } else {
@@ -12335,7 +12450,7 @@ void FrameRenderer::passChromaDenoise(int dst_w, int dst_h, int rot,
   // 改动前逐位相同，a 通道也回到档 A 的 moire 语义。
   glUniform1f(u_chroma_dn_.cg_k, cg_k > 0.0f ? cg_k : 0.0f);
   glUniform1f(u_chroma_dn_.cg_scope, cg_scope);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);
   glActiveTexture(GL_TEXTURE0);
   // 档 A 诊断：强度图统计（仅开启时执行 —— 关闭时零新增成本）。成本 = 32×32
   // fragment × 256 次 texelFetch（≈ 全图 2% 采样）+ 16KB 读回，每张成片一次。
@@ -12500,7 +12615,8 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
     glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uPrev"),0);
     glUniform2i(glGetUniformLocation(prog_chroma_blur_,"uSize"),hw,hh);
     glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uStep"),1<<l);
-    glDrawArrays(GL_TRIANGLES,0,3);
+    // Bound both axes, not just the final apply, while leaving every tap intact.
+    drawStriped(8);
     glUseProgram(prog_chroma_at_);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D,tex_ch_tmp_);
@@ -12519,7 +12635,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[src]);
     glUniform1i(u_chroma_at_.removed, 2);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    drawStriped(8);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
   }
   // Chroma = c0 - accumulated removal; preserve source Y, strength and sat core.
@@ -12539,7 +12655,7 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
   glUniform1i(u_chroma_apply_.satmask, 2);
   glUniform1i(u_chroma_apply_.satmask_on, satmask_enabled_ ? 1 : 0);
   glActiveTexture(GL_TEXTURE0);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  drawStriped(16);
   return true;
 }
 
@@ -14565,7 +14681,9 @@ void FrameRenderer::passRcdDir(int w, int h, int cfa,
               black_phase[3]);
   glUniform1f(u_rcd_dir_.white, white_level);
   glUniform3f(u_rcd_dir_.gain, gains[0], gains[1], gains[2]);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // Submit smaller GPU jobs while retaining the full-image RCD viewport.
+  if (still_ctx_) drawStriped();
+  else glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // RCD P2：G@RB（比值修正 + 方向混合 + 限幅），输出全图 G 到 tex_g_
@@ -14594,7 +14712,8 @@ void FrameRenderer::passRcdG(int w, int h, int cfa,
   glUniform1f(u_rcd_g_.white, white_level);
   glUniform3f(u_rcd_g_.gain, gains[0], gains[1], gains[2]);
   if (u_rcd_g_.gorig >= 0) glUniform1f(u_rcd_g_.gorig, g_orig);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  if (still_ctx_) drawStriped();
+  else glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // RCD P3：色度填充（+ LSC）→ **D3**（相机 RGB：LSC 后、CCM 前，写 tex_work_）。
@@ -14655,7 +14774,8 @@ void FrameRenderer::passRcdChroma(int dst_w, int dst_h, int rot, int cfa,
   glUniform1i(u_rcd_chroma_.hlmask, 5);
   glUniform1i(u_rcd_chroma_.maskon, hl_mask_on ? 1 : 0);
   glActiveTexture(GL_TEXTURE0);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  if (still_ctx_) drawStriped();
+  else glDrawArrays(GL_TRIANGLES, 0, 3);
   glActiveTexture(GL_TEXTURE0);
 }
 
@@ -14696,7 +14816,8 @@ void FrameRenderer::passRcdChromaA(int w, int h, int cfa,
   if (u_rcd_chroma_a_.satclip >= 0)
     glUniform3f(u_rcd_chroma_a_.satclip, gains[0], gains[1], gains[2]);
   glActiveTexture(GL_TEXTURE0);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  if (still_ctx_) drawStriped();
+  else glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // 3b：G 位轴向填充（= 原版 STEP 4.3，交叉轴从 3a 的 tex_rcd_a_ 读已填充色）
@@ -14735,7 +14856,8 @@ void FrameRenderer::passRcdChromaB(int dst_w, int dst_h, int rot, int cfa,
   glUniform1i(u_rcd_chroma_b_.hlmask, 4);
   glUniform1i(u_rcd_chroma_b_.maskon, hl_mask_on_b ? 1 : 0);
   glActiveTexture(GL_TEXTURE0);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
+  if (still_ctx_) drawStriped();
+  else glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 // P3.5（第 4a 期 S14）：**D3 → D4** 独立 CCM pass（tex_work_ → tex_scene_）。
@@ -15422,7 +15544,17 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     params.pixelUm /= std::max(c.dst_w, c.dst_h);
     params.captureExposureEv = c.p->exposure_ev;
     const int w = c.dst_w, h = c.dst_h;
-    std::vector<Triplet> image(static_cast<std::size_t>(w) * h);
+    // RAW reconstruction and every covariance-consuming denoiser have finished.
+    // Keep the final scene texture for HDR, but not the dead FP32 maps
+    // alongside the full-resolution FP64 spectral buffers.
+    const auto releaseStart = Clock::now();
+    releaseChromaCovarianceTargets();
+    const auto releaseEnd = Clock::now();
+    const auto count = static_cast<std::size_t>(w) * h;
+    auto image = std::make_unique_for_overwrite<Triplet[]>(count);
+    const auto allocEnd = Clock::now();
+    ScopedPixelWorkers pixelWorkers(8);
+    double firstReadMs = 0;
     struct ReadbackState {
       GLint draw = 0, read = 0, pack = 0, buffer = 0, row = 0, rows = 0, pixels = 0, texture = 0;
       GLuint fbo = 0;
@@ -15471,9 +15603,33 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       const auto half = isHalf && ok ? std::make_unique_for_overwrite<unsigned short[]>(capacity) : nullptr;
       const auto full = !isHalf && ok ? std::make_unique_for_overwrite<float[]>(capacity) : nullptr;
       const auto convert = [&](const auto* src, auto decode, int y, int count) {
-        auto* dst = image.data() + static_cast<std::size_t>(y) * w;
-        return parallelPixels(static_cast<std::size_t>(count) * w, 4, [&](auto begin, auto n) {
-          for (std::size_t i = begin; i < begin + n; ++i) {
+        auto* dst = image.get() + static_cast<std::size_t>(y) * w;
+        return parallelPixels(static_cast<std::size_t>(count) * w, 4, [&](std::size_t begin, std::size_t n) {
+          auto i = begin;
+#if defined(__aarch64__)
+          if constexpr (std::is_same_v<std::remove_cv_t<std::remove_pointer_t<decltype(src)>>, unsigned short>) {
+            for (; begin + n - i >= 4; i += 4) {
+              const auto values = vld4_u16(src + i * 4);
+              const auto decode4 = [&](uint16x4_t bits) {
+                const auto exponent = vand_u16(bits, vdup_n_u16(0x7c00));
+                const auto special = vceq_u16(exponent, vdup_n_u16(0x7c00));
+                const auto subnormal = vand_u16(vceqz_u16(exponent),
+                    vcgt_u16(vand_u16(bits, vdup_n_u16(0x03ff)), vdup_n_u16(0)));
+                if (vmaxv_u16(vorr_u16(special, subnormal))) {
+                  return float32x4_t{decode(bits[0]), decode(bits[1]), decode(bits[2]), decode(bits[3])};
+                }
+                return vcvt_f32_f16(vreinterpret_f16_u16(bits));
+              };
+              const auto r = decode4(values.val[0]), g = decode4(values.val[1]), b = decode4(values.val[2]);
+              const float64x2x3_t lo{{vcvt_f64_f32(vget_low_f32(r)), vcvt_f64_f32(vget_low_f32(g)),
+                                      vcvt_f64_f32(vget_low_f32(b))}};
+              const float64x2x3_t hi{{vcvt_high_f64_f32(r), vcvt_high_f64_f32(g), vcvt_high_f64_f32(b)}};
+              vst3q_f64(dst[i].data(), lo);
+              vst3q_f64(dst[i + 2].data(), hi);
+            }
+          }
+#endif
+          for (; i < begin + n; ++i) {
             for (int ch = 0; ch < 3; ++ch) {
               const float v = decode(src[i * 4 + ch]);
               if (!std::isfinite(v)) return false;
@@ -15485,8 +15641,13 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       };
       for (int y = 0; ok && y < h; y += rows) {
         const int count = std::min(rows, h - y);
+        const auto firstReadStart = y == 0 ? Clock::now() : Clock::time_point{};
         glReadPixels(0, y, w, count, GL_RGBA, isHalf ? GL_HALF_FLOAT : GL_FLOAT,
                      isHalf ? static_cast<void*>(half.get()) : static_cast<void*>(full.get()));
+        if (y == 0) {
+          firstReadMs = std::chrono::duration<double, std::milli>(
+              Clock::now() - firstReadStart).count();
+        }
         ok = glGetError() == GL_NO_ERROR;
         if (!ok) break;
         if (isHalf) {
@@ -15511,35 +15672,44 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     const auto readEnd = Clock::now();
     const auto backend = hasSpectralBackend(SpectralBackend::AdvSimd) ? SpectralBackend::AdvSimd : SpectralBackend::Scalar;
     const auto seed = c.grain_fp ^ (std::uint64_t(w) << 32) ^ std::uint64_t(h);
+    // Small renders and the independent one-pixel HDR reference use direct integration.
+    const bool useSpectralLut = backend == SpectralBackend::AdvSimd && count >= 4 * 1024 * 1024;
     RenderTimings timing;
-    if (!renderNegativeSrgb(image, w, h, params, backend, {8, 8, 8, 8}, seed,
-                            seed ^ 0x9e3779b97f4a7c15ULL, &timing)) return false;
+    if (!renderNegativeSrgb(image, count, w, h, params, backend, {8, 8, 8, 8}, seed,
+                            seed ^ 0x9e3779b97f4a7c15ULL, &timing, useSpectralLut)) return false;
     const auto renderEnd = Clock::now();
-    out_rgba->resize(image.size() * 4);
+    out_rgba->resize(count * 4);
     // Match passOutput(flip_y=true): Bitmap row zero is the scene's top row.
     // No second OETF,
     // legacy rolloff, USM, grain, halation, LUT or display-AE redraw is applied.
-    for (std::size_t i = 0; i < image.size(); ++i) {
-      const std::size_t dst = (static_cast<std::size_t>(h - 1) - i / w) * w + i % w;
-      std::uint32_t packed = 3u << 30;
-      for (int channel = 0; channel < 3; ++channel) {
-        const double v = image[i][channel];
-        if (!std::isfinite(v)) { out_rgba->clear(); return false; }
-        const auto code = static_cast<std::uint32_t>(std::floor(std::clamp(v, 0.0, 1.0) * (c.ten_bit ? 1023.0 : 255.0) + 0.5));
-        if (c.ten_bit) packed |= code << (10 * channel);
-        else (*out_rgba)[dst * 4 + channel] = static_cast<uint8_t>(code);
+    const bool packedOk = parallelPixels(static_cast<std::size_t>(h), 4, [&](auto begin, auto count) {
+      for (std::size_t y = begin; y < begin + count; ++y) {
+        const auto* src = image.get() + y * w;
+        auto* dst = out_rgba->data() + (h - 1 - y) * w * 4;
+        for (int x = 0; x < w; ++x) {
+          std::uint32_t packed = 3u << 30;
+          for (int channel = 0; channel < 3; ++channel) {
+            const double v = src[x][channel];
+            if (!std::isfinite(v)) return false;
+            const auto code = static_cast<std::uint32_t>(std::floor(std::clamp(v, 0.0, 1.0) * (c.ten_bit ? 1023.0 : 255.0) + 0.5));
+            if (c.ten_bit) packed |= code << (10 * channel);
+            else dst[x * 4 + channel] = static_cast<uint8_t>(code);
+          }
+          if (c.ten_bit) std::memcpy(dst + x * 4, &packed, sizeof(packed));
+          else dst[x * 4 + 3] = 255;
+        }
       }
-      if (c.ten_bit) std::memcpy(out_rgba->data() + dst * 4, &packed, sizeof(packed));
-      else (*out_rgba)[dst * 4 + 3] = 255;
-    }
-    std::vector<Triplet>().swap(image);
+      return true;
+    }, 16);
+    if (!packedOk) { out_rgba->clear(); return false; }
+    image.reset();
     const auto rgbaEnd = Clock::now();
     // Reuse the PC display-reference solve, but never probe the composition
     // proxy shader: measure this exact spectral recipe, including its gamut.
     // Exposure is already inside the sampled response, so source stays unscaled.
     const auto hdrStart = Clock::now();
     std::vector<Triplet> response(1024);
-    bool hdrOk = negativeNeutralResponse(params, backend, response);
+    bool hdrOk = negativeNeutralResponse(params, backend, response, 4);
     const auto hdrProbeEnd = Clock::now();
     GLuint baseTex = 0;
     GLint active = 0, texture = 0, draw = 0, read = 0, unpack = 0;
@@ -15637,7 +15807,11 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
         ",\"h\":" + std::to_string(h) + ",\"mfnr\":" + (c.mfnr_fused ? "true" : "false") +
         ",\"bits\":" + (c.ten_bit ? "10" : "8") + ",\"backend\":\"" +
         (backend == SpectralBackend::AdvSimd ? "neon-fp64" : "scalar-fp64") + "\"" +
+        ",\"spectralLut\":" + (useSpectralLut ? "true" : "false") +
         ",\"readMs\":" + std::to_string(elapsed(start, readEnd)) +
+        ",\"covarianceReleaseMs\":" + std::to_string(elapsed(releaseStart, releaseEnd)) +
+        ",\"readAllocMs\":" + std::to_string(elapsed(releaseEnd, allocEnd)) +
+        ",\"firstReadMs\":" + std::to_string(firstReadMs) +
         ",\"hanatosMs\":" + std::to_string(timing.hanatos * 1000) +
         ",\"filmExposureMs\":" + std::to_string(timing.filmExposure * 1000) +
         ",\"dirMs\":" + std::to_string(timing.dir * 1000) +
@@ -15677,8 +15851,8 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   dbg_cs_on_ = dbg_cm_on_ = 0;
   dbg_cs_k_ = c.p->color_smooth;
   dbg_cs_ok_ = prog_cs_ != 0 ? 1 : 0;
-  const bool sync_stage_timing =
-      g_still_stage_timing_sync.load(std::memory_order_relaxed);
+  const bool spectralStill = std::lround(c.p->engine_slot) == kSpektrafilmSlot;
+  const bool sync_stage_timing = !spectralStill && g_still_stage_timing_sync.load(std::memory_order_relaxed);
   auto stageGl = [&](const char* stage) {
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) Logger::instance().log(LogLevel::kError,"engine","still.stage_gl_error",
@@ -15699,7 +15873,7 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
   float dir_ms = 0.0f, g_ms = 0.0f, ccm_ms = 0.0f, dn_ms = 0.0f;
   // 0.13.5：RCD 三段拆分（preMs = HR+P0 到 P1 提交前；dirGpuMs/gGpuMs = GPU query）
   float pre_ms = 0.0f, dir_gpu_ms = 0.0f, g_gpu_ms = 0.0f, p0_ms = 0.0f;
-  const DiagFrameScope diag_frame;  // Also closes diagnostics on early failure.
+  DiagFrameScope diag_frame(spectralStill);  // Also closes diagnostics on early failure.
   edge_dump_token_.clear();
   { const std::string d = Logger::instance().dir(); const std::string s = d.empty() ? std::string() : d + "/edge_dump.enable"; FILE* f = s.empty() ? nullptr : std::fopen(s.c_str(), "rb"); if (f) { std::fclose(f); edge_dump_token_ = std::to_string(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(t1.time_since_epoch()).count())); std::remove(s.c_str()); } }
   // AMaZE 诊断帧首清零（passCaCorrect 里的清零已删除，见那里的注释）
@@ -16349,12 +16523,14 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 色度的只剩 PC3D。本开关强制关它，用于确认"平台是不是 PC3D 造的"。
     // ⚠ 只作 A/B：关掉后彩噪会回来、画面观感变化，不作为最终默认。
     if (!kPc3dAbOff && p.pc3d > 0.5f) {
-      glFinish();   // 起点同步：只计本模块的工作，不背前面 pass 的尾巴
+      if (!spectralStill) glFinish();   // 起点同步：只计本模块的工作，不背前面 pass 的尾巴
       const auto pc0 = std::chrono::steady_clock::now();
       pc3d_ok = passPc3d(dst_w, dst_h, c.nc, p, p4_src);
-      glFinish();
-      dbg_pc3d_ms_ = std::chrono::duration<float, std::milli>(
-                         std::chrono::steady_clock::now() - pc0).count();
+      if (!spectralStill) {
+        glFinish();
+        dbg_pc3d_ms_ = std::chrono::duration<float, std::milli>(
+                           std::chrono::steady_clock::now() - pc0).count();
+      }
       // A failed MRT may have partly overwritten covariance storage. Never
       // continue with an image/noise pair from different stages.
       if (!pc3d_ok) return;
@@ -16417,10 +16593,10 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     if (!pc3d_replace) diagStatsTex("P4", tex_dn_, dst_w, dst_h, &p);
     if (df_ok) diagStatsTex("DEFRINGE", tex_df_, dst_w, dst_h, &p);
     if (mst_ok) diagStatsTex("D1", tex_scene_, dst_w, dst_h, &p);
-    glFinish();
-    dn_ms = std::chrono::duration<float, std::milli>(
-                std::chrono::steady_clock::now() - n0)
-                .count();
+    if (!spectralStill) {
+      glFinish();
+      dn_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - n0).count();
+    }
   }
   // v0.10.16：HR 已移入 passFilm（黑白点标定之后、still 才跑）——darktable 的
   // 高光重建与黑白点 autodetect 是配套的（裁剪阈值由 white_source 决定）。
@@ -16467,11 +16643,12 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
       : (pc3d_replace ? (df_ok ? tex_df_ : tex_pc3d_)   // [54]=1：PC3D →(defringe)→ film
                       : ((c.dn && mst_ok) ? tex_scene_
                           : (c.dn ? (df_ok ? tex_df_ : tex_dn_) : tex_scene_)));
-  if (std::lround(p.engine_slot) == kSpektrafilmSlot) {
+  if (spectralStill) {
     // Shared complete RAW front chain, then the original spectral stage order.
     // Legacy TEQ/Filmic/output sharpening are not part of this recipe.
     const auto frontEnd = std::chrono::steady_clock::now();
     still_chain_ok_ = renderSpektrafilm(c, film_src, out_rgba);
+    diag_frame.finish();
     const auto end = std::chrono::steady_clock::now();
     const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     Logger::instance().log(still_chain_ok_ ? LogLevel::kInfo : LogLevel::kError,
@@ -17218,14 +17395,15 @@ bool FrameRenderer::ensureMfnrTargets(int w, int h) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, w, h, 0, GL_RED_INTEGER,
                  GL_UNSIGNED_SHORT, nullptr);
   }
-  // 对齐金字塔 L1..L4（RGBA8，sqrt 预编码灰度；L2..L4 是 readback 层）
+  // Only R is sampled by the downsample shader and both alignment solvers.
+  // Preserve the 8-bit gray codes without storing three unused channels.
   const auto mkPyr = [&](GLuint* tex, GLuint* fbo, int ww, int hh) {
     if (*tex) {
       glDeleteTextures(1, tex);
       glDeleteFramebuffers(1, fbo);
     }
     *tex = *fbo = 0;
-    makeTex(tex, fbo, GL_RGBA8, ww, hh);
+    makeTex(tex, fbo, GL_R8, ww, hh);
   };
   mkPyr(&tex_pyr1_, &fbo_pyr1_, w1, h1);
   mkPyr(&tex_pyr2_, &fbo_pyr2_, (w1 + 1) / 2, (h1 + 1) / 2);
@@ -17327,6 +17505,30 @@ void FrameRenderer::passMfnrDown(GLuint src, GLuint fbo, int sw, int sh) {
   glUniform1i(u_mfnr_down_.tex, 0);
   glUniform2i(u_mfnr_down_.size, sw, sh);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+void FrameRenderer::releaseChromaCovarianceTargets() {
+  std::size_t bytes = static_cast<std::size_t>(highlight_cov_w_) * highlight_cov_h_ * 32;
+  if (fbo_highlight_cov_) glDeleteFramebuffers(1, &fbo_highlight_cov_);
+  const GLuint original[]{tex_highlight_cov_diag_, tex_highlight_cov_off_};
+  glDeleteTextures(2, original);
+  fbo_highlight_cov_ = tex_highlight_cov_diag_ = tex_highlight_cov_off_ = 0;
+  highlight_cov_w_ = highlight_cov_h_ = 0;
+  for (int slot = 0; slot < 5; ++slot) {
+    // Slot 3 aliases the original covariance, including its FBO.
+    if (slot != 3) {
+      bytes += static_cast<std::size_t>(highlight_filter_w_[slot]) * highlight_filter_h_[slot] * 32;
+      if (highlight_filter_fbo_[slot]) glDeleteFramebuffers(1, &highlight_filter_fbo_[slot]);
+      glDeleteTextures(2, highlight_filter_cov_[slot]);
+    }
+    highlight_filter_fbo_[slot] = 0;
+    highlight_filter_cov_[slot][0] = highlight_filter_cov_[slot][1] = 0;
+    highlight_filter_w_[slot] = highlight_filter_h_[slot] = 0;
+  }
+  chroma_input_cov_[0] = chroma_input_cov_[1] = 0;
+  chroma_model_ready_ = false;
+  if (bytes) Logger::instance().log(LogLevel::kInfo, "engine", "render.covariance_release",
+      "{\"bytes\":" + std::to_string(bytes) + "}");
 }
 
 bool FrameRenderer::ensureHighlightFilterCov(int slot, int width, int height) {
@@ -18446,7 +18648,7 @@ void FrameRenderer::passMfnrMismatch(int cfa, const float black_phase[4],
   }
   // The small grid still scans every CFA phase in a full RAW cell. Keep its
   // viewport/samples intact, but split this measured ~100ms preview blocker.
-  drawStriped(4);
+  drawStriped(16, 4);
 }
 
 // 0.13.8 预览卡顿优化（照 PC photon denoiser 的 strip 做法，2026-11-12）：
@@ -18500,12 +18702,12 @@ void FrameRenderer::endGpuPass() {
   // 让路没有换来帧率，纯亏时间。fence 窗口保留（它把队列压到 ≤2，成本可忽略）。
 }
 
-void FrameRenderer::drawStriped(int strips) {
+void FrameRenderer::drawStriped(int strips, int min_rows) {
   GLint vp[4] = {0, 0, 0, 0};
   glGetIntegerv(GL_VIEWPORT, vp);
   const int w = vp[2], h = vp[3];
   const int kStrips = std::max(strips, 1);
-  if (w <= 0 || h < kStrips * 16) {   // 太小就不拆，免得 draw 开销反超
+  if (w <= 0 || h < kStrips * min_rows) {   // 太小就不拆，免得 draw 开销反超
     glDrawArrays(GL_TRIANGLES, 0, 3);
     return;
   }
@@ -18514,11 +18716,15 @@ void FrameRenderer::drawStriped(int strips) {
   glGetIntegerv(GL_SCISSOR_BOX, sb);
   glEnable(GL_SCISSOR_TEST);
   const int rows = (h + kStrips - 1) / kStrips;
+  int submitted = 0;
   for (int y = vp[1]; y < vp[1] + h; y += rows) {
     const int rh = std::min(rows, vp[1] + h - y);
     glScissor(vp[0], y, w, rh);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glFlush();
+    // Bound queued work within heavy passes as well as between passes.
+    // The scissor, samples and pixel arithmetic are unchanged.
+    if (kStrips >= 16 && (++submitted % 2) == 0) endGpuPass();
   }
   glScissor(sb[0], sb[1], sb[2], sb[3]);
   if (!scissor_was) glDisable(GL_SCISSOR_TEST);
@@ -19256,7 +19462,7 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
 // 真机日志（0.13.19/0.13.20）：第一张的 preMs 比第二张多 ~300ms，主要是
 // 2.4GB 纹理首次分配 + satmask 的 125MB CPU 缓冲首次触页；预热把这些搬到
 // 用户构图时（相机页可见 2s 后）。分配并清理中间 target，不跑图像依赖的画质 pass。
-bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
+bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter) {
   if (raw_w <= 0 || raw_h <= 0) return false;
   const auto t0 = std::chrono::steady_clock::now();
   const int effective_rot = (rotation + 1) % 4;
@@ -19278,9 +19484,10 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
   ok = ensureHighlightMergeResources(raw_w, raw_h) && ok;
   ok = ensureHighlightLongResources(raw_w, raw_h) && ok;
   ok = ensureHighlightNoiseResources(dst_w, dst_h) && ok;
-  ok = ensureHighlightFilterCov(2, dst_w, dst_h) && ok;
-  ok = ensureHighlightFilterCov(3, dst_w, dst_h) && ok;
-  ok = ensureHighlightFilterCov(4, dst_w, dst_h) && ok;
+  // Slot 3 aliases the original. Capture can still allocate either optional
+  // bank if the settings changed after warmup was scheduled.
+  if (pc3d) ok = ensureHighlightFilterCov(2, dst_w, dst_h) && ok;
+  if (prefilter) ok = ensureHighlightFilterCov(4, dst_w, dst_h) && ok;
   // satmask 的 4 张 CPU 缓冲（~125MB）同步预分配：passSatMask 按 raw 尺寸复用。
   const size_t n = static_cast<size_t>(raw_w) * raw_h;
   if (satm_sat_.size() != n) {
@@ -19323,7 +19530,8 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation) {
       fbo_cs_, fbo_cs_tmp_, fbo_cm_, fbo_cm_tmp_,
       fbo_teq_i_, fbo_teq_mean_, fbo_teq_tmp_, fbo_teq_out_,
       fbo_pc3d_, fbo_pc3d_t1_, fbo_pc3d_lo_[0], fbo_pc3d_lo_[1],
-      fbo_highlight_cov_, highlight_filter_fbo_[2], highlight_filter_fbo_[4],
+      fbo_highlight_cov_, pc3d ? highlight_filter_fbo_[2] : 0u,
+      prefilter ? highlight_filter_fbo_[4] : 0u,
       fbo_highlight_long_[0], fbo_highlight_long_[1], fbo_highlight_long_[2],
       fbo_ca_, fbo_ca_ds_,
   };
@@ -19444,25 +19652,6 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     }
   }
 
-  // 上传：帧 0 → raw_tex_（参考帧），帧 1..3 → tex_mfnr_（hdr 时 4 帧原样，
-  // 含跨曝光侧帧 —— 归一在各 pass 内做）
-  if (ensureRawTex(w, h) == 0) return false;
-  if (!uploadRawTex(raw_tex_, frames[0], w, h, row_strides_px[0])) return false;
-  if (p.sat_mask > 0.5f) {   // 0.12.186：参考帧 CPU 副本（bracket 路径）
-    const auto* rp = static_cast<const uint16_t*>(frames[0]);
-    raw_cpu_.assign(static_cast<size_t>(w) * h, 0);
-    for (int y = 0; y < h; ++y)
-      std::memcpy(&raw_cpu_[static_cast<size_t>(y) * w],
-                  rp + static_cast<size_t>(y) * row_strides_px[0],
-                  sizeof(uint16_t) * w);
-    raw_cpu_w_ = w;
-    raw_cpu_h_ = h;
-  }
-  if (!ensureMfnrTargets(w, h)) return false;
-  for (int i = 1; i < count; ++i) {
-    if (!uploadRawTex(tex_mfnr_[i - 1], frames[i], w, h, row_strides_px[i]))
-      return false;
-  }
   // U-3：[1..3] × [88][89]（与单帧链同一口径 —— 两条成片链必须一致，见 wbTempTint 注释）
   float wb_tt[3];
   wbTempTint(p, wb_tt);
@@ -19565,6 +19754,8 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   HighlightGuideSet guides;
   std::string admission_error;
   bool guides_ok = false;
+  bool empty_reference_mask = false;
+  const bool overlap_guides = admit_short && std::lround(p.engine_slot) == kSpektrafilmSlot;
   const auto buildGuides = [&]() {
     const auto start = std::chrono::steady_clock::now();
     HighlightRawView base_view;
@@ -19584,17 +19775,39 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
       short_noise.shot[phase] = model.S[color] * hdr_gain_4[short_idx];
       short_noise.read[phase] = model.O[color] * hdr_gain_4[short_idx] * hdr_gain_4[short_idx];
     }
-    guides_ok = highlightGenerateGuides(base_view, short_view,
-        {rc.gains[0], rc.gains[1], rc.gains[2]}, frame_scale[0], frame_scale[short_idx],
-        base_noise, short_noise, &guides, &admission_error);
+    const std::array<float, 3> wb{{rc.gains[0], rc.gains[1], rc.gains[2]}};
+    guides_ok = overlap_guides
+        ? highlightPrepareMergeGuides(base_view, short_view, wb, frame_scale[0], frame_scale[short_idx],
+                                      base_noise, short_noise, &guides, empty_reference_mask, &admission_error)
+        : highlightGenerateGuides(base_view, short_view, wb, frame_scale[0], frame_scale[short_idx],
+                                  base_noise, short_noise, &guides, &admission_error);
     return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
   };
   std::future<float> guide_job;
-  const bool overlap_guides = admit_short && std::lround(p.engine_slot) == kSpektrafilmSlot;
   if (overlap_guides) {
-    // Current RAW/calibration only; no GL access or dependency on temporal flow.
+    // Current RAW/calibration only; overlap the guide with texture upload and
+    // temporal alignment. The future joins before the borrowed RAW can die.
     // If a worker cannot be created, run the same work at the join point.
     guide_job = std::async(std::launch::async | std::launch::deferred, buildGuides);
+  }
+  // 上传：帧 0 → raw_tex_（参考帧），帧 1..3 → tex_mfnr_（hdr 时 4 帧原样，
+  // 含跨曝光侧帧 —— 归一在各 pass 内做）
+  if (ensureRawTex(w, h) == 0) return false;
+  if (!uploadRawTex(raw_tex_, frames[0], w, h, row_strides_px[0])) return false;
+  if (p.sat_mask > 0.5f) {   // 0.12.186：参考帧 CPU 副本（bracket 路径）
+    const auto* rp = static_cast<const uint16_t*>(frames[0]);
+    raw_cpu_.assign(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; ++y)
+      std::memcpy(&raw_cpu_[static_cast<size_t>(y) * w],
+                  rp + static_cast<size_t>(y) * row_strides_px[0],
+                  sizeof(uint16_t) * w);
+    raw_cpu_w_ = w;
+    raw_cpu_h_ = h;
+  }
+  if (!ensureMfnrTargets(w, h)) return false;
+  for (int i = 1; i < count; ++i) {
+    if (!uploadRawTex(tex_mfnr_[i - 1], frames[i], w, h, row_strides_px[i]))
+      return false;
   }
   stage("pyr");
 
@@ -19607,38 +19820,64 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   // readback 与 CPU SAD 分开计时（alignRbMs / alignCpuMs）—— 成本必须实测后
   // 交用户拍板，不能替用户决定（项目铁律）。
   float align_rb_ms = 0.f, align_cpu_ms = 0.f;
+  struct PyramidPackState {
+    GLint buffer = 0, alignment = 0, row = 0, skip_rows = 0, skip_pixels = 0;
+    PyramidPackState() {
+      glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
+      glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+      glGetIntegerv(GL_PACK_ROW_LENGTH, &row);
+      glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+      glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      glPixelStorei(GL_PACK_ALIGNMENT, 1);
+      glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+      glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    }
+    ~PyramidPackState() {
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(buffer));
+      glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+      glPixelStorei(GL_PACK_ROW_LENGTH, row);
+      glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+      glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+    }
+  };
+  const auto readLevel = [&](GLuint fbo, int width, int height, std::vector<uint8_t>& pixels) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    pixels.resize(static_cast<size_t>(width) * height);
+    GLint format = 0, type = 0;
+    glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &format);
+    glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &type);
+    if (glGetError() != GL_NO_ERROR) return false;
+    if (format == GL_RED && type == GL_UNSIGNED_BYTE) {
+      glReadPixels(0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, pixels.data());
+      if (glGetError() == GL_NO_ERROR) return true;
+    }
+    // RGBA/UBYTE remains the portable read pair for normalized targets.
+    std::vector<uint8_t> rgba(pixels.size() * 4);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    if (glGetError() != GL_NO_ERROR) return false;
+    for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = rgba[i * 4];
+    return true;
+  };
   auto capturePyr = [&](GLuint raw_tex, MfnrPyramid* py, float scale) {
     passMfnrPyr(raw_tex, cfa, black_phase, wl, rc.gains, scale);
     passMfnrDown(tex_pyr1_, fbo_pyr2_, pyr1_w_, pyr1_h_);
     passMfnrDown(tex_pyr2_, fbo_pyr3_, w2, h2);
     passMfnrDown(tex_pyr3_, fbo_pyr4_, w3, h3);
-    const auto readL = [&](GLuint fbo, int ww, int hh,
-                           std::vector<uint8_t>* dst) {
-      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-      dst->resize(static_cast<size_t>(ww) * hh);
-      // 0.13.11：只读 R 通道。金字塔图是灰度（R=G=B），原来按 RGBA 读 4× 数据
-      //（1/2 域每帧 12.5MB），传输量占 alignRbMs 的大头。GL_RED 不被驱动接受时
-      // 回退整块 RGBA 再抽 R —— 像素结果逐位不变。
-      while (glGetError() != GL_NO_ERROR) {
-      }
-      glReadPixels(0, 0, ww, hh, GL_RED, GL_UNSIGNED_BYTE, dst->data());
-      if (glGetError() != GL_NO_ERROR) {
-        std::vector<uint8_t> rgba(static_cast<size_t>(ww) * hh * 4);
-        glReadPixels(0, 0, ww, hh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        for (size_t k = 0; k < dst->size(); ++k) (*dst)[k] = rgba[k * 4];
-      }
-      glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    };
     const auto rb0 = std::chrono::steady_clock::now();
-    // align_l1 = false（prefs align_l1，A/B 开关）时不读 1/2 域：l1 为空 →
-    // mfnrAlign 自动走旧路径（use_l1=false），日志 alignL1 记 0。
-    if (align_l1) readL(fbo_pyr1_, pyr1_w_, pyr1_h_, &py->l1);
-    readL(fbo_pyr2_, w2, h2, &py->l2);
-    readL(fbo_pyr3_, w3, h3, &py->l3);
-    readL(fbo_pyr4_, w4, h4, &py->l4);
+    const PyramidPackState pack;
+    const bool ok = (!align_l1 || readLevel(fbo_pyr1_, pyr1_w_, pyr1_h_, py->l1)) &&
+        readLevel(fbo_pyr2_, w2, h2, py->l2) && readLevel(fbo_pyr3_, w3, h3, py->l3) &&
+        readLevel(fbo_pyr4_, w4, h4, py->l4);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     align_rb_ms += std::chrono::duration<float, std::milli>(
                        std::chrono::steady_clock::now() - rb0)
                        .count();
+    if (!ok) {
+      Logger::instance().log(LogLevel::kError, "engine", "mfnr.pyramid_readback_failed", "{}");
+      return false;
+    }
     py->w1 = align_l1 ? pyr1_w_ : 0;
     py->h1 = align_l1 ? pyr1_h_ : 0;
     py->w2 = w2;
@@ -19647,10 +19886,10 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     py->h3 = h3;
     py->w4 = w4;
     py->h4 = h4;
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return true;
   };
   MfnrPyramid ref;
-  capturePyr(raw_tex_, &ref, frame_scale[0]);
+  if (!capturePyr(raw_tex_, &ref, frame_scale[0])) return false;
   // 期 B bracket：参考帧饱和修复（对齐用原始 ref，融合用修复后的 ref）
   ref_fuse_tex_ = raw_tex_;
   hr_fix_mark_ = 0;
@@ -19676,7 +19915,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
   MfnrPyramid short_pyramid;
   for (int i = 1; i < count; ++i) {
     MfnrPyramid cur;
-    capturePyr(tex_mfnr_[i - 1], &cur, frame_scale[i]);
+    if (!capturePyr(tex_mfnr_[i - 1], &cur, frame_scale[i])) return false;
     const auto cpu0 = std::chrono::steady_clock::now();
     const MfnrAlignOut a = mfnrAlign(ref, cur, tiles_w_, tiles_h_);
     // 同帧 A/B 诊断：再算一遍**旧路径**（最细层 1/4 域）的位移场，上传到第二
@@ -19759,50 +19998,62 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
     const int gw = (guides.base.width + stride - 1) / stride;
     const int gh = (guides.base.height + stride - 1) / stride;
     if (guides_ok) {
-      // The temporal A/B preference may skip L1; it must not silently lower the
-      // fixed eight-quad highlight solver to a coarser observation domain.
-      auto readFine = [&](MfnrPyramid* pyramid) {
-        if (!pyramid->l1.empty()) return;
-        std::vector<uint8_t> rgba(static_cast<size_t>(pyr1_w_) * pyr1_h_ * 4);
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo_pyr1_);
-        glReadPixels(0, 0, pyr1_w_, pyr1_h_, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        pyramid->l1.resize(static_cast<size_t>(pyr1_w_) * pyr1_h_);
-        for (size_t k = 0; k < pyramid->l1.size(); ++k) pyramid->l1[k] = rgba[k * 4];
-        pyramid->w1 = pyr1_w_; pyramid->h1 = pyr1_h_;
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      const auto assess = [&] {
+        if (empty_reference_mask) {
+          assessment.status = HighlightAdmission::NoHighlights;
+          return true;
+        }
+        // The temporal A/B preference may skip L1; it must not silently lower the
+        // fixed eight-quad highlight solver to a coarser observation domain.
+        auto readFine = [&](MfnrPyramid* pyramid) {
+          if (!pyramid->l1.empty()) return true;
+          const PyramidPackState pack;
+          const bool ok = readLevel(fbo_pyr1_, pyr1_w_, pyr1_h_, pyramid->l1);
+          glBindFramebuffer(GL_FRAMEBUFFER, 0);
+          if (!ok) {
+            Logger::instance().log(LogLevel::kError, "engine", "mfnr.pyramid_readback_failed", "{}");
+            return false;
+          }
+          pyramid->w1 = pyr1_w_; pyramid->h1 = pyr1_h_;
+          return true;
+        };
+        MfnrPyramid highlight_ref = ref;
+        if (highlight_ref.l1.empty()) {
+          passMfnrPyr(raw_tex_, cfa, black_phase, wl, rc.gains, frame_scale[0]);
+          if (!readFine(&highlight_ref)) return false;
+        }
+        if (short_pyramid.l1.empty()) {
+          if (!capturePyr(tex_mfnr_[short_idx - 1], &short_pyramid, frame_scale[short_idx]) ||
+              !readFine(&short_pyramid)) return false;
+        }
+        pyramid_ms = stageMs();
+        auto both = highlightAlignBidirectional(highlight_ref, short_pyramid, gw, gh, true, stride);
+        align_ms = stageMs();
+        HighlightGeometryGrid grid{guides.base.width, guides.base.height, gw, gh, stride, 0.5f};
+        std::vector<HighlightTileSupport> support;
+        if (both.valid && highlightObservableSupport(grid, guides.base.rgb,
+            guides.short_normalized.rgb, guides.highlight, both.forward.off,
+            both.reverse.off, &support)) {
+          geometry = highlightResolveGeometry(grid, guides.highlight, both.forward.off, support);
+        }
+        geometry_ms = stageMs();
+        HighlightFlowView flow;
+        if (geometry.usable()) flow = {geometry.flow.data(), gw, gh, stride * 2};
+        const auto assessmentFn = overlap_guides ? highlightAssessMergeMasks : highlightAssessMasks;
+        const bool masks_ok = assessmentFn(short_view, guides, flow,
+            geometry.usable(), &assessment, &admission_error);
+        mask_ms = stageMs();
+        return masks_ok;
       };
-      MfnrPyramid highlight_ref = ref;
-      if (highlight_ref.l1.empty()) {
-        passMfnrPyr(raw_tex_, cfa, black_phase, wl, rc.gains, frame_scale[0]);
-        readFine(&highlight_ref);
-      }
-      if (short_pyramid.l1.empty()) {
-        capturePyr(tex_mfnr_[short_idx - 1], &short_pyramid, frame_scale[short_idx]);
-        readFine(&short_pyramid);
-      }
-      pyramid_ms = stageMs();
-      auto both = highlightAlignBidirectional(highlight_ref, short_pyramid, gw, gh, true, stride);
-      align_ms = stageMs();
-      HighlightGeometryGrid grid{guides.base.width, guides.base.height, gw, gh, stride, 0.5f};
-      std::vector<HighlightTileSupport> support;
-      if (both.valid && highlightObservableSupport(grid, guides.base.rgb,
-          guides.short_normalized.rgb, guides.highlight, both.forward.off,
-          both.reverse.off, &support)) {
-        geometry = highlightResolveGeometry(grid, guides.highlight, both.forward.off, support);
-      }
-      geometry_ms = stageMs();
-      HighlightFlowView flow;
-      if (geometry.usable()) flow = {geometry.flow.data(), gw, gh, stride * 2};
-      const bool masks_ok = highlightAssessMasks(short_view, guides, flow,
-          geometry.usable(), &assessment, &admission_error);
-      mask_ms = stageMs();
-      if (masks_ok) {
+      if (assess()) {
         // Preserve full adjusted RGB-derived mask and its R8 complementary
         // quantization on the actual RAW/4 merge-weight domain. PC's current
         // RAW/2 -> texelFetch RAW/4 linear-mask wiring is corrected explicitly.
         const int mw = w / 4, mh = h / 4;
         std::vector<uint8_t> selected, linear;
-        if (!highlightBuildMergeMasks(assessment.adjusted, guides.base.width,
+        // A proven-empty reference mask also represents the all-zero adjusted mask.
+        const auto& adjusted = empty_reference_mask ? guides.highlight : assessment.adjusted;
+        if (!highlightBuildMergeMasks(adjusted, guides.base.width,
             guides.base.height, w, h, assessment.accepted(), &selected, &linear,
             &admission_error)) return false;
         auto upload = [&](GLuint* texture, int ww, int hh, GLenum internal,
@@ -19866,6 +20117,7 @@ bool FrameRenderer::submitRawBurst(const void* const* frames, int count,
         ",\"largestHole\":" + std::to_string(assessment.largest_inpainting_area) +
         ",\"supportedTiles\":" + std::to_string(geometry.supported_tiles) +
         ",\"regions\":" + std::to_string(geometry.regions) +
+        ",\"emptyMaskFastPath\":" + std::string(empty_reference_mask ? "true" : "false") +
         ",\"ready\":" + std::string(highlight_merge_ready_ ? "true" : "false") +
         ",\"error\":\"" + jsonEscape(admission_error) + "\"" +
         ",\"guideMs\":" + std::to_string(guide_ms) +

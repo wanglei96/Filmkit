@@ -69,6 +69,15 @@ HighlightMaskAssessment assess(const Raw& shortRaw, const HighlightGuideSet& gui
   std::string error;
   const bool ok = highlightAssessMasks(shortRaw.view(), guides, fv, support, &result, &error);
   require(ok, "assess: " + error);
+  HighlightMaskAssessment merge;
+  require(highlightAssessMergeMasks(shortRaw.view(), guides, fv, support, &merge, &error), error);
+  require(merge.adjusted == result.adjusted && merge.inpainting == result.inpainting &&
+          merge.status == result.status && merge.has_support == result.has_support &&
+          merge.clipped_pixels == result.clipped_pixels && merge.clipped_ratio == result.clipped_ratio &&
+          merge.largest_inpainting_area == result.largest_inpainting_area,
+          "merge-only assessment retains the same masks and decision");
+  require(merge.short_clipping.empty() && merge.normalized_error.empty(),
+          "merge-only assessment omits diagnostic maps");
   return result;
 }
 void recoverableAndColor() {
@@ -121,6 +130,33 @@ void admissionStates() {
   a = assess(shortRaw, g, false);
   require(a.status == HighlightAdmission::NoHighlights, "no highlights is separate no-op state");
   require(a.clipped_pixels == 0 && !a.accepted(), "no-highlight frame not injected");
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    // Empty mask, native clipping at an edge, and guide-only clipping.
+    base.fill({{.2f, .2f, .2f, .2f}});
+    if (scenario == 1) base.set(base.w - 1, base.h - 1, 1.f);
+    const float refScale = scenario == 2 ? 6.f : 1.f;
+    const auto full = generate(base, shortRaw, 2.f, identity, refScale);
+    HighlightGuideSet merge;
+    bool empty = scenario != 0;
+    require(highlightPrepareMergeGuides(base.view(), shortRaw.view(), identity, refScale, 2.f,
+                                        noiseless, noiseless, &merge, empty, &error), error);
+    require(empty == (scenario == 0), "only a zero reference mask bypasses short guides");
+    require(merge.highlight == full.highlight && merge.native_clipping == full.native_clipping &&
+            merge.base.rgb == full.base.rgb && merge.base.variance == full.base.variance,
+            "merge preparation keeps the complete reference unchanged");
+    if (empty) {
+      require(merge.short_unscaled.rgb.empty() && merge.short_normalized.rgb.empty(),
+              "no short buffers on the empty mask path");
+      require(assess(shortRaw, full, false).adjusted == merge.highlight,
+              "zero reference mask is the same adjusted mask as the complete solver");
+    } else {
+      require(merge.short_unscaled.rgb == full.short_unscaled.rgb &&
+              merge.short_unscaled.variance == full.short_unscaled.variance &&
+              merge.short_normalized.rgb == full.short_normalized.rgb &&
+              merge.short_normalized.variance == full.short_normalized.variance,
+              "nonempty mask preserves both full short guides");
+    }
+  }
   std::cout << "PASS large ghost rejected; unsupported rejected; no-highlights distinguished\n";
 }
 void nativeThresholdAndScaling() {

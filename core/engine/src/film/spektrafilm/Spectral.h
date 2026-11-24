@@ -39,4 +39,6 @@ bool projectSpectralLight(const SpectralProjection& projection,
                           std::span<Triplet> output,
                           SpectralBackend backend) noexcept;
 
+void decodeLogSpectralLight(std::span<Triplet> pixels, SpectralBackend backend) noexcept;
+
 }  // namespace filmkit::spektrafilm

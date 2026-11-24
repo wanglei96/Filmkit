@@ -4,18 +4,23 @@
 
 namespace filmkit::spektrafilm {
 
+class SpatialWorkspace;
+
 // The original Hanatos response table stores per-stock raw sensitivities,
 // not developed film or the final look. xyzFromRgb includes CAT16 adaptation.
 // Input and output may be identical or disjoint.
 bool projectHanatosRaw(std::span<const Triplet> linearRgb, std::span<Triplet> raw,
                        const std::array<Triplet, 3>& xyzFromRgb,
-                       std::span<const Triplet> response, std::size_t side);
+                       std::span<const Triplet> response, std::size_t side,
+                       double exposureGain = 1.0);
 
 struct HighlightBoost {
     double ev = 0.0;
     double range = 0.3;
     double protectEv = 4.0;
 };
+
+bool prepareFilmExposureGain(double exposureEv, const HighlightBoost& boost, double& gain);
 
 struct FilmHalation {
     bool active = true;
@@ -37,6 +42,7 @@ struct FilmHalation {
 bool boostFilmRaw(std::span<Triplet> raw, double exposureEv, const HighlightBoost& boost);
 bool finishFilmLogExposure(std::span<Triplet> raw, std::size_t width, std::size_t height,
                            double pixelUm, double lensBlurUm, const FilmHalation& halation,
-                           double exposureCorrection, std::size_t filterWorkers = 1);
+                           double exposureCorrection, std::size_t filterWorkers = 1,
+                           SpatialWorkspace* workspace = nullptr);
 
 }  // namespace filmkit::spektrafilm

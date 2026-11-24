@@ -5,6 +5,7 @@
 #include "Grain.h"
 #include "PrintScan.h"
 
+#include <memory>
 #include <utility>
 
 namespace filmkit::spektrafilm {
@@ -67,19 +68,27 @@ struct RenderTimings {
 
 // Overwrites scene-linear Rec.2020 with encoded sRGB, without clipping.
 // Includes temporary-buffer allocation; no file I/O or reference pixel reads.
+// The optional LUT applies only at the two spectral projection stages.
 // On failure discard the image. Replay hooks exist only for oracle validation.
 bool renderNegativeSrgb(std::vector<Triplet>& image, std::size_t width, std::size_t height,
                          const NegativeRenderParams& params, SpectralBackend backend,
                          RenderWorkers workers, std::uint64_t grainSeed,
                          std::uint64_t glareSeed, RenderTimings* timings = nullptr,
                          const GrainReplay* grainReplay = nullptr,
-                         std::span<const double> glareReplay = {});
+                         std::span<const double> glareReplay = {}, bool useSpectralLut = false);
+
+// Production overload: image owns exactly count fully written pixels. It may
+// adopt the developed buffer, so no full-frame copy or zero fill is needed.
+bool renderNegativeSrgb(std::unique_ptr<Triplet[]>& image, std::size_t count,
+                        std::size_t width, std::size_t height, const NegativeRenderParams& params,
+                        SpectralBackend backend, RenderWorkers workers, std::uint64_t grainSeed,
+                        std::uint64_t glareSeed, RenderTimings* timings, bool useSpectralLut);
 
 // Independent uniform patches, not a blurred ramp. Only stochastic texture is
 // disabled for this display-reference calibration; the photograph is unchanged.
 // Returns the selected recipe's full negative/paper/scan linear RGB response.
 bool negativeNeutralResponse(const NegativeRenderParams& params, SpectralBackend backend,
-                              std::span<Triplet> response);
+                              std::span<Triplet> response, std::size_t workers = 1);
 
 // Versioned engine-private controls, independent of the shared FilmParams ABI.
 bool applyRenderOptions(NegativeRenderParams& params, std::span<const double> options);

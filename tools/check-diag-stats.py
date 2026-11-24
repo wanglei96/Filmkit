@@ -87,6 +87,11 @@ def main() -> int:
         ("GL_BLEND", r"if \(prev_blend\) glEnable\(GL_BLEND\)"),
         ("GL_SCISSOR_TEST", r"if \(prev_scissor\) glEnable\(GL_SCISSOR_TEST\)"),
         ("GL_DEPTH_TEST", r"if \(prev_depth\) glEnable\(GL_DEPTH_TEST\)"),
+        ("GL_PIXEL_PACK_BUFFER_BINDING", r"glBindBuffer\(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>\(prev_buffer\)\)"),
+        ("GL_PACK_ALIGNMENT", r"glPixelStorei\(GL_PACK_ALIGNMENT, prev_pack\)"),
+        ("GL_PACK_ROW_LENGTH", r"glPixelStorei\(GL_PACK_ROW_LENGTH, prev_row\)"),
+        ("GL_PACK_SKIP_ROWS", r"glPixelStorei\(GL_PACK_SKIP_ROWS, prev_rows\)"),
+        ("GL_PACK_SKIP_PIXELS", r"glPixelStorei\(GL_PACK_SKIP_PIXELS, prev_pixels\)"),
     ]
     for saved, restorer in pairs:
         check(f"glGetIntegerv({saved}" in tex_fn or f"glIsEnabled({saved}" in tex_fn,

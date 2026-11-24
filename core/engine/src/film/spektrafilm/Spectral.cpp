@@ -120,4 +120,20 @@ bool projectSpectralLight(const SpectralProjection& projection, std::span<const 
     return project<false>(projection, density, output, backend);
 }
 
+void decodeLogSpectralLight(std::span<Triplet> pixels, SpectralBackend backend) noexcept {
+    std::size_t i = 0;
+#if defined(FILMKIT_SPEKTRAFILM_ARM_EXP10)
+    if (backend == SpectralBackend::AdvSimd) {
+        for (; pixels.size() - i >= 2; i += 2) {
+            const auto a = _ZGVnN2v_exp10(float64x2_t{pixels[i][0], pixels[i][1]});
+            const auto b = _ZGVnN2v_exp10(float64x2_t{pixels[i][2], pixels[i + 1][0]});
+            const auto c = _ZGVnN2v_exp10(float64x2_t{pixels[i + 1][1], pixels[i + 1][2]});
+            pixels[i] = {a[0], a[1], b[0]};
+            pixels[i + 1] = {b[1], c[0], c[1]};
+        }
+    }
+#endif
+    for (; i < pixels.size(); ++i) for (auto& v : pixels[i]) v = std::pow(10.0, v);
+}
+
 }  // namespace filmkit::spektrafilm

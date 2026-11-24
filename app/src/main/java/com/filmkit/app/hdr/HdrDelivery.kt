@@ -59,6 +59,7 @@ object HdrDelivery {
         gainmapW: Int,
         gainmapH: Int,
         quality: Int,
+        exif: ByteArray? = null,
     ): ByteArray? {
         if (!jpegRSupported) return null
         if (bitmap.width <= 0 || bitmap.height <= 0) return null
@@ -71,7 +72,8 @@ object HdrDelivery {
             return null
         }
         return runCatching {
-            EngineBridge.nativeEncodeUltraHdr(bitmap, gainmap, gainmapW, gainmapH, quality)
+            if (exif == null) EngineBridge.nativeEncodeUltraHdr(bitmap, gainmap, gainmapW, gainmapH, quality)
+            else EngineBridge.nativeEncodeUltraHdrWithExif(bitmap, gainmap, gainmapW, gainmapH, quality, exif)
         }.getOrNull()
     }
 

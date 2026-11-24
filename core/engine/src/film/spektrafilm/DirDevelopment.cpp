@@ -1,6 +1,7 @@
 #include "DirDevelopment.h"
 #include "ParallelPixels.h"
 #include "SpatialFilter.h"
+#include "SpatialWorkspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,28 +55,22 @@ DensityCurve preInhibitionCurve(std::span<const double> axis, std::span<const Tr
 
 bool diffuse(std::span<const Triplet> exposure, std::span<Triplet> correction,
              std::size_t width, std::size_t height, double sigma, double decay, double tailWeight,
-             std::size_t filterWorkers) {
+             std::size_t filterWorkers, SpatialWorkspace* workspace) {
     constexpr std::array amplitudes{0.1633, 0.6496, 0.1870};
     constexpr std::array ratios{0.5360, 1.5236, 2.7684};
     const auto count = exposure.size();
     // Every plane is written in full before its first read, including the first tail tap.
-    const std::unique_ptr<double[]> planeStorage(new double[count]);
-    const std::unique_ptr<double[]> filteredStorage(new double[count]);
-    const std::unique_ptr<double[]> scratchStorage(new double[count]);
-    const std::unique_ptr<double[]> tail(new double[count]);
-    const std::span<double> plane(planeStorage.get(), count), filtered(filteredStorage.get(), count),
-                            scratch(scratchStorage.get(), count);
+    SpatialWorkspace local(count);
+    auto& buffers = workspace ? *workspace : local;
+    const auto plane = buffers.plane(0), filtered = buffers.plane(1),
+               scratch = buffers.plane(2), tail = buffers.plane(3);
+    std::array<GaussianTap, amplitudes.size()> taps;
+    for (std::size_t j = 0; j < taps.size(); ++j) taps[j] = {ratios[j] * decay, amplitudes[j]};
     for (std::size_t c = 0; c < 3; ++c) {
         if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
             plane[i] = correction[i][c];
         })) return false;
-        for (std::size_t j = 0; j < amplitudes.size(); ++j) {
-            if (!gaussianBlur(plane, filtered, scratch, width, height, ratios[j] * decay, filterWorkers)) return false;
-            if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
-                const double value = amplitudes[j] * filtered[i];
-                tail[i] = j == 0 ? value : tail[i] + value;
-            })) return false;
-        }
+        if (!gaussianBlurMixture(plane, filtered, scratch, tail, taps, width, height, filterWorkers)) return false;
         if (!gaussianBlur(plane, filtered, scratch, width, height, sigma, filterWorkers)) return false;
         if (!parallelPixelIndices(plane.size(), filterWorkers, [&](auto i) {
             const double core = (1.0 - tailWeight) * filtered[i];
@@ -90,9 +85,11 @@ bool diffuse(std::span<const Triplet> exposure, std::span<Triplet> correction,
 bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet> density,
                             std::size_t width, std::size_t height, double pixelSizeUm,
                             std::span<const double> axis, std::span<const Triplet> stock,
-                            Triplet gamma, EmulsionType type, const DirCouplers& dir, std::size_t filterWorkers) {
+                            Triplet gamma, EmulsionType type, const DirCouplers& dir,
+                            std::size_t filterWorkers, SpatialWorkspace* workspace) {
     if (!width || !height || width > exposure.size() / height || width * height != exposure.size() ||
-        density.size() != exposure.size() || exposure.data() == density.data()) return false;
+        density.size() != exposure.size() || exposure.data() == density.data() ||
+        (workspace && workspace->size() != exposure.size())) return false;
     if (!dir.active) {
         const auto curve = prepareInitialFilmDevelopment(axis, stock, gamma);
         return parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
@@ -131,7 +128,7 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
         return true;
     })) return false;
     if (spread && !diffuse(exposure, density, width, height, dir.diffusionUm / pixelSizeUm,
-                           dir.tailUm / pixelSizeUm, dir.tailWeight, filterWorkers)) return false;
+                           dir.tailUm / pixelSizeUm, dir.tailWeight, filterWorkers, workspace)) return false;
     return parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
         const auto part = density.subspan(begin, count);
         return beforeDir.develop(part, part);

@@ -74,6 +74,21 @@ int main(int argc, char** argv) {
               scalarSad(a.data(), b.data(), w, h, x, y, dx, dy, tw, th, step),
               "SAD mismatch");
     }
+    int fullWidthCases = 0;
+    for (int w : {31, 32, 33, 191, 192, 193, 255, 256, 257}) {
+      constexpr int h = 17;
+      std::vector<uint8_t> a(size_t(w) * h), b(a.size());
+      for (auto& v : a) v = static_cast<uint8_t>(random());
+      for (auto& v : b) v = static_cast<uint8_t>(random());
+      for (int x : {-1, 0, 1}) for (int dx : {-16, -3, -1, 0, 1, 3, 16}) {
+        for (int dy : {-1, 0, 1}) for (int step : {1, 2}) {
+          require(filmkit::sadTile(a.data(), b.data(), w, h, x, 0, dx, dy, w, h, step) ==
+                  scalarSad(a.data(), b.data(), w, h, x, 0, dx, dy, w, h, step),
+                  "full-width shifted SAD mismatch");
+          ++fullWidthCases;
+        }
+      }
+    }
     int cases = 0;
     for (const auto& dims : {std::make_pair(65, 67), {129, 131}, {256, 192}, {513, 385}}) {
       auto a = pyramid(dims.first, dims.second, random), b = a;
@@ -95,7 +110,8 @@ int main(int argc, char** argv) {
         }
       }
     }
-    std::printf("PASS 12000 SAD cases, %d full alignments, exact fields and residuals\n", cases);
+    std::printf("PASS 12000 random SAD cases, %d full-width SAD cases, %d full alignments, "
+                "exact fields and residuals\n", fullWidthCases, cases);
     if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) {
       const auto a = pyramid(2048, 1536, random), b = pyramid(2048, 1536, random);
       for (int block = 0; block < 4; ++block) for (int item = 0; item < 4; ++item) {
@@ -105,7 +121,7 @@ int main(int argc, char** argv) {
                                : filmkit::mfnrAlign(a, b, 32, 24, true, 64);
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
-        std::printf("BENCH block=%d scalar=%d ms=%.3f cost=%.3f\n", block, ref, ms, value.gcost);
+        std::printf("BENCH block=%d reference=%d ms=%.3f cost=%.3f\n", block, ref, ms, value.gcost);
       }
     }
     return 0;

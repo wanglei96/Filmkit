@@ -163,7 +163,8 @@ class JpegR : public UltraHdr {
   uhdr_error_info_t encodeJPEGR(uhdr_compressed_image_t* base_img_compressed,
                                 uhdr_compressed_image_t* gainmap_img_compressed,
                                 uhdr_gainmap_metadata_ext_t* metadata,
-                                uhdr_compressed_image_t* dest);
+                                uhdr_compressed_image_t* dest,
+                                uhdr_mem_block_t* exif = nullptr);
 
   /*!\brief Decode API.
    *

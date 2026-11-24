@@ -1,7 +1,9 @@
 #include "PrintScan.h"
+#include "ExposureMath.h"
 #include "OutputGamut.h"
 #include "ParallelPixels.h"
 #include "SpatialFilter.h"
+#include "SpatialWorkspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -105,9 +107,7 @@ bool exposePaperRaw(const SpectralProjection& enlarger, std::span<const Triplet>
 }
 
 bool developPaper(std::span<Triplet> raw, const DensityCurve& curve) {
-    for (auto& pixel : raw) {
-        for (auto& v : pixel) v = std::log10(std::fmax(v, 0.0) + kFloor);
-    }
+    logExposure(raw, 1.0);
     return curve.develop(raw, raw);
 }
 
@@ -115,10 +115,12 @@ bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xy
                         std::size_t width, std::size_t height,
                         const PrintReferences& references, const PaperGlare& glare,
                         std::uint64_t seed, std::span<const double> replay,
-                        std::size_t filterWorkers, std::size_t pixelWorkers) {
+                        std::size_t filterWorkers, std::size_t pixelWorkers,
+                        SpatialWorkspace* workspace) {
     if (!width || !height || width > xyz.size() / height || width * height != xyz.size() ||
         !pixelWorkers || pixelWorkers > 8 ||
-        (!replay.empty() && replay.size() != xyz.size())) return false;
+        (!replay.empty() && replay.size() != xyz.size()) ||
+        (workspace && workspace->size() != xyz.size())) return false;
     if (references.correctXyz && !parallelPixels(xyz.size(), pixelWorkers, [&](auto begin, auto count) {
         for (auto& pixel : xyz.subspan(begin, count)) {
             const double y = pixel[1];
@@ -130,21 +132,25 @@ bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xy
     })) return false;
     if (!glare.active || glare.percent <= 0.0) return true;
     const Triplet illuminant = scannerWhite(scanner);
-    std::vector<double> randomField;
+    SpatialWorkspace local(xyz.size());
+    auto& buffers = workspace ? *workspace : local;
     if (replay.empty()) {
-        randomField.resize(xyz.size());
+        const auto randomField = buffers.plane(0);
         const double variance = std::log1p(glare.roughness * glare.roughness);
         const double location = std::log(glare.percent) - 0.5 * variance;
         const double deviation = std::sqrt(variance);
         std::mt19937_64 rng(seed);
         std::normal_distribution<double> normal;
-        for (auto& v : randomField) v = std::exp(location + deviation * normal(rng));
+        // Retain the seeded sample order and distribute the independent exponential work.
+        for (auto& v : randomField) v = location + deviation * normal(rng);
+        if (!parallelPixels(xyz.size(), pixelWorkers, [&](auto begin, auto count) {
+            for (auto& v : randomField.subspan(begin, count)) v = std::exp(v);
+            return true;
+        })) return false;
         replay = randomField;
     }
-    std::vector<double> filtered, scratch;
     if (glare.blurPx > 0.0) {
-        filtered.resize(xyz.size());
-        scratch.resize(xyz.size());
+        const auto filtered = buffers.plane(1), scratch = buffers.plane(2);
         if (!gaussianBlur(replay, filtered, scratch, width, height, glare.blurPx, filterWorkers)) return false;
         replay = filtered;
     }

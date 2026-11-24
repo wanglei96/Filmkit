@@ -1516,15 +1516,17 @@ uhdr_error_info_t uhdr_encode(uhdr_codec_private_t* enc) {
       auto& gainmap_entry = handle->m_compressed_images.find(UHDR_GAIN_MAP_IMG)->second;
 
       size_t size =
-          (std::max)(((size_t)64 * 1024), 2 * (base_entry->data_sz + gainmap_entry->data_sz));
+          (std::max)(((size_t)64 * 1024), 2 * (base_entry->data_sz + gainmap_entry->data_sz)) +
+          exif.data_sz;
       handle->m_compressed_output_buffer = std::make_unique<ultrahdr::uhdr_compressed_image_ext_t>(
           UHDR_CG_UNSPECIFIED, UHDR_CT_UNSPECIFIED, UHDR_CR_UNSPECIFIED, size);
 
       ultrahdr::uhdr_gainmap_metadata_ext_t metadata(handle->m_metadata, ultrahdr::kJpegrVersion);
 
-      // api - 4
+      // FilmKit: fold EXIF into the mux so MPF offsets match the finished file.
       status = jpegr.encodeJPEGR(base_entry.get(), gainmap_entry.get(), &metadata,
-                                 handle->m_compressed_output_buffer.get());
+                                 handle->m_compressed_output_buffer.get(),
+                                 exif.data_sz > 0 ? &exif : nullptr);
     } else if (handle->m_raw_images.find(UHDR_HDR_IMG) != handle->m_raw_images.end()) {
       auto& hdr_raw_entry = handle->m_raw_images.find(UHDR_HDR_IMG)->second;
 

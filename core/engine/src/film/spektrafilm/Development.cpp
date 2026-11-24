@@ -98,6 +98,17 @@ DensityCurve::DensityCurve(std::span<const double> exposure, std::span<const Tri
     }
 }
 
+std::pair<Triplet, Triplet> DensityCurve::densityBounds() const noexcept {
+    Triplet lo{}, hi{};
+    for (std::size_t c = 0; c < channels_.size(); ++c) {
+        for (const auto& knot : channels_[c]) {
+            lo[c] = std::min(lo[c], knot.y);
+            hi[c] = std::max(hi[c], knot.y);
+        }
+    }
+    return {lo, hi};
+}
+
 bool DensityCurve::develop(std::span<const Triplet> exposure, std::span<Triplet> density) const noexcept {
     if (exposure.size() != density.size() || channels_[0].empty()) return false;
     for (std::size_t i = 0; i < exposure.size(); ++i) {

@@ -6,6 +6,8 @@
 
 namespace filmkit::spektrafilm {
 
+class SpatialWorkspace;
+
 struct ScanLevels {
     bool black = false;
     bool white = false;
@@ -49,7 +51,8 @@ bool finishPaperScanXYZ(const SpectralProjection& scanner, std::span<Triplet> xy
                         std::size_t width, std::size_t height,
                         const PrintReferences& references, const PaperGlare& glare,
                         std::uint64_t seed, std::span<const double> replay = {},
-                        std::size_t filterWorkers = 1, std::size_t pixelWorkers = 1);
+                        std::size_t filterWorkers = 1, std::size_t pixelWorkers = 1,
+                        SpatialWorkspace* workspace = nullptr);
 
 // Complete the original scanner output after the linear-XYZ scan correction.
 // The three scalar buffers are caller-owned, reusable pixel-sized work planes.

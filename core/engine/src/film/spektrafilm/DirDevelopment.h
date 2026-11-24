@@ -4,6 +4,8 @@
 
 namespace filmkit::spektrafilm {
 
+class SpatialWorkspace;
+
 struct DirCouplers {
     bool active = true;
     std::array<Triplet, 3> inhibition{};  // Donor rows, receiver columns; includes amount.
@@ -17,6 +19,6 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
                             std::size_t width, std::size_t height, double pixelSizeUm,
                             std::span<const double> logExposureKnots, std::span<const Triplet> stockDensity,
                             Triplet gamma, EmulsionType type, const DirCouplers& dir,
-                            std::size_t filterWorkers = 1);
+                            std::size_t filterWorkers = 1, SpatialWorkspace* workspace = nullptr);
 
 }  // namespace filmkit::spektrafilm

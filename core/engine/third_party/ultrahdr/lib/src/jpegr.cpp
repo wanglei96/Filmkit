@@ -394,7 +394,7 @@ uhdr_error_info_t JpegR::encodeJPEGR(uhdr_raw_image_t* hdr_intent,
 uhdr_error_info_t JpegR::encodeJPEGR(uhdr_compressed_image_t* base_img_compressed,
                                      uhdr_compressed_image_t* gainmap_img_compressed,
                                      uhdr_gainmap_metadata_ext_t* metadata,
-                                     uhdr_compressed_image_t* dest) {
+                                     uhdr_compressed_image_t* dest, uhdr_mem_block_t* exif) {
   // We just want to check if ICC is present, so don't do a full decode. Note,
   // this doesn't verify that the ICC is valid.
   JpegDecoderHelper decoder;
@@ -418,7 +418,7 @@ uhdr_error_info_t JpegR::encodeJPEGR(uhdr_compressed_image_t* base_img_compresse
 
   // Add ICC if not already present.
   if (decoder.getICCSize() > 0) {
-    UHDR_ERR_CHECK(appendGainMap(base_img_compressed, gainmap_img_compressed, /* exif */ nullptr,
+    UHDR_ERR_CHECK(appendGainMap(base_img_compressed, gainmap_img_compressed, exif,
                                  /* icc */ nullptr, /* icc size */ 0, metadata, dest));
   } else {
     if (base_img_compressed->cg <= UHDR_CG_UNSPECIFIED ||
@@ -432,7 +432,7 @@ uhdr_error_info_t JpegR::encodeJPEGR(uhdr_compressed_image_t* base_img_compresse
     }
     std::shared_ptr<DataStruct> newIcc =
         IccHelper::writeIccProfile(UHDR_CT_SRGB, base_img_compressed->cg);
-    UHDR_ERR_CHECK(appendGainMap(base_img_compressed, gainmap_img_compressed, /* exif */ nullptr,
+    UHDR_ERR_CHECK(appendGainMap(base_img_compressed, gainmap_img_compressed, exif,
                                  newIcc->getData(), newIcc->getLength(), metadata, dest));
   }
 

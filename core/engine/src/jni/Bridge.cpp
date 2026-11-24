@@ -575,14 +575,15 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
 // 在本线程（still 线程）执行，所有分配与后续拍照共用同一 context。
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeStillWarmup(JNIEnv*, jobject, jint w,
-                                                    jint h, jint rot) {
+                                                    jint h, jint rot, jboolean pc3d,
+                                                    jboolean prefilter) {
   FrameRenderer* r = g_renderer_still.load();
   if (r == nullptr) return JNI_FALSE;
   if (g_still_surface == EGL_NO_SURFACE ||
       !stillEgl().makeCurrent(g_still_surface))
     return JNI_FALSE;
   return r->warmup(static_cast<int>(w), static_cast<int>(h),
-                   static_cast<int>(rot))
+                   static_cast<int>(rot), pc3d == JNI_TRUE, prefilter == JNI_TRUE)
              ? JNI_TRUE
              : JNI_FALSE;
 }

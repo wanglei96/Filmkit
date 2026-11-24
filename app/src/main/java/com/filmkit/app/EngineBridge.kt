@@ -68,7 +68,7 @@ object EngineBridge {
      * CPU 缓冲先分配好，不跑画质 pass、不写像素。调用前必须 nativeStillStart 成功，
      * 且必须在拍照线程上调用（与后续合成同一 context）。
      */
-    external fun nativeStillWarmup(w: Int, h: Int, rot: Int): Boolean
+    external fun nativeStillWarmup(w: Int, h: Int, rot: Int, pc3d: Boolean, prefilter: Boolean): Boolean
 
     /**
      * 生命周期释放（0.13.21）：销毁拍照侧 FrameRenderer（**保留 EGL context**），
@@ -338,6 +338,15 @@ object EngineBridge {
         gainmapW: Int,
         gainmapH: Int,
         quality: Int,
+    ): ByteArray?
+
+    external fun nativeEncodeUltraHdrWithExif(
+        bitmap: android.graphics.Bitmap,
+        gainmap: ByteArray,
+        gainmapW: Int,
+        gainmapH: Int,
+        quality: Int,
+        exif: ByteArray,
     ): ByteArray?
 
     /**

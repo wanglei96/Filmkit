@@ -48,7 +48,9 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
         "${arm_math}/math/aarch64/advsimd/expm1.c"
         "${arm_math}/math/aarch64/advsimd/hypot.c"
         "${arm_math}/math/aarch64/advsimd/log1p.c"
+        "${arm_math}/math/aarch64/advsimd/log10.c"
         "${arm_math}/math/aarch64/v_exp_data.c"
+        "${arm_math}/math/aarch64/v_log10_data.c"
         "${arm_math}/math/aarch64/advsimd/pow.c"
         "${arm_math}/math/aarch64/v_pow_log_data.c"
         "${arm_math}/math/aarch64/v_pow_exp_data.c")
@@ -66,6 +68,8 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
         COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_EXP10)
     set_property(SOURCE src/film/spektrafilm/OutputGamut.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_CAM16)
+    set_property(SOURCE src/film/spektrafilm/FilmExposure.cpp src/film/spektrafilm/PrintScan.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS FILMKIT_SPEKTRAFILM_ARM_LOG10)
 endif()
 
 # Match the FP64 oracle's operation order without changing unrelated pipelines.

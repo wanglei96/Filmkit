@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace filmkit::spektrafilm;
@@ -74,6 +76,25 @@ std::vector<double> scalarRecursive(std::vector<double> pixels, std::size_t w,
 }  // namespace
 
 int main() {
+    {
+        ScopedPixelWorkers workers(8);
+        const auto noop = [](auto, auto) { return true; };
+        for (std::size_t n : {8, 2, 4, 8}) {
+            std::vector<std::atomic<unsigned>> visits(1027);
+            if (!parallelPixelIndices(visits.size(), n, [&](auto i) { ++visits[i]; })) return 1;
+            for (const auto& visit : visits) if (visit.load() != 1) return 1;
+        }
+        if (parallelPixels(8, 8, [](auto begin, auto) { return begin != 1; })) return 1;
+        try {
+            parallelPixels(8, 8, [](auto begin, auto) {
+                if (begin == 1 || begin == 4) throw std::runtime_error("worker failure");
+                return true;
+            });
+            return 1;
+        } catch (const std::runtime_error&) {
+            if (!parallelPixels(8, 8, [&](auto, auto) { return parallelPixels(2, 2, noop); })) return 1;
+        }
+    }
     for (std::size_t count : {0, 1, 31, 131071, 131073}) {
         for (std::size_t workers : {1, 4, 8}) {
             for (std::size_t block : {4, 16384}) {
@@ -90,16 +111,69 @@ int main() {
             }
         }
     }
+    for (const auto [w, h] : {std::pair{1, 7}, {5, 3}, {9, 11}, {22, 1}, {35, 37}, {192, 96}}) {
+        const auto n = static_cast<std::size_t>(w) * h;
+        std::vector<Triplet> rgb(n);
+        std::vector<double> source(n), reference(n), scratch(n);
+        std::array<std::vector<double>, 3> result;
+        for (auto& channel : result) channel.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            rgb[i] = {std::sin(i * .043), std::cos(i * .023), double(i % 127) / 63.0};
+        }
+        for (double sigma : {1.0 / 6.0, 0.7, 0.94, 1.45, 1.87, 2.99}) {
+            constexpr double amount = 0.7;
+            if (!unsharpRgbFir(rgb, {result[0], result[1], result[2]}, w, h, sigma, amount, 4)) return 1;
+            for (std::size_t c = 0; c < 3; ++c) {
+                for (std::size_t i = 0; i < n; ++i) source[i] = rgb[i][c];
+                if (!gaussianBlur(source, reference, scratch, w, h, sigma, 4)) return 1;
+                for (std::size_t i = 0; i < n; ++i) {
+                    const double expected = source[i] + amount * (source[i] - reference[i]);
+                    if (std::bit_cast<std::uint64_t>(result[c][i]) != std::bit_cast<std::uint64_t>(expected)) {
+                        std::cerr << "RGB unsharp mismatch " << w << 'x' << h << " sigma=" << sigma
+                                  << " channel=" << c << " pixel=" << i << '\n';
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
     const auto noop = [](auto, auto) { return true; };
     if (parallelPixels(100, 0, noop) || parallelPixels(100, 9, noop) ||
         parallelPixels(100, 4, noop, 0)) return 1;
-    const std::array<std::array<std::size_t, 2>, 6> sizes{{{1, 1}, {3, 5}, {35, 17}, {151, 129}, {257, 65}, {65, 257}}};
-    constexpr std::array sigmas{0.0, 0.16, 0.3, 0.5, 1.0, 1.3, 2.33143, 2.999, 3.0, 12.496, 35.522, 64.543};
-    std::size_t checked = 0;
+    const std::array<std::array<std::size_t, 2>, 9> sizes{{
+        {1, 1}, {3, 5}, {16, 8}, {32, 24}, {35, 17}, {151, 129}, {256, 128}, {257, 65}, {65, 257}}};
+    constexpr std::array sigmas{0.0, 0.16, 0.3, 0.5, 1.0, 1.3, 2.33143, 2.999,
+                                3.0, 12.496, 35.522, 64.543, 226.0, 454.0};
+    std::size_t checked = 0, weightedChecked = 0, mixtureChecked = 0;
+    double worst = 0.0;
     for (const auto& [w, h] : sizes) {
         std::vector<double> input(w * h), reference(w * h), output(w * h), scratch(w * h);
+        std::vector<double> accumulation(w * h);
         for (std::size_t i = 0; i < input.size(); ++i) {
             input[i] = 0.5 * std::sin(static_cast<double>(i) * 0.17) + static_cast<double>(i % 73) * 0.03;
+        }
+        const std::array<std::array<GaussianTap, 4>, 3> mixtures{{
+            {{{12.496, 0.1633}, {35.522, 0.6496}, {64.543, 0.1870}, {2.33143, 0.17}}},
+            {{{0.16, 0.1}, {0.5, 0.2}, {226.0, 0.3}, {454.0, 0.4}}},
+            {{{3.0, 0.25}, {12.496, -0.5}, {226.0, 0.5}, {454.0, 0.75}}},
+        }};
+        for (const auto& taps : mixtures) {
+            for (std::size_t i = 0; i < taps.size(); ++i) {
+                if (!gaussianBlurWeighted(input, output, scratch, reference, taps[i].weight,
+                                          i != 0, w, h, taps[i].sigma, 1)) return 2;
+            }
+            for (std::size_t workers : {1, 4, 8}) {
+                std::fill(accumulation.begin(), accumulation.end(), std::numeric_limits<double>::quiet_NaN());
+                if (!gaussianBlurMixture(input, output, scratch, accumulation, taps, w, h, workers)) return 2;
+                for (std::size_t i = 0; i < input.size(); ++i) {
+                    if (std::bit_cast<std::uint64_t>(accumulation[i]) != std::bit_cast<std::uint64_t>(reference[i])) {
+                        std::cerr << "mixture mismatch " << w << 'x' << h << " workers=" << workers
+                                  << " pixel=" << i << '\n';
+                        return 1;
+                    }
+                    ++mixtureChecked;
+                }
+            }
         }
         input.front() = 8.0;
         input.back() = -0.25;
@@ -107,21 +181,54 @@ int main() {
             if (sigma >= 3) reference = scalarRecursive(input, w, h, sigma);
             else if (sigma > 0 && 3 * sigma + 0.5 >= 1) reference = scalarFir(input, w, h, sigma);
             else reference = input;
+            const auto matches = [&](double actual, double expected) {
+                if (!std::isfinite(actual)) return false;
+                worst = std::max(worst, std::abs(actual - expected));
+#if defined(__aarch64__)
+                // FP64 FMA changes roundoff, amplified by the long IIR poles.
+                if (sigma >= 3) return std::abs(actual - expected) <= 5e-9;
+                if (sigma < 3 && 3 * sigma + 0.5 >= 1) return std::abs(actual - expected) <= 8e-15;
+#endif
+                return std::bit_cast<std::uint64_t>(actual) == std::bit_cast<std::uint64_t>(expected);
+            };
+            std::vector<double> singleWorker;
             for (std::size_t workers : {1, 4, 8}) {
                 if (!gaussianBlur(input, output, scratch, w, h, sigma, workers)) return 2;
+                if (workers == 1) singleWorker = output;
+                else if (singleWorker != output) return 1;
                 for (std::size_t i = 0; i < output.size(); ++i) {
-                    if (!std::isfinite(output[i]) || std::bit_cast<std::uint64_t>(output[i]) !=
-                        std::bit_cast<std::uint64_t>(reference[i])) {
+                    if (!matches(output[i], reference[i])) {
                         std::cerr << "filter mismatch " << w << 'x' << h << " sigma=" << sigma
                                   << " workers=" << workers << " pixel=" << i << '\n';
                         return 1;
                     }
                     ++checked;
                 }
+                for (bool add : {false, true}) {
+                    constexpr double weight = 0.6496;
+                    if (!add) std::fill(accumulation.begin(), accumulation.end(),
+                                        std::numeric_limits<double>::quiet_NaN());
+                    if (!gaussianBlurWeighted(input, output, scratch, accumulation,
+                                              weight, add, w, h, sigma, workers)) return 2;
+                    for (std::size_t i = 0; i < output.size(); ++i) {
+                        const double tap = weight * reference[i];
+                        const double expected = add ? tap + tap : tap;
+                        if (!matches(accumulation[i], expected)) {
+                            std::cerr << "weighted filter mismatch " << w << 'x' << h << " sigma=" << sigma
+                                      << " workers=" << workers << " add=" << add << " pixel=" << i << '\n';
+                            return 1;
+                        }
+                        ++weightedChecked;
+                    }
+                }
             }
         }
         if (gaussianBlur(input, output, scratch, w, h, 1.0, 0) ||
-            gaussianBlur(input, output, scratch, w, h, 1.0, 9)) return 1;
+            gaussianBlur(input, output, scratch, w, h, 1.0, 9) ||
+            gaussianBlurWeighted(input, output, scratch, input, 0.5, false, w, h, 1.0, 1) ||
+            gaussianBlurWeighted(input, output, scratch, {}, 0.5, false, w, h, 1.0, 1)) return 1;
     }
-    std::cout << "filter_parallel_bitwise_values=" << checked << " failed=0\n";
+    std::cout << "filter_parallel_values=" << checked
+              << " weighted_values=" << weightedChecked << " mixture_values=" << mixtureChecked
+              << " max_abs_error=" << worst << " failed=0\n";
 }
