@@ -1,8 +1,8 @@
 ---
 summary: Spektrafilm落地与提速交接
 created: 2026-11-19 21:15
-updated: 2026-11-19 21:15
-status: active
+updated: 2026-11-24 20:55
+status: absorbed
 ---
 
 # Spektrafilm落地与提速交接
