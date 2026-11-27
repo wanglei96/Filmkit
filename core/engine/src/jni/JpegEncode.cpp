@@ -1,6 +1,8 @@
 #include "JpegEncode.h"
 
 #include <algorithm>
+#include <array>
+#include <future>
 #include <csetjmp>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +99,100 @@ bool encodeJpegTurbo444(const uint8_t* data, int w, int h, int channels,
 #else
   (void)quality;
   return false;
+#endif
+}
+
+#ifdef FILMKIT_HDR
+namespace {
+struct JpegStrip {
+    std::vector<uint8_t> bytes;
+    size_t sofHeight = 0, scanHeader = 0, scan = 0;
+
+    bool findBaselineScan() {
+        // Only parse the known single-scan baseline output of our own encoder.
+        if (bytes.size() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 ||
+            bytes[bytes.size() - 2] != 0xff || bytes.back() != 0xd9) return false;
+        for (size_t i = 2; i + 4 <= bytes.size();) {
+            if (bytes[i] != 0xff) return false;
+            const unsigned marker = bytes[i + 1];
+            const size_t length = (bytes[i + 2] << 8) | bytes[i + 3];
+            if (length < 2 || i + 2 + length > bytes.size() - 2) return false;
+            if (marker == 0xc0 && length == 17 && bytes[i + 4] == 8 && bytes[i + 9] == 3) {
+                sofHeight = i + 5;
+            } else if (marker == 0xda) {
+                if (!sofHeight || length != 12 || bytes[i + 4] != 3) return false;
+                scanHeader = i;
+                scan = i + 2 + length;
+                return scan < bytes.size() - 2;
+            } else if (marker != 0xe0 && marker != 0xdb && marker != 0xc4) {
+                return false;  // In particular, do not accept a pre-existing DRI.
+            }
+            i += 2 + length;
+        }
+        return false;
+    }
+};
+}  // namespace
+#endif
+
+bool encodeJpegTurbo444Striped(const uint8_t* data, int w, int h, int quality,
+                              std::vector<uint8_t>* out) {
+#ifdef FILMKIT_HDR
+    if (!data || !out || w <= 0 || h <= 0 || w > JPEG_MAX_DIMENSION || h > JPEG_MAX_DIMENSION ||
+        static_cast<uint64_t>(w) * h < 8'000'000) return false;
+    constexpr int kWorkers = 3;
+    constexpr int kMcu = 8; // Sequential baseline, sampling factors all 1×1.
+    const int mcuRows = (h + kMcu - 1) / kMcu;
+    const int rowsPerStrip = (mcuRows + kWorkers - 1) / kWorkers;
+    const int fullRows = rowsPerStrip * kMcu;
+    const int restartInterval = ((w + kMcu - 1) / kMcu) * rowsPerStrip;
+    if (restartInterval > 65535 || h <= (kWorkers - 1) * fullRows) return false;
+
+    std::array<JpegStrip, kWorkers> parts;
+    const auto encode = [&](int i) {
+        const int start = i * fullRows;
+        return encodeJpegTurbo444(data + static_cast<size_t>(start) * w * 4,
+                                  w, std::min(fullRows, h - start), 4, quality, &parts[i].bytes) &&
+               parts[i].findBaselineScan();
+    };
+    try {
+        auto a = std::async(std::launch::async, encode, 1);
+        auto b = std::async(std::launch::async, encode, 2);
+        if (!encode(0) || !a.get() || !b.get()) return false;
+
+        // Match all stream parameters (DQT, DHT, sampling, SOS, etc.) except strip height.
+        auto& first = parts[0];
+        for (int i = 1; i < kWorkers; ++i) {
+            const auto& part = parts[i];
+            if (part.sofHeight != first.sofHeight || part.scan != first.scan ||
+                !std::equal(first.bytes.begin(), first.bytes.begin() + first.sofHeight, part.bytes.begin()) ||
+                !std::equal(first.bytes.begin() + first.sofHeight + 2, first.bytes.begin() + first.scan,
+                            part.bytes.begin() + part.sofHeight + 2)) return false;
+        }
+        size_t size = first.scan + 6 + 2;
+        for (int i = 0; i < kWorkers; ++i) size += parts[i].bytes.size() - parts[i].scan;
+        out->clear();
+        out->reserve(size);
+        first.bytes[first.sofHeight] = h >> 8;
+        first.bytes[first.sofHeight + 1] = h & 255;
+        out->insert(out->end(), first.bytes.begin(), first.bytes.begin() + first.scanHeader);
+        out->insert(out->end(), {0xff, 0xdd, 0, 4, static_cast<uint8_t>(restartInterval >> 8),
+                                  static_cast<uint8_t>(restartInterval & 255)});
+        out->insert(out->end(), first.bytes.begin() + first.scanHeader, first.bytes.begin() + first.scan);
+        for (int i = 0; i < kWorkers; ++i) {
+            const auto& part = parts[i];
+            // Each compressor restarts DC prediction at zero and flushes its last entropy byte.
+            if (i > 0) out->insert(out->end(), {0xff, static_cast<uint8_t>(0xd0 + i - 1)});
+            out->insert(out->end(), part.bytes.begin() + part.scan, part.bytes.end() - 2);
+        }
+        out->insert(out->end(), {0xff, 0xd9});
+        return true;
+    } catch (const std::exception&) {
+        return false;  // Single-stream libjpeg remains available.
+    }
+#else
+    (void)data; (void)w; (void)h; (void)quality; (void)out;
+    return false;
 #endif
 }
 

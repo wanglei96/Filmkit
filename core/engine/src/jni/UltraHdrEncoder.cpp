@@ -1,7 +1,7 @@
 // Ultra HDR（JPEG/R）成片封装（v0.11.50）。
 //
 // ## 路线（2026-10-19 定案 + 实测确认）
-// base = **我们自己的 4:4:4 JPEG**（`JpegEncoder.cpp` 的 stb 直编），
+// base = **我们自己的 4:4:4 JPEG**（libjpeg-turbo，失败时 stb 直编），
 // gainmap = 我们按 **libultrahdr 官方 gainmapmath.cpp 的公式**自算后自编灰度 JPEG，
 // libultrahdr 只做**封装**（MPF 多图 + XMP 元数据）。
 //
@@ -33,7 +33,9 @@
 #include <android/bitmap.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -41,6 +43,7 @@
 #include "ultrahdr_api.h"
 
 #include "../render/FrameRenderer.h"
+#include "../log/Logger.h"
 
 // stb（与 JpegEncoder.cpp 同一份，4:4:4 直编；gainmap 用它编单通道灰度）
 // ⚠ **不定义** STB_IMAGE_WRITE_IMPLEMENTATION：那份实现已经在 `JpegEncoder.cpp` 里
@@ -51,6 +54,21 @@
 #include "../../third_party/stb/stb_image_write.h"
 
 namespace {
+
+struct EncodeStamp {
+  std::chrono::steady_clock::time_point wall = std::chrono::steady_clock::now();
+  int64_t cpuNs = 0;
+  EncodeStamp() {
+    timespec cpu{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu) == 0) {
+      cpuNs = static_cast<int64_t>(cpu.tv_sec) * 1000000000 + cpu.tv_nsec;
+    }
+  }
+  double elapsed(const EncodeStamp& start) const {
+    return std::chrono::duration<double, std::milli>(wall - start.wall).count();
+  }
+  double threadCpu(const EncodeStamp& start) const { return (cpuNs - start.cpuNs) / 1e6; }
+};
 
 // 官方常量（lib/include/ultrahdr/gainmapmath.h）—— 官方版公式用，保留不删
 constexpr float kHdrOffset = 1e-7f;
@@ -204,6 +222,7 @@ enum class GainmapMath { kOfficial, kPhotonCamera };
 static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap,
                                 jint gw, jint gh, jint quality, jbyteArray exif) {
   if (!bitmap || !gainmap || gw <= 0 || gh <= 0) return nullptr;
+  const EncodeStamp start;
   std::vector<uint8_t> exifBytes;
   if (exif) {
     const auto size = env->GetArrayLength(exif);
@@ -247,6 +266,8 @@ static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap
   // ── ① base = 我们的 4:4:4 JPEG ───────────────────────────────────
   const int q = std::clamp(static_cast<int>(quality), 1, 100);
   std::vector<unsigned char> baseJpeg;
+  const EncodeStamp baseStart;
+  bool striped = false, baseStb = false;
   {
     // Keep the Bitmap locked until encoding finishes; only padded rows need packing.
     const auto* src = static_cast<const unsigned char*>(pixels);
@@ -258,7 +279,9 @@ static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap
       }
       src = packed.data();
     }
-    if (!filmkit::encodeJpegTurbo444(src, w, h, 4, q, &baseJpeg)) {
+    striped = filmkit::encodeJpegTurbo444Striped(src, w, h, q, &baseJpeg);
+    if (!striped && !filmkit::encodeJpegTurbo444(src, w, h, 4, q, &baseJpeg)) {
+      baseStb = true;
       std::vector<unsigned char> rgb;
       rgbaToRgb(src, w, h, rgb);
       baseJpeg = stbEncodeRgb(rgb.data(), w, h, q);
@@ -266,14 +289,17 @@ static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap
   }
   AndroidBitmap_unlockPixels(env, bitmap);
   if (baseJpeg.empty()) return nullptr;
+  const EncodeStamp baseEnd;
 
   // ── ② gainmap 已是 8bit，直接编成灰度 JPEG ────────────────────────
   // gainmap 是辅助数据（8bit 量化 + 1/2 分辨率），q95 足够且省体积。
   std::vector<unsigned char> gmJpeg;
-  if (!filmkit::encodeJpegTurbo444(gm.data(), gw, gh, 1, 95, &gmJpeg)) {
+  const bool gainmapStb = !filmkit::encodeJpegTurbo444(gm.data(), gw, gh, 1, 95, &gmJpeg);
+  if (gainmapStb) {
     gmJpeg = stbEncodeGray(gm.data(), gw, gh, 95);
   }
   if (gmJpeg.empty()) return nullptr;
+  const EncodeStamp gainmapEnd;
 
   // ── ③ 封装：base 原样 + gainmap + 元数据 → JPEG/R ─────────────────
   uhdr_codec_private_t* enc = uhdr_create_encoder();
@@ -338,6 +364,7 @@ static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap
   ok = ok && uhdr_enc_set_output_format(enc, UHDR_CODEC_JPG).error_code == UHDR_CODEC_OK;
   ok = ok && uhdr_encode(enc).error_code == UHDR_CODEC_OK;
 
+  const EncodeStamp packageEnd;
   jbyteArray result = nullptr;
   if (ok) {
     auto* out = uhdr_get_encoded_stream(enc);
@@ -359,6 +386,18 @@ static jbyteArray encodeUltraHdr(JNIEnv* env, jobject bitmap, jbyteArray gainmap
     }
   }
   uhdr_release_encoder(enc);
+  const EncodeStamp done;
+  filmkit::Logger::instance().log(filmkit::LogLevel::kInfo, "hdr", "hdr.jpegr_encode",
+      std::string("{\"ok\":") + (result ? "true" : "false") +
+      ",\"base\":\"" + (striped ? "turbo_striped" : baseStb ? "stb" : "turbo_serial") + "\"" +
+      ",\"gainmapStb\":" + (gainmapStb ? "true" : "false") +
+      ",\"prepMs\":" + std::to_string(baseStart.elapsed(start)) +
+      ",\"baseMs\":" + std::to_string(baseEnd.elapsed(baseStart)) +
+      ",\"baseCallerCpuMs\":" + std::to_string(baseEnd.threadCpu(baseStart)) +
+      ",\"gainmapMs\":" + std::to_string(gainmapEnd.elapsed(baseEnd)) +
+      ",\"packageMs\":" + std::to_string(packageEnd.elapsed(gainmapEnd)) +
+      ",\"verifyAndCopyMs\":" + std::to_string(done.elapsed(packageEnd)) +
+      ",\"totalMs\":" + std::to_string(done.elapsed(start)) + "}");
   return result;
 }
 

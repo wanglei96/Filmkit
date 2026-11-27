@@ -17,6 +17,9 @@ PATHS = {
 
 PHASES = (
     "readMs",
+    "firstReadMs",
+    "glReadMs",
+    "readConvertMs",
     "hanatosMs",
     "filmExposureMs",
     "dirMs",
@@ -29,6 +32,9 @@ PHASES = (
     "scanSpectralMs",
     "scanGlareMs",
     "scanOutputMs",
+    "scanCam16Ms",
+    "scanFilterMs",
+    "scanSrgbEncodeMs",
     "renderMs",
     "rgbaMs",
     "hdrProbeMs",

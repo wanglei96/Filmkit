@@ -1,10 +1,11 @@
 #include "Grain.h"
+#include "ParallelPixels.h"
+#include "SpatialWorkspace.h"
 #include "SpatialFilter.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <future>
 #include <limits>
 #include <random>
 
@@ -20,22 +21,60 @@ struct LayerKnot {
     Triplet density;
 };
 
-double interpolate(std::span<const LayerKnot> knots, double x, std::size_t layer) {
-    if (x <= knots.front().x) return knots.front().density[layer];
-    if (x >= knots.back().x) return knots.back().density[layer];
-    // Measured stock curves can locally reverse. Keep the reference's scalar
-    // searchsorted(right) decisions without requiring a partitioned range.
-    std::size_t lo = 0, hi = knots.size();
-    while (lo < hi) {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        if (x < knots[mid].x) hi = mid;
-        else lo = mid + 1;
+// Measured curves can reverse locally. Index the actual decisions of the
+// reference binary search, not a sorted copy of the density knots.
+class LayerSearch {
+public:
+    explicit LayerSearch(std::span<const LayerKnot> knots) : knots_(knots) {
+        if (knots_.empty()) return;
+        first_ = knots_.front().x;
+        last_ = knots_.back().x;
+        scale_ = lower_.size() / (last_ - first_);
+        if (!(scale_ > 0.0 && std::isfinite(scale_))) return;
+        for (std::size_t i = 0; i < lower_.size(); ++i) {
+            const double x = std::lerp(first_, last_, (i + 0.5) / lower_.size());
+            lower_[i] = find(x);
+        }
     }
-    const auto& upper = knots[lo];
-    const auto& lower = knots[lo - 1];
-    const double t = (x - lower.x) * lower.inverseStep;
-    return lower.density[layer] + t * (upper.density[layer] - lower.density[layer]);
-}
+
+    double interpolate(double x, std::size_t layer) const {
+        if (x <= first_) return knots_.front().density[layer];
+        if (x >= last_) return knots_.back().density[layer];
+        Range hit{};
+        if (std::isfinite(scale_) && scale_ > 0.0) {
+            const double pos = std::min((x - first_) * scale_, static_cast<double>(lower_.size() - 1));
+            hit = lower_[static_cast<std::size_t>(pos)];
+        }
+        if (!(x >= hit.min && x < hit.max)) hit = find(x);
+        const auto& upper = knots_[hit.index];
+        const auto& lower = knots_[hit.index - 1];
+        const double t = (x - lower.x) * lower.inverseStep;
+        return lower.density[layer] + t * (upper.density[layer] - lower.density[layer]);
+    }
+
+private:
+    struct Range { double min, max; std::size_t index; };
+    Range find(double x) const {
+        double min = first_, max = last_;
+        std::size_t lo = 0, hi = knots_.size();
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            const double boundary = knots_[mid].x;
+            if (x < boundary) {
+                hi = mid;
+                max = std::min(max, boundary);
+            } else {
+                lo = mid + 1;
+                min = std::max(min, boundary);
+            }
+        }
+        return {min, max, lo};
+    }
+
+    std::span<const LayerKnot> knots_;
+    double first_ = 0.0, last_ = 0.0, scale_ = 0.0;
+    std::array<Range, 1024> lower_{};
+};
 
 bool positiveFinite(double value) {
     return value > 0.0 && std::isfinite(value);
@@ -79,7 +118,13 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
     const bool finalBlur = p.finalBlurPx > (p.layered ? 0.0 : 0.4);
     const bool spatial = finalBlur || (p.layered && p.dyeCloudBlur > 0.0) ||
                          (useClumping && microBlurPx > 0.4);
-    std::vector<double> plane(n), filtered(spatial ? n : 0), scratch(spatial ? n : 0);
+    SpatialWorkspace work(n);
+    const auto plane = work.plane(0);
+    const auto filtered = spatial ? work.plane(1) : std::span<double>{};
+    const auto scratch = spatial ? work.plane(2) : std::span<double>{};
+    const auto parallel = [&](auto op) {
+        return parallelPixelIndices(n, replay ? 1 : filterWorkers, op);
+    };
     const double sign = type == EmulsionType::Positive ? -1.0 : 1.0;
     const double pixelArea = pixelUm * pixelUm;
     const double logVariance = useClumping ? std::log1p(deviation * deviation) : 0.0;
@@ -125,17 +170,24 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
             particles[0] = {p.densityFloor[c], maximum + p.densityFloor[c],
                             pixelArea / area / static_cast<double>(count)};
         }
+        const LayerSearch search(knots);
         for (std::size_t s = 0; s < count; ++s) {
             const auto spec = particles[p.layered ? s : 0];
             if (!positiveFinite(spec.maxDensity) || !positiveFinite(spec.population) ||
                 spec.population >= static_cast<double>(std::numeric_limits<std::int64_t>::max()) * 1e-6) return false;
             const double od = spec.maxDensity / spec.population;
             if (!positiveFinite(od)) return false;
+            const bool dyeBlur = p.layered && p.dyeCloudBlur > 0.0;
+            const double dyeSigma = dyeBlur ? p.dyeCloudBlur * std::sqrt(od) : 0.0;
+            // The original radius-zero filter only copies its input. In that
+            // case accumulate the sample directly without a full-frame plane.
+            const bool direct = !dyeBlur || (std::isfinite(dyeSigma) && filterWorkers > 0 && filterWorkers <= 8 &&
+                                             gaussianBlurIsIdentity(dyeSigma));
             const auto particlesStarted = timings ? Clock::now() : Clock::time_point{};
             // Streams belong to fixed pixel blocks, not workers. Scheduling
             // cannot move random draws or change the layer accumulation order.
-            const auto sampleBlocks = [&](std::size_t worker) {
-                for (std::size_t block = worker; block < blocks; block += workers) {
+            if (!parallelPixels(blocks, workers, [&](std::size_t begin, std::size_t numBlocks) {
+                for (std::size_t block = begin; block < begin + numBlocks; ++block) {
                     std::seed_seq stream{static_cast<std::uint32_t>(seed), static_cast<std::uint32_t>(seed >> 32),
                                          static_cast<std::uint32_t>(c), static_cast<std::uint32_t>(s),
                                          static_cast<std::uint32_t>(block), 1U};
@@ -144,7 +196,7 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
                     const auto start = block * blockSize;
                     const auto stop = start + std::min(blockSize, n - start);
                     for (std::size_t i = start; i < stop; ++i) {
-                        const double d = p.layered ? interpolate(knots, sign * input[i][c], s) : input[i][c];
+                        const double d = p.layered ? search.interpolate(sign * input[i][c], s) : input[i][c];
                         const double probability = std::clamp((d + spec.floor) / spec.maxDensity, 1e-6, 1.0 - 1e-6);
                         const double saturation = 1.0 - probability * p.uniformity[c] * (1.0 - 1e-6);
                         const double mean = spec.population / saturation;
@@ -153,25 +205,20 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
                         const auto developed = replay
                             ? replay->developed(replay->context, c, s, i, mean, probability)
                             : poisson(rng, decltype(poisson)::param_type(mean * probability));
-                        plane[i] = static_cast<double>(developed) * od * saturation;
+                        const double sample = static_cast<double>(developed) * od * saturation;
+                        if (direct) output[i][c] = (s ? output[i][c] : 0.0) + sample;
+                        else plane[i] = sample;
                     }
                 }
-            };
-            std::array<std::future<void>, 7> pending;
-            for (std::size_t worker = 1; worker < workers; ++worker) {
-                pending[worker - 1] = std::async(std::launch::async, sampleBlocks, worker);
-            }
-            sampleBlocks(0);
-            for (std::size_t worker = 1; worker < workers; ++worker) pending[worker - 1].get();
+                return true;
+            }, 1)) return false;
             if (timings) timings->particlesSeconds += elapsed(particlesStarted);
-            const auto dyeStarted = timings ? Clock::now() : Clock::time_point{};
-            const std::vector<double>* dye = &plane;
-            if (p.layered && p.dyeCloudBlur > 0.0) {
-                if (!gaussianBlur(plane, filtered, scratch, width, height, p.dyeCloudBlur * std::sqrt(od), filterWorkers)) return false;
-                dye = &filtered;
+            if (!direct) {
+                const auto dyeStarted = timings ? Clock::now() : Clock::time_point{};
+                if (!gaussianBlur(plane, filtered, scratch, width, height, dyeSigma, filterWorkers)) return false;
+                if (!parallel([&](auto i) { output[i][c] = (s ? output[i][c] : 0.0) + filtered[i]; })) return false;
+                if (timings) timings->dyeCloudSeconds += elapsed(dyeStarted);
             }
-            for (std::size_t i = 0; i < n; ++i) output[i][c] = (s ? output[i][c] : 0.0) + (*dye)[i];
-            if (timings) timings->dyeCloudSeconds += elapsed(dyeStarted);
         }
     }
 
@@ -181,25 +228,27 @@ bool applyFilmGrain(std::span<const Triplet> input, std::span<Triplet> output,
     const double logDeviation = std::sqrt(logVariance);
     for (std::size_t c = 0; c < 3; ++c) {
         if (useClumping) {
-            for (std::size_t i = 0; i < n; ++i) {
-                plane[i] = replay ? replay->clumping(replay->context, c, i, deviation)
-                                  : std::exp(-0.5 * logVariance + logDeviation * normal(microRng));
+            if (replay) {
+                for (std::size_t i = 0; i < n; ++i) plane[i] = replay->clumping(replay->context, c, i, deviation);
+            } else {
+                for (auto& v : plane) v = -0.5 * logVariance + logDeviation * normal(microRng);
+                if (!parallel([&](auto i) { plane[i] = std::exp(plane[i]); })) return false;
             }
-            const std::vector<double>* field = &plane;
+            std::span<const double> field = plane;
             if (microBlurPx > 0.4) {
                 if (!gaussianBlur(plane, filtered, scratch, width, height, microBlurPx, filterWorkers)) return false;
-                field = &filtered;
+                field = filtered;
             }
-            for (std::size_t i = 0; i < n; ++i) output[i][c] *= (*field)[i];
+            if (!parallel([&](auto i) { output[i][c] *= field[i]; })) return false;
         }
-        for (std::size_t i = 0; i < n; ++i) {
+        if (!parallel([&](auto i) {
             const double sum = output[i][c];
             output[i][c] = (p.layered ? sum : sum / static_cast<double>(count)) - p.densityFloor[c];
             if (finalBlur) plane[i] = output[i][c];
-        }
+        })) return false;
         if (finalBlur) {
             if (!gaussianBlur(plane, filtered, scratch, width, height, p.finalBlurPx, filterWorkers)) return false;
-            for (std::size_t i = 0; i < n; ++i) output[i][c] = filtered[i];
+            if (!parallel([&](auto i) { output[i][c] = filtered[i]; })) return false;
         }
     }
     if (timings) timings->finishSeconds = elapsed(finishStarted);

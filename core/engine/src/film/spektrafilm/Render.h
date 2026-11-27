@@ -3,6 +3,7 @@
 #include "DirDevelopment.h"
 #include "FilmExposure.h"
 #include "Grain.h"
+#include "OutputGamut.h"
 #include "PrintScan.h"
 
 #include <memory>
@@ -41,6 +42,7 @@ struct NegativeRenderParams {
     double scanLensBlur = 0.0;
     double unsharpSigma = 0.0;
     double unsharpAmount = 0.0;
+    bool vulkanReadback = false;  // Shutter-frozen opt-in, not a recipe parameter.
 
     explicit NegativeRenderParams(DensityCurve curve) : paperCurve(std::move(curve)) {}
 };
@@ -63,6 +65,7 @@ struct RenderTimings {
     double scanSpectral = 0.0;
     double scanGlare = 0.0;
     double scanOutput = 0.0;
+    ScanOutputTimings scanOutputParts;
     double total = 0.0;
 };
 
@@ -83,6 +86,14 @@ bool renderNegativeSrgb(std::unique_ptr<Triplet[]>& image, std::size_t count,
                         std::size_t width, std::size_t height, const NegativeRenderParams& params,
                         SpectralBackend backend, RenderWorkers workers, std::uint64_t grainSeed,
                         std::uint64_t glareSeed, RenderTimings* timings, bool useSpectralLut);
+
+#if defined(FILMKIT_VULKAN_HANATOS)
+// Starts from the full-frame Hanatos exposure, including gain when boost is off.
+bool renderNegativeSrgbFromHanatos(std::unique_ptr<Triplet[]>& image, std::size_t count,
+                                   std::size_t width, std::size_t height, const NegativeRenderParams& params,
+                                   SpectralBackend backend, RenderWorkers workers, std::uint64_t grainSeed,
+                                   std::uint64_t glareSeed, RenderTimings* timings, bool useSpectralLut);
+#endif
 
 // Independent uniform patches, not a blurred ramp. Only stochastic texture is
 // disabled for this display-reference calibration; the photograph is unchanged.

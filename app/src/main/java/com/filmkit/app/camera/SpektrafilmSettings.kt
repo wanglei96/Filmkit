@@ -16,13 +16,14 @@ data class SpektrafilmSettings(
     val unsharpRadius: Double = 0.7,
     val unsharpAmount: Double = 0.7,
     val formatMm: Double = 35.0,
+    val vulkan: Boolean = false,
 ) {
     fun nativeOptions() = doubleArrayOf(1.0, if (grain) 1.0 else 0.0, grainArea,
         grainBlur, halation, scatter, dir, printEv, scanBlur, unsharpRadius, unsharpAmount, formatMm)
 
     fun save(prefs: SharedPreferences) {
         prefs.edit().putString("spektra_film", film).putString("spektra_paper", paper)
-            .putBoolean("spektra_grain", grain).apply {
+            .putBoolean("spektra_grain", grain).putBoolean("spektra_vulkan", vulkan).apply {
                 val values = nativeOptions()
                 for (i in 2 until values.size) putFloat("spektra_option_$i", values[i].toFloat())
             }.apply()
@@ -38,7 +39,8 @@ data class SpektrafilmSettings(
             return SpektrafilmSettings(prefs.getString("spektra_film", "kodak_portra_400").orEmpty(),
                 prefs.getString("spektra_paper", "kodak_portra_endura").orEmpty(),
                 prefs.getBoolean("spektra_grain", false), value(2), value(3), value(4), value(5),
-                value(6), value(7), value(8), value(9), value(10), value(11))
+                value(6), value(7), value(8), value(9), value(10), value(11),
+                vulkan = prefs.getBoolean("spektra_vulkan", false))
         }
     }
 }
@@ -56,5 +58,5 @@ class SpektrafilmCapture(
     val recipe: SpektrafilmRecipe, val settings: SpektrafilmSettings,
     val profile: ByteArray, val response: ByteArray,
 ) {
-    val options: DoubleArray = settings.nativeOptions()
+    val options: DoubleArray = settings.nativeOptions() + if (settings.vulkan) 1.0 else 0.0
 }

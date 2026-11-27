@@ -1,0 +1,205 @@
+#version 450
+layout(local_size_x=16, local_size_y=8) in;
+layout(std430,binding=0) readonly buffer Input { vec4 xyz[]; };
+layout(std430,binding=1) buffer Color { vec4 color[]; };
+layout(std430,binding=2) buffer Temp { vec4 temp[]; };
+layout(std430,binding=3) buffer Lens { vec4 lens[]; };
+layout(std430,binding=4) buffer Packed { uint result[]; };
+layout(std430,binding=5) writeonly buffer HdrBase { uint base8[]; };
+layout(std430,binding=6) readonly buffer Lut { vec4 node[]; };
+layout(std430,binding=7) readonly buffer Tables {
+    vec4 adaptationFl;
+    vec4 nbbZAwScale;
+    vec4 view;
+    float weights[38];
+    float lightness[64];
+    float cmax[46080];
+    uint good[8192];
+};
+layout(push_constant) uniform Scan {
+    vec4 scanToRgb[3];
+    ivec4 dims; // width, full height, first input row, input rows
+    ivec4 stripe; // first output row, output rows, ten bit, use LUT
+    ivec4 kernel; // lens radius, USM radius, mode, error offset in Packed
+    float amount;
+};
+
+const float PI=3.14159265358979323846;
+const mat3 rgbToXyz=mat3(.4124,.2126,.0193,.3576,.7152,.1192,.1805,.0722,.9505);
+const mat3 xyzToRgb=mat3(3.2406,-.9689,.0557,-1.5372,1.8758,-.2040,-.4986,.0415,1.0570);
+const mat3 cat16=mat3(.401288,-.250268,-.002079,.650173,1.204414,.048952,-.051461,.045854,.953127);
+const mat3 invCat16=mat3(1.8620678550872327,.3875265432361372,-.01584149884933386,-1.0112546305316843,.6214474419314753,-.03412293802851557,.14918677544445175,-.00897398516761252,1.0499644368778496);
+
+float signedPow(float x,float p) { return (x < 0.0 ? -1.0 : 1.0)*pow(abs(x),p); }
+float log1p(float x) {
+    // The correction avoids losing the argument at the addition to 1.
+    float y=1.0+x;
+    return y==1.0 ? x : log(y)*(x/(y-1.0));
+}
+float expm1(float x) {
+    if (abs(x)<0.001) return x*(1.0+x*(0.5+x*(1.0/6.0)));
+    return exp(x)-1.0;
+}
+float angle(float b,float a) {
+    // GLSL atan(y,x) is undefined at x=0.
+    if (a==0.0) return b==0.0 ? 0.0 : (b<0.0 ? -0.5*PI : 0.5*PI);
+    return atan(b,a);
+}
+float hueCmax(float J,float h) {
+    float pos=(h-view.y)/view.z;
+    float hueFloor=floor(pos);
+    int h0=(int(hueFloor)%720+720)%720,h1=(h0+1)%720;
+    float hf=pos-hueFloor;
+    J=clamp(J,lightness[0],lightness[63]);
+    int i=0,j=63;
+    while (i+1<j) {
+        int m=(i+j)/2;
+        if (J<lightness[m]) j=m; else i=m;
+    }
+    float lf=(J-lightness[i])/(lightness[j]-lightness[i]);
+    return mix(mix(cmax[i*720+h0],cmax[i*720+h1],hf),
+               mix(cmax[j*720+h0],cmax[j*720+h1],hf),lf);
+}
+vec3 compressCam16(vec3 rgb) {
+    float fl=adaptationFl.w,nbb=nbbZAwScale.x,z=nbbZAwScale.y,aw=nbbZAwScale.z;
+    float chromaScale=nbbZAwScale.w,colorfulness=view.x;
+    vec3 cone=adaptationFl.xyz*(cat16*(rgbToXyz*rgb*100.0));
+    vec3 x=pow(fl*abs(cone)/100.0,vec3(.42));
+    vec3 adapted=400.0*sign(cone)*x/(27.13+x)+0.1;
+    float a=adapted.r-12.0*adapted.g/11.0+adapted.b/11.0;
+    float b=(adapted.r+adapted.g-2.0*adapted.b)/9.0;
+    float h=angle(b,a);
+    if (h<0.0) h+=2.0*PI;
+    float r=length(vec2(a,b));
+    vec2 dir=r>1e-12 ? vec2(a,b)/r : vec2(cos(h),sin(h));
+    float et=0.25*(dir.x*cos(2.0)-dir.y*sin(2.0)+3.8);
+    float A=(2.0*adapted.r+adapted.g+0.05*adapted.b-0.305)*nbb;
+    float J=100.0*signedPow(A/aw,0.69*z);
+    float denominator=adapted.r+adapted.g+21.0*adapted.b/20.0;
+    float t=denominator==0.0 ? 0.0 : (50000.0/13.0)*nbb*et*r/denominator;
+    float C=signedPow(t,.9)*signedPow(J/100.0,.5)*chromaScale;
+    float Jp=(1.7*J/(1.0+.007*J))/100.0;
+    float Cp=log1p(.0228*C*colorfulness)/.0228;
+    if (isnan(Jp)||isinf(Jp)||isnan(Cp)||isinf(Cp)) return vec3(uintBitsToFloat(0x7fc00000u));
+    bool preserve=Jp>=0.0 && Jp<=.7 && Cp>0.0;
+    if (Jp>.7) {
+        float knee=(Jp-.7)/.3;
+        Jp=.7+.3*knee/pow(1.0+pow(knee,2.2),1.0/2.2);
+    }
+    Jp*=100.0;
+    float hp=h>PI ? h-2.0*PI : h;
+    if (Cp<=0.0) {
+        vec2 ab=Cp*vec2(cos(h),sin(h));
+        hp=angle(ab.y,ab.x);
+        Cp=length(ab);
+        dir=vec2(cos(hp),sin(hp));
+        et=.25*(cos(hp+2.0)+3.8);
+    }
+    float safe=max(hueCmax(Jp,hp),1e-9);
+    float q=Cp/safe,qq=q*q;
+    Cp=q*safe/pow(1.0+qq*qq*qq,1.0/6.0);
+    J=-Jp/(.007*Jp-1.7);
+    C=expm1(.0228*Cp)/(.0228*colorfulness);
+    t=pow(C/(sqrt(max(J,2.220446049250313e-16)/100.0)*chromaScale),1.0/.9);
+    if (!preserve) A=aw*signedPow(J/100.0,1.0/(.69*z));
+    float p2=A/nbb+.305,p3=21.0/20.0;
+    float n=p2*(2.0+p3)*(460.0/1403.0);
+    float p1=t==0.0 ? 0.0 : (50000.0/13.0)*nbb*et/t;
+    a=0.0; b=0.0;
+    if (t!=0.0 && abs(dir.y)>=abs(dir.x)) {
+        b=n/(p1/dir.y+(2.0+p3)*(220.0/1403.0)*dir.x/dir.y-27.0/1403.0+p3*(6300.0/1403.0));
+        a=b*dir.x/dir.y;
+    } else if (t!=0.0) {
+        a=n/(p1/dir.x+(2.0+p3)*(220.0/1403.0)-(27.0/1403.0-p3*(6300.0/1403.0))*dir.y/dir.x);
+        b=a*dir.y/dir.x;
+    }
+    adapted=vec3(460.0*p2+451.0*a+288.0*b,460.0*p2-891.0*a-261.0*b,460.0*p2-220.0*a-6300.0*b)/1403.0;
+    x=abs(adapted-0.1);
+    cone=sign(adapted-0.1)*(100.0/fl)*pow(27.13*x/(400.0-x),vec3(1.0/.42))/adaptationFl.xyz;
+    return xyzToRgb*(invCat16*cone/100.0);
+}
+bool interpolate(vec3 rgb,out vec3 outRgb) {
+    if (!all(greaterThan(rgb,vec3(0.0))) || !all(lessThan(rgb,vec3(1.5625)))) return false;
+    vec3 p=sqrt(rgb)*51.2;
+    ivec3 id=min(ivec3(p),ivec3(63));
+    uint cell=uint((id.r*64+id.g)*64+id.b);
+    if ((good[cell>>5]&(1u<<(cell&31u)))==0u) return false;
+    int base=(id.r*65+id.g)*65+id.b;
+    vec3 f=p-vec3(id);
+    const ivec3 stride=ivec3(4225,65,1);
+    int hi=0,mid=1,lo=2;
+    if (f[hi]<f[mid]) { int k=hi; hi=mid; mid=k; }
+    if (f[mid]<f[lo]) { int k=mid; mid=lo; lo=k; }
+    if (f[hi]<f[mid]) { int k=hi; hi=mid; mid=k; }
+    vec3 a=node[base].rgb,b=node[base+stride[hi]].rgb;
+    vec3 c=node[base+stride[hi]+stride[mid]].rgb,d=node[base+4225+65+1].rgb;
+    outRgb=a+f[hi]*(b-a)+f[mid]*(c-b)+f[lo]*(d-c);
+    return true;
+}
+vec3 adapt(int i) {
+    vec3 v=xyz[i].rgb;
+    return vec3(dot(scanToRgb[0].xyz,v),dot(scanToRgb[1].xyz,v),dot(scanToRgb[2].xyz,v));
+}
+int reflect(int x,int n) {
+    if (x>=0 && x<n) return x;
+    int p=((x%(2*n))+(2*n))%(2*n);
+    return p<n ? p : 2*n-1-p;
+}
+vec3 horizontal(int x,int y,int radius,int start) {
+    vec3 sum=vec3(0);
+    for (int k=-radius;k<=radius;++k)
+        sum+=weights[start+k+radius]*temp[y*dims.x+reflect(x+k,dims.x)].rgb;
+    return sum;
+}
+float oetf(float v) {
+    return v<=.0031308 ? 12.92*v : 1.055*pow(v,1.0/2.4)-.055;
+}
+
+void main() {
+    int x=int(gl_GlobalInvocationID.x),y=int(gl_GlobalInvocationID.y);
+    int stage=kernel.z;
+    if (stage==0) {
+        x*=2;
+        if (x>=dims.x || y>=dims.w) return;
+        int i=y*dims.x+x;
+        vec3 a=adapt(i),b=adapt(i+1),p,q;
+        bool hit=stripe.w!=0 && interpolate(a,p) && interpolate(b,q);
+        color[i]=vec4(hit ? p : compressCam16(a),0);
+        color[i+1]=vec4(hit ? q : compressCam16(b),0);
+        return;
+    }
+    if (x>=dims.x || y>=(stage==4 ? stripe.y : dims.w)) return;
+    int i=y*dims.x+x;
+    if (stage==1 || stage==3) {
+        int radius=stage==1 ? kernel.x : kernel.y;
+        int start=stage==1 ? 0 : 19;
+        vec3 sum=vec3(0);
+        for (int k=-radius;k<=radius;++k) {
+            int sy=clamp(reflect(dims.z+y+k,dims.y)-dims.z,0,dims.w-1);
+            int si=sy*dims.x+x;
+            sum+=weights[start+k+radius]*(stage==3 && kernel.x>0 ? lens[si].rgb : color[si].rgb);
+        }
+        temp[i]=vec4(sum,0);
+    } else if (stage==2) {
+        lens[i]=vec4(horizontal(x,y,kernel.x,0),0);
+    } else {
+        int row=stripe.x+y-dims.z;
+        int inputPixel=row*dims.x+x;
+        vec3 v=kernel.x>0 ? lens[inputPixel].rgb : color[inputPixel].rgb;
+        if (kernel.y>0) v+=amount*(v-horizontal(x,row,kernel.y,19));
+        v=xyzToRgb*(rgbToXyz*v);
+        vec3 encoded=vec3(oetf(v.r),oetf(v.g),oetf(v.b));
+        if (any(isnan(encoded)) || any(isinf(encoded))) {
+            atomicOr(result[kernel.w],1u);
+            return;
+        }
+        uvec3 q=uvec3(floor(clamp(encoded,0.0,1.0)*(stripe.z!=0 ? 1023.0 : 255.0)+0.5));
+        uint dest=uint((stripe.y-1-y)*dims.x+x);
+        result[dest]=stripe.z!=0 ? (q.r | (q.g<<10) | (q.b<<20) | (3u<<30))
+                                 : (q.r | (q.g<<8) | (q.b<<16) | (255u<<24));
+        if (stripe.z!=0) {
+            q=(q*255u+511u)/1023u;
+            base8[dest]=q.r | (q.g<<8) | (q.b<<16) | (255u<<24);
+        }
+    }
+}

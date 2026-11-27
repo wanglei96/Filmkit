@@ -2,6 +2,7 @@
 
 #include "Spectral.h"
 
+#include <cstdint>
 #include <span>
 
 namespace filmkit::spektrafilm {
@@ -27,6 +28,17 @@ bool cam16UcsToXyz(Triplet jab, Triplet& xyz) noexcept;
 // Original Spektrafilm CAM16-UCS compression for linear sRGB.
 bool compressSrgbCam16Ucs(Triplet linearRgb, Triplet& compressedRgb) noexcept;
 
+// The descriptor may be closed after the call. Maps an immutable signed APK
+// asset once per process, without reading its pages; on failure use exact CAM16.
+bool installScanCam16Lut(int fd, std::int64_t offset, std::int64_t length) noexcept;
+
+struct ScanOutputTimings {
+    double cam16 = 0.0;
+    std::size_t cam16LutHits = 0;
+    double filters = 0.0;
+    double encode = 0.0;
+};
+
 // Completes the scanner stage in place: scanner-white XYZ adaptation,
 // output gamut compression, lens blur, unsharp, then optional sRGB encoding.
 // The image and the three work planes must be disjoint. Discard the image on failure.
@@ -37,6 +49,7 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
                     std::span<double> plane,
                     std::span<double> filtered,
                     std::span<double> scratch,
-                    std::size_t workerCount = 4, std::size_t filterWorkers = 1);
+                    std::size_t workerCount = 4, std::size_t filterWorkers = 1,
+                    ScanOutputTimings* timings = nullptr, bool allowCam16Lut = false);
 
 }  // namespace filmkit::spektrafilm

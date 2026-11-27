@@ -13,6 +13,12 @@ bool unsharpRgbFir(std::span<const Triplet> input, const std::array<std::span<do
                    std::size_t width, std::size_t height, double sigma, double amount,
                    std::size_t workers);
 
+// For finite sigma, the original Gaussian kernel is exactly the identity
+// when the short-kernel radius rounds to zero.
+inline bool gaussianBlurIsIdentity(double sigma) noexcept {
+    return sigma <= 0.0 || (sigma < 3.0 && 3.0 * sigma + 0.5 < 1.0);
+}
+
 // Filters one row-major plane. All spans must be distinct and exactly width * height.
 // The scratch plane is reusable between channels and between mixture components.
 bool gaussianBlur(std::span<const double> input, std::span<double> output,

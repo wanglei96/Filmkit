@@ -38,6 +38,7 @@ class RenderClient {
     private var lastPresentMs = 0L
     // Only touched on FilmFrameCallback; callback dispatch is not a HAL timestamp.
     private var lastArriveMs = 0L
+    @Volatile private var stillPreviewTiming = false
     private val droppedCallbacks = AtomicInteger(0)
     private var timingStartNs = 0L
     private var lastFrameNs = 0L
@@ -183,6 +184,12 @@ class RenderClient {
         val nowArrive = android.os.SystemClock.elapsedRealtime()
         if (lastArriveMs > 0) {
             val ag = (nowArrive - lastArriveMs).toInt()
+            if (stillPreviewTiming && ag in 150..10_000) {
+                EngineBridge.nativeAppendLog(
+                    EngineBridge.LEVEL_INFO, "engine", "render.preview_callback_stall",
+                    kv("endMonoMs" to nowArrive, "gapMs" to ag),
+                )
+            }
             if (ag in 401..10_000) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_INFO, "engine", "render.preview_arrive_gap",
@@ -267,13 +274,27 @@ class RenderClient {
 
     private fun recordFrameTiming(queued: Long, start: Long, update: Long, submit: Long, done: Long, texture: Long) {
         if (timingStartNs == 0L) timingStartNs = start
-        if (lastFrameNs > 0L) frameIntervals.add((done - lastFrameNs) / 1e6)
-        if (lastTextureNs > 0L && texture > lastTextureNs) textureIntervals.add((texture - lastTextureNs) / 1e6)
+        val gapMs = (done - lastFrameNs) / 1e6
+        val textureGapMs = (texture - lastTextureNs) / 1e6
+        val queueMs = (start - queued) / 1e6
+        val updateMs = (submit - update) / 1e6
+        val submitMs = (done - submit) / 1e6
+        if (lastFrameNs > 0L) frameIntervals.add(gapMs)
+        if (lastTextureNs > 0L && texture > lastTextureNs) textureIntervals.add(textureGapMs)
+        // Per-frame values must stay together: maxima in the 1s window can be different frames.
+        if (stillPreviewTiming && lastFrameNs > 0L && gapMs in 150.0..10_000.0) {
+            EngineBridge.nativeAppendLog(
+                EngineBridge.LEVEL_INFO, "engine", "render.preview_frame_stall",
+                kv("endMonoMs" to done / 1e6, "gapMs" to gapMs,
+                    "textureGapMs" to textureGapMs.takeIf { lastTextureNs > 0L && it > 0.0 },
+                    "queueMs" to queueMs, "updateMs" to updateMs, "submitMs" to submitMs),
+            )
+        }
         lastFrameNs = done
         lastTextureNs = texture
-        queueTimes.add((start - queued) / 1e6)
-        updateTimes.add((submit - update) / 1e6)
-        renderTimes.add((done - submit) / 1e6)
+        queueTimes.add(queueMs)
+        updateTimes.add(updateMs)
+        renderTimes.add(submitMs)
         if (done - timingStartNs < 1_000_000_000L) return
         val values = arrayListOf<Pair<String, Any?>>()
         values.add("windowMs" to (done - timingStartNs) / 1e6)
@@ -305,6 +326,7 @@ class RenderClient {
      */
     fun setPreviewScale(scale: Float) {
         EngineBridge.nativeEngineSetPreviewScale(scale)
+        stillPreviewTiming = scale < 1f
         EngineBridge.nativeAppendLog(
             EngineBridge.LEVEL_INFO, "engine", "render.preview_scale",
             kv("scale" to "%.2f".format(scale)),

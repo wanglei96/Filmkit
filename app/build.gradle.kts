@@ -66,6 +66,9 @@ val buildFilmEngine by tasks.registering {
                     "-DCMAKE_TOOLCHAIN_FILE=" + File(ndkDir, "build/cmake/android.toolchain.cmake").absolutePath,
                     "-DANDROID_ABI=$abi",
                     "-DANDROID_PLATFORM=android-26",
+                    "-DFILMKIT_VULKAN_HANATOS=ON",
+                    "-DFILMKIT_VULKAN_AHB_PROBE=OFF",
+                    "-DFILMKIT_VULKAN_STILL_PROBE=OFF",
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DFILMKIT_HDR=" + (if (engineHdr) "ON" else "OFF"),
                 )
@@ -97,12 +100,14 @@ android {
         applicationId = "com.filmkit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 847
-        versionName = "0.14.50"
+        versionCode = 854
+        versionName = "0.14.57"
         // 只打真机用的 arm64：CMake 有时会把 x86_64 也编进 jniLibs（产物不稳定），
         // 那会让 APK 平白多 5.4MB（v0.6.31 实测 33.6MB → 39.2MB）。
         ndk { abiFilters += "arm64-v8a" }
     }
+
+    androidResources { noCompress += "fkcam16" }
 
     sourceSets {
         getByName("main") {

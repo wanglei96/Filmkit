@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Pixels { vec4 pixels[]; };
+layout(std430, binding = 1) readonly buffer Response { vec4 response[]; };
+#ifdef HANATOS_SHARED_IMAGE
+layout(binding = 2) uniform sampler2D sharedImage;
+#else
+layout(std430, binding = 2) readonly buffer RawReadback { uint rawReadback[]; };
+#endif
+layout(push_constant) uniform Projection {
+    vec4 xyzFromRgb[3];
+    float exposureGain;
+    int side;
+    uint count;
+    uint inputFormat;
+    uint width;
+    uint firstRow;
+} p;
+
+void responseTaps(float position, int end, out ivec4 index, out vec4 weight) {
+    float coord = clamp(position, 0.0, float(end));
+    int base = min(int(coord), end - 1);
+    float t = coord - float(base);
+    float t2 = t * t;
+    index = ivec4(abs(base - 1), base, base + 1, min(base + 2, 2 * end - (base + 2)));
+    weight = vec4(1.0 / 18.0 - 0.5 * t + t2 * (5.0 / 6.0 - (7.0 / 18.0) * t),
+                  8.0 / 9.0 + t2 * ((7.0 / 6.0) * t - 2.0),
+                  1.0 / 18.0 + 0.5 * t + t2 * (1.5 - (7.0 / 6.0) * t),
+                  t2 * ((7.0 / 18.0) * t - 1.0 / 3.0));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+#ifdef HANATOS_SHARED_IMAGE
+    vec3 rgb = texelFetch(sharedImage, ivec2(i % p.width, p.firstRow + i / p.width), 0).rgb;
+#else
+    vec3 rgb;
+    if (p.inputFormat == 1u) {
+        rgb = vec3(unpackHalf2x16(rawReadback[2u * i]),
+                   unpackHalf2x16(rawReadback[2u * i + 1u]).x);
+    } else if (p.inputFormat == 2u) {
+        uint offset = 4u * i;
+        rgb = uintBitsToFloat(uvec3(rawReadback[offset], rawReadback[offset + 1u],
+                                   rawReadback[offset + 2u]));
+    } else {
+        rgb = pixels[i].rgb;
+    }
+#endif
+    vec3 xyz = vec3(dot(p.xyzFromRgb[0].rgb, rgb),
+                    dot(p.xyzFromRgb[1].rgb, rgb),
+                    dot(p.xyzFromRgb[2].rgb, rgb));
+    float sum = (xyz.x + xyz.y) + xyz.z;
+    float inverse = 1.0 / max(sum, 1e-10);
+    float oneMinusX = 1.0 - xyz.x * inverse;
+    // Hand unusually ill-conditioned inputs back to the FP64 projection.
+    if (isnan(sum) || isinf(sum) || abs(oneMinusX) < 2e-6 ||
+        abs(sum) < 1e-5 * dot(abs(xyz), vec3(1.0))) {
+        pixels[i].a = 1.0;
+        return;
+    }
+    float x = clamp(oneMinusX * oneMinusX, 0.0, 1.0);
+    float y = clamp((xyz.y * inverse) / max(oneMinusX, 1e-10), 0.0, 1.0);
+    int end = p.side - 1;
+    ivec4 ix, iy;
+    vec4 wx, wy;
+    responseTaps(x * float(end), end, ix, wx);
+    responseTaps(y * float(end), end, iy, wy);
+    vec3 result = vec3(0.0);
+    for (int a = 0; a < 4; ++a) {
+        int row = ix[a] * p.side;
+        vec3 horizontal = wy.x * response[row + iy.x].rgb + wy.y * response[row + iy.y].rgb
+                        + wy.z * response[row + iy.z].rgb + wy.w * response[row + iy.w].rgb;
+        result += wx[a] * horizontal;
+    }
+    float norm = dot(wx, vec4(1.0)) * dot(wy, vec4(1.0));
+    vec3 raw = ((result * (norm != 0.0 ? 1.0 / norm : 1.0)) * sum) * p.exposureGain;
+    pixels[i] = vec4(raw, any(isnan(raw)) || any(isinf(raw)) ? 1.0 : 0.0);
+}

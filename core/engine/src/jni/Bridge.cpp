@@ -26,6 +26,10 @@
 #include <unistd.h>
 #include "../render/FrameRenderer.h"
 #include "../film/spektrafilm/Profile.h"
+#include "../film/spektrafilm/OutputGamut.h"
+#if defined(FILMKIT_VULKAN_HANATOS)
+#include "../film/spektrafilm/HanatosVulkan.h"
+#endif
 #include "../spike/SpikeFftMerge.h"
 #include "../spike/SpikePass.h"
 
@@ -45,6 +49,15 @@ using filmkit::runSpikePass;
 using filmkit::runSpikeFftMerge;
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeSupportsSpektrafilmVulkan(JNIEnv*, jobject) {
+#if defined(FILMKIT_VULKAN_HANATOS)
+  return filmkit::spektrafilm::supportsHanatosVulkan() ? JNI_TRUE : JNI_FALSE;
+#else
+  return JNI_FALSE;
+#endif
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeLoadSpektrafilmProfile(JNIEnv* env, jobject, jbyteArray data) {
   if (!data) return JNI_FALSE;
   const auto length = env->GetArrayLength(data);
@@ -62,6 +75,11 @@ Java_com_filmkit_app_EngineBridge_nativeLoadSpektrafilmProfile(JNIEnv* env, jobj
   } catch (const std::exception&) {
     return JNI_FALSE;
   }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_filmkit_app_EngineBridge_nativeInstallScanCam16Lut(JNIEnv*, jobject, jint fd, jlong offset, jlong length) {
+  return filmkit::spektrafilm::installScanCam16Lut(fd, offset, length) ? JNI_TRUE : JNI_FALSE;
 }
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
@@ -368,12 +386,17 @@ bool prepareSpectralCapture(JNIEnv* env, FrameRenderer* renderer, const FilmPara
     std::string error;
     const auto loaded = filmkit::spektrafilm::loadNegativeProfile(bytes, &error, table);
     if (!loaded) throw std::runtime_error(error);
-    if (!options || env->GetArrayLength(options) != 12) throw std::runtime_error("missing spectral options");
-    std::array<double, 12> values;
-    env->GetDoubleArrayRegion(options, 0, values.size(), values.data());
+    const jsize optionCount = options ? env->GetArrayLength(options) : 0;
+    if (optionCount != 12 && optionCount != 13) throw std::runtime_error("missing spectral options");
+    std::array<double, 13> values{};
+    env->GetDoubleArrayRegion(options, 0, optionCount, values.data());
     auto configured = std::make_shared<filmkit::spektrafilm::NegativeRenderParams>(*loaded);
-    if (env->ExceptionCheck() || !filmkit::spektrafilm::applyRenderOptions(*configured, values))
+    if (env->ExceptionCheck() || (values[12] != 0.0 && values[12] != 1.0) ||
+        !filmkit::spektrafilm::applyRenderOptions(*configured, std::span(values).first<12>()))
       throw std::runtime_error("invalid spectral options");
+#if defined(FILMKIT_VULKAN_HANATOS)
+    configured->vulkanReadback = values[12] == 1.0;
+#endif
     renderer->setSpektrafilmProfile(std::move(configured));
     return true;
   } catch (const std::exception& e) {
@@ -576,14 +599,17 @@ Java_com_filmkit_app_EngineBridge_nativeStillStart(JNIEnv*, jobject) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_filmkit_app_EngineBridge_nativeStillWarmup(JNIEnv*, jobject, jint w,
                                                     jint h, jint rot, jboolean pc3d,
-                                                    jboolean prefilter) {
+                                                    jboolean prefilter, jint spectralMask) {
   FrameRenderer* r = g_renderer_still.load();
   if (r == nullptr) return JNI_FALSE;
   if (g_still_surface == EGL_NO_SURFACE ||
       !stillEgl().makeCurrent(g_still_surface))
     return JNI_FALSE;
+  const FrameRenderer::SpectralWarmupPath path{
+      (spectralMask & 1) != 0, (spectralMask & 2) != 0, (spectralMask & 4) != 0};
   return r->warmup(static_cast<int>(w), static_cast<int>(h),
-                   static_cast<int>(rot), pc3d == JNI_TRUE, prefilter == JNI_TRUE)
+                   static_cast<int>(rot), pc3d == JNI_TRUE, prefilter == JNI_TRUE,
+                   spectralMask >= 0 ? &path : nullptr)
              ? JNI_TRUE
              : JNI_FALSE;
 }

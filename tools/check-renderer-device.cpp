@@ -20,6 +20,9 @@
 // --no-short (HDR with a physically clamped +0.662 EV fourth observation).
 // --highlight-cases (no-short -> accepted short -> no-short -> plain -> single -> no-short).
 // --raw-directory DIR (four fN.raw files and generated replay.txt calibration).
+// --single-raw (only f0.raw, no synthetic or duplicated burst observations).
+// --spektrafilm-vulkan (verify the JNI probe and opt in on the frozen recipe).
+// --scan-cam16 PATH (map the production CAM16 asset).
 // --expect-source-white (assert production resolve event for each HDR capture).
 // --expect-chroma (require the full multiscale pass, not only nonblack output).
 // --lens-switch-cases (warmup/RAW-size/rotation/strength changes in one renderer).
@@ -47,6 +50,10 @@
 #include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
 #include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <jni.h>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -60,10 +67,13 @@
 #include <thread>
 #include <vector>
 #include "../core/engine/src/film/EngineRegistry.h"
+#include "../core/engine/src/film/spektrafilm/OutputGamut.h"
 #include "../core/engine/src/render/FrameRenderer.h"
 #include "../core/engine/src/log/Logger.h"
 #include "../core/engine/src/log/GpuTimer.h"
 #include "../core/engine/src/jni/JpegEncode.h"
+
+extern "C" jboolean Java_com_filmkit_app_EngineBridge_nativeSupportsSpektrafilmVulkan(JNIEnv*, jobject);
 
 namespace {
 void require(bool condition, const std::string& message) {
@@ -271,6 +281,8 @@ int run(int argc, char** argv) {
     bool stageSync = true, diagStats = false, aeHal = false, expectChroma = false, alignL1 = true;
     bool lensSwitchCases = false, tenBit = false, previewReinit = false;
     bool prefilterCases = false, concurrent = false, spektraGrain = false;
+    bool singleRaw = false, spektraVulkan = false;
+    std::string scanCam16;
     int feedbackSlot = -1;
     int colorSmooth = -1, colorMedian = -1;
     float chromaGate = -1.f;
@@ -301,6 +313,9 @@ int run(int argc, char** argv) {
       else if (arg == "--synthetic-feedback" && i + 1 < argc) feedbackSlot = std::stoi(argv[++i]);
       else if (arg == "--film-params" && i + 1 < argc) filmParamsFile = argv[++i];
       else if (arg == "--print-ev" && i + 1 < argc) printEv = std::stod(argv[++i]);
+      else if (arg == "--single-raw") singleRaw = true;
+      else if (arg == "--spektrafilm-vulkan") spektraVulkan = true;
+      else if (arg == "--scan-cam16" && i + 1 < argc) scanCam16 = argv[++i];
       else if (arg == "--spektrafilm-grain") spektraGrain = true;
       else if (arg == "--spektrafilm" && i + 2 < argc) {
         spektraProfile = argv[++i];
@@ -348,8 +363,24 @@ int run(int argc, char** argv) {
     require(!syntheticFeedback || (!rawDirectory.empty() && !preview && !warmup && filmParamsFile.empty()),
             "synthetic feedback requires a real RAW replay without warmup");
     require(!concurrent || (!rawDirectory.empty() && !preview && !syntheticFeedback &&
-            !covarianceCases && !prefilterCases && repeat == 1),
+            !covarianceCases && !prefilterCases),
             "concurrent preview requires one RAW replay");
+    require(!singleRaw || (!rawDirectory.empty() && !prefilterCases && !highlightCases &&
+                           !lensSwitchCases && !covarianceCases), "single RAW requires f0.raw replay");
+    require(!spektraVulkan || !spektraProfile.empty(), "Vulkan requires a Spektrafilm recipe");
+    if (spektraVulkan) {
+      require(Java_com_filmkit_app_EngineBridge_nativeSupportsSpektrafilmVulkan(nullptr, nullptr),
+              "production JNI Vulkan probe rejected this device");
+      std::puts("VULKAN probe=pass captureOption=on");
+    }
+    if (!scanCam16.empty()) {
+      const int fd = open(scanCam16.c_str(), O_RDONLY | O_CLOEXEC);
+      struct stat statInfo{};
+      const bool mapped = fd >= 0 && fstat(fd, &statInfo) == 0 &&
+          filmkit::spektrafilm::installScanCam16Lut(fd, 0, statInfo.st_size);
+      if (fd >= 0) close(fd);
+      require(mapped, "production CAM16 asset failed to map");
+    }
     const int surfaceSize = preview || syntheticFeedback ? size : 16;
     Egl egl(surfaceSize, surfaceSize, concurrent ? EGL_CONTEXT_PRIORITY_LOW_IMG : 0);
     if (allocationOnly) { checkAllocation(); return EXIT_SUCCESS; }
@@ -397,6 +428,7 @@ int run(int argc, char** argv) {
       auto recipe = std::make_shared<filmkit::spektrafilm::NegativeRenderParams>(*loaded);
       const std::array<double, 12> options{1, spektraGrain ? 1.0 : 0.0, .45, .8, .5, .5, 1, printEv, 0, .7, .7, 35};
       require(filmkit::spektrafilm::applyRenderOptions(*recipe, options), "Spektrafilm options rejected");
+      recipe->vulkanReadback = spektraVulkan;
       renderer.setSpektrafilmProfile(std::move(recipe));
       params.engine_slot = filmkit::kSpektrafilmSlot;
       params.exposure_ev = .7f;
@@ -512,7 +544,7 @@ int run(int argc, char** argv) {
     const float shotCases[] = {.0007f, .000004f, .00008f, .00008f, .000004f, .0007f, .000004f, .0007f};
     const float pc3dCases[] = {1.f, 1.f, 1.f, 2.f, 0.f, 2.f, 1.f, 1.f};
     for (int capture = 0; capture < (prefilterCases ? 24 : covarianceCases ? 8 : highlightCases ? 6 : lensSwitchCases ? 8 : repeat); ++capture) {
-    const bool single = (highlightCases && capture == 4) || (prefilterCases && capture >= 12);
+    const bool single = singleRaw || (highlightCases && capture == 4) || (prefilterCases && capture >= 12);
     if (prefilterCases) {
       const int mode = (capture/3)%4;
       params.color_smooth = float(mode&1);
@@ -549,7 +581,7 @@ int run(int argc, char** argv) {
         require(glGetError() == GL_NO_ERROR, "lens-switch warmup GL error");
       }
     }
-    for (int f = 0; f < 4; ++f) {
+    for (int f = 0; f < (single ? 1 : 4); ++f) {
       raw[f].resize(size_t(strides[f]) * height);
       if (!rawDirectory.empty()) {
         require(strides[f] >= width && strides[f] <= 16384, "invalid replay stride");
@@ -705,7 +737,7 @@ int run(int argc, char** argv) {
       save(output + "/case-" + std::to_string(capture) + ".jpg", jpeg.data(), jpeg.size());
     }
     }
-    std::printf("PASS full production FrameRenderer RAW burst -> RGBA -> JPEG\n");
+    std::printf("PASS full production FrameRenderer RAW %s -> RGBA -> JPEG\n", singleRaw ? "single" : "burst");
     return EXIT_SUCCESS;
   } catch (const std::exception& e) {
     std::printf("FAIL %s EGL_error=0x%x\n", e.what(), eglGetError());

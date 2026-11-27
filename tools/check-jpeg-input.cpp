@@ -1,10 +1,13 @@
 // Link with production JpegEncode.cpp and the same libjpeg-turbo static library.
 #include "../core/engine/src/jni/JpegEncode.h"
 
+#include <jpeglib.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -41,6 +44,40 @@ std::vector<uint8_t> input(int w, int h, int mode, std::mt19937& random) {
     }
   return rgba;
 }
+// Rewrite the quantized coefficients with the same tables, removing restart
+// markers and DC predictor resets. Exact equality covers every coded block.
+std::vector<uint8_t> canonical(std::vector<uint8_t>& bytes, int w, int h) {
+  jpeg_decompress_struct src{};
+  jpeg_compress_struct dst{};
+  jpeg_error_mgr readError{}, writeError{};
+  src.err = jpeg_std_error(&readError);
+  dst.err = jpeg_std_error(&writeError);
+  jpeg_create_decompress(&src);
+  jpeg_create_compress(&dst);
+  jpeg_mem_src(&src, bytes.data(), bytes.size());
+  require(jpeg_read_header(&src, TRUE) == JPEG_HEADER_OK && src.image_width == unsigned(w) &&
+          src.image_height == unsigned(h) && src.num_components == 3 && !src.progressive_mode,
+          "wrong JPEG dimensions, channels or coding mode");
+  for (int c = 0; c < 3; ++c) {
+    require(src.comp_info[c].h_samp_factor == 1 && src.comp_info[c].v_samp_factor == 1,
+            "JPEG chroma subsampled");
+  }
+  auto coefficients = jpeg_read_coefficients(&src);
+  jpeg_copy_critical_parameters(&src, &dst);
+  unsigned char* output = nullptr;
+  unsigned long size = 0;
+  jpeg_mem_dest(&dst, &output, &size);
+  jpeg_write_coefficients(&dst, coefficients);
+  jpeg_finish_compress(&dst);
+  require(jpeg_finish_decompress(&src) && !readError.num_warnings && !writeError.num_warnings,
+          "JPEG coefficient rewrite issued warnings");
+  std::vector<uint8_t> result(output, output + size);
+  std::free(output);
+  jpeg_destroy_compress(&dst);
+  jpeg_destroy_decompress(&src);
+  return result;
+}
+
 }
 int main(int argc, char** argv) {
   try {
@@ -55,6 +92,28 @@ int main(int argc, char** argv) {
         ++count;
       }
     std::printf("PASS %d exact RGB/RGBA JPEG comparisons, random alpha ignored\n", count);
+    if (argc == 2 && std::strcmp(argv[1], "--stripes") == 0) {
+      int stripes = 0;
+      for (const auto dims : {std::array{3072, 4080}, std::array{4080, 3072},
+                              std::array{4081, 3071}, std::array{4097, 2197}}) {
+        const auto [w, h] = dims;
+        const auto rgba = input(w, h, stripes % 2, random);
+        for (int q : {91, 95, 100}) {
+          auto serial = encode(rgba, w, h, q, false);
+          std::vector<uint8_t> parallel;
+          require(filmkit::encodeJpegTurbo444Striped(rgba.data(), w, h, q, &parallel),
+                  "striped JPEG encode failed");
+          require(serial != parallel && canonical(serial, w, h) == canonical(parallel, w, h),
+                  "striped JPEG changed coefficients");
+          ++stripes;
+        }
+      }
+      std::vector<uint8_t> output;
+      const auto small = input(32, 64, 2, random);
+      require(!filmkit::encodeJpegTurbo444Striped(small.data(), 32, 64, 100, &output),
+              "small JPEG should use the single-stream path");
+      std::printf("PASS %d striped JPEG coefficient comparisons and small-image bypass\n", stripes);
+    }
     if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) {
       const auto rgba = input(3072, 4080, 1, random);
       const auto expected = encode(rgba, 3072, 4080, 100, true);

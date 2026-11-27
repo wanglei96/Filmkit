@@ -18,12 +18,26 @@ class SpektrafilmSettingsTest {
     @Test fun absentSettingsDisableGrainWithoutChangingSharedFilmParams() {
         val s = SpektrafilmSettings.read(prefs())
         assertFalse(s.grain)
+        assertFalse(s.vulkan)
         assertEquals("kodak_portra_400", s.film)
         assertEquals("kodak_portra_endura", s.paper)
         assertEquals(12, s.nativeOptions().size)
         assertEquals(0.0, s.nativeOptions()[1], 0.0)
         assertArrayEquals(doubleArrayOf(1.0, 0.0, 0.45, 0.8, 0.5, 0.5, 1.0,
             0.0, 0.0, 0.7, 0.7, 35.0), s.nativeOptions(), 1e-7)
+    }
+
+    @Test fun vulkanOptInIsFrozenWithTheCaptureWithoutChangingRecipeControls() {
+        val recipe = SpektrafilmRecipe("id", "film", "film", false, "paper", "paper",
+            "profile", "checksum", "response", "checksum")
+        val on = SpektrafilmSettings.read(prefs(mapOf("spektra_vulkan" to true)))
+        val capture = SpektrafilmCapture(recipe, on, byteArrayOf(), byteArrayOf())
+        val next = SpektrafilmCapture(recipe, on.copy(vulkan = false), byteArrayOf(), byteArrayOf())
+        assertTrue(capture.settings.vulkan)
+        assertEquals(13, capture.options.size)
+        assertEquals(1.0, capture.options[12], 0.0)
+        assertEquals(0.0, next.options[12], 0.0)
+        assertArrayEquals(on.nativeOptions(), capture.options.copyOf(12), 0.0)
     }
 
     @Test fun privateOptionsHaveFiniteBoundedInputs() {

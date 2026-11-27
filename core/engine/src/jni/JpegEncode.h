@@ -21,6 +21,11 @@ namespace filmkit {
 bool encodeJpegTurbo444(const uint8_t* data, int w, int h, int channels, int quality,
                         std::vector<uint8_t>* out);
 
+// Equivalent baseline 4:4:4 RGBA JPEG with standard restart markers between
+// independently encoded MCU-aligned strips. False uses the single-stream path.
+bool encodeJpegTurbo444Striped(const uint8_t* data, int w, int h, int quality,
+                              std::vector<uint8_t>* out);
+
 // 编译期是否带 libjpeg（FILMKIT_HDR 关闭时没有 jpeg-static）。
 bool jpegTurboAvailable();
 

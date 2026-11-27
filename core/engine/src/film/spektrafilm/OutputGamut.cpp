@@ -1,8 +1,22 @@
 #include "OutputGamut.h"
 #include "ParallelPixels.h"
 #include "SpatialFilter.h"
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+#include "render/vulkan_probe/StillGpuProbe.h"
+#endif
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstdint>
+#include <cstring>
+
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -340,6 +354,101 @@ bool compressSrgbCam16Ucs(Triplet linearRgb, Triplet& compressedRgb) noexcept {
     return finite(compressedRgb);
 }
 
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+namespace {
+#include "OfflineScanLut.inc"
+
+struct MappedScanLut {
+    void* mapping = MAP_FAILED;
+    std::size_t size = 0;
+    ScanCamLut view{};
+
+    MappedScanLut(int fd, std::int64_t offset, std::int64_t length) noexcept {
+        static_assert(sizeof(Triplet) == 24 && std::endian::native == std::endian::little);
+        struct stat st{};
+        const auto page = sysconf(_SC_PAGESIZE);
+        if (fd < 0 || page <= 0 || offset < 0 || length != ScanCamLut::byteCount ||
+            fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < length ||
+            offset > st.st_size - length) return;
+        const auto padding = static_cast<std::size_t>(offset % page);
+        size = padding + ScanCamLut::byteCount;
+        mapping = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, offset - static_cast<std::int64_t>(padding));
+        if (mapping == MAP_FAILED) return;
+        const auto* data = static_cast<const std::byte*>(mapping) + padding;
+        view = {data, reinterpret_cast<const uint8_t*>(data + ScanCamLut::nodeCount * sizeof(Triplet))};
+    }
+
+    ~MappedScanLut() { if (mapping != MAP_FAILED) munmap(mapping, size); }
+};
+
+std::atomic<const ScanCamLut*> sScanCamLut{nullptr};
+}  // namespace
+#endif
+
+bool installScanCam16Lut(int fd, std::int64_t offset, std::int64_t length) noexcept {
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+    static const MappedScanLut table(fd, offset, length);
+    if (!table.view.values) return false;
+    sScanCamLut.store(&table.view, std::memory_order_release);
+    return true;
+#else
+    (void)fd;
+    (void)offset;
+    (void)length;
+    return false;
+#endif
+}
+
+#if defined(FILMKIT_VULKAN_STILL_PROBE) && defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+bool tryVulkanScan(std::span<const Triplet> xyz, int w, int h, Triplet scannerWhiteXyz,
+                   double lensBlurSigma, double unsharpSigma, double unsharpAmount, bool useLut) {
+    auto* job = vkprobe::ScanJob::current();
+    if (!job || !vkprobe::mode("FILMKIT_VK_SCAN") || !finite(scannerWhiteXyz) ||
+        !(scannerWhiteXyz[1] > 0.0)) return false;
+    constexpr double cat02[3][3] = {
+        {0.7328, 0.4296, -0.1624},
+        {-0.7036, 1.6975, 0.0061},
+        {0.0030, 0.0136, 0.9834},
+    };
+    constexpr double cat02Inverse[3][3] = {
+        {1.096123820835514, -0.27886900021828726, 0.18274517938277304},
+        {0.4543690419753592, 0.4735331543074118, 0.07209780371722913},
+        {-0.00962760873842936, -0.00569803121611342, 1.0153256399545427},
+    };
+    constexpr Triplet d65{0.9504559270516716, 1.0, 1.0890577507598784};
+    const double whiteScale = scannerWhiteXyz[1];
+    for (double& value : scannerWhiteXyz) value /= whiteScale;
+    const Triplet sourceCone = multiply(cat02, scannerWhiteXyz);
+    const Triplet targetCone = multiply(cat02, d65);
+    for (double component : sourceCone) {
+        if (!std::isfinite(component) || component <= 0.0) return false;
+    }
+    Triplet adaptation{};
+    for (std::size_t c = 0; c < 3; ++c) adaptation[c] = targetCone[c] / sourceCone[c];
+    Matrix scaledCat02;
+    for (std::size_t row = 0; row < 3; ++row) {
+        for (std::size_t col = 0; col < 3; ++col) scaledCat02[row][col] = adaptation[row] * cat02[row][col];
+    }
+    const auto cat02Adapted = composeMatrix(cat02Inverse, scaledCat02);
+    const auto toRgb = composeMatrix(kXyzToSrgb, cat02Adapted);
+    const auto* lut = useLut ? sScanCamLut.load(std::memory_order_acquire) : nullptr;
+    const auto asFloat = [](const Triplet& v, double a = 0) {
+        return vkprobe::Float4{float(v[0]), float(v[1]), float(v[2]), float(a)};
+    };
+    const auto& v = kViewing;
+    const vkprobe::ScanParams p{
+        {asFloat(toRgb[0]), asFloat(toRgb[1]), asFloat(toRgb[2])},
+        asFloat(v.adaptation, v.fL), {float(v.nbb), float(v.z), float(v.aw), float(v.chromaScale)},
+        {float(v.colorfulnessScale), float(kCam16SrgbHue[0]),
+         float(kCam16SrgbHue[1] - kCam16SrgbHue[0]), 0},
+        kCam16SrgbLightness, kCam16SrgbCmax,
+        lut ? std::span(lut->values, ScanCamLut::nodeCount * sizeof(Triplet)) : std::span<const std::byte>{},
+        lut ? std::span(lut->good, ScanCamLut::cellCount) : std::span<const uint8_t>{},
+        lensBlurSigma, unsharpSigma, unsharpAmount};
+    return vkprobe::scan(xyz, w, h, p, *job);
+}
+#endif
+
 bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
                     std::size_t height, Triplet scannerWhiteXyz,
                     double lensBlurSigma, double unsharpSigma,
@@ -347,7 +456,17 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
                     std::span<double> plane,
                     std::span<double> filtered,
                     std::span<double> scratch,
-                    std::size_t workerCount, std::size_t filterWorkers) {
+                    std::size_t workerCount, std::size_t filterWorkers,
+                    ScanOutputTimings* timings, bool allowCam16Lut) {
+    using Clock = std::chrono::steady_clock;
+    auto previous = timings ? Clock::now() : Clock::time_point{};
+    const auto mark = [&](double ScanOutputTimings::*part) {
+        if (!timings) return;
+        const auto now = Clock::now();
+        timings->*part = std::chrono::duration<double>(now - previous).count();
+        previous = now;
+    };
+    if (timings) *timings = {};
     if (width == 0 || height == 0 || width > std::numeric_limits<std::size_t>::max() / height ||
         xyz.size() != width * height || plane.size() != xyz.size() ||
         filtered.size() != xyz.size() || scratch.size() != xyz.size() ||
@@ -391,6 +510,12 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
     const auto cat02Adapted = composeMatrix(cat02Inverse, scaledCat02);
     auto scanToCone = composeMatrix(rgbToCone, composeMatrix(kXyzToSrgb, cat02Adapted));
     for (auto& row : scanToCone) for (auto& value : row) value *= 100.0;
+    const auto* scanLut = allowCam16Lut && xyz.size() >= 16384
+        ? sScanCamLut.load(std::memory_order_acquire) : nullptr;
+    const auto scanToRgb = composeMatrix(kXyzToSrgb, cat02Adapted);
+    std::atomic<std::size_t> lutHits{0};
+#else
+    (void)allowCam16Lut;
 #endif
     workerCount = std::min<std::size_t>({workerCount, 8, xyz.size()});
     if (!parallelPixels(xyz.size(), workerCount, [&](std::size_t begin, std::size_t count) {
@@ -401,9 +526,28 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
         };
         auto i = begin;
 #if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+        std::size_t hits = 0;
         for (; begin + count - i >= 2; i += 2) {
+            if (scanLut) {
+                const auto linearRgb = [&](const Triplet& pixel) {
+                    Triplet rgb{};
+                    for (int c = 0; c < 3; ++c) {
+                        for (int k = 0; k < 3; ++k) rgb[c] += scanToRgb[c][k] * pixel[k];
+                    }
+                    return rgb;
+                };
+                Triplet first, second;
+                if (scanLut->sample(linearRgb(xyz[i]), first) &&
+                    scanLut->sample(linearRgb(xyz[i + 1]), second)) {
+                    xyz[i] = first;
+                    xyz[i + 1] = second;
+                    hits += 2;
+                    continue;
+                }
+            }
             if (!compressScanCam16UcsPair(xyz[i], xyz[i + 1], scanToCone, adapt)) return false;
         }
+        if (scanLut && timings) lutHits.fetch_add(hits, std::memory_order_relaxed);
 #endif
         for (; i < begin + count; ++i) {
             Triplet& value = xyz[i];
@@ -414,6 +558,11 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
         }
         return true;
     })) return false;
+
+    mark(&ScanOutputTimings::cam16);
+#if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
+    if (timings && scanLut) timings->cam16LutHits = lutHits.load(std::memory_order_relaxed);
+#endif
 
     const bool blur = lensBlurSigma > 0.0;
     const bool sharpen = unsharpSigma > 0.0 && unsharpAmount > 0.0;
@@ -447,8 +596,9 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
             })) return false;
         }
     }
+    mark(&ScanOutputTimings::filters);
     if (!encodeSrgb && !fusedSharpen) return true;
-    return parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
+    const bool ok = parallelPixels(xyz.size(), workerCount, [&](auto begin, auto count) {
         auto block = xyz.subspan(begin, count);
         const auto scanPlanes = std::array{plane, filtered, scratch};
 #if defined(FILMKIT_SPEKTRAFILM_ARM_CAM16)
@@ -489,6 +639,8 @@ bool finishScanSrgb(std::span<Triplet> xyz, std::size_t width,
         }
         return true;
     });
+    mark(&ScanOutputTimings::encode);
+    return ok;
 }
 
 }  // namespace filmkit::spektrafilm

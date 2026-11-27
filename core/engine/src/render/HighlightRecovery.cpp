@@ -15,6 +15,10 @@
 #include <limits>
 #include <utility>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace filmkit {
 namespace {
 constexpr float kClip = 250.f / 255.f;
@@ -112,6 +116,80 @@ int mirrorGuideCenter(int coordinate, int extent) {
   return coordinate > maximum ? 2 * maximum - coordinate : coordinate;
 }
 
+#if defined(__aarch64__)
+// The lanes are independent guide pixels. Keep the original dy/dx loop and
+// each lane's arithmetic order (including separate G1/G2 moments). Mirrored
+// horizontal borders and uncommon FPCR modes still use the scalar oracle.
+uint8_t guideBlock(const std::array<float, 4>* const (&rows)[3], int x,
+                   const std::array<float, 10>& lut, float green_clipping,
+                   float* rgb, float* variance) {
+  using Vec = float32x4_t;
+  const Vec zero = vdupq_n_f32(0.f);
+  Vec m0[3]{zero, zero, zero}, m1[3]{zero, zero, zero};
+  Vec avg[3]{zero, zero, zero};
+  Vec g0 = zero, g1 = zero, center_green = zero;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      const auto q = vld4q_f32(rows[dy + 1][x + dx].data());
+      const Vec greens = q.val[1] + q.val[2];
+      const Vec colors[3]{q.val[0], .5f * greens, q.val[3]};
+      const float wt = (dx ? .25f : .5f) * (dy ? .25f : .5f);
+      for (int c = 0; c < 3; ++c) {
+        avg[c] += colors[c] * wt;
+        m0[c] += colors[c];
+        m1[c] += colors[c] * colors[c];
+      }
+      g0 += greens;
+      g1 += q.val[1] * q.val[1] + q.val[2] * q.val[2];
+      if (!dx && !dy) center_green = colors[1];
+    }
+  }
+  Vec var[3];
+  for (int c = 0; c < 3; ++c) {
+    m0[c] /= 9.f;
+    m1[c] /= 9.f;
+    var[c] = vmaxnmq_f32(zero, m1[c] - m0[c] * m0[c]);
+  }
+  g0 /= 18.f;
+  g1 /= 18.f;
+  const Vec green_var = vmaxnmq_f32(zero, g1 - g0 * g0);
+  const Vec luma = .25f * avg[0] + .5f * avg[1] + .25f * avg[2];
+  const Vec lookup = vminnmq_f32(vmaxnmq_f32(zero, (.9f * luma + .05f) * 10.f - .5f),
+                                  vdupq_n_f32(9.f));
+  const auto idx = vcvtq_s32_f32(lookup);
+  const Vec f = lookup - vcvtq_f32_s32(idx);
+  Vec low, high;
+  for (int i = 0; i < 4; ++i) {
+    low[i] = lut[idx[i]];
+    high[i] = lut[std::min(idx[i] + 1, 9)];
+  }
+  const Vec noise_var = 2.f * ((1.f - f) * low + f * high);
+  const auto use_center = vcgtq_f32(green_var, 3.f * noise_var);
+  avg[1] = vbslq_f32(use_center, center_green, avg[1]);
+  const Vec ref_var = vbslq_f32(use_center, -vmaxnmq_f32(var[1], green_var),
+                                (var[0] + var[1] + var[2]) / 3.f);
+  const auto clipped = vcgeq_f32(center_green, vdupq_n_f32(green_clipping));
+  const auto store_half = [](Vec v) { return vcvt_f32_f16(vcvt_f16_f32(v)); };
+  float32x4x3_t packed;
+  for (int c = 0; c < 3; ++c)
+    packed.val[c] = store_half(vbslq_f32(clipped, vdupq_n_f32(10000.f), avg[c]));
+  const Vec variance_half = store_half(ref_var * 1024.f);
+  const Vec limit = vdupq_n_f32(std::numeric_limits<float>::max());
+  const auto rgb_finite = vcaleq_f32(packed.val[0], limit) &
+                          vcaleq_f32(packed.val[1], limit) & vcaleq_f32(packed.val[2], limit);
+  const auto var_finite = vcaleq_f32(variance_half, limit);
+  if (vminvq_u32(rgb_finite & var_finite) == 0) {
+    for (int i = 0; i < 4; ++i) {
+      if (!rgb_finite[i]) return 1;
+      if (!var_finite[i]) return 2;
+    }
+  }
+  vst3q_f32(rgb, packed);
+  vst1q_f32(variance, variance_half);
+  return 0;
+}
+#endif
+
 // Same clamp as guide.rawQuad (not the aligned native clipping footprint).
 std::array<float, 4> rawQuad(const HighlightRawView& raw, int qx, int qy,
                            const std::array<float, 4>& gains,
@@ -164,9 +242,19 @@ bool validGuide(const HighlightGuide& g, int w, int h) {
   std::size_t n;
   if (g.width != w || g.height != h || !dimensions(w, h, &n) ||
       g.rgb.size() != n * 3 || g.variance.size() != n) return false;
-  for (float v : g.rgb) if (!std::isfinite(v)) return false;
-  for (float v : g.variance) if (!std::isfinite(v)) return false;
-  return true;
+  const auto allFinite = [](const std::vector<float>& data) {
+    std::size_t i = 0;
+#if defined(__aarch64__)
+    const auto limit = vdupq_n_f32(std::numeric_limits<float>::max());
+    auto finite = vdupq_n_u32(~0u);
+    for (; data.size() - i >= 4; i += 4)
+      finite = vandq_u32(finite, vcaleq_f32(vld1q_f32(data.data() + i), limit));
+    if (vminvq_u32(finite) == 0) return false;
+#endif
+    for (; i < data.size(); ++i) if (!std::isfinite(data[i])) return false;
+    return true;
+  };
+  return allFinite(g.rgb) && allFinite(g.variance);
 }
 float mirroredUv(float v) {
   if (!(v > -2.f && v < 2.f)) v = std::fmod(v, 2.f);
@@ -279,6 +367,12 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
   result.variance.resize(n);
   std::vector<uint8_t> row_error(result.height, 0);
   parallelRows(result.height, [&](int row0, int row1) {
+#if defined(__aarch64__)
+  std::uint64_t fpcr;
+  asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+  // Match software binary16 rounding, NaN and subnormal behavior.
+  const bool nativeHalf = (fpcr & (0x07c80000u | 3u)) == 0;
+#endif
   // Cache calibrated CFA quads, not reduced moments: every output retains the
   // reference's nine samples and exact accumulation order. Each worker owns
   // its rows; reflected borders and odd RAW extents still use rawQuad's clamp.
@@ -298,7 +392,17 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
       }
       neighbors[dy + 1] = quadRows[slot].data();
     }
-    for (int x = 0; x < result.width; ++x) {
+    for (int x = 0; x < result.width;) {
+#if defined(__aarch64__)
+      if (nativeHalf && x >= 1 && x + 3 <= result.width - 2) {
+        const auto p = static_cast<std::size_t>(y) * result.width + x;
+        const auto error = guideBlock(neighbors, x, greenLut, greenClipping,
+                                      result.rgb.data() + 3 * p, result.variance.data() + p);
+        if (error) { row_error[y] = error; return; }
+        x += 4;
+        continue;
+      }
+#endif
       const int cx = mirrorGuideCenter(x, result.width);
       std::array<float, 3> m0{{0.f, 0.f, 0.f}}, m1 = m0, average = m0;
       float g0 = 0.f, g1 = 0.f, centerGreen = 0.f;
@@ -348,6 +452,7 @@ bool highlightGenerateGuide(const HighlightRawView& raw,
       }
       result.variance[p] = halfStorage(referenceVariance * 1024.f);
       if (!std::isfinite(result.variance[p])) { row_error[y] = 2; return; }
+      ++x;
     }
   }
   });
@@ -469,6 +574,8 @@ static bool assessMasks(const HighlightRawView& short_frame,
     return fail(error, "guide set shape, calibration or finite samples invalid");
   if (hasSupport && !corrected_flow.xy)
     return fail(error, "supported assessment requires corrected flow");
+  std::vector<std::array<float, 2>> flowUv;
+  const int flowStride = corrected_flow.strideRaw / 2;
   if (corrected_flow.xy) {
     std::size_t flowCount;
     if (!dimensions(corrected_flow.width, corrected_flow.height, &flowCount) ||
@@ -478,6 +585,15 @@ static bool assessMasks(const HighlightRawView& short_frame,
       return fail(error, "flow grid must cover guide with an even positive RAW tile stride");
     for (std::size_t p = 0; p < flowCount * 2; ++p)
       if (!std::isfinite(corrected_flow.xy[p])) return fail(error, "flow contains nonfinite displacement");
+    // Every validated tile has at least one pixel. Quantize all tiles once,
+    // even those without a highlight, so overflow still fails closed.
+    flowUv.resize(flowCount);
+    for (std::size_t tile = 0; tile < flowCount; ++tile) {
+      const auto du = halfStorage((corrected_flow.xy[2 * tile] * .5f) / w);
+      const auto dv = halfStorage((corrected_flow.xy[2 * tile + 1] * .5f) / h);
+      if (!std::isfinite(du) || !std::isfinite(dv)) return fail(error, "converted flow binary16 overflow");
+      flowUv[tile] = {du, dv};
+    }
   }
   HighlightMaskAssessment result;
   result.has_support = hasSupport;
@@ -488,24 +604,16 @@ static bool assessMasks(const HighlightRawView& short_frame,
     result.normalized_error.resize(n);
   }
   const auto levels = clippingLevels(short_frame);
-  std::vector<uint8_t> row_error(h, 0);
   std::vector<size_t> row_clipped(h, 0), row_short_clipped(h, 0);
   parallelRows(h, [&](int row0, int row1) {
-  for (int y = row0; y < row1; ++y)
+  for (int y = row0; y < row1; ++y) {
+    const auto* rowFlow = flowUv.empty() ? nullptr : flowUv.data() +
+        static_cast<std::size_t>(y / flowStride) * corrected_flow.width;
     for (int x = 0; x < w; ++x) {
       const std::size_t p = static_cast<std::size_t>(y) * w + x;
-      float du = 0.f, dv = 0.f;
-      if (corrected_flow.xy) {
-        const int tx = x / (corrected_flow.strideRaw / 2);
-        const int ty = y / (corrected_flow.strideRaw / 2);
-        const std::size_t tile = static_cast<std::size_t>(ty) * corrected_flow.width + tx;
-        // PC ConvertAlignment stores normalized XY in RGBA16F before use.
-        du = halfStorage((corrected_flow.xy[2 * tile] * .5f) / w);
-        dv = halfStorage((corrected_flow.xy[2 * tile + 1] * .5f) / h);
-        if (!std::isfinite(du) || !std::isfinite(dv)) { row_error[y] = 1; return; }
-      }
       // A zero reference weight makes both merge masks zero, regardless of the short RGB.
       if (!diagnostics && guides.highlight[p] == 0) continue;
+      const auto [du, dv] = rowFlow ? rowFlow[x / flowStride] : std::array<float, 2>{};
       const auto shortRgb = sampleMirrored(guides.short_unscaled,
                                            (x + .5f) / w + du, (y + .5f) / h + dv);
       std::array<float, 3> base8;
@@ -537,9 +645,9 @@ static bool assessMasks(const HighlightRawView& short_frame,
         if (guides.highlight[p] && result.short_clipping[p]) ++row_short_clipped[y];
       }
     }
+  }
   });
   for (int y = 0; y < h; ++y) {
-    if (row_error[y]) return fail(error, "converted flow binary16 overflow");
     result.clipped_pixels += row_clipped[y];
     result.short_clipped_highlight_pixels += row_short_clipped[y];
   }

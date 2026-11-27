@@ -72,6 +72,28 @@ inline int sadTile(const uint8_t* a, const uint8_t* b, int w, int h, int x0,
   return s;
 }
 
+#if defined(__aarch64__) && !defined(FILMKIT_ALIGN_SCALAR)
+// For small highlight tiles, SIMD lanes represent consecutive horizontal
+// displacements, not pixels of a single row. Share the reference and load all
+// five candidate bytes together. Dispatch only if the entire 8-byte load is
+// in bounds; edge candidates keep the original clamped scorer.
+template<int Tile, int Step>
+void sadFive(const uint8_t* a, const uint8_t* b, int w, int h, int x0,
+             int y0, int dx, int dy, uint16_t (&cost)[8]) {
+  static_assert((Tile / Step) * (Tile / Step) * 255 <= 65535);
+  uint16x8_t first = vdupq_n_u16(0), second = vdupq_n_u16(0);
+  for (int y = 0; y < Tile; y += Step) {
+    const auto* pa = a + static_cast<size_t>(clampi(y0 + y, 0, h - 1)) * w + x0;
+    const auto* pb = b + static_cast<size_t>(clampi(y0 + y + dy, 0, h - 1)) * w + (x0 + dx);
+    for (int x = 0; x < Tile; x += 2 * Step) {
+      first = vabal_u8(first, vld1_dup_u8(pa + x), vld1_u8(pb + x));
+      second = vabal_u8(second, vld1_dup_u8(pa + x + Step), vld1_u8(pb + x + Step));
+    }
+  }
+  vst1q_u16(cost, vaddq_u16(first, second));
+}
+#endif
+
 // ref tile 的纹理度：平均梯度（步长 step 采样点上的 |∂x|+|∂y|）。
 inline float gradTile(const uint8_t* a, int w, int h, int x0, int y0, int tw,
                       int th, int step) {
@@ -144,22 +166,46 @@ inline TileMatch matchTile(const uint8_t* a, const uint8_t* b, int aw, int ah,
                            int x0, int y0, int tile, int step, int cx, int cy,
                            int range, bool full) {
   TileMatch m;
-  for (int dy = cy - range; dy <= cy + range; ++dy) {
-    for (int dx = cx - range; dx <= cx + range; ++dx) {
-      const int s = sadTile(a, b, aw, ah, x0, y0, dx, dy, tile, tile, step);
-      if (s < m.cost) {
-        m.cost = s;
-        m.bx = dx;
-        m.by = dy;
-      }
+  const auto consider = [&](int s, int dx, int dy) {
+    if (s < m.cost) {
+      m.cost = s;
+      m.bx = dx;
+      m.by = dy;
     }
+  };
+#if defined(__aarch64__) && !defined(FILMKIT_ALIGN_SCALAR)
+  uint16_t grid[5][8];
+  const int dx0 = cx - 2;
+  const bool batch = range == 2 &&
+      ((step == 1 && (tile == 4 || tile == 8)) || (step == 2 && tile == 16)) &&
+      x0 >= 0 && x0 <= aw - tile && x0 + dx0 >= 0 && x0 + dx0 <= aw - tile + step - 8;
+  if (batch) {
+    for (int j = 0; j < 5; ++j) {
+      const int dy = cy - 2 + j;
+      if (tile == 4) sadFive<4, 1>(a, b, aw, ah, x0, y0, dx0, dy, grid[j]);
+      else if (tile == 8) sadFive<8, 1>(a, b, aw, ah, x0, y0, dx0, dy, grid[j]);
+      else sadFive<16, 2>(a, b, aw, ah, x0, y0, dx0, dy, grid[j]);
+      for (int i = 0; i < 5; ++i) consider(grid[j][i], dx0 + i, dy);
+    }
+  } else
+#endif
+  {
+    for (int dy = cy - range; dy <= cy + range; ++dy)
+      for (int dx = cx - range; dx <= cx + range; ++dx)
+        consider(sadTile(a, b, aw, ah, x0, y0, dx, dy, tile, tile, step), dx, dy);
   }
   if (!full) return m;
-  // 亚像素：x/y 各自的 ±1 邻域 cost（独立重算）
-  const int cp = sadTile(a, b, aw, ah, x0, y0, m.bx + 1, m.by, tile, tile, step);
-  const int cm = sadTile(a, b, aw, ah, x0, y0, m.bx - 1, m.by, tile, tile, step);
-  const int cy1 = sadTile(a, b, aw, ah, x0, y0, m.bx, m.by + 1, tile, tile, step);
-  const int cym = sadTile(a, b, aw, ah, x0, y0, m.bx, m.by - 1, tile, tile, step);
+  // Reuse integer scores already evaluated; the subpixel stencil extends
+  // one candidate beyond the search box only if the minimum is on its edge.
+  const auto score = [&](int dx, int dy) -> int {
+#if defined(__aarch64__) && !defined(FILMKIT_ALIGN_SCALAR)
+    if (batch && dx >= dx0 && dx <= cx + 2 && dy >= cy - 2 && dy <= cy + 2)
+      return grid[dy - cy + 2][dx - dx0];
+#endif
+    return sadTile(a, b, aw, ah, x0, y0, dx, dy, tile, tile, step);
+  };
+  const int cp = score(m.bx + 1, m.by), cm = score(m.bx - 1, m.by);
+  const int cy1 = score(m.bx, m.by + 1), cym = score(m.bx, m.by - 1);
   m.sx = subpixel(static_cast<float>(cm), static_cast<float>(m.cost),
                   static_cast<float>(cp));
   m.sy = subpixel(static_cast<float>(cym), static_cast<float>(m.cost),
@@ -229,21 +275,10 @@ MfnrAlignOut mfnrAlign(const MfnrPyramid& ref, const MfnrPyramid& cur,
   for (int ty = row0; ty < row1; ++ty) {
     for (int tx = 0; tx < nx3; ++tx) {
       const int x0 = tx * kTile3, y0 = ty * kTile3;
-      int best3 = 1 << 30;
-      int bx = 0, by = 0;
-      for (int dy = 2 * bgy - kRange; dy <= 2 * bgy + kRange; ++dy) {
-        for (int dx = 2 * bgx - kRange; dx <= 2 * bgx + kRange; ++dx) {
-          const int s = sadTile(ref.l3.data(), cur.l3.data(), ref.w3, ref.h3,
-                                x0, y0, dx, dy, kTile3, kTile3, 1);
-          if (s < best3) {
-            best3 = s;
-            bx = dx;
-            by = dy;
-          }
-        }
-      }
-      d3x[static_cast<size_t>(ty * nx3 + tx)] = bx;
-      d3y[static_cast<size_t>(ty * nx3 + tx)] = by;
+      const auto m = matchTile(ref.l3.data(), cur.l3.data(), ref.w3, ref.h3,
+                               x0, y0, kTile3, 1, 2 * bgx, 2 * bgy, kRange, false);
+      d3x[static_cast<size_t>(ty * nx3 + tx)] = m.bx;
+      d3y[static_cast<size_t>(ty * nx3 + tx)] = m.by;
     }
   }
   });

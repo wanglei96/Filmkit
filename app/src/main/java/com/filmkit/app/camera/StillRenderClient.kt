@@ -158,7 +158,7 @@ object StillRenderClient {
     /** 0.13.21 预热：把大纹理与 satmask 缓冲先分配好（见 nativeStillWarmup）。
      *  未就绪时静默跳过 —— 调用方已经先 startAsync，队列串行
      *  保证 warmup 排在 start 之后。失败只记日志，不影响拍照路径。 */
-    fun warmup(w: Int, h: Int, rot: Int, pc3d: Boolean, prefilter: Boolean, idle: () -> Boolean) {
+    fun warmup(w: Int, h: Int, rot: Int, pc3d: Boolean, prefilter: Boolean, spectralMask: Int, idle: () -> Boolean) {
         if (w <= 0 || h <= 0) return
         // 不在**调用线程**上判 ready_：startAsync 只是排队，ready_ 要等 start 执行完
         // 才变 true。这里同样只排队，真正的就绪判断放到队列内（start 必然先执行）。
@@ -173,7 +173,7 @@ object StillRenderClient {
             if (!ready_ || !idle()) return@Runnable
             val t0 = SystemClock.elapsedRealtime()
             val ok = try {
-                EngineBridge.nativeStillWarmup(w, h, rot, pc3d, prefilter)
+                EngineBridge.nativeStillWarmup(w, h, rot, pc3d, prefilter, spectralMask)
             } catch (t: Throwable) {
                 EngineBridge.nativeAppendLog(
                     EngineBridge.LEVEL_WARN, "engine", "render.still_warmup_error",

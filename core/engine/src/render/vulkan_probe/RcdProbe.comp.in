@@ -1,0 +1,45 @@
+#version 450
+#define RCD_STAGE @STAGE@
+layout(local_size_x=16, local_size_y=8) in;
+layout(binding=0) uniform sampler2D mosaic;
+layout(std430, binding=1) buffer Direction { uvec2 dir[]; };
+layout(std430, binding=2) writeonly buffer Green { uvec2 green[]; };
+layout(push_constant) uniform Rcd { ivec2 uSize; int uCfaLut; float uGOrig; };
+int chanAt(ivec2 p);
+float source(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    return texelFetch(mosaic, p, 0)[chanAt(p)];
+}
+
+#if RCD_STAGE == 1
+#ifdef USE_TILE
+shared float tile[24*16];
+void loadTile() {
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * ivec2(16,8) - 4;
+    for (uint i = gl_LocalInvocationIndex; i < 24*16; i += 16*8)
+        tile[i] = source(origin + ivec2(int(i % 24u), int(i / 24u)));
+    barrier();
+}
+float s(ivec2 p) {
+    const ivec2 local = p - ivec2(gl_WorkGroupID.xy) * ivec2(16,8) + 4;
+    return tile[local.y * 24 + local.x];
+}
+#else
+void loadTile() {}
+float s(ivec2 p) { return source(p); }
+#endif
+void store(ivec2 p, vec4 value) {
+    dir[p.y * uSize.x + p.x] = uvec2(packHalf2x16(value.xy), packHalf2x16(value.zw));
+}
+#else
+float s(ivec2 p) { return source(p); }
+vec4 directionAt(ivec2 p) {
+    p = clamp(p, ivec2(0), uSize - 1);
+    uvec2 v = dir[p.y * uSize.x + p.x];
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+}
+void store(ivec2 p, vec4 value) {
+    green[p.y * uSize.x + p.x] = uvec2(packHalf2x16(value.xy), packHalf2x16(value.zw));
+}
+#endif
+@BODY@

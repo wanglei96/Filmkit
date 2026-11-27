@@ -17,6 +17,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Size
 import android.view.Surface
@@ -3000,8 +3001,14 @@ class CameraController(private val context: Context, private val render: RenderC
         StillRenderClient.startAsync()
         val spectral = usesSpectralStill()
         val pc3d = !spectral || filmParams[54] > 0.5
-        val prefilter = !spectral || filmParams[59] > 0.5 || filmParams[104] > 0.5
-        StillRenderClient.warmup(stillSize.width, stillSize.height, orientationStep, pc3d, prefilter, idle)
+        val cs = filmParams[59] > 0.5
+        val cm = filmParams[104] > 0.5
+        val ca = filmParams[50] > 0.5
+        val prefilter = !spectral || cs || cm
+        // Advisory only: capture allocates any newly enabled targets on demand.
+        val spectralMask = if (!spectral) -1 else
+            (if (cs) 1 else 0) or (if (cm) 2 else 0) or (if (ca) 4 else 0)
+        StillRenderClient.warmup(stillSize.width, stillSize.height, orientationStep, pc3d, prefilter, spectralMask, idle)
     }
 
     @SuppressLint("MissingPermission")
@@ -5185,7 +5192,8 @@ class CameraController(private val context: Context, private val render: RenderC
             EngineBridge.LEVEL_INFO, "camera", "photo.save_queued",
             kv("bytes" to bytes.size),
         )
-        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap, gainmap, zoom) }
+        val queuedNs = System.nanoTime()
+        saver.execute { saveJpeg(bytes, w, h, iso, secNs, extraTag, snap, gainmap, zoom, queuedNs) }
     }
 
     /** 后台线程执行（saver 队列）。iso/secNs = 拍摄瞬间的快照，不能用成员变量。
@@ -5195,7 +5203,10 @@ class CameraController(private val context: Context, private val render: RenderC
         extraTag: String = "", snap: StillSnapshot,
         gainmap: GainmapSnapshot? = null,
         zoom: Float = 1f,
+        queuedNs: Long? = null,
     ) {
+        val saveStartNs = System.nanoTime()
+        val saveStartCpuMs = SystemClock.currentThreadTimeMillis()
         val bmp = Bitmap.createBitmap(w, h, EngineBridge.OUTPUT_BITMAP_CONFIG)
         bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
         // 16×16 网格采样平均亮度：诊断「管线输出是否全黑」
@@ -5269,7 +5280,9 @@ class CameraController(private val context: Context, private val render: RenderC
         val jpeg444 = prefs.getBoolean("jpeg_444", true)
         // 编码一次（下面两个落盘分支只差写入目标）；native 失败返回 null ⇒ 回退
         // Bitmap.compress（宁可退到 4:2:0，不可丢成片）。
+        // Thread CPU excludes Binder/file waits and periods when this worker was not running.
         val encT0 = System.nanoTime()
+        val encCpuT0 = SystemClock.currentThreadTimeMillis()
         // runCatching 兜住 UnsatisfiedLinkError（老 .so 被缓存等极端情形）：任何失败都退
         // 回 Bitmap.compress，绝不让编码环节把成片整张丢掉。
         // ── HDR 成片（v0.11.50）：优先走 JPEG/R（Ultra HDR）─────────────────
@@ -5282,14 +5295,17 @@ class CameraController(private val context: Context, private val render: RenderC
         var hdrPath = "none"
         var embeddedExif = false
         var exifNs = 0L
+        var encodeExifCpuMs = 0L
         if (useGainmap != null && jpeg444) {
             val exifStart = System.nanoTime()
+            val exifCpuStart = SystemClock.currentThreadTimeMillis()
             val payload = runCatching {
                 JpegExif.payload(context.cacheDir, outW, outH) {
                     setPhotoExif(it, now, iso, secNs)
                 }
             }.onFailure { logExifFailure(it) }.getOrNull()
             exifNs = System.nanoTime() - exifStart
+            encodeExifCpuMs = SystemClock.currentThreadTimeMillis() - exifCpuStart
             hdrBytes = HdrDelivery.encodeJpegR(outBmp, useGainmap.data, useGainmap.w,
                 useGainmap.h, jpegQ, payload)
             embeddedExif = payload != null && hdrBytes != null
@@ -5332,6 +5348,7 @@ class CameraController(private val context: Context, private val render: RenderC
             jpegBytes = bos.toByteArray().takeIf { it.isNotEmpty() }
         }
         val encMs = (System.nanoTime() - encT0 - exifNs) / 1_000_000
+        val encCpuMs = SystemClock.currentThreadTimeMillis() - encCpuT0 - encodeExifCpuMs
         // chroma/encoder 按**实际产出**的字节流报（hdrBytes 的 base 也是 4:4:4）：
         // 0.13.0 之前这两项靠 native444 != null 推断，HDR 成功时会误报 420/bitmap420。
         EngineBridge.nativeAppendLog(
@@ -5343,7 +5360,12 @@ class CameraController(private val context: Context, private val render: RenderC
                     else -> "bitmap420"
                 }),
                 "jpeg444" to jpeg444, "nativeFail" to (jpeg444 && hdrBytes == null && native444 == null),
-                "q" to jpegQ, "ms" to encMs, "bytes" to (jpegBytes?.size ?: 0),
+                "q" to jpegQ, "ms" to encMs, "cpuMs" to encCpuMs,
+                "encodeExifMs" to (exifNs / 1_000_000), "encodeExifCpuMs" to encodeExifCpuMs,
+                "queueMs" to queuedNs?.let { (saveStartNs - it) / 1_000_000 },
+                "prepMs" to ((encT0 - saveStartNs) / 1_000_000),
+                "prepCpuMs" to (encCpuT0 - saveStartCpuMs),
+                "bytes" to (jpegBytes?.size ?: 0),
                 "hdr" to hdrPath),
         )
         // LUT 名写入文件名（设置页开关，prefs lut_in_name，默认开）：便于事后分辨哪张用了哪套风格；
@@ -5365,7 +5387,10 @@ class CameraController(private val context: Context, private val render: RenderC
             var savedUri: android.net.Uri? = null
             var insertMs = 0L
             var publishMs = 0L
+            var insertCpuMs: Long? = null
+            var publishCpuMs: Long? = null
             val writeMs: Long
+            val writeCpuMs: Long
             if (Build.VERSION.SDK_INT >= 29) {
                 val cv = android.content.ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, name)
@@ -5375,22 +5400,28 @@ class CameraController(private val context: Context, private val render: RenderC
                 }
                 val resolver = context.contentResolver
                 val insertStart = System.nanoTime()
+                val insertCpuStart = SystemClock.currentThreadTimeMillis()
                 val uri = checkNotNull(resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv))
                 insertMs = (System.nanoTime() - insertStart) / 1_000_000
+                insertCpuMs = SystemClock.currentThreadTimeMillis() - insertCpuStart
                 try {
                     val writeStart = System.nanoTime()
+                    val writeCpuStart = SystemClock.currentThreadTimeMillis()
                     checkNotNull(resolver.openOutputStream(uri)).use(writeJpeg)
                     writeMs = (System.nanoTime() - writeStart) / 1_000_000
+                    writeCpuMs = SystemClock.currentThreadTimeMillis() - writeCpuStart
                     if (!embeddedExif) {
                         val exifStart = System.nanoTime()
                         writeExif(uri, null, now, iso, secNs)
                         exifNs += System.nanoTime() - exifStart
                     }
                     val publishStart = System.nanoTime()
+                    val publishCpuStart = SystemClock.currentThreadTimeMillis()
                     cv.clear()
                     cv.put(MediaStore.Images.Media.IS_PENDING, 0)
                     check(resolver.update(uri, cv, null, null) == 1) { "Photo publication failed" }
                     publishMs = (System.nanoTime() - publishStart) / 1_000_000
+                    publishCpuMs = SystemClock.currentThreadTimeMillis() - publishCpuStart
                     savedUri = uri
                 } catch (t: Throwable) {
                     // Do not delete a fully written photo if publishing fails.
@@ -5403,8 +5434,10 @@ class CameraController(private val context: Context, private val render: RenderC
                 dir.mkdirs()
                 val file = File(dir, name)
                 val writeStart = System.nanoTime()
+                val writeCpuStart = SystemClock.currentThreadTimeMillis()
                 file.outputStream().use(writeJpeg)
                 writeMs = (System.nanoTime() - writeStart) / 1_000_000
+                writeCpuMs = SystemClock.currentThreadTimeMillis() - writeCpuStart
                 if (!embeddedExif) {
                     val exifStart = System.nanoTime()
                     writeExif(null, file, now, iso, secNs)
@@ -5434,6 +5467,8 @@ class CameraController(private val context: Context, private val render: RenderC
                     "avgLuma" to (sum / n.coerceAtLeast(1)),
                     "iso" to iso, "sec" to "%.4f".format(secNs / 1e9f),
                     "insertMs" to insertMs, "writeMs" to writeMs, "publishMs" to publishMs,
+                    "insertCpuMs" to insertCpuMs, "writeCpuMs" to writeCpuMs,
+                    "publishCpuMs" to publishCpuMs,
                     "exifMs" to exifNs / 1_000_000, "embeddedExif" to embeddedExif,
                 ),
             )

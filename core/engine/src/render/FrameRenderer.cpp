@@ -30,6 +30,9 @@
 #include "../film/SigmoidParams.h"
 #include "../film/spektrafilm/ParallelPixels.h"
 #include "../film/spektrafilm/Profile.h"
+#if defined(FILMKIT_VULKAN_HANATOS)
+#include "../film/spektrafilm/HanatosVulkan.h"
+#endif
 #include "Align.h"
 #include "HighlightGeometry.h"
 #include "HighlightRecovery.h"
@@ -46,6 +49,10 @@
 
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+#include "vulkan_probe/StillGpuProbe.h"
 #endif
 
 namespace filmkit {
@@ -1775,7 +1782,7 @@ mat3 localCovariance(vec2 uv) {
     ivec2 sz = textureSize(uLocalVariance, 0);
     ivec2 q = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
     vec3 d = max(texelFetch(uLocalVariance, q, 0).rgb, vec3(0));
-    vec3 o = texelFetch(uLocalCovariance, q, 0).rgb;
+    vec3 o = FK_COV_OFF(uLocalVariance,uLocalCovariance,q);
     return mat3(d.r, o.r, o.g, o.r, d.g, o.b, o.g, o.b, d.b) * uLocalNoiseScale;
 }
 float projectedVariance(mat3 cov, vec3 axis) { return max(dot(axis, cov * axis), 1e-12); }
@@ -2219,7 +2226,7 @@ bool protectedAt(ivec2 q) {
 }
 mat3 covarianceAt(ivec2 q) {
     vec3 d=texelFetch(uVariance,q,0).rgb;
-    vec3 o=texelFetch(uCovariance,q,0).rgb;
+    vec3 o=FK_COV_OFF(uVariance,uCovariance,q);
     return mat3(d.r,o.r,o.g, o.r,d.g,o.b, o.g,o.b,d.b);
 }
 void addJac(ivec2 q, mat3 J) {
@@ -2251,8 +2258,7 @@ void emitResult(vec4 c, bool clipOutput) {
         mat3 J=D*noiseJac[0];
         bound=J*covarianceAt(noisePos[0])*transpose(J);
     }
-    oVariance=vec4(bound[0][0],bound[1][1],bound[2][2],1.0);
-    oCovariance=vec4(bound[1][0],bound[2][0],bound[2][1],1.0);
+    FK_COV_EMIT(oVariance,oCovariance,vec4(bound[0][0],bound[1][1],bound[2][2],1.0),vec4(bound[1][0],bound[2][0],bound[2][1],1.0))
     oColor=vec4(clipOutput ? clamp(c.rgb,vec3(0.0),vec3(64.0)) : c.rgb,c.a);
 }
 void passthrough(ivec2 p, vec4 c) {
@@ -2366,7 +2372,7 @@ bool protectedAt(ivec2 q) {
 }
 mat3 covarianceAt(ivec2 q) {
     vec3 d=texelFetch(uVariance,q,0).rgb;
-    vec3 o=texelFetch(uCovariance,q,0).rgb;
+    vec3 o=FK_COV_OFF(uVariance,uCovariance,q);
     return mat3(d.r,o.r,o.g, o.r,d.g,o.b, o.g,o.b,d.b);
 }
 void addJac(ivec2 q, mat3 J) {
@@ -2398,8 +2404,7 @@ void emitResult(vec4 c, bool clipOutput) {
         mat3 J=D*noiseJac[0];
         bound=J*covarianceAt(noisePos[0])*transpose(J);
     }
-    oVariance=vec4(bound[0][0],bound[1][1],bound[2][2],1.0);
-    oCovariance=vec4(bound[1][0],bound[2][0],bound[2][1],1.0);
+    FK_COV_EMIT(oVariance,oCovariance,vec4(bound[0][0],bound[1][1],bound[2][2],1.0),vec4(bound[1][0],bound[2][0],bound[2][1],1.0))
     oColor=vec4(clipOutput ? clamp(c.rgb,vec3(0.0),vec3(64.0)) : c.rgb,c.a);
 }
 void passthrough(ivec2 p, vec4 c) {
@@ -2537,6 +2542,7 @@ layout(location = 1) out vec4 oSigma;
 layout(location = 2) out vec4 oRemoved;
 uniform highp sampler2D uTex;
 uniform ivec2 uSize;
+uniform int uTileY;
 uniform vec3 uNoiseA;
 uniform vec3 uNoiseB;
 uniform highp sampler2D uLsc;
@@ -2565,11 +2571,11 @@ uniform int uLocalNoiseOn;
 uniform float uLocalNoiseScale;
 mat3 covarianceAt(ivec2 p) {
     vec3 d=texelFetch(uLocalVariance,p,0).rgb;
-    vec3 o=texelFetch(uLocalCovariance,p,0).rgb;
+    vec3 o=FK_COV_OFF(uLocalVariance,uLocalCovariance,p);
     return mat3(d.r,o.r,o.g,o.r,d.g,o.b,o.g,o.b,d.b) * uLocalNoiseScale;
 }
 void main() {
-    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - 1);
+    ivec2 p = clamp(ivec2(gl_FragCoord.xy) + ivec2(0, uTileY), ivec2(0), uSize - 1);
     vec3 c = texelFetch(uTex, p, 0).rgb;
     float y = dot(c, LUMA);
     vec2 variance;
@@ -2617,6 +2623,7 @@ uniform highp sampler2D uGuide;
 uniform highp sampler2D uSigma;
 uniform highp sampler2D uRemoved;
 uniform ivec2 uSize;
+uniform int uTileY;
 uniform int uStep;
 uniform float uK;
 uniform float uRevert;
@@ -2654,12 +2661,13 @@ void main() {
     //      —— 上限由绝对 0.2 改为相对 16·σ，且平坦区严格 0。
     // uCgK = 0 时整段不执行（sig 逐位不变）。
     if (uCgK > 0.0 && uStep <= 2) {
-        ivec2 mx = uSize - 1;
+        ivec2 mx = textureSize(uGuide, 0) - 1;
+        ivec2 guideP = p + ivec2(0, uTileY);
         const vec3 luma = vec3(.2627,.6780,.0593);
-        float yL = dot(texelFetch(uGuide, clamp(p - ivec2(uStep, 0), ivec2(0), mx), 0).rgb,luma);
-        float yR = dot(texelFetch(uGuide, clamp(p + ivec2(uStep, 0), ivec2(0), mx), 0).rgb,luma);
-        float yU = dot(texelFetch(uGuide, clamp(p - ivec2(0, uStep), ivec2(0), mx), 0).rgb,luma);
-        float yD = dot(texelFetch(uGuide, clamp(p + ivec2(0, uStep), ivec2(0), mx), 0).rgb,luma);
+        float yL = dot(texelFetch(uGuide, clamp(guideP - ivec2(uStep, 0), ivec2(0), mx), 0).rgb,luma);
+        float yR = dot(texelFetch(uGuide, clamp(guideP + ivec2(uStep, 0), ivec2(0), mx), 0).rgb,luma);
+        float yU = dot(texelFetch(uGuide, clamp(guideP - ivec2(0, uStep), ivec2(0), mx), 0).rgb,luma);
+        float yD = dot(texelFetch(uGuide, clamp(guideP + ivec2(0, uStep), ivec2(0), mx), 0).rgb,luma);
         float gmag = 0.5 * length(vec2(yR - yL, yD - yU));
         float cgGate = smoothstep(kCgG0, kCgG1, gmag);
         sig = max(sig, min(vec2(uCgK * gmag), kCgRel * sig) * cgGate);
@@ -2676,6 +2684,7 @@ precision highp float;
 layout(location = 0) out vec4 oColor;
 uniform highp sampler2D uTex;
 uniform highp sampler2D uRemoved;
+uniform int uTileY;
 uniform highp sampler2D uSatMask;
 uniform int uSatMaskOn;
 uniform float uMix;
@@ -2688,7 +2697,7 @@ void main() {
         oColor = vec4(c,1);
         return;
     }
-    vec2 ch = vec2(c.b-y,c.r-y) - texelFetch(uRemoved,p,0).rg * uMix;
+    vec2 ch = vec2(c.b-y,c.r-y) - texelFetch(uRemoved, p - ivec2(0, uTileY), 0).rg * uMix;
     // ── 亮度各向异性核（v0.10.56 起**默认关闭**；v0.10.57 CPU 侧把 uL 置 0 ⇒ 整段
     // 恒等于 dyn≡0；第 1b 期已删除该段，此处仅留事故记录）────────────────────
     // 事故记录：0.10.54（L=16 无条件）与 0.10.55（L=6 + coherence 门控）两版
@@ -2799,7 +2808,7 @@ mat3 localCovariance(vec2 uv) {
     ivec2 sz = textureSize(uLocalVariance, 0);
     ivec2 q = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
     vec3 d = max(texelFetch(uLocalVariance, q, 0).rgb, vec3(0));
-    vec3 o = texelFetch(uLocalCovariance, q, 0).rgb;
+    vec3 o = FK_COV_OFF(uLocalVariance,uLocalCovariance,q);
     return mat3(d.r, o.r, o.g, o.r, d.g, o.b, o.g, o.b, d.b) * uLocalNoiseScale;
 }
 float projectedVariance(mat3 cov, vec3 axis) { return max(dot(axis, cov * axis), 1e-12); }
@@ -3056,8 +3065,7 @@ void main() {
         mat3 resultNoise = pc3dOutputNoise(cin, final_colour/Z, final_colour2/Z2,
             covMatrix(covarianceADiag,covarianceAOff)/Z,
             covMatrix(covarianceBDiag,covarianceBOff)/Z2, centerCovariance, uLuma);
-        oNoiseDiag = vec4(resultNoise[0][0], resultNoise[1][1], resultNoise[2][2], 1);
-        oNoiseOff = vec4(resultNoise[1][0], resultNoise[2][0], resultNoise[2][1], 1);
+        FK_COV_EMIT(oNoiseDiag,oNoiseOff,vec4(resultNoise[0][0], resultNoise[1][1], resultNoise[2][2], 1),vec4(resultNoise[1][0], resultNoise[2][0], resultNoise[2][1], 1))
     } else { oNoiseDiag=vec4(0); oNoiseOff=vec4(0); }
     oColor = vec4(resColour, 1.0);
 })";
@@ -8232,6 +8240,18 @@ void main() {
 
 GLuint compileShader(GLenum type, const char* src) {
   GLuint sh = glCreateShader(type);
+  std::string covarianceSource;
+  if (std::strstr(src, "FK_COV_")) {
+    covarianceSource = src;
+    const auto nl = covarianceSource.find('\n');
+    // The two float targets store all six symmetric covariance terms:
+    // RGBA32F=(RR, GG, BB, RG), RG32F=(RB, GB).
+    covarianceSource.insert(nl + 1, R"FKCOV(
+#define FK_COV_OFF(diag, off, coord) vec3(texelFetch(diag,coord,0).a, texelFetch(off,coord,0).rg)
+#define FK_COV_EMIT(dout,oout,dpart,opart) { vec4 packedOff_ = (opart); dout = vec4((dpart).rgb, packedOff_.r); oout = vec4(packedOff_.gb, 0.0, 1.0); }
+)FKCOV");
+    src = covarianceSource.c_str();
+  }
   glShaderSource(sh, 1, &src, nullptr);
   glCompileShader(sh);
   GLint ok = 0;
@@ -12490,6 +12510,7 @@ bool FrameRenderer::ensureChromaMst(int w, int h) {
   if (ch_w_ == hw && ch_h_ == hh && tex_ch_a_[0] != 0 && tex_ch_sig_ != 0) {
     return true;
   }
+  const StillFirstUseTiming timing("chroma.d1.allocate", w, h);
   for (int i = 0; i < 2; ++i) {
     if (tex_ch_a_[i]) glDeleteTextures(1, &tex_ch_a_[i]);
     if (fbo_ch_a_[i]) glDeleteFramebuffers(1, &fbo_ch_a_[i]);
@@ -12533,8 +12554,18 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
                                         float cg_k) {
   dbg_cms_ = 0; dbg_cms_k_ = 0.f;
   if (!prog_chroma_down_ || !prog_chroma_blur_ || !prog_chroma_at_ || !prog_chroma_apply_) return false;
-  if (!ensureChromaMst(dst_w, dst_h)) return false;
-  const int hw = ch_w_, hh = ch_h_;
+  // The full six-level undecimated B3 cascade extends by two taps at
+  // each dyadic stride. Scratch rows outside the submitted central band
+  // are computed as halo, not replaced by an artificial image boundary.
+  // The input/guide use full-image coordinates; only scratch is tile-local.
+  // Commit just the center rows so neighboring bands cannot overwrite them.
+  constexpr int kBandRows = 1024;
+  constexpr int kHalo = 2 * ((1 << kChromaLevels) - 1);
+  if (!ensureChromaMst(dst_w, std::min(dst_h, kBandRows + 2 * kHalo))) return false;
+  const int hw = dst_w;
+  const GLint seedTileY = glGetUniformLocation(prog_chroma_down_, "uTileY");
+  const GLint bandTileY = glGetUniformLocation(prog_chroma_at_, "uTileY");
+  const GLint applyTileY = glGetUniformLocation(prog_chroma_apply_, "uTileY");
   auto complete = [&]() {
     const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status == GL_FRAMEBUFFER_COMPLETE) return true;
@@ -12544,118 +12575,127 @@ bool FrameRenderer::passChromaMultiScale(int dst_w, int dst_h,
     return false;
   };
   const GLenum bufs3[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
-  // Full-resolution chroma, input-model sigma, zero removed-detail accumulator.
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[0]);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
-                         tex_ch_sig_, 0);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D,
-                         tex_ch_dp_[0], 0);
-  glDrawBuffers(3, bufs3);
-  if (!complete()) return false;
-  glViewport(0, 0, hw, hh);
-  glUseProgram(prog_chroma_down_);
-  const bool covariance_ready = highlight_merge_ready_ || chroma_model_ready_;
-  const float noise_strength = std::max(1.f,nc.k_p0);
-  glActiveTexture(GL_TEXTURE6);
-  glBindTexture(GL_TEXTURE_2D, covariance_ready ? chroma_input_cov_[0] : tex_scene_);
-  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalVariance"),6);
-  glActiveTexture(GL_TEXTURE7);
-  glBindTexture(GL_TEXTURE_2D, covariance_ready ? chroma_input_cov_[1] : tex_scene_);
-  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalCovariance"),7);
-  glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalNoiseOn"),covariance_ready?1:0);
-  glUniform1f(glGetUniformLocation(prog_chroma_down_,"uLocalNoiseScale"),
-              (nc.model_src ? 2.25f : 1.f)*noise_strength*noise_strength);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
-  glUniform1i(u_chroma_down_.tex, 0);
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, lsc_tex_);
-  glUniform1i(u_chroma_down_.lsc, 1);
-  glUniform2i(u_chroma_down_.lsc_size, lsc_w_, lsc_h_);
-  glUniform2i(u_chroma_down_.size, dst_w, dst_h);
-  glUniform3f(u_chroma_down_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
-  glUniform3f(u_chroma_down_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, 0, 0);
-  // Six complete starlet bands; retain the existing rational shrink/revert law.
-  // This is not darktable's VST/edge-aware BayesShrink implementation.
-  glUseProgram(prog_chroma_at_);
-  glUniform2i(u_chroma_at_.size, hw, hh);
-  // v0.10.57：k 8.0 → 2.5、revert 0.08 → 0.20。8σ 的收缩阈值把幅度 2–5σ 的
-  // **真实彩色纹理**（木纹/布纹等以色度为主的细节）整片压掉 —— 真机同刻诊断：
-  // 色度 2/4/8px 带通只剩 PC 的 0.47/0.72/0.79，而亮度 1.34/1.08/1.02（未丢）。
-  // 离线选参时只优化了 σC
-  // （噪声），没看色度纹理，是第五次同类口径事故。
-  glUniform1f(u_chroma_at_.k, 2.5f);
-  glUniform1f(u_chroma_at_.revert, 0.20f);
-  // v0.10.173：强边缘色度梯度门（逐级作用在收缩阈值 sig 上；引导量 = 全分辨率
-  // Y 的中心差分，由 kFsChromaDown 的 oChroma.b 携带）。cg_k = 0 ⇒ 整段不执行。
-  glUniform1f(u_chroma_at_.cg_k, cg_k > 0.0f ? cg_k : 0.0f);
-  dbg_cms_ = 1; dbg_cms_k_ = 2.5f;
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
-  glUniform1i(u_chroma_at_.sigma, 1);
-  glActiveTexture(GL_TEXTURE4);
-  glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
-  glUniform1i(glGetUniformLocation(prog_chroma_at_,"uGuide"),4);
-  // L2 norms of H_(l-1) tensor H_(l-1) - H_l tensor H_l, generated from
-  // the complete B3 impulse responses (not 0.5^l or an empirical kernel cap).
-  static constexpr float band_sigma[kChromaLevels] = {
-      .8907963103f, .2006638510f, .0855075048f,
-      .0412174444f, .0204249666f, .0101897592f};
-  for (int l = 0; l < kChromaLevels; ++l) {
-    const int src = l & 1, dst = (l + 1) & 1;
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_tmp_);
-    glDrawBuffers(1, bufs3);
-    if (!complete()) return false;
-    glUseProgram(prog_chroma_blur_);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D,tex_ch_a_[src]);
-    glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uPrev"),0);
-    glUniform2i(glGetUniformLocation(prog_chroma_blur_,"uSize"),hw,hh);
-    glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uStep"),1<<l);
-    // Bound both axes, not just the final apply, while leaving every tap intact.
-    drawStriped(8);
-    glUseProgram(prog_chroma_at_);
-    glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D,tex_ch_tmp_);
-    glUniform1i(glGetUniformLocation(prog_chroma_at_,"uHorizontal"),3);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[dst]);
+  for (int y = 0; y < dst_h; y += kBandRows) {
+    const int bandEnd = std::min(dst_h, y + kBandRows);
+    const int origin = std::max(0, y - kHalo);
+    const int hh = std::min(dst_h, bandEnd + kHalo) - origin;
+    // Full-resolution chroma, input-model sigma, zero removed-detail accumulator.
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[0]);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
-                           tex_ch_dp_[dst], 0);
-    glDrawBuffers(2, bufs3);
+                           tex_ch_sig_, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D,
+                           tex_ch_dp_[0], 0);
+    glDrawBuffers(3, bufs3);
     if (!complete()) return false;
     glViewport(0, 0, hw, hh);
+    glUseProgram(prog_chroma_down_);
+    glUniform1i(seedTileY, origin);
+    const bool covariance_ready = highlight_merge_ready_ || chroma_model_ready_;
+    const float noise_strength = std::max(1.f,nc.k_p0);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, covariance_ready ? chroma_input_cov_[0] : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalVariance"),6);
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, covariance_ready ? chroma_input_cov_[1] : tex_scene_);
+    glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalCovariance"),7);
+    glUniform1i(glGetUniformLocation(prog_chroma_down_,"uLocalNoiseOn"),covariance_ready?1:0);
+    glUniform1f(glGetUniformLocation(prog_chroma_down_,"uLocalNoiseScale"),
+                (nc.model_src ? 2.25f : 1.f)*noise_strength*noise_strength);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_ch_a_[src]);
-    glUniform1i(u_chroma_at_.prev, 0);
-    glUniform1i(u_chroma_at_.step, 1 << l);
-    glUniform1f(u_chroma_at_.band_sigma, band_sigma[l]);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[src]);
-    glUniform1i(u_chroma_at_.removed, 2);
-    drawStriped(8);
+    glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
+    glUniform1i(u_chroma_down_.tex, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, lsc_tex_);
+    glUniform1i(u_chroma_down_.lsc, 1);
+    glUniform2i(u_chroma_down_.lsc_size, lsc_w_, lsc_h_);
+    glUniform2i(u_chroma_down_.size, dst_w, dst_h);
+    glUniform3f(u_chroma_down_.noise_a, nc.p4a[0], nc.p4a[1], nc.p4a[2]);
+    glUniform3f(u_chroma_down_.noise_b, nc.p4b[0], nc.p4b[1], nc.p4b[2]);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, 0, 0);
+    // Six complete starlet bands; retain the existing rational shrink/revert law.
+    // This is not darktable's VST/edge-aware BayesShrink implementation.
+    glUseProgram(prog_chroma_at_);
+    glUniform2i(u_chroma_at_.size, hw, hh);
+    glUniform1i(bandTileY, origin);
+    // v0.10.57：k 8.0 → 2.5、revert 0.08 → 0.20。8σ 的收缩阈值把幅度 2–5σ 的
+    // **真实彩色纹理**（木纹/布纹等以色度为主的细节）整片压掉 —— 真机同刻诊断：
+    // 色度 2/4/8px 带通只剩 PC 的 0.47/0.72/0.79，而亮度 1.34/1.08/1.02（未丢）。
+    // 离线选参时只优化了 σC
+    // （噪声），没看色度纹理，是第五次同类口径事故。
+    glUniform1f(u_chroma_at_.k, 2.5f);
+    glUniform1f(u_chroma_at_.revert, 0.20f);
+    // v0.10.173：强边缘色度梯度门（逐级作用在收缩阈值 sig 上；引导量 = 全分辨率
+    // Y 的中心差分，由 kFsChromaDown 的 oChroma.b 携带）。cg_k = 0 ⇒ 整段不执行。
+    glUniform1f(u_chroma_at_.cg_k, cg_k > 0.0f ? cg_k : 0.0f);
+    dbg_cms_ = 1; dbg_cms_k_ = 2.5f;
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_ch_sig_);
+    glUniform1i(u_chroma_at_.sigma, 1);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
+    glUniform1i(glGetUniformLocation(prog_chroma_at_,"uGuide"),4);
+    // L2 norms of H_(l-1) tensor H_(l-1) - H_l tensor H_l, generated from
+    // the complete B3 impulse responses (not 0.5^l or an empirical kernel cap).
+    static constexpr float band_sigma[kChromaLevels] = {
+        .8907963103f, .2006638510f, .0855075048f,
+        .0412174444f, .0204249666f, .0101897592f};
+    for (int l = 0; l < kChromaLevels; ++l) {
+      const int src = l & 1, dst = (l + 1) & 1;
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_tmp_);
+      glDrawBuffers(1, bufs3);
+      if (!complete()) return false;
+      glUseProgram(prog_chroma_blur_);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D,tex_ch_a_[src]);
+      glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uPrev"),0);
+      glUniform2i(glGetUniformLocation(prog_chroma_blur_,"uSize"),hw,hh);
+      glUniform1i(glGetUniformLocation(prog_chroma_blur_,"uStep"),1<<l);
+      // Bound both axes, not just the final apply, while leaving every tap intact.
+      drawStriped(8);
+      glUseProgram(prog_chroma_at_);
+      glActiveTexture(GL_TEXTURE3);
+      glBindTexture(GL_TEXTURE_2D,tex_ch_tmp_);
+      glUniform1i(glGetUniformLocation(prog_chroma_at_,"uHorizontal"),3);
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo_ch_a_[dst]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
+                             tex_ch_dp_[dst], 0);
+      glDrawBuffers(2, bufs3);
+      if (!complete()) return false;
+      glViewport(0, 0, hw, hh);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, tex_ch_a_[src]);
+      glUniform1i(u_chroma_at_.prev, 0);
+      glUniform1i(u_chroma_at_.step, 1 << l);
+      glUniform1f(u_chroma_at_.band_sigma, band_sigma[l]);
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[src]);
+      glUniform1i(u_chroma_at_.removed, 2);
+      drawStriped(8);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+    }
+    // Chroma = c0 - accumulated removal; preserve source Y, strength and sat core.
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
+    glDrawBuffers(1, bufs3);
+    glViewport(0, y, dst_w, bandEnd - y);
+    glUseProgram(prog_chroma_apply_);
+    glUniform1i(applyTileY, origin);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
+    glUniform1i(u_chroma_apply_.tex, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[kChromaLevels & 1]);
+    glUniform1i(u_chroma_apply_.removed, 1);
+    glUniform1f(u_chroma_apply_.mix, nc.mix_p4);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_satm_dst_ ? tex_satm_dst_ : tex_satm_);
+    glUniform1i(u_chroma_apply_.satmask, 2);
+    glUniform1i(u_chroma_apply_.satmask_on, satmask_enabled_ ? 1 : 0);
+    glActiveTexture(GL_TEXTURE0);
+    drawStriped(16);
   }
-  // Chroma = c0 - accumulated removal; preserve source Y, strength and sat core.
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo_scene_);
-  glDrawBuffers(1, bufs3);
   glViewport(0, 0, dst_w, dst_h);
-  glUseProgram(prog_chroma_apply_);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, src_tex ? src_tex : tex_dn_);
-  glUniform1i(u_chroma_apply_.tex, 0);
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, tex_ch_dp_[kChromaLevels & 1]);
-  glUniform1i(u_chroma_apply_.removed, 1);
-  glUniform1f(u_chroma_apply_.mix, nc.mix_p4);
-  glActiveTexture(GL_TEXTURE2);
-  glBindTexture(GL_TEXTURE_2D, tex_satm_dst_ ? tex_satm_dst_ : tex_satm_);
-  glUniform1i(u_chroma_apply_.satmask, 2);
-  glUniform1i(u_chroma_apply_.satmask_on, satmask_enabled_ ? 1 : 0);
-  glActiveTexture(GL_TEXTURE0);
-  drawStriped(16);
   return true;
 }
 
@@ -15540,6 +15580,9 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     return false;
   }
   try {
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    vkprobe::warmScan();
+#endif
     auto params = *stored;
     params.pixelUm /= std::max(c.dst_w, c.dst_h);
     params.captureExposureEv = c.p->exposure_ev;
@@ -15554,7 +15597,9 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     auto image = std::make_unique_for_overwrite<Triplet[]>(count);
     const auto allocEnd = Clock::now();
     ScopedPixelWorkers pixelWorkers(8);
-    double firstReadMs = 0;
+    double firstReadMs = 0, glReadMs = 0, readConvertMs = 0;
+    bool hanatosPrepared = false;
+    double hanatosInReadbackMs = 0;
     struct ReadbackState {
       GLint draw = 0, read = 0, pack = 0, buffer = 0, row = 0, rows = 0, pixels = 0, texture = 0;
       GLuint fbo = 0;
@@ -15596,6 +15641,41 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     glBindTexture(GL_TEXTURE_2D, source);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
     ok = ok && glGetError() == GL_NO_ERROR && (format == GL_RGBA16F || format == GL_RGBA32F);
+#if defined(FILMKIT_VULKAN_HANATOS)
+    const auto vkMode = hanatosVulkanMode();
+    const bool tryShared = vkMode == HanatosVulkanMode::SharedImage || vkMode == HanatosVulkanMode::SharedImageSimd;
+    if (ok && count >= 1024 * 1024 &&
+        (params.vulkanReadback || vkMode == HanatosVulkanMode::RawReadback || tryShared)) {
+      double gain = 1.0;
+      if (params.boost.ev == 0.0 &&
+          !prepareFilmExposureGain(params.exposureEv + params.captureExposureEv, params.boost, gain)) {
+        return false;
+      }
+      const bool half = format == GL_RGBA16F;
+      const auto projectionStart = Clock::now();
+      const HanatosReadback sourceReadback{static_cast<std::size_t>(w), half,
+          [&](std::size_t y, std::size_t rows, void* destination) {
+            const auto readStart = Clock::now();
+            glReadPixels(0, static_cast<GLint>(y), w, static_cast<GLsizei>(rows), GL_RGBA,
+                         half ? GL_HALF_FLOAT : GL_FLOAT, destination);
+            const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - readStart).count();
+            if (y == 0) firstReadMs = ms;
+            glReadMs += ms;
+            return glGetError() == GL_NO_ERROR;
+          }};
+      const bool useShared = half && tryShared;
+      const HanatosSharedSource sharedSource{w, h, vkMode == HanatosVulkanMode::SharedImageSimd};
+      const auto projected = projectHanatosVulkan({image.get(), count}, params.xyzFromRgb,
+          params.response, params.responseSide, gain, 8, useShared ? nullptr : &sourceReadback,
+          useShared ? &sharedSource : nullptr);
+      hanatosPrepared = projected && *projected == count;
+      if (hanatosPrepared) {
+        const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - projectionStart).count();
+        hanatosInReadbackMs = ms - glReadMs;
+      }
+    }
+#endif
+    if (!hanatosPrepared)
     {
       constexpr int rows = 512;
       const std::size_t capacity = static_cast<std::size_t>(w) * std::min(rows, h) * 4;
@@ -15641,13 +15721,13 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       };
       for (int y = 0; ok && y < h; y += rows) {
         const int count = std::min(rows, h - y);
-        const auto firstReadStart = y == 0 ? Clock::now() : Clock::time_point{};
+        const auto glReadStart = Clock::now();
         glReadPixels(0, y, w, count, GL_RGBA, isHalf ? GL_HALF_FLOAT : GL_FLOAT,
                      isHalf ? static_cast<void*>(half.get()) : static_cast<void*>(full.get()));
-        if (y == 0) {
-          firstReadMs = std::chrono::duration<double, std::milli>(
-              Clock::now() - firstReadStart).count();
-        }
+        const auto convertStart = Clock::now();
+        const auto stripeReadMs = std::chrono::duration<double, std::milli>(convertStart - glReadStart).count();
+        glReadMs += stripeReadMs;
+        if (y == 0) firstReadMs = stripeReadMs;
         ok = glGetError() == GL_NO_ERROR;
         if (!ok) break;
         if (isHalf) {
@@ -15661,6 +15741,7 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
         } else {
           ok = convert(full.get(), [](float v) { return v; }, y, count);
         }
+        readConvertMs += std::chrono::duration<double, std::milli>(Clock::now() - convertStart).count();
       }
     }
     }
@@ -15675,14 +15756,32 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
     // Small renders and the independent one-pixel HDR reference use direct integration.
     const bool useSpectralLut = backend == SpectralBackend::AdvSimd && count >= 4 * 1024 * 1024;
     RenderTimings timing;
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    vkprobe::ScanJob scanJob(c.ten_bit);
+#endif
+#if defined(FILMKIT_VULKAN_HANATOS)
+    const decltype(&renderNegativeSrgbFromHanatos) renderFilm =
+        hanatosPrepared ? &renderNegativeSrgbFromHanatos
+                        : static_cast<decltype(&renderNegativeSrgbFromHanatos)>(&renderNegativeSrgb);
+    if (!renderFilm(image, count, w, h, params, backend, {8, 8, 8, 8}, seed,
+#else
     if (!renderNegativeSrgb(image, count, w, h, params, backend, {8, 8, 8, 8}, seed,
+#endif
                             seed ^ 0x9e3779b97f4a7c15ULL, &timing, useSpectralLut)) return false;
     const auto renderEnd = Clock::now();
+    bool packedOk = true;
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    scanJob.close();
+    if (scanJob.hdrBase) {
+      out_rgba->swap(scanJob.bytes);
+    } else
+#endif
+    {
     out_rgba->resize(count * 4);
     // Match passOutput(flip_y=true): Bitmap row zero is the scene's top row.
     // No second OETF,
     // legacy rolloff, USM, grain, halation, LUT or display-AE redraw is applied.
-    const bool packedOk = parallelPixels(static_cast<std::size_t>(h), 4, [&](auto begin, auto count) {
+    packedOk = parallelPixels(static_cast<std::size_t>(h), 4, [&](auto begin, auto count) {
       for (std::size_t y = begin; y < begin + count; ++y) {
         const auto* src = image.get() + y * w;
         auto* dst = out_rgba->data() + (h - 1 - y) * w * 4;
@@ -15701,6 +15800,7 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       }
       return true;
     }, 16);
+    }
     if (!packedOk) { out_rgba->clear(); return false; }
     image.reset();
     const auto rgbaEnd = Clock::now();
@@ -15749,6 +15849,13 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 1, GL_RGBA, GL_FLOAT, rgba.data());
       // Gainmap must see the exact quantized SDR base, including HEIC's existing
       // 10-to-8 conversion. Do not estimate it from the pre-quantized scan.
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+      if (scanJob.hdrBase) {
+        baseTex = scanJob.hdrBase;
+        scanJob.hdrBase = 0;
+      } else
+#endif
+      {
       std::vector<uint8_t> base8;
       const uint8_t* base = out_rgba->data();
       if (c.ten_bit) {
@@ -15768,6 +15875,7 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, base);
+      }
       hdrOk = hdrOk && glGetError() == GL_NO_ERROR;
       hdr_prepared_w_ = w;
       hdr_prepared_h_ = h;
@@ -15808,11 +15916,13 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
         ",\"bits\":" + (c.ten_bit ? "10" : "8") + ",\"backend\":\"" +
         (backend == SpectralBackend::AdvSimd ? "neon-fp64" : "scalar-fp64") + "\"" +
         ",\"spectralLut\":" + (useSpectralLut ? "true" : "false") +
-        ",\"readMs\":" + std::to_string(elapsed(start, readEnd)) +
+        ",\"readMs\":" + std::to_string(elapsed(start, readEnd) - hanatosInReadbackMs) +
         ",\"covarianceReleaseMs\":" + std::to_string(elapsed(releaseStart, releaseEnd)) +
         ",\"readAllocMs\":" + std::to_string(elapsed(releaseEnd, allocEnd)) +
         ",\"firstReadMs\":" + std::to_string(firstReadMs) +
-        ",\"hanatosMs\":" + std::to_string(timing.hanatos * 1000) +
+        ",\"glReadMs\":" + std::to_string(glReadMs) +
+        ",\"readConvertMs\":" + std::to_string(readConvertMs) +
+        ",\"hanatosMs\":" + std::to_string(timing.hanatos * 1000 + hanatosInReadbackMs) +
         ",\"filmExposureMs\":" + std::to_string(timing.filmExposure * 1000) +
         ",\"dirMs\":" + std::to_string(timing.dir * 1000) +
         ",\"grainMs\":" + std::to_string(timing.grain * 1000) +
@@ -15824,6 +15934,10 @@ bool FrameRenderer::renderSpektrafilm(const ChainCtx& c, GLuint source,
         ",\"scanSpectralMs\":" + std::to_string(timing.scanSpectral * 1000) +
         ",\"scanGlareMs\":" + std::to_string(timing.scanGlare * 1000) +
         ",\"scanOutputMs\":" + std::to_string(timing.scanOutput * 1000) +
+        ",\"scanCam16Ms\":" + std::to_string(timing.scanOutputParts.cam16 * 1000) +
+        ",\"scanCam16LutHits\":" + std::to_string(timing.scanOutputParts.cam16LutHits) +
+        ",\"scanFilterMs\":" + std::to_string(timing.scanOutputParts.filters * 1000) +
+        ",\"scanSrgbEncodeMs\":" + std::to_string(timing.scanOutputParts.encode * 1000) +
         ",\"renderMs\":" + std::to_string(timing.total * 1000) +
         ",\"rgbaMs\":" + std::to_string(elapsed(renderEnd, rgbaEnd)) +
         ",\"hdrProbeMs\":" + std::to_string(elapsed(hdrStart, hdrProbeEnd)) +
@@ -16178,29 +16292,59 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 「HR + P0 + P1」的合计。冷机支架实测 dirMs 909~1486ms 波动 63%，而同样全分辨率的
     // gMs（P2）只有 12~21ms —— 两个数不可能同时为真，正是这个口径造成的。
     // 现在拆成三段：preMs（HR+P0，到 P1 提交前）、dirMs（P1 净墙钟）、dirGpuMs（GPU query）。
-    if (sync_stage_timing) glFinish();
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    const bool profileRcd = sync_stage_timing || (still_ctx_ && vkprobe::mode("FILMKIT_VK_RCD_PROFILE"));
+#else
+    constexpr bool profileRcd = false;
+#endif
+    const bool syncRcd = sync_stage_timing || profileRcd;
+    if (syncRcd) glFinish();
     pre_ms = std::chrono::duration<float, std::milli>(
                  std::chrono::steady_clock::now() - d0)
                  .count();
     GpuTimer gpu_dir, gpu_g;
-    const bool gpu_timers = sync_stage_timing && GpuTimer::supported();
+    const bool gpu_timers = syncRcd && GpuTimer::supported();
     const auto d_dir0 = std::chrono::steady_clock::now();
     if (!c.amaze) {
+    auto d2 = d_dir0;
+    bool vkRcd = false;
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    vkprobe::RcdOutput rcdOutput;
+    if (still_ctx_ && vkprobe::mode("FILMKIT_VK_RCD")) {
+      vkRcd = vkprobe::rcd(hr_src_override_ ? hr_src_override_ : tex_mos_,
+                          fbo_dir_, fbo_g_, w, h, cfaLutOf(c.cfa), p.rcd_g_orig, rcdOutput);
+      if (vkRcd) {
+        d2 = std::chrono::steady_clock::now();
+        dir_ms = std::chrono::duration<float, std::milli>(d2 - d_dir0).count();
+      } else {
+        Logger::instance().log(LogLevel::kWarn, "engine", "vkprobe.rcd_fallback", "{}");
+      }
+    }
+#endif
+    if (!vkRcd) {
     if (gpu_timers) gpu_dir.begin();
     passRcdDir(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true);
-    if (sync_stage_timing) glFinish();
+    if (syncRcd) glFinish();
     const auto d1 = std::chrono::steady_clock::now();
     if (gpu_timers) dir_gpu_ms = static_cast<float>(gpu_dir.endMs());
     if (gpu_timers) gpu_g.begin();
     if (!stageGl("after_RCD_direction")) return;
     passRcdG(w, h, c.cfa, c.black_phase, c.white_level, c.gains, true,
              p.rcd_g_orig);
-    if (sync_stage_timing) glFinish();
-    const auto d2 = std::chrono::steady_clock::now();
+    if (syncRcd) glFinish();
+    d2 = std::chrono::steady_clock::now();
     if (gpu_timers) g_gpu_ms = static_cast<float>(gpu_g.endMs());
     dir_ms = std::chrono::duration<float, std::milli>(d1 - d_dir0).count();
     g_ms = std::chrono::duration<float, std::milli>(d2 - d1).count();
     if (!stageGl("after_RCD_green")) return;
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    if (profileRcd && still_ctx_) {
+      Logger::instance().log(LogLevel::kInfo, "engine", "vkprobe.gles_rcd",
+          "{\"dirMs\":" + std::to_string(dir_ms) + ",\"gMs\":" + std::to_string(g_ms) +
+          ",\"dirGpuMs\":" + std::to_string(dir_gpu_ms) + ",\"gGpuMs\":" + std::to_string(g_gpu_ms) + "}");
+    }
+#endif
+    }
     // ── P3 色度段（v0.10.180 加 [58] 拆双 pass A/B 路径）───────────────────
     // rcdSplit=1：3a 对角段填充（tex_rcd_a_）→ 3b G 位轴向填充（交叉轴 ±1 读
     // 3a 的 STEP4.2 已填充色，恢复原版四正邻双轴估计）——单 pass 版并行读不到
@@ -16208,6 +16352,20 @@ void FrameRenderer::finishStillChain(const ChainCtx& c,
     // 放大 2×（+85.6），docs/research/11 号 §8。3a/3b 分别计时（rcdAMs/rcdBMs，
     // 铁律：性能取舍必须实测）；3b 含 glFinish 同步，与 ccmMs 同口径。
     // rcdSplit=0：旧单 pass，逐位不变。
+#if defined(FILMKIT_VULKAN_STILL_PROBE)
+    // P3 samples the shared FP16 textures directly. Keep the normal targets
+    // installed outside this exact consumer scope (e.g. for the HDR side frame).
+    struct RestoreRcdInputs {
+      GLuint& dir;
+      GLuint& green;
+      GLuint oldDir, oldGreen;
+      ~RestoreRcdInputs() { dir = oldDir; green = oldGreen; }
+    } restoreRcd{tex_dir_, tex_g_, tex_dir_, tex_g_};
+    if (rcdOutput.dir && rcdOutput.green) {
+      tex_dir_ = rcdOutput.dir;
+      tex_g_ = rcdOutput.green;
+    }
+#endif
     dbg_rcd_split_ = 0;
     dbg_rcd_a_ms_ = dbg_rcd_b_ms_ = 0.f;
     if (p.rcd_p3_split > 0.5f) {
@@ -17508,7 +17666,7 @@ void FrameRenderer::passMfnrDown(GLuint src, GLuint fbo, int sw, int sh) {
 }
 
 void FrameRenderer::releaseChromaCovarianceTargets() {
-  std::size_t bytes = static_cast<std::size_t>(highlight_cov_w_) * highlight_cov_h_ * 32;
+  std::size_t bytes = static_cast<std::size_t>(highlight_cov_w_) * highlight_cov_h_ * 24;
   if (fbo_highlight_cov_) glDeleteFramebuffers(1, &fbo_highlight_cov_);
   const GLuint original[]{tex_highlight_cov_diag_, tex_highlight_cov_off_};
   glDeleteTextures(2, original);
@@ -17517,7 +17675,7 @@ void FrameRenderer::releaseChromaCovarianceTargets() {
   for (int slot = 0; slot < 5; ++slot) {
     // Slot 3 aliases the original covariance, including its FBO.
     if (slot != 3) {
-      bytes += static_cast<std::size_t>(highlight_filter_w_[slot]) * highlight_filter_h_[slot] * 32;
+      bytes += static_cast<std::size_t>(highlight_filter_w_[slot]) * highlight_filter_h_[slot] * 24;
       if (highlight_filter_fbo_[slot]) glDeleteFramebuffers(1, &highlight_filter_fbo_[slot]);
       glDeleteTextures(2, highlight_filter_cov_[slot]);
     }
@@ -17535,7 +17693,7 @@ bool FrameRenderer::ensureHighlightFilterCov(int slot, int width, int height) {
   if (slot < 0 || slot >= 5 || width <= 0 || height <= 0) return false;
   if (slot == 3) {
     // Both PC3D branches finish reading the original covariance before the
-    // final pass, which reads only slot 2. Reuse its exact RGBA32F storage;
+    // final pass, which reads only slot 2. Reuse the same packed FP32 storage;
     // same-context GL ordering preserves the earlier reads, including upsample.
     if (!ensureHighlightNoiseResources(width, height)) return false;
     highlight_filter_fbo_[3] = fbo_highlight_cov_;
@@ -17559,7 +17717,9 @@ bool FrameRenderer::ensureHighlightFilterCov(int slot, int width, int height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+    const bool packed = channel == 1;
+    glTexImage2D(GL_TEXTURE_2D, 0, packed ? GL_RG32F : GL_RGBA32F,
+        width, height, 0, packed ? GL_RG : GL_RGBA, GL_FLOAT, nullptr);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0+channel, GL_TEXTURE_2D,
         highlight_filter_cov_[slot][channel], 0);
   }
@@ -17593,7 +17753,8 @@ bool FrameRenderer::ensureHighlightNoiseResources(int width, int height) {
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+      glTexImage2D(GL_TEXTURE_2D, 0, i ? GL_RG32F : GL_RGBA32F, width, height, 0,
+                   i ? GL_RG : GL_RGBA, GL_FLOAT, nullptr);
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, *textures[i], 0);
     }
     highlight_cov_w_ = width; highlight_cov_h_ = height;
@@ -19462,7 +19623,8 @@ GLuint FrameRenderer::runHighlightReconstruct(GLuint src, int w, int h,
 // 真机日志（0.13.19/0.13.20）：第一张的 preMs 比第二张多 ~300ms，主要是
 // 2.4GB 纹理首次分配 + satmask 的 125MB CPU 缓冲首次触页；预热把这些搬到
 // 用户构图时（相机页可见 2s 后）。分配并清理中间 target，不跑图像依赖的画质 pass。
-bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter) {
+bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter,
+                           const SpectralWarmupPath* spectral) {
   if (raw_w <= 0 || raw_h <= 0) return false;
   const auto t0 = std::chrono::steady_clock::now();
   const int effective_rot = (rotation + 1) % 4;
@@ -19474,13 +19636,20 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool p
   ok = ensureHlTargets(raw_w, raw_h) && ok;
   ok = ensureTargets(dst_w, dst_h) && ok;
   ok = ensureDefringe(dst_w, dst_h) && ok;
-  ok = ensureColorSmooth(dst_w, dst_h) && ok;
-  ok = ensureColorMedianTargets(dst_w, dst_h) && ok;
-  ok = ensureCaTargets(dst_w, dst_h) && ok;
-  ok = ensureTeqTargets(dst_w, dst_h) && ok;
+  // Only affect optional warm allocations, not execution or the original
+  // allocation-on-first-use paths. Legacy TEQ never consumes spectral RAW.
+  const bool warmCs = !spectral || spectral->cs;
+  const bool warmCm = !spectral || spectral->cm;
+  const bool warmCa = !spectral || spectral->ca;
+  const bool warmTeq = !spectral;
+  const bool warmPc3d = !spectral || pc3d;
+  if (warmCs) ok = ensureColorSmooth(dst_w, dst_h) && ok;
+  if (warmCm) ok = ensureColorMedianTargets(dst_w, dst_h) && ok;
+  if (warmCa) ok = ensureCaTargets(dst_w, dst_h) && ok;
+  if (warmTeq) ok = ensureTeqTargets(dst_w, dst_h) && ok;
   // PC3D 全分辨率两张恒定；低分辨率按 scale=2 预分配（实际 scale 变化时只重建小的）
-  ok = ensurePc3dTargets(dst_w, dst_h, 2) && ok;
-  // Reuse the same RGBA32F allocations as capture; no image-dependent state.
+  if (warmPc3d) ok = ensurePc3dTargets(dst_w, dst_h, 2) && ok;
+  // Reuse the same packed FP32 allocations as capture; no image-dependent state.
   ok = ensureHighlightMergeResources(raw_w, raw_h) && ok;
   ok = ensureHighlightLongResources(raw_w, raw_h) && ok;
   ok = ensureHighlightNoiseResources(dst_w, dst_h) && ok;
@@ -19527,13 +19696,16 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool p
       fbo_hl_mask_, fbo_hl_dil_, fbo_hl_sum_, fbo_hl_, fbo_hl_ref_, fbo_hl_ref2_,
       fbo_scene_, fbo_work_,
       fbo_df_lab_, fbo_df_det_, fbo_df_avg_, fbo_df_,
-      fbo_cs_, fbo_cs_tmp_, fbo_cm_, fbo_cm_tmp_,
-      fbo_teq_i_, fbo_teq_mean_, fbo_teq_tmp_, fbo_teq_out_,
-      fbo_pc3d_, fbo_pc3d_t1_, fbo_pc3d_lo_[0], fbo_pc3d_lo_[1],
+      warmCs ? fbo_cs_ : 0u, warmCs ? fbo_cs_tmp_ : 0u,
+      warmCm ? fbo_cm_ : 0u, warmCm ? fbo_cm_tmp_ : 0u,
+      warmTeq ? fbo_teq_i_ : 0u, warmTeq ? fbo_teq_mean_ : 0u,
+      warmTeq ? fbo_teq_tmp_ : 0u, warmTeq ? fbo_teq_out_ : 0u,
+      warmPc3d ? fbo_pc3d_ : 0u, warmPc3d ? fbo_pc3d_t1_ : 0u,
+      warmPc3d ? fbo_pc3d_lo_[0] : 0u, warmPc3d ? fbo_pc3d_lo_[1] : 0u,
       fbo_highlight_cov_, pc3d ? highlight_filter_fbo_[2] : 0u,
       prefilter ? highlight_filter_fbo_[4] : 0u,
       fbo_highlight_long_[0], fbo_highlight_long_[1], fbo_highlight_long_[2],
-      fbo_ca_, fbo_ca_ds_,
+      warmCa ? fbo_ca_ : 0u, warmCa ? fbo_ca_ds_ : 0u,
   };
   for (GLuint f : targets) clearTarget(f);
   // Noise is the second attachment of the fused RAW pass, not its own FBO.
@@ -19558,8 +19730,13 @@ bool FrameRenderer::warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool p
       LogLevel::kInfo, "engine", "engine.still_warmup",
       std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"w\":" +
           std::to_string(raw_w) + ",\"h\":" + std::to_string(raw_h) +
-          ",\"rot\":" + std::to_string(rotation) + ",\"ms\":" +
-          std::to_string(static_cast<int>(ms)) + "}");
+          ",\"rot\":" + std::to_string(rotation) +
+          ",\"warmCs\":" + std::to_string(warmCs) +
+          ",\"warmCm\":" + std::to_string(warmCm) +
+          ",\"warmCa\":" + std::to_string(warmCa) +
+          ",\"warmTeq\":" + std::to_string(warmTeq) +
+          ",\"warmPc3d\":" + std::to_string(warmPc3d) +
+          ",\"ms\":" + std::to_string(static_cast<int>(ms)) + "}");
   return ok;
 }
 

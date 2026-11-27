@@ -86,10 +86,10 @@ class SpektrafilmIntegrationTest {
         assertTrue(delayed.contains("if (usesSpectralStill() ||"))
         val warmup = src.substringAfter("private fun warmupStillTargets() {").substringBefore("\n    }")
         assertTrue(warmup.contains("!capturing && rendersInFlight.get() == 0"))
-        assertTrue(warmup.contains("orientationStep, pc3d, prefilter, idle)"))
+        assertTrue(warmup.contains("orientationStep, pc3d, prefilter, spectralMask, idle)"))
         val client = File("src/main/java/com/filmkit/app/camera/StillRenderClient.kt").readText()
             .substringAfter("fun warmup(").substringBefore("fun cancelWarmup(")
         assertTrue(client.contains("if (!ready_ || !idle()) return@Runnable"))
-        assertTrue(client.contains("nativeStillWarmup(w, h, rot, pc3d, prefilter)"))
+        assertTrue(client.contains("nativeStillWarmup(w, h, rot, pc3d, prefilter, spectralMask)"))
     }
 }

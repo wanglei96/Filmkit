@@ -311,7 +311,11 @@ class FrameRenderer {
    *  dst 侧的大纹理与 satmask CPU 缓冲先分配好，让第一张的 ~2.4GB 分配发生在
    *  用户构图时而不是快门后。不跑任何画质 pass，不写像素；失败只是没预热。
    *  rotation 语义与 submitRawBurst 相同（引擎内部 +1 后再换宽高）。 */
-  bool warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter);
+  // A null path preserves the shipped warmup. A spectral plan is advisory:
+  // a changed capture setting still allocates in its original consumer.
+  struct SpectralWarmupPath { bool cs, cm, ca; };
+  bool warmup(int raw_w, int raw_h, int rotation, bool pc3d, bool prefilter,
+              const SpectralWarmupPath* spectral = nullptr);
   bool submitRawBurst(const void* const* frames, int count,
                       const int* row_strides_px, int w, int h, int cfa,
                       const float black_phase[4], int white_level,

@@ -24,7 +24,7 @@ uniform float uSigma;
 mat3 covarianceAt(ivec2 p) {
     p=clamp(p,ivec2(0),uSize-1);
     vec3 d=texelFetch(uVariance,p,0).rgb;
-    vec3 o=texelFetch(uCovariance,p,0).rgb;
+    vec3 o=FK_COV_OFF(uVariance,uCovariance,p);
     return mat3(d.r,o.r,o.g, o.r,d.g,o.b, o.g,o.b,d.b);
 }
 float normpdf(float x,float sigma) {
@@ -44,8 +44,7 @@ void main() {
     // sum alpha < 1 because signal shader's denominator has a constant seed.
     // Cauchy: Cov(sum alpha X) <= (sum alpha)*sum alpha Sigma.
     mat3 result=total*(observedWeight/(ws*ws));
-    oVariance=vec4(result[0][0],result[1][1],result[2][2],1.0);
-    oCovariance=vec4(result[1][0],result[2][0],result[2][1],1.0);
+    FK_COV_EMIT(oVariance,oCovariance,vec4(result[0][0],result[1][1],result[2][2],1.0),vec4(result[1][0],result[2][0],result[2][1],1.0))
 }
 )";
 
@@ -69,7 +68,7 @@ uniform int uR;
 const vec3 L=vec3(1.0/3.0);
 mat3 loadCov(highp sampler2D diagTex,highp sampler2D offTex,ivec2 p) {
     vec3 d=texelFetch(diagTex,p,0).rgb;
-    vec3 o=texelFetch(offTex,p,0).rgb;
+    vec3 o=FK_COV_OFF(diagTex,offTex,p);
     return mat3(d.r,o.r,o.g, o.r,d.g,o.b, o.g,o.b,d.b);
 }
 void main() {
@@ -150,8 +149,7 @@ void main() {
     // Low image and high guide originate in the same capture, NOT independent.
     float branches=(lowK>0.0 && guideK>0.0)?2.0:1.0;
     mat3 result=branches*(lowBound+guideBound);
-    oVariance=vec4(result[0][0],result[1][1],result[2][2],1.0);
-    oCovariance=vec4(result[1][0],result[2][0],result[2][1],1.0);
+    FK_COV_EMIT(oVariance,oCovariance,vec4(result[0][0],result[1][1],result[2][2],1.0),vec4(result[1][0],result[2][0],result[2][1],1.0))
 }
 )";
 

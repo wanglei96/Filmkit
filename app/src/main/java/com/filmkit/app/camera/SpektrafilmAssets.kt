@@ -1,6 +1,7 @@
 package com.filmkit.app.camera
 
 import android.content.Context
+import android.os.SystemClock
 import com.filmkit.app.EngineBridge
 import com.filmkit.app.kv
 import java.security.MessageDigest
@@ -10,6 +11,8 @@ internal object SpektrafilmAssets {
     const val PROFILE_ID = "portra400-endura-v1"
     const val ASSET = "spektrafilm/portra400-endura.skp"
     const val SHA256 = "436c0050838d7aa3ef2dbba235b55502aec16423bfe0f2013f4bcecfb67f84c9"
+    private const val SCAN_CAM16_ASSET = "spektrafilm/scan-cam16-v1.fkcam16"
+    private var triedScanCam16 = false
     @Volatile private var ready = false
     private var recipes: List<SpektrafilmRecipe>? = null
     private val cache = object : LinkedHashMap<String, ByteArray>(8, 0.75f, true) {
@@ -39,6 +42,20 @@ internal object SpektrafilmAssets {
                 .joinToString("") { "%02x".format(it.toInt() and 255) }
             check(digest == expected) { "Spektrafilm checksum mismatch: $name" }
             bytes.also { cache[name] = it }
+        }
+        if (!settings.grain && !triedScanCam16) {
+            triedScanCam16 = true
+            val startNs = SystemClock.elapsedRealtimeNanos()
+            val mapped = try {
+                context.assets.openFd(SCAN_CAM16_ASSET).use {
+                    EngineBridge.nativeInstallScanCam16Lut(it.parcelFileDescriptor.fd, it.startOffset, it.length)
+                }
+            } catch (_: java.io.IOException) {
+                false
+            }
+            EngineBridge.nativeAppendLog(if (mapped) EngineBridge.LEVEL_INFO else EngineBridge.LEVEL_WARN,
+                "engine", "spektrafilm.scan_cam16_asset",
+                kv("mapped" to mapped, "ms" to (SystemClock.elapsedRealtimeNanos() - startNs) / 1e6))
         }
         return SpektrafilmCapture(recipe, settings,
             asset(recipe.asset, recipe.sha256), asset(recipe.response, recipe.responseSha256))

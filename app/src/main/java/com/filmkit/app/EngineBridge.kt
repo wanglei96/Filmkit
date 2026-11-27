@@ -38,7 +38,9 @@ object EngineBridge {
 
     // ── M0 ──
     external fun nativeInitLogger(dir: String): Boolean
+    external fun nativeSupportsSpektrafilmVulkan(): Boolean
     external fun nativeLoadSpektrafilmProfile(data: ByteArray): Boolean
+    external fun nativeInstallScanCam16Lut(fd: Int, offset: Long, length: Long): Boolean
     external fun nativeAppendLog(level: Int, module: String, event: String, kvJson: String)
     external fun nativeRecentLogs(maxLines: Int): String?
     external fun nativeFlushLogs(): Boolean
@@ -68,7 +70,7 @@ object EngineBridge {
      * CPU 缓冲先分配好，不跑画质 pass、不写像素。调用前必须 nativeStillStart 成功，
      * 且必须在拍照线程上调用（与后续合成同一 context）。
      */
-    external fun nativeStillWarmup(w: Int, h: Int, rot: Int, pc3d: Boolean, prefilter: Boolean): Boolean
+    external fun nativeStillWarmup(w: Int, h: Int, rot: Int, pc3d: Boolean, prefilter: Boolean, spectralMask: Int): Boolean
 
     /**
      * 生命周期释放（0.13.21）：销毁拍照侧 FrameRenderer（**保留 EGL context**），

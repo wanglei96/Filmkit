@@ -463,7 +463,7 @@ bool blur(std::span<const double> input, std::span<double> output, std::span<dou
           std::size_t width, std::size_t height, double sigma, std::size_t workers,
           WeightedOutput weighted) {
     if (!std::isfinite(sigma) || !validPlanes(input, output, scratch, width, height, workers)) return false;
-    if (sigma <= 0.0 || (sigma < 3.0 && 3.0 * sigma + 0.5 < 1.0)) {
+    if (gaussianBlurIsIdentity(sigma)) {
         if (weighted.data) {
             return parallelPixels(input.size(), workers, [&](auto begin, auto count) {
                 weighted.write(begin, input.data() + begin, count);

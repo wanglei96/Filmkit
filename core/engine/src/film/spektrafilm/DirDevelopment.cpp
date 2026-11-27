@@ -80,6 +80,67 @@ bool diffuse(std::span<const Triplet> exposure, std::span<Triplet> correction,
     return true;
 }
 
+// Generate all three donor-weighted inhibitor planes before writing any
+// source exposure. The full-frame Gaussian passes now read these directly.
+bool developInPlace(std::span<Triplet> exposure, std::size_t width, std::size_t height,
+                    double pixelSizeUm, const DensityCurve& initial, const DensityCurve& beforeDir,
+                    const Triplet& maximum, EmulsionType type, const DirCouplers& dir,
+                    std::size_t workers, SpatialWorkspace* workspace) {
+    const std::size_t count = exposure.size();
+    const bool spread = dir.diffusionUm > 0.0;
+    SpatialWorkspace local(count);
+    auto& work = workspace ? *workspace : local;
+    std::array<std::unique_ptr<double[]>, 2> extra;
+    std::array<std::span<double>, 3> field;
+    if (spread) {
+        field[0] = work.plane(0);
+        for (std::size_t c = 1; c < 3; ++c) {
+            extra[c - 1] = std::make_unique_for_overwrite<double[]>(count);
+            field[c] = {extra[c - 1].get(), count};
+        }
+    }
+    if (!parallelPixels(count, workers, [&](std::size_t begin, std::size_t n) {
+        std::array<Triplet, 256> developed;
+        for (std::size_t offset = 0; offset < n;) {
+            const auto start = begin + offset;
+            const auto length = std::min(n - offset, developed.size());
+            const auto part = exposure.subspan(start, length);
+            const auto initialDensity = std::span(developed).first(length);
+            if (!initial.develop(part, initialDensity)) return false;
+            for (std::size_t i = 0; i < length; ++i) {
+                const auto shifts = inhibitors(initialDensity[i], maximum, type, dir.inhibition);
+                for (std::size_t c = 0; c < 3; ++c) {
+                    if (spread) field[c][start + i] = shifts[c];
+                    else part[i][c] = part[i][c] - shifts[c];
+                }
+            }
+            offset += length;
+        }
+        return true;
+    })) return false;
+    if (spread) {
+        constexpr std::array amplitudes{0.1633, 0.6496, 0.1870};
+        constexpr std::array ratios{0.5360, 1.5236, 2.7684};
+        const double sigma = dir.diffusionUm / pixelSizeUm, decay = dir.tailUm / pixelSizeUm;
+        std::array<GaussianTap, amplitudes.size()> taps;
+        for (std::size_t j = 0; j < taps.size(); ++j) taps[j] = {ratios[j] * decay, amplitudes[j]};
+        const auto filtered = work.plane(1), scratch = work.plane(2), tail = work.plane(3);
+        for (std::size_t c = 0; c < 3; ++c) {
+            if (!gaussianBlurMixture(field[c], filtered, scratch, tail, taps, width, height, workers)) return false;
+            if (!gaussianBlur(field[c], filtered, scratch, width, height, sigma, workers)) return false;
+            if (!parallelPixelIndices(count, workers, [&](std::size_t i) {
+                const double core = (1.0 - dir.tailWeight) * filtered[i];
+                exposure[i][c] = exposure[i][c] - (core + tail[i] * dir.tailWeight);
+            })) return false;
+            if (c != 0) extra[c - 1].reset();
+        }
+    }
+    return parallelPixels(count, workers, [&](std::size_t begin, std::size_t n) {
+        const auto part = exposure.subspan(begin, n);
+        return beforeDir.develop(part, part);
+    });
+}
+
 }  // namespace
 
 bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet> density,
@@ -88,7 +149,7 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
                             Triplet gamma, EmulsionType type, const DirCouplers& dir,
                             std::size_t filterWorkers, SpatialWorkspace* workspace) {
     if (!width || !height || width > exposure.size() / height || width * height != exposure.size() ||
-        density.size() != exposure.size() || exposure.data() == density.data() ||
+        density.size() != exposure.size() ||
         (workspace && workspace->size() != exposure.size())) return false;
     if (!dir.active) {
         const auto curve = prepareInitialFilmDevelopment(axis, stock, gamma);
@@ -114,6 +175,10 @@ bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet
     }
     const DensityCurve initial(axis, normalized, gamma);
     const auto beforeDir = preInhibitionCurve(axis, normalized, maximum, gamma, type, dir);
+    if (exposure.data() == density.data()) {
+        return developInPlace(density, width, height, pixelSizeUm, initial, beforeDir,
+                              maximum, type, dir, filterWorkers, workspace);
+    }
     const bool spread = dir.diffusionUm > 0.0;
     if (!parallelPixels(density.size(), filterWorkers, [&](auto begin, auto count) {
         const auto input = exposure.subspan(begin, count);

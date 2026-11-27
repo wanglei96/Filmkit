@@ -75,8 +75,7 @@ void main() {
     mat3 sigma = uCcm * mat3(v.r, 0.0, 0.0,
                              0.0, v.g, 0.0,
                              0.0, 0.0, v.b) * transpose(uCcm);
-    oVariance = vec4(max(vec3(sigma[0][0], sigma[1][1], sigma[2][2]), vec3(0.0)), 1.0);
-    oCovariance = vec4(sigma[1][0], sigma[2][0], sigma[2][1], 1.0);
+    FK_COV_EMIT(oVariance,oCovariance,vec4(max(vec3(sigma[0][0], sigma[1][1], sigma[2][2]), vec3(0.0)), 1.0),vec4(sigma[1][0], sigma[2][0], sigma[2][1], 1.0))
 }
 )";
 

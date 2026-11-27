@@ -4,6 +4,10 @@
 #include "SpectralLut.h"
 #include "SpatialWorkspace.h"
 
+#if defined(FILMKIT_VULKAN_HANATOS)
+#include "HanatosVulkan.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,6 +15,10 @@
 #include <optional>
 
 namespace filmkit::spektrafilm {
+#if defined(FILMKIT_VULKAN_STILL_PROBE) && defined(__aarch64__)
+bool tryVulkanScan(std::span<const Triplet> xyz, int w, int h, Triplet scannerWhiteXyz,
+                   double lensBlurSigma, double unsharpSigma, double unsharpAmount, bool useLut);
+#endif
 namespace {
 
 template <class Exact, class Finish>
@@ -53,7 +61,7 @@ bool renderSrgb(Buffer& image, std::size_t size, std::size_t width, std::size_t 
                 RenderWorkers workers, std::uint64_t grainSeed,
                 std::uint64_t glareSeed, RenderTimings* timings,
                 const GrainReplay* grainReplay, std::span<const double> glareReplay,
-                bool useSpectralLut) {
+                bool useSpectralLut, bool hanatosPrepared = false) {
     using Clock = std::chrono::steady_clock;
     if (timings) *timings = {};
     const auto view = [&](Buffer& buffer) -> std::span<Triplet> {
@@ -97,8 +105,17 @@ bool renderSrgb(Buffer& image, std::size_t size, std::size_t width, std::size_t 
     const double exposureEv = p.exposureEv + p.captureExposureEv;
     double exposureGain = 1.0;
     if (p.boost.ev == 0.0 && !prepareFilmExposureGain(exposureEv, p.boost, exposureGain)) return false;
-    if (!parallelPixels(size, workers.pixels, [&](auto begin, auto count) {
-            const auto part = pixels().subspan(begin, count);
+    std::size_t projected = hanatosPrepared ? size : 0;
+#if defined(FILMKIT_VULKAN_HANATOS)
+    if (!hanatosPrepared && size >= 1024 * 1024 && hanatosVulkanMode() == HanatosVulkanMode::CpuInput) {
+        const auto result = projectHanatosVulkan(pixels(), p.xyzFromRgb, p.response, p.responseSide,
+                                                exposureGain, workers.pixels);
+        if (!result) return false;
+        projected = *result;
+    }
+#endif
+    if (projected < size && !parallelPixels(size - projected, workers.pixels, [&](auto begin, auto count) {
+            const auto part = pixels().subspan(projected + begin, count);
             return projectHanatosRaw(part, part, p.xyzFromRgb, p.response, p.responseSide, exposureGain);
         })) return false;
     mark(t.hanatos);
@@ -106,16 +123,21 @@ bool renderSrgb(Buffer& image, std::size_t size, std::size_t width, std::size_t 
         !finishFilmLogExposure(pixels(), width, height, p.pixelUm, p.lensBlurUm,
                                p.halation, p.exposureCorrection, workers.filters, &workspace)) return false;
     mark(t.filmExposure);
-    Buffer work = [size] {
+    const auto makeWork = [size] {
         if constexpr (requires (Buffer b) { b.get(); }) return std::make_unique_for_overwrite<Triplet[]>(size);
         else return Buffer(size);
-    }();
-    if (!developFilmBeforeGrain(pixels(), view(work), width, height, p.pixelUm,
+    };
+    // Full-frame DIR writes in place only after generating all inhibitor planes.
+    const bool planar = size >= 16384;
+    Buffer work;
+    if (!planar) work = makeWork();
+    if (!developFilmBeforeGrain(pixels(), planar ? pixels() : view(work), width, height, p.pixelUm,
                                 p.filmAxis, p.filmStock, p.filmGamma,
                                 p.filmType, p.dir, workers.filters, &workspace)) return false;
-    image.swap(work);
+    if (!planar) image.swap(work);
     mark(t.dir);
     if (p.grain.active) {
+        if (planar) work = makeWork();
         // Grain owns its own work planes; do not increase its peak memory use.
         workspace.release();
         if (!applyFilmGrain(pixels(), view(work), width, height, p.pixelUm, p.grainTotal, p.grainLayers,
@@ -163,11 +185,17 @@ bool renderSrgb(Buffer& image, std::size_t size, std::size_t width, std::size_t 
         for (std::size_t c = 0; c < 3; ++c) white[c] += band.illuminant * band.response[c];
     }
     for (auto& value : white) value /= p.scanner.normalizer;
+#if defined(FILMKIT_VULKAN_STILL_PROBE) && defined(__aarch64__)
+    if (!tryVulkanScan(pixels(), static_cast<int>(width), static_cast<int>(height), white,
+                       p.scanLensBlur, p.unsharpSigma, p.unsharpAmount, !p.grain.active))
+#endif
     {
         // Scan filtering overwrites all used work planes, so no clearing pass is needed.
         if (!finishScanSrgb(pixels(), width, height, white, p.scanLensBlur, p.unsharpSigma,
                             p.unsharpAmount, true, workspace.plane(0), workspace.plane(1),
-                            workspace.plane(2), workers.output, workers.filters)) return false;
+                            workspace.plane(2), workers.output, workers.filters,
+                            timings ? &t.scanOutputParts : nullptr,
+                            !p.grain.active)) return false;
     }
     mark(t.scanOutput);
     pool.reset();
@@ -194,6 +222,16 @@ bool renderNegativeSrgb(std::unique_ptr<Triplet[]>& image, std::size_t size,
     return image && renderSrgb(image, size, width, height, p, backend, workers, grainSeed, glareSeed,
                                timings, nullptr, {}, useSpectralLut);
 }
+
+#if defined(FILMKIT_VULKAN_HANATOS)
+bool renderNegativeSrgbFromHanatos(std::unique_ptr<Triplet[]>& image, std::size_t size,
+                                   std::size_t width, std::size_t height, const NegativeRenderParams& p,
+                                   SpectralBackend backend, RenderWorkers workers, std::uint64_t grainSeed,
+                                   std::uint64_t glareSeed, RenderTimings* timings, bool useSpectralLut) {
+    return image && renderSrgb(image, size, width, height, p, backend, workers, grainSeed, glareSeed,
+                               timings, nullptr, {}, useSpectralLut, true);
+}
+#endif
 
 bool negativeNeutralResponse(const NegativeRenderParams& params, SpectralBackend backend,
                               std::span<Triplet> response, std::size_t workers) {

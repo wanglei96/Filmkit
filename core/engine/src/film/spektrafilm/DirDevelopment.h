@@ -14,7 +14,7 @@ struct DirCouplers {
     double tailWeight = 0.06;
 };
 
-// Produces density after DIR and before grain. Exposure and density must not overlap.
+// Produces density after DIR and before grain. Exposure and density must be disjoint or identical.
 bool developFilmBeforeGrain(std::span<const Triplet> exposure, std::span<Triplet> density,
                             std::size_t width, std::size_t height, double pixelSizeUm,
                             std::span<const double> logExposureKnots, std::span<const Triplet> stockDensity,

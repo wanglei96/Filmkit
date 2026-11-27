@@ -32,6 +32,10 @@ static int run(int argc, char** argv) {
         const bool altered = std::stoi(argv[5]) != 0;
         std::array<double, 12> options{1, 0, 1, .65, 1, 1, 1, 0, 0, .7, .7, 35};
         if (altered) options = {1, 0, 1.5, .9, .4, 1.3, .6, .8, .25, .9, .4, 50};
+        // Opt in to same-seed, FP64 comparisons across the full recipe catalog.
+        if (const auto* grain = std::getenv("FILMKIT_RECIPE_GRAIN"); grain && std::string_view(grain) == "1") {
+            options[1] = 1;
+        }
         if (!applyRenderOptions(p, options)) throw std::runtime_error("valid options rejected");
         auto invalid = options; invalid[1] = .5;
         if (applyRenderOptions(p, invalid)) throw std::runtime_error("invalid options accepted");

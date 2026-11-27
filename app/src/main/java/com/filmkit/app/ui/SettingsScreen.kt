@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -1899,6 +1900,7 @@ private fun SpektrafilmControls(prefs: android.content.SharedPreferences) {
     val catalog = remember { SpektrafilmAssets.catalog(context) }
     var settings by remember { mutableStateOf(SpektrafilmSettings.read(prefs)) }
     var choosing by remember { mutableStateOf("") }
+    var vulkanSupported by remember { mutableStateOf<Boolean?>(null) }
     val films = remember(catalog) { catalog.distinctBy { it.film } }
     val selected = catalog.first { it.film == settings.film && (it.positive || it.paper == settings.paper) }
     fun commit(next: SpektrafilmSettings) { settings = next; next.save(prefs) }
@@ -1931,6 +1933,27 @@ private fun SpektrafilmControls(prefs: android.content.SharedPreferences) {
             confirmButton = {},
         )
     }
+    LaunchedEffect(Unit) {
+        val supported = withContext(Dispatchers.IO) {
+            try {
+                EngineBridge.ensureLoaded()
+                EngineBridge.nativeSupportsSpektrafilmVulkan()
+            } catch (_: LinkageError) {
+                false
+            }
+        }
+        if (!supported && settings.vulkan) commit(settings.copy(vulkan = false))
+        vulkanSupported = supported
+    }
+    SettingSwitchRow("Vulkan 成片加速",
+        when (vulkanSupported) {
+            null -> "正在检测设备…"
+            false -> "此设备不支持当前 Vulkan 成片后端"
+            true -> "Spektrafilm 走 Vulkan；运行失败自动回退，不改变取景设置"
+        },
+        checked = vulkanSupported == true && settings.vulkan,
+        onChecked = { if (!it || vulkanSupported == true) commit(settings.copy(vulkan = it)) },
+        enabled = vulkanSupported == true)
     SettingSwitchRow("Spektrafilm · 颗粒", null, settings.grain,
         onChecked = { commit(settings.copy(grain = it)) })
     if (settings.grain) {

@@ -91,6 +91,82 @@ find_library(log-lib log)
 find_library(jnigraphics-lib jnigraphics)
 target_link_libraries(filmengine PRIVATE GLESv3 EGL android ${log-lib} ${jnigraphics-lib})
 
+option(FILMKIT_VULKAN_HANATOS "Build the opt-in Spektrafilm Vulkan still backend" OFF)
+option(FILMKIT_VULKAN_AHB_PROBE "Enable experimental AHardwareBuffer replay modes (3 and 4)" OFF)
+if(FILMKIT_VULKAN_HANATOS)
+    set(hanatos_shader "${CMAKE_CURRENT_SOURCE_DIR}/src/film/spektrafilm/Hanatos.comp")
+    set(hanatos_spirv "${CMAKE_CURRENT_BINARY_DIR}/HanatosSpirv.inc")
+    set(hanatos_shared_spirv "${CMAKE_CURRENT_BINARY_DIR}/HanatosSharedSpirv.inc")
+    find_program(hanatos_glslc glslc
+        HINTS "${ANDROID_NDK}/shader-tools/darwin-x86_64"
+              "${ANDROID_NDK}/shader-tools/linux-x86_64"
+              "${ANDROID_NDK}/shader-tools/windows-x86_64"
+        REQUIRED)
+    add_custom_command(OUTPUT "${hanatos_spirv}"
+        COMMAND "${hanatos_glslc}" --target-env=vulkan1.0 -O -mfmt=num
+            "${hanatos_shader}" -o "${hanatos_spirv}"
+        DEPENDS "${hanatos_shader}"
+        VERBATIM)
+    add_custom_command(OUTPUT "${hanatos_shared_spirv}"
+        COMMAND "${hanatos_glslc}" --target-env=vulkan1.1 -O -mfmt=num -DHANATOS_SHARED_IMAGE=1
+            "${hanatos_shader}" -o "${hanatos_shared_spirv}"
+        DEPENDS "${hanatos_shader}"
+        VERBATIM)
+    target_sources(filmengine PRIVATE src/film/spektrafilm/HanatosVulkan.cpp
+        "${hanatos_spirv}" "${hanatos_shared_spirv}")
+    # Unspecified members of Vulkan's extensible structures are zero-initialized.
+    set_property(SOURCE src/film/spektrafilm/HanatosVulkan.cpp APPEND PROPERTY
+        COMPILE_OPTIONS -Wno-missing-designated-field-initializers)
+    target_include_directories(filmengine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_definitions(filmengine PRIVATE FILMKIT_VULKAN_HANATOS=1)
+    if(FILMKIT_VULKAN_AHB_PROBE)
+        set_property(SOURCE src/film/spektrafilm/HanatosVulkan.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS FILMKIT_VULKAN_AHB_PROBE=1)
+    endif()
+    target_link_libraries(filmengine PRIVATE vulkan)
+endif()
+
+option(FILMKIT_VULKAN_STILL_PROBE "Experimental Vulkan still replay only" OFF)
+if(FILMKIT_VULKAN_STILL_PROBE)
+    if(NOT FILMKIT_VULKAN_HANATOS OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
+        message(FATAL_ERROR "Still replay needs the Android ARM64 Vulkan build")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(probe_dir "${CMAKE_CURRENT_SOURCE_DIR}/src/render/vulkan_probe")
+    set(frame_renderer "${CMAKE_CURRENT_SOURCE_DIR}/src/render/FrameRenderer.cpp")
+    foreach(stage 1 2)
+        set(source "${CMAKE_CURRENT_BINARY_DIR}/Rcd${stage}.comp")
+        add_custom_command(OUTPUT "${source}"
+            COMMAND "${Python3_EXECUTABLE}" "${probe_dir}/generate_rcd.py" "${frame_renderer}"
+                "${probe_dir}/RcdProbe.comp.in" "${source}" "${stage}"
+            DEPENDS "${probe_dir}/generate_rcd.py" "${probe_dir}/RcdProbe.comp.in" "${frame_renderer}"
+            VERBATIM)
+    endforeach()
+    foreach(shader Rcd1 Rcd1Tile Rcd2)
+        set(source "${CMAKE_CURRENT_BINARY_DIR}/${shader}.comp")
+        unset(tile_arg)
+        if(shader STREQUAL "Rcd1Tile")
+            set(source "${CMAKE_CURRENT_BINARY_DIR}/Rcd1.comp")
+            set(tile_arg -DUSE_TILE)
+        endif()
+        set(words "${CMAKE_CURRENT_BINARY_DIR}/${shader}.inc")
+        add_custom_command(OUTPUT "${words}"
+            COMMAND "${hanatos_glslc}" --target-env=vulkan1.1 -O -mfmt=num ${tile_arg} "${source}" -o "${words}"
+            DEPENDS "${source}" VERBATIM)
+        target_sources(filmengine PRIVATE "${words}")
+    endforeach()
+    set(scan_words "${CMAKE_CURRENT_BINARY_DIR}/ScanProbe.inc")
+    add_custom_command(OUTPUT "${scan_words}"
+        COMMAND "${hanatos_glslc}" --target-env=vulkan1.1 -O -mfmt=num
+            "${probe_dir}/ScanProbe.comp" -o "${scan_words}"
+        DEPENDS "${probe_dir}/ScanProbe.comp" VERBATIM)
+    target_sources(filmengine PRIVATE "${probe_dir}/VkRun.cpp" "${probe_dir}/RcdProbe.cpp"
+        "${probe_dir}/ScanProbe.cpp" "${scan_words}")
+    set_property(SOURCE "${probe_dir}/VkRun.cpp" "${probe_dir}/RcdProbe.cpp" APPEND PROPERTY
+        COMPILE_OPTIONS -Wno-missing-designated-field-initializers)
+    target_compile_definitions(filmengine PRIVATE FILMKIT_VULKAN_STILL_PROBE=1)
+endif()
+
 # ── HDR（JPEG/R Ultra HDR）—— 默认 OFF ─────────────────────────────────
 # 为什么做成开关：libultrahdr 要 vendor libjpeg-turbo（FetchContent，首次约 1~2 分钟），
 # 日常构建不该为一条还没接进交付链的新路径付这份成本；**接交付链时再打开**。
