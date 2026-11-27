@@ -1,8 +1,8 @@
 ---
 summary: LUT换血与AE高光保护
 created: 2026-11-11 16:15
-updated: 2026-11-11 16:15
-status: absorbed
+updated: 2026-11-27 09:55
+status: archived
 ---
 
 # LUT换血与AE高光保护

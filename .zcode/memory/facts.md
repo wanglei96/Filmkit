@@ -1,7 +1,7 @@
 ---
 summary: 环境约束、关键路径与可复用命令
 created: 2026-09-18 10:20
-updated: 2026-11-19 21:15
+updated: 2026-11-27 09:55
 status: active
 ---
 # 事实
@@ -29,7 +29,6 @@ status: active
 - [2026-10-30] **历史sat mask判据（已被native整数域判据取代）**：`wb >= gain[c] − 3σ`，1px 膨胀 + 2×2 聚合，日志 satmP/satmRaw/satmHit/satmCov。
 - [2026-10-30] **gainmap 读数口径**：`raw.render` 的 gm* 恒 0（设计）；真值在 `gainmap.readback` 的 gmMin/gmMean/gmMax，`ratio = 0.25 × 16^g`。
 - [2026-10-30] **徕卡标定边界**：`recipe-fit.py` 从 filmic 之后接起，RAW/CCM/WB/kFsFilm 的 sat·split·mono 是"未验证段" ⇒ 预设不在饱和度补偿之后标定。
-- [2026-11-17] 历史发布：**0.14.25(822)，tag `v0.14.25`，commit `9613b51`**；当前交付见末节。内置 7 条预设，46 个 LUT。
 - [2026-11-02] **`diag.stats.sat` = `[20][21][22]` 的实际下发值**（判断预设饱和是否生效的唯一日志字段）；`setFilmParams` 换数组后必须把 21 个 applier 缓存置哨兵；改 assets 后单测必须 `--rerun-tasks`。
 ## 预设群与 LUT 特征（11-02）
 - [2026-11-02] **理光正片 / 富士NC**：`ricoh_positive_v1` 灰轴 暗 +1.36 / 中 −1.06 / 高光 +0.64，色相 红 29°/绿 134°/蓝 303°；`fuji_nc` 原资产压白 8.2%，`fuji_nc_v2` 归一后 L\* 恒等 0.26、白点 1.43/255。
@@ -96,11 +95,8 @@ status: active
 - [2026-11-17] **镜头恢复**：后台恢复实际 session 为 lens 3、equiv 70.25037mm、zoom 1；UI 与照片 视场一致，回主摄 24mm。`camera.session_ready` 是判定实际镜头的日志字段。
 - [2026-11-17] **回归**：同一 renderer 八例覆盖 4080×3072/4096×3072、主/长焦、重复、强度和旋转； 旧库第二例变黑，修复库全过。841 项单测 0 failure，864 项 JNI JPEG/R 对照通过。
 - [2026-11-17] **发布产物**：`filmkit-0.14.25-LENS.apk`，57,519,060B，SHA256 `4578b3a95df196e2a5c5c6d64d1e054f0aa9e3200ee015ec95608d9d3d9d2e9c`；822/0.14.25，签名/JNI 通过并已安装。
-- [2026-11-17] **清理与磁盘**：`cleanup-applied.json` 记录 153 文件/3,397,116,589B（3.163811GiB）； `test_temp` 约 1.3GB、`/private/tmp` 约 1.9GB，根目录仅留 0.14.25 与回退 0.14.20。
 ## 长帧保护与灯边证据（11-17）
-- [2026-11-17] 历史交付0.14.26(823)，`filmkit-0.14.26-HLGUARD.apk`，代码提交 `34691a1`。日光栏杆问题待条件复测，细紫边未闭环。
 - [2026-11-17] long guard 完整三阶段接入：RAW/4 原生四相位裁切、原始 reference-highlight exclusion、source exclusion 两次 UNORM 存储；同权重消费于融合/支持/归一化/方差，未修改 PC3D/预设。
-- [2026-11-17] 0.14.26构建/GLSL通过，20裁切夹具、80融合噪声组、75既有merge组通过；841单测中839通过/2跳过。签名/DEX版本/JNI已验；非日光实拍质量验收。
 - [2026-11-17] 灯罩证据：`test_temp/purple-lampshade-burst-20261117-1819/`；4帧GRBG4080×3072，stage token83158734972；42文件950093410B的大小/SHA256复核通过；DNG RAW与f0逐值一致。
 - [2026-11-17] 本张scene-linear紫边指标：D3白界前7290.700、白界后601.417、D4 CCM851.931、P4+D1后858.341（+0.75%）；指标非最终JPEG色差，窄边已存在于P4之前。
 - [2026-11-17] UI「色差中值滤波」实际控制`color_smooth`（CS），不是CM；PC3D替换链消费CS/CM，P4链不消费。CS压紫边也使已知合成2px彩线损失约85%色度。
@@ -112,9 +108,12 @@ status: active
 - [2026-11-18] 同 RAW 真机线性灯弧指标：关 843.331、CS 200.413(-76.24%)、CM 653.462(-22.51%)、CS+CM 158.793(-81.17%)；SDR JPEG 编码域：74.051、42.008(-43.27%)、75.757(+2.30%)、30.667(-58.59%)。编码域不是线性辐射量或感知分。
 - [2026-11-18] Filmic V7 参考固定 darktable `395aa7d5156b68a69d8f2d25a3e6fc66c525a3c2`；UI V7 是 `DT_FILMIC_COLORSCIENCE_V5`/`filmic_v5`。原版 CPU 整模块与隔离参考在 sRGB/P3 D0 的编码端到端最大差约 `1.08e-4`，不是设备生产误差预算。
 - [2026-11-18] 旧 Filmic 与 V7 固定 `-7.65/+4.56` 的同输入 A/B：灯罩 D0 和 PhotonCamera 白天 DNG 均无肉眼差异，全图任一 RGB 通道最多差 1 个 8-bit 阶；两张都未覆盖 V7 白点以上输入，也未做完整应用链。
-- [2026-11-19] Spektrafilm上游锁定`3bb2c2d2801ff68b92019cf1dbcbb133d60832bc`，位于`test_temp/engine-reference-20261118/spektrafilm-upstream`；配套Python为同目录`spektrafilm-env/bin/python`。0.14.29(826)已安装于10AG6Y0DEH009DA，完整负片/直扫、RAW多帧/HDR落盘，详见新交接。
-- [2026-11-19] `test_temp/spektrafilm-apk-20261119/phone-controls.log`记录快门保存22.098/25.539/19.309s，光谱17453.553/19451.609/13576.293ms；生产日志尚未暴露已有RenderTimings全部子阶段，须补同RAW测量。
+- [2026-11-19] Spektrafilm上游锁定`3bb2c2d2801ff68b92019cf1dbcbb133d60832bc`，位于`test_temp/engine-reference-20261118/spektrafilm-upstream`；配套Python为同目录`spektrafilm-env/bin/python`。历史版0.14.29(826)当时安装于10AG6Y0DEH009DA，完整负片/直扫、RAW多帧/HDR落盘，详见新交接。
 - [2026-11-19] 同DNG颗粒开关Q100444：10676174→20246324B（1.8964倍）；真机21.05MB中主图20.87MB、gainmap0.178MB，无重复颗粒调用。`spektrafilm-grain-size-20261119.json`保留，同输入300MB中间文件/完整JPEG已删；不改生产JPEG质量。
 - [2026-11-18] 长期合同：highlight 分支强制完整 L1；NN 不兼容恢复域时明确回退并记日志；0.14.20 使用完整对称主元 LDLT、thread-local 诊断与重复 SurfaceTexture 时间戳跳过。
 - [2026-11-18] 长期合同：HEIF 使用 VBR 与官方固定 QP 4，不按体积自动升 QP；10bit→8bit HEIF→JPEG 三级回退，读头失败继续回退。
 - [2026-11-18] 长期边界：历史 PMRID 只替 P0、不是 PC3D，失败整张回退；不得据此宣称当前已启用或适用于高光恢复域。
+## 0.14.57 收尾证据与固定回归集
+- [2026-11-27] 0.14.57（854）真机 Gold 200 / Portra Endura 5.507s、Provia 100F 直扫 5.748s（快门到保存，四帧、关颗粒、Vulkan 开、8 位 JPEG/R）；同 RAW Gold 四对配对中位省 812ms，Provia 波动不作稳定收益。详见 `docs/reports/spektrafilm-workset-delivery-20261127.md`。
+- [2026-11-27] 签名包 `filmkit-0.14.57-WORKSET.apk`；稳定回退 `filmkit-0.14.56-VULKAN.apk`。收尾 ARM64 与签名包 SHA-256 一致；Release JVM 852 项、850 通过、2 跳过。0.15.0（855）是开发版元数据，不代表已出包。
+- [2026-11-26] 固定 DNG 在 `test_temp/`：`FILMKIT_20261119-110832.dng` 人像、`FILMKIT_20261119-110846.dng` 绿植、`FILMKIT_20261119-110904.dng` 建筑、`FILMKIT_20261119-110936.dng` 鲜花；`tools/prepare-spektrafilm-regression-dng.py` 校验及提取。0.14.57 交付库两配方×四原片×8/10 位共 48 个输出哈希与 0.14.56 基线一致。

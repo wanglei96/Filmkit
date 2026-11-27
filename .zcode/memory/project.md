@@ -1,7 +1,7 @@
 ---
 summary: FilmKit 胶片相机:RAW/YUV 双输入,M 档专业拍摄,X300 专项
 created: 2026-09-18 10:20
-updated: 2026-11-24 20:55
+updated: 2026-11-27 09:55
 status: active
 ---
 # 项目状态
@@ -11,7 +11,7 @@ status: active
 - `app/`：Kotlin/Compose UI（相机/设置/能力/日志四 Tab）+ CameraController（Camera2 双流）+ RenderClient（预览渲染）+ StillRenderClient（拍照渲染）+ CameraAudit + `camera/StdColorMatrix.kt` + `ui/CameraPresets.kt`（FilmParams 槽位唯一来源，**kCount=105**）+ `ui/ParamControls.kt`（参数表单一来源，拍照与编辑器共用）
 - `core/engine/`：C++20 引擎——render/（FrameRenderer + Align）、gl/、spike/（SpikeFftMerge）、log/、jni/Bridge.cpp、`film/FilmParams.h`、`film/EngineRegistry.{h,cpp}`
 - `assets/`：`luts/` 46 个 .lut（33³ 为主 + `leica_m9_ccd`128³ + 3×64³ 自烘 + `ricoh_negative_ye` 33³）+ `noise_models/` 三摄 + `presets/builtin.json` **七条**预设；`tools/`：validate-shaders / check-diag-* / bake-{m9,ricoh}-lut / normalize-lut-luma / recipe-fit / tuning 工具族
-**历史发布（2026-11-17 14:36）**：0.14.25(822, `9613b51`) 的 dev/main/tag/GitHub Release 当时同步；当前 0.14.27 状态见末节。
+**历史发布（2026-11-17 14:36）**：0.14.25(822, `9613b51`) 的 dev/main/tag/GitHub Release 当时同步；当前性能收尾与 0.15 待办见末节。
 切镜头黑图与焦段假保持已修复。性能目标 3--5s/优选≤4s 与预览几乎不掉帧仍未全面证明；
 0.14.20 保存中位 5.599s，剩余热点仍是 PC3D/共享 GPU、warmup、RAW producer 与 histogram 同步。
 旧账：高光扩展场景、Spektrafilm、理光曲线重标、绿植/绿段、亮部亮度降噪、超广畸变。
@@ -80,11 +80,17 @@ status: active
 - [2026-11-18→19] Spektrafilm 定位独立可选风格引擎，停止与 Filmic/sigmoid 四路排名；已在0.14.29接入生产，完整原版一致性与设备成本见下节，分发许可仍待审计。
 - [2026-11-18] 不重开已因灰云斑失败的 RAW opposed 高光重建；彩边修复必须先做真实细彩线/色准/噪声/高光/运动回归，不能只按紫边指标放行。
 ## Spektrafilm 落地与提速（11-19）
-- [2026-11-19] 已安装0.14.29(826)：slot2共享RAW多帧前链，完整光谱曝光/DIR/颗粒/负片印放/扫描，SDR与HDR JPEG/R落盘；20胶片、8介质、132配方，正片直扫。私有double[12]，共享FilmParams仍105槽。
-- [2026-11-19] 快门冻结配方/参数/HDR意图，JNI每renderer持有profile；预览仅构图代理，非完整光谱预览；自定义扩散/化学显影/全部纸面黑白点未开放，更多端点和HDR显示质量待验。
+- [2026-11-19] 当时已安装0.14.29(826)：slot2共享RAW多帧前链，完整光谱曝光/DIR/颗粒/负片印放/扫描，SDR与HDR JPEG/R落盘；20胶片、8介质、132配方，正片直扫。私有double[12]，共享FilmParams仍105槽。
+- [2026-11-19] 快门冻结配方/参数/HDR意图，JNI每renderer持有profile；当时预览仅构图代理，非完整光谱预览；自定义扩散/化学显影/全部纸面黑白点未开放，更多端点和HDR显示质量待验。
 - [2026-11-19] 原版与生产ARM64对象147配方/控制对照最坏约3.43e-10；HDR975点约1.12e-10；既往849 JVM测试0失败/2跳过。本轮仅默认值3测试通过，未重新跑全套。
 - [2026-11-19] 真机快门到保存：负片颗粒关22.098s、开25.539s、Velvia直扫关19.309s；光谱13.58--19.45s，编码129--254ms。不同采集不能据此算颗粒因果提速比例。
 - [2026-11-19] 当时源码默认颗粒关、面积0.45、模糊0.8px、晕光0.5、散射0.5、DIR1；保留保存值。相纸/单帧 HDR/参数端点与分发许可仍待复验。
 
-## 当前交接：Spektrafilm 0.14.50
+## 历史基线：Spektrafilm 0.14.50
 - [2026-11-24] 0.14.50（847）已真机验收，Gold 印相 7.442s、Provia 直扫 6.274s，取景几乎不卡。三个后续试验均撤回，GPU 算法原型未测。见 `handoffs/Spektrafilm提速与GPU交接.memo.md`。
+
+## 当前交接：0.14.57 性能收尾与 0.15
+- [2026-11-27] 性能专项收尾于 0.14.57（854）。生产启用可选 Vulkan Hanatos、RAW 协方差紧凑布局、FP64 DIR 平面、按需预热和并行 JPEG/R 底图；未启用 AHardwareBuffer 共享或连续 Vulkan 扫描。代码 `10ce0c3`，实拍与对照见 `docs/reports/spektrafilm-workset-delivery-20261127.md`。
+- [2026-11-27] 下一开发版从 0.15.0（855）起；工作列表：预设标定、边框水印、AI 构图、预览效果。只定任务，不预设实现、顺序或上线标准。
+- [2026-11-27] 预览效果与流畅度分开验收：先确认当前取景和同配方成片在曝光、影调、色彩上的差距；保留 0.14.57 取景体感基线。旧显示域对齐见本文件 11-04 节，不能假设取景已是全光谱成片。
+- [2026-11-27] 历史画质待办不误标为完成：个别照片相册整图变暗未独立归因；彩边真色线、日光栏杆长帧保护、高光扩展、HDR/相纸端点及分发许可另行跟踪。

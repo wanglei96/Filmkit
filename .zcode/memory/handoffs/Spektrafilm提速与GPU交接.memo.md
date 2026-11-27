@@ -1,8 +1,8 @@
 ---
 summary: Spektrafilm提速与GPU交接
 created: 2026-11-24 20:55
-updated: 2026-11-24 20:55
-status: active
+updated: 2026-11-27 09:55
+status: absorbed
 ---
 
 # Spektrafilm提速与GPU交接
